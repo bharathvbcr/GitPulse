@@ -146,26 +146,53 @@ pub(crate) fn notify_flags(provider: &str) -> &'static [&'static str] {
     }
 }
 
-/// A plain agent tab's arguments with the notification flags in front.
+/// Claude Code's `--setting-sources`, when the user narrowed which of its
+/// settings files an agent loads (`tool_config::AgentDefaults`). Nothing
+/// otherwise, and nothing for any other CLI: none of them has the flag.
+pub(crate) fn setting_source_flags(provider: &str, sources: Option<&str>) -> Vec<String> {
+    match (provider, sources) {
+        ("claude", Some(sources)) => vec!["--setting-sources".to_owned(), sources.to_owned()],
+        _ => Vec::new(),
+    }
+}
+
+/// Every flag an agent launch adds for the user's settings rather than for
+/// its permission mode: the notification flags when `notify`, then the
+/// setting sources. The one list both launch paths pass and the task lane
+/// checks the build for, so the three cannot disagree.
+pub(crate) fn launch_flags(provider: &str, notify: bool, sources: Option<&str>) -> Vec<String> {
+    let mut flags: Vec<String> = if notify {
+        notify_flags(provider)
+            .iter()
+            .map(|flag| (*flag).to_owned())
+            .collect()
+    } else {
+        Vec::new()
+    };
+    flags.extend(setting_source_flags(provider, sources));
+    flags
+}
+
+/// A plain agent tab's arguments with the [`launch_flags`] in front.
 ///
 /// In front because Claude Code's prompt form is `-- <text>`, after which
 /// every argument is positional: a flag appended behind the prompt becomes
 /// part of what the user asked for. [`apply_permission_mode`] then puts the
-/// policy flags in front of these, so the order is policy, notify, caller.
-pub(crate) fn with_notify_flags(
+/// policy flags in front of these, so the order is policy, launch, caller.
+pub(crate) fn with_launch_flags(
     program: Option<&str>,
     notify: bool,
+    sources: Option<&str>,
     args: Option<Vec<String>>,
 ) -> Option<Vec<String>> {
     let flags = program
         .map(str::trim)
-        .filter(|_| notify)
-        .map(notify_flags)
+        .map(|provider| launch_flags(provider, notify, sources))
         .unwrap_or_default();
     if flags.is_empty() {
         return args;
     }
-    let mut out: Vec<String> = flags.iter().map(|flag| (*flag).to_owned()).collect();
+    let mut out = flags;
     out.extend(args.unwrap_or_default());
     Some(out)
 }
@@ -193,6 +220,8 @@ pub(super) struct Extras<'a> {
     pub brief_dir: Option<&'a Path>,
     /// Whether to add [`notify_flags`].
     pub notify: bool,
+    /// The user's `--setting-sources` value, if they narrowed it.
+    pub setting_sources: Option<&'a str>,
 }
 
 fn error(code: &str, message: impl Into<String>) -> WorkbenchError {
@@ -240,6 +269,7 @@ pub(super) fn check(
     provider: &str,
     mode: &str,
     notify: bool,
+    sources: Option<&str>,
 ) -> Result<(), WorkbenchError> {
     let version = capture_command(
         program,
@@ -257,7 +287,7 @@ pub(super) fn check(
         &[],
     )
     .map_err(|e| error("capability_error", e))?;
-    advertises(provider, mode, notify, &version, &help)
+    advertises(provider, mode, notify, sources, &version, &help)
 }
 
 /// Whether what a build *said* proves it can be launched the way `mode` asks.
@@ -276,6 +306,7 @@ fn advertises(
     provider: &str,
     mode: &str,
     notify: bool,
+    sources: Option<&str>,
     version: &CapturedOutput,
     help: &CapturedOutput,
 ) -> Result<(), WorkbenchError> {
@@ -328,14 +359,17 @@ fn advertises(
         ],
         _ => &[],
     };
-    let notifying = notify_flags(provider)
+    let chosen = launch_flags(provider, notify, sources);
+    let chosen = chosen
         .iter()
-        .filter(|flag| notify && flag.starts_with('-'));
+        .map(String::as_str)
+        .filter(|flag| flag.starts_with('-'));
     if !identity
         || !supported
         || required
             .iter()
-            .chain(notifying)
+            .copied()
+            .chain(chosen)
             .any(|flag| !advertised_option(help, flag, None))
     {
         return Err(error(
@@ -575,9 +609,11 @@ pub(super) fn arguments(
         .ok_or_else(|| error("file_error", "Task brief path is not Unicode."))?;
     let quoted = serde_json::to_string(path).map_err(|e| error("file_error", e.to_string()))?;
     let mut args: Vec<String> = flags.into_iter().map(String::from).collect();
-    if extras.notify {
-        args.extend(notify_flags(provider).iter().map(|flag| (*flag).to_owned()));
-    }
+    args.extend(launch_flags(
+        provider,
+        extras.notify,
+        extras.setting_sources,
+    ));
     match provider {
         "codex" => args.extend(["--cd".into(), cwd.into()]),
         "grok" => args.extend(["--cwd".into(), cwd.into()]),
@@ -901,7 +937,7 @@ mod permission_default_tests {
 #[cfg(test)]
 mod tests {
     use super::{
-        is_canonical_uuid, notify_flags, with_notify_flags, BriefFile, CapturedOutput, Extras,
+        is_canonical_uuid, notify_flags, with_launch_flags, BriefFile, CapturedOutput, Extras,
     };
 
     /// The launch as these tests mostly want it: no session id, no granted
@@ -965,7 +1001,7 @@ mod tests {
     #[test]
     fn a_plain_agent_tab_gets_policy_then_notification_then_its_prompt() {
         let prompt = Some(vec!["--".to_owned(), "Fix the failing test".to_owned()]);
-        let with = with_notify_flags(Some("claude"), true, prompt.clone());
+        let with = with_launch_flags(Some("claude"), true, None, prompt.clone());
         let out = super::apply_permission_mode(Some("claude"), Some("edit"), false, with)
             .unwrap()
             .unwrap();
@@ -977,15 +1013,15 @@ mod tests {
 
         // Off means exactly what the caller sent, including "nothing at all".
         assert_eq!(
-            with_notify_flags(Some("claude"), false, prompt.clone()),
+            with_launch_flags(Some("claude"), false, None, prompt.clone()),
             prompt
         );
-        assert_eq!(with_notify_flags(Some("claude"), false, None), None);
-        assert_eq!(with_notify_flags(None, true, prompt.clone()), prompt);
-        assert_eq!(with_notify_flags(Some("grok"), true, None), None);
+        assert_eq!(with_launch_flags(Some("claude"), false, None, None), None);
+        assert_eq!(with_launch_flags(None, true, None, prompt.clone()), prompt);
+        assert_eq!(with_launch_flags(Some("grok"), true, None, None), None);
         // A promptless Codex tab is flags only.
         assert_eq!(
-            with_notify_flags(Some("codex"), true, None).unwrap(),
+            with_launch_flags(Some("codex"), true, None, None).unwrap(),
             notify_flags("codex")
         );
     }
@@ -1039,6 +1075,7 @@ mod tests {
                 run_id: Some(RUN),
                 brief_dir: Some(&brief.dir),
                 notify: true,
+                setting_sources: None,
             },
         )
         .unwrap();
@@ -1087,6 +1124,7 @@ mod tests {
                     run_id: Some(RUN),
                     brief_dir: Some(&brief.dir),
                     notify: false,
+                    setting_sources: None,
                 },
             )
             .unwrap();
@@ -1123,7 +1161,7 @@ mod tests {
     fn a_claude_build_must_advertise_every_flag_the_launch_will_pass() {
         let version = on_stdout("2.1.289 (Claude Code)\n");
         let help = on_stdout(CLAUDE_HELP);
-        super::advertises("claude", "ask", true, &version, &help).unwrap();
+        super::advertises("claude", "ask", true, None, &version, &help).unwrap();
         for missing in ["--session-id", "--add-dir", "--settings"] {
             let narrower: String = CLAUDE_HELP
                 .lines()
@@ -1131,7 +1169,7 @@ mod tests {
                 .map(|line| format!("{line}\n"))
                 .collect();
             assert_eq!(
-                super::advertises("claude", "ask", true, &version, &on_stdout(&narrower))
+                super::advertises("claude", "ask", true, None, &version, &on_stdout(&narrower))
                     .unwrap_err()
                     .code,
                 "unsupported_capability",
@@ -1144,7 +1182,117 @@ mod tests {
             .filter(|line| !line.trim_start().starts_with("--settings"))
             .map(|line| format!("{line}\n"))
             .collect();
-        super::advertises("claude", "ask", false, &version, &on_stdout(&no_settings)).unwrap();
+        super::advertises(
+            "claude",
+            "ask",
+            false,
+            None,
+            &version,
+            &on_stdout(&no_settings),
+        )
+        .unwrap();
+    }
+
+    /// The user's narrowing of Claude's settings files reaches both launch
+    /// paths ahead of the prompt, reaches no other CLI, and is absent — the
+    /// CLI's own default — when nothing was chosen.
+    #[test]
+    fn a_claude_launch_loads_only_the_settings_sources_the_user_chose() {
+        let root = tempfile::tempdir().unwrap();
+        let brief = BriefFile::under(root.path(), "# Task brief v1\n").unwrap();
+        let task = |provider: &str, sources: Option<&str>| {
+            super::arguments(
+                provider,
+                "edit",
+                false,
+                "/checkout",
+                &brief.path,
+                &Extras {
+                    run_id: Some(RUN),
+                    brief_dir: Some(&brief.dir),
+                    notify: true,
+                    setting_sources: sources,
+                },
+            )
+            .unwrap()
+        };
+        let args = task("claude", Some("user"));
+        let at = |args: &[String], flag: &str| args.iter().position(|a| a == flag);
+        let flag = at(&args, "--setting-sources").expect("not passed");
+        assert_eq!(args[flag + 1], "user");
+        assert!(flag < at(&args, "--").unwrap(), "{args:?}");
+        assert_eq!(args.iter().filter(|a| *a == "--setting-sources").count(), 1);
+        assert!(at(&task("claude", None), "--setting-sources").is_none());
+        for provider in ["codex", "grok", "agy"] {
+            assert!(
+                at(&task(provider, Some("user")), "--setting-sources").is_none(),
+                "{provider}"
+            );
+        }
+
+        let prompt = Some(vec!["--".to_owned(), "Fix the failing test".to_owned()]);
+        let tab = super::apply_permission_mode(
+            Some("claude"),
+            Some("edit"),
+            false,
+            with_launch_flags(Some("claude"), false, Some("user,local"), prompt.clone()),
+        )
+        .unwrap()
+        .unwrap();
+        let flag = at(&tab, "--setting-sources").expect("a plain tab was not narrowed");
+        assert_eq!(tab[flag + 1], "user,local");
+        assert!(at(&tab, "--permission-mode").unwrap() < flag, "{tab:?}");
+        assert!(flag < at(&tab, "--").unwrap(), "{tab:?}");
+        assert_eq!(
+            with_launch_flags(Some("grok"), false, Some("user"), prompt.clone()),
+            prompt
+        );
+        assert_eq!(
+            with_launch_flags(None, false, Some("user"), prompt.clone()),
+            prompt
+        );
+    }
+
+    /// A build that does not know `--setting-sources` would refuse to start,
+    /// or read "user" as the prompt, so a launch that will pass it asks the
+    /// build first — and one that will not pass it does not.
+    #[test]
+    fn a_claude_build_must_advertise_setting_sources_only_when_they_are_chosen() {
+        let version = on_stdout("2.1.289 (Claude Code)\n");
+        let with = format!(
+            "{CLAUDE_HELP}  --setting-sources <sources>  Comma-separated list of setting sources\n"
+        );
+        super::advertises(
+            "claude",
+            "ask",
+            true,
+            Some("user"),
+            &version,
+            &on_stdout(&with),
+        )
+        .unwrap();
+        super::advertises(
+            "claude",
+            "ask",
+            true,
+            None,
+            &version,
+            &on_stdout(CLAUDE_HELP),
+        )
+        .unwrap();
+        assert_eq!(
+            super::advertises(
+                "claude",
+                "ask",
+                true,
+                Some("user"),
+                &version,
+                &on_stdout(CLAUDE_HELP)
+            )
+            .unwrap_err()
+            .code,
+            "unsupported_capability"
+        );
     }
 
     #[test]
@@ -1152,10 +1300,18 @@ mod tests {
         let version = on_stdout("codex-cli 0.130.0\n");
         let base = "  -s, --sandbox <MODE>\n    [possible values: read-only, workspace-write]\n  -a, --ask-for-approval <POLICY>\n    - on-request: ask\n  -C, --cd <DIR>\n    Set root\n";
         let with_config = format!("  -c, --config <key=value>\n    Override a value\n{base}");
-        super::advertises("codex", "edit", true, &version, &on_stdout(&with_config)).unwrap();
-        super::advertises("codex", "edit", false, &version, &on_stdout(base)).unwrap();
+        super::advertises(
+            "codex",
+            "edit",
+            true,
+            None,
+            &version,
+            &on_stdout(&with_config),
+        )
+        .unwrap();
+        super::advertises("codex", "edit", false, None, &version, &on_stdout(base)).unwrap();
         assert_eq!(
-            super::advertises("codex", "edit", true, &version, &on_stdout(base))
+            super::advertises("codex", "edit", true, None, &version, &on_stdout(base))
                 .unwrap_err()
                 .code,
             "unsupported_capability"
@@ -1209,6 +1365,7 @@ mod tests {
                     provider,
                     mode,
                     true,
+                    None,
                 )
                 .unwrap_or_else(|error| panic!("{provider}/{mode}: {}", error.message));
             }
@@ -1246,9 +1403,9 @@ mod tests {
     fn probe_refuses_a_build_that_advertises_the_flag_without_the_requested_value() {
         let version = on_stdout("2.1.263 (Claude Code)\n");
         let help = on_stdout(CLAUDE_HELP);
-        assert!(super::advertises("claude", "ask", false, &version, &help).is_ok());
+        assert!(super::advertises("claude", "ask", false, None, &version, &help).is_ok());
         assert_eq!(
-            super::advertises("claude", "bypass", false, &version, &help)
+            super::advertises("claude", "bypass", false, None, &version, &help)
                 .unwrap_err()
                 .code,
             "unsupported_capability",
@@ -1460,8 +1617,8 @@ mod tests {
              default, acceptEdits, auto, dontAsk, bypassPermissions, plan]\n      --cwd <CWD>\n \
                       Working directory\n",
         );
-        super::advertises("grok", "ask", false, &version, &help).unwrap();
-        super::advertises("grok", "bypass", false, &version, &help).unwrap();
+        super::advertises("grok", "ask", false, None, &version, &help).unwrap();
+        super::advertises("grok", "bypass", false, None, &version, &help).unwrap();
 
         // The same build without the mode `ask` needs, and without `--cwd`.
         let narrower = on_stdout(
@@ -1469,7 +1626,7 @@ mod tests {
              default, plan]\n",
         );
         assert_eq!(
-            super::advertises("grok", "ask", false, &version, &narrower)
+            super::advertises("grok", "ask", false, None, &version, &narrower)
                 .unwrap_err()
                 .code,
             "unsupported_capability"
@@ -1487,14 +1644,14 @@ mod tests {
              prompt interactively\n  --dangerously-skip-permissions  Auto-approve all tool \
              permission requests\n  --sandbox                       Run in a sandbox\n",
         );
-        super::advertises("agy", "ask", false, &version, &help).unwrap();
-        super::advertises("agy", "inspect", false, &version, &help).unwrap();
-        super::advertises("agy", "bypass", false, &version, &help).unwrap();
+        super::advertises("agy", "ask", false, None, &version, &help).unwrap();
+        super::advertises("agy", "inspect", false, None, &version, &help).unwrap();
+        super::advertises("agy", "bypass", false, None, &version, &help).unwrap();
 
         let without_controls =
             on_stderr("Usage of agy:\n  --prompt-interactive            prompt\n");
         assert_eq!(
-            super::advertises("agy", "ask", false, &version, &without_controls)
+            super::advertises("agy", "ask", false, None, &version, &without_controls)
                 .unwrap_err()
                 .code,
             "unsupported_capability"
@@ -1512,13 +1669,13 @@ mod tests {
              default, acceptEdits, auto, dontAsk, bypassPermissions, plan]\n      --cwd <CWD>\n \
                       Working directory\n",
         );
-        super::advertises("grok", "ask", false, &version, &help)
+        super::advertises("grok", "ask", false, None, &version, &help)
             .expect("the bounded case still passes");
 
         let mut flood = help.clone();
         flood.stdout.resize(128 * 1024 + 1, b' ');
         assert_eq!(
-            super::advertises("grok", "ask", false, &version, &flood)
+            super::advertises("grok", "ask", false, None, &version, &flood)
                 .unwrap_err()
                 .code,
             "capability_error",
@@ -1528,7 +1685,7 @@ mod tests {
         let mut chatty = version.clone();
         chatty.stderr.resize(1025, b' ');
         assert_eq!(
-            super::advertises("grok", "ask", false, &chatty, &help)
+            super::advertises("grok", "ask", false, None, &chatty, &help)
                 .unwrap_err()
                 .code,
             "capability_error"

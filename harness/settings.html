@@ -110,7 +110,21 @@
             if (limit !== undefined && !(Number.isInteger(limit) && limit >= 1 && limit <= 64)) {
               throw "Agents running at once must be between 1 and 64";
             }
-            agentDefaults = structuredClone(args.defaults);
+            // tool_config::canonical_setting_sources: known names, at least
+            // one, canonical order, and every source stored as absence.
+            const order = ["user", "project", "local"];
+            const sources = args?.defaults?.claude_setting_sources;
+            const next = structuredClone(args.defaults);
+            if (sources !== undefined) {
+              if (!Array.isArray(sources) || sources.some((s) => !order.includes(s))) {
+                throw "not a Claude Code settings source";
+              }
+              const kept = order.filter((s) => sources.includes(s));
+              if (kept.length === 0) throw "Claude Code needs at least one settings source";
+              if (kept.length === order.length) delete next.claude_setting_sources;
+              else next.claude_setting_sources = kept;
+            }
+            agentDefaults = next;
             return agentView();
           }
           if (cmd === "cmd_mcp_info") return mcpInfo;

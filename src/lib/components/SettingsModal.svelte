@@ -73,6 +73,7 @@
   import SessionAlertSettings from "./SessionAlertSettings.svelte";
   import AgentDefaultsSettings from "./AgentDefaultsSettings.svelte";
   import AgentLiveRunsSetting from "./AgentLiveRunsSetting.svelte";
+  import AgentSettingSourcesSetting from "./AgentSettingSourcesSetting.svelte";
   import GlobalCleaner from "./GlobalCleaner.svelte";
   import HygieneDefaultsPanel from "./HygieneDefaultsPanel.svelte";
 
@@ -1235,6 +1236,9 @@
                 </div>
                 <div class="border-border/70 mt-3 border-t pt-3" data-setting="agent-live-runs" hidden={!shown("agent-live-runs")}>
                   <AgentLiveRunsSetting active={isOpen && activeSection === "agents"} />
+                </div>
+                <div class="border-border/70 mt-3 border-t pt-3" data-setting="agent-setting-sources" hidden={!shown("agent-setting-sources")}>
+                  <AgentSettingSourcesSetting active={isOpen && activeSection === "agents"} />
                 </div>
                 <!-- Part of the external-tools entry (it has no catalog row of
                      its own), so it follows that entry's visibility. -->

@@ -83,7 +83,15 @@ task; the agent marks it Done or Review itself through the GitPulse MCP server.
 
 A task's agent gets the same notification flags as an agent tab (*Configure
 agent CLIs GitPulse launches* in the session notification settings), so one waiting on a permission prompt in a
-hidden tab still raises an alert. Claude Code is also given the attempt's id as
+hidden tab still raises an alert. Which of Claude Code's settings files an
+agent loads is **Settings → Agents → Claude Code settings files** (user,
+project, local; all three — Claude Code's own default — until you change it).
+It applies to task attempts and new Claude tabs alike, as `--setting-sources`.
+Turning off project and local stops a repository's `.claude/settings*.json`
+from widening an agent's permissions, and also drops that repository's
+allow-lists and hooks. Managed sessions always load your user settings only;
+that is Manvi's rule, since project settings could answer the approvals the
+managed lane exists to show you. Claude Code is also given the attempt's id as
 its session id and the brief's private folder as a readable directory. An ended
 Claude Code attempt offers **Resume conversation**: GitPulse looks for the
 transcript Claude Code saved for that session and, if it is there, opens a new

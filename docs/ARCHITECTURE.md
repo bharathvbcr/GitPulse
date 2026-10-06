@@ -645,7 +645,7 @@ Schema-five run records retain one immutable brief per attempt, bounded active
 reservations, and a one-use launch claim. A reservation belongs to a checkout
 (its `git_dir`), not to the repository: agents in separate worktrees of one
 repository run concurrently, a second attempt in the same working tree is
-refused as `checkout_busy`, and the profile holds at most the user's limit of live attempts (`agent_defaults.max_live_runs` in `tools.json`, 1–64, default 8), which the host passes to the store as `runs.prepare`'s `max_active_runs` on every preparation. Raw `runs.prepare` is host-only. Managed launches are exclusive per attempt (`managed_launches`), not per host. `workbench/terminal_launch.rs` adds
+refused as `checkout_busy`, and the profile holds at most the user's limit of live attempts (`agent_launch.max_live_runs` in `tools.json`, 1–64, default 8; a block of its own because v1.3.5 reads `agent_defaults` with `deny_unknown_fields`), which the host passes to the store as `runs.prepare`'s `max_active_runs` on every preparation. Raw `runs.prepare` is host-only. Managed launches are exclusive per attempt (`managed_launches`), not per host. `workbench/terminal_launch.rs` adds
 native `runs.prepare_terminal` through existing workbench IPC, observing actual
 cwd, Git directories, commit and branch before preparation. Native `runs.claim`
 rechecks those observations and then delegates snapshot/CAS validation to Manvi.
@@ -738,8 +738,14 @@ before a `checkout_busy`/`capacity_reached` refusal is returned, and the run
 history's **Release checkout** asks for one run and shows the host's reason when
 it keeps it. A released attempt is `exited` with `outcome_uncertain`, no exit
 code, and the `run_unresolved` inbox notice. The renderer cannot call
-`runs.reconcile`; it is host-only. Managed attempts with no recorded process
-stay held, because nothing here can prove their Manvi owner ended. Crash-file
+`runs.reconcile`; it is host-only. A managed attempt with no recorded process
+was never activated, and is judged by Manvi's own contract: it stops the
+provider before recording such an attempt `unresolved` (released at once), and
+abandons one not activated within five minutes (`starting` is released
+`MANAGED_ACTIVATION_GRACE_SECS`, ten minutes, after `claimed_at`). Before that,
+an owner of the form `manvi-{pid}-{nanos}-{token}` is released once that Manvi
+is gone. A provider driven as Manvi drives it exits when its driver is killed
+(measured for Claude Code and Codex before any turn). Crash-file
 cleanup and durable retries after receipt storage failure remain open. Run
 history uses bounded newest-first metadata pages and polls active attempts only
 while the inspector is visible.

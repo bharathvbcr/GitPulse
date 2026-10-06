@@ -95,6 +95,41 @@ export interface AgentDefaults {
    * passes it to the store at each launch, so a change applies to the next.
    */
   max_live_runs?: number;
+  /**
+   * Which of Claude Code's settings files an agent GitPulse starts in a
+   * terminal loads (`--setting-sources`). Absent means the CLI's own default,
+   * every one of {@link CLAUDE_SETTING_SOURCES}; a stored value is a
+   * non-empty proper subset in that order, which is how the backend stores it.
+   */
+  claude_setting_sources?: ClaudeSettingSource[];
+}
+
+/**
+ * Claude Code's settings sources, in the order `--setting-sources` names them.
+ * Mirrors `tool_config::CLAUDE_SETTING_SOURCES`; `agentDefaults.test.ts` reads
+ * the Rust source and fails if the two differ.
+ */
+export const CLAUDE_SETTING_SOURCES = ["user", "project", "local"] as const;
+export type ClaudeSettingSource = (typeof CLAUDE_SETTING_SOURCES)[number];
+
+/**
+ * A setting-sources choice as the backend stores it: known names, each once,
+ * in canonical order — `undefined` when every source is chosen (the CLI's own
+ * default, so nothing is passed) and `null` when none is, which no launch can
+ * use. Anything that is not an array of strings is `null` too.
+ */
+export function canonicalSettingSources(value: unknown): ClaudeSettingSource[] | undefined | null {
+  if (!Array.isArray(value) || value.length > 16) return null;
+  if (!value.every((source) => (CLAUDE_SETTING_SOURCES as readonly unknown[]).includes(source))) return null;
+  const kept = CLAUDE_SETTING_SOURCES.filter((source) => value.includes(source));
+  if (kept.length === 0) return null;
+  return kept.length === CLAUDE_SETTING_SOURCES.length ? undefined : kept;
+}
+
+/** The sources a Claude launch will load: the stored subset, or all of them. */
+export function settingSources(defaults: AgentDefaults): ClaudeSettingSource[] {
+  const stored = canonicalSettingSources(defaults.claude_setting_sources);
+  return stored ?? [...CLAUDE_SETTING_SOURCES];
 }
 
 export const EMPTY_AGENT_DEFAULTS: AgentDefaults = { permission: {} };
@@ -151,7 +186,11 @@ export function sanitizeAgentDefaults(
       permission[launcher as LauncherKind] = mode;
     }
   }
-  return isLiveRunLimit(raw.max_live_runs) ? { permission, max_live_runs: raw.max_live_runs } : { permission };
+  const sanitized: AgentDefaults = { permission };
+  if (isLiveRunLimit(raw.max_live_runs)) sanitized.max_live_runs = raw.max_live_runs;
+  const sources = canonicalSettingSources(raw.claude_setting_sources);
+  if (sources) sanitized.claude_setting_sources = sources;
+  return sanitized;
 }
 
 /** Whether `value` is a limit the store accepts: a whole number in 1..=ceiling. */

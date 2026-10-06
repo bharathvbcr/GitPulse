@@ -8,6 +8,7 @@
 import { describe, expect, it } from "vitest";
 import {
   BYPASS_MODE,
+  CLAUDE_SETTING_SOURCES,
   PERMISSION_LAUNCHERS,
   PERMISSION_MODES,
   effectiveMode,
@@ -15,9 +16,12 @@ import {
   isPermissionMode,
   liveRunLimit,
   requiresAcknowledgement,
+  canonicalSettingSources,
   sanitizeAgentDefaults,
+  settingSources,
   type AgentDefaults,
 } from "./agentDefaults";
+import { readFileSync } from "node:fs";
 import { DEFAULT_LIVE_RUNS, MAX_LIVE_RUNS } from "../workbench/vocabulary";
 
 describe("isPermissionMode", () => {
@@ -178,5 +182,32 @@ describe("agents running at once", () => {
   it("absent means the store's default", () => {
     expect(liveRunLimit({ permission: {} })).toBe(DEFAULT_LIVE_RUNS);
     expect(DEFAULT_LIVE_RUNS).toBeLessThan(MAX_LIVE_RUNS);
+  });
+});
+
+describe("Claude settings sources", () => {
+  it("names exactly the sources the backend stores and passes", () => {
+    const rust = readFileSync(new URL("../../../src-tauri/src/tool_config.rs", import.meta.url), "utf8");
+    const declared = rust.match(/pub const CLAUDE_SETTING_SOURCES: \[&str; 3\] = \[([^\]]*)\];/);
+    expect(declared, "tool_config::CLAUDE_SETTING_SOURCES moved or changed shape").toBeTruthy();
+    expect(JSON.parse(`[${declared?.[1]}]`)).toEqual([...CLAUDE_SETTING_SOURCES]);
+  });
+
+  it("keeps a canonical proper subset and drops everything else alone", () => {
+    expect(canonicalSettingSources(["local", "user", "user"])).toEqual(["user", "local"]);
+    expect(canonicalSettingSources(["project", "local", "user"])).toBeUndefined();
+    for (const bad of [[], ["policy"], ["User"], ["user,project"], [""], "user", null, {}, [1], Array(17).fill("user")]) {
+      expect(canonicalSettingSources(bad), JSON.stringify(bad)).toBeNull();
+      const sanitized = sanitizeAgentDefaults({ permission: { claude: "edit" }, max_live_runs: 9, claude_setting_sources: bad });
+      // One bad key costs that key, never the settings beside it.
+      expect(sanitized).toEqual({ permission: { claude: "edit" }, max_live_runs: 9 });
+      expect(settingSources(sanitized)).toEqual([...CLAUDE_SETTING_SOURCES]);
+    }
+    const narrowed = sanitizeAgentDefaults({ permission: {}, claude_setting_sources: ["local", "user"] });
+    expect(narrowed).toEqual({ permission: {}, claude_setting_sources: ["user", "local"] });
+    expect(sanitizeAgentDefaults(narrowed)).toEqual(narrowed);
+    expect(settingSources(narrowed)).toEqual(["user", "local"]);
+    // Every source chosen is the CLI's default, stored as absence.
+    expect(sanitizeAgentDefaults({ permission: {}, claude_setting_sources: ["user", "project", "local"] })).toEqual({ permission: {} });
   });
 });

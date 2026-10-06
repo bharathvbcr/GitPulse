@@ -84,6 +84,51 @@ pub struct AgentDefaults {
     /// store's ceiling ([`MAX_LIVE_RUNS`]), a resource limit on one machine.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_live_runs: Option<u32>,
+    /// Which of Claude Code's settings files an agent GitPulse starts in a
+    /// terminal loads, passed as `--setting-sources`. Absent means the CLI's
+    /// own default — all of [`CLAUDE_SETTING_SOURCES`] — so nothing changes
+    /// for a user who never chose; a stored value is a non-empty proper
+    /// subset in that order.
+    ///
+    /// Leaving out `project` and `local` stops a repository's own
+    /// `.claude/settings*.json` from widening the permissions of an agent
+    /// working in it, and also drops that project's allow-lists and hooks,
+    /// which is why it is a choice and not a default. The managed lane always
+    /// runs with `user` only; that is Manvi's decision, not this one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claude_setting_sources: Option<Vec<String>>,
+}
+
+/// Claude Code's settings sources, in the order `--setting-sources` names
+/// them. Choosing all of them is the same as passing nothing.
+pub const CLAUDE_SETTING_SOURCES: [&str; 3] = ["user", "project", "local"];
+
+/// The setting-sources choice as it is stored and passed: known names only,
+/// at least one, each once, in [`CLAUDE_SETTING_SOURCES`] order — and `None`
+/// when every source is chosen, because that is the CLI's own default and
+/// passing it would only pin today's list of sources.
+pub fn canonical_setting_sources(chosen: &[String]) -> Result<Option<Vec<String>>, String> {
+    if chosen.len() > 16 {
+        return Err("Too many Claude settings sources".into());
+    }
+    if let Some(unknown) = chosen
+        .iter()
+        .find(|source| !CLAUDE_SETTING_SOURCES.contains(&source.as_str()))
+    {
+        return Err(format!(
+            "{unknown:?} is not a Claude Code settings source (user, project or local)"
+        ));
+    }
+    let kept: Vec<String> = CLAUDE_SETTING_SOURCES
+        .iter()
+        .filter(|source| chosen.iter().any(|c| c == *source))
+        .map(|source| (*source).to_owned())
+        .collect();
+    match kept.len() {
+        0 => Err("Claude Code needs at least one settings source".into()),
+        n if n == CLAUDE_SETTING_SOURCES.len() => Ok(None),
+        _ => Ok(Some(kept)),
+    }
 }
 
 /// The store's own default for live attempts, used when nothing is stored.
@@ -96,6 +141,13 @@ impl AgentDefaults {
     /// The limit a launch passes to the store: the stored one, or the default.
     pub fn live_runs(&self) -> u32 {
         self.max_live_runs.unwrap_or(DEFAULT_LIVE_RUNS)
+    }
+
+    /// The value for `--setting-sources`, or `None` to pass nothing.
+    pub fn claude_setting_sources_arg(&self) -> Option<String> {
+        self.claude_setting_sources
+            .as_ref()
+            .map(|sources| sources.join(","))
     }
 
     /// Rejects anything the launch path would later have to refuse or ignore.
@@ -118,43 +170,91 @@ impl AgentDefaults {
                 ));
             }
         }
+        if let Some(sources) = &self.claude_setting_sources {
+            canonical_setting_sources(sources)?;
+        }
         Ok(())
+    }
+}
+
+/// `agent_defaults` as it is written to disk: the permission map, nothing else.
+///
+/// That is exactly the block v1.3.5 reads, and v1.3.5 reads it with
+/// `deny_unknown_fields` — one key it does not know there costs that build
+/// every stored permission default, and its next save writes them away. So
+/// agent settings added since live in [`StoredAgentLaunch`], a block of its
+/// own that an older build skips. Read without `deny_unknown_fields`, so a
+/// newer build's addition here costs this one only that key.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct StoredAgentPermissions {
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub permission: std::collections::BTreeMap<String, String>,
+}
+
+/// `agent_launch` on disk: the agent settings added after v1.3.5.
+///
+/// Read key by key (see its `Deserialize`), so a value this build cannot read
+/// costs that one setting, and a key it does not know is skipped.
+#[derive(Debug, Clone, Default, Serialize, PartialEq, Eq)]
+pub struct StoredAgentLaunch {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_live_runs: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub claude_setting_sources: Option<Vec<String>>,
+}
+
+impl StoredAgentLaunch {
+    fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+impl<'de> Deserialize<'de> for StoredAgentLaunch {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let raw = serde_json::Value::deserialize(deserializer)?;
+        let serde_json::Value::Object(fields) = raw else {
+            log::warn!(target: "tool_config", "ignoring agent_launch: not an object");
+            return Ok(Self::default());
+        };
+        fn field<T: serde::de::DeserializeOwned>(
+            fields: &serde_json::Map<String, serde_json::Value>,
+            key: &str,
+        ) -> Option<T> {
+            let value = fields.get(key)?;
+            match serde_json::from_value(value.clone()) {
+                Ok(read) => Some(read),
+                Err(error) => {
+                    log::warn!(
+                        target: "tool_config",
+                        "ignoring unreadable agent_launch.{key}, keeping the other agent settings: {error}"
+                    );
+                    None
+                }
+            }
+        }
+        Ok(Self {
+            max_live_runs: field(&fields, "max_live_runs"),
+            claude_setting_sources: field(&fields, "claude_setting_sources"),
+        })
     }
 }
 
 /// Reads `agent_defaults` without being able to fail.
 ///
-/// Goes through `Value` rather than trying and retrying the deserializer: a
-/// `Deserializer` is consumed by the attempt, so a failure part-way through
-/// cannot be un-done. JSON is self-describing, so buffering the block first
-/// costs one allocation and makes the retry possible at all.
-fn lenient_agent_defaults<'de, D>(deserializer: D) -> Result<AgentDefaults, D::Error>
+/// Goes through `Value` so a block of the wrong shape is buffered and then
+/// dropped, rather than failing the parse of the whole file.
+fn lenient_agent_defaults<'de, D>(deserializer: D) -> Result<StoredAgentPermissions, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
     let raw = serde_json::Value::deserialize(deserializer)?;
-    let error = match serde_json::from_value(raw.clone()) {
-        Ok(defaults) => return Ok(defaults),
-        Err(error) => error,
-    };
-    // A limit of the wrong type is one bad key; it must not also discard the
-    // permission defaults beside it.
-    if let serde_json::Value::Object(mut fields) = raw {
-        if fields.remove("max_live_runs").is_some() {
-            if let Ok(defaults) = serde_json::from_value(serde_json::Value::Object(fields)) {
-                log::warn!(
-                    target: "tool_config",
-                    "ignoring unreadable agents-at-once limit, keeping the other agent defaults: {error}"
-                );
-                return Ok(defaults);
-            }
-        }
-    }
-    log::warn!(
-        target: "tool_config",
-        "ignoring unreadable agent_defaults block, using no stored default: {error}"
-    );
-    Ok(AgentDefaults::default())
+    Ok(serde_json::from_value(raw).unwrap_or_else(|error| {
+        log::warn!(
+            target: "tool_config",
+            "ignoring unreadable agent_defaults block, using no stored default: {error}"
+        );
+        StoredAgentPermissions::default()
+    }))
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -257,7 +357,16 @@ pub struct ToolConfig {
     /// must not be able to do that, so a block this cannot read degrades to
     /// "no stored default" on its own and says so in the log.
     #[serde(default, deserialize_with = "lenient_agent_defaults")]
-    pub agent_defaults: AgentDefaults,
+    pub agent_defaults: StoredAgentPermissions,
+    /// Agent settings added after v1.3.5; see [`StoredAgentPermissions`] for
+    /// why they are not in `agent_defaults`.
+    #[serde(default, skip_serializing_if = "StoredAgentLaunch::is_empty")]
+    pub agent_launch: StoredAgentLaunch,
+    /// Top-level keys this build does not know, written back as they were
+    /// read. Without this, saving any setting here would delete what a newer
+    /// build stored, so moving between versions would quietly cost settings.
+    #[serde(flatten)]
+    pub unknown: serde_json::Map<String, serde_json::Value>,
 }
 
 impl Default for ToolConfig {
@@ -268,7 +377,9 @@ impl Default for ToolConfig {
             manvi: ToolPaths::default(),
             onboarding: OnboardingState::default(),
             session_alerts: SessionAlertSettings::default(),
-            agent_defaults: AgentDefaults::default(),
+            agent_defaults: StoredAgentPermissions::default(),
+            agent_launch: StoredAgentLaunch::default(),
+            unknown: serde_json::Map::new(),
         }
     }
 }
@@ -586,7 +697,11 @@ pub fn agent_defaults() -> AgentDefaults {
     let Ok(cfg) = load() else {
         return AgentDefaults::default();
     };
-    let mut defaults = cfg.agent_defaults;
+    let mut defaults = AgentDefaults {
+        permission: cfg.agent_defaults.permission,
+        max_live_runs: cfg.agent_launch.max_live_runs,
+        claude_setting_sources: cfg.agent_launch.claude_setting_sources,
+    };
     defaults.permission.retain(|launcher, mode| {
         let ok = crate::workbench::terminal_command::validate_permission_default(launcher, mode)
             .is_ok();
@@ -614,13 +729,33 @@ pub fn agent_defaults() -> AgentDefaults {
         );
         defaults.max_live_runs = None;
     }
+    if let Some(sources) = defaults.claude_setting_sources.take() {
+        defaults.claude_setting_sources =
+            canonical_setting_sources(&sources).unwrap_or_else(|error| {
+                log::warn!(
+                    target: "tool_config",
+                    "ignoring stored Claude settings sources: {error}"
+                );
+                None
+            });
+    }
     defaults
 }
 
 pub fn set_agent_defaults(next: AgentDefaults) -> Result<(), String> {
     next.validate()?;
+    let sources = match &next.claude_setting_sources {
+        Some(sources) => canonical_setting_sources(sources)?,
+        None => None,
+    };
     let mut cfg = load()?;
-    cfg.agent_defaults = next;
+    cfg.agent_defaults = StoredAgentPermissions {
+        permission: next.permission,
+    };
+    cfg.agent_launch = StoredAgentLaunch {
+        max_live_runs: next.max_live_runs,
+        claude_setting_sources: sources,
+    };
     save(&cfg)?;
     Ok(())
 }
@@ -788,7 +923,7 @@ mod tests {
                 write_raw(
                     path,
                     &format!(
-                        r#"{{"version":1,"agent_defaults":{{"permission":{{"claude":"edit"}},{raw}}}}}"#
+                        r#"{{"version":1,"agent_defaults":{{"permission":{{"claude":"edit"}}}},"agent_launch":{{{raw}}}}}"#
                     ),
                 );
                 let defaults = agent_defaults();
@@ -799,6 +934,154 @@ mod tests {
                     Some("edit"),
                     "{raw} took the permission defaults with it"
                 );
+            }
+        });
+    }
+
+    /// What v1.3.5 reads `agent_defaults` as: its exact struct, strict about
+    /// unknown keys. Copied from `git show v1.3.5:src-tauri/src/tool_config.rs`.
+    #[derive(Debug, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    #[allow(dead_code)]
+    struct ShippedAgentDefaults {
+        #[serde(default)]
+        permission: std::collections::BTreeMap<String, String>,
+    }
+
+    /// The downgrade defect: the agents-at-once limit was written inside
+    /// `agent_defaults`, which v1.3.5 reads with `deny_unknown_fields`, so
+    /// opening the file in that build discarded every stored permission
+    /// default and its next save wrote them away. Settings added since must
+    /// land where an older build does not look.
+    #[test]
+    fn every_agent_setting_is_stored_where_the_last_release_still_reads_its_own() {
+        with_temp_config(|path| {
+            let mut defaults = AgentDefaults {
+                max_live_runs: Some(24),
+                claude_setting_sources: Some(vec!["user".into()]),
+                ..AgentDefaults::default()
+            };
+            defaults.permission.insert("claude".into(), "edit".into());
+            set_agent_defaults(defaults.clone()).unwrap();
+            let written: serde_json::Value =
+                serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap();
+            let block = &written["agent_defaults"];
+            assert_eq!(
+                block.as_object().unwrap().keys().collect::<Vec<_>>(),
+                ["permission"],
+                "{written}"
+            );
+            let shipped: ShippedAgentDefaults = serde_json::from_value(block.clone())
+                .expect("the last release can no longer read its agent defaults");
+            assert_eq!(shipped.permission.get("claude").unwrap(), "edit");
+            assert_eq!(written["agent_launch"]["max_live_runs"], 24);
+            assert_eq!(written["agent_launch"]["claude_setting_sources"][0], "user");
+            invalidate_cache();
+            assert_eq!(agent_defaults(), defaults);
+
+            // Nothing chosen beyond the defaults writes no new block at all.
+            set_agent_defaults(AgentDefaults::default()).unwrap();
+            let written: serde_json::Value =
+                serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap();
+            assert!(written.get("agent_launch").is_none(), "{written}");
+        });
+    }
+
+    /// The same class one version on: a key a newer build stores must survive
+    /// this build saving any setting, or moving between versions quietly costs
+    /// settings again.
+    #[test]
+    fn keys_a_newer_build_stored_survive_a_save_here() {
+        with_temp_config(|path| {
+            write_raw(
+                path,
+                r#"{"version":1,"agent_defaults":{"permission":{"claude":"edit"},"from_later":1},
+                    "agent_launch":{"max_live_runs":12,"from_later":true},
+                    "from_a_newer_build":{"kept":[1,2,3]}}"#,
+            );
+            let read = agent_defaults();
+            assert_eq!(read.permission.get("claude").unwrap(), "edit");
+            assert_eq!(read.live_runs(), 12);
+            set_onboarding(OnboardingState {
+                dismissed: true,
+                ..OnboardingState::default()
+            })
+            .unwrap();
+            let written: serde_json::Value =
+                serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap();
+            assert_eq!(written["from_a_newer_build"]["kept"][2], 3, "{written}");
+            assert_eq!(written["agent_launch"]["max_live_runs"], 12);
+            assert_eq!(written["onboarding"]["dismissed"], true);
+        });
+    }
+
+    /// Which Claude settings files an agent loads is the user's to narrow:
+    /// stored canonically, refused when it names nothing or something Claude
+    /// does not know, all-of-them stored as "pass nothing", and a hand-edited
+    /// bad value costs only itself.
+    #[test]
+    fn claude_setting_sources_are_canonical_and_degrade_alone() {
+        let owned = |items: &[&str]| items.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
+        assert_eq!(
+            canonical_setting_sources(&owned(&["local", "user", "user"])).unwrap(),
+            Some(owned(&["user", "local"]))
+        );
+        assert_eq!(
+            canonical_setting_sources(&owned(&["project", "local", "user"])).unwrap(),
+            None
+        );
+        for refused in [
+            owned(&[]),
+            owned(&["policy"]),
+            owned(&["user", "User"]),
+            owned(&["user,project"]),
+            owned(&[""]),
+            vec!["user".to_owned(); 17],
+        ] {
+            assert!(canonical_setting_sources(&refused).is_err(), "{refused:?}");
+        }
+        with_temp_config(|path| {
+            for (chosen, stored, arg) in [
+                (owned(&["user"]), Some(owned(&["user"])), Some("user")),
+                (
+                    owned(&["local", "user"]),
+                    Some(owned(&["user", "local"])),
+                    Some("user,local"),
+                ),
+                (owned(&["user", "project", "local"]), None, None),
+            ] {
+                set_agent_defaults(AgentDefaults {
+                    claude_setting_sources: Some(chosen.clone()),
+                    ..AgentDefaults::default()
+                })
+                .unwrap();
+                let read = agent_defaults();
+                assert_eq!(read.claude_setting_sources, stored, "{chosen:?}");
+                assert_eq!(read.claude_setting_sources_arg().as_deref(), arg);
+            }
+            for empty in [owned(&[]), owned(&["nope"])] {
+                assert!(set_agent_defaults(AgentDefaults {
+                    claude_setting_sources: Some(empty),
+                    ..AgentDefaults::default()
+                })
+                .is_err());
+            }
+            for raw in [
+                r#""claude_setting_sources":[]"#,
+                r#""claude_setting_sources":["policy"]"#,
+                r#""claude_setting_sources":"user""#,
+                r#""claude_setting_sources":[1]"#,
+            ] {
+                write_raw(
+                    path,
+                    &format!(
+                        r#"{{"version":1,"agent_defaults":{{"permission":{{"claude":"edit"}}}},"agent_launch":{{"max_live_runs":9,{raw}}}}}"#
+                    ),
+                );
+                let read = agent_defaults();
+                assert_eq!(read.claude_setting_sources, None, "{raw} survived");
+                assert_eq!(read.live_runs(), 9, "{raw} took the limit with it");
+                assert_eq!(read.permission.get("claude").unwrap(), "edit", "{raw}");
             }
         });
     }

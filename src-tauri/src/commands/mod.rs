@@ -3709,15 +3709,18 @@ pub async fn cmd_terminal_spawn(
     // a mode are the workbench's table and the frontend never carries them.
     // The refusals inside are what make a bypassed session impossible without
     // an acknowledgement, whatever the frontend did or forgot to do. The
-    // notification flags go in first so the policy flags land in front of
-    // them: policy, notify, then the caller's own prompt.
+    // notification and setting-source flags go in first so the policy flags
+    // land in front of them: policy, launch flags, then the caller's prompt.
     let args = crate::workbench::terminal_command::apply_permission_mode(
         program.as_deref(),
         permission_mode.as_deref(),
         acknowledged.unwrap_or(false),
-        crate::workbench::terminal_command::with_notify_flags(
+        crate::workbench::terminal_command::with_launch_flags(
             program.as_deref(),
             crate::tool_config::session_alerts().configure_agents,
+            crate::tool_config::agent_defaults()
+                .claude_setting_sources_arg()
+                .as_deref(),
             args,
         ),
     )?;

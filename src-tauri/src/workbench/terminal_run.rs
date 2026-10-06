@@ -104,16 +104,28 @@ pub(super) fn spawn<R: tauri::Runtime>(
     let program = terminal_command::program(&source.provider)?;
     // Read once, so the flags the build is checked for are the flags it gets.
     let notify = crate::tool_config::session_alerts().configure_agents;
+    let sources = crate::tool_config::agent_defaults().claude_setting_sources_arg();
     terminal_command::check(
         &program,
         &source.cwd,
         &source.provider,
         &source.permission_mode,
         notify,
+        sources.as_deref(),
     )?;
-    start(app, terminals, state, launch, source, program, notify)
+    start(
+        app,
+        terminals,
+        state,
+        launch,
+        source,
+        program,
+        notify,
+        sources.as_deref(),
+    )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn start<R: tauri::Runtime>(
     app: &AppHandle<R>,
     terminals: &TerminalSessions,
@@ -122,6 +134,7 @@ fn start<R: tauri::Runtime>(
     source: Source,
     program: String,
     notify: bool,
+    setting_sources: Option<&str>,
 ) -> Result<TerminalSpawned, WorkbenchError> {
     let brief = terminal_command::BriefFile::create(&source.brief.markdown)?;
     let args = terminal_command::arguments(
@@ -134,6 +147,7 @@ fn start<R: tauri::Runtime>(
             run_id: Some(&source.id),
             brief_dir: Some(&brief.dir),
             notify,
+            setting_sources,
         },
     )?;
     let stamp = SystemTime::now()
@@ -392,6 +406,7 @@ mod tests {
                 source(&state),
                 program,
                 false,
+                None,
             )
             .unwrap();
             drop(first);
@@ -453,6 +468,7 @@ mod tests {
             source(&state),
             program,
             false,
+            None,
         )
         .unwrap();
         let running = state.request("runs.get", r#"{"id":"run"}"#).unwrap();
@@ -548,6 +564,7 @@ mod tests {
             source(&state),
             program,
             false,
+            None,
         )
         .unwrap();
         state.shutdown();
@@ -592,7 +609,8 @@ mod tests {
                 .join("removed-provider")
                 .to_string_lossy()
                 .into_owned(),
-            false
+            false,
+            None,
         )
         .is_err());
         let saved = state.request("runs.get", r#"{"id":"run"}"#).unwrap();
@@ -627,6 +645,7 @@ mod tests {
             source(&state),
             program,
             false,
+            None,
         )
         .is_err());
         received.recv_timeout(Duration::from_secs(5)).unwrap();

@@ -16,6 +16,7 @@ import { SETTINGS_CATALOG } from "../ui/settingsCatalog";
 const here = dirname(fileURLToPath(import.meta.url));
 const panel = readFileSync(join(here, "AgentDefaultsSettings.svelte"), "utf8");
 const liveRuns = readFileSync(join(here, "AgentLiveRunsSetting.svelte"), "utf8");
+const sources = readFileSync(join(here, "AgentSettingSourcesSetting.svelte"), "utf8");
 const session = readFileSync(join(here, "TerminalSession.svelte"), "utf8");
 const modal = readFileSync(join(here, "SettingsModal.svelte"), "utf8");
 
@@ -44,6 +45,28 @@ describe("agents running at once", () => {
     expect(liveRuns).toContain("delete rest.max_live_runs");
     expect(liveRuns).toContain("next === DEFAULT_LIVE_RUNS ? rest");
     expect(liveRuns).toContain("const rest = { ...view.defaults };");
+  });
+});
+
+describe("Claude settings files", () => {
+  it("is findable by the words a reader would type, in its own wrapper", () => {
+    const entry = SETTINGS_CATALOG.find((row) => row.id === "agent-setting-sources");
+    expect(entry?.section).toBe("agents");
+    for (const word of ["setting-sources", "project", "hooks", "settings.local.json"]) {
+      expect(entry?.keywords, `"${word}" does not find this setting`).toContain(word);
+    }
+    expect(modal).toMatch(/data-setting="agent-setting-sources"[^>]*>\s*<AgentSettingSourcesSetting/);
+    expect(panel).not.toContain("claude_setting_sources");
+  });
+
+  it("offers the sources the backend knows and stores every-source as absence", () => {
+    // The list is the mirrored constant, never a literal here.
+    expect(sources).toContain("{#each CLAUDE_SETTING_SOURCES as source (source)}");
+    expect(sources).toContain("delete rest.claude_setting_sources");
+    expect(sources).toContain("canonical === undefined ? rest");
+    expect(sources).toContain("const rest = { ...view.defaults };");
+    // Unchecking the last source is refused here, not sent to be refused.
+    expect(sources).toMatch(/canonical === null\) \{[\s\S]*?input\.checked = true;[\s\S]*?return;/);
   });
 });
 
