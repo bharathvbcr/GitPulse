@@ -1,7 +1,7 @@
 import "../src/app.css";
 import { mount, tick } from "svelte";
 import { get } from "svelte/store";
-import { mockIPC } from "@tauri-apps/api/mocks";
+import { mockIPCWithEvents } from "./tauriMocks";
 import { repoStore } from "../src/lib/stores/repoStore";
 import { themeStore } from "../src/lib/stores/themeStore";
 import CommandPalette from "../src/lib/components/CommandPalette.svelte";
@@ -35,7 +35,7 @@ const fixture = {
  cmd_codeintel_search: a => new Promise(resolve => pending.set(a.query, resolve)),
  cmd_workspace_search: () => { if (failWorkspace) throw Error("Workspace offline"); return { items: [symbol("workspaceResult", "other")], shown: 1, total: partialWorkspace ? 75 : 1, hidden: partialWorkspace ? 74 : 0, truncated: partialWorkspace, unavailable: partialWorkspace ? [{repo:"unavailable-repo",reason:"Index missing"}] : [], repos_queried: 1, semantic: false }; },
 };
-mockIPC((cmd, args) => { calls.push({ cmd, args }); if (fixture[cmd]) return fixture[cmd](args); throw Error(`Unconfigured command: ${cmd}`); }, { shouldMockEvents: true });
+mockIPCWithEvents((cmd, args) => { calls.push({ cmd, args }); if (fixture[cmd]) return fixture[cmd](args); throw Error(`Unconfigured command: ${cmd}`); });
 themeStore.setTheme(params.get("theme") === "light" ? "light" : "dark");
 await repoStore.openRepo("/fixture/GitPulse");
 const opener = document.getElementById("opener");

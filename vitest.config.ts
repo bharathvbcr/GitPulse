@@ -22,7 +22,7 @@ export default defineConfig({
     // Tests whose cost is serial process spawns rather than CPU derive their
     // own budget from case count (src/lib/commit/agentCommit.stress.test.ts).
     maxWorkers: 4,
-    include: ["src/**/*.{test,spec}.{js,ts}", "scripts/**/*.test.ts"],
+    include: ["src/**/*.{test,spec}.{js,ts}", "scripts/**/*.test.ts", "harness/**/*.test.ts"],
     coverage: {
       provider: "v8",
       reporter: ["text", "lcov", "json-summary"],

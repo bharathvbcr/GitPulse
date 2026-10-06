@@ -25,7 +25,7 @@
   </div>
   <script type="module">
     import "../src/app.css";
-    import { mockIPC } from "@tauri-apps/api/mocks";
+    import { mockIPCWithEvents } from "./tauriMocks";
     import { mount } from "svelte";
     import TaskBoard from "../src/lib/components/TaskBoard.svelte";
     import { holdForeground } from "./foreground";
@@ -53,7 +53,7 @@
     const errors = [];
     addEventListener("error", event => errors.push(event.message));
     addEventListener("unhandledrejection", event => errors.push(String(event.reason)));
-    mockIPC((command, args) => {
+    mockIPCWithEvents((command, args) => {
       if (command === "cmd_pick_folder") return null;
       if (command === "cmd_workbench_register_repository") return JSON.stringify({ ok: true, repository: repositories[0] });
       if (command === "cmd_ai_status") {
@@ -110,7 +110,7 @@
           return JSON.stringify({ ok: true, state: "disabled", reason: "", task_id: "", proposal_id: "", next_check_at: 0 });
         default: throw new Error(`Unconfigured fixture method: ${args.method}`);
       }
-    }, { shouldMockEvents: true });
+    });
     const { harnessStore } = await import("../src/lib/stores/harnessStore");
     void harnessStore.selectModel({ base_url: "http://127.0.0.1:11434/v1", model: "fixture-model" });
     // The inbox reads only while the window is in front. A person is looking

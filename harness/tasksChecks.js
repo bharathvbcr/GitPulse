@@ -2,7 +2,7 @@ import "../src/app.css";
 import { mount, tick } from "svelte";
 import { get } from "svelte/store";
 import { promptState } from "../src/lib/stores/modalStore";
-import { mockIPC } from "@tauri-apps/api/mocks";
+import { mockIPCWithEvents } from "./tauriMocks";
 import { applyPlatformClass } from "../src/lib/platform";
 import { shortcutTextLabel } from "../src/lib/ui/platformCopy";
 import { hostPlatform } from "../src/lib/stores/platformStore";
@@ -56,7 +56,7 @@ let failList = false, corruptSave = false, loseSave = false, holdSave = false, r
 const receipts = new Map(), proposals = new Map(), enhancementWrites = [];
 let failConfiguration = false, blankConfiguration = false, loseEnhancement = false, holdDelete = false, releaseDelete;
 const page = (items, start = 0, limit = 200) => ({ ok: true, items: items.slice(start, start + limit), total: items.length, shown: items.slice(start, start + limit).length, has_more: start + limit < items.length, next_cursor: start + limit < items.length ? String(start + limit) : null });
-mockIPC(async (cmd, args) => {
+mockIPCWithEvents(async (cmd, args) => {
   if (cmd === "cmd_workbench_register_repository") return JSON.stringify({ repository: repos.find(repo => repo.identity_key === `local:${args.repoPath}/.git`) });
   if (cmd === "cmd_pick_folder") return null;
   if (cmd === "cmd_ai_status") {
@@ -243,7 +243,7 @@ mockIPC(async (cmd, args) => {
     }
     default: unknown.push(args.method); throw Error(`Unconfigured method: ${args.method}`);
   }
-}, {shouldMockEvents: true});
+});
 applyPlatformClass();
 themeStore.setTheme(params.get("theme") === "light" ? "light" : "dark");
 void harnessStore.selectModel({ base_url: "http://127.0.0.1:11434/v1", model: "quick-fixture" });

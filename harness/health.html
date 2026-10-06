@@ -9,7 +9,7 @@
     <button id="checks" disabled style="position:fixed;bottom:8px;right:8px;z-index:100">Run health checks</button>
     <pre id="result" style="position:fixed;bottom:40px;right:8px;max-height:30vh;overflow:auto;font:11px monospace;background:#141a29;color:#e9edf8;z-index:100"></pre>
     <script type="module">
-      import { mockIPC } from "@tauri-apps/api/mocks";
+      import { mockIPCWithEvents } from "./tauriMocks";
       import "../src/app.css";
 
       const errors = [];
@@ -152,7 +152,7 @@
         reason: mode === "unrun" ? "no code graph has been built here" : null,
       });
 
-      mockIPC((cmd, args) => {
+      mockIPCWithEvents((cmd, args) => {
         switch (cmd) {
           case "cmd_resolve_repo": return { path: args.repoPath, name: args.repoPath.split("/").pop(), is_bare: false };
           case "cmd_scan_deps_health":
@@ -174,7 +174,7 @@
           case "cmd_repo_operation": case "cmd_workspace_sync": return null;
           default: throw new Error(`Unimplemented fixture: ${cmd}`);
         }
-      }, { shouldMockEvents: true });
+      });
 
       const { mount, tick } = await import("svelte");
       const { repoStore } = await import("../src/lib/stores/repoStore");
