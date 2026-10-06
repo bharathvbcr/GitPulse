@@ -78,9 +78,26 @@ pub struct AgentDefaults {
     /// default" — which is distinct from any mode this could name.
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub permission: std::collections::BTreeMap<String, String>,
+    /// How many task attempts may be live at once across every repository,
+    /// passed to the store as `runs.prepare`'s `max_active_runs`. Absent means
+    /// the store's own default ([`DEFAULT_LIVE_RUNS`]); the bound is the
+    /// store's ceiling ([`MAX_LIVE_RUNS`]), a resource limit on one machine.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_live_runs: Option<u32>,
 }
 
+/// The store's own default for live attempts, used when nothing is stored.
+pub const DEFAULT_LIVE_RUNS: u32 = dc_store::workbench::DEFAULT_ACTIVE_RUNS as u32;
+/// The most the store accepts. Manvi's managed runner refuses past the same
+/// number, so a limit this allows is never refused one layer down.
+pub const MAX_LIVE_RUNS: u32 = dc_store::workbench::MAX_ACTIVE_RUNS_CEILING as u32;
+
 impl AgentDefaults {
+    /// The limit a launch passes to the store: the stored one, or the default.
+    pub fn live_runs(&self) -> u32 {
+        self.max_live_runs.unwrap_or(DEFAULT_LIVE_RUNS)
+    }
+
     /// Rejects anything the launch path would later have to refuse or ignore.
     ///
     /// Validity is asked of the policy table rather than restated here, so a
@@ -93,6 +110,13 @@ impl AgentDefaults {
         }
         for (launcher, mode) in &self.permission {
             crate::workbench::terminal_command::validate_permission_default(launcher, mode)?;
+        }
+        if let Some(limit) = self.max_live_runs {
+            if !(1..=MAX_LIVE_RUNS).contains(&limit) {
+                return Err(format!(
+                    "Agents running at once must be between 1 and {MAX_LIVE_RUNS}"
+                ));
+            }
         }
         Ok(())
     }
@@ -109,13 +133,28 @@ where
     D: serde::Deserializer<'de>,
 {
     let raw = serde_json::Value::deserialize(deserializer)?;
-    Ok(serde_json::from_value(raw).unwrap_or_else(|error| {
-        log::warn!(
-            target: "tool_config",
-            "ignoring unreadable agent_defaults block, using no stored default: {error}"
-        );
-        AgentDefaults::default()
-    }))
+    let error = match serde_json::from_value(raw.clone()) {
+        Ok(defaults) => return Ok(defaults),
+        Err(error) => error,
+    };
+    // A limit of the wrong type is one bad key; it must not also discard the
+    // permission defaults beside it.
+    if let serde_json::Value::Object(mut fields) = raw {
+        if fields.remove("max_live_runs").is_some() {
+            if let Ok(defaults) = serde_json::from_value(serde_json::Value::Object(fields)) {
+                log::warn!(
+                    target: "tool_config",
+                    "ignoring unreadable agents-at-once limit, keeping the other agent defaults: {error}"
+                );
+                return Ok(defaults);
+            }
+        }
+    }
+    log::warn!(
+        target: "tool_config",
+        "ignoring unreadable agent_defaults block, using no stored default: {error}"
+    );
+    Ok(AgentDefaults::default())
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -563,6 +602,18 @@ pub fn agent_defaults() -> AgentDefaults {
         log::warn!(target: "tool_config", "ignoring oversized agent permission defaults");
         defaults.permission.clear();
     }
+    if let Some(limit) = defaults
+        .max_live_runs
+        .filter(|limit| !(1..=MAX_LIVE_RUNS).contains(limit))
+    {
+        // A hand-edited out-of-range limit costs the preference, not every
+        // launch: the store would refuse it as input on each one.
+        log::warn!(
+            target: "tool_config",
+            "ignoring stored agents-at-once limit {limit}: outside 1..={MAX_LIVE_RUNS}"
+        );
+        defaults.max_live_runs = None;
+    }
     defaults
 }
 
@@ -686,6 +737,69 @@ mod tests {
             let defaults = agent_defaults();
             assert_eq!(defaults.permission.len(), 1);
             assert_eq!(defaults.permission.get("claude").unwrap(), "edit");
+        });
+    }
+
+    /// How many agents run at once is the user's: stored as chosen within the
+    /// store's bounds, refused outside them at save, and degraded per key —
+    /// never by discarding the permission defaults beside it — when a
+    /// hand-edited file carries a value no launch could pass.
+    #[test]
+    fn the_agents_at_once_limit_is_bounded_by_the_store_and_degrades_alone() {
+        assert_eq!(DEFAULT_LIVE_RUNS, 8);
+        assert_eq!(MAX_LIVE_RUNS, 64);
+        with_temp_config(|path| {
+            assert_eq!(agent_defaults().live_runs(), DEFAULT_LIVE_RUNS);
+            // What a launch passes: the host reads the stored limit at each
+            // preparation, so a save applies to the next one.
+            let host = crate::workbench::WorkbenchState::default();
+            assert_eq!(host.live_runs(), DEFAULT_LIVE_RUNS);
+            for limit in [1, 2, 9, MAX_LIVE_RUNS] {
+                let defaults = AgentDefaults {
+                    max_live_runs: Some(limit),
+                    ..AgentDefaults::default()
+                };
+                set_agent_defaults(defaults.clone()).unwrap();
+                assert_eq!(agent_defaults(), defaults);
+                assert_eq!(agent_defaults().live_runs(), limit);
+                assert_eq!(host.live_runs(), limit);
+            }
+            for limit in [0, MAX_LIVE_RUNS + 1, u32::MAX] {
+                let refused = set_agent_defaults(AgentDefaults {
+                    max_live_runs: Some(limit),
+                    ..AgentDefaults::default()
+                });
+                assert!(refused.is_err(), "{limit} was stored");
+            }
+            assert_eq!(
+                agent_defaults().live_runs(),
+                MAX_LIVE_RUNS,
+                "a refused save changed the limit"
+            );
+
+            for raw in [
+                r#""max_live_runs":0"#,
+                r#""max_live_runs":65"#,
+                r#""max_live_runs":"12""#,
+                r#""max_live_runs":-3"#,
+                r#""max_live_runs":1.5"#,
+                r#""max_live_runs":[8]"#,
+            ] {
+                write_raw(
+                    path,
+                    &format!(
+                        r#"{{"version":1,"agent_defaults":{{"permission":{{"claude":"edit"}},{raw}}}}}"#
+                    ),
+                );
+                let defaults = agent_defaults();
+                assert_eq!(defaults.max_live_runs, None, "{raw} survived");
+                assert_eq!(defaults.live_runs(), DEFAULT_LIVE_RUNS, "{raw}");
+                assert_eq!(
+                    defaults.permission.get("claude").map(String::as_str),
+                    Some("edit"),
+                    "{raw} took the permission defaults with it"
+                );
+            }
         });
     }
 

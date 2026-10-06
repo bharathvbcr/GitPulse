@@ -11,11 +11,14 @@ import {
   PERMISSION_LAUNCHERS,
   PERMISSION_MODES,
   effectiveMode,
+  isLiveRunLimit,
   isPermissionMode,
+  liveRunLimit,
   requiresAcknowledgement,
   sanitizeAgentDefaults,
   type AgentDefaults,
 } from "./agentDefaults";
+import { DEFAULT_LIVE_RUNS, MAX_LIVE_RUNS } from "../workbench/vocabulary";
 
 describe("isPermissionMode", () => {
   it("accepts every declared mode and nothing else", () => {
@@ -154,5 +157,26 @@ describe("sanitizeAgentDefaults", () => {
         expect(sanitizeAgentDefaults(once)).toEqual(once);
       }
     }
+  });
+});
+
+describe("agents running at once", () => {
+  it("keeps a whole number in the store's range and nothing else", () => {
+    for (const ok of [1, 2, DEFAULT_LIVE_RUNS, 40, MAX_LIVE_RUNS]) {
+      expect(sanitizeAgentDefaults({ permission: {}, max_live_runs: ok })).toEqual({ permission: {}, max_live_runs: ok });
+      expect(liveRunLimit({ permission: {}, max_live_runs: ok })).toBe(ok);
+    }
+    for (const bad of [0, -1, MAX_LIVE_RUNS + 1, 1.5, Number.NaN, Number.POSITIVE_INFINITY, "12", null, [8], {}]) {
+      const sanitized = sanitizeAgentDefaults({ permission: { claude: "edit" }, max_live_runs: bad });
+      // One bad key costs that key, never the permission beside it.
+      expect(sanitized).toEqual({ permission: { claude: "edit" } });
+      expect(liveRunLimit(sanitized)).toBe(DEFAULT_LIVE_RUNS);
+      expect(isLiveRunLimit(bad)).toBe(false);
+    }
+  });
+
+  it("absent means the store's default", () => {
+    expect(liveRunLimit({ permission: {} })).toBe(DEFAULT_LIVE_RUNS);
+    expect(DEFAULT_LIVE_RUNS).toBeLessThan(MAX_LIVE_RUNS);
   });
 });

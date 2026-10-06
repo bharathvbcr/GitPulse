@@ -80,9 +80,20 @@ export function asAgentProvider(value: unknown): AgentProvider | null {
 export type RunKind = "external_terminal" | "managed";
 
 /**
- * How many attempts the profile may hold at once — the store's
- * `MAX_ACTIVE_RUNS` in the vendored `dc-store/src/workbench/runs.rs`, which
- * `run-capacity-contract.test.ts` reads to keep this equal. One checkout
- * holds one attempt; this bounds the whole machine.
+ * How many attempts the profile may hold at once when the user has not
+ * chosen — the store's `DEFAULT_ACTIVE_RUNS`. The user's choice lives in
+ * agent defaults (Settings → Agents) and the host passes it to the store.
  */
-export const MAX_LIVE_RUNS = 8;
+export const DEFAULT_LIVE_RUNS = 8;
+
+/**
+ * The most the user may choose — the store's `MAX_ACTIVE_RUNS_CEILING`, which
+ * Manvi's managed runner also refuses past. A resource bound on one machine,
+ * not a product limit. It also sizes the queue of terminals waiting to open:
+ * there can never be more live attempts than this.
+ *
+ * `run-capacity-contract.test.ts` reads both from the vendored
+ * `dc-store/src/workbench/runs.rs` to keep them equal. One checkout holds
+ * one attempt.
+ */
+export const MAX_LIVE_RUNS = 64;

@@ -40,7 +40,7 @@ pub(super) fn parse(input: &str) -> Result<Launch, WorkbenchError> {
             .id
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
-        || launch.expected_revision != 1
+        || launch.expected_revision != terminal_launch::PREPARED_REVISION
         || launch.rows == 0
         || launch.rows > 1000
         || launch.cols == 0
@@ -251,7 +251,7 @@ impl<R: tauri::Runtime> SessionObserver for RunObserver<R> {
         &self.run_id
     }
     fn before_spawn(&self, session: &str) -> Result<(), String> {
-        let result = terminal_launch::claim(&self.host, &json!({"id":self.run_id,"request_id":format!("{}-claim",self.owner),"expected_revision":1,"owner_id":self.owner,"session_id":session}).to_string()).map_err(message)?;
+        let result = terminal_launch::claim(&self.host, &json!({"id":self.run_id,"request_id":format!("{}-claim",self.owner),"expected_revision":terminal_launch::PREPARED_REVISION,"owner_id":self.owner,"session_id":session}).to_string()).map_err(message)?;
         announce(&self.app, &result);
         Ok(())
     }

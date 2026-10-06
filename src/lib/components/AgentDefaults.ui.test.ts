@@ -18,6 +18,30 @@ const panel = readFileSync(join(here, "AgentDefaultsSettings.svelte"), "utf8");
 const session = readFileSync(join(here, "TerminalSession.svelte"), "utf8");
 const modal = readFileSync(join(here, "SettingsModal.svelte"), "utf8");
 
+describe("agents running at once", () => {
+  it("is findable by the words a reader would type", () => {
+    const entry = SETTINGS_CATALOG.find((row) => row.id === "agent-live-runs");
+    expect(entry?.section).toBe("agents");
+    for (const word of ["concurrent", "parallel", "many", "sessions", "manvi"]) {
+      expect(entry?.keywords, `"${word}" does not find this setting`).toContain(word);
+    }
+    expect(panel).toContain('data-setting="agent-live-runs"');
+  });
+
+  it("takes its bounds from the store's constants, not a literal", () => {
+    // The capacity contract ties these to dc-store; a 64 or an 8 written
+    // here would be a third copy nothing checks.
+    expect(panel).toContain("max={MAX_LIVE_RUNS}");
+    expect(panel).toMatch(/\{MAX_LIVE_RUNS\}.*\{DEFAULT_LIVE_RUNS\}/s);
+    expect(panel).not.toMatch(/\b(64|8)\b(?![\d.])/);
+  });
+
+  it("stores the default as absence, so the default can move", () => {
+    expect(panel).toContain("delete rest.max_live_runs");
+    expect(panel).toContain("next === DEFAULT_LIVE_RUNS ? rest");
+  });
+});
+
 describe("the settings pane", () => {
   it("lives in the agents section and is reachable from the catalog", () => {
     const entry = SETTINGS_CATALOG.find((row) => row.id === "agent-defaults");

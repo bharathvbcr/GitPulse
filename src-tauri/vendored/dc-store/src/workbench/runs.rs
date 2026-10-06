@@ -8,10 +8,16 @@ use super::{
 };
 use rusqlite::{OptionalExtension, params, params_from_iter, types::Value};
 
-/// Live attempts across the whole profile. Concurrency is per checkout (see
-/// `prepare`), so this bounds only how many agents one machine supervises at
-/// once; it is not what keeps two agents out of one working tree.
-const MAX_ACTIVE_RUNS: i64 = 8;
+/// Live attempts across the whole profile when the host names no limit.
+/// Concurrency is per checkout (see `prepare`), so this bounds only how many
+/// agents one machine supervises at once; it is not what keeps two agents out
+/// of one working tree.
+pub const DEFAULT_ACTIVE_RUNS: i64 = 8;
+/// The most a host may raise that limit to. How many agents to run is the
+/// user's choice, passed by the host as `max_active_runs`; this ceiling is a
+/// resource bound on one machine's process and file-handle budget, never a
+/// product limit, and Manvi's managed runner refuses past the same number.
+pub const MAX_ACTIVE_RUNS_CEILING: i64 = 64;
 const ACTIVE: &str =
     "(state IN ('starting','running','unresolved') OR (state='prepared' AND expires_at>?1))";
 const STATES: &[&str] = &[
@@ -391,12 +397,25 @@ fn prepare(input: &Input<'_>, id: &str, revision: i64, now: i64) -> Result<()> {
         "head_oid",
         "head_ref",
         "kind",
+        "max_active_runs",
     ])?;
     if revision != 1 {
         return Err(refuse(
             "invalid_state",
             "a launch attempt is immutable; prepare a new run ID",
         ));
+    }
+    // Read before any lookup, so a malformed limit is refused as input rather
+    // than surfacing after the checkout and capacity queries have run.
+    let limit = input.integer(
+        "max_active_runs",
+        Some(DEFAULT_ACTIVE_RUNS),
+        MAX_ACTIVE_RUNS_CEILING,
+    )?;
+    if limit < 1 {
+        return Err(Error::invalid(format!(
+            "max_active_runs must be between 1 and {MAX_ACTIVE_RUNS_CEILING}"
+        )));
     }
     let task_id = input.id("task_id")?;
     let source_revision = input.integer("source_revision", None, MAX_INTEGER)?;
@@ -498,11 +517,11 @@ fn prepare(input: &Input<'_>, id: &str, revision: i64, now: i64) -> Result<()> {
         [now],
         |r| r.get(0),
     )?;
-    if active >= MAX_ACTIVE_RUNS {
+    if active >= limit {
         return Err(Error {
             code: "capacity_reached",
             message: format!(
-                "{MAX_ACTIVE_RUNS} runs are already prepared, active or unresolved; finish or reconcile one before launching another"
+                "{limit} runs are already prepared, active or unresolved; finish or reconcile one before launching another"
             ),
         });
     }

@@ -645,7 +645,7 @@ Schema-five run records retain one immutable brief per attempt, bounded active
 reservations, and a one-use launch claim. A reservation belongs to a checkout
 (its `git_dir`), not to the repository: agents in separate worktrees of one
 repository run concurrently, a second attempt in the same working tree is
-refused as `checkout_busy`, and the profile holds at most eight live attempts. `workbench/terminal_launch.rs` adds
+refused as `checkout_busy`, and the profile holds at most the user's limit of live attempts (`agent_defaults.max_live_runs` in `tools.json`, 1–64, default 8), which the host passes to the store as `runs.prepare`'s `max_active_runs` on every preparation. Raw `runs.prepare` is host-only. Managed launches are exclusive per attempt (`managed_launches`), not per host. `workbench/terminal_launch.rs` adds
 native `runs.prepare_terminal` through existing workbench IPC, observing actual
 cwd, Git directories, commit and branch before preparation. Native `runs.claim`
 rechecks those observations and then delegates snapshot/CAS validation to Manvi.

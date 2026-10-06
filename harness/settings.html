@@ -92,8 +92,27 @@
         notes: [], repo_changes: repoChanges, outside_changes: outsideChanges,
         protected: [], ...extra,
       });
+      // Agent defaults round-trip the way the backend does: a save answers
+      // with what was stored, so the panel shows the saved limit afterwards
+      // and a refused value can be told apart from one that never left.
+      let agentDefaults = { permission: {} };
+      const agentView = () => ({
+        defaults: agentDefaults,
+        modes: ["inspect", "ask", "edit", "auto_review", "preapproved", "bypass"],
+        launchers: ["claude", "codex", "grok", "agy"],
+      });
+      window.__gpAgentDefaults = () => agentDefaults;
       window.__TAURI_INTERNALS__ = {
-        invoke: async (cmd) => {
+        invoke: async (cmd, args) => {
+          if (cmd === "cmd_agent_defaults") return agentView();
+          if (cmd === "cmd_agent_defaults_save") {
+            const limit = args?.defaults?.max_live_runs;
+            if (limit !== undefined && !(Number.isInteger(limit) && limit >= 1 && limit <= 64)) {
+              throw "Agents running at once must be between 1 and 64";
+            }
+            agentDefaults = structuredClone(args.defaults);
+            return agentView();
+          }
           if (cmd === "cmd_mcp_info") return mcpInfo;
           if (cmd === "cmd_devcouncil_suite_status") return suiteReport;
           if (cmd === "cmd_devmap_integration_survey") {

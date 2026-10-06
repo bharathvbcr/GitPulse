@@ -66,7 +66,14 @@ struct Inner {
             Arc<crate::harness::sidecar::ProfileConnection>,
         )>,
     >,
-    managed_launch: Mutex<()>,
+    /// Attempt ids whose managed launch is in flight. Per attempt, not one
+    /// lock for the host: a launch blocks for the provider's whole startup,
+    /// and one global lock refused every other task's launch meanwhile.
+    managed_launches: Mutex<std::collections::HashSet<String>>,
+    /// How many attempts may be live at once. Only tests supply one; the app
+    /// reads the user's setting at each launch, so a change applies to the
+    /// next launch without a restart.
+    live_runs: Option<u32>,
     /// The PTY registry, attached at startup. Run reconciliation reads it to
     /// leave alone any run whose terminal this process still holds.
     terminals: OnceLock<crate::terminal::TerminalSessions>,
@@ -90,6 +97,20 @@ impl WorkbenchState {
 
     fn terminals(&self) -> Option<&crate::terminal::TerminalSessions> {
         self.0.terminals.get()
+    }
+
+    /// The limit the next preparation passes to the store.
+    ///
+    /// A state with a test-supplied profile and no test-supplied limit uses
+    /// the store's default rather than the machine's `tools.json`: tests run
+    /// in parallel, and one that saves a limit of 1 would otherwise refuse
+    /// another test's second attempt.
+    pub(crate) fn live_runs(&self) -> u32 {
+        match (self.0.live_runs, &self.0.path) {
+            (Some(limit), _) => limit,
+            (None, Some(_)) => crate::tool_config::DEFAULT_LIVE_RUNS,
+            (None, None) => crate::tool_config::agent_defaults().live_runs(),
+        }
     }
 
     /// Releases every run whose owner and process are provably gone.
@@ -217,6 +238,11 @@ impl WorkbenchState {
                 | "decisions.create"
                 | "decisions.claim"
                 | "decisions.resolve"
+                // Preparation goes through `runs.prepare_terminal` /
+                // `runs.prepare_managed`, which observe the checkout and name
+                // the user's limit. The raw method would take a renderer's
+                // word for both.
+                | "runs.prepare"
                 | "runs.started"
                 | "runs.finish"
                 | "runs.reconcile"
@@ -940,6 +966,9 @@ done
             "notifications.claim",
             "notifications.finish",
             "notifications.activate",
+            // Raw preparation would take the renderer's word for the
+            // checkout and for how many attempts may run at once.
+            "runs.prepare",
             "runs.started",
             "runs.finish",
             "runs.protocol",

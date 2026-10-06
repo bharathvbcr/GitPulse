@@ -69,6 +69,7 @@ export const SETTINGS_CATALOG: readonly SettingEntry[] = [
     label: "Agent launch defaults",
     keywords: "agent default permission mode terminal launch claude codex grok antigravity skip permissions bypass sandbox plan ask accept edits preapproved auto review dangerously authority yolo",
   },
+  { id: "agent-live-runs", section: "agents", label: "Agents running at once", keywords: "concurrent parallel simultaneous many multiple agents sessions tasks attempts at once limit capacity managed manvi worktree" },
   { id: "hygiene-defaults", section: "hygiene", label: "Hygiene defaults", keywords: "repository hygiene default retention days inherit override per repository shared cache review weekly all repositories scope storage preview" },
   { id: "global-cleaner", section: "hygiene", label: "Global build cleaner", keywords: "repository hygiene storage disk cache clean cleanup schedule scheduled retention exclusions roots cargo go build artifacts" },
   {

@@ -8,6 +8,13 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use std::path::Path;
 
+/// The revision every prepared attempt has. The store refuses to revise a
+/// preparation ("a launch attempt is immutable; prepare a new run ID"), so a
+/// claim or a managed preparation always names this one, and naming it — not
+/// the row's current revision — is what keeps a retried request identical
+/// to the original after the claim moved the row on.
+pub(super) const PREPARED_REVISION: u64 = 1;
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Preparation {
@@ -290,9 +297,12 @@ fn prepare_in(
         "acknowledge_bypass":input.acknowledge_bypass, "cwd":checkout.cwd,
         "git_dir":checkout.git_dir, "git_common_dir":checkout.git_common_dir,
         "head_oid":checkout.head_oid, "head_ref":checkout.head_ref,
+        // The user's choice, read at each launch so a change in Settings
+        // applies to the next one. The store owns the bound and the count.
+        "max_active_runs": state.live_runs(),
     });
     let prepare = || state.with_store(|store| query(store, "runs.prepare", &body.to_string()));
-    match prepare() {
+    capacity_hint(match prepare() {
         // The slot may be held by an attempt whose owner died. Release what
         // the evidence allows, once, and ask again with the identical request;
         // a refusal is rolled back, so the same request_id is still unused.
@@ -307,7 +317,26 @@ fn prepare_in(
             }
         }
         other => other,
-    }
+    })
+}
+
+/// Says where the limit is set when the profile is full. The store's own
+/// sentence names the number in force but not that the reader chose it, so a
+/// refusal at the default read as a wall rather than a setting.
+fn capacity_hint(result: Result<Value, WorkbenchError>) -> Result<Value, WorkbenchError> {
+    result.map_err(|error| {
+        if error.code != "capacity_reached" {
+            return error;
+        }
+        let max = crate::tool_config::MAX_LIVE_RUNS;
+        WorkbenchError::new(
+            &error.code,
+            format!(
+                "{} To run more at once, raise \"Agents running at once\" in Settings → Agents (up to {max}).",
+                error.message
+            ),
+        )
+    })
 }
 
 pub(super) fn revalidate(saved: &Value) -> Result<(), WorkbenchError> {
@@ -766,6 +795,68 @@ mod tests {
 
     fn porcelain(root: &Path) -> String {
         git_text(root, &["status", "--porcelain", "--untracked-files=all"]).unwrap()
+    }
+
+    /// The limit is the one the store enforces: two at once refuses a third —
+    /// saying where to raise it, and removing the worktree made for the
+    /// refused attempt — and a host passing a higher limit admits the third
+    /// into the same profile.
+    #[test]
+    fn the_users_agents_at_once_limit_is_what_the_store_enforces() {
+        let dir = tempfile::tempdir().unwrap();
+        let profile = dir.path().join("profile.sqlite");
+        let limited = |n: u32| {
+            WorkbenchState(Arc::new(Inner {
+                path: Some(profile.clone()),
+                live_runs: Some(n),
+                ..Inner::default()
+            }))
+        };
+        let root = dir.path().join("repo");
+        init(&root);
+        commit(&root);
+        let state = limited(2);
+        seed(&state, &root);
+        state
+            .request("runs.prepare_terminal", &prepare(&root).to_string())
+            .unwrap();
+        state
+            .request(
+                "runs.prepare_terminal",
+                &with_worktree(&root, "f00dcafe-1").to_string(),
+            )
+            .unwrap();
+        let full = state
+            .request(
+                "runs.prepare_terminal",
+                &with_worktree(&root, "beefbeef-2").to_string(),
+            )
+            .unwrap_err();
+        assert_eq!(full.code, "capacity_reached");
+        assert!(
+            full.message.starts_with("2 runs are already"),
+            "{}",
+            full.message
+        );
+        assert!(
+            full.message.contains("Settings → Agents (up to 64)"),
+            "{}",
+            full.message
+        );
+        assert!(
+            !root
+                .canonicalize()
+                .unwrap()
+                .join(".gitpulse/worktrees/preserve-e42-beefbeef")
+                .exists(),
+            "a refused attempt left its worktree behind"
+        );
+        limited(3)
+            .request(
+                "runs.prepare_terminal",
+                &with_worktree(&root, "beefbeef-2").to_string(),
+            )
+            .unwrap();
     }
 
     #[test]

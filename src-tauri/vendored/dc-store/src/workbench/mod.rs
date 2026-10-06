@@ -11,6 +11,8 @@ mod input;
 mod notifications;
 mod runs;
 
+pub use runs::{DEFAULT_ACTIVE_RUNS, MAX_ACTIVE_RUNS_CEILING};
+
 use crate::Store;
 use input::Input;
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};

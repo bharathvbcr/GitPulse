@@ -25,6 +25,7 @@
  */
 
 import type { LauncherKind } from "./tabs";
+import { DEFAULT_LIVE_RUNS, MAX_LIVE_RUNS } from "../workbench/vocabulary";
 
 /**
  * Permission modes, least authority first, so the dangerous end of the range
@@ -88,6 +89,12 @@ export function isPermissionMode(value: unknown): value is PermissionMode {
  */
 export interface AgentDefaults {
   permission: Partial<Record<LauncherKind, PermissionMode>>;
+  /**
+   * How many task attempts may be live at once, across every repository.
+   * Absent means the store's default ({@link DEFAULT_LIVE_RUNS}); the host
+   * passes it to the store at each launch, so a change applies to the next.
+   */
+  max_live_runs?: number;
 }
 
 export const EMPTY_AGENT_DEFAULTS: AgentDefaults = { permission: {} };
@@ -144,5 +151,15 @@ export function sanitizeAgentDefaults(
       permission[launcher as LauncherKind] = mode;
     }
   }
-  return { permission };
+  return isLiveRunLimit(raw.max_live_runs) ? { permission, max_live_runs: raw.max_live_runs } : { permission };
+}
+
+/** Whether `value` is a limit the store accepts: a whole number in 1..=ceiling. */
+export function isLiveRunLimit(value: unknown): value is number {
+  return typeof value === "number" && Number.isInteger(value) && value >= 1 && value <= MAX_LIVE_RUNS;
+}
+
+/** The limit a launch will pass: the stored one, or the store's default. */
+export function liveRunLimit(defaults: AgentDefaults): number {
+  return isLiveRunLimit(defaults.max_live_runs) ? defaults.max_live_runs : DEFAULT_LIVE_RUNS;
 }
