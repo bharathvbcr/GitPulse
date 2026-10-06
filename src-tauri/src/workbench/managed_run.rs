@@ -62,49 +62,10 @@ struct Prepared {
     phase: String,
 }
 
-/// Holds one attempt's place in the in-flight set until the launch returns.
-struct InFlight<'a> {
-    state: &'a WorkbenchState,
-    id: String,
-}
-
-impl<'a> InFlight<'a> {
-    /// Refuses only a second launch of the *same* attempt. Launches of other
-    /// attempts proceed concurrently: one blocks for its provider's whole
-    /// startup, and a single host-wide lock refused every other task's launch
-    /// for that long — a second "one at a time" behind the store's limit.
-    fn enter(state: &'a WorkbenchState, id: &str) -> Result<Self, WorkbenchError> {
-        let mut launches = state
-            .0
-            .managed_launches
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if !launches.insert(id.to_owned()) {
-            return Err(WorkbenchError::new(
-                "busy",
-                "This attempt is already being launched. Retry shortly.",
-            ));
-        }
-        Ok(Self {
-            state,
-            id: id.to_owned(),
-        })
-    }
-}
-
-impl Drop for InFlight<'_> {
-    fn drop(&mut self) {
-        self.state
-            .0
-            .managed_launches
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(&self.id);
-    }
-}
-
 pub(super) fn launch(state: &WorkbenchState, input: &str) -> Result<Value, WorkbenchError> {
-    let _launch = InFlight::enter(state, &parse(input)?)?;
+    // Refused rather than waited for: a managed launch blocks for the
+    // provider's whole startup, and the caller can retry.
+    let _launch = state.0.managed_launches.try_enter(&parse(input)?)?;
     launch_with(
         state,
         input,
@@ -284,71 +245,6 @@ mod tests {
     use super::*;
     use crate::engine::git_cli::git_global;
     use std::sync::Arc;
-
-    /// Launches of different attempts run at once; only the same attempt is
-    /// refused while its launch is in flight, and its place is given back
-    /// when the launch ends — including by unwinding.
-    #[test]
-    fn launches_are_exclusive_per_attempt_not_per_host() {
-        let state = WorkbenchState::default();
-        let held: Vec<_> = (0..64)
-            .map(|i| {
-                InFlight::enter(&state, &format!("attempt-{i}"))
-                    .expect("a different attempt was refused")
-            })
-            .collect();
-        let again = InFlight::enter(&state, "attempt-7")
-            .err()
-            .expect("the same attempt launched twice");
-        assert_eq!(again.code, "busy");
-        drop(held);
-        assert!(
-            InFlight::enter(&state, "attempt-7").is_ok(),
-            "a finished launch kept its place"
-        );
-
-        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _launch = InFlight::enter(&state, "panics").unwrap();
-            panic!("launch failed mid-way");
-        }));
-        assert!(unwound.is_err());
-        assert!(
-            InFlight::enter(&state, "panics").is_ok(),
-            "an unwound launch kept its place"
-        );
-
-        // Racing: thirty-two hosts asking for one attempt admit exactly one,
-        // while thirty-two distinct attempts are all admitted together.
-        // Every racer asks before any lets go (the second barrier), so the
-        // count does not depend on scheduling.
-        let (start, asked) = (std::sync::Barrier::new(64), std::sync::Barrier::new(64));
-        let race = |id: String| {
-            start.wait();
-            let entered = InFlight::enter(&state, &id);
-            asked.wait();
-            entered.is_ok()
-        };
-        let (same, distinct) = std::thread::scope(|scope| {
-            let race = &race;
-            let same: Vec<_> = (0..32)
-                .map(|_| scope.spawn(move || race("contended".into())))
-                .collect();
-            let distinct: Vec<_> = (0..32)
-                .map(|i| scope.spawn(move || race(format!("racer-{i}"))))
-                .collect();
-            let admitted = |handles: Vec<std::thread::ScopedJoinHandle<'_, bool>>| {
-                handles
-                    .into_iter()
-                    .map(|h| h.join().unwrap())
-                    .filter(|ok| *ok)
-                    .count()
-            };
-            (admitted(same), admitted(distinct))
-        });
-        assert_eq!(same, 1);
-        assert_eq!(distinct, 32);
-        assert!(state.0.managed_launches.lock().unwrap().is_empty());
-    }
 
     #[cfg(unix)]
     #[test]

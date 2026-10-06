@@ -13,6 +13,7 @@ use tauri::{Emitter, State};
 mod agent_worktree;
 mod conversation;
 pub(crate) mod external_changes;
+mod in_flight;
 pub(crate) mod intake;
 mod managed_run;
 pub(crate) mod notifications;
@@ -66,10 +67,9 @@ struct Inner {
             Arc<crate::harness::sidecar::ProfileConnection>,
         )>,
     >,
-    /// Attempt ids whose managed launch is in flight. Per attempt, not one
-    /// lock for the host: a launch blocks for the provider's whole startup,
-    /// and one global lock refused every other task's launch meanwhile.
-    managed_launches: Mutex<std::collections::HashSet<String>>,
+    /// Attempts whose launch is in flight, per lane (see `in_flight.rs`).
+    managed_launches: in_flight::Attempts,
+    terminal_launches: in_flight::Attempts,
     /// How many attempts may be live at once. Only tests supply one; the app
     /// reads the user's setting at each launch, so a change applies to the
     /// next launch without a restart.

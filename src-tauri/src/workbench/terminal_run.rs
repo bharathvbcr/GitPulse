@@ -15,6 +15,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tauri::AppHandle;
 
 static OWNER_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+/// How long a second launch of one attempt waits for the first to register
+/// its session. Covers a fork and two store writes with room to spare.
+const LAUNCH_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -76,6 +79,16 @@ pub(super) fn spawn<R: tauri::Runtime>(
     state: &WorkbenchState,
     launch: Launch,
 ) -> Result<TerminalSpawned, WorkbenchError> {
+    // One launch of this attempt at a time, and a second one waits for the
+    // first rather than failing. The claim below is single-use and the
+    // session is registered only after the fork, so a second caller in that
+    // window read "already claimed" with nothing to attach to — a reloaded
+    // page or a second window asking for the same terminal got an error
+    // instead of the terminal.
+    let _launch = state
+        .0
+        .terminal_launches
+        .enter_within(&launch.id, LAUNCH_WAIT)?;
     let response =
         state.with_store(|store| query(store, "runs.get", &json!({"id":launch.id}).to_string()))?;
     let source: Source = serde_json::from_value(response["item"].clone())
@@ -335,6 +348,63 @@ mod tests {
         std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
         path.to_str().unwrap().to_owned()
+    }
+
+    /// A second launch of one attempt that arrives while the first holds it —
+    /// claimed, forking, not yet registered — waits and then gets the first
+    /// one's session. It read "already claimed" with nothing to attach to,
+    /// so a reloaded page or a second window got an error instead of the
+    /// terminal. One process, one claim, the same session for both.
+    #[test]
+    fn a_second_launch_in_flight_waits_and_attaches_to_the_first() {
+        let root = tempfile::tempdir().unwrap();
+        let state = fixture(root.path());
+        let app = tauri::test::mock_builder().build(crate::context()).unwrap();
+        let terminals = TerminalSessions::default();
+        let _cleanup = Cleanup(terminals.clone());
+        let ack = terminals.clone();
+        app.listen("terminal-output", move |event| {
+            let value: Value = serde_json::from_str(event.payload()).unwrap();
+            let _ = acknowledge_output(
+                &ack,
+                value["id"].as_str().unwrap(),
+                value["bytes"].as_u64().unwrap() as usize,
+            );
+        });
+        let program = script(root.path(), "IFS= read -r finish\nexit 0");
+        let first = state.0.terminal_launches.try_enter("run").unwrap();
+        let (first_session, second) = std::thread::scope(|scope| {
+            let handle = app.handle();
+            let waiter = scope.spawn(|| spawn(handle, &terminals, &state, launch()));
+            let parked = Instant::now();
+            while state.0.terminal_launches.waiting() == 0 {
+                assert!(
+                    parked.elapsed() < Duration::from_secs(10),
+                    "the second launch never waited"
+                );
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            let started = start(
+                app.handle(),
+                &terminals,
+                &state,
+                launch(),
+                source(&state),
+                program,
+                false,
+            )
+            .unwrap();
+            drop(first);
+            (started, waiter.join().unwrap())
+        });
+        let second = second.expect("the second launch got an error instead of the terminal");
+        assert_eq!(second.id, first_session.id);
+        assert_eq!(
+            state.request("runs.get", r#"{"id":"run"}"#).unwrap()["item"]["state"],
+            "running"
+        );
+        assert!(state.0.terminal_launches.is_empty());
+        write_to_session(&terminals, &first_session.id, "finish\n").unwrap();
     }
 
     #[test]
