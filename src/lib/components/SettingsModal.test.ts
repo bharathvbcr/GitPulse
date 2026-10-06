@@ -24,6 +24,25 @@ const appCss = readFileSync(
 const open = () => render(SettingsModal, { props: { isOpen: true } }).body;
 
 /**
+ * Every `data-setting` div opened while another one is still open, as
+ * "inner in outer". Walks div open and close tags in order, comments
+ * stripped; a tag cut short by an arrow inside an attribute still counts as
+ * one open div, which is all the walk needs.
+ */
+function nestedSettings(markup: string): string[] {
+  const found: string[] = [];
+  const open: (string | null)[] = [];
+  for (const tag of markup.replace(/<!--[\s\S]*?-->/g, "").matchAll(/<div\b[^>]*>|<\/div>/g)) {
+    if (tag[0] === "</div>") { open.pop(); continue; }
+    const id = /data-setting="([^"]+)"/.exec(tag[0])?.[1] ?? null;
+    const outer = open.filter((entry): entry is string => entry !== null).at(-1);
+    if (id && outer) found.push(`${id} in ${outer}`);
+    open.push(id);
+  }
+  return found;
+}
+
+/**
  * A label as it appears in rendered markup.
  *
  * Svelte escapes text, so a label carrying `&`, `<` or `>` never appears
@@ -284,6 +303,16 @@ describe("SettingsModal is wired to the search catalog", () => {
 
   it("stamps each id exactly once, so a filter cannot half-hide a row", () => {
     expect(new Set(stamped).size).toBe(stamped.length);
+  });
+
+  it("never nests one entry's row inside another's, so a match cannot be hidden by its parent", () => {
+    // A row inside another row's wrapper is hidden whenever the search
+    // matches it but not the wrapper — the reader gets the right panel with
+    // nothing in it. That is what happened to the agent rows inside
+    // external-tools.
+    expect(nestedSettings(source)).toEqual([]);
+    expect(nestedSettings('<div data-setting="a"><div data-setting="b"></div></div>')).toEqual(["b in a"]);
+    expect(nestedSettings('<div data-setting="a"></div><div data-setting="b"><div></div></div>')).toEqual([]);
   });
 
   it("has a catalog entry for every control on the page", () => {

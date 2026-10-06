@@ -22,12 +22,9 @@
   import {
     BYPASS_MODE,
     PERMISSION_LABELS,
-    isLiveRunLimit,
     isPermissionMode,
-    liveRunLimit,
     type PermissionMode,
   } from "../terminal/agentDefaults";
-  import { DEFAULT_LIVE_RUNS, MAX_LIVE_RUNS } from "../workbench/vocabulary";
   import { launcherLabel, type LauncherKind } from "../terminal/tabs";
   import { formatError } from "../ui/formatError";
 
@@ -78,36 +75,6 @@
 
   const chosen = (launcher: LauncherKind): PermissionMode | "" =>
     view.defaults.permission[launcher] ?? INHERIT;
-
-  const liveRuns = $derived(liveRunLimit(view.defaults));
-
-  /**
-   * Saves how many attempts may run at once. The default is stored as
-   * absence, so a later change to the store's default reaches a reader who
-   * never chose; an out-of-range entry is refused here with the bound named,
-   * rather than sent for the backend to refuse.
-   */
-  async function chooseLiveRuns(input: HTMLInputElement) {
-    const next = Number(input.value);
-    if (!isLiveRunLimit(next)) {
-      error = `Agents running at once must be a whole number from 1 to ${MAX_LIVE_RUNS}.`;
-      input.value = String(liveRuns);
-      return;
-    }
-    if (next === liveRuns) return;
-    const rest = { ...view.defaults };
-    delete rest.max_live_runs;
-    busy = true;
-    error = "";
-    try {
-      await saveAgentDefaults(next === DEFAULT_LIVE_RUNS ? rest : { ...rest, max_live_runs: next });
-    } catch (err) {
-      error = formatError(err);
-      input.value = String(liveRuns);
-    } finally {
-      busy = false;
-    }
-  }
 
   /**
    * Launchers whose stored default turns permission checks off. Listed rather
@@ -160,30 +127,6 @@
       {/if}
     {/each}
   </div>
-
-  <div class="flex items-center gap-2 mt-3" data-setting="agent-live-runs">
-    <label class="text-textPrimary text-[11px] flex-1 min-w-0" for="gp-agent-live-runs">
-      Agents running at once
-    </label>
-    <input
-      id="gp-agent-live-runs"
-      type="number"
-      inputmode="numeric"
-      min="1"
-      max={MAX_LIVE_RUNS}
-      step="1"
-      class="gp-input text-[11px] py-0.5! w-16 text-right"
-      data-testid="agent-live-runs"
-      disabled={busy}
-      value={liveRuns}
-      onchange={(event) => void chooseLiveRuns(event.currentTarget)}
-    />
-  </div>
-  <p class="text-textMuted text-[10px] leading-snug mt-1" data-testid="agent-live-runs-note">
-    Task attempts that may be live together, across every repository — up to {MAX_LIVE_RUNS}, {DEFAULT_LIVE_RUNS} unless you change it.
-    Each checkout still runs one at a time; a busy one gives the next attempt its own worktree.
-    Terminal attempts also need a free terminal session.
-  </p>
 
   {#if bypassing.length}
     <!-- Named rather than counted, and phrased as what will happen rather than

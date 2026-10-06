@@ -72,6 +72,7 @@
   import AgentIntegrationPanel from "./AgentIntegrationPanel.svelte";
   import SessionAlertSettings from "./SessionAlertSettings.svelte";
   import AgentDefaultsSettings from "./AgentDefaultsSettings.svelte";
+  import AgentLiveRunsSetting from "./AgentLiveRunsSetting.svelte";
   import GlobalCleaner from "./GlobalCleaner.svelte";
   import HygieneDefaultsPanel from "./HygieneDefaultsPanel.svelte";
 
@@ -1222,19 +1223,27 @@
                       active={isOpen && activeSection === "agents"}
                     />
                   </div>
-                  <div class="border-border/70 mt-3 border-t pt-3" data-setting="session-alerts" hidden={!shown("session-alerts")}>
-                    <SessionAlertSettings active={isOpen && activeSection === "agents"} />
-                  </div>
-                  <div class="border-border/70 mt-3 border-t pt-3" data-setting="agent-defaults" hidden={!shown("agent-defaults")}>
-                    <AgentDefaultsSettings active={isOpen && activeSection === "agents"} />
-                  </div>
-                  <div class="border-border/70 mt-3 border-t pt-3">
-                    <AgentIntegrationPanel
-                      repoPath={isOpen && activeSection === "agents"
-                        ? $repoStore.currentPath
-                        : null}
-                    />
-                  </div>
+                </div>
+                <!-- Siblings of the external-tools wrapper, never inside it:
+                     a search that matched one of these but not the CLIs hid
+                     its parent and so hid it too, leaving an empty panel. -->
+                <div class="border-border/70 mt-3 border-t pt-3" data-setting="session-alerts" hidden={!shown("session-alerts")}>
+                  <SessionAlertSettings active={isOpen && activeSection === "agents"} />
+                </div>
+                <div class="border-border/70 mt-3 border-t pt-3" data-setting="agent-defaults" hidden={!shown("agent-defaults")}>
+                  <AgentDefaultsSettings active={isOpen && activeSection === "agents"} />
+                </div>
+                <div class="border-border/70 mt-3 border-t pt-3" data-setting="agent-live-runs" hidden={!shown("agent-live-runs")}>
+                  <AgentLiveRunsSetting active={isOpen && activeSection === "agents"} />
+                </div>
+                <!-- Part of the external-tools entry (it has no catalog row of
+                     its own), so it follows that entry's visibility. -->
+                <div class="border-border/70 mt-3 border-t pt-3" hidden={!shown("external-tools")}>
+                  <AgentIntegrationPanel
+                    repoPath={isOpen && activeSection === "agents"
+                      ? $repoStore.currentPath
+                      : null}
+                  />
                 </div>
               {:else if entry.id === "hygiene"}
                 <div class="space-y-3">
