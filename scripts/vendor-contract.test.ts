@@ -52,7 +52,7 @@ describe("GitPulse builds standalone", () => {
     const deps = pathDependencies(manifest);
     expect(deps).toEqual(
       expect.arrayContaining([
-        "vendored/dc-verify",
+        "vendored/dc-redact",
         "vendored/dc-store",
         "vendored/devmap-query",
         "vendored/devmap-store",
@@ -71,7 +71,7 @@ describe("GitPulse builds standalone", () => {
   });
 
   it("resolves every vendored crate's own path dependencies inside the vendor tree", () => {
-    // dc-verify depends on dc-glob and dc-evidence, and the devmap crates on
+    // dc-regress depends on dc-proc and devmap-extract, and the devmap crates on
     // each other. Those
     // are `../<name>`, which is only correct because the copies sit as
     // siblings — vendoring one and not the others would break here.

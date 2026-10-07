@@ -1,8 +1,9 @@
 //! Credential redaction on the ledger's write path.
 //!
-//! Vendor-shaped tokens delegate to `dc_verify::rigor`, whose
-//! `SECRET_PATTERNS` table is the single owner of those signatures. This module
-//! additionally owns context-shaped credentials (authorization/cookie headers,
+//! Vendor-shaped tokens delegate to `dc_redact`, whose `SECRET_PATTERNS` table
+//! — the one dc-verify's secret gate also reads — is the single owner of those
+//! signatures. This module additionally owns context-shaped credentials
+//! (authorization/cookie headers,
 //! URL passwords, named secret fields, and private-key blocks) that cannot be
 //! identified safely by a token prefix alone.
 //!
@@ -118,7 +119,7 @@ fn redacted_embedded_assignment(captures: &Captures<'_>) -> String {
 }
 
 fn redact_contextual(value: &str) -> String {
-    // Private-key blocks go first. dc-verify deliberately recognizes the PEM
+    // Private-key blocks go first. dc-redact deliberately recognizes the PEM
     // prefix as a secret token, but token-oriented matching stops at the first
     // space and cannot remove the body after it has rewritten that prefix.
     let private_key = compiled(
@@ -226,7 +227,7 @@ fn redact_contextual(value: &str) -> String {
 }
 
 fn redact_vendor_tokens(value: &str) -> String {
-    // dc-verify defines a token boundary as whitespace, quote, or comma, but
+    // dc-redact defines a token boundary as whitespace, quote, or comma, but
     // its public helper returns only the first distinct value for one vendor
     // on a line. Apply that same owner independently to every such segment so
     // a short/previously-redacted candidate cannot hide a later credential.
@@ -239,13 +240,13 @@ fn redact_vendor_tokens(value: &str) -> String {
             continue;
         }
         if start < index {
-            out.push_str(&dc_verify::rigor::redact_secrets(&value[start..index]));
+            out.push_str(&dc_redact::redact_secrets(&value[start..index]));
         }
         out.push(ch);
         start = index + ch.len_utf8();
     }
     if start < value.len() {
-        out.push_str(&dc_verify::rigor::redact_secrets(&value[start..]));
+        out.push_str(&dc_redact::redact_secrets(&value[start..]));
     }
     out
 }

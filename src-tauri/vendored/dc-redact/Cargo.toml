@@ -1,0 +1,20 @@
+[package]
+name = "dc-redact"
+version = "0.2.4"
+edition = "2024"
+license = "Apache-2.0"
+description = "The credential table every secret gate and redactor shares, with no dependencies"
+
+# None, and tests/no_dependencies.rs keeps it that way. GitPulse vendors this
+# crate on its own to redact its ledger; a dependency here becomes one there,
+# and `dc-verify`'s tree-sitter is the reason this crate was split out of it.
+[dependencies]
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = "warn"
+
+[package.metadata.dist]
+dist = false

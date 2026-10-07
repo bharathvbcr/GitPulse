@@ -39,9 +39,10 @@ pub mod paths;
 pub mod progress;
 pub mod safe_fs;
 /// The bounded subprocess runner, re-exported at the path its callers have
-/// always used. The implementation lives in `dc-proc` because nothing in this
-/// crate uses it and `dc-verify` needs it without compiling tree-sitter
-/// grammars — a second copy there is the drift this module exists to prevent.
+/// always used by the kernel crates. The implementation lives in `dc-proc`
+/// because nothing in this crate uses it, and `dc-verify` and `dc-regress`
+/// need the same runner without depending on the kernel — a second copy is
+/// the drift this module exists to prevent.
 pub use dc_proc as subprocess;
 pub use git_metadata::{git_metadata, GitMetadata};
 // Needs the grammars: a notebook's cells are reconstructed and then handed to

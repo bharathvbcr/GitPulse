@@ -96,13 +96,19 @@ export function sources(env = process.env, from = REPO) {
       root: env.GITPULSE_DEVCOUNCIL_ROOT ?? findSibling("DevCouncil", from),
       workspace: "rust",
       crates: [
-        "dc-glob",
-        "dc-evidence",
         // Bounded subprocess helper. Not vendored originally, because nothing
-        // in the closure depended on it; `dc-verify` and `devmap-extract` both
+        // in the closure depended on it; `devmap-extract` and `dc-regress`
         // took it as a hard dependency upstream after that, so a re-vendor
         // without it fails to resolve rather than building a stale tree.
         "dc-proc",
+        // The credential table the ledger redacts with — the same one
+        // dc-verify's secret gate blocks on, so the two cannot disagree about
+        // what a secret is. GitPulse vendored all of dc-verify for this until
+        // upstream split it out: dc-verify links tree-sitter 0.25 for its stub
+        // detection, markdev-highlight links 0.26, and cargo admits one package
+        // per `links = "tree-sitter"`. dc-verify's own dependencies, dc-glob and
+        // dc-evidence, left with it; nothing here used them directly.
+        "dc-redact",
         // Which commits could have caused a symptom: git blame joined to the
         // code graph. `dc-regress` is the analysis and knows nothing about
         // storage; `dc-regress-store` is the adapter that presents a persisted
@@ -114,12 +120,6 @@ export function sources(env = process.env, from = REPO) {
         "dc-regress",
         "dc-regress-store",
         "dc-store",
-        // Held at 4efeecfd, so `--check` reports it drifted. From c17fd379
-        // upstream it links tree-sitter 0.25 unconditionally, MarkDev's
-        // markdev-highlight links 0.26, and cargo admits one package per
-        // `links = "tree-sitter"`. A refresh of it fails to resolve until one
-        // side moves; GitPulse only calls `rigor::redact_secrets`.
-        "dc-verify",
         "devmap-analyze",
         "devmap-extract",
         "devmap-query",

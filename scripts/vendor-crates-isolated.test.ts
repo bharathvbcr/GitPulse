@@ -120,10 +120,10 @@ describe("vendor refresh integrity", () => {
     const f = fixture();
     try {
       const manifestPath = path.join(f.vendorDir, "VENDOR.json");
-      const libraryPath = path.join(f.vendorDir, "dc-glob", "src", "lib.rs");
+      const libraryPath = path.join(f.vendorDir, "dc-redact", "src", "lib.rs");
       const oldManifest = readFileSync(manifestPath, "utf8");
       const oldLibrary = readFileSync(libraryPath, "utf8");
-      writeFileSync(path.join(f.roots.devcouncil, "rust", "dc-glob", "src", "lib.rs"), "changed before failure\n");
+      writeFileSync(path.join(f.roots.devcouncil, "rust", "dc-redact", "src", "lib.rs"), "changed before failure\n");
       // The last source refreshed, so its failure lands after the first
       // source's crates have already been staged.
       writeFileSync(
@@ -143,7 +143,7 @@ describe("vendor refresh integrity", () => {
   it("detects deleted upstream files and resolved Cargo manifest drift", () => {
     const f = fixture();
     try {
-      const crateDir = path.join(f.roots.devcouncil, "rust", "dc-glob");
+      const crateDir = path.join(f.roots.devcouncil, "rust", "dc-redact");
       const removed = path.join(crateDir, "src", "lib.rs");
       rmSync(removed);
       writeFileSync(
@@ -153,7 +153,7 @@ describe("vendor refresh integrity", () => {
 
       const result = f.run("--check");
       expect(result.status, result.stderr).toBe(1);
-      const crate = JSON.parse(result.stdout).crates.find((entry: { name: string }) => entry.name === "dc-glob");
+      const crate = JSON.parse(result.stdout).crates.find((entry: { name: string }) => entry.name === "dc-redact");
       expect(crate.upstream).toBe("drifted");
       expect(crate.drifted).toEqual(expect.arrayContaining(["Cargo.toml", "src/lib.rs"]));
       expect(crate.edited).toEqual([]);
@@ -165,10 +165,10 @@ describe("vendor refresh integrity", () => {
   it("keeps local edits separate from upstream drift", () => {
     const f = fixture();
     try {
-      writeFileSync(path.join(f.vendorDir, "dc-glob", "src", "lib.rs"), "edited only in GitPulse\n");
+      writeFileSync(path.join(f.vendorDir, "dc-redact", "src", "lib.rs"), "edited only in GitPulse\n");
       const result = f.run("--check");
       expect(result.status, result.stderr).toBe(1);
-      const crate = JSON.parse(result.stdout).crates.find((entry: { name: string }) => entry.name === "dc-glob");
+      const crate = JSON.parse(result.stdout).crates.find((entry: { name: string }) => entry.name === "dc-redact");
       expect(crate.edited).toEqual(["src/lib.rs"]);
       expect(crate.upstream).toBe("matches");
       expect(crate.drifted).toEqual([]);
@@ -183,12 +183,12 @@ describe("vendor refresh integrity", () => {
       const untouched = path.join(f.vendorDir, "markdev-md", "src", "lib.rs");
       const oldUntouched = readFileSync(untouched, "utf8");
       writeFileSync(
-        path.join(f.roots.devcouncil, "rust", "dc-glob", "src", "lib.rs"),
+        path.join(f.roots.devcouncil, "rust", "dc-redact", "src", "lib.rs"),
         "pub const GENERATION: usize = 2;\n",
       );
       const result = spawnSync(
         process.execPath,
-        [path.join(f.root, "scripts", "vendor-crates.mjs"), "--crate=dc-glob", "--json"],
+        [path.join(f.root, "scripts", "vendor-crates.mjs"), "--crate=dc-redact", "--json"],
         {
           encoding: "utf8",
           env: {
@@ -199,7 +199,7 @@ describe("vendor refresh integrity", () => {
         },
       );
       expect(result.status, result.stderr).toBe(0);
-      expect(readFileSync(path.join(f.vendorDir, "dc-glob", "src", "lib.rs"), "utf8")).toContain("GENERATION");
+      expect(readFileSync(path.join(f.vendorDir, "dc-redact", "src", "lib.rs"), "utf8")).toContain("GENERATION");
       expect(readFileSync(untouched, "utf8")).toBe(oldUntouched);
     } finally {
       f.cleanup();
@@ -252,7 +252,7 @@ describe("vendor refresh integrity", () => {
       const before = readFileSync(manifest, "utf8");
       const outside = path.join(f.root, "outside.rs");
       writeFileSync(outside, "external bytes\n");
-      symlinkSync(outside, path.join(f.roots.devcouncil, "rust", "dc-glob", "src", "escape.rs"));
+      symlinkSync(outside, path.join(f.roots.devcouncil, "rust", "dc-redact", "src", "escape.rs"));
       const result = f.run();
       expect(result.status).toBe(2);
       expect(result.stderr).toMatch(/symbolic link|symlink/i);
@@ -288,7 +288,7 @@ describe("vendor refresh integrity", () => {
             const cargo =
               location === "workspace"
                 ? path.join(f.roots.devcouncil, "rust", "Cargo.toml")
-                : path.join(f.roots.devcouncil, "rust", "dc-glob", "Cargo.toml");
+                : path.join(f.roots.devcouncil, "rust", "dc-redact", "Cargo.toml");
             const original = readFileSync(cargo, "utf8");
             rmSync(cargo);
             if (shape === "symlink") {

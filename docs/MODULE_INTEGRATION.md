@@ -19,7 +19,7 @@ the configured executable and restarting it.
 | Parse, resolve and build a code index | DevCouncil `devmap` CLI | Bounded CLI calls in `src-tauri/src/devmap/cli.rs` |
 | Read and query a persisted index | DevCouncil `devmap-store`, `devmap-query`, `devmap-resolve` | Vendored Rust path dependencies with `default-features = false` |
 | HTML map and graph projection | DevCouncil `devmap-query` | Same upstream projection; HTML assets live inside the crate |
-| Repository execution task/lease reads and credential redaction | DevCouncil `dc-store`, `dc-verify`, `dc-glob` | Vendored Rust libraries (Manvi wraps the same modules in the harness); execution tasks and leases remain read-only in GitPulse |
+| Repository execution task/lease reads and credential redaction | DevCouncil `dc-store`, `dc-redact` | Vendored Rust libraries (Manvi wraps the same modules in the harness); execution tasks and leases remain read-only in GitPulse |
 | Profile workspaces, tasks, briefs and run records | Manvi wrap of DevCouncil `dc-store` workbench API | `cmd_workbench_request` performs typed CRUD against a separate profile database; Manvi owns the wrap's schemas, revisions and receipts |
 | Task suggestions and managed agent hosting | Profile Manvi host | GitPulse presents proposals and run controls; Manvi owns provider execution and request/decision delivery |
 | Policy, local-model discovery and chat preparation | Manvi `serve` | Protocol v1 in `src-tauri/src/harness/`; advertised `hello.ops` capabilities |
@@ -33,7 +33,7 @@ or HTML assets into independent implementations.
 flowchart TD
     subgraph DevCouncil["DevCouncil (Components & Modules)"]
         direction TB
-        DCLibs["Rust Libraries:<br/><code>devmap-store</code> · <code>devmap-query</code><br/><code>devmap-resolve</code> · <code>dc-store</code> · <code>dc-verify</code>"]
+        DCLibs["Rust Libraries:<br/><code>devmap-store</code> · <code>devmap-query</code><br/><code>devmap-resolve</code> · <code>dc-store</code> · <code>dc-redact</code>"]
         DCCLI["Process Tools:<br/><code>devmap</code> CLI (build, search, impact, explore)<br/><code>devmap serve</code> (background watcher daemon)"]
     end
 

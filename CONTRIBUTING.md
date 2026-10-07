@@ -357,8 +357,8 @@ whatever an interrupted one did not finish and writes it exactly once.
 
 ### Vendored crates
 
-GitPulse links selected crates it does not own — `dc-verify`, `dc-store`,
-`dc-glob`, and `dc-evidence` from DevCouncil, five `devmap-*` crates from
+GitPulse links selected crates it does not own — `dc-store`, `dc-redact`,
+`dc-proc`, and `dc-regress`/`dc-regress-store` from DevCouncil, five `devmap-*` crates from
 DevCouncil, and `markdev` from MarkDev (parse/highlight with default features off).
 Manvi is the wrap around those DevCouncil components at runtime (`manvi serve`);
 its analysis crates are not a vendor origin. They used to

@@ -46,12 +46,19 @@ before that tag is pushed.
 - **The code graph opens maps the current devmap CLI writes.** The vendored
   store read schema 23 and the CLI writes 24, so every code-intel answer in
   GitPulse was "unavailable". DevCouncil's crates are re-vendored from
-  `c17fd37`, except `dc-verify`, which stays at `4efeecf` because upstream now
-  links a tree-sitter version that conflicts with the Markdown highlighter's.
-  The same refresh lets GitPulse, which links no grammar, check that a map was
+  `c17fd37` (`dc-verify` aside; see the next entry). The same refresh lets GitPulse, which links no grammar, check that a map was
   written by the current analyzer, so a current map now reads as fresh rather
   than "analyzer freshness unverified". `markdev-html` is re-vendored from
   MarkDev `20dec7a`.
+- **Ledger redaction no longer holds a DevCouncil crate back.** The
+  credential table came from `dc-verify`, which had to stay at `4efeecf`:
+  upstream it now links tree-sitter 0.25 for stub detection, the Markdown
+  highlighter links 0.26, and cargo allows only one. DevCouncil split the
+  table into `dc-redact`, a crate with no dependencies, and GitPulse vendors
+  that instead (`devcouncil@1a956bf`). The table is unchanged since `4efeecf`,
+  so redaction behaves as before. `dc-verify` and the two crates only it
+  needed, `dc-glob` and `dc-evidence`, are no longer vendored, and
+  `vendor:check` no longer reports DevCouncil drift.
 
 ## [1.4.0] - 2026-10-06
 
