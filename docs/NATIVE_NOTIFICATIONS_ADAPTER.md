@@ -107,11 +107,16 @@ actions instead of presenting inactive controls.
   shows, at most 64. It keeps only identities whose saved delivery is this
   profile's, then removes those whose notice is read, dismissed, snoozed or no
   longer `current`. The `current` check uses the store's `target_status`,
-  the same one eligibility uses. It covers a decision that was answered,
-  expired or resolved by the provider, a run that changed, and a task that was
-  edited or deleted. The pass runs before the background/visibility gate,
-  because it posts nothing. A failed pass is reported but does not hold back
-  delivery. `attention.update` and `decisions.decide` wake the coordinator so
+  the same one eligibility uses. Tests cover an answered decision and an
+  edited or deleted task. A decision that expires or that the provider
+  resolves should be covered too, because `fresh_notice` and
+  `decisions.resolve` change what `target_status` reads, but that is inferred
+  from the SQL and not tested. The pass runs before the background/visibility
+  gate, because it posts nothing. A failed pass is reported but does not hold
+  back delivery. On an enabled profile, every five-second pass now makes one
+  `getDeliveredNotifications` call (5 s bounded) and up to two store reads per
+  delivered banner (64 banners, 128 reads at most). The idle CPU/memory
+  measurement still owed must include this work. `attention.update` and `decisions.decide` wake the coordinator so
   in-app actions withdraw at once. Go-host writes are picked up by the
   five-second reconcile. A disabled profile has no timer, so it withdraws
   only on a wake.
@@ -151,7 +156,7 @@ or unclaimed identity is refused.
 dismissed, snoozed, task-edited, task-deleted, current, foreign-profile and
 session banners. It removes exactly the first five, never calls the OS when
 nothing is stale, and stops treating an ended snooze as stale.
-`every_managed_callback_kind_produces_a_bannerable_notice` is described below.
+`every_managed_callback_kind_produces_a_bannerable_notice` is described below; it also answers the permission request with `decisions.decide` and checks that the delivered banner then reads as stale.
 Removing the `target_status` arm or the snooze arm from `resolved` fails the
 withdrawal tests. Changing the renderer's snooze to 1800 seconds fails the
 contract test. The macOS calls themselves (`getDeliveredNotifications`,

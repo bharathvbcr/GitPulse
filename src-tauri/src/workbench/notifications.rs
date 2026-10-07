@@ -965,8 +965,32 @@ mod tests {
             .into_iter()
             .map(|(id, t)| (id, t.to_owned()))
             .collect();
+        let permission = expected[0].0.clone();
         expected.sort();
         assert_eq!(queued, expected);
+
+        // Answering the request in the inspector resolves its banner: the
+        // decision's revision moves, so its notice stops being `current` and
+        // the withdrawal pass takes the banner down.
+        let mut native = String::new();
+        let notice = Notice {
+            id: permission.clone(),
+            title: "Coding agent needs permission".into(),
+        };
+        deliver(&host, &notice, 720, false, |n, _, _| {
+            native = n.to_owned();
+            Ok(true)
+        })
+        .unwrap();
+        let now = unix_now().unwrap();
+        assert!(stale_banners(&host, std::slice::from_ref(&native), now)
+            .unwrap()
+            .is_empty());
+        call(&host,"decisions.decide",json!({"id":"d1","request_id":"deny","expected_revision":1,"payload_digest":"a".repeat(64),"decision":"deny"})).unwrap();
+        assert_eq!(
+            stale_banners(&host, std::slice::from_ref(&native), now).unwrap(),
+            vec![native]
+        );
     }
 
     #[test]
