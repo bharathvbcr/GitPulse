@@ -14,7 +14,7 @@ vi.mock("../stores/repoStore", () => ({ repoStore: { subscribe: repoState.subscr
 const setGlobalSurface = vi.fn();
 vi.mock("../stores/interfaceStore", () => ({ interfaceStore: { setGlobalSurface: (s: string) => setGlobalSurface(s) } }));
 
-const { attemptWorktreeOffer, discardAttemptWorktree, liveRunIn, mainCheckoutOf, mergeAttemptWorktree, mergeTargetLabel, reviewAttemptChanges } = await import("./attemptWorktree");
+const { attemptWorktreeOffer, discardAttemptWorktree, mainCheckoutOf, mergeAttemptWorktree, mergeTargetLabel, reviewAttemptChanges } = await import("./attemptWorktree");
 
 const NOW = 1_800_000_000_000;
 const WT = "/work/repo/.gitpulse/worktrees/fix-e42-wt0attem";
@@ -122,11 +122,3 @@ describe("merge and discard", () => {
   });
 });
 
-describe("liveRunIn", () => {
-  it("finds the live attempt working in a worktree by checkout identity, not spelling", () => {
-    const runs = [{ id: "a", cwd: `${WT}/` }, { id: "b", cwd: "/work/repo" }];
-    expect(liveRunIn(WT, runs)?.id).toBe("a");
-    expect(liveRunIn("/work/repo/.gitpulse/worktrees/other-12345678", runs)).toBeUndefined();
-    expect(liveRunIn("", runs)).toBeUndefined();
-  });
-});

@@ -63,7 +63,6 @@
   import StatusBar from "./lib/components/StatusBar.svelte";
   import CoachMark from "./lib/components/CoachMark.svelte";
   import ProductTour from "./lib/components/onboarding/ProductTour.svelte";
-  import SetupWizard from "./lib/components/onboarding/SetupWizard.svelte";
   import {
     dismissFirstRun,
     onboardingStore,
@@ -73,6 +72,7 @@
   } from "./lib/tools/onboardingStore";
 
   const showFirstRunCard = onboardingStore.showFirstRunCard;
+  const setupWizard = onboardingStore.wizard;
   import WorkspaceView from "./lib/components/WorkspaceView.svelte";
   import CodeView from "./lib/components/CodeView.svelte";
   import LazyView from "./lib/components/LazyView.svelte";
@@ -120,6 +120,9 @@
   const loadCommandPalette = () => import("./lib/components/CommandPalette.svelte");
   const loadDiagnosticsModal = () => import("./lib/components/DiagnosticsModal.svelte");
   const loadBranchCleanupModal = () => import("./lib/components/BranchCleanupModal.svelte");
+  // Opened from the first-run card, the tools panels and the palette, never
+  // at startup; it renders nothing until `onboardingStore.wizard.open`.
+  const loadSetupWizard = () => import("./lib/components/onboarding/SetupWizard.svelte");
   import HeaderRepoMenu from "./lib/components/HeaderRepoMenu.svelte";
   import RepoTabBar from "./lib/components/RepoTabBar.svelte";
   import ViewTabBar from "./lib/components/ViewTabBar.svelte";
@@ -181,6 +184,7 @@
   let shortcutsMounted = $state(false);
   let diagnosticsMounted = $state(false);
   let branchCleanupMounted = $state(false);
+  let setupWizardMounted = $state(false);
   // The palette owns ⌘K itself, so App has to arm it before the first press
   // can reach it; see the global keydown handler.
   let paletteMounted = $state(false);
@@ -202,6 +206,7 @@
     if (isShortcutsOpen) shortcutsMounted = true;
     if (isDiagnosticsOpen) diagnosticsMounted = true;
     if (isBranchCleanupOpen) branchCleanupMounted = true;
+    if ($setupWizard.open) setupWizardMounted = true;
   });
   let dropActive = $state(false);
   let headerScroller: HTMLDivElement | undefined = $state();
@@ -1170,7 +1175,9 @@
     repositoryPath={$repoStore.currentPath} activeView={$repoStore.activeTab}
     repositoryVisible={$interfaceStore.globalSurface === "repository"}
     tasksOpen={$interfaceStore.globalSurface === "tasks"} settingsOpen={isSettingsModalOpen} />
-  <SetupWizard />
+  {#if setupWizardMounted}
+    <LazyMount load={loadSetupWizard} name="The setup wizard" />
+  {/if}
 
   {#if tasksMounted}
     <svelte:boundary failed={paneFailed} onerror={(error) => paneCrashes.report("tasks", error)}>

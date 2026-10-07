@@ -28,7 +28,7 @@
   import { isCaseInsensitiveFs, sameRepo } from "../repos/paths";
   import { trustExtended } from "../repos/trustExtension";
   import { listAllLiveRuns, type TaskRun } from "../workbench/client";
-  import { liveRunIn } from "../workbench/attemptWorktree";
+  import { liveRunIn } from "../workbench/liveRun";
   import { runStateLabel } from "../workbench/taskHandoff";
   import { openTaskForRun } from "../workbench/taskOpen";
 
