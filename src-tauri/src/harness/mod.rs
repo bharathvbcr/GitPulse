@@ -94,21 +94,32 @@ pub(crate) fn guard_command_allowing(
     allowed: &[String],
 ) -> Result<PolicyVerdict, String> {
     let command = render_command(argv);
-    let scope = match scope_for(repo_path) {
-        Ok(scope) => scope,
-        Err(failure) => {
-            let verdict = failure.verdict(&command);
-            let action = crate::ledger::action_for_argv(argv);
-            let argv_json = serde_json::to_string(argv).ok();
-            record_gate(repo_path, &action, &command, argv_json, &verdict);
-            return gated(verdict);
-        }
-    };
-    let verdict = check_command_allowing(repo_path, &command, scope.as_ref(), allowed);
+    let verdict = judge_command(repo_path, &command, allowed);
     let action = crate::ledger::action_for_argv(argv);
     let argv_json = serde_json::to_string(argv).ok();
     record_gate(repo_path, &action, &command, argv_json, &verdict);
     gated(verdict)
+}
+
+/// Judges a command line against this checkout's bound task scope, recording
+/// nothing.
+///
+/// The agent hook's entry to the gate (`hooks::run_command_gate`). It resolves
+/// the scope through the same [`scope_for`] that [`guard_command`] uses, so an
+/// agent's Bash call and GitPulse's own guarded action are measured against one
+/// declaration — including the fail-closed answer when a binding names a task
+/// whose scope cannot be read. It does not write a ledger row: the hook runs on
+/// every Bash call an agent makes, and the gate rows record GitPulse's own
+/// actions, which an agent's shell is not.
+pub(crate) fn check_command_in_scope(repo_path: &str, command: &str) -> PolicyVerdict {
+    judge_command(repo_path, command, &[])
+}
+
+fn judge_command(repo_path: &str, command: &str, allowed: &[String]) -> PolicyVerdict {
+    match scope_for(repo_path) {
+        Ok(scope) => check_command_allowing(repo_path, command, scope.as_ref(), allowed),
+        Err(failure) => failure.verdict(command),
+    }
 }
 
 /// Evaluates one file write, on the same terms as [`guard_command`].
