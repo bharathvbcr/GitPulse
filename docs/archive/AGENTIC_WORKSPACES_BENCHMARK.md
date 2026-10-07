@@ -1,5 +1,65 @@
 # Workbench data-layer measurements
 
+## 2026-10-07 stress search checkpoint
+
+**Stress broad search now meets the 100 ms target on the committed benchmark.**
+DevCouncil commit `3bf19415` (branch `perf/workbench-search-p95`) against its
+`main` at `a284d14f`. The benchmark is `BenchmarkWorkbenchProfileStress` in
+DevCouncil's `backend/go_orchestrator/dc/store/workbench_bench_test.go`, which
+now lives there rather than in Manvi; it still execs a **debug** `dcstore`
+through the real Go client. Same host as below (Apple M5 Pro, macOS 27.0).
+
+Run interleaved A, B, A, B, A, B, each a full benchmark (fresh 100,000-task
+profile, 100 samples per case); other agent sessions were active on the host
+and were not controlled. p95 in ms, minimum of three runs, worst B run in brackets:
+
+| Operation | A: main | B: change |
+|---|---:|---:|
+| Broad global search | 97.59 | 44.60 (53.02) |
+| Workspace-scoped broad search | 158.7 | 70.48 (82.46) |
+| Repository-scoped broad search | 68.44 | 33.95 (40.67) |
+| Workspace | 86.97 | 36.15 (42.54) |
+| Global | 5.024 | 4.873 |
+| Rare global search | 0.250 | 0.260 |
+| Committed task text edit | 0.738 | 0.722 |
+
+A's 97.59/158.7 ms is below the 484.5/527.8 ms recorded on 2026-09-09. A run
+of the same unchanged benchmark earlier the same day, while other sessions were
+compiling, measured 176.9/205.6 ms; that spread is why the comparison is
+interleaved rather than made against a recorded number.
+
+**Where the time went** (ignored test `stress_search_profile` in
+`rust/dc-store/src/workbench/item_query_tests.rs`, which seeds the same profile
+through the public API onto disk; debug, in-process):
+
+- Unscoped search's total joined every full-text hit to its task row to read
+  `deleted` — 100,000 row reads, about 65 ms of a 99 ms request. The hit set
+  itself costs 13 ms; projecting the 201 page bodies 0.4 ms. Ordering was not
+  the cost: the ordered page scan was 30 ms, mostly building the hit set again.
+- Scoped queries found their candidates twice, for the total and the page —
+  the workspace membership union (18 ms) and the hit set each paid two times.
+- An in-memory store hides most of the row-read cost (SQLite's page cache is a
+  few MiB against a ~690 MB profile), so the profile runs on disk.
+
+**What changed:** unscoped search totals full-text hits minus deleted hits
+(every task has exactly one full-text row; tasks are only soft-deleted), with
+deleted hits found from the deleted side of the board index; scoped listings
+materialize their candidates once and count and page from that set; and a
+`(id, deleted, position)` index lets membership skip whole task rows. Release
+build, in-process, on disk: broad search 14.0 ms and workspace-scoped broad
+search 30.5 ms p95.
+
+Not yet in GitPulse: the app vendors `dc-store`, and the vendored copy is being
+re-vendored from DevCouncil's unmerged repository-relink branch in another
+session. Re-vendor (`scripts/vendor-crates.mjs --crate=dc-store`) once both
+DevCouncil branches are on its `main`.
+
+Reproduce, from DevCouncil's `backend/go_orchestrator`:
+
+```sh
+go test ./dc/store -run '^$' -bench '^BenchmarkWorkbenchProfileStress$' -benchtime=100x -count=1 -timeout=30m
+```
+
 ## 2026-09-09 query checkpoint
 
 The 10,000-task fixture now measures scoped search and durable edits as well as

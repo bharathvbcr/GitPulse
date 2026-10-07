@@ -16,7 +16,7 @@ before treating a row as still open.
 | Manvi intelligence | Semantic quality evaluation, context/planning/orchestration, installed native qualification |
 | Agent supervision | Real-account approvals and remaining callback types, launch-time fencing, code review, crash recovery, installed-app qualification |
 | Native notifications | Installed OS delivery/activation, callback crash-window, native Snooze/withdrawal, remaining event producers, other platforms, native resource measurements — see [NATIVE_NOTIFICATIONS_ADAPTER.md](NATIVE_NOTIFICATIONS_ADAPTER.md) |
-| Performance | Stress broad global/workspace search missed the 100 ms target (484.5/527.8 ms p95 in [the archived benchmark](archive/AGENTIC_WORKSPACES_BENCHMARK.md)). Native rendering, cold/warm navigation, idle CPU/memory, eight-hour soak |
+| Performance | Stress broad global/workspace search meets the 100 ms target upstream (44.6/70.5 ms p95, interleaved A/B on the committed benchmark, 2026-10-07 in [the archived benchmark](archive/AGENTIC_WORKSPACES_BENCHMARK.md)); GitPulse's vendored `dc-store` does not have it until re-vendored. Installed-build native rendering/frame pacing, cold/warm navigation, idle CPU/memory and the eight-hour soak are **not measured** — the release build was not installed; `scripts/native-sample.mjs` is the soak sampler. Browser canary 2026-10-07 in [PERFORMANCE.md](PERFORMANCE.md): six components clean at 12 cycles; ManviOpsPanel not clean (harness crash) and TerminalPanel/termtabs never armed |
 
 ## Platform coverage
 
