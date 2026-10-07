@@ -1346,8 +1346,8 @@ struct AreaCoupling<'edges> {
 /// more honest.
 ///
 /// The remaining kinds are deliberately not listed. `Instantiates`,
-/// `SubscribesTo`, `WiredTo`, `DependsOn` and `TaintFlow` are each arguably a
-/// coupling, but this relation is read by a write gate to *widen* what a task
+/// `SubscribesTo`, `Registers`, `WiredTo`, `DependsOn` and `TaintFlow` are each
+/// arguably a coupling, but this relation is read by a write gate to *widen* what a task
 /// may touch, and each one needs its own evidence that it is a dependency and
 /// not a coincidence before it earns that. They are a separate question, not
 /// an oversight.

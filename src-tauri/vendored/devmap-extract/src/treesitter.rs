@@ -492,6 +492,7 @@ fn extract_treesitter_before_deadline(
                     parent_symbol: None,
                     body_signature: None,
                     declaration_hash: None,
+                    return_type: None,
                 });
 
                 // File-level wiring first, so a file-scoped exemption always
@@ -691,10 +692,12 @@ fn extract_treesitter_before_deadline(
                 // later and silently omit its signatures.
                 crate::clonesig::stamp_signatures(&mut symbols, root, source);
                 crate::clonesig::stamp_declaration_hashes(&mut symbols, root, source);
+                crate::returns::stamp_return_types(&mut symbols, root, source);
 
                 let local_bindings = collect_site_bindings(
                     root,
                     source,
+                    lang,
                     &file_symbol_name,
                     &calls,
                     &references,
@@ -1628,6 +1631,7 @@ fn module_binding_symbol(
         parent_symbol: Some(file_symbol_name.to_string()),
         body_signature: None,
         declaration_hash: None,
+        return_type: None,
     }
 }
 
@@ -1735,6 +1739,7 @@ fn unparsed_extraction(
             parent_symbol: None,
             body_signature: None,
             declaration_hash: None,
+            return_type: None,
         }],
         imports: Vec::new(),
         calls: Vec::new(),
@@ -1828,6 +1833,7 @@ fn unavailable_extraction(path: &str, lang: &str, source: &str) -> Extraction {
         // bodies, and `None` means "not computed", never "no duplicates".
         body_signature: None,
         declaration_hash: None,
+        return_type: None,
     });
     symbols.extend(scan.symbols);
     let mut diagnostics: Vec<String> = Vec::new();
@@ -2016,7 +2022,7 @@ fn walk_tree(
 }
 
 /// Nodes walked between deadline checks. See `walk_tree`.
-const DEADLINE_CHECK_STRIDE: u32 = 256;
+pub(crate) const DEADLINE_CHECK_STRIDE: u32 = 256;
 
 /// The `{ a, b as c }` clause of a JavaScript/TypeScript import or export
 /// statement, or `None` when the statement has no binding clause at all.
@@ -2206,6 +2212,89 @@ fn callable_binding_name(node: Node, source: &str) -> Option<String> {
     let parent = bounded_parent(node)?;
     if parent.kind() == "variable_declarator" {
         return get_child_text(parent, "name", source);
+    }
+    // `const save = useCallback(() => { … }, [deps])`: the binding *is* the
+    // function, reached through a wrapper that returns something calling it.
+    // Named by the declarator, exactly as the symbol emitter names it.
+    js_wrapper_declarator(node, source)
+        .and_then(|declarator| get_child_text(declarator, "name", source))
+}
+
+/// Callees that return a function which, when called, runs the function they
+/// were given — so `const f = wrapper(() => …)` binds `f` to that function.
+///
+/// Chosen from what a real React corpus wraps arrow consts in (ScholarLM, 2026-
+/// 10-07: `useCallback` 393 + `React.useCallback` 7, then `memo`/`forwardRef`
+/// for components). Deliberately absent: `useMemo` returns the function's
+/// *result*, so the calls inside it run in the enclosing render and belong to
+/// it; `lazy(() => import(…))` is an import thunk, not the component's body;
+/// `setTimeout`/`setInterval` return a handle, and `promise.then` / array
+/// methods return values.
+const JS_FUNCTION_WRAPPERS: &[&str] = &[
+    "useCallback",
+    "React.useCallback",
+    "useEvent",
+    "useEffectEvent",
+    "React.useEffectEvent",
+    "memo",
+    "React.memo",
+    "forwardRef",
+    "React.forwardRef",
+    "debounce",
+    "throttle",
+    "_.debounce",
+    "_.throttle",
+    "vi.fn",
+    "jest.fn",
+];
+
+/// How many wrappers deep `memo(forwardRef(() => …))` is followed.
+const JS_WRAPPER_NESTING: usize = 3;
+
+/// The function a wrapper call binds, when `value` is one: the first argument
+/// of a [`JS_FUNCTION_WRAPPERS`] call, through at most [`JS_WRAPPER_NESTING`]
+/// nested wrappers.
+fn js_wrapped_function<'tree>(value: Node<'tree>, source: &str) -> Option<Node<'tree>> {
+    let mut current = value;
+    for _ in 0..JS_WRAPPER_NESTING {
+        if current.kind() != "call_expression" {
+            return None;
+        }
+        let callee = current.child_by_field_name("function")?;
+        if !JS_FUNCTION_WRAPPERS.contains(&get_node_text(callee, source).as_str()) {
+            return None;
+        }
+        let first = current.child_by_field_name("arguments")?.named_child(0)?;
+        if matches!(first.kind(), "arrow_function" | "function_expression") {
+            return Some(first);
+        }
+        current = first;
+    }
+    None
+}
+
+/// The `variable_declarator` whose value wraps `function` in
+/// [`JS_FUNCTION_WRAPPERS`] calls, or `None` when `function` is anything else
+/// — an argument of an ordinary call, or the second argument of a wrapper.
+fn js_wrapper_declarator<'tree>(function: Node<'tree>, source: &str) -> Option<Node<'tree>> {
+    let mut current = function;
+    for _ in 0..JS_WRAPPER_NESTING {
+        let arguments = bounded_parent(current)?;
+        if arguments.kind() != "arguments" {
+            return None;
+        }
+        let call = bounded_parent(arguments)?;
+        if call.kind() != "call_expression" {
+            return None;
+        }
+        let parent = bounded_parent(call)?;
+        if parent.kind() == "variable_declarator" {
+            let value = parent.child_by_field_name("value")?;
+            return (value.id() == call.id()
+                && js_wrapped_function(value, source).is_some_and(|f| f.id() == function.id()))
+            .then_some(parent);
+        }
+        current = call;
     }
     None
 }
@@ -3374,6 +3463,7 @@ fn extract_node(
                             parent_symbol: Some(file_symbol_name.to_string()),
                             body_signature: None,
                             declaration_hash: None,
+                            return_type: None,
                         });
                     }
                 }
@@ -3444,6 +3534,7 @@ fn extract_node(
                         parent_symbol: Some(parent_symbol),
                         body_signature: None,
                         declaration_hash: None,
+                        return_type: None,
                     });
                 }
             }
@@ -3460,6 +3551,7 @@ fn extract_node(
                         parent_symbol: Some(file_symbol_name.to_string()),
                         body_signature: None,
                         declaration_hash: None,
+                        return_type: None,
                     });
                 }
             }
@@ -3610,19 +3702,24 @@ fn extract_node(
                         parent_symbol: Some(parent_symbol),
                         body_signature: None,
                         declaration_hash: None,
+                        return_type: None,
                     });
                 }
             }
             "variable_declarator" => {
-                let value_kind = node.child_by_field_name("value").map(|value| value.kind());
+                let value = node.child_by_field_name("value");
+                // `const f = () => …` and `const f = useCallback(() => …)` both
+                // bind `f` to a function; see `JS_FUNCTION_WRAPPERS`.
+                let binds_function = value.is_some_and(|value| {
+                    matches!(value.kind(), "arrow_function" | "function_expression")
+                        || js_wrapped_function(value, source).is_some()
+                });
                 // A module-level binding — with or without an initializer
                 // (`export let U: number;`), and every name a destructuring
                 // pattern binds. Kept as a candidate whatever its own keyword
                 // says: `export { local }` may publish it further down, so the
                 // export filter runs after the walk.
-                if !matches!(value_kind, Some("arrow_function" | "function_expression"))
-                    && is_module_level(node)
-                {
+                if !binds_function && is_module_level(node) {
                     if let Some(target) = node.child_by_field_name("name") {
                         let is_exported = js_symbol_is_exported(node, source);
                         for name in js_pattern_bound_names(target, source) {
@@ -3635,31 +3732,30 @@ fn extract_node(
                         }
                     }
                 }
-                if let Some(vk) = value_kind {
-                    if vk == "arrow_function" || vk == "function_expression" {
-                        if let Some(n) = get_child_text(node, "name", source) {
-                            let is_exported = js_symbol_is_exported(node, source);
-                            let parent_symbol =
-                                enclosing_callable_qualified(node, source, file_symbol_name)
-                                    .unwrap_or_else(|| file_symbol_name.to_string());
-                            symbols.push(ExtractedSymbol {
-                                name: n.clone(),
-                                qualified_name: scoped_qualified_name(
-                                    node,
-                                    source,
-                                    file_symbol_name,
-                                    &n,
-                                ),
-                                kind: SymbolKind::Function,
-                                span,
-                                is_exported,
-                                docstring: None,
-                                signature: None,
-                                parent_symbol: Some(parent_symbol),
-                                body_signature: None,
-                                declaration_hash: None,
-                            });
-                        }
+                if binds_function {
+                    if let Some(n) = get_child_text(node, "name", source) {
+                        let is_exported = js_symbol_is_exported(node, source);
+                        let parent_symbol =
+                            enclosing_callable_qualified(node, source, file_symbol_name)
+                                .unwrap_or_else(|| file_symbol_name.to_string());
+                        symbols.push(ExtractedSymbol {
+                            name: n.clone(),
+                            qualified_name: scoped_qualified_name(
+                                node,
+                                source,
+                                file_symbol_name,
+                                &n,
+                            ),
+                            kind: SymbolKind::Function,
+                            span,
+                            is_exported,
+                            docstring: None,
+                            signature: None,
+                            parent_symbol: Some(parent_symbol),
+                            body_signature: None,
+                            declaration_hash: None,
+                            return_type: None,
+                        });
                     }
                 }
             }
@@ -3677,6 +3773,7 @@ fn extract_node(
                         parent_symbol: Some(file_symbol_name.to_string()),
                         body_signature: None,
                         declaration_hash: None,
+                        return_type: None,
                     });
                 }
             }
@@ -3694,6 +3791,7 @@ fn extract_node(
                         parent_symbol: Some(file_symbol_name.to_string()),
                         body_signature: None,
                         declaration_hash: None,
+                        return_type: None,
                     });
                 }
             }
@@ -3711,6 +3809,7 @@ fn extract_node(
                         parent_symbol: Some(file_symbol_name.to_string()),
                         body_signature: None,
                         declaration_hash: None,
+                        return_type: None,
                     });
                 }
             }
@@ -3728,6 +3827,7 @@ fn extract_node(
                         parent_symbol: Some(file_symbol_name.to_string()),
                         body_signature: None,
                         declaration_hash: None,
+                        return_type: None,
                     });
                 }
             }
@@ -4020,7 +4120,7 @@ fn extract_node(
                         span,
                         is_exported: text.starts_with("pub"),
                         docstring: None,
-                        signature: None,
+                        signature: rust_fn_signature(node, source),
                         parent_symbol: Some(match &owner {
                             Some(type_name) => format!("{}::{}", file_symbol_name, type_name),
                             None => enclosing_callable_qualified(node, source, file_symbol_name)
@@ -4028,6 +4128,7 @@ fn extract_node(
                         }),
                         body_signature: None,
                         declaration_hash: None,
+                        return_type: None,
                     });
                 }
             }
@@ -4112,7 +4213,7 @@ fn extract_node(
                         span,
                         is_exported: false,
                         docstring: None,
-                        signature: None,
+                        signature: rust_fn_signature(node, source),
                         parent_symbol: Some(match &owner {
                             Some(type_name) => format!("{}::{}", file_symbol_name, type_name),
                             None => enclosing_callable_qualified(node, source, file_symbol_name)
@@ -4120,6 +4221,7 @@ fn extract_node(
                         }),
                         body_signature: None,
                         declaration_hash: None,
+                        return_type: None,
                     });
                 }
             }
@@ -4141,6 +4243,7 @@ fn extract_node(
                         parent_symbol: Some(file_symbol_name.to_string()),
                         body_signature: None,
                         declaration_hash: None,
+                        return_type: None,
                     });
                 }
             }
@@ -4168,6 +4271,7 @@ fn extract_node(
                         parent_symbol: Some(file_symbol_name.to_string()),
                         body_signature: None,
                         declaration_hash: None,
+                        return_type: None,
                     });
                 }
             }
@@ -4403,6 +4507,7 @@ fn extract_node(
                         parent_symbol: Some(parent_symbol),
                         body_signature: None,
                         declaration_hash: None,
+                        return_type: None,
                     });
                 }
             }
@@ -4424,6 +4529,7 @@ fn extract_node(
                         parent_symbol: Some(file_symbol_name.to_string()),
                         body_signature: None,
                         declaration_hash: None,
+                        return_type: None,
                     });
                 }
             }
@@ -4465,6 +4571,7 @@ fn extract_node(
                         parent_symbol: Some(file_symbol_name.to_string()),
                         body_signature: None,
                         declaration_hash: None,
+                        return_type: None,
                     });
                 }
             }
@@ -4571,6 +4678,7 @@ fn extract_node(
                         parent_symbol: Some(file_symbol_name.to_string()),
                         body_signature: None,
                         declaration_hash: None,
+                        return_type: None,
                     });
                 }
             }
@@ -4658,6 +4766,7 @@ fn extract_node(
                     parent_symbol: Some(declaration.parent_symbol(file_symbol_name)),
                     body_signature: None,
                     declaration_hash: None,
+                    return_type: None,
                 });
                 // Same SC12 binding Rust and Go already emit: a parameter's
                 // declared type is the only typed binding available when the
@@ -6516,7 +6625,7 @@ fn rust_type_name_is_reachable(node: Node) -> bool {
     )
 }
 
-fn rust_type_name(node: Node, source: &str, depth: usize) -> Option<String> {
+pub(crate) fn rust_type_name(node: Node, source: &str, depth: usize) -> Option<String> {
     if depth > 16 {
         return None;
     }
@@ -6969,6 +7078,26 @@ fn js_object_literal_argument_callee(node: Node, source: &str) -> Option<String>
         }
         current = bounded_parent(current)?;
     }
+}
+
+/// A Rust function's header — from the item's start to its body, or the whole
+/// item for a bodiless signature — with whitespace collapsed to single spaces.
+///
+/// What the skeleton shows for the function, and what the resolver reads a
+/// return type and a closure parameter's type out of (see
+/// [`crate::rustsig`]): `fn read(conn: &Connection) -> Result<Self>`.
+/// A header longer than [`crate::rustsig::MAX_SIGNATURE_BYTES`] is not
+/// recorded, because a truncated one would read as a different header.
+fn rust_fn_signature(node: Node, source: &str) -> Option<String> {
+    let end = node
+        .child_by_field_name("body")
+        .map_or(node.end_byte(), |body| body.start_byte());
+    let header = source.get(node.start_byte()..end)?;
+    let header = header.trim().trim_end_matches(';').trim_end();
+    if header.is_empty() || header.len() > crate::rustsig::MAX_SIGNATURE_BYTES {
+        return None;
+    }
+    Some(header.split_whitespace().collect::<Vec<_>>().join(" "))
 }
 
 /// Whether a `use_declaration` republishes beyond the crate that wrote it.
@@ -7470,6 +7599,7 @@ fn maybe_push_name_reference(
         ref_kind = ReferenceKind::Type;
     }
     if is_argument_label(node)
+        || name_field_holds_a_use(node)
         || is_defining_name(node)
         || is_inside_import_or_export(node)
         || is_call_callee(node)
@@ -7517,6 +7647,8 @@ fn maybe_push_name_reference(
                     .then(|| {
                         swift_parameter_bound_from_type(node, source)
                             .or_else(|| ts_parameter_bound_from_type(node, source))
+                            .or_else(|| go_var_bound_from_type(node, source))
+                            .or_else(|| python_parameter_bound_from_type(node, source))
                     })
                     .flatten()
             }),
@@ -7725,8 +7857,60 @@ fn is_argument_label(node: Node) -> bool {
     })
 }
 
+/// Whether `node` is the `name` field of a node kind that spells a *use* there.
+///
+/// The generic rule in [`is_defining_name`] reads any identifier on a `name`
+/// field as a declaration, and most grammars agree. These do not — enumerated
+/// from every vendored grammar's `node-types.json` (each kind whose `name`
+/// field admits an identifier), then classified by hand:
+///
+/// - JSX `jsx_opening_element` / `jsx_closing_element` /
+///   `jsx_self_closing_element`: `<HomePage …/>` names the component it
+///   renders. Read as a declaration, the tag made `HomePage` a local of every
+///   component that rendered it, and the resolver then refused the tag's own
+///   call as "a local binding whose value is not known" — so an imported
+///   component rendered inside another component had no caller at all.
+///   Measured on ScholarLM: `HomePage`, `ResultsPage`, `UserModeProvider` and
+///   3,686 TSX sites in all were filed `local_binding`.
+/// - C# `member_access_expression` / `member_binding_expression`:
+///   `other.Format` / `x?.Format` read a member; as a declaration it shadowed a
+///   bare `Format(…)` call later in the same method.
+/// - Java/Dart `annotation` / `marker_annotation`, C-family and C# `attribute`,
+///   C `macro_type_specifier`, and the preprocessor's `#ifdef` / `#elifdef` /
+///   `#undef`: each names something declared elsewhere.
+///
+/// Left alone, deliberately: C# `qualified_name` / `alias_qualified_name`
+/// (also the spelling of a `namespace A.B` declaration, and only ever in type
+/// position inside a body, where it cannot shadow a value call), and C++
+/// `qualified_identifier` (the spelling of an out-of-line definition, which
+/// [`c_declarator_declaration`] owns).
+///
+/// Reference emission refuses these positions too, which keeps it exactly as
+/// it was: a JSX tag is already a `JsxTag` reference plus a call, and a C#
+/// member name carries no receiver here, so a bare `Name` for it could bind to
+/// an unrelated symbol of the same name.
+fn name_field_holds_a_use(node: Node) -> bool {
+    bounded_parent(node).is_some_and(|parent| {
+        matches!(
+            parent.kind(),
+            "jsx_opening_element"
+                | "jsx_closing_element"
+                | "jsx_self_closing_element"
+                | "member_access_expression"
+                | "member_binding_expression"
+                | "annotation"
+                | "marker_annotation"
+                | "attribute"
+                | "macro_type_specifier"
+                | "preproc_ifdef"
+                | "preproc_elifdef"
+                | "preproc_undef"
+        ) && field_contains(parent, "name", node)
+    })
+}
+
 fn is_defining_name(node: Node) -> bool {
-    if is_argument_label(node) {
+    if is_argument_label(node) || name_field_holds_a_use(node) {
         return false;
     }
     // A grammar's `name` field is not necessarily a declaration. Java/Lua
@@ -8176,7 +8360,7 @@ fn rust_item_is_pub(node: Node, source: &str) -> bool {
     is_pub
 }
 
-fn is_symbol_binding(node: Node) -> bool {
+fn is_symbol_binding(node: Node, source: &str) -> bool {
     // A C-family function name binds a symbol, not a local. Without this the
     // `declarator` arm of `is_defining_name` would file every function's own
     // identifier into `collect_non_symbol_locals`, and `name_is_shadowed_by_local`
@@ -8222,7 +8406,7 @@ fn is_symbol_binding(node: Node) -> bool {
             matches!(
                 value.kind(),
                 "arrow_function" | "function_expression" | "generator_function"
-            )
+            ) || js_wrapped_function(value, source).is_some()
         });
     }
     false
@@ -8264,7 +8448,7 @@ fn collect_non_symbol_locals(scope: Node, source: &str) -> HashSet<String> {
             if is_user_ident(&name) {
                 if module_binding_is_symbol(node, source) {
                     module_bindings.insert(name);
-                } else if !is_symbol_binding(node) {
+                } else if !is_symbol_binding(node, source) {
                     locals.insert(name);
                 }
             }
@@ -8382,6 +8566,7 @@ fn python_fixture_names(root: Node, source: &str, imports: &[ExtractedImport]) -
 fn collect_site_bindings(
     root: Node,
     source: &str,
+    lang: &str,
     file_symbol_name: &str,
     calls: &[ExtractedCall],
     references: &[ExtractedReference],
@@ -8389,9 +8574,12 @@ fn collect_site_bindings(
 ) -> Vec<LocalBinding> {
     let fixtures = python_fixture_names(root, source, imports);
     let declared_types = binding_declared_types(references);
-    let initializers = binding_initializers(references, calls);
+    let mut initializers = binding_initializers(references, calls);
+    collapse_initializers_to_statements(root, &mut initializers);
     let mut sites = BTreeSet::new();
     let mut parameters: HashMap<usize, BTreeSet<String>> = HashMap::new();
+    // Rust only; built lazily per block, so it costs nothing elsewhere.
+    let mut binders = crate::rustlocal::Binders::new(source);
     let inputs = calls
         .iter()
         .map(|call| {
@@ -8499,12 +8687,26 @@ fn collect_site_bindings(
                                     })
                                 })
                                 .flatten();
-                            let (declared_type, initializer) = binding_facts_for(
-                                &declared_types,
-                                &initializers,
-                                &scope_name,
-                                name,
-                            );
+                            let mut declared_type =
+                                binding_declared_type_for(&declared_types, &scope_name, name);
+                            let mut initializer = initializer_at(&initializers, name, node, scope);
+                            // The binder above this very use, where the
+                            // function's text states its type — a `MutexGuard`
+                            // from `Ok(guard)`, a loop variable over a `Vec<T>`.
+                            // More specific than the `(scope, name)` facts,
+                            // which one shadowing `let` can make about a
+                            // different value, so it wins when it answers.
+                            // What it cannot type alone — the value of
+                            // `T::f(..)?`, a closure's parameter — it hands the
+                            // resolver as an initializer shape, in place of the
+                            // facts' guess at the same binding.
+                            if lang == "rust" {
+                                if let Some(stated) = binders.binder_type(node, name, scope) {
+                                    declared_type = Some(stated);
+                                } else if let Some(hint) = binders.binder_hint(node, name, scope) {
+                                    initializer = Some(hint);
+                                }
+                            }
                             sites.insert(LocalBinding {
                                 start_byte: span.start_byte,
                                 name: name.to_string(),
@@ -8544,17 +8746,24 @@ fn binding_declared_types(
     out
 }
 
-/// Call/Constructor refs with `assigned_to`, reduced to a simple initializer shape.
+/// Call/Constructor refs with `assigned_to`, reduced to a simple initializer
+/// shape, as `binding name -> [(assignment start, shape)]` in source order.
 ///
-/// Call *references* do not always carry `receiver_expr` — `extracted_reference`
-/// derives it from member-access shape, while `Engine::new` is a
-/// `scoped_identifier` whose receiver lives on the mirrored `ExtractedCall`.
-/// Join on the call span that contains the reference when filling `T::new`.
+/// Only the **outermost** expression of each assignment is kept. Every
+/// argument of `p := NewDBLP(dep())` carries `assigned_to: p` too, and taking
+/// `dep` would type `p` by its dependency; a candidate whose start lies inside
+/// another candidate's call is an argument of it.
+///
+/// Keyed by name alone, not by enclosing symbol: which assignment a use reads
+/// is decided by position in [`initializer_at`], because a name is commonly
+/// reassigned in one function — every `t.Run(…, func() { p := … })` subtest
+/// rebinds `p` — and the first assignment is not the one a later use sees.
 fn binding_initializers(
     references: &[ExtractedReference],
     calls: &[ExtractedCall],
-) -> HashMap<(Option<String>, String), String> {
-    let mut out = HashMap::new();
+) -> HashMap<String, Vec<(usize, String)>> {
+    // (start, end of the expression it begins, shape) per bound name.
+    let mut candidates: HashMap<String, Vec<(usize, usize, String)>> = HashMap::new();
     for reference in references {
         let Some(bound) = reference.assigned_to.as_ref() else {
             continue;
@@ -8562,51 +8771,277 @@ fn binding_initializers(
         if bound.is_empty() {
             continue;
         }
-        let shape = match reference.kind {
-            ReferenceKind::Constructor => Some(format!("{}{{..}}", reference.name)),
-            ReferenceKind::Call => {
-                let receiver = reference.receiver_expr.as_deref().or_else(|| {
-                    calls.iter().find_map(|call| {
-                        (call.callee_name == reference.name
-                            && call.span.start_byte <= reference.span.start_byte
-                            && call.span.end_byte >= reference.span.end_byte)
-                            .then_some(call.receiver_expr.as_deref())
-                            .flatten()
-                    })
-                });
-                Some(match receiver {
-                    Some(receiver) if reference.name == "new" => format!("{receiver}::new"),
-                    Some(receiver) => format!("{receiver}.{}", reference.name),
-                    None => reference.name.clone(),
-                })
-            }
-            _ => None,
-        };
-        let Some(shape) = shape else {
+        let Some(shape) = reference.initializer_shape(calls) else {
             continue;
         };
-        out.entry((reference.enclosing_symbol.clone(), bound.clone()))
-            .or_insert(shape);
+        let extent_end = calls
+            .iter()
+            .filter(|call| {
+                call.callee_name == reference.name
+                    && call.span.start_byte <= reference.span.start_byte
+                    && call.span.end_byte >= reference.span.end_byte
+            })
+            .map(|call| call.span.end_byte)
+            .min()
+            .unwrap_or(reference.span.end_byte);
+        candidates.entry(bound.clone()).or_default().push((
+            reference.span.start_byte,
+            extent_end,
+            shape,
+        ));
     }
-    out
+    candidates
+        .into_iter()
+        .map(|(name, found)| {
+            let mut outermost: Vec<(usize, String)> = found
+                .iter()
+                .filter(|(start, end, _)| {
+                    !found.iter().any(|(other_start, other_end, _)| {
+                        // An argument of another candidate's call.
+                        (other_start < start && start < other_end)
+                            // The outer link of a chain rooted at another
+                            // candidate: `PipeDrain::new(r).expect(..)` starts
+                            // where `PipeDrain::new` starts and contains it.
+                            // The value is typed by the root, and the outer
+                            // link's shape names a method of an expression.
+                            || (other_start == start && other_end < end)
+                    })
+                })
+                .map(|(start, _, shape)| (*start, shape.clone()))
+                .collect();
+            outermost.sort();
+            outermost.dedup();
+            (name, outermost)
+        })
+        .collect()
 }
 
-fn binding_facts_for(
+/// Keep one initializer per assignment *statement*: the one that starts it.
+///
+/// [`binding_initializers`] drops a call's own arguments and a chain's outer
+/// links by span, but a struct or composite literal has no call span: in
+/// `let s = Scanner { bytes: text.as_bytes(), .. }` the field's
+/// `text.as_bytes` carries `assigned_to: s` too, starts after `Scanner`, and —
+/// being nearer the use — would be read as the value. Grouping by the
+/// statement each candidate sits in, and keeping the earliest, leaves the
+/// expression the statement assigns. Statements are told apart with the tree,
+/// which this pass has and `binding_initializers` does not.
+fn collapse_initializers_to_statements(
+    root: Node,
+    initializers: &mut HashMap<String, Vec<(usize, String)>>,
+) {
+    for assignments in initializers.values_mut() {
+        // Sorted by start, so the first candidate of each statement is its
+        // earliest; a candidate whose statement the tree cannot name stands
+        // alone.
+        let mut current: Option<usize> = None;
+        assignments.retain(|(start, _)| {
+            let statement = statement_start(root, *start);
+            let repeats = statement.is_some() && statement == current;
+            current = statement;
+            !repeats
+        });
+    }
+}
+
+/// Start byte of the statement holding the byte at `start`: the highest
+/// ancestor below a block, a callable, or the file.
+fn statement_start(root: Node, start: usize) -> Option<usize> {
+    statement_node(root, start).map(|statement| statement.start_byte())
+}
+
+/// The statement holding the byte at `start`, as [`statement_start`] finds it.
+fn statement_node(root: Node, start: usize) -> Option<Node> {
+    let mut node = root.descendant_for_byte_range(start, start)?;
+    while let Some(parent) = bounded_parent(node) {
+        if parent.id() == root.id()
+            || is_callable_node(parent)
+            || matches!(
+                parent.kind(),
+                "block"
+                    | "statement_block"
+                    | "compound_statement"
+                    | "func_literal"
+                    | "source_file"
+                    | "program"
+                    | "module"
+                    | "class_body"
+                    | "declaration_list"
+            )
+        {
+            return Some(node);
+        }
+        node = parent;
+    }
+    Some(node)
+}
+
+/// Whether a use inside the statement that assigns `name` at `start` reads the
+/// binding *before* that statement.
+///
+/// `let wrapped = spawn(move || { wrapped.snapshot(); wrapped })` moves the
+/// earlier `wrapped` into the closure: the right-hand side is evaluated before
+/// the name is bound, so a use there — `x = wrap(x)` too — sees what the name
+/// held before. A closure is the exception where the variable is the same one
+/// and is read when the closure runs, after the assignment: `x = make(() =>
+/// x.run())` in JavaScript or Python, `c = Wrap(func() { c.Ping() })` in Go.
+/// A Rust `let` and a Go `:=` or `var` declare a fresh variable whose scope
+/// begins after the statement, so even a closure there reads the earlier one.
+/// A Rust closure (`closure_expression`) is never the exception: it captures
+/// when it is created, so `w = make(|| w.run())` reads the earlier `w` too.
+fn use_reads_the_earlier_binding(region: Node, start: usize, use_node: Node) -> bool {
+    let Some(statement) = statement_node(region, start) else {
+        return false;
+    };
+    let use_start = use_node.start_byte();
+    if !(statement.start_byte() <= use_start && use_start < statement.end_byte()) {
+        return false;
+    }
+    if matches!(
+        statement.kind(),
+        "let_declaration" | "short_var_declaration" | "var_declaration"
+    ) {
+        return true;
+    }
+    let mut node = use_node;
+    while let Some(parent) = bounded_parent(node) {
+        if parent.id() == statement.id() {
+            break;
+        }
+        // Closures that read a captured variable when they run.
+        if matches!(
+            parent.kind(),
+            "func_literal"
+                | "arrow_function"
+                | "function_expression"
+                | "function"
+                | "generator_function"
+                | "lambda"
+        ) {
+            return false;
+        }
+        node = parent;
+    }
+    true
+}
+
+/// The initializer of `name` that a use at `use_node` reads, searched outward
+/// from the use to `scope` — the callable that binds the name.
+///
+/// At each enclosing region (a callable, or a Go `func_literal`, which
+/// `is_callable_node` does not count as a scope) the assignments to `name`
+/// inside the region and before the use are walked from the nearest back:
+///
+/// - `x = x.with_y()` re-assigns the value from itself — a builder step — and
+///   says nothing new about its type, so it is passed over;
+/// - a use inside the assignment's own right-hand side reads the value from
+///   before it ([`use_reads_the_earlier_binding`]), so it is passed over too;
+/// - an assignment inside a block that does not also hold the use ran only on
+///   some paths (`if ieee { p = NewIEEE() }`), so its shape is collected and
+///   the walk continues to the value it may have left in place;
+/// - the first assignment that runs on every path to the use ends the walk.
+///
+/// Every collected shape must agree, or the answer is `None`: naming one
+/// branch's constructor would type the other branch's value. A region with no
+/// assignment widens the search. This replaced a map that kept the *first*
+/// assignment in the enclosing function, which typed every `t.Run` subtest's
+/// `p` by the first subtest's constructor.
+fn initializer_at(
+    initializers: &HashMap<String, Vec<(usize, String)>>,
+    name: &str,
+    use_node: Node,
+    scope: Node,
+) -> Option<String> {
+    let assignments = initializers.get(name)?;
+    let use_start = use_node.start_byte();
+    let mut region = bounded_parent(use_node);
+    while let Some(node) = region {
+        let is_scope = node.id() == scope.id();
+        if is_scope || is_callable_node(node) || node.kind() == "func_literal" {
+            let mut seen: Option<&str> = None;
+            let mut settled = false;
+            for (start, shape) in assignments
+                .iter()
+                .rev()
+                .filter(|(start, _)| *start >= node.start_byte() && *start < use_start)
+            {
+                if reassigns_from_itself(shape, name)
+                    || use_reads_the_earlier_binding(node, *start, use_node)
+                {
+                    continue;
+                }
+                match seen {
+                    Some(earlier) if earlier != shape.as_str() => return None,
+                    _ => seen = Some(shape.as_str()),
+                }
+                if !assignment_is_conditional(node, *start, use_start) {
+                    settled = true;
+                    break;
+                }
+            }
+            if let Some(shape) = seen {
+                // Conditional assignments with nothing unconditional before
+                // them: on some path the binding came from outside this
+                // region, so the shape is not the only value it can hold.
+                return settled.then(|| shape.to_string());
+            }
+        }
+        if is_scope {
+            break;
+        }
+        region = bounded_parent(node);
+    }
+    None
+}
+
+/// `x = x.step()`: an initializer whose receiver is the binding itself.
+///
+/// A method call on the binding, and nothing else: `lexical::store::Builder::
+/// new` is a path whose first segment merely shares the binding's name, and a
+/// chain written across lines (`window\n  .center()`) carries the line break
+/// in its receiver text.
+fn reassigns_from_itself(shape: &str, name: &str) -> bool {
+    let compact: String = shape.chars().filter(|c| !c.is_whitespace()).collect();
+    compact
+        .strip_prefix(name)
+        .is_some_and(|rest| rest.starts_with('.'))
+}
+
+/// Whether the assignment starting at `start` sits in a block that does not
+/// also contain the use at `use_start`, between itself and `region`.
+fn assignment_is_conditional(region: Node, start: usize, use_start: usize) -> bool {
+    let Some(mut node) = region.descendant_for_byte_range(start, start) else {
+        return true;
+    };
+    while node.id() != region.id() {
+        let contains_use = node.start_byte() <= use_start && use_start < node.end_byte();
+        if contains_use {
+            return false;
+        }
+        if matches!(
+            node.kind(),
+            "block" | "statement_block" | "compound_statement" | "else_clause"
+        ) {
+            return true;
+        }
+        let Some(parent) = bounded_parent(node) else {
+            return true;
+        };
+        node = parent;
+    }
+    false
+}
+
+fn binding_declared_type_for(
     declared_types: &HashMap<(Option<String>, String), String>,
-    initializers: &HashMap<(Option<String>, String), String>,
     scope: &Option<String>,
     name: &str,
-) -> (Option<String>, Option<String>) {
+) -> Option<String> {
     let key = (scope.clone(), name.to_string());
-    let declared_type = declared_types.get(&key).cloned().or_else(|| {
+    declared_types.get(&key).cloned().or_else(|| {
         // File-scoped Type bindings (rare) and unscoped parameter rows.
         declared_types.get(&(None, name.to_string())).cloned()
-    });
-    let initializer = initializers
-        .get(&key)
-        .cloned()
-        .or_else(|| initializers.get(&(None, name.to_string())).cloned());
-    (declared_type, initializer)
+    })
 }
 
 fn name_is_shadowed_by_local(node: Node, source: &str, name: &str) -> bool {
@@ -8948,6 +9383,18 @@ fn assignment_binding(mut node: Node, source: &str) -> Option<String> {
                 .child_by_field_name("left")
                 .or_else(|| node.child_by_field_name("name")),
             "variable_declarator" => node.child_by_field_name("name"),
+            // Go `var x = New()` / `const x = …`, at package level or in a
+            // function. `name` repeats for `var a, b = …`, which binds two
+            // names to two values; nothing here says which value is whose, so
+            // only the single-name spec binds.
+            "var_spec" | "const_spec" => {
+                let mut cursor = node.walk();
+                let mut names = node.children_by_field_name("name", &mut cursor);
+                match (names.next(), names.next()) {
+                    (Some(only), None) => Some(only),
+                    _ => return None,
+                }
+            }
             "let_declaration" => node
                 .child_by_field_name("pattern")
                 .or_else(|| node.child_by_field_name("name")),
@@ -9039,6 +9486,79 @@ fn swift_parameter_bound_from_type(node: Node, source: &str) -> Option<String> {
             return None;
         }
         current = parent;
+    }
+    None
+}
+
+/// The parameter a Python annotation types: `def summarise(shape: Shape)`.
+///
+/// The annotation was already read as a Type reference — that is how
+/// `summarise -> Shape` existed — but nothing bound it to `shape`, so
+/// `shape.describe()` had no receiver type and `Shape.describe` was reported
+/// dead with its caller in the same signature. Only an annotation that *is*
+/// the type counts — the identifier must be the whole `type` node: in
+/// `xs: list[Shape]` or `s: Shape | None` the name is not what the parameter
+/// holds, so nothing is bound.
+fn python_parameter_bound_from_type(node: Node, source: &str) -> Option<String> {
+    let annotation = bounded_parent(node).filter(|parent| parent.kind() == "type")?;
+    let parameter = bounded_parent(annotation)
+        .filter(|parent| matches!(parent.kind(), "typed_parameter" | "typed_default_parameter"))?;
+    if !parameter
+        .child_by_field_name("type")
+        .is_some_and(|ty| ty.id() == annotation.id())
+    {
+        return None;
+    }
+    // `typed_default_parameter` names its binding; `typed_parameter` holds it
+    // as its first child, which is a `list_splat_pattern` for `*args: T`.
+    let binding = parameter
+        .child_by_field_name("name")
+        .or_else(|| parameter.named_child(0))
+        .filter(|binding| binding.kind() == "identifier")?;
+    let name = get_node_text(binding, source);
+    (is_user_ident(&name) && name != "self" && name != "cls").then_some(name)
+}
+
+/// The variable a Go `var w T` declares, when `node` is that type.
+///
+/// The Go spelling of a typed local with no initializer, and the idiomatic
+/// one for a value decoded in place: `var w requirementWire;
+/// json.Unmarshal(data, &w); w.Priority.valid()`. A parameter's type was
+/// already bound to its name; this declaration was not, so `w` had no type and
+/// every method reached through it — the `valid` checks on each decoded field
+/// — was reported dead.
+///
+/// Only a pointer or package qualifier may stand between the type and the
+/// spec: `var xs []T` and `var m map[K]T` do not make `xs` a `T`. A spec
+/// declaring several names (`var a, b T`) types each of them identically,
+/// but which one this reference serves is not knowable from one
+/// `assigned_to`, so it binds none.
+fn go_var_bound_from_type(node: Node, source: &str) -> Option<String> {
+    let mut current = node;
+    for _ in 0..4 {
+        let parent = bounded_parent(current)?;
+        match parent.kind() {
+            "pointer_type" | "qualified_type" => current = parent,
+            "var_spec" => {
+                if !parent
+                    .child_by_field_name("type")
+                    .is_some_and(|ty| ty.id() == current.id())
+                {
+                    return None;
+                }
+                let mut cursor = parent.walk();
+                let mut names = parent
+                    .children_by_field_name("name", &mut cursor)
+                    .filter(|name| name.kind() == "identifier");
+                let only = names.next()?;
+                if names.next().is_some() {
+                    return None;
+                }
+                let name = get_node_text(only, source);
+                return (is_user_ident(&name) && name != "_").then_some(name);
+            }
+            _ => return None,
+        }
     }
     None
 }

@@ -27,6 +27,7 @@ pub mod map_preview;
 pub mod model;
 pub mod query_match;
 pub mod rung;
+pub mod scope;
 pub mod snapshots;
 pub mod stat_memo;
 
@@ -54,9 +55,9 @@ pub use code_graph::{
     CODE_GRAPH_TOP_LEVEL_KEYS, EDGE_KIND_LABELS,
 };
 pub use engine::{
-    budget_take, clone_group_tokens, is_test_path, link_candidates, parse_clone_kind,
-    resolved_edge_from_stored, traversal_starts, traversed_resolution_edges, workspace_search,
-    PathOutsideRepoRoot, QueryEngine, StoreQueryEngine, BYTES_PER_TOKEN,
+    budget_take, clone_group_tokens, graph_core_for_store, is_test_path, link_candidates,
+    parse_clone_kind, resolved_edge_from_stored, traversal_starts, traversed_resolution_edges,
+    workspace_search, PathOutsideRepoRoot, QueryEngine, StoreQueryEngine, BYTES_PER_TOKEN,
     EVIDENCE_TEST_BUDGET_SHARE, EVIDENCE_TEST_DEPTH, MAX_NEIGHBOR_TARGETS, MAX_TOKEN_BUDGET,
     MAX_TRAVERSAL_DEPTH, PREVIEW_CALLER_MIN_CONFIDENCE,
 };
@@ -76,3 +77,4 @@ pub use snapshots::{semantic_snapshot_for_file, semantic_snapshots, SemanticSnap
 
 pub use ask::{ASK_DEFAULT_MIN_CONFIDENCE, ASK_MAX_ITERS, ASK_RESTART};
 pub use rung::{filter_by_rung, histogram as rung_histogram, Rung, RungHistogram};
+pub use scope::{ResolvedScope, ScopeReport, SymbolScope, MAX_SCOPE_LANGUAGES, MAX_SCOPE_PATHS};

@@ -670,6 +670,75 @@ impl UnresolvedClass {
             UnresolvedClass::Unresolved => "unresolved",
         }
     }
+
+    /// Whether this miss has affirmative evidence that no edge was ever
+    /// findable — a builtin, a host global, an external import, a name nothing
+    /// declares, a module path. The other three classes are sites where a
+    /// repository symbol may be the target the resolver could not bind.
+    ///
+    /// The one owner of the split: `resolution_rate` counts `explained_sites`
+    /// with it, and the ledger reads filter stored labels through
+    /// [`UNATTRIBUTED_LABELS`], which a test pins to this.
+    pub fn is_explained(&self) -> bool {
+        matches!(
+            self,
+            UnresolvedClass::Builtin
+                | UnresolvedClass::HostGlobal { .. }
+                | UnresolvedClass::External { .. }
+                | UnresolvedClass::NoNamesake
+                | UnresolvedClass::ModulePath
+        )
+    }
+}
+
+/// The persisted [`UnresolvedClass::label`]s of the classes that are not
+/// [`UnresolvedClass::is_explained`] — the sites that may hide an edge.
+pub const UNATTRIBUTED_LABELS: &[&str] = &["local_binding", "uninferred_receiver", "unresolved"];
+
+#[cfg(test)]
+mod unattributed_label_tests {
+    use super::{UnresolvedClass, UNATTRIBUTED_LABELS};
+
+    #[test]
+    fn the_unattributed_labels_are_exactly_the_unexplained_classes() {
+        let every = [
+            UnresolvedClass::Builtin,
+            UnresolvedClass::HostGlobal {
+                environment: "web".into(),
+            },
+            UnresolvedClass::LocalBinding,
+            UnresolvedClass::External {
+                module: "react".into(),
+            },
+            UnresolvedClass::UninferredReceiver,
+            UnresolvedClass::NoNamesake,
+            UnresolvedClass::ModulePath,
+            UnresolvedClass::Unresolved,
+        ];
+        for class in &every {
+            // Exhaustive on purpose: a new class fails to compile here until
+            // it is added to `every` above.
+            match class {
+                UnresolvedClass::Builtin
+                | UnresolvedClass::HostGlobal { .. }
+                | UnresolvedClass::LocalBinding
+                | UnresolvedClass::External { .. }
+                | UnresolvedClass::UninferredReceiver
+                | UnresolvedClass::NoNamesake
+                | UnresolvedClass::ModulePath
+                | UnresolvedClass::Unresolved => {}
+            }
+            assert_eq!(
+                UNATTRIBUTED_LABELS.contains(&class.label()),
+                !class.is_explained(),
+                "{class:?}"
+            );
+        }
+        assert_eq!(
+            every.iter().filter(|class| !class.is_explained()).count(),
+            UNATTRIBUTED_LABELS.len()
+        );
+    }
 }
 
 /// Which edge family a ledger row failed to produce.
@@ -796,12 +865,13 @@ pub struct ResolutionResult {
     /// terminal declaration.
     ///
     /// **Empty is a real answer here, and a narrow one.** A chain is recorded
-    /// only where an export names its own source module — which is JS/TS
-    /// syntax. Python's `from .impl import thing` inside an `__init__.py` is a
-    /// re-export to any reader, and the extractor records it as an *import*
-    /// with no export-side specifier, so no chain exists for it and none is
-    /// inferred. `reexport_chains_are_only_claimed_where_an_export_names_its_
-    /// source` pins that scope.
+    /// where a file publishes a name it does not declare: a JS/TS export that
+    /// names its own source module, a Rust `pub use`, and a Python
+    /// *module-scope* `from m import name` — which binds `name` as a module
+    /// attribute, so `from barrel import name` elsewhere reaches it. An import
+    /// inside a function or class body binds a local and publishes nothing, so
+    /// it yields no chain. `reexport_chains_are_scoped_to_what_the_language_
+    /// publishes` pins that boundary.
     ///
     /// A cycle yields no entry at all: there is no terminal file, and naming
     /// either endpoint would invent one. Depth is bounded by

@@ -1059,6 +1059,10 @@ pub struct SearchPage {
     pub analysis: Option<AnalysisDisclosure>,
 }
 
+/// Every file one generation indexed, as `(path, language)`; see
+/// [`Store::all_symbols_page_with_files`].
+pub type IndexedFiles = Vec<(String, String)>;
+
 /// File parse state, touching edges, and coverage from one pinned generation.
 #[derive(Debug, Clone)]
 pub struct FileEdges {
@@ -1703,6 +1707,17 @@ pub struct UnresolvedSiteRow {
     /// The ledger's own class: `uninferred_receiver`, `unresolved`,
     /// `external`, … — why the resolver did not bind it.
     pub classification: String,
+    /// The name the site calls. Equal to the map key for a by-name read;
+    /// carried because a by-caller read is keyed by the caller instead.
+    pub callee_name: String,
+}
+
+/// Which ledger column a keyed read matches its keys against.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LedgerKey {
+    Callee,
+    SourceSymbol,
+    SourceFile,
 }
 
 /// One committed build, as recorded by [`Store::build_history`].
@@ -3223,6 +3238,14 @@ impl Store {
             // built it makes this a no-op rather than a failure.
             conn.execute_batch(MIGRATION_V23_TO_V24)?;
             conn.execute("PRAGMA user_version = 24", [])?;
+            version = 24;
+        }
+        if version == 24 {
+            // Version-only rung: `Registers` edges (route middleware) are free
+            // TEXT in the existing `edge_kind` column. Advancing the stamp
+            // makes an older binary refuse the store at open instead of
+            // failing every edge read on a kind it cannot parse.
+            conn.execute("PRAGMA user_version = 25", [])?;
             version = CURRENT_SCHEMA_VERSION;
         }
         if version != CURRENT_SCHEMA_VERSION {
@@ -6292,6 +6315,79 @@ impl Store {
         names: &[String],
         limit_per_name: usize,
     ) -> Result<Option<UnresolvedSitesByName>> {
+        self.unresolved_sites_keyed(generation, LedgerKey::Callee, names, false, limit_per_name)
+    }
+
+    /// [`Self::unresolved_sites_naming`], keeping only the sites that may hide
+    /// an edge — the classes in [`devmap_resolve::UNATTRIBUTED_LABELS`], minus
+    /// receiver calls whose method name no symbol at `generation` carries.
+    ///
+    /// The filter is in SQL, not applied to the rows afterwards, so the
+    /// per-name cap counts only the rows that matter: a name with a hundred
+    /// builtin namesakes ahead of one untyped receiver must still report the
+    /// receiver.
+    pub fn unattributed_sites_naming(
+        &self,
+        generation: u32,
+        names: &[String],
+        limit_per_name: usize,
+    ) -> Result<Option<UnresolvedSitesByName>> {
+        self.unresolved_sites_keyed(generation, LedgerKey::Callee, names, true, limit_per_name)
+    }
+
+    /// The unattributed sites whose *caller* is one of `symbols`, keyed by that
+    /// caller — the calls inside a walked symbol the resolver could not bind
+    /// and that may hide an edge (same filter as
+    /// [`Self::unattributed_sites_naming`]).
+    ///
+    /// The ledger has no index on `source_symbol` (adding one is a schema
+    /// change), so this is one scan of it: measured on ScholarLM's 573,716
+    /// rows at 51–228 ms. One scan answers every symbol, which is why the caller
+    /// passes them all at once.
+    pub fn unattributed_sites_within(
+        &self,
+        generation: u32,
+        symbols: &[String],
+        limit_per_symbol: usize,
+    ) -> Result<Option<UnresolvedSitesByName>> {
+        self.unresolved_sites_keyed(
+            generation,
+            LedgerKey::SourceSymbol,
+            symbols,
+            true,
+            limit_per_symbol,
+        )
+    }
+
+    /// The unattributed sites written in one of `files`, keyed by file — what a
+    /// file's outbound dependency list cannot show. One scan, as above.
+    pub fn unattributed_sites_in_files(
+        &self,
+        generation: u32,
+        files: &[String],
+        limit_per_file: usize,
+    ) -> Result<Option<UnresolvedSitesByName>> {
+        self.unresolved_sites_keyed(
+            generation,
+            LedgerKey::SourceFile,
+            files,
+            true,
+            limit_per_file,
+        )
+    }
+
+    /// The one ledger read behind the four above: rows at `generation` whose
+    /// `key` column is one of `keys`, at most `limit_per_key` per key, ordered
+    /// by `(file, symbol)` and flagged when the cap cut them.
+    fn unresolved_sites_keyed(
+        &self,
+        generation: u32,
+        key: LedgerKey,
+        keys: &[String],
+        // Only the sites that may hide an edge: see `unattributed_sites_naming`.
+        unattributed_only: bool,
+        limit_per_key: usize,
+    ) -> Result<Option<UnresolvedSitesByName>> {
         let conn = lock_conn(&self.conn)?;
         let retained: bool = conn.query_row(
             "SELECT EXISTS(SELECT 1 FROM generations WHERE id = ?1)",
@@ -6301,42 +6397,73 @@ impl Store {
         if !retained {
             return Ok(None);
         }
-        let mut found: UnresolvedSitesByName = names
+        let mut found: UnresolvedSitesByName = keys
             .iter()
             .map(|name| (name.clone(), (Vec::new(), false)))
             .collect();
-        if names.is_empty() {
+        if keys.is_empty() {
             return Ok(Some(found));
         }
-        let placeholders = vec!["?"; names.len()].join(", ");
+        let column = match key {
+            LedgerKey::Callee => "u.callee_name",
+            LedgerKey::SourceSymbol => "u.source_symbol",
+            LedgerKey::SourceFile => "p.path",
+        };
+        let placeholders = vec!["?"; keys.len()].join(", ");
+        // A receiver call whose method name no symbol at this generation
+        // carries cannot be a missed edge into it — an edge needs a target, and
+        // no target has that name (`rows.length`, `mu.Unlock()`: 126,023 of
+        // ScholarLM's 200,790 untyped-receiver rows). A receiver-less call
+        // keeps counting without a namesake: `f = make(); f()` may hold any
+        // function. In SQL, before the cap, for the reason the class filter is.
+        let class_filter = if unattributed_only {
+            format!(
+                "AND c.text IN ({})
+                   AND (u.receiver IS NULL
+                        OR u.callee_name IN (SELECT n.name FROM generation_nodes n
+                                             WHERE n.generation_id = ?))",
+                vec!["?"; devmap_resolve::UNATTRIBUTED_LABELS.len()].join(", ")
+            )
+        } else {
+            String::new()
+        };
         let sql = format!(
-            "SELECT callee_name, path, source_symbol, receiver, class, rn FROM (
-                 SELECT u.callee_name AS callee_name, p.path AS path,
+            "SELECT key, path, source_symbol, receiver, class, rn, callee_name FROM (
+                 SELECT {column} AS key, p.path AS path,
                         u.source_symbol AS source_symbol, u.receiver AS receiver,
-                        c.text AS class,
+                        c.text AS class, u.callee_name AS callee_name,
                         ROW_NUMBER() OVER (
-                            PARTITION BY u.callee_name
+                            PARTITION BY {column}
                             ORDER BY p.path, u.source_symbol, u.unresolved_id
                         ) AS rn
                  FROM unresolved_rows u
                  JOIN paths p            ON p.id = u.source_file_id
                  JOIN unresolved_texts c ON c.id = u.classification_id
-                 WHERE u.callee_name IN ({placeholders})
+                 WHERE {column} IN ({placeholders})
                    AND u.valid_from <= ?
                    AND (u.valid_to IS NULL OR u.valid_to > ?)
+                   {class_filter}
              )
              WHERE rn <= ?
-             ORDER BY callee_name, rn"
+             ORDER BY key, rn"
         );
         let mut stmt = conn.prepare(&sql)?;
         let generation = i64::from(generation);
-        let cap = sqlite_limit(limit_per_name.saturating_add(1));
-        let mut values: Vec<rusqlite::types::Value> = names
+        let cap = sqlite_limit(limit_per_key.saturating_add(1));
+        let mut values: Vec<rusqlite::types::Value> = keys
             .iter()
             .map(|name| rusqlite::types::Value::Text(name.clone()))
             .collect();
         values.push(rusqlite::types::Value::Integer(generation));
         values.push(rusqlite::types::Value::Integer(generation));
+        if unattributed_only {
+            values.extend(
+                devmap_resolve::UNATTRIBUTED_LABELS
+                    .iter()
+                    .map(|label| rusqlite::types::Value::Text((*label).to_string())),
+            );
+            values.push(rusqlite::types::Value::Integer(generation));
+        }
         values.push(rusqlite::types::Value::Integer(cap));
         let mut rows = stmt.query(rusqlite::params_from_iter(values.iter()))?;
         while let Some(row) = rows.next()? {
@@ -6345,7 +6472,7 @@ impl Store {
             let Some((sites, truncated)) = found.get_mut(&name) else {
                 continue;
             };
-            if usize::try_from(rank).unwrap_or(usize::MAX) > limit_per_name {
+            if usize::try_from(rank).unwrap_or(usize::MAX) > limit_per_key {
                 *truncated = true;
                 continue;
             }
@@ -6354,6 +6481,7 @@ impl Store {
                 source_symbol: row.get(2)?,
                 receiver: row.get(3)?,
                 classification: row.get(4)?,
+                callee_name: row.get(6)?,
             });
         }
         Ok(Some(found))
@@ -7403,6 +7531,43 @@ generation {latest}; run `devmap status` to re-verify",
         }))
     }
 
+    /// [`Self::all_symbols_page`], with every file the same generation indexed
+    /// as `(path, language)`, ordered by path.
+    ///
+    /// A scoped ranking checks its path prefixes and languages against this
+    /// list, so it has to describe the generation the rows came from: a list
+    /// read by a second "latest" lookup could refuse a prefix the rows do
+    /// cover, or admit one they do not. Read from the generation's files, not
+    /// derived from the rows, so a file is listed whatever it declares.
+    pub fn all_symbols_page_with_files(&self) -> Result<Option<(SearchPage, IndexedFiles)>> {
+        let conn = lock_conn(&self.conn)?;
+        let Some((snapshot, generation)) = Self::latest_snapshot(&conn)? else {
+            return Ok(None);
+        };
+        let rows = Self::all_symbols_in(&snapshot, generation)?;
+        let mut stmt = snapshot.prepare(
+            "SELECT p.path, f.language
+             FROM generation_files f
+             JOIN paths p ON p.id = f.file_id
+             WHERE f.generation_id = ?1
+             ORDER BY p.path",
+        )?;
+        let files = stmt
+            .query_map(params![generation], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<Result<Vec<(String, String)>>>()?;
+        Ok(Some((
+            SearchPage {
+                generation,
+                total: u32::try_from(rows.len())
+                    .map_err(|_| refusal("symbol count exceeds u32"))?,
+                rows,
+                repo_root: Self::generation_repo_root_in(&snapshot, generation)?,
+                analysis: Self::analysis_disclosure_in(&snapshot, generation)?,
+            },
+            files,
+        )))
+    }
+
     fn all_symbols_in(snapshot: &Connection, gen: u32) -> Result<Vec<StoredSymbol>> {
         let mut stmt = snapshot.prepare(
             "SELECT n.name, n.qualified_name, n.kind, p.path,
@@ -8187,7 +8352,8 @@ generation {latest}; run `devmap status` to re-verify",
         let analysis = Self::analysis_disclosure_in(&snapshot, gen)?;
         let index = builder
             .finish_with_stored_evidence(analysis, EdgeOrder::ReadOrder)
-            .map_err(|error| refusal(error.to_string()))?;
+            .map_err(|error| refusal(error.to_string()))?
+            .with_generation(gen);
         Ok(Some((gen, index)))
     }
 

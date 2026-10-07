@@ -137,6 +137,7 @@ pub fn semantic_snapshots(
         dead_clusters_truncated: 0,
         dead_clusters_incomplete: None,
         unresolved_namesakes: None,
+        scope: None,
     }
 }
 
@@ -160,6 +161,7 @@ mod tests {
             parent_symbol: None,
             body_signature: None,
             declaration_hash: None,
+            return_type: None,
         }
     }
 

@@ -1798,8 +1798,10 @@ pub fn analyze_liveness_with_coverage(
         // construction. `is_parse_failed` could not see this because the parse
         // did not fail — that is exactly how CFML and Terraform symbols reached
         // the `extracted` tier.
-        let file_is_call_blind =
-            a_grammar_read_this_file(ext) && !ext.capabilities().contains(Capability::Calls);
+        // `Extraction::is_call_blind` is the one predicate `impact` and
+        // `trace` refuse an empty answer with, so the two surfaces cannot
+        // disagree about which files were never looked at.
+        let file_is_call_blind = ext.is_call_blind();
 
         // Every finding about a symbol in this file, priced against the
         // blindness that actually bears on it.
@@ -1899,11 +1901,39 @@ pub fn analyze_liveness_with_coverage(
             file_wiring.first().map(|w| w.details.clone())
         };
 
+        // One report per graph identity. Two `#[cfg]` variants of one method —
+        // `ShutdownSignals::recv` for unix and for windows — are two extracted
+        // symbols sharing one qualified name, which is one node with one set
+        // of callers. Reporting each listed the same finding twice, and a
+        // reader counting rows counted it twice. Every input to the verdict is
+        // keyed by that name except the parse-error overlap, which is a fact
+        // about one variant's span; it is taken over all of them, so the row
+        // is exempt if any variant could hide a caller.
+        let mut overlaps_by_identity: HashMap<&str, bool> = HashMap::new();
+        for sym in &ext.symbols {
+            let overlaps = match &ext.parse_outcome {
+                ParseOutcome::Partial { error_ranges } => error_ranges.iter().any(|range| {
+                    sym.span.start_byte < range.end_byte && range.start_byte < sym.span.end_byte
+                }),
+                ParseOutcome::Clean
+                | ParseOutcome::Failed { .. }
+                | ParseOutcome::Fallback { .. }
+                | ParseOutcome::Skipped { .. } => false,
+            };
+            *overlaps_by_identity
+                .entry(sym.qualified_name.as_str())
+                .or_default() |= overlaps;
+        }
+        let mut reported: HashSet<&str> = HashSet::new();
+
         for sym in &ext.symbols {
             // `starts_with("__")` was also tested here and is subsumed by the
             // single-underscore check — dead code that no mutant could kill.
             if is_never_dead_candidate(sym.kind) || sym.name.starts_with('_') {
                 continue; // See `is_never_dead_candidate`; plus underscore-private
+            }
+            if !reported.insert(sym.qualified_name.as_str()) {
+                continue;
             }
 
             let is_called = called_symbols.contains(&(ext.file_path.clone(), sym.name.clone()))
@@ -1912,17 +1942,13 @@ pub fn analyze_liveness_with_coverage(
                 .contains(&(ext.file_path.clone(), sym.name.clone()))
                 || ambiguous_symbols.contains(&(ext.file_path.clone(), sym.qualified_name.clone()));
 
-            let overlaps_parse_error = match &ext.parse_outcome {
-                ParseOutcome::Partial { error_ranges } => error_ranges.iter().any(|range| {
-                    sym.span.start_byte < range.end_byte && range.start_byte < sym.span.end_byte
-                }),
-                // No grammar ran, so there are no error ranges to overlap.
-                // The file is exempt wholesale via `is_parse_failed` above.
-                ParseOutcome::Clean
-                | ParseOutcome::Failed { .. }
-                | ParseOutcome::Fallback { .. }
-                | ParseOutcome::Skipped { .. } => false,
-            };
+            // No grammar ran for `Failed`/`Fallback`/`Skipped`, so there are no
+            // error ranges to overlap; the file is exempt wholesale via
+            // `is_parse_failed` above.
+            let overlaps_parse_error = overlaps_by_identity
+                .get(sym.qualified_name.as_str())
+                .copied()
+                .unwrap_or(false);
 
             let is_exported = sym.is_exported;
             // One lookup where six `.or_else` arms used to sit. The arms moved
@@ -2063,6 +2089,7 @@ mod tests {
             parent_symbol: None,
             body_signature: None,
             declaration_hash: None,
+            return_type: None,
         }
     }
 

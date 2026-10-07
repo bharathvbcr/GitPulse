@@ -703,10 +703,29 @@ fn factory_binding_re() -> Result<&'static Regex, String> {
 /// An argument list with no top-level comma yields the whole list, which is the
 /// right answer: a call with one argument has that argument as its last.
 fn last_top_level_argument(arguments: &str) -> &str {
+    top_level_arguments(arguments)
+        .last()
+        .map_or("", |(_, argument)| *argument)
+}
+
+/// Every top-level argument of a call, trimmed, each with the byte offset in
+/// `arguments` where its trimmed text starts.
+///
+/// The one splitter: [`last_top_level_argument`] is its final element, and the
+/// middleware producers read the elements before it. Always yields at least one
+/// entry — an empty list is one empty argument, which is what the handler
+/// check needs to see to reject a settings getter.
+fn top_level_arguments(arguments: &str) -> Vec<(usize, &str)> {
+    fn trimmed(text: &str, start: usize, end: usize) -> (usize, &str) {
+        let raw = &text[start..end];
+        let lead = raw.len() - raw.trim_start().len();
+        (start + lead, raw.trim())
+    }
     let mut depth = 0i32;
     let mut quote: Option<char> = None;
     let mut escaped = false;
-    let mut last = arguments;
+    let mut start = 0usize;
+    let mut out = Vec::new();
     for (offset, character) in arguments.char_indices() {
         if in_string_literal(character, &mut quote, &mut escaped) {
             continue;
@@ -714,11 +733,15 @@ fn last_top_level_argument(arguments: &str) -> &str {
         match character {
             '(' | '[' | '{' => depth += 1,
             ')' | ']' | '}' => depth -= 1,
-            ',' if depth == 0 => last = &arguments[offset + 1..],
+            ',' if depth == 0 => {
+                out.push(trimmed(arguments, start, offset));
+                start = offset + 1;
+            }
             _ => {}
         }
     }
-    last.trim()
+    out.push(trimmed(arguments, start, arguments.len()));
+    out
 }
 
 /// Whether a call's final argument is shaped like an Express handler.
@@ -782,6 +805,624 @@ fn express_handler_name(source: &str, after: usize) -> Option<String> {
     Some(name)
 }
 
+// ---------------------------------------------------------------------------
+// Middleware
+// ---------------------------------------------------------------------------
+
+/// Words that open an expression but name no symbol: a `function`/`func`
+/// literal with no name, an `async` arrow, a constructor call, a literal.
+const NOT_A_SYMBOL: &[&str] = &[
+    "function",
+    "func",
+    "async",
+    "await",
+    "new",
+    "typeof",
+    "true",
+    "false",
+    "null",
+    "undefined",
+    "nil",
+    "this",
+];
+
+/// The symbol a middleware argument names, and the binding it was reached
+/// through.
+///
+/// `auth` → `("auth", None)`; `middleware.Logger` → `("Logger",
+/// Some("middleware"))`; `requireRole('admin')` → `("requireRole", None)`,
+/// because the factory is the symbol the repository declares and the
+/// middleware is what it returns; `function auth(req, res, next) {…}` →
+/// `("auth", None)`. Anything else — an arrow function, a `func` literal, an
+/// object, a string — names nothing, and yields an empty name so the entry is
+/// still listed by its expression rather than dropped.
+fn middleware_reference(expression: &str) -> (String, Option<String>) {
+    let text = expression.trim();
+    if let Some(tail) = text.strip_prefix("function") {
+        let name: String = tail
+            .trim_start()
+            .chars()
+            .take_while(|character| is_binding_char(*character))
+            .collect();
+        return (name, None);
+    }
+    // A call is named by its callee: everything before the first `(`.
+    let callee = text.find('(').map_or(text, |at| &text[..at]).trim();
+    let segments: Vec<&str> = callee.split('.').collect();
+    let well_formed = segments.iter().all(|segment| {
+        !segment.is_empty()
+            && segment.chars().all(is_binding_char)
+            && !segment.starts_with(|c: char| c.is_ascii_digit())
+    });
+    let Some(last) = segments.last().filter(|_| well_formed) else {
+        return (String::new(), None);
+    };
+    if NOT_A_SYMBOL.contains(last) {
+        return (String::new(), None);
+    }
+    let qualifier = (segments.len() > 1).then(|| segments[0].to_string());
+    (last.to_string(), qualifier)
+}
+
+/// One middleware entry, from an argument that starts `offset` bytes into
+/// `source`.
+fn middleware_entry(argument: &str, offset: usize, scope: MiddlewareScope) -> ExtractedMiddleware {
+    let (name, qualifier) = middleware_reference(argument);
+    let mut expression = argument.to_string();
+    if expression.len() > MIDDLEWARE_EXPRESSION_CAP {
+        let mut cut = MIDDLEWARE_EXPRESSION_CAP;
+        while !expression.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        expression.truncate(cut);
+        expression.push('…');
+    }
+    ExtractedMiddleware {
+        name,
+        qualifier,
+        expression,
+        scope,
+        span: Span {
+            start_byte: offset,
+            end_byte: offset + argument.len(),
+        },
+    }
+}
+
+/// Middleware entries for a run of arguments, an array literal flattened in
+/// place — Express documents `app.get(path, [mw1, mw2], handler)`.
+///
+/// `base` is where `arguments` starts in the file, so every span is absolute.
+fn middleware_entries(
+    arguments: &[(usize, &str)],
+    base: usize,
+    scope: MiddlewareScope,
+) -> Vec<ExtractedMiddleware> {
+    let mut entries = Vec::new();
+    for (offset, argument) in arguments {
+        if argument.is_empty() {
+            continue;
+        }
+        if let Some(inner) = argument
+            .strip_prefix('[')
+            .and_then(|rest| rest.strip_suffix(']'))
+        {
+            for (inner_offset, element) in top_level_arguments(inner) {
+                if !element.is_empty() {
+                    entries.push(middleware_entry(
+                        element,
+                        base + offset + 1 + inner_offset,
+                        scope,
+                    ));
+                }
+            }
+            continue;
+        }
+        entries.push(middleware_entry(argument, base + offset, scope));
+    }
+    entries
+}
+
+/// The `{…}` blocks of a file, as `(open, close)` byte pairs.
+///
+/// Router-scoped middleware is lexical here: an `r.Use(auth)` applies to the
+/// routes registered on `r` after it *in the same block*. That is what makes
+/// chi's idiomatic `r.Group(func(r chi.Router) { r.Use(auth); r.Get(...) })`
+/// come out right — the closure's parameter shadows the outer `r`, and an
+/// `auth` that leaked onto the routes after the group would report public
+/// routes as authenticated, which is the one wrong answer about middleware
+/// that gets acted on.
+///
+/// String literals are skipped with the same tracker every other scan here
+/// uses. A brace in a comment is not, and an unbalanced one leaves its block
+/// open to end of file — which widens a scope rather than dropping one.
+fn brace_blocks(source: &str) -> Vec<(usize, usize)> {
+    let mut stack = Vec::new();
+    let mut blocks = Vec::new();
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+    for (offset, character) in source.char_indices() {
+        if in_string_literal(character, &mut quote, &mut escaped) {
+            continue;
+        }
+        match character {
+            '{' => stack.push(offset),
+            '}' => {
+                if let Some(open) = stack.pop() {
+                    blocks.push((open, offset));
+                }
+            }
+            _ => {}
+        }
+    }
+    blocks.extend(stack.into_iter().map(|open| (open, source.len())));
+    blocks
+}
+
+/// Where the innermost block enclosing `at` closes; end of file at top level.
+fn block_end(blocks: &[(usize, usize)], at: usize, source_len: usize) -> usize {
+    blocks
+        .iter()
+        .filter(|(open, close)| *open < at && at < *close)
+        .max_by_key(|(open, _)| *open)
+        .map_or(source_len, |(_, close)| *close)
+}
+
+/// One router-level registration: `app.use(...)`, `r.Use(...)`.
+struct RouterUse {
+    receiver: String,
+    /// Where the registration starts. It applies to routes after this.
+    at: usize,
+    /// Where its enclosing block closes. It applies to routes before this.
+    scope_end: usize,
+    /// Express's mount path: `app.use('/api', auth)` runs only under `/api`.
+    prefix: Option<String>,
+    middleware: Vec<ExtractedMiddleware>,
+}
+
+impl RouterUse {
+    fn covers(&self, receiver: &str, at: usize, path: &str) -> bool {
+        self.receiver == receiver
+            && self.at < at
+            && at < self.scope_end
+            && self.prefix.as_deref().is_none_or(|prefix| {
+                let prefix = prefix.trim_end_matches('/');
+                prefix.is_empty()
+                    || prefix == "*"
+                    || path == prefix
+                    || path
+                        .strip_prefix(prefix)
+                        .is_some_and(|rest| rest.starts_with('/'))
+            })
+    }
+}
+
+/// A receiver bound from another: gin's `v1 := r.Group("/v1", auth)`, chi's
+/// `admin := r.With(auth)`. The child runs the parent's middleware registered
+/// before the derivation, then its own inline arguments.
+struct Derivation {
+    child: String,
+    parent: String,
+    at: usize,
+    scope_end: usize,
+    middleware: Vec<ExtractedMiddleware>,
+}
+
+/// Router-scoped middleware for a route on `receiver` at `at`, in run order.
+///
+/// Follows derivations back to their parents, bounded so a self-derivation or
+/// a cycle (`r = r.With(x)` in a loop) terminates.
+fn router_middleware(
+    uses: &[RouterUse],
+    derivations: &[Derivation],
+    receiver: &str,
+    at: usize,
+    path: &str,
+) -> Vec<ExtractedMiddleware> {
+    const MAX_DERIVATION_HOPS: usize = 8;
+    let mut chain = Vec::new();
+    let (mut current, mut position) = (receiver.to_string(), at);
+    for _ in 0..MAX_DERIVATION_HOPS {
+        let own: Vec<ExtractedMiddleware> = uses
+            .iter()
+            .filter(|registration| registration.covers(&current, position, path))
+            .flat_map(|registration| registration.middleware.iter().cloned())
+            .collect();
+        chain.push(own);
+        // The nearest derivation of this receiver before the route, in scope.
+        let Some(derivation) = derivations
+            .iter()
+            .filter(|d| d.child == current && d.at < position && position < d.scope_end)
+            .max_by_key(|d| d.at)
+        else {
+            break;
+        };
+        chain.push(derivation.middleware.clone());
+        current = derivation.parent.clone();
+        position = derivation.at;
+    }
+    // Collected innermost-first; the parent's run first.
+    chain.into_iter().rev().flatten().collect()
+}
+
+/// `app.use(...)` / `router.use(...)` on any receiver.
+fn express_use_re() -> Result<&'static Regex, String> {
+    static RE: OnceLock<Result<Regex, String>> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(
+            r#"(?m)(?-u:\b)([A-Za-z_$][A-Za-z0-9_$]*(?:\.[A-Za-z_$][A-Za-z0-9_$]*)*)\.use\s*\("#,
+        )
+        .map_err(|error| format!("invalid Express middleware matcher: {error}"))
+    })
+    .as_ref()
+    .map_err(Clone::clone)
+}
+
+/// The text of a string literal argument, if the argument is one.
+fn string_literal(argument: &str) -> Option<&str> {
+    let mut characters = argument.chars();
+    let open = characters.next()?;
+    if !matches!(open, '"' | '\'' | '`') || argument.len() < 2 || !argument.ends_with(open) {
+        return None;
+    }
+    Some(&argument[1..argument.len() - 1])
+}
+
+/// Every `X.use(...)` registration in an Express file.
+///
+/// A receiver the file bound to a non-Express package is skipped for the same
+/// reason [`non_router_receivers`] skips it for routes — `md.use(plugin)` is
+/// markdown-it. A first argument that is a string is Express's mount path, and
+/// one not starting with `/` means the call is not Express's `use` at all.
+/// A mounted router (`app.use('/api', apiRouter)`) is recorded like any other
+/// entry, because to Express it is one: a function in the stack, run for the
+/// paths under its prefix.
+fn express_router_uses(
+    source: &str,
+    not_routers: &std::collections::HashSet<String>,
+    blocks: &[(usize, usize)],
+) -> Result<Vec<RouterUse>, String> {
+    let mut uses = Vec::new();
+    for cap in express_use_re()?.captures_iter(source) {
+        let (Some(full), Some(receiver)) = (cap.get(0), cap.get(1)) else {
+            continue;
+        };
+        let root = receiver.as_str().split('.').next().unwrap_or_default();
+        if not_routers.contains(root) {
+            continue;
+        }
+        let Some((arguments, _)) = call_arguments(source, full.end()) else {
+            continue;
+        };
+        let mut arguments = top_level_arguments(arguments);
+        let prefix = match arguments
+            .first()
+            .and_then(|(_, first)| string_literal(first))
+        {
+            Some(path) if path.starts_with('/') || path == "*" => {
+                let path = path.to_string();
+                arguments.remove(0);
+                Some(path)
+            }
+            Some(_) => continue,
+            None => None,
+        };
+        let middleware = middleware_entries(&arguments, full.end(), MiddlewareScope::Router);
+        if middleware.is_empty() {
+            continue;
+        }
+        uses.push(RouterUse {
+            receiver: receiver.as_str().to_string(),
+            at: full.start(),
+            scope_end: block_end(blocks, full.start(), source.len()),
+            prefix,
+            middleware,
+        });
+    }
+    Ok(uses)
+}
+
+/// A Go route registration: any receiver, an optional chi `.With(...)` chain,
+/// a verb or `Handle`/`HandleFunc`, and a string-literal pattern.
+///
+/// The verb set is chi's (`Get`, `Post`, …), gin's and echo's (`GET`, `POST`,
+/// …, `Any`), and the `Handle`/`HandleFunc` pair net/http, gorilla/mux and chi
+/// share. The receiver is not matched by name, for the reason the Express and
+/// Python matchers are not: a router is whatever the author called it.
+///
+/// The word boundary is ASCII (`(?-u:\b)`), as in every matcher added beside
+/// it. The identifiers it bounds are ASCII by construction, and a Unicode `\b`
+/// makes the regex crate's lazy DFA give up at the first non-ASCII byte — a
+/// comment in any other script — and finish the file on a slower engine. These
+/// run on every Go, JavaScript and TypeScript file an index reads.
+fn go_route_re() -> Result<&'static Regex, String> {
+    static RE: OnceLock<Result<Regex, String>> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(concat!(
+            r#"(?m)(?-u:\b)([A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*)"#,
+            r#"((?:\.With\((?:[^()]|\([^()]*\))*\))*)"#,
+            r#"\.(Get|Post|Put|Delete|Patch|Head|Options|GET|POST|PUT|DELETE|PATCH|HEAD|OPTIONS|Any|HandleFunc|Handle)"#,
+            r#"\s*\(\s*(?:"([^"\n]*)"|`([^`]*)`)\s*,"#,
+        ))
+        .map_err(|error| format!("invalid Go route matcher: {error}"))
+    })
+    .as_ref()
+    .map_err(Clone::clone)
+}
+
+/// `r.Use(...)` on any receiver.
+fn go_use_re() -> Result<&'static Regex, String> {
+    static RE: OnceLock<Result<Regex, String>> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(r#"(?m)(?-u:\b)([A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*)\.Use\s*\("#)
+            .map_err(|error| format!("invalid Go middleware matcher: {error}"))
+    })
+    .as_ref()
+    .map_err(Clone::clone)
+}
+
+/// `v1 := r.Group(...)` / `admin := r.With(...)` — a receiver derived from
+/// another, which inherits its middleware.
+fn go_derivation_re() -> Result<&'static Regex, String> {
+    static RE: OnceLock<Result<Regex, String>> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(
+            r#"(?m)(?-u:\b)([A-Za-z_][A-Za-z0-9_]*)\s*:?=\s*([A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*)\.(Group|With)\s*\("#,
+        )
+        .map_err(|error| format!("invalid Go router derivation matcher: {error}"))
+    })
+    .as_ref()
+    .map_err(Clone::clone)
+}
+
+/// Which Go router a file uses, read from its import paths.
+///
+/// Used for two things only: the `framework` label, and the one place the
+/// frameworks disagree about argument order — echo's
+/// `e.GET(path, handler, middleware...)` puts the handler *first*, where gin
+/// puts it last and chi takes one. Never as a gate: a file that imports none of
+/// these still has its registrations read, with gin's order and the label
+/// `go`.
+fn go_router_framework(source: &str) -> &'static str {
+    const KNOWN: &[(&str, &str)] = &[
+        ("\"github.com/labstack/echo", "echo"),
+        ("\"github.com/gin-gonic/gin\"", "gin"),
+        ("\"github.com/go-chi/chi", "chi"),
+        ("\"github.com/gorilla/mux\"", "gorilla/mux"),
+        ("\"net/http\"", "net/http"),
+    ];
+    KNOWN
+        .iter()
+        .find(|(import, _)| source.contains(import))
+        .map_or("go", |(_, framework)| framework)
+}
+
+/// Whether a Go argument could be a handler: not a literal, not `nil`.
+///
+/// `cache.Get("/k", &out)` has a receiver, a verb, a `/` path and a second
+/// argument, so the argument is what tells it from a route. An address-of is
+/// accepted only by `Handle`, whose argument is an `http.Handler` value and is
+/// routinely `&server{}`; on a verb method it is an out-parameter.
+fn go_argument_is_a_handler(argument: &str, takes_handler_value: bool) -> bool {
+    let Some(first) = argument.chars().next() else {
+        return false;
+    };
+    if matches!(first, '"' | '`' | '\'') || first.is_ascii_digit() || first == '-' {
+        return false;
+    }
+    if first == '&' && !takes_handler_value {
+        return false;
+    }
+    !matches!(argument, "nil" | "true" | "false")
+}
+
+/// A Go handler argument's symbol: the final segment of an identifier path,
+/// or nothing for a `func` literal or a wrapping call.
+fn go_handler_name(argument: &str) -> String {
+    if argument.contains('(') || argument.starts_with("func") {
+        return String::new();
+    }
+    let (name, _) = middleware_reference(argument);
+    name
+}
+
+/// The methods gorilla/mux chains after a registration:
+/// `r.HandleFunc("/x", h).Methods("GET", "POST")`.
+fn go_chained_methods(source: &str, call_end: usize) -> Vec<String> {
+    let Some(rest) = source.get(call_end..) else {
+        return Vec::new();
+    };
+    let Some(after) = rest.trim_start().strip_prefix(".Methods(") else {
+        return Vec::new();
+    };
+    let start = source.len() - after.len();
+    let Some((arguments, _)) = call_arguments(source, start) else {
+        return Vec::new();
+    };
+    top_level_arguments(arguments)
+        .into_iter()
+        .filter_map(|(_, argument)| string_literal(argument))
+        .filter(|method| !method.is_empty() && method.chars().all(|c| c.is_ascii_alphabetic()))
+        .map(str::to_ascii_uppercase)
+        .collect()
+}
+
+/// Go HTTP routes with their middleware.
+///
+/// Covers chi, gin, echo, gorilla/mux and net/http (including Go 1.22's
+/// `"GET /path"` patterns), plus `r.Use(...)` and the `Group`/`With`
+/// derivations that carry middleware to a child router. Not covered, and not
+/// guessed at: chi's `r.Route("/api", func(r chi.Router) {...})` and gin's
+/// `Group("/v1")` *path* prefixes (the route is recorded under its own path, as
+/// an Express route on a mounted router already is), `Method("GET", ...)`,
+/// gin's `Handle("GET", ...)`, and middleware applied by wrapping a handler in
+/// a call (`mux.Handle("/x", auth(h))`), which has no registration to read.
+fn go_routes(source: &str) -> Result<Vec<ExtractedRoute>, String> {
+    let framework = go_router_framework(source);
+    // Scopes are only consulted for a `Use` or a derivation, so a file with
+    // neither — most Go files, including most route files — never pays for
+    // the brace walk.
+    let blocks = if go_use_re()?.is_match(source) || go_derivation_re()?.is_match(source) {
+        brace_blocks(source)
+    } else {
+        Vec::new()
+    };
+
+    let mut uses = Vec::new();
+    for cap in go_use_re()?.captures_iter(source) {
+        let (Some(full), Some(receiver)) = (cap.get(0), cap.get(1)) else {
+            continue;
+        };
+        let Some((arguments, _)) = call_arguments(source, full.end()) else {
+            continue;
+        };
+        let middleware = middleware_entries(
+            &top_level_arguments(arguments),
+            full.end(),
+            MiddlewareScope::Router,
+        );
+        if middleware.is_empty() {
+            continue;
+        }
+        uses.push(RouterUse {
+            receiver: receiver.as_str().to_string(),
+            at: full.start(),
+            scope_end: block_end(&blocks, full.start(), source.len()),
+            prefix: None,
+            middleware,
+        });
+    }
+
+    let mut derivations = Vec::new();
+    for cap in go_derivation_re()?.captures_iter(source) {
+        let (Some(full), Some(child), Some(parent), Some(kind)) =
+            (cap.get(0), cap.get(1), cap.get(2), cap.get(3))
+        else {
+            continue;
+        };
+        let Some((arguments, _)) = call_arguments(source, full.end()) else {
+            continue;
+        };
+        let mut arguments = top_level_arguments(arguments);
+        // gin's `Group(path, handlers...)`: the first argument is the prefix.
+        if kind.as_str() == "Group" {
+            match arguments.first().map(|(_, first)| *first) {
+                Some(first) if string_literal(first).is_some() => {
+                    arguments.remove(0);
+                }
+                // chi's `Group(func(r chi.Router) {...})` derives no receiver
+                // by assignment; its closure is scoped by `brace_blocks`.
+                _ => continue,
+            }
+        }
+        derivations.push(Derivation {
+            child: child.as_str().to_string(),
+            parent: parent.as_str().to_string(),
+            at: full.start(),
+            scope_end: block_end(&blocks, full.start(), source.len()),
+            middleware: middleware_entries(&arguments, full.end(), MiddlewareScope::Router),
+        });
+    }
+
+    let mut routes = Vec::new();
+    for cap in go_route_re()?.captures_iter(source) {
+        let (Some(full), Some(receiver), Some(method)) = (cap.get(0), cap.get(1), cap.get(3))
+        else {
+            continue;
+        };
+        let Some(pattern) = cap.get(4).or_else(|| cap.get(5)).map(|m| m.as_str()) else {
+            continue;
+        };
+        let method = method.as_str();
+        let takes_pattern = matches!(method, "Handle" | "HandleFunc");
+        // Go 1.22 `net/http` patterns may carry their method: `"GET /users"`.
+        let (pattern_method, path) = match pattern.split_once(' ') {
+            Some((verb, path))
+                if takes_pattern
+                    && !verb.is_empty()
+                    && verb.chars().all(|c| c.is_ascii_uppercase()) =>
+            {
+                (Some(verb.to_string()), path.trim_start())
+            }
+            _ => (None, pattern),
+        };
+        if !path.starts_with('/') {
+            continue;
+        }
+        let Some((arguments, call_end)) = call_arguments(source, full.end()) else {
+            continue;
+        };
+        let arguments = top_level_arguments(arguments);
+        let echo_order = framework == "echo";
+        let handler_index = if echo_order { 0 } else { arguments.len() - 1 };
+        let (_, handler) = arguments[handler_index];
+        if !go_argument_is_a_handler(handler, method == "Handle") {
+            continue;
+        }
+        let inline = if echo_order {
+            &arguments[1..]
+        } else {
+            &arguments[..handler_index]
+        };
+
+        let methods = match method {
+            "Handle" | "HandleFunc" => match pattern_method {
+                Some(verb) => vec![verb],
+                None => {
+                    let chained = go_chained_methods(source, call_end);
+                    if chained.is_empty() {
+                        vec![UNSPECIFIED_METHOD.to_string()]
+                    } else {
+                        chained
+                    }
+                }
+            },
+            "Any" => vec![UNSPECIFIED_METHOD.to_string()],
+            verb => vec![verb.to_ascii_uppercase()],
+        };
+
+        // Router-scoped first, then `.With(...)`, then the call's own: the
+        // order the frameworks run them in.
+        let mut middleware =
+            router_middleware(&uses, &derivations, receiver.as_str(), full.start(), path);
+        if let Some(chain) = cap.get(2).filter(|m| !m.as_str().is_empty()) {
+            let mut cursor = chain.start();
+            while let Some(found) = source[cursor..chain.end()].find(".With(") {
+                let open = cursor + found + ".With(".len();
+                let Some((arguments, end)) = call_arguments(source, open) else {
+                    break;
+                };
+                middleware.extend(middleware_entries(
+                    &top_level_arguments(arguments),
+                    open,
+                    MiddlewareScope::Route,
+                ));
+                cursor = end;
+            }
+        }
+        middleware.extend(middleware_entries(
+            inline,
+            full.end(),
+            MiddlewareScope::Route,
+        ));
+
+        for verb in methods {
+            routes.push(ExtractedRoute {
+                framework: framework.to_string(),
+                http_method: verb,
+                path_pattern: path.to_string(),
+                handler_name: go_handler_name(handler),
+                span: Span {
+                    start_byte: full.start(),
+                    end_byte: full.end(),
+                },
+                middleware: Some(middleware.clone()),
+            });
+        }
+    }
+    Ok(routes)
+}
+
 pub fn extract_framework_routes(
     framework_name: &str,
     source: &str,
@@ -811,6 +1452,10 @@ pub fn extract_framework_routes(
                         start_byte: full.start(),
                         end_byte: full.end(),
                     },
+                    // No producer: Flask's `before_request` and FastAPI's
+                    // `Depends` are not read, so middleware is unknown here,
+                    // not absent.
+                    middleware: None,
                 });
             }
         }
@@ -863,6 +1508,9 @@ pub fn extract_framework_routes(
                         start_byte: name.start(),
                         end_byte: full.end(),
                     },
+                    // Django's middleware is a settings list, not a URLconf
+                    // fact; no producer reads it.
+                    middleware: None,
                 });
             }
         }
@@ -882,8 +1530,14 @@ pub fn extract_framework_routes(
                     start_byte: full.start(),
                     end_byte: full.end(),
                 },
+                // Axum layers (`.layer(...)`) are not read.
+                middleware: None,
             });
         }
+    }
+
+    if framework_name == "go" {
+        routes.extend(go_routes(source)?);
     }
 
     if framework_name == "javascript"
@@ -894,6 +1548,13 @@ pub fn extract_framework_routes(
         // of the file, and a site-by-site scan would be quadratic in a server
         // that registers many routes.
         let not_routers = non_router_receivers(source);
+        // Only paid for when the file registers middleware at all.
+        let blocks = if express_use_re()?.is_match(source) {
+            brace_blocks(source)
+        } else {
+            Vec::new()
+        };
+        let uses = express_router_uses(source, &not_routers, &blocks)?;
         for cap in express_re()?.captures_iter(source) {
             let (Some(full), Some(receiver)) = (cap.get(0), cap.get(1)) else {
                 continue;
@@ -916,20 +1577,39 @@ pub fn extract_framework_routes(
             // a list nobody could read would turn an unread call into a
             // deletion. The path and the trailing comma already matched.
             let readable_arguments = call_arguments(source, full.end())
-                .map(|(arguments, _)| last_top_level_argument(arguments));
-            if matches!(readable_arguments, Some(last) if !express_final_argument_is_a_handler(last))
-            {
+                .map(|(arguments, _)| top_level_arguments(arguments));
+            if matches!(
+                readable_arguments.as_deref().and_then(<[_]>::last),
+                Some((_, last)) if !express_final_argument_is_a_handler(last)
+            ) {
                 continue;
             }
+            // Everything between the path and the handler is middleware, and
+            // so is what the router registered before this route. An argument
+            // list nobody could read leaves the route's own entries unknown,
+            // so the whole field is: a list missing its inline half would
+            // read as complete.
+            let path = &cap[3];
+            let middleware = readable_arguments.map(|arguments| {
+                let mut middleware =
+                    router_middleware(&uses, &[], receiver.as_str(), full.start(), path);
+                middleware.extend(middleware_entries(
+                    &arguments[..arguments.len() - 1],
+                    full.end(),
+                    MiddlewareScope::Route,
+                ));
+                middleware
+            });
             routes.push(ExtractedRoute {
                 framework: "express".to_string(),
                 http_method: cap[2].to_uppercase(),
-                path_pattern: cap[3].to_string(),
+                path_pattern: path.to_string(),
                 handler_name: express_handler_name(source, full.end()).unwrap_or_default(),
                 span: Span {
                     start_byte: full.start(),
                     end_byte: full.end(),
                 },
+                middleware,
             });
         }
     }
@@ -2156,5 +2836,229 @@ mod express_receiver_tests {
             routes("app.get(/^\\/users/, handleUsers);\n").is_empty(),
             "a RegExp path is not a string literal, before or after this change"
         );
+    }
+}
+
+#[cfg(test)]
+mod middleware_tests {
+    use super::*;
+
+    /// `VERB path -> handler [scope:name(qualifier)...]` for every route, so a
+    /// whole file's middleware reads as one comparable value. An entry that
+    /// names no symbol prints its expression in braces.
+    fn shape(language: &str, source: &str) -> Vec<String> {
+        extract_framework_routes(language, source)
+            .expect("matchers compile")
+            .into_iter()
+            .map(|route| {
+                let middleware = match &route.middleware {
+                    None => "unknown".to_string(),
+                    Some(entries) => entries
+                        .iter()
+                        .map(|entry| {
+                            let what = if entry.name.is_empty() {
+                                format!("{{{}}}", entry.expression)
+                            } else {
+                                match &entry.qualifier {
+                                    Some(q) => format!("{}({q})", entry.name),
+                                    None => entry.name.clone(),
+                                }
+                            };
+                            format!("{}:{what}", entry.scope.label())
+                        })
+                        .collect::<Vec<_>>()
+                        .join(" "),
+                };
+                format!(
+                    "{} {} -> {} [{middleware}]",
+                    route.http_method, route.path_pattern, route.handler_name
+                )
+            })
+            .collect()
+    }
+
+    /// The Express stack, as Express runs it: what the router registered
+    /// before the route, then the route's own arguments between path and
+    /// handler. A `use` after a route does not run for it, a `use` on another
+    /// router does not run for it, and a mount path scopes a `use` to the
+    /// paths under it — on segment boundaries, so `/api` does not cover
+    /// `/apix`.
+    #[test]
+    fn an_express_route_carries_the_middleware_that_runs_before_it() {
+        let source = concat!(
+            "const express = require('express');\n",
+            "import cors from 'cors';\n",
+            "const app = express();\n",
+            "const router = express.Router();\n",
+            "app.get('/early', early);\n",
+            "app.use(cors());\n",
+            "app.use(express.json());\n",
+            "app.use('/api', apiAuth);\n",
+            "router.use(routerOnly);\n",
+            "app.get('/api/users', validate, [audit, auth.required], listUsers);\n",
+            "app.get('/apix', h1);\n",
+            "app.get('/health', (req, res, next) => next(), health);\n",
+            "app.post('/api', requireRole('admin'), function create(req, res) {});\n",
+        );
+        assert_eq!(
+            shape("javascript", source),
+            [
+                "GET /early -> early []",
+                "GET /api/users -> listUsers [router:cors router:json(express) router:apiAuth \
+                 route:validate route:audit route:required(auth)]",
+                "GET /apix -> h1 [router:cors router:json(express)]",
+                "GET /health -> health [router:cors router:json(express) \
+                 route:{(req, res, next) => next()}]",
+                "POST /api -> create [router:cors router:json(express) router:apiAuth \
+                 route:requireRole]",
+            ]
+        );
+    }
+
+    /// A middleware producer ran and found nothing is `Some([])`; no producer
+    /// is `None`. The two must never look alike, or "this route is
+    /// unauthenticated" is read off a framework nothing inspected.
+    #[test]
+    fn only_a_framework_with_a_producer_claims_to_know_its_middleware() {
+        assert_eq!(
+            shape("javascript", "app.get('/x', handler);\n"),
+            ["GET /x -> handler []"]
+        );
+        let flask = "@app.get(\"/x\")\ndef view():\n    return 1\n";
+        assert_eq!(shape("python", flask), ["GET /x -> view [unknown]"]);
+        let axum = r#".route("/x", get(handler))"#;
+        assert_eq!(shape("rust", axum), ["GET /x -> handler [unknown]"]);
+    }
+
+    /// chi, as written: `r.Use` before routes, a `Group` closure whose own
+    /// `Use` must stay inside it, and a `With` chain on one route.
+    ///
+    /// The closure is the case that matters. Its parameter is also called `r`,
+    /// so a name-only rule would let `requireAuth` leak onto `/after` and
+    /// report a public route as authenticated. The parent's `Logger` does run
+    /// inside the group — chi copies the stack — and is reported there.
+    #[test]
+    fn a_chi_group_scopes_its_middleware_to_its_own_block() {
+        let source = r#"package api
+
+import (
+	"net/http"
+
+	"github.com/go-chi/chi/v5"
+	"github.com/go-chi/chi/v5/middleware"
+)
+
+func Routes() http.Handler {
+	r := chi.NewRouter()
+	r.Use(middleware.Logger)
+	r.Get("/public", publicHandler)
+	r.Group(func(r chi.Router) {
+		r.Use(requireAuth)
+		r.Get("/private", h.Private)
+	})
+	r.With(rateLimit(10)).Post("/login", loginHandler)
+	r.Get("/after", afterHandler)
+	return r
+}
+"#;
+        assert_eq!(
+            shape("go", source),
+            [
+                "GET /public -> publicHandler [router:Logger(middleware)]",
+                "GET /private -> Private [router:Logger(middleware) router:requireAuth]",
+                "POST /login -> loginHandler [router:Logger(middleware) route:rateLimit]",
+                "GET /after -> afterHandler [router:Logger(middleware)]",
+            ]
+        );
+        let routes = extract_framework_routes("go", source).unwrap();
+        assert!(routes.iter().all(|route| route.framework == "chi"));
+    }
+
+    /// gin: middleware before the handler, a `Group` that inherits the
+    /// parent's stack and adds its own, and a handler written as a literal.
+    #[test]
+    fn a_gin_group_inherits_its_parents_middleware() {
+        let source = r#"package server
+
+import "github.com/gin-gonic/gin"
+
+func Setup() *gin.Engine {
+	r := gin.New()
+	r.Use(gin.Recovery())
+	v1 := r.Group("/v1", authRequired)
+	v1.GET("/users", rateLimit, listUsers)
+	r.GET("/ping", func(c *gin.Context) { c.String(200, "pong") })
+	return r
+}
+"#;
+        assert_eq!(
+            shape("go", source),
+            [
+                "GET /users -> listUsers [router:Recovery(gin) router:authRequired \
+                 route:rateLimit]",
+                "GET /ping ->  [router:Recovery(gin)]",
+            ]
+        );
+    }
+
+    /// echo puts the handler first and route middleware after it; reading it
+    /// in gin's order would name the middleware as the handler.
+    #[test]
+    fn echo_route_middleware_follows_the_handler() {
+        let source = "package s\n\nimport \"github.com/labstack/echo/v4\"\n\n\
+                      func S(e *echo.Echo) {\n\te.GET(\"/x\", getX, audit, cache.Wrap)\n}\n";
+        assert_eq!(
+            shape("go", source),
+            ["GET /x -> getX [route:audit route:Wrap(cache)]"]
+        );
+    }
+
+    /// net/http and gorilla/mux: Go 1.22 method patterns, a pattern with no
+    /// method, gorilla's chained `.Methods(...)`, and an `http.Handler` value.
+    #[test]
+    fn net_http_and_gorilla_patterns_name_their_methods() {
+        let source = r#"package web
+
+import (
+	"net/http"
+
+	"github.com/gorilla/mux"
+)
+
+func Wire(mux *http.ServeMux, r *mux.Router) {
+	mux.HandleFunc("GET /items/{id}", getItem)
+	http.HandleFunc("/health", health)
+	mux.Handle("/static/", &fileServer{})
+	r.HandleFunc("/users", users).Methods("GET", "POST")
+}
+"#;
+        assert_eq!(
+            shape("go", source),
+            [
+                "GET /items/{id} -> getItem []",
+                "ANY /health -> health []",
+                "ANY /static/ ->  []",
+                "GET /users -> users []",
+                "POST /users -> users []",
+            ]
+        );
+    }
+
+    /// Go's other `Get`s are not routes: an HTTP client's takes one argument,
+    /// a cache's takes an out-parameter, and a key that is not a path is not a
+    /// route whatever follows it.
+    #[test]
+    fn a_go_get_that_is_not_a_route_is_not_recorded() {
+        let source = r#"package c
+
+func f() {
+	resp, err := http.Get("/x")
+	cache.Get("/k", &out)
+	store.Get("/k", nil)
+	cfg.Get("key", handler)
+	r.Get("/real", handler)
+}
+"#;
+        assert_eq!(shape("go", source), ["GET /real -> handler []"]);
     }
 }

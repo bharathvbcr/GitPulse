@@ -100,10 +100,11 @@ pub struct EvidencePack {
     /// nearest first, excluding test files already in `files`. Its own
     /// counters and `walk_incomplete` describe it; they are not the hits'.
     pub related_tests: Response<AffectedTest>,
-    /// Repository-wide: how much of the call graph could not be attributed,
-    /// so how far `calls`, `called_by` and `related_tests` may fall short.
-    /// Stated once for the pack rather than repeated on each list; `None` when
-    /// the generation records no gap or no edge was walked.
+    /// Where calls the resolver could not bind touch *this* pack: sites inside
+    /// a hit (its `calls` may fall short) and sites naming a symbol the
+    /// related-test walk reached (`called_by` and `related_tests` may), plus
+    /// any corpus-level hole. Stated once for the pack rather than repeated on
+    /// each list; `None` when the ledger holds no such site.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub coverage_gap: Option<String>,
     pub source_freshness: SourceFreshness,
@@ -115,6 +116,11 @@ pub struct EvidencePack {
     pub resolution: ResolutionAvailability,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub walk_incomplete: Option<String>,
+    /// The scope the hits were ranked within; see [`crate::Response::scope`].
+    /// `related_tests` is restricted to it too, and
+    /// `related_tests_outside_scope` counts what that left out.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<crate::scope::ScopeReport>,
 }
 
 /// Build the pack from an `ask` response and its index-aligned qualified names.
@@ -141,6 +147,7 @@ pub fn assemble(
         truncated,
         resolution,
         walk_incomplete,
+        scope,
         ..
     } = response;
 
@@ -224,6 +231,7 @@ pub fn assemble(
         tokens_used,
         resolution,
         walk_incomplete,
+        scope,
     })
 }
 

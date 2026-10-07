@@ -1313,7 +1313,16 @@ CREATE INDEX IF NOT EXISTS idx_unresolved_rows_callee
     ON unresolved_rows(callee_name);
 "#;
 
-pub const CURRENT_SCHEMA_VERSION: i32 = 24;
+/// v24 → v25 advances `user_version` only. The bump exists so an older binary
+/// that does not know `EdgeKind::Registers` — route middleware, stored as the
+/// `Registers` spelling in the free-TEXT `edge_kind` column — refuses the store
+/// at open with a schema message, rather than failing every edge read with
+/// `UnknownEdgeKind` once a build has written one. No DDL changes. (Written as
+/// v23 → v24 on its branch; renumbered at merge because main had already
+/// claimed v24 for the `callee_name` index.)
+pub const MIGRATION_V24_TO_V25: &str = "";
+
+pub const CURRENT_SCHEMA_VERSION: i32 = 25;
 
 /// The `user_version` the Python engine's `index.sqlite` carries — a database
 /// this kernel never wrote and cannot read. Named once, here, so the store's
@@ -1354,6 +1363,8 @@ pub const FRESH_SCHEMA_BATCHES: &[&str] = &[
     // After `MIGRATION_V20_TO_V21`, which drops this same index: the order is
     // the ladder's, so a fresh store ends where a migrated one does.
     MIGRATION_V23_TO_V24,
+    // Empty: v25 only stamps `user_version`.
+    MIGRATION_V24_TO_V25,
 ];
 
 /// Strip SQL line comments so a scan of DDL text cannot read prose as code.

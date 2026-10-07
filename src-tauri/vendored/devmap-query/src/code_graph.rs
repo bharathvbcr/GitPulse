@@ -181,6 +181,7 @@ pub const EDGE_KIND_LABELS: &[&str] = &[
     "implements",
     "subscribes",
     "routes_to",
+    "registers",
     "wired_to",
     "member_of",
     "depends_on",
@@ -204,6 +205,7 @@ fn edge_kind_label(kind: EdgeKind) -> &'static str {
         EdgeKind::Implements => "implements",
         EdgeKind::SubscribesTo => "subscribes",
         EdgeKind::HandlesRoute => "routes_to",
+        EdgeKind::Registers => "registers",
         EdgeKind::WiredTo => "wired_to",
         EdgeKind::MemberOf => "member_of",
         EdgeKind::DependsOn => "depends_on",
@@ -957,6 +959,29 @@ fn graph_core(
                 "framework".to_string(),
                 Value::String(route.framework.clone()),
             );
+            // The middleware as declared, including entries that name no
+            // symbol and so have no `registers` edge — an inline arrow
+            // function is still middleware the route runs. The key is absent
+            // when no producer ran for this route, which is the one signal a
+            // consumer has that "unknown" is not "none".
+            if let Some(middleware) = &route.middleware {
+                extras.insert(
+                    "middleware".to_string(),
+                    Value::Array(
+                        middleware
+                            .iter()
+                            .map(|entry| {
+                                json!({
+                                    "name": entry.name,
+                                    "qualifier": entry.qualifier,
+                                    "expression": entry.expression,
+                                    "scope": entry.scope.label(),
+                                })
+                            })
+                            .collect(),
+                    ),
+                );
+            }
 
             let kind = node_kind_label(SymbolKind::Route);
             node_index.insert(id.clone(), (line, kind));

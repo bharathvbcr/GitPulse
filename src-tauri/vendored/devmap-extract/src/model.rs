@@ -166,6 +166,13 @@ pub enum EdgeKind {
     Implements,
     SubscribesTo,
     HandlesRoute,
+    /// A route runs a piece of middleware before its handler: `app.use(auth)`
+    /// ahead of `app.get('/x', h)`, `r.Use(mw)`, an inline `app.get('/x',
+    /// auth, h)`. Source is the route node — the same identity `HandlesRoute`
+    /// starts from — and target the middleware symbol, so a route's
+    /// out-edges are everything it dispatches to and the middleware is
+    /// reached from outside the call graph exactly as a handler is.
+    Registers,
     WiredTo,
     MemberOf,
     DependsOn,
@@ -751,6 +758,21 @@ pub struct ExtractedSymbol {
     /// carry a number nothing reads back.
     #[serde(default, skip_serializing)]
     pub declaration_hash: Option<u64>,
+    /// The return type a callable's declaration writes, verbatim and trimmed:
+    /// `*Registry` for Go's `func NewRegistry() *Registry`, `Svc` for
+    /// TypeScript's `function make(): Svc` and Python's `-> Svc`, `Self` for a
+    /// Rust `fn new() -> Self`.
+    ///
+    /// The fact that types a factory-built value. `w := NewWorker()` and
+    /// `const svc = createService()` are the idiomatic constructors in Go and
+    /// in most service-style TypeScript, and without the callee's written
+    /// return type the receiver `w` had no type and every method called on it
+    /// had no caller. Recorded as written; the resolver decides what is a
+    /// nominal type (it refuses generics, tuples and unions) so one owner
+    /// holds that rule. `None` when nothing was written, and for a Go result
+    /// list of more than one type: `(T, error)` names no single value.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub return_type: Option<String>,
 }
 
 /// Two hashes of one symbol body, from [`crate::clonesig`].
@@ -948,6 +970,44 @@ pub struct ExtractedReference {
     pub receiver_expr: Option<String>,
 }
 
+impl ExtractedReference {
+    /// The simple shape of the expression this reference starts, when it is an
+    /// initializer: `T{..}` for a constructor, `T::new` for a Rust associated
+    /// constructor, `recv.f` for a call through a receiver, and the bare callee
+    /// otherwise. `None` for anything that is not a call or a constructor.
+    ///
+    /// One owner for the spelling, because two readers need it: the extractor
+    /// stamps it on a local binding's `initializer`, and the resolver reads it
+    /// for a module-scope value, whose declaration has no local binding.
+    ///
+    /// A call *reference* does not always carry `receiver_expr` — `Engine::new`
+    /// is a `scoped_identifier` whose receiver lives on the mirrored
+    /// `ExtractedCall` — so the call whose span contains this reference is
+    /// consulted for it.
+    pub fn initializer_shape(&self, calls: &[ExtractedCall]) -> Option<String> {
+        match self.kind {
+            ReferenceKind::Constructor => Some(format!("{}{{..}}", self.name)),
+            ReferenceKind::Call => {
+                let receiver = self.receiver_expr.as_deref().or_else(|| {
+                    calls.iter().find_map(|call| {
+                        (call.callee_name == self.name
+                            && call.span.start_byte <= self.span.start_byte
+                            && call.span.end_byte >= self.span.end_byte)
+                            .then_some(call.receiver_expr.as_deref())
+                            .flatten()
+                    })
+                });
+                Some(match receiver {
+                    Some(receiver) if self.name == "new" => format!("{receiver}::new"),
+                    Some(receiver) => format!("{receiver}.{}", self.name),
+                    None => self.name.clone(),
+                })
+            }
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExtractedExport {
     pub exported_name: String,
@@ -963,6 +1023,78 @@ pub struct ExtractedRoute {
     pub path_pattern: String,
     pub handler_name: String,
     pub span: Span,
+    /// The middleware that runs before this route's handler, in order.
+    ///
+    /// Three states, and the difference between the first two is the point:
+    ///
+    /// * `None` — no middleware producer ran for this route. Flask, FastAPI,
+    ///   Django and Axum routes have none, and so does every route a binary
+    ///   older than the field extracted. A consumer must report middleware as
+    ///   *unknown* here, never as empty.
+    /// * `Some([])` — a producer ran and this route has no middleware.
+    /// * `Some([..])` — what the producer found, router-registered entries
+    ///   first, then the route's own, which is the order the frameworks run
+    ///   them.
+    ///
+    /// `serde(default)` reads a cached extraction written before the field as
+    /// `None`, which is the truth about it.
+    #[serde(default)]
+    pub middleware: Option<Vec<ExtractedMiddleware>>,
+}
+
+/// One piece of middleware a route runs through.
+///
+/// Recorded as written, not as resolved: `name` is the symbol the expression
+/// names and `qualifier` the binding it was reached through, and the resolver
+/// decides whether that is a repository symbol (a `Registers` edge), an
+/// external package, or neither. The extractor cannot tell `middleware.Logger`
+/// from chi apart from a repository package called `middleware`; the resolver
+/// holds the file's imports and can.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExtractedMiddleware {
+    /// The symbol the expression names: `auth` for `auth`,
+    /// `requireRole` for `requireRole('admin')` (the factory is the symbol the
+    /// repository declares), `Logger` for `middleware.Logger`. Empty when it
+    /// names none — an arrow function, a `func` literal — so there is nothing
+    /// to bind and the entry is reported by its expression alone.
+    pub name: String,
+    /// The root binding of a qualified expression — `middleware` in
+    /// `middleware.Logger`, `express` in `express.json()` — or `None` for a
+    /// bare name.
+    #[serde(default)]
+    pub qualifier: Option<String>,
+    /// The argument's source text, trimmed and capped at
+    /// [`MIDDLEWARE_EXPRESSION_CAP`] bytes, so an anonymous entry is still
+    /// identifiable.
+    pub expression: String,
+    pub scope: MiddlewareScope,
+    pub span: Span,
+}
+
+/// Longest middleware expression kept verbatim, in bytes. An inline arrow
+/// function can be a whole handler body; the head of it identifies it.
+pub const MIDDLEWARE_EXPRESSION_CAP: usize = 160;
+
+/// Where a piece of middleware was attached to the route.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MiddlewareScope {
+    /// Registered on the router before the route was: `app.use(auth)`,
+    /// `r.Use(auth)`, or inherited by a group derived from that router.
+    Router,
+    /// Passed in the route's own registration: `app.get('/x', auth, h)`,
+    /// gin's `r.GET("/x", auth, h)`, echo's trailing middleware, chi's
+    /// `r.With(auth).Get(...)`.
+    Route,
+}
+
+impl MiddlewareScope {
+    pub fn label(self) -> &'static str {
+        match self {
+            MiddlewareScope::Router => "router",
+            MiddlewareScope::Route => "route",
+        }
+    }
 }
 
 impl ExtractedRoute {
@@ -1446,13 +1578,7 @@ impl Extraction {
     /// `RegexFallback` and `Unavailable` are excluded: a grammar was *wanted*
     /// there and did not run, which is a failure and is charged as one.
     pub fn grammar_read_this_file(&self) -> bool {
-        matches!(
-            self.engine,
-            ExtractionEngine::TreeSitter { .. } | ExtractionEngine::Notebook { .. }
-        ) && matches!(
-            self.parse_outcome,
-            ParseOutcome::Clean | ParseOutcome::Partial { .. }
-        )
+        grammar_read(&self.engine, &self.parse_outcome)
     }
 
     /// Whether this file can be the subject of a liveness verdict, and if not,
@@ -1547,12 +1673,14 @@ impl Extraction {
     /// future engine that re-dispatches to another grammar answers here rather
     /// than at four call sites that would each have to remember.
     pub fn capabilities(&self) -> crate::languages::Capabilities {
-        match &self.engine {
-            ExtractionEngine::Notebook { kernel_language } => {
-                crate::languages::capabilities_for_language(kernel_language)
-            }
-            _ => crate::languages::capabilities_for_language(&self.language),
-        }
+        capabilities_of(&self.language, &self.engine)
+    }
+
+    /// Whether a grammar read this file and no call extractor exists for its
+    /// language — every symbol in it is uncalled and calls nothing *by
+    /// construction*. See [`is_call_blind`].
+    pub fn is_call_blind(&self) -> bool {
+        is_call_blind(&self.language, &self.engine, &self.parse_outcome)
     }
 
     /// Method `qualified_name` to declared parameter count, for the Go
@@ -1591,6 +1719,56 @@ impl Extraction {
         });
         durable
     }
+}
+
+/// What the extractor can observe in a file read by `engine` under
+/// `language`. The body of [`Extraction::capabilities`], lifted out so a
+/// *stored* file row — which keeps `language` and `engine` but not the
+/// extraction — gets the same answer, notebook kernels included.
+pub fn capabilities_of(
+    language: &str,
+    engine: &ExtractionEngine,
+) -> crate::languages::Capabilities {
+    match engine {
+        ExtractionEngine::Notebook { kernel_language } => {
+            crate::languages::capabilities_for_language(kernel_language)
+        }
+        _ => crate::languages::capabilities_for_language(language),
+    }
+}
+
+/// The body of [`Extraction::grammar_read_this_file`], for the same reason as
+/// [`capabilities_of`].
+pub fn grammar_read(engine: &ExtractionEngine, parse_outcome: &ParseOutcome) -> bool {
+    matches!(
+        engine,
+        ExtractionEngine::TreeSitter { .. } | ExtractionEngine::Notebook { .. }
+    ) && matches!(
+        parse_outcome,
+        ParseOutcome::Clean | ParseOutcome::Partial { .. }
+    )
+}
+
+/// Whether a grammar read this file cleanly in a language this build has no
+/// call extractor for.
+///
+/// The one predicate `dead` prices a symbol's ceiling with and `impact` /
+/// `trace` refuse an empty answer with (P2.7a). Two copies is how the two
+/// came to disagree: `dead` charged a `.tf` symbol as call-blind while
+/// `impact` on the same symbol answered `total: 0, Available` with no
+/// qualification — a check that never ran, published as one that found
+/// nothing.
+///
+/// Files a grammar did not read are not call-blind: they are charged as
+/// parse failures or pattern recoveries instead, and charging them twice
+/// would double-count one hole.
+pub fn is_call_blind(
+    language: &str,
+    engine: &ExtractionEngine,
+    parse_outcome: &ParseOutcome,
+) -> bool {
+    grammar_read(engine, parse_outcome)
+        && !capabilities_of(language, engine).contains(crate::languages::Capability::Calls)
 }
 
 #[cfg(test)]
@@ -1797,6 +1975,7 @@ mod go_interface_exemption_tests {
             parent_symbol: None,
             body_signature: None,
             declaration_hash: None,
+            return_type: None,
         }
     }
 

@@ -350,6 +350,7 @@ pub fn scan_declarations_in(language: &str, file_path: &str, source: &str) -> Fa
                 parent_symbol: None,
                 body_signature: None,
                 declaration_hash: None,
+                return_type: None,
             });
             // First matching pattern wins for a given line; the tables are
             // ordered from most to least specific.

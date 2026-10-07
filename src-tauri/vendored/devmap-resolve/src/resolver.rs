@@ -115,16 +115,23 @@ fn charge_ambiguity(
         candidates.rows.len() as u64
     };
     let additional = candidates.evidence_bytes.saturating_mul(rows);
-    counter
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
-            used.checked_add(additional).filter(|next| *next <= limit)
-        })
-        .map(|_| ())
-        .map_err(|used| ResolutionLimitError {
-            resource: "ambiguity evidence bytes",
-            limit,
-            attempted: used.saturating_add(additional),
-        })
+    // An explicit compare-exchange loop rather than `fetch_update`, which Rust
+    // 1.99 deprecates in favour of `try_update` — a name older toolchains this
+    // workspace still builds on do not have.
+    let mut used = counter.load(Ordering::Relaxed);
+    loop {
+        let Some(next) = used.checked_add(additional).filter(|next| *next <= limit) else {
+            return Err(ResolutionLimitError {
+                resource: "ambiguity evidence bytes",
+                limit,
+                attempted: used.saturating_add(additional),
+            });
+        };
+        match counter.compare_exchange_weak(used, next, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => return Ok(()),
+            Err(current) => used = current,
+        }
+    }
 }
 
 /// Where the name a resolution rung failed on was written.
@@ -286,6 +293,10 @@ pub struct Resolver {
     /// Ambiguity abstains rather than picking, the same rule
     /// [`Self::unique_basename`] follows.
     rust_crate_roots: BTreeMap<String, Option<String>>,
+    /// `(file, qualified name)` → the header a Rust function was declared
+    /// with. Read by the rungs that type a binding from a return type or a
+    /// closure parameter; see `devmap_extract::rustsig`.
+    rust_signatures: BTreeMap<(String, String), String>,
     /// `<file>::<exported name>` -> the file that declares it, for
     /// `export { x } from './m'`. See `compute_reexport_chains`.
     reexport_chains: BTreeMap<String, String>,
@@ -325,6 +336,53 @@ pub struct Resolver {
     subtypes: BTreeMap<(LangFamily, String), BTreeSet<String>>,
     /// Per-file local import name → (target file, exported symbol) for import-scoped calls (G6).
     import_bindings: BTreeMap<String, BTreeMap<String, (String, String)>>,
+    /// `(importing file, local name)` → the `(file, name)` that **declares** the
+    /// value a named import binds, for the subset of `import_bindings` that
+    /// name a declared value rather than a module.
+    ///
+    /// `import { svc } from './service'` and `from pkg import obj` bind a
+    /// *value*; `import * as service`, `import pkg` and a Python submodule
+    /// bound by `from pkg import cmd` bind a *module*. Both land in
+    /// `import_bindings` with the same shape, and the module-member rung (2b)
+    /// read every one of them as a module: `svc.zzhelper()` bound to a free
+    /// function `zzhelper` that merely shares the module, at DETERMINISTIC.
+    /// Recorded at the one place the binding is made, because only there is it
+    /// known which branch chose the target — inferring it afterwards from
+    /// `file_symbols` cannot tell `service.py` declaring `service` from the
+    /// module `service` itself.
+    value_imports: BTreeMap<(String, String), (String, String)>,
+    /// `(file, name)` → the one indexed class a **module-scope** value is an
+    /// instance of: `export const svc = new SvcClass()`, Python
+    /// `service = Service()`.
+    ///
+    /// Kept apart from `receiver_types`, whose `file:var` key is written by
+    /// every assignment in the file whatever its scope — so a function-local
+    /// `const svc = new Other()` would lend the exported `svc` its type. This
+    /// map is written only from the declaration's own initializer, and
+    /// withdrawn when anything else in the file assigns the name. It is what a
+    /// value import is typed by in another file, which is the whole shape of a
+    /// singleton service: declared once, called everywhere else.
+    module_value_types: BTreeMap<(String, String), String>,
+    /// `(file, name)` → the names a module-scope value's **own declaration**
+    /// carries: the shorthand properties of `export const api = { get, post }`
+    /// and the methods written inside `export const log = { info() {…} }`.
+    ///
+    /// The evidence that makes `api.get()` a call to the module's `get`. A
+    /// named value import is not a module, so its members are not the
+    /// module's free functions in general — `svc.helper()` on a service
+    /// instance is never a sibling `function helper` — but an object literal
+    /// built from those functions is exactly that. Only a name the literal
+    /// itself spells is admitted, so the coincidence stays refused.
+    module_value_members: BTreeMap<(String, String), BTreeSet<String>>,
+    /// `(file, qualified name)` → the return type a callable's declaration
+    /// writes, as the extractor recorded it. What types a factory-built value;
+    /// read only through [`Self::factory_return_type`].
+    return_types: BTreeMap<(String, String), String>,
+    /// `(file, name)` → the initializer shape of a module-scope value built by
+    /// a call that is not a class: `var r = NewRegistry()`, `export const s =
+    /// createService()`. Resolved lazily, because the factory may be declared
+    /// in a file indexed after this one.
+    module_value_factories: BTreeMap<(String, String), (LangFamily, String)>,
     /// `file:scope:var` and `file:var` → the *declared* type name of a value,
     /// whether or not that type is indexed (SC25).
     ///
@@ -511,6 +569,7 @@ impl Resolver {
             path_module_bindings: BTreeMap::new(),
             py_search_dirs: BTreeMap::new(),
             rust_crate_roots: BTreeMap::new(),
+            rust_signatures: BTreeMap::new(),
             reexport_chains: BTreeMap::new(),
             receiver_types: BTreeMap::new(),
             scoped_receiver_types: BTreeMap::new(),
@@ -519,6 +578,11 @@ impl Resolver {
             supertypes: BTreeMap::new(),
             subtypes: BTreeMap::new(),
             import_bindings: BTreeMap::new(),
+            value_imports: BTreeMap::new(),
+            module_value_types: BTreeMap::new(),
+            module_value_members: BTreeMap::new(),
+            return_types: BTreeMap::new(),
+            module_value_factories: BTreeMap::new(),
             declared_types: BTreeMap::new(),
             external_imports: BTreeMap::new(),
             unindexed_local_imports: BTreeMap::new(),
@@ -540,6 +604,458 @@ impl Resolver {
             max_indexed_path_depth: 0,
             unique_basename: BTreeMap::new(),
         }
+    }
+
+    /// The one indexed `Class`/`Struct` called `name` in a family `family`
+    /// admits, or `None` when there is no such type or more than one.
+    ///
+    /// The same test the receiver maps have always applied before binding a
+    /// name to a type: a type the corpus declares twice cannot be dispatched
+    /// on, so it types nothing.
+    fn unique_indexed_type(&self, family: LangFamily, name: &str) -> bool {
+        self.symbol_index.get(name).is_some_and(|candidates| {
+            candidates
+                .iter()
+                .filter(|(_, kind, candidate_family, _)| {
+                    family.admits(*candidate_family)
+                        && matches!(kind, SymbolKind::Class | SymbolKind::Struct)
+                })
+                .count()
+                == 1
+        })
+    }
+
+    /// Fill [`Self::module_value_types`] for one file.
+    ///
+    /// A module-scope value is typed by its declaration's **initializer** —
+    /// the outermost reference the extractor attached to the declared name
+    /// inside the declaration's own span. "Outermost" is the earliest start:
+    /// in `new Service(makeDep())` the constructor begins before its
+    /// arguments, and every argument carries the same `assigned_to`, so taking
+    /// any of them would type the singleton by its dependency. A tie at the
+    /// earliest offset is two readings of one expression and abstains.
+    ///
+    /// Withdrawn — never re-answered — when anything else in the file assigns
+    /// the name a constructor or call: a second module-level assignment, or a
+    /// function that reassigns it (`function swap() { svc = new Other(); }`).
+    /// A function-local of the same name is indistinguishable from that
+    /// reassignment in the extraction, so it withdraws the answer too; that
+    /// costs an abstention, where reading it the other way would cost a
+    /// confidently wrong edge.
+    fn index_module_value_types(&mut self, ext: &Extraction, family: LangFamily) {
+        let mut declarations: BTreeMap<&str, Vec<&Span>> = BTreeMap::new();
+        for symbol in &ext.symbols {
+            if symbol.kind == SymbolKind::Variable
+                && symbol.parent_symbol.as_deref() == Some(ext.file_path.as_str())
+            {
+                declarations
+                    .entry(symbol.name.as_str())
+                    .or_default()
+                    .push(&symbol.span);
+            }
+        }
+        // An unexported Go package var is no symbol — the extractor publishes
+        // only exported package bindings — but its initializer is bound to its
+        // name at package scope. Go has no package-level statements other than
+        // declarations, and forbids declaring a name twice in a package, so the
+        // whole file is that declaration's span: every package-scope reference
+        // bound to the name belongs to it.
+        if ext.language == "go" {
+            if let Some(file_span) = ext
+                .symbols
+                .iter()
+                .find(|symbol| symbol.kind == SymbolKind::File)
+                .map(|symbol| &symbol.span)
+            {
+                for reference in &ext.references {
+                    let Some(bound) = reference.assigned_to.as_deref() else {
+                        continue;
+                    };
+                    if reference.enclosing_symbol.is_none()
+                        && matches!(
+                            reference.kind,
+                            ReferenceKind::Constructor | ReferenceKind::Call
+                        )
+                        && !declarations.contains_key(bound)
+                    {
+                        declarations.insert(bound, vec![file_span]);
+                    }
+                }
+            }
+        }
+        for (name, spans) in declarations {
+            // Two module-level declarations of one name: the type is whichever
+            // ran last, which is not a fact the extraction holds.
+            let [span] = spans.as_slice() else {
+                continue;
+            };
+            let within = |inner: &Span| {
+                inner.start_byte >= span.start_byte && inner.end_byte <= span.end_byte
+            };
+            // What the declaration itself spells: methods written inside it,
+            // and names it reads at module scope (`{ get, post }`). A name read
+            // inside one of those methods' bodies has an enclosing symbol and
+            // is not a member.
+            let members: BTreeSet<String> = ext
+                .symbols
+                .iter()
+                .filter(|symbol| symbol.name != name && within(&symbol.span))
+                .map(|symbol| symbol.name.clone())
+                .chain(
+                    ext.references
+                        .iter()
+                        .filter(|reference| {
+                            reference.enclosing_symbol.is_none()
+                                && reference.receiver_expr.is_none()
+                                && matches!(reference.kind, ReferenceKind::Name)
+                                && within(&reference.span)
+                        })
+                        .map(|reference| reference.name.clone()),
+                )
+                .collect();
+            // Members are read only for a value import, which Go does not have
+            // — and a Go declaration's span may be the whole file, which would
+            // make every symbol in it a member.
+            if !members.is_empty() && ext.language != "go" {
+                self.module_value_members
+                    .insert((ext.file_path.clone(), name.to_string()), members);
+            }
+            let mut earliest: Option<(usize, &ExtractedReference)> = None;
+            let mut tied = false;
+            let mut reassigned = false;
+            for reference in &ext.references {
+                if reference.assigned_to.as_deref() != Some(name)
+                    || !matches!(
+                        reference.kind,
+                        ReferenceKind::Constructor | ReferenceKind::Call
+                    )
+                {
+                    continue;
+                }
+                let in_declaration = reference.enclosing_symbol.is_none()
+                    && reference.span.start_byte >= span.start_byte
+                    && reference.span.end_byte <= span.end_byte;
+                if !in_declaration {
+                    reassigned = true;
+                    break;
+                }
+                match earliest {
+                    Some((start, _)) if reference.span.start_byte > start => {}
+                    Some((start, _)) if reference.span.start_byte == start => tied = true,
+                    _ => {
+                        earliest = Some((reference.span.start_byte, reference));
+                        tied = false;
+                    }
+                }
+            }
+            if reassigned || tied {
+                continue;
+            }
+            let Some((_, initializer)) = earliest else {
+                continue;
+            };
+            let key = (ext.file_path.clone(), name.to_string());
+            if self.unique_indexed_type(family, &initializer.name) {
+                self.module_value_types
+                    .insert(key, initializer.name.clone());
+            } else if initializer.kind == ReferenceKind::Call {
+                // A factory. Its declaration may sit in a file not yet indexed,
+                // so the shape is kept and resolved when it is read.
+                if let Some(shape) = initializer.initializer_shape(&ext.calls) {
+                    self.module_value_factories.insert(key, (family, shape));
+                }
+            }
+        }
+    }
+
+    /// The class a module-scope value `name` declared in `file` is an instance
+    /// of, following a re-export chain to the file that declares it, and — for
+    /// Go — to the sibling file of the same package that declares it.
+    fn module_value_type(&self, file: &str, name: &str) -> Option<String> {
+        if let Some(found) = self.module_value_type_in(file, name) {
+            return Some(found);
+        }
+        if let Some(terminal) = self.reexport_chains.get(&format!("{file}::{name}")) {
+            let (declaring_file, declared) = terminal.rsplit_once("::")?;
+            return self.module_value_type_in(declaring_file, declared);
+        }
+        self.go_package_value_type(file, name)
+    }
+
+    /// The type one file's own declaration of `name` gives it: a constructor
+    /// initializer recorded at index time, or a factory resolved now.
+    fn module_value_type_in(&self, file: &str, name: &str) -> Option<String> {
+        let key = (file.to_string(), name.to_string());
+        if let Some(found) = self.module_value_types.get(&key) {
+            return Some(found.clone());
+        }
+        let (family, shape) = self.module_value_factories.get(&key)?;
+        self.factory_return_type(*family, file, None, shape)
+    }
+
+    /// A Go package-level value declared in another file of `file`'s package.
+    ///
+    /// A Go package is one namespace spread over its files, so
+    /// `defaultRegistry.Add()` in `register.go` names the `var` in
+    /// `registry.go` with no import between them. Only an answer every
+    /// declaring file agrees on is given: two build-constrained files may each
+    /// declare the name, and they need not agree.
+    fn go_package_value_type(&self, file: &str, name: &str) -> Option<String> {
+        if !file.ends_with(".go") || !Self::is_plain_ident(name) {
+            return None;
+        }
+        let package = self.go_package_by_file.get(file)?;
+        let mut found: Option<String> = None;
+        for sibling in self.go_files_in_dir(&Self::parent_dir(file)) {
+            if sibling == file || self.go_package_by_file.get(&sibling) != Some(package) {
+                continue;
+            }
+            let key = (sibling.clone(), name.to_string());
+            if !self.module_value_types.contains_key(&key)
+                && !self.module_value_factories.contains_key(&key)
+            {
+                continue;
+            }
+            let typed = self.module_value_type_in(&sibling, name)?;
+            match &found {
+                Some(existing) if existing != &typed => return None,
+                _ => found = Some(typed),
+            }
+        }
+        found
+    }
+
+    /// The language family a file was indexed under, read from its own `File`
+    /// symbol so it cannot disagree with the family its symbols carry.
+    fn family_of_file(&self, file: &str) -> Option<LangFamily> {
+        self.symbol_index
+            .get(file)?
+            .iter()
+            .find_map(|(path, kind, family, _)| {
+                (path == file && *kind == SymbolKind::File).then_some(*family)
+            })
+    }
+
+    /// The nominal type a factory call returns, from the callee's written
+    /// return type: `NewRegistry` → `Registry` for `func NewRegistry()
+    /// *Registry`, `svc.make` → `Svc`, `Svc::open` → `Svc`.
+    ///
+    /// The callee is found the way the call ladder would find it, and only by
+    /// rungs that name one declaration: a file-level function of this file (or
+    /// of its Go package), a named import, a member of an imported module
+    /// handle, or an associated function of a type. A bare callee the scope
+    /// binds itself — a parameter or a local closure named `make` — is not the
+    /// module's `make`, so it abstains. The answer must be a single indexed
+    /// class or struct; a generic, a tuple, `Promise<T>` or an optional names
+    /// no type a method can be dispatched on, and `admissible_nominal_type`
+    /// refuses each.
+    fn factory_return_type(
+        &self,
+        family: LangFamily,
+        file: &str,
+        scope: Option<&str>,
+        shape: &str,
+    ) -> Option<String> {
+        let shape = shape.trim();
+        if shape.ends_with("{..}") || shape.ends_with("::new") {
+            // Constructor shapes have their own rung, which needs no callee.
+            return None;
+        }
+        let (callee_file, callee) = if let Some((owner, function)) = shape.rsplit_once("::") {
+            let owner = owner.rsplit("::").next()?;
+            self.unique_type_method(family, owner, function)?
+        } else if let Some((receiver, function)) = shape.rsplit_once('.') {
+            if !Self::is_plain_ident(receiver)
+                || !Self::is_plain_ident(function)
+                || scope.is_some_and(|scope| self.scope_declares_local(file, scope, receiver))
+            {
+                return None;
+            }
+            let module = self
+                .import_bindings
+                .get(file)
+                .and_then(|bindings| bindings.get(receiver))
+                .filter(|_| !self.is_value_import(file, receiver));
+            match module {
+                Some((module_file, _)) => self.lookup_in_package(module_file, function)?,
+                // `Svc.create()`: a static factory on a type this corpus
+                // declares once.
+                None if self.unique_indexed_type(family, receiver) => {
+                    self.unique_type_method(family, receiver, function)?
+                }
+                None => return None,
+            }
+        } else {
+            if !Self::is_plain_ident(shape)
+                || scope.is_some_and(|scope| self.scope_declares_local(file, scope, shape))
+            {
+                return None;
+            }
+            match self.lookup_in_package(file, shape) {
+                Some(found) => found,
+                None => {
+                    let (target, declared) = self.import_bindings.get(file)?.get(shape)?;
+                    self.lookup_in_package(target, declared)?
+                }
+            }
+        };
+        let written = self
+            .return_types
+            .get(&(callee_file.clone(), callee.clone()))?;
+        let mut nominal = Self::admissible_nominal_type(written)?;
+        if nominal == "Self" {
+            nominal = self.declaring_type_of(&callee_file, &callee)?.to_string();
+        }
+        (self.unique_indexed_type(family, &nominal)
+            || self.names_one_type_in_both(file, &callee_file, &nominal))
+        .then_some(nominal)
+    }
+
+    /// Whether `nominal`, read where the factory wrote it and where the call is
+    /// written, is the same one type declaration.
+    ///
+    /// A type name is what a receiver map holds, and the method rung reads it
+    /// in the *caller's* scope — which is how `client := &Client{}` dispatches
+    /// in a corpus with a `Client` in every package. A factory's return type is
+    /// written in the *callee's* scope, so a name the corpus declares twice is
+    /// only safe to hand on when both scopes bind it to one declaration: the
+    /// same file, or the same Go package. Anywhere else the caller's `Client`
+    /// may be another type, and the corpus-wide uniqueness test decides.
+    fn names_one_type_in_both(&self, file: &str, callee_file: &str, nominal: &str) -> bool {
+        let Some(here) = self.lookup_in_package(file, nominal) else {
+            return false;
+        };
+        if self.lookup_in_package(callee_file, nominal).as_ref() != Some(&here) {
+            return false;
+        }
+        self.symbol_index.get(nominal).is_some_and(|candidates| {
+            candidates.iter().any(|(path, kind, _, identity)| {
+                *path == here.0
+                    && **identity == *here.1
+                    && matches!(kind, SymbolKind::Class | SymbolKind::Struct)
+            })
+        })
+    }
+
+    /// The one method `type_name` declares called `method`, as `(file,
+    /// qualified name)`, or `None` when it declares none or the type name is
+    /// declared twice.
+    fn unique_type_method(
+        &self,
+        family: LangFamily,
+        type_name: &str,
+        method: &str,
+    ) -> Option<(String, String)> {
+        let hits = self
+            .type_methods
+            .get(&(family, type_name.to_string(), method.to_string()))?;
+        let [only] = hits.as_slice() else {
+            return None;
+        };
+        Some(only.clone())
+    }
+
+    /// The type of a receiver this file reaches through an import: a named
+    /// import of a module-scope instance (`import { svc }`, `from m import
+    /// svc`), or one member of an imported module handle (`ns.svc`,
+    /// `service_module.service`).
+    fn imported_receiver_type(&self, file: &str, receiver: &str) -> Option<String> {
+        if Self::is_plain_ident(receiver) {
+            let (declaring_file, declared) = self
+                .value_imports
+                .get(&(file.to_string(), receiver.to_string()))?;
+            return self.module_value_type(declaring_file, declared);
+        }
+        let (root, member) = Self::one_hop_field(receiver)?;
+        if self.is_value_import(file, root) {
+            return None;
+        }
+        let (module_file, _) = self.import_bindings.get(file)?.get(root)?;
+        self.module_value_type(module_file, member)
+    }
+
+    /// Whether `member` may be read as a module-level declaration when it is
+    /// reached through `receiver`, a name `file` imports.
+    ///
+    /// A module handle: always — that is what a module member is. An imported
+    /// type (`Page.SystematicReview`, `SvcClass.build()`): always, the static
+    /// shape. A named import of any other value: only when the value's own
+    /// declaration spells the member, which is the object-literal namespace
+    /// (`api = { get }`), and never when it is a typed instance — rung 1 owns
+    /// that answer, and a method its class lacks is not the module's function.
+    fn module_member_admitted(&self, file: &str, receiver: &str, member: &str) -> bool {
+        let Some((declaring_file, declared)) = self
+            .value_imports
+            .get(&(file.to_string(), receiver.to_string()))
+        else {
+            return true;
+        };
+        if self.imports_a_type(file, receiver) {
+            return true;
+        }
+        if self.module_value_type(declaring_file, declared).is_some() {
+            return false;
+        }
+        self.module_value_members
+            .get(&(declaring_file.clone(), declared.clone()))
+            .is_some_and(|members| members.contains(member))
+    }
+
+    /// Whether `local` in `file` is a named import of a declared value rather
+    /// than a module handle. See [`Self::value_imports`].
+    fn is_value_import(&self, file: &str, local: &str) -> bool {
+        self.value_imports
+            .contains_key(&(file.to_string(), local.to_string()))
+    }
+
+    /// Whether the value `local` imports into `file` is itself a type
+    /// declaration. `SvcClass.build()` on an imported class is a static call,
+    /// and the literal-type rung below the import rungs answers it; only a
+    /// non-type value stops the ladder when its type is unknown.
+    fn imports_a_type(&self, file: &str, local: &str) -> bool {
+        let Some((declaring_file, declared)) = self
+            .value_imports
+            .get(&(file.to_string(), local.to_string()))
+        else {
+            return false;
+        };
+        self.symbol_index.get(declared).is_some_and(|candidates| {
+            candidates.iter().any(|(path, kind, _, _)| {
+                path == declaring_file
+                    && matches!(
+                        kind,
+                        SymbolKind::Class
+                            | SymbolKind::Struct
+                            | SymbolKind::Enum
+                            | SymbolKind::Interface
+                            | SymbolKind::Trait
+                    )
+            })
+        })
+    }
+
+    /// Whether the declaration a named import binds owns a member `member` in
+    /// its own file — a factory whose returned object literal declares it
+    /// (`registryAdapter(run).tagsForDigest()`), recorded by the extractor as
+    /// `registryAdapter.tagsForDigest`. The literal-type rung answers that
+    /// shape from the import's own declaring file, so the import-scoped stop
+    /// must leave it to that rung rather than pre-empt it.
+    fn imported_declaration_owns(
+        &self,
+        family: LangFamily,
+        file: &str,
+        local: &str,
+        member: &str,
+    ) -> bool {
+        let Some((declaring_file, declared)) = self
+            .value_imports
+            .get(&(file.to_string(), local.to_string()))
+        else {
+            return false;
+        };
+        self.type_methods
+            .get(&(family, declared.clone(), member.to_string()))
+            .is_some_and(|hits| hits.iter().any(|(path, _)| path == declaring_file))
     }
 
     /// Record `key -> type_name`, poisoning the key if a second type claims it.
@@ -631,6 +1147,35 @@ impl Resolver {
             ))
     }
 
+    /// Whether `root`, written as a receiver's first segment, is a **value**
+    /// at this site rather than a module or crate name.
+    ///
+    /// `serde_json::from_str(x)` and `let serde_json = build(); serde_json.
+    /// take()` reduce to the same receiver string, and only the scope's own
+    /// binding tables separate them. One owner, because the classifier and the
+    /// Rust path rung must agree: a root the classifier calls a value must
+    /// never be bound as a crate by the rung.
+    ///
+    /// A positive use-site fact is authoritative even for an untyped capture.
+    /// Absence is not proof of no binding — older or hand-built extractions
+    /// may omit site facts — so the file-wide maps are kept as wider evidence.
+    fn root_is_a_value(
+        &self,
+        file_path: &str,
+        enclosing_symbol: &str,
+        root: &str,
+        receiver_binding: Option<&LocalBinding>,
+    ) -> bool {
+        receiver_binding.is_some()
+            || self.scope_declares_local(file_path, enclosing_symbol, root)
+            || self
+                .declared_types
+                .contains_key(&format!("{file_path}:{root}@type"))
+            || self
+                .receiver_types
+                .contains_key(&format!("{file_path}:{root}"))
+    }
+
     /// A binding belongs to its lexical scope. An untyped local must veto the
     /// file-wide fallback just as a typed one supplies the scoped answer.
     ///
@@ -662,13 +1207,35 @@ impl Resolver {
                         .then(|| scope.and_then(|scope| self.declaring_type_of(file, scope)))
                         .flatten()
                         .map(str::to_string)
-                })?;
-            return self.field_type_on(file, &owner, field);
+                });
+            return match owner {
+                Some(owner) => self.field_type_on(file, &owner, field),
+                // `ns.svc.run()`: the root is no typed value, but it may be an
+                // imported module whose member is a module-scope instance. A
+                // root the scope binds itself shadows the import.
+                None if root_binding.is_none()
+                    && !scope.is_some_and(|scope| self.scope_declares_local(file, scope, root)) =>
+                {
+                    self.imported_receiver_type(file, name)
+                }
+                None => None,
+            };
         }
 
         if let Some(binding) = binding {
             if let Some(from_facts) = Self::type_from_binding_facts(binding) {
                 return Some(from_facts);
+            }
+            if let Some(from_header) = self.type_from_rust_header(file, scope, binding) {
+                return Some(from_header);
+            }
+            // `w := NewWorker()`: the binding's initializer is a factory, and
+            // the factory's declaration says what it returns.
+            if let Some(from_factory) = binding.initializer.as_deref().and_then(|shape| {
+                let family = self.family_of_file(file)?;
+                self.factory_return_type(family, file, binding.scope.as_deref(), shape)
+            }) {
+                return Some(from_factory);
             }
             let declaring_scope = binding.scope.as_deref()?;
             return self
@@ -702,6 +1269,80 @@ impl Resolver {
             .get(&format!("{file}:{name}"))
             .cloned()
             .or_else(|| self.lookup_declared_type_name(file, None, name))
+            // Last, because every rung above is evidence written in this file
+            // and an import is evidence about another one.
+            .or_else(|| self.imported_receiver_type(file, name))
+            // A Go package-level value is in scope in every file of its
+            // package, with no import between them.
+            .or_else(|| self.module_value_type(file, name))
+    }
+
+    /// The type a Rust binding has according to a **function header** in the
+    /// corpus — the half of binder typing one file cannot do alone, because
+    /// the function is usually declared in another file. The extractor states
+    /// the shape (see `devmap_extract::rustlocal`); this reads the header.
+    ///
+    /// * `T::f()` / `T::f()?`: `T` when every indexed `T::f` is declared to
+    ///   return `Self` or `T` — through a `Result`/`Option` only when the call
+    ///   was unwrapped, because a `Result<T>` is not a `T`. With no `T::new`
+    ///   indexed, an un-unwrapped `T::new()` keeps the reading the
+    ///   initializer shape always gave it.
+    /// * `|f|k|p`: parameter `p` of the closure type `f` declares for its
+    ///   argument `k`. `f` is bound only as this file binds it — its own
+    ///   lexical scope or a `use` — never by a corpus-wide name match, which
+    ///   would type the closure by some other crate's `f`.
+    fn type_from_rust_header(
+        &self,
+        file: &str,
+        scope: Option<&str>,
+        binding: &devmap_extract::model::LocalBinding,
+    ) -> Option<String> {
+        use devmap_extract::rustsig;
+        let shape = binding.initializer.as_deref()?;
+        if let Some(closure) = shape.strip_prefix('|') {
+            let mut parts = closure.split('|');
+            let (callee, arg, param) = (parts.next()?, parts.next()?, parts.next()?);
+            let (arg, param): (usize, usize) = (arg.parse().ok()?, param.parse().ok()?);
+            let (callee_file, callee_identity) = self
+                .lexical_target(file, LangFamily::Rust, scope, callee)
+                .map(|identity| (file.to_string(), identity))
+                .or_else(|| {
+                    let (target_file, target_symbol) =
+                        self.import_bindings.get(file)?.get(callee)?;
+                    let (target_file, target_symbol) =
+                        self.declaring_site(target_file, target_symbol);
+                    self.lookup_in_package(&target_file, &target_symbol)
+                })?;
+            let header = self.rust_signatures.get(&(callee_file, callee_identity))?;
+            let header = rustsig::parse_header(header)?;
+            return Self::admissible_nominal_type(rustsig::closure_parameter(&header, arg, param)?);
+        }
+        let (call, unwrapped) = match shape.strip_suffix("()?") {
+            Some(call) => (call, true),
+            None => (shape.strip_suffix("()")?, false),
+        };
+        let (written_type, function) = call.split_once("::")?;
+        if !Self::is_plain_ident(written_type) || !Self::is_plain_ident(function) {
+            return None;
+        }
+        let type_name = if written_type == "Self" {
+            self.declaring_type_of(file, scope?)?.to_string()
+        } else {
+            written_type.to_string()
+        };
+        let Some(hits) =
+            self.type_methods
+                .get(&(LangFamily::Rust, type_name.clone(), function.to_string()))
+        else {
+            return (function == "new" && !unwrapped).then_some(type_name);
+        };
+        let every_hit_returns_it = hits.iter().all(|(hit_file, hit_identity)| {
+            self.rust_signatures
+                .get(&(hit_file.clone(), hit_identity.clone()))
+                .and_then(|header| rustsig::parse_header(header))
+                .is_some_and(|header| rustsig::returns_type(&header, &type_name, unwrapped))
+        });
+        (!hits.is_empty() && every_hit_returns_it).then_some(type_name)
     }
 
     /// `root.field` with exactly one hop of plain identifiers — the shape
@@ -1255,14 +1896,8 @@ impl Resolver {
         // A positive use-site fact is authoritative even for an untyped
         // capture. Absence is not proof of no binding: older/hand-built
         // extractions may omit site facts, so retain their wider evidence.
-        let root_is_a_value_here = receiver_binding.is_some()
-            || self.scope_declares_local(file_path, enclosing_symbol, root)
-            || self
-                .declared_types
-                .contains_key(&format!("{file_path}:{root}@type"))
-            || self
-                .receiver_types
-                .contains_key(&format!("{file_path}:{root}"));
+        let root_is_a_value_here =
+            self.root_is_a_value(file_path, enclosing_symbol, root, receiver_binding);
         // The bare shape requires the receiver to *be* the root and nothing
         // else. `std::fs::write("out.txt", body)` as the receiver of `unwrap()`
         // is also rooted at `std`, and it is an expression, not a module — the
@@ -1457,6 +2092,7 @@ impl Resolver {
         self.path_module_bindings.clear();
         self.py_search_dirs.clear();
         self.rust_crate_roots.clear();
+        self.rust_signatures.clear();
         self.reexport_chains.clear();
         self.receiver_types.clear();
         self.scoped_receiver_types.clear();
@@ -1465,6 +2101,11 @@ impl Resolver {
         self.supertypes.clear();
         self.subtypes.clear();
         self.import_bindings.clear();
+        self.value_imports.clear();
+        self.module_value_types.clear();
+        self.module_value_members.clear();
+        self.return_types.clear();
+        self.module_value_factories.clear();
         self.declared_types.clear();
         self.external_imports.clear();
         self.unindexed_local_imports.clear();
@@ -1525,6 +2166,14 @@ impl Resolver {
             let family = LangFamily::from_lang(&ext.language);
             let mut file_syms = Vec::new();
             for sym in &ext.symbols {
+                if family == LangFamily::Rust {
+                    if let Some(signature) = &sym.signature {
+                        self.rust_signatures.insert(
+                            (ext.file_path.clone(), sym.qualified_name.clone()),
+                            signature.clone(),
+                        );
+                    }
+                }
                 let identity: Arc<str> = Arc::from(sym.qualified_name.as_str());
                 self.symbol_index
                     .entry(sym.name.clone())
@@ -1546,6 +2195,12 @@ impl Resolver {
                             .or_default()
                             .push((ext.file_path.clone(), sym.qualified_name.clone()));
                     }
+                }
+                if let Some(written) = &sym.return_type {
+                    self.return_types.insert(
+                        (ext.file_path.clone(), sym.qualified_name.clone()),
+                        written.clone(),
+                    );
                 }
                 self.symbol_index
                     .entry(sym.qualified_name.clone())
@@ -1755,6 +2410,8 @@ impl Resolver {
         // universe built above.
         for ext in extractions {
             let mut file_bindings = BTreeMap::new();
+            // The value-binding subset of `file_bindings`; see `value_imports`.
+            let mut file_values: Vec<(String, (String, String))> = Vec::new();
             // SC18: the mirror of `file_bindings` — every local name whose
             // module resolved to no indexed file. Recorded from the same walk so
             // the two maps cannot disagree about what an import specifier means.
@@ -1875,28 +2532,84 @@ impl Resolver {
                             })
                             .flatten()
                             .and_then(|terminal| {
-                                terminal.rsplit_once("::").map(|(file, _)| file.to_string())
+                                terminal.rsplit_once("::").map(|(file, declared)| {
+                                    (file.to_string(), declared.to_string())
+                                })
                             });
+                        // A renaming re-export (`export { a as b }`, `from impl
+                        // import a as b`) publishes `b` and declares `a`; the
+                        // binding must name what the terminal file declares,
+                        // or every lookup through it asks for a name that file
+                        // does not have.
+                        let mut declared_as = name.clone();
+                        // Both branches that answer with a file *declaring* the
+                        // name bind a value; the submodule fallback below binds
+                        // a module. `via_reexport` keeps the terminal's own
+                        // name, because `export { svc as questions }` publishes
+                        // a name the declaring file never wrote.
+                        let declared_value = if declares_name {
+                            direct.clone().map(|file| (file, name.clone()))
+                        } else {
+                            via_reexport.clone()
+                        };
+                        // Only where an import binds one namespace. A Rust
+                        // `use blast::{blast}` binds the function while
+                        // `blast::Report` still walks the module of the same
+                        // name — values and modules live apart there, so the
+                        // binding says nothing about what a path through it
+                        // means.
+                        let single_namespace = matches!(
+                            LangFamily::from_lang(&ext.language),
+                            LangFamily::JsTs | LangFamily::Python
+                        );
+                        if let (true, Some(declared), Some(_)) =
+                            (single_namespace, &declared_value, &direct)
+                        {
+                            file_values.push((local.to_string(), declared.clone()));
+                        }
                         let resolved = if declares_name {
                             direct
-                        } else if let Some(file) = via_reexport {
+                        } else if let Some((file, symbol)) = via_reexport {
+                            declared_as = symbol;
                             Some(file)
                         } else {
-                            let submodule = (ext.language == "python").then(|| {
-                                let dotted = format!("{}.{}", imp.module_specifier, name);
-                                self.resolve_import_path(&ext.file_path, &ext.language, &dotted)
-                                    .or_else(|| {
-                                        self.resolve_via_search_dirs(
-                                            ext,
-                                            imp.span.start_byte,
-                                            &dotted,
-                                        )
-                                    })
-                            });
-                            submodule.flatten().or(direct)
+                            let submodule = match ext.language.as_str() {
+                                "python" => {
+                                    let dotted = format!("{}.{}", imp.module_specifier, name);
+                                    self.resolve_import_path(&ext.file_path, &ext.language, &dotted)
+                                        .or_else(|| {
+                                            self.resolve_via_search_dirs(
+                                                ext,
+                                                imp.span.start_byte,
+                                                &dotted,
+                                            )
+                                        })
+                                }
+                                // The same shape in Rust: `use devmap_serve::
+                                // session_log;` names the module `session_log`,
+                                // and the crate root it was bound to declares
+                                // no such item — `pub mod session_log;` is a
+                                // module declaration, not a symbol — so every
+                                // `session_log::read_live()` through it found
+                                // nothing. Only a file that *is* that module
+                                // counts: a walk that popped the name back off
+                                // lands on the parent, which is `direct`.
+                                "rust" => self
+                                    .resolve_import_path(
+                                        &ext.file_path,
+                                        &ext.language,
+                                        &format!("{}::{}", imp.module_specifier, name),
+                                    )
+                                    .filter(|file| {
+                                        file.ends_with(&format!("/{name}.rs"))
+                                            || file.ends_with(&format!("/{name}/mod.rs"))
+                                    }),
+                                _ => None,
+                            };
+                            submodule.or(direct)
                         };
                         if let Some(target_f) = resolved {
-                            file_bindings.insert(local.to_string(), (target_f, name.clone()));
+                            file_bindings.insert(local.to_string(), (target_f, declared_as));
                         } else {
                             unresolved_import(local.to_string(), &imp.module_specifier);
                         }
@@ -1999,6 +2712,17 @@ impl Resolver {
             if !file_local_gap.is_empty() {
                 self.unindexed_local_imports
                     .insert(ext.file_path.clone(), file_local_gap);
+            }
+            for (local, declared) in file_values {
+                // A later whole-module import of the same local name replaces
+                // the binding, and with it the claim that the name is a value.
+                let still_value = file_bindings
+                    .get(&local)
+                    .is_some_and(|(target, _): &(String, String)| target == &declared.0);
+                if still_value {
+                    self.value_imports
+                        .insert((ext.file_path.clone(), local), declared);
+                }
             }
             if !file_bindings.is_empty() {
                 self.import_bindings
@@ -2119,6 +2843,7 @@ impl Resolver {
                     );
                 }
             }
+            self.index_module_value_types(ext, family);
             // A `let x = self.field` (including through `if` / `&`) takes the
             // field's type, so `x.run()` can dispatch. Field `Type` references
             // are indexed just above; this pass is a second walk so a field
@@ -2334,6 +3059,55 @@ impl Resolver {
     /// A cycle — `a.ts` re-exporting from `b.ts` re-exporting from `a.ts` —
     /// yields no entry at all. There is no terminal file, so there is nothing
     /// true to record, and recording either endpoint would invent one.
+    /// A Python module's own `from m import name` is a re-export hop.
+    ///
+    /// Python has no export statement: every name a module binds at module
+    /// scope is an attribute of that module, and `from barrel import name`
+    /// elsewhere reads it. So `barrel.py: from impl import normalise` states
+    /// where `barrel.normalise` comes from as plainly as `export { normalise }
+    /// from './impl'` does — and the chain never saw it, because only
+    /// `ext.exports` fed it. The importer's binding pointed at `barrel.py`,
+    /// which declares nothing, and `impl.normalise` was reported dead at 0.4
+    /// with its caller one file away. The same shape is every package
+    /// `__init__.py` that lifts a name out of a submodule.
+    ///
+    /// Module scope only: an import inside a function or class body binds a
+    /// local or a class attribute, never a module attribute. An explicit hop
+    /// for the same name — there is none in Python today — is never displaced.
+    fn python_import_hops(&self, ext: &Extraction, hops: &mut BTreeMap<String, (String, String)>) {
+        let enclosed = |span: &Span| {
+            ext.symbols.iter().any(|symbol| {
+                matches!(
+                    symbol.kind,
+                    SymbolKind::Function | SymbolKind::Method | SymbolKind::Class
+                ) && symbol.span.start_byte <= span.start_byte
+                    && span.end_byte <= symbol.span.end_byte
+            })
+        };
+        for imp in &ext.imports {
+            if imp.path_load.is_some() || imp.imported_names.is_empty() || enclosed(&imp.span) {
+                continue;
+            }
+            for (index, name) in imp.imported_names.iter().enumerate() {
+                if name.is_empty() || name == "*" {
+                    continue;
+                }
+                let local = imp
+                    .local_names
+                    .get(index)
+                    .filter(|local| !local.is_empty())
+                    .unwrap_or(name);
+                let spec = Self::import_spec_for_name(&imp.module_specifier, name);
+                let Some(target) = self.resolve_import_path(&ext.file_path, &ext.language, &spec)
+                else {
+                    continue;
+                };
+                hops.entry(format!("{}::{local}", ext.file_path))
+                    .or_insert((target, name.clone()));
+            }
+        }
+    }
+
     fn compute_reexport_chains(&self, extractions: &[Extraction]) -> BTreeMap<String, String> {
         // One hop per re-export, keyed by the re-exporting file's own name for
         // the symbol.
@@ -2367,6 +3141,9 @@ impl Resolver {
                     format!("{}::{}", ext.file_path, export.exported_name),
                     (target, source_name),
                 );
+            }
+            if ext.language == "python" {
+                self.python_import_hops(ext, &mut hops);
             }
         }
 
@@ -2684,15 +3461,23 @@ impl Resolver {
                             .filter(|_| family.admits(family))
                         {
                             let key = (family, class_type.clone(), call.callee_name.clone());
-                            if let Some(hits) = self.type_methods.get(&key) {
-                                if hits.len() == 1 {
-                                    let (target_f, target_symbol) = &hits[0];
-                                    resolution = Some(Arc::new(Resolution::ReceiverType {
-                                        target_symbol: target_symbol.clone(),
-                                        target_file: target_f.clone(),
-                                        receiver_type: class_type.clone(),
-                                    }));
-                                }
+                            if let Some((target_f, target_symbol)) =
+                                self.type_methods.get(&key).and_then(|hits| {
+                                    self.receiver_type_method(
+                                        ext,
+                                        call.caller_symbol.as_deref(),
+                                        recv,
+                                        site_binding,
+                                        &class_type,
+                                        hits,
+                                    )
+                                })
+                            {
+                                resolution = Some(Arc::new(Resolution::ReceiverType {
+                                    target_symbol: target_symbol.clone(),
+                                    target_file: target_f.clone(),
+                                    receiver_type: class_type.clone(),
+                                }));
                             }
                         }
                     }
@@ -2791,13 +3576,39 @@ impl Resolver {
                             && ext.local_binding_at(call.span.start_byte, &recv).is_none() {
                             if let Some(bindings) = self.import_bindings.get(&ext.file_path) {
                                 if let Some((target_f, _)) = bindings.get(&recv) {
-                                    if let Some((resolved_file, resolved_sym)) =
-                                        self.lookup_in_package(target_f, &method)
+                                    // A module member: a member of a module
+                                    // handle, of an imported type, or of an
+                                    // object literal that spells it — never
+                                    // an arbitrary value's method that shares
+                                    // a name with a free function beside it.
+                                    if self.module_member_admitted(&ext.file_path, &recv, &method) {
+                                        if let Some((resolved_file, resolved_sym)) =
+                                            self.lookup_in_package(target_f, &method)
+                                        {
+                                            resolution = Some(Arc::new(Resolution::ImportScoped {
+                                                target_symbol: resolved_sym,
+                                                target_file: resolved_file,
+                                                imported_from: recv.clone(),
+                                            }));
+                                        }
+                                    }
+                                    if resolution.is_none()
+                                        && self.is_value_import(&ext.file_path, &recv)
+                                        && !self.imports_a_type(&ext.file_path, &recv)
+                                        && !self.imported_declaration_owns(
+                                            family,
+                                            &ext.file_path,
+                                            &recv,
+                                            &method,
+                                        )
                                     {
-                                        resolution = Some(Arc::new(Resolution::ImportScoped {
-                                            target_symbol: resolved_sym,
-                                            target_file: resolved_file,
-                                            imported_from: recv.clone(),
+                                        // Stop here. The import is this file's
+                                        // evidence about `recv`, so a later
+                                        // rung matching a same-spelled type
+                                        // elsewhere would be a coincidence
+                                        // outranking it (R-2).
+                                        resolution = Some(Arc::new(Resolution::Unresolved {
+                                            reason: "the receiver is an imported value whose type is not known".to_string(),
                                         }));
                                     }
                                 }
@@ -2977,11 +3788,30 @@ impl Resolver {
                     // declares. After 2d so an import in this file still wins,
                     // and only for Rust — `work::helper()` in C++ is not this
                     // module system.
+                    //
+                    // A bare root — `dc_glob::matches()` reduces to the
+                    // receiver `dc_glob` — is a crate only when nothing in
+                    // this scope binds that name and no `use` here does: a
+                    // local or an import alias shadows the extern crate.
                     if resolution.is_none() && family == LangFamily::Rust {
                         if let Some(recv) = call.receiver_expr.as_deref() {
-                            if let Some(found) =
-                                self.rust_qualified_call(&ext.file_path, recv, &call.callee_name)
-                            {
+                            let bare_root_is_free = Self::is_plain_ident(recv)
+                                && !self.root_is_a_value(
+                                    &ext.file_path,
+                                    call.caller_symbol.as_deref().unwrap_or(&ext.file_path),
+                                    recv,
+                                    ext.local_binding_at(call.span.start_byte, recv),
+                                )
+                                && !self
+                                    .import_bindings
+                                    .get(&ext.file_path)
+                                    .is_some_and(|bindings| bindings.contains_key(recv));
+                            if let Some(found) = self.rust_qualified_call(
+                                &ext.file_path,
+                                recv,
+                                &call.callee_name,
+                                bare_root_is_free,
+                            ) {
                                 resolution = Some(Arc::new(found));
                             }
                         }
@@ -3319,6 +4149,94 @@ impl Resolver {
 
                 // Resolve routes
                 for route in &ext.routes {
+                    // The route's node identity, not a bare "VERB /path"
+                    // label. `ExtractedRoute::node_id` owns the shape so the
+                    // graph export can emit a node under the same id; an edge
+                    // whose source names no node leaves every route consumer
+                    // reading an empty graph.
+                    let route_source = route.node_id(&ext.file_path);
+
+                    // Middleware first in the loop body only because the
+                    // handler arm ends in `continue`s; neither depends on the
+                    // other. Each named entry binds through the handler's
+                    // ladder to a `Registers` edge, or is recorded as not
+                    // binding — the same Class A rule: an unbound middleware
+                    // must not look like a route that registers none.
+                    for entry in route.middleware.iter().flatten() {
+                        // An anonymous entry — an arrow function, a `func`
+                        // literal — names nothing. The route node lists it by
+                        // expression; there is no symbol to bind or miss.
+                        if entry.name.is_empty() {
+                            continue;
+                        }
+                        // A package's middleware — `cors()`, chi's
+                        // `middleware.Logger`, `express.json()` — is outside
+                        // the repository, and the file's own import says so.
+                        // Classified `External`, which the dead-code namesake
+                        // veto ignores, rather than left to a global name
+                        // lookup that would bind it to whatever repository
+                        // symbol shares its name.
+                        let binding = entry.qualifier.as_deref().unwrap_or(&entry.name);
+                        if let Some(module) = self
+                            .external_imports
+                            .get(&ext.file_path)
+                            .and_then(|imports| imports.get(binding))
+                        {
+                            unresolved.push(UnresolvedReference {
+                                source_file: ext.file_path.clone(),
+                                source_symbol: route_source.clone(),
+                                callee_name: entry.name.clone(),
+                                kind: UnresolvedKind::Route,
+                                resolution: Resolution::Unresolved {
+                                    reason: format!(
+                                        "route middleware {:?} in {} comes from external \
+                                         module {module:?}",
+                                        entry.expression, ext.file_path
+                                    ),
+                                },
+                                class: UnresolvedClass::External {
+                                    module: module.clone(),
+                                },
+                                receiver: entry.qualifier.clone(),
+                            });
+                            continue;
+                        }
+                        match self.bind_route_reference(
+                            ext,
+                            family,
+                            &entry.name,
+                            entry.qualifier.as_deref(),
+                        ) {
+                            Ok((target_f, resolution)) => {
+                                let target_symbol = self.qualified_for(&target_f, &entry.name);
+                                edges.push(ResolvedEdge::resolved(
+                                    ext.file_path.clone(),
+                                    target_f,
+                                    route_source.clone(),
+                                    target_symbol,
+                                    EdgeKind::Registers,
+                                    Arc::new(resolution),
+                                    Some(format!("{}:{}", route.framework, entry.scope.label())),
+                                ));
+                            }
+                            Err(candidate_count) => unresolved.push(UnresolvedReference {
+                                source_file: ext.file_path.clone(),
+                                source_symbol: route_source.clone(),
+                                callee_name: entry.name.clone(),
+                                kind: UnresolvedKind::Route,
+                                resolution: Resolution::Unresolved {
+                                    reason: format!(
+                                        "route middleware {:?} in {} bound to none of {} \
+                                         same-family candidates",
+                                        entry.expression, ext.file_path, candidate_count
+                                    ),
+                                },
+                                class: UnresolvedClass::Unresolved,
+                                receiver: entry.qualifier.clone(),
+                            }),
+                        }
+                    }
+
                     // An anonymous handler — an Express arrow function — has no
                     // name to resolve, so there is nothing to bind and nothing
                     // to report. Every other route names a handler, and either
@@ -3326,69 +4244,11 @@ impl Resolver {
                     if route.handler_name.is_empty() {
                         continue;
                     }
-                    let hits = self.symbol_index.get(&route.handler_name);
-                    // The route's node identity, not a bare "VERB /path"
-                    // label. `ExtractedRoute::node_id` owns the shape so the
-                    // graph export can emit a node under the same id; an edge
-                    // whose source names no node leaves every route consumer
-                    // reading an empty graph.
-                    let route_source = route.node_id(&ext.file_path);
-                    let mut candidate_count = 0usize;
-                    let route_target = hits.and_then(|hits| {
-                        let same_file: Vec<_> = hits
-                            .iter()
-                            .filter(|(path, _, _, _)| path == &ext.file_path)
-                            .collect();
-                        if same_file.len() == 1 {
-                            let (target_f, _, _, _) = same_file[0];
-                            return Some((
-                                target_f.clone(),
-                                Resolution::SameFile {
-                                    target_symbol: route.handler_name.clone(),
-                                    target_file: target_f.clone(),
-                                },
-                            ));
-                        }
-                        if let Some((target_f, target_symbol)) = self
-                            .import_bindings
-                            .get(&ext.file_path)
-                            .and_then(|bindings| bindings.get(&route.handler_name))
-                        {
-                            return Some((
-                                target_f.clone(),
-                                Resolution::ImportScoped {
-                                    target_symbol: target_symbol.clone(),
-                                    target_file: target_f.clone(),
-                                    imported_from: route.handler_name.clone(),
-                                },
-                            ));
-                        }
-                        let family_hits: Vec<_> = hits
-                            .iter()
-                            .filter(|(path, _, candidate_family, _)| {
-                                family.admits(*candidate_family)
-                                    && (*candidate_family != LangFamily::Go
-                                        || Self::go_symbol_visible_from(
-                                            &ext.file_path,
-                                            path,
-                                            &route.handler_name,
-                                        ))
-                            })
-                            .collect();
-                        candidate_count = family_hits.len();
-                        (family_hits.len() == 1).then(|| {
-                            let (target_f, _, _, _) = family_hits[0];
-                            (
-                                target_f.clone(),
-                                Resolution::UniqueGlobal {
-                                    target_symbol: route.handler_name.clone(),
-                                    target_file: target_f.clone(),
-                                    family,
-                                },
-                            )
-                        })
-                    });
-                    let Some((target_f, resolution)) = route_target else {
+                    let route_target =
+                        self.bind_route_reference(ext, family, &route.handler_name, None);
+                    let (target_f, resolution) = match route_target {
+                        Ok(bound) => bound,
+                        Err(candidate_count) => {
                         // Class A. A route whose handler did not bind used to
                         // produce no edge and no record, byte-identical to a
                         // route with no named handler at all. `HandlesRoute` is
@@ -3416,6 +4276,7 @@ impl Resolver {
                             receiver: None,
                         });
                         continue;
+                        }
                     };
                     // The handler by its graph identity, the way every
                     // other edge kind names its target. `route.handler_name`
@@ -3666,6 +4527,90 @@ impl Resolver {
             || Self::parent_dir(source_file) == Self::parent_dir(target_file)
     }
 
+    /// Bind a name a route registration wrote — its handler, or a piece of its
+    /// middleware — to the declaration it names.
+    ///
+    /// The one ladder for both, so a handler and a middleware written the same
+    /// way bind the same way: a single same-file declaration, then this file's
+    /// import binding, then a single same-family declaration anywhere (a Go
+    /// one only if it is visible from here). `Err` carries how many
+    /// same-family candidates the last rung saw, so ambiguity (2) and absence
+    /// (0) stay distinguishable in the ledger.
+    ///
+    /// `qualifier` is the binding a qualified reference went through —
+    /// `middleware` in `middleware.Logger`. A qualified name is never a
+    /// same-file or import-bound bare name, so those rungs are skipped, and the
+    /// global rung admits only a declaration whose directory or file stem *is*
+    /// the qualifier: Go names a package after its directory and a namespace
+    /// import after its module. Without that narrowing, chi's
+    /// `middleware.Logger` would bind to whichever one `Logger` the repository
+    /// happens to declare.
+    fn bind_route_reference(
+        &self,
+        ext: &Extraction,
+        family: LangFamily,
+        name: &str,
+        qualifier: Option<&str>,
+    ) -> Result<(String, Resolution), usize> {
+        let Some(hits) = self.symbol_index.get(name) else {
+            return Err(0);
+        };
+        if qualifier.is_none() {
+            let mut same_file = hits.iter().filter(|(path, ..)| path == &ext.file_path);
+            if let (Some((target_f, ..)), None) = (same_file.next(), same_file.next()) {
+                return Ok((
+                    target_f.clone(),
+                    Resolution::SameFile {
+                        target_symbol: name.to_string(),
+                        target_file: target_f.clone(),
+                    },
+                ));
+            }
+            if let Some((target_f, target_symbol)) = self
+                .import_bindings
+                .get(&ext.file_path)
+                .and_then(|bindings| bindings.get(name))
+            {
+                return Ok((
+                    target_f.clone(),
+                    Resolution::ImportScoped {
+                        target_symbol: target_symbol.clone(),
+                        target_file: target_f.clone(),
+                        imported_from: name.to_string(),
+                    },
+                ));
+            }
+        }
+        let family_hits: Vec<_> = hits
+            .iter()
+            .filter(|(path, _, candidate_family, _)| {
+                family.admits(*candidate_family)
+                    && (*candidate_family != LangFamily::Go
+                        || Self::go_symbol_visible_from(&ext.file_path, path, name))
+                    && qualifier.is_none_or(|qualifier| {
+                        let dir = Self::parent_dir(path);
+                        let stem = path
+                            .rsplit('/')
+                            .next()
+                            .and_then(|file| file.split('.').next())
+                            .unwrap_or_default();
+                        dir.rsplit('/').next() == Some(qualifier) || stem == qualifier
+                    })
+            })
+            .collect();
+        match family_hits.as_slice() {
+            [(target_f, ..)] => Ok((
+                target_f.clone(),
+                Resolution::UniqueGlobal {
+                    target_symbol: name.to_string(),
+                    target_file: target_f.clone(),
+                    family,
+                },
+            )),
+            many => Err(many.len()),
+        }
+    }
+
     /// Delegates to `importpath::normalize_rel`, which is the single owner.
     ///
     /// The two implementations were identical when the table-driven ladder
@@ -3886,7 +4831,14 @@ impl Resolver {
                 if let Some((_, tail)) = path.split_once("::") {
                     self.consider_module_rel(&mut found, &src_root, tail);
                 } else {
-                    self.consider_crate_root_files(&mut found, &src_root);
+                    // A crate *name* is the library target. A package with
+                    // both `lib.rs` and `main.rs` is not ambiguous to an
+                    // importer — the binary is not addressable by name — so
+                    // `main.rs` answers only when there is no library.
+                    self.consider_indexed(&mut found, format!("{src_root}/lib.rs"));
+                    if found.is_empty() {
+                        self.consider_indexed(&mut found, format!("{src_root}/main.rs"));
+                    }
                 }
             }
             RustPathRoot::Child => {
@@ -3957,20 +4909,42 @@ impl Resolver {
     /// names and the callee is a method of that type in that file. Either
     /// shape binds only when exactly one indexed file is the module. A second
     /// file, a second method, or a prefix that had to be popped is no target.
-    fn rust_qualified_call(&self, file: &str, receiver: &str, callee: &str) -> Option<Resolution> {
+    ///
+    /// A receiver with no `::` left — `dc_glob::matches()` reduces to `dc_glob`
+    /// — is syntactically indistinguishable from a value, so it is a path only
+    /// when the caller has established `bare_root_is_free` (no local, no import
+    /// of that name) and the name is an indexed crate. A bare child module is
+    /// not taken here: `mod work;` already binds `work` through its import.
+    ///
+    /// A crate root that states `pub use index::build_index;` declares nothing
+    /// itself, so both shapes follow the root's re-export to the declaring
+    /// file — the statement says where the name comes from.
+    fn rust_qualified_call(
+        &self,
+        file: &str,
+        receiver: &str,
+        callee: &str,
+        bare_root_is_free: bool,
+    ) -> Option<Resolution> {
         if !Self::is_plain_ident(callee) {
             return None;
         }
+        let bare_crate = bare_root_is_free
+            && Self::is_plain_ident(receiver)
+            && matches!(self.rust_path_root(file, receiver), RustPathRoot::Crate(_));
         if !Self::receiver_is_module_path(receiver)
             && !matches!(receiver, "crate" | "self" | "super")
+            && !bare_crate
         {
             return None;
         }
         match self.rust_exact_module(file, receiver) {
             RustModulePlace::Ambiguous => return None,
             RustModulePlace::Unique(module_file) => {
-                let (target_file, target_symbol) = self.lookup_in_package(&module_file, callee)?;
-                if self.symbol_kind_in(&target_file, callee) != Some(SymbolKind::Function) {
+                let (decl_file, decl_name) = self.declaring_site(&module_file, callee);
+                let (target_file, target_symbol) =
+                    self.lookup_in_package(&decl_file, &decl_name)?;
+                if self.symbol_kind_in(&target_file, &decl_name) != Some(SymbolKind::Function) {
                     return None;
                 }
                 return Some(Self::rust_module_resolution(
@@ -3990,21 +4964,18 @@ impl Resolver {
             RustModulePlace::Unique(module_file) => module_file,
             RustModulePlace::Ambiguous | RustModulePlace::Absent => return None,
         };
+        let (type_file, type_name) = self.declaring_site(&module_file, type_name);
         if !self
-            .symbol_kind_in(&module_file, type_name)
+            .symbol_kind_in(&type_file, &type_name)
             .is_some_and(Self::rust_type_kind)
         {
             return None;
         }
-        let hits = self.type_methods.get(&(
-            LangFamily::Rust,
-            type_name.to_string(),
-            callee.to_string(),
-        ))?;
-        let mut matched: Vec<&(String, String)> = hits
-            .iter()
-            .filter(|(path, _)| path == &module_file)
-            .collect();
+        let hits =
+            self.type_methods
+                .get(&(LangFamily::Rust, type_name.clone(), callee.to_string()))?;
+        let mut matched: Vec<&(String, String)> =
+            hits.iter().filter(|(path, _)| path == &type_file).collect();
         matched.sort();
         matched.dedup();
         if matched.len() != 1 {
@@ -4014,8 +4985,28 @@ impl Resolver {
         Some(Resolution::ReceiverType {
             target_symbol: target_symbol.clone(),
             target_file: target_file.clone(),
-            receiver_type: type_name.to_string(),
+            receiver_type: type_name,
         })
+    }
+
+    /// The file and name that actually declare `name` as `file` exposes it.
+    ///
+    /// `file` itself when it declares the name; otherwise the terminal of the
+    /// re-export `file` states for it (`pub use index::build_index;`), which
+    /// `compute_reexport_chains` has already followed through nested barrels
+    /// and refused for a cycle. With neither, `file` and `name` unchanged, so a
+    /// caller's own lookup fails exactly as it did before.
+    fn declaring_site(&self, file: &str, name: &str) -> (String, String) {
+        if self.symbol_kind_in(file, name).is_none() {
+            if let Some((terminal_file, terminal_name)) = self
+                .reexport_chains
+                .get(&format!("{file}::{name}"))
+                .and_then(|terminal| terminal.rsplit_once("::"))
+            {
+                return (terminal_file.to_string(), terminal_name.to_string());
+            }
+        }
+        (file.to_string(), name.to_string())
     }
 
     fn import_local_name(lang: &str, specifier: &str) -> String {
@@ -4720,6 +5711,128 @@ impl Resolver {
         (candidates.len() == 1).then(|| candidates.pop().unwrap())
     }
 
+    /// The one `type_methods` hit a typed receiver dispatches to.
+    ///
+    /// `type_methods` is keyed by the *bare* type name, so `(Go, "Client",
+    /// "Zzembed")` holds both `rpc.Client.Zzembed` and `llm.Client.Zzembed`
+    /// when two packages declare a `Client`. One hit is the answer, as it always
+    /// was. Several are refused — except in the one case Go's scoping settles:
+    /// a type spelled **unqualified, in the caller's own file**, means the type
+    /// the caller's package block declares ([`Self::go_own_package_method`]).
+    ///
+    /// `class_type` cannot say which case it is: the binding facts record
+    /// `&rpc.Client{}` as `Client{..}` and `c *rpc.Client` as `Client`, and a
+    /// type reached through a field or a call is spelled relative to whichever
+    /// package declared *that*. So the spelling is read again, from the
+    /// references the extractor emitted for this variable
+    /// ([`Self::go_receiver_spelled_bare`]).
+    fn receiver_type_method<'a>(
+        &self,
+        ext: &Extraction,
+        scope: Option<&str>,
+        receiver: &str,
+        binding: Option<&LocalBinding>,
+        class_type: &str,
+        hits: &'a [(String, String)],
+    ) -> Option<&'a (String, String)> {
+        if let [only] = hits {
+            return Some(only);
+        }
+        let scope = binding.and_then(|b| b.scope.as_deref()).or(scope);
+        if ext.language != "go" || !Self::go_receiver_spelled_bare(ext, scope, receiver, class_type)
+        {
+            return None;
+        }
+        self.go_own_package_method(ext, class_type, hits)
+    }
+
+    /// Whether this file wrote `receiver`'s type as a bare `class_type`, and
+    /// never as a qualified one.
+    ///
+    /// The Go extractor ties each typed name to the variable it types through
+    /// `assigned_to`: a parameter or method receiver `c *Client` is a `Type`
+    /// reference, `c := &Client{}` a `Constructor` reference, and a qualified
+    /// parameter type `c *rpc.Client` adds a `TypeQualifier` reference naming
+    /// `rpc`. A composite literal carries no qualifier reference, but its span
+    /// is the written type, so `rpc.Client{}` is the `Client` whose span is
+    /// longer than its name.
+    ///
+    /// Refuses any qualified spelling of the variable in the scope, and a type
+    /// nothing here wrote for it: one learned from a call's return, or a
+    /// field's (`h.Inner` names no variable, so no reference is assigned to
+    /// it, and its type is spelled in the package that declared the field).
+    fn go_receiver_spelled_bare(
+        ext: &Extraction,
+        scope: Option<&str>,
+        receiver: &str,
+        class_type: &str,
+    ) -> bool {
+        let mut bare = false;
+        for reference in ext.references.iter().filter(|reference| {
+            reference.assigned_to.as_deref() == Some(receiver)
+                && reference.enclosing_symbol.as_deref() == scope
+        }) {
+            match reference.kind {
+                ReferenceKind::TypeQualifier => return false,
+                ReferenceKind::Type if reference.name == class_type => bare = true,
+                ReferenceKind::Constructor if reference.name == class_type => {
+                    let written = reference.span.end_byte - reference.span.start_byte;
+                    if written != reference.name.len() {
+                        return false;
+                    }
+                    bare = true;
+                }
+                _ => {}
+            }
+        }
+        bare
+    }
+
+    /// The method `class_type` declares in `file`'s own Go package, when the
+    /// package block is where a bare `class_type` written in `file` points.
+    ///
+    /// The type's declaration is [`Self::lookup_in_package`]'s answer — this
+    /// file, then the one non-test file of its `(directory, package clause)`
+    /// — and the method must sit in that same package, under the build-tag
+    /// rule [`Self::same_package_target`] states: a non-test file does not see
+    /// a `_test.go` declaration. A file with a dot-import refuses outright: it
+    /// puts another package's names in this file's scope, so even a bare
+    /// `Client` can mean someone else's.
+    fn go_own_package_method<'a>(
+        &self,
+        ext: &Extraction,
+        class_type: &str,
+        hits: &'a [(String, String)],
+    ) -> Option<&'a (String, String)> {
+        if ext
+            .imports
+            .iter()
+            .any(|imp| imp.alias.as_deref() == Some("."))
+        {
+            return None;
+        }
+        let file = ext.file_path.as_str();
+        let (declaring_file, _) = self.lookup_in_package(file, class_type)?;
+        let dir = Self::parent_dir(&declaring_file);
+        let package = self.go_package_by_file.get(&declaring_file)?;
+        let source_is_test = file.ends_with("_test.go");
+        let mut own: Vec<&(String, String)> = hits
+            .iter()
+            .filter(|(path, _)| {
+                path.ends_with(".go")
+                    && Self::parent_dir(path) == dir
+                    && self.go_package_by_file.get(path) == Some(package)
+                    && (source_is_test || !path.ends_with("_test.go"))
+            })
+            .collect();
+        own.sort();
+        own.dedup();
+        match own.as_slice() {
+            [only] => Some(*only),
+            _ => None,
+        }
+    }
+
     fn go_import_edge_targets(&self, files: &[String]) -> Vec<String> {
         let mut nodes = BTreeSet::new();
         for file in files {
@@ -5218,32 +6331,41 @@ impl Resolver {
         receiver: &str,
         name: &str,
     ) -> Option<ResolvedEdge> {
+        let binding = {
+            let root = Self::path_root(receiver);
+            ext.local_binding_at(reference.span.start_byte, root)
+                .or_else(|| ext.local_binding_at(reference.span.start_byte, receiver))
+        };
         if let Some(class_type) = self.receiver_type_for(
             &ext.file_path,
             reference.enclosing_symbol.as_deref(),
             receiver,
-            {
-                let root = Self::path_root(receiver);
-                ext.local_binding_at(reference.span.start_byte, root)
-                    .or_else(|| ext.local_binding_at(reference.span.start_byte, receiver))
-            },
+            binding,
         ) {
             let key = (family, class_type.clone(), name.to_string());
-            if let Some(hits) = self.type_methods.get(&key) {
-                if hits.len() == 1 {
-                    let (target_file, target_symbol) = &hits[0];
-                    return Some(self.reference_edge(
+            if let Some((target_file, target_symbol)) =
+                self.type_methods.get(&key).and_then(|hits| {
+                    self.receiver_type_method(
                         ext,
-                        target_file,
-                        target_symbol,
-                        reference,
-                        Resolution::ReceiverType {
-                            target_symbol: self.qualified_for(target_file, target_symbol),
-                            target_file: target_file.clone(),
-                            receiver_type: class_type.clone(),
-                        },
-                    ));
-                }
+                        reference.enclosing_symbol.as_deref(),
+                        receiver,
+                        binding,
+                        &class_type,
+                        hits,
+                    )
+                })
+            {
+                return Some(self.reference_edge(
+                    ext,
+                    target_file,
+                    target_symbol,
+                    reference,
+                    Resolution::ReceiverType {
+                        target_symbol: self.qualified_for(target_file, target_symbol),
+                        target_file: target_file.clone(),
+                        receiver_type: class_type.clone(),
+                    },
+                ));
             }
         }
 
@@ -5308,6 +6430,10 @@ impl Resolver {
             .local_binding_at(reference.span.start_byte, receiver)
             .is_some()
         {
+            return None;
+        }
+        // The call ladder's rung-2b rule, for the same reason.
+        if !self.module_member_admitted(&ext.file_path, receiver, name) {
             return None;
         }
         let (module_file, _) = self.import_bindings.get(&ext.file_path)?.get(receiver)?;
@@ -7771,6 +8897,94 @@ mod reference_resolution_tests {
         assert!(
             edges_of(&anonymous, &[EdgeKind::HandlesRoute]).is_empty(),
             "an arrow-function handler is anonymous and binds to nothing"
+        );
+    }
+
+    /// Route middleware binds through the handler's ladder to a `Registers`
+    /// edge from the route node, and what does not bind is recorded, not lost.
+    ///
+    /// Three outcomes, each with its own evidence: a repository function binds
+    /// (`Registers`, which is also what keeps it from reading as dead); a
+    /// package's middleware is `External` by the file's own import, so it can
+    /// neither bind to a same-named repository symbol nor veto that symbol's
+    /// dead-code finding; and a qualified Go reference binds only to a
+    /// declaration in the package its qualifier names — chi's
+    /// `middleware.Logger` must not become an edge to the one `Logger` this
+    /// repository happens to declare in another package.
+    #[test]
+    #[cfg(feature = "parse")]
+    fn route_middleware_binds_to_a_registers_edge_or_says_why_not() {
+        let express = resolve(&[
+            (
+                "app.js",
+                "import cors from 'cors';\n\
+                 import { requireAuth } from './auth';\n\
+                 app.use(cors());\n\
+                 app.use(requireAuth);\n\
+                 app.get('/users', audit, listUsers);\n\
+                 function audit(req, res, next) { next(); }\n\
+                 function listUsers(req, res) {}\n",
+            ),
+            (
+                "auth.js",
+                "export function requireAuth(req, res, next) { next(); }\n",
+            ),
+            // A repository symbol sharing the package middleware's name.
+            ("util.js", "export function cors() {}\n"),
+        ]);
+        assert_eq!(
+            edges_of(&express, &[EdgeKind::Registers]),
+            [
+                "app.js::GET /users->app.js::audit",
+                "app.js::GET /users->auth.js::requireAuth",
+            ],
+            "repository middleware binds; the package's `cors()` does not bind to util.js"
+        );
+        let cors = express
+            .unresolved
+            .iter()
+            .find(|row| row.callee_name == "cors")
+            .expect("the package middleware is recorded, not dropped");
+        assert_eq!(cors.kind, UnresolvedKind::Route);
+        assert!(
+            matches!(&cors.class, UnresolvedClass::External { module } if module == "cors"),
+            "{:?}",
+            cors.class
+        );
+
+        let go = resolve(&[
+            (
+                "api/routes.go",
+                "package api\n\n\
+                 import \"github.com/go-chi/chi/v5/middleware\"\n\n\
+                 func Routes(r Router) {\n\
+                 \tr.Use(middleware.Logger)\n\
+                 \tr.Use(auth.Check)\n\
+                 \tr.Use(auth.Logger)\n\
+                 \tr.Get(\"/orders\", ListOrders)\n\
+                 }\n\n\
+                 func ListOrders() {}\n",
+            ),
+            ("auth/check.go", "package auth\n\nfunc Check() {}\n"),
+            ("logging/log.go", "package logging\n\nfunc Logger() {}\n"),
+        ]);
+        // `middleware.Logger` is stopped by the file's external import;
+        // `auth.Logger` has no import to stop it, and the repository's only
+        // `Logger` lives in `logging/` — only the qualifier keeps it unbound.
+        assert_eq!(
+            edges_of(&go, &[EdgeKind::Registers]),
+            ["api/routes.go::GET /orders->auth/check.go::Check"],
+            "a qualified reference binds inside the package it names, and nowhere else"
+        );
+        assert!(
+            go.unresolved.iter().any(|row| row.callee_name == "Logger"
+                && row.receiver.as_deref() == Some("auth")
+                && row.class == UnresolvedClass::Unresolved),
+            "the unbound `auth.Logger` is recorded as not binding"
+        );
+        assert_eq!(
+            edges_of(&go, &[EdgeKind::HandlesRoute]),
+            ["api/routes.go::GET /orders->api/routes.go::ListOrders"]
         );
     }
 

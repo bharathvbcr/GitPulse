@@ -224,6 +224,7 @@ impl<'a> Collector<'a> {
             parent_symbol: None,
             body_signature: None,
             declaration_hash: None,
+            return_type: None,
         });
     }
 

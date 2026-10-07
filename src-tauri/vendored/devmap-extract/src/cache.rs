@@ -498,7 +498,47 @@ pub const ANALYZER_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// dropped every module-level read of it. A v65 row lacks all of this — most
 /// sharply, a constant `__all__` omitted has no node and its importers no
 /// target — so it must not be served to this build.
-pub const EXTRACTION_SCHEMA_VERSION: &str = "66";
+///
+/// v68 stops filing the `name` of a JSX element, a C# member access, an
+/// annotation, an attribute or a preprocessor test as a local binding of the
+/// enclosing callable, and binds `const f = useCallback(() => …)` (and
+/// `memo`/`forwardRef`/`debounce`/`vi.fn` wrappers) as a `Function` that owns
+/// its body's calls. A v66 row carries `HomePage` as a local of every
+/// component that renders `<HomePage/>` — so the tag's call is classified
+/// `local_binding` and the component reads as callerless — and has no symbol
+/// for a wrapped callback, so none of this may be served warm. (v67 is taken
+/// by unmerged sibling branches; skipping it keeps two different payloads from
+/// sharing one identity.)
+///
+/// v69 records each callable's written return type (`ExtractedSymbol::
+/// return_type`) and binds a single-name Go `var`/`const` spec's initializer
+/// to its name (`assigned_to`). A row without it leaves a factory-built
+/// receiver — `w := NewWorker()`, `var r = NewRegistry()`,
+/// `const s = createService()` — untyped.
+///
+/// v70 is the merge of the lanes that claimed 67, 68 and 69 on separate
+/// branches. Each of those numbers was stamped on payloads that carry only
+/// that lane's half, so the combined payload takes a number none of them used:
+/// a v69 row from the return-type branch lacks v68's bindings, and a v68 row
+/// lacks return types.
+///
+/// v71 adds the resolver-precision lane's v67 payload: a Rust function's
+/// header as its `signature`; a Rust local typed from its own binder (a
+/// `MutexGuard` from `Ok(g)` or an unwrapped `.lock()`, a loop variable over a
+/// `Vec<T>`/`[T]`/set); the value shape of `T::f(..)?` and of a closure
+/// argument handed to the resolver; and a Go `var w T` bound to `w`. Without
+/// them every method reached only through such a local stays an uninferred
+/// receiver from a warm cache.
+///
+/// v72 adds the MCP-parity lane's v67: route middleware —
+/// `ExtractedRoute::middleware` for Express (`use` registrations and the
+/// arguments between path and handler) and for Go routers — and Go routes at
+/// all: chi, gin, echo, gorilla/mux and net/http. A row without it has
+/// `middleware: None` on every route and no Go routes, which reads as "no
+/// producer ran"; served warm, it would keep every `Registers` edge and every
+/// Go `HandlesRoute` edge out of the graph with nothing to say the producer
+/// exists.
+pub const EXTRACTION_SCHEMA_VERSION: &str = "72";
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct CacheKey {

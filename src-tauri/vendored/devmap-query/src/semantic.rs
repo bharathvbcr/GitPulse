@@ -165,11 +165,21 @@ impl SemanticIndex {
     /// not a match, and padding a ranked list with them turns "nothing matched"
     /// into a page of results.
     pub fn score(&self, query: &str, cancel: &Cancel) -> Result<Vec<(usize, f32)>, QueryCancelled> {
-        let terms = tokenize(query);
+        self.score_terms(&tokenize(query), cancel)
+    }
+
+    /// [`Self::score`] over terms the caller already chose — `ask` drops the
+    /// words a question is phrased in before scoring (see
+    /// [`crate::ask::question_terms`]).
+    pub fn score_terms(
+        &self,
+        terms: &[String],
+        cancel: &Cancel,
+    ) -> Result<Vec<(usize, f32)>, QueryCancelled> {
         if terms.is_empty() {
             return Ok(Vec::new());
         }
-        let query_vector = Self::unit_vector(&terms, &self.idf);
+        let query_vector = Self::unit_vector(terms, &self.idf);
         let mut scored: Vec<(usize, f32)> = Vec::new();
         for (index, document) in self.documents.iter().enumerate() {
             cancel.check_every(index)?;
@@ -192,7 +202,91 @@ impl SemanticIndex {
         });
         Ok(scored)
     }
+
+    /// How well the best of the first `hits` documents covers `query`, as a
+    /// disclosure for the response — or `None` when there is nothing to say.
+    ///
+    /// Cosine similarity ranks, but it does not say whether *any* hit answers
+    /// the question: a page where every name shares exactly one word with a
+    /// six-word query is ranked just as confidently as a page of answers. Two
+    /// facts separate them, and both are cheap here because the vocabulary is
+    /// already built:
+    ///
+    /// - **absent terms** — a query term no indexed name or docstring contains
+    ///   at all, so nothing on the page can be about it (`unmount` when the
+    ///   index holds names and the behaviour lives in bodies);
+    /// - **weak match** — no hit among the first `hits` carries more than one
+    ///   of the query's terms that the corpus does contain.
+    ///
+    /// Function words (`in`, `after`, `the`) are left out of both counts: they
+    /// are in the query because it is a sentence, not because the asker wants a
+    /// symbol named after them.
+    pub fn coverage_note(&self, query: &str, hits: &[usize]) -> Option<String> {
+        let mut terms: Vec<String> = tokenize(query)
+            .into_iter()
+            .filter(|term| !STOPWORDS.contains(&term.as_str()))
+            .collect();
+        terms.sort_unstable();
+        terms.dedup();
+        if terms.is_empty() {
+            return None;
+        }
+        let (present, absent): (Vec<&String>, Vec<&String>) = terms
+            .iter()
+            .partition(|term| self.idf.contains_key(term.as_str()));
+        let best = hits
+            .iter()
+            .filter_map(|&index| self.documents.get(index))
+            .map(|document| {
+                present
+                    .iter()
+                    .filter(|term| document.contains_key(term.as_str()))
+                    .count()
+            })
+            .max()
+            .unwrap_or(0);
+        let weak = present.len() >= 2 && best <= 1;
+        // The note rides `walk_incomplete`, which the session ledger counts as
+        // an index-health signal. It must stay rare: a question with one
+        // unfamiliar word and a hit covering the rest is answered, and saying
+        // otherwise on every sentence-shaped query would drown the signal.
+        // Absent terms are named only when the answer is weak anyway, or when
+        // they are at least half of what was asked.
+        let mostly_absent = !absent.is_empty() && absent.len() * 2 >= terms.len();
+        let mut notes = Vec::new();
+        if !absent.is_empty() && (weak || mostly_absent) {
+            let listed: Vec<&str> = absent.iter().map(|term| term.as_str()).collect();
+            notes.push(format!(
+                "the index contains none of the terms {}; it holds names and \
+                 docstrings, not bodies, so a behaviour named only in code bodies \
+                 is not findable here",
+                listed.join(", ")
+            ));
+        }
+        if weak {
+            let listed: Vec<&str> = present.iter().map(|term| term.as_str()).collect();
+            notes.push(format!(
+                "weak match: no hit among the first {} matches more than one \
+                 of the terms {}; these are single-word coincidences, not \
+                 answers — narrow the question to a name, or read the code \
+                 the hits do not cover",
+                hits.len(),
+                listed.join(", ")
+            ));
+        }
+        (!notes.is_empty()).then(|| notes.join("; "))
+    }
 }
+
+/// Words a plain-language question carries for grammar, never as the name of
+/// what it is looking for. Used only by [`SemanticIndex::coverage_note`];
+/// scoring keeps every term and lets IDF weigh it.
+const STOPWORDS: &[&str] = &[
+    "about", "after", "an", "and", "any", "are", "as", "at", "be", "before", "by", "can", "does",
+    "do", "for", "from", "how", "if", "in", "into", "is", "it", "its", "not", "of", "on", "or",
+    "over", "so", "that", "the", "then", "there", "this", "to", "under", "up", "via", "what",
+    "when", "where", "which", "while", "who", "why", "with",
+];
 
 #[cfg(test)]
 mod tests {

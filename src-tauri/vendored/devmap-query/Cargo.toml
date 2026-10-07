@@ -134,7 +134,15 @@ name = "a_delete_this_list_reads_for_its_answer"
 required-features = ["parse"]
 
 [[test]]
+name = "a_bare_ruby_send_has_a_caller"
+required-features = ["parse"]
+
+[[test]]
 name = "a_traversal_over_a_hole_says_so"
+required-features = ["parse"]
+
+[[test]]
+name = "a_call_blind_target_is_unavailable_not_empty"
 required-features = ["parse"]
 
 [[test]]
@@ -234,6 +242,10 @@ name = "ask_evidence"
 required-features = ["parse"]
 
 [[test]]
+name = "ask_scope"
+required-features = ["parse"]
+
+[[test]]
 name = "affected_counts_inline_tests"
 required-features = ["parse"]
 
@@ -244,4 +256,16 @@ required-features = ["parse"]
 
 [[test]]
 name = "impact_names_its_unresolved_callers"
+required-features = ["parse"]
+
+[[test]]
+name = "a_rendered_component_has_a_caller"
+required-features = ["parse"]
+
+[[test]]
+name = "a_wrapped_callback_is_a_function"
+required-features = ["parse"]
+
+[[test]]
+name = "a_walk_names_only_the_gaps_it_touches"
 required-features = ["parse"]

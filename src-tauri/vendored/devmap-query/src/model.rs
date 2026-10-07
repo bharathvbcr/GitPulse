@@ -218,6 +218,15 @@ pub struct Response<T> {
     /// ledger could not be read; `Some` with no sites is a checked absence.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub unresolved_namesakes: Option<UnresolvedNamesakes>,
+    /// The path prefixes and languages the ranking was restricted to, with the
+    /// scoped and whole corpus sizes. Set by a scoped `ask` or semantic
+    /// `search` alone.
+    ///
+    /// A client that asked for a scope over the socket protocol should
+    /// require this on the answer: an older daemon ignores fields it does not
+    /// know, and answers unscoped without it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<crate::scope::ScopeReport>,
 }
 
 /// The unresolved call sites that name an `impact` target. See

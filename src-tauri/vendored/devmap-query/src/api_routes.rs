@@ -6,7 +6,7 @@
 //!
 //! Python reads nodes of kind `ROUTE` carrying `extras.route` / `extras.verb` /
 //! `extras.framework`, plus `registers` edges for middleware. This module now
-//! reads the same shape, with one of the three still genuinely absent:
+//! reads the same shape:
 //!
 //! * `code_graph.rs` emits a node per `ExtractedRoute`, keyed by
 //!   [`ExtractedRoute::node_id`] — `"{file}::{VERB} {path}"` — carrying
@@ -15,8 +15,12 @@
 //!   still dropped at the store boundary.
 //! * The `routes_to` edge names that node as its `source` and the handler's
 //!   qualified name as its `target`, so both endpoints are node identities.
-//! * There is still no `Registers` edge kind at all, so middleware has no
-//!   kernel source whatever.
+//! * Middleware is read from `extras.middleware` — the list as declared,
+//!   anonymous entries included — and each named entry is bound through the
+//!   `registers` edge the resolver wrote from the same route node. The key is
+//!   present only where a producer ran (Express and Go routers); unlike the
+//!   Python, which read `registers` as file → route ownership, the kernel's
+//!   edge runs route → middleware, the direction `routes_to` runs.
 //!
 //! **Both shapes are read, because both exist.** A generation written before
 //! route nodes carries `routes_to` edges with a bare `"VERB path"` source and
@@ -452,6 +456,14 @@ struct RouteRow {
     /// The framework the node declared. `None` on an edge-only row, which is
     /// what keeps a null `framework` meaning "not seen" rather than "none".
     framework: Option<String>,
+    /// The middleware the route node declared, in run order, or `None` when
+    /// the node carries no `middleware` key — no producer ran for its
+    /// framework, or the generation predates the field. An edge-only row is
+    /// always `None`.
+    middleware: Option<Vec<Value>>,
+    /// Targets of the `registers` edges leaving this route's node: the
+    /// declared middleware the resolver bound to a symbol.
+    registered: Vec<String>,
 }
 
 /// What the graph could say about routes, so a null field can be read.
@@ -462,6 +474,9 @@ struct RouteProvenance {
     /// Routes recovered from a `routes_to` edge whose source named no route
     /// node — a generation older than route nodes. These have no framework.
     routes_without_a_node: usize,
+    /// Route nodes carrying a `middleware` list — routes a middleware
+    /// producer ran for. The rest report middleware as unknown.
+    routes_with_middleware_producer: usize,
 }
 
 /// Split a `routes_to` edge source into its verb and path.
@@ -503,6 +518,8 @@ fn routes_from_graph(graph: &Value) -> (Vec<RouteRow>, RouteProvenance) {
         file: Option<String>,
         line: Option<u64>,
         framework: Option<String>,
+        middleware: Option<Vec<Value>>,
+        registered: BTreeSet<String>,
     }
     // `(path, verb, node id)`. The id is last so rows sort by the HTTP surface
     // first and the declaring node only breaks ties; `None` — the edge-only
@@ -542,16 +559,34 @@ fn routes_from_graph(graph: &Value) -> (Vec<RouteRow>, RouteProvenance) {
             .as_str()
             .filter(|framework| !framework.is_empty())
             .map(str::to_string);
+        entry.middleware = extras["middleware"].as_array().cloned();
+        if entry.middleware.is_some() {
+            provenance.routes_with_middleware_producer += 1;
+        }
         keyed_by_node.insert(id, key);
     }
 
     for edge in graph["edges"].as_array().into_iter().flatten() {
-        if edge["kind"].as_str() != Some("routes_to") {
-            continue;
-        }
         let Some(source) = edge["source"].as_str() else {
             continue;
         };
+        match edge["kind"].as_str() {
+            Some("routes_to") => {}
+            // A `registers` edge always starts at a route node: the resolver
+            // writes one only from `ExtractedRoute::node_id`. One naming no
+            // node has no row to attach to and no verb or path of its own.
+            Some("registers") => {
+                if let (Some(key), Some(target)) =
+                    (keyed_by_node.get(source), edge["target"].as_str())
+                {
+                    if let Some(entry) = by_route.get_mut(key) {
+                        entry.registered.insert(target.to_string());
+                    }
+                }
+                continue;
+            }
+            _ => continue,
+        }
         let key = match keyed_by_node.get(source) {
             Some(key) => key.clone(),
             None => {
@@ -580,9 +615,57 @@ fn routes_from_graph(graph: &Value) -> (Vec<RouteRow>, RouteProvenance) {
             file: accum.file,
             line: accum.line,
             framework: accum.framework,
+            middleware: accum.middleware,
+            registered: accum.registered.into_iter().collect(),
         })
         .collect();
     (rows, provenance)
+}
+
+/// One declared middleware entry, with the symbol it bound to if it bound.
+///
+/// `resolution` says which of four things the entry is, because each licenses
+/// a different conclusion: `id` (a `registers` edge names the symbol),
+/// `ambiguous` (two edges could be this entry), `unbound` (it names a symbol
+/// and no edge was written — an external package or a name the resolver could
+/// not place; the unresolved ledger says which), and `anonymous` (an inline
+/// function, which names nothing and needs no binding).
+fn resolve_middleware(
+    entry: &Value,
+    registered: &[String],
+    by_id: &BTreeMap<String, Value>,
+) -> Value {
+    let mut out = entry.clone();
+    let name = entry["name"].as_str().unwrap_or_default();
+    let resolution = if name.is_empty() {
+        json!({"resolution": "anonymous"})
+    } else {
+        // The resolver writes the target as `qualified_for(file, name)`, so
+        // the name is the id's final segment after `::` — or after `.` for a
+        // method, which `qualified_for` spells `Type.name`.
+        let matches: Vec<&String> = registered
+            .iter()
+            .filter(|id| {
+                let tail = id.rsplit("::").next().unwrap_or(id);
+                tail == name || tail.rsplit('.').next() == Some(name)
+            })
+            .collect();
+        match matches.as_slice() {
+            [id] => match by_id.get(id.as_str()) {
+                Some(node) => json!({
+                    "resolution": "id", "id": node["id"], "path": node["path"],
+                    "line": node["line"], "kind": node["kind"],
+                }),
+                None => json!({"resolution": "id", "id": id}),
+            },
+            [] => json!({"resolution": "unbound"}),
+            many => json!({"resolution": "ambiguous", "candidates": many}),
+        }
+    };
+    if let (Some(object), Some(extra)) = (out.as_object_mut(), resolution.as_object()) {
+        object.insert("symbol".to_string(), Value::Object(extra.clone()));
+    }
+    out
 }
 
 /// Index nodes by id and by bare name, since a `routes_to` target is the
@@ -743,13 +826,21 @@ pub fn route_map(root: &Path, graph: &Value, budget: &ScanBudget) -> Value {
             // Absent by name when absent. A null `framework` means no route
             // node declared one — an edge-only route out of a generation older
             // than route nodes — and never "this route has no framework".
-            // `middleware` is null on every route: there is no `registers`
-            // edge kind for it to be read from.
+            // `middleware` follows the same rule: null when no producer ran
+            // for this route, `[]` when one ran and found none.
             "framework": match &row.framework {
                 Some(framework) => Value::String(framework.clone()),
                 None => Value::Null,
             },
-            "middleware": Value::Null,
+            "middleware": match &row.middleware {
+                Some(entries) => Value::Array(
+                    entries
+                        .iter()
+                        .map(|entry| resolve_middleware(entry, &row.registered, &by_id))
+                        .collect(),
+                ),
+                None => Value::Null,
+            },
         }));
     }
 
@@ -765,12 +856,71 @@ pub fn route_map(root: &Path, graph: &Value, budget: &ScanBudget) -> Value {
             "framework_available": provenance.route_nodes > 0,
             "route_nodes": provenance.route_nodes,
             "routes_without_a_route_node": provenance.routes_without_a_node,
-            "middleware_available": false,
+            // True only when a producer ran for at least one route here, and
+            // never a global claim: `routes_with_middleware` says how many,
+            // and every other route's `middleware` is null.
+            "middleware_available": provenance.routes_with_middleware_producer > 0,
+            "routes_with_middleware": provenance.routes_with_middleware_producer,
+            "routes_without_middleware_producer": rows.len()
+                - provenance.routes_with_middleware_producer,
             "reason": "framework is read from the route node the graph carries; a route \
     recovered from a routes_to edge with no such node has none, and every store carries \
-    those until its next build. middleware has no `registers` edge kind at all",
+    those until its next build. middleware is read from the route node too, and only Express \
+    and Go routers have a producer: a Flask, FastAPI, Django or Axum route reports null \
+    middleware, which means not examined, never none. A named entry binds through a \
+    `registers` edge; `symbol.resolution` says when it did not",
         },
     })
+}
+
+/// Keep only routes matching `filter`, leaving the scan report intact.
+///
+/// `count` stays the number of routes the graph holds and `shown` becomes
+/// what the filter kept: overwriting `count` would make a filtered view read
+/// as the whole surface. The predicate is [`route_matches_filter`], the one
+/// `shape-check` and `api-impact` already match by, so the three views agree
+/// on which routes a filter names.
+pub fn retain_matching_routes(mapped: &mut Value, filter: &str) {
+    let kept: Vec<Value> = mapped["routes"]
+        .as_array()
+        .map(|routes| {
+            routes
+                .iter()
+                .filter(|route| route_matches_filter(route, filter))
+                .cloned()
+                .collect()
+        })
+        .unwrap_or_default();
+    mapped["shown"] = json!(kept.len());
+    mapped["routes"] = Value::Array(kept);
+}
+
+/// Trim the route list to a token budget, in order, and say what was cut.
+///
+/// A route carries its consumers and their accessed keys, so one route on a
+/// large repository can be kilobytes; an answer an agent's context cannot
+/// hold is not an answer. `total` is what the list held before the cut (after
+/// any filter), `shown` what fits, and `truncated` is set whenever they
+/// differ. Charged at [`crate::BYTES_PER_TOKEN`], like every other surface.
+pub fn budget_routes(mapped: &mut Value, token_budget: u32) {
+    let routes = mapped["routes"].as_array().cloned().unwrap_or_default();
+    let total = routes.len();
+    let mut spent = 0u64;
+    let mut kept = Vec::new();
+    for route in routes {
+        let cost = (route.to_string().len() as u64).div_ceil(u64::from(crate::BYTES_PER_TOKEN));
+        if spent + cost > u64::from(token_budget) {
+            break;
+        }
+        spent += cost;
+        kept.push(route);
+    }
+    mapped["shown"] = json!(kept.len());
+    mapped["hidden"] = json!(total - kept.len());
+    mapped["total"] = json!(total);
+    mapped["truncated"] = json!(kept.len() < total);
+    mapped["tokens_used"] = json!(spent);
+    mapped["routes"] = Value::Array(kept);
 }
 
 fn route_matches_filter(route: &Value, filter: &str) -> bool {
@@ -948,7 +1098,7 @@ pub fn api_impact(root: &Path, graph: &Value, budget: &ScanBudget, target: &str)
         "handlers": route["handlers"],
         "handler_keys": route["handler_keys"],
         "consumers": consumers,
-        "middleware": Value::Null,
+        "middleware": route["middleware"],
         "shape_mismatches": mismatches,
         "risk": risk,
         "risk_reason": reason,
@@ -1161,7 +1311,8 @@ mod tests {
         );
         assert_eq!(legacy["id"], "GET /legacy");
 
-        // Middleware has no source at all, on either row.
+        // No `middleware` key on the node: no producer ran for a Flask route,
+        // and the edge-only row has no node at all. Null on both, never `[]`.
         assert!(users["middleware"].is_null());
         assert_eq!(mapped["capabilities"]["middleware_available"], json!(false));
         // Both numbers, so a reader can tell which kind of null they have.
@@ -1415,6 +1566,99 @@ async function load() {
         std::fs::remove_dir_all(&root).ok();
     }
 
+    /// A route whose producer ran lists its middleware in order, each named
+    /// entry bound through its `registers` edge or saying it was not, and the
+    /// capability counts say how many routes that holds for.
+    #[test]
+    fn middleware_is_read_from_the_route_node_and_bound_through_registers() {
+        let root = tempdir("middleware");
+        let g = graph(
+            json!([
+                {"id": "app.js::listUsers", "name": "listUsers", "path": "app.js", "line": 9,
+                 "kind": "function"},
+                {"id": "auth.js::requireAuth", "name": "requireAuth", "path": "auth.js",
+                 "line": 3, "kind": "function"},
+                {"id": "app.js::GET /users", "name": "GET /users", "path": "app.js",
+                 "line": 5, "kind": "route",
+                 "extras": {"route": "/users", "verb": "GET", "framework": "express",
+                  "middleware": [
+                    {"name": "cors", "qualifier": null, "expression": "cors()",
+                     "scope": "router"},
+                    {"name": "requireAuth", "qualifier": null, "expression": "requireAuth",
+                     "scope": "router"},
+                    {"name": "", "qualifier": null, "expression": "(req, res, next) => next()",
+                     "scope": "route"}
+                  ]}},
+                {"id": "app.js::GET /open", "name": "GET /open", "path": "app.js",
+                 "line": 6, "kind": "route",
+                 "extras": {"route": "/open", "verb": "GET", "framework": "express",
+                  "middleware": []}},
+                {"id": "a.py::GET /py", "name": "GET /py", "path": "a.py", "line": 1,
+                 "kind": "route",
+                 "extras": {"route": "/py", "verb": "GET", "framework": "fastapi/flask"}},
+            ]),
+            json!([
+                {"kind": "routes_to", "source": "app.js::GET /users", "target": "app.js::listUsers"},
+                {"kind": "registers", "source": "app.js::GET /users",
+                 "target": "auth.js::requireAuth"},
+            ]),
+        );
+        let mapped = route_map(&root, &g, &ScanBudget::default());
+        let route = |path: &str| {
+            mapped["routes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|r| r["path"] == path)
+                .unwrap()
+                .clone()
+        };
+
+        let users = route("/users");
+        let middleware = users["middleware"].as_array().expect("producer ran");
+        let summary: Vec<(String, String)> = middleware
+            .iter()
+            .map(|m| {
+                (
+                    m["expression"].as_str().unwrap().to_string(),
+                    m["symbol"]["resolution"].as_str().unwrap().to_string(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            summary,
+            [
+                ("cors()".to_string(), "unbound".to_string()),
+                ("requireAuth".to_string(), "id".to_string()),
+                (
+                    "(req, res, next) => next()".to_string(),
+                    "anonymous".to_string()
+                ),
+            ],
+            "{users}"
+        );
+        assert_eq!(middleware[1]["symbol"]["path"], "auth.js");
+
+        assert_eq!(
+            route("/open")["middleware"],
+            json!([]),
+            "ran and found none"
+        );
+        assert!(
+            route("/py")["middleware"].is_null(),
+            "no producer: unknown, not none"
+        );
+
+        let capabilities = &mapped["capabilities"];
+        assert_eq!(capabilities["middleware_available"], json!(true));
+        assert_eq!(capabilities["routes_with_middleware"], json!(2));
+        assert_eq!(capabilities["routes_without_middleware_producer"], json!(1));
+
+        let impact = api_impact(&root, &g, &ScanBudget::default(), "/users");
+        assert_eq!(impact["middleware"], users["middleware"]);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
     #[test]
     fn fields_the_kernel_cannot_see_are_null_and_say_why() {
         let root = tempdir("caps");
@@ -1423,8 +1667,8 @@ async function load() {
             json!([{"kind": "routes_to", "source": "GET /x", "target": "h"}]),
         );
         let mapped = route_map(&root, &g, &ScanBudget::default());
-        // Null, not "" and []: this kernel drops the framework at the store
-        // boundary and has no `registers` edge kind.
+        // Null, not "" and []: an edge-only route has no node to carry a
+        // framework, and no producer ran for its middleware.
         assert!(mapped["routes"][0]["framework"].is_null());
         assert!(mapped["routes"][0]["middleware"].is_null());
         assert_eq!(mapped["capabilities"]["framework_available"], json!(false));

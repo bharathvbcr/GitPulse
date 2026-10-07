@@ -17,9 +17,7 @@
 //!   regression golden files structurally cannot catch.
 
 use devmap_extract::model::{EdgeKind, Extraction};
-use devmap_resolve::model::{
-    Resolution, ResolutionResult, ResolvedEdge, UnresolvedClass, UnresolvedReference,
-};
+use devmap_resolve::model::{Resolution, ResolutionResult, ResolvedEdge, UnresolvedReference};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
 
@@ -183,14 +181,7 @@ fn resolved_sites_by_language<'a>(
 
 /// Whether this miss has affirmative evidence that no edge was ever findable.
 fn is_explained(row: &UnresolvedReference) -> bool {
-    matches!(
-        row.class,
-        UnresolvedClass::Builtin
-            | UnresolvedClass::HostGlobal { .. }
-            | UnresolvedClass::External { .. }
-            | UnresolvedClass::NoNamesake
-            | UnresolvedClass::ModulePath
-    )
+    row.class.is_explained()
 }
 
 /// Compute the rate over one generation's resolution.

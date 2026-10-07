@@ -33,6 +33,49 @@ pub const ASK_DEFAULT_MIN_CONFIDENCE: f32 = {
     Rung::Deterministic.floor_millis() as f32 / 1000.0
 };
 
+/// Share of a hit's final score that is its lexical match; the rest is its
+/// personalized PageRank. Both are normalised to the best in the answer first.
+///
+/// PageRank alone let a helper every seed calls outrank the symbol whose name
+/// says what was asked: on ScholarLM "where does the Go backend decode seeded
+/// papers" put `AsOptionalString` first and `decodeSearchPapers` 44th
+/// (2026-10-07). The graph still moves a hit up — a seed its neighbours call
+/// beats an equally named one nothing reaches — but it cannot carry a symbol
+/// the question does not describe past one it does.
+pub const ASK_LEXICAL_WEIGHT: f32 = 0.7;
+
+/// The words a plain-language question is phrased in, which name nothing in a
+/// code base. Dropped from an `ask` query before scoring, so "where does the
+/// Go backend decode …" seeds on what it asks about rather than on every
+/// symbol that happens to contain "where" or "does".
+///
+/// Function words only. A word that also names code — `get`, `load`,
+/// `handle`, `code` — is a term and stays.
+const QUESTION_WORDS: &[&str] = &[
+    "about", "an", "and", "are", "at", "be", "been", "by", "can", "could", "did", "do", "does",
+    "for", "from", "how", "in", "into", "is", "it", "its", "of", "on", "or", "should", "that",
+    "the", "their", "there", "these", "this", "those", "to", "was", "we", "were", "what", "when",
+    "where", "which", "who", "whom", "whose", "why", "with", "would",
+];
+
+/// The terms of an `ask` question: [`crate::semantic::tokenize`], minus
+/// [`QUESTION_WORDS`] — unless that would leave nothing, in which case the
+/// question *is* its words and every term stays (`ask "where"` still searches
+/// for "where").
+pub fn question_terms(query: &str) -> Vec<String> {
+    let terms = crate::semantic::tokenize(query);
+    let content: Vec<String> = terms
+        .iter()
+        .filter(|term| !QUESTION_WORDS.contains(&term.as_str()))
+        .cloned()
+        .collect();
+    if content.is_empty() {
+        terms
+    } else {
+        content
+    }
+}
+
 /// One seed text for TF-IDF: bare name, qualified name, and docstring when set.
 pub fn seed_text(name: &str, qualified_name: &str, docstring: Option<&str>) -> String {
     match docstring.map(str::trim).filter(|text| !text.is_empty()) {
@@ -139,12 +182,14 @@ pub fn personalized_pagerank(
     for step in 0..ASK_MAX_ITERS {
         cancel.check_every(step)?;
         let mut next = vec![0.0; n];
+        // Every dangling node hands its mass to the teleport distribution, so
+        // the total is summed once and spread once. Spreading it per dangling
+        // node was O(dangling × n) per iteration — on ScholarLM's ask graph,
+        // tens of thousands of nodes squared, 32 times.
+        let mut dangling = 0.0f32;
         for (i, outs) in outbound.iter().enumerate() {
             if outs.is_empty() {
-                let mass = rank[i];
-                for (j, weight) in teleport.iter().enumerate() {
-                    next[j] += mass * weight;
-                }
+                dangling += rank[i];
             } else {
                 let share = rank[i] / outs.len() as f32;
                 for &j in outs {
@@ -153,12 +198,19 @@ pub fn personalized_pagerank(
             }
         }
         for j in 0..n {
+            next[j] += dangling * teleport[j];
             next[j] = ASK_RESTART * teleport[j] + (1.0 - ASK_RESTART) * next[j];
         }
         rank = next;
     }
     Ok(rank)
 }
+
+/// How many of the best TF-IDF matches the coverage note judges.
+///
+/// The first page an agent reads, not the whole tail: a weak head under a
+/// strong match ranked 400th is still a weak answer.
+pub const ASK_COVERAGE_HEAD: usize = 10;
 
 /// Line carried when seeds matched but every call edge among them sat below
 /// the confidence floor.
