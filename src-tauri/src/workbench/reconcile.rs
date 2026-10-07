@@ -326,6 +326,23 @@ pub(super) fn release(state: &WorkbenchState, input: &str) -> Result<Value, Work
     })
 }
 
+/// Removes the task brief directories a crashed GitPulse left in the temp
+/// root, judged by the same writer-liveness evidence a native owner is.
+///
+/// Separate from [`sweep`] because it needs no task store: a profile that was
+/// never created can still have briefs on disk from a launch that crashed
+/// before anything else was saved.
+pub(super) fn sweep_briefs() -> usize {
+    let removed = super::terminal_command::remove_abandoned_briefs(
+        &std::env::temp_dir(),
+        process_birth::running_since,
+    );
+    if removed > 0 {
+        log::info!(target: "workbench", "removed {removed} task brief(s) left behind by an earlier session");
+    }
+    removed
+}
+
 /// Every held run, judged; the ones the evidence allows are released.
 ///
 /// Returns how many were released. Bounded by `MAX_PAGES` per state, and a
