@@ -2,6 +2,7 @@ import { mergeTerminalNotice, type PtyBus, type TerminalExitEvent } from "./ptyB
 import type { TerminalSpawned } from "./runResult";
 import { createTerminalInput, terminalDeadline } from "./inputQueue";
 import type { createSessionRegistry } from "./sessionRegistry";
+import type { LauncherKind } from "./tabs";
 
 export interface SessionTransport {
   spawn(): Promise<TerminalSpawned>;
@@ -23,6 +24,8 @@ export function createSessionLifecycle(options: {
   key: string;
   repoPath: string;
   label: string;
+  /** See `TerminalSessionRecord.launcher`. */
+  launcher?: LauncherKind;
   bus: PtyBus;
   registry: ReturnType<typeof createSessionRegistry>;
   transport: SessionTransport;
@@ -128,6 +131,7 @@ export function createSessionLifecycle(options: {
     try {
       slot ??= registry.reserve({
         key: options.key, repoPath: options.repoPath, label: options.label, status: "starting", close,
+        ...(options.launcher ? { launcher: options.launcher } : {}),
         reveal: options.reveal, confirmClose: options.confirmClose,
         ...(options.title ? { title: options.title } : {}),
         ...(options.taskRunId ? { taskRunId: options.taskRunId } : {}),

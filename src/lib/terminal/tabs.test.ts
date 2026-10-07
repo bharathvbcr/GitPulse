@@ -280,6 +280,22 @@ describe("a resumed conversation's tab", () => {
     expect(tabFor(again, { runId: "run-1", title: "x" })?.taskRunId).toBe("run-1");
   });
 
+  it("starts in the conversation's own directory when that is below the checkout root", () => {
+    // Claude Code keeps a conversation under the directory it ran in, so a
+    // resume started at the checkout root finds no conversation.
+    const state = openTab(initialState(), "claude", { ...resume, startDir: "packages/web" });
+    expect(state.tabs.find((item) => item.id === state.activeId)?.startDir).toBe("packages/web");
+    const attempt = openTab(initialState(), "claude", { runId: "run-2", title: "Fix", startDir: "packages/web" });
+    expect(attempt.tabs.find((item) => item.id === attempt.activeId)?.startDir).toBe("packages/web");
+    // A directory that climbs or is absolute is one the host refuses; it is
+    // not carried.
+    for (const startDir of ["../x", "/abs", "a/../../b"]) {
+      const opened = openTab(initialState(), "claude", { ...resume, startDir });
+      expect(opened.tabs.find((item) => item.id === opened.activeId)?.resume, startDir).toBeDefined();
+      expect(opened.tabs.find((item) => item.id === opened.activeId)?.startDir, startDir).toBeUndefined();
+    }
+  });
+
   it("opens nothing for a launcher or session id Claude Code would refuse", () => {
     const start = initialState();
     expect(openTab(start, "codex", resume)).toBe(start);

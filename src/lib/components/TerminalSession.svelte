@@ -106,6 +106,7 @@
   import { linksForRow, resolveLinkAction, type LinkBuffer } from "../terminal/links";
   import { requestReveal } from "../files/revealRequests";
   import { openTaskForRun } from "../workbench/taskOpen";
+  import { noteAttempt } from "../terminal/taskLaunches";
   import { toastStore } from "../stores/toastStore";
   import {
     clampTerminalFontSize, hasRenderedBox, macLineEditing, spawnGridSize, terminalViewChord, terminalSearchSummary,
@@ -539,7 +540,7 @@
 
   function createLifecycle() {
     return createSessionLifecycle({
-      key: tabId, repoPath, label: launcherLabel(launcher), bus: ptyBus, registry: terminalSessions,
+      key: tabId, repoPath, label: launcherLabel(launcher), launcher, bus: ptyBus, registry: terminalSessions,
       singleAttempt: !!taskRunId,
       reveal: revealSelf,
       confirmClose: confirmCloseSelf,
@@ -584,6 +585,7 @@
           exited = status === "exited";
           error = status === "error" ? message ?? "Terminal failed" : null;
           onStatus(status);
+          if (taskRunId) reportAttemptStart(taskRunId, status, message);
         },
         started(spawned) {
           shellPath = spawned.shell;
@@ -646,6 +648,33 @@
     });
   }
 
+  /**
+   * Tells the attempt's row what became of its start. This tab is usually
+   * hidden (a launch starts the agent out of sight), so a spawn the host
+   * refused — the CLI missing or too old, a bad argument — was said only in
+   * here, and the failed start then released its registry slot, leaving the
+   * Agents pane to say a quiet "not connected". Only a failure before this
+   * tab ever had a process counts as a failed start; a later one is a live
+   * session's problem, which the pane already shows from the registry.
+   *
+   * A failed start is one whose registry slot is gone once the lifecycle
+   * has finished with it (it releases the slot right after this hook). A
+   * spawn still pending past its watchdog also reports an error, but keeps
+   * its slot and may yet start, so it is not one.
+   */
+  function reportAttemptStart(runId: string, status: "starting" | "running" | "exited" | "error", message?: string) {
+    if (status === "running") noteAttempt(runId, "running", `${launcherLabel(launcher)} is running.`);
+    else if (status === "starting") noteAttempt(runId, "starting", `Starting ${launcherLabel(launcher)}…`);
+    else if (status === "error" && !nativeSessionId) {
+      // The lifecycle stringifies the rejection; its "Error: " says nothing.
+      const cause = (message ?? "").replace(/^Error:\s*/, "").trim() || "The terminal failed to start.";
+      queueMicrotask(() => {
+        if (nativeSessionId || get(terminalSessions).some((record) => record.key === tabId)) return;
+        noteAttempt(runId, "failed", cause);
+      });
+    }
+  }
+
   async function spawnPty() { await lifecycle?.start(); }
 
   /** Agreed to for this tab. The stored preference is untouched. */
@@ -673,11 +702,17 @@
 
   export function restart() { void lifecycle?.restart(); }
 
-  /** Opens the task this attempt belongs to, where a new attempt starts. */
+  /**
+   * The attempt this tab belongs to: its own, or the one a resumed
+   * conversation continues. Its task lists both, so both link back to it.
+   */
+  const linkedRunId = $derived(taskRunId ?? resume?.runId ?? null);
+
+  /** Opens the task this tab's attempt belongs to, where a new attempt starts. */
   async function openOwnTask() {
-    if (!taskRunId) return;
+    if (!linkedRunId) return;
     try {
-      await openTaskForRun(taskRunId);
+      await openTaskForRun(linkedRunId);
     } catch (cause) {
       toastStore.error(`This attempt's task could not be opened: ${formatError(cause)}`);
     }
@@ -1162,7 +1197,7 @@
         </button>
       {:else if exited}
         <span class="text-textMuted flex-1 text-[11px]">This session ended.</span>
-        {#if taskRunId}
+        {#if linkedRunId}
           <!-- The task details are where a new attempt starts, so the way
                there is here rather than only named in a tooltip. -->
           <button type="button" class="gp-btn py-1! text-[11px]!" data-testid="terminal-open-task" onclick={() => void openOwnTask()}>

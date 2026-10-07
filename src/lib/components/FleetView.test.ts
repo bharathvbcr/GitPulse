@@ -3,7 +3,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import { render } from "svelte/server";
-import FleetView, { applyFilter, scanTargets, SEVERITY_STRIPE } from "./FleetView.svelte";
+import FleetView, { agentKindsTitle, agentSessionsLabel, applyFilter, scanTargets, SEVERITY_STRIPE } from "./FleetView.svelte";
 import FleetCell from "./FleetCell.svelte";
 import FleetLanguageBar from "./FleetLanguageBar.svelte";
 import FleetPulsePanel from "./FleetPulse.svelte";
@@ -771,5 +771,38 @@ describe("per-repository scans stay opt-in and open-only", () => {
 
   it("refuses to start a second scan while a sweep is running", () => {
     expect(source).toContain("if ($fleetStore.scanning !== null) return undefined;");
+  });
+});
+
+describe("FleetView agent sessions", () => {
+  it("pluralises the session count", () => {
+    // It read "3 agent".
+    expect(agentSessionsLabel(1)).toBe("1 agent");
+    expect(agentSessionsLabel(3)).toBe("3 agents");
+    expect(source).not.toContain("{row.work.value.agentSessions} agent<");
+    expect(source).toContain("{agentSessionsLabel(row.work.value.agentSessions)}");
+  });
+
+  it("names the kinds the way the Worktrees panel does", () => {
+    expect(agentKindsTitle(["claude", "gitpulse"])).toBe(
+      "Agent checkouts: Claude Code, GitPulse task. Show them in Agents.",
+    );
+    expect(agentKindsTitle([])).toBe("Show this repository in Agents.");
+  });
+
+  it("is a button that opens the Agents view for that repository", () => {
+    const cell = source.slice(source.indexOf('data-testid="fleet-open-agents"') - 200, source.indexOf("{agentSessionsLabel("));
+    expect(cell).toContain("<button");
+    expect(cell).toContain("e.stopPropagation();");
+    expect(cell).toContain("void openAgents(row);");
+    // The repository is opened first — the Agents view lists the sessions of
+    // open repositories only — and the surface switches only once it opened.
+    const fn = source.slice(source.indexOf("async function openAgents"), source.indexOf("async function removeRow"));
+    expect(fn).toContain("if (!(await repoStore.openRepo(row.path))) return;");
+    expect(fn).toContain('interfaceStore.setGlobalSurface("agents");');
+    // The view opens narrowed to this repository, scoped before it is shown.
+    expect(fn.indexOf("setAgentsRepositoryScope(row.path);")).toBeGreaterThan(-1);
+    expect(fn.indexOf("setAgentsRepositoryScope(row.path);")).toBeLessThan(fn.indexOf("setGlobalSurface"));
+    expect(fn).not.toContain("setFleetOpen");
   });
 });

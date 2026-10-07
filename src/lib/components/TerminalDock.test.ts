@@ -71,6 +71,12 @@ describe("TerminalDock", () => {
     expect(focus).toContain('showRepositorySurface: () => interfaceStore.setGlobalSurface("repository")');
   });
 
+  it("hands the panel the open tabs, so the Sessions list can name each checkout", () => {
+    // The panel cannot read the store; the repository, checkout and agent
+    // worktree a session runs in come from the tab on that checkout.
+    expect(source).toContain("checkouts: $repoStore.openTabs");
+  });
+
   it("a clicked session alert jumps through the same owner as Go to", () => {
     // It called `record.reveal()` directly: the tab was selected inside
     // whichever repository's panel held it, hidden if that was not the

@@ -15,11 +15,10 @@
 
 import { isAdoptedSession } from "../terminal/detachedSessions";
 import type { TerminalSessionRecord } from "../terminal/sessionRegistry";
-import type { TaskTerminalRequest } from "../terminal/taskLaunches";
+import type { AttemptNotice, TaskTerminalRequest } from "../terminal/taskLaunches";
 import type { SessionActivity } from "../terminal/sessionActivity";
 import type { OpenRepoTab } from "../stores/repoStore";
-import { identityKey, type PathIdentityOptions } from "../repos/paths";
-import { isAgentWorktree } from "../work/agentWorktree";
+import { identityKey, pathSegments, type PathIdentityOptions } from "../repos/paths";
 import { runExpired, runHoldsCheckout } from "./taskHandoff";
 import type { TaskRun } from "./client";
 
@@ -40,7 +39,17 @@ export interface AttemptTerminalView {
    * A request for this attempt that no session has taken yet, and why it is
    * still waiting. Null when nothing is waiting.
    */
-  waiting: { role: "attempt" | "resumed"; reason: "capacity" | "checkout" } | null;
+  waiting: {
+    role: "attempt" | "resumed";
+    /**
+     * `trust`: its checkout opened as a repository nobody has trusted, and
+     * the dock will not start an agent there until someone does. `capacity`:
+     * every terminal slot is taken. `checkout`: its checkout is not open yet.
+     */
+    reason: "capacity" | "checkout" | "trust";
+    /** The checkout the request waits for, as queued. */
+    checkout: string;
+  } | null;
 }
 
 const STARTING = "starting";
@@ -68,6 +77,8 @@ export function attemptTerminalView(
   records: readonly TerminalSessionRecord[],
   requests: readonly TaskTerminalRequest[],
   capacityFull: boolean,
+  /** Whether the checkout at this path is open but waiting to be trusted. */
+  trustPending: (repoPath: string) => boolean = () => false,
 ): AttemptTerminalView {
   if (!runId) return { sessions: [], waiting: null };
   const sessions: AttemptSession[] = [];
@@ -85,18 +96,27 @@ export function attemptTerminalView(
     // not waiting for anything the reader can act on.
     const served = sessions.some((session) => session.role === role);
     if (served) continue;
-    waiting = { role, reason: capacityFull ? "capacity" : "checkout" };
+    // Trust first: no free slot serves a checkout the dock will not host.
+    const reason = trustPending(request.repoPath) ? "trust" : capacityFull ? "capacity" : "checkout";
+    waiting = { role, reason, checkout: request.repoPath };
     if (role === "attempt") break;
   }
   return { sessions, waiting };
 }
 
-/** The sentence for a waiting request. */
+function lastSegment(path: string): string {
+  return path.split(/[\\/]/).filter(Boolean).pop() ?? path;
+}
+
+/** The sentence for a waiting request: what it waits for, then what to do. */
 export function waitingLabel(waiting: NonNullable<AttemptTerminalView["waiting"]>, limit: number): string {
-  const what = waiting.role === "attempt" ? "The agent's terminal" : "The resumed conversation";
-  return waiting.reason === "capacity"
-    ? `${what} is waiting for a free terminal session — all ${limit} are in use. Close one, or raise the limit in Settings → Agents.`
-    : `${what} is waiting for its checkout to open in GitPulse.`;
+  const lead = waiting.role === "attempt" ? "" : "Resumed conversation · ";
+  const name = lastSegment(waiting.checkout);
+  switch (waiting.reason) {
+    case "capacity": return `${lead}Waiting for a terminal slot — all ${limit} are in use. Close one, or raise the limit in Settings → Agents.`;
+    case "trust": return `${lead}Waiting for you to trust ${name}. It opened without asking; trust it and the agent starts.`;
+    default: return `${lead}Waiting for ${name} to open.`;
+  }
 }
 
 // ---- At a glance ----------------------------------------------------------
@@ -175,10 +195,11 @@ export function mostUrgent(glances: readonly AgentGlance[]): AgentGlance | null 
  */
 export function attemptUrgency(
   glances: readonly AgentGlance[],
-  extra: { pendingRequests?: number; waiting?: boolean; disconnected?: boolean } = {},
+  extra: { pendingRequests?: number; waiting?: boolean; disconnected?: boolean; failed?: boolean } = {},
 ): GlanceTone | null {
   const tones: GlanceTone[] = glances.map((glance) => glance.tone);
   if ((extra.pendingRequests ?? 0) > 0) tones.push("needs-you");
+  if (extra.failed) tones.push("error");
   if (extra.disconnected) tones.push("problem");
   if (extra.waiting) tones.push("starting");
   let best: GlanceTone | null = null;
@@ -207,6 +228,14 @@ export interface MonitorContext {
   now: number;
   /** For "still holds its checkout"; the instant the runs were read against. */
   clock: number;
+  /**
+   * What this window recorded about the attempt's start, when it recorded
+   * anything (`taskLaunches.ts::attemptNotices`). Optional: a surface that
+   * does not pass it simply shows no start failures.
+   */
+  notices?: (runId: string) => AttemptNotice | undefined;
+  /** Whether the checkout at a path is open but waiting to be trusted. */
+  trustPending?: (repoPath: string) => boolean;
 }
 
 export interface MonitoredAttempt {
@@ -218,6 +247,12 @@ export interface MonitoredAttempt {
   disconnected: boolean;
   /** Prepared for a terminal that nothing in this window is starting. */
   unstarted: boolean;
+  /**
+   * Why the attempt's process did not start, when this window saw it fail
+   * and nothing has started since: a checkout that would not open, a spawn
+   * the host refused, a managed start that failed. Null otherwise.
+   */
+  failure: string | null;
 }
 
 /**
@@ -226,17 +261,56 @@ export interface MonitoredAttempt {
  * reader sees first and the card that sent them there say the same thing.
  */
 export function monitorAttempt(run: TaskRun, context: MonitorContext): MonitoredAttempt {
-  const view = attemptTerminalView(run.id, context.records, context.requests, context.capacityFull);
+  const view = attemptTerminalView(run.id, context.records, context.requests, context.capacityFull, context.trustPending);
   const own = view.sessions.some((session) => session.role === "attempt");
   const terminal = run.kind === "external_terminal";
-  const disconnected = terminal && !own && !view.waiting && ["starting", "running"].includes(run.state);
-  const unstarted = terminal && !own && !view.waiting && run.state === "prepared" && !runExpired(run, context.clock);
+  // A failure stands only while nothing has replaced it: no session of its
+  // own here, no request waiting, and a run the store has not seen claimed.
+  // A claimed run whose start reply this window lost is running somewhere —
+  // that is "not connected here", and Show terminal reconnects it.
+  const notice = context.notices?.(run.id);
+  const unclaimed = run.state === "prepared" || (run.kind === "managed" && run.state === "starting");
+  const failure = notice?.phase === "failed" && unclaimed && !own && view.waiting?.role !== "attempt" ? notice.text : null;
+  const disconnected = terminal && !own && !view.waiting && !failure && ["starting", "running"].includes(run.state);
+  const unstarted = terminal && !own && !view.waiting && !failure && run.state === "prepared" && !runExpired(run, context.clock);
   const glances = view.sessions.map((session) =>
     agentGlance(session, session.record.sessionId ? context.activity(session.record.sessionId) : undefined, context.now));
   const tone = runHoldsCheckout(run, context.clock)
-    ? attemptUrgency(glances, { pendingRequests: context.pending(run.id)?.count ?? 0, waiting: view.waiting !== null, disconnected })
+    ? attemptUrgency(glances, { pendingRequests: context.pending(run.id)?.count ?? 0, waiting: view.waiting !== null, disconnected, failed: failure !== null })
     : attemptUrgency(glances);
-  return { run, view, glances, tone, disconnected, unstarted };
+  return { run, view, glances, tone, disconnected, unstarted, failure };
+}
+
+/**
+ * One attempt's place on the ladder every row reads the same way:
+ * Preparing worktree → Starting agent → Running → Needs you → Exited /
+ * Failed / Expired. (The host's worktree setup runs inside the one
+ * preparation call, so it has no rung of its own: nothing reports it apart.)
+ *
+ * `tone` is the pill's colour: `live` for work in progress, `ask` for a
+ * reader wanted, `bad` for something that will not proceed by itself,
+ * `done` for an attempt that has ended.
+ */
+export interface AttemptStage {
+  stage: "starting" | "waiting" | "running" | "needs-you" | "failed" | "expired" | "ended" | "unresolved" | "unstarted";
+  label: string;
+  tone: "live" | "ask" | "bad" | "done";
+}
+
+export function attemptStage(row: Pick<MonitoredAttempt, "run" | "view" | "tone" | "failure" | "unstarted" | "disconnected">, clock: number): AttemptStage {
+  const { run } = row;
+  if (row.failure) return { stage: "failed", label: "Failed to start", tone: "bad" };
+  if (run.state === "prepared" && runExpired(run, clock)) return { stage: "expired", label: "Expired", tone: "done" };
+  if (run.state === "unresolved") return { stage: "unresolved", label: "Unresolved", tone: "bad" };
+  if (run.state === "failed") return { stage: "ended", label: "Failed", tone: "bad" };
+  if (run.state === "cancelled") return { stage: "ended", label: "Cancelled", tone: "done" };
+  if (run.state === "exited") return { stage: "ended", label: run.outcome_uncertain ? "Ended · outcome unknown" : "Exited", tone: "done" };
+  if (asksForReader(row.tone)) return { stage: "needs-you", label: "Needs you", tone: "ask" };
+  if (row.view.waiting?.role === "attempt") return { stage: "waiting", label: row.view.waiting.reason === "trust" ? "Needs trust" : "Starting agent", tone: row.view.waiting.reason === "trust" ? "ask" : "live" };
+  if (row.unstarted) return { stage: "unstarted", label: "Not started", tone: "live" };
+  if (run.state === "prepared" || run.state === "starting" || row.tone === "starting") return { stage: "starting", label: "Starting agent", tone: "live" };
+  if (row.disconnected) return { stage: "running", label: "Running elsewhere", tone: "live" };
+  return { stage: "running", label: "Running", tone: "live" };
 }
 
 /** Most urgent first; among equals, the newest attempt first. */
@@ -273,17 +347,64 @@ export function taskAgentSummaries(runs: readonly TaskRun[], context: MonitorCon
  */
 export interface CheckoutChanges { files: number; branch: string | null; shared: boolean }
 
+/** Which attempt is asking, and the other attempts the caller knows are live. */
+export interface AttemptIdentity {
+  runId: string;
+  /** Live attempts as read; the asking one may be among them. */
+  peers?: readonly Pick<TaskRun, "id" | "cwd">[];
+}
+
+/**
+ * Whether `cwd` is the worktree the host made for this attempt.
+ *
+ * Read from the run, not from the layout: the host places an attempt's own
+ * worktree at `<main checkout>/.gitpulse/worktrees/<slug>-<short>`, where
+ * `short` is the first 8 ASCII letters and digits of the run id, lowercased
+ * (`src-tauri/src/workbench/agent_worktree.rs`, `short` and `provision`). A
+ * worktree any agent made — `.claude/worktrees/…`, or another attempt's —
+ * does not carry this run's id, so it is not this attempt's own. Transcribed
+ * from the host; the run record carries no ownership field to read instead.
+ */
+export function isAttemptWorktree(cwd: string, runId: string): boolean {
+  const short = [...runId].filter((ch) => /[A-Za-z0-9]/.test(ch)).slice(0, 8).join("").toLowerCase();
+  if (short.length < 4) return false;
+  const segments = pathSegments(cwd);
+  if (segments.length < 3) return false;
+  const [container, worktrees, name] = segments.slice(-3);
+  return container === ".gitpulse" && worktrees === "worktrees" && name.toLowerCase().endsWith(`-${short}`);
+}
+
+/**
+ * What to say once the host has released an attempt's hold on its checkout.
+ *
+ * Releasing ends the hold, not the directory: the host never removes a
+ * worktree whose attempt it accepted (`agent_worktree.rs` — the agent's work
+ * lives there), so for the attempt's own worktree the reader is told it is
+ * still on disk, and where, rather than left to think it went.
+ */
+export function releasedNote(run: Pick<TaskRun, "id" | "cwd">): string {
+  return isAttemptWorktree(run.cwd, run.id)
+    ? `Released. The attempt's worktree stays on disk at ${run.cwd}, with its changes and branch, and its checkout is free for another attempt.`
+    : "Released. The checkout is free for another attempt.";
+}
+
 export function checkoutChanges(
   cwd: string,
-  tabs: readonly Pick<OpenRepoTab, "path" | "isLoading" | "error" | "trustRequired" | "changedCount" | "currentBranch">[],
+  tabs: readonly Pick<OpenRepoTab, "path" | "familyRoot" | "isLoading" | "error" | "trustRequired" | "changedCount" | "currentBranch">[],
   options: PathIdentityOptions,
+  attempt: AttemptIdentity,
 ): CheckoutChanges | null {
   const key = identityKey(cwd, options);
   if (!key) return null;
   const tab = tabs.find((candidate) => identityKey(candidate.path, options) === key);
   if (!tab || tab.isLoading || tab.error || tab.trustRequired) return null;
   if (!Number.isFinite(tab.changedCount) || tab.changedCount < 0) return null;
-  return { files: tab.changedCount, branch: tab.currentBranch, shared: !isAgentWorktree(cwd) };
+  // Shared unless it is this run's own worktree and no other live attempt is
+  // working in it. The main checkout is never an attempt's own.
+  const mainCheckout = !!tab.familyRoot && identityKey(tab.familyRoot, options) === key;
+  const crowded = (attempt.peers ?? []).some((peer) => peer.id !== attempt.runId && identityKey(peer.cwd, options) === key);
+  const own = !mainCheckout && !crowded && isAttemptWorktree(cwd, attempt.runId);
+  return { files: tab.changedCount, branch: tab.currentBranch, shared: !own };
 }
 
 /**

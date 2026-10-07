@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { ACTIVE_WINDOW_MS, GLANCE_RANK, agentGlance, asksForReader, attemptTerminalView, attemptUrgency, checkoutChanges, mostUrgent, pendingRequests, requestsLine, shortSpan, waitingLabel, type AttemptSession } from "./taskSessions";
+import { ACTIVE_WINDOW_MS, GLANCE_RANK, agentGlance, asksForReader, attemptTerminalView, attemptUrgency, checkoutChanges, mostUrgent, pendingRequests, releasedNote, requestsLine, shortSpan, waitingLabel, type AttemptSession } from "./taskSessions";
 import type { SessionActivity } from "../terminal/sessionActivity";
 import type { TerminalSessionRecord } from "../terminal/sessionRegistry";
 import type { TaskTerminalRequest } from "../terminal/taskLaunches";
@@ -38,17 +38,17 @@ describe("attemptTerminalView", () => {
   });
 
   it("reports a request no session has taken, and why it waits", () => {
-    expect(attemptTerminalView("a", [], [request({})], false).waiting).toEqual({ role: "attempt", reason: "checkout" });
-    expect(attemptTerminalView("a", [], [request({})], true).waiting).toEqual({ role: "attempt", reason: "capacity" });
+    expect(attemptTerminalView("a", [], [request({})], false).waiting).toEqual({ role: "attempt", reason: "checkout", checkout: "/work/a" });
+    expect(attemptTerminalView("a", [], [request({})], true).waiting).toEqual({ role: "attempt", reason: "capacity", checkout: "/work/a" });
     expect(attemptTerminalView("a", [], [request({ resume: { sessionId: SESSION, mode: "ask", runId: "a" } })], false).waiting)
-      .toEqual({ role: "resumed", reason: "checkout" });
+      .toEqual({ role: "resumed", reason: "checkout", checkout: "/work/a" });
   });
 
   it("does not call a request waiting once its session exists", () => {
     expect(attemptTerminalView("a", [record({ key: "t", taskRunId: "a" })], [request({})], true).waiting).toBeNull();
     // The attempt's own session does not serve a resume request, nor the reverse.
     expect(attemptTerminalView("a", [record({ key: "t", taskRunId: "a" })], [request({ resume: { sessionId: SESSION, mode: "ask" } })], false).waiting)
-      .toEqual({ role: "resumed", reason: "checkout" });
+      .toEqual({ role: "resumed", reason: "checkout", checkout: "/work/a" });
   });
 
   it("ignores another attempt's requests, a reload's attach requests, and an empty id", () => {
@@ -64,9 +64,19 @@ describe("attemptTerminalView", () => {
 });
 
 describe("waitingLabel", () => {
-  it("sends the reader to the limit when slots are full, and to the checkout otherwise", () => {
-    expect(waitingLabel({ role: "attempt", reason: "capacity" }, 32)).toContain("all 32 are in use");
-    expect(waitingLabel({ role: "resumed", reason: "checkout" }, 32)).toMatch(/^The resumed conversation is waiting for its checkout/);
+  it("names what the start waits for: a terminal slot, the named checkout, or the reader's trust", () => {
+    expect(waitingLabel({ role: "attempt", reason: "capacity", checkout: "/work/a" }, 32)).toMatch(/^Waiting for a terminal slot — all 32 are in use/);
+    expect(waitingLabel({ role: "attempt", reason: "checkout", checkout: "/work/repo/.gitpulse/worktrees/fix-a1b2c3d4" }, 32)).toBe("Waiting for fix-a1b2c3d4 to open.");
+    expect(waitingLabel({ role: "resumed", reason: "checkout", checkout: "/work/a/" }, 32)).toBe("Resumed conversation · Waiting for a to open.");
+    expect(waitingLabel({ role: "attempt", reason: "trust", checkout: "/work/a" }, 32)).toMatch(/^Waiting for you to trust a\./);
+  });
+});
+
+describe("attemptTerminalView trust", () => {
+  it("says a request waits for trust before it says it waits for a slot or the checkout", () => {
+    const untrusted = (path: string) => path === "/work/a";
+    expect(attemptTerminalView("a", [], [request({})], true, untrusted).waiting).toEqual({ role: "attempt", reason: "trust", checkout: "/work/a" });
+    expect(attemptTerminalView("a", [], [request({ repoPath: "/work/b" })], false, untrusted).waiting?.reason).toBe("checkout");
   });
 });
 
@@ -145,17 +155,59 @@ describe("checkoutChanges", () => {
   const tab = (fields: Record<string, unknown>) => ({ path: "/work/repo/.gitpulse/worktrees/fix-1", isLoading: false, error: null, trustRequired: false, changedCount: 4, currentBranch: "gitpulse/fix-1", ...fields });
   const opts = { caseInsensitive: true };
 
+  // The host names an attempt's own worktree `<main>/.gitpulse/worktrees/
+  // <slug>-<first 8 alphanumerics of the run id, lowercased>`.
+  const OWN = "/work/repo/.gitpulse/worktrees/fix-1-a1b2c3d4";
+  const attempt = { runId: "A1B2-C3D4-e5f6" };
+
   it("reads the attempt's own worktree, matched by checkout identity", () => {
-    expect(checkoutChanges("/Work/Repo/.gitpulse/worktrees/fix-1/", [tab({})], opts)).toEqual({ files: 4, branch: "gitpulse/fix-1", shared: false });
-    expect(checkoutChanges("/work/repo", [tab({ path: "/work/repo" })], opts)).toMatchObject({ shared: true });
+    expect(checkoutChanges("/Work/Repo/.gitpulse/worktrees/FIX-1-a1b2c3d4/", [tab({ path: OWN })], opts, attempt)).toEqual({ files: 4, branch: "gitpulse/fix-1", shared: false });
+    expect(checkoutChanges("/work/repo", [tab({ path: "/work/repo" })], opts, attempt)).toMatchObject({ shared: true });
+  });
+
+  it("decides 'own' from the run, not from an agent-looking layout", () => {
+    // Any `.claude/worktrees/…` path used to count as the attempt's own
+    // worktree. An attempt run in a Claude Code session's worktree — or in
+    // another attempt's — shares it with whoever made it.
+    const claude = "/work/repo/.claude/worktrees/session-8540d4";
+    expect(checkoutChanges(claude, [tab({ path: claude })], opts, attempt)).toMatchObject({ shared: true });
+    const other = "/work/repo/.gitpulse/worktrees/fix-1-ffff0000";
+    expect(checkoutChanges(other, [tab({ path: other })], opts, attempt)).toMatchObject({ shared: true });
+    // The main checkout, known from the tab's repository family.
+    expect(checkoutChanges("/work/repo", [tab({ path: "/work/repo", familyRoot: "/work/repo" })], opts, attempt)).toMatchObject({ shared: true });
+  });
+
+  it("calls the attempt's own worktree shared while another live attempt runs in it", () => {
+    const peers = [{ id: "A1B2-C3D4-e5f6", cwd: OWN }, { id: "zz99", cwd: "/work/repo/.gitpulse/worktrees/fix-1-a1b2c3d4/" }];
+    expect(checkoutChanges(OWN, [tab({ path: OWN })], opts, { ...attempt, peers })).toMatchObject({ shared: true });
+    // Itself, or a peer elsewhere, does not make it shared.
+    expect(checkoutChanges(OWN, [tab({ path: OWN })], opts, { ...attempt, peers: [peers[0], { id: "zz99", cwd: "/work/repo" }] })).toMatchObject({ shared: false });
   });
 
   it("reports nothing rather than a zero it never read", () => {
     for (const fields of [{ isLoading: true }, { error: "denied" }, { trustRequired: true }, { changedCount: Number.NaN }, { changedCount: -1 }]) {
-      expect(checkoutChanges("/work/repo/.gitpulse/worktrees/fix-1", [tab(fields)], opts), JSON.stringify(fields)).toBeNull();
+      expect(checkoutChanges(OWN, [tab({ path: OWN, ...fields })], opts, attempt), JSON.stringify(fields)).toBeNull();
     }
-    expect(checkoutChanges("/work/elsewhere", [tab({})], opts)).toBeNull();
-    expect(checkoutChanges("", [tab({ path: "" })], opts)).toBeNull();
+    expect(checkoutChanges("/work/elsewhere", [tab({})], opts, attempt)).toBeNull();
+    expect(checkoutChanges("", [tab({ path: "" })], opts, attempt)).toBeNull();
+  });
+});
+
+describe("releasedNote", () => {
+  it("tells the reader the attempt's worktree stays on disk, and where", () => {
+    // "The checkout is free for another attempt" read like the worktree had
+    // gone. Releasing ends the attempt's hold; the host never removes an
+    // accepted attempt's worktree (agent_worktree.rs), and its work is there.
+    const own = { id: "A1B2-C3D4", cwd: "/work/repo/.gitpulse/worktrees/fix-a1b2c3d4" };
+    const note = releasedNote(own);
+    expect(note).toContain("stays on disk");
+    expect(note).toContain(own.cwd);
+  });
+
+  it("says the checkout is free when the attempt ran in a checkout it did not make", () => {
+    const note = releasedNote({ id: "A1B2-C3D4", cwd: "/work/repo" });
+    expect(note).toContain("free for another attempt");
+    expect(note).not.toContain("stays on disk");
   });
 });
 

@@ -1,5 +1,19 @@
 <script module lang="ts">
   import type { FleetRow, ScanFamily } from "../fleet/types";
+  import { agentKindLabel } from "../work/agentWorktree";
+  import { setAgentsRepositoryScope } from "../agents/scope";
+  import { plural } from "../format";
+
+  /** "1 agent", "3 agents": the Fleet work cell's count of agent checkouts. */
+  export function agentSessionsLabel(count: number): string {
+    return plural(count, "agent");
+  }
+
+  /** The kinds behind that count, named the way the Worktrees panel names them. */
+  export function agentKindsTitle(kinds: readonly string[]): string {
+    const named = kinds.map(agentKindLabel).filter(Boolean);
+    return named.length ? `Agent checkouts: ${named.join(", ")}. Show them in Agents.` : "Show this repository in Agents.";
+  }
 
   /** Which rows the grid shows. */
   export type FleetFilter = "all" | "attention";
@@ -100,7 +114,6 @@
   } from "../fleet/sort";
   import { FAMILY_LABEL, SCAN_FAMILIES } from "../fleet/types";
   import { disambiguateLabels, displayName, isPathAmong, isCaseInsensitiveFs } from "../repos/paths";
-  import { plural } from "../format";
   import { formatAge, humanBytes } from "../storage/format";
   import { formatAuditCounts } from "../health/format";
   import { firstFailure, isCleanSweep, summarizeRun } from "../repos/workspaceOps";
@@ -530,6 +543,17 @@
     if (!row) return;
     await repoStore.openRepo(row.path);
     interfaceStore.setFleetOpen(false);
+  }
+
+  /**
+   * The Agents view reads the open repositories, so the repository is opened
+   * first — that is what puts its rows on the plane — and the view is shown
+   * narrowed to it only once it did. The scope chip there clears it.
+   */
+  async function openAgents(row: FleetRow) {
+    if (!(await repoStore.openRepo(row.path))) return;
+    setAgentsRepositoryScope(row.path);
+    interfaceStore.setGlobalSurface("agents");
   }
 
   async function removeRow(row: FleetRow | undefined) {
@@ -1143,10 +1167,16 @@
                       <Trees size={10} class="shrink-0" />{row.work.value.worktrees}
                     </span>
                     {#if row.work.value.agentSessions > 0}
-                      <span
-                        class="text-[10px] text-textMuted"
-                        title="Agent sessions: {row.work.value.agentKinds.join(', ')}"
-                        >{row.work.value.agentSessions} agent</span
+                      <button
+                        type="button"
+                        class="rounded-full px-1 text-[10px] text-textMuted hover:bg-surfaceHover hover:text-accent"
+                        data-testid="fleet-open-agents"
+                        title={agentKindsTitle(row.work.value.agentKinds)}
+                        onclick={(e) => {
+                          e.stopPropagation();
+                          void openAgents(row);
+                        }}
+                        >{agentSessionsLabel(row.work.value.agentSessions)}</button
                       >
                     {/if}
                   {/if}

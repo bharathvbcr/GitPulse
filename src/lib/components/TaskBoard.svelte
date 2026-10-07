@@ -45,7 +45,7 @@
   import { createBoardAgents } from "../workbench/boardAgents";
   import { taskAgentSummaries, type TaskAgentSummary } from "../workbench/taskSessions";
   import { terminalSessions } from "../terminal/sessionRegistry";
-  import { taskTerminalRequests } from "../terminal/taskLaunches";
+  import { attemptNotices, taskTerminalRequests } from "../terminal/taskLaunches";
   import { terminalSessionLimit } from "../terminal/sessionLimit";
   import { sessionActivity } from "../terminal/sessionActivity";
   import { DEFERRED_DELETE_MS, TaskBatch, UNDO_OFFER_MS, bounded, defer, describeTaskAction, MAX_TASK_SELECTION, type TaskAction, type TaskChanges, type UndoPlan } from "../workbench/taskActions";
@@ -406,6 +406,7 @@
       capacityFull: $terminalSessions.length >= $terminalSessionLimit,
       activity: (sessionId) => $sessionActivity.get(sessionId),
       pending: (runId) => read.pending.get(runId),
+      notices: (runId) => $attemptNotices.get(runId),
       now: read.readAt,
       clock: read.readAt,
     });

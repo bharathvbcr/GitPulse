@@ -47,7 +47,8 @@
     type TabColor,
   } from "../repos/tabColors";
   import { terminalSessions, sessionsByRepo } from "../terminal/sessionRegistry";
-  import { liveAgentCount } from "../agents/plane";
+  import { liveAgentCount, plural } from "../agents/plane";
+  import { agentDirectories } from "../agents/cwd";
   import WorkspaceActions from "./WorkspaceActions.svelte";
   import ScrollCue from "./ScrollCue.svelte";
   import { taskChrome } from "../workbench/taskTabs";
@@ -206,7 +207,9 @@
   );
   const tasksOpen = $derived($interfaceStore.globalSurface === "tasks");
   const agentsOpen = $derived($interfaceStore.globalSurface === "agents");
-  const liveAgents = $derived(liveAgentCount($terminalSessions));
+  // The Agents plane's own definition, over the directories it last read, so
+  // the chip and the plane's "live terminals" are one number.
+  const liveAgents = $derived(liveAgentCount($terminalSessions, $agentDirectories));
 
   function closeStripMenu(options?: { restoreFocus?: boolean }) {
     const opener = stripMenuOpener;
@@ -1268,7 +1271,7 @@
         <Bot size={12} />
         <span>Agents</span>
         {#if liveAgents > 0}
-          <span class="gp-pill !px-1.5 !py-0 min-w-4 justify-center" title="{liveAgents} live {liveAgents === 1 ? 'agent' : 'agents'} this window started">{liveAgents}</span>
+          <span class="gp-pill !px-1.5 !py-0 min-w-4 justify-center" title="{plural(liveAgents, 'live agent terminal', 'live agent terminals')} this window started">{liveAgents}</span>
         {/if}
       </button>
       {#if agentsOpen}

@@ -17,15 +17,20 @@
     Lock,
     Unlock,
     Sparkles,
+    Eraser,
     AlertTriangle,
     GitMerge,
     Globe,
-    Zap,
     RefreshCw,
   } from "@lucide/svelte";
   import { openExternal } from "../desktop/openExternal";
-  import { agentKind, agentSessionSlug, isAgentWorktree } from "../work/agentWorktree";
+  import { agentKind, agentKindLabel, agentSessionSlug, isAgentWorktree, isGitPulseLane } from "../work/agentWorktree";
+  import { isCaseInsensitiveFs, sameRepo } from "../repos/paths";
   import { trustExtended } from "../repos/trustExtension";
+  import { listAllLiveRuns, type TaskRun } from "../workbench/client";
+  import { liveRunIn } from "../workbench/attemptWorktree";
+  import { runStateLabel } from "../workbench/taskHandoff";
+  import { openTaskForRun } from "../workbench/taskOpen";
 
 
   let worktrees = $state<WorktreeInfo[]>([]);
@@ -55,6 +60,13 @@
   let aiSummaries = $state<Record<string, string>>({});
   let loadingSummaries = $state<Record<string, boolean>>({});
   let inflight: AsyncGuard | null = null;
+  /**
+   * Live task attempts, read once per load when this repository has a
+   * GitPulse task worktree (the host's own attempt worktrees), so its row can say
+   * which task it is and what its agent is doing — and open that task. Not a
+   * poll: the panel reloads on the same triggers it always did.
+   */
+  let liveRuns = $state<TaskRun[]>([]);
   let confirmTimer: ReturnType<typeof setTimeout> | null = null;
 
   // Load trigger keyed on the real dependencies: active repo + its hydration
@@ -106,7 +118,7 @@
       const next = await invoke<WorktreeInfo[]>("cmd_list_worktrees", { repoPath: repo });
       if (!guard.isLive()) return;
       worktrees = next;
-      await loadTaskState(repo, next, guard);
+      await Promise.all([loadTaskState(repo, next, guard), loadLaneRuns(next, guard)]);
     } catch (err: unknown) {
       if (!guard.isLive()) return;
       error = reportPanelError("worktrees", err);
@@ -148,6 +160,35 @@
       // an enrichment, and losing it must not read as "the worktrees failed".
       reportPanelError("worktrees", err);
       taskView = null;
+    }
+  }
+
+  /**
+   * The live attempts GitPulse's own task worktrees belong to. Read only when
+   * one is listed; a failed read is an enrichment lost, reported to
+   * diagnostics, and the rows fall back to naming the worktree kind.
+   */
+  async function loadLaneRuns(list: WorktreeInfo[], guard: AsyncGuard) {
+    if (!list.some((wt) => isGitPulseLane(agentKind(wt.path)))) {
+      liveRuns = [];
+      return;
+    }
+    try {
+      const { runs } = await listAllLiveRuns();
+      if (!guard.isLive()) return;
+      liveRuns = runs;
+    } catch (err: unknown) {
+      if (!guard.isLive()) return;
+      reportPanelError("worktrees", err);
+      liveRuns = [];
+    }
+  }
+
+  async function showLaneTask(run: TaskRun) {
+    try {
+      await openTaskForRun(run.id);
+    } catch (err: unknown) {
+      error = `That worktree's task could not be opened: ${reportPanelError("worktrees", err)}`;
     }
   }
 
@@ -317,16 +358,19 @@
     void repoStore.openRepo(wt.path);
   }
 
-  function spawnAgentLane() {
-    const repo = $repoStore.currentPath;
-    if (!repo) return;
-    const laneId = `agent-${Date.now().toString(36)}`;
-    newPath = `${repo}/.gitpulse/worktrees/${laneId}`;
-    newBranch = `agent/${laneId}`;
-    startPoint = "";
-    cowCaches = true;
-    showAddForm = true;
-  }
+  /**
+   * Whether a tab is already open on this worktree. `openRepo` focuses that
+   * tab rather than opening another, so the control has to say which of the
+   * two it will do. Compared the way the tab strip compares paths.
+   */
+  const hasOpenTab = $derived((wt: WorktreeInfo) =>
+    $repoStore.openTabs.some((tab) => sameRepo(tab.path, wt.path, { caseInsensitive: isCaseInsensitiveFs() })),
+  );
+
+  /** Nothing to list but the main checkout: the panel explains instead. */
+  const onlyMain = $derived(
+    !isLoading && !error && worktrees.length > 0 && worktrees.every((wt) => wt.is_main),
+  );
 
   async function mergeTeardown(wt: WorktreeInfo) {
     const repo = $repoStore.currentPath;
@@ -361,12 +405,11 @@
         ok: true,
       });
       for (const notice of worktreeSetupNotices(res.output, "merge")) toastStore.warning(notice);
+      // The teardown removed the directory: a tab on it is stranded whether
+      // or not it is the active one (T-F09, same as remove()).
+      const stranded = $repoStore.openTabs.find((tab) => tab.path === wt.path);
+      if (stranded) await repoStore.closeTab(stranded.id);
       if ($repoStore.currentPath !== repo) return;
-      if ($repoStore.currentPath === wt.path) {
-        const stranded = $repoStore.openTabs.find((tab) => tab.path === wt.path);
-        if (stranded) await repoStore.closeTab(stranded.id);
-        return;
-      }
       await load();
     } catch (err: unknown) {
       if (!mergeCompleted) {
@@ -443,20 +486,12 @@
     </span>
     <div class="flex items-center gap-1">
       <button
-        onclick={spawnAgentLane}
-        title="Spawn dedicated Agent Lane (CoW cloned)"
-        aria-label="Spawn agent lane"
-        class="p-0.5 rounded-full hover:bg-surfaceHover hover:text-accent transition-colors"
-      >
-        <Zap size={11} />
-      </button>
-      <button
         onclick={prune}
         title="Prune stale worktree metadata"
         aria-label="Prune stale worktree metadata"
         class="p-0.5 rounded-full hover:bg-surfaceHover hover:text-accent transition-colors"
       >
-        <Sparkles size={11} />
+        <Eraser size={11} />
       </button>
       <button
         onclick={() => (showAddForm = !showAddForm)}
@@ -515,6 +550,18 @@
   {#if isLoading && worktrees.length === 0}
     <div class="text-[11px] text-textMuted/60 px-2 py-1 italic">Loading…</div>
   {:else}
+    {#if onlyMain && !showAddForm}
+      <div class="mx-1 mb-1 px-2 py-1.5 rounded-xl border border-dashed border-border/70 text-[10px] text-textMuted" data-testid="worktrees-empty">
+        <p>No linked worktrees yet. A worktree checks out another branch in its own folder, so you can work on two things without stashing.</p>
+        <button
+          type="button"
+          class="mt-1 inline-flex items-center gap-1 text-accent hover:underline"
+          onclick={() => (showAddForm = true)}
+        >
+          <Plus size={10} /> Create worktree
+        </button>
+      </div>
+    {/if}
     <div class="space-y-0.5">
       {#each worktrees as wt (wt.path)}
         <div
@@ -562,18 +609,20 @@
           <div class="absolute right-0 top-1/2 -translate-y-1/2 flex items-center gap-0.5 rounded-full bg-surfaceHover pl-1 opacity-0 pointer-events-none group-hover:opacity-100 group-hover:pointer-events-auto group-focus-within:opacity-100 group-focus-within:pointer-events-auto">
             <button
               onclick={() => open(wt)}
-              title="Open in a new tab"
-              aria-label="Open {wt.name} in a new tab"
+              title={hasOpenTab(wt) ? "Show tab" : "Open"}
+              aria-label={hasOpenTab(wt) ? `Show the open tab for ${wt.name}` : `Open ${wt.name}`}
               class="p-0.5 rounded-full hover:bg-surfaceHover hover:text-accent"
             >
               <ExternalLink size={11} />
             </button>
             {#if !wt.is_main}
+              <!-- The armed confirm is said once, inline under the row; the
+                   button keeps one stable name so it is not described twice. -->
               <button
                 onclick={() => void mergeTeardown(wt)}
                 disabled={mergingPath === wt.path}
-                title={mergingPath === wt.path ? "Merging and tearing down..." : mergeConfirmPath === wt.path ? "Click again to confirm merge into main & remove worktree" : "Merge into main & teardown worktree"}
-                aria-label="Merge and teardown {wt.name}"
+                title={mergingPath === wt.path ? "Merging…" : "Merge into main and remove this worktree"}
+                aria-label="Merge {wt.name} into main and remove it"
                 class="p-0.5 rounded-full {mergingPath === wt.path ? 'opacity-50 cursor-not-allowed' : mergeConfirmPath === wt.path ? 'text-amber-400' : 'hover:bg-surfaceHover hover:text-accent'}"
               >
                 <GitMerge size={11} class={mergingPath === wt.path ? "animate-spin" : ""} />
@@ -635,10 +684,25 @@
             style="mask-image: linear-gradient(to right, #000 calc(100% - 14px), transparent); -webkit-mask-image: linear-gradient(to right, #000 calc(100% - 14px), transparent);"
           >
             {#if isAgentWorktree(wt.path)}
-              <span
-                class="shrink-0 text-[9px] uppercase rounded-full bg-accent/10 px-1 text-accent"
-                title="Agent session {agentSessionSlug(wt.path) || agentKind(wt.path)}"
-              >{agentKind(wt.path)}</span>
+              {@const kind = agentKind(wt.path)}
+              {@const slug = agentSessionSlug(wt.path)}
+              {@const lane = isGitPulseLane(kind) ? liveRunIn(wt.path, liveRuns) : undefined}
+              {#if lane}
+                <!-- A GitPulse task worktree with a live attempt: which task,
+                     what its agent is doing, and the way back to it. -->
+                <button
+                  type="button"
+                  class="shrink-0 min-w-0 max-w-[60%] truncate text-[9px] rounded-full bg-accent/10 px-1 text-accent hover:bg-accent/20"
+                  data-testid="worktree-task"
+                  title="Open the task this worktree's agent is working on: {lane.task_title} ({runStateLabel(lane.state)})"
+                  onclick={() => void showLaneTask(lane)}
+                >{lane.task_title || "Task"} · {runStateLabel(lane.state)}</button>
+              {:else}
+                <span
+                  class="shrink-0 text-[9px] rounded-full bg-accent/10 px-1 text-accent"
+                  title="{isGitPulseLane(kind) ? 'GitPulse task worktree' : `Agent worktree (${agentKindLabel(kind)})`}{isGitPulseLane(kind) ? ' — no agent is running in it' : ''}{slug ? `: ${slug}` : ''}"
+                >{agentKindLabel(kind)}</span>
+              {/if}
             {/if}
             {#if wt.is_bare}
               <span class="shrink-0 text-[9px] uppercase rounded-full bg-surfaceHover border border-border/80 px-1 text-textMuted">bare</span>
@@ -713,8 +777,8 @@
           {/if}
 
           {#if mergeConfirmPath === wt.path}
-            <div class="text-[9px] font-semibold text-amber-400 pt-0.5">
-              Merge {wt.branch ?? wt.name} into main & delete worktree? Click GitMerge icon again.
+            <div class="text-[9px] font-semibold text-amber-400 pt-0.5" role="status">
+              Merge {wt.branch ?? wt.name} into main and remove this worktree? Press merge again to confirm.
             </div>
           {/if}
 

@@ -9,8 +9,11 @@
 
 import type { SessionActivity } from "../terminal/sessionActivity";
 import type { TerminalSessionRecord } from "../terminal/sessionRegistry";
-import type { TaskTerminalRequest } from "../terminal/taskLaunches";
-import type { TaskRun } from "../workbench/client";
+import type { AttemptNotice, TaskTerminalRequest } from "../terminal/taskLaunches";
+import { identityKey, type PathIdentityOptions } from "../repos/paths";
+import type { Repository, TaskRun } from "../workbench/client";
+import { identityCommonDir, tabMatchesRegistered } from "../workbench/openMembership";
+import { currentLocation } from "../workbench/repositoryRelink";
 import { monitorAttempt, type MonitorContext, type PendingRequests } from "../workbench/taskSessions";
 import type { PlaneTask, TaskProbe } from "./plane";
 
@@ -27,9 +30,44 @@ export interface TaskBoardWatch {
   records: readonly TerminalSessionRecord[];
   requests: readonly TaskTerminalRequest[];
   activity: (sessionId: string) => SessionActivity | undefined;
+  /** A start that failed out of sight (`taskLaunches.ts::attemptNotices`), so the row says so. */
+  notices?: (runId: string) => AttemptNotice | undefined;
   /** Terminal slots this window will open. Full when the registry has that many. */
   sessionLimit: number;
   now: number;
+  /**
+   * The path of a registered repository, by id. A run records only the id
+   * and its working directory, and the directory is a checkout, not the
+   * repository. Null (or no resolver) leaves the repository unresolved.
+   */
+  repositoryPath?: (repositoryId: string) => string | null;
+}
+
+/**
+ * Where each registered repository is, by id.
+ *
+ * An open tab that is the registered checkout names it, so a task row joins
+ * the repository the sweep read under that tab's path. Otherwise the store's
+ * own location (its common directory, less `.git`). An identity that carries
+ * no local location is left out: the caller reports it as unresolved.
+ */
+export function repositoryPaths(
+  repositories: readonly Pick<Repository, "id" | "identity_key">[],
+  tabs: readonly { path: string }[],
+  paths: PathIdentityOptions,
+): Map<string, string> {
+  const found = new Map<string, string>();
+  for (const repository of repositories) {
+    const tab = tabs.find((item) => tabMatchesRegistered(item.path, repository.identity_key, paths));
+    if (tab) {
+      found.set(repository.id, tab.path);
+      continue;
+    }
+    if (!identityCommonDir(repository.identity_key)) continue;
+    const location = currentLocation(repository);
+    if (identityKey(location, paths)) found.set(repository.id, location);
+  }
+  return found;
 }
 
 export function taskProbeFromBoard(board: TaskBoardRead, watch: TaskBoardWatch): TaskProbe {
@@ -45,6 +83,7 @@ export function taskProbeFromBoard(board: TaskBoardRead, watch: TaskBoardWatch):
     requests: watch.requests,
     capacityFull: watch.sessionLimit > 0 && watch.records.length >= watch.sessionLimit,
     activity: watch.activity,
+    notices: watch.notices,
     pending: (runId) => board.pending.get(runId),
     now: watch.now,
     clock,
@@ -55,7 +94,7 @@ export function taskProbeFromBoard(board: TaskBoardRead, watch: TaskBoardWatch):
     return {
       runId: run.id,
       title: run.task_title || run.task_id || run.id,
-      repoPath: run.cwd,
+      repoPath: watch.repositoryPath?.(run.repository_id) ?? "",
       cwd: run.cwd,
       provider: run.provider,
       tone: monitored.tone,

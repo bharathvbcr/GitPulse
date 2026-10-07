@@ -18,6 +18,14 @@
   const report = { managedSpawns:0, managedStops:0, detailReads:0, lists:0, holdingLists:0, taskSpawns:0, launchCalls:0, shellSpawns:0, kills:0, conversationReads:0, resumes:[], resizes:[], writes:[], errors:[], checks:[] };
   let loseManagedLaunch = true;
   let loseLaunch = true, losePreparation = false, conversationMissing = false;
+  // Holds a terminal preparation's reply until released; the pane is
+  // remounted meanwhile, as switching task tabs does.
+  let holdPreparation = null, onPreparationHeld = null;
+  // A spawn the host refuses before it claims the attempt (CLI missing/old).
+  let refuseSpawn = null;
+  // No Git checkout contains the attempt's directory.
+  let gitRootMissing = false;
+  const worktreeCalls = [];
   const preparations = [];
   const show = () => document.getElementById("result").textContent = JSON.stringify(report, null, 2);
   addEventListener("error", event => { report.errors.push(event.message); show(); });
@@ -65,6 +73,7 @@
         if (prepared.has(input.request_id)) return record(prepared.get(input.request_id));
         const run = {kind:args.method === "runs.prepare_managed" ? "managed" : "external_terminal",id:input.id,revision:1,updated_at:1,task_id:task.id,source_revision:task.revision,task_title:task.title,repository_id:repository.id,provider:input.provider,permission_mode:input.permission_mode,state:"prepared",cwd:input.repo_path,created_at:Math.floor(Date.now()/1000),expires_at:Math.floor(Date.now()/1000)+300,session_id:null,exit_code:null,reason:"",outcome_uncertain:false};
         runs.set(run.id,run); prepared.set(input.request_id,{...run});
+        if (holdPreparation) { const held=holdPreparation; onPreparationHeld?.(); await held; }
         if (losePreparation) { losePreparation=false; throw {code:"transport_error",message:"Prepared successfully; reply lost by fixture"}; }
         return record(run);
       }
@@ -92,6 +101,9 @@
       const input=JSON.parse(args.input), run=runs.get(input.id);
       if (!run || !["prepared","running"].includes(run.state)) throw new Error("Attempt has ended");
       report.launchCalls++;
+      // Refused before the claim, as terminal_run.rs refuses a missing or
+      // too-old CLI: the attempt stays prepared and no session exists.
+      if (refuseSpawn && run.state === "prepared") { show(); throw new Error(refuseSpawn); }
       // The grid the FIRST start asked for. It now starts with the dock
       // closed, so this is what an unseen terminal measures itself as.
       report.launchGrid ??= {rows:input.rows,cols:input.cols};
@@ -104,7 +116,21 @@
       return {id,cwd:run.cwd,shell:run.provider};
     }
     switch (cmd) {
-      case "cmd_resolve_repo":return {path:args.repoPath,name:"GitPulse",is_bare:false};
+      // An attempt's own worktree shares the main checkout's Git directory.
+      case "cmd_resolve_repo":return args.repoPath.includes("/.gitpulse/worktrees/")
+        ? {path:args.repoPath,name:"GitPulse",is_bare:false,common_dir:"/fixture/GitPulse/.git"}
+        : {path:args.repoPath,name:"GitPulse",is_bare:false};
+      // The fixture's attempt directories are checkout roots.
+      case "cmd_resolve_git_root":if (gitRootMissing) throw new Error(`Not a Git repository: ${args.path}`); return args.path;
+      case "cmd_repository_trust":return {path:args.repoPath,git_dir:"/fixture/GitPulse/.git",common_dir:"/fixture/GitPulse/.git",identity:"fixture",scope:"repository",worktrees:2};
+      case "cmd_list_worktrees":worktreeCalls.push({cmd,...args});return [
+        {path:"/fixture/GitPulse",name:"GitPulse",head:"abc1234",branch:"main",is_bare:false,is_detached:false,is_main:true,is_locked:false,is_prunable:false,dirty_files:0,diff_stat:null,main_divergence:null,active_routes:[]},
+        {path:"/fixture/GitPulse/.gitpulse/worktrees/fix-e42-wt0attem",name:"fix-e42-wt0attem",head:"def5678",branch:"gitpulse/fix-e42-wt0attem",is_bare:false,is_detached:false,is_main:false,is_locked:false,is_prunable:false,dirty_files:2,diff_stat:null,main_divergence:null,active_routes:[]},
+      ];
+      // The backend lane refuses while a live run holds the worktree.
+      case "cmd_worktree_merge_teardown":worktreeCalls.push({cmd,...args});throw new Error("Claude Code is still working in this worktree (attempt wt0attempt). Stop it or wait for it to finish, then merge.");
+      case "cmd_remove_worktree":worktreeCalls.push({cmd,...args});return {policy:null,output:null};
+      case "cmd_delete_branch":worktreeCalls.push({cmd,...args});throw new Error("error: the branch 'gitpulse/fix-e42-wt0attem' is not fully merged");
       case "cmd_terminal_spawn":
         if (args.args?.[0]==="--resume") { report.resumes.push({program:args.program,args:args.args,permissionMode:args.permissionMode??null}); show(); return {id:`resume-${report.resumes.length}`,cwd:args.repoPath,shell:"claude"}; }
         report.shellSpawns++;show();return {id:`shell-${report.shellSpawns}`,cwd:args.repoPath,shell:"/bin/sh"};
@@ -286,7 +312,7 @@
       // them, and the store binds each to the run's own owner), so a terminal
       // run offers no review it could never have.
       check("A terminal run offers no structured request review",!button("Review requests"));
-      await finish();button("Refresh").click();await wait(()=>document.body.textContent.includes("Process exited"));
+      await finish();button("Refresh").click();await wait(()=>[...document.querySelectorAll('[data-testid="agent-stage"]')].some(el=>el.textContent.trim()==="Exited"&&el.title==="Process exited"));
       check("Process completion remains separate from task acceptance",task.status==="ready");
       // An ended attempt's tab says a new attempt starts from the task, and
       // links there rather than only naming it in a tooltip.
@@ -476,7 +502,7 @@
         button("Launch in Claude Code").click();
         await wait(()=>pane().querySelector('[data-testid="agent-session-waiting"]'));
         check("A launch with every terminal slot taken says, in the pane, that it waits for one",
-          pane().querySelector('[data-testid="agent-session-waiting"]').textContent.includes("waiting for a free terminal session")&&report.taskSpawns===before+BURST);
+          pane().querySelector('[data-testid="agent-session-waiting"]').textContent.includes("Waiting for a terminal slot")&&report.taskSpawns===before+BURST);
         setTerminalSessionLimit(32);
         await wait(()=>report.taskSpawns===before+BURST+1&&!pane().querySelector('[data-testid="agent-session-waiting"]'));
         check("Raising the limit starts the waiting agent at once",read(interfaceStore).globalSurface==="tasks");
@@ -505,6 +531,112 @@
         check("The pane goes on polling for it, and sees it end without a manual refresh",document.querySelector('[data-testid="host-working"]').dataset.count==="0");
         for(const id of [elder.id,...later])runs.delete(id);
         button("Refresh").click();await pause(100);
+      }
+      // ---- After the store accepts an attempt, nothing depends on the form ----
+      {
+        const {toastStore}=await import("../src/lib/stores/toastStore");
+        // Every toast ever shown, in order: a dismissed one is still evidence.
+        const seen=[];const stopToasts=toastStore.subscribe(list=>{for(const t of list)if(!seen.some(s=>s.id===t.id))seen.push(t);});
+        const {promptState,completePrompt}=await import("../src/lib/stores/modalStore");
+        const row=id=>pane().querySelector(`[data-run-id="${id}"]`);
+        const stage=id=>row(id)?.querySelector('[data-testid="agent-stage"]')?.textContent.trim();
+        const visible=el=>!!el&&el.offsetParent!==null;
+        const lastPrepared=()=>JSON.parse(preparations.at(-1)).id;
+        let preparedBefore=0;
+        const launchNow=async()=>{preparedBefore=preparations.length;await openLaunchForm();await wait(()=>button("Launch in Claude Code")&&!button("Launch in Claude Code").disabled);button("Launch in Claude Code").click();};
+        interfaceStore.setGlobalSurface("tasks");
+        await finish();button("Refresh").click();await pause(100);
+        // The pane is remounted while the store is still answering the
+        // preparation, as switching task tabs remounts the editor. The form
+        // that pressed Launch is gone when the answer arrives.
+        let releasePreparation=()=>{};
+        holdPreparation=new Promise(resolve=>{releasePreparation=resolve;});
+        let sawPending=false,pendingWhy="";
+        // A task later, so the pane has rendered what Launch set.
+        onPreparationHeld=()=>setTimeout(()=>{const id=lastPrepared(),stageText=stage(id);sawPending=!!row(id)&&["Preparing","Preparing worktree","Not started","Starting agent"].includes(stageText);pendingWhy=`row=${!!row(id)} stage=${stageText} pending=${pane().querySelectorAll('[data-testid="agent-run-pending"]').length} working=${!!pane().querySelector('[data-testid="agents-working"]')}`;button("Remount pane").click();setTimeout(()=>releasePreparation(),60);},0);
+        const spawnsBefore=report.taskSpawns,seenBefore=seen.length;
+        await launchNow();
+        await wait(()=>preparations.length>preparedBefore&&runs.get(lastPrepared())?.state!=="prepared");
+        holdPreparation=null;onPreparationHeld=null;
+        const accepted=lastPrepared();
+        check(`An accepted attempt still starts when its form is destroyed before the store answers${report.taskSpawns===spawnsBefore+1?"":` (spawns ${spawnsBefore}→${report.taskSpawns}, state ${runs.get(accepted)?.state})`}`,report.taskSpawns===spawnsBefore+1);
+        await wait(()=>stage(accepted)==="Running");
+        check("The remounted pane lists it as Running",read(interfaceStore).globalSurface==="tasks");
+        check(`The attempt was on the pane, under its own id, before the store had answered${sawPending?"":` (${pendingWhy})`}`,sawPending);
+        await wait(()=>seen.slice(seenBefore).some(t=>t.message.startsWith("Claude Code started on revision")));
+        {
+          const fresh=seen.slice(seenBefore);
+          const starting=fresh.findIndex(t=>t.kind==="info"&&t.message.startsWith("Starting Claude Code on revision"));
+          const started=fresh.findIndex(t=>t.kind==="success"&&t.message.startsWith("Claude Code started on revision"));
+          const ok=starting>=0&&started>starting&&!read(toastStore).some(t=>t.id===fresh[starting].id);
+          check(`The toast says Starting… first, and confirms only once the process runs${ok?"":` (${JSON.stringify(fresh.map(t=>[t.kind,t.message]))})`}`,ok);
+        }
+        await finish();button("Refresh").click();await pause(100);
+        // The host refuses the spawn before it claims the attempt (a missing
+        // CLI). That was said only inside the hidden task tab.
+        refuseSpawn="Claude Code is not installed or not on PATH (claude: command not found).";
+        const toastsBefore=seen.length;
+        await launchNow();
+        await wait(()=>preparations.length>preparedBefore&&row(lastPrepared())?.querySelector('[data-testid="agent-session-failed"]'));
+        const refused=lastPrepared();
+        check("A spawn the host refused is an error on the attempt's row, with its cause",
+          visible(row(refused).querySelector('[data-testid="agent-session-failed"]'))&&row(refused).textContent.includes("claude: command not found")&&stage(refused)==="Failed to start"&&row(refused).dataset.tone==="error");
+        check("…the toast says it did not start, never that it started",
+          seen.slice(toastsBefore).some(t=>t.kind==="error"&&t.message.includes("did not start"))&&!seen.slice(toastsBefore).some(t=>t.kind==="success"));
+        {const {attemptNotices}=await import("../src/lib/terminal/taskLaunches");
+        check(`…and the form stays open for another try, rather than folding away an attempt that did not start${launchForm().hidden?` (notice=${JSON.stringify(read(attemptNotices).get(refused))} state=${runs.get(refused).state} stage=${stage(refused)} toggle=${formToggle().getAttribute("aria-expanded")})`:""}`,!launchForm().hidden);}
+        refuseSpawn=null;
+        [...row(refused).querySelectorAll("button")].find(b=>b.textContent.trim()==="Cancel preparation").click();
+        await wait(()=>runs.get(refused).state==="cancelled"&&!row(refused)?.querySelector('[data-testid="agent-session-failed"]'));
+        check("Cancelling it withdraws the failure with the attempt",true);
+        // No checkout contains the attempt's directory.
+        gitRootMissing=true;
+        await launchNow();
+        await wait(()=>preparations.length>preparedBefore&&row(lastPrepared())?.querySelector('[data-testid="agent-session-failed"]'));
+        const homeless=lastPrepared();
+        check("'No Git checkout contains …' is shown on the attempt's row, not inside a folded form",
+          visible(row(homeless).querySelector('[data-testid="agent-session-failed"]'))&&row(homeless).textContent.includes("No Git checkout contains")&&!launchForm().hidden);
+        gitRootMissing=false;
+        [...row(homeless).querySelectorAll("button")].find(b=>b.textContent.trim()==="Cancel preparation").click();
+        await wait(()=>runs.get(homeless).state==="cancelled");
+        button("Refresh").click();await pause(100);
+        // ---- After the agent: review, merge, discard ----
+        const template=[...runs.values()].find(run=>run.kind==="external_terminal");
+        const wtPath="/fixture/GitPulse/.gitpulse/worktrees/fix-e42-wt0attem";
+        const attempt={...template,id:"wt0attempt",cwd:wtPath,state:"running",session_id:"wt-session",revision:3,exit_code:null,expires_at:Math.floor(Date.now()/1000)+600};
+        runs.set(attempt.id,attempt);button("Refresh").click();
+        await wait(()=>row(attempt.id));
+        check("Merge and discard are not offered while the agent still holds its worktree",
+          !row(attempt.id).querySelector('[data-testid="agent-merge"]')&&!row(attempt.id).querySelector('[data-testid="agent-discard"]')&&!row(attempt.id).querySelector('[data-testid="agent-review"]'));
+        attempt.state="exited";attempt.exit_code=0;attempt.revision++;button("Refresh").click();
+        await wait(()=>row(attempt.id)?.querySelector('[data-testid="agent-merge"]'));
+        check("An ended attempt's own worktree offers Review changes, Merge and Discard",
+          !!row(attempt.id).querySelector('[data-testid="agent-review"]')&&!!row(attempt.id).querySelector('[data-testid="agent-discard"]')&&stage(attempt.id)==="Exited");
+        row(attempt.id).querySelector('[data-testid="agent-merge"]').click();
+        await wait(()=>read(promptState));
+        check("Merge asks first, naming the target branch and the uncommitted files the removal loses",
+          read(promptState).options.title==="Merge into main?"&&read(promptState).options.message.includes("2 uncommitted files"));
+        completePrompt(true);
+        await wait(()=>row(attempt.id)?.querySelector('[data-testid="agent-run-message"]'));
+        const mergeCall=worktreeCalls.find(c=>c.cmd==="cmd_worktree_merge_teardown");
+        check("Merge runs against the repository's main checkout, and the host's refusal shows in the row",
+          mergeCall.repoPath==="/fixture/GitPulse"&&mergeCall.worktreePath===wtPath&&mergeCall.targetBranch==="main"
+          &&row(attempt.id).querySelector('[data-testid="agent-run-message"]').textContent.includes("still working in this worktree")
+          &&row(attempt.id).querySelector('[data-testid="agent-run-message"]').dataset.tone==="error");
+        row(attempt.id).querySelector('[data-testid="agent-discard"]').click();
+        await wait(()=>read(promptState));
+        check("Discard asks first and says how many changed files are lost",read(promptState).options.message.includes("2 uncommitted files in it will be lost"));
+        completePrompt(false);await pause(50);
+        check("Declining discards nothing",!worktreeCalls.some(c=>c.cmd==="cmd_remove_worktree"));
+        row(attempt.id).querySelector('[data-testid="agent-discard"]').click();
+        await wait(()=>read(promptState));completePrompt(true);
+        await wait(()=>row(attempt.id)?.querySelector('[data-testid="agent-run-message"]')?.textContent.includes("was kept"));
+        const removal=worktreeCalls.find(c=>c.cmd==="cmd_remove_worktree"),branchDelete=worktreeCalls.find(c=>c.cmd==="cmd_delete_branch");
+        check("Discard removes the worktree from the main checkout, forced only for the changes it named, and never forces the branch",
+          removal.repoPath==="/fixture/GitPulse"&&removal.targetPath===wtPath&&removal.force===true&&branchDelete.force===false
+          &&row(attempt.id).querySelector('[data-testid="agent-run-message"]').textContent.includes("not fully merged"));
+        runs.delete(attempt.id);button("Refresh").click();await pause(100);
+        stopToasts();
       }
       check("No unrelated shell was started",report.shellSpawns===0);
       check("The remembered handoff never carries bypass into storage",sanitizeHandoff({provider:"codex",kind:"managed",permission:"bypass"}).permission==="ask");

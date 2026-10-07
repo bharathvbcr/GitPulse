@@ -242,6 +242,7 @@
               expanded,
               onToggleExpanded: () => (expanded = !expanded),
               onGoToSession: goToSession,
+              checkouts: $repoStore.openTabs,
             }}
           />
         </div>

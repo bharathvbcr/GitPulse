@@ -366,6 +366,17 @@ fn activity_check(path: &Path) -> Result<(), String> {
                 return Err(format!("An active {name} process may be using build output. Stop builds before cleanup."));
             }
         }
+    }
+    open_files_under(path)
+}
+
+/// Whether any process has a file — or its working directory — open under
+/// `path`. Only a completed `lsof` scan that found nothing is `Ok`: a scan
+/// that reported problems, timed out, or cannot run here is an error, never
+/// "nothing is open".
+pub(crate) fn open_files_under(path: &Path) -> Result<(), String> {
+    #[cfg(unix)]
+    {
         let path = path.to_str().ok_or("Non-UTF-8 path")?;
         let output = capture_command(
             "lsof",

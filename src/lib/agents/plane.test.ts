@@ -128,7 +128,7 @@ describe("projectAgentPlane", () => {
     expect(plane.gaps).toEqual([]);
   });
 
-  it("drops a path that names no session", () => {
+  it("keeps an agent checkout with no slug, and drops a path that is not an agent checkout", () => {
     const plane = project({
       probes: [probe({
         snapshot: snapshot({
@@ -143,7 +143,11 @@ describe("projectAgentPlane", () => {
         }),
       })],
     });
-    expect(plane.rows).toEqual([]);
+    // The slugless checkout is a worktree an agent layout holds, and Fleet's
+    // `agent_summary` counts it. `/repo/human` has no agent kind.
+    expect(plane.rows).toHaveLength(1);
+    expect(plane.rows[0]).toMatchObject({ worktreePath: "/repo/.claude/worktrees", kind: "claude", session: "claude" });
+    expect(plane.checkouts).toBe(1);
     expect(plane.read).toBe(1);
   });
 
@@ -341,7 +345,7 @@ describe("projectAgentPlane", () => {
     ])).toBe(1);
   });
 
-  it("folds a task onto its attempt and does not invent a row for a quiet unmatched one", () => {
+  it("folds a task onto its attempt, and keeps a quiet attempt with no checkout off the plane (P2: kept)", () => {
     const folded = project({
       terminals: [terminal({ taskRunId: "run-1", cwd: "/repo/.claude/worktrees/alpha" })],
       tasks: tasks({ tasks: [task({ tone: "needs-you", pendingCount: 2 })] }),
@@ -482,12 +486,12 @@ describe("filters and the headline", () => {
     expect(applyAgentFilter(unread.rows, "attention")).toHaveLength(1);
   });
 
-  it("counts sessions the filter hid, and does not call a cap a filter", () => {
+  it("counts rows the filter hid, and does not call a cap a filter", () => {
     const plane = project();
     const visible = applyAgentFilter(plane.rows, "live");
     expect(planeHeadline(plane, visible.length)).toContain("1 hidden by the filter");
     expect(planeHeadline(plane, plane.rows.length)).not.toContain("hidden");
-    expect(planeHeadline(plane, plane.rows.length)).toBe("1 session · 0 need attention");
+    expect(planeHeadline(plane, plane.rows.length)).toBe("1 agent checkout · 0 live terminals · 0 need attention");
   });
 
   it("counts repositories that were not read", () => {

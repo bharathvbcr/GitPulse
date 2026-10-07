@@ -23,16 +23,18 @@
   import AgentDecisions from "./AgentDecisions.svelte";
   import TaskHandoffForm from "./TaskHandoffForm.svelte";
   import { interfaceStore } from "../stores/interfaceStore";
-  import { consumeTaskTerminal, taskTerminalRequests } from "../terminal/taskLaunches";
+  import { attemptNotices, clearAttemptNotice, consumeTaskTerminal, noteAttempt, pruneTaskTerminals, taskTerminalRequests } from "../terminal/taskLaunches";
   import { closeWithConfirmation, terminalSessions, type TerminalSessionRecord } from "../terminal/sessionRegistry";
   import { terminalSessionLimit } from "../terminal/sessionLimit";
   import { focusTerminalSession } from "../terminal/sessionFocus";
   import { PERMISSION_LABELS } from "../terminal/agentDefaults";
-  import { queuedTerminalNote, resumeTaskConversation, showTaskTerminal } from "../workbench/taskTerminal";
-  import { asksForReader, checkoutChanges, monitorAttempt, orderMonitored, readPendingRequests, requestsLine, waitingLabel, type MonitorContext, type MonitoredAttempt, type PendingRequests } from "../workbench/taskSessions";
+  import { attemptStartNote, openAttemptCheckout, queuedTerminalNote, resumeTaskConversation, showAttemptTerminal, stopWatchingAttempt, trustAttemptCheckout } from "../workbench/taskTerminal";
+  import { attemptWorktreeOffer, discardAttemptWorktree, mergeAttemptWorktree, mergeTargetLabel, reviewAttemptChanges } from "../workbench/attemptWorktree";
+  import { describeCheckout } from "../terminal/checkoutLabel";
+  import { asksForReader, attemptStage, checkoutChanges, monitorAttempt, orderMonitored, readPendingRequests, releasedNote, requestsLine, waitingLabel, type MonitorContext, type MonitoredAttempt, type PendingRequests } from "../workbench/taskSessions";
   import { sessionActivity } from "../terminal/sessionActivity";
   import { repoStore } from "../stores/repoStore";
-  import { isCaseInsensitiveFs } from "../repos/paths";
+  import { identityKey, isCaseInsensitiveFs } from "../repos/paths";
   import { formatRelativeTime } from "../format";
   import {
     cancelTaskRun,
@@ -110,9 +112,20 @@
   let detail = $state<TaskRun | null>(null);
   let busy = $state(false);
   let loading = $state(false);
-  let error = $state("");
   let historyError = $state("");
-  let note = $state("");
+  /**
+   * Each attempt's one message slot: what its last action said, or why it
+   * failed. Keyed by run, so a message stays with the attempt it is about —
+   * the pane used to say everything in one line at the top, and the form said
+   * what happened after a launch inside itself, after it had folded away.
+   */
+  let messages = $state<Record<string, { tone: "note" | "error"; text: string }>>({});
+  /**
+   * The attempt being prepared, from the moment Launch is pressed until the
+   * store answers. Keyed by the id the run will have, so the row the run
+   * then fills is the same row.
+   */
+  let preparing = $state<{ id: string; provider: TaskRun["provider"]; kind: TaskRun["kind"]; worktree: boolean } | null>(null);
   let runs = $state<TaskRun[]>([]);
   let total = $state(0);
   let cursor = $state<string | null>(null);
@@ -156,6 +169,11 @@
     pending: (runId) => pending.get(runId),
     now,
     clock,
+    notices: (runId) => $attemptNotices.get(runId),
+    trustPending: (repoPath) => {
+      const key = identityKey(repoPath, pathOpts);
+      return !!key && $repoStore.openTabs.some((tab) => tab.trustRequired && identityKey(tab.path, pathOpts) === key);
+    },
   });
   /** One attempt as the pane describes it (`taskSessions.ts::monitorAttempt`, shared with the board). */
   function monitor(run: TaskRun): MonitoredAttempt {
@@ -170,6 +188,8 @@
     return orderMonitored(rows);
   });
   const live = $derived(monitored.map((row) => row.run));
+  /** The attempt being prepared, until a run with its id is on the pane. */
+  const pendingRow = $derived(preparing && !allRuns.some((run) => run.id === preparing?.id) ? preparing : null);
   const ended = $derived(allRuns.filter((run) => !runHoldsCheckout(run, clock)).sort((a, b) => b.created_at - a.created_at));
   const askingCount = $derived(monitored.filter((row) => asksForReader(row.tone)).length);
   // Null means "nobody has chosen"; the default follows whether a run is live.
@@ -229,6 +249,10 @@
       runs = more ? [...new Map([...runs, ...page.items].map((run) => [run.id, run])).values()] : page.items;
       if (working) { liveRuns = working.runs; liveComplete = working.complete; }
       total = page.total; cursor = page.next_cursor;
+      // A terminal request whose attempt can no longer start (ended, expired
+      // while it waited, cancelled elsewhere) must not outlive it: judged
+      // against these same reads, never against a run they did not return.
+      pruneTaskTerminals(working ? [...page.items, ...working.runs] : page.items, Date.now());
       decisionRefresh += 1;
       historyError = "";
       if (working) void readPending(working.runs, ticket);
@@ -262,47 +286,99 @@
   });
   onDestroy(() => { disposed = true; generation += 1; if (timer) clearTimeout(timer); });
 
-  function launched(run: TaskRun) {
-    // `onPrepared` and `onLaunched` both land here for one run: counted once.
+  /** Puts a run on the pane (history first), counted once whichever callback brings it. */
+  function admit(run: TaskRun) {
     const known = runs.some((item) => item.id === run.id);
     runs = [run, ...runs.filter((item) => item.id !== run.id)];
     if (!known) total += 1;
     total = Math.max(total, runs.length);
-    if (run.kind === "managed") reviewingRunID = run.id;
-    // A fresh run is the answer now, so stop showing the question.
-    expandedForm = false;
+    if (preparing?.id === run.id) preparing = null;
     schedule();
   }
-  /** Runs one row action with the shared busy flag and a fresh message line. */
-  async function act(work: () => Promise<void>) {
-    busy = true; error = ""; note = "";
+  /**
+   * The store accepted the attempt. It is listed now, before its start can
+   * fail — but the form stays open: a start that then fails is said on the
+   * attempt's row, and the reader may want to launch again.
+   */
+  function prepared(run: TaskRun) {
+    admit(run);
+  }
+  /**
+   * The launch was handed off. The form folds away once the attempt has
+   * really started — its process reported running, or the store saw it
+   * claimed — because that is the answer to the form's question. A start that
+   * fails leaves the form open for another try, with the failure on the row.
+   */
+  function launched(run: TaskRun) {
+    admit(run);
+    if (run.kind === "managed") reviewingRunID = run.id;
+    awaitingStart = run.id;
+  }
+  let awaitingStart = $state<string | null>(null);
+  $effect(() => {
+    const id = awaitingStart;
+    if (!id) return;
+    const run = allRuns.find((item) => item.id === id);
+    const notice = $attemptNotices.get(id);
+    const started = notice?.phase === "running" || (!!run && ["starting", "running"].includes(run.state));
+    // A recorded failure does not end the wait: a start whose reply this
+    // window lost is still claimed by the host, which the next read shows.
+    if (!started && !(run && !runHoldsCheckout(run, clock))) return;
+    untrack(() => {
+      if (started) expandedForm = false;
+      awaitingStart = null;
+    });
+  });
+  function say(runId: string, tone: "note" | "error", text: string) {
+    if (!disposed) messages = { ...messages, [runId]: { tone, text } };
+  }
+  function unsay(runId: string) {
+    if (!messages[runId]) return;
+    const next = { ...messages };
+    delete next[runId];
+    messages = next;
+  }
+  /** Runs one row action with the shared busy flag and that row's message slot. */
+  async function act(run: Pick<TaskRun, "id">, work: () => Promise<void>) {
+    busy = true; unsay(run.id);
     try { await work(); }
-    catch (cause) { if (!disposed) error = explainError(cause); }
+    catch (cause) { say(run.id, "error", explainError(cause)); }
     finally { if (!disposed) { busy = false; schedule(); } }
   }
   function showTerminal(run: TaskRun) {
-    return act(async () => {
-      if ((await showTaskTerminal(run)) === "queued" && !disposed) note = queuedTerminalNote(run.cwd);
+    return act(run, async () => {
+      const outcome = await showAttemptTerminal(run);
+      const said = attemptStartNote(outcome);
+      if (said) say(run.id, outcome.kind === "failed" ? "error" : "note", said);
     });
   }
-  function showSession(record: TerminalSessionRecord) {
-    return act(async () => {
+  function trust(run: TaskRun) {
+    return act(run, async () => {
+      if (!(await trustAttemptCheckout(run))) say(run.id, "note", `${run.cwd} is not open in GitPulse. Show terminal opens it and asks.`);
+    });
+  }
+  function showSession(run: TaskRun, record: TerminalSessionRecord) {
+    return act(run, async () => {
       const outcome = await focusTerminalSession(record);
-      if (!outcome.ok && !disposed) error = "That session can no longer be shown. It may have just ended.";
+      if (!outcome.ok) say(run.id, "error", "That session can no longer be shown. It may have just ended.");
     });
   }
   function stopSession(run: TaskRun, record: TerminalSessionRecord) {
-    return act(async () => {
+    return act(run, async () => {
       if (!(await closeWithConfirmation(record))) return;
-      if (!disposed) note = record.taskRunId === run.id
+      say(run.id, "note", record.taskRunId === run.id
         ? `${PROVIDER_LABELS[run.provider] ?? run.provider} was stopped. The attempt has ended; start a new one to continue.`
-        : "The resumed conversation was stopped.";
+        : "The resumed conversation was stopped.");
     });
   }
   function cancel(run: TaskRun) {
-    return act(async () => {
+    return act(run, async () => {
       const saved = await cancelTaskRun(run);
+      // Withdrawn everywhere this window was starting it: the request, the
+      // watch that would have toasted its start, and what its row said.
       consumeTaskTerminal(run.id);
+      stopWatchingAttempt(run.id);
+      clearAttemptNotice(run.id);
       replaceRun(saved);
     });
   }
@@ -311,11 +387,13 @@
     if (disposed) return;
     replaceRun(current);
     reviewingRunID = current.id;
-    note = current.state === "running" ? `Managed ${PROVIDER_LABELS[current.provider]} started. Review its requests below.` : `Managed attempt: ${current.state}.`;
+    // Recovered: whatever failure was recorded for its start is history.
+    if (current.state === "running") noteAttempt(current.id, "running", `Managed ${PROVIDER_LABELS[current.provider]} is running.`);
+    say(current.id, "note", current.state === "running" ? `Managed ${PROVIDER_LABELS[current.provider]} started. Review its requests below.` : `Managed attempt: ${current.state}.`);
   }
-  function resumeManaged(run: TaskRun) { return act(() => manage(run)); }
+  function resumeManaged(run: TaskRun) { return act(run, () => manage(run)); }
   function stopManaged(run: TaskRun) {
-    return act(async () => { await stopManagedRun(run.id); note = "Stop requested. Waiting for process confirmation."; });
+    return act(run, async () => { await stopManagedRun(run.id); say(run.id, "note", "Stop requested. Waiting for process confirmation."); });
   }
   /**
    * Ask the host to free a checkout this attempt still holds. It decides on
@@ -323,37 +401,61 @@
    * was none — never a silent no-op.
    */
   function release(run: TaskRun) {
-    return act(async () => {
+    return act(run, async () => {
       const result = await releaseTaskRun(run.id);
       if (disposed) return;
       replaceRun(result.run);
-      note = result.released ? "Released. The checkout is free for another attempt." : result.reason;
+      say(run.id, "note", result.released ? releasedNote(result.run) : result.reason);
     });
   }
   function inspect(run: TaskRun) {
-    return act(async () => { const current = await getTaskRun(run.id); if (!disposed) detail = current; });
+    return act(run, async () => { const current = await getTaskRun(run.id); if (!disposed) detail = current; });
   }
   function resume(run: TaskRun) {
-    return act(async () => {
+    return act(run, async () => {
       const result = await resumeTaskConversation(run);
-      if (disposed) return;
-      if (result.outcome === "unavailable") note = result.reason;
-      else if (result.outcome === "queued") note = queuedTerminalNote(run.cwd);
-      else note = "Resuming the conversation in its checkout. It is listed under this attempt; Show terminal to continue it.";
+      if (result.outcome === "unavailable") say(run.id, "note", result.reason);
+      else if (result.outcome === "queued") say(run.id, "note", queuedTerminalNote(run.cwd));
+      else say(run.id, "note", "Resuming the conversation in its checkout. It is listed under this attempt; Show conversation to continue it.");
     });
   }
 
   function showWaitingConversation(run: TaskRun) {
-    return act(async () => {
+    return act(run, async () => {
       const result = await resumeTaskConversation(run, "show");
-      if (disposed) return;
-      if (result.outcome === "unavailable") note = result.reason;
-      else if (result.outcome === "queued") note = queuedTerminalNote(run.cwd);
+      if (result.outcome === "unavailable") say(run.id, "note", result.reason);
+      else if (result.outcome === "queued") say(run.id, "note", queuedTerminalNote(run.cwd));
     });
   }
 
-  function checkoutName(path: string): string {
-    return path.split(/[\\/]/).filter(Boolean).pop() ?? path;
+  /**
+   * Brings the attempt's checkout forward as the active repository tab. Only
+   * on request, like Show terminal; it starts nothing.
+   */
+  function openCheckout(run: TaskRun) {
+    return act(run, async () => {
+      if (!(await openAttemptCheckout(run))) say(run.id, "error", `${run.cwd} did not open. If its repository tab shows an error, that is why; otherwise try again.`);
+    });
+  }
+  /** Its uncommitted changes, in the repository view. Moves the reader, on request. */
+  function review(run: TaskRun) {
+    return act(run, () => reviewAttemptChanges(run));
+  }
+  /**
+   * Merge or discard. The host refuses either while a live run works in the
+   * worktree; that refusal (and any other) lands in this row's message slot.
+   */
+  function merge(run: TaskRun) {
+    return act(run, async () => {
+      const result = await mergeAttemptWorktree(run);
+      if (result) say(run.id, "note", result.message);
+    });
+  }
+  function discard(run: TaskRun) {
+    return act(run, async () => {
+      const result = await discardAttemptWorktree(run);
+      if (result) say(run.id, "note", result.message);
+    });
   }
   function permissionLabel(run: TaskRun): string {
     return PERMISSION_LABELS[run.permission_mode]?.label ?? run.permission_mode;
@@ -366,16 +468,23 @@
   {@const row = monitor(run)}
   {@const view = row.view}
   {@const own = view.sessions.find((session) => session.role === "attempt")}
-  {@const changes = holding ? checkoutChanges(run.cwd, $repoStore.openTabs, pathOpts) : null}
+  {@const changes = holding ? checkoutChanges(run.cwd, $repoStore.openTabs, pathOpts, { runId: run.id, peers: live }) : null}
+  {@const place = describeCheckout(run.cwd, $repoStore.openTabs, pathOpts)}
   {@const asked = requestsLine(holding ? pending.get(run.id) : undefined)}
+  {@const stage = attemptStage(row, clock)}
+  {@const offer = attemptWorktreeOffer(run, clock)}
+  {@const message = messages[run.id]}
   <article class="run" class:is-live={holding} data-tone={holding ? row.tone : null} data-testid="agent-run" data-run-id={run.id} data-run-state={run.state}>
     <div class="run-head">
       <strong>{PROVIDER_LABELS[run.provider] ?? run.provider}</strong>
       <span class="kind">{run.kind === "managed" ? "Managed" : "Terminal"}</span>
-      <span class="state" data-tone={holding ? "live" : run.state === "failed" || run.state === "unresolved" ? "bad" : "done"}>{runStatusLabel(run, clock)}</span>
+      <!-- One ladder for every attempt (taskSessions.ts::attemptStage). Polite,
+           so a transition is announced without interrupting; fixed in the
+           head row, so a longer label wraps the row rather than moving it. -->
+      <span class="state" role="status" aria-live="polite" data-tone={stage.tone} data-stage={stage.stage} data-testid="agent-stage" title={runStatusLabel(run, clock)}>{stage.label}</span>
     </div>
     <small class="facts">
-      <span title={run.cwd}>{checkoutName(run.cwd)}</span>
+      <span title={run.cwd} data-testid="agent-checkout">{place.repository}{#if place.checkout} / {place.checkout}{/if}</span>
       · Revision {run.source_revision} · {permissionLabel(run)}
       {#if run.created_at} · started {formatRelativeTime(run.created_at, Math.floor(now / 1000))}{/if}
       {#if run.exit_code !== null} · exit {run.exit_code}{/if}
@@ -389,7 +498,7 @@
       </small>
     {/if}
 
-    {#if view.sessions.length || view.waiting || row.disconnected || row.unstarted || asked}
+    {#if view.sessions.length || view.waiting || row.disconnected || row.unstarted || asked || row.failure}
       <ul class="sessions" aria-label="What this attempt is doing">
         {#each view.sessions as session, index (session.record.key)}
           {@const glance = row.glances[index]}
@@ -406,7 +515,14 @@
           <li data-phase="requests" data-tone={asked.tone} data-testid="agent-requests"><span class="dot" aria-hidden="true"></span><span class="glance"><span class="headline">{asked.text}</span></span></li>
         {/if}
         {#if view.waiting}
-          <li data-phase="waiting" data-tone="starting" data-testid="agent-session-waiting"><span class="dot" aria-hidden="true"></span><span class="glance">{waitingLabel(view.waiting, $terminalSessionLimit)}</span></li>
+          <li data-phase="waiting" data-reason={view.waiting.reason} data-tone={view.waiting.reason === "trust" ? "needs-you" : "starting"} data-testid="agent-session-waiting"><span class="dot" aria-hidden="true"></span><span class="glance">{waitingLabel(view.waiting, $terminalSessionLimit)}</span></li>
+        {/if}
+        {#if row.failure}
+          <!-- Recorded by this window when the start failed: the checkout
+               would not open, the host refused the spawn (a missing or old
+               CLI), a managed start failed. Without it, a spawn refused in a
+               hidden tab read as a quiet "not connected". -->
+          <li data-phase="failed" data-tone="error" data-testid="agent-session-failed"><span class="dot" aria-hidden="true"></span><span class="glance"><span class="headline">Did not start</span><span class="cause">{row.failure}</span></span></li>
         {/if}
         {#if row.disconnected}
           <!-- The store says it runs; no session in this window is attached
@@ -429,10 +545,14 @@
     {#if run.state === "unresolved"}<p class="error">This attempt's outcome is unresolved and it still holds its checkout. Release it once its agent has stopped; another worktree can run meanwhile.</p>
     {:else if run.outcome_uncertain}<p>Released without an observed exit. Review what it changed before relying on it.</p>{/if}
     {#if expired}<p>This preparation expired before it started, so it no longer holds its checkout. Cancel it to clear it from the history, then prepare a new attempt.</p>{/if}
+    {#if message}<p class="row-message" data-tone={message.tone} role={message.tone === "error" ? "alert" : "status"} data-testid="agent-run-message">{message.text}</p>{/if}
 
     <div class="actions">
       {#if run.kind === "external_terminal" && OPENABLE.includes(run.state) && !expired}
         <button class="gp-btn-primary" type="button" onclick={() => showTerminal(run)} disabled={busy}><SquareTerminal size={12} /> Show terminal</button>
+      {/if}
+      {#if view.waiting?.role === "attempt" && view.waiting.reason === "trust"}
+        <button class="gp-btn-primary" type="button" onclick={() => trust(run)} disabled={busy} data-testid="agent-trust" title="Asks whether to trust this checkout's repository. The agent starts once you do.">Trust checkout…</button>
       {/if}
       {#if own && own.phase !== "adopted"}
         <button class="gp-btn" type="button" onclick={() => stopSession(run, own.record)} disabled={busy} title="Stops the agent. You are asked first, because stopping ends this attempt.">Stop agent</button>
@@ -443,7 +563,7 @@
         <button class="gp-btn-primary" type="button" onclick={() => showWaitingConversation(run)} disabled={busy}><SquareTerminal size={12} /> Show conversation</button>
       {/if}
       {#each view.sessions.filter((session) => session.role === "resumed") as session (session.record.key)}
-        <button class="gp-btn" type="button" onclick={() => showSession(session.record)} disabled={busy}>Show conversation</button>
+        <button class="gp-btn" type="button" onclick={() => showSession(run, session.record)} disabled={busy}>Show conversation</button>
         <button class="gp-btn" type="button" onclick={() => stopSession(run, session.record)} disabled={busy}>Stop conversation</button>
       {/each}
       {#if run.kind === "managed"}
@@ -453,7 +573,14 @@
       {/if}
       {#if run.provider === "claude" && RESUMABLE.includes(run.state) && !view.sessions.some((session) => session.role === "resumed")}<button class="gp-btn" type="button" onclick={() => resume(run)} disabled={busy} title="Starts a Claude Code tab in this attempt's checkout that continues its conversation, in the same permission mode. You stay on this task.">Resume conversation</button>{/if}
       {#if run.state === "prepared"}<button class="gp-btn" type="button" onclick={() => cancel(run)} disabled={busy}>Cancel preparation</button>{/if}
-      {#if canRelease(run)}<button class="gp-btn" type="button" onclick={() => release(run)} disabled={busy} title="Frees the checkout if the agent and the GitPulse that launched it have both stopped. A running agent is never released.">Release checkout</button>{/if}
+      <button class="gp-btn" type="button" onclick={() => openCheckout(run)} disabled={busy} data-testid="agent-open-checkout" title={`Opens ${run.cwd} as the active repository tab. Starts nothing.`}>Open checkout</button>
+      {#if offer.review}<button class="gp-btn" type="button" onclick={() => review(run)} disabled={busy} data-testid="agent-review" title={`Opens ${run.cwd} on its uncommitted changes.`}>Review changes</button>{/if}
+      {#if offer.ownWorktree}
+        {@const target = mergeTargetLabel(run.cwd)}
+        <button class="gp-btn" type="button" onclick={() => merge(run)} disabled={busy} data-testid="agent-merge" title="Merges this attempt's branch into the main checkout's branch and removes its worktree. You are asked first.">{target ? `Merge into ${target}` : "Merge into main checkout"}</button>
+        <button class="gp-btn" type="button" onclick={() => discard(run)} disabled={busy} data-testid="agent-discard" title="Removes this attempt's worktree. You are told how many uncommitted files are lost, and asked first.">Discard worktree</button>
+      {/if}
+      {#if canRelease(run)}<button class="gp-btn" type="button" onclick={() => release(run)} disabled={busy} title="Frees the checkout if the agent and the GitPulse that launched it have both stopped. A running agent is never released. The worktree and its changes stay on disk.">Release checkout</button>{/if}
       {#if run.session_id && run.kind === "managed"}<button class="gp-btn" type="button" onclick={() => { reviewingRunID = reviewingRunID === run.id ? null : run.id; }}>{reviewingRunID === run.id ? "Hide requests" : "Review requests"}</button>{/if}
     </div>
 
@@ -480,13 +607,23 @@
     <button class="gp-btn" type="button" onclick={() => refresh()} disabled={loading} title="Refresh this task's attempts"><RotateCw size={12} /> Refresh</button>
   </header>
 
-  {#if note}<p role="status" class="notice">{note}</p>{/if}
-  {#if error}<p class="error" role="alert">{error}</p>{/if}
   {#if historyError}<p class="error" role="alert">{historyError}</p>{/if}
 
-  {#if live.length}
+  {#if live.length || pendingRow}
     <h4 class="group-heading">Working now</h4>
     <div class="run-list" data-testid="agents-working">
+      {#if pendingRow}
+        <!-- Optimistic: shown from the moment Launch is pressed until the
+             store answers, then replaced by the run, which has this id. -->
+        <article class="run is-live" data-testid="agent-run-pending" data-run-id={pendingRow.id}>
+          <div class="run-head">
+            <strong>{PROVIDER_LABELS[pendingRow.provider] ?? pendingRow.provider}</strong>
+            <span class="kind">{pendingRow.kind === "managed" ? "Managed" : "Terminal"}</span>
+            <span class="state" role="status" aria-live="polite" data-tone="live" data-stage="preparing" data-testid="agent-stage">{pendingRow.worktree ? "Preparing worktree" : "Preparing"}</span>
+          </div>
+          <small class="facts">{pendingRow.worktree ? "Creating its worktree and running the repository's setup, then the agent starts." : "Checking the task and the checkout, then the agent starts."}</small>
+        </article>
+      {/if}
       {#each live as run (run.id)}{@render runCard(run)}{/each}
     </div>
   {/if}
@@ -516,8 +653,14 @@
       {openTabs}
       {dirty}
       {disabled}
-      onPrepared={launched}
+      onPrepared={prepared}
       onLaunched={launched}
+      onPreparing={(draft) => {
+        preparing = draft;
+        // Pinned open for the launch in flight: the run becoming live must
+        // not fold the form before its start is confirmed (see `launched`).
+        if (draft && formOpen) expandedForm = true;
+      }}
       onGate={(next) => { gate = next; }}
       onBusy={(next) => { launching = next; }}
       onPending={(next) => { preparePending = next; }}
@@ -552,7 +695,6 @@
   .group-heading{font-size:10px;letter-spacing:.04em;text-transform:uppercase;color:rgb(var(--c-text-muted))}
   p{color:rgb(var(--c-text-muted));line-height:1.5;margin:0}
   .meta{color:rgb(var(--c-text-muted));font-size:11px}
-  .notice{padding:7px 9px;border-radius:7px;background:rgb(var(--c-accent)/.08);color:rgb(var(--c-text))}
   .form-toggle{display:flex;align-items:center;gap:7px;width:100%;padding:7px 8px;border:1px solid rgb(var(--c-border));border-radius:8px;font-weight:600;background:rgb(var(--c-bg)/.35)}
   .form-toggle:hover{background:rgb(var(--c-surface-hover)/.7)}
   .form-toggle:focus-visible{outline:2px solid rgb(var(--c-accent)/.6);outline-offset:-1px}
@@ -569,6 +711,11 @@
   .state{margin-left:auto;font-size:10.5px;font-weight:600;padding:1px 7px;border-radius:999px;background:rgb(var(--c-text-muted)/.12);color:rgb(var(--c-text-muted));white-space:nowrap}
   .state[data-tone="live"]{background:rgb(var(--c-accent)/.14);color:rgb(var(--c-accent))}
   .state[data-tone="bad"]{background:rgb(220 101 101/.14);color:#dc6565}
+  .state[data-tone="ask"]{background:rgb(210 153 34/.16);color:#d29922}
+  .row-message{padding:6px 8px;border-radius:7px;background:rgb(var(--c-accent)/.08);color:rgb(var(--c-text));overflow-wrap:anywhere}
+  .row-message[data-tone="error"]{background:rgb(220 101 101/.1);color:#dc6565}
+  .cause{color:rgb(var(--c-text));overflow-wrap:anywhere}
+  li[data-tone="error"] .cause{color:#dc6565}
   .facts{display:block;color:rgb(var(--c-text-muted));margin:5px 0 0;overflow-wrap:anywhere}
   .sessions{list-style:none;margin:8px 0 0;padding:0;display:flex;flex-direction:column;gap:5px}
   .sessions li{display:flex;align-items:baseline;gap:7px;color:rgb(var(--c-text));line-height:1.45;min-width:0}

@@ -2,9 +2,11 @@ import { describe, expect, it } from "vitest";
 import {
   AGENT_WORKTREE_SEGMENT,
   agentKind,
+  agentKindLabel,
   agentKindsOn,
   agentSessionSlug,
   isAgentWorktree,
+  isGitPulseLane,
 } from "./agentWorktree";
 
 describe("isAgentWorktree", () => {
@@ -108,5 +110,28 @@ describe("agentSessionSlug", () => {
 
   it("is empty when the segment is present but names no session", () => {
     expect(agentSessionSlug("/repo/.claude/worktrees/")).toBe("");
+  });
+});
+
+describe("GitPulse task worktrees", () => {
+  it("recognises GitPulse's own layout from the kind, case-insensitively", () => {
+    expect(isGitPulseLane(agentKind("/repo/.gitpulse/worktrees/fix-x-1a2b3c4d"))).toBe(true);
+    expect(isGitPulseLane("GitPulse")).toBe(true);
+    expect(isGitPulseLane("claude")).toBe(false);
+    expect(isGitPulseLane("gitpulsex")).toBe(false);
+    expect(isGitPulseLane("")).toBe(false);
+  });
+
+  it("names each kind for a person, never as a bare directory name", () => {
+    expect(agentKindLabel("gitpulse")).toBe("GitPulse task");
+    expect(agentKindLabel("GITPULSE")).toBe("GitPulse task");
+    expect(agentKindLabel("claude")).toBe("Claude Code");
+    expect(agentKindLabel("Claude")).toBe("Claude Code");
+    expect(agentKindLabel("codex")).toBe("Codex");
+    expect(agentKindLabel("agy")).toBe("Antigravity");
+    expect(agentKindLabel("cursor")).toBe("Cursor");
+    expect(agentKindLabel("my-agent")).toBe("My Agent");
+    expect(agentKindLabel("")).toBe("");
+    expect(agentKindLabel("   ")).toBe("");
   });
 });

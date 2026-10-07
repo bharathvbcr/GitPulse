@@ -30,6 +30,14 @@
     { "path": "/repo/.클로드/worktrees/세션", "kind": "클로드", "slug": "세션", "why": "Non-ASCII directory names are ordinary path segments." },
     { "path": "/repo/.claude/worktrees/outer/.cursor/worktrees/inner", "kind": "claude", "slug": "outer", "why": "Outermost layout wins: a session that itself contains a nested layout is still the session it is." },
 
+    { "path": "/repo/.gitpulse/worktrees/fix-the-watcher-1a2b3c4d", "kind": "gitpulse", "slug": "fix-the-watcher-1a2b3c4d", "gitpulse_lane": true, "why": "The worktree GitPulse provisions for a task attempt (workbench/agent_worktree.rs): `<task-slug>-<attempt id>` on branch `gitpulse/<same>`." },
+    { "path": "C:\\repo\\.gitpulse\\worktrees\\task-1a2b3c4d", "kind": "gitpulse", "slug": "task-1a2b3c4d", "gitpulse_lane": true, "why": "A GitPulse task worktree on Windows separators is still one." },
+    { "path": "/repo/.gitpulse/worktrees", "kind": "gitpulse", "slug": "", "gitpulse_lane": true, "why": "The GitPulse task-worktree container names no task, but it is still GitPulse's own layout." },
+    { "path": "/repo/.GitPulse/worktrees/s", "kind": "GitPulse", "slug": "s", "gitpulse_lane": true, "why": "The kind is reported as found, and recognising GitPulse's own layout is case-insensitive: on a case-insensitive volume this is the same directory." },
+    { "path": "/repo/.gitpulse/hooks.json", "kind": "", "slug": "", "why": "GitPulse's repository configuration lives beside its worktrees and is not a worktree." },
+    { "path": "/repo/.gitpulsex/worktrees/s", "kind": "gitpulsex", "slug": "s", "why": "Only the exact GitPulse directory is a GitPulse task worktree; a lookalike is an ordinary agent kind." },
+    { "path": "/repo/.claude/worktrees/gitpulse", "kind": "claude", "slug": "gitpulse", "why": "A Claude session named `gitpulse` is a Claude session: the lane decision reads the kind, never the slug." },
+
     { "path": "/Users/me/worktrees/myrepo/.claude/worktrees/session-abc", "kind": "claude", "slug": "session-abc", "why": "REGRESSION: an ancestor directory named `worktrees` used to capture the slug (`myrepo`), collapsing every session under such a parent to one label." },
     { "path": "/srv/worktrees/app/.cursor/worktrees/fix-auth", "kind": "cursor", "slug": "fix-auth", "why": "REGRESSION: same ancestor-`worktrees` trap, different agent." },
     { "path": "/work/worktrees/.claude/worktrees/a", "kind": "claude", "slug": "a", "why": "REGRESSION: the ancestor `worktrees` used to yield a slug of `.claude`." },

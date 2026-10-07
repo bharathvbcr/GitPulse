@@ -328,6 +328,89 @@ mod tests {
         path.to_str().unwrap().to_owned()
     }
 
+    /// An attempt chosen for a folder inside a checkout runs its agent in that
+    /// folder, with the checkout's root as the repository it trusts and
+    /// records. It could not run at all: preparation refused anything but
+    /// the root, and the spawn validated the folder as if it were a
+    /// repository of its own.
+    #[test]
+    fn an_attempt_in_a_subdirectory_of_its_checkout_starts_there() {
+        let root = tempfile::tempdir().unwrap();
+        git_global(&["init", root.path().to_str().unwrap()]).unwrap();
+        crate::test_support::trust_repo(root.path());
+        let folder = root.path().join("packages").join("web app");
+        std::fs::create_dir_all(&folder).unwrap();
+        let state = WorkbenchState(Arc::new(Inner {
+            path: Some(root.path().join("profile.sqlite")),
+            ..Inner::default()
+        }));
+        state
+            .register(root.path().to_str().unwrap(), "repo", "register")
+            .unwrap();
+        state.request("items.put", &json!({"id":"task","request_id":"task","expected_revision":0,"title":"Keep E42","repository_ids":["repo"],"primary_repository_id":"repo"}).to_string()).unwrap();
+        let prepared = state
+            .request("runs.prepare_terminal", &json!({"id":"run","request_id":"prepare","task_id":"task","source_revision":1,"repository_id":"repo","repository_revision":1,"repo_path":folder,"provider":"claude","permission_mode":"ask"}).to_string())
+            .unwrap_or_else(|e| panic!("a subdirectory of the checkout was refused: {} {}", e.code, e.message));
+        let canonical = folder.canonicalize().unwrap();
+        assert_eq!(prepared["item"]["cwd"], json!(canonical));
+        assert_eq!(
+            prepared["item"]["git_dir"],
+            json!(root.path().join(".git").canonicalize().unwrap())
+        );
+        let app = tauri::test::mock_builder().build(crate::context()).unwrap();
+        let terminals = TerminalSessions::default();
+        let _cleanup = Cleanup(terminals.clone());
+        let output = Arc::new(Mutex::new(String::new()));
+        let captured = output.clone();
+        let ack = terminals.clone();
+        app.listen("terminal-output", move |event| {
+            let value: Value = serde_json::from_str(event.payload()).unwrap();
+            let bytes = STANDARD
+                .decode(value["data_b64"].as_str().unwrap())
+                .unwrap();
+            captured
+                .lock()
+                .unwrap()
+                .push_str(&String::from_utf8_lossy(&bytes));
+            acknowledge_output(&ack, value["id"].as_str().unwrap(), bytes.len()).unwrap();
+        });
+        let program = script(
+            root.path(),
+            "printf 'cwd=%s\\n' \"$(pwd -P)\"\nIFS= read -r finish\nexit 0",
+        );
+        let started = start(
+            app.handle(),
+            &terminals,
+            &state,
+            launch(),
+            source(&state),
+            program,
+            super::terminal_command::LaunchOptions::default(),
+        )
+        .unwrap_or_else(|e| {
+            panic!(
+                "the agent could not start in the subdirectory: {} {}",
+                e.code, e.message
+            )
+        });
+        let expected = format!("cwd={}", canonical.display());
+        let waited = Instant::now();
+        while !output.lock().unwrap().contains(&expected) {
+            assert!(
+                waited.elapsed() < Duration::from_secs(30),
+                "the agent did not start in {}: {}",
+                canonical.display(),
+                output.lock().unwrap()
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(
+            state.request("runs.get", r#"{"id":"run"}"#).unwrap()["item"]["state"],
+            "running"
+        );
+        write_to_session(&terminals, &started.id, "finish\n").unwrap();
+    }
+
     /// A second launch of one attempt that arrives while the first holds it —
     /// claimed, forking, not yet registered — waits and then gets the first
     /// one's session. It read "already claimed" with nothing to attach to,

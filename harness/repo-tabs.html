@@ -32,13 +32,15 @@
       const SITE = "/code/web/site";
       const API = "/code/devtools/Api";
       const API_FEATURE = "/code/devtools/Api-feature";
+      const SITE_WT = `${SITE}/.gitpulse/worktrees/site-preview`;
       const COMMON = {
         [MAIN]: `${MAIN}/.git`, [WT_A]: `${MAIN}/.git`, [WT_B]: `${MAIN}/.git`,
         [SITE]: `${SITE}/.git`, [API]: `${API}/.git`, [API_FEATURE]: `${API}/.git`,
+        [SITE_WT]: `${SITE}/.git`,
       };
       const BRANCH = {
         [MAIN]: "main", [WT_A]: "fix/handoff-sheet-launch-crash", [WT_B]: "feat/agent-model-launch",
-        [SITE]: "main", [API]: "main", [API_FEATURE]: "feature/rate-limits",
+        [SITE]: "main", [API]: "main", [API_FEATURE]: "feature/rate-limits", [SITE_WT]: "gitpulse/site-preview",
       };
       const branch = (name) => ({
         name, is_current: true, is_remote: false, remote_name: null, tip_commit_id: "abc123456789",
@@ -297,6 +299,21 @@
           });
           key(menu(), { key: "Escape" });
           await settle();
+
+          // ---- a worktree of a grouped repository -----------------------------
+          // The reported bug: with its repository in a user group, a new
+          // worktree opened ungrouped at the far end of the strip and drew as
+          // a repository of its own, because a stack is (group, repository).
+          repoStore.setTabGroup(get(repoStore).openTabs.find((t) => t.path === SITE).id, "web");
+          await settle();
+          await repoStore.openRepo(SITE_WT, { activate: false });
+          await settle();
+          const siteGroupOf = (path) => get(repoStore).openTabs.find((t) => t.path === path)?.group ?? null;
+          check("a worktree of a grouped repository joins its group", () => siteGroupOf(SITE_WT) === "web");
+          check("…and stacks with its repository instead of drawing as another one", () =>
+            !!stackShell("site") && !pills().some((el) => el.textContent.includes("site-preview")));
+          check("…seated right after its repository on the strip", () =>
+            order().indexOf(SITE_WT) === order().indexOf(SITE) + 1);
 
           check("every IPC call had a fixture", () => unexpected.length === 0);
           check("no unhandled runtime errors", () => errors.length === 0);

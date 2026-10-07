@@ -38,6 +38,8 @@
  * `agentWorktree.cases.json`, so they cannot drift apart silently.
  */
 
+import { asAgentProvider, PROVIDER_LABELS } from "../workbench/vocabulary";
+
 /** The path segment Claude Code nests its worktrees under. */
 export const AGENT_WORKTREE_SEGMENT = ".claude/worktrees/";
 
@@ -126,11 +128,51 @@ export function isAgentWorktree(path: string): boolean {
  * The agent that created this worktree (`claude`, `cursor`, `codex`, `grok`, `agy`, …).
  *
  * Empty when the path is not an agent worktree. The hidden-directory name is
- * returned as-is: inventing a prettier label would claim knowledge we do not
- * have about a tool we have only seen a folder of.
+ * returned as-is, because it is an identity other code compares; the text a
+ * person reads comes from {@link agentKindLabel}.
  */
 export function agentKind(path: string): string {
   return agentLayout(path)?.kind ?? "";
+}
+
+/** The kind GitPulse's own task worktrees carry (`.gitpulse/worktrees/<slug>`). */
+const GITPULSE_LANE_KIND = "gitpulse";
+
+/**
+ * Whether an agent kind names a worktree GitPulse provisioned for a task.
+ *
+ * The layout rule accepts any hidden directory, so `.gitpulse/worktrees/` was
+ * reported as an agent called "gitpulse" by accident — read like an external
+ * tool's session rather than GitPulse's own task attempt. Case-insensitive:
+ * on the default macOS and Windows volumes `.GitPulse` is the same directory.
+ * Mirrors `is_gitpulse_lane` in `src-tauri/src/engine/worktree.rs`; both are
+ * held to `agentWorktree.cases.json`.
+ */
+export function isGitPulseLane(kind: string): boolean {
+  return kind.toLowerCase() === GITPULSE_LANE_KIND;
+}
+
+/**
+ * The name a person reads for an agent kind.
+ *
+ * GitPulse's own worktrees say what they are — a task attempt — rather than
+ * naming GitPulse as if it were a coding agent. A kind GitPulse can launch
+ * takes the same label the launch controls use (`PROVIDER_LABELS`), so a chip
+ * and the menu that started the session agree. Any other kind is a tool we
+ * have only seen a folder of: its directory name, capitalised, and nothing
+ * invented beyond that.
+ */
+export function agentKindLabel(kind: string): string {
+  const trimmed = kind.trim();
+  if (!trimmed) return "";
+  if (isGitPulseLane(trimmed)) return "GitPulse task";
+  const provider = asAgentProvider(trimmed.toLowerCase());
+  if (provider) return PROVIDER_LABELS[provider];
+  return trimmed
+    .split(/[-_\s]+/)
+    .filter(Boolean)
+    .map((word) => word.charAt(0).toUpperCase() + word.slice(1))
+    .join(" ");
 }
 
 /**

@@ -152,17 +152,74 @@ describe("sessionsByRepo", () => {
     expect(counts.get("/r/a")).toBe(1);
   });
 
-  it("does not fold paths that differ only by case or trailing separator", () => {
-    // Deliberate: every producer hands out the path the repository store
-    // already resolved, so folding here would invent a second identity rule.
-    // Pinned so a future change to that assumption is a failing test, not a
-    // badge that quietly counts the wrong repository.
+  it("counts one checkout spelled two ways as one, by the tab strip's identity rule", () => {
+    // This used to pin exact-string keys on the claim that every producer
+    // hands out one spelling. It does not: a task launch's checkout, an
+    // adopted session's host path and a tab's path can differ by case on a
+    // case-insensitive volume or by a trailing separator, and the strip and
+    // the Agents plane already treat those as one checkout (`identityKey`).
+    // A badge keyed differently counted the same checkout as two.
+    const insensitive = { caseInsensitive: true };
     const counts = sessionsByRepo([
       { repoPath: "/r/A" },
       { repoPath: "/r/a" },
       { repoPath: "/r/a/" },
-    ]);
-    expect(counts.size).toBe(3);
+      { repoPath: "/r//a" },
+    ], insensitive);
+    expect(counts.size).toBe(1);
+    expect(counts.get("/r/a")).toBe(4);
+    expect(counts.get("/R/A/")).toBe(4);
+    expect(counts.has("/r/A")).toBe(true);
+    // The first spelling seen names the entry, so `keys()` stays a real path.
+    expect([...counts.keys()]).toEqual(["/r/A"]);
+  });
+
+  it("keeps case apart on a case-sensitive volume, and folds only separators there", () => {
+    const counts = sessionsByRepo([{ repoPath: "/r/A" }, { repoPath: "/r/a" }, { repoPath: "/r/a/" }], { caseInsensitive: false });
+    expect(counts.size).toBe(2);
+    expect(counts.get("/r/A")).toBe(1);
+    expect(counts.get("/r/a")).toBe(2);
+    expect(counts.get("/R/a")).toBeUndefined();
+  });
+
+  it("maps random spellings of the same checkout to the same sessions (seeded)", () => {
+    let seed = 0x5eed1e55;
+    const random = () => {
+      seed = (seed + 0x6d2b79f5) | 0;
+      let t = Math.imul(seed ^ (seed >>> 15), 1 | seed);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+    const pick = <T,>(list: readonly T[]) => list[Math.floor(random() * list.length)];
+    const flipCase = (text: string) => [...text].map((ch) => (random() < 0.5 ? ch.toUpperCase() : ch.toLowerCase())).join("");
+    const respell = (path: string, caseInsensitive: boolean) => {
+      let out = caseInsensitive ? flipCase(path) : path;
+      if (random() < 0.3) out = out.replace(/\//g, "\\");
+      // An inner separator only: a doubled LEADING one is a UNC path, which
+      // is a different place.
+      if (random() < 0.3) out = out.replace(/(.)[\\/]/, "$1//");
+      if (random() < 0.4) out += pick(["/", "//", "\\"]);
+      return out;
+    };
+    const checkouts = ["/Users/me/Code/app", "/Users/me/Code/app/.claude/worktrees/fix-1", "/Volumes/Work/api", "/srv/repo"];
+    for (let round = 0; round < 200; round += 1) {
+      const caseInsensitive = random() < 0.5;
+      const options = { caseInsensitive };
+      const expected = new Map<string, number>();
+      const records: { repoPath: string }[] = [];
+      const total = 1 + Math.floor(random() * 12);
+      for (let i = 0; i < total; i += 1) {
+        const checkout = pick(checkouts);
+        records.push({ repoPath: respell(checkout, caseInsensitive) });
+        expected.set(checkout, (expected.get(checkout) ?? 0) + 1);
+      }
+      const counts = sessionsByRepo(records, options);
+      expect(counts.size, JSON.stringify(records)).toBe(expected.size);
+      for (const [checkout, count] of expected) {
+        // Asked under yet another spelling, the answer is the same count.
+        expect(counts.get(respell(checkout, caseInsensitive)), `${checkout} in ${JSON.stringify(records)}`).toBe(count);
+      }
+    }
   });
 
   it("reads a live registry's published array", () => {
@@ -170,7 +227,7 @@ describe("sessionsByRepo", () => {
     registry.reserve(record({ key: "a", repoPath: "/r/one" }));
     registry.reserve(record({ key: "b", repoPath: "/r/two" }));
     registry.reserve(record({ key: "c", repoPath: "/r/one" }));
-    expect(sessionsByRepo(get(registry))).toEqual(new Map([["/r/one", 2], ["/r/two", 1]]));
+    expect([...sessionsByRepo(get(registry), { caseInsensitive: false })]).toEqual([["/r/one", 2], ["/r/two", 1]]);
   });
 });
 

@@ -748,6 +748,13 @@ function project(internal: InternalState, options: PathIdentityOptions): RepoSta
 
 const REPOSITORY_TRUST_REQUIRED = "REPOSITORY_TRUST_REQUIRED";
 
+/** What a person reads when a tab cannot be opened at all. */
+function openRefusalMessage(reason: "invalid" | "capacity"): string {
+  return reason === "capacity"
+    ? `Too many open repositories (max ${MAX_OPEN_TABS}). Close a tab to open another.`
+    : "Invalid repository path";
+}
+
 export function repositoryTrustRefused(message: string): boolean {
   return message.includes(REPOSITORY_TRUST_REQUIRED);
 }
@@ -786,7 +793,7 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
   const graph = deps.graph ?? graphStore;
   const filters = deps.filter ?? filterStore;
   const terminals = deps.terminals ?? {
-    countFor: (repoPath: string) => sessionsByRepo(get(terminalSessions)).get(repoPath) ?? 0,
+    countFor: (repoPath: string) => sessionsByRepo(get(terminalSessions), options).get(repoPath) ?? 0,
   };
 
   /**
@@ -1076,15 +1083,40 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
   }
 
   /**
-   * Moves a newly opened checkout to just after the last open checkout of the
-   * same repository in the same group. Without it an agent's worktree tab
-   * landed at the far end of the strip, as far from its repository as the
-   * strip allowed, and with stacking turned off nothing tied the two together.
+   * Seats a newly opened checkout with the open checkouts of its repository:
+   * in their group, just after the last of them. Without it an agent's
+   * worktree tab landed at the far end of the strip, and when the repository
+   * sat in a user group the worktree opened ungrouped — a stack is keyed by
+   * (group, family), so it could never join and read as a second repository.
+   *
+   * The group comes from the family's checkout the reader used last, else the
+   * last one on the strip. An explicit group from the caller always wins.
    */
-  function placeBesideFamily(id: string, commonDir: string | null | undefined) {
+  function placeBesideFamily(
+    id: string,
+    commonDir: string | null | undefined,
+    explicitGroup: boolean,
+    activate: boolean,
+  ) {
     const family = familyFromCommonDir(commonDir, options);
     if (!family) return;
-    const ws = internal.workspace;
+    let ws = internal.workspace;
+    const members = ws.tabs.filter(
+      (tab) => tab.id !== id && familyOfTab(tab.id)?.key === family.key,
+    );
+    if (members.length === 0) return;
+    if (!explicitGroup) {
+      const lastUsedId = lastUsedCheckouts().get(family.key);
+      const anchor =
+        members.find((tab) => tab.id === lastUsedId) ?? members[members.length - 1];
+      const anchorGroup = anchor.group ?? null;
+      const current = ws.tabs.find((tab) => tab.id === id);
+      if (current && (current.group ?? null) !== anchorGroup) {
+        ws = setWorkspaceTabGroup(ws, id, anchorGroup);
+        // Shown means visible: a folded group would hide the tab just opened.
+        if (activate && anchorGroup) ws = setWorkspaceGroupCollapsed(ws, anchorGroup, false);
+      }
+    }
     const from = ws.tabs.findIndex((tab) => tab.id === id);
     if (from < 0) return;
     const group = ws.tabs[from].group ?? null;
@@ -1093,8 +1125,8 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
       if (tab.id === id || (tab.group ?? null) !== group) return;
       if (familyOfTab(tab.id)?.key === family.key) last = index;
     });
-    if (last < 0) return;
-    replaceWorkspace(moveWorkspaceTabTo(ws, id, from > last ? last + 1 : last));
+    if (last >= 0) ws = moveWorkspaceTabTo(ws, id, from > last ? last + 1 : last);
+    if (ws !== internal.workspace) replaceWorkspace(ws);
   }
 
   function beginShortcut(): boolean {
@@ -1488,6 +1520,30 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
   }
 
   /**
+   * What a successful resolve says about a session — the one place those
+   * fields are copied, so no path that resolves (open, a trust grant, a
+   * re-resolve on hydrate) can update the path and forget the family.
+   */
+  function resolvedFields(id: string, resolved: ResolvedRepo) {
+    familyUnknown.delete(id);
+    return {
+      path: resolved.path,
+      name: resolved.name,
+      isBare: resolved.is_bare,
+      commonDir: resolved.common_dir ?? null,
+    };
+  }
+
+  /**
+   * Tab ids whose family is unknown because no resolve has succeeded for them
+   * yet (restored untrusted, or unreachable at restore). A resolve that
+   * answered "no common directory" is an answer and is not listed. `hydrate`
+   * asks again for these, once per hydrate: without it a family split at
+   * restore stayed split until the app restarted.
+   */
+  const familyUnknown = new Set<string>();
+
+  /**
    * Ordering token for snapshot fetches. `activateTab` starts a hydrate at
    * generation N; `refresh()` and watcher events start more at the SAME N
    * (refresh never bumps). Generation alone cannot order those, so the older
@@ -1533,9 +1589,96 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
     return { ...snapshot, branches };
   }
 
+  /**
+   * Asks the backend which repository a session belongs to when no resolve
+   * has answered yet. A failure leaves it listed for the next hydrate; it
+   * never retries on its own.
+   */
+  async function learnFamily(id: string, path: string, generation: number) {
+    if (!familyUnknown.has(id)) return;
+    familyUnknown.delete(id);
+    let resolved: ResolvedRepo;
+    try {
+      resolved = await resolvePath(path);
+    } catch {
+      if (internal.sessions[id]) familyUnknown.add(id);
+      return;
+    }
+    const session = internal.sessions[id];
+    if (!session || session.generation !== generation) {
+      if (session) familyUnknown.add(id);
+      return;
+    }
+    // The path stays the tab's: a canonical spelling that differs is an alias
+    // only openRepo may adopt, since it re-keys the tab.
+    const { commonDir, name, isBare } = resolvedFields(id, resolved);
+    applyToSession(id, generation, { commonDir, name, isBare });
+  }
+
+  /**
+   * Asks the person to trust a tab that is waiting for it, and on a grant
+   * loads it — wherever it is. The one owner of that sequence: a click on the
+   * tab (activateTab) and an agent waiting on its checkout from the task sheet
+   * (trustTab) both come here, so a grant always carries the family and only
+   * the tab on screen counts as an activation.
+   */
+  async function grantTrust(id: string): Promise<boolean> {
+    const current = internal.sessions[id];
+    if (!current?.trustRequired) return false;
+    const trustedPath = await requestRepositoryTrust(current.path, "Trust and Open", invokeFn);
+    const live = internal.sessions[id];
+    if (!live?.trustRequired) return false;
+    if (!trustedPath) return false;
+    let granted: ReturnType<typeof resolvedFields>;
+    try {
+      granted = resolvedFields(id, await resolvePath(trustedPath));
+    } catch (err: unknown) {
+      const message = formatError(err);
+      applyToSession(id, live.generation, {
+        isLoading: false,
+        error: message,
+        trustRequired: repositoryTrustRefused(message) || live.trustRequired,
+      });
+      return false;
+    }
+    const latest = internal.sessions[id];
+    if (!latest) return false;
+    // The grant is the first resolve this tab has had: it carries the
+    // family, not only the path. Copying the path alone left every
+    // checkout restored untrusted outside its repository's stack.
+    const path = granted.path;
+    const activation = bumped({ ...latest, ...granted });
+    const onScreen = internal.workspace.activeId === id;
+    putSession({ ...activation, isLoading: true });
+    if (onScreen) {
+      syncFilterFromSession(activation);
+      revealGraph(activation);
+    }
+    publish();
+    const watchState = await watch(path);
+    applyToSession(id, activation.generation, { watch: watchState });
+    if (onScreen) {
+      watcherRefreshPolicy.onActivated(path);
+      await noteTabActivated(path);
+    }
+    await hydrate(id, path, activation.generation);
+    const after = internal.sessions[id];
+    if (after && after.generation === activation.generation && !after.trustRequired) {
+      ensureStatusPoll();
+      flushPersist();
+    }
+    return true;
+  }
+
   async function hydrate(id: string, path: string, generation: number) {
     const run = (snapshotRuns.get(id) ?? 0) + 1;
     snapshotRuns.set(id, run);
+    // Synchronous unless there is something to learn: an extra yield on every
+    // hydrate would reorder the snapshot fetches the run token arbitrates.
+    if (familyUnknown.has(id)) {
+      await learnFamily(id, path, generation);
+      if (snapshotRuns.get(id) !== run) return;
+    }
     try {
       const raw = await loadSnapshot(path);
       if (snapshotRuns.get(id) !== run) return;
@@ -1798,6 +1941,22 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
       publish();
     },
     trustRepo: (path: string) => requestRepositoryTrust(path, "Trust Repository", invokeFn),
+    /**
+     * Asks to trust a tab waiting for it without bringing it on screen — for
+     * a surface (the task sheet) whose reader is not looking at that tab.
+     * Resolves to whether trust was granted and the tab loaded.
+     */
+    trustTab: (id: string) => grantTrust(id),
+    /**
+     * Why `openRepo(rawPath)` would be refused before anything is resolved,
+     * or null. Only refusals that waiting cannot fix are knowable here: an
+     * invalid path, or every tab slot taken by other repositories. Same rule
+     * and words as the refusal itself, so a caller never re-derives the bound.
+     */
+    openRefusal: (rawPath: string): string | null => {
+      const probe = openTab(internal.workspace, rawPath, options, { activate: false });
+      return probe.ok ? null : openRefusalMessage(probe.reason);
+    },
     openRepo: async (
       rawPath: string,
       extras: {
@@ -1812,6 +1971,12 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
         color?: TabColor | null;
         /** Restore must not advance the epoch; a partial walk cannot shrink the saved list. */
         keepEpoch?: boolean;
+        /**
+         * Create, resolve and watch the tab, but leave the snapshot to the
+         * caller. Restore uses it to put every tab — and so every family —
+         * on the strip before the first git read.
+         */
+        skipHydrate?: boolean;
         /**
          * Keep the tab when the repository is not trusted yet, without
          * prompting. Restore uses this so closing the app cannot drop every
@@ -1903,7 +2068,10 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
             ),
           };
           const sessions = { ...internal.sessions };
-          for (const id of aliasIds) delete sessions[id];
+          for (const id of aliasIds) {
+            delete sessions[id];
+            familyUnknown.delete(id);
+          }
           internal = { ...internal, sessions };
         }
       }
@@ -1920,10 +2088,7 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
       if (!opened.ok) {
         internal = {
           ...internal,
-          workspaceError:
-            opened.reason === "capacity"
-              ? `Too many open repositories (max ${MAX_OPEN_TABS}). Close a tab to open another.`
-              : "Invalid repository path",
+          workspaceError: openRefusalMessage(opened.reason),
         };
         publish();
         return false;
@@ -1938,18 +2103,21 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
       // A restore keeps the order it was saved in; anything else opened
       // beside an open checkout of the same repository lands next to it.
       if (opened.created && !extras.keepEpoch) {
-        placeBesideFamily(opened.id, resolved?.common_dir);
+        placeBesideFamily(opened.id, resolved?.common_dir, extras.group !== undefined, activate);
       }
       const existing = internal.sessions[opened.id];
+      // A fresh resolve is the answer, including "could not read it"; a
+      // failed one keeps what the last good resolve said, and leaves a family
+      // never learned for the next hydrate to ask about.
+      const fromResolve = resolved ? resolvedFields(opened.id, resolved) : null;
+      if (!resolved && !existing?.commonDir) familyUnknown.add(opened.id);
       const session = existing
         ? {
             ...bumped(existing),
             path,
-            name: resolved?.name ?? existing.name,
-            isBare: resolved?.is_bare ?? existing.isBare,
-            // A fresh resolve is the answer, including "could not read it";
-            // a failed one keeps what the last good resolve said.
-            commonDir: resolved ? resolved.common_dir ?? null : existing.commonDir,
+            name: fromResolve?.name ?? existing.name,
+            isBare: fromResolve?.isBare ?? existing.isBare,
+            commonDir: fromResolve ? fromResolve.commonDir : existing.commonDir,
             pinned:
               opened.workspace.tabs.find((tab) => tab.id === opened.id)
                 ?.pinned ?? existing.pinned,
@@ -1969,9 +2137,9 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
               pinned: (extras.pinned ?? carriedPinned) === true,
             },
             {
-              name: resolved?.name,
-              isBare: resolved?.is_bare,
-              commonDir: resolved?.common_dir ?? null,
+              name: fromResolve?.name,
+              isBare: fromResolve?.isBare,
+              commonDir: fromResolve?.commonDir ?? null,
               // An adopted alias tab hands over its state; an explicit
               // restore payload always wins over what the alias carried.
               activeTab: extras.restore?.viewTab ?? carriedSession?.activeTab,
@@ -2007,6 +2175,8 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
       // for a repository that never got a watcher.
       const watchState = await watch(path);
       applyToSession(opened.id, session.generation, { watch: watchState });
+      // An open that takes the screen always renders; only a background one may wait.
+      if (extras.skipHydrate && !shouldPresent) return true;
       if (shouldPresent && !extras.keepEpoch) await noteTabActivated(path);
       await hydrate(opened.id, path, session.generation);
       const latest = internal.sessions[opened.id];
@@ -2069,42 +2239,7 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
         }
         syncFilterFromSession(current);
         publish();
-        const trustedPath = await requestRepositoryTrust(current.path, "Trust and Open", invokeFn);
-        const live = internal.sessions[id];
-        if (!live?.trustRequired) return;
-        if (!trustedPath) return;
-        let path = trustedPath;
-        try {
-          const resolved = await resolvePath(trustedPath);
-          path = resolved.path;
-        } catch (err: unknown) {
-          const message = formatError(err);
-          applyToSession(id, live.generation, {
-            isLoading: false,
-            error: message,
-            trustRequired: repositoryTrustRefused(message) || live.trustRequired,
-          });
-          return;
-        }
-        const latest = internal.sessions[id];
-        if (!latest) return;
-        const activation = bumped({ ...latest, path });
-        putSession({ ...activation, path, isLoading: true });
-        if (internal.workspace.activeId === id) {
-          syncFilterFromSession(activation);
-          revealGraph(activation);
-        }
-        publish();
-        const watchState = await watch(path);
-        applyToSession(id, activation.generation, { watch: watchState });
-        watcherRefreshPolicy.onActivated(path);
-        await noteTabActivated(path);
-        await hydrate(id, path, activation.generation);
-        const after = internal.sessions[id];
-        if (after && after.generation === activation.generation && !after.trustRequired) {
-          ensureStatusPoll();
-          flushPersist();
-        }
+        await grantTrust(id);
         return;
       }
       if (!extras.force && internal.workspace.activeId === id) return;
@@ -2149,6 +2284,7 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
       commitEdit(result.closedPath ? [result.closedPath] : []);
       replaceWorkspace(result.workspace);
       const { [id]: _removed, ...rest } = internal.sessions;
+      familyUnknown.delete(id);
       internal = { ...internal, sessions: rest };
       stopStatusPoll();
       if (session) {
@@ -2505,10 +2641,14 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
           lastClosed: persisted.lastClosed,
         });
         internal = { ...internal, sessions: {} };
-        // Preserve persisted tab order, but activate the previously-active
-        // session the moment ITS hydration lands — not after every remaining
-        // tab finishes restoring — so the workspace becomes usable without
-        // changing the user's tab arrangement.
+        familyUnknown.clear();
+        // Two phases, in the persisted order. First every tab is opened —
+        // resolved and watched, no git read — so the whole strip, and every
+        // repository's family, is there at once: one tab per await used to
+        // draw a worktree as its own repository until its repository's tab
+        // finished hydrating. Then the previously-active tab is presented
+        // (its hydrate first, so the workspace is usable soonest) and the
+        // rest hydrate behind it.
         const ordered = [...persisted.tabs];
         let activated = false;
         const isActive = (path: string) =>
@@ -2529,15 +2669,14 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
 
         for (const tab of ordered) {
           // Always append (activate: false) so restore cannot shuffle tab
-          // order. Present the previously-active session as soon as that
-          // iteration finishes — remaining tabs keep hydrating behind it.
-          // keepEpoch + a suspended save: quitting halfway cannot replace
-          // the durable list with the tabs opened so far.
+          // order. keepEpoch + a suspended save: quitting halfway cannot
+          // replace the durable list with the tabs opened so far.
           await store.openRepo(tab.path, {
             allowBroken: true,
             deferTrust: true,
             keepEpoch: true,
             activate: false,
+            skipHydrate: true,
             pinned: tab.pinned,
             group: tab.group ?? null,
             ...(tab.color ? { color: tab.color } : {}),
@@ -2549,15 +2688,16 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
               terminalOpen: tab.terminalOpen,
             },
           });
-          if (!activated && isActive(tab.path)) {
-            activated = true;
-            const sessionTab = internal.workspace.tabs.find((item) =>
-              sameRepo(item.path, tab.path, options),
-            );
-            if (sessionTab) {
-              await presentRestored(sessionTab.id);
-            }
-          }
+        }
+        const activeTab = persisted.activePath
+          ? ordered.find((tab) => isActive(tab.path))
+          : undefined;
+        const activeSessionTab = activeTab
+          ? internal.workspace.tabs.find((item) => sameRepo(item.path, activeTab.path, options))
+          : undefined;
+        if (activeSessionTab) {
+          activated = true;
+          await presentRestored(activeSessionTab.id);
         }
         // Applied after every tab exists, so a collapsed group is not
         // discarded for having no members yet. The active tab's group was
@@ -2590,6 +2730,15 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
             publish();
           }
         }
+        // Phase two: every other resolved tab hydrates in strip order. A tab
+        // that never resolved stays unread, as above; one the reader opened
+        // or closed meanwhile is skipped by the generation check.
+        for (const tab of [...internal.workspace.tabs]) {
+          const session = internal.sessions[tab.id];
+          if (!session || session.hasHydrated || session.error || session.trustRequired) continue;
+          await hydrate(tab.id, session.path, session.generation);
+        }
+        ensureStatusPoll();
       } finally {
         persistSuspended -= 1;
         flushPersist(true);
