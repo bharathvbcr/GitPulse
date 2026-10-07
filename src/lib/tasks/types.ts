@@ -56,10 +56,12 @@ export interface TaskEvidence {
   data_json: string;
 }
 
+/** Every field dc-store keeps for a gap; null where it was not recorded. */
 export interface TaskGap {
   id: string;
   severity: string;
   gap_type: string;
+  requirement_id: string | null;
   task_id: string | null;
   description: string;
   evidence_json: string;
@@ -67,6 +69,12 @@ export interface TaskGap {
   blocking: boolean;
   file: string | null;
   line: number | null;
+  suggested_command: string | null;
+  acceptance_criterion_id: string | null;
+  expected_verification_method: string | null;
+  /** Where a failed verification command's captured output was written. */
+  stdout_path: string | null;
+  stderr_path: string | null;
 }
 
 export interface TaskRun {

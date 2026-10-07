@@ -171,6 +171,11 @@ const KNOWN_FLAGS: &[&str] = &[
     "line",
     "suggested-command",
     "expected-verification-method",
+    // Where a failed command's captured output was written. Listed with the
+    // handler that reads them, not after it, which is the order the comment
+    // above asks for.
+    "stdout-path",
+    "stderr-path",
 ];
 
 /// The identity a caller checks to confirm it is talking to this store and not
@@ -662,6 +667,53 @@ fn dispatch(store: &Store, command: &str, flags: &[(String, String)]) -> Result<
             ]))
         }
 
+        // The requirement rows a task links to, which the verifier dispatches
+        // on by verification method. `acceptance_criteria_json` is carried as a
+        // string, not embedded: the column is not validated here, and a
+        // malformed one must reach the reader as a decode error it reports,
+        // not as a reply that no longer parses.
+        "requirements" => {
+            match store
+                .task_requirements(required("task")?)
+                .map_err(|e| Failure::Fatal(e.to_string()))?
+            {
+                None => Ok(object(&[
+                    ("ok", &json_bool(true)),
+                    ("task_found", &json_bool(false)),
+                    ("requirements", &"[]".to_string()),
+                    ("missing", &"[]".to_string()),
+                    ("truncated", &json_bool(false)),
+                ])),
+                Some(linked) => {
+                    let items: Vec<String> = linked
+                        .rows
+                        .iter()
+                        .map(|r| {
+                            object(&[
+                                ("id", &quote(&r.id)),
+                                ("title", &quote(&r.title)),
+                                ("description", &quote(&r.description)),
+                                ("priority", &quote(&r.priority)),
+                                ("source", &quote(&r.source)),
+                                (
+                                    "acceptance_criteria_json",
+                                    &quote(&r.acceptance_criteria_json),
+                                ),
+                            ])
+                        })
+                        .collect();
+                    let missing: Vec<String> = linked.missing.iter().map(|m| quote(m)).collect();
+                    Ok(object(&[
+                        ("ok", &json_bool(true)),
+                        ("task_found", &json_bool(true)),
+                        ("requirements", &format!("[{}]", items.join(","))),
+                        ("missing", &format!("[{}]", missing.join(","))),
+                        ("truncated", &json_bool(linked.truncated)),
+                    ]))
+                }
+            }
+        }
+
         "gaps" => {
             let (rows, truncated) = store
                 .gaps_list(flag("task"))
@@ -673,17 +725,34 @@ fn dispatch(store: &Store, command: &str, flags: &[(String, String)]) -> Result<
                         ("id", &quote(&r.id)),
                         ("severity", &quote(&r.severity)),
                         ("gap_type", &quote(&r.gap_type)),
-                        (
-                            "task_id",
-                            &r.task_id
-                                .as_deref()
-                                .map(quote)
-                                .unwrap_or_else(|| "null".into()),
-                        ),
+                        ("task_id", &maybe(r.task_id.as_deref())),
                         ("description", &quote(&r.description)),
                         ("recommended_fix", &quote(&r.recommended_fix)),
                         ("blocking", &json_bool(r.blocking)),
                         ("evidence_json", &r.evidence_json),
+                        // What a criterion gap is about and how it was meant to
+                        // be proven. Stored by `gap-upsert` all along; without
+                        // them here the reply named a criterion gap but not its
+                        // criterion. `null` when the gap is not about one.
+                        ("requirement_id", &maybe(r.requirement_id.as_deref())),
+                        (
+                            "acceptance_criterion_id",
+                            &maybe(r.acceptance_criterion_id.as_deref()),
+                        ),
+                        (
+                            "expected_verification_method",
+                            &maybe(r.expected_verification_method.as_deref()),
+                        ),
+                        // Where the gap is and what reproduces it, dropped the
+                        // same way and for as long.
+                        ("file", &maybe(r.file.as_deref())),
+                        (
+                            "line",
+                            &r.line.map_or_else(|| "null".to_string(), |n| n.to_string()),
+                        ),
+                        ("suggested_command", &maybe(r.suggested_command.as_deref())),
+                        ("stdout_path", &maybe(r.stdout_path.as_deref())),
+                        ("stderr_path", &maybe(r.stderr_path.as_deref())),
                     ])
                 })
                 .collect();
@@ -743,6 +812,16 @@ fn dispatch(store: &Store, command: &str, flags: &[(String, String)]) -> Result<
                 flag("blocking").unwrap_or("false"),
                 "1" | "true" | "True" | "yes"
             );
+            // Refused rather than parsed with `.ok()`: a `--line 4x` used to
+            // store a gap with no location and report success, so the caller
+            // believed it had recorded where the gap was.
+            let line = match flag("line") {
+                Some(raw) => Some(
+                    raw.parse::<i64>()
+                        .map_err(|_| Failure::Fatal(format!("--line {raw:?} is not a number")))?,
+                ),
+                None => None,
+            };
             let gap = dc_store::records::GapRow {
                 id: required("id")?.to_string(),
                 severity: flag("severity").unwrap_or("medium").to_string(),
@@ -754,11 +833,13 @@ fn dispatch(store: &Store, command: &str, flags: &[(String, String)]) -> Result<
                 recommended_fix: flag("recommended-fix").unwrap_or("").to_string(),
                 blocking,
                 file: flag("file").map(str::to_string),
-                line: flag("line").and_then(|s| s.parse().ok()),
+                line,
                 suggested_command: flag("suggested-command").map(str::to_string),
                 acceptance_criterion_id: flag("acceptance-criterion-id").map(str::to_string),
                 expected_verification_method: flag("expected-verification-method")
                     .map(str::to_string),
+                stdout_path: flag("stdout-path").map(str::to_string),
+                stderr_path: flag("stderr-path").map(str::to_string),
             };
             store
                 .gap_upsert(&gap)

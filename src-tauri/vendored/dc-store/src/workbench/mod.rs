@@ -129,6 +129,7 @@ impl Store {
             "workspaces.put"
                 | "workspaces.delete"
                 | "repositories.put"
+                | "repositories.relink"
                 | "items.put"
                 | "items.delete"
                 | "enhancements.create"
@@ -359,6 +360,35 @@ fn ensure_schema(conn: &Connection) -> Result<()> {
             message: format!("workbench schema {version} is not supported"),
         });
     }
+    ensure_index(conn, MEMBER_INDEX, MEMBER_INDEX_SQL)?;
+    Ok(())
+}
+
+/// Lets a workspace's membership join check `deleted` and read `position`
+/// without loading each member's whole task row. A query aid, not a contract,
+/// so it is not a schema version: a host that does not know it is unaffected.
+const MEMBER_INDEX: &str = "work_items_member";
+const MEMBER_INDEX_SQL: &str =
+    "CREATE INDEX IF NOT EXISTS work_items_member ON work_items(id,deleted,position)";
+
+/// Creates `name` when missing. Looked up first so opening an indexed profile
+/// takes no write lock; created under an immediate transaction otherwise.
+fn ensure_index(conn: &Connection, name: &str, create: &str) -> Result<()> {
+    let present = || -> Result<bool> {
+        Ok(conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='index' AND name=?1)",
+            [name],
+            |r| r.get(0),
+        )?)
+    };
+    if present()? {
+        return Ok(());
+    }
+    let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+    if !present()? {
+        conn.execute_batch(create)?;
+    }
+    tx.commit()?;
     Ok(())
 }
 
@@ -397,7 +427,7 @@ fn mutate(input: &Input<'_>, method: &str, now: i64, now_ms: i64) -> Result<Stri
     let expected = input.integer("expected_revision", None, MAX_INTEGER)?;
     let entity = match method {
         "workspaces.put" | "workspaces.delete" => Entity::Workspace,
-        "repositories.put" => Entity::Repository,
+        "repositories.put" | "repositories.relink" => Entity::Repository,
         "automation.put" => Entity::Automation,
         "attention.update" => Entity::Attention,
         "notifications.settings.put" => Entity::NotificationSettings,
@@ -466,6 +496,13 @@ fn mutate(input: &Input<'_>, method: &str, now: i64, now_ms: i64) -> Result<Stri
         }
         "repositories.put" => {
             put_repository(input, &id, revision, now)?;
+            Affected::none()
+        }
+        "repositories.relink" => {
+            if current.is_none() {
+                return Err(Error::missing());
+            }
+            relink_repository(input, &id, revision, now)?;
             Affected::none()
         }
         "items.put" => {
@@ -647,6 +684,105 @@ fn put_repository(input: &Input<'_>, id: &str, revision: i64, now: i64) -> Resul
         return Err(Error::invalid("repository identity is already registered"));
     }
     let body:String=input.conn.query_row("SELECT json_object('id',?1,'revision',?2,'name',?3,'identity_key',?4,'remote_url',?5,'updated_at',?6)",params![id,revision,name,identity,remote,now],|r|r.get(0))?;
+    put_body(input.conn, Entity::Repository, id, revision, &body)
+}
+
+/// Point a registered repository at the checkout it now lives in.
+///
+/// The repository keeps its id, so every task link, workspace membership, run
+/// and revision stays attached; only `identity_key` (and optionally the display
+/// name) changes, and the previous identity remains in `work_revisions`.
+///
+/// Two distinct clones are never merged by this method. A target identity that
+/// another repository already holds is refused, unless the caller names that
+/// repository in `absorb_id` *and* it holds nothing: no task links, no
+/// workspace memberships and no runs. That is the record a host registers on
+/// its own the first time it opens the moved checkout, before anyone relinks.
+/// It is removed in the same transaction, so the identity has one owner.
+fn relink_repository(input: &Input<'_>, id: &str, revision: i64, now: i64) -> Result<()> {
+    input.fields(&[
+        "request_id",
+        "id",
+        "expected_revision",
+        "identity_key",
+        "name",
+        "absorb_id",
+    ])?;
+    let identity = input.required_text("identity_key", 4096)?;
+    let name = input.text("name", 300)?;
+    if name.as_deref().is_some_and(|name| name.trim().is_empty()) {
+        return Err(Error::invalid("name must not be blank"));
+    }
+    let absorb = input.optional_id("absorb_id")?;
+    if absorb.as_deref() == Some(id) {
+        return Err(Error::invalid("a repository cannot absorb its own record"));
+    }
+    let old: String = input.conn.query_row(
+        "SELECT identity_key FROM work_repositories WHERE id=?1",
+        [id],
+        |r| r.get(0),
+    )?;
+    if old == identity {
+        return Err(Error::invalid(
+            "the repository is already linked to that checkout",
+        ));
+    }
+    if runs::active_on_repository(input.conn, id, now)? {
+        return Err(Error {
+            code: "repository_busy",
+            message: "a run is active on this repository; finish or cancel it before relinking"
+                .into(),
+        });
+    }
+    let holder: Option<String> = input
+        .conn
+        .query_row(
+            "SELECT id FROM work_repositories WHERE identity_key=?1 AND id<>?2",
+            params![identity, id],
+            |r| r.get(0),
+        )
+        .optional()?;
+    match (holder, absorb) {
+        (None, None) => {}
+        (None, Some(_)) => {
+            return Err(Error::invalid(
+                "absorb_id does not hold the requested identity",
+            ));
+        }
+        (Some(_), None) => {
+            return Err(Error::invalid(
+                "repository identity is already registered; name that record in absorb_id to absorb it if it is empty",
+            ));
+        }
+        (Some(holder), Some(absorb)) if holder != absorb => {
+            return Err(Error::invalid(
+                "absorb_id does not hold the requested identity",
+            ));
+        }
+        (Some(holder), Some(_)) => {
+            let (links, members, runs): (i64, i64, i64) = input.conn.query_row(
+                "SELECT (SELECT count(*) FROM work_item_repositories WHERE repository_id=?1),(SELECT count(*) FROM work_workspace_repositories WHERE repository_id=?1),(SELECT count(*) FROM work_runs WHERE repository_id=?1)",
+                [&holder],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )?;
+            if links + members + runs > 0 {
+                return Err(Error {
+                    code: "repository_not_empty",
+                    message: format!(
+                        "the repository registered at that checkout holds {links} task link(s), {members} workspace membership(s) and {runs} run(s); distinct records are never merged"
+                    ),
+                });
+            }
+            input
+                .conn
+                .execute("DELETE FROM work_repositories WHERE id=?1", [&holder])?;
+        }
+    }
+    let body: String = input.conn.query_row(
+        "SELECT json_set(body,'$.identity_key',?2,'$.name',coalesce(?3,json_extract(body,'$.name')),'$.revision',?4,'$.updated_at',?5) FROM work_repositories WHERE id=?1",
+        params![id, identity, name, revision, now],
+        |r| r.get(0),
+    )?;
     put_body(input.conn, Entity::Repository, id, revision, &body)
 }
 
@@ -903,10 +1039,21 @@ struct PageRows {
 }
 
 fn collect_page(rows: &mut rusqlite::Rows<'_>, limit: i64) -> Result<PageRows> {
+    collect_page_with(rows, limit, |_| Ok(()))
+}
+
+/// [`collect_page`], also handing every fetched row to `each`, lookahead
+/// included, so a query can carry a value beside its records.
+fn collect_page_with(
+    rows: &mut rusqlite::Rows<'_>,
+    limit: i64,
+    mut each: impl FnMut(&rusqlite::Row<'_>) -> Result<()>,
+) -> Result<PageRows> {
     let mut records = Vec::new();
     let mut bytes = 0;
     let mut count = 0;
     while let Some(row) = rows.next()? {
+        each(row)?;
         if count == limit {
             return Ok(PageRows {
                 records,
@@ -1070,11 +1217,17 @@ fn list_items(input: &Input<'_>) -> Result<String> {
         fts.as_deref(),
         false,
     );
-    let total = input.conn.query_row(
-        &format!("SELECT count(*) {query}"),
-        rusqlite::params_from_iter(values.iter()),
-        |r| r.get(0),
-    )?;
+    if workspace.is_some() || (repo.is_some() && fts.is_some()) {
+        return list_scoped_items(input, &query, values, p);
+    }
+    let total = match fts.as_deref() {
+        Some(fts) if repo.is_none() && status.is_none() => global_search_total(input.conn, fts)?,
+        _ => input.conn.query_row(
+            &format!("SELECT count(*) {query}"),
+            rusqlite::params_from_iter(values.iter()),
+            |r| r.get(0),
+        )?,
+    };
     // A result set that fits the maximum page stays driven by indexed hits.
     // For larger global searches, materialize the FTS row IDs once and scan
     // the covering board index until the page fills. Reopening MATCH for every
@@ -1110,6 +1263,91 @@ fn list_items(input: &Input<'_>) -> Result<String> {
         &mut stmt.query(rusqlite::params_from_iter(values.iter()))?,
         p.limit,
     )?;
+    page_response(input.conn, rows, total)
+}
+
+/// Live tasks matching an unscoped, unfiltered search.
+///
+/// Every task row has exactly one full-text row: the insert trigger adds it,
+/// the update trigger replaces it, and tasks are only ever soft-deleted. So
+/// MATCH alone counts every hit, live or deleted, from the index, and the
+/// deleted hits are subtracted. Checking each hit's own row for `deleted`
+/// instead read every matching task row, which at 100,000 hits was most of a
+/// broad search. The deleted side walks only deleted rows in the board index
+/// and builds the hit set only if there is one.
+fn global_search_total(conn: &Connection, fts: &str) -> Result<i64> {
+    let hits: i64 = conn.query_row(
+        "SELECT count(*) FROM work_items_fts WHERE work_items_fts MATCH ?1",
+        [fts],
+        |r| r.get(0),
+    )?;
+    let deleted: i64 = conn.query_row(DELETED_SEARCH_HITS, [fts], |r| r.get(0))?;
+    Ok(hits - deleted)
+}
+
+/// Deleted tasks that match `?1`, found from the deleted side: two ranges of
+/// the board index (`deleted<>0` would scan every task), each probing the hit
+/// set. The unary `+` keeps the planner from driving the other way — from
+/// every hit to its task row, the very cost this count exists to avoid.
+const DELETED_SEARCH_HITS: &str = "SELECT count(*) FROM work_items t
+    WHERE (t.deleted<0 OR t.deleted>0)
+      AND +t.rowid IN(SELECT rowid FROM work_items_fts WHERE work_items_fts MATCH ?1)";
+
+/// A workspace's tasks, or a repository's narrowed by search.
+///
+/// Finding these candidates is the cost — the workspace membership union, the
+/// full-text hit set — and counting them and selecting a page each paid it in
+/// full, in two statements. One statement materializes them once; the total is
+/// counted from that set and the page cut from it, so the work is done once.
+/// Bodies are still read only for the page and its lookahead row.
+fn list_scoped_items(
+    input: &Input<'_>,
+    query: &str,
+    values: Vec<rusqlite::types::Value>,
+    p: Page,
+) -> Result<String> {
+    let bound = values.len();
+    let mut stmt = input.conn.prepare(&format!(
+        "WITH candidates AS MATERIALIZED (
+            SELECT t.rowid AS item_rowid,t.position,t.id {query}
+        ), page AS MATERIALIZED (
+            SELECT item_rowid,position,id FROM candidates
+            WHERE (position,id)>(?{},?{}) ORDER BY position,id LIMIT ?{}
+        ) SELECT json_remove(t.body,'$.description','$.acceptance_criteria','$.logs'),page.position,page.id,
+                 (SELECT count(*) FROM candidates)
+          FROM page CROSS JOIN work_items t ON t.rowid=page.item_rowid
+          ORDER BY page.position,page.id",
+        bound + 1,
+        bound + 2,
+        bound + 3
+    ))?;
+    let mut paged = values.clone();
+    paged.extend([
+        rusqlite::types::Value::Integer(p.position),
+        rusqlite::types::Value::Text(p.id),
+        rusqlite::types::Value::Integer(p.limit + 1),
+    ]);
+    let mut total = None;
+    let rows = collect_page_with(
+        &mut stmt.query(rusqlite::params_from_iter(paged.iter()))?,
+        p.limit,
+        |row| {
+            if total.is_none() {
+                total = Some(row.get(3)?);
+            }
+            Ok(())
+        },
+    )?;
+    // An empty page carries no row to read the total from. That is a cursor
+    // past the end or no match at all, so counting again is rare.
+    let total = match total {
+        Some(total) => total,
+        None => input.conn.query_row(
+            &format!("SELECT count(*) {query}"),
+            rusqlite::params_from_iter(values.iter()),
+            |r| r.get(0),
+        )?,
+    };
     page_response(input.conn, rows, total)
 }
 

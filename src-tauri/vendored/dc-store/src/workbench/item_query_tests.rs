@@ -1,4 +1,4 @@
-use super::item_query;
+use super::{DELETED_SEARCH_HITS, item_query};
 use crate::Store;
 use rusqlite::{StatementStatus, params, params_from_iter};
 
@@ -84,6 +84,57 @@ fn sparse_queries_do_not_visit_unrelated_profile_rows() {
     assert!(
         excessive.is_empty(),
         "unrelated profile rows dominate the queries: {excessive:?}"
+    );
+}
+
+#[test]
+fn an_existing_profile_gains_the_member_index_when_opened() {
+    let path = std::env::temp_dir().join(format!(
+        "dc-store-member-index-{}.sqlite",
+        std::process::id()
+    ));
+    remove_store_files(&path);
+    let present = |store: &Store| -> bool {
+        store
+            .connection()
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='index' AND name='work_items_member')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
+    };
+    let store = Store::open(&path).unwrap();
+    store.workbench_request("items.list", "{}").unwrap();
+    assert!(present(&store), "a new profile has it");
+    // A profile written before the index existed.
+    store
+        .connection()
+        .execute_batch("DROP INDEX work_items_member")
+        .unwrap();
+    drop(store);
+    let store = Store::open(&path).unwrap();
+    store.workbench_request("items.list", "{}").unwrap();
+    assert!(present(&store), "reopening an older profile adds it");
+    drop(store);
+    remove_store_files(&path);
+}
+
+#[test]
+fn counting_deleted_search_hits_visits_only_deleted_tasks() {
+    // The subtraction in an unscoped search's total must cost what the deleted
+    // tasks cost, not what the profile does. With none deleted it should not
+    // even build the hit set.
+    let store = fixture(10_000);
+    let mut statement = store.connection().prepare(DELETED_SEARCH_HITS).unwrap();
+    let deleted: i64 = statement
+        .query_row(["\"evidence\"*"], |r| r.get(0))
+        .unwrap();
+    assert_eq!(deleted, 0);
+    let steps = statement.get_status(StatementStatus::VmStep);
+    assert!(
+        steps < 100,
+        "{steps} operations to find no deleted task among 10,000"
     );
 }
 
@@ -276,6 +327,18 @@ fn scoped_search_tracks_link_changes_group_membership_deletion_and_renamed_text(
         9,
         "FTS included a deleted task"
     );
+    // Unscoped search counts index hits and subtracts deleted ones; a broad
+    // query must lose the deleted task too.
+    assert_eq!(count(r#"{"query":"evidence"}"#), 119);
+    // A page past the end has no row to carry the scoped total.
+    assert_eq!(
+        count(r#"{"workspace_id":"workspace","cursor":"1:999999:zzz"}"#),
+        14
+    );
+    assert_eq!(
+        count(r#"{"repository_id":"common","query":"evidence","cursor":"1:999999:zzz"}"#),
+        110
+    );
     assert_eq!(
         count(r#"{"workspace_id":"workspace","query":"Rareword"}"#),
         9
@@ -332,4 +395,121 @@ fn search_only_projects_bodies_in_the_selected_page() {
         (total, rows, first.as_str(), last.as_str()),
         (120, 7, "t000120", "t000114")
     );
+}
+
+/// The Go host benchmark's 100,000-task profile (`BenchmarkWorkbenchProfileStress`
+/// in `backend/go_orchestrator/dc/store`), built the same way: 100
+/// repositories, ten workspaces of ten repositories each, and every task put
+/// through the public API in its own transaction, homed in workspace `i % 10`
+/// and linked to repository `i % 100`. The commits matter as much as the rows:
+/// one transaction per task leaves the full-text index in many segments and
+/// fills the revision, event and request tables, as a real profile does.
+///
+/// On disk, as the host's is: SQLite's page cache is a few MiB, so a read that
+/// touches whole task rows misses it, and an in-memory store flatters it.
+fn stress_fixture(tasks: i64) -> (Store, std::path::PathBuf) {
+    let path = std::env::temp_dir().join(format!(
+        "dc-store-stress-{}-{tasks}.sqlite",
+        std::process::id()
+    ));
+    remove_store_files(&path);
+    let store = Store::open(&path).unwrap();
+    for i in 0..100 {
+        store.workbench_request("repositories.put", &format!(r#"{{"request_id":"r{i}","id":"r{i}","expected_revision":0,"name":"Repository {i}","identity_key":"benchmark:r{i}"}}"#)).unwrap();
+    }
+    for i in 0..10 {
+        let ids = (0..10)
+            .map(|j| format!(r#""r{}""#, i * 10 + j))
+            .collect::<Vec<_>>()
+            .join(",");
+        store.workbench_request("workspaces.put", &format!(r#"{{"request_id":"w{i}","id":"w{i}","expected_revision":0,"name":"Workspace {i}","repository_ids":[{ids}]}}"#)).unwrap();
+    }
+    let description = "Grounded task evidence. ".repeat(24);
+    for i in 0..tasks {
+        store.workbench_request("items.put", &format!(r#"{{"request_id":"t{i}-v0","id":"t{i}","expected_revision":0,"title":"Benchmark startup latency task {i}","description":"{description}","repository_ids":["r{r}"],"primary_repository_id":"r{r}","home_workspace_id":"w{w}","position":{i}}}"#, r = i % 100, w = i % 10)).unwrap();
+    }
+    (store, path)
+}
+
+fn remove_store_files(path: &std::path::Path) {
+    for suffix in ["", "-wal", "-shm"] {
+        let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+    }
+}
+
+fn min_and_p95(
+    mut samples: Vec<std::time::Duration>,
+) -> (std::time::Duration, std::time::Duration) {
+    samples.sort();
+    (samples[0], samples[(samples.len() - 1) * 95 / 100])
+}
+
+/// Where stress-scale broad search spends its time. Run explicitly:
+/// `cargo test -p dc-store --release --lib stress_search_profile -- --ignored --nocapture`
+#[test]
+#[ignore = "profiling harness: 100,000 tasks, prints timings, asserts shape only"]
+fn stress_search_profile() {
+    let (store, path) = stress_fixture(100_000);
+    let conn = store.connection();
+    for (name, input, total) in [
+        (
+            "search",
+            r#"{"query":"startup latency","limit":200}"#,
+            100_000,
+        ),
+        (
+            "workspace_search",
+            r#"{"workspace_id":"w0","query":"startup latency","limit":200}"#,
+            19_000,
+        ),
+        (
+            "repository_search",
+            r#"{"repository_id":"r0","query":"startup latency","limit":200}"#,
+            1_000,
+        ),
+        ("workspace", r#"{"workspace_id":"w0","limit":200}"#, 19_000),
+        ("rare_search", r#"{"query":"99999","limit":200}"#, 1),
+    ] {
+        let response = store.workbench_request("items.list", input).unwrap();
+        let got: i64 = conn
+            .query_row("SELECT json_extract(?1,'$.total')", [&response], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(got, total, "{name}");
+        let samples = (0..30)
+            .map(|_| {
+                let started = std::time::Instant::now();
+                store.workbench_request("items.list", input).unwrap();
+                started.elapsed()
+            })
+            .collect();
+        let (min, p95) = min_and_p95(samples);
+        eprintln!("{name:>26}: request min {min:?} p95 {p95:?}");
+    }
+    // The phases of broad search, each run alone.
+    let fts = "\"startup\"* AND \"latency\"*";
+    for (name, sql) in [
+        ("fts hit set", format!("SELECT count(*) FROM work_items_fts WHERE work_items_fts MATCH '{fts}'")),
+        ("fts + live rows", format!("SELECT count(*) FROM work_items_fts CROSS JOIN work_items t ON t.rowid=work_items_fts.rowid WHERE t.deleted=0 AND work_items_fts MATCH '{fts}'")),
+        ("ordered scan, IN hit set", format!("SELECT t.rowid FROM work_items t WHERE t.deleted=0 AND t.rowid IN(SELECT rowid FROM work_items_fts WHERE work_items_fts MATCH '{fts}') ORDER BY t.position,t.id LIMIT 201")),
+        ("workspace members", "SELECT count(*) FROM (SELECT id FROM work_items WHERE home_workspace_id='w0' AND deleted=0 UNION SELECT ir.item_id FROM work_workspace_repositories wr CROSS JOIN work_item_repositories ir ON ir.repository_id=wr.repository_id WHERE wr.workspace_id='w0')".into()),
+        ("single-token fts", "SELECT count(*) FROM work_items_fts WHERE work_items_fts MATCH '\"startup\"*'".into()),
+        ("exact-token fts", "SELECT count(*) FROM work_items_fts WHERE work_items_fts MATCH '\"startup\" AND \"latency\"'".into()),
+        ("project 201 bodies", "SELECT json_remove(body,'$.description','$.acceptance_criteria','$.logs') FROM work_items ORDER BY rowid LIMIT 201".into()),
+    ] {
+        let mut statement = conn.prepare(&sql).unwrap();
+        let samples = (0..15)
+            .map(|_| {
+                let started = std::time::Instant::now();
+                let mut rows = statement.query([]).unwrap();
+                while rows.next().unwrap().is_some() {}
+                started.elapsed()
+            })
+            .collect();
+        let (min, p95) = min_and_p95(samples);
+        eprintln!("{name:>26}: min {min:?} p95 {p95:?}");
+    }
+    drop(store);
+    remove_store_files(&path);
 }

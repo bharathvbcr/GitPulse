@@ -134,7 +134,7 @@
         "repo": "devcouncil",
         "root_env": "GITPULSE_DEVCOUNCIL_ROOT",
         "path": "rust/dc-store",
-        "commit": "08a77bd69dc4a3aa0c6df43a603f6c887e195c54"
+        "commit": "e9175c4270bb5559dbea4d568045f3557f26af55"
       },
       "omitted": [
         "tests/",
@@ -148,11 +148,11 @@
       ],
       "files": {
         "Cargo.toml": "30311ece69f83db931cdd36cd589826a3f77e8bf4dd5e2df8622d78b49ba0b2c",
-        "src/bin/dcstore.rs": "bc6a76ae3e80b07f525df2870a31f12a1212a32561d24df925e6ffee78b5ec13",
+        "src/bin/dcstore.rs": "7c9b5917cc8ef067f333bab1dbb3c3f5c95163912954d161f7ceace310477854",
         "src/json.rs": "00fad17a5c902c59eafce74ca45c8bd68859ee898bbeb898854cded0a5d6f2ea",
-        "src/lib.rs": "9890c1d6a569277ae92db22e76366b85fa462a04bdf480b0a35839a36c645ce8",
-        "src/records.rs": "8d4779c18245506abaca1052ad48f86df484f653adfa8a5d803da3455fc5774a",
-        "src/schema.rs": "1056a674806b4f1de386b4ea346766791ab16dccedb60454fe14482127ca9873",
+        "src/lib.rs": "6e5c48872661e52e703e283302ab93dcc37a95527c0ef363a638b098cac75c40",
+        "src/records.rs": "ffbbf588fad3a8242ac983e54c74a45684cdab417f2988bcc4cd2fa1f9d46fa7",
+        "src/schema.rs": "2dd9e00dee520281a3832adb7ce3b60b4bffbc8e437d4aba3ac62e3fc30f769d",
         "src/workbench/agent_guidance.md": "422b999eea166cfb75310decb92829dee6583ef8ca8a8af85762ff1274d70667",
         "src/workbench/attention.rs": "bf179a4f82c08403fc760147f6e3de5e4228484fcb00f258b2a677a76f77e4cb",
         "src/workbench/attention.sql": "09b96497ba44f1141a64b2a5a86aff06114cb13b1c0b2a3bdab2345ce4915ad3",
@@ -165,12 +165,12 @@
         "src/workbench/enhancements.rs": "fe1ddd04c49cde732b740f2cdab6bb672e845609bbe9be42a661bf0d937e2453",
         "src/workbench/enhancements.sql": "fea69b449c9e7122df25e0f0bb24517e9f17b1ec5472b034f6cc534eaf616372",
         "src/workbench/input.rs": "f1f97d6114180fd0fcdda7c437faadab601a09c4edfcedabbebee15dd718361c",
-        "src/workbench/item_query_tests.rs": "f0138fd5856b7a9100571149e9d1def15317c940caab0d0f6e7db6ac171cb3d5",
+        "src/workbench/item_query_tests.rs": "a80611effd1a00f62ca0317f23e0c6a4ce8bc269a66de1ec4a9c8860f9a33210",
         "src/workbench/logs_tests.rs": "352308cfbe50d1a74cb4e84b0c78cbb474e15036f29f3cc8938f7624b5419053",
-        "src/workbench/mod.rs": "cf1a14e58d60f816b0d997144386b285f0e5ae23bee3ad2121c558db48a62a15",
+        "src/workbench/mod.rs": "e045f9c50370ac329f222b52bce7e905fb1a64299ca30efbcd4af90842abc42a",
         "src/workbench/notifications.rs": "b845ec5c599f621a3c57f5b807f75c09c911d1c01df3fce60d39e107c6f60e8e",
         "src/workbench/notifications.sql": "35d39f5bcd61a1750aeeee661b053fa1ee7298271c90b6f4357180b7323489c5",
-        "src/workbench/runs.rs": "a5a996b73cfd442d05c4536f87c86fbbb6cb553d0050955f6f2d54525e443941",
+        "src/workbench/runs.rs": "b223dbcd6b88ec6cb2b8e90aba5f56f2656dac09c046b5179d8408807b41b090",
         "src/workbench/runs.sql": "03b207aafb7c99df78b3ab465314b322e36e8056f339c3db26af001bd92cbe59",
         "src/workbench/schema.sql": "d1e7452b7a5eb0e5bf2fdf71aa0b6a0590cd0f130665dfd2f00e9bfd511b2c19"
       }
