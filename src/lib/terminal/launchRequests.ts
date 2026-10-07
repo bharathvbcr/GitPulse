@@ -1,6 +1,7 @@
 import { writable } from "svelte/store";
 import type { LauncherKind } from "./tabs";
 import { AGENT_PROMPT_MAX_BYTES } from "./agentPromptText";
+import { isCaseInsensitiveFs, sameRepo, type PathIdentityOptions } from "../repos/paths";
 
 export type PromptLauncher = Extract<LauncherKind, "claude" | "codex" | "grok" | "agy">;
 
@@ -105,8 +106,13 @@ export function createTerminalLaunchRequests() {
         store.set(pending);
       });
     },
-    take(repoPath: string): LaunchRequest | null {
-      if (pending?.repoPath !== repoPath) return null;
+    /**
+     * Claims the pending launch when it is for `repoPath`'s checkout, by
+     * identity — the panel holds its tab's path, the caller whatever path it
+     * had, and one checkout spelled two ways is still one.
+     */
+    take(repoPath: string, options: PathIdentityOptions = { caseInsensitive: isCaseInsensitiveFs() }): LaunchRequest | null {
+      if (!pending || !sameRepo(pending.repoPath, repoPath, options)) return null;
       const request = pending;
       pending = null;
       store.set(null);

@@ -131,6 +131,25 @@ describe("focusTerminalSession", () => {
     expect(calls).toEqual([]);
   });
 
+  it("finds the open tab for a checkout spelled differently instead of reopening it", async () => {
+    // The tab strip matches checkouts by identity. Matching by exact string
+    // here sent a session whose path differed by case (a case-insensitive
+    // volume) or a trailing separator to `openRepo`, which opened a second
+    // tab — or failed — instead of switching to the one already open.
+    const tabs = [{ id: "alpha", path: "/r/alpha" }, { id: "beta", path: "/Work/Beta" }];
+    for (const spelling of ["/work/beta", "/Work/Beta/", "/WORK//beta"]) {
+      const { actions, calls } = stub(tabs, "alpha", { identity: { caseInsensitive: true } });
+      const reveal = vi.fn(() => void calls.push("reveal"));
+      const outcome = await focusTerminalSession({ repoPath: spelling, reveal }, actions);
+      expect(outcome, spelling).toEqual({ ok: true, switchedRepo: true, openedDock: true });
+      expect(calls, spelling).toEqual(["surface", "activate:beta", "dock:true", "render", "reveal"]);
+    }
+    // On a case-sensitive volume a different case IS a different directory.
+    const { actions, calls } = stub(tabs, "alpha", { identity: { caseInsensitive: false } });
+    await focusTerminalSession({ repoPath: "/work/beta", reveal: vi.fn() }, actions);
+    expect(calls).toContain("open:/work/beta");
+  });
+
   it("reads the active tab fresh, so a stale snapshot cannot skip the switch", async () => {
     const reveal = vi.fn();
     // Active tab is beta at call time even though the list was built earlier.

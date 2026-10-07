@@ -1,5 +1,6 @@
 import { writable } from "svelte/store";
 import { currentSessionLimit } from "./sessionLimit";
+import { identityKey, isCaseInsensitiveFs, type PathIdentityOptions } from "../repos/paths";
 
 export interface TerminalSessionRecord {
   key: string;
@@ -52,27 +53,77 @@ export interface TerminalSessionRecord {
 }
 
 /**
- * How many live sessions each repository holds, keyed by the exact
- * `repoPath` the session was started with.
+ * Session counts per checkout, looked up by checkout identity.
  *
- * Exact string equality, not path identity: every producer of a `repoPath`
- * here — the dock's `tab.path`, a task launch's resolved `onReady` path —
- * already hands out the canonical path the repository store resolved, and
- * `TerminalPanel` matches launch requests the same way. Normalising again
- * here would invent a second identity rule for one badge.
+ * `get` and `has` accept any spelling of a checkout — a different case on a
+ * case-insensitive volume, a trailing or doubled separator — because the
+ * strip and the Agents plane treat those as one checkout (`identityKey`), and
+ * a badge that did not would count one checkout as two, or miss it. The
+ * entry is named by the first spelling seen, so `keys()` stays a real path.
+ */
+class RepoSessionCounts extends Map<string, number> {
+  private readonly spellings = new Map<string, string>();
+
+  constructor(private readonly options: PathIdentityOptions) {
+    super();
+  }
+
+  add(path: string): void {
+    this.set(path, (this.get(path) ?? 0) + 1);
+  }
+
+  override set(path: string, count: number): this {
+    const identity = identityKey(path, this.options);
+    // A blank or unreadable path names no checkout, so it is not counted.
+    if (!identity) return this;
+    const spelling = this.spellings.get(identity) ?? path;
+    this.spellings.set(identity, spelling);
+    return super.set(spelling, count);
+  }
+
+  override get(path: string): number | undefined {
+    const spelling = this.spellings.get(identityKey(path, this.options));
+    return spelling === undefined ? undefined : super.get(spelling);
+  }
+
+  override has(path: string): boolean {
+    return this.get(path) !== undefined;
+  }
+
+  override delete(path: string): boolean {
+    const identity = identityKey(path, this.options);
+    const spelling = this.spellings.get(identity);
+    if (spelling === undefined) return false;
+    this.spellings.delete(identity);
+    return super.delete(spelling);
+  }
+
+  override clear(): void {
+    this.spellings.clear();
+    super.clear();
+  }
+}
+
+/**
+ * How many live sessions each repository checkout holds.
+ *
+ * Matched by checkout identity, the rule the repository store and tab strip
+ * use (`repos/paths.ts::identityKey`), with the same `caseInsensitive`
+ * default the store takes when none is injected. It used to be exact string
+ * equality on the claim that every producer hands out one spelling; a task
+ * launch's checkout, an adopted session's host path and a tab's path do not
+ * always agree, and the badge then counted the wrong repository.
  *
  * Pure and separate from the store so the tab bar's badge can be tested
  * without a PTY, and so "no sessions" is a value rather than a rendering
- * accident.
+ * accident: a checkout with none has no entry, never a 0.
  */
 export function sessionsByRepo(
   records: readonly Pick<TerminalSessionRecord, "repoPath">[],
+  options: PathIdentityOptions = { caseInsensitive: isCaseInsensitiveFs() },
 ): Map<string, number> {
-  const counts = new Map<string, number>();
-  for (const record of records) {
-    if (!record.repoPath) continue;
-    counts.set(record.repoPath, (counts.get(record.repoPath) ?? 0) + 1);
-  }
+  const counts = new RepoSessionCounts(options);
+  for (const record of records) counts.add(record.repoPath);
   return counts;
 }
 

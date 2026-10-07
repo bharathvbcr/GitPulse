@@ -10,7 +10,7 @@
   import type { FocusOutcome } from "../terminal/sessionFocus";
   import { isPromptLauncher, terminalLaunchRequests } from "../terminal/launchRequests";
   import { taskTerminalRequests, consumeTaskTerminalRequest, requestFor } from "../terminal/taskLaunches";
-  import { isCaseInsensitiveFs } from "../repos/paths";
+  import { isCaseInsensitiveFs, sameRepo } from "../repos/paths";
   import { consoleLaunchRequests, consumeConsoleLaunch } from "../terminal/consoleLaunches";
   import { boundedCommand, retainCommand, retainExecutions, followsConsoleOutput } from "../terminal/consoleHistory";
   import { harnessStore } from "../stores/harnessStore";
@@ -166,11 +166,14 @@
   // so a tab switch cannot kill the shells, and a hidden panel cannot follow
   // `currentPath` into a different worktree.
   // ---------------------------------------------------------------------
+  /** The repository store's checkout identity rule, for every path compared here. */
+  const pathOpts = { caseInsensitive: isCaseInsensitiveFs() };
   type PtyMode = "shell" | "console";
   let mode = $state<PtyMode>("shell");
   function initialTabs(): TabState {
-    if (get(terminalLaunchRequests)?.repoPath === repoPath) return { tabs: [], activeId: null };
-    const request = requestFor(get(taskTerminalRequests), repoPath, { caseInsensitive: isCaseInsensitiveFs() });
+    const launch = get(terminalLaunchRequests);
+    if (launch && repoPath && sameRepo(launch.repoPath, repoPath, pathOpts)) return { tabs: [], activeId: null };
+    const request = requestFor(get(taskTerminalRequests), repoPath, pathOpts);
     return request ? initialState(request.provider, request) : initialState();
   }
   let tabState = $state<TabState>(untrack(initialTabs));
@@ -340,12 +343,12 @@
    * agent seemed never to have started.
    */
   const waitingForCapacity = $derived.by(() => {
-    const request = requestFor($taskTerminalRequests, repoPath, { caseInsensitive: isCaseInsensitiveFs() });
+    const request = requestFor($taskTerminalRequests, repoPath, pathOpts);
     return request && !canCreate && !tabFor(tabState, request) ? request : null;
   });
 
   $effect(() => {
-    const request = requestFor($taskTerminalRequests, repoPath, { caseInsensitive: isCaseInsensitiveFs() });
+    const request = requestFor($taskTerminalRequests, repoPath, pathOpts);
     if (!request || (!canCreate && !tabFor(tabState, request))) return;
     untrack(() => {
       tabState = openTab(tabState, request.provider, request);
@@ -477,9 +480,12 @@
 
   $effect(() => {
     const request = $terminalLaunchRequests;
-    if (!request || !visible || request.repoPath !== repoPath) return;
+    const here = repoPath;
+    // By checkout identity, as `requestFor` matches task launches: the caller
+    // may hold the same checkout spelled differently from this panel's tab.
+    if (!request || !visible || !here || !sameRepo(request.repoPath, here, pathOpts)) return;
     untrack(() => {
-      const claimed = terminalLaunchRequests.take(request.repoPath);
+      const claimed = terminalLaunchRequests.take(here, pathOpts);
       if (!claimed) return;
       mode = "shell";
       const opened = newTab(claimed.launcher, claimed.prompt);

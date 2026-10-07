@@ -19,6 +19,18 @@ describe("terminal agent launch requests", () => {
     expect(get(requests)).toBeNull();
   });
 
+  it("delivers to the panel whose checkout is the same one spelled differently", async () => {
+    // Panels are bound to their tab's path; the palette asks with whatever
+    // path it holds. One checkout spelled two ways must still be one.
+    const requests = createTerminalLaunchRequests();
+    const launched = requests.request("/Work/App/", "claude", "Look");
+    expect(requests.take("/work/app", { caseInsensitive: false })).toBeNull();
+    const request = requests.take("/work/app", { caseInsensitive: true });
+    expect(request?.prompt).toBe("Look");
+    request?.complete();
+    await expect(launched).resolves.toBeUndefined();
+  });
+
   it("carries a promptless launch for every launcher, so one channel serves 'new shell' too", async () => {
     // Widened rather than duplicated: adding a fourth request store beside
     // this one would mean a second copy of claim, capacity refusal and the
