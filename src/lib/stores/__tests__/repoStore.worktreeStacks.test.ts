@@ -208,6 +208,52 @@ describe("a family learned after the first open", () => {
     expect(get(store).openTabs.find((t) => t.path === wt("a"))?.group).toBe("devtools");
   });
 
+  it("restores the whole strip, families included, before the first git read — and reads the active tab first", async () => {
+    const storage = memoryStorage();
+    const deps = (invoke: InvokeFn) => ({
+      invoke,
+      storage,
+      caseInsensitive: true,
+      graph: { showRepo: () => {}, loadGraph: async () => {}, evict: () => {} },
+      filter: { subscribe: writable({ searchQuery: "", selectedBranch: null }).subscribe, setSearch: () => {}, selectBranch: () => {}, clear: () => {} },
+    });
+    const seed = createRepoStore(deps(makeInvoke()));
+    // The worktree is saved BEFORE its repository, and the active tab is last.
+    await seed.openRepo(wt("a"));
+    await seed.openRepo(OTHER);
+    await seed.openRepo(MAIN);
+    const idOf = (path: string) => get(seed).openTabs.find((t) => t.path === path)!.id;
+    expect(seed.arrangeTabs([idOf(wt("a")), idOf(OTHER), idOf(MAIN)])).toBe(true);
+    await seed.activateTab(idOf(MAIN));
+
+    let atFirstRead: { paths: string[]; families: (string | null)[] } | null = null;
+    const reads: string[] = [];
+    const base = makeInvoke();
+    let store: ReturnType<typeof createRepoStore>;
+    store = createRepoStore(
+      deps(
+        makeInvoke({
+          cmd_get_status: async (cmd, args) => {
+            reads.push(String(args?.repoPath));
+            if (!atFirstRead) {
+              const tabs = get(store).openTabs;
+              atFirstRead = { paths: tabs.map((t) => t.path), families: tabs.map((t) => t.family ?? null) };
+            }
+            return base(cmd, args);
+          },
+        }),
+      ),
+    );
+    await store.restoreWorkspace();
+    expect(atFirstRead).not.toBeNull();
+    expect(atFirstRead!.paths).toEqual([wt("a"), OTHER, MAIN]);
+    expect(atFirstRead!.families[0]).toBeTruthy();
+    expect(atFirstRead!.families[0]).toBe(atFirstRead!.families[2]);
+    expect(reads[0]).toBe(MAIN);
+    expect(new Set(reads)).toEqual(new Set([MAIN, wt("a"), OTHER]));
+    expect(get(store).openTabs.find((t) => t.isActive)?.path).toBe(MAIN);
+  });
+
   it("asks once per hydrate and never loops when the backend reports no family at all", async () => {
     let resolves = 0;
     const store = makeStore(

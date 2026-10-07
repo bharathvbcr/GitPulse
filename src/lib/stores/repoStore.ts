@@ -1880,6 +1880,12 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
         /** Restore must not advance the epoch; a partial walk cannot shrink the saved list. */
         keepEpoch?: boolean;
         /**
+         * Create, resolve and watch the tab, but leave the snapshot to the
+         * caller. Restore uses it to put every tab — and so every family —
+         * on the strip before the first git read.
+         */
+        skipHydrate?: boolean;
+        /**
          * Keep the tab when the repository is not trusted yet, without
          * prompting. Restore uses this so closing the app cannot drop every
          * repository that would have asked.
@@ -2080,6 +2086,8 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
       // for a repository that never got a watcher.
       const watchState = await watch(path);
       applyToSession(opened.id, session.generation, { watch: watchState });
+      // An open that takes the screen always renders; only a background one may wait.
+      if (extras.skipHydrate && !shouldPresent) return true;
       if (shouldPresent && !extras.keepEpoch) await noteTabActivated(path);
       await hydrate(opened.id, path, session.generation);
       const latest = internal.sessions[opened.id];
@@ -2566,10 +2574,13 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
         });
         internal = { ...internal, sessions: {} };
         familyUnknown.clear();
-        // Preserve persisted tab order, but activate the previously-active
-        // session the moment ITS hydration lands — not after every remaining
-        // tab finishes restoring — so the workspace becomes usable without
-        // changing the user's tab arrangement.
+        // Two phases, in the persisted order. First every tab is opened —
+        // resolved and watched, no git read — so the whole strip, and every
+        // repository's family, is there at once: one tab per await used to
+        // draw a worktree as its own repository until its repository's tab
+        // finished hydrating. Then the previously-active tab is presented
+        // (its hydrate first, so the workspace is usable soonest) and the
+        // rest hydrate behind it.
         const ordered = [...persisted.tabs];
         let activated = false;
         const isActive = (path: string) =>
@@ -2590,15 +2601,14 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
 
         for (const tab of ordered) {
           // Always append (activate: false) so restore cannot shuffle tab
-          // order. Present the previously-active session as soon as that
-          // iteration finishes — remaining tabs keep hydrating behind it.
-          // keepEpoch + a suspended save: quitting halfway cannot replace
-          // the durable list with the tabs opened so far.
+          // order. keepEpoch + a suspended save: quitting halfway cannot
+          // replace the durable list with the tabs opened so far.
           await store.openRepo(tab.path, {
             allowBroken: true,
             deferTrust: true,
             keepEpoch: true,
             activate: false,
+            skipHydrate: true,
             pinned: tab.pinned,
             group: tab.group ?? null,
             ...(tab.color ? { color: tab.color } : {}),
@@ -2610,15 +2620,16 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
               terminalOpen: tab.terminalOpen,
             },
           });
-          if (!activated && isActive(tab.path)) {
-            activated = true;
-            const sessionTab = internal.workspace.tabs.find((item) =>
-              sameRepo(item.path, tab.path, options),
-            );
-            if (sessionTab) {
-              await presentRestored(sessionTab.id);
-            }
-          }
+        }
+        const activeTab = persisted.activePath
+          ? ordered.find((tab) => isActive(tab.path))
+          : undefined;
+        const activeSessionTab = activeTab
+          ? internal.workspace.tabs.find((item) => sameRepo(item.path, activeTab.path, options))
+          : undefined;
+        if (activeSessionTab) {
+          activated = true;
+          await presentRestored(activeSessionTab.id);
         }
         // Applied after every tab exists, so a collapsed group is not
         // discarded for having no members yet. The active tab's group was
@@ -2651,6 +2662,15 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
             publish();
           }
         }
+        // Phase two: every other resolved tab hydrates in strip order. A tab
+        // that never resolved stays unread, as above; one the reader opened
+        // or closed meanwhile is skipped by the generation check.
+        for (const tab of [...internal.workspace.tabs]) {
+          const session = internal.sessions[tab.id];
+          if (!session || session.hasHydrated || session.error || session.trustRequired) continue;
+          await hydrate(tab.id, session.path, session.generation);
+        }
+        ensureStatusPoll();
       } finally {
         persistSuspended -= 1;
         flushPersist(true);
