@@ -291,6 +291,11 @@ to a moved checkout; and the code graph opens the maps devmap 0.2.4 writes.
 
 ### Fixed
 
+- **Startup loads less again.** The Worktrees panel pulled the task board's
+  attempt and session code into the startup bundle for one lookup, and the
+  setup wizard was parsed at boot though it opens only on request. The lookup
+  has its own module and the wizard loads on first open, which brings the
+  startup chunk from 791 KB back under its 780 KB budget (766 KB).
 - **The code graph opens maps the current devmap CLI writes.** The vendored
   store read schema 23, then 24, while the CLI moved on to 25, so every
   code-intel answer in GitPulse was "unavailable". DevCouncil's crates are
