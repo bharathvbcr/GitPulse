@@ -11,6 +11,22 @@ before that tag is pushed.
 
 ## [Unreleased]
 
+## [1.4.0] - 2026-10-07
+
+Agents that start in the background with a pane showing every one at work,
+stacked worktree tabs, a model choice per agent, one agent guidance in every
+handoff, and board tools that delete and merge tasks and make agents group work
+before filing — plus stale-branch cleanup with backups, a secret scan that never
+reads a partial scan as clean, worktree cache sync and named local routes,
+symbol-level collision notes, Markdown rendered by MarkDev, terminals that
+report what they are running, coloured tabs, timers that stop in the
+background, Bun for installs and scripts, and git spawns admitted by class so
+a refresh storm can no longer starve the actions you asked for, with branch
+churn kept across restarts. Two live agents sharing one worktree now show up
+in collision risk; the task board gains Undo, bulk changes and full keyboard
+operation; workspaces can be reordered, imported from tab groups and relinked
+to a moved checkout; and the code graph opens the maps devmap 0.2.4 writes.
+
 ### Added
 
 - **Two agents in one worktree are no longer invisible.** Collision risk used
@@ -49,41 +65,6 @@ before that tag is pushed.
   `repositories.relink`.
 - **The home workspace is editable** in the task sheet; it could only be set
   when a task was created.
-
-### Fixed
-
-- **The code graph opens maps the current devmap CLI writes.** The vendored
-  store read schema 23 and the CLI writes 24, so every code-intel answer in
-  GitPulse was "unavailable". DevCouncil's crates are re-vendored from
-  `c17fd37` (`dc-verify` aside; see the next entry). The same refresh lets GitPulse, which links no grammar, check that a map was
-  written by the current analyzer, so a current map now reads as fresh rather
-  than "analyzer freshness unverified". `markdev-html` is re-vendored from
-  MarkDev `20dec7a`.
-- **Ledger redaction no longer holds a DevCouncil crate back.** The
-  credential table came from `dc-verify`, which had to stay at `4efeecf`:
-  upstream it now links tree-sitter 0.25 for stub detection, the Markdown
-  highlighter links 0.26, and cargo allows only one. DevCouncil split the
-  table into `dc-redact`, a crate with no dependencies, and GitPulse vendors
-  that instead (`devcouncil@1a956bf`). The table is unchanged since `4efeecf`,
-  so redaction behaves as before. `dc-verify` and the two crates only it
-  needed, `dc-glob` and `dc-evidence`, are no longer vendored, and
-  `vendor:check` no longer reports DevCouncil drift.
-
-## [1.4.0] - 2026-10-06
-
-Agents that start in the background with a pane showing every one at work,
-stacked worktree tabs, a model choice per agent, one agent guidance in every
-handoff, and board tools that delete and merge tasks and make agents group work
-before filing — plus stale-branch cleanup with backups, a secret scan that never
-reads a partial scan as clean, worktree cache sync and named local routes,
-symbol-level collision notes, Markdown rendered by MarkDev, terminals that
-report what they are running, coloured tabs, timers that stop in the
-background, Bun for installs and scripts, and git spawns admitted by class so
-a refresh storm can no longer starve the actions you asked for, with branch
-churn kept across restarts.
-
-### Added
-
 - **Agents can merge duplicate board tasks.** `gitpulse_merge_tasks` folds up
   to 25 tasks into one that stays: a `## Merged from …` section per task in its
   description, the union of their acceptance criteria and labels, and the most
@@ -310,6 +291,24 @@ churn kept across restarts.
 
 ### Fixed
 
+- **The code graph opens maps the current devmap CLI writes.** The vendored
+  store read schema 23, then 24, while the CLI moved on to 25, so every
+  code-intel answer in GitPulse was "unavailable". DevCouncil's crates are
+  re-vendored from `c17fd37` (`dc-verify` aside; see the next entry) and the
+  five `devmap-*` crates again from `c390778`, which reads schema 25 — the
+  schema devmap 0.2.4 writes. The same refresh lets GitPulse, which links no
+  grammar, check that a map was written by the current analyzer, so a current
+  map now reads as fresh rather than "analyzer freshness unverified".
+  `markdev-html` is re-vendored from MarkDev `20dec7a`.
+- **Ledger redaction no longer holds a DevCouncil crate back.** The
+  credential table came from `dc-verify`, which had to stay at `4efeecf`:
+  upstream it now links tree-sitter 0.25 for stub detection, the Markdown
+  highlighter links 0.26, and cargo allows only one. DevCouncil split the
+  table into `dc-redact`, a crate with no dependencies, and GitPulse vendors
+  that instead (`devcouncil@1a956bf`). The table is unchanged since `4efeecf`,
+  so redaction behaves as before. `dc-verify` and the two crates only it
+  needed, `dc-glob` and `dc-evidence`, are no longer vendored, and
+  `vendor:check` no longer reports DevCouncil drift.
 - **Many open tabs no longer starve GitPulse's own git budget.** Every open
   tab ran a full refresh on each of its own file events, so with about ten
   repositories open the shared spawn budget stayed spent and the reads you
