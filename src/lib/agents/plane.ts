@@ -1,12 +1,13 @@
 /**
- * The Agents plane: one reading of every session a workspace is holding.
+ * The Agents plane: the agent checkouts, terminals and task attempts the
+ * open repositories are holding, one row each.
  *
  * Three sources, and they do not say the same thing:
  *
  * - A git worktree under `.<agent>/worktrees/<slug>` is a checkout. It is not
  *   a running process. Insights can see the checkout and cannot see whether
  *   anyone is still in it.
- * - A terminal session is a process this window started. A Claude the person
+ * - A terminal is a process this window started. A Claude the person
  *   launched outside GitPulse is absent here, not idle.
  * - A task attempt is a run the workbench recorded. A run whose list could
  *   not be read is not a run that does not exist.
@@ -15,11 +16,18 @@
  * did not run, a list that was capped, and a checkout whose changes were not
  * measured each stay visible as that fact. Callers render the gaps; they do
  * not treat an empty row list as a quiet workspace.
+ *
+ * Attribution is by containment. A terminal or an attempt belongs to the
+ * checkout whose directory contains its own (a subdirectory included), and a
+ * directory that is known and outside every checkout belongs to none of them,
+ * whatever tab the process was opened from. One repository read through two
+ * of its own checkouts is one repository: each checkout appears once.
  */
 
 import type { InsightsSnapshot, WorktreeSummary } from "../insights/types";
 import { identityKey, type PathIdentityOptions } from "../repos/paths";
 import { agentKind } from "../work/agentWorktree";
+import { nearestContaining } from "./cwd";
 
 /** Repositories one sweep will read. The rest are reported as skipped. */
 export const MAX_AGENT_REPOS = 64;
@@ -99,7 +107,15 @@ const REASON_LABEL: Record<AttentionReason, string> = {
   dirty: "Uncommitted changes",
 };
 
-export type AgentPresence = "live" | "on-disk" | "missing";
+/**
+ * `exited` is a process this window started that has ended and still has
+ * something to say (it needs the reader, or stopped on an error). It is not
+ * live, and the live filter and the live count leave it out.
+ */
+export type AgentPresence = "live" | "exited" | "on-disk" | "missing";
+
+/** Which source a row was first drawn from. A checkout row stays one when a terminal joins it. */
+export type AgentOrigin = "checkout" | "terminal" | "task";
 
 export type GapKind = "failed" | "skipped" | "unread" | "partial";
 
@@ -138,6 +154,7 @@ export interface PlaneTerminal {
 export interface PlaneTask {
   runId: string;
   title: string;
+  /** The repository the run belongs to, resolved from its id. Empty when that failed. */
   repoPath: string;
   cwd: string;
   provider: string;
@@ -168,13 +185,18 @@ export interface PlaneInput {
 
 export interface AgentRow {
   id: string;
+  /** The repository's path. Empty for an attempt whose repository could not be resolved. */
   repoPath: string;
   repoLabel: string;
   kind: string;
-  /** Session slug, terminal title, or task title. Never invented. */
+  /** Checkout slug, terminal title, or task title. Never invented. */
   session: string;
   checkout: string;
+  /** Where the row is: the checkout, the terminal's directory, or the attempt's. */
   worktreePath: string;
+  /** The checkout "Open checkout" opens. Null when the row is outside every checkout read. */
+  checkoutPath: string | null;
+  origin: AgentOrigin;
   presence: AgentPresence;
   /** What the presence word is claiming, in one sentence. */
   presenceDetail: string;
@@ -194,11 +216,29 @@ export interface AgentPlane {
   rows: AgentRow[];
   shown: number;
   total: number;
-  /** True when `rows` is shorter than the sessions that were found. */
+  /** True when `rows` is shorter than the rows that were found. */
   truncated: boolean;
   gaps: ProbeGap[];
   /** True when any included count is a floor rather than a total. */
   sessionsAreFloor: boolean;
+  /**
+   * Agent checkouts on disk, by the rule `agent_summary` (insights/mod.rs)
+   * uses for Fleet: every listed worktree with an agent kind, each once.
+   */
+  checkouts: number;
+  checkoutsFloor: boolean;
+  /** Live agent terminals this window started: `liveAgentCount` over the same terminals. */
+  live: number;
+  /** Task attempts the workbench returned. Null when they were not read or not watched. */
+  taskAttempts: number | null;
+  tasksWatched: boolean;
+  tasksFloor: boolean;
+  /**
+   * Rows in the attention filter, split by why. `needing` asked for the
+   * reader; `unread` are there only because a measurement was not read.
+   * Their sum is what `applyAgentFilter(rows, "attention")` keeps.
+   */
+  attention: { needing: number; unread: number };
   requested: number;
   read: number;
   failed: number;
@@ -206,13 +246,14 @@ export interface AgentPlane {
 }
 
 interface Draft {
-  id: string;
   repoPath: string;
   repoLabel: string;
   kind: string;
   session: string;
   checkout: string;
   worktreePath: string;
+  checkoutPath: string | null;
+  origin: AgentOrigin;
   presence: AgentPresence;
   presenceDetail: string;
   attention: Set<AttentionReason>;
@@ -225,8 +266,29 @@ interface Draft {
   diskSessions: number | null;
 }
 
+/** One repository, however many of its checkouts were probed. */
+interface Family {
+  repoPath: string;
+  repoLabel: string;
+  diskSessions: number | null;
+  floor: boolean;
+  listed: number;
+}
+
+/** A listed worktree (or a probed path), and the repository it belongs to. */
+interface Place {
+  family: Family;
+  path: string;
+  checkout: string;
+}
+
 const LIVE_STATUS = new Set(["starting", "running"]);
 const MAX_TEXT = 160;
+const LIVE_DETAIL = "A process this window started.";
+const EXITED_DETAIL = "A process this window started. It has exited.";
+
+/** Reasons that say a reading is missing, not that anyone asked for anything. */
+const UNREAD_REASONS = new Set<AttentionReason>(["unscanned", "unprobed", "unmeasured"]);
 
 function clean(value: string, max = MAX_TEXT): string {
   const text = value.replace(/[\u0000-\u001f\u007f]/g, " ").replace(/\s+/g, " ").trim();
@@ -234,14 +296,39 @@ function clean(value: string, max = MAX_TEXT): string {
   return `${text.slice(0, max - 1)}…`;
 }
 
-function same(a: string, b: string, paths: PathIdentityOptions): boolean {
-  const left = identityKey(a, paths);
-  const right = identityKey(b, paths);
-  return left !== "" && left === right;
-}
-
 function keyOf(path: string, paths: PathIdentityOptions): string {
   return identityKey(path, paths) || path;
+}
+
+/**
+ * A GitPulse task-run worktree (`.gitpulse/worktrees/<slug>`). The lane's
+ * own kind names the launcher, not the agent working in it.
+ */
+const isGitPulseLane = (kind: string): boolean => kind.trim().toLowerCase() === "gitpulse";
+
+const KIND_LABELS: Readonly<Record<string, string>> = {
+  claude: "Claude Code",
+  codex: "Codex",
+  shell: "Shell",
+  agent: "Agent",
+};
+
+/**
+ * The words a person reads for a row's kind. A kind this table does not
+ * know is shown as it was found: a prettier name would claim knowledge of a
+ * tool we have only seen a folder of.
+ */
+export function kindLabel(kind: string): string {
+  if (isGitPulseLane(kind)) return "GitPulse task";
+  return KIND_LABELS[kind.trim().toLowerCase()] ?? kind;
+}
+
+/** Where a terminal is: its directory when the OS said, else the tab it was opened from. */
+function knownCwd(terminal: { cwd: string | null }, paths?: PathIdentityOptions): string | null {
+  const cwd = terminal.cwd?.trim() ?? "";
+  if (!cwd) return null;
+  if (paths && !identityKey(cwd, paths)) return null;
+  return cwd;
 }
 
 /**
@@ -249,26 +336,50 @@ function keyOf(path: string, paths: PathIdentityOptions): string {
  *
  * A shell the person opened is not an agent. A shell whose directory is an
  * agent checkout is still an occupant of that checkout, which is the fact
- * parallel sessions exist to show. Anything else with a launcher name other
- * than Shell is an agent this window started, including one sitting in the
- * main tree.
+ * parallel sessions exist to show. The directory decides when it is known;
+ * the tab only when it is not, so a shell that left the checkout is not
+ * counted as still in it. Anything else with a launcher name other than
+ * Shell is an agent this window started, including one in the main tree.
  */
 export function terminalInScope(terminal: { label: string; repoPath: string; cwd: string | null }): boolean {
-  if (agentKind(terminal.cwd ?? "") || agentKind(terminal.repoPath)) return true;
+  if (agentKind(knownCwd(terminal) ?? terminal.repoPath)) return true;
   const label = terminal.label.trim().toLowerCase();
   return label !== "" && label !== "shell";
 }
 
+/**
+ * Live agent terminals this window started: the one definition the tab chip
+ * and the plane's headline both use.
+ *
+ * A record counts when it is starting or running and in scope, with its
+ * directory taken from `directories` (by backend session id) when that is
+ * known. A key counts once however many records repeat it.
+ */
 export function liveAgentCount(
-  records: readonly { label: string; status: string; repoPath: string }[],
+  records: readonly { key?: string; label: string; status: string; repoPath: string; sessionId?: string | null }[],
+  directories: ReadonlyMap<string, string> = new Map(),
 ): number {
+  const seen = new Set<string>();
   let count = 0;
   for (const record of records) {
     if (!LIVE_STATUS.has(record.status)) continue;
-    if (!terminalInScope({ label: record.label, repoPath: record.repoPath, cwd: null })) continue;
+    const cwd = record.sessionId ? directories.get(record.sessionId) ?? null : null;
+    if (!terminalInScope({ label: record.label, repoPath: record.repoPath, cwd })) continue;
+    if (record.key) {
+      if (seen.has(record.key)) continue;
+      seen.add(record.key);
+    }
     count += 1;
   }
   return count;
+}
+
+/** `base`, or the first `base|n` the set does not already hold. */
+export function uniqueRowId(base: string, used: ReadonlySet<string>): string {
+  if (!used.has(base)) return base;
+  let suffix = 1;
+  while (used.has(`${base}|${suffix}`)) suffix += 1;
+  return `${base}|${suffix}`;
 }
 
 function checkoutLabel(item: WorktreeSummary): string {
@@ -290,6 +401,11 @@ function attentionText(reasons: readonly AttentionReason[]): string {
 
 function wantsAttention(reasons: readonly AttentionReason[]): boolean {
   return reasons.some((reason) => FILTER_ATTENTION.has(reason));
+}
+
+/** In the attention filter because someone or something asked, not only because a reading is missing. */
+function asksForAttention(reasons: readonly AttentionReason[]): boolean {
+  return reasons.some((reason) => FILTER_ATTENTION.has(reason) && !UNREAD_REASONS.has(reason));
 }
 
 function urgentRank(reasons: readonly AttentionReason[]): number {
@@ -382,8 +498,9 @@ function keepTerminal(terminal: PlaneTerminal): boolean {
 }
 
 function attach(draft: Draft, terminal: PlaneTerminal): void {
-  draft.presence = "live";
-  draft.presenceDetail = "A process this window started.";
+  const live = LIVE_STATUS.has(terminal.status);
+  draft.presence = live ? "live" : "exited";
+  draft.presenceDetail = live ? LIVE_DETAIL : EXITED_DETAIL;
   draft.liveKey = terminal.key;
   if (terminal.taskRunId) draft.taskRunId = terminal.taskRunId;
   else if (terminal.continuesRunId && !draft.taskRunId) draft.taskRunId = terminal.continuesRunId;
@@ -393,16 +510,18 @@ function attach(draft: Draft, terminal: PlaneTerminal): void {
   else if (title && !draft.session) draft.session = title;
 }
 
-function fromCheckout(probe: PlaneProbe, item: WorktreeSummary, collisions: Set<string> | null, paths: PathIdentityOptions, diskSessions: number | null, parallelFloor: boolean): Draft {
-  const slug = clean(item.session_slug, 80);
+function fromCheckout(family: Family, item: WorktreeSummary, collisions: Set<string> | null, paths: PathIdentityOptions): Draft {
   return {
-    id: "",
-    repoPath: probe.path,
-    repoLabel: clean(probe.label || probe.path, 80),
+    repoPath: family.repoPath,
+    repoLabel: family.repoLabel,
     kind: clean(item.agent_kind, 40),
-    session: slug,
+    // A worktree at the layout's container has no slug. It is still a
+    // checkout an agent layout holds; the row falls back to its kind.
+    session: clean(item.session_slug, 80),
     checkout: checkoutLabel(item),
     worktreePath: item.path,
+    checkoutPath: item.path,
+    origin: "checkout",
     presence: "on-disk",
     presenceDetail: "A checkout on disk. This does not say a process is running.",
     attention: checkoutReasons(item, collisions, paths),
@@ -410,26 +529,39 @@ function fromCheckout(probe: PlaneProbe, item: WorktreeSummary, collisions: Set<
     taskRunId: null,
     dirtyFiles: item.dirty_files,
     dirtyKnown: item.dirty_files !== null,
-    parallelFloor,
-    diskSessions,
+    parallelFloor: family.floor,
+    diskSessions: family.diskSessions,
   };
 }
 
-function fromTerminal(probe: PlaneProbe | undefined, terminal: PlaneTerminal, paths: PathIdentityOptions): Draft {
-  const repoPath = probe?.path || terminal.repoPath;
+function fromTerminal(terminal: PlaneTerminal, cwd: string | null, places: ReadonlyMap<string, Place>, paths: PathIdentityOptions): Draft {
+  // Kind, checkout and repository come from where the process is. The tab
+  // it was opened from speaks only when that directory is unknown.
+  const where = cwd ?? terminal.repoPath;
+  const place = nearestContaining(places, where, paths);
+  const family = place?.family ?? nearestContaining(places, terminal.repoPath, paths)?.family;
+  const kind = agentKind(where);
+  const checkout = kind
+    ? "Agent checkout"
+    : place
+      ? place.checkout
+      : cwd
+        ? "Outside the repositories read"
+        : "Main checkout";
   return {
-    id: "",
-    repoPath,
-    repoLabel: clean(probe?.label || terminal.repoPath, 80),
-    kind: clean(agentKind(terminal.repoPath) || terminal.label, 40),
+    repoPath: family?.repoPath || terminal.repoPath,
+    repoLabel: family?.repoLabel || clean(terminal.repoPath, 80),
+    kind: clean(kind || terminal.label, 40),
     session: clean(terminal.title || terminal.label, 80),
-    checkout: agentKind(terminal.repoPath) ? "Agent checkout" : "Main checkout",
-    worktreePath: terminal.cwd && identityKey(terminal.cwd, paths) ? terminal.cwd : terminal.repoPath,
+    checkout,
+    worktreePath: where,
+    checkoutPath: place?.path ?? (cwd ? null : terminal.repoPath),
+    origin: "terminal",
     presence: "live",
-    presenceDetail: "A process this window started.",
-    attention: new Set(terminalReasons(terminal)),
-    liveKey: terminal.key,
-    taskRunId: terminal.taskRunId || terminal.continuesRunId || null,
+    presenceDetail: LIVE_DETAIL,
+    attention: new Set(),
+    liveKey: null,
+    taskRunId: null,
     dirtyFiles: null,
     dirtyKnown: false,
     parallelFloor: false,
@@ -437,22 +569,40 @@ function fromTerminal(probe: PlaneProbe | undefined, terminal: PlaneTerminal, pa
   };
 }
 
+/**
+ * Folds an attempt into the row of its own run.
+ *
+ * A run-backed row is named for the run: its provider is the kind, and its
+ * task is the name. A GitPulse lane's own kind (`gitpulse`) says who made
+ * the checkout, not which agent works in it. A row with this window's
+ * terminal attached is the run being shown here, so `disconnected` is not
+ * carried onto it.
+ */
 function foldTask(draft: Draft, task: PlaneTask): void {
   draft.taskRunId = task.runId;
-  if (!draft.kind) draft.kind = clean(task.provider, 40);
-  if (!draft.session) draft.session = clean(task.title, 80);
-  for (const reason of taskReasons(task)) draft.attention.add(reason);
+  const provider = clean(task.provider, 40);
+  if (provider) draft.kind = provider;
+  const title = clean(task.title, 80);
+  if (title) draft.session = title;
+  for (const reason of taskReasons(task)) {
+    if (reason === "disconnected" && draft.liveKey !== null) continue;
+    draft.attention.add(reason);
+  }
 }
 
-function fromTask(task: PlaneTask): Draft {
+function fromTask(task: PlaneTask, places: ReadonlyMap<string, Place>, paths: PathIdentityOptions): Draft {
+  const family = nearestContaining(places, task.repoPath, paths)?.family
+    ?? nearestContaining(places, task.cwd, paths)?.family;
+  const repoPath = family?.repoPath || task.repoPath;
   return {
-    id: "",
-    repoPath: task.repoPath || task.cwd,
-    repoLabel: clean(task.repoPath || task.cwd, 80),
+    repoPath,
+    repoLabel: family?.repoLabel || (repoPath ? clean(repoPath, 80) : "Repository not resolved"),
     kind: clean(task.provider, 40),
     session: clean(task.title, 80),
     checkout: clean(task.cwd, 80),
     worktreePath: task.cwd,
+    checkoutPath: task.cwd || null,
+    origin: "task",
     presence: "missing",
     presenceDetail: "The workbench has this attempt, and no terminal in this window is attached to it.",
     attention: new Set(taskReasons(task)),
@@ -465,8 +615,9 @@ function fromTask(task: PlaneTask): Draft {
   };
 }
 
-function findHost(drafts: readonly Draft[], path: string, paths: PathIdentityOptions): Draft | undefined {
-  return drafts.find((draft) => draft.worktreePath !== "" && same(draft.worktreePath, path, paths));
+/** True when this read listed every worktree and counted every agent. */
+function completeRead(snapshot: InsightsSnapshot): boolean {
+  return snapshot.agents.ok && !snapshot.agents.truncated && !snapshot.worktrees.truncated;
 }
 
 /**
@@ -474,7 +625,12 @@ function findHost(drafts: readonly Draft[], path: string, paths: PathIdentityOpt
  *
  * A failed or skipped probe contributes a gap and no rows. Rows from a
  * repository whose agent list was capped carry `parallelFloor`, and the
- * plane's `sessionsAreFloor` is set. `rows` is capped; `total` is not.
+ * plane's `sessionsAreFloor` is set. `rows` is capped; `total` and every
+ * count are not.
+ *
+ * Linear in the input: checkouts, places and runs are looked up in maps
+ * keyed by `identityKey` and run id, and a directory's containing checkout
+ * is found by walking its own ancestors, not by scanning every checkout.
  */
 export function projectAgentPlane(input: PlaneInput): AgentPlane {
   const paths = input.paths;
@@ -486,6 +642,10 @@ export function projectAgentPlane(input: PlaneInput): AgentPlane {
   let failed = 0;
   let skipped = 0;
 
+  // Which repository each read probe belongs to. Every checkout of one
+  // repository lists the same main worktree, so that path names the family;
+  // a listing without one keeps the probe on its own.
+  const readProbes: { probe: PlaneProbe; snapshot: InsightsSnapshot; family: string }[] = [];
   for (const probe of probes) {
     const label = clean(probe.label || probe.path, 80);
     if (probe.skipped) {
@@ -522,68 +682,121 @@ export function projectAgentPlane(input: PlaneInput): AgentPlane {
       continue;
     }
     read += 1;
-    const diskSessions = snapshot.agents.ok ? snapshot.agents.sessions : null;
-    const parallelFloor = !snapshot.agents.ok || snapshot.agents.truncated || snapshot.worktrees.truncated;
-    if (parallelFloor) sessionsAreFloor = true;
-    if (!snapshot.agents.ok) {
+    const main = snapshot.worktrees.items.find((item) => item.is_main);
+    readProbes.push({ probe, snapshot, family: keyOf(main?.path || probe.path, paths) });
+  }
+
+  const members = new Map<string, typeof readProbes>();
+  for (const entry of readProbes) {
+    const list = members.get(entry.family);
+    if (list) list.push(entry);
+    else members.set(entry.family, [entry]);
+  }
+
+  /** Every listed worktree and probed path, to the repository it belongs to. */
+  const places = new Map<string, Place>();
+  /** Agent checkouts by path. A checkout is a row once, whichever tab listed it. */
+  const checkouts = new Map<string, Draft>();
+  const families: Family[] = [];
+
+  for (const [familyKey, entries] of members) {
+    // The repository is named for its main checkout when that was a tab;
+    // otherwise for the first tab that read it.
+    const named = entries.find((entry) => keyOf(entry.probe.path, paths) === familyKey) ?? entries[0];
+    const complete = entries.filter((entry) => completeRead(entry.snapshot));
+    const counted = entries.filter((entry) => entry.snapshot.agents.ok);
+    const family: Family = {
+      repoPath: named.probe.path,
+      repoLabel: clean(named.probe.label || named.probe.path, 80),
+      diskSessions: counted.length === 0 ? null : Math.max(...counted.map((entry) => entry.snapshot.agents.sessions)),
+      floor: complete.length === 0,
+      listed: 0,
+    };
+    families.push(family);
+    if (family.floor) sessionsAreFloor = true;
+    if (counted.length === 0) {
       gaps.push({
-        repoPath: probe.path,
-        label,
+        repoPath: family.repoPath,
+        label: family.repoLabel,
         kind: "partial",
         reason: "Agent counts could not be read. The checkouts below are only the ones whose paths were listed.",
       });
-    } else if (snapshot.agents.truncated || snapshot.worktrees.truncated) {
+    } else if (family.floor) {
       gaps.push({
-        repoPath: probe.path,
-        label,
+        repoPath: family.repoPath,
+        label: family.repoLabel,
         kind: "partial",
         reason: "The worktree list was capped. Session counts for this repository are a floor.",
       });
     }
-    const collisions = collisionPaths(snapshot, paths);
+    let collisions: Set<string> | null = null;
+    for (const entry of entries) {
+      collisions = collisionPaths(entry.snapshot, paths);
+      if (collisions !== null) break;
+    }
     if (collisions === null) {
       gaps.push({
-        repoPath: probe.path,
-        label,
+        repoPath: family.repoPath,
+        label: family.repoLabel,
         kind: "partial",
-        reason: snapshot.collisions.ok
+        reason: named.snapshot.collisions.ok
           ? "Collision scan did not cover every worktree. An empty overlap list is not a clear one."
-          : clean(snapshot.collisions.error || "Collisions could not be read.", 240),
+          : clean(named.snapshot.collisions.error || "Collisions could not be read.", 240),
       });
     }
-    for (const item of snapshot.worktrees.items) {
-      if (!item.agent_kind || !item.session_slug) continue;
-      drafts.push(fromCheckout(probe, item, collisions, paths, diskSessions, parallelFloor));
+    for (const entry of entries) {
+      const probeKey = keyOf(entry.probe.path, paths);
+      if (!places.has(probeKey)) places.set(probeKey, { family, path: entry.probe.path, checkout: "Checkout" });
+      for (const item of entry.snapshot.worktrees.items) {
+        const key = keyOf(item.path, paths);
+        if (!key) continue;
+        const known = places.get(key);
+        if (!known || known.checkout === "Checkout") {
+          places.set(key, { family, path: item.path, checkout: item.is_main ? "Main checkout" : checkoutLabel(item) });
+        }
+        // The rule `agent_summary` counts by, so a row here is a session there.
+        if (!item.agent_kind || checkouts.has(key)) continue;
+        const draft = fromCheckout(family, item, collisions, paths);
+        checkouts.set(key, draft);
+        drafts.push(draft);
+        family.listed += 1;
+      }
     }
   }
 
-  const seenTerminal = new Set<string>();
+  // One record per key. When a key repeats, the live record is the one shown,
+  // so the row and the live count agree.
+  const chosen = new Map<string, PlaneTerminal>();
   for (const terminal of input.terminals) {
-    if (!keepTerminal(terminal) || seenTerminal.has(terminal.key)) continue;
-    if (!terminalInScope(terminal)) continue;
-    seenTerminal.add(terminal.key);
-    const hostPath = terminal.cwd || terminal.repoPath;
-    const host = findHost(drafts, hostPath, paths) ?? findHost(drafts, terminal.repoPath, paths);
+    if (!keepTerminal(terminal) || !terminalInScope(terminal)) continue;
+    const previous = chosen.get(terminal.key);
+    if (!previous || (!LIVE_STATUS.has(previous.status) && LIVE_STATUS.has(terminal.status))) {
+      chosen.set(terminal.key, terminal);
+    }
+  }
+
+  let live = 0;
+  for (const terminal of chosen.values()) {
+    if (LIVE_STATUS.has(terminal.status)) live += 1;
+    const cwd = knownCwd(terminal, paths);
+    // A known directory decides alone. Falling back to the tab here is how a
+    // process in `/tmp` used to land in the agent checkout it was opened from.
+    const host = nearestContaining(checkouts, cwd ?? terminal.repoPath, paths);
     if (host && host.liveKey === null) {
       attach(host, terminal);
       continue;
     }
-    const probe = probes.find((item) => same(item.path, terminal.repoPath, paths) || (host ? same(item.path, host.repoPath, paths) : false));
-    const draft = host
-      ? {
-          ...host,
-          attention: new Set(host.attention),
-          liveKey: null,
-          taskRunId: null,
-          session: clean(host.session, 80),
-        }
-      : fromTerminal(probe, terminal, paths);
+    const draft: Draft = host
+      ? { ...host, origin: "terminal", attention: new Set(host.attention), liveKey: null, taskRunId: null }
+      : fromTerminal(terminal, cwd, places, paths);
     attach(draft, terminal);
-    // A second process in a checkout is its own session, not a rewrite of the first.
+    // A second process in a checkout is its own row, not a rewrite of the first.
     if (host) draft.session = clean(terminal.title || terminal.label || host.session, 80);
     drafts.push(draft);
   }
 
+  let taskAttempts: number | null = null;
+  let tasksFloor = false;
   if (input.tasks === null) {
     // The caller is not watching attempts. Say nothing about them.
   } else if (input.tasks.unread) {
@@ -603,6 +816,7 @@ export function projectAgentPlane(input: PlaneInput): AgentPlane {
   } else {
     if (!input.tasks.complete) {
       sessionsAreFloor = true;
+      tasksFloor = true;
       gaps.push({
         repoPath: "",
         label: "Tasks",
@@ -610,56 +824,84 @@ export function projectAgentPlane(input: PlaneInput): AgentPlane {
         reason: "The task-attempt list was capped. Counts of attempts are a floor.",
       });
     }
+    const byRun = new Map<string, Draft>();
+    for (const draft of drafts) {
+      if (draft.taskRunId && !byRun.has(draft.taskRunId)) byRun.set(draft.taskRunId, draft);
+    }
+    const attempts = new Set<string>();
     for (const task of input.tasks.tasks) {
       if (!task.runId) continue;
-      const existing = drafts.find((draft) => draft.taskRunId === task.runId);
+      attempts.add(task.runId);
+      const existing = byRun.get(task.runId);
       if (existing) {
         foldTask(existing, task);
         continue;
       }
-      const host = findHost(drafts, task.cwd, paths);
-      if (host && host.taskRunId === null) {
+      // The checkout the attempt runs in hosts it only while nothing else
+      // does: a terminal of another run (or of no run) in that checkout is
+      // not this attempt, and folding it there would show one row as both
+      // live and "not shown in this window".
+      const host = nearestContaining(checkouts, task.cwd, paths);
+      if (host && host.liveKey === null && host.taskRunId === null) {
         foldTask(host, task);
+        byRun.set(task.runId, host);
         continue;
       }
-      const reasons = taskReasons(task);
-      if (reasons.length === 0) continue;
-      drafts.push(fromTask(task));
+      // P2, kept: an attempt with nothing to report and no checkout row to
+      // fold into adds no row. `monitorAttempt` gives a running attempt with
+      // no terminal here `disconnected`, and one not started `unstarted`, so
+      // an attempt reaching this line has a terminal in this window already
+      // (whose row carries it when that terminal is in scope) and asks for
+      // nothing. A row for it would count one process twice.
+      if (taskReasons(task).length === 0) continue;
+      const draft = fromTask(task, places, paths);
+      drafts.push(draft);
+      byRun.set(task.runId, draft);
     }
+    taskAttempts = attempts.size;
   }
 
-  const perRepo = new Map<string, Draft[]>();
-  for (const draft of drafts) {
-    const key = keyOf(draft.repoPath, paths);
-    const list = perRepo.get(key);
-    if (list) list.push(draft);
-    else perRepo.set(key, [draft]);
-  }
+  // One repository has one parallel count, computed once. A row that did not
+  // come from the agent summary (a terminal in the main tree) must not report
+  // a smaller number than the checkout beside it. An attempt whose repository
+  // was not resolved is a repository of its own.
+  const groups = new Map<string, { size: number; disk: number | null; floor: boolean }>();
+  const groupKeys = drafts.map((draft, index) => draft.repoPath ? keyOf(draft.repoPath, paths) : `\u0000${index}`);
+  drafts.forEach((draft, index) => {
+    const group = groups.get(groupKeys[index]) ?? { size: 0, disk: null, floor: false };
+    group.size += 1;
+    if (draft.diskSessions !== null) group.disk = Math.max(group.disk ?? 0, draft.diskSessions);
+    group.floor = group.floor || draft.parallelFloor;
+    groups.set(groupKeys[index], group);
+  });
 
   const finished: AgentRow[] = [];
   const used = new Set<string>();
-  for (const draft of drafts) {
-    const siblings = perRepo.get(keyOf(draft.repoPath, paths)) ?? [draft];
-    // One repository has one session count. A row that did not come from the
-    // agent summary (a terminal sitting in the main tree) must not report a
-    // smaller number than the checkout beside it.
-    const disks = siblings.flatMap((sibling) => sibling.diskSessions === null ? [] : [sibling.diskSessions]);
-    const disk = disks.length === 0 ? null : Math.max(...disks);
-    const parallelFloor = siblings.some((sibling) => sibling.parallelFloor) || (disk !== null && disk > siblings.length);
-    const parallelCount = disk === null ? siblings.length : Math.max(siblings.length, disk);
+  let needing = 0;
+  let unread = 0;
+  drafts.forEach((draft, index) => {
+    const group = groups.get(groupKeys[index])!;
+    const parallelFloor = group.floor || (group.disk !== null && group.disk > group.size);
+    const parallelCount = group.disk === null ? group.size : Math.max(group.size, group.disk);
     if (parallelFloor) sessionsAreFloor = true;
     const attention = orderReasons(draft.attention);
-    let id = [keyOf(draft.repoPath, paths), keyOf(draft.worktreePath, paths), draft.liveKey ?? "", draft.taskRunId ?? ""].join("|");
-    if (used.has(id)) id = `${id}|${used.size}`;
+    if (asksForAttention(attention)) needing += 1;
+    else if (wantsAttention(attention)) unread += 1;
+    const id = uniqueRowId(
+      [keyOf(draft.repoPath, paths), keyOf(draft.worktreePath, paths), draft.liveKey ?? "", draft.taskRunId ?? ""].join("|"),
+      used,
+    );
     used.add(id);
     finished.push({
       id,
       repoPath: draft.repoPath,
       repoLabel: draft.repoLabel || clean(draft.repoPath, 80),
       kind: draft.kind || "agent",
-      session: draft.session || draft.kind || "session",
+      session: draft.session || draft.kind || "agent",
       checkout: draft.checkout,
       worktreePath: draft.worktreePath,
+      checkoutPath: draft.checkoutPath,
+      origin: draft.origin,
       presence: draft.presence,
       presenceDetail: draft.presenceDetail,
       attention,
@@ -671,7 +913,7 @@ export function projectAgentPlane(input: PlaneInput): AgentPlane {
       liveKey: draft.liveKey,
       taskRunId: draft.taskRunId,
     });
-  }
+  });
 
   finished.sort((a, b) =>
     urgentRank(a.attention) - urgentRank(b.attention)
@@ -679,6 +921,13 @@ export function projectAgentPlane(input: PlaneInput): AgentPlane {
     || a.kind.localeCompare(b.kind)
     || a.session.localeCompare(b.session)
     || a.id.localeCompare(b.id));
+
+  let checkoutCount = 0;
+  let checkoutsFloor = false;
+  for (const family of families) {
+    checkoutCount += Math.max(family.listed, family.diskSessions ?? 0);
+    if (family.floor) checkoutsFloor = true;
+  }
 
   const total = finished.length;
   const truncated = total > MAX_AGENT_ROWS;
@@ -690,6 +939,13 @@ export function projectAgentPlane(input: PlaneInput): AgentPlane {
     truncated,
     gaps,
     sessionsAreFloor: sessionsAreFloor || truncated,
+    checkouts: checkoutCount,
+    checkoutsFloor,
+    live,
+    taskAttempts,
+    tasksWatched: input.tasks !== null,
+    tasksFloor,
+    attention: { needing, unread },
     requested: probes.length,
     read,
     failed,
@@ -704,17 +960,33 @@ export function applyAgentFilter(rows: readonly AgentRow[], filter: AgentFilter)
   return rows.filter((row) => wantsAttention(row.attention));
 }
 
+/** `1 agent checkout`, `2 agent checkouts`. */
+export function plural(count: number, one: string, many: string): string {
+  return `${count} ${count === 1 ? one : many}`;
+}
+
+/**
+ * One line naming what the rows are: agent checkouts, live terminals and task
+ * attempts, then how many rows are in the attention filter and why. Each
+ * count is the plane's own, computed before the row cap.
+ */
 export function planeHeadline(plane: AgentPlane, visible: number): string {
-  const noun = plane.sessionsAreFloor ? "at least " : "";
-  const sessions = `${noun}${plane.total} ${plane.total === 1 ? "session" : "sessions"}`;
-  const needing = plane.rows.filter((row) => wantsAttention(row.attention)).length;
-  // `rows` may be capped; the attention count is then also a floor.
-  const need = plane.truncated ? `${needing}+ need attention` : `${needing} need attention`;
+  const parts = [
+    `${plane.checkoutsFloor ? "at least " : ""}${plural(plane.checkouts, "agent checkout", "agent checkouts")}`,
+    plural(plane.live, "live terminal", "live terminals"),
+  ];
+  if (plane.tasksWatched) {
+    parts.push(plane.taskAttempts === null
+      ? "task attempts not read"
+      : `${plane.tasksFloor ? "at least " : ""}${plural(plane.taskAttempts, "task attempt", "task attempts")}`);
+  }
+  parts.push(`${plane.attention.needing} need attention`);
+  if (plane.attention.unread > 0) parts.push(`${plane.attention.unread} not fully read`);
   // Rows past the cap are not hidden by the filter. `visible` counts how many
   // of the returned rows the caller kept.
   const hidden = plane.rows.length - visible;
-  const filter = hidden > 0 ? ` · ${hidden} hidden by the filter` : "";
-  const unread = plane.failed + plane.skipped;
-  const gap = unread > 0 ? ` · ${unread} ${unread === 1 ? "repository" : "repositories"} not read` : "";
-  return `${sessions} · ${need}${filter}${gap}`;
+  if (hidden > 0) parts.push(`${hidden} hidden by the filter`);
+  const notRead = plane.failed + plane.skipped;
+  if (notRead > 0) parts.push(`${plural(notRead, "repository", "repositories")} not read`);
+  return parts.join(" · ");
 }

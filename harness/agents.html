@@ -132,6 +132,12 @@
         },
         cmd_workbench_request: async (args) => {
           await maybeHold();
+          if (args.method === "repositories.list") {
+            // A run names its repository by id. The plane places the attempt
+            // in that repository, not in the directory it runs in.
+            const item = { id: "repo-1", revision: 1, updated_at: 1, name: "GitPulse", identity_key: `local:${MAIN}/.git`, remote_url: null };
+            return JSON.stringify({ ok: true, items: [item], total: 1, shown: 1, has_more: false, next_cursor: null });
+          }
           if (args.method !== "runs.list") throw new Error(`unexpected workbench method ${args.method}`);
           return runPage(JSON.parse(args.input).state);
         },
@@ -217,10 +223,16 @@
             && attempt.textContent.includes("Running, not shown in this window")
             && !attempt.textContent.includes("Stopped on an error");
         });
-        check("the headline counts sessions and who needs attention", () =>
-          text().includes("5 sessions") && text().includes("2 need attention") && !text().includes("at least"));
-        check("parallel counts agree across the repository's checkouts", () =>
-          ["alpha", "beta", "gamma", "bad name"].every((name) => row(name).querySelectorAll("td")[3].textContent.trim() === "4"));
+        check("the headline names checkouts, terminals and attempts, and who needs attention", () =>
+          text().includes("4 agent checkouts · 0 live terminals · 1 task attempt · 2 need attention")
+          && !text().includes("session") && !text().includes("at least"));
+        check("an attempt is placed in the repository its id names, not the directory it runs in", () =>
+          row("Fix the gate").textContent.includes("GitPulse") && row("Fix the gate").querySelectorAll("td")[3].textContent.trim() === "5");
+        check("parallel counts agree across the repository's rows", () =>
+          ["alpha", "beta", "gamma", "bad name"].every((name) => row(name).querySelectorAll("td")[3].textContent.trim() === "5"));
+        check("kinds read as names and every row has a labelled action", () =>
+          row("alpha").textContent.includes("Claude Code")
+          && rows().every((item) => item.querySelector("[data-testid=agents-row-actions] button[aria-label]")));
         check("the main checkout and an empty session name are not sessions", () =>
           rows().length === 5 && !rows().some((item) => item.textContent.includes("GitPulse") && item.textContent.includes("main")));
 
@@ -228,8 +240,8 @@
         check("uncommitted work alone does not enter the attention filter", () =>
           !row("alpha") && !row("beta") && row("gamma") && row("Fix the gate") && text().includes("3 hidden by the filter"));
         await press("Parallel");
-        check("the parallel filter keeps the checkouts and not the lone attempt", () =>
-          row("alpha") && row("beta") && !row("Fix the gate") && text().includes("1 hidden by the filter"));
+        check("the parallel filter keeps every row of the repository, the attempt included", () =>
+          row("alpha") && row("beta") && row("Fix the gate") && !text().includes("hidden by the filter"));
         await press("Live");
         check("nothing is live until this window has a process there", () =>
           rows().length === 0 && text().includes("Nothing matches this filter") && text().includes("5 hidden by the filter"));
@@ -276,10 +288,10 @@
         compact.click();
         await settle();
 
-        row("alpha").querySelector("button").click();
-        await until(() => revealed === 1 && get(repoStore).currentPath === ALPHA, "opening the row did not reveal its terminal");
-        check("opening a live row returns to the repository and reveals that terminal", () =>
-          get(interfaceStore).globalSurface === "repository" && revealed === 1);
+        row("alpha").querySelector("[aria-label='Show terminal for alpha']").click();
+        await until(() => revealed === 1, "showing the row's terminal did not reveal it");
+        check("showing a live row's terminal returns to the tab that hosts it and reveals that terminal", () =>
+          get(interfaceStore).globalSurface === "repository" && revealed === 1 && get(repoStore).currentPath === MAIN);
         interfaceStore.setAgentsOpen(true);
         await until(() => row("alpha") && !button("Refresh").disabled, "the plane did not return");
 

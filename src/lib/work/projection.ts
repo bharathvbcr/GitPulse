@@ -468,6 +468,18 @@ export interface WorkInsightSummary {
 }
 
 /**
+ * Agent checkouts among these worktree paths, each counted once.
+ *
+ * The rule `agent_summary` (src-tauri/src/insights/mod.rs) counts by — a
+ * worktree in an agent layout — so the Work view's tile, Fleet's work cell
+ * and the Agents plane's headline report one quantity. plane.counts.test.ts
+ * holds the three to one fixture.
+ */
+export function agentCheckoutCount(paths: readonly string[]): number {
+  return new Set(paths.filter((path) => isAgentWorktree(path))).size;
+}
+
+/**
  * Instant strip above the rows: derived from the join, not a second fetch.
  *
  * Collision files are not here — the projection only has dirty *counts* —
@@ -497,7 +509,7 @@ export function insightSummary(projection: WorkProjection): WorkInsightSummary {
   }
   return {
     worktrees,
-    agentSessions: paths.filter((path) => isAgentWorktree(path)).length,
+    agentSessions: agentCheckoutCount(paths),
     agentKinds: agentKindsOn(paths),
     dirtyWorktrees,
     blocked,

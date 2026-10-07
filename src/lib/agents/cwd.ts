@@ -8,8 +8,10 @@
  * its time does not start another read.
  */
 
+import { writable } from "svelte/store";
 import { mapWithConcurrency } from "../async/pool";
 import { invoke } from "../ipc/invoke";
+import { identityKey, type PathIdentityOptions } from "../repos/paths";
 import { parseTerminalContext } from "../terminal/sessionContext";
 
 /** How long a directory sweep may keep starting reads. */
@@ -18,6 +20,64 @@ export const AGENT_CWD_DEADLINE_MS = 4_000;
 export const AGENT_CWD_CONCURRENCY = 4;
 /** Sessions past this are left unknown rather than queued. */
 export const MAX_AGENT_CWD_READS = 64;
+
+/**
+ * The directories the last sweep read, by backend session id.
+ *
+ * The Agents plane writes it; the tab chip reads it, so both count a shell
+ * sitting in an agent checkout the same way. A session absent here is
+ * unknown, not in the repository root.
+ */
+export const agentDirectories = writable<ReadonlyMap<string, string>>(new Map());
+
+/**
+ * Which sessions to ask for a directory, agents first.
+ *
+ * An agent's directory decides which checkout its row joins. A shell's only
+ * decides whether it is in scope at all, so shells take what the cap leaves
+ * and never displace an agent. The order inside each group is by id, and
+ * only the id and the launcher name are read: a title or status change gives
+ * the same list, so a caller keyed on it does not re-read every directory
+ * whenever a terminal retitles itself.
+ */
+export function agentCwdTargets(
+  records: readonly { sessionId?: string | null; label: string }[],
+): string[] {
+  const agents = new Set<string>();
+  const shells = new Set<string>();
+  for (const record of records) {
+    const id = record.sessionId?.trim() ?? "";
+    if (!id) continue;
+    if (record.label.trim().toLowerCase() === "shell") shells.add(id);
+    else agents.add(id);
+  }
+  for (const id of agents) shells.delete(id);
+  const sorted = (ids: Set<string>) => [...ids].sort();
+  return [...sorted(agents), ...sorted(shells)].slice(0, MAX_AGENT_CWD_READS);
+}
+
+/**
+ * The value stored for `path` or its nearest ancestor.
+ *
+ * `index` is keyed by `identityKey`. The walk drops one whole segment at a
+ * time, so `/repo/alphabet` never matches `/repo/alpha`. Linear in the
+ * path's depth, not in the size of the index.
+ */
+export function nearestContaining<V>(
+  index: ReadonlyMap<string, V>,
+  path: string,
+  paths: PathIdentityOptions,
+): V | undefined {
+  let key = identityKey(path, paths);
+  while (key) {
+    const found = index.get(key);
+    if (found !== undefined) return found;
+    const cut = key.lastIndexOf("/");
+    if (cut <= 0) return undefined;
+    key = key.slice(0, cut);
+  }
+  return undefined;
+}
 
 export interface AgentCwdDeps {
   readonly read?: (sessionId: string) => Promise<unknown>;
