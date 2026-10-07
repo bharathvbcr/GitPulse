@@ -2986,7 +2986,12 @@ mod tests {
             items[3].session_slug, "",
             "the container has no slug and still counts"
         );
-        let summary = agent_summary(true, false, &items);
+        let summary = agent_summary(
+            true,
+            false,
+            &items,
+            live_sessions::attribute(&Vec::new(), &[]),
+        );
         assert_eq!(summary.sessions, 3, "{summary:?}");
     }
 
