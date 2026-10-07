@@ -20,7 +20,7 @@ vi.mock("../repos/paths", async (importOriginal) => {
 });
 
 const { projectAgentPlane } = await import("./plane");
-const { listing, PATHS, probe, snapshot, task, tasks, terminal, worktree } = await import("./testFixtures");
+const { listing, PATHS, probe, snapshot, task, tasks, terminal, worktree } = await import("./__tests__/fixtures");
 
 function workspace(size: number) {
   const items = Array.from({ length: size }, (_, index) =>

@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { applyAgentFilter, kindLabel, uniqueRowId } from "./plane";
-import { family, listing, probe, project, snapshot, task, tasks, terminal, worktree } from "./testFixtures";
+import { family, listing, probe, project, snapshot, task, tasks, terminal, worktree } from "./__tests__/fixtures";
 
 const ALPHA = "/repo/.claude/worktrees/alpha";
 const BETA = "/repo/.claude/worktrees/beta";

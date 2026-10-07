@@ -5,7 +5,7 @@ import { unknownFacts } from "../repos/facts";
 import { WATCH_ACTIVE } from "../repos/watchState";
 import { agentCheckoutCount } from "../work/projection";
 import { applyAgentFilter, liveAgentCount, planeHeadline } from "./plane";
-import { listing, probe, project, snapshot, tasks, task, terminal, worktree } from "./testFixtures";
+import { listing, probe, project, snapshot, tasks, task, terminal, worktree } from "./__tests__/fixtures";
 
 /**
  * Three surfaces count agents, and they count two different things:

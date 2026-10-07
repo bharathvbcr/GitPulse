@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import type { WorktreeSummary } from "../insights/types";
 import { applyAgentFilter, liveAgentCount, projectAgentPlane, type PlaneProbe, type PlaneTask, type PlaneTerminal } from "./plane";
-import { listing, PATHS, snapshot } from "./testFixtures";
+import { listing, PATHS, snapshot } from "./__tests__/fixtures";
 
 /**
  * Attribution rules under generated workspaces: several repositories, each

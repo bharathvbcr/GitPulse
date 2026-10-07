@@ -3,7 +3,7 @@
  * imports this file.
  */
 
-import type { InsightsSnapshot, WorktreeSummary } from "../insights/types";
+import type { InsightsSnapshot, WorktreeSummary } from "../../insights/types";
 import {
   projectAgentPlane,
   type PlaneInput,
@@ -11,7 +11,7 @@ import {
   type PlaneTask,
   type PlaneTerminal,
   type TaskProbe,
-} from "./plane";
+} from "../plane";
 
 export const PATHS = { caseInsensitive: false };
 
