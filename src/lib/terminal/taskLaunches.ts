@@ -37,6 +37,8 @@ export interface TaskTerminalRequest {
   title: string;
   resume?: ResumeLaunch;
   attach?: { sessionId: string };
+  /** See `TaskLaunch.startDir`: where below `repoPath` the work ran. */
+  startDir?: string;
 }
 const pending = writable<TaskTerminalRequest[]>([]);
 export const taskTerminalRequests = { subscribe: pending.subscribe };

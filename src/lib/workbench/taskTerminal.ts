@@ -26,6 +26,10 @@ import { handOverDetachedRun, isAdoptedSession } from "../terminal/detachedSessi
 import { focusTerminalSession } from "../terminal/sessionFocus";
 import { terminalSessions, type TerminalSessionRecord } from "../terminal/sessionRegistry";
 import { findConversation, type TaskRun } from "./client";
+import { resolveGitRoot } from "../desktop/nativeShell";
+import { identityKey, isCaseInsensitiveFs, normalizeRepoPath } from "../repos/paths";
+import { relativeStartDir } from "../terminal/tabs";
+import { formatError } from "../ui/formatError";
 
 /**
  * `opened`: on screen now. `started`: its checkout is open and the terminal
@@ -40,8 +44,53 @@ type RunRef = Pick<TaskRun, "id" | "cwd" | "provider" | "task_title">;
  * Starts an attempt's terminal without changing what is on screen.
  */
 export async function startTaskTerminal(run: RunRef): Promise<TaskTerminalOutcome> {
-  queueAttempt(run);
-  return (await repoStore.openRepo(run.cwd, backgroundOpen())) ? "started" : "queued";
+  const place = await checkoutFor(run.cwd);
+  queueAttempt(run, place);
+  return (await repoStore.openRepo(place.root, backgroundOpen())) ? "started" : "queued";
+}
+
+/** The checkout a directory belongs to, and where below its root the directory is. */
+interface Placement {
+  root: string;
+  startDir?: string;
+}
+
+/**
+ * Finds the checkout that holds `cwd`, through the same native walk a dropped
+ * folder uses (`find_git_root`).
+ *
+ * An attempt's directory need not be a checkout root, and the repository
+ * store opens only roots: opening a subdirectory was refused every time, so
+ * the launch reported "queued" and waited for a tab that could never open.
+ * When no checkout holds the directory at all, that is said now, and nothing
+ * is queued — a request nothing can ever take is not "waiting".
+ *
+ * `exact` asks for the subdirectory to be known exactly (a resumed
+ * conversation must start where it ran). When the host's canonical root and
+ * the recorded directory are spelled through different links, the relative
+ * part cannot be read off the two strings, and that is refused rather than
+ * guessed.
+ */
+async function checkoutFor(cwd: string, exact = false): Promise<Placement> {
+  let root: string;
+  try {
+    root = await resolveGitRoot(cwd);
+  } catch (cause) {
+    throw new Error(`No Git checkout contains ${cwd}, so its terminal cannot start. ${formatError(cause)}`);
+  }
+  const options = { caseInsensitive: isCaseInsensitiveFs() };
+  const rootKey = identityKey(root, options);
+  const cwdKey = identityKey(cwd, options);
+  if (!rootKey) throw new Error(`No Git checkout contains ${cwd}, so its terminal cannot start.`);
+  if (cwdKey === rootKey) return { root };
+  const normalizedRoot = normalizeRepoPath(root) ?? root;
+  const normalizedCwd = normalizeRepoPath(cwd) ?? cwd;
+  const startDir = cwdKey.startsWith(`${rootKey}/`) ? relativeStartDir(normalizedCwd.slice(normalizedRoot.length + 1)) : null;
+  if (startDir) return { root, startDir };
+  if (exact) {
+    throw new Error(`${cwd} is inside the checkout ${root}, but under a different spelling of its path, so the conversation cannot be started where it ran.`);
+  }
+  return { root };
 }
 
 /**
@@ -73,8 +122,9 @@ export async function showTaskTerminal(run: RunRef): Promise<TaskTerminalOutcome
     const focused = await focusTerminalSession(live);
     if (focused.ok) return "opened";
   }
-  queueAttempt(run);
-  return showCheckout(run.cwd);
+  const place = await checkoutFor(run.cwd);
+  queueAttempt(run, place);
+  return showCheckout(place.root);
 }
 
 /** Which way a resumed conversation should arrive. */
@@ -94,21 +144,23 @@ export async function resumeTaskConversation(
 ): Promise<{ outcome: TaskTerminalOutcome } | { outcome: "unavailable"; reason: string }> {
   const conversation = await findConversation(run.id);
   if (!conversation.resumable) return { outcome: "unavailable", reason: conversation.reason };
-  const request: TaskTerminalRequest = {
-    runId: run.id,
-    repoPath: conversation.cwd,
-    provider: "claude",
-    title: run.task_title,
-    resume: { sessionId: conversation.sessionId, mode: conversation.mode, runId: run.id },
-  };
   if (disposition === "show") {
     const live = get(terminalSessions).find((record) => record.continuesRunId === run.id && record.reveal);
     if (live && (await focusTerminalSession(live)).ok) return { outcome: "opened" };
-    enqueueTaskTerminal(request);
-    return { outcome: await showCheckout(conversation.cwd) };
   }
+  // Exact: Claude Code keeps the conversation under the directory it ran in.
+  const place = await checkoutFor(conversation.cwd, true);
+  const request: TaskTerminalRequest = {
+    runId: run.id,
+    repoPath: place.root,
+    provider: "claude",
+    title: run.task_title,
+    resume: { sessionId: conversation.sessionId, mode: conversation.mode, runId: run.id },
+    ...(place.startDir ? { startDir: place.startDir } : {}),
+  };
   enqueueTaskTerminal(request);
-  return { outcome: (await repoStore.openRepo(conversation.cwd, backgroundOpen())) ? "started" : "queued" };
+  if (disposition === "show") return { outcome: await showCheckout(place.root) };
+  return { outcome: (await repoStore.openRepo(place.root, backgroundOpen())) ? "started" : "queued" };
 }
 
 /**
@@ -122,8 +174,11 @@ function liveAttemptSession(runId: string): TerminalSessionRecord | undefined {
   );
 }
 
-function queueAttempt(run: RunRef): void {
-  enqueueTaskTerminal({ runId: run.id, repoPath: run.cwd, provider: run.provider, title: run.task_title });
+function queueAttempt(run: RunRef, place: Placement): void {
+  enqueueTaskTerminal({
+    runId: run.id, repoPath: place.root, provider: run.provider, title: run.task_title,
+    ...(place.startDir ? { startDir: place.startDir } : {}),
+  });
   // A session a reloaded page left running for this attempt gives up its
   // adopted record now, before the tab that takes the same process over
   // reserves a slot. Queued first, so the request that stands is this one.

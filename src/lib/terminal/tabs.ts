@@ -73,7 +73,29 @@ export interface ResumeLaunch {
  * A task attempt's terminal; with `resume`, its conversation resumed; with
  * `attach`, a session a reloaded page left running, shown again.
  */
-export interface TaskLaunch { runId: string; title: string; resume?: ResumeLaunch; attach?: { sessionId: string } }
+export interface TaskLaunch {
+  runId: string;
+  title: string;
+  resume?: ResumeLaunch;
+  attach?: { sessionId: string };
+  /**
+   * Checkout-relative directory the work ran in, when that is below the
+   * checkout's root. A resumed Claude Code conversation is kept under the
+   * directory it ran in, so it has to start there to be found.
+   */
+  startDir?: string;
+}
+
+/**
+ * A checkout-relative start directory the host will accept, or null for the
+ * root: one that climbs or is absolute is refused there, so it is not
+ * offered here either.
+ */
+export function relativeStartDir(dir: string | null | undefined): string | null {
+  if (!dir || dir === ".") return null;
+  if (/^([\\/]|[A-Za-z]:)/.test(dir) || dir.split(/[\\/]/).includes("..")) return null;
+  return dir;
+}
 
 const CANONICAL_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
@@ -189,6 +211,9 @@ export function openTab(state: TabState, launcher: LauncherKind, launch?: string
     tab.resume = { ...task.resume, runId: task.runId };
     tab.name = `${task.title} (resumed)`;
   } else if (task) { tab.taskRunId = task.runId; tab.name = task.title; }
+  // A taken-over session is already running wherever it runs.
+  const startDir = task && !task.attach ? relativeStartDir(task.startDir) : null;
+  if (startDir) tab.startDir = startDir;
   return { tabs: [...state.tabs, tab], activeId: tab.id };
 }
 

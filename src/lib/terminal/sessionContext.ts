@@ -11,6 +11,7 @@
  */
 
 import type { TerminalContext } from "./runResult";
+import { relativeStartDir } from "./tabs";
 export type { TerminalContext };
 
 const MAX_FIELD = 4096;
@@ -40,10 +41,7 @@ export function parseTerminalContext(raw: unknown): TerminalContext | null {
  * one the backend would accept, so it is not offered.
  */
 export function startDirFrom(context: TerminalContext | null): string | null {
-  const dir = context?.repo_dir;
-  if (!dir) return null;
-  if (dir.startsWith("/") || dir.split(/[\\/]/).includes("..")) return null;
-  return dir;
+  return relativeStartDir(context?.repo_dir);
 }
 
 /** What the panel knows about a tab whose process *is* an agent CLI. */
