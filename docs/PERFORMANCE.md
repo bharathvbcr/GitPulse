@@ -254,6 +254,44 @@ canary could not be evaluated in this pass: the in-app browser repeatedly
 returned `target closed while handling command`, and Chrome automation was
 unavailable. That is an unavailable check, not a passing canary.
 
+**Browser harnesses, 2026-10-07** (Chromium in the desktop app's browser pane,
+`bunx vite --config vite.harness.config.ts`; the harness served the main
+checkout, which then held another session's uncommitted workbench edits):
+
+- `harness/responsiveness.html`: the deliberate 900 ms block was reported as
+  `1 delayed UI timer sample(s); max_delay_ms=404`. The probe measures timer
+  lateness, not the block's length; the detector is live.
+- Stress canary (`harness/stress.html`, `tabs=5`, `cycles=12` — a short run,
+  not the 40–45-cycle sweep): `LoopCanary` tripped first (`depth=1`,
+  `effect_update_depth_exceeded`; it needs at least two tabs, and at `tabs=1`
+  it reads 0, which is a dead detector, not a pass). Then, each with
+  `depthExceeded=0`, `mountError=null`, `otherCrashes=[]`: `PulseView/chaos`,
+  `StoragePanel/switch`, `HealthPanel/chaos`, `CoverageViewer/chaos`,
+  `FleetView/chaos`, `StatusBar/chaos`.
+- **Not clean:** `ManviOpsPanel/chaos` reported `otherCrashes: ["TypeError:
+  Cannot read properties of undefined (reading 'unregisterListener')"]` —
+  probably the harness's Tauri event mock lacking unlisten internals, but not
+  established, so this component is unexamined, not clean.
+- **Did not arm:** `TerminalPanel/termtabs` ended with 0 terminal tabs and 0
+  xterm screens. The harness mounts the panel with no repository ("Open a
+  repository to start a shell") and the scenario's opener filter skips buttons
+  with an `aria-label`, which the launcher now has. No terminal tab was ever
+  opened, so its `depthExceeded=0` says nothing.
+
+**Installed build, not measured.** Native WKWebView frame pacing, cold/warm
+navigation, idle CPU/memory and the eight-hour soak were not run: the release
+build was not installed over the user's app (their choice), and no number here
+stands in for them. `scripts/native-sample.mjs` records the installed app's
+resident memory and CPU over a soak (`--duration 8h --interval 60 --out
+soak.jsonl`) and prints the least-squares memory slope. It keeps the app, its
+bundled helpers and the processes it hosts (agent CLIs and shells in terminal
+tabs) apart, and it cannot see the WKWebView content processes, which launchd
+starts. Frame pacing comes from the app's own responsiveness monitor
+(`performance:ui` entries in the diagnostics log during the soak); cold and
+warm navigation need a stopwatch or an instrumented build. A two-second smoke
+run against the running 1.4.0 app read 167 MiB resident for the app process —
+a wiring check, not an idle measurement: agents were working in its tabs.
+
 The semaphore saturation test initially used the global gate and interfered
 with unrelated concurrent tests. It now drives the same production runner
 with a private gate; the deadline assertion remains unchanged.
