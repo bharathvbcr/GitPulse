@@ -1,6 +1,7 @@
+import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 import type { ChangeKind, RepoChange } from "./events";
-import { readRepoChange, routeRepoChange } from "./changeScope";
+import { CHANGE_KINDS, readRepoChange, routeRepoChange } from "./changeScope";
 
 const REPO = "/repos/app";
 
@@ -56,6 +57,22 @@ describe("routing a repository change to the views that depend on it", () => {
 
   it("a pathless event still refreshes the current repository's state", () => {
     expect(route(change(["worktree"]), false, null)).toEqual(["state:current"]);
+  });
+});
+
+describe("the kind list is the watcher's", () => {
+  it("names every ChangeKind variant the Rust watcher can emit, and no other", () => {
+    // Transcribed, so derived here rather than trusted: a variant added in Rust
+    // and missed here would make every event carrying it read as no
+    // information — safe, but every view would refresh on it forever.
+    const rust = readFileSync(new URL("../../../src-tauri/src/watcher/mod.rs", import.meta.url), "utf8");
+    const body = /pub enum ChangeKind \{([\s\S]*?)\n\}/.exec(rust)?.[1];
+    expect(body, "ChangeKind not found in watcher/mod.rs").toBeDefined();
+    const variants = [...(body ?? "").matchAll(/^\s{4}([A-Z][A-Za-z]*),$/gm)].map((m) =>
+      m[1].replace(/([a-z])([A-Z])/g, "$1_$2").toLowerCase(),
+    );
+    expect(variants.length).toBeGreaterThan(0);
+    expect([...CHANGE_KINDS].sort()).toEqual(variants.sort());
   });
 });
 

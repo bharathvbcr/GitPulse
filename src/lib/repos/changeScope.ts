@@ -30,9 +30,12 @@ import type { ChangeKind, RepoChange } from "./events";
 
 export type ChangeDependency = (change: RepoChange) => boolean;
 
-const KINDS: ReadonlySet<string> = new Set<ChangeKind>([
+/** Every kind this build understands; checked against `ChangeKind` in Rust. */
+export const CHANGE_KINDS: readonly ChangeKind[] = [
   "refs", "index", "config", "ignore", "objects", "git_state", "worktree", "documents", "unknown",
-]);
+];
+
+const KINDS: ReadonlySet<string> = new Set(CHANGE_KINDS);
 
 function isChangeKind(value: unknown): value is ChangeKind {
   return typeof value === "string" && KINDS.has(value);
