@@ -60,7 +60,7 @@ afterEach(() => {
 
 describe("the close guard's terminal count", () => {
   it("counts a shell recorded under another spelling of the tab's checkout on a case-insensitive store", async () => {
-    const slot = terminalSessions.reserve({ key: "identity-a", repoPath: "/R/Alpha", label: "Shell", status: "running" });
+    const slot = terminalSessions.reserve({ key: "identity-a", repoPath: "/R/Alpha", label: "Shell", status: "running", close: async () => {} });
     release = () => slot.release();
     const store = makeStore(true);
     await store.openRepo("/r/alpha");
@@ -72,7 +72,7 @@ describe("the close guard's terminal count", () => {
   });
 
   it("does not count it on a case-sensitive store, where they are two checkouts", async () => {
-    const slot = terminalSessions.reserve({ key: "identity-b", repoPath: "/R/Alpha", label: "Shell", status: "running" });
+    const slot = terminalSessions.reserve({ key: "identity-b", repoPath: "/R/Alpha", label: "Shell", status: "running", close: async () => {} });
     release = () => slot.release();
     const store = makeStore(false);
     await store.openRepo("/r/alpha");
