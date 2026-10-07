@@ -79,7 +79,10 @@
           if (scenario === "unavailable") throw new Error("Fixture overlap scan unavailable");
           return { ok: scenario !== "partial", error: scenario === "partial" ? "Fixture one worktree inaccessible" : "", overlapping_files: scenario === "partial" ? 1 : 0, worktrees_involved: scenario === "partial" ? 2 : 0,
             scanned_worktrees: worktrees.length, unscanned_worktrees: 0, failed_worktrees: scenario === "partial" ? 1 : 0,
-            truncated: false, items: scenario === "partial" ? [{ path: "shared-overlap.ts", worktrees: worktrees.slice(0, 2).map(w => ({ path: w.path, branch: w.branch, agent_kind: "" })) }] : [] };
+            truncated: false, items: scenario === "partial" ? [{ path: "shared-overlap.ts", worktrees: worktrees.slice(0, 2).map(w => ({ path: w.path, branch: w.branch, agent_kind: "" })) }] : [],
+            shared_worktree_files: scenario === "partial" ? 2 : 0, sessions_ok: false, sessions_error: "codex: not observable",
+            shared_worktrees: scenario === "partial" ? [{ path: root, branch: "main", scanned: true, truncated: false, files: ["src/a.ts", "src/b.ts"],
+              sessions: [11, 12].map(pid => ({ kind: "claude", pid, entrypoint: "cli", status: "busy", cwd: root })) }] : [] };
         },
       };
       if (scenario === "failed") {
@@ -134,6 +137,7 @@
               check("both truncations surfaced", target.textContent.includes("pull request list truncated") && target.textContent.includes("workflow run list truncated"));
               check("failed overlap probes surfaced", target.textContent.includes("1 failed"));
               check("known overlaps remain visible after another probe fails", target.textContent.includes("shared-overlap.ts"));
+              check("two live sessions in one worktree are surfaced", target.textContent.includes("Live agent sessions are sharing a worktree") && target.textContent.includes("2 sessions") && target.textContent.includes("2 dirty files"));
               check("actual workflow outcome shown", target.textContent.includes("Build: failure"));
             } else if (scenario === "failed") {
               check("failed sources do not claim nothing is in flight", target.textContent.includes("Workspace data unavailable") && !target.textContent.includes("Nothing in flight"));

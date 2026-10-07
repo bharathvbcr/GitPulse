@@ -48,7 +48,7 @@ export function snapshot(fields: Partial<InsightsSnapshot> = {}): InsightsSnapsh
     branch_ok: true,
     deadline_expired: false,
     duration_ms: 1,
-    agents: { ok: true, sessions, kinds: [], truncated: false },
+    agents: { ok: true, sessions, kinds: [], truncated: false, live: { ok: true, sessions: 0, kinds: [], worktrees: [] } },
     changes: {
       ok: true, error: "", files: 0, staged: 0, unstaged: 0, untracked: 0, conflicted: 0,
       additions: 0, deletions: 0, churn_warnings: 0, churn_overflowed: false, truncated: false,
@@ -56,6 +56,7 @@ export function snapshot(fields: Partial<InsightsSnapshot> = {}): InsightsSnapsh
     collisions: {
       ok: true, error: "", overlapping_files: 0, worktrees_involved: 0, scanned_worktrees: 1,
       unscanned_worktrees: 0, failed_worktrees: 0, truncated: false, items: [],
+      shared_worktree_files: 0, shared_worktrees: [], sessions_ok: true, sessions_error: "",
     },
     ledger: { recording: true, path: "", dropped: 0, error: "", error_code: "" },
     codeintel: { available: false, db_path: "" },

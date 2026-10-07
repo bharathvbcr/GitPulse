@@ -44,14 +44,14 @@ function snapshot(fields: Partial<InsightsSnapshot> = {}): InsightsSnapshot {
     branch_ok: true,
     deadline_expired: false,
     duration_ms: 1,
-    agents: { ok: true, sessions: 1, kinds: [{ kind: "claude", sessions: 1 }], truncated: false },
+    agents: { ok: true, sessions: 1, kinds: [{ kind: "claude", sessions: 1 }], truncated: false, live: { ok: true, sessions: 0, kinds: [], worktrees: [] } },
     changes: {
       ok: true, error: "", files: 0, staged: 0, unstaged: 0, untracked: 0, conflicted: 0,
       additions: 0, deletions: 0, churn_warnings: 0, churn_overflowed: false, truncated: false,
     },
     collisions: {
       ok: true, error: "", overlapping_files: 0, worktrees_involved: 0, scanned_worktrees: 1,
-      unscanned_worktrees: 0, failed_worktrees: 0, truncated: false, items: [],
+      unscanned_worktrees: 0, failed_worktrees: 0, truncated: false, shared_worktree_files: 0, shared_worktrees: [], sessions_ok: true, sessions_error: "", items: [],
     },
     ledger: { recording: true, path: "", dropped: 0, error: "", error_code: "" },
     codeintel: { available: false, db_path: "" },
@@ -233,7 +233,7 @@ describe("projectAgentPlane", () => {
         snapshot: snapshot({
           collisions: {
             ok: true, error: "", overlapping_files: 0, worktrees_involved: 0, scanned_worktrees: 0,
-            unscanned_worktrees: 2, failed_worktrees: 0, truncated: false, items: [],
+            unscanned_worktrees: 2, failed_worktrees: 0, truncated: false, shared_worktree_files: 0, shared_worktrees: [], sessions_ok: true, sessions_error: "", items: [],
           },
         }),
       })],
@@ -255,10 +255,10 @@ describe("projectAgentPlane", () => {
               worktree({ path: "/repo/.claude/worktrees/beta", session_slug: "beta", name: "beta" }),
             ],
           },
-          agents: { ok: true, sessions: 2, kinds: [], truncated: false },
+          agents: { ok: true, sessions: 2, kinds: [], truncated: false, live: { ok: true, sessions: 0, kinds: [], worktrees: [] } },
           collisions: {
             ok: true, error: "", overlapping_files: 1, worktrees_involved: 1, scanned_worktrees: 2,
-            unscanned_worktrees: 0, failed_worktrees: 0, truncated: false,
+            unscanned_worktrees: 0, failed_worktrees: 0, truncated: false, shared_worktree_files: 0, shared_worktrees: [], sessions_ok: true, sessions_error: "",
             items: [{ path: "a.ts", worktrees: [{ path: "/repo/.claude/worktrees/alpha", branch: null, agent_kind: "claude" }] }],
           },
         }),
@@ -274,7 +274,7 @@ describe("projectAgentPlane", () => {
   it("treats a capped agent list as a floor, not as the rows it managed to return", () => {
     const plane = project({
       probes: [probe({
-        snapshot: snapshot({ agents: { ok: true, sessions: 9, kinds: [], truncated: true } }),
+        snapshot: snapshot({ agents: { ok: true, sessions: 9, kinds: [], truncated: true, live: { ok: true, sessions: 0, kinds: [], worktrees: [] } } }),
       })],
     });
     expect(plane.rows[0].parallelCount).toBe(9);
@@ -286,7 +286,7 @@ describe("projectAgentPlane", () => {
   it("does not turn an unread agent summary into zero sessions", () => {
     const plane = project({
       probes: [probe({
-        snapshot: snapshot({ agents: { ok: false, sessions: 0, kinds: [], truncated: false } }),
+        snapshot: snapshot({ agents: { ok: false, sessions: 0, kinds: [], truncated: false, live: { ok: true, sessions: 0, kinds: [], worktrees: [] } } }),
       })],
     });
     expect(plane.rows[0].parallelCount).toBe(1);
@@ -404,7 +404,7 @@ describe("projectAgentPlane", () => {
             ok: true, error: "", count: items.length, scanned: items.length, dirty: 0, dirty_unknown: 0,
             blocked: 0, blocked_unknown: 0, truncated: false, items,
           },
-          agents: { ok: true, sessions: items.length, kinds: [], truncated: false },
+          agents: { ok: true, sessions: items.length, kinds: [], truncated: false, live: { ok: true, sessions: 0, kinds: [], worktrees: [] } },
         }),
       })],
     });
@@ -437,7 +437,7 @@ describe("projectAgentPlane", () => {
   it("agrees on the parallel count for a live process in the same repository", () => {
     const plane = project({
       probes: [probe({
-        snapshot: snapshot({ agents: { ok: true, sessions: 4, kinds: [], truncated: false } }),
+        snapshot: snapshot({ agents: { ok: true, sessions: 4, kinds: [], truncated: false, live: { ok: true, sessions: 0, kinds: [], worktrees: [] } } }),
       })],
       terminals: [terminal({ cwd: "/repo", repoPath: "/repo", label: "Claude", title: "main tree" })],
     });

@@ -38,7 +38,7 @@ const FACETS: &[Facet] = &[
     Facet {
         name: "insights",
         title: "Repository insights",
-        description: "Worktrees, agent sessions, uncommitted changes, overlapping dirty files, ledger and code-graph availability. Facets fail independently, so a missed scan is reported rather than read as clean.",
+        description: "Worktrees, agent sessions (running sessions per worktree path), uncommitted changes, overlapping dirty files, ledger and code-graph availability. Facets fail independently, so a missed scan is reported rather than read as clean.",
     },
     Facet {
         name: "status",
@@ -48,7 +48,7 @@ const FACETS: &[Facet] = &[
     Facet {
         name: "collisions",
         title: "Collision risk",
-        description: "Files with uncommitted changes in more than one worktree. Unscanned worktrees are counted, never implied clean.",
+        description: "Files with uncommitted changes in more than one worktree, and dirty files in any worktree two or more live agent sessions share. Unscanned worktrees are counted, never implied clean.",
     },
     Facet {
         name: "changes",

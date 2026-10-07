@@ -6,6 +6,7 @@
 //! nothing. Nothing here mutates a repository.
 
 mod entity_collision;
+mod live_sessions;
 
 pub use entity_collision::{
     classify_overlapping_path, classify_party_symbols, parse_old_side_ranges,
@@ -67,14 +68,73 @@ pub struct AgentKindCount {
     pub sessions: u32,
 }
 
+/// One running agent session, as its agent registered it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LiveSession {
+    pub kind: String,
+    pub pid: u32,
+    /// How the session was started (`cli`, `claude-desktop`, …), verbatim
+    /// from the agent; empty when it did not say.
+    pub entrypoint: String,
+    /// The agent's own last-reported state (`busy`, `idle`, …), verbatim.
+    pub status: String,
+    pub cwd: String,
+}
+
+/// The live sessions whose working directory is inside one worktree.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LiveWorktree {
+    pub path: String,
+    pub sessions: Vec<LiveSession>,
+}
+
+/// What one agent kind's detector established for this repository.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LiveKindStatus {
+    pub kind: String,
+    /// Whether this kind's sessions could be observed at all. `sessions: 0`
+    /// with `ok: false` is "unknown", never "none running".
+    pub ok: bool,
+    pub error: String,
+    /// Live sessions of this kind attributed to a worktree of this repository.
+    pub sessions: u32,
+    /// Registry entries that may be live sessions here but could not be
+    /// verified (unreadable, or the process could not be judged). Non-zero
+    /// makes `sessions` a floor.
+    pub unverified: u32,
+    /// True when the registry held more entries than one probe reads.
+    pub truncated: bool,
+}
+
+/// Running agent sessions, attributed to worktree paths.
+///
+/// This is the half [`AgentSummary::sessions`] cannot see: that count is of
+/// worktrees laid out for an agent, so several sessions in one checkout —
+/// the main one included — read as one, or as none.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LiveSessionFacet {
+    /// True only when every kind was observed, completely and verifiably.
+    pub ok: bool,
+    /// Live sessions attributed to this repository, over the kinds that could
+    /// be observed. A floor whenever `ok` is false.
+    pub sessions: u32,
+    pub kinds: Vec<LiveKindStatus>,
+    /// Worktrees with at least one live session.
+    pub worktrees: Vec<LiveWorktree>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentSummary {
     /// Whether the worktree listing these counts are derived from ran at all.
     /// Zero sessions with `ok: false` is "we could not look", which must never
     /// render as "no agent sessions running".
     pub ok: bool,
+    /// Worktrees laid out for an agent (`.<agent>/worktrees/<slug>`), counted
+    /// by layout. Not a count of running sessions — see `live` for those.
     pub sessions: u32,
     pub kinds: Vec<AgentKindCount>,
+    /// Running sessions per worktree path, from each agent's own registry.
+    pub live: LiveSessionFacet,
     /// True when these numbers came from a capped sample of the repository's
     /// worktrees rather than all of them.
     ///
@@ -150,6 +210,24 @@ pub struct CollisionItem {
     pub entity: Option<EntityCollisionVerdict>,
 }
 
+/// One worktree with two or more live agent sessions in it, and the files
+/// dirty there. Those sessions share one index and one working tree, so every
+/// one of these files is open to both of them; which session dirtied which
+/// is not something git records.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SharedWorktree {
+    pub path: String,
+    pub branch: Option<String>,
+    pub sessions: Vec<LiveSession>,
+    /// Dirty paths, repo-relative. Empty with `scanned: false` is "not
+    /// looked at", not "nothing dirty".
+    pub files: Vec<String>,
+    /// Whether this worktree's dirty files were read.
+    pub scanned: bool,
+    /// True when `files` stopped at the per-worktree path cap.
+    pub truncated: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CollisionRisk {
     /// True only when every worktree this scan targeted was read. A scan that
@@ -169,6 +247,17 @@ pub struct CollisionRisk {
     pub failed_worktrees: u32,
     pub truncated: bool,
     pub items: Vec<CollisionItem>,
+    /// Dirty files in worktrees that two or more live sessions share — the
+    /// collision `overlapping_files` cannot see, because it compares
+    /// worktrees and these sessions are in one.
+    pub shared_worktree_files: u32,
+    pub shared_worktrees: Vec<SharedWorktree>,
+    /// Whether every agent kind's live sessions could be observed. False
+    /// means a worktree shared with an unobservable session is missing from
+    /// `shared_worktrees`, so its emptiness is not a clean result.
+    pub sessions_ok: bool,
+    /// Why `sessions_ok` is false: each kind that could not be observed.
+    pub sessions_error: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -306,11 +395,12 @@ fn empty_worktrees(error: impl Into<String>) -> WorktreeFacet {
 }
 
 /// Agent counts from a listing that never ran.
-fn unknown_agents() -> AgentSummary {
+fn unknown_agents(error: &str) -> AgentSummary {
     AgentSummary {
         ok: false,
         sessions: 0,
         kinds: Vec::new(),
+        live: live_sessions::unattributed(error),
         // Not "we saw everything there was": `ok: false` already says the
         // listing never ran, and claiming a complete sample on top of that
         // would be a second false statement rather than a safer default.
@@ -336,9 +426,10 @@ fn empty_changes(error: impl Into<String>) -> ChangesFacet {
 }
 
 fn empty_collisions(error: impl Into<String>) -> CollisionRisk {
+    let error = error.into();
     CollisionRisk {
         ok: false,
-        error: error.into(),
+        error: error.clone(),
         overlapping_files: 0,
         worktrees_involved: 0,
         scanned_worktrees: 0,
@@ -346,7 +437,33 @@ fn empty_collisions(error: impl Into<String>) -> CollisionRisk {
         failed_worktrees: 0,
         truncated: false,
         items: Vec::new(),
+        shared_worktree_files: 0,
+        shared_worktrees: Vec::new(),
+        sessions_ok: false,
+        sessions_error: error,
     }
+}
+
+/// Every kind that could not be fully observed, and why, as one sentence.
+fn sessions_error(live: &LiveSessionFacet) -> String {
+    live.kinds
+        .iter()
+        .filter_map(|k| {
+            if !k.ok {
+                Some(format!("{}: {}", k.kind, k.error))
+            } else if k.truncated {
+                Some(format!("{}: registry truncated", k.kind))
+            } else if k.unverified > 0 {
+                Some(format!(
+                    "{}: {} session(s) unverified",
+                    k.kind, k.unverified
+                ))
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
 }
 
 /// A file list from a read that failed. Zero files with `ok: false` is "we
@@ -420,7 +537,12 @@ fn summarise_worktree(
 /// with no agents are the same input and must not be the same answer; and a
 /// slice that is all of a repository's worktrees is indistinguishable here
 /// from the first 64 of 300, which is why the caller has to say which it is.
-fn agent_summary(ok: bool, truncated: bool, items: &[WorktreeSummary]) -> AgentSummary {
+fn agent_summary(
+    ok: bool,
+    truncated: bool,
+    items: &[WorktreeSummary],
+    live: LiveSessionFacet,
+) -> AgentSummary {
     let mut counts: Vec<AgentKindCount> = Vec::new();
     for item in items {
         if item.agent_kind.is_empty() {
@@ -440,6 +562,7 @@ fn agent_summary(ok: bool, truncated: bool, items: &[WorktreeSummary]) -> AgentS
         ok,
         sessions,
         kinds: counts,
+        live,
         truncated,
     }
 }
@@ -613,9 +736,31 @@ pub fn snapshot(repo_path: &str) -> InsightsSnapshot {
 /// repository. Sixty-five real worktrees to prove one boolean would be a slow,
 /// load-sensitive test of git rather than of this function.
 fn snapshot_within(repo_path: &str, deadline: Duration, max_worktrees: usize) -> InsightsSnapshot {
+    snapshot_observed(
+        repo_path,
+        deadline,
+        max_worktrees,
+        &live_sessions::observe(),
+    )
+}
+
+/// [`snapshot_within`] over a live-session observation the caller made, so a
+/// test can place sessions without running agents.
+fn snapshot_observed(
+    repo_path: &str,
+    deadline: Duration,
+    max_worktrees: usize,
+    observation: &live_sessions::Observation,
+) -> InsightsSnapshot {
     let started = Instant::now();
     let listed = worktree::list_worktrees_scanned(repo_path, ScanDepth::Dirty);
     let mut deadline_expired = false;
+    // Attributed over the whole listing, not the capped summaries: a session
+    // in the 65th worktree is still a session in this repository.
+    let live = match &listed {
+        Ok(list) => live_in(observation, list),
+        Err(error) => live_sessions::unattributed(error),
+    };
     let (worktrees, agents) = match &listed {
         Ok(list) => {
             let truncated = list.len() > max_worktrees;
@@ -639,10 +784,10 @@ fn snapshot_within(repo_path: &str, deadline: Duration, max_worktrees: usize) ->
             // The same `truncated` the facet carries: these counts are rolled
             // from `facet.items`, which is the capped list, so a repository
             // past the cap must not report its floor as an exact count.
-            let agents = agent_summary(true, truncated, &facet.items);
+            let agents = agent_summary(true, truncated, &facet.items, live.clone());
             (facet, agents)
         }
-        Err(error) => (empty_worktrees(error.clone()), unknown_agents()),
+        Err(error) => (empty_worktrees(error.clone()), unknown_agents(error)),
     };
 
     let changes = match GitReader::get_status(repo_path) {
@@ -668,7 +813,7 @@ fn snapshot_within(repo_path: &str, deadline: Duration, max_worktrees: usize) ->
                 // one: `ok: false` with a reason, never `overlapping_files: 0`.
                 empty_collisions("the snapshot ran out of time before the collision scan")
             } else {
-                collision_from_list(list)
+                collision_from_list(list, &live)
             }
         }
         Err(error) => empty_collisions(error.clone()),
@@ -1026,6 +1171,7 @@ pub struct FleetSnapshot {
 }
 
 fn unreadable_facet(repo_path: &str, error: String) -> FleetRepoFacet {
+    let agents = unknown_agents(&error);
     FleetRepoFacet {
         repo_path: repo_path.to_string(),
         ok: false,
@@ -1033,7 +1179,7 @@ fn unreadable_facet(repo_path: &str, error: String) -> FleetRepoFacet {
         worktrees_ok: false,
         worktrees_error: String::new(),
         worktrees: 0,
-        agents: unknown_agents(),
+        agents,
         last_commit_ok: false,
         last_commit_epoch: 0,
         commits_ok: false,
@@ -1072,7 +1218,12 @@ fn last_commit_epoch(repo: &Path) -> Result<i64, String> {
 /// repository, twenty-four rows would carry twenty-four slightly different
 /// anchors and their series could no longer be summed bucket for bucket —
 /// which is exactly what the fleet-wide activity chart does with them.
-fn fleet_facet(repo_path: &str, anchor_epoch: i64, window_days: u32) -> FleetRepoFacet {
+fn fleet_facet(
+    repo_path: &str,
+    anchor_epoch: i64,
+    window_days: u32,
+    observation: &live_sessions::Observation,
+) -> FleetRepoFacet {
     let repo = match validate_repo(repo_path) {
         Ok(path) => path,
         Err(error) => return unreadable_facet(repo_path, error),
@@ -1096,10 +1247,13 @@ fn fleet_facet(repo_path: &str, anchor_epoch: i64, window_days: u32) -> FleetRep
                     // `list_worktrees_lite` returns every worktree — the cost
                     // this facet avoids is the per-worktree `git status`, not
                     // the listing — so this sample is complete.
-                    agent_summary(true, false, &items),
+                    agent_summary(true, false, &items, live_in(observation, &list)),
                 )
             }
-            Err(error) => (false, error, 0, unknown_agents()),
+            Err(error) => {
+                let agents = unknown_agents(&error);
+                (false, error, 0, agents)
+            }
         };
 
     let (commits_ok, commits_error, commits) =
@@ -1176,6 +1330,9 @@ pub fn fleet_snapshot(repo_paths: &[String], window_days: Option<u32>) -> FleetS
     let over_cap = targets.len() > MAX_FLEET_REPOS;
     targets.truncate(MAX_FLEET_REPOS);
 
+    // One look at the running agents for the whole sweep; each repository
+    // only attributes it to its own worktrees.
+    let observation = live_sessions::observe();
     let expired = AtomicBool::new(false);
     let repos: Vec<FleetRepoFacet> = targets
         .par_iter()
@@ -1186,7 +1343,7 @@ pub fn fleet_snapshot(repo_paths: &[String], window_days: Option<u32>) -> FleetS
                 // never arrive looking like one that was read and found empty.
                 return unreadable_facet(path, "the fleet sweep ran out of time".to_string());
             }
-            fleet_facet(path, anchor_epoch, window_days)
+            fleet_facet(path, anchor_epoch, window_days, &observation)
         })
         .collect();
 
@@ -1205,10 +1362,32 @@ pub fn fleet_snapshot(repo_paths: &[String], window_days: Option<u32>) -> FleetS
     }
 }
 
-fn collision_from_list(list: &[WorktreeInfo]) -> CollisionRisk {
-    let scan_targets: Vec<&WorktreeInfo> = list
+/// Live sessions attributed to the worktrees of one listing.
+fn live_in(observation: &live_sessions::Observation, list: &[WorktreeInfo]) -> LiveSessionFacet {
+    let paths: Vec<String> = list.iter().map(|w| w.path.clone()).collect();
+    live_sessions::attribute(observation, &paths)
+}
+
+/// Worktrees two or more live sessions are working in.
+fn shared_paths(live: &LiveSessionFacet) -> HashSet<&str> {
+    live.worktrees
+        .iter()
+        .filter(|w| w.sessions.len() > 1)
+        .map(|w| w.path.as_str())
+        .collect()
+}
+
+fn collision_from_list(list: &[WorktreeInfo], live: &LiveSessionFacet) -> CollisionRisk {
+    let shared = shared_paths(live);
+    // A worktree that two sessions share is scanned ahead of the cap: it is
+    // the one place a collision is already known to be possible.
+    let (first, rest): (Vec<&WorktreeInfo>, Vec<&WorktreeInfo>) = list
         .iter()
         .filter(|w| !w.is_bare)
+        .partition(|w| shared.contains(w.path.as_str()));
+    let scan_targets: Vec<&WorktreeInfo> = first
+        .into_iter()
+        .chain(rest)
         .take(MAX_COLLISION_SCANS)
         .collect();
     let unscanned = list
@@ -1227,11 +1406,15 @@ fn collision_from_list(list: &[WorktreeInfo]) -> CollisionRisk {
     let mut scanned = 0u32;
     let mut failed = 0u32;
     let mut paths_truncated = false;
+    let mut shared_scans: HashMap<&str, (Vec<String>, bool)> = HashMap::new();
     for (wt, result) in scans {
         match result {
             Ok((paths, truncated)) => {
                 scanned += 1;
                 paths_truncated |= truncated;
+                if shared.contains(wt.path.as_str()) {
+                    shared_scans.insert(wt.path.as_str(), (paths.clone(), truncated));
+                }
                 let party = CollisionParty {
                     path: wt.path.clone(),
                     branch: wt.branch.clone(),
@@ -1277,6 +1460,31 @@ fn collision_from_list(list: &[WorktreeInfo]) -> CollisionRisk {
         }
     }
 
+    let shared_worktrees: Vec<SharedWorktree> = live
+        .worktrees
+        .iter()
+        .filter(|w| w.sessions.len() > 1)
+        .map(|w| {
+            // Absent from the scans: past the cap, or its `git status` failed.
+            // Either way its files were not read, which `scanned` says.
+            let scan = shared_scans.remove(w.path.as_str());
+            let scanned = scan.is_some();
+            let (files, truncated) = scan.unwrap_or_default();
+            SharedWorktree {
+                path: w.path.clone(),
+                branch: list
+                    .iter()
+                    .find(|info| info.path == w.path)
+                    .and_then(|info| info.branch.clone()),
+                sessions: w.sessions.clone(),
+                files,
+                scanned,
+                truncated,
+            }
+        })
+        .collect();
+    let shared_worktree_files = shared_worktrees.iter().map(|w| w.files.len() as u32).sum();
+
     CollisionRisk {
         // Every attempted worktree has to have been read. The old rule —
         // "no error, OR at least one success" — let one success speak for
@@ -1296,17 +1504,33 @@ fn collision_from_list(list: &[WorktreeInfo]) -> CollisionRisk {
         failed_worktrees: failed,
         truncated,
         items,
+        shared_worktree_files,
+        shared_worktrees,
+        sessions_ok: live.ok,
+        sessions_error: sessions_error(live),
     }
 }
 
-/// Overlapping dirty files across worktrees of `repo_path`.
+/// Overlapping dirty files across worktrees of `repo_path`, and dirty files
+/// in any worktree two live agent sessions share.
 ///
 /// The porcelain path scan stays bounded and cheap. Symbol classification runs
 /// afterwards on the first overlapping path only — see
 /// [`entity_collision::enrich_first_item`].
 pub fn collision_risk(repo_path: &str) -> CollisionRisk {
+    collision_risk_observed(repo_path, &live_sessions::observe())
+}
+
+/// [`collision_risk`] over a live-session observation the caller made.
+fn collision_risk_observed(
+    repo_path: &str,
+    observation: &live_sessions::Observation,
+) -> CollisionRisk {
     match worktree::list_worktrees_lite(repo_path) {
-        Ok(list) => entity_collision::enrich_first_item(collision_from_list(&list)),
+        Ok(list) => entity_collision::enrich_first_item(collision_from_list(
+            &list,
+            &live_in(observation, &list),
+        )),
         Err(error) => empty_collisions(error),
     }
 }
@@ -1500,10 +1724,17 @@ fn collisions_involving(risk: CollisionRisk, target: &str) -> CollisionRisk {
             involved.insert(party.path.clone());
         }
     }
+    let shared_worktrees: Vec<SharedWorktree> = risk
+        .shared_worktrees
+        .into_iter()
+        .filter(|w| Path::new(&w.path) == Path::new(target))
+        .collect();
     CollisionRisk {
         overlapping_files: items.len() as u32,
         worktrees_involved: involved.len() as u32,
         items,
+        shared_worktree_files: shared_worktrees.iter().map(|w| w.files.len() as u32).sum(),
+        shared_worktrees,
         ..risk
     }
 }
@@ -1803,6 +2034,162 @@ mod tests {
         );
     }
 
+    /// A running process registered as one Claude Code session in `cwd`.
+    /// Killed when dropped, so a failing assertion leaves nothing behind.
+    struct SimulatedSession(std::process::Child);
+
+    impl Drop for SimulatedSession {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    fn simulate_session(registry: &Path, cwd: &Path) -> SimulatedSession {
+        let child = std::process::Command::new("sleep")
+            .arg("60")
+            .spawn_locked()
+            .expect("spawn a stand-in session process");
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        // The fields Claude Code writes, as observed in its registry.
+        let entry = serde_json::json!({
+            "pid": child.id(),
+            "sessionId": format!("simulated-{}", child.id()),
+            "cwd": cwd,
+            "startedAt": now_ms,
+            "kind": "interactive",
+            "entrypoint": "cli",
+            "status": "busy",
+        });
+        fs::write(
+            registry.join(format!("{}.json", child.id())),
+            entry.to_string(),
+        )
+        .unwrap();
+        SimulatedSession(child)
+    }
+
+    /// Two live sessions in one worktree, the case `overlapping_files`
+    /// cannot see: there is only one worktree, so nothing overlaps across
+    /// worktrees, and both sessions are editing the same files.
+    #[cfg(unix)]
+    #[test]
+    fn collision_risk_flags_a_file_dirty_while_two_sessions_share_one_worktree() {
+        let main = init_repo();
+        let repo = main.path().to_str().unwrap();
+        fs::write(main.path().join("shared.txt"), "edited").unwrap();
+        let registry = tempfile::TempDir::new().unwrap();
+        let _first = simulate_session(registry.path(), main.path());
+        // The second session works from a subdirectory of the same checkout.
+        fs::create_dir_all(main.path().join("src")).unwrap();
+        let _second = simulate_session(registry.path(), &main.path().join("src"));
+        let observation = live_sessions::observe_with(
+            Some(registry.path()),
+            &crate::workbench::process_birth::running_since,
+        );
+        let claude = observation.iter().find(|k| k.kind == "claude").unwrap();
+        assert_eq!(claude.live.len(), 2, "both stand-ins are alive: {claude:?}");
+
+        let risk = collision_risk_observed(repo, &observation);
+        assert!(risk.ok, "{risk:?}");
+        assert_eq!(risk.overlapping_files, 0, "one worktree overlaps nothing");
+        assert_eq!(risk.shared_worktree_files, 1, "{risk:?}");
+        let shared = &risk.shared_worktrees[0];
+        assert!(same_path(&shared.path, repo), "{shared:?}");
+        assert_eq!(shared.sessions.len(), 2, "{shared:?}");
+        assert!(shared.scanned);
+        assert_eq!(shared.files, ["shared.txt"]);
+        // Codex cannot be observed, so the same-worktree half is never
+        // reported as a clean, complete check.
+        assert!(!risk.sessions_ok);
+        assert!(
+            risk.sessions_error.contains("codex"),
+            "{}",
+            risk.sessions_error
+        );
+
+        let snap = snapshot_observed(
+            repo,
+            SNAPSHOT_DEADLINE,
+            MAX_SNAPSHOT_WORKTREES,
+            &observation,
+        );
+        assert_eq!(snap.agents.live.sessions, 2, "{:?}", snap.agents.live);
+        assert_eq!(snap.agents.live.worktrees.len(), 1);
+        assert!(same_path(&snap.agents.live.worktrees[0].path, repo));
+        assert_eq!(snap.collisions.shared_worktree_files, 1);
+        // The layout count still sees no agent worktree, which is exactly why
+        // it cannot stand for the number of running sessions.
+        assert_eq!(snap.agents.sessions, 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn one_session_per_worktree_is_not_a_shared_worktree() {
+        let main = init_repo();
+        let repo = main.path().to_str().unwrap();
+        fs::create_dir_all(main.path().join(".claude/worktrees")).unwrap();
+        let wt = main.path().join(".claude/worktrees/lane");
+        worktree::add_worktree(
+            repo,
+            wt.to_str().unwrap(),
+            Some("lane"),
+            Some("main"),
+            false,
+        )
+        .expect("add worktree");
+        crate::test_support::trust_repo(&wt);
+        fs::write(main.path().join("shared.txt"), "edited").unwrap();
+        let registry = tempfile::TempDir::new().unwrap();
+        let _main_session = simulate_session(registry.path(), main.path());
+        let _lane_session = simulate_session(registry.path(), &wt);
+        let observation = live_sessions::observe_with(
+            Some(registry.path()),
+            &crate::workbench::process_birth::running_since,
+        );
+
+        let risk = collision_risk_observed(repo, &observation);
+        assert!(risk.ok, "{risk:?}");
+        assert!(risk.shared_worktrees.is_empty(), "{risk:?}");
+        assert_eq!(risk.shared_worktree_files, 0);
+
+        let snap = snapshot_observed(
+            repo,
+            SNAPSHOT_DEADLINE,
+            MAX_SNAPSHOT_WORKTREES,
+            &observation,
+        );
+        assert_eq!(snap.agents.live.sessions, 2);
+        assert_eq!(
+            snap.agents.live.worktrees.len(),
+            2,
+            "{:?}",
+            snap.agents.live
+        );
+    }
+
+    #[test]
+    fn a_failed_listing_reports_every_session_kind_as_unknown() {
+        let snap = snapshot_observed(
+            "/no/such/gitpulse-insights-repo",
+            SNAPSHOT_DEADLINE,
+            MAX_SNAPSHOT_WORKTREES,
+            &Vec::new(),
+        );
+        assert!(!snap.agents.live.ok);
+        assert!(!snap.agents.live.kinds.is_empty());
+        assert!(snap
+            .agents
+            .live
+            .kinds
+            .iter()
+            .all(|k| !k.ok && !k.error.is_empty()));
+        assert!(!snap.collisions.sessions_ok);
+    }
+
     #[test]
     fn snapshot_on_missing_repo_fails_facets_loudly() {
         let snap = snapshot("/no/such/gitpulse-insights-repo");
@@ -1889,7 +2276,7 @@ mod tests {
         fs::write(wt.join("shared.txt"), "agent-edit").unwrap();
 
         let list = worktree::list_worktrees(repo).expect("list");
-        let scanned = collision_from_list(&list);
+        let scanned = collision_from_list(&list, &live_in(&Vec::new(), &list));
         assert!(
             scanned.items.iter().all(|item| item.entity.is_none()),
             "porcelain scan must leave entity unset: {scanned:?}"
@@ -2186,6 +2573,7 @@ mod tests {
             dir.path().to_str().unwrap(),
             anchor,
             FLEET_COMMIT_WINDOW_DAYS,
+            &Vec::new(),
         );
         assert!(facet.commits_ok, "{facet:?}");
         let stats = facet.commits.as_ref().expect("ok implies Some");
@@ -2608,13 +2996,18 @@ mod tests {
         // repository or the front of it, which is exactly why both facts are
         // arguments. An empty slice has three distinct meanings and this is
         // the function that must keep them apart.
-        let none = agent_summary(true, false, &[]);
+        let none = agent_summary(true, false, &[], live_sessions::attribute(&Vec::new(), &[]));
         assert!(none.ok && !none.truncated && none.sessions == 0);
 
-        let unreadable = agent_summary(false, false, &[]);
+        let unreadable = agent_summary(
+            false,
+            false,
+            &[],
+            live_sessions::attribute(&Vec::new(), &[]),
+        );
         assert!(!unreadable.ok && unreadable.sessions == 0);
 
-        let capped = agent_summary(true, true, &[]);
+        let capped = agent_summary(true, true, &[], live_sessions::attribute(&Vec::new(), &[]));
         assert!(capped.ok && capped.truncated && capped.sessions == 0);
 
         // Same zero, three different facts — and no two of them compare equal.

@@ -12,7 +12,7 @@ function deferred<T>() {
 const ok = { ok: true, present: true, detail: "" };
 const input: WorkInputs = { leases: [], titles: {}, worktrees: [], bindings: {}, pullRequests: [], runs: [], events: [], grants: [], operations: {}, sources: { tasks: ok, worktrees: ok, github: ok, ledger: ok, grants: ok } };
 const projection = projectWork(input);
-const risk: CollisionRisk = { ok: true, error: "", overlapping_files: 0, worktrees_involved: 0, scanned_worktrees: 1, unscanned_worktrees: 0, failed_worktrees: 0, truncated: false, items: [] };
+const risk: CollisionRisk = { ok: true, error: "", overlapping_files: 0, worktrees_involved: 0, scanned_worktrees: 1, unscanned_worktrees: 0, failed_worktrees: 0, truncated: false, shared_worktree_files: 0, shared_worktrees: [], sessions_ok: true, sessions_error: "", items: [] };
 function observer(): WorkRefreshObserver { return { projection: vi.fn(), collisions: vi.fn(), finished: vi.fn() }; }
 const tick = async () => { for (let i = 0; i < 20; i++) await Promise.resolve(); };
 afterEach(() => vi.useRealTimers());

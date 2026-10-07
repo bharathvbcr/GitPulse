@@ -29,11 +29,49 @@ export interface AgentKindCount {
   sessions: number;
 }
 
+/** One running agent session, as its agent registered it. */
+export interface LiveSession {
+  kind: string;
+  pid: number;
+  /** How the session was started (`cli`, `claude-desktop`, …), verbatim. */
+  entrypoint: string;
+  /** The agent's own last-reported state (`busy`, `idle`, …), verbatim. */
+  status: string;
+  cwd: string;
+}
+
+export interface LiveWorktree {
+  path: string;
+  sessions: LiveSession[];
+}
+
+export interface LiveKindStatus {
+  kind: string;
+  /** False when this kind cannot be observed. `sessions: 0` then means unknown. */
+  ok: boolean;
+  error: string;
+  sessions: number;
+  /** Entries that may be live here but could not be verified; makes `sessions` a floor. */
+  unverified: number;
+  truncated: boolean;
+}
+
+/** Running agent sessions per worktree path, from each agent's own registry. */
+export interface LiveSessionFacet {
+  /** True only when every kind was observed completely. Otherwise `sessions` is a floor. */
+  ok: boolean;
+  sessions: number;
+  kinds: LiveKindStatus[];
+  worktrees: LiveWorktree[];
+}
+
 export interface AgentSummary {
   /** False when the session listing failed. `sessions: 0` then means unknown. */
   ok: boolean;
+  /** Worktrees laid out for an agent, by layout — not running sessions; see `live`. */
   sessions: number;
   kinds: AgentKindCount[];
+  live: LiveSessionFacet;
   /**
    * True when these numbers came from a capped sample of the repository's
    * worktrees.
@@ -100,6 +138,17 @@ export interface CollisionItem {
   entity?: EntityCollisionVerdict;
 }
 
+/** A worktree two or more live sessions share, and the files dirty there. */
+export interface SharedWorktree {
+  path: string;
+  branch: string | null;
+  sessions: LiveSession[];
+  files: string[];
+  /** False when this worktree's dirty files were not read. Empty `files` then means unknown. */
+  scanned: boolean;
+  truncated: boolean;
+}
+
 export interface CollisionRisk {
   ok: boolean;
   error: string;
@@ -112,6 +161,12 @@ export interface CollisionRisk {
   failed_worktrees: number;
   truncated: boolean;
   items: CollisionItem[];
+  /** Dirty files in worktrees two live sessions share — invisible to `overlapping_files`. */
+  shared_worktree_files: number;
+  shared_worktrees: SharedWorktree[];
+  /** False when some agent kind could not be observed; empty `shared_worktrees` is then not clean. */
+  sessions_ok: boolean;
+  sessions_error: string;
 }
 
 export interface InsightsSnapshot {

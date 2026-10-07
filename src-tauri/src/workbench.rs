@@ -12,13 +12,13 @@ use tauri::{Emitter, State};
 
 pub(crate) mod agent_models;
 mod agent_worktree;
-mod conversation;
+pub(crate) mod conversation;
 pub(crate) mod external_changes;
 mod in_flight;
 pub(crate) mod intake;
 mod managed_run;
 pub(crate) mod notifications;
-mod process_birth;
+pub(crate) mod process_birth;
 mod receipts;
 mod reconcile;
 pub(crate) mod terminal_command;

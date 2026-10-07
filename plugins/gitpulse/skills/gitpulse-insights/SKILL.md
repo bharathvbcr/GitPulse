@@ -18,7 +18,7 @@ It surfaces GitPulse-owned facts and selected **DevCouncil** modules (in-process
 
 1. Call `gitpulse_insights` with the absolute `repo_path`.
 2. Read every facet's `ok` / `error` / `available` field. An empty list with `ok: false` means the check did not run — not that the repository is clean.
-3. If `collisions.overlapping_files > 0`, or `collisions.unscanned_worktrees > 0`, call `gitpulse_collision_risk` and `gitpulse_change_context` for the worktree you are about to touch.
+3. If `collisions.overlapping_files > 0`, or `collisions.unscanned_worktrees > 0`, or `collisions.shared_worktree_files > 0`, call `gitpulse_collision_risk` and `gitpulse_change_context` for the worktree you are about to touch.
 4. Prefer `gitpulse_change_context` over guessing the branch, dirty files, or parked merge/rebase of a worktree.
 
 ## Tool map

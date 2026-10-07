@@ -19,7 +19,7 @@ pub(super) struct Birth {
 
 /// Whether a recorded process still exists.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) enum Liveness {
+pub(crate) enum Liveness {
     Alive,
     /// No process holds the PID, or a different (later) process does.
     Gone,
@@ -53,7 +53,7 @@ pub(super) fn probe(pid: u32, expected: &str) -> Liveness {
 /// This is how a host that only recorded a PID and a moment can be judged
 /// later: a process that started *after* that moment is a reuse of the PID,
 /// so the one that was there is gone.
-pub(super) fn running_since(pid: u32, instant: u128) -> Liveness {
+pub(crate) fn running_since(pid: u32, instant: u128) -> Liveness {
     match observe(pid) {
         Ok(Some(birth)) if birth.started_unix_nanos <= instant => Liveness::Alive,
         Ok(_) => Liveness::Gone,

@@ -43,9 +43,38 @@ describe("validateWorkResponse", () => {
         scanned_worktrees: 2,
         unscanned_worktrees: 0,
         failed_worktrees: 0,
+        shared_worktree_files: 0,
+        shared_worktrees: [],
+        sessions_ok: true,
+        sessions_error: "",
         items: [{ path: "src/lib", worktrees: [{ path: "wt-a", agent_kind: "runner" }] }],
       }),
     ).not.toThrow();
+  });
+
+  const sharedRisk = () => ({
+    ok: true, truncated: false, error: "", overlapping_files: 0, worktrees_involved: 0,
+    scanned_worktrees: 1, unscanned_worktrees: 0, failed_worktrees: 0, items: [],
+    shared_worktree_files: 1, sessions_ok: false, sessions_error: "codex: not observable",
+    shared_worktrees: [{
+      path: "/repo", branch: "main", scanned: true, truncated: false, files: ["a.ts"],
+      sessions: [11, 12].map((pid) => ({ kind: "claude", pid, entrypoint: "cli", status: "busy", cwd: "/repo" })),
+    }],
+  });
+
+  it("accepts cmd_collision_risk payloads naming a worktree two live sessions share", () => {
+    expect(() => validateWorkResponse("cmd_collision_risk", sharedRisk())).not.toThrow();
+  });
+
+  it("rejects cmd_collision_risk payloads that cannot say whether sessions share a worktree", () => {
+    for (const drop of ["shared_worktree_files", "shared_worktrees", "sessions_ok"] as const) {
+      const risk: Record<string, unknown> = sharedRisk();
+      delete risk[drop];
+      expect(() => validateWorkResponse("cmd_collision_risk", risk), drop).toThrow(/invalid response/);
+    }
+    const unscanned = sharedRisk();
+    (unscanned.shared_worktrees[0] as Record<string, unknown>).scanned = undefined;
+    expect(() => validateWorkResponse("cmd_collision_risk", unscanned)).toThrow(/invalid response/);
   });
 
   it("accepts cmd_collision_risk payloads with an entity verdict on a row", () => {
@@ -59,6 +88,10 @@ describe("validateWorkResponse", () => {
         scanned_worktrees: 2,
         unscanned_worktrees: 0,
         failed_worktrees: 0,
+        shared_worktree_files: 0,
+        shared_worktrees: [],
+        sessions_ok: true,
+        sessions_error: "",
         items: [
           {
             path: "src/lib.rs",

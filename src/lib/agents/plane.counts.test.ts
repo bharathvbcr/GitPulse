@@ -44,7 +44,7 @@ function facet(): FleetRepoFacet {
   return {
     repo_path: "/repo", ok: true, error: "", worktrees_ok: true, worktrees_error: "",
     worktrees: items.length,
-    agents: { ok: true, sessions: facetSessions, kinds: [], truncated: false },
+    agents: { ...snapshot().agents, sessions: facetSessions },
     last_commit_ok: true, last_commit_epoch: 1, commits_ok: false, commits_error: "", commits: null,
     metrics_ok: false, metrics_error: "", metrics: null,
   };
@@ -126,10 +126,7 @@ describe("the attention filter and the headline", () => {
             worktree({ path: "/repo/.claude/worktrees/gamma", session_slug: "gamma", name: "gamma", operation_ok: false }),
           ]),
           // A partial collision scan marks every checkout `unscanned`.
-          collisions: {
-            ok: true, error: "", overlapping_files: 0, worktrees_involved: 0, scanned_worktrees: 2,
-            unscanned_worktrees: 1, failed_worktrees: 0, truncated: false, items: [],
-          },
+          collisions: { ...snapshot().collisions, scanned_worktrees: 2, unscanned_worktrees: 1 },
         }),
       })],
       terminals: [terminal({ cwd: "/repo/.claude/worktrees/alpha", attention: "needs-you" })],

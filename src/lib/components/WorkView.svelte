@@ -598,6 +598,31 @@
       <span>Could not check overlapping files — {collisionError}. Absence of a list is not “no collisions”.</span>
     </div>
   {/if}
+  {#if collisions && collisions.shared_worktrees.length > 0}
+    <div
+      class="mb-3 mx-auto w-full max-w-6xl rounded-xl border border-amber-500/30 bg-amber-500/10 p-2.5 text-[11px] text-amber-700 dark:text-amber-300"
+    >
+      <div class="flex items-start gap-2 font-medium">
+        <AlertTriangle size={14} class="shrink-0 mt-px" />
+        <span>Live agent sessions are sharing a worktree. Every dirty file there is open to all of them.</span>
+      </div>
+      <ul class="mt-1.5 ml-6 space-y-0.5 font-mono text-[10px]">
+        {#each collisions.shared_worktrees as shared (shared.path)}
+          <li>
+            {shared.path}
+            <span class="text-textMuted">
+              — {shared.sessions.length} sessions ·
+              {#if shared.scanned}
+                {shared.files.length} dirty file{shared.files.length === 1 ? "" : "s"}{shared.truncated ? " (list truncated)" : ""}
+              {:else}
+                dirty files not scanned
+              {/if}
+            </span>
+          </li>
+        {/each}
+      </ul>
+    </div>
+  {/if}
   {#if collisions && (collisions.overlapping_files > 0 || collisions.unscanned_worktrees > 0 || collisions.failed_worktrees > 0 || collisions.truncated)}
     <div
       class="mb-3 mx-auto w-full max-w-6xl rounded-xl border border-amber-500/30 bg-amber-500/10 p-2.5 text-[11px] text-amber-700 dark:text-amber-300"

@@ -29,10 +29,7 @@ describe("P1: one repository read through two of its checkouts", () => {
   it("names a partial note once per repository, not once per tab", () => {
     const partial = snapshot({
       worktrees: family().worktrees,
-      collisions: {
-        ok: true, error: "", overlapping_files: 0, worktrees_involved: 0, scanned_worktrees: 1,
-        unscanned_worktrees: 2, failed_worktrees: 0, truncated: false, items: [],
-      },
+      collisions: { ...snapshot().collisions, scanned_worktrees: 1, unscanned_worktrees: 2 },
     });
     const plane = project({ probes: [probe({ snapshot: partial }), probe({ path: BETA, label: "beta", snapshot: partial })] });
     expect(plane.gaps.filter((gap) => gap.kind === "partial")).toHaveLength(1);

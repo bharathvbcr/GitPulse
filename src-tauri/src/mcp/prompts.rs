@@ -49,7 +49,7 @@ const CATALOG: &[Prompt] = &[
     Prompt {
         name: "gitpulse_collision_triage",
         title: "Triage overlapping work",
-        description: "Every file with uncommitted changes in more than one worktree, with the parties involved, so the overlap can be resolved before it becomes a conflict.",
+        description: "Every file with uncommitted changes in more than one worktree, or in a worktree two live agent sessions share, with the parties involved, so the overlap can be resolved before it becomes a conflict.",
         arguments: &[REPO_ARG],
         facets: &["collisions"],
     },

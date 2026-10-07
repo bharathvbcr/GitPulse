@@ -963,6 +963,27 @@ pub fn session_brief(snapshot: &InsightsSnapshot, here: &str, source: &str) -> S
             or_unknown(&snapshot.collisions.error)
         ));
     }
+    out.push_str(&live_sessions_lines(&snapshot.agents.live, here));
+    for shared in &snapshot.collisions.shared_worktrees {
+        out.push_str(&format!(
+            "  ! {} live sessions share {}: {}\n",
+            shared.sessions.len(),
+            shared.path,
+            if shared.scanned {
+                format!(
+                    "{} dirty file(s) open to all of them{}",
+                    shared.files.len(),
+                    if shared.truncated {
+                        " [list truncated]"
+                    } else {
+                        ""
+                    }
+                )
+            } else {
+                "its dirty files were NOT scanned".to_string()
+            }
+        ));
+    }
 
     out.push_str(&format!(
         "ledger: {}\n",
@@ -1308,6 +1329,41 @@ fn same_path(a: &Path, b: &Path) -> bool {
     }
 }
 
+/// The brief's live-session line: how many running agents this repository
+/// and this worktree hold, per kind, with every kind that could not be
+/// observed named as unknown rather than left out of the sum.
+fn live_sessions_lines(live: &crate::insights::LiveSessionFacet, here: &str) -> String {
+    let kinds: Vec<String> = live
+        .kinds
+        .iter()
+        .map(|k| {
+            if !k.ok {
+                format!("{} unknown", k.kind)
+            } else if k.unverified > 0 || k.truncated {
+                format!("{} at least {}", k.kind, k.sessions)
+            } else {
+                format!("{} {}", k.kind, k.sessions)
+            }
+        })
+        .collect();
+    let here_count = live
+        .worktrees
+        .iter()
+        .filter(|w| same_path(Path::new(&w.path), Path::new(here)))
+        .map(|w| w.sessions.len())
+        .sum::<usize>();
+    format!(
+        "live agent sessions: {}{} in this repository ({}), {here_count} in this worktree\n",
+        if live.ok { "" } else { "at least " },
+        live.sessions,
+        if kinds.is_empty() {
+            "no kind observed".to_string()
+        } else {
+            kinds.join(", ")
+        },
+    )
+}
+
 /// Never let an empty explanation render as an empty string: "unknown" is a
 /// worse answer than a real reason and a much better one than a blank.
 fn or_unknown(text: &str) -> String {
@@ -1381,6 +1437,10 @@ mod tests {
             failed_worktrees: 0,
             truncated: false,
             items,
+            shared_worktree_files: 0,
+            shared_worktrees: Vec::new(),
+            sessions_ok: true,
+            sessions_error: String::new(),
         }
     }
 
@@ -1468,6 +1528,12 @@ mod tests {
                 ok: true,
                 sessions: 1,
                 kinds: Vec::new(),
+                live: crate::insights::LiveSessionFacet {
+                    ok: true,
+                    sessions: 0,
+                    kinds: Vec::new(),
+                    worktrees: Vec::new(),
+                },
                 truncated: false,
             },
             changes: ChangesFacet {
@@ -2009,6 +2075,10 @@ mod tests {
             failed_worktrees: 5,
             truncated: true,
             items: Vec::new(),
+            shared_worktree_files: 0,
+            shared_worktrees: Vec::new(),
+            sessions_ok: true,
+            sessions_error: String::new(),
         };
         let facts = collision_facts(&risk, Path::new("/repo"), "a.txt", &|_| String::new());
         assert!(facts.ok, "one worktree was read, so the scan ran");
@@ -2066,6 +2136,10 @@ mod tests {
             failed_worktrees: 1,
             truncated: false,
             items: Vec::new(),
+            shared_worktree_files: 0,
+            shared_worktrees: Vec::new(),
+            sessions_ok: true,
+            sessions_error: String::new(),
         };
         let facts = collision_facts(&risk, Path::new("/repo"), "src/lib.rs", &no_sessions);
         assert!(!facts.ok);
@@ -2586,6 +2660,62 @@ done
         assert!(brief.contains("11294 symbols"));
     }
 
+    /// Two sessions in the worktree the brief is read from, and a kind that
+    /// could not be observed: the line names both, and the shared worktree is
+    /// called out even though no file is dirty in two worktrees.
+    #[test]
+    fn the_brief_names_live_sessions_here_and_unknown_kinds() {
+        use crate::insights::{LiveKindStatus, LiveSession, LiveWorktree, SharedWorktree};
+        let mut snapshot = snapshot_fixture();
+        let session = |pid| LiveSession {
+            kind: "claude".into(),
+            pid,
+            entrypoint: "cli".into(),
+            status: "busy".into(),
+            cwd: "/repo".into(),
+        };
+        let kind = |kind: &str, ok, sessions| LiveKindStatus {
+            kind: kind.into(),
+            ok,
+            error: if ok {
+                String::new()
+            } else {
+                "no registry".into()
+            },
+            sessions,
+            unverified: 0,
+            truncated: false,
+        };
+        snapshot.agents.live = crate::insights::LiveSessionFacet {
+            ok: false,
+            sessions: 2,
+            kinds: vec![kind("claude", true, 2), kind("codex", false, 0)],
+            worktrees: vec![LiveWorktree {
+                path: "/repo".into(),
+                sessions: vec![session(11), session(12)],
+            }],
+        };
+        snapshot.collisions.shared_worktrees = vec![SharedWorktree {
+            path: "/repo".into(),
+            branch: Some("main".into()),
+            sessions: vec![session(11), session(12)],
+            files: vec!["a.rs".into(), "b.rs".into()],
+            scanned: true,
+            truncated: false,
+        }];
+        let brief = session_brief(&snapshot, "/repo", "startup");
+        assert!(
+            brief.contains(
+                "live agent sessions: at least 2 in this repository (claude 2, codex unknown), 2 in this worktree"
+            ),
+            "{brief}"
+        );
+        assert!(
+            brief.contains("! 2 live sessions share /repo: 2 dirty file(s) open to all of them"),
+            "{brief}"
+        );
+    }
+
     #[test]
     fn the_brief_distinguishes_stale_and_unverified_navigation() {
         let mut snapshot = snapshot_fixture();
@@ -2644,6 +2774,10 @@ done
             failed_worktrees: 0,
             truncated: false,
             items: Vec::new(),
+            shared_worktree_files: 0,
+            shared_worktrees: Vec::new(),
+            sessions_ok: true,
+            sessions_error: String::new(),
         };
         snapshot.ledger.recording = false;
         snapshot.ledger.error = "database locked".to_string();

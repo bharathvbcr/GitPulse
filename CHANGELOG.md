@@ -13,6 +13,15 @@ before that tag is pushed.
 
 ### Added
 
+- **Two agents in one worktree are no longer invisible.** Collision risk used
+  to compare worktrees only, so two sessions editing one checkout read as
+  `overlapping_files: 0`. `gitpulse_insights` now reports running Claude Code
+  sessions (CLI and Desktop) per worktree path in `agents.live`, read from
+  Claude Code's session registry with each pid checked against its birth
+  time. `gitpulse_collision_risk`, the Work view and the session brief flag
+  the dirty files of any worktree two live sessions share. Codex keeps no
+  registry of running sessions, so it is reported as unknown rather than
+  zero, and `sessions_ok` stays false while any kind cannot be seen.
 - **Undo on the task board.** A move, bulk label, priority, owner, due date,
   reorder or archive offers Undo (and ⌘Z / Ctrl+Z) for a minute. The undo puts
   back each task's own previous values with a revision-checked write, so a
