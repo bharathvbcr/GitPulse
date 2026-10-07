@@ -219,8 +219,6 @@ export interface AgentPlane {
   /** True when `rows` is shorter than the rows that were projected. */
   truncated: boolean;
   gaps: ProbeGap[];
-  /** True when any included count is a floor rather than a total. */
-  sessionsAreFloor: boolean;
   /** Distinct agent checkouts the read repositories listed. */
   checkouts: number;
   /** True when a listing or agent summary was capped or unread. */
@@ -384,6 +382,17 @@ function collapseProbes(probes: readonly PlaneProbe[], paths: PathIdentityOption
     if (probeRank(probe) > probeRank(previous)) by.set(key, probe);
   }
   return order.map((key) => by.get(key)!);
+}
+
+/**
+ * How much of a repository one read listing saw: a whole agent summary
+ * outranks a capped one, which outranks an unread one, and a full collision
+ * scan breaks the tie.
+ */
+function listingRank(probe: PlaneProbe, paths: PathIdentityOptions): number {
+  const snapshot = probe.snapshot!;
+  const agents = !snapshot.agents.ok ? 0 : snapshot.agents.truncated || snapshot.worktrees.truncated ? 1 : 2;
+  return agents * 2 + (collisionPaths(snapshot, paths) === null ? 0 : 1);
 }
 
 function collisionPaths(snapshot: InsightsSnapshot, paths: PathIdentityOptions): Set<string> | null {
@@ -578,7 +587,7 @@ function repoGroup(draft: Draft, paths: PathIdentityOptions): string {
  *
  * A failed or skipped probe contributes a gap and no rows. Rows from a
  * repository whose agent list was capped carry `parallelFloor`, and the
- * plane's `sessionsAreFloor` is set. `rows` is capped; `total` is not.
+ * plane's `checkoutsAreFloor` is set. `rows` is capped; `total` is not.
  *
  * Linear in its inputs: every lookup goes through a map keyed by
  * `identityKey` (worktrees, probes) or run id, and a containment lookup
@@ -593,13 +602,17 @@ export function projectAgentPlane(input: PlaneInput): AgentPlane {
   const worktrees = new Map<string, Place>();
   const probeByPath = new Map<string, PlaneProbe>();
   const byRun = new Map<string, Draft>();
-  let sessionsAreFloor = false;
   let checkoutsAreFloor = false;
   let checkouts = 0;
   let read = 0;
   let failed = 0;
   let skipped = 0;
 
+  // Probes that listed worktrees, grouped by repository. Two tabs of one
+  // repository whose common directory was not read are two probes listing
+  // the same worktrees, and a shared worktree is what makes them one group.
+  const groups: PlaneProbe[][] = [];
+  const groupOf = new Map<string, PlaneProbe[]>();
   for (const probe of probes) {
     const label = clean(probe.label || probe.path, 80);
     if (probe.skipped) {
@@ -638,31 +651,50 @@ export function projectAgentPlane(input: PlaneInput): AgentPlane {
     read += 1;
     const probeKey = identityKey(probe.path, paths);
     if (probeKey && !probeByPath.has(probeKey)) probeByPath.set(probeKey, probe);
+    let group: PlaneProbe[] | undefined;
+    for (const item of snapshot.worktrees.items) {
+      group = groupOf.get(identityKey(item.path, paths));
+      if (group) break;
+    }
+    if (!group) {
+      group = [];
+      groups.push(group);
+    }
+    group.push(probe);
+    for (const item of snapshot.worktrees.items) {
+      const key = identityKey(item.path, paths);
+      if (key && !groupOf.has(key)) groupOf.set(key, group);
+    }
+  }
+
+  for (const group of groups) {
+    // The most complete listing speaks for the repository: its gaps, its
+    // counts, and the path its rows are filed under. Another tab of it adds
+    // only worktrees the first did not list, and no second set of notes.
+    const primary = group.reduce((best, probe) => (listingRank(probe, paths) > listingRank(best, paths) ? probe : best));
+    const snapshot = primary.snapshot!;
+    const label = clean(primary.label || primary.path, 80);
     const diskSessions = snapshot.agents.ok ? snapshot.agents.sessions : null;
     const parallelFloor = !snapshot.agents.ok || snapshot.agents.truncated || snapshot.worktrees.truncated;
-    if (parallelFloor) {
-      sessionsAreFloor = true;
-      checkoutsAreFloor = true;
-    }
+    if (parallelFloor) checkoutsAreFloor = true;
     if (!snapshot.agents.ok) {
       gaps.push({
-        repoPath: probe.path,
+        repoPath: primary.path,
         label,
         kind: "partial",
         reason: "Agent counts could not be read. The checkouts below are only the ones whose paths were listed.",
       });
     } else if (snapshot.agents.truncated || snapshot.worktrees.truncated) {
       gaps.push({
-        repoPath: probe.path,
+        repoPath: primary.path,
         label,
         kind: "partial",
         reason: "The worktree list was capped. Session counts for this repository are a floor.",
       });
     }
-    const collisions = collisionPaths(snapshot, paths);
-    if (collisions === null) {
+    if (collisionPaths(snapshot, paths) === null) {
       gaps.push({
-        repoPath: probe.path,
+        repoPath: primary.path,
         label,
         kind: "partial",
         reason: snapshot.collisions.ok
@@ -670,16 +702,18 @@ export function projectAgentPlane(input: PlaneInput): AgentPlane {
           : clean(snapshot.collisions.error || "Collisions could not be read.", 240),
       });
     }
-    for (const item of snapshot.worktrees.items) {
-      // Two tabs of one repository are two probes listing the same
-      // worktrees. A checkout is one row, owned by the first listing.
-      const key = identityKey(item.path, paths);
-      if (key && worktrees.has(key)) continue;
-      const draft = item.agent_kind ? fromCheckout(probe, item, collisions, paths, diskSessions, parallelFloor) : null;
-      if (key) worktrees.set(key, { probe, item, draft });
-      if (!draft) continue;
-      drafts.push(draft);
-      checkouts += 1;
+    for (const probe of [primary, ...group.filter((other) => other !== primary)]) {
+      const collisions = collisionPaths(probe.snapshot!, paths);
+      for (const item of probe.snapshot!.worktrees.items) {
+        // A checkout is one row, however many listings name it.
+        const key = identityKey(item.path, paths);
+        if (key && worktrees.has(key)) continue;
+        const draft = item.agent_kind ? fromCheckout(primary, item, collisions, paths, diskSessions, parallelFloor) : null;
+        if (key) worktrees.set(key, { probe: primary, item, draft });
+        if (!draft) continue;
+        drafts.push(draft);
+        checkouts += 1;
+      }
     }
   }
 
@@ -735,7 +769,6 @@ export function projectAgentPlane(input: PlaneInput): AgentPlane {
     });
   } else {
     if (!input.tasks.complete) {
-      sessionsAreFloor = true;
       tasksAreFloor = true;
       gaps.push({
         repoPath: "",
@@ -795,7 +828,6 @@ export function projectAgentPlane(input: PlaneInput): AgentPlane {
     // agent summary (a terminal sitting in the main tree) must not report a
     // smaller number than the checkout beside it.
     if (count.disk !== null && count.disk > count.rows) count.floor = true;
-    if (count.floor) sessionsAreFloor = true;
   }
 
   const finished: AgentRow[] = [];
@@ -848,7 +880,6 @@ export function projectAgentPlane(input: PlaneInput): AgentPlane {
     total,
     truncated,
     gaps,
-    sessionsAreFloor: sessionsAreFloor || truncated,
     checkouts,
     checkoutsAreFloor,
     live: liveKeys(input.terminals).size,

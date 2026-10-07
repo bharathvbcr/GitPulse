@@ -22,7 +22,7 @@
   import { taskTerminalRequests } from "../terminal/taskLaunches";
   import { terminalSessionLimit } from "../terminal/sessionLimit";
   import { createBoardAgents } from "../workbench/boardAgents";
-  import { agentCwdTargets, agentDirectories, readAgentCwds } from "../agents/cwd";
+  import { agentDirectories } from "../agents/cwd";
   import { agentPlaneStore, sweepTargets } from "../agents/store";
   import { createRegisteredRepositories, repositoryPaths, taskProbeFromBoard } from "../agents/tasks";
   import {
@@ -40,15 +40,8 @@
   const board = createBoardAgents();
   let now = $state(Date.now());
   let sweepKey = "";
-  let cwdGeneration = $state(0);
   /** Registered repositories, so a task names its repository and not its cwd. */
   const registered = createRegisteredRepositories();
-  /**
-   * The sessions whose directory is read, as one string: it changes when a
-   * session opens, closes, or is relabelled, and not when a title or a
-   * status does, so those updates do not start another sweep.
-   */
-  const cwdTargets = $derived(agentCwdTargets($terminalSessions).join("\n"));
   const repoPaths = $derived(repositoryPaths($registered, $repoStore.openTabs, pathOpts));
 
   const showing = $derived($interfaceStore.globalSurface === "agents");
@@ -68,7 +61,8 @@
       taskRunId: record.taskRunId ?? "",
       continuesRunId: record.continuesRunId ?? "",
       // Unknown stays unknown. The registry has no directory, and a failed
-      // context read must not be filled in with the repository root.
+      // context read must not be filled in with the repository root. The
+      // tab chip counts from this same sweep (`agentDirectories`).
       cwd: record.sessionId ? $agentDirectories.get(record.sessionId) ?? null : null,
       attention: activity?.attention?.kind ?? null,
     };
@@ -109,7 +103,8 @@
   }
 
   function refresh() {
-    cwdGeneration += 1;
+    agentDirectories.refresh();
+    registered.refresh();
     void agentPlaneStore.refresh(targets());
   }
 
@@ -147,19 +142,6 @@
     if (key === sweepKey) return;
     sweepKey = key;
     void agentPlaneStore.refresh(sweepTargets($repoStore.openTabs));
-  });
-
-  $effect(() => {
-    if (!showing) return;
-    const ticket = cwdGeneration;
-    const ids = cwdTargets ? cwdTargets.split("\n") : [];
-    let cancelled = false;
-    void readAgentCwds(ids).then((found) => {
-      if (!cancelled && ticket === cwdGeneration) agentDirectories.set(found);
-    });
-    return () => {
-      cancelled = true;
-    };
   });
 
   $effect(() => {

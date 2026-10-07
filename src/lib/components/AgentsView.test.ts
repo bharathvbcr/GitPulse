@@ -45,23 +45,18 @@ describe("AgentsView", () => {
     expect(source).toContain("bg-background");
   });
 
-  it("asks the terminal where it is, and does not invent a directory", () => {
-    expect(source).toContain("readAgentCwds");
+  it("takes directories from the sweep the tab chip also reads, and does not invent one", () => {
     expect(source).toContain("$agentDirectories.get(record.sessionId)");
     expect(source).not.toContain("cwd: null");
-  });
-
-  it("reads directories again only when the set of sessions changes", () => {
-    const effect = source.slice(source.indexOf("readAgentCwds(ids)") - 400, source.indexOf("readAgentCwds(ids)"));
-    expect(source).toContain("const cwdTargets = $derived(agentCwdTargets($terminalSessions)");
-    expect(effect).toContain("cwdTargets");
-    // Reading the whole registry here would re-run the sweep on every title or status change.
-    expect(effect).not.toContain("$terminalSessions");
-    expect(source).toContain("agentDirectories.set(found)");
+    // The sweep (cwd.ts, createAgentDirectorySweep) owns when to read. A
+    // second reader here would re-run on every registry change.
+    expect(source).not.toContain("readAgentCwds");
+    expect(source).toContain("agentDirectories.refresh()");
   });
 
   it("names a task's repository from its registered id", () => {
     expect(source).toContain("repositoryPath: (id) => repoPaths.get(id) ?? null");
     expect(source).toContain("registered.want($board.runs.map((run) => run.repository_id))");
+    expect(source).toContain("registered.refresh()");
   });
 });

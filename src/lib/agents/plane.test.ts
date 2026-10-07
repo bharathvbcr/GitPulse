@@ -282,7 +282,7 @@ describe("projectAgentPlane", () => {
     });
     expect(plane.rows[0].parallelCount).toBe(9);
     expect(plane.rows[0].parallelFloor).toBe(true);
-    expect(plane.sessionsAreFloor).toBe(true);
+    expect(plane.checkoutsAreFloor).toBe(true);
     expect(planeHeadline(plane, plane.rows.length)).toMatch(/^at least /);
   });
 
@@ -379,7 +379,7 @@ describe("projectAgentPlane", () => {
     const failed = project({ tasks: tasks({ ok: false, error: "store down" }) });
     expect(failed.gaps.find((gap) => gap.label === "Tasks")?.kind).toBe("failed");
     const capped = project({ tasks: tasks({ complete: false, tasks: [] }) });
-    expect(capped.sessionsAreFloor).toBe(true);
+    expect(capped.tasksAreFloor).toBe(true);
     expect(capped.gaps.find((gap) => gap.label === "Tasks")?.kind).toBe("partial");
   });
 
@@ -415,7 +415,7 @@ describe("projectAgentPlane", () => {
     expect(plane.shown).toBe(MAX_AGENT_ROWS);
     expect(plane.total).toBe(MAX_AGENT_ROWS + 5);
     expect(plane.truncated).toBe(true);
-    expect(plane.sessionsAreFloor).toBe(true);
+    expect(planeHeadline(plane, plane.rows.length)).toContain("5 past the row cap");
     expect(new Set(plane.rows.map((row) => row.id)).size).toBe(plane.rows.length);
   });
 
@@ -481,6 +481,51 @@ describe("checkout attribution", () => {
     expect(new Set(plane.rows.map((row) => row.repoPath))).toEqual(new Set(["/repo"]));
     expect(plane.rows.every((row) => row.parallelCount === 2)).toBe(true);
     expect(plane.rows.find((row) => row.liveKey === "t1")?.worktreePath).toBe("/repo/.claude/worktrees/alpha");
+    expect(plane.checkouts).toBe(2);
+  });
+
+  it("P1: two tabs of one repository give one set of notes, from the more complete listing", () => {
+    const partial = snapshot({
+      ...two,
+      agents: { ok: true, sessions: 2, kinds: [], truncated: true },
+      collisions: {
+        ok: true, error: "", overlapping_files: 0, worktrees_involved: 0, scanned_worktrees: 1,
+        unscanned_worktrees: 2, failed_worktrees: 0, truncated: false, items: [],
+      },
+    });
+    for (const order of [[0, 1], [1, 0]]) {
+      const probes = [
+        probe({ path: "/repo", label: "Repo", snapshot: two }),
+        probe({ path: "/repo/.claude/worktrees/alpha", label: "alpha", snapshot: partial }),
+      ];
+      const plane = project({ probes: order.map((index) => probes[index]) });
+      expect(plane.gaps).toEqual([]);
+      expect(plane.checkoutsAreFloor).toBe(false);
+      expect(plane.rows).toHaveLength(2);
+      expect(new Set(plane.rows.map((row) => row.repoPath))).toEqual(new Set(["/repo"]));
+      expect(plane.rows.every((row) => !row.attention.includes("unscanned") && !row.parallelFloor)).toBe(true);
+      expect(plane.read).toBe(2);
+    }
+    const bothPartial = project({
+      probes: [probe({ path: "/repo", snapshot: partial }), probe({ path: "/repo/.claude/worktrees/beta", snapshot: partial })],
+    });
+    expect(bothPartial.gaps.map((gap) => gap.repoPath)).toEqual(["/repo", "/repo"]);
+    expect(bothPartial.gaps.map((gap) => gap.reason)).toEqual([
+      "The worktree list was capped. Session counts for this repository are a floor.",
+      "Collision scan did not cover every worktree. An empty overlap list is not a clear one.",
+    ]);
+  });
+
+  it("P1: a second listing adds the worktrees the first did not see, under the same repository", () => {
+    const first = snapshot({ ...two, worktrees: { ...two.worktrees, items: two.worktrees.items.slice(0, 2) } });
+    const plane = project({
+      probes: [probe({ path: "/repo", snapshot: first }), probe({ path: "/repo/.claude/worktrees/alpha", label: "alpha", snapshot: two })],
+    });
+    expect(plane.rows.map((row) => row.worktreePath).sort()).toEqual([
+      "/repo/.claude/worktrees/alpha",
+      "/repo/.claude/worktrees/beta",
+    ]);
+    expect(new Set(plane.rows.map((row) => row.repoPath))).toEqual(new Set(["/repo"]));
     expect(plane.checkouts).toBe(2);
   });
 
@@ -651,6 +696,8 @@ describe("one definition of each agent count", () => {
   it("transcribes the facet's rule from the Rust that computes it", () => {
     // `facetSessions` above restates `agent_summary`: every listed worktree
     // with a kind counts, slug or none. If that rule changes, so must the plane.
+    // insights/mod.rs runs the same fixture through the Rust in
+    // `agent_summary_counts_every_agent_checkout_slug_or_none`.
     const rust = readFileSync(new URL("../../../src-tauri/src/insights/mod.rs", import.meta.url), "utf8");
     const body = rust.slice(rust.indexOf("fn agent_summary("), rust.indexOf("let sessions = counts"));
     expect(body).toMatch(/for item in items \{\s*if item\.agent_kind\.is_empty\(\) \{\s*continue;\s*\}/);

@@ -4,6 +4,7 @@ import type { TerminalSessionRecord } from "../terminal/sessionRegistry";
 import { get } from "svelte/store";
 import {
   MAX_REPOSITORY_PAGES,
+  REPOSITORY_RETRY_MS,
   createRegisteredRepositories,
   readRegisteredRepositories,
   repositoryPaths,
@@ -167,6 +168,48 @@ describe("createRegisteredRepositories", () => {
     registry.want(["r2"]);
     await settle();
     expect(get(registry).map((item) => item.id)).toEqual(["r1"]);
+  });
+
+  it("retries a failed read for the same ids once the wait has passed, not before", async () => {
+    let time = 0;
+    let reads = 0;
+    let fail = true;
+    const registry = createRegisteredRepositories(async () => {
+      reads += 1;
+      if (fail) throw new Error("store down");
+      return { repositories: [repo("r1")] };
+    }, () => time);
+    registry.want(["r1"]);
+    await settle();
+    expect(reads).toBe(1);
+    registry.want(["r1"]);
+    await settle();
+    expect(reads).toBe(1);
+    time = REPOSITORY_RETRY_MS;
+    fail = false;
+    registry.want(["r1"]);
+    await settle();
+    expect(reads).toBe(2);
+    expect(get(registry).map((item) => item.id)).toEqual(["r1"]);
+    time = 10 * REPOSITORY_RETRY_MS;
+    registry.want(["r1"]);
+    await settle();
+    expect(reads).toBe(2);
+  });
+
+  it("reads again at once when refreshed, and not while a read is running", async () => {
+    let reads = 0;
+    const registry = createRegisteredRepositories(async () => {
+      reads += 1;
+      return { repositories: [repo("r1")] };
+    });
+    registry.want(["r1"]);
+    registry.refresh();
+    await settle();
+    expect(reads).toBe(1);
+    registry.refresh();
+    await settle();
+    expect(reads).toBe(2);
   });
 });
 

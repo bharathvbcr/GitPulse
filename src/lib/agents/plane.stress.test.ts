@@ -169,7 +169,7 @@ describe("projectAgentPlane under arbitrary mixtures", () => {
       });
 
       rowsSeen += plane.rows.length;
-      if (plane.sessionsAreFloor) floors += 1;
+      if (plane.checkoutsAreFloor || plane.tasksAreFloor || plane.rows.some((row) => row.parallelFloor)) floors += 1;
       failedGaps += plane.gaps.filter((gap) => gap.kind === "failed").length;
 
       expect(plane.shown).toBe(plane.rows.length);
