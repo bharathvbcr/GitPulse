@@ -8,17 +8,18 @@ vi.mock("../stores/modalStore", () => ({ askConfirm: (...args: unknown[]) => ask
 type Tab = { id: string; path: string; familyRoot: string | null; currentBranch: string | null };
 const repoState = writable<{ openTabs: Tab[] }>({ openTabs: [] });
 const trustRepo = vi.fn(async (path: string) => path);
-const closeTab = vi.fn(async () => {});
-const previewUncommitted = vi.fn(async () => {});
+const closeTab = vi.fn(async (_id: string) => {});
+const previewUncommitted = vi.fn(async (_path: string) => {});
 vi.mock("../stores/repoStore", () => ({ repoStore: { subscribe: repoState.subscribe, trustRepo: (p: string) => trustRepo(p), closeTab: (id: string) => closeTab(id), previewUncommitted: (p: string) => previewUncommitted(p) } }));
 const setGlobalSurface = vi.fn();
 vi.mock("../stores/interfaceStore", () => ({ interfaceStore: { setGlobalSurface: (s: string) => setGlobalSurface(s) } }));
 
-const { attemptWorktreeOffer, discardAttemptWorktree, mainCheckoutOf, mergeAttemptWorktree, mergeTargetLabel, reviewAttemptChanges } = await import("./attemptWorktree");
+const { attemptWorktreeOffer, discardAttemptWorktree, liveRunIn, mainCheckoutOf, mergeAttemptWorktree, mergeTargetLabel, reviewAttemptChanges } = await import("./attemptWorktree");
 
 const NOW = 1_800_000_000_000;
 const WT = "/work/repo/.gitpulse/worktrees/fix-e42-wt0attem";
-const run = (fields: Partial<{ id: string; cwd: string; state: string; expires_at: number }> = {}) =>
+type RunRef = Pick<import("./client").TaskRun, "id" | "cwd" | "state" | "expires_at">;
+const run = (fields: Partial<RunRef> = {}): RunRef =>
   ({ id: "wt0attempt", cwd: WT, state: "exited", expires_at: NOW / 1000 + 300, ...fields });
 const listing = (dirty: number | null) => [
   { path: "/work/repo", name: "repo", head: "a", branch: "main", is_bare: false, is_detached: false, is_main: true, is_locked: false, is_prunable: false, dirty_files: 0, diff_stat: null, main_divergence: null, active_routes: [] },
@@ -118,5 +119,14 @@ describe("merge and discard", () => {
     await reviewAttemptChanges(run());
     expect(previewUncommitted).toHaveBeenCalledWith(WT);
     expect(setGlobalSurface).toHaveBeenCalledWith("repository");
+  });
+});
+
+describe("liveRunIn", () => {
+  it("finds the live attempt working in a worktree by checkout identity, not spelling", () => {
+    const runs = [{ id: "a", cwd: `${WT}/` }, { id: "b", cwd: "/work/repo" }];
+    expect(liveRunIn(WT, runs)?.id).toBe("a");
+    expect(liveRunIn("/work/repo/.gitpulse/worktrees/other-12345678", runs)).toBeUndefined();
+    expect(liveRunIn("", runs)).toBeUndefined();
   });
 });

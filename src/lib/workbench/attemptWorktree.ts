@@ -76,6 +76,17 @@ export async function mainCheckoutOf(cwd: string): Promise<string> {
   return root;
 }
 
+/**
+ * The live attempt working in a worktree, by checkout identity, from a read of
+ * live runs. A GitPulse lane with no live attempt answers undefined: its
+ * attempt ended (its worktree stays on disk), which a live read cannot name.
+ */
+export function liveRunIn<T extends Pick<TaskRun, "cwd">>(path: string, runs: readonly T[]): T | undefined {
+  const opts = options();
+  const key = identityKey(path, opts);
+  return key ? runs.find((run) => identityKey(run.cwd, opts) === key) : undefined;
+}
+
 /** The main checkout's branch, from its open tab, for the button's label. Null when unknown. */
 export function mergeTargetLabel(cwd: string): string | null {
   const opts = options();
