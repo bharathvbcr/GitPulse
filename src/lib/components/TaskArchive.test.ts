@@ -197,7 +197,9 @@ describe("the dock reads only what the store actually has", () => {
 
 describe("the dock never presents a page as the whole archive", () => {
   it("renders the summary that carries both numbers", () => {
-    expect(source).toContain("archiveSummary(result ? rows.length : null, result?.total ?? 0)");
+    // Less any task the board is about to delete in its undo window: those
+    // have left the dock too, and the total must not still count them.
+    expect(source).toContain("archiveSummary(result ? rows.length : null, Math.max(0, (result?.total ?? 0) - hiddenHere))");
     expect(source).toContain("{summary.text}");
     expect(source).toContain("summary.partial");
     expect(source).toContain('data-testid="task-archive-summary"');

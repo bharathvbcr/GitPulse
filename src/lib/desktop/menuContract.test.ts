@@ -295,14 +295,14 @@ describe("the payload budget", () => {
 
 describe("every flag combination the builder branches on", () => {
   const themes: ThemePreference[] = ["system", "light", "dark"];
-  const surfaces: InterfacePrefs["globalSurface"][] = ["repository", "fleet", "tasks"];
+  const surfaces: InterfacePrefs["globalSurface"][] = ["repository", "fleet", "tasks", "agents"];
   const watches: RepoState["watch"][] = [
     { status: "unknown", reason: null },
     { status: "watching", reason: null },
     { status: "degraded", reason: "polling" },
   ];
 
-  // The cartesian product is about ten thousand payloads. Under coverage that
+  // The cartesian product is a few tens of thousands of payloads. Under coverage that
   // crossed Vitest's 5s default while the rest of ci:local was also running.
   it("projects a sendable payload for all of them", { timeout: 30_000 }, () => {
     let checked = 0;
@@ -353,7 +353,7 @@ describe("every flag combination the builder branches on", () => {
       }
     }
     // Guards the loop against passing because it ran over nothing.
-    expect(checked).toBe(3 * 3 * 3 * 2 * 2 * 2 * 2 * 2 * 2 * 2 * 3 * 2);
+    expect(checked).toBe(3 * 4 * 3 * 2 * 2 * 2 * 2 * 2 * 2 * 2 * 3 * 2);
   });
 });
 

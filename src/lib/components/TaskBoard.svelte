@@ -4,7 +4,7 @@
   import { onMount, untrack } from "svelte";
   import { invoke } from "../ipc/invoke";
   import { listen } from "@tauri-apps/api/event";
-  import { Archive, Bot, Clipboard, EyeOff, Inbox, LayoutGrid, List, Plus, RefreshCw, Search, Sparkles, SquarePen, Trash2, X } from "@lucide/svelte";
+  import { Archive, Bot, ChevronDown, ChevronUp, Clipboard, EyeOff, FolderSync, Import, Inbox, LayoutGrid, List, Plus, RefreshCw, Search, Sparkles, SquarePen, Trash2, Undo2, X } from "@lucide/svelte";
   import { isMacOS, isTauri } from "../platform";
   import { createListenerTracker } from "../dom/listenerTracker";
   import { createAdaptiveTimer } from "../runtime/adaptiveTimer";
@@ -24,6 +24,9 @@
   } from "../workbench/client";
   import { addableOpenTabs, attachRepositories, openAddActionLabel, openMembershipCandidates, pickerSelectionIds } from "../workbench/openMembership";
   import { quickAddRefusal, taskCreation } from "../workbench/taskCreation";
+  import { defaultRelinkIO, relinkCheckout, type RelinkOutcome } from "../workbench/repositoryRelink";
+  import { applyMove, moveWrites, navigatorOrder } from "../workbench/workspaceOrder";
+  import { importSummary, importTabGroups, tabGroups } from "../workbench/workspaceImport";
   import { workspaceMembershipLabel } from "../workbench/taskRepositories";
   import { cardsById, contextMenuAnchor, duplicateTitle, flattenVisibleIds, isContextMenuKey, rangeSelect, taskMenuItems, toggleSelection, type TaskMenuItem } from "../workbench/taskMenu";
   import { checkoutCandidates, handoffFromTarget, type HandoffSettings } from "../workbench/taskHandoff";
@@ -45,7 +48,7 @@
   import { taskTerminalRequests } from "../terminal/taskLaunches";
   import { terminalSessionLimit } from "../terminal/sessionLimit";
   import { sessionActivity } from "../terminal/sessionActivity";
-  import { TaskBatch, bounded, MAX_TASK_SELECTION, type TaskAction, type TaskChanges } from "../workbench/taskActions";
+  import { DEFERRED_DELETE_MS, TaskBatch, UNDO_OFFER_MS, bounded, defer, describeTaskAction, MAX_TASK_SELECTION, type TaskAction, type TaskChanges, type UndoPlan } from "../workbench/taskActions";
   import {
     MAX_TASK_TABS,
     TASK_EDITOR_PANE_ID,
@@ -99,13 +102,30 @@
   let tabStrip: HTMLDivElement | undefined = $state();
   let workspaceHandle = $state<{ canLeave: () => Promise<boolean> }>();
   let pendingUpdate = $state<TaskBatch | null>(null);
-  let actionDialog = $state<{ cards: TaskCard[]; action: TaskAction } | null>(null);
+  let actionDialog = $state<{ cards: TaskCard[]; action: TaskAction; batch?: TaskBatch } | null>(null);
+  /** The latest write the board can still take back (`offerUndo`). */
+  let undoOffer = $state<UndoPlan | null>(null);
+  let undoTimer: ReturnType<typeof setTimeout> | undefined;
+  type PendingDeletion = { batch: TaskBatch; cards: TaskCard[]; ids: ReadonlySet<string>; running: boolean; window: ReturnType<typeof defer> };
+  /**
+   * A confirmed deletion that has not been written yet (`deferDeletion`).
+   * Raw, not proxied: the timer and the strip must act on the same entry,
+   * and `running` is read by both.
+   */
+  let pendingDelete = $state.raw<PendingDeletion | null>(null);
+  /** Deferred deletions being written now; a board writing one is busy. */
+  let deletesRunning = $state(0);
   let loadedKey = $state("");
   let unreadError = $state("");
   let unreadRevision = 0, initializationRevision = 0, openingRevision = 0;
   const boardKey = $derived(JSON.stringify([scope, search]));
-  const displayColumns = $derived(loadedKey === boardKey ? columns : {});
+  // A deletion waiting out its undo window is already gone from the board:
+  // its cards, its counts and anything a selection could act on.
+  const displayColumns = $derived(loadedKey === boardKey ? (pendingDelete ? removeFromColumns(columns, pendingDelete.ids) : columns) : {});
   $effect(() => { boardKey; facet; selected = new Set(); selectionAnchor = null; menu = null; });
+  // An undo offer belongs to the board it was made on. A pending deletion is
+  // not withdrawn by a scope change: it is still the reader's to undo.
+  $effect(() => { JSON.stringify(scope); untrack(() => offerUndo(null)); });
   let opening = $state(false); let moving = $state(false); let deleting = $state(false);
   let press = $state<{ card: TaskCard; x: number; y: number } | null>(null);
   let drag = $state<{ card: TaskCard; over: TaskStatus | null; insertIndex: number; x: number; y: number } | null>(null);
@@ -117,6 +137,8 @@
   let addMenu = $state(false);
   let addRepoTriggerEl: HTMLButtonElement | undefined = $state();
   let adding = $state(false);
+  let relinking = $state(false);
+  let relinkPending = $state<Extract<RelinkOutcome, { kind: "uncertain" }> | null>(null);
   let addMenuEl: HTMLDivElement | undefined = $state();
   let workspaceMemberIds = $state<string[] | null>(null);
   let membershipToken = $state(0);
@@ -206,6 +228,12 @@
   const hiddenColumns = $derived($interfaceStore.taskHiddenColumns);
   const showArchived = $derived($interfaceStore.taskShowArchivedWorkspaces);
   const visibleWorkspaces = $derived(showArchived ? workspaces : workspaces.filter((group) => !group.archived));
+  /** The navigator's order; moves are computed against this same list. */
+  const orderedWorkspaces = $derived(navigatorOrder(visibleWorkspaces));
+  /** Named groups on the repository tab strip that could become workspaces. */
+  const importableGroups = $derived(tabGroups($repoStore.openTabs, $repoStore.groupColors));
+  let movingGroup = $state(false);
+  let importingGroups = $state(false);
   const columnTotals = $derived(Object.fromEntries(STATUSES.map((status) => [status, displayColumns[status]?.total ?? 0])) as Partial<Record<TaskStatus, number>>);
   /**
    * Work a hidden column is keeping off screen.
@@ -248,7 +276,7 @@
    * label, so this is also what stops a re-run filing it twice.
    */
   let relinks = $state<{ taskId: string; number: number; title: string }[]>([]);
-  const busy = $derived(moving || opening || deleting || filingIssue || actionDialog !== null || pendingUpdate !== null);
+  const busy = $derived(moving || opening || deleting || deletesRunning > 0 || filingIssue || actionDialog !== null || pendingUpdate !== null);
   const openCardIds = $derived(openSavedTaskIds(taskTabs));
   const inProgressCount = $derived(displayColumns.in_progress?.total ?? 0);
   /** The server's count for this scope, so the badge is not a page size. */
@@ -405,7 +433,10 @@
     listeners.track(stopClock);
     listeners.track(bindForegroundChanges(document, typeof window === "undefined" ? null : window, onForeground));
     return () => {
-      disposed = true; revision++; unreadRevision++; initializationRevision++; openingRevision++; pendingUpdate?.stop(); clearTimeout(refreshTimer); listeners.dispose();
+      disposed = true; revision++; unreadRevision++; initializationRevision++; openingRevision++; pendingUpdate?.stop(); clearTimeout(refreshTimer); clearTimeout(undoTimer); listeners.dispose();
+      // Leaving the board ends the undo window rather than dropping it: the
+      // reader saw these tasks go, so they go.
+      if (pendingDelete && !pendingDelete.running) void commitPendingDelete();
     };
   });
   $effect(() => {
@@ -491,6 +522,38 @@
       toastStore.success(announce);
     } catch (cause) { catalogError = explainError(cause); }
     finally { adding = false; }
+  }
+  /**
+   * Point a repository at the checkout it moved to (`repositoryRelink.ts`).
+   *
+   * An uncertain reply keeps a Retry that resends the same request id, so a
+   * lost answer can be confirmed without relinking twice.
+   */
+  async function relinkRepo(repo: Repository) {
+    if (relinking || busy) return;
+    relinking = true;
+    try {
+      const io = defaultRelinkIO(() => invoke<string | null>("cmd_pick_folder"), (prompt) => askConfirm(prompt));
+      await settleRelink(await relinkCheckout(repo, io));
+    } finally { if (!disposed) relinking = false; }
+  }
+  async function retryRelink() {
+    const pending = relinkPending;
+    if (!pending || relinking) return;
+    relinking = true;
+    try { await settleRelink(await pending.retry()); }
+    finally { if (!disposed) relinking = false; }
+  }
+  async function settleRelink(outcome: RelinkOutcome) {
+    if (disposed || outcome.kind === "cancelled") return;
+    if (outcome.kind === "uncertain") { relinkPending = outcome; return; }
+    relinkPending = null;
+    if (outcome.kind === "failed") { catalogError = outcome.message; return; }
+    announce = outcome.message;
+    toastStore.success(outcome.message);
+    // A repository write, not a task write: the tasks are untouched, so the
+    // archive dock has nothing to reload. The board re-reads the catalog.
+    await refresh();
   }
   async function pickFolder() {
     addMenu = false;
@@ -607,6 +670,50 @@
     void focusOpenTab(target.id);
     focusTabAt(tabStrip, move.index);
   }
+  /**
+   * Move a workspace one place up or down the navigator (`workspaceOrder.ts`).
+   * Positions are stored, so the order survives a reload; a move the store
+   * only partly took is reported with both numbers, never as done.
+   */
+  async function moveGroup(id: string, delta: -1 | 1) {
+    if (movingGroup || busy) return;
+    const writes = moveWrites(orderedWorkspaces, id, delta);
+    if (!writes) return;
+    const name = workspaces.find((group) => group.id === id)?.name ?? "Workspace";
+    movingGroup = true;
+    try {
+      const result = await applyMove(writes);
+      if (disposed) return;
+      try { await catalog(); } catch (cause) { catalogError = explainError(cause); }
+      if (result.failed.length) {
+        catalogError = `${name} did not finish moving: ${result.failed.length} of ${writes.length} ${writes.length === 1 ? "workspace" : "workspaces"} could not be updated. ${result.failed[0]?.error ?? ""}`;
+      } else {
+        announce = `${name} moved ${delta < 0 ? "up" : "down"}`;
+      }
+      boardEl?.querySelector<HTMLElement>(`[data-workspace-row="${CSS.escape(id)}"] > button`)?.focus();
+    } finally { if (!disposed) movingGroup = false; }
+  }
+  /**
+   * Make a workspace of every named tab group that has none yet
+   * (`workspaceImport.ts`). The name check needs every workspace, so a
+   * catalog with more pages is read to the end first rather than trusted.
+   */
+  async function importGroups() {
+    if (importingGroups || busy || !importableGroups.length) return;
+    importingGroups = true;
+    try {
+      for (let page = 0; workspaceCursor && page < 50; page++) await moreWorkspaces();
+      if (workspaceCursor) { catalogError = "Not every workspace could be read, so the import could not tell which tab groups already have one."; return; }
+      const report = await importTabGroups(importableGroups, workspaces);
+      if (disposed) return;
+      try { await catalog(); } catch (cause) { catalogError = explainError(cause); }
+      announce = importSummary(report);
+      if (report.created.length) toastStore.success(announce);
+      if (report.failed.length) catalogError = `${announce} ${report.failed.map((entry) => `${entry.name}: ${entry.error}`).join(" ")}`;
+      else if (!report.created.length) toastStore.info(announce);
+    } catch (cause) { if (!disposed) catalogError = explainError(cause); }
+    finally { if (!disposed) importingGroups = false; }
+  }
   async function newWorkspace() {
     if (busy || !await confirmDiscard("Open a new workspace?") || disposed) return;
     session = null; taskTabs = emptyTaskTabs(); enhanceId = null; workspaceEditor = { value: null };
@@ -700,17 +807,23 @@
     if (!current) return;
     skipClick = true;
     requestAnimationFrame(() => { skipClick = false; });
-    const over = current.over;
-    const fromIndex = (columns[current.card.status]?.items ?? []).findIndex((item) => item.id === current.card.id);
-    if (!shouldCommitMove(current.card.status, over, { moving, fromIndex, insertIndex: current.insertIndex })) return;
-    const items = columns[over]?.items ?? [];
-    const { before, after } = insertionNeighbors(items, current.card.id, current.insertIndex);
+    void dropCard(current.card, current.over, current.insertIndex);
+  }
+  /**
+   * Put a card at `insertIndex` of a column (counted without the card itself).
+   * The one place a drop becomes a write, for the pointer and the keyboard.
+   */
+  async function dropCard(card: TaskCard, over: TaskStatus | null, insertIndex: number) {
+    const fromIndex = (displayColumns[card.status]?.items ?? []).findIndex((item) => item.id === card.id);
+    if (!shouldCommitMove(card.status, over, { moving, fromIndex, insertIndex })) return;
+    const items = displayColumns[over]?.items ?? [];
+    const { before, after } = insertionNeighbors(items, card.id, insertIndex);
     const position = insertionPosition(before,after);
     if (after !== null && (position >= after || before !== null && position <= before)) {
-      const plan = reorderPlan(items,current.card,current.insertIndex);
+      const plan = reorderPlan(items,card,insertIndex);
       if (columns[over]?.next_cursor || plan.cards.length > MAX_TASK_SELECTION) { error = `This column needs re-spacing. Load its remaining tasks first; up to ${MAX_TASK_SELECTION} tasks can be reordered together. Priority and title sorting remain available.`; return; }
-      void applyUpdate(new TaskBatch(plan.cards,{kind:"reorder",status:over,positions:plan.positions}));
-    } else void moveCard(current.card, over, position);
+      await applyUpdate(new TaskBatch(plan.cards,{kind:"reorder",status:over,positions:plan.positions}));
+    } else await moveCard(card, over, position);
   }
   function onCardClick(e: MouseEvent, card: TaskCard) {
     // A card is not `disabled` while a task opens: a disabled button loses
@@ -724,7 +837,7 @@
       return;
     }
     if (e.shiftKey) {
-      const ids = flattenVisibleIds(columns, shown, (item) => cardMatchesFacet(item, facet, now));
+      const ids = flattenVisibleIds(displayColumns, shown, (item) => cardMatchesFacet(item, facet, now));
       selected = rangeSelect(ids, selectionAnchor, card.id);
       return;
     }
@@ -790,12 +903,69 @@
       void openQuickEnhance(card.id);
       return;
     }
+    // `x` selects without a modifier. Space only toggles once something is
+    // selected, and Command- or Control-Space belong to the system on macOS,
+    // so without this a keyboard could not start a selection at all.
+    if (e.key.toLowerCase() === "x" && !e.metaKey && !e.ctrlKey && !e.altKey) {
+      e.preventDefault();
+      selected = toggleSelection(selected, card.id);
+      selectionAnchor = card.id;
+      return;
+    }
+    if ((e.key === "ArrowUp" || e.key === "ArrowDown") && e.altKey && !e.metaKey && !e.ctrlKey) {
+      e.preventDefault();
+      void nudgeCard(card, e.key === "ArrowUp" ? -1 : 1);
+      return;
+    }
+    if (e.key === "ArrowUp" || e.key === "ArrowDown" || e.key === "Home" || e.key === "End") {
+      const next = cardNeighbor(e.currentTarget as HTMLElement, e.key);
+      if (!next) return;
+      e.preventDefault();
+      next.focus();
+      const id = next.dataset.cardId;
+      if (id && e.shiftKey && (e.key === "ArrowUp" || e.key === "ArrowDown")) {
+        const ids = flattenVisibleIds(displayColumns, shown, (item) => cardMatchesFacet(item, facet, now));
+        if (!selectionAnchor) selectionAnchor = card.id;
+        selected = rangeSelect(ids, selectionAnchor, id);
+      }
+      return;
+    }
     if (e.key !== "ArrowLeft" && e.key !== "ArrowRight") return;
     e.preventDefault();
     const next = neighborStatus(card.status, e.key === "ArrowRight" ? 1 : -1);
     if (!next) return;
     const last = (columns[next]?.items ?? []).at(-1);
     void moveCard(card, next, insertionPosition(last?.position ?? null, null));
+  }
+  /**
+   * The card a vertical key lands on: the next or previous card in the same
+   * column (or in the list), or its first or last. Read from the DOM because
+   * that is the order the reader sees, filters and hidden columns applied.
+   */
+  function cardNeighbor(from: HTMLElement, key: string): HTMLElement | null {
+    const group = from.closest("[data-task-column], [data-task-list]");
+    if (!group) return null;
+    const cards = [...group.querySelectorAll<HTMLElement>("[data-task-card]")];
+    const index = cards.indexOf(from);
+    if (index === -1) return null;
+    const target = key === "Home" ? 0 : key === "End" ? cards.length - 1 : index + (key === "ArrowUp" ? -1 : 1);
+    return target === index ? null : cards[target] ?? null;
+  }
+  /**
+   * Move a card one place up or down its column from the keyboard — the drag
+   * a pointer would do, through the same position rules and the same write.
+   */
+  async function nudgeCard(card: TaskCard, delta: -1 | 1) {
+    if (busy) return;
+    const items = displayColumns[card.status]?.items ?? [];
+    const from = items.findIndex((item) => item.id === card.id);
+    const to = from + delta;
+    if (from === -1 || to < 0 || to >= items.length) return;
+    await dropCard(card, card.status, to);
+    if (disposed) return;
+    announce = `${card.title} moved ${delta < 0 ? "up" : "down"} in ${STATUS_LABELS[card.status]}`;
+    // The board reloaded; put the focus back on the card it was on.
+    boardEl?.querySelector<HTMLElement>(`[data-task-card][data-card-id="${CSS.escape(card.id)}"]`)?.focus();
   }
   function onBoardKeydown(e: KeyboardEvent) {
     if (!active || !boardEl) return;
@@ -807,9 +977,14 @@
       if (menu) { menu = null; return; }
       if (selected.size) { selected = new Set(); selectionAnchor = null; return; }
     }
+    if ((e.metaKey || e.ctrlKey) && !e.shiftKey && !e.altKey && e.key.toLowerCase() === "z" && (pendingDelete || undoOffer)) {
+      e.preventDefault();
+      void undoLast();
+      return;
+    }
     if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "a") {
       e.preventDefault();
-      selected = new Set(flattenVisibleIds(columns, shown, (item) => cardMatchesFacet(item, facet, now)));
+      selected = new Set(flattenVisibleIds(displayColumns, shown, (item) => cardMatchesFacet(item, facet, now)));
       selectionAnchor = [...selected][0] ?? null;
       return;
     }
@@ -855,11 +1030,95 @@
       const rows = batch.snapshot();
       if (!rows.some(row => row.state === "uncertain" || row.state === "waiting")) pendingUpdate = null;
       const done = rows.filter(row => row.state === "done").length;
-      announce = `${done} of ${rows.length} tasks updated`;
+      // Every write this board makes through here can be taken back, except
+      // a restore: its undo would be a redo nobody asked for.
+      const plan = batch.undo();
+      offerUndo(plan);
+      announce = plan ? `${plan.label}${done < rows.length ? ` (${done} of ${rows.length})` : ""}. Undo is available.` : `${done} of ${rows.length} tasks updated`;
       if (done) { taskWritten(); await loadBoard(); }
       const failure = rows.find(row => row.state === "uncertain" || row.state === "failed");
       if (failure) error = failure.error;
     } finally { moving = false; }
+  }
+  /**
+   * Offer to undo a batch that wrote something.
+   *
+   * One offer at a time: the latest write replaces it, and a scope change or
+   * a minute's wait withdraws it. The undo itself is revision-checked
+   * (`TaskBatch.undo`), so an old offer can only ever be refused, never
+   * revert a task someone edited since.
+   */
+  function offerUndo(plan: UndoPlan | null) {
+    clearTimeout(undoTimer);
+    undoOffer = plan;
+    if (plan) undoTimer = setTimeout(() => { if (undoOffer === plan) undoOffer = null; }, UNDO_OFFER_MS);
+  }
+  async function undoLast() {
+    if (pendingDelete && !pendingDelete.running) { cancelPendingDelete(); return; }
+    const plan = undoOffer;
+    if (!plan || busy) return;
+    offerUndo(null);
+    await applyUpdate(new TaskBatch(plan.cards, plan.action));
+    if (!disposed && !error) announce = `Undone: ${plan.label}`;
+  }
+  /**
+   * Hide a confirmed deletion and wait before writing it.
+   *
+   * The store never reuses a deleted id, so a deletion that was sent cannot be
+   * taken back. This is the only undo it can have: the cards leave the board
+   * at once, and nothing is written until the window closes or the reader
+   * says Delete now. Undo in that window writes nothing at all.
+   */
+  function deferDeletion(batch: TaskBatch, cards: TaskCard[]) {
+    actionDialog = null;
+    const previous = pendingDelete;
+    if (previous && !previous.running) void commitPendingDelete(previous);
+    offerUndo(null);
+    const ids = new Set(cards.map((card) => card.id));
+    selected = new Set([...selected].filter((id) => !ids.has(id)));
+    const entry: PendingDeletion = { batch, cards, ids, running: false, window: defer(DEFERRED_DELETE_MS, () => { void commitPendingDelete(entry); }) };
+    pendingDelete = entry;
+    announce = `${describeTaskAction({kind:"delete"}, cards.length)}. Undo is available for ${DEFERRED_DELETE_MS / 1000} seconds.`;
+  }
+  function deferDialogDeletion(batch: TaskBatch) {
+    const cards = actionDialog?.cards;
+    if (cards) deferDeletion(batch, cards);
+  }
+  function cancelPendingDelete() {
+    const entry = pendingDelete;
+    if (!entry || entry.running || !entry.window.cancel()) return;
+    pendingDelete = null;
+    announce = `Kept ${plural(entry.cards.length, "task")}. Nothing was deleted.`;
+  }
+  /**
+   * Write a deferred deletion now. Rows that fail or need confirmation open
+   * the action dialog on the same batch, so its receipts and its exact retry
+   * are the ones every other task action uses.
+   */
+  async function commitPendingDelete(entry: PendingDeletion | null = pendingDelete) {
+    if (!entry || entry.running) return;
+    entry.window.cancel();
+    entry.running = true;
+    deletesRunning++;
+    // Keep them off the board while they are written, even once a newer
+    // deletion has taken the pending slot; a failure reloads them.
+    columns = removeFromColumns(columns, entry.ids);
+    await entry.batch.run();
+    const rows = entry.batch.snapshot();
+    const done = rows.filter((row) => row.state === "done").map((row) => row.id);
+    if (disposed) {
+      // The board went away mid-window; the deletion still went out, so say
+      // what did not, where it can still be read.
+      const missed = rows.length - done.length;
+      if (missed) toastStore.error(`${plural(missed, "task")} could not be deleted. Open Tasks to retry.`);
+      return;
+    }
+    deletesRunning--;
+    if (pendingDelete === entry) pendingDelete = null;
+    tasksChanged(done);
+    if (done.length === rows.length) { announce = describeTaskAction({kind:"delete"}, done.length); return; }
+    void loadBoard();
+    actionDialog = { cards: entry.cards, action: {kind:"delete"}, batch: entry.batch };
   }
   async function moveCard(card: TaskCard, status: TaskStatus, position: number) {
     if (busy || card.status === status && card.position === position) return;
@@ -1285,10 +1544,11 @@
 <div bind:this={boardEl} class="workbench bg-background" class:is-dragging={drag !== null} class:is-compact={compact} data-testid="task-board">
   {#if !repositoryPath}
     <nav class="navigator gp-glass" class:gp-liquid-tabs={macos} aria-label="Task scopes">
-      <div class="nav-heading">Workspaces<button type="button" class="icon gp-icon-btn" title="New workspace" aria-label="New workspace" onclick={newWorkspace}><Plus size={12} /></button></div>
+      <div class="nav-heading">Workspaces<span class="heading-actions">{#if importableGroups.length}<button type="button" class="icon gp-icon-btn" data-testid="import-tab-groups" title={`Import ${plural(importableGroups.length, "tab group")} as workspaces`} aria-label={`Import ${plural(importableGroups.length, "tab group")} as workspaces`} disabled={importingGroups || busy} onclick={() => void importGroups()}><Import size={12} /></button>{/if}<button type="button" class="icon gp-icon-btn" title="New workspace" aria-label="New workspace" onclick={newWorkspace}><Plus size={12} /></button></span></div>
       <button type="button" class="gp-seg-btn" aria-pressed={scope.kind === "global"} data-active={scope.kind === "global"} class:selected={scope.kind === "global"} onclick={() => { scope = { kind: "global" }; }}>{@render scopeSelection(scope.kind === "global")}<span>All</span></button>
-      {#each [...visibleWorkspaces].sort((a, b) => Number(b.pinned) - Number(a.pinned) || a.position - b.position) as group (group.id)}
-        <div class="nav-row"><button type="button" class="gp-seg-btn" aria-pressed={scope.kind === "workspace" && scope.id === group.id} data-active={scope.kind === "workspace" && scope.id === group.id} class:selected={scope.kind === "workspace" && scope.id === group.id} onclick={() => { scope = { kind: "workspace", id: group.id }; }} title="{group.name} — {workspaceMembershipLabel(group.repository_count)}">{@render scopeSelection(scope.kind === "workspace" && scope.id === group.id)}<span>{group.icon} {group.name}{group.repository_count === 0 ? " · Empty" : ""}{group.archived ? " · Archived" : ""}</span></button><button type="button" class="icon gp-icon-btn" aria-label={`Edit ${group.name}`} onclick={() => editWorkspace(group.id)} disabled={opening}>⋯</button></div>
+      {#each orderedWorkspaces as group, index (group.id)}
+        {@const siblings = orderedWorkspaces.filter((other) => other.pinned === group.pinned)}
+        <div class="nav-row" data-workspace-row={group.id}><button type="button" class="gp-seg-btn" aria-pressed={scope.kind === "workspace" && scope.id === group.id} data-active={scope.kind === "workspace" && scope.id === group.id} class:selected={scope.kind === "workspace" && scope.id === group.id} aria-keyshortcuts="Alt+ArrowUp Alt+ArrowDown" onkeydown={(e) => { if (e.altKey && (e.key === "ArrowUp" || e.key === "ArrowDown")) { e.preventDefault(); void moveGroup(group.id, e.key === "ArrowUp" ? -1 : 1); } }} onclick={() => { scope = { kind: "workspace", id: group.id }; }} title="{group.name} — {workspaceMembershipLabel(group.repository_count)}">{@render scopeSelection(scope.kind === "workspace" && scope.id === group.id)}<span>{group.icon} {group.name}{group.repository_count === 0 ? " · Empty" : ""}{group.archived ? " · Archived" : ""}</span></button><span class="reorder"><button type="button" class="gp-icon-btn" aria-label={`Move ${group.name} up`} disabled={movingGroup || busy || siblings[0]?.id === group.id} onclick={() => void moveGroup(group.id, -1)}><ChevronUp size={11} /></button><button type="button" class="gp-icon-btn" aria-label={`Move ${group.name} down`} disabled={movingGroup || busy || siblings.at(-1)?.id === group.id || (index === orderedWorkspaces.length - 1)} onclick={() => void moveGroup(group.id, 1)}><ChevronDown size={11} /></button></span><button type="button" class="icon gp-icon-btn" aria-label={`Edit ${group.name}`} onclick={() => editWorkspace(group.id)} disabled={opening}>⋯</button></div>
       {/each}
       {#if workspaceCursor}<button type="button" onclick={moreWorkspaces}>More ({workspaces.length}/{workspaceTotal})</button>{/if}
       {#if workspaces.some((group) => group.archived)}
@@ -1336,9 +1596,9 @@
           <button type="button" class="gp-menu-item" role="menuitem" onclick={() => void pickFolder()}>Choose folder…</button>
         </div>
       {/if}
-      {#each repositories as repo (repo.id)}<button type="button" class="gp-seg-btn" class:selected={scope.kind === "repository" && scope.id === repo.id} aria-pressed={scope.kind === "repository" && scope.id === repo.id} data-active={scope.kind === "repository" && scope.id === repo.id} onclick={() => { scope = { kind: "repository", id: repo.id }; }} title={repo.identity_key}>
+      {#each repositories as repo (repo.id)}<div class="nav-row" data-repository-row={repo.id}><button type="button" class="gp-seg-btn" class:selected={scope.kind === "repository" && scope.id === repo.id} aria-pressed={scope.kind === "repository" && scope.id === repo.id} data-active={scope.kind === "repository" && scope.id === repo.id} onclick={() => { scope = { kind: "repository", id: repo.id }; }} title={repo.identity_key}>
         {@render scopeSelection(scope.kind === "repository" && scope.id === repo.id)}<span>{repo.name}</span>
-      </button>{/each}
+      </button><button type="button" class="icon gp-icon-btn" aria-label={`Relink ${repo.name} to a moved checkout`} title={`Relink ${repo.name} — its checkout moved or was cloned again`} disabled={relinking || busy} onclick={() => void relinkRepo(repo)}><FolderSync size={12} /></button></div>{/each}
       {#if repositoryCursor}<button type="button" onclick={moreRepositories}>More ({repositories.length}/{repositoryTotal})</button>{/if}
     </nav>
   {/if}
@@ -1447,6 +1707,22 @@
         <button type="button" class="link" onclick={() => interfaceStore.showAllTaskColumns()}>Show all columns</button>
       </p>
     {/if}
+    {#if pendingDelete || undoOffer}
+      <!-- The one place a board write can be taken back. A deletion waiting
+           out its window has written nothing yet; anything else here was
+           written and is undone by a revision-checked restore. -->
+      <div class="undo-strip gp-glass" role="status" aria-label="Undo" data-testid="task-undo">
+        {#if pendingDelete}
+          <span>{deletesRunning > 0 && pendingDelete.running ? `Deleting ${plural(pendingDelete.cards.length, "task")}…` : `${describeTaskAction({kind:"delete"}, pendingDelete.cards.length)}. Nothing is written until ${DEFERRED_DELETE_MS / 1000} seconds pass.`}</span>
+          <button type="button" class="gp-btn" aria-keyshortcuts="Meta+Z Control+Z" disabled={deletesRunning > 0 && pendingDelete.running} onclick={() => cancelPendingDelete()}><Undo2 size={12} /> Undo</button>
+          <button type="button" class="gp-btn-danger" disabled={deletesRunning > 0 && pendingDelete.running} onclick={() => void commitPendingDelete()}><Trash2 size={12} /> Delete now</button>
+        {:else if undoOffer}
+          <span>{undoOffer.label}</span>
+          <button type="button" class="gp-btn" aria-keyshortcuts="Meta+Z Control+Z" disabled={busy} onclick={() => void undoLast()}><Undo2 size={12} /> Undo</button>
+          <button type="button" class="gp-icon-btn" aria-label="Dismiss undo" onclick={() => offerUndo(null)}><X size={12} /></button>
+        {/if}
+      </div>
+    {/if}
     {#if selected.size > 0}
       <div class="selection gp-glass" role="status" aria-label="Selected task actions">
         <span>{selected.size} selected</span>
@@ -1458,6 +1734,18 @@
           {/if}
         {/if}
         <button type="button" class="gp-btn" onclick={() => void copyCardsForAgent(selectedCards)} disabled={busy}><Clipboard size={12} /> Copy for agent</button>
+        <!-- Status, priority, labels, owner and due date for the whole
+             selection: the card menu's own rows, opened from here so the
+             bulk edits are on screen and not only behind a right click. -->
+        <button
+          type="button"
+          class="gp-btn"
+          data-testid="task-selection-change"
+          aria-haspopup="menu"
+          aria-expanded={menu !== null && menu.column === null && menu.cards.length > 0}
+          disabled={busy}
+          onclick={(e) => { const rect = e.currentTarget.getBoundingClientRect(); menu = { cards: selectedCards, column: null, x: rect.left, y: rect.bottom + 4 }; }}
+        >Change…</button>
         <!-- The bulk half of the card menu's Archive row, disabled for the
              same reason and titled with where the work goes. Without it the
              only bulk end-of-life action on this bar was Delete. -->
@@ -1484,11 +1772,13 @@
         {busy}
         {hiddenColumns}
         refreshToken={archiveToken}
+        hiddenIds={pendingDelete?.ids}
         onopen={openTask}
         onaction={(cards, action) => void archiveDockAction(cards, action)}
         ontogglecolumn={() => interfaceStore.toggleTaskColumn(ARCHIVE_STATUS)}
       />
     {/if}
+    {#if relinkPending}<div class="banner error" role="alert" data-testid="repository-relink-uncertain"><span>{relinkPending.message}</span><button type="button" class="gp-btn" disabled={relinking} onclick={() => void retryRelink()}>Retry relink</button></div>{/if}
     {#if catalogError}<div class="banner error" role="alert">{catalogError}<button type="button" class="gp-btn" onclick={() => initialized ? refresh() : initialize()}>Retry</button></div>{/if}
     {#if issueProgress}<div class="banner" data-testid="task-issue-progress"><span>Filing issue {issueProgress.index} of {issueProgress.total}: {issueProgress.title}</span>{#if issueProgress.total > 1}<button type="button" class="gp-btn" disabled={issueStop} onclick={() => { issueStop = true; }}>{issueStop ? "Stopping…" : "Stop"}</button>{/if}</div>{/if}
     {#if error}<div class="banner error" role="alert">{error}</div>{/if}
@@ -1511,7 +1801,7 @@
     {:else if initialized && !loading && listCards.length === 0 && filtering}
       <EmptyState icon={Search} title="No tasks match" hint="Clear search or filters to see the rest of this board. Server search only covers the current pages." action={{ label: "Clear filters", onClick: () => { facet = emptyFacet(); search = ""; }, variant: "secondary" }} />
     {:else if layout === "list"}
-      <div class="list" data-testid="task-columns" aria-busy={loading || moving} aria-label="Task list">
+      <div class="list" role="group" data-testid="task-columns" data-task-list aria-busy={loading || moving} aria-label="Task list">
         {#each listCards as card (card.id)}
           {@const face = cardFace(card, repoName)}
           {@const chrome = cardChrome(card, now)}
@@ -1527,14 +1817,14 @@
             data-open-task={openCardIds.has(card.id) || undefined}
             aria-haspopup="menu"
             aria-expanded={menu?.cards.some((item) => item.id === card.id) ?? false}
-            aria-keyshortcuts="ArrowLeft ArrowRight Delete ContextMenu"
+            aria-keyshortcuts="ArrowUp ArrowDown Home End Shift+ArrowUp Shift+ArrowDown Alt+ArrowUp Alt+ArrowDown ArrowLeft ArrowRight X Delete ContextMenu"
             aria-disabled={opening || undefined}
             onclick={(e) => onCardClick(e, card)}
             oncontextmenu={(e) => onCardContextMenu(e, card, card.status)}
             onkeydown={(e) => onCardKeydown(e, card, card.status)}
           >
             <span class="status">{STATUS_LABELS[card.status]}</span>
-            <span class="row-title">{face.title}</span>
+            <span class="row-title">{face.title}</span>{#if selected.has(card.id)}<span class="sr-only">, selected</span>{/if}
             {#if agents}<span class="agents-chip" data-testid="card-agents" data-tone={agents.tone ?? undefined} data-asking={agents.asking || undefined} title={agentsTitle(agents)}><Bot size={11} aria-hidden="true" />{agents.working}{$boardAgents.complete ? "" : "+"}<span class="sr-only"> {agents.working === 1 ? "agent" : "agents"} working</span>{#if agents.asking}<span class="asking"> · {agents.asking} {agents.asking === 1 ? "needs" : "need"} you</span>{/if}</span>{/if}
             {#if openCardIds.has(card.id)}<span class="open-mark">Open</span>{/if}
             {#if face.repo && cardFields.has("repo")}<span class="muted">{face.repo}{chrome.extraRepos ? ` +${chrome.extraRepos}` : ""}</span>{/if}
@@ -1578,10 +1868,9 @@
                   data-card-id={card.id}
                   data-open-task={openCardIds.has(card.id) || undefined}
                   draggable="false"
-                  aria-grabbed={drag?.card.id === card.id}
                   aria-haspopup="menu"
                   aria-expanded={menu?.cards.some((item) => item.id === card.id) ?? false}
-                  aria-keyshortcuts="ArrowLeft ArrowRight Delete ContextMenu"
+                  aria-keyshortcuts="ArrowUp ArrowDown Home End Shift+ArrowUp Shift+ArrowDown Alt+ArrowUp Alt+ArrowDown ArrowLeft ArrowRight X Delete ContextMenu"
                   aria-disabled={opening || undefined}
                   onpointerdown={(e) => onCardPointerDown(e, card)}
                   onpointermove={onCardPointerMove}
@@ -1593,7 +1882,7 @@
                 >
                   <div class="card-meta">
                     {#if face.pip !== null}<span class="pip" data-priority={face.pip}></span>{/if}
-                    <h3>{face.title}</h3>
+                    <h3>{face.title}{#if selected.has(card.id)}<span class="sr-only">, selected</span>{/if}</h3>
                     {#if openCardIds.has(card.id)}<span class="open-mark">Open</span>{/if}
                   </div>
                   {#if agents}<span class="agents-chip" data-testid="card-agents" data-tone={agents.tone ?? undefined} data-asking={agents.asking || undefined} title={agentsTitle(agents)}><Bot size={11} aria-hidden="true" />{agents.working}{$boardAgents.complete ? "" : "+"}<span class="sr-only"> {agents.working === 1 ? "agent" : "agents"} working</span>{#if agents.asking}<span class="asking"> · {agents.asking} {agents.asking === 1 ? "needs" : "need"} you</span>{/if}</span>{/if}
@@ -1731,7 +2020,7 @@
   {#if workspaceEditor}{#key workspaceEditor}<WorkspaceEditor bind:this={workspaceHandle} value={workspaceEditor.value} {repositories} openTabs={openTabRefs} onSaved={() => { scope = { kind: "global" }; void refresh(); }} onClose={() => { workspaceEditor = null; }} />{/key}{/if}
 </div>
 
-{#if actionDialog}<TaskActionDialog tasks={actionDialog.cards} action={actionDialog.action} onChanged={tasksChanged} onClose={() => { actionDialog = null; }} />{/if}
+{#if actionDialog}<TaskActionDialog tasks={actionDialog.cards} action={actionDialog.action} batch={actionDialog.batch} onDefer={actionDialog.action.kind === "delete" && !actionDialog.batch ? deferDialogDeletion : undefined} onChanged={tasksChanged} onClose={() => { actionDialog = null; }} />{/if}
 {#if handoff}
   <TaskHandoffSheet
     card={handoff.card}
@@ -1766,16 +2055,22 @@
   .add-name,.add-path{display:block;min-width:0;overflow-wrap:anywhere;word-break:break-word;white-space:normal}
   .add-path{font-size:10px;color:rgb(var(--c-text-muted))}
   .hint-action{border:0;background:transparent;padding:0;color:rgb(var(--c-accent));font-size:11px}
-  .nav-row{display:flex}
+  .nav-row{display:flex;align-items:center}
+  .nav-row .reorder{display:none;flex-shrink:0}
+  .nav-row:hover .reorder,.nav-row:focus-within .reorder{display:inline-flex}
+  .reorder>button{width:18px;height:26px;padding:0;display:inline-flex;align-items:center;justify-content:center}
+  .heading-actions{display:inline-flex;gap:2px}
+  .heading-actions>button{width:26px;height:26px;padding:0;display:inline-flex;align-items:center;justify-content:center}
   .nav-row>button:first-child{min-width:0;flex:1}
   .archive-toggle{display:flex;align-items:center;gap:6px;padding:6px 8px;font-size:11px;color:rgb(var(--c-text-muted))}
   .board-main{flex:1;min-width:0;display:flex;flex-direction:column;overflow:hidden}
   header{padding:10px 14px;display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;border-bottom:1px solid rgb(var(--c-border) / 0.65)}
   h1{font-size:15px;line-height:1.2;font-weight:650;margin:0;display:flex;align-items:baseline;gap:8px}
   h1 span{font-size:11px;font-weight:500;color:rgb(var(--c-text-muted))}
-  .actions,.facets,.selection{display:flex;gap:6px;align-items:center;flex-wrap:wrap}
+  .actions,.facets,.selection,.undo-strip{display:flex;gap:6px;align-items:center;flex-wrap:wrap}
   .facets,.selection{padding:8px 14px}
-  .selection{margin:8px 14px 0;padding:8px 10px;border-radius:12px}
+  .selection,.undo-strip{margin:8px 14px 0;padding:8px 10px;border-radius:12px}
+  .undo-strip>span{flex:1;min-width:0;font-size:12px}
   button,input,select{font-size:12px}
   button:disabled{opacity:.5}
   .hint{font-size:11px;color:rgb(var(--c-text-muted))}

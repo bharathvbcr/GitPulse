@@ -108,6 +108,7 @@ impl Default for MenuState {
                 actions::THEME_LIGHT,
                 actions::THEME_DARK,
                 actions::FLEET,
+                actions::AGENTS,
                 actions::PALETTE,
                 actions::CHECK_UPDATES,
             ]
@@ -147,6 +148,7 @@ pub fn checkable(id: &str) -> bool {
                 | actions::THEME_LIGHT
                 | actions::THEME_DARK
                 | actions::FLEET
+                | actions::AGENTS
                 | actions::TERMINAL_DOCK
         )
 }

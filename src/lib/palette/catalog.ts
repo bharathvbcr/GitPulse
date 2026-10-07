@@ -1,5 +1,5 @@
 import { get } from "svelte/store";
-import { Bug, CircleUserRound, Download, FileCode, FolderGit2, FolderOpen, GitBranch, GitCommit, Keyboard, Layers, LayoutGrid, Moon, Percent, Plug, Plus, RefreshCw, Search, Settings, Terminal, Trash2, Upload, Wrench, X } from "@lucide/svelte";
+import { Bot, Bug, CircleUserRound, Download, FileCode, FolderGit2, FolderOpen, GitBranch, GitCommit, Keyboard, Layers, LayoutGrid, Moon, Percent, Plug, Plus, RefreshCw, Search, Settings, Terminal, Trash2, Upload, Wrench, X } from "@lucide/svelte";
 import { repoStore, type RepoState } from "../stores/repoStore";
 import { themeStore } from "../stores/themeStore";
 import { interfaceStore } from "../stores/interfaceStore";
@@ -66,6 +66,7 @@ export function buildCommands(state: RepoState, changeMode: (mode: PaletteMode) 
     { id: "clone_repo", label: "Clone Repository…", description: "Clone a remote repository to a local folder", category: "Repositories", icon: Download, closeBefore: true, disabledReason: host.onClone ? undefined : "Cloning is unavailable in this window.", action: () => host.onClone?.() },
     { id: "tasks", label: "Open Tasks — global and workspace Kanban boards", category: "Workspace", icon: LayoutGrid, action: () => interfaceStore.setGlobalSurface("tasks") },
     { id: "fleet", label: "Open Fleet — every repository at a glance", category: "Workspace", icon: LayoutGrid, action: () => interfaceStore.setFleetOpen(true) },
+    { id: "agents", label: "Open Agents — sessions, worktrees, and what needs you", category: "Workspace", icon: Bot, shortcut: "⌘⇧A", action: () => interfaceStore.setAgentsOpen(true) },
     { id: "terminal-dock", label: "Toggle Terminal — the shell, docked under this repository", category: "Workspace", icon: Terminal, shortcut: "⌃`", disabledReason: unavailable, action: () => repoStore.toggleTerminal() },
     // Starting a session had exactly one door: open the dock, then find the
     // launcher dropdown and the + beside it. Naming each launcher here makes

@@ -129,6 +129,7 @@ impl Store {
             "workspaces.put"
                 | "workspaces.delete"
                 | "repositories.put"
+                | "repositories.relink"
                 | "items.put"
                 | "items.delete"
                 | "enhancements.create"
@@ -397,7 +398,7 @@ fn mutate(input: &Input<'_>, method: &str, now: i64, now_ms: i64) -> Result<Stri
     let expected = input.integer("expected_revision", None, MAX_INTEGER)?;
     let entity = match method {
         "workspaces.put" | "workspaces.delete" => Entity::Workspace,
-        "repositories.put" => Entity::Repository,
+        "repositories.put" | "repositories.relink" => Entity::Repository,
         "automation.put" => Entity::Automation,
         "attention.update" => Entity::Attention,
         "notifications.settings.put" => Entity::NotificationSettings,
@@ -466,6 +467,13 @@ fn mutate(input: &Input<'_>, method: &str, now: i64, now_ms: i64) -> Result<Stri
         }
         "repositories.put" => {
             put_repository(input, &id, revision, now)?;
+            Affected::none()
+        }
+        "repositories.relink" => {
+            if current.is_none() {
+                return Err(Error::missing());
+            }
+            relink_repository(input, &id, revision, now)?;
             Affected::none()
         }
         "items.put" => {
@@ -647,6 +655,105 @@ fn put_repository(input: &Input<'_>, id: &str, revision: i64, now: i64) -> Resul
         return Err(Error::invalid("repository identity is already registered"));
     }
     let body:String=input.conn.query_row("SELECT json_object('id',?1,'revision',?2,'name',?3,'identity_key',?4,'remote_url',?5,'updated_at',?6)",params![id,revision,name,identity,remote,now],|r|r.get(0))?;
+    put_body(input.conn, Entity::Repository, id, revision, &body)
+}
+
+/// Point a registered repository at the checkout it now lives in.
+///
+/// The repository keeps its id, so every task link, workspace membership, run
+/// and revision stays attached; only `identity_key` (and optionally the display
+/// name) changes, and the previous identity remains in `work_revisions`.
+///
+/// Two distinct clones are never merged by this method. A target identity that
+/// another repository already holds is refused, unless the caller names that
+/// repository in `absorb_id` *and* it holds nothing: no task links, no
+/// workspace memberships and no runs. That is the record a host registers on
+/// its own the first time it opens the moved checkout, before anyone relinks.
+/// It is removed in the same transaction, so the identity has one owner.
+fn relink_repository(input: &Input<'_>, id: &str, revision: i64, now: i64) -> Result<()> {
+    input.fields(&[
+        "request_id",
+        "id",
+        "expected_revision",
+        "identity_key",
+        "name",
+        "absorb_id",
+    ])?;
+    let identity = input.required_text("identity_key", 4096)?;
+    let name = input.text("name", 300)?;
+    if name.as_deref().is_some_and(|name| name.trim().is_empty()) {
+        return Err(Error::invalid("name must not be blank"));
+    }
+    let absorb = input.optional_id("absorb_id")?;
+    if absorb.as_deref() == Some(id) {
+        return Err(Error::invalid("a repository cannot absorb its own record"));
+    }
+    let old: String = input.conn.query_row(
+        "SELECT identity_key FROM work_repositories WHERE id=?1",
+        [id],
+        |r| r.get(0),
+    )?;
+    if old == identity {
+        return Err(Error::invalid(
+            "the repository is already linked to that checkout",
+        ));
+    }
+    if runs::active_on_repository(input.conn, id, now)? {
+        return Err(Error {
+            code: "repository_busy",
+            message: "a run is active on this repository; finish or cancel it before relinking"
+                .into(),
+        });
+    }
+    let holder: Option<String> = input
+        .conn
+        .query_row(
+            "SELECT id FROM work_repositories WHERE identity_key=?1 AND id<>?2",
+            params![identity, id],
+            |r| r.get(0),
+        )
+        .optional()?;
+    match (holder, absorb) {
+        (None, None) => {}
+        (None, Some(_)) => {
+            return Err(Error::invalid(
+                "absorb_id does not hold the requested identity",
+            ));
+        }
+        (Some(_), None) => {
+            return Err(Error::invalid(
+                "repository identity is already registered; name that record in absorb_id to absorb it if it is empty",
+            ));
+        }
+        (Some(holder), Some(absorb)) if holder != absorb => {
+            return Err(Error::invalid(
+                "absorb_id does not hold the requested identity",
+            ));
+        }
+        (Some(holder), Some(_)) => {
+            let (links, members, runs): (i64, i64, i64) = input.conn.query_row(
+                "SELECT (SELECT count(*) FROM work_item_repositories WHERE repository_id=?1),(SELECT count(*) FROM work_workspace_repositories WHERE repository_id=?1),(SELECT count(*) FROM work_runs WHERE repository_id=?1)",
+                [&holder],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )?;
+            if links + members + runs > 0 {
+                return Err(Error {
+                    code: "repository_not_empty",
+                    message: format!(
+                        "the repository registered at that checkout holds {links} task link(s), {members} workspace membership(s) and {runs} run(s); distinct records are never merged"
+                    ),
+                });
+            }
+            input
+                .conn
+                .execute("DELETE FROM work_repositories WHERE id=?1", [&holder])?;
+        }
+    }
+    let body: String = input.conn.query_row(
+        "SELECT json_set(body,'$.identity_key',?2,'$.name',coalesce(?3,json_extract(body,'$.name')),'$.revision',?4,'$.updated_at',?5) FROM work_repositories WHERE id=?1",
+        params![id, identity, name, revision, now],
+        |r| r.get(0),
+    )?;
     put_body(input.conn, Entity::Repository, id, revision, &body)
 }
 

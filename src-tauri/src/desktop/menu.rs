@@ -24,6 +24,10 @@ const SETTINGS_ACCEL: &str = "CmdOrCtrl+,";
 /// ⌘F (Search Commits) rather than on top of a reserved chord.
 const FLEET_ACCEL: &str = "CmdOrCtrl+Shift+F";
 
+/// Agents accelerator. ⌘⇧A is free: the webview shortcut table does not
+/// claim it, and it sits beside Fleet rather than on a reserved chord.
+const AGENTS_ACCEL: &str = "CmdOrCtrl+Shift+A";
+
 /// View-menu digit shortcuts. Repository tab actions must not reuse these.
 const VIEW_TAB_BINDINGS: &[(&str, &str, &str)] = &[
     (actions::TAB_CODE, "Code", "CmdOrCtrl+1"),
@@ -243,6 +247,7 @@ pub fn build_native_menu<R: Runtime>(
     let work_item = item(app, actions::TAB_WORK, "Work", Some("F10"))?;
     let sep_one = PredefinedMenuItem::separator(app)?;
     let fleet_item = item(app, actions::FLEET, "Fleet", Some(FLEET_ACCEL))?;
+    let agents_item = item(app, actions::AGENTS, "Agents", Some(AGENTS_ACCEL))?;
     let terminal_item = item(app, actions::TERMINAL_DOCK, "Terminal", Some("Ctrl+`"))?;
     let sep_two = PredefinedMenuItem::separator(app)?;
     let search_item = item(
@@ -285,6 +290,7 @@ pub fn build_native_menu<R: Runtime>(
     // is on screen. Both sit after the separator, away from the views.
     // Ctrl, not Cmd, on every platform — Cmd+` is the macOS window cycler.
     view_items.push(&fleet_item);
+    view_items.push(&agents_item);
     view_items.push(&terminal_item);
     view_items.push(&sep_two);
     view_items.push(&search_item);
@@ -546,6 +552,7 @@ mod tests {
             PREV_REPO_TAB_ACCEL,
             SETTINGS_ACCEL,
             FLEET_ACCEL,
+            AGENTS_ACCEL,
         ] {
             assert!(
                 !accel.eq_ignore_ascii_case("Shift+F10"),
@@ -569,6 +576,7 @@ mod tests {
             PREV_REPO_TAB_ACCEL,
             SETTINGS_ACCEL,
             FLEET_ACCEL,
+            AGENTS_ACCEL,
         ];
         all.extend(VIEW_TAB_BINDINGS.iter().map(|(_, _, accel)| *accel));
         let before = all.len();

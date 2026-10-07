@@ -197,6 +197,20 @@ describe("interfaceStore", () => {
     expect(get(interfaceStore).globalSurface).toBe("repository");
   });
 
+  it("opens and closes the Agents surface, and remembers its filter", () => {
+    interfaceStore.reset();
+    interfaceStore.setAgentsOpen(true);
+    expect(get(interfaceStore).globalSurface).toBe("agents");
+    interfaceStore.setAgentsFilter("attention");
+    interfaceStore.toggleAgentsColumn("changes");
+    expect(get(interfaceStore).agentsFilter).toBe("attention");
+    expect(get(interfaceStore).agentsHiddenColumns).toEqual(["changes"]);
+    interfaceStore.showAllAgentsColumns();
+    expect(get(interfaceStore).agentsHiddenColumns).toEqual([]);
+    interfaceStore.setAgentsOpen(false);
+    expect(get(interfaceStore).globalSurface).toBe("repository");
+  });
+
   it("opens and closes the Tasks surface without toggling", () => {
     interfaceStore.reset();
     interfaceStore.setTasksOpen(true);

@@ -11,10 +11,11 @@ const model = (repo = empty(), activity: Record<string, string[]> = {}) =>
   buildMenuState(repo, prefs(), "system", activity, false);
 
 describe("native menu projection", () => {
-  it.each(["fleet", "tasks", "repository"] as const)("projects selection for the %s surface", (globalSurface) => {
+  it.each(["fleet", "tasks", "agents", "repository"] as const)("projects selection for the %s surface", (globalSurface) => {
     const repo = { ...loaded(), activeTab: "history" as const, viewSections: { history: "reflog" } };
     const state = buildMenuState(repo, { ...prefs(), globalSurface }, "system", {}, false);
     expect(state.checked.includes("fleet")).toBe(globalSurface === "fleet");
+    expect(state.checked.includes("agents")).toBe(globalSurface === "agents");
     expect(state.checked.includes("tab-history")).toBe(globalSurface === "repository");
     expect(state.checked.includes("section:history:reflog")).toBe(globalSurface === "repository");
     expect(menuActionEnabled(state, "tab-history")).toBe(true);

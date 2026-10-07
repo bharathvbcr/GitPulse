@@ -4,11 +4,24 @@
   import { portal } from "../dom/portal";
   import { trapFocus } from "../ui/focusTrap";
   import { LAYERS } from "../ui/layers";
-  import { TaskBatch, type TaskAction } from "../workbench/taskActions";
+  import { DEFERRED_DELETE_MS, TaskBatch, type TaskAction } from "../workbench/taskActions";
   import type { TaskCard } from "../workbench/client";
-  let { tasks, action, onClose, onChanged }: { tasks: TaskCard[]; action: TaskAction; onClose: () => void; onChanged: (ids: string[]) => void } = $props();
-  const batch = new TaskBatch(untrack(() => tasks), untrack(() => action));
-  let rows = $state(batch.snapshot()), busy = $state(false), started = $state(false), stopped = $state(false);
+  let { tasks, action, batch: existing, onDefer, onClose, onChanged }: {
+    tasks: TaskCard[];
+    action: TaskAction;
+    /** A batch that already ran (a deferred deletion): show its receipts and retry it. */
+    batch?: TaskBatch;
+    /**
+     * Hand a confirmed deletion back instead of running it, so the board can
+     * hold it for its undo window (`DEFERRED_DELETE_MS`).
+     */
+    onDefer?: (batch: TaskBatch) => void;
+    onClose: () => void;
+    onChanged: (ids: string[]) => void;
+  } = $props();
+  const batch = untrack(() => existing) ?? new TaskBatch(untrack(() => tasks), untrack(() => action));
+  let rows = $state(batch.snapshot()), busy = $state(false), started = $state(untrack(() => existing) !== undefined), stopped = $state(false);
+  const deferring = $derived(onDefer !== undefined && action.kind === "delete" && !started);
   let cancelButton: HTMLButtonElement;
   let disposed = false;
   const deleting = $derived(action.kind === "delete");
@@ -20,6 +33,7 @@
   onMount(() => { void tick().then(() => { if(!disposed) cancelButton.focus(); }); });
   async function run() {
     if (busy) return;
+    if (deferring && onDefer) { onDefer(batch); return; }
     busy = true; started = true; stopped = false;
     await batch.run(() => { if (!disposed) rows = batch.snapshot(); });
     if (!disposed) { busy = false; onChanged(rows.filter(row => row.state === "done").map(row => row.id)); }
@@ -35,7 +49,7 @@
   <div class="task-action-dialog gp-card gp-glass shadow-float" role="dialog" aria-modal="true" aria-label={deleting ? "Delete tasks" : "Update tasks"} tabindex="-1" onkeydown={key} use:trapFocus={{initial: () => cancelButton}}>
     <header><h2>{deleting ? "Delete tasks" : "Update tasks"}</h2><button class="gp-icon-btn" aria-label="Close task action" disabled={busy || uncertain} onclick={close}><X size={16} /></button></header>
     <div class="body">
-      {#if !started}<p>{deleting ? "Delete these tasks from every linked repository and workspace? History is retained, but deletion cannot be undone here. Running agents continue." : "Apply this change to the selected tasks? Existing descriptions, links and other fields are preserved."}</p>{/if}
+      {#if !started}<p>{deleting ? deferring ? `Delete these tasks from every linked repository and workspace? Nothing is deleted for ${DEFERRED_DELETE_MS / 1000} seconds, and Undo on the board keeps them. After that, deletion cannot be undone here. History is retained. Running agents continue.` : "Delete these tasks from every linked repository and workspace? History is retained, but deletion cannot be undone here. Running agents continue." : "Apply this change to the selected tasks? Existing descriptions, links and other fields are preserved."}</p>{/if}
       <ul>{#each rows as row (row.id)}<li><span>{row.title}</span>{#if started}<small>{row.state === "done" ? deleting ? "Deleted" : "Updated" : row.state === "uncertain" ? "Needs confirmation" : row.state === "failed" ? "Not changed" : row.state === "running" ? "Working…" : "Waiting"}</small>{/if}{#if row.error}<p class="error">{row.error}</p>{/if}</li>{/each}</ul>
       {#if started}<p role="status">{done} of {rows.length} {deleting ? "deleted" : "updated"}{failures ? ` · ${failures} not changed` : ""}{stopped ? " · Paused" : ""}.</p>{/if}
       {#if failures}<p>Refresh tasks and review changed items before trying them again.</p>{/if}

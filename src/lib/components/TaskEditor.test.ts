@@ -179,14 +179,16 @@ describe("TaskEditor", () => {
     expect(pane).toMatch(/<TaskDuePicker[\s\S]*?disabled=\{saving \|\| reloading \|\| pending !== null \|\| pendingDelete !== null \|\| enhancementBusy\}/);
   });
 
-  it("drops the Home workspace control without dropping the value it held", () => {
-    // The control was removed because picking a home workspace from the sheet
-    // did not work; the field itself is still part of a task and still has to
-    // survive a save. The draft carries whatever was loaded (or seeded for a
-    // new task in a workspace) straight back to `taskWrite`.
+  it("offers the Home workspace as a field, and keeps the value it was seeded with", () => {
+    // The plan's optional home group. The control was once removed for not
+    // working, which left the field settable only at creation; it is back,
+    // and `harness/tasks.html` now saves both a chosen workspace and None and
+    // reads each back. An archived workspace is offered only while it is the
+    // current choice, so opening and saving never silently clears it.
     const pane = taskPane();
-    expect(pane).not.toContain("Home workspace");
-    expect(pane).not.toMatch(/bind:value=\{draft\.home_workspace_id\}/);
+    expect(pane).toContain("Home workspace");
+    expect(pane).toMatch(/bind:value=\{draft\.home_workspace_id\}/);
+    expect(pane).toContain("!space.archived || space.id === draft.home_workspace_id");
     expect(source).toContain("home_workspace_id: initial.home");
     // And it is still read, for the membership notice under the picker.
     expect(source).toContain("const workspaceId = draft.home_workspace_id");

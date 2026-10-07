@@ -42,6 +42,7 @@ function handlers(): NativeMenuHandlers & { calls: string[] } {
     zoomOut: () => calls.push("zoomOut"),
     resetZoom: () => calls.push("resetZoom"),
     fleet: () => calls.push("fleet"),
+    agents: () => calls.push("agents"),
     terminalDock: () => calls.push("terminalDock"),
     fetch: () => calls.push("fetch"),
     pull: () => calls.push("pull"),
@@ -238,6 +239,7 @@ describe("dispatchNativeMenu — every id reaches its own handler", () => {
     // Workspace-scoped, so it is its own id rather than a `tab-*` one; this
     // route also proves it never reaches setTab.
     ["fleet", "fleet", "fleet"],
+    ["agents", "agents", "agents"],
     // A dock rather than a view, so it likewise has its own id; this route
     // also proves it never reaches setTab.
     ["terminal-dock", "terminalDock", "terminalDock"],

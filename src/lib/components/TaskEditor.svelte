@@ -750,6 +750,11 @@
                     </label>
                     <label>Severity<select class="gp-select" bind:value={draft.severity}><option value={null}>None</option>{#each SEVERITY_OPTIONS as severity}<option value={severity.value}>{severity.label}</option>{/each}</select></label>
                   </div>
+                  <!-- The plan's optional home group. It was set once, from the
+                       scope a task was created in, and nothing could change it.
+                       An archived workspace is offered only while it is the
+                       current choice, so saving never silently clears it. -->
+                  <label>Home workspace<select class="gp-select" bind:value={draft.home_workspace_id}><option value={null}>None</option>{#each workspaces.filter((space) => !space.archived || space.id === draft.home_workspace_id) as space (space.id)}<option value={space.id}>{space.name}{space.archived ? " (archived)" : ""}</option>{/each}</select></label>
                   <div class="due-field">
                     <span class="field-label">Due</span>
                     <!-- `disabled` is passed rather than inherited: the popover is

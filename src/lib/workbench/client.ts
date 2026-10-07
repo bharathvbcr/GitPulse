@@ -521,6 +521,19 @@ export async function registerRepository(path: string): Promise<Repository> {
   const raw = object(decodeJSON(await invoke<unknown>("cmd_workbench_register_repository", { repoPath: path, id: newID(), requestId: newID() })));
   return repository(raw.repository);
 }
+/**
+ * Point a registered repository at the checkout it now lives in.
+ *
+ * The host resolves `path` to its git identity and the store keeps the
+ * repository's id, so the tasks linked to it — and their history — stay put.
+ * One `request_id` per attempt: the caller passes the same one to retry an
+ * uncertain reply, so a lost answer cannot become a second relink.
+ */
+export async function relinkRepository(repo: Repository, path: string, requestId: string): Promise<Repository> {
+  const raw = object(decodeJSON(await invoke<unknown>("cmd_workbench_relink_repository", { repositoryId: repo.id, expectedRevision: repo.revision, repoPath: path, requestId })));
+  const saved = repository(raw.repository);
+  return saved.id === repo.id && saved.revision === repo.revision + 1 ? saved : invalid();
+}
 export async function listRepositories(cursor?: string): Promise<Page<Repository>> { return page(await request("repositories.list", { limit: 200, ...(cursor ? { cursor } : {}) }), repository); }
 export async function listWorkspaces(cursor?: string): Promise<Page<WorkspaceCard>> { return page(await request("workspaces.list", { limit: 200, include_archived: true, ...(cursor ? { cursor } : {}) }), workspaceCard); }
 export async function getWorkspace(id: string): Promise<Workspace> { return record(await request("workspaces.get", { id }), workspace); }

@@ -10,6 +10,7 @@ import TasksHost from "./TasksHost.svelte";
 import { requestTaskOpen, taskOpenRequest } from "../src/lib/workbench/taskOpen";
 import { themeStore } from "../src/lib/stores/themeStore";
 import { harnessStore } from "../src/lib/stores/harnessStore";
+import { repoStore } from "../src/lib/stores/repoStore";
 import { describeForeground, holdForeground } from "./foreground";
 
 const params = new URLSearchParams(location.search);
@@ -55,10 +56,57 @@ const deleted = new Set(), deleteWrites = [];
 let failList = false, corruptSave = false, loseSave = false, holdSave = false, releaseSave, holdSearch = false, heldSearch = [], holdGet = false, releaseGet;
 const receipts = new Map(), proposals = new Map(), enhancementWrites = [];
 let failConfiguration = false, blankConfiguration = false, loseEnhancement = false, holdDelete = false, releaseDelete;
+// Relinking a moved checkout and importing tab groups (see the end of the run).
+let pickFolderResult = null, registerUnknown = false, loseRelink = false;
+const relinkCalls = [], repoCommandCalls = [];
+// What `repoStore.openRepo` asks the host for, answered the way an empty,
+// healthy repository would. Only the tab-group checks open tabs.
+const fixtureRepoCommands = {
+  cmd_resolve_repo: a => ({ path: a.repoPath, name: a.repoPath.split("/").pop(), is_bare: false }),
+  cmd_watch_repo: () => null, cmd_unwatch_repo: () => null, cmd_set_recent_menu: () => null,
+  cmd_list_branches: () => [], cmd_get_status: () => [], cmd_list_tags: () => ({ tags: [], truncated: false }),
+  cmd_stash_list: () => ({ entries: [], truncated: false }),
+  cmd_branch_stats: () => ({ updates: [], capped: false, compute_failures: 0, compared_to: "main" }),
+  cmd_workspace_sync: () => ({ repos: [] }),
+  cmd_repo_operation: () => null, cmd_last_fetch_at: () => null,
+  cmd_devcouncil_init: a => ({ repo: a.repoPath, state_dir: `${a.repoPath}/.devmap`, exclude: { status: "already_ignored", source: "harness" }, workspace_registry: null, workspace_reason: null, skipped_untrusted: [], skipped_unavailable: [], devmap_available: false }),
+  cmd_devmap_maybe_refresh: () => ({ decision: "skip_unavailable", facts: { available: false, is_fresh: false, schema_ok: false, already_building: false }, reason: null }),
+};
 const page = (items, start = 0, limit = 200) => ({ ok: true, items: items.slice(start, start + limit), total: items.length, shown: items.slice(start, start + limit).length, has_more: start + limit < items.length, next_cursor: start + limit < items.length ? String(start + limit) : null });
 mockIPCWithEvents(async (cmd, args) => {
-  if (cmd === "cmd_workbench_register_repository") return JSON.stringify({ repository: repos.find(repo => repo.identity_key === `local:${args.repoPath}/.git`) });
-  if (cmd === "cmd_pick_folder") return null;
+  if (cmd === "cmd_workbench_register_repository") {
+    const known = repos.find(repo => repo.identity_key === `local:${args.repoPath}/.git`);
+    if (known) return JSON.stringify({ repository: known });
+    // A folder the store has not seen registers as a record of its own, as
+    // the host does — which is how a moved checkout ends up as a second one.
+    if (!registerUnknown) return JSON.stringify({ repository: undefined });
+    const name = args.repoPath.split("/").pop();
+    const created = { id: args.id, name, revision: 1, updated_at: 1, identity_key: `local:${args.repoPath}/.git`, remote_url: null };
+    repos.push(created);
+    return JSON.stringify({ repository: created });
+  }
+  if (cmd === "cmd_pick_folder") return pickFolderResult;
+  // The host resolves the folder, then the store swaps the identity under the
+  // same id: tasks keep pointing at it. Receipts make a retried request
+  // return the first answer instead of relinking twice.
+  if (cmd === "cmd_workbench_relink_repository") {
+    relinkCalls.push(structuredClone(args));
+    if (receipts.has(args.requestId)) return receipts.get(args.requestId);
+    const index = repos.findIndex(repo => repo.id === args.repositoryId);
+    if (index < 0) throw {code:"not_found", message:"Fixture has no such repository"};
+    if (repos[index].revision !== args.expectedRevision) throw {code:"revision_conflict", message:"Repository changed"};
+    const identity = `local:${args.repoPath}/.git`;
+    const holder = repos.find(repo => repo.identity_key === identity && repo.id !== args.repositoryId);
+    if (holder && tasks.some(task => task.repository_ids.includes(holder.id))) throw {code:"repository_not_empty", message:`the repository registered at that checkout holds task links; distinct records are never merged`};
+    if (holder) repos.splice(repos.indexOf(holder), 1);
+    const at = repos.findIndex(repo => repo.id === args.repositoryId);
+    repos[at] = { ...repos[at], identity_key: identity, name: args.repoPath.split("/").pop(), revision: repos[at].revision + 1 };
+    const result = JSON.stringify({ repository: repos[at], path: args.repoPath, is_bare: false });
+    receipts.set(args.requestId, result);
+    if (loseRelink) { loseRelink = false; throw {code:"transport_error", message:"Lost relink reply"}; }
+    return result;
+  }
+  if (fixtureRepoCommands[cmd]) { repoCommandCalls.push(cmd); return fixtureRepoCommands[cmd](args); }
   if (cmd === "cmd_ai_status") {
     return {
       harness: { available: false, binary: "", protocol: 0, posture: "", ops: [], error: "", error_code: "" },
@@ -118,11 +166,19 @@ mockIPCWithEvents(async (cmd, args) => {
       Object.assign(run, { state: "running", revision: run.revision + 1, session_id: "managed-session", provider_state: "running", provider_thread_id: "managed-thread", provider_turn_id: "managed-turn", effective_configuration: JSON.stringify({sandbox: {type: "readOnly"}, approvalPolicy: "on-request"}), output: "", output_truncated: false });
       return JSON.stringify({ok: true, item: run});
     }
-    case "workspaces.list": return JSON.stringify(page(workspaces));
+    // `ORDER BY position,id`, as the store lists them. Array order would make
+    // a reorder look persisted whether or not its position was written.
+    case "workspaces.list": return JSON.stringify(page([...workspaces].sort((a, b) => a.position - b.position || (a.id < b.id ? -1 : 1))));
     case "workspaces.get": return JSON.stringify({ok: true, item: workspaces.find(space => space.id === input.id) ?? workspace});
     case "workspaces.put": {
       workspaceWrites.push(structuredClone(input));
       const index = workspaces.findIndex(space => space.id === input.id);
+      if (index < 0 && input.expected_revision === 0) {
+        const created = { description: "", icon: "", color: "", pinned: false, archived: false, ...input, revision: 1, updated_at: 1, repository_count: (input.repository_ids ?? []).length };
+        delete created.expected_revision; delete created.request_id;
+        workspaces.push(created);
+        return JSON.stringify({ok: true, item: created});
+      }
       if (index < 0) throw {code:"not_found", message:"Fixture has no such workspace"};
       if (workspaces[index].revision !== input.expected_revision) throw {code:"conflict", message:"Fixture workspace changed elsewhere"};
       const saved = { ...workspaces[index], ...input, revision: workspaces[index].revision + 1, repository_count: (input.repository_ids ?? workspaces[index].repository_ids).length };
@@ -793,15 +849,63 @@ if (params.has("check")) {
     check("bulk deletion confirms every selected task and cross-scope effects", dialog.querySelectorAll("li").length===2 && dialog.textContent.includes("every linked repository and workspace") && document.activeElement.textContent === "Cancel");
     button("Cancel",dialog).click(); await settle();
     check("cancelled deletion does not issue storage writes", deleteWrites.length===2 && !deleted.has("task-12"));
-    await click("Delete selected tasks"); dialog=document.querySelector('[aria-label="Delete tasks"]');
-    tasks.find(task=>task.id==="task-13").revision++; holdDelete=true;
-    button("Delete 2 tasks",dialog).click(); await wait(()=>releaseDelete);
-    check("in-flight deletion cannot close or submit twice", button("Close task action",dialog).disabled && !button("Delete 2 tasks",dialog));
-    dialog.dispatchEvent(new KeyboardEvent("keydown",{key:"Escape",bubbles:true,cancelable:true})); await settle();
-    check("Escape retains the in-flight deletion dialog", document.querySelector('[aria-label="Delete tasks"]')===dialog);
-    holdDelete=false; releaseDelete(); await wait(()=>dialog.textContent.includes("1 of 2 deleted"));
-    check("mixed batch deletion preserves concurrent edits and reports partial failure", deleted.has("task-12") && !deleted.has("task-13") && dialog.textContent.includes("1 not changed"));
-    button("Done",dialog).click(); await settle(); await click("Clear task selection");
+    try {
+      // A confirmed deletion is held, not sent: the store never reuses a deleted
+      // id, so not sending it yet is the only undo a deletion can have.
+      const undoStrip = () => root.querySelector('[data-testid="task-undo"]');
+      const deleteDialog = () => document.querySelector('[aria-label="Delete tasks"]');
+      await click("Delete selected tasks"); dialog=deleteDialog();
+      check("the deletion confirmation says how long Undo keeps the tasks", dialog?.textContent.includes("12 seconds"));
+      button("Delete 2 tasks",dialog).click(); await settle();
+      check("a confirmed deletion leaves the board at once and writes nothing yet",
+        !card("task-12") && !card("task-13") && deleteWrites.length===2 && !deleteDialog() && Boolean(undoStrip()?.textContent.includes("Deleted 2 tasks")));
+      button("Undo", undoStrip()).click(); await settle();
+      check("Undo inside the window brings the tasks back and never sent a deletion",
+        Boolean(card("task-12")) && Boolean(card("task-13")) && deleteWrites.length===2 && !deleted.has("task-12") && !undoStrip());
+      await selectCard("task-12"); await selectCard("task-13");
+      await click("Delete selected tasks"); button("Delete 2 tasks",deleteDialog()).click(); await settle();
+      card("task-14").dispatchEvent(new KeyboardEvent("keydown",{key:"z",metaKey:true,ctrlKey:true,bubbles:true,cancelable:true})); await settle();
+      check("Command- or Control-Z undoes a pending deletion from the keyboard", Boolean(card("task-12")) && Boolean(card("task-13")) && deleteWrites.length===2);
+      // Delete now sends it, with the same receipts and partial-failure report
+      // every other task action has.
+      await selectCard("task-12"); await selectCard("task-13");
+      await click("Delete selected tasks"); button("Delete 2 tasks",deleteDialog()).click(); await settle();
+      tasks.find(task=>task.id==="task-13").revision++; holdDelete=true;
+      button("Delete now", undoStrip()).click(); await wait(()=>releaseDelete);
+      check("a deletion being written can no longer be undone or sent twice",
+        button("Undo", undoStrip())?.disabled === true && button("Delete now", undoStrip())?.disabled === true && !card("task-12"));
+      holdDelete=false; releaseDelete(); await wait(()=>deleteDialog()?.textContent.includes("1 of 2 deleted"));
+      dialog=deleteDialog();
+      check("mixed batch deletion preserves concurrent edits and reports partial failure", deleted.has("task-12") && !deleted.has("task-13") && dialog.textContent.includes("1 not changed"));
+      await wait(()=>card("task-13"));
+      check("the task that was not deleted is back on the board", Boolean(card("task-13")) && !card("task-12") && !undoStrip());
+      button("Done",dialog).click(); await settle(); if (root.querySelector(".selection")) await click("Clear task selection");
+      // A lost reply leaves the same exact retry the dialog always offered.
+      await selectCard("task-13"); await click("Delete selected tasks"); button("Delete 1 task",deleteDialog()).click(); await settle();
+      loseDelete = true; button("Delete now", undoStrip()).click(); await wait(()=>button("Retry deletion", deleteDialog() ?? document));
+      const lostDelete = deleteWrites.at(-1);
+      check("an uncertain deferred deletion opens the dialog with its exact retry, and it cannot be closed",
+        Boolean(button("Retry deletion", deleteDialog())) && button("Close task action", deleteDialog()).disabled);
+      button("Retry deletion", deleteDialog()).click(); await wait(()=>deleteDialog()?.textContent.includes("1 of 1 deleted"));
+      check("the retry reuses the lost request and deletes once", deleteWrites.at(-1).request_id === lostDelete.request_id && deleted.has("task-13"));
+      button("Done", deleteDialog()).click(); await settle();
+      // And with nobody pressing anything, the window closes on its own. The
+      // fixture compresses the clock for this one timer — the board's 12 s
+      // window — so the run does not spend twelve real seconds waiting on it.
+      {
+        const realSetTimeout = window.setTimeout;
+        window.setTimeout = (fn, ms, ...rest) => realSetTimeout(fn, ms === 12_000 ? 1_200 : ms, ...rest);
+        try {
+          await selectCard("task-30"); await click("Delete selected tasks"); button("Delete 1 task",deleteDialog()).click(); await settle();
+        } finally { window.setTimeout = realSetTimeout; }
+        const writesBeforeWindow = deleteWrites.length;
+        await settle(400);
+        check("nothing is sent while the window is open", deleteWrites.length === writesBeforeWindow && !card("task-30"));
+        const windowDeadline = Date.now() + 5_000;
+        while (Date.now() < windowDeadline && !deleted.has("task-30")) await settle(100);
+        check("the deletion is sent once the window closes", deleted.has("task-30") && deleteWrites.length === writesBeforeWindow + 1 && !undoStrip());
+      }
+    } catch (error) { check(`the deferred deletion checks ran to the end (${error.message})`, false); }
 
     await selectCard("task-14"); await selectCard("task-15");
     await openMenu("task-14"); button("Move to…",menu()).click(); await settle(); button("Review",menu()).click(); await wait(()=>tasks.find(task=>task.id==="task-15").status==="review"); await settle();
@@ -1400,6 +1504,56 @@ if (params.has("check")) {
     const labelText = firstLabel?.textContent.trim();
     firstLabel?.click(); await settle(200);
     check("the menu toggles a label in place", tasks.find(task=>task.id==="task-11").labels.includes(labelText));
+    if (menu()) { menu().dispatchEvent(new KeyboardEvent("keydown",{key:"Escape",bubbles:true,cancelable:true})); await settle(); }
+
+    // ---- Bulk edits from the selection bar, and undo ----------------------
+    try {
+      const undoStrip = () => root.querySelector('[data-testid="task-undo"]');
+      const of = id => tasks.find(task => task.id === id);
+      const pick = async id => { card(id).dispatchEvent(new MouseEvent("click",{bubbles:true,ctrlKey:true})); await settle(); };
+      if (root.querySelector(".selection")) await click("Clear task selection");
+      await pick("task-31"); await pick("task-32");
+      root.querySelector('[data-testid="task-selection-change"]')?.click(); await settle();
+      const rows = () => [...(menu()?.querySelectorAll("button") ?? [])].map(el => el.textContent.trim());
+      check("the selection bar opens status, label, priority, owner and due changes for the whole selection",
+        ["Move to…","Labels…","Set priority…","Owner…","Due…"].every(name => rows().some(text => text.includes(name))));
+      const before = ["task-31","task-32"].map(id => ({ id, labels: [...of(id).labels], revision: of(id).revision }));
+      button("Labels…", menu()).click(); await settle();
+      const bulkRow = [...menu().querySelectorAll('[role="menuitemcheckbox"]')].find(el => !before.some(entry => entry.labels.includes(el.textContent.trim())));
+      const bulkLabel = bulkRow?.textContent.trim();
+      bulkRow?.click(); await wait(() => ["task-31","task-32"].every(id => of(id).labels.includes(bulkLabel)));
+      if (menu()) { menu().dispatchEvent(new KeyboardEvent("keydown",{key:"Escape",bubbles:true,cancelable:true})); await settle(); }
+      check("a bulk label lands on every selected task in one revision each", before.every(entry => of(entry.id).revision === entry.revision + 1));
+      check("the board offers to undo the bulk change it just wrote, and names it", undoStrip()?.textContent.includes(`Added label “${bulkLabel}” to 2 tasks`));
+      button("Undo", undoStrip()).click();
+      await wait(() => ["task-31","task-32"].every(id => !of(id).labels.includes(bulkLabel)));
+      check("Undo puts back each task's own labels with a revision-checked write",
+        before.every(entry => JSON.stringify(of(entry.id).labels) === JSON.stringify(entry.labels) && of(entry.id).revision === entry.revision + 2));
+      check("an undo is not offered for undo again", !undoStrip());
+      root.querySelector('[data-testid="task-selection-change"]')?.click(); await settle();
+      button("Move to…", menu()).click(); await settle(); button("Backlog", menu()).click();
+      await wait(() => ["task-31","task-32"].every(id => of(id).status === "backlog"));
+      check("a bulk move from the selection bar moves every selected task", Boolean(card("task-31")?.closest('[data-task-column="backlog"]')));
+      card("task-31").dispatchEvent(new KeyboardEvent("keydown",{key:"z",metaKey:true,ctrlKey:true,bubbles:true,cancelable:true}));
+      await wait(() => ["task-31","task-32"].every(id => of(id).status === "ready"));
+      check("Command- or Control-Z undoes the last board change from the keyboard", Boolean(card("task-31")?.closest('[data-task-column="ready"]')) && !undoStrip());
+      // Archive is a move to Done, so its undo is the same restore.
+      root.querySelector('[data-testid="task-archive-selected"]').click(); await settle();
+      await wait(() => ["task-31","task-32"].every(id => of(id).status === "done"));
+      check("bulk Archive offers its own undo", undoStrip()?.textContent.includes("Moved 2 tasks to Done"));
+      button("Undo", undoStrip()).click();
+      await wait(() => ["task-31","task-32"].every(id => of(id).status === "ready"));
+      check("undoing an archive returns each task to the column it left", Boolean(card("task-32")?.closest('[data-task-column="ready"]')));
+      // An undo never reverts work someone did after the change.
+      if (root.querySelector(".selection")) await click("Clear task selection");
+      await pick("task-31"); await pick("task-32");
+      root.querySelector('[data-testid="task-archive-selected"]').click(); await wait(() => of("task-32").status === "done");
+      const edited = of("task-32"); tasks = [...tasks.filter(task => task.id !== "task-32"), {...edited, title: "Edited elsewhere", revision: edited.revision + 1}];
+      button("Undo", undoStrip()).click(); await wait(() => of("task-31").status === "ready"); await settle(100);
+      check("Undo is refused for a task edited since, says so, and still undoes the rest",
+        of("task-32").status === "done" && of("task-32").title === "Edited elsewhere" && of("task-31").status === "ready" && root.textContent.includes("changed while you were moving it"));
+      if (root.querySelector(".selection")) await click("Clear task selection");
+    } catch (error) { check(`the bulk edits and undo checks ran to the end (${error.message})`, false); }
 
     // ---- Filing a task as a GitHub issue ----------------------------------
     {
@@ -1730,7 +1884,161 @@ if (params.has("check")) {
       check("once every agent has ended, no card is marked", !root.querySelector('[data-testid="card-agents"]'));
     }
 
-    check("no runtime errors or unconfigured fixture requests occurred", crashes.length === 0 && unknown.length === 0);
+    // ---- Keyboard: moving between cards, selecting and reordering ----------
+    try {
+      const column = status => [...root.querySelectorAll(`[data-task-column="${status}"] [data-task-card]`)];
+      const press = (el, key, extra = {}) => el.dispatchEvent(new KeyboardEvent("keydown",{key,bubbles:true,cancelable:true,...extra}));
+      const ready = column("ready");
+      ready[0].focus(); press(ready[0], "ArrowDown"); await settle();
+      check("ArrowDown moves focus to the next card in the column", document.activeElement === column("ready")[1]);
+      press(document.activeElement, "End"); await settle();
+      check("End moves focus to the column's last card", document.activeElement === column("ready").at(-1));
+      press(document.activeElement, "Home"); await settle();
+      check("Home moves focus to the column's first card", document.activeElement === column("ready")[0]);
+      press(document.activeElement, "ArrowUp"); await settle();
+      check("ArrowUp at the top stays put rather than leaving the column", document.activeElement === column("ready")[0]);
+      const firstId = document.activeElement.dataset.cardId;
+      press(document.activeElement, "x"); await settle();
+      check("x selects the focused card without a modifier", root.querySelector('[aria-label="Selected task actions"]')?.textContent.includes("1 selected"));
+      check("a selected card says so to a screen reader", card(firstId)?.querySelector(".sr-only")?.textContent.includes("selected"));
+      press(document.activeElement, "ArrowDown", {shiftKey:true}); await settle();
+      press(document.activeElement, "ArrowDown", {shiftKey:true}); await settle();
+      check("Shift+ArrowDown extends the selection with the focus", root.querySelector('[aria-label="Selected task actions"]')?.textContent.includes("3 selected") && document.activeElement === column("ready")[2]);
+      document.activeElement.dispatchEvent(new KeyboardEvent("keydown",{key:"Escape",bubbles:true,cancelable:true})); await settle();
+      check("Escape clears a keyboard selection", !root.querySelector('[aria-label="Selected task actions"]'));
+      const target = column("ready")[0]; const targetId = target.dataset.cardId;
+      target.focus(); const writesBeforeNudge = writes.length;
+      press(target, "ArrowDown", {altKey:true});
+      await wait(() => column("ready")[1]?.dataset.cardId === targetId);
+      check("Alt+ArrowDown moves a card down its column with one write", writes.length > writesBeforeNudge && column("ready")[1]?.dataset.cardId === targetId);
+      check("the moved card keeps the focus", document.activeElement?.dataset?.cardId === targetId);
+      press(document.activeElement, "ArrowUp", {altKey:true});
+      await wait(() => column("ready")[0]?.dataset.cardId === targetId);
+      check("Alt+ArrowUp moves it back", column("ready")[0]?.dataset.cardId === targetId);
+      check("every card names the keys it answers to",
+        ["ArrowUp","ArrowDown","Home","End","Shift+ArrowDown","Alt+ArrowUp","X","ContextMenu"].every(key => target.getAttribute("aria-keyshortcuts")?.split(" ").includes(key)));
+      await click("List view");
+      const listRows = () => [...root.querySelectorAll('[data-task-list] [data-task-card]')];
+      check("the list layout is a labelled group", root.querySelector('[aria-label="Task list"]')?.getAttribute("role") === "group");
+      listRows()[0].focus(); press(listRows()[0], "ArrowDown"); await settle();
+      check("ArrowDown moves through the list layout too", document.activeElement === listRows()[1]);
+      press(document.activeElement, "End"); await settle();
+      check("End reaches the last row of the list", document.activeElement === listRows().at(-1));
+      await click("Board view");
+      if (root.querySelector('[data-testid="task-undo"]')) { button("Dismiss undo", root.querySelector('[data-testid="task-undo"]'))?.click(); await settle(); }
+    } catch (error) { check(`the keyboard operation checks ran to the end (${error.message})`, false); }
+
+    // ---- Task fields: the home workspace can be changed ---------------------
+    try {
+      if (editor()) { confirmAnswer = true; await click("Close task details"); }
+      card("task-3").click(); await wait(editor);
+      const home = () => field("Home workspace");
+      check("the task sheet offers the home workspace as a field", home() instanceof HTMLSelectElement && [...home().options].some(option => option.value === "workspace"));
+      await change(home(), "workspace", "change");
+      await click("Save task");
+      await wait(() => tasks.find(task => task.id === "task-3")?.home_workspace_id === "workspace");
+      check("saving writes the chosen home workspace and keeps the rest of the task",
+        writes.at(-1).id === "task-3" && writes.at(-1).home_workspace_id === "workspace" && writes.at(-1).description === "Keep changes focused and verify the result.");
+      confirmAnswer = true; await click("Close task details");
+      card("task-3").click(); await wait(editor);
+      check("the home workspace reads back when the task is opened again", home()?.value === "workspace");
+      const none = [...home().options].find(option => option.textContent.trim() === "None");
+      await change(home(), none?.value ?? "", "change");
+      await click("Save task");
+      await wait(() => (tasks.find(task => task.id === "task-3")?.home_workspace_id ?? null) === null);
+      check("choosing None saves the task with no home workspace", writes.at(-1).id === "task-3" && (writes.at(-1).home_workspace_id ?? null) === null);
+      confirmAnswer = true; await click("Close task details"); await settle(100);
+    } catch (error) { check(`the home workspace checks ran to the end (${error.message})`, false); }
+
+    // ---- Workspaces: reorder, persisted through a reload ------------------
+    try {
+      const navRows = () => [...root.querySelectorAll('nav[aria-label="Task scopes"] [data-workspace-row]')].map(row => row.dataset.workspaceRow);
+      const reload = async () => { await click("GitPulse fixture"); await settle(300); await click("Global fixture"); await wait(() => navRows().length > 0); await settle(200); };
+      check("the first workspace cannot move further up", button("Move Developer tools up")?.disabled === true);
+      const before = workspaceWrites.length;
+      const spaceBefore = structuredClone(workspaces.find(space => space.id === "workspace-empty"));
+      button("Move Fresh space up").click();
+      await wait(() => navRows()[0] === "workspace-empty");
+      check("a workspace moves up the navigator with one stored position write",
+        workspaceWrites.length === before + 1 && workspaceWrites.at(-1).id === "workspace-empty" && workspaceWrites.at(-1).position < workspace.position);
+      const movedSpace = workspaces.find(space => space.id === "workspace-empty");
+      check("the move changes the position and nothing else about the workspace",
+        ["name", "description", "icon", "color", "pinned", "archived"].every(key => movedSpace[key] === spaceBefore[key])
+        && JSON.stringify(movedSpace.repository_ids) === JSON.stringify(spaceBefore.repository_ids) && movedSpace.position !== spaceBefore.position);
+      await reload();
+      check("the order is read back from the store after a reload", JSON.stringify(navRows().slice(0, 2)) === JSON.stringify(["workspace-empty", "workspace"]));
+      const row = root.querySelector('[data-workspace-row="workspace-empty"] > button');
+      row.focus(); row.dispatchEvent(new KeyboardEvent("keydown",{key:"ArrowDown",altKey:true,bubbles:true,cancelable:true}));
+      await wait(() => navRows()[0] === "workspace");
+      check("Alt+ArrowDown moves a workspace down from the keyboard and keeps the focus on it",
+        navRows()[1] === "workspace-empty" && document.activeElement === root.querySelector('[data-workspace-row="workspace-empty"] > button'));
+      await reload();
+      check("and that order survives a reload too", JSON.stringify(navRows().slice(0, 2)) === JSON.stringify(["workspace", "workspace-empty"]));
+    } catch (error) { check(`the workspace reorder checks ran to the end (${error.message})`, false); }
+
+    // ---- Workspaces: importing the tab strip's groups ---------------------
+    try {
+      const named = name => workspaces.find(space => space.name === name);
+      registerUnknown = true;
+      await repoStore.openRepo("/fixture/GitPulse", { activate: false, group: "Agent tools" });
+      await repoStore.openRepo("/fixture/Manvi", { activate: false, group: "Agent tools" });
+      await repoStore.openRepo("/fixture/Research", { activate: false, group: "Research" });
+      await repoStore.openRepo("/fixture/Notes", { activate: false, group: "developer tools" });
+      await repoStore.openRepo("/fixture/Loose", { activate: false });
+      await settle(200);
+      const importButton = () => root.querySelector('[data-testid="import-tab-groups"]');
+      check("the navigator offers to import every named tab group", importButton()?.getAttribute("aria-label") === "Import 3 tab groups as workspaces");
+      const writesBefore = workspaceWrites.length;
+      importButton().click();
+      await wait(() => Boolean(named("Agent tools")) && Boolean(named("Research")));
+      await settle(200);
+      check("a tab group becomes a workspace holding each of its repositories once",
+        JSON.stringify(named("Agent tools").repository_ids) === JSON.stringify(["repo-0", "repo-1"]) && named("Research").repository_ids.length === 1);
+      check("a group whose name a workspace already has is skipped, never written into",
+        workspaces.filter(space => space.name.toLowerCase() === "developer tools").length === 1
+        && workspaceWrites.slice(writesBefore).every(write => write.id !== "workspace")
+        && root.textContent.toLowerCase().includes("skipped 1 group that already has a workspace"));
+      const navNames = () => [...root.querySelectorAll('nav[aria-label="Task scopes"] [data-workspace-row] > button')].map(el => el.textContent.trim());
+      check("imported workspaces join the navigator after the ones already arranged",
+        navNames().findIndex(name => name.includes("Agent tools")) > navNames().findIndex(name => name.includes("Developer tools"))
+        && navNames().findIndex(name => name.includes("Agent tools")) > navNames().findIndex(name => name.includes("Fresh space")));
+      const created = workspaces.length;
+      importButton().click(); await settle(300);
+      check("importing again creates nothing: it is idempotent by name", workspaces.length === created);
+      registerUnknown = false;
+    } catch (error) { check(`the tab group import checks ran to the end (${error.message})`, false); }
+
+    // ---- Relinking a repository whose checkout moved -----------------------
+    try {
+      const relinkButton = () => button("Relink GitPulse to a moved checkout");
+      const relinkPrompt = () => [...document.querySelectorAll('[role="dialog"]')].find(node => node.getAttribute("aria-label") === "Relink GitPulse?");
+      const linkedBefore = tasks.filter(task => task.repository_ids.includes("repo-0")).map(task => `${task.id}@${task.revision}`);
+      pickFolderResult = null; relinkButton().click(); await settle(100);
+      check("cancelling the folder picker relinks nothing", relinkCalls.length === 0 && !relinkPrompt());
+      pickFolderResult = "/moved/GitPulse"; relinkButton().click(); await wait(() => relinkPrompt());
+      check("the confirmation names where the repository was and where it goes",
+        relinkPrompt().textContent.includes("/fixture/GitPulse") && relinkPrompt().textContent.includes("/moved/GitPulse") && relinkPrompt().textContent.includes("never merged"));
+      button("Relink", relinkPrompt()).click();
+      await wait(() => repos.find(repo => repo.id === "repo-0").identity_key === "local:/moved/GitPulse/.git");
+      await settle(200);
+      check("relinking keeps the repository's id and every task linked to it, untouched",
+        relinkCalls.length === 1 && relinkCalls[0].expectedRevision === 1
+        && JSON.stringify(tasks.filter(task => task.repository_ids.includes("repo-0")).map(task => `${task.id}@${task.revision}`)) === JSON.stringify(linkedBefore));
+      button("GitPulse").click(); await settle(400);
+      check("the repository's board still shows its tasks after the relink", Boolean(card("task-2")));
+      // A lost reply leaves a retry that sends the same request again.
+      loseRelink = true; pickFolderResult = "/moved-again/GitPulse";
+      relinkButton().click(); await wait(() => relinkPrompt()); button("Relink", relinkPrompt()).click();
+      await wait(() => root.querySelector('[data-testid="repository-relink-uncertain"]'));
+      check("an uncertain relink says so and offers a retry", Boolean(button("Retry relink")));
+      button("Retry relink").click();
+      await wait(() => !root.querySelector('[data-testid="repository-relink-uncertain"]'));
+      check("the retry reuses the request and relinks once", relinkCalls.length === 3 && relinkCalls[1].requestId === relinkCalls[2].requestId
+        && repos.find(repo => repo.id === "repo-0").revision === 3);
+      await click("Global fixture"); await settle(200);
+    } catch (error) { check(`the repository relink checks ran to the end (${error.message})`, false); }
+
+    check(`no runtime errors or unconfigured fixture requests occurred${crashes.length || unknown.length ? ` (${[...crashes, ...unknown].join("; ")})` : ""}`, crashes.length === 0 && unknown.length === 0);
   } catch(error) { results.push({name:error.message, stack:error.stack, pass:false}); }
   document.getElementById("verdict").textContent = JSON.stringify({results}, null, 2);
   document.documentElement.setAttribute("data-gp-result", encodeURIComponent(JSON.stringify({results})));

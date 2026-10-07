@@ -58,6 +58,7 @@
         ...viewShortcutRows(),
         ...sectionShortcutRows(),
         { keys: ["⌘", "⇧", "F"], description: "Open the Fleet dashboard" },
+        { keys: ["⌘", "⇧", "A"], description: "Open the Agents plane" },
         { keys: ["Ctrl", "`"], description: "Toggle the terminal dock" },
         { keys: ["⌘", "F"], description: "Search commits — switches to History from Work and other views. In Code it searches the open file, and in History → Diff it searches the diff." },
         { keys: ["?"], description: "Show keyboard shortcuts cheat sheet" },

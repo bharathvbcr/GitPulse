@@ -14,7 +14,7 @@ export interface LappiSettings {
   record_caller_data: boolean;
 }
 
-export interface LappiStoreStatus {
+export interface StoreStatus {
   dir: string;
   written: number;
   dropped: number;
@@ -26,7 +26,7 @@ export interface LappiView {
   settings: LappiSettings;
   collect_forced_off: boolean;
   socket: string | null;
-  store: LappiStoreStatus | null;
+  store: StoreStatus | null;
   transport_supported: boolean;
 }
 

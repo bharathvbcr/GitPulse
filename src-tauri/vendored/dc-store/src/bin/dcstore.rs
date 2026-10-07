@@ -662,6 +662,53 @@ fn dispatch(store: &Store, command: &str, flags: &[(String, String)]) -> Result<
             ]))
         }
 
+        // The requirement rows a task links to, which the verifier dispatches
+        // on by verification method. `acceptance_criteria_json` is carried as a
+        // string, not embedded: the column is not validated here, and a
+        // malformed one must reach the reader as a decode error it reports,
+        // not as a reply that no longer parses.
+        "requirements" => {
+            match store
+                .task_requirements(required("task")?)
+                .map_err(|e| Failure::Fatal(e.to_string()))?
+            {
+                None => Ok(object(&[
+                    ("ok", &json_bool(true)),
+                    ("task_found", &json_bool(false)),
+                    ("requirements", &"[]".to_string()),
+                    ("missing", &"[]".to_string()),
+                    ("truncated", &json_bool(false)),
+                ])),
+                Some(linked) => {
+                    let items: Vec<String> = linked
+                        .rows
+                        .iter()
+                        .map(|r| {
+                            object(&[
+                                ("id", &quote(&r.id)),
+                                ("title", &quote(&r.title)),
+                                ("description", &quote(&r.description)),
+                                ("priority", &quote(&r.priority)),
+                                ("source", &quote(&r.source)),
+                                (
+                                    "acceptance_criteria_json",
+                                    &quote(&r.acceptance_criteria_json),
+                                ),
+                            ])
+                        })
+                        .collect();
+                    let missing: Vec<String> = linked.missing.iter().map(|m| quote(m)).collect();
+                    Ok(object(&[
+                        ("ok", &json_bool(true)),
+                        ("task_found", &json_bool(true)),
+                        ("requirements", &format!("[{}]", items.join(","))),
+                        ("missing", &format!("[{}]", missing.join(","))),
+                        ("truncated", &json_bool(linked.truncated)),
+                    ]))
+                }
+            }
+        }
+
         "gaps" => {
             let (rows, truncated) = store
                 .gaps_list(flag("task"))

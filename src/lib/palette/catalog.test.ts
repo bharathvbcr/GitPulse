@@ -58,7 +58,7 @@ describe("command catalog and context", () => {
   });
   it("keeps global actions reachable while unavailable repository commands explain why", () => {
     const commands = buildCommands(snapshot({ currentPath: null }), () => {});
-    for (const id of ["fleet", "open_repo", "settings", "theme", "shortcuts", "optional_tools_setup"]) {
+    for (const id of ["fleet", "agents", "open_repo", "settings", "theme", "shortcuts", "optional_tools_setup"]) {
       expect(commands.find(command => command.id === id)?.disabledReason).toBeUndefined();
     }
     for (const id of ["fetch", "pull", "push", "refresh", "new_branch", "rename_branch", "stash", "stash_pop", "terminal-dock", "code", "history:diff"]) {

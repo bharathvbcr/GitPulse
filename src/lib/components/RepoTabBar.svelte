@@ -22,6 +22,7 @@
     FolderGit2,
     FolderOpen,
     Layers,
+    Bot,
     LayoutGrid,
     ListChecks,
     SquareTerminal,
@@ -46,6 +47,7 @@
     type TabColor,
   } from "../repos/tabColors";
   import { terminalSessions, sessionsByRepo } from "../terminal/sessionRegistry";
+  import { liveAgentCount } from "../agents/plane";
   import WorkspaceActions from "./WorkspaceActions.svelte";
   import ScrollCue from "./ScrollCue.svelte";
   import { taskChrome } from "../workbench/taskTabs";
@@ -203,6 +205,8 @@
     ),
   );
   const tasksOpen = $derived($interfaceStore.globalSurface === "tasks");
+  const agentsOpen = $derived($interfaceStore.globalSurface === "agents");
+  const liveAgents = $derived(liveAgentCount($terminalSessions));
 
   function closeStripMenu(options?: { restoreFocus?: boolean }) {
     const opener = stripMenuOpener;
@@ -1253,6 +1257,33 @@
       <LayoutGrid size={12} />
       <span>Fleet</span>
     </button>
+    <div class="{surfaceChipClass(agentsOpen)} pr-1!" data-testid="agents-tab-chip">
+      <button
+        type="button"
+        class="flex items-center gap-1.5 flex-1 bg-transparent border-0 p-0 text-inherit font-medium"
+        aria-pressed={agentsOpen}
+        onclick={() => interfaceStore.setAgentsOpen(true)}
+        title="Agents — checkouts on disk, processes this window started, and attempts that need you. A checkout is not a running process."
+      >
+        <Bot size={12} />
+        <span>Agents</span>
+        {#if liveAgents > 0}
+          <span class="gp-pill !px-1.5 !py-0 min-w-4 justify-center" title="{liveAgents} live {liveAgents === 1 ? 'agent' : 'agents'} this window started">{liveAgents}</span>
+        {/if}
+      </button>
+      {#if agentsOpen}
+        <button
+          type="button"
+          class="p-0.5 rounded hover:bg-surfaceHover text-textMuted hover:text-rose-400"
+          data-testid="agents-tab-close"
+          aria-label="Close Agents"
+          title="Close Agents"
+          onclick={() => interfaceStore.setAgentsOpen(false)}
+        >
+          <X size={11} />
+        </button>
+      {/if}
+    </div>
     <div class="{surfaceChipClass(tasksOpen)} pr-1!" data-testid="tasks-tab-chip">
       <button
         type="button"

@@ -18,6 +18,7 @@ import {
   TERMINAL_DOCK_DEFAULT_HEIGHT,
 } from "../terminal/dockMetrics";
 import { DEFAULT_ACCENT, isAccentId, type AccentId } from "../ui/accents";
+import { isAgentFilter, type AgentFilter } from "../agents/plane";
 import {
   DEFAULT_TAB_WIDTH,
   isDiffLayout,
@@ -42,7 +43,7 @@ import type { TaskStatus } from "../workbench/vocabulary";
 import { defaultHandoff, reconcileHandoff, sanitizeHandoff, type HandoffSettings } from "../workbench/taskHandoff";
 import type { CodePercentageMode } from "../language/barStats";
 
-export type GlobalSurface = "repository" | "fleet" | "tasks";
+export type GlobalSurface = "repository" | "fleet" | "tasks" | "agents";
 
 export interface InterfacePrefs {
   /**
@@ -144,6 +145,16 @@ export interface InterfacePrefs {
   fleetHiddenColumns: string[];
   /** Compact rows fit roughly twice as many repositories on screen. */
   fleetCompact: boolean;
+  /**
+   * Agents columns the reader has hidden. The session name is not one of
+   * them. A hidden column does not hide a gap: a read that failed stays
+   * above the table.
+   */
+  agentsHiddenColumns: string[];
+  /** Compact rows on the Agents plane. */
+  agentsCompact: boolean;
+  /** Which sessions the Agents plane lists. Anything else reads as all. */
+  agentsFilter: AgentFilter;
   /**
    * Layout the Tasks board opens in. The header still switches the one on
    * screen; this is what a fresh window starts with.
@@ -279,6 +290,9 @@ const DEFAULTS: InterfacePrefs = {
   fleetPulseOpen: true,
   fleetHiddenColumns: [],
   fleetCompact: false,
+  agentsHiddenColumns: [],
+  agentsCompact: false,
+  agentsFilter: "all",
   taskLayout: "board",
   taskDensity: "comfortable",
   taskHiddenColumns: [],
@@ -308,6 +322,7 @@ function freshDefaults(): InterfacePrefs {
     ...DEFAULTS,
     hiddenViews: [...DEFAULTS.hiddenViews],
     fleetHiddenColumns: [...DEFAULTS.fleetHiddenColumns],
+    agentsHiddenColumns: [...DEFAULTS.agentsHiddenColumns],
     taskHiddenColumns: [...DEFAULTS.taskHiddenColumns],
     taskCardFields: [...DEFAULTS.taskCardFields],
     taskHandoff: { ...DEFAULTS.taskHandoff },
@@ -409,12 +424,15 @@ function readPrefs(): InterfacePrefs {
       diagnosticsButton: isDiagnosticsButtonMode(parsed.diagnosticsButton)
         ? parsed.diagnosticsButton
         : DEFAULTS.diagnosticsButton,
-      globalSurface: parsed.globalSurface === "tasks" || parsed.globalSurface === "fleet" || parsed.globalSurface === "repository"
+      globalSurface: parsed.globalSurface === "tasks" || parsed.globalSurface === "fleet" || parsed.globalSurface === "agents" || parsed.globalSurface === "repository"
         ? parsed.globalSurface
         : parsed.fleetOpen === true ? "fleet" : "repository",
       fleetPulseOpen: bool(parsed.fleetPulseOpen, DEFAULTS.fleetPulseOpen),
       fleetHiddenColumns: columnKeys(parsed.fleetHiddenColumns, DEFAULTS.fleetHiddenColumns),
       fleetCompact: bool(parsed.fleetCompact, DEFAULTS.fleetCompact),
+      agentsHiddenColumns: columnKeys(parsed.agentsHiddenColumns, DEFAULTS.agentsHiddenColumns),
+      agentsCompact: bool(parsed.agentsCompact, DEFAULTS.agentsCompact),
+      agentsFilter: isAgentFilter(parsed.agentsFilter) ? parsed.agentsFilter : DEFAULTS.agentsFilter,
       taskLayout: isBoardLayout(parsed.taskLayout) ? parsed.taskLayout : DEFAULTS.taskLayout,
       taskDensity: isTaskDensity(parsed.taskDensity) ? parsed.taskDensity : DEFAULTS.taskDensity,
       // Both sanitizers bound and normalize the stored array; neither can
@@ -572,6 +590,17 @@ function createInterfaceStore() {
       })),
     showAllFleetColumns: () => patch({ fleetHiddenColumns: [] }),
     toggleFleetCompact: () => patch((prefs) => ({ fleetCompact: !prefs.fleetCompact })),
+    setAgentsOpen: (open: boolean) => patch({ globalSurface: open ? "agents" : "repository" }),
+    toggleAgents: () => patch((prefs) => ({ globalSurface: prefs.globalSurface === "agents" ? "repository" : "agents" })),
+    toggleAgentsColumn: (key: string) =>
+      patch((prefs) => ({
+        agentsHiddenColumns: prefs.agentsHiddenColumns.includes(key)
+          ? prefs.agentsHiddenColumns.filter((column) => column !== key)
+          : [...prefs.agentsHiddenColumns, key],
+      })),
+    showAllAgentsColumns: () => patch({ agentsHiddenColumns: [] }),
+    toggleAgentsCompact: () => patch((prefs) => ({ agentsCompact: !prefs.agentsCompact })),
+    setAgentsFilter: (agentsFilter: AgentFilter) => patch({ agentsFilter }),
     setTaskLayout: (taskLayout: BoardLayout) => patch({ taskLayout }),
     setTaskDensity: (taskDensity: TaskDensity) => patch({ taskDensity }),
     /** Adds or removes one status column; never hides the last visible one. */

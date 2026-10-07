@@ -1,0 +1,67 @@
+/**
+ * Where a live terminal is, when the OS will say.
+ *
+ * The session registry does not carry a directory. Binding a process to the
+ * repository root because the directory is unknown would put it in a checkout
+ * it was never seen in. A missing, empty, or rejected answer stays unknown.
+ * One session's failure does not drop the others, and a sweep that has used
+ * its time does not start another read.
+ */
+
+import { mapWithConcurrency } from "../async/pool";
+import { invoke } from "../ipc/invoke";
+import { parseTerminalContext } from "../terminal/sessionContext";
+
+/** How long a directory sweep may keep starting reads. */
+export const AGENT_CWD_DEADLINE_MS = 4_000;
+/** Reads in flight at once. Matches the rest of the workspace fan-out. */
+export const AGENT_CWD_CONCURRENCY = 4;
+/** Sessions past this are left unknown rather than queued. */
+export const MAX_AGENT_CWD_READS = 64;
+
+export interface AgentCwdDeps {
+  readonly read?: (sessionId: string) => Promise<unknown>;
+  readonly now?: () => number;
+}
+
+function uniqueIds(sessionIds: readonly string[]): string[] {
+  const seen = new Set<string>();
+  const ids: string[] = [];
+  for (const id of sessionIds) {
+    const trimmed = id.trim();
+    if (!trimmed || seen.has(trimmed)) continue;
+    seen.add(trimmed);
+    ids.push(trimmed);
+    if (ids.length >= MAX_AGENT_CWD_READS) break;
+  }
+  return ids;
+}
+
+/**
+ * Directories the OS reported for these sessions.
+ *
+ * The map contains only a non-empty directory from a payload
+ * `parseTerminalContext` accepted. Anything else is absent, which the caller
+ * must keep as unknown.
+ */
+export async function readAgentCwds(
+  sessionIds: readonly string[],
+  deps: AgentCwdDeps = {},
+): Promise<Map<string, string>> {
+  const read = deps.read ?? ((sessionId: string) => invoke<unknown>("cmd_terminal_context", { sessionId }));
+  const now = deps.now ?? (() => Date.now());
+  const ids = uniqueIds(sessionIds);
+  const started = now();
+  const found = new Map<string, string>();
+  await mapWithConcurrency(ids.length, AGENT_CWD_CONCURRENCY, async (index) => {
+    if (now() - started >= AGENT_CWD_DEADLINE_MS) return;
+    const id = ids[index];
+    try {
+      const cwd = parseTerminalContext(await read(id))?.cwd?.trim() ?? "";
+      if (cwd) found.set(id, cwd);
+    } catch {
+      // Unknown stays unknown. The next session still gets its own read.
+    }
+  });
+  return found;
+}

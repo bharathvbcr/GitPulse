@@ -11,6 +11,36 @@ before that tag is pushed.
 
 ## [Unreleased]
 
+### Added
+
+- **Undo on the task board.** A move, bulk label, priority, owner, due date,
+  reorder or archive offers Undo (and ⌘Z / Ctrl+Z) for a minute. The undo puts
+  back each task's own previous values with a revision-checked write, so a
+  task someone edited since is refused rather than reverted. A confirmed
+  deletion is held for 12 seconds before anything is written — Undo in that
+  window sends nothing, Delete now sends it at once — because the store never
+  reuses a deleted task's id.
+- **Bulk changes from the selection bar.** Change… opens status, labels,
+  priority, owner and due date for the whole selection, beside Archive and
+  Delete.
+- **A keyboard-operable board and list.** Up/Down, Home and End move between
+  cards; Shift+Up/Down extends the selection; X selects without a modifier;
+  Alt+Up/Down moves a card within its column. A selected card says so to a
+  screen reader, and the list layout is a labelled group.
+- **Workspaces can be reordered and imported.** Move up/down (or
+  Alt+Up/Down on a workspace) stores its position, so the order survives a
+  restart. Import turns the repository tab strip's named groups into
+  workspaces, skipping a group whose name a workspace already has.
+- **Relink a repository whose checkout moved.** A moved or re-cloned
+  checkout resolves to a new git identity and used to register as a second,
+  empty repository. Relink points the original record at the new folder and
+  keeps its id, so its tasks, memberships, runs and history stay attached;
+  an empty record the new folder had already registered is folded in, and a
+  copy with work of its own is never merged. Needs dc-store's new
+  `repositories.relink`.
+- **The home workspace is editable** in the task sheet; it could only be set
+  when a task was created.
+
 ## [1.4.0] - 2026-10-06
 
 Agents that start in the background with a pane showing every one at work,

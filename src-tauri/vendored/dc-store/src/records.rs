@@ -24,6 +24,89 @@ pub struct EvidenceRow {
     pub data_json: String,
 }
 
+/// One row of the `requirements` table.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RequirementRow {
+    pub id: String,
+    pub title: String,
+    pub description: String,
+    pub priority: String,
+    pub source: String,
+    /// The criteria as stored: JSON text, validated by the reader that
+    /// dispatches on it rather than here.
+    pub acceptance_criteria_json: String,
+}
+
+/// The requirements one task links to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LinkedRequirements {
+    /// Rows, in the order the task's `requirement_ids_json` lists them.
+    pub rows: Vec<RequirementRow>,
+    /// Linked ids no row defines. Reported rather than dropped: the verifier
+    /// must not read a criterion it cannot find as one with nothing to prove.
+    pub missing: Vec<String>,
+    /// More than [`MAX_LIST_ROWS`] links.
+    pub truncated: bool,
+}
+
+/// Reads the requirement rows a task links to, or `None` for an unknown task.
+///
+/// The link is resolved here, from the task's own column, rather than from ids
+/// a caller passes: which requirements a task answers to is the planner's
+/// judgement, and an argument would let a caller choose them.
+pub fn task_requirements(conn: &Connection, task_id: &str) -> Result<Option<LinkedRequirements>> {
+    let exists: Option<i64> = conn
+        .query_row(
+            "SELECT 1 FROM tasks WHERE id = ?1",
+            params![task_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if exists.is_none() {
+        return Ok(None);
+    }
+    let limit = (MAX_LIST_ROWS + 1) as i64;
+    let mut stmt = conn.prepare(
+        "SELECT j.value, r.id, r.title, r.description, r.priority, r.source,
+                r.acceptance_criteria_json
+         FROM tasks t, json_each(t.requirement_ids_json) j
+         LEFT JOIN requirements r ON r.id = j.value
+         WHERE t.id = ?1
+         ORDER BY CAST(j.key AS INTEGER)
+         LIMIT ?2",
+    )?;
+    let linked = stmt
+        .query_map(params![task_id, limit], |row| {
+            let linked_id: String = row.get(0)?;
+            let id: Option<String> = row.get(1)?;
+            Ok(match id {
+                None => Err(linked_id),
+                Some(id) => Ok(RequirementRow {
+                    id,
+                    title: row.get(2)?,
+                    description: row.get(3)?,
+                    priority: row.get(4)?,
+                    source: row.get(5)?,
+                    acceptance_criteria_json: row.get(6)?,
+                }),
+            })
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let truncated = linked.len() > MAX_LIST_ROWS;
+    let mut out = LinkedRequirements {
+        rows: Vec::new(),
+        missing: Vec::new(),
+        truncated,
+    };
+    for entry in linked.into_iter().take(MAX_LIST_ROWS) {
+        match entry {
+            Ok(row) => out.rows.push(row),
+            Err(id) => out.missing.push(id),
+        }
+    }
+    Ok(Some(out))
+}
+
 /// One row of the `gaps` table.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GapRow {

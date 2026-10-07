@@ -63,7 +63,7 @@ describe("TaskBoard", () => {
     expect(source).toContain("neighborStatus");
     expect(source).toContain("ArrowLeft");
     expect(source).toContain("ContextMenu");
-    expect(source).toContain('aria-keyshortcuts="ArrowLeft ArrowRight Delete ContextMenu"');
+    expect(source).toContain('aria-keyshortcuts="ArrowUp ArrowDown Home End Shift+ArrowUp Shift+ArrowDown Alt+ArrowUp Alt+ArrowDown ArrowLeft ArrowRight X Delete ContextMenu"');
   });
 
   it("keeps the board chrome short and skips generic marketing labels", () => {
@@ -435,7 +435,8 @@ describe("the board can archive a task", () => {
   });
 
   it("refuses the write that would store the status already there", () => {
-    const bar = source.slice(source.indexOf('data-testid="task-archive-selected"'), source.indexOf("Trash2 size={12} /> Delete"));
+    const start = source.indexOf('data-testid="task-archive-selected"');
+    const bar = source.slice(start, source.indexOf("Trash2 size={12} /> Delete", start));
     expect(bar).toContain('selectionArchived === "all"');
     expect(bar).toContain("disabled={busy ||");
     // The disabled control still says why, rather than sitting there dead.

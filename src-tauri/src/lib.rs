@@ -228,6 +228,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             workbench::cmd_workbench_request,
             workbench::cmd_workbench_register_repository,
+            workbench::cmd_workbench_relink_repository,
             workbench::cmd_workbench_launch_terminal,
             host_platform::cmd_host_platform,
             cmd_pick_folder,

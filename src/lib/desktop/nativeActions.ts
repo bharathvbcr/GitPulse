@@ -29,6 +29,15 @@ export interface NativeEvent {
 export const FLEET_ACTION_ID = "fleet";
 
 /**
+ * The native id for the Agents plane.
+ *
+ * Outside the `tab-*` namespace for the same reason as Fleet: it is a
+ * workspace surface, and `viewTabForMenuId` would otherwise route it into
+ * `setTab` and drop it.
+ */
+export const AGENTS_ACTION_ID = "agents";
+
+/**
  * The native id for the terminal dock.
  *
  * Outside the `tab-` namespace for the same reason as Fleet: `viewTabForMenuId`
@@ -76,6 +85,8 @@ export interface NativeMenuHandlers {
   resetZoom: () => void;
   /** Opens the workspace-wide Fleet dashboard. Not a view: see actions.rs. */
   fleet: () => void;
+  /** Opens the workspace-wide Agents plane. Not a view: see actions.rs. */
+  agents: () => void;
   /** Shows or hides the terminal dock. Not a view: see actions.rs. */
   terminalDock: () => void;
   fetch: () => void;
@@ -224,6 +235,9 @@ export function dispatchNativeMenu(
       return true;
     case "fleet":
       handlers.fleet();
+      return true;
+    case "agents":
+      handlers.agents();
       return true;
     case "terminal-dock":
       handlers.terminalDock();

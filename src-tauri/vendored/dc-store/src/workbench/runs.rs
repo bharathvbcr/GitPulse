@@ -30,6 +30,20 @@ const STATES: &[&str] = &[
     "unresolved",
 ];
 
+/// Whether any attempt still holds a checkout of this repository. A relink
+/// must not move the identity out from under a run that is prepared or live.
+pub(super) fn active_on_repository(
+    conn: &rusqlite::Connection,
+    repository_id: &str,
+    now: i64,
+) -> Result<bool> {
+    Ok(conn.query_row(
+        &format!("SELECT EXISTS(SELECT 1 FROM work_runs WHERE repository_id=?2 AND {ACTIVE})"),
+        params![now, repository_id],
+        |r| r.get(0),
+    )?)
+}
+
 fn refuse(code: &'static str, message: &str) -> Error {
     Error {
         code,

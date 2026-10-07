@@ -42,6 +42,9 @@ pub const TAB_INSIGHTS: &str = "tab-insights";
 /// NOT a `tab-*` id: those are parsed back into a `ViewTab` and stored on the
 /// active repository's session, which is exactly what Fleet must not be.
 pub const FLEET: &str = "fleet";
+/// Agents is workspace-scoped, like Fleet. A `tab-*` id would be stored on
+/// the active repository's session and destroyed on every tab switch.
+pub const AGENTS: &str = "agents";
 /// The terminal dock, for the same reason it is not a `tab-*` id: the terminal
 /// is no longer a view. It renders beneath whichever view is on screen, so
 /// parsing it into a `ViewTab` would store a destination that does not exist.
@@ -151,6 +154,7 @@ pub enum NativeAction {
     TabCode,
     TabInsights,
     Fleet,
+    Agents,
     TerminalDock,
     Fetch,
     Pull,
@@ -224,6 +228,7 @@ impl NativeAction {
             TAB_CODE => Self::TabCode,
             TAB_INSIGHTS => Self::TabInsights,
             FLEET => Self::Fleet,
+            AGENTS => Self::Agents,
             TERMINAL_DOCK => Self::TerminalDock,
             FETCH => Self::Fetch,
             PULL => Self::Pull,
@@ -284,6 +289,7 @@ impl NativeAction {
             Self::TabCode => TAB_CODE,
             Self::TabInsights => TAB_INSIGHTS,
             Self::Fleet => FLEET,
+            Self::Agents => AGENTS,
             Self::TerminalDock => TERMINAL_DOCK,
             Self::Fetch => FETCH,
             Self::Pull => PULL,

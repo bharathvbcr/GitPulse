@@ -64,6 +64,7 @@
     busy = false,
     hiddenColumns = [],
     refreshToken = 0,
+    hiddenIds = new Set<string>(),
     onopen,
     onaction,
     ontogglecolumn,
@@ -75,6 +76,8 @@
     hiddenColumns?: readonly TaskStatus[];
     /** Bumped by the board after a write, so a lost live event still reloads. */
     refreshToken?: number;
+    /** Tasks the board is about to delete (its undo window); already gone here too. */
+    hiddenIds?: ReadonlySet<string>;
     onopen: (taskID: string) => Promise<void>;
     onaction: (cards: TaskCard[], action: TaskAction) => void;
     ontogglecolumn: () => void;
@@ -89,11 +92,12 @@
   let generation = 0, disposed = false, loading = false, again = false;
   let refreshTimer: ReturnType<typeof setTimeout> | undefined;
 
-  const rows = $derived(result?.items ?? []);
+  const rows = $derived((result?.items ?? []).filter((card) => !hiddenIds.has(card.id)));
+  const hiddenHere = $derived((result?.items.length ?? 0) - rows.length);
   // `null` until a read succeeds, so an unread dock never renders as an empty
   // archive. The dock defers while the window is in the background, which is
   // exactly when that distinction stops being theoretical.
-  const summary = $derived(archiveSummary(result ? rows.length : null, result?.total ?? 0));
+  const summary = $derived(archiveSummary(result ? rows.length : null, Math.max(0, (result?.total ?? 0) - hiddenHere)));
   const presence = $derived(boardPresence(hiddenColumns));
   const chosen = $derived(rows.filter((card) => selected.has(card.id)));
   // The cap is the board's, not a second policy: a batch larger than this is

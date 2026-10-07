@@ -185,6 +185,7 @@ fn is_status_allowed(id: &str) -> bool {
                     | NativeAction::TabCode
                     | NativeAction::TabInsights
                     | NativeAction::Fleet
+                    | NativeAction::Agents
                     | NativeAction::TerminalDock
                     | NativeAction::Palette
                     | NativeAction::CopyBranch
@@ -209,7 +210,7 @@ fn validate_action(state: &MenuState, id: &str, repo_path: Option<&str>) -> Resu
     }
     let workspace = matches!(
         id,
-        "open" | "clone" | "fleet" | "palette" | "toggle-theme" | "shortcuts" | "diagnostics"
+        "open" | "clone" | "fleet" | "agents" | "palette" | "toggle-theme" | "shortcuts" | "diagnostics"
     ) || id.starts_with(super::actions::REPOSITORY_PREFIX);
     if !workspace && state.active_path.as_deref() != repo_path {
         return Err("Repository changed. Review the current status and try again.".into());
@@ -318,6 +319,7 @@ mod tests {
         assert!(validate_action(&state, "fetch", Some("/a")).is_err());
         assert!(validate_action(&state, "quick-commit", Some("/a")).is_err());
         assert!(validate_action(&state, "fleet", Some("/a")).is_ok());
+        assert!(validate_action(&state, "agents", Some("/b")).is_ok());
         assert!(validate_action(&state, "copy-branch", Some("/a")).is_ok());
         assert!(validate_action(&state, "section:insights:pulse", Some("/a")).is_ok());
         assert!(validate_action(&state, "toggle-theme", Some("/a")).is_ok());

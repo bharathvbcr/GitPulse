@@ -1,0 +1,350 @@
+<!doctype html>
+<html lang="en" class="dark">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>GitPulse agents verification</title>
+    <style>
+      body { margin: 0; background: rgb(11 14 23); }
+      #stage { width: 1280px; height: 820px; overflow: hidden; display: flex; }
+      #result { font: 12px ui-monospace, monospace; white-space: pre-wrap; padding: 12px; color: #ccc; }
+    </style>
+  </head>
+  <body>
+    <div id="stage"></div>
+    <pre id="result">Loading…</pre>
+    <script type="module">
+      import "../src/app.css";
+      import { mockIPCWithEvents } from "./tauriMocks";
+
+      const errors = [];
+      const unexpected = [];
+      addEventListener("error", (event) => errors.push(event.message));
+      addEventListener("unhandledrejection", (event) => errors.push(String(event.reason)));
+
+      const MAIN = "/code/devtools/GitPulse";
+      const ALPHA = `${MAIN}/.claude/worktrees/alpha`;
+      const BETA = `${MAIN}/.claude/worktrees/beta`;
+      const GAMMA = `${MAIN}/.claude/worktrees/gamma`;
+      const NAMED = `${MAIN}/.claude/worktrees/bad-name`;
+      const AWAY = `${MAIN}/.claude/worktrees/away`;
+      const branch = (name) => ({
+        name, is_current: true, is_remote: false, remote_name: null, tip_commit_id: "abc123456789",
+        is_default: name === "main", is_gone: false, last_commit_timestamp: 1700000000,
+        last_author: "Alex", last_summary: "Work",
+      });
+      const worktree = (path, slug, fields = {}) => ({
+        path, name: slug || "GitPulse", branch: fields.branch ?? (slug ? `agent/${slug}` : "main"),
+        is_detached: false, is_main: !slug, is_bare: false,
+        dirty_files: fields.dirty ?? 0, agent_kind: fields.kind ?? (slug ? "claude" : ""),
+        session_slug: slug, operation_kind: fields.operation ?? "", operation_ok: fields.operationOk ?? true,
+      });
+      const facet = (items, fields = {}) => ({
+        ok: true, error: "", count: items.length, scanned: items.length, dirty: 0, dirty_unknown: 0,
+        blocked: 0, blocked_unknown: 0, truncated: false, items, ...fields,
+      });
+
+      let mode = "ready";
+      let taskMode = "running";
+      let holding = true;
+      let releaseHold = () => {};
+      const hold = new Promise((resolve) => { releaseHold = () => resolve(); });
+      let slow = null;
+      const maybeHold = async () => { if (holding) await hold; };
+
+      function snapshot() {
+        const hostile = "bad\u0000name";
+        const items = [
+          worktree(MAIN, ""),
+          worktree(ALPHA, "alpha", { dirty: 3 }),
+          worktree(BETA, "beta"),
+          worktree(GAMMA, "gamma", { operation: "rebase", branch: "agent/gamma-with-a-very-long-name-that-must-stay-inside-the-scroller" }),
+          worktree(NAMED, hostile),
+        ];
+        const truncated = mode === "truncated";
+        const unscanned = mode === "unscanned";
+        return {
+          repo_path: MAIN, branch: mode === "slow" ? "SHOULD-NOT-LAND" : "main", branch_ok: true,
+          deadline_expired: false, duration_ms: 4,
+          worktrees: facet(items, { truncated }),
+          agents: {
+            ok: true, sessions: truncated ? 9 : 4, kinds: [{ kind: "claude", sessions: truncated ? 9 : 4 }], truncated,
+          },
+          changes: {
+            ok: true, error: "", files: 3, staged: 0, unstaged: 3, untracked: 0, conflicted: 0,
+            additions: 3, deletions: 0, churn_warnings: 0, churn_overflowed: false, truncated: false,
+          },
+          collisions: {
+            ok: true, error: "", overlapping_files: 0, worktrees_involved: 0, scanned_worktrees: unscanned ? 1 : 5,
+            unscanned_worktrees: unscanned ? 2 : 0, failed_worktrees: 0, truncated: false, items: [],
+          },
+          ledger: { recording: true, path: "", dropped: 0, error: "", error_code: "" },
+          codeintel: { available: false, db_path: "" },
+        };
+      }
+
+      function runPage(state) {
+        const empty = { ok: true, items: [], total: 0, shown: 0, has_more: false, next_cursor: null };
+        if (taskMode !== "running" || state !== "running") return JSON.stringify(empty);
+        const item = {
+          id: "run-gate", revision: 1, updated_at: 1, kind: "external_terminal",
+          task_id: "task-gate", source_revision: 1, task_title: "Fix the gate",
+          repository_id: "repo-1", provider: "claude", permission_mode: "ask", state: "running",
+          cwd: AWAY, created_at: 1, expires_at: 4_000_000_000_000, session_id: null,
+          exit_code: null, reason: "", outcome_uncertain: false,
+        };
+        return JSON.stringify({ ok: true, items: [item], total: 1, shown: 1, has_more: false, next_cursor: null });
+      }
+
+      const fixtures = {
+        cmd_resolve_repo: (args) => ({
+          path: args.repoPath, name: "GitPulse", is_bare: false, common_dir: `${MAIN}/.git`,
+        }),
+        cmd_list_branches: () => [branch("main")],
+        cmd_get_status: () => [],
+        cmd_list_tags: () => ({ tags: [], truncated: false }),
+        cmd_repo_operation: () => null,
+        cmd_stash_list: () => ({ entries: [], truncated: false }),
+        cmd_branch_stats: () => ({ updates: [], capped: false, compute_failures: 0, compared_to: "main" }),
+        cmd_watch_repo: () => null,
+        cmd_unwatch_repo: () => null,
+        cmd_set_recent_menu: () => null,
+        cmd_last_fetch_at: () => null,
+        cmd_note_tab_activated: () => null,
+        cmd_get_commit_graph: () => ({ nodes: [], edges: [], total_commits: 0, truncated: false }),
+        cmd_workspace_sync: () => ({ repos: [] }),
+        cmd_devcouncil_init: (args) => ({
+          repo: args.repoPath, state_dir: `${args.repoPath}/.devmap`,
+          exclude: { status: "already_ignored", source: "harness" },
+          workspace_registry: null, workspace_reason: null, skipped_untrusted: [], skipped_unavailable: [],
+          devmap_available: false,
+        }),
+        cmd_devmap_maybe_refresh: () => ({
+          decision: "skip_unavailable",
+          facts: { available: false, is_fresh: false, schema_ok: false, already_building: false },
+          reason: null,
+        }),
+        cmd_insights_snapshot: async () => {
+          await maybeHold();
+          if (slow) await slow;
+          if (mode === "fail") throw new Error("insights down");
+          return snapshot();
+        },
+        cmd_workbench_request: async (args) => {
+          await maybeHold();
+          if (args.method !== "runs.list") throw new Error(`unexpected workbench method ${args.method}`);
+          return runPage(JSON.parse(args.input).state);
+        },
+        cmd_terminal_context: (args) => (
+          args.sessionId === "pty-alpha"
+            ? { process: "claude", busy: false, cwd: ALPHA, repo_dir: ".claude/worktrees/alpha" }
+            : { process: null, busy: null, cwd: null, repo_dir: null }
+        ),
+      };
+      mockIPCWithEvents((cmd, args) => {
+        if (cmd.startsWith("plugin:")) return null;
+        if (fixtures[cmd]) return fixtures[cmd](args ?? {});
+        unexpected.push(cmd);
+        return null;
+      });
+
+      const { mount, tick } = await import("svelte");
+      const { get } = await import("svelte/store");
+      const { createChecks } = await import("./checks.ts");
+      const { repoStore } = await import("../src/lib/stores/repoStore.ts");
+      const { interfaceStore } = await import("../src/lib/stores/interfaceStore.ts");
+      const { noteForegroundFocus } = await import("../src/lib/runtime/foreground.ts");
+      const { terminalSessions } = await import("../src/lib/terminal/sessionRegistry.ts");
+      const { sessionActivity } = await import("../src/lib/terminal/sessionActivity.ts");
+      const AgentsView = (await import("../src/lib/components/AgentsView.svelte")).default;
+
+      const { results, check, stopped } = createChecks();
+      const stage = document.querySelector("#stage");
+      const root = () => stage.querySelector("[data-testid=agents-view]");
+      const text = () => root()?.textContent ?? "";
+      const button = (name) => [...root().querySelectorAll("button")].find((node) => node.textContent.trim() === name);
+      const row = (name) => [...root().querySelectorAll("[data-testid=agents-row]")].find((node) => node.textContent.includes(name));
+      const rows = () => [...root().querySelectorAll("[data-testid=agents-row]")];
+      const wait = (ms = 40) => new Promise((resolve) => setTimeout(resolve, ms));
+      const settle = async () => { await tick(); await wait(); await tick(); };
+      const until = async (test, label) => {
+        const end = Date.now() + 8000;
+        while (!test() && Date.now() < end) await settle();
+        if (!test()) throw new Error(label || "Timed out");
+      };
+      const press = async (name) => { button(name).click(); await settle(); };
+      let revealed = 0;
+
+      const finish = (extra = "") => {
+        const payload = { results, errors, unexpected };
+        document.querySelector("#result").textContent = `${results.map((item) => `${item.pass ? "PASS" : "FAIL"} ${item.name}`).join("\n")}${extra}`;
+        document.documentElement.dataset.gpResult = encodeURIComponent(JSON.stringify(payload));
+        document.title = `GitPulse agents ${results.filter((item) => item.pass).length}/${results.length}`;
+        const report = new URL(location.href).searchParams.get("report");
+        if (report?.startsWith("/__gp_result/")) return fetch(report, { method: "POST", body: document.documentElement.outerHTML });
+      };
+
+      try {
+        noteForegroundFocus(true);
+        await repoStore.openRepo(MAIN);
+        interfaceStore.setAgentsOpen(true);
+        mount(AgentsView, { target: stage });
+        await settle();
+
+        check("the plane is a labelled region", () => root()?.getAttribute("aria-label") === "Agents");
+        check("an unread task board is not an empty workspace", () =>
+          text().includes("Task attempts have not been read yet") && text().includes("Still reading") && !text().includes("No agent sessions"));
+        check("an unread board is not reported as a failed read", () => !text().includes("could not be read"));
+        check("refresh waits, and can be cancelled, while the first read is in flight", () =>
+          button("Refresh").disabled && button("Cancel"));
+
+        holding = false;
+        releaseHold();
+        await until(() => row("alpha") && row("Fix the gate"), "sessions did not arrive");
+
+        const presence = (name) => row(name).querySelectorAll("td")[1];
+        check("a checkout on disk is not called a running process", () =>
+          presence("beta").textContent.includes("On disk")
+          && presence("beta").getAttribute("title").includes("does not say a process is running"));
+        check("a known dirty count is the number, including a clean zero", () =>
+          row("alpha").textContent.includes("Uncommitted changes") && row("beta").textContent.includes("0") && !row("beta").textContent.includes("Not read"));
+        check("a parked git operation is its own reason", () => row("gamma").textContent.includes("Git operation parked"));
+        check("a control character in a session name is not rendered", () =>
+          text().includes("bad name") && !text().includes("\u0000"));
+        check("a running attempt with no terminal here is not described as stopped", () => {
+          const attempt = row("Fix the gate");
+          return attempt.textContent.includes("Not in this window")
+            && attempt.textContent.includes("Running, not shown in this window")
+            && !attempt.textContent.includes("Stopped on an error");
+        });
+        check("the headline counts sessions and who needs attention", () =>
+          text().includes("5 sessions") && text().includes("2 need attention") && !text().includes("at least"));
+        check("parallel counts agree across the repository's checkouts", () =>
+          ["alpha", "beta", "gamma", "bad name"].every((name) => row(name).querySelectorAll("td")[3].textContent.trim() === "4"));
+        check("the main checkout and an empty session name are not sessions", () =>
+          rows().length === 5 && !rows().some((item) => item.textContent.includes("GitPulse") && item.textContent.includes("main")));
+
+        await press("Needs action");
+        check("uncommitted work alone does not enter the attention filter", () =>
+          !row("alpha") && !row("beta") && row("gamma") && row("Fix the gate") && text().includes("3 hidden by the filter"));
+        await press("Parallel");
+        check("the parallel filter keeps the checkouts and not the lone attempt", () =>
+          row("alpha") && row("beta") && !row("Fix the gate") && text().includes("1 hidden by the filter"));
+        await press("Live");
+        check("nothing is live until this window has a process there", () =>
+          rows().length === 0 && text().includes("Nothing matches this filter") && text().includes("5 hidden by the filter"));
+        await press("All");
+
+        const slot = terminalSessions.reserve({
+          key: "live-alpha", repoPath: MAIN, label: "Claude", title: "alpha", status: "running",
+          sessionId: "pty-alpha", close: async () => {}, reveal: () => { revealed += 1; },
+        });
+        await until(() => row("alpha").textContent.includes("Live"), "the live terminal did not join its checkout");
+        check("a reported directory joins the process to that checkout", () =>
+          rows().length === 5
+          && presence("alpha").textContent.includes("Live")
+          && presence("alpha").getAttribute("title").includes("A process this window started.")
+          && presence("beta").textContent.includes("On disk"));
+        terminalSessions.reserve({
+          key: "live-shell", repoPath: MAIN, label: "Shell", title: "zsh", status: "running",
+          close: async () => {},
+        });
+        await settle();
+        check("a shell in the main checkout is not an agent session", () => rows().length === 5 && !text().includes("zsh"));
+
+        sessionActivity.announce({ session: "pty-alpha", channel: "bell", event: "permission_prompt", detail: "allow the edit" });
+        await until(() => row("alpha").textContent.includes("Needs you"), "attention did not reach the row");
+        check("a permission prompt outranks the checkout's uncommitted files", () =>
+          row("alpha").textContent.includes("Needs you"));
+
+        await press("Changes");
+        check("hiding changes removes the column and keeps the attention", () =>
+          !text().includes("Uncommitted changes")
+          && row("alpha").textContent.includes("Needs you")
+          && button("Show columns")
+          && ![...root().querySelectorAll("th")].some((cell) => cell.textContent.trim() === "Changes"));
+        await press("Show columns");
+        check("show columns brings the change count back", () =>
+          [...root().querySelectorAll("th")].some((cell) => cell.textContent.trim() === "Changes")
+          && row("alpha").querySelectorAll("td")[4].textContent.trim() === "3"
+          && !button("Show columns"));
+
+        const compact = root().querySelector("[aria-label='Use compact rows']");
+        compact.click();
+        await settle();
+        check("compact rows is a pressed toggle", () => compact.getAttribute("aria-pressed") === "true");
+        compact.click();
+        await settle();
+
+        row("alpha").querySelector("button").click();
+        await until(() => revealed === 1 && get(repoStore).currentPath === ALPHA, "opening the row did not reveal its terminal");
+        check("opening a live row returns to the repository and reveals that terminal", () =>
+          get(interfaceStore).globalSurface === "repository" && revealed === 1);
+        interfaceStore.setAgentsOpen(true);
+        await until(() => row("alpha") && !button("Refresh").disabled, "the plane did not return");
+
+        let releaseSlow = () => {};
+        slow = new Promise((resolve) => { releaseSlow = resolve; });
+        mode = "slow";
+        button("Refresh").click();
+        await until(() => button("Refresh").disabled && button("Cancel"), "refresh did not show it was reading");
+        check("a refresh keeps the sessions that are already on screen", () =>
+          row("alpha") && !text().includes("No agent sessions") && !text().includes("SHOULD-NOT-LAND"));
+        button("Cancel").click();
+        await settle();
+        releaseSlow();
+        await settle();
+        await wait(80);
+        check("cancelling drops the read in flight", () => !text().includes("SHOULD-NOT-LAND") && !button("Cancel"));
+        slow = null;
+        mode = "ready";
+        button("Refresh").click();
+        await until(() => button("Refresh") && !button("Refresh").disabled && row("alpha"), "refresh did not finish");
+
+        mode = "truncated";
+        await until(() => button("Refresh")?.disabled === false, "refresh was still running");
+        button("Refresh").click();
+        await until(() => text().includes("at least"), "a capped session list was not a floor");
+        check("a capped worktree list says the count is a floor", () =>
+          text().includes("at least") && text().includes("Session counts for this repository are a floor"));
+
+        mode = "unscanned";
+        button("Refresh").click();
+        await until(() => text().includes("did not cover every worktree"), "an incomplete collision scan looked clear");
+        check("an incomplete collision scan is not a clear one", () =>
+          text().includes("Collisions not fully read") && root().querySelector("[data-testid=agents-gaps]"));
+        await press("Attention");
+        check("the collision gap stays when its column is hidden", () => {
+          const gaps = root().querySelector("[data-testid=agents-gaps]");
+          const table = root().querySelector("table");
+          return gaps && (!table || gaps.compareDocumentPosition(table) & Node.DOCUMENT_POSITION_FOLLOWING);
+        });
+        await press("Show columns");
+        await press("All");
+
+        stage.style.width = "390px";
+        await settle();
+        check("the plane fits a narrow window without widening the page", () =>
+          stage.scrollWidth <= 391 && root().scrollWidth <= root().clientWidth + 1);
+        stage.style.width = "1280px";
+        await settle();
+        check("the plane fits the wide window as well", () =>
+          stage.scrollWidth <= 1281 && root().scrollWidth <= root().clientWidth + 1);
+
+        slot.release();
+        taskMode = "empty";
+        await until(() => !row("Fix the gate"), "the attempt did not leave after the board read it gone");
+        mode = "fail";
+        button("Refresh").click();
+        await until(() => text().includes("Sessions could not be read"), "a failed read looked like an empty workspace");
+        check("a failed read names itself and is not an empty workspace", () =>
+          text().includes("insights down") && text().includes("Sessions could not be read") && !text().includes("No agent sessions"));
+        check("the run made no unexpected native calls", () => unexpected.length === 0 && errors.length === 0);
+        await finish();
+      } catch (error) {
+        stopped(error);
+        await finish(`\n${error}`);
+      }
+    </script>
+  </body>
+</html>

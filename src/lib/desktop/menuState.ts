@@ -60,6 +60,7 @@ const STATUS_SHORTCUTS: StatusShortcut[] = [
   { id: "section:history:graph", label: "History", group: "go" },
   { id: "section:insights:pulse", label: "Pulse", group: "go" },
   { id: "fleet", label: "Fleet", group: "go" },
+  { id: "agents", label: "Agents", group: "go" },
   { id: "terminal-dock", label: "Terminal", group: "go" },
   { id: "copy-branch", label: "Copy branch", group: "tool" },
   { id: "reveal-repo", label: "Reveal", group: "tool" },
@@ -84,7 +85,7 @@ export interface MenuState {
 
 const GLOBAL_ACTIONS = ["open", "clone", "settings", "shortcuts", "diagnostics", "documentation",
   "release-notes", "report-issue", "setup-tools", "toggle-theme", "theme-system", "theme-light",
-  "theme-dark", "fleet", "palette"];
+  "theme-dark", "fleet", "agents", "palette"];
 
 /** Menu titles must not turn path control characters into accelerators or extra rows. */
 export function menuText(value: string, max = 240): string {
@@ -223,6 +224,7 @@ export function buildMenuState(
   label("copy-commit", repo.selectedCommitId ? "Copy Selected Commit SHA" : "Copy HEAD SHA");
   if (repo.terminalOpen && hasRepo) checked.add("terminal-dock");
   if (prefs.globalSurface === "fleet") checked.add("fleet");
+  if (prefs.globalSurface === "agents") checked.add("agents");
   for (const view of REGISTERED_VIEWS) {
     allow(`tab-${view.id}`, hasRepo);
     if (hasRepo && prefs.globalSurface === "repository" && repo.activeTab === view.id) checked.add(`tab-${view.id}`);

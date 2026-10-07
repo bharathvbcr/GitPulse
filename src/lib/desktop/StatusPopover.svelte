@@ -1,6 +1,6 @@
 <script lang="ts">
   import { slide } from "svelte/transition";
-  import { Activity, Archive, ArrowDown, ArrowUp, ArrowUpRight, Check, ChevronDown, ChevronRight, CircleAlert, Command, Copy, FileDiff, FolderOpen, GitBranch, Globe, HeartPulse, History, Layers, LayoutGrid, Moon, Power, RefreshCw, Settings2, Sun, Terminal } from "@lucide/svelte";
+  import { Activity, Archive, ArrowDown, ArrowUp, ArrowUpRight, Bot, Check, ChevronDown, ChevronRight, CircleAlert, Command, Copy, FileDiff, FolderOpen, GitBranch, Globe, HeartPulse, History, Layers, LayoutGrid, Moon, Power, RefreshCw, Settings2, Sun, Terminal } from "@lucide/svelte";
   import type { MenuState } from "./menuState";
   import { formatFetchAge, statusDetailRows, statusInsights, statusKeyAction, statusShortcuts } from "./menuState";
   import { createAdaptiveTimer } from "../runtime/adaptiveTimer";
@@ -40,7 +40,7 @@
     { label: "Conflicts", value: card?.conflicts, icon: CircleAlert, action: "section:work:resolve" },
   ]);
   const shortcutIcon = $derived<Record<string, typeof History>>({
-    "section:history:graph": History, "section:insights:pulse": HeartPulse, fleet: LayoutGrid,
+    "section:history:graph": History, "section:insights:pulse": HeartPulse, fleet: LayoutGrid, agents: Bot,
     "terminal-dock": Terminal, "copy-branch": Copy, "reveal-repo": FolderOpen, "open-remote": Globe,
     "toggle-theme": dark ? Sun : Moon,
   });

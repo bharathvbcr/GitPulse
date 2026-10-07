@@ -253,6 +253,10 @@ impl WorkbenchState {
                 | "runs.protocol"
                 | "runs.managed.prepare"
                 | "runs.managed.activate"
+                // A relink names a checkout the host resolves itself, through
+                // `cmd_workbench_relink_repository`. The raw method would take
+                // a renderer's word for which directory a repository is.
+                | "repositories.relink"
         ) {
             return Err(WorkbenchError::new(
                 "host_only",
@@ -405,6 +409,20 @@ impl WorkbenchState {
         self.check_open()?;
         let local = intake::resolve(repo_path)?;
         self.with_store(|store| intake::register(store, &local, id, request_id))
+    }
+
+    fn relink(
+        &self,
+        repository_id: &str,
+        expected_revision: i64,
+        repo_path: &str,
+        request_id: &str,
+    ) -> Result<Value, WorkbenchError> {
+        self.check_open()?;
+        let local = intake::resolve(repo_path)?;
+        self.with_store(|store| {
+            intake::relink(store, &local, repository_id, expected_revision, request_id)
+        })
     }
 }
 
@@ -646,6 +664,42 @@ pub async fn cmd_workbench_register_repository(
     let response = tauri::async_runtime::spawn_blocking(move || {
         let _reservation = reservation;
         state.register(&repo_path, &id, &request_id)
+    })
+    .await
+    .map_err(|e| WorkbenchError::new("worker_error", e.to_string()))??;
+    announce(&app, &response);
+    Ok(response.to_string())
+}
+
+/// Point a registered repository at the checkout it now lives in, after a
+/// move or a re-clone. The host resolves `repo_path` to its git identity; the
+/// store keeps the repository's id, so its tasks and their history stay put.
+#[tauri::command]
+pub async fn cmd_workbench_relink_repository(
+    state: State<'_, WorkbenchState>,
+    app: tauri::AppHandle,
+    repository_id: String,
+    expected_revision: i64,
+    repo_path: String,
+    request_id: String,
+) -> Result<String, WorkbenchError> {
+    if repo_path.len() > 16_384 || repository_id.len() > 128 || request_id.len() > 128 {
+        return Err(WorkbenchError::new(
+            "invalid_input",
+            "Repository request exceeds the size limit.",
+        ));
+    }
+    if expected_revision < 1 {
+        return Err(WorkbenchError::new(
+            "invalid_input",
+            "Only a registered repository can be relinked.",
+        ));
+    }
+    let reservation = state.reserve()?;
+    let state = state.inner().clone();
+    let response = tauri::async_runtime::spawn_blocking(move || {
+        let _reservation = reservation;
+        state.relink(&repository_id, expected_revision, &repo_path, &request_id)
     })
     .await
     .map_err(|e| WorkbenchError::new("worker_error", e.to_string()))??;
@@ -1180,5 +1234,133 @@ done
             2
         );
         assert!(!repo.join(".devcouncil").exists());
+    }
+
+    #[test]
+    fn a_reordered_workspace_keeps_its_place_when_the_profile_is_reopened() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("profile.sqlite");
+        let host = state(&path);
+        for (id, position) in [("first", 100), ("second", 200), ("third", 300)] {
+            let input = json!({"request_id":id,"id":id,"expected_revision":0,"name":id,"position":position});
+            host.request("workspaces.put", &input.to_string()).unwrap();
+        }
+        // The navigator's move: one write of the moved workspace's position.
+        let moved = json!({"request_id":"move","id":"third","expected_revision":1,"name":"third","position":150});
+        host.request("workspaces.put", &moved.to_string()).unwrap();
+        drop(host);
+        let reopened = state(&path);
+        let listed = reopened.request("workspaces.list", "{}").unwrap();
+        let order: Vec<&str> = listed["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|item| item["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(order, ["first", "third", "second"]);
+    }
+
+    #[test]
+    fn a_moved_checkout_is_relinked_without_losing_its_tasks_and_a_busy_clone_is_never_merged() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        let moved = dir.path().join("moved");
+        let other = dir.path().join("other");
+        let git = |cwd: &std::path::Path, args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .current_dir(cwd)
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .args(args)
+                .output_locked()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        git(dir.path(), &["init", repo.to_str().unwrap()]);
+        crate::test_support::trust_repo(&repo);
+        let path = dir.path().join("profile.sqlite");
+        let host = state(&path);
+        let first = host
+            .register(repo.to_str().unwrap(), "repo-1", "register-1")
+            .unwrap();
+        let task = json!({"request_id":"t1","id":"t1","expected_revision":0,"title":"Survive the move","repository_ids":["repo-1"],"primary_repository_id":"repo-1"});
+        host.request("items.put", &task.to_string()).unwrap();
+
+        // The renderer cannot name a checkout for a repository: only the
+        // command, which resolves the directory itself, may relink.
+        let raw = json!({"request_id":"raw","id":"repo-1","expected_revision":1,"identity_key":"local:/anywhere"});
+        assert_eq!(
+            host.request("repositories.relink", &raw.to_string())
+                .unwrap_err()
+                .code,
+            "host_only"
+        );
+
+        std::fs::rename(&repo, &moved).unwrap();
+        crate::test_support::trust_repo(&moved);
+        // Opening the moved checkout registers it as a record of its own.
+        let fresh = host
+            .register(moved.to_str().unwrap(), "repo-fresh", "register-2")
+            .unwrap();
+        assert_ne!(fresh["repository"]["id"], first["repository"]["id"]);
+        assert_eq!(
+            host.request("items.list", r#"{"repository_id":"repo-fresh"}"#)
+                .unwrap()["total"],
+            0
+        );
+
+        let relinked = host
+            .relink("repo-1", 1, moved.to_str().unwrap(), "relink-1")
+            .unwrap();
+        assert_eq!(relinked["repository"]["id"], "repo-1");
+        assert_eq!(
+            relinked["repository"]["identity_key"],
+            fresh["repository"]["identity_key"]
+        );
+        let repositories = host.request("repositories.list", "{}").unwrap();
+        assert_eq!(repositories["total"], 1);
+        let tasks = host
+            .request("items.list", r#"{"repository_id":"repo-1"}"#)
+            .unwrap();
+        assert_eq!(tasks["total"], 1);
+        assert_eq!(tasks["items"][0]["id"], "t1");
+        // Re-registering the moved checkout now finds the original record.
+        let again = host
+            .register(moved.to_str().unwrap(), "unused", "register-3")
+            .unwrap();
+        assert_eq!(again["repository"]["id"], "repo-1");
+        // Relinking to where it already is changes nothing and says so.
+        assert_eq!(
+            host.relink("repo-1", 2, moved.to_str().unwrap(), "relink-2")
+                .unwrap_err()
+                .code,
+            "invalid_input"
+        );
+
+        // A distinct clone that carries work of its own is never absorbed.
+        git(
+            dir.path(),
+            &[
+                "clone",
+                "--local",
+                moved.to_str().unwrap(),
+                other.to_str().unwrap(),
+            ],
+        );
+        crate::test_support::trust_repo(&other);
+        host.register(other.to_str().unwrap(), "repo-other", "register-4")
+            .unwrap();
+        let clone_task = json!({"request_id":"t2","id":"t2","expected_revision":0,"title":"Clone work","repository_ids":["repo-other"],"primary_repository_id":"repo-other"});
+        host.request("items.put", &clone_task.to_string()).unwrap();
+        assert_eq!(
+            host.relink("repo-1", 2, other.to_str().unwrap(), "relink-3")
+                .unwrap_err()
+                .code,
+            "repository_not_empty"
+        );
+        assert_eq!(host.request("repositories.list", "{}").unwrap()["total"], 2);
     }
 }

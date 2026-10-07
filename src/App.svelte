@@ -104,6 +104,7 @@
   const loadConflictEditor = () => import("./lib/components/ConflictEditor.svelte");
   const loadPulseView = () => import("./lib/components/pulse/PulseView.svelte");
   const loadFleetView = () => import("./lib/components/FleetView.svelte");
+  const loadAgentsView = () => import("./lib/components/AgentsView.svelte");
   const loadTaskBoard = () => import("./lib/components/TaskBoard.svelte");
 
   // Overlays. None of these is on screen at startup and most sessions open
@@ -230,10 +231,12 @@
   const fleetOpen = $derived($interfaceStore.globalSurface === "fleet");
   let fleetMounted = $state(false);
   let tasksMounted = $state(false);
+  let agentsMounted = $state(false);
   $effect(() => { if ($interfaceStore.globalSurface === "tasks") tasksMounted = true; });
   $effect(() => {
     if (fleetOpen) fleetMounted = true;
   });
+  $effect(() => { if ($interfaceStore.globalSurface === "agents") agentsMounted = true; });
 
   // Forward legacy repoStore.error to the centralized toast queue AND to the
   // diagnostics ring.
@@ -619,6 +622,7 @@
       zoomOut: () => interfaceStore.zoomOut(),
       resetZoom: () => interfaceStore.resetZoom(),
       fleet: () => interfaceStore.setFleetOpen(true),
+      agents: () => interfaceStore.setAgentsOpen(true),
       terminalDock: () => repoStore.toggleTerminal(),
       rebase: openRebaseDialog,
       palette: () => openCommandPalette(),
@@ -1171,6 +1175,14 @@
     <svelte:boundary failed={paneFailed} onerror={(error) => paneCrashes.report("fleet", error)}>
       <div class="flex-1 flex flex-col min-h-0" class:hidden={!fleetOpen}>
         <LazyView load={loadFleetView} name="the Fleet dashboard" />
+      </div>
+    </svelte:boundary>
+  {/if}
+
+  {#if agentsMounted}
+    <svelte:boundary failed={paneFailed} onerror={(error) => paneCrashes.report("agents", error)}>
+      <div class="gp-workspace flex-1 flex flex-col min-h-0 min-w-0 bg-background gp-pane" class:hidden={$interfaceStore.globalSurface !== "agents"}>
+        <LazyView load={loadAgentsView} name="Agents" />
       </div>
     </svelte:boundary>
   {/if}

@@ -140,6 +140,50 @@ pub(crate) fn register(
     }
 }
 
+/// Point a registered repository at the checkout `local` resolved to.
+///
+/// The repository keeps its id, so its tasks, workspace memberships, runs and
+/// history stay where they are; the store swaps only the identity. When the
+/// new checkout was already opened — which registers it as a record of its own
+/// — that record is named for the store to absorb. The store, not this
+/// function, decides whether it may: it refuses unless the record holds no
+/// tasks, memberships or runs, so two clones with work of their own are never
+/// merged by a relink.
+pub(crate) fn relink(
+    store: &Store,
+    local: &LocalRepository,
+    repository_id: &str,
+    expected_revision: i64,
+    request_id: &str,
+) -> Result<Value, WorkbenchError> {
+    let mut input = json!({
+        "id": repository_id,
+        "request_id": request_id,
+        "expected_revision": expected_revision,
+        "identity_key": local.identity,
+        "name": local.name,
+    });
+    if let Some(holder) = find(store, &local.identity)? {
+        let holder_id = holder["id"].as_str().ok_or_else(|| {
+            WorkbenchError::new("protocol_error", "Registered repository has no id.")
+        })?;
+        if holder_id == repository_id {
+            return Err(WorkbenchError::new(
+                "invalid_input",
+                "This repository is already linked to that checkout.",
+            ));
+        }
+        input["absorb_id"] = json!(holder_id);
+    }
+    let response = query(store, "repositories.relink", &input.to_string())?;
+    Ok(json!({
+        "repository": response["item"],
+        "path": local.path,
+        "is_bare": local.is_bare,
+        "sequence": response["sequence"],
+    }))
+}
+
 // ---------------------------------------------------------------------------
 // Tasks
 // ---------------------------------------------------------------------------

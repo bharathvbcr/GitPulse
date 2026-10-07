@@ -905,6 +905,12 @@ impl Store {
         records::evidence_list(&self.conn, task_id)
     }
 
+    /// Reads the requirements a task links to. See
+    /// [`records::task_requirements`].
+    pub fn task_requirements(&self, task_id: &str) -> Result<Option<records::LinkedRequirements>> {
+        records::task_requirements(&self.conn, task_id)
+    }
+
     /// Lists gap history. See [`records::gap_history_list`].
     pub fn gap_history_list(
         &self,

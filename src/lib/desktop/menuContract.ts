@@ -82,7 +82,7 @@ export const MENU_ACTION_IDS: readonly string[] = [
   "open", "clone", "settings", "shortcuts", "diagnostics", "documentation",
   "release-notes", "report-issue", "setup-tools", "zoom-in", "zoom-out",
   "reset-zoom", "refresh", "toggle-theme", "theme-system", "theme-light",
-  "theme-dark", "tab-work", "tab-history", "tab-code", "tab-insights", "fleet",
+  "theme-dark", "tab-work", "tab-history", "tab-code", "tab-insights", "fleet", "agents",
   "terminal-dock", "fetch", "pull", "push", "stash", "stash-pop",
   "quick-commit", "rebase", "palette", "focus-filter", "close-tab",
   "next-repo-tab", "prev-repo-tab", "reopen-repo-tab",
@@ -111,7 +111,7 @@ export function isCheckable(id: string): boolean {
     id.startsWith("tab-") ||
     id.startsWith("section:") ||
     id.startsWith(REPOSITORY_PREFIX) ||
-    ["theme-system", "theme-light", "theme-dark", "fleet", "terminal-dock"].includes(id)
+    ["theme-system", "theme-light", "theme-dark", "fleet", "agents", "terminal-dock"].includes(id)
   );
 }
 

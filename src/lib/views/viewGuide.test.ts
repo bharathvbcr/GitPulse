@@ -36,6 +36,7 @@ describe("destination guides", () => {
   it("returns null for keys this build does not offer", () => {
     expect(destinationGuide("")).toBeNull();
     expect(destinationGuide("fleet")).toBeNull();
+    expect(destinationGuide("agents")).toBeNull();
     expect(destinationGuide("work:missing")).toBeNull();
     expect(destinationGuide("work:")).toBeNull();
   });

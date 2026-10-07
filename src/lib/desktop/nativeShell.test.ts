@@ -92,6 +92,7 @@ function buildHandlers() {
     zoomOut: vi.fn(),
     resetZoom: vi.fn(),
     fleet: vi.fn(),
+    agents: vi.fn(),
     terminalDock: vi.fn(),
     fetch: vi.fn(),
     pull: vi.fn(),

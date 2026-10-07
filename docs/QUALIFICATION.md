@@ -12,11 +12,40 @@ before treating a row as still open.
 
 | Area | Remaining |
 |------|-----------|
-| Workspaces and boards | Full task fields, checkout identities and relinking; group import/reorder; board/list/bulk/undo/accessibility; installed-app qualification |
+| Workspaces and boards | The task fields the store cannot hold yet (see [Task fields](#task-fields-against-the-plan)); detecting an unavailable checkout before a relink, and remote-only repositories; swimlanes, saved views and WIP limits; installed-app qualification. Board/list multi-select with bulk status/label/archive, undo (a deferred window for deletion), keyboard operation, group import from tab groups, group reorder and relinking a moved or re-cloned checkout shipped 2026-10-07 — `harness/tasks.html` checks each in Chrome and WKWebView |
 | Manvi intelligence | Semantic quality evaluation, context/planning/orchestration, installed native qualification |
 | Agent supervision | Approve/deny round-trip through the managed lane on real Claude Code and Codex accounts (only controlled providers so far). Codex mid-turn driver kill with a tool running or an approval pending (its configured model is refused on the measuring machine; the other mid-turn cases are measured, see ARCHITECTURE.md). End-to-end test that a refused provider callback (Claude `request_user_dialog`/`elicitation`/any other subtype, Codex any unhandled method) lands as the run's visible reason — traced in code, adapter-tested, not driven through `serve`. The agent hook's scope fence covers redirection targets only: Manvi does not read writes out of a command's arguments, so `sed -i` outside the plan is still a demoted allow — and the file-tool hook (`collision-guard`, on Edit/Write) checks collisions only, so a task-bound agent's direct write outside its scope is not fenced by any hook. It applies only in repositories GitPulse is trusted in; elsewhere commands are judged unscoped, silently. A redirect into a *planned* file is refused (`scope.operation`) until Manvi's `fix/hostscope-unspecialised-write` ships in the installed harness. Code review is designed, not built ([AGENT_OUTPUT_REVIEW.md](AGENT_OUTPUT_REVIEW.md)). Installed-app qualification |
 | Native notifications | Installed OS delivery/activation, callback crash-window, native Snooze/withdrawal, remaining event producers, other platforms, native resource measurements — see [NATIVE_NOTIFICATIONS_ADAPTER.md](NATIVE_NOTIFICATIONS_ADAPTER.md) |
 | Performance | Stress broad global/workspace search meets the 100 ms target upstream (44.6/70.5 ms p95, interleaved A/B on the committed benchmark, 2026-10-07 in [the archived benchmark](archive/AGENTIC_WORKSPACES_BENCHMARK.md)); GitPulse's vendored `dc-store` does not have it until re-vendored. Installed-build native rendering/frame pacing, cold/warm navigation, idle CPU/memory and the eight-hour soak are **not measured** — the release build was not installed; `scripts/native-sample.mjs` is the soak sampler. Browser canary 2026-10-07 in [PERFORMANCE.md](PERFORMANCE.md): six components clean at 12 cycles; ManviOpsPanel not clean (harness crash) and TerminalPanel/termtabs never armed |
+
+### Task fields against the plan
+
+Checked 2026-10-07 against the plan's section 2 and against what the store
+accepts: `put_item` in `src-tauri/vendored/dc-store/src/workbench/mod.rs`
+takes exactly 19 named fields and refuses any other, so a field the store does
+not name cannot ride along in a task — not even as extra JSON.
+
+| Plan field | Store | Task sheet | State |
+| --- | --- | --- | --- |
+| Type: issue, bug, feature, improvement, maintenance, research, documentation, custom | `kind`, free text up to 64 | Seven presets plus Custom… | Closed |
+| Title, description | Yes | Yes | Closed |
+| Priority, severity, owner, labels | Yes | Yes | Closed |
+| Acceptance criteria | `acceptance_criteria`, up to 128 lines | Yes | Closed |
+| Linked repositories and a primary one | `repository_ids`, `primary_repository_id` | Repository picker | Closed |
+| Optional home group | `home_workspace_id` | Home workspace select (it was set once, at creation, and could not be changed) | Closed 2026-10-07 |
+| Dates | `due_at` only; `updated_at` is the store's | Due | Due is closed. A start date is **declined**: no field holds it, and when a task changed is already in its revision history |
+| Checklists | None: subtasks are plain lines in `acceptance_criteria`, with no done state | Subtasks list without checkboxes | **Declined here** — needs a store field |
+| Attachments | None | None | **Declined here** — needs a store field and a file store |
+| Source links | None; a GitHub issue is linked by an `issue-N` label | Through labels | **Declined here** — needs a store field |
+| Parent, blocking, related and duplicate links | None; a merge records its sources as `## Merged from <id>` text in the description, not as a link | None | **Declined here** — needs a link table |
+| Per-repository objectives | None: `work_item_repositories` holds only the link and its order | None; intake folds per-repository detail into the description | **Declined here** — needs a column on the link |
+
+Each declined row is a dc-store change in DevCouncil first — the field
+whitelist, the body built in `put_item`, and the brief format agents read —
+then a re-vendor, then the sheet. That is a schema migration of its own, not
+a board change, so it is listed here instead of being emulated: a reserved
+label or description heading would look like a field and silently drop on
+the next edit by a host that does not know the convention.
 
 ## Platform coverage
 

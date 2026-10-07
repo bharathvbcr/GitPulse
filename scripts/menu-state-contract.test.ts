@@ -131,7 +131,7 @@ describe("the frontend mirror matches MenuState::validate", () => {
 
     const listed = [...body.slice(body.indexOf("matches!"), body.indexOf("}\n")).matchAll(/actions::([A-Z_]+)/g)]
       .map((match) => constant(match[1] as string));
-    expect(listed).toEqual(["theme-system", "theme-light", "theme-dark", "fleet", "terminal-dock"]);
+    expect(listed).toEqual(["theme-system", "theme-light", "theme-dark", "fleet", "agents", "terminal-dock"]);
     for (const id of listed) expect(isCheckable(id)).toBe(true);
     for (const id of ["fetch", "push", "open", "refresh", "check-updates"]) {
       expect(isCheckable(id), `${id} must not be checkable`).toBe(false);
