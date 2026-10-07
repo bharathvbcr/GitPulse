@@ -1,5 +1,5 @@
 use super::{
-    announce, process_birth, query, terminal_command, terminal_launch, WorkbenchError,
+    announce, process_birth, query, receipts, terminal_command, terminal_launch, WorkbenchError,
     WorkbenchState,
 };
 use crate::terminal::{
@@ -154,9 +154,16 @@ fn start<R: tauri::Runtime>(
     let observer = Arc::new(RunObserver {
         app: app.clone(),
         host: state.clone(),
+        observed: Mutex::new(receipts::Observed {
+            run_id: source.id.clone(),
+            owner: owner.clone(),
+            session: String::new(),
+            start: None,
+            exit: None,
+            spawn_failure: None,
+        }),
         run_id: source.id,
         owner,
-        start: Mutex::new(None),
         _brief: brief,
     });
     terminal::spawn_tracked_session(
@@ -177,91 +184,50 @@ struct RunObserver<R: tauri::Runtime> {
     host: WorkbenchState,
     run_id: String,
     owner: String,
-    start: Mutex<Option<(u32, String)>>,
+    /// Everything seen so far. The decision about what to store is
+    /// `receipts::apply`, shared with the replay of a receipt that storage
+    /// refused.
+    observed: Mutex<receipts::Observed>,
     _brief: terminal_command::BriefFile,
 }
 
 impl<R: tauri::Runtime> RunObserver<R> {
-    fn current(&self) -> Result<Value, WorkbenchError> {
-        self.host.with_run_receipt(|store| {
-            query(store, "runs.get", &json!({"id":self.run_id}).to_string())
-        })
-    }
-    fn write(&self, method: &str, input: Value) -> Result<(), WorkbenchError> {
-        let result = self
-            .host
-            .with_run_receipt(|store| query(store, method, &input.to_string()))?;
-        announce(&self.app, &result);
-        Ok(())
-    }
-    fn record_start(&self, session: &str) -> Result<(), WorkbenchError> {
-        let identity = self
-            .start
-            .lock()
-            .map_err(|_| WorkbenchError::new("process_error", "Process identity lock failed."))?
-            .clone()
-            .ok_or_else(|| {
-                WorkbenchError::new(
-                    "process_error",
-                    "Process creation identity was unavailable.",
-                )
+    /// Adds what was just seen, then brings the store up to date. A refusal
+    /// is journaled before it is returned, so the observation outlives this
+    /// process; the store taking it retires any earlier journal entry.
+    fn observe(&self, update: impl FnOnce(&mut receipts::Observed)) -> Result<(), WorkbenchError> {
+        let observed = {
+            let mut observed = self.observed.lock().map_err(|_| {
+                WorkbenchError::new("process_error", "Process identity lock failed.")
             })?;
-        let current = self.current()?;
-        if current["item"]["state"] == "running"
-            && current["item"]["session_id"] == session
-            && current["item"]["process_id"] == identity.0
-            && current["item"]["process_start"] == identity.1
-        {
-            return Ok(());
-        }
-        self.write("runs.started", json!({"id":self.run_id,"request_id":format!("{}-started",self.owner),"expected_revision":current["item"]["revision"],"owner_id":self.owner,"session_id":session,"process_id":identity.0,"process_start":identity.1}))
-    }
-    fn finish(
-        &self,
-        session: &str,
-        spawn_failure: Option<&str>,
-        payload: Option<&TerminalExitPayload>,
-    ) -> Result<(), WorkbenchError> {
-        let mut current = self.current()?;
-        if payload.is_some() && current["item"]["state"] == "starting" {
-            // Retry only storage bookkeeping using retained, actually observed
-            // process identity. This path can never execute another child.
-            match self.record_start(session) {
-                Ok(()) => current = self.current()?,
-                Err(error) => {
-                    log::warn!(target: "workbench", "Process-start receipt remains unavailable at exit: {}", message(error))
+            update(&mut observed);
+            observed.clone()
+        };
+        let store = |method: &str, input: &Value| {
+            self.host
+                .with_run_receipt(|store| query(store, method, &input.to_string()))
+        };
+        match receipts::apply(&store, &observed) {
+            Ok(written) => {
+                for result in &written {
+                    announce(&self.app, result);
                 }
+                receipts::retire(&self.host, &self.run_id);
+                Ok(())
+            }
+            Err(error) => {
+                let why = format!("{}: {}", error.code, error.message);
+                match receipts::journal(&self.host, &observed) {
+                    Ok(()) => {
+                        log::warn!(target: "workbench", "run {} receipt was not stored ({why}); kept on disk for the next reconciliation", self.run_id)
+                    }
+                    Err(journal) => {
+                        log::error!(target: "workbench", "run {} receipt was not stored ({why}) and could not be kept on disk: {journal}", self.run_id)
+                    }
+                }
+                Err(error)
             }
         }
-        let state = current["item"]["state"].as_str().unwrap_or("");
-        if matches!(state, "exited" | "failed" | "cancelled") {
-            return Ok(());
-        }
-        let outcome = if spawn_failure.is_some() {
-            "failed"
-        } else if payload.is_some_and(|p| p.reaped)
-            && (state == "running"
-                || (state == "unresolved" && current["item"]["process_id"].is_u64()))
-        {
-            "exited"
-        } else {
-            "unresolved"
-        };
-        let reason = match (spawn_failure, payload) {
-            (Some(reason), _) => reason.to_owned(),
-            (_, Some(exit)) if outcome == "exited" => format!("Terminal process exited. Signal: {}. {}", exit.signal, exit.error.as_deref().unwrap_or("")),
-            (_, Some(exit)) if !exit.reaped => format!("Process exit could not be confirmed. {}", exit.error.as_deref().unwrap_or("Execution needs reconciliation.")),
-            _ => "Terminal ended without a durable process-start receipt; execution outcome needs reconciliation.".into(),
-        };
-        let reason: String = reason.chars().take(512).collect();
-        let code = if outcome == "exited" {
-            payload
-                .and_then(|p| p.exit_code)
-                .and_then(|c| u32::try_from(c).ok())
-        } else {
-            None
-        };
-        self.write("runs.finish", json!({"id":self.run_id,"request_id":format!("{}-finished",self.owner),"expected_revision":current["item"]["revision"],"owner_id":self.owner,"session_id":session,"outcome":outcome,"reason":reason,"exit_code":code}))
     }
 }
 
@@ -279,19 +245,25 @@ impl<R: tauri::Runtime> SessionObserver for RunObserver<R> {
             .filter(|pid| *pid > 0)
             .ok_or("PTY did not report a process ID")?;
         let birth = process_birth::read(pid)?;
-        *self
-            .start
-            .lock()
-            .map_err(|_| "Process identity lock failed")? = Some((pid, birth));
-        self.record_start(session).map_err(message)
+        self.observe(|observed| {
+            observed.session = session.to_owned();
+            observed.start = Some((pid, birth));
+        })
+        .map_err(message)
     }
     fn spawn_failed(&self, session: &str, reason: &str) {
-        if let Err(error) = self.finish(session, Some(reason), None) {
+        if let Err(error) = self.observe(|observed| {
+            observed.session = session.to_owned();
+            observed.spawn_failure = Some(reason.to_owned());
+        }) {
             log::error!(target: "workbench", "Could not record a failed task launch: {}", message(error));
         }
     }
     fn finished(&self, payload: &TerminalExitPayload) {
-        if let Err(error) = self.finish(&payload.id, None, Some(payload)) {
+        if let Err(error) = self.observe(|observed| {
+            observed.session = payload.id.clone();
+            observed.exit = Some(receipts::ObservedExit::from(payload));
+        }) {
             log::error!(target: "workbench", "Task terminal exited but its receipt is unresolved: {}", message(error));
         }
     }
@@ -672,5 +644,94 @@ mod tests {
         let saved = state.request("runs.get", r#"{"id":"run"}"#).unwrap();
         assert_eq!(saved["item"]["state"], "unresolved");
         assert_eq!(saved["item"]["outcome_uncertain"], true);
+    }
+
+    /// The exit receipt is refused by storage. Before, the observer logged it
+    /// and the exit code the PTY reported was gone for good: the run stayed
+    /// `running` until a reconciler released it as `outcome_uncertain` with
+    /// no code. Now the observation is kept on disk and stored on the next
+    /// start, exactly once.
+    #[test]
+    fn an_exit_receipt_storage_refused_is_stored_after_a_restart_exactly_once() {
+        let root = tempfile::tempdir().unwrap();
+        let state = fixture(root.path());
+        state.with_store(|store| { store.connection().execute_batch("CREATE TRIGGER fail_finish BEFORE UPDATE ON work_runs WHEN json_extract(NEW.body,'$.state')='exited' BEGIN SELECT RAISE(ABORT,'injected finish failure'); END;").unwrap(); Ok(()) }).unwrap();
+        let app = tauri::test::mock_builder().build(crate::context()).unwrap();
+        let terminals = TerminalSessions::default();
+        let _cleanup = Cleanup(terminals.clone());
+        let (sent, received) = mpsc::channel();
+        app.listen("terminal-exit", move |event| {
+            sent.send(event.payload().to_owned()).unwrap();
+        });
+        let program = script(root.path(), "IFS= read -r finish\nexit 7");
+        let session = start(
+            app.handle(),
+            &terminals,
+            &state,
+            launch(),
+            source(&state),
+            program,
+            super::terminal_command::LaunchOptions::default(),
+        )
+        .unwrap();
+        write_to_session(&terminals, &session.id, "finish\n").unwrap();
+        let exit: Value =
+            serde_json::from_str(&received.recv_timeout(Duration::from_secs(5)).unwrap()).unwrap();
+        assert_eq!(exit["exit_code"], 7);
+
+        let saved = state.request("runs.get", r#"{"id":"run"}"#).unwrap();
+        assert_eq!(
+            saved["item"]["state"], "running",
+            "the injected failure did not fire"
+        );
+        let journal = root.path().join("run-receipts").join("run.json");
+        assert!(journal.exists(), "the refused receipt was not kept on disk");
+        let kept: super::receipts::Observed =
+            serde_json::from_slice(&std::fs::read(&journal).unwrap()).unwrap();
+        assert_eq!(kept.exit.as_ref().and_then(|e| e.exit_code), Some(7));
+
+        // The storage fault clears; GitPulse starts again.
+        state
+            .with_store(|store| {
+                store
+                    .connection()
+                    .execute_batch("DROP TRIGGER fail_finish;")
+                    .unwrap();
+                Ok(())
+            })
+            .unwrap();
+        state.shutdown();
+        let restarted = WorkbenchState(Arc::new(Inner {
+            path: Some(root.path().join("profile.sqlite")),
+            ..Inner::default()
+        }));
+        restarted.reconcile_stale_runs().unwrap();
+        let stored = restarted.request("runs.get", r#"{"id":"run"}"#).unwrap();
+        assert_eq!(stored["item"]["state"], "exited");
+        assert_eq!(
+            stored["item"]["exit_code"], 7,
+            "the observed exit code was lost"
+        );
+        assert_eq!(stored["item"]["outcome_uncertain"], false);
+        assert!(!journal.exists(), "a stored receipt must be retired");
+
+        // Idempotent: another pass changes nothing.
+        let revision = stored["item"]["revision"].clone();
+        restarted.reconcile_stale_runs().unwrap();
+        assert_eq!(
+            restarted.request("runs.get", r#"{"id":"run"}"#).unwrap()["item"]["revision"],
+            revision
+        );
+
+        // A receipt for a run the store has already ended is retired, and the
+        // store's record stands.
+        let mut stale = kept.clone();
+        stale.exit.as_mut().unwrap().exit_code = Some(9);
+        super::receipts::journal(&restarted, &stale).unwrap();
+        restarted.reconcile_stale_runs().unwrap();
+        let after = restarted.request("runs.get", r#"{"id":"run"}"#).unwrap();
+        assert_eq!(after["item"]["exit_code"], 7);
+        assert_eq!(after["item"]["revision"], revision);
+        assert!(!journal.exists());
     }
 }

@@ -19,6 +19,7 @@ pub(crate) mod intake;
 mod managed_run;
 pub(crate) mod notifications;
 mod process_birth;
+mod receipts;
 mod reconcile;
 pub(crate) mod terminal_command;
 mod terminal_launch;
@@ -114,12 +115,14 @@ impl WorkbenchState {
         }
     }
 
-    /// Releases every run whose owner and process are provably gone.
+    /// Releases every run whose owner and process are provably gone, and
+    /// removes the brief files a crashed owner left behind.
     ///
     /// Runs at startup, which is when a crash's stranded attempts are first
-    /// visible. Does nothing for a profile that does not exist yet: a sweep is
+    /// visible. Does nothing to a profile that does not exist yet: a sweep is
     /// a read first, and reads never create task storage.
     pub(crate) fn reconcile_stale_runs(&self) -> Result<usize, WorkbenchError> {
+        reconcile::sweep_briefs();
         if !self.profile_path()?.exists() {
             return Ok(0);
         }
