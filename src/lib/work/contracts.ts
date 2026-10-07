@@ -83,7 +83,13 @@ export function validateWorkResponse(command: string, value: unknown): void {
       }
       case "cmd_collision_risk": {
         const risk = record(value); flag(risk.ok); flag(risk.truncated); text(risk.error);
-        for (const name of ["overlapping_files", "worktrees_involved", "scanned_worktrees", "unscanned_worktrees", "failed_worktrees"]) count(risk[name]);
+        for (const name of ["overlapping_files", "worktrees_involved", "scanned_worktrees", "unscanned_worktrees", "failed_worktrees", "shared_worktree_files"]) count(risk[name]);
+        flag(risk.sessions_ok); text(risk.sessions_error);
+        list(risk.shared_worktrees, entry => {
+          const shared = fields(entry, ["path"]);
+          nullableText(shared.branch); flag(shared.scanned); flag(shared.truncated); texts(shared.files);
+          list(shared.sessions, session => { const s = fields(session, ["kind"]); count(s.pid); });
+        });
         list(risk.items, entry => {
           const item = fields(entry, ["path"]);
           list(item.worktrees, party => { const p = fields(party, ["path", "agent_kind"]); nullableText(p.branch); });

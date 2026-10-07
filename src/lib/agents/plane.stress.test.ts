@@ -50,16 +50,16 @@ function snapshot(items: WorktreeSummary[], agentsOk: boolean, agentsTruncated: 
       ok: true, error: "", count: items.length, scanned: items.length, dirty: 0, dirty_unknown: 0,
       blocked: 0, blocked_unknown: 0, truncated: agentsTruncated, items,
     },
-    agents: { ok: agentsOk, sessions, kinds: [], truncated: agentsTruncated },
+    agents: { ok: agentsOk, sessions, kinds: [], truncated: agentsTruncated, live: { ok: true, sessions: 0, kinds: [], worktrees: [] } },
     changes: {
       ok: true, error: "", files: 0, staged: 0, unstaged: 0, untracked: 0, conflicted: 0,
       additions: 0, deletions: 0, churn_warnings: 0, churn_overflowed: false, truncated: false,
     },
     collisions: collision === "failed"
-      ? { ok: false, error: "scan failed", overlapping_files: 0, worktrees_involved: 0, scanned_worktrees: 0, unscanned_worktrees: 0, failed_worktrees: 0, truncated: false, items: [] }
+      ? { ok: false, error: "scan failed", overlapping_files: 0, worktrees_involved: 0, scanned_worktrees: 0, unscanned_worktrees: 0, failed_worktrees: 0, truncated: false, shared_worktree_files: 0, shared_worktrees: [], sessions_ok: true, sessions_error: "", items: [] }
       : {
           ok: true, error: "", overlapping_files: 0, worktrees_involved: 0, scanned_worktrees: items.length,
-          unscanned_worktrees: collision === "partial" ? 1 : 0, failed_worktrees: 0, truncated: false, items: [],
+          unscanned_worktrees: collision === "partial" ? 1 : 0, failed_worktrees: 0, truncated: false, shared_worktree_files: 0, shared_worktrees: [], sessions_ok: true, sessions_error: "", items: [],
         },
     ledger: { recording: true, path: "", dropped: 0, error: "", error_code: "" },
     codeintel: { available: false, db_path: "" },

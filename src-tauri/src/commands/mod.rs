@@ -4582,7 +4582,8 @@ pub async fn cmd_insights_snapshot(
     off_thread(move || Ok(crate::insights::snapshot(&repo_path))).await
 }
 
-/// Files with uncommitted changes in more than one worktree.
+/// Files with uncommitted changes in more than one worktree, and in any
+/// worktree two live agent sessions share.
 #[tauri::command(async)]
 pub async fn cmd_collision_risk(
     repo_path: String,

@@ -55,7 +55,7 @@ const fixtures={
  cmd_repository_trust:()=>({path:"/workspace/alpha",git_dir:"/workspace/alpha/.git",common_dir:"/workspace/alpha/.git",identity:"fixture-identity",scope:"repository",worktrees:2}),
  cmd_worktree_task:()=>null,cmd_ledger_tail:()=>[],cmd_grants_view:()=>({available:false,path:"",grants:[],error:""}),
  cmd_github_context:()=>({available:false,cli_present:false,owner:"",repo:"",pull_requests:[],workflow_runs:[],issues:[],releases:[],warnings:[],error:null}),
- cmd_collision_risk:()=>({ok:true,error:"",overlapping_files:0,worktrees_involved:0,scanned_worktrees:2,unscanned_worktrees:0,failed_worktrees:0,truncated:false,items:[]}),
+ cmd_collision_risk:()=>({ok:true,error:"",overlapping_files:0,worktrees_involved:0,scanned_worktrees:2,unscanned_worktrees:0,failed_worktrees:0,truncated:false,items:[],shared_worktree_files:0,shared_worktrees:[],sessions_ok:true,sessions_error:""}),
  cmd_fleet_snapshot:()=>({repos:[],requested:2,scanned:0,anchor_epoch:0,truncated:true,duration_ms:0}),
 };
 window.__TAURI_INTERNALS__={invoke:async(cmd,args)=>{if(cmd.startsWith("plugin:event|"))return 1;if(fixtures[cmd])return fixtures[cmd](args);unexpected.push(cmd);throw Error(`Unconfigured preview command: ${cmd}`);},transformCallback:cb=>cb};

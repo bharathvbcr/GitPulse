@@ -13,7 +13,7 @@ function snapshot(paths: string[]): FleetSnapshot {
       worktrees_ok: true,
       worktrees_error: "",
       worktrees: 1,
-      agents: { ok: true, sessions: 0, kinds: [], truncated: false },
+      agents: { ok: true, sessions: 0, kinds: [], truncated: false, live: { ok: true, sessions: 0, kinds: [], worktrees: [] } },
       last_commit_ok: true,
       last_commit_epoch: 1_757_000_000,
       commits_ok: true,

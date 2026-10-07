@@ -383,7 +383,7 @@ fn build_tools() -> Vec<Value> {
         tool(
             "gitpulse_insights",
             "Repository insights",
-            "One-shot snapshot of worktrees, agent sessions, uncommitted changes, overlapping dirty files, ledger, and code-graph availability. Facets fail independently so a missed scan never looks clean.",
+            "One-shot snapshot of worktrees, agent sessions (agents.live: running Claude Code sessions per worktree path; kinds it cannot observe, such as Codex, are reported unknown), uncommitted changes, overlapping dirty files, ledger, and code-graph availability. Facets fail independently so a missed scan never looks clean.",
             json!({ "repo_path": repo_prop() }),
             &["repo_path"],
             json!({
@@ -447,7 +447,7 @@ fn build_tools() -> Vec<Value> {
         tool(
             "gitpulse_collision_risk",
             "Collision risk",
-            "Files with uncommitted changes in more than one worktree — parallel agent checkouts editing the same path. Unscanned worktrees are counted, never implied clean.",
+            "Files with uncommitted changes in more than one worktree — parallel agent checkouts editing the same path — and, in shared_worktrees, the dirty files of any worktree two or more live agent sessions share, which overlapping_files cannot see. Unscanned worktrees are counted, never implied clean; sessions_ok is false when an agent kind could not be observed.",
             json!({ "repo_path": repo_prop() }),
             &["repo_path"],
             ok_error_output(
@@ -457,9 +457,13 @@ fn build_tools() -> Vec<Value> {
                     "scanned_worktrees": { "type": "integer" },
                     "unscanned_worktrees": { "type": "integer" },
                     "truncated": { "type": "boolean" },
-                    "items": { "type": "array" }
+                    "items": { "type": "array" },
+                    "shared_worktree_files": { "type": "integer" },
+                    "shared_worktrees": { "type": "array" },
+                    "sessions_ok": { "type": "boolean" },
+                    "sessions_error": { "type": "string" }
                 }),
-                &["overlapping_files", "scanned_worktrees", "unscanned_worktrees", "items"],
+                &["overlapping_files", "scanned_worktrees", "unscanned_worktrees", "items", "shared_worktree_files", "shared_worktrees", "sessions_ok"],
             ),
         ),
         tool(

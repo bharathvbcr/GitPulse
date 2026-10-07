@@ -86,7 +86,7 @@ pub(super) fn judge(
 
 /// Claude Code's configuration directory: `CLAUDE_CONFIG_DIR`, else
 /// `~/.claude`.
-fn claude_home() -> Option<PathBuf> {
+pub(crate) fn claude_home() -> Option<PathBuf> {
     if let Some(dir) = std::env::var_os("CLAUDE_CONFIG_DIR").filter(|dir| !dir.is_empty()) {
         return Some(PathBuf::from(dir));
     }

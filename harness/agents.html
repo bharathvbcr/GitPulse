@@ -68,7 +68,7 @@
           deadline_expired: false, duration_ms: 4,
           worktrees: facet(items, { truncated }),
           agents: {
-            ok: true, sessions: truncated ? 9 : 4, kinds: [{ kind: "claude", sessions: truncated ? 9 : 4 }], truncated,
+            ok: true, sessions: truncated ? 9 : 4, kinds: [{ kind: "claude", sessions: truncated ? 9 : 4 }], truncated, live: { ok: true, sessions: 0, kinds: [], worktrees: [] },
           },
           changes: {
             ok: true, error: "", files: 3, staged: 0, unstaged: 3, untracked: 0, conflicted: 0,
@@ -76,7 +76,7 @@
           },
           collisions: {
             ok: true, error: "", overlapping_files: 0, worktrees_involved: 0, scanned_worktrees: unscanned ? 1 : 5,
-            unscanned_worktrees: unscanned ? 2 : 0, failed_worktrees: 0, truncated: false, items: [],
+            unscanned_worktrees: unscanned ? 2 : 0, failed_worktrees: 0, truncated: false, items: [], shared_worktree_files: 0, shared_worktrees: [], sessions_ok: true, sessions_error: "",
           },
           ledger: { recording: true, path: "", dropped: 0, error: "", error_code: "" },
           codeintel: { available: false, db_path: "" },
