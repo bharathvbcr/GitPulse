@@ -1,6 +1,7 @@
 <script lang="ts">
   /**
-   * The Agents plane: every session the open repositories are holding.
+   * The Agents plane: the agent checkouts, terminals and task attempts the
+   * open repositories are holding.
    *
    * It stays mounted once opened, the same way Fleet and Tasks do. The
    * parent hides it. Unmounting it would drop the sweep and the task
@@ -9,39 +10,55 @@
    *
    * A checkout, a process this window started, and a task attempt are
    * drawn from one projection (`plane.ts`). This file decides when to
-   * look, which columns to keep, and where a row goes when opened.
+   * look, which columns to keep, and where a row's actions go. Each action
+   * goes through the owner of that move: a terminal is shown by
+   * `focusTerminalSession` (surface, then the tab that hosts it, then its
+   * dock, then the terminal), an attempt's terminal by `showTaskTerminal`,
+   * and an attempt's task by `openTaskForRun`.
    */
   import { get } from "svelte/store";
-  import { Bot, CircleAlert, RefreshCw, Rows3, X } from "@lucide/svelte";
+  import { Bot, CircleAlert, FolderOpen, ListChecks, RefreshCw, Rows3, SquareTerminal, X } from "@lucide/svelte";
   import { repoStore } from "../stores/repoStore";
   import { interfaceStore } from "../stores/interfaceStore";
+  import { toastStore } from "../stores/toastStore";
   import { isCaseInsensitiveFs } from "../repos/paths";
   import { terminalSessions } from "../terminal/sessionRegistry";
   import { sessionActivity } from "../terminal/sessionActivity";
+  import { focusTerminalSession } from "../terminal/sessionFocus";
   import { taskTerminalRequests } from "../terminal/taskLaunches";
   import { terminalSessionLimit } from "../terminal/sessionLimit";
   import { createBoardAgents } from "../workbench/boardAgents";
-  import { readAgentCwds } from "../agents/cwd";
+  import { explainError, getTaskRun, listRepositories, type Repository } from "../workbench/client";
+  import { openTaskForRun } from "../workbench/taskOpen";
+  import { queuedTerminalNote, showTaskTerminal } from "../workbench/taskTerminal";
+  import { agentCwdTargets, agentDirectories, readAgentCwds } from "../agents/cwd";
   import { agentPlaneStore, sweepTargets } from "../agents/store";
-  import { taskProbeFromBoard } from "../agents/tasks";
+  import { repositoryPaths, taskProbeFromBoard } from "../agents/tasks";
   import {
     AGENT_COLUMNS,
     applyAgentFilter,
     isAgentFilter,
+    kindLabel,
     planeHeadline,
+    plural,
     projectAgentPlane,
     type AgentColumnKey,
     type AgentFilter,
     type AgentRow,
   } from "../agents/plane";
 
+  /** Pages of registered repositories one read follows. Past it, ids stay unresolved. */
+  const MAX_REPOSITORY_PAGES = 5;
+
   const pathOpts = { caseInsensitive: isCaseInsensitiveFs() };
   const board = createBoardAgents();
   let now = $state(Date.now());
   let sweepKey = "";
-  /** Directories `cmd_terminal_context` accepted. Absent means unknown. */
-  let directories = $state(new Map<string, string>());
   let cwdGeneration = $state(0);
+  /** Registered repositories, for an attempt's repository id. Null before the first read. */
+  let repositories = $state<Repository[] | null>(null);
+  let repositoriesError = $state("");
+  let repositoriesPartial = $state(false);
 
   const showing = $derived($interfaceStore.globalSurface === "agents");
   const hidden = $derived(new Set($interfaceStore.agentsHiddenColumns));
@@ -61,10 +78,12 @@
       continuesRunId: record.continuesRunId ?? "",
       // Unknown stays unknown. The registry has no directory, and a failed
       // context read must not be filled in with the repository root.
-      cwd: record.sessionId ? directories.get(record.sessionId) ?? null : null,
+      cwd: record.sessionId ? $agentDirectories.get(record.sessionId) ?? null : null,
       attention: activity?.attention?.kind ?? null,
     };
   }));
+
+  const repoPaths = $derived(repositoryPaths(repositories ?? [], $repoStore.openTabs, pathOpts));
 
   const taskProbe = $derived(taskProbeFromBoard($board, {
     records: $terminalSessions,
@@ -72,6 +91,7 @@
     activity: (sessionId) => $sessionActivity.get(sessionId),
     sessionLimit: $terminalSessionLimit,
     now,
+    repositoryPath: (id) => repoPaths.get(id) ?? null,
   }));
 
   const plane = $derived(projectAgentPlane({
@@ -83,6 +103,20 @@
   const visible = $derived(applyAgentFilter(plane.rows, filter));
   const headline = $derived(planeHeadline(plane, visible.length));
   const scanning = $derived($agentPlaneStore.scanning);
+  const notes = $derived([
+    ...plane.gaps,
+    ...(repositoriesError
+      ? [{ kind: "partial", repoPath: "", label: "Repositories", reason: `Registered repositories could not be read, so an attempt's repository is not named: ${repositoriesError}` }]
+      : repositoriesPartial
+        ? [{ kind: "partial", repoPath: "", label: "Repositories", reason: "The registered repository list was capped. Some attempts may not name their repository." }]
+        : []),
+  ]);
+  /**
+   * Which sessions to ask for a directory. A title or status change gives the
+   * same key, and Svelte does not re-run an effect for a derived value that
+   * did not change, so the directory reads follow the set of sessions only.
+   */
+  const cwdKey = $derived(agentCwdTargets($terminalSessions).join("\n"));
 
   const FILTERS: { id: AgentFilter; label: string }[] = [
     { id: "all", label: "All" },
@@ -104,15 +138,55 @@
     void agentPlaneStore.refresh(targets());
   }
 
-  function openRow(row: AgentRow) {
-    const liveKey = row.liveKey;
+  /** The run behind a row, from the board's read when it has it. */
+  async function runOf(runId: string) {
+    return get(board).runs.find((run) => run.id === runId) ?? await getTaskRun(runId);
+  }
+
+  /**
+   * Brings the row's terminal on screen in the tab that hosts it. An attempt
+   * whose terminal is not here goes through `showTaskTerminal`, the owner of
+   * starting or focusing an attempt's terminal.
+   */
+  async function showTerminal(row: AgentRow) {
+    try {
+      const record = row.liveKey ? get(terminalSessions).find((item) => item.key === row.liveKey) : undefined;
+      if (record) {
+        const outcome = await focusTerminalSession(record);
+        if (outcome.ok) return;
+        if (!row.taskRunId) {
+          toastStore.error("That terminal can no longer be shown. It may have just ended.");
+          return;
+        }
+      }
+      if (!row.taskRunId) return;
+      const run = await runOf(row.taskRunId);
+      if ((await showTaskTerminal(run)) === "queued") toastStore.info(queuedTerminalNote(run.cwd));
+    } catch (cause) {
+      toastStore.error(`The terminal could not be shown: ${explainError(cause)}`);
+    }
+  }
+
+  async function openTask(row: AgentRow) {
+    if (!row.taskRunId) return;
+    try {
+      await openTaskForRun(row.taskRunId);
+    } catch (cause) {
+      toastStore.error(`This attempt's task could not be opened: ${explainError(cause)}`);
+    }
+  }
+
+  function openCheckout(row: AgentRow) {
+    if (!row.checkoutPath) return;
     interfaceStore.setGlobalSurface("repository");
-    void repoStore.openRepo(row.worktreePath || row.repoPath, {
-      onReady: () => {
-        if (!liveKey) return;
-        get(terminalSessions).find((record) => record.key === liveKey)?.reveal?.();
-      },
-    });
+    void repoStore.openRepo(row.checkoutPath);
+  }
+
+  function presenceWord(row: AgentRow): string {
+    if (row.presence === "live") return "Live";
+    if (row.presence === "exited") return "Exited";
+    if (row.presence === "on-disk") return "On disk";
+    return "Not in this window";
   }
 
   $effect(() => {
@@ -142,17 +216,48 @@
 
   $effect(() => {
     if (!showing) return;
+    const ids = cwdKey ? cwdKey.split("\n") : [];
     const ticket = cwdGeneration;
-    const ids = $terminalSessions.map((record) => record.sessionId ?? "");
     let cancelled = false;
     void readAgentCwds(ids).then((found) => {
-      if (!cancelled && ticket === cwdGeneration) directories = found;
+      if (!cancelled && ticket === cwdGeneration) agentDirectories.set(found);
     });
     return () => {
       cancelled = true;
     };
   });
+
+  $effect(() => {
+    if (!showing) return;
+    const ticket = cwdGeneration;
+    let cancelled = false;
+    void (async () => {
+      const found: Repository[] = [];
+      let cursor: string | undefined;
+      let more = false;
+      try {
+        for (let page = 0; page < MAX_REPOSITORY_PAGES; page += 1) {
+          const read = await listRepositories(cursor);
+          found.push(...read.items);
+          more = read.has_more && read.next_cursor !== null;
+          if (!more) break;
+          cursor = read.next_cursor ?? undefined;
+        }
+        if (cancelled || ticket !== cwdGeneration) return;
+        repositories = found;
+        repositoriesPartial = more;
+        repositoriesError = "";
+      } catch (cause) {
+        if (cancelled || ticket !== cwdGeneration) return;
+        repositoriesError = explainError(cause);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  });
 </script>
+
 
 <div
   class="gp-workspace flex-1 flex flex-col min-h-0 min-w-0 bg-background"
@@ -237,9 +342,9 @@
     </div>
   </header>
 
-  {#if plane.gaps.length > 0}
+  {#if notes.length > 0}
     <ul class="shrink-0 border-b border-border px-4 py-2 flex flex-col gap-1" data-testid="agents-gaps">
-      {#each plane.gaps as gap, index (`${gap.kind}:${gap.repoPath}:${index}`)}
+      {#each notes as gap, index (`${gap.kind}:${gap.repoPath}:${index}`)}
         <li class="flex items-start gap-2 text-[11px] text-textSecondary" role="status">
           <CircleAlert size={12} class="shrink-0 mt-0.5 text-amber-500" />
           <span><span class="font-medium text-textPrimary">{gap.label}.</span> {gap.reason}</span>
@@ -252,21 +357,21 @@
     {#if visible.length === 0}
       <p class="px-4 py-8 text-[12px] text-textMuted max-w-xl" data-testid="agents-empty">
         {#if plane.rows.length > 0}
-          Nothing matches this filter. The headline still counts the sessions it hid.
+          Nothing matches this filter. The headline still counts the {plural(plane.rows.length, "row", "rows")} it hid.
         {:else if plane.gaps.some((gap) => gap.kind === "failed" || gap.kind === "skipped")}
           Sessions could not be read. The notes above are the reason, not an empty workspace.
         {:else if plane.gaps.length > 0 || scanning}
           Still reading. A note above says what has not come back, and an empty list is not a quiet workspace.
         {:else}
-          No agent sessions in the open repositories. A checkout appears when its path is an agent worktree. A process appears when this window started it.
+          No agent checkouts, terminals or task attempts in the open repositories. A checkout appears when its path is an agent worktree. A terminal appears when this window started it.
         {/if}
       </p>
     {:else}
       <table class="w-full text-left border-collapse {compact ? 'text-[11px]' : 'text-[12px]'}">
-        <caption class="sr-only">Agent sessions across open repositories</caption>
+        <caption class="sr-only">Agent checkouts, terminals and task attempts across open repositories</caption>
         <thead class="sticky top-0 bg-background text-textMuted">
           <tr class="border-b border-border">
-            <th scope="col" class="px-4 py-2 font-medium">Session</th>
+            <th scope="col" class="px-4 py-2 font-medium">Agent</th>
             {#if columnVisible("checkout")}<th scope="col" class="px-3 py-2 font-medium">Checkout</th>{/if}
             {#if columnVisible("presence")}<th scope="col" class="px-3 py-2 font-medium">Presence</th>{/if}
             {#if columnVisible("attention")}<th scope="col" class="px-3 py-2 font-medium">Attention</th>{/if}
@@ -278,17 +383,51 @@
           {#each visible as row (row.id)}
             <tr class="border-b border-border/60 hover:bg-surfaceHover/60" data-testid="agents-row">
               <th scope="row" class="px-4 py-2 font-normal text-left align-top">
-                <button type="button" class="text-left bg-transparent border-0 p-0 text-inherit" onclick={() => openRow(row)}>
-                  <span class="block font-medium text-textPrimary">{row.session}</span>
-                  <span class="block text-textMuted">{row.kind} · {row.repoLabel}</span>
-                </button>
+                <span class="block font-medium text-textPrimary">{row.session}</span>
+                <span class="block text-textMuted">{kindLabel(row.kind)} · {row.repoLabel}</span>
+                <span class="mt-1 flex flex-wrap gap-1" data-testid="agents-row-actions">
+                  {#if row.liveKey || row.taskRunId}
+                    <button
+                      type="button"
+                      class="gp-btn py-0.5! px-1.5! text-[11px]!"
+                      aria-label="Show terminal for {row.session}"
+                      onclick={() => showTerminal(row)}
+                    >
+                      <SquareTerminal size={11} />
+                      <span>Show terminal</span>
+                    </button>
+                  {/if}
+                  {#if row.taskRunId}
+                    <button
+                      type="button"
+                      class="gp-btn py-0.5! px-1.5! text-[11px]!"
+                      aria-label="Open task for {row.session}"
+                      onclick={() => openTask(row)}
+                    >
+                      <ListChecks size={11} />
+                      <span>Open task</span>
+                    </button>
+                  {/if}
+                  {#if row.checkoutPath}
+                    <button
+                      type="button"
+                      class="gp-btn py-0.5! px-1.5! text-[11px]!"
+                      aria-label="Open checkout {row.checkout} for {row.session}"
+                      title={row.checkoutPath}
+                      onclick={() => openCheckout(row)}
+                    >
+                      <FolderOpen size={11} />
+                      <span>Open checkout</span>
+                    </button>
+                  {/if}
+                </span>
               </th>
               {#if columnVisible("checkout")}
                 <td class="px-3 py-2 align-top text-textSecondary">{row.checkout}</td>
               {/if}
               {#if columnVisible("presence")}
                 <td class="px-3 py-2 align-top" title={row.presenceDetail}>
-                  {row.presence === "live" ? "Live" : row.presence === "on-disk" ? "On disk" : "Not in this window"}
+                  {presenceWord(row)}
                 </td>
               {/if}
               {#if columnVisible("attention")}

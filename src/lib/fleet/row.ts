@@ -272,6 +272,9 @@ function tierOne(
       ? readCell(
           {
             worktrees: facet.worktrees,
+            // Agent checkouts on disk, not running agents: the quantity the
+            // Work view (`agentCheckoutCount`) and the Agents plane's
+            // `checkouts` report. plane.counts.test.ts holds the three equal.
             agentSessions: facet.agents.sessions,
             agentKinds: facet.agents.kinds.map((kind) => kind.kind),
           },

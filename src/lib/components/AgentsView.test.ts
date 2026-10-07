@@ -26,11 +26,22 @@ describe("AgentsView", () => {
     expect(source).toContain("Still reading");
   });
 
-  it("opens a checkout in the repository surface and reveals a live terminal after it is ready", () => {
-    expect(source).toContain('interfaceStore.setGlobalSurface("repository")');
-    expect(source).toContain("repoStore.openRepo");
-    expect(source).toContain("onReady");
-    expect(source).toContain("reveal?.()");
+  it("shows a terminal through the focus owner, in the tab that hosts it, not by revealing it by hand", () => {
+    // focusTerminalSession owns surface → hosting tab → dock → reveal. A
+    // hand-rolled reveal after opening the row's directory skipped the dock
+    // and opened the cwd, which is not the tab the terminal lives in.
+    expect(source).toContain("focusTerminalSession(record)");
+    expect(source).toContain("showTaskTerminal(run)");
+    expect(source).not.toContain("reveal?.()");
+    expect(source).not.toContain("onReady");
+  });
+
+  it("gives each row explicit, labelled actions", () => {
+    expect(source).toContain('aria-label="Show terminal for {row.session}"');
+    expect(source).toContain('aria-label="Open task for {row.session}"');
+    expect(source).toContain("openTaskForRun(row.taskRunId)");
+    expect(source).toContain("repoStore.openRepo(row.checkoutPath)");
+    expect(source).toContain("kindLabel(row.kind)");
   });
 
   it("watches task attempts only while this surface is showing", () => {
@@ -47,7 +58,14 @@ describe("AgentsView", () => {
 
   it("asks the terminal where it is, and does not invent a directory", () => {
     expect(source).toContain("readAgentCwds");
-    expect(source).toContain("directories.get(record.sessionId)");
+    expect(source).toContain("$agentDirectories.get(record.sessionId)");
     expect(source).not.toContain("cwd: null");
+  });
+
+  it("re-reads directories when the set of sessions changes, not on every registry update", () => {
+    const effect = source.slice(source.indexOf("readAgentCwds(ids)") - 400, source.indexOf("readAgentCwds(ids)"));
+    expect(source).toContain("const cwdKey = $derived(agentCwdTargets($terminalSessions)");
+    expect(effect).toContain("cwdKey");
+    expect(effect).not.toContain("$terminalSessions");
   });
 });
