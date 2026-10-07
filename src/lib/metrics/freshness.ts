@@ -47,6 +47,7 @@
  */
 
 import type { BackgroundScope } from "../async/pacedQueue";
+import type { RepoChange } from "../repos/events";
 
 /** Why a snapshot's `value` may no longer describe the repository. */
 export type StaleReason =
@@ -93,6 +94,12 @@ export interface MetricDefinition<T> {
   isPartial?: (value: T) => boolean;
   /** Bound on how many repositories are tracked at once. */
   maxRepos?: number;
+  /**
+   * What this measurement is derived from (`repos/changeScope.ts`). A change
+   * that touches none of it neither marks the value stale nor costs a
+   * refresh. Omitted: every change does.
+   */
+  dependsOn?: (change: RepoChange) => boolean;
   /**
    * Renders a rejection into the message panels display.
    *
@@ -148,9 +155,11 @@ export interface Metric<T> {
   /**
    * The repository changed. Marks the snapshot stale immediately and schedules
    * a coalesced refresh. Marking is synchronous on purpose: the UI should say
-   * "out of date" the instant it is, not when the refresh lands.
+   * "out of date" the instant it is, not when the refresh lands. A `change`
+   * this metric does not depend on is ignored; null or omitted means the
+   * change is unknown, which every metric depends on.
    */
-  invalidate(repoPath: string): void;
+  invalidate(repoPath: string, change?: RepoChange | null): void;
   /** Automatic measurements follow the application's visible repository. */
   setScope(scope: BackgroundScope | null): void;
   /** Drops all state and pending timers for one repository. */
@@ -442,8 +451,9 @@ export function createMetric<T>(
       return measureNow(repoPath, cell);
     },
 
-    invalidate(repoPath): void {
+    invalidate(repoPath, change): void {
       if (disposed) return;
+      if (change && definition.dependsOn && !definition.dependsOn(change)) return;
       const cell = cells.get(repoPath);
       // Not tracked means no panel is watching and nothing has been measured;
       // creating state here would grow the map from watcher noise alone.
@@ -496,8 +506,8 @@ export function createMetric<T>(
 export interface MetricRegistry {
   register(metric: Metric<unknown>): void;
   setScope(scope: BackgroundScope | null): void;
-  /** Route a `repo-changed` event to every registered metric. */
-  invalidate(repoPath: string): void;
+  /** Route a `repo-changed` event to every metric that depends on `change`. */
+  invalidate(repoPath: string, change?: RepoChange | null): void;
   /** A repository was closed: drop its state everywhere. */
   forget(repoPath: string): void;
   dispose(): void;
@@ -518,8 +528,8 @@ export function createMetricRegistry(): MetricRegistry {
       scope = next ? { ...next, retainedKeys: [...next.retainedKeys] } : null;
       for (const metric of metrics) metric.setScope(scope);
     },
-    invalidate(repoPath) {
-      for (const metric of metrics) metric.invalidate(repoPath);
+    invalidate(repoPath, change) {
+      for (const metric of metrics) metric.invalidate(repoPath, change);
     },
     forget(repoPath) {
       for (const metric of metrics) metric.forget(repoPath);

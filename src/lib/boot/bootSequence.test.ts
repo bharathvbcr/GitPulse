@@ -9,7 +9,7 @@ import { createListenerTracker } from "../dom/listenerTracker";
 function createHarness(overrides: Partial<BootStepDeps> = {}) {
   const log: string[] = [];
   const errors: Array<{ step: BootStepName; err: unknown }> = [];
-  let repoChangedHandler: ((path?: string) => void) | null = null;
+  let repoChangedHandler: Parameters<BootStepDeps["listenRepoChanged"]>[0] | null = null;
   const deps: BootStepDeps = {
     subscribeNativeShell: async () => {
       log.push("subscribe-native-shell");
@@ -28,8 +28,8 @@ function createHarness(overrides: Partial<BootStepDeps> = {}) {
     syncRecentMenu: async (paths) => {
       log.push(`sync-recent-menu:[${paths.join("|")}]`);
     },
-    handleRepoChanged: (path) => {
-      log.push(`handle-repo-changed:${path ?? "undefined"}`);
+    handleRepoChanged: (path, change) => {
+      log.push(`handle-repo-changed:${path ?? "undefined"}${change ? `:${change.kinds.join("+")}` : ""}`);
     },
     listenRepoChanged: async (handler) => {
       log.push("listen-repo-changed");
@@ -188,7 +188,11 @@ describe("runBootSequence", () => {
     await runBootSequence(h.deps, [], {} as never);
     h.repoChangedHandler?.("/repos/live");
     h.repoChangedHandler?.(undefined);
+    h.repoChangedHandler?.("/repos/live", { kinds: ["refs", "objects"], paths: [], paths_truncated: false });
     expect(h.log).toContain("handle-repo-changed:/repos/live");
+    // What moved travels with the event; dropping it here would refresh
+    // every view for every event again.
+    expect(h.log).toContain("handle-repo-changed:/repos/live:refs+objects");
     expect(h.log).toContain("handle-repo-changed:undefined");
   });
 

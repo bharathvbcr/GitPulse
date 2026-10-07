@@ -43,6 +43,7 @@ import type { LanguageStatsReport } from "../language/barStats";
 import type { StorageReport } from "../storage/types";
 import { formatDiagnosticFailure, reportPanelError } from "../diagnostics/report";
 import { createMetric, createMetricRegistry, type Metric } from "./freshness";
+import { dependsOnStorage, dependsOnWorktreeContent } from "../repos/changeScope";
 
 /**
  * Shared failure wiring for every metric.
@@ -93,6 +94,7 @@ export const locMetric: Metric<LanguageStatsReport> = createMetric<LanguageStats
   // A truncated report is a floor, and must never render as a total.
   isPartial: (report) => report?.truncated === true,
   maxRepos: MAX_TRACKED_REPOS,
+  dependsOn: dependsOnWorktreeContent,
   ...failureWiring("pulse"),
 });
 
@@ -111,6 +113,7 @@ export const coverageMetric: Metric<CoverageReport> = createMetric<CoverageRepor
   minIntervalMs: 30_000,
   isPartial: (report) => report?.truncated === true,
   maxRepos: MAX_TRACKED_REPOS,
+  dependsOn: dependsOnWorktreeContent,
   ...failureWiring("coverage"),
 });
 
@@ -122,6 +125,7 @@ export const storageMetric: Metric<StorageReport> = createMetric<StorageReport>(
   minIntervalMs: 120_000,
   isPartial: (report) => report?.scan?.truncated === true,
   maxRepos: MAX_TRACKED_REPOS,
+  dependsOn: dependsOnStorage,
   ...failureWiring("storage"),
 });
 

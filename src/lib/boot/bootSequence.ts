@@ -1,4 +1,5 @@
 import type { NativeMenuHandlers } from "../desktop/nativeActions";
+import type { RepoChange } from "../repos/events";
 
 /**
  * nativeShell.ts consumes NativeMenuHandlers without re-exporting it;
@@ -22,9 +23,9 @@ export interface BootStepDeps {
   /** openFromExternal — applies a pending external open intent. */
   openRepo(path: string): Promise<void>;
   syncRecentMenu(paths: string[]): Promise<unknown>;
-  /** The effect of a repo-changed event (repoStore.handleRepoChanged). */
-  handleRepoChanged(path?: string): void;
-  listenRepoChanged(handler: (path?: string) => void): Promise<() => void>;
+  /** The effect of a repo-changed event (`routeRepoChange`). */
+  handleRepoChanged(path?: string, change?: RepoChange | null): void;
+  listenRepoChanged(handler: (path?: string, change?: RepoChange | null) => void): Promise<() => void>;
   track(unlisten: () => void): void;
   onError(step: BootStepName, err: unknown): void;
 }
@@ -77,7 +78,7 @@ export async function runBootSequence(
   // Registered last but reached even when every earlier step threw.
   await guarded("repo-changed-listen", async () => {
     deps.track(
-      await deps.listenRepoChanged((path) => deps.handleRepoChanged(path)),
+      await deps.listenRepoChanged((path, change) => deps.handleRepoChanged(path, change)),
     );
   });
 }

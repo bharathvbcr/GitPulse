@@ -14,7 +14,7 @@
  *       presence no longer agrees.
  *
  * SCOPE: see CONTRACTS below for exactly what is checked — 75 contracts over
- * 189 structs, spanning both wire surfaces: command returns and event payloads.
+ * 190 structs, spanning both wire surfaces: command returns and event payloads.
  * Enums are still skipped here and covered separately, by
  * scripts/enum-variant-contract.test.ts. That is most, not all, of the named types crossing the IPC
  * boundary: the ones still missing declare their TypeScript interface inside a
@@ -227,7 +227,7 @@ export const CONTRACTS = Object.freeze([
   { label: "remotes", rustPath: rust("engine", "remotes.rs"), tsPath: ts("repos", "remotes.ts"), structs: ["RemoteInfo", "RemoteList"] },
   { label: "submodules", rustPath: rust("engine", "submodules.rs"), tsPath: ts("repos", "submodules.ts"), structs: ["SubmoduleInfo", "SubmoduleList"] },
   // Events are a second wire surface: emitted payloads, not command returns.
-  { label: "repo-events", rustPath: rust("watcher", "mod.rs"), tsPath: ts("repos", "events.ts"), structs: ["RepoChangedPayload"] },
+  { label: "repo-events", rustPath: rust("watcher", "mod.rs"), tsPath: ts("repos", "events.ts"), structs: ["RepoChangedPayload", "RepoChange"] },
   { label: "native-menu-state", rustPath: rust("desktop", "state.rs"), tsPath: ts("desktop", "menuState.ts"), structs: ["MenuState", "MenuLabel", "MenuRepository", "StatusCard"] },
   { label: "native-events", rustPath: rust("desktop", "mod.rs"), tsPath: ts("desktop", "nativeActions.ts"), structs: ["NativeEvent"] },
   { label: "codeintel", rustPath: rust("codeintel", "mod.rs"), tsPath: ts("codeintel", "types.ts"), structs: ["CodeintelSymbolHit", "CodeintelEdge", "CodeintelDeadSymbol", "CodeintelResponse", "CodeintelStatus"] },

@@ -180,11 +180,33 @@ Local evidence: `/tmp/gitpulse-docs-timing-before.log`,
 `/tmp/gitpulse-exit-observation-baseline.log`.
 
 Still open in the overall audit: finer-grained stutter recording and unfinished
-operation diagnostics, path-aware watcher invalidation, and measured native
-macOS rendering/idle-power behavior with the updated build. Scope deferral
-does not yet govern repository-state or subscribed metric refreshes. Physical
-Windows/Linux execution and native Mac sleep/wake/display testing remain
-separate from these deterministic queue and filesystem tests.
+operation diagnostics, and measured native macOS rendering/idle-power behavior
+with the updated build. Physical Windows/Linux execution and native Mac
+sleep/wake/display testing remain separate from these deterministic queue and
+filesystem tests.
+
+Closed since (2026-10-07):
+
+- **Scope deferral covers repository state and metrics.** Repository-state
+  refreshes follow `src/lib/repos/watcherRefresh.ts`: the active tab of a shown
+  window after the 200 ms debounce; a background tab at most once per 30 s
+  (once per 5 s across all tabs) so its tab-strip badges stay roughly current —
+  bounded, deliberately not zero; nothing while the window is hidden, owed once
+  when it is shown; activation hydrates in full. Subscribed metrics measure
+  automatically only for the visible, active repository
+  (`canMeasureAutomatically` in `src/lib/metrics/freshness.ts`) and resume on
+  activation. The sentence this replaces predated both.
+- **Watcher invalidation is path-aware.** `repo-changed` carries what moved —
+  `refs`, `index`, `config`, `ignore`, `objects`, `git_state`, `worktree`
+  (with up to 64 top-level paths), `documents`, or `unknown` — classified in
+  `src-tauri/src/watcher/mod.rs` from the same paths the noise gate admitted,
+  so fsmonitor cookies and split-index touches still record nothing.
+  `src/lib/repos/changeScope.ts` routes it: a `git fetch` (refs and objects)
+  refreshes repository state and disk usage, not line counts, coverage, the
+  code index or the document vault; a source edit skips the vault. An index
+  write counts as content (git writes it whenever it rewrites tracked files),
+  and an unknown or unreadable change refreshes everything. The worktree watch
+  stays non-recursive, so a path list means "at least these".
 
 ## Earlier validation and remaining gates
 

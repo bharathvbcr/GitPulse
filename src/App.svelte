@@ -1,5 +1,6 @@
 <script lang="ts">
   import type { RepoChangedPayload } from "./lib/repos/events";
+  import { readRepoChange, routeRepoChange } from "./lib/repos/changeScope";
   import type { LedgerAppended } from "./lib/ledger/types";
   import { onDestroy, onMount, tick, untrack } from "svelte";
   import { invoke } from "./lib/ipc/invoke";
@@ -644,20 +645,22 @@
         restoreWorkspace: () => repoStore.restoreWorkspace(),
         openRepo: openFromExternal,
         syncRecentMenu: () => syncRecentMenu([...get(repoStore).recentRepos]),
-        handleRepoChanged: (path) => {
-          void repoStore.handleRepoChanged(path);
+        handleRepoChanged: (path, change) => {
           const blocked = path
             ? get(repoStore).openTabs.some((tab) => tab.trustRequired === true && tab.path === path)
             : false;
-          if (path && !blocked) repoMetrics.invalidate(path);
-          // Live index: gated incremental `devmap build` when the map is stale
-          // (or the watcher dirty signal forces it) and no build is in flight.
-          if (path && !blocked) liveIndex.onRepoChanged(path);
-          if (path && !blocked) onDocsRepoChanged(path);
+          routeRepoChange(path, change ?? null, blocked, {
+            repoState: (repo) => void repoStore.handleRepoChanged(repo),
+            metrics: (repo, touched) => repoMetrics.invalidate(repo, touched),
+            // Live index: gated incremental `devmap build` when the map is stale
+            // (or the watcher dirty signal forces it) and no build is in flight.
+            codeIndex: (repo) => liveIndex.onRepoChanged(repo),
+            docs: (repo) => onDocsRepoChanged(repo),
+          });
         },
         listenRepoChanged: (changed) =>
           listen<RepoChangedPayload>("repo-changed", (event) =>
-            changed(event.payload?.path),
+            changed(event.payload?.path, readRepoChange(event.payload?.change)),
           ),
         track,
         onError: (step, err) => diagnostics.warn(`boot:${step}`, err),
