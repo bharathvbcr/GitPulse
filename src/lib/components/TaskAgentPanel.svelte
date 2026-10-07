@@ -28,8 +28,9 @@
   import { terminalSessionLimit } from "../terminal/sessionLimit";
   import { focusTerminalSession } from "../terminal/sessionFocus";
   import { PERMISSION_LABELS } from "../terminal/agentDefaults";
-  import { queuedTerminalNote, resumeTaskConversation, showTaskTerminal } from "../workbench/taskTerminal";
-  import { asksForReader, checkoutChanges, monitorAttempt, orderMonitored, readPendingRequests, requestsLine, waitingLabel, type MonitorContext, type MonitoredAttempt, type PendingRequests } from "../workbench/taskSessions";
+  import { openAttemptCheckout, queuedTerminalNote, resumeTaskConversation, showTaskTerminal } from "../workbench/taskTerminal";
+  import { describeCheckout } from "../terminal/checkoutLabel";
+  import { asksForReader, checkoutChanges, monitorAttempt, orderMonitored, readPendingRequests, releasedNote, requestsLine, waitingLabel, type MonitorContext, type MonitoredAttempt, type PendingRequests } from "../workbench/taskSessions";
   import { sessionActivity } from "../terminal/sessionActivity";
   import { repoStore } from "../stores/repoStore";
   import { isCaseInsensitiveFs } from "../repos/paths";
@@ -327,7 +328,7 @@
       const result = await releaseTaskRun(run.id);
       if (disposed) return;
       replaceRun(result.run);
-      note = result.released ? "Released. The checkout is free for another attempt." : result.reason;
+      note = result.released ? releasedNote(result.run) : result.reason;
     });
   }
   function inspect(run: TaskRun) {
@@ -352,8 +353,14 @@
     });
   }
 
-  function checkoutName(path: string): string {
-    return path.split(/[\\/]/).filter(Boolean).pop() ?? path;
+  /**
+   * Brings the attempt's checkout forward as the active repository tab. Only
+   * on request, like Show terminal; it starts nothing.
+   */
+  function openCheckout(run: TaskRun) {
+    return act(async () => {
+      if (!(await openAttemptCheckout(run)) && !disposed) note = `${run.cwd} did not open. If its repository tab shows an error, that is why; otherwise try again.`;
+    });
   }
   function permissionLabel(run: TaskRun): string {
     return PERMISSION_LABELS[run.permission_mode]?.label ?? run.permission_mode;
@@ -366,7 +373,8 @@
   {@const row = monitor(run)}
   {@const view = row.view}
   {@const own = view.sessions.find((session) => session.role === "attempt")}
-  {@const changes = holding ? checkoutChanges(run.cwd, $repoStore.openTabs, pathOpts) : null}
+  {@const changes = holding ? checkoutChanges(run.cwd, $repoStore.openTabs, pathOpts, { runId: run.id, peers: live }) : null}
+  {@const place = describeCheckout(run.cwd, $repoStore.openTabs, pathOpts)}
   {@const asked = requestsLine(holding ? pending.get(run.id) : undefined)}
   <article class="run" class:is-live={holding} data-tone={holding ? row.tone : null} data-testid="agent-run" data-run-id={run.id} data-run-state={run.state}>
     <div class="run-head">
@@ -375,7 +383,7 @@
       <span class="state" data-tone={holding ? "live" : run.state === "failed" || run.state === "unresolved" ? "bad" : "done"}>{runStatusLabel(run, clock)}</span>
     </div>
     <small class="facts">
-      <span title={run.cwd}>{checkoutName(run.cwd)}</span>
+      <span title={run.cwd} data-testid="agent-checkout">{place.repository}{#if place.checkout} / {place.checkout}{/if}</span>
       · Revision {run.source_revision} · {permissionLabel(run)}
       {#if run.created_at} · started {formatRelativeTime(run.created_at, Math.floor(now / 1000))}{/if}
       {#if run.exit_code !== null} · exit {run.exit_code}{/if}
@@ -453,7 +461,8 @@
       {/if}
       {#if run.provider === "claude" && RESUMABLE.includes(run.state) && !view.sessions.some((session) => session.role === "resumed")}<button class="gp-btn" type="button" onclick={() => resume(run)} disabled={busy} title="Starts a Claude Code tab in this attempt's checkout that continues its conversation, in the same permission mode. You stay on this task.">Resume conversation</button>{/if}
       {#if run.state === "prepared"}<button class="gp-btn" type="button" onclick={() => cancel(run)} disabled={busy}>Cancel preparation</button>{/if}
-      {#if canRelease(run)}<button class="gp-btn" type="button" onclick={() => release(run)} disabled={busy} title="Frees the checkout if the agent and the GitPulse that launched it have both stopped. A running agent is never released.">Release checkout</button>{/if}
+      <button class="gp-btn" type="button" onclick={() => openCheckout(run)} disabled={busy} data-testid="agent-open-checkout" title={`Opens ${run.cwd} as the active repository tab. Starts nothing.`}>Open checkout</button>
+      {#if canRelease(run)}<button class="gp-btn" type="button" onclick={() => release(run)} disabled={busy} title="Frees the checkout if the agent and the GitPulse that launched it have both stopped. A running agent is never released. The worktree and its changes stay on disk.">Release checkout</button>{/if}
       {#if run.session_id && run.kind === "managed"}<button class="gp-btn" type="button" onclick={() => { reviewingRunID = reviewingRunID === run.id ? null : run.id; }}>{reviewingRunID === run.id ? "Hide requests" : "Review requests"}</button>{/if}
     </div>
 

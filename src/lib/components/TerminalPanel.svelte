@@ -10,7 +10,7 @@
   import type { FocusOutcome } from "../terminal/sessionFocus";
   import { isPromptLauncher, terminalLaunchRequests } from "../terminal/launchRequests";
   import { taskTerminalRequests, consumeTaskTerminalRequest, requestFor } from "../terminal/taskLaunches";
-  import { isCaseInsensitiveFs } from "../repos/paths";
+  import { isCaseInsensitiveFs, sameRepo } from "../repos/paths";
   import { consoleLaunchRequests, consumeConsoleLaunch } from "../terminal/consoleLaunches";
   import { boundedCommand, retainCommand, retainExecutions, followsConsoleOutput } from "../terminal/consoleHistory";
   import { harnessStore } from "../stores/harnessStore";
@@ -49,6 +49,7 @@
   import { closeQuestion, startDirFrom } from "../terminal/sessionContext";
   import { askConfirm } from "../stores/modalStore";
   import { openTaskForRun } from "../workbench/taskOpen";
+  import { sessionRow, type CheckoutTab } from "../terminal/checkoutLabel";
   import ScrollCue from "./ScrollCue.svelte";
   import {
     LAUNCHERS,
@@ -97,6 +98,7 @@
     expanded = false,
     onToggleExpanded,
     onGoToSession,
+    checkouts = [],
   }: {
     repoPath?: string | null;
     /** False while another repository's panel (or a closed dock) is showing. */
@@ -112,6 +114,13 @@
      * panel deliberately cannot see — see `goToSession`.
      */
     onGoToSession?: (session: TerminalSessionRecord) => Promise<FocusOutcome>;
+    /**
+     * The open repository tabs, for naming the checkout each listed session
+     * runs in (repository, checkout, agent worktree). Handed in by the dock
+     * for the same reason as `onGoToSession`; without it a row falls back to
+     * what its path alone says.
+     */
+    checkouts?: readonly CheckoutTab[];
   } = $props();
 
   interface ExecutionEntry {
@@ -166,11 +175,14 @@
   // so a tab switch cannot kill the shells, and a hidden panel cannot follow
   // `currentPath` into a different worktree.
   // ---------------------------------------------------------------------
+  /** The repository store's checkout identity rule, for every path compared here. */
+  const pathOpts = { caseInsensitive: isCaseInsensitiveFs() };
   type PtyMode = "shell" | "console";
   let mode = $state<PtyMode>("shell");
   function initialTabs(): TabState {
-    if (get(terminalLaunchRequests)?.repoPath === repoPath) return { tabs: [], activeId: null };
-    const request = requestFor(get(taskTerminalRequests), repoPath, { caseInsensitive: isCaseInsensitiveFs() });
+    const launch = get(terminalLaunchRequests);
+    if (launch && repoPath && sameRepo(launch.repoPath, repoPath, pathOpts)) return { tabs: [], activeId: null };
+    const request = requestFor(get(taskTerminalRequests), repoPath, pathOpts);
     return request ? initialState(request.provider, request) : initialState();
   }
   let tabState = $state<TabState>(untrack(initialTabs));
@@ -340,12 +352,12 @@
    * agent seemed never to have started.
    */
   const waitingForCapacity = $derived.by(() => {
-    const request = requestFor($taskTerminalRequests, repoPath, { caseInsensitive: isCaseInsensitiveFs() });
+    const request = requestFor($taskTerminalRequests, repoPath, pathOpts);
     return request && !canCreate && !tabFor(tabState, request) ? request : null;
   });
 
   $effect(() => {
-    const request = requestFor($taskTerminalRequests, repoPath, { caseInsensitive: isCaseInsensitiveFs() });
+    const request = requestFor($taskTerminalRequests, repoPath, pathOpts);
     if (!request || (!canCreate && !tabFor(tabState, request))) return;
     untrack(() => {
       tabState = openTab(tabState, request.provider, request);
@@ -381,11 +393,11 @@
    * run, which is the one record that names it, so a session adopted after a
    * reload — which knows only its run — links the same way a tab does.
    */
-  async function openListedTask(session: TerminalSessionRecord) {
-    if (!session.taskRunId) return;
+  async function openListedTask(runId: string | null) {
+    if (!runId) return;
     sessionListOpen = false;
     try {
-      await openTaskForRun(session.taskRunId);
+      await openTaskForRun(runId);
     } catch (cause) {
       validationError = `That session's task could not be opened: ${formatError(cause)}`;
     }
@@ -477,9 +489,12 @@
 
   $effect(() => {
     const request = $terminalLaunchRequests;
-    if (!request || !visible || request.repoPath !== repoPath) return;
+    const here = repoPath;
+    // By checkout identity, as `requestFor` matches task launches: the caller
+    // may hold the same checkout spelled differently from this panel's tab.
+    if (!request || !visible || !here || !sameRepo(request.repoPath, here, pathOpts)) return;
     untrack(() => {
-      const claimed = terminalLaunchRequests.take(request.repoPath);
+      const claimed = terminalLaunchRequests.take(here, pathOpts);
       if (!claimed) return;
       mode = "shell";
       const opened = newTab(claimed.launcher, claimed.prompt);
@@ -874,10 +889,18 @@
         class="w-full mb-1.5 bg-background border border-border rounded px-2 py-1 text-[11px]"
       />
       {#each filteredSessions as session (session.key)}
-        <div class="flex gap-2 items-center py-0.5">
-          <span class="flex-1 min-w-0 truncate" title={session.repoPath}>
-            {session.repoPath.split(/[\\/]/).pop()} · {session.title ? `${session.title} — ${session.label}` : session.label}{session.taskRunId ? " · task attempt" : ""} · {session.status}
-            {#if session.repoPath !== repoPath}<span class="text-textMuted"> · other repository</span>{/if}
+        <!-- Repository and checkout, not the path's last segment: an agent
+             worktree's slug alone says nothing about which repository it is
+             in, and two repositories can share a name. Named by the rule the
+             tab strip's stacks use (`terminal/checkoutLabel.ts`). -->
+        {@const row = sessionRow(session, repoPath, checkouts, pathOpts)}
+        <div class="flex gap-2 items-center py-0.5" data-testid="session-row">
+          <span class="flex-1 min-w-0 flex items-center gap-1.5" title={session.repoPath}>
+            <span class="min-w-0 truncate">
+              <span class="font-medium" data-testid="session-repository">{row.repository}</span>{#if row.checkout}<span class="text-textMuted" aria-hidden="true"> / </span><span class="sr-only">, checkout </span><span data-testid="session-checkout">{row.checkout}</span>{/if}
+              <span class="text-textMuted"> · {session.title ? `${session.title} · ` : ""}{row.agent ? "" : `${session.label} · `}{session.status}{session.taskRunId ? " · task attempt" : session.continuesRunId ? " · resumed conversation" : ""}{row.here ? "" : " · other checkout"}</span>
+            </span>
+            {#if row.agent}<span class="shrink-0 rounded border border-accent/40 px-1 text-[10px] leading-4 text-accent" data-testid="session-agent" title={`Agent: ${row.agent}`}><span class="sr-only">Agent: </span>{row.agent}</span>{/if}
           </span>
           <!-- The list has always been able to NAME every shell across every
                repository; until now the only thing it could do with one was
@@ -887,17 +910,19 @@
             class="gp-btn py-0!"
             disabled={!session.reveal}
             title={session.reveal
-              ? (session.repoPath === repoPath ? "Show this session" : `Switch to ${session.repoPath} and show this session`)
+              ? (row.here ? "Show this session" : `Switch to ${session.repoPath} and show this session`)
               : "This session's panel is not mounted, so it cannot be shown"}
             onclick={() => void goToSession(session)}
           >Go to</button>
-          {#if session.taskRunId}
+          {#if row.taskRunId}
+            <!-- A resumed conversation links back too: it continues an
+                 attempt, and that attempt's task is where it is listed. -->
             <button
               type="button"
               class="gp-btn py-0!"
               data-testid="session-open-task"
               title={`Open the task ${session.title ? `“${session.title}” ` : ""}this session is working on`}
-              onclick={() => void openListedTask(session)}
+              onclick={() => void openListedTask(row.taskRunId)}
             >Task</button>
           {/if}
           <button type="button" class="gp-btn py-0!" onclick={() => void closeListed(session)}>Close session</button>

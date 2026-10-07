@@ -319,3 +319,14 @@ describe("TerminalSession accessibility", () => {
     expect(source).toContain("term.options.screenReaderMode = on");
   });
 });
+
+describe("TerminalSession task link", () => {
+  it("an ended resumed conversation links back to its task, as an ended attempt does", () => {
+    // Only `taskRunId` offered "Open task": a resumed conversation knows the
+    // attempt it continues (`resume.runId`) and its task lists it, but the
+    // ended tab left the reader with no way back there.
+    expect(source).toContain("const linkedRunId = $derived(taskRunId ?? resume?.runId ?? null)");
+    expect(source).toContain("{#if linkedRunId}");
+    expect(source).toContain("await openTaskForRun(linkedRunId)");
+  });
+});

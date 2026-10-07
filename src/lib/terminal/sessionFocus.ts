@@ -23,6 +23,7 @@ import { get } from "svelte/store";
 import { interfaceStore } from "../stores/interfaceStore";
 import { repoStore } from "../stores/repoStore";
 import type { TerminalSessionRecord } from "./sessionRegistry";
+import { isCaseInsensitiveFs, sameRepo, type PathIdentityOptions } from "../repos/paths";
 
 /** What `focusTerminalSession` needs from the repository store. */
 export interface RepoFocusTarget {
@@ -44,6 +45,11 @@ export interface RepoFocusActions {
   openRepo(path: string): Promise<boolean> | boolean;
   /** Defers to the next render so the revealed panel is on screen first. */
   afterRender(): Promise<void>;
+  /**
+   * How checkouts are compared — the repository store's rule. Absent means
+   * the host's own volume rule, which is what the store defaults to.
+   */
+  identity?: PathIdentityOptions;
 }
 
 export type FocusOutcome =
@@ -70,7 +76,11 @@ export async function focusTerminalSession(
 
   repo.showRepositorySurface();
   const before = repo.snapshot();
-  const target = before.openTabs.find((tab) => tab.path === record.repoPath);
+  // By checkout identity, as the tab strip matches: the same checkout spelled
+  // with another case or a trailing separator is this tab, not a reason to
+  // open a second one.
+  const identity = repo.identity ?? { caseInsensitive: isCaseInsensitiveFs() };
+  const target = before.openTabs.find((tab) => sameRepo(tab.path, record.repoPath, identity));
   let switchedRepo = false;
 
   if (target) {
@@ -81,7 +91,11 @@ export async function focusTerminalSession(
   } else {
     // A live session whose repository tab is gone should be impossible —
     // closing the tab disposes the panel and kills its shells. Reopening is
-    // the honest fallback rather than pretending the jump worked.
+    // the honest fallback rather than pretending the jump worked. The path is
+    // a checkout root by construction, so it needs no root resolution: a
+    // panel's record carries the tab path it was mounted on, and an adopted
+    // one carries the host's session repo, which it only spawned after
+    // `validate_repo` accepted it as a checkout.
     const opened = await repo.openRepo(record.repoPath);
     if (!opened) return { ok: false, reason: "unavailable" };
     switchedRepo = true;

@@ -9,10 +9,12 @@ vi.mock("../stores/repoStore", () => ({ repoStore: { subscribe: repoState.subscr
 vi.mock("../stores/interfaceStore", () => ({ interfaceStore: { setGlobalSurface: (...args: unknown[]) => setGlobalSurface(...args) } }));
 const findConversation = vi.fn();
 vi.mock("./client", () => ({ findConversation: (...args: unknown[]) => findConversation(...args) }));
+const resolveGitRoot = vi.fn();
+vi.mock("../desktop/nativeShell", () => ({ resolveGitRoot: (...args: unknown[]) => resolveGitRoot(...args) }));
 const focusTerminalSession = vi.fn();
 vi.mock("../terminal/sessionFocus", () => ({ focusTerminalSession: (...args: unknown[]) => focusTerminalSession(...args) }));
 
-const { queuedTerminalNote, resumeTaskConversation, showTaskTerminal, startTaskTerminal } = await import("./taskTerminal");
+const { openAttemptCheckout, queuedTerminalNote, resumeTaskConversation, showTaskTerminal, startTaskTerminal } = await import("./taskTerminal");
 const { consumeTaskTerminalRequest, taskTerminalRequests } = await import("../terminal/taskLaunches");
 const { terminalSessions } = await import("../terminal/sessionRegistry");
 
@@ -32,6 +34,8 @@ function liveSession(fields: { key: string; taskRunId?: string; continuesRunId?:
 beforeEach(() => {
   repoState.set({ currentPath: "/work/current" });
   openRepo.mockReset(); setTerminalOpen.mockReset(); setGlobalSurface.mockReset(); findConversation.mockReset(); focusTerminalSession.mockReset();
+  // A checkout root resolves to itself.
+  resolveGitRoot.mockReset(); resolveGitRoot.mockImplementation(async (path: string) => path);
 });
 afterEach(() => {
   for (const request of get(taskTerminalRequests)) consumeTaskTerminalRequest(request);
@@ -88,6 +92,8 @@ describe("startTaskTerminal", () => {
     openRepo.mockResolvedValueOnce(true);
     const first = startTaskTerminal(run("a", "/work/a"));
     const second = startTaskTerminal(run("b", "/work/b"));
+    // Both opens are in flight (each first resolves its checkout root).
+    await vi.waitFor(() => expect(openRepo).toHaveBeenCalledTimes(2));
     release(false);
     expect(await first).toBe("queued");
     expect(await second).toBe("started");
@@ -99,6 +105,79 @@ describe("startTaskTerminal", () => {
     await expect(startTaskTerminal(run("d", "/work/d"))).rejects.toThrow("trust prompt failed");
     // The request stands: the checkout opening later still starts it.
     expect(get(taskTerminalRequests).map((r) => r.runId)).toEqual(["d"]);
+  });
+});
+
+describe("an attempt whose directory is below its checkout's root", () => {
+  // `openRepo` opens checkouts; the host refuses a directory with no `.git`
+  // of its own. Opening the attempt's subdirectory failed every time, so the
+  // launch reported "queued" and waited for a tab that could never open.
+  const SUB = "/work/a/packages/web";
+
+  it("opens the checkout that contains it, and queues the terminal for that checkout", async () => {
+    resolveGitRoot.mockImplementation(async (path: string) => (path === SUB ? "/work/a" : path));
+    openRepo.mockImplementation(async (path: string) => {
+      expect(get(taskTerminalRequests)).toEqual([{ runId: "a", repoPath: "/work/a", provider: "claude", title: "Task a", startDir: "packages/web" }]);
+      return path === "/work/a";
+    });
+    expect(await startTaskTerminal(run("a", SUB))).toBe("started");
+    expect(openRepo).toHaveBeenCalledWith("/work/a", { activate: false });
+  });
+
+  it("shows it the same way", async () => {
+    resolveGitRoot.mockImplementation(async (path: string) => (path === SUB ? "/work/a" : path));
+    openRepo.mockImplementation(async (path: string, options: { onReady: () => void }) => { if (path === "/work/a") options.onReady(); return path === "/work/a"; });
+    expect(await showTaskTerminal(run("a", SUB))).toBe("opened");
+  });
+
+  it("resumes a conversation in the subdirectory it ran in, inside the checkout's tab", async () => {
+    resolveGitRoot.mockImplementation(async (path: string) => (path === SUB ? "/work/a" : path));
+    findConversation.mockResolvedValueOnce({ resumable: true, sessionId: SESSION, cwd: SUB, mode: "ask", reason: "saved" });
+    openRepo.mockImplementation(async (path: string) => path === "/work/a");
+    expect(await resumeTaskConversation({ id: "a", task_title: "Fix" })).toEqual({ outcome: "started" });
+    expect(get(taskTerminalRequests)[0]).toMatchObject({ repoPath: "/work/a", startDir: "packages/web" });
+  });
+
+  it("resumes at the root when the host's canonical root spells the recorded checkout through a link", async () => {
+    // find_git_root canonicalizes (/tmp -> /private/tmp). The recorded
+    // directory naming the same checkout through the link is the root itself,
+    // not a reason to refuse the resume.
+    resolveGitRoot.mockResolvedValue("/private/tmp/repo");
+    findConversation.mockResolvedValueOnce({ resumable: true, sessionId: SESSION, cwd: "/tmp/repo", mode: "ask", reason: "saved" });
+    openRepo.mockResolvedValue(true);
+    expect(await resumeTaskConversation({ id: "a", task_title: "Fix" })).toEqual({ outcome: "started" });
+    expect(get(taskTerminalRequests)[0]).toMatchObject({ repoPath: "/private/tmp/repo" });
+    expect(get(taskTerminalRequests)[0]).not.toHaveProperty("startDir");
+  });
+
+  it("says so, and queues nothing, when no checkout contains the directory", async () => {
+    resolveGitRoot.mockRejectedValue(new Error("Not a Git repository: /tmp/loose"));
+    await expect(startTaskTerminal(run("z", "/tmp/loose"))).rejects.toThrow(/No Git checkout contains \/tmp\/loose/);
+    await expect(showTaskTerminal(run("z", "/tmp/loose"))).rejects.toThrow(/No Git checkout contains/);
+    expect(openRepo).not.toHaveBeenCalled();
+    // Never "queued": nothing would ever open it.
+    expect(get(taskTerminalRequests)).toEqual([]);
+  });
+});
+
+describe("openAttemptCheckout", () => {
+  it("opens the attempt's checkout as the active tab, in front, without touching its terminal", async () => {
+    resolveGitRoot.mockImplementation(async (path: string) => (path === "/work/a/pkg" ? "/work/a" : path));
+    openRepo.mockImplementation(async (_path: string, options: { onReady: () => void }) => { options.onReady(); return true; });
+    expect(await openAttemptCheckout({ cwd: "/work/a/pkg" })).toBe(true);
+    expect(openRepo).toHaveBeenCalledWith("/work/a", expect.objectContaining({ activate: true }));
+    expect(setGlobalSurface).toHaveBeenCalledWith("repository");
+    // Opening a checkout is not starting or showing an agent.
+    expect(get(taskTerminalRequests)).toEqual([]);
+    expect(setTerminalOpen).not.toHaveBeenCalled();
+  });
+
+  it("stays where it is when the checkout cannot be opened, and says why when none holds it", async () => {
+    openRepo.mockResolvedValueOnce(false);
+    expect(await openAttemptCheckout({ cwd: "/work/a" })).toBe(false);
+    expect(setGlobalSurface).not.toHaveBeenCalled();
+    resolveGitRoot.mockRejectedValueOnce(new Error("Not a Git repository: /gone"));
+    await expect(openAttemptCheckout({ cwd: "/gone" })).rejects.toThrow(/No Git checkout contains \/gone/);
   });
 });
 

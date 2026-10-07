@@ -63,6 +63,9 @@ const relinkCalls = [], repoCommandCalls = [];
 // healthy repository would. Only the tab-group checks open tabs.
 const fixtureRepoCommands = {
   cmd_resolve_repo: a => ({ path: a.repoPath, name: a.repoPath.split("/").pop(), is_bare: false }),
+  // A task terminal opens the checkout holding the attempt's directory; the
+  // fixture's directories are checkout roots.
+  cmd_resolve_git_root: a => a.path,
   cmd_watch_repo: () => null, cmd_unwatch_repo: () => null, cmd_set_recent_menu: () => null,
   cmd_list_branches: () => [], cmd_get_status: () => [], cmd_list_tags: () => ({ tags: [], truncated: false }),
   cmd_stash_list: () => ({ entries: [], truncated: false }),
