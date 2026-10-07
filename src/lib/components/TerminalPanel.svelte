@@ -1009,7 +1009,7 @@
             <ChevronDown size={11} />
           </button>
         </div>
-        <button type="button" class="gp-icon-btn" disabled={!repoPath || !canCreate} onclick={() => void openBeside(nextLauncher)} aria-label={`New ${launcherLabel(nextLauncher)} session`} title={capacityTitle}><Plus size={14} /></button>
+        <button type="button" class="gp-icon-btn" data-terminal-new disabled={!repoPath || !canCreate} onclick={() => void openBeside(nextLauncher)} aria-label={`New ${launcherLabel(nextLauncher)} session`} title={capacityTitle}><Plus size={14} /></button>
       </div>
     </div>
 

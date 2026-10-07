@@ -187,3 +187,36 @@ describe("harness fixtures speak the CodeintelResponse wire shape", () => {
     });
   }
 });
+
+/**
+ * Two ways the stress harness came to report clean while exercising nothing.
+ *
+ * It hand-rolled `window.__TAURI_INTERNALS__`, answering `plugin:event|listen`
+ * with null and installing no `__TAURI_EVENT_PLUGIN_INTERNALS__`: no `listen()`
+ * ever registered, and every unlisten on teardown threw reading
+ * `unregisterListener` (ManviOpsPanel's chaos remount). `harness/tauriMocks.ts`
+ * is the mock layer every other harness uses, so stress.html uses it too.
+ *
+ * And `termtabs` found the terminal opener by markup shape and copy — buttons
+ * in the tablist's parent WITHOUT an aria-label — until the opener became an
+ * icon button labelled "New Shell session" outside that parent. Every run then
+ * opened zero tabs. It now selects by the panel's own `data-terminal-*`
+ * attributes, so each one it names must exist on the panel.
+ */
+describe("the stress harness can arm what it claims to stress", () => {
+  const terminalPanel = src("../src/lib/components/TerminalPanel.svelte");
+
+  it("installs IPC through the shared mock layer, not a hand-rolled one", () => {
+    expect(fixtures).toContain("mockIPCWithEvents");
+    expect(fixtures).not.toMatch(/window\.__TAURI_INTERNALS__\s*=/);
+  });
+
+  it("finds terminal tabs by attributes TerminalPanel actually renders", () => {
+    const selectors = [...new Set([...fixtures.matchAll(/\[(data-terminal-[\w-]+)/g)].map((match) => match[1]))];
+    // The opener is the one the scenario cannot arm without; a list that lost
+    // it would turn this into a check of nothing.
+    expect(selectors).toContain("data-terminal-new");
+    const missing = selectors.filter((name) => !new RegExp(`\\b${name}(?=[\\s=>])`).test(terminalPanel));
+    expect(missing, `stress.html selects ${missing.join(", ")}, which TerminalPanel.svelte never renders`).toEqual([]);
+  });
+});

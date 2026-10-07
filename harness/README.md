@@ -367,6 +367,12 @@ presented).
   every open mounts an xterm into a visible box and hides the previous one, which
   is the only place the reveal effects can form a loop. Named apart from the
   `tabs` count parameter below, which means repositories, not terminal sessions.
+  The harness hands TerminalPanel the first repository as `repoPath`, as the dock
+  would, and finds the opener by `[data-terminal-new]`. The verdict's
+  `termtabs: { initial, opened, peakXterms }` counts only tabs the scenario
+  opened (the panel opens one shell on mount by itself); a run that opens none,
+  or mounts no xterm, sets `armed: false`, puts the reason first in
+  `otherCrashes` and titles the page `gp-stress FAIL unarmed …`.
 - `tabs`, `cycles`
 - `css=1` — load the real stylesheet, for *looking* at a component instead of
   only stressing it. Off by default: a behaviour run should not depend on
@@ -374,7 +380,7 @@ presented).
 
 Two rules learned the hard way:
 
-1. **Check `otherCrashes` before believing `depthExceeded: 0`.** A component
+1. **Check `armed` and `otherCrashes` before believing `depthExceeded: 0`.** A component
    that throws mid-render tears down the effects below it, so an incomplete
    fixture turns a loop into a false clean. Every fixture here is shaped from
    the real interface in `src/lib/**/types.ts` for that reason.

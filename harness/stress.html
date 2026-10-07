@@ -425,10 +425,13 @@
         cmd_terminal_resize: () => null,
         cmd_terminal_kill: () => null,
       };
-      window.__TAURI_INTERNALS__ = {
-        invoke: async (cmd, args) => (FIXTURES[cmd] ? FIXTURES[cmd](args) : null),
-        transformCallback: (cb) => cb,
-      };
+      // The shared mock layer, not a hand-rolled `__TAURI_INTERNALS__`. The
+      // hand-rolled one answered `plugin:event|listen` with null and installed
+      // no `__TAURI_EVENT_PLUGIN_INTERNALS__`, so no `listen()` ever registered
+      // and every unlisten on teardown threw reading `unregisterListener` --
+      // ManviOpsPanel's chaos remount reported that TypeError as a crash.
+      const { mockIPCWithEvents } = await import("./tauriMocks.ts");
+      mockIPCWithEvents(async (cmd, args) => (FIXTURES[cmd] ? FIXTURES[cmd](args) : null));
 
       // ---- loop detection -------------------------------------------------
       const crashes = [];
@@ -467,10 +470,18 @@
       const repos = ALL_REPOS.slice(0, Math.max(1, TABS));
       for (const r of repos) await repoStore.openRepo(r, { activate: true });
 
+      // TerminalPanel is props-driven by design -- the dock hands each panel its
+      // repository and deliberately keeps the store out of it -- so it needs the
+      // props the dock would pass. Without a `repoPath` it renders "Open a
+      // repository to start a shell." and disables its opener, and termtabs ran
+      // twelve cycles against a panel that could open nothing. Every mount site
+      // below goes through this, or a remount would silently drop back to it.
+      const propsFor = () => (COMPONENT === "TerminalPanel" ? { repoPath: repos[0], visible: true } : {});
+
       const target = document.getElementById("app");
       let instance = null;
       let mountError = null;
-      try { instance = mount(Component, { target, props: {} }); }
+      try { instance = mount(Component, { target, props: propsFor() }); }
       catch (err) { mountError = String(err); crashes.push(mountError); }
 
       const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -478,6 +489,9 @@
 
       // ---- scenarios ------------------------------------------------------
       let cycles = 0;
+      // Reasons the chosen scenario could not arm. Non-empty means FAIL.
+      const armFailures = [];
+      let termtabs = null;
       if (SCENARIO === "churn") {
         // Open and close repositories under the mounted pane. Every close
         // supersedes an in-flight subscription run.
@@ -526,7 +540,7 @@
           void storageMetric.refresh(repos[i % repos.length], { force: true });
           const gone = st.openTabs.find((t) => t.path === extra);
           if (gone) void repoStore.closeTab(gone.id);
-          if (i % 7 === 6 && instance) { await unmount(instance); instance = mount(Component, { target, props: {} }); }
+          if (i % 7 === 6 && instance) { await unmount(instance); instance = mount(Component, { target, props: propsFor() }); }
           await sleep(6);
           cycles++;
         }
@@ -537,21 +551,34 @@
         // box that had no layout while hidden. Those are exactly the moments
         // the reveal effects run, and the only place a loop could form.
         const click = (node) => node?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
-        // The launcher group sits OUTSIDE the tablist (only tabs belong in
-        // one), so it is found on the strip row rather than within the list.
-        const strip = () => target.querySelector('[role="tablist"]')?.parentElement;
-        const newButtons = () => [...(strip()?.querySelectorAll("button") ?? [])].filter(
-          (b) => b.getAttribute("role") !== "tab" && !b.hasAttribute("aria-label") && !b.disabled,
-        );
-        const tabButtons = () => [...(strip()?.querySelectorAll('button[role="tab"]') ?? [])];
-        const closeButtons = () => [...(strip()?.querySelectorAll('button[aria-label^="Close "]') ?? [])];
+        // Found by the panel's own data attributes, not by markup shape or
+        // copy. This used to take the tablist's parent and keep only buttons
+        // WITHOUT an aria-label; the opener became an icon button labelled
+        // "New Shell session" and moved out of that parent, so the filter
+        // matched nothing and every run opened zero tabs while reporting clean.
+        const newButtons = () => [...target.querySelectorAll("[data-terminal-new]:not([disabled])")];
+        const tabButtons = () => [...target.querySelectorAll('[data-terminal-tab] button[role="tab"]')];
+        const closeButtons = () => [...target.querySelectorAll('[data-terminal-tab] button:not([role="tab"])')];
+        // The panel opens one shell on mount by itself, so a tab existing
+        // proves nothing about the opener. Only tabs that appear after the
+        // scenario starts clicking count as opened.
+        const tabIds = () => [...target.querySelectorAll("[data-terminal-tab]")].map((node) => node.getAttribute("data-terminal-tab"));
+        const initialTabIds = new Set(tabIds());
+        const seenTabs = new Set();
+        let peakXterms = 0;
+        const observe = () => {
+          for (const id of tabIds()) if (!initialTabIds.has(id)) seenTabs.add(id);
+          peakXterms = Math.max(peakXterms, target.querySelectorAll(".xterm-screen").length);
+        };
         for (let i = 0; i < CYCLES; i++) {
           const openers = newButtons();
           if (openers.length) click(openers[i % openers.length]);
           await sleep(10);
+          observe();
           const tabs = tabButtons();
           if (tabs.length) click(tabs[i % tabs.length]);
           await sleep(10);
+          observe();
           // Close on a cadence that lets the strip both grow and shrink, so
           // the ceiling and the empty state are both reached over a long run.
           if (i % 3 === 2) {
@@ -561,10 +588,21 @@
           }
           cycles++;
         }
+        await sleep(200);
+        observe();
+        termtabs = { initial: initialTabIds.size, opened: seenTabs.size, peakXterms };
+        // A scenario that exercised nothing must never read as a clean run.
+        // These go into `crashes`, so `otherCrashes` is non-empty and every
+        // reader that checks it -- the README's rule -- sees the failure.
+        if (seenTabs.size === 0) {
+          armFailures.push(`harness: termtabs opened 0 terminal tabs in ${CYCLES} cycles -- the scenario exercised nothing (is the opener [data-terminal-new] present and enabled?)`);
+        } else if (peakXterms === 0) {
+          armFailures.push(`harness: termtabs opened ${seenTabs.size} terminal tabs but no xterm ever mounted -- the reveal effects it exists to stress never ran`);
+        }
       } else if (SCENARIO === "remount") {
         for (let i = 0; i < CYCLES; i++) {
           if (instance) await unmount(instance);
-          instance = mount(Component, { target, props: {} });
+          instance = mount(Component, { target, props: propsFor() });
           await sleep(20);
           cycles++;
         }
@@ -578,22 +616,31 @@
       const finalState = await new Promise((res) => { const off = repoStore.subscribe(res); off(); });
       const openPaths = finalState.openTabs.map((t) => t.path).sort();
       const strip = [...target.querySelectorAll("span[title^=\"/r/\"]")].map((n) => n.getAttribute("title")).sort();
+      for (const failure of armFailures) console.error(failure);
 
       window.__gpResult = {
         component: COMPONENT, scenario: SCENARIO, cycles,
+        armed: armFailures.length === 0,
+        termtabs,
         tabsAtEnd: openPaths.length,
         depthExceeded: depthCount(),
         mountError,
         stripPaths: strip,
         openPaths,
-        stripMatchesTabs: strip.length === 0 ? "n/a" : JSON.stringify(strip) === JSON.stringify(openPaths),
-        otherCrashes: [...new Set(crashes.filter((c) => !c.includes("effect_update_depth_exceeded")))].slice(0, 4),
+        // A pane handed one repository by props shows that repository by
+        // design, whatever else is open; comparing it to the tab set would
+        // report a staleness that is not there.
+        stripMatchesTabs: strip.length === 0 ? "n/a"
+          : propsFor().repoPath ? `n/a: bound to ${propsFor().repoPath} by props`
+          : JSON.stringify(strip) === JSON.stringify(openPaths),
+        // Arming failures first, so the four-entry cap can never hide them.
+        otherCrashes: [...new Set([...armFailures, ...crashes.filter((c) => !c.includes("effect_update_depth_exceeded"))])].slice(0, 4),
         renderedChars: target.textContent.trim().length,
         terminalTabs: target.querySelectorAll('[role="tablist"] button[role="tab"]').length,
         terminalPanels: target.querySelectorAll('[role="tabpanel"]').length,
         xtermScreens: target.querySelectorAll(".xterm-screen").length,
       };
-      document.title = `gp-stress done ${COMPONENT}/${SCENARIO} depth=${depthCount()} chars=${window.__gpResult.renderedChars}`;
+      document.title = `gp-stress ${armFailures.length ? "FAIL unarmed" : "done"} ${COMPONENT}/${SCENARIO} depth=${depthCount()} chars=${window.__gpResult.renderedChars}`;
       document.documentElement.setAttribute(
         "data-gp-result",
         encodeURIComponent(JSON.stringify(window.__gpResult)),
