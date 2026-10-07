@@ -82,12 +82,17 @@ pub struct TaskEvidence {
     pub data_json: String,
 }
 
-/// One gap row from `dc-store`.
+/// One gap row from `dc-store`: every field `GapRow` stores, none dropped.
+///
+/// [`read_view`] destructures `GapRow` without `..`, so a field dc-store adds
+/// is a compile error here until this struct carries it, and
+/// `scripts/check-coverage-types.mjs` holds the TypeScript twin to this shape.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct TaskGap {
     pub id: String,
     pub severity: String,
     pub gap_type: String,
+    pub requirement_id: Option<String>,
     pub task_id: Option<String>,
     pub description: String,
     pub evidence_json: String,
@@ -95,6 +100,12 @@ pub struct TaskGap {
     pub blocking: bool,
     pub file: Option<String>,
     pub line: Option<i64>,
+    pub suggested_command: Option<String>,
+    pub acceptance_criterion_id: Option<String>,
+    pub expected_verification_method: Option<String>,
+    /// Where a failed verification command's captured output was written.
+    pub stdout_path: Option<String>,
+    pub stderr_path: Option<String>,
 }
 
 /// One verification run from `dc-store`.
@@ -235,17 +246,45 @@ fn read_view(
     let (gap_rows, gaps_truncated) = store.gaps_list(task_id).map_err(|e| format!("gaps: {e}"))?;
     let gaps = gap_rows
         .into_iter()
-        .map(|row| TaskGap {
-            id: row.id,
-            severity: row.severity,
-            gap_type: row.gap_type,
-            task_id: row.task_id,
-            description: row.description,
-            evidence_json: row.evidence_json,
-            recommended_fix: row.recommended_fix,
-            blocking: row.blocking,
-            file: row.file,
-            line: row.line,
+        .map(|row| {
+            // Exhaustive on purpose — no `..`. A field dc-store starts keeping
+            // must fail to compile here, not vanish from the view.
+            let dc_store::records::GapRow {
+                id,
+                severity,
+                gap_type,
+                requirement_id,
+                task_id,
+                description,
+                evidence_json,
+                recommended_fix,
+                blocking,
+                file,
+                line,
+                suggested_command,
+                acceptance_criterion_id,
+                expected_verification_method,
+                stdout_path,
+                stderr_path,
+            } = row;
+            TaskGap {
+                id,
+                severity,
+                gap_type,
+                requirement_id,
+                task_id,
+                description,
+                evidence_json,
+                recommended_fix,
+                blocking,
+                file,
+                line,
+                suggested_command,
+                acceptance_criterion_id,
+                expected_verification_method,
+                stdout_path,
+                stderr_path,
+            }
         })
         .collect();
 
@@ -443,6 +482,119 @@ mod tests {
         assert_eq!(v.runs[0].id, "run-1");
         // Still read-only: no lease was created by this view.
         assert!(v.leases.is_empty());
+    }
+
+    #[test]
+    fn every_gap_field_dc_store_keeps_reaches_the_view() {
+        // Three rounds of the same bug: dc-store learned to keep a gap field
+        // and this view dropped it. Each optional field is written through
+        // dc-store's own upsert and must come back as itself, and an unset one
+        // must come back as None — "" would read as a field set to nothing.
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().to_str().unwrap();
+        let db = store_path(repo);
+        std::fs::create_dir_all(db.parent().unwrap()).unwrap();
+        let store = dc_store::Store::open(&db).unwrap();
+        store
+            .gap_upsert(&dc_store::records::GapRow {
+                id: "g-full".into(),
+                severity: "high".into(),
+                gap_type: "failed_command".into(),
+                requirement_id: Some("REQ-7".into()),
+                task_id: Some("TASK-1".into()),
+                description: "cargo test failed".into(),
+                evidence_json: r#"{"exit":101}"#.into(),
+                recommended_fix: "fix the failing test".into(),
+                blocking: true,
+                file: Some("src/a.rs".into()),
+                line: Some(42),
+                suggested_command: Some("cargo test -p a".into()),
+                acceptance_criterion_id: Some("AC-3".into()),
+                expected_verification_method: Some("unit_test".into()),
+                stdout_path: Some(".devcouncil/runs/r1/stdout.log".into()),
+                stderr_path: Some(".devcouncil/runs/r1/stderr.log".into()),
+            })
+            .unwrap();
+        store
+            .gap_upsert(&dc_store::records::GapRow {
+                id: "g-bare".into(),
+                severity: "low".into(),
+                gap_type: "coverage".into(),
+                requirement_id: None,
+                task_id: Some("TASK-1".into()),
+                description: "missing test".into(),
+                evidence_json: "{}".into(),
+                recommended_fix: "add a test".into(),
+                blocking: false,
+                file: None,
+                line: None,
+                suggested_command: None,
+                acceptance_criterion_id: None,
+                expected_verification_method: None,
+                stdout_path: None,
+                stderr_path: None,
+            })
+            .unwrap();
+        drop(store);
+
+        let v = view_filtered(repo, Some("TASK-1"));
+        assert!(v.available, "{}", v.error);
+        let gap = |id: &str| {
+            v.gaps
+                .iter()
+                .find(|g| g.id == id)
+                .unwrap_or_else(|| panic!("gap {id} missing from {:?}", v.gaps))
+        };
+
+        let full = gap("g-full");
+        assert_eq!(
+            full,
+            &TaskGap {
+                id: "g-full".into(),
+                severity: "high".into(),
+                gap_type: "failed_command".into(),
+                requirement_id: Some("REQ-7".into()),
+                task_id: Some("TASK-1".into()),
+                description: "cargo test failed".into(),
+                evidence_json: r#"{"exit":101}"#.into(),
+                recommended_fix: "fix the failing test".into(),
+                blocking: true,
+                file: Some("src/a.rs".into()),
+                line: Some(42),
+                suggested_command: Some("cargo test -p a".into()),
+                acceptance_criterion_id: Some("AC-3".into()),
+                expected_verification_method: Some("unit_test".into()),
+                stdout_path: Some(".devcouncil/runs/r1/stdout.log".into()),
+                stderr_path: Some(".devcouncil/runs/r1/stderr.log".into()),
+            }
+        );
+
+        let bare = gap("g-bare");
+        assert_eq!(bare.requirement_id, None);
+        assert_eq!(bare.file, None);
+        assert_eq!(bare.line, None);
+        assert_eq!(bare.suggested_command, None);
+        assert_eq!(bare.acceptance_criterion_id, None);
+        assert_eq!(bare.expected_verification_method, None);
+        assert_eq!(bare.stdout_path, None);
+        assert_eq!(bare.stderr_path, None);
+
+        // And on the wire every field is present, unset ones as null, so the
+        // MCP tool and resource (which serialize this view) carry them too.
+        let wire = serde_json::to_value(bare).unwrap();
+        for key in [
+            "requirement_id",
+            "suggested_command",
+            "acceptance_criterion_id",
+            "expected_verification_method",
+            "stdout_path",
+            "stderr_path",
+        ] {
+            assert_eq!(wire.get(key), Some(&serde_json::Value::Null), "{key}");
+        }
+        let wire = serde_json::to_value(full).unwrap();
+        assert_eq!(wire["stdout_path"], ".devcouncil/runs/r1/stdout.log");
+        assert_eq!(wire["requirement_id"], "REQ-7");
     }
 
     #[test]

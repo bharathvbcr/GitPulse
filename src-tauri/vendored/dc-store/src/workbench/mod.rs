@@ -360,6 +360,35 @@ fn ensure_schema(conn: &Connection) -> Result<()> {
             message: format!("workbench schema {version} is not supported"),
         });
     }
+    ensure_index(conn, MEMBER_INDEX, MEMBER_INDEX_SQL)?;
+    Ok(())
+}
+
+/// Lets a workspace's membership join check `deleted` and read `position`
+/// without loading each member's whole task row. A query aid, not a contract,
+/// so it is not a schema version: a host that does not know it is unaffected.
+const MEMBER_INDEX: &str = "work_items_member";
+const MEMBER_INDEX_SQL: &str =
+    "CREATE INDEX IF NOT EXISTS work_items_member ON work_items(id,deleted,position)";
+
+/// Creates `name` when missing. Looked up first so opening an indexed profile
+/// takes no write lock; created under an immediate transaction otherwise.
+fn ensure_index(conn: &Connection, name: &str, create: &str) -> Result<()> {
+    let present = || -> Result<bool> {
+        Ok(conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='index' AND name=?1)",
+            [name],
+            |r| r.get(0),
+        )?)
+    };
+    if present()? {
+        return Ok(());
+    }
+    let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+    if !present()? {
+        conn.execute_batch(create)?;
+    }
+    tx.commit()?;
     Ok(())
 }
 
@@ -1010,10 +1039,21 @@ struct PageRows {
 }
 
 fn collect_page(rows: &mut rusqlite::Rows<'_>, limit: i64) -> Result<PageRows> {
+    collect_page_with(rows, limit, |_| Ok(()))
+}
+
+/// [`collect_page`], also handing every fetched row to `each`, lookahead
+/// included, so a query can carry a value beside its records.
+fn collect_page_with(
+    rows: &mut rusqlite::Rows<'_>,
+    limit: i64,
+    mut each: impl FnMut(&rusqlite::Row<'_>) -> Result<()>,
+) -> Result<PageRows> {
     let mut records = Vec::new();
     let mut bytes = 0;
     let mut count = 0;
     while let Some(row) = rows.next()? {
+        each(row)?;
         if count == limit {
             return Ok(PageRows {
                 records,
@@ -1177,11 +1217,17 @@ fn list_items(input: &Input<'_>) -> Result<String> {
         fts.as_deref(),
         false,
     );
-    let total = input.conn.query_row(
-        &format!("SELECT count(*) {query}"),
-        rusqlite::params_from_iter(values.iter()),
-        |r| r.get(0),
-    )?;
+    if workspace.is_some() || (repo.is_some() && fts.is_some()) {
+        return list_scoped_items(input, &query, values, p);
+    }
+    let total = match fts.as_deref() {
+        Some(fts) if repo.is_none() && status.is_none() => global_search_total(input.conn, fts)?,
+        _ => input.conn.query_row(
+            &format!("SELECT count(*) {query}"),
+            rusqlite::params_from_iter(values.iter()),
+            |r| r.get(0),
+        )?,
+    };
     // A result set that fits the maximum page stays driven by indexed hits.
     // For larger global searches, materialize the FTS row IDs once and scan
     // the covering board index until the page fills. Reopening MATCH for every
@@ -1217,6 +1263,91 @@ fn list_items(input: &Input<'_>) -> Result<String> {
         &mut stmt.query(rusqlite::params_from_iter(values.iter()))?,
         p.limit,
     )?;
+    page_response(input.conn, rows, total)
+}
+
+/// Live tasks matching an unscoped, unfiltered search.
+///
+/// Every task row has exactly one full-text row: the insert trigger adds it,
+/// the update trigger replaces it, and tasks are only ever soft-deleted. So
+/// MATCH alone counts every hit, live or deleted, from the index, and the
+/// deleted hits are subtracted. Checking each hit's own row for `deleted`
+/// instead read every matching task row, which at 100,000 hits was most of a
+/// broad search. The deleted side walks only deleted rows in the board index
+/// and builds the hit set only if there is one.
+fn global_search_total(conn: &Connection, fts: &str) -> Result<i64> {
+    let hits: i64 = conn.query_row(
+        "SELECT count(*) FROM work_items_fts WHERE work_items_fts MATCH ?1",
+        [fts],
+        |r| r.get(0),
+    )?;
+    let deleted: i64 = conn.query_row(DELETED_SEARCH_HITS, [fts], |r| r.get(0))?;
+    Ok(hits - deleted)
+}
+
+/// Deleted tasks that match `?1`, found from the deleted side: two ranges of
+/// the board index (`deleted<>0` would scan every task), each probing the hit
+/// set. The unary `+` keeps the planner from driving the other way — from
+/// every hit to its task row, the very cost this count exists to avoid.
+const DELETED_SEARCH_HITS: &str = "SELECT count(*) FROM work_items t
+    WHERE (t.deleted<0 OR t.deleted>0)
+      AND +t.rowid IN(SELECT rowid FROM work_items_fts WHERE work_items_fts MATCH ?1)";
+
+/// A workspace's tasks, or a repository's narrowed by search.
+///
+/// Finding these candidates is the cost — the workspace membership union, the
+/// full-text hit set — and counting them and selecting a page each paid it in
+/// full, in two statements. One statement materializes them once; the total is
+/// counted from that set and the page cut from it, so the work is done once.
+/// Bodies are still read only for the page and its lookahead row.
+fn list_scoped_items(
+    input: &Input<'_>,
+    query: &str,
+    values: Vec<rusqlite::types::Value>,
+    p: Page,
+) -> Result<String> {
+    let bound = values.len();
+    let mut stmt = input.conn.prepare(&format!(
+        "WITH candidates AS MATERIALIZED (
+            SELECT t.rowid AS item_rowid,t.position,t.id {query}
+        ), page AS MATERIALIZED (
+            SELECT item_rowid,position,id FROM candidates
+            WHERE (position,id)>(?{},?{}) ORDER BY position,id LIMIT ?{}
+        ) SELECT json_remove(t.body,'$.description','$.acceptance_criteria','$.logs'),page.position,page.id,
+                 (SELECT count(*) FROM candidates)
+          FROM page CROSS JOIN work_items t ON t.rowid=page.item_rowid
+          ORDER BY page.position,page.id",
+        bound + 1,
+        bound + 2,
+        bound + 3
+    ))?;
+    let mut paged = values.clone();
+    paged.extend([
+        rusqlite::types::Value::Integer(p.position),
+        rusqlite::types::Value::Text(p.id),
+        rusqlite::types::Value::Integer(p.limit + 1),
+    ]);
+    let mut total = None;
+    let rows = collect_page_with(
+        &mut stmt.query(rusqlite::params_from_iter(paged.iter()))?,
+        p.limit,
+        |row| {
+            if total.is_none() {
+                total = Some(row.get(3)?);
+            }
+            Ok(())
+        },
+    )?;
+    // An empty page carries no row to read the total from. That is a cursor
+    // past the end or no match at all, so counting again is rare.
+    let total = match total {
+        Some(total) => total,
+        None => input.conn.query_row(
+            &format!("SELECT count(*) {query}"),
+            rusqlite::params_from_iter(values.iter()),
+            |r| r.get(0),
+        )?,
+    };
     page_response(input.conn, rows, total)
 }
 
