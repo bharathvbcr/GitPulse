@@ -8,11 +8,12 @@
  * its time does not start another read.
  */
 
-import { writable } from "svelte/store";
+import { readable, type Readable } from "svelte/store";
 import { mapWithConcurrency } from "../async/pool";
 import { invoke } from "../ipc/invoke";
 import { identityKey, type PathIdentityOptions } from "../repos/paths";
 import { parseTerminalContext } from "../terminal/sessionContext";
+import { terminalSessions } from "../terminal/sessionRegistry";
 
 /** How long a directory sweep may keep starting reads. */
 export const AGENT_CWD_DEADLINE_MS = 4_000;
@@ -20,15 +21,6 @@ export const AGENT_CWD_DEADLINE_MS = 4_000;
 export const AGENT_CWD_CONCURRENCY = 4;
 /** Sessions past this are left unknown rather than queued. */
 export const MAX_AGENT_CWD_READS = 64;
-
-/**
- * The directories the last sweep read, by backend session id.
- *
- * The Agents plane writes it; the tab chip reads it, so both count a shell
- * sitting in an agent checkout the same way. A session absent here is
- * unknown, not in the repository root.
- */
-export const agentDirectories = writable<ReadonlyMap<string, string>>(new Map());
 
 /**
  * Which sessions to ask for a directory, agents first.
@@ -125,3 +117,78 @@ export async function readAgentCwds(
   });
   return found;
 }
+
+export interface AgentDirectorySweep extends Readable<ReadonlyMap<string, string>> {
+  /** Reads every session again, for a shell that changed directory. */
+  refresh(): void;
+}
+
+type DirectoryRecord = { sessionId?: string | null; label: string };
+
+/**
+ * The directories of the open sessions, by session id, read whenever the set
+ * of sessions changes and someone is subscribed.
+ *
+ * One sweep feeds the tab bar's live-agent chip and the Agents plane, so a
+ * shell sitting in an agent checkout counts the same in both whether or not
+ * the plane has been opened. A title or status change leaves the set equal
+ * and starts nothing; an older sweep that finishes after a newer one started
+ * is dropped. A session the sweep has not read is absent: unknown, not the
+ * repository root.
+ */
+export function createAgentDirectorySweep(
+  sessions: Readable<readonly DirectoryRecord[]>,
+  read: (sessionIds: readonly string[]) => Promise<Map<string, string>> = (ids) => readAgentCwds(ids),
+): AgentDirectorySweep {
+  let generation = 0;
+  let targets: string | null = null;
+  let publish: ((value: ReadonlyMap<string, string>) => void) | null = null;
+
+  function sweep(): void {
+    const set = publish;
+    if (!set) return;
+    const ticket = ++generation;
+    const ids = targets ? targets.split("\n") : [];
+    if (ids.length === 0) {
+      set(new Map());
+      return;
+    }
+    void read(ids).then(
+      (found) => {
+        if (ticket === generation) set(found);
+      },
+      () => {
+        // The last answer stays. A failed sweep is not an empty one.
+      },
+    );
+  }
+
+  const store = readable<ReadonlyMap<string, string>>(new Map(), (set) => {
+    publish = set;
+    const stop = sessions.subscribe((records) => {
+      const next = agentCwdTargets(records).join("\n");
+      if (next === targets) return;
+      targets = next;
+      sweep();
+    });
+    return () => {
+      stop();
+      publish = null;
+      targets = null;
+      generation += 1;
+    };
+  });
+
+  return { subscribe: store.subscribe, refresh: sweep };
+}
+
+/**
+ * The directories the last sweep read, by backend session id.
+ *
+ * The tab chip and the Agents plane read the same sweep, so both count a
+ * shell sitting in an agent checkout the same way. Driving it from the chip
+ * means sessions are read when one opens, closes or is relabelled, even with
+ * the plane closed — one bounded sweep per change to the set of sessions,
+ * never one per output line.
+ */
+export const agentDirectories = createAgentDirectorySweep(terminalSessions);

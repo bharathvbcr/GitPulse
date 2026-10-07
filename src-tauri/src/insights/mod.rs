@@ -2562,6 +2562,47 @@ mod tests {
     }
 
     #[test]
+    fn agent_summary_counts_every_agent_checkout_slug_or_none() {
+        // The same worktrees as the counts fixture in
+        // src/lib/agents/plane.test.ts, which asserts that Fleet's facet, the
+        // Work view and the Agents plane all report 3 for them. This is the
+        // facet's side of that agreement, executed rather than transcribed.
+        let info = |path: &str, is_main: bool| WorktreeInfo {
+            path: path.to_string(),
+            name: String::new(),
+            head: String::new(),
+            branch: None,
+            is_bare: false,
+            is_detached: false,
+            is_main,
+            is_locked: false,
+            is_prunable: false,
+            dirty_files: Some(0),
+            diff_stat: None,
+            main_divergence: None,
+            active_routes: Vec::new(),
+            scan_note: None,
+        };
+        let items: Vec<WorktreeSummary> = [
+            info("/repo", true),
+            info("/repo/.claude/worktrees/alpha", false),
+            info("/repo/.codex/worktrees/b", false),
+            info("/repo/.claude/worktrees", false),
+            info("/repo/feature", false),
+        ]
+        .iter()
+        .map(|item| summarise_worktree(item, String::new(), true))
+        .collect();
+        assert_eq!(items[3].agent_kind, "claude");
+        assert_eq!(
+            items[3].session_slug, "",
+            "the container has no slug and still counts"
+        );
+        let summary = agent_summary(true, false, &items);
+        assert_eq!(summary.sessions, 3, "{summary:?}");
+    }
+
+    #[test]
     fn agent_summary_never_infers_completeness_from_its_own_input() {
         // The rollup cannot see whether the slice it was handed is all of a
         // repository or the front of it, which is exactly why both facts are

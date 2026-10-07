@@ -56,16 +56,24 @@ describe("AgentsView", () => {
     expect(source).toContain("bg-background");
   });
 
-  it("asks the terminal where it is, and does not invent a directory", () => {
-    expect(source).toContain("readAgentCwds");
+  it("takes directories from the sweep the tab chip also reads, and does not invent one", () => {
     expect(source).toContain("$agentDirectories.get(record.sessionId)");
     expect(source).not.toContain("cwd: null");
+    // The sweep (cwd.ts, createAgentDirectorySweep) owns when to read, and
+    // re-reads only when the set of sessions changes (cwd.test.ts). A second
+    // reader here would re-run on every registry change.
+    expect(source).not.toContain("readAgentCwds");
+    expect(source).toContain("agentDirectories.refresh()");
   });
 
-  it("re-reads directories when the set of sessions changes, not on every registry update", () => {
-    const effect = source.slice(source.indexOf("readAgentCwds(ids)") - 400, source.indexOf("readAgentCwds(ids)"));
-    expect(source).toContain("const cwdKey = $derived(agentCwdTargets($terminalSessions)");
-    expect(effect).toContain("cwdKey");
-    expect(effect).not.toContain("$terminalSessions");
+  it("names a task's repository from its registered id", () => {
+    expect(source).toContain("repositoryPath: (id) => repoPaths.get(id) ?? null");
+    expect(source).toContain("registered.want($board.runs.map((run) => run.repository_id))");
+    expect(source).toContain("registered.refresh()");
+  });
+
+  it("says when registered repositories could not be read or were capped", () => {
+    expect(source).toContain("$registeredStatus.error");
+    expect(source).toContain("!$registeredStatus.complete");
   });
 });

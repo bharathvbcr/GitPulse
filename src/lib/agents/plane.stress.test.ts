@@ -121,6 +121,11 @@ describe("projectAgentPlane under arbitrary mixtures", () => {
       if (random() < 0.4 && probes[0]) {
         probes.push({ ...probes[0], error: random() < 0.5 ? "late" : probes[0].error, snapshot: random() < 0.5 ? null : probes[0].snapshot });
       }
+      // Another tab of the first repository at a different path: one family
+      // whose common directory was not read, so the sweep probed it twice.
+      if (random() < 0.4 && probes[0]?.snapshot) {
+        probes.push({ ...probes[0], path: "/wt/0/0", label: "R0 tab" });
+      }
 
       const terminals: PlaneTerminal[] = Array.from({ length: Math.floor(random() * 5) }, (_, index) => ({
         key: random() < 0.1 ? "" : `term-${seed}-${index}`,
@@ -131,14 +136,16 @@ describe("projectAgentPlane under arbitrary mixtures", () => {
         sessionId: `sid-${index}`,
         taskRunId: random() < 0.3 ? "run-shared" : "",
         continuesRunId: "",
-        cwd: random() < 0.3 ? null : `/wt/${Math.floor(random() * repoCount)}/${Math.floor(random() * 4)}`,
+        cwd: random() < 0.3
+          ? null
+          : `/wt/${Math.floor(random() * repoCount)}/${Math.floor(random() * 4)}${random() < 0.3 ? "/src/lib" : ""}`,
         attention: pick(ATTENTIONS),
       }));
 
       const tasks: PlaneTask[] = Array.from({ length: Math.floor(random() * 4) }, (_, index) => ({
         runId: random() < 0.15 ? "" : index === 0 ? "run-shared" : `run-${seed}-${index}`,
         title: `task ${index}`,
-        repoPath: `/repo-0`,
+        repoPath: random() < 0.2 ? "" : `/repo-0`,
         cwd: random() < 0.4 ? `/wt/0/0` : `/missing/${index}`,
         provider: "claude",
         tone: pick([null, "quiet", "needs-you", "error", "problem", "active"] as const),
@@ -162,7 +169,7 @@ describe("projectAgentPlane under arbitrary mixtures", () => {
       });
 
       rowsSeen += plane.rows.length;
-      if (plane.sessionsAreFloor) floors += 1;
+      if (plane.checkoutsFloor || plane.tasksFloor || plane.rows.some((row) => row.parallelFloor)) floors += 1;
       failedGaps += plane.gaps.filter((gap) => gap.kind === "failed").length;
 
       expect(plane.shown).toBe(plane.rows.length);
@@ -181,6 +188,12 @@ describe("projectAgentPlane under arbitrary mixtures", () => {
         if (row.dirtyKnown) expect(row.dirtyFiles).not.toBeNull();
         for (let index = 1; index < row.attention.length; index += 1) {
           expect(rankOf(row.attention[index])).toBeGreaterThanOrEqual(rankOf(row.attention[index - 1]));
+        }
+        // A task whose repository was not resolved belongs to no repository.
+        if (row.repoPath === "") {
+          expect(row.parallelCount).toBe(1);
+          expect(row.repoLabel).toBe("Repository not resolved");
+          continue;
         }
         const list = byRepo.get(row.repoPath) ?? [];
         list.push(row);
@@ -209,6 +222,19 @@ describe("projectAgentPlane under arbitrary mixtures", () => {
         if (onlyDirty) expect(applyAgentFilter([row], "attention")).toEqual([]);
         if (row.attention.includes("unmeasured")) expect(applyAgentFilter([row], "attention")).toHaveLength(1);
         if (row.attention.includes("needs-you")) expect(applyAgentFilter([row], "attention")).toHaveLength(1);
+      }
+      // A row is never both a process in this window and one not shown in it.
+      for (const row of plane.rows) {
+        if (row.presence === "live" || row.presence === "exited") expect(row.attention).not.toContain("disconnected");
+      }
+      // One row per checkout, however many tabs listed it.
+      const onDisk = plane.rows.filter((row) => row.liveKey === null && row.presence === "on-disk").map((row) => row.worktreePath);
+      expect(new Set(onDisk).size).toBe(onDisk.length);
+      // The live count is the live rows, and the headline's two attention
+      // numbers are exactly what the attention filter keeps.
+      expect(plane.rows.filter((row) => row.presence === "live")).toHaveLength(plane.live);
+      if (!plane.truncated) {
+        expect(applyAgentFilter(plane.rows, "attention")).toHaveLength(plane.attention.needing + plane.attention.unread);
       }
       const taskGaps = plane.gaps.filter((gap) => gap.label === "Tasks");
       expect(taskGaps.length).toBeLessThanOrEqual(1);

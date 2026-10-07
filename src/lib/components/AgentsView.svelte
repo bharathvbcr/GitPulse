@@ -28,15 +28,15 @@
   import { attemptNotices, taskTerminalRequests } from "../terminal/taskLaunches";
   import { terminalSessionLimit } from "../terminal/sessionLimit";
   import { createBoardAgents } from "../workbench/boardAgents";
-  import { explainError, getTaskRun, listRepositories, type Repository } from "../workbench/client";
+  import { explainError, getTaskRun } from "../workbench/client";
   import { openTaskForRun } from "../workbench/taskOpen";
   import { queuedTerminalNote, showTaskTerminal } from "../workbench/taskTerminal";
-  import { agentCwdTargets, agentDirectories, readAgentCwds } from "../agents/cwd";
+  import { agentDirectories } from "../agents/cwd";
   import { agentPlaneStore, sweepTargets } from "../agents/store";
   import { agentKindLabel } from "../work/agentWorktree";
   import { agentsRepositoryScope, setAgentsRepositoryScope } from "../agents/scope";
   import { displayName } from "../repos/paths";
-  import { repositoryPaths, taskProbeFromBoard } from "../agents/tasks";
+  import { createRegisteredRepositories, repositoryPaths, taskProbeFromBoard } from "../agents/tasks";
   import {
     AGENT_COLUMNS,
     applyAgentFilter,
@@ -50,18 +50,13 @@
     type AgentRow,
   } from "../agents/plane";
 
-  /** Pages of registered repositories one read follows. Past it, ids stay unresolved. */
-  const MAX_REPOSITORY_PAGES = 5;
-
   const pathOpts = { caseInsensitive: isCaseInsensitiveFs() };
   const board = createBoardAgents();
   let now = $state(Date.now());
   let sweepKey = "";
-  let cwdGeneration = $state(0);
-  /** Registered repositories, for an attempt's repository id. Null before the first read. */
-  let repositories = $state<Repository[] | null>(null);
-  let repositoriesError = $state("");
-  let repositoriesPartial = $state(false);
+  /** Registered repositories, so a task names its repository and not its cwd. */
+  const registered = createRegisteredRepositories();
+  const registeredStatus = registered.status;
 
   const showing = $derived($interfaceStore.globalSurface === "agents");
   const hidden = $derived(new Set($interfaceStore.agentsHiddenColumns));
@@ -80,13 +75,14 @@
       taskRunId: record.taskRunId ?? "",
       continuesRunId: record.continuesRunId ?? "",
       // Unknown stays unknown. The registry has no directory, and a failed
-      // context read must not be filled in with the repository root.
+      // context read must not be filled in with the repository root. The tab
+      // chip counts from this same sweep (`agentDirectories`).
       cwd: record.sessionId ? $agentDirectories.get(record.sessionId) ?? null : null,
       attention: activity?.attention?.kind ?? null,
     };
   }));
 
-  const repoPaths = $derived(repositoryPaths(repositories ?? [], $repoStore.openTabs, pathOpts));
+  const repoPaths = $derived(repositoryPaths($registered, $repoStore.openTabs, pathOpts));
 
   const taskProbe = $derived(taskProbeFromBoard($board, {
     records: $terminalSessions,
@@ -111,18 +107,12 @@
   const scanning = $derived($agentPlaneStore.scanning);
   const notes = $derived([
     ...plane.gaps,
-    ...(repositoriesError
-      ? [{ kind: "partial", repoPath: "", label: "Repositories", reason: `Registered repositories could not be read, so an attempt's repository is not named: ${repositoriesError}` }]
-      : repositoriesPartial
+    ...($registeredStatus.error
+      ? [{ kind: "partial", repoPath: "", label: "Repositories", reason: `Registered repositories could not be read, so an attempt's repository is not named: ${$registeredStatus.error}` }]
+      : !$registeredStatus.complete
         ? [{ kind: "partial", repoPath: "", label: "Repositories", reason: "The registered repository list was capped. Some attempts may not name their repository." }]
         : []),
   ]);
-  /**
-   * Which sessions to ask for a directory. A title or status change gives the
-   * same key, and Svelte does not re-run an effect for a derived value that
-   * did not change, so the directory reads follow the set of sessions only.
-   */
-  const cwdKey = $derived(agentCwdTargets($terminalSessions).join("\n"));
 
   const FILTERS: { id: AgentFilter; label: string }[] = [
     { id: "all", label: "All" },
@@ -140,7 +130,8 @@
   }
 
   function refresh() {
-    cwdGeneration += 1;
+    agentDirectories.refresh();
+    registered.refresh();
     void agentPlaneStore.refresh(targets());
   }
 
@@ -222,45 +213,9 @@
 
   $effect(() => {
     if (!showing) return;
-    const ids = cwdKey ? cwdKey.split("\n") : [];
-    const ticket = cwdGeneration;
-    let cancelled = false;
-    void readAgentCwds(ids).then((found) => {
-      if (!cancelled && ticket === cwdGeneration) agentDirectories.set(found);
-    });
-    return () => {
-      cancelled = true;
-    };
-  });
-
-  $effect(() => {
-    if (!showing) return;
-    const ticket = cwdGeneration;
-    let cancelled = false;
-    void (async () => {
-      const found: Repository[] = [];
-      let cursor: string | undefined;
-      let more = false;
-      try {
-        for (let page = 0; page < MAX_REPOSITORY_PAGES; page += 1) {
-          const read = await listRepositories(cursor);
-          found.push(...read.items);
-          more = read.has_more && read.next_cursor !== null;
-          if (!more) break;
-          cursor = read.next_cursor ?? undefined;
-        }
-        if (cancelled || ticket !== cwdGeneration) return;
-        repositories = found;
-        repositoriesPartial = more;
-        repositoriesError = "";
-      } catch (cause) {
-        if (cancelled || ticket !== cwdGeneration) return;
-        repositoriesError = explainError(cause);
-      }
-    })();
-    return () => {
-      cancelled = true;
-    };
+    // A run naming a repository the last read did not have asks again, so a
+    // repository registered after the plane opened is still named.
+    registered.want($board.runs.map((run) => run.repository_id));
   });
 </script>
 

@@ -10,8 +10,9 @@
 import type { SessionActivity } from "../terminal/sessionActivity";
 import type { TerminalSessionRecord } from "../terminal/sessionRegistry";
 import type { AttemptNotice, TaskTerminalRequest } from "../terminal/taskLaunches";
+import { writable, type Readable } from "svelte/store";
 import { identityKey, type PathIdentityOptions } from "../repos/paths";
-import type { Repository, TaskRun } from "../workbench/client";
+import { explainError, listRepositories, type Page, type Repository, type TaskRun } from "../workbench/client";
 import { identityCommonDir, tabMatchesRegistered } from "../workbench/openMembership";
 import { currentLocation } from "../workbench/repositoryRelink";
 import { monitorAttempt, type MonitorContext, type PendingRequests } from "../workbench/taskSessions";
@@ -68,6 +69,111 @@ export function repositoryPaths(
     if (identityKey(location, paths)) found.set(repository.id, location);
   }
   return found;
+}
+
+/** Pages of registered repositories one read will follow. */
+export const MAX_REPOSITORY_PAGES = 10;
+
+/**
+ * Every registered repository, up to the page cap. `complete` is false when
+ * the cap stopped the read; an id past it stays unresolved rather than guessed.
+ */
+export async function readRegisteredRepositories(
+  list: (cursor?: string) => Promise<Page<Repository>> = listRepositories,
+): Promise<{ repositories: Repository[]; complete: boolean }> {
+  const repositories: Repository[] = [];
+  let cursor: string | undefined;
+  for (let page = 0; page < MAX_REPOSITORY_PAGES; page += 1) {
+    const next = await list(cursor);
+    repositories.push(...next.items);
+    if (!next.has_more || !next.next_cursor) return { repositories, complete: true };
+    cursor = next.next_cursor;
+  }
+  return { repositories, complete: false };
+}
+
+/** How long a failed registry read waits before a run may ask again. */
+export const REPOSITORY_RETRY_MS = 30_000;
+
+/** What the last registry read established, beside the repositories it found. */
+export interface RegisteredRepositoriesStatus {
+  /** False when the page cap stopped the last successful read. */
+  complete: boolean;
+  /** Why the last read failed; empty when it succeeded or none has run. */
+  error: string;
+}
+
+export interface RegisteredRepositories extends Readable<readonly Repository[]> {
+  /** Whether the list is capped, and why the last read failed, if it did. */
+  status: Readable<RegisteredRepositoriesStatus>;
+  /** Reads the registry when one of these ids is not among those already read. */
+  want(repositoryIds: readonly string[]): void;
+  /** Reads again now, whatever the last read found. */
+  refresh(): void;
+}
+
+/**
+ * The registered repositories the plane names task attempts by.
+ *
+ * Read once, then again only when a run names an id the last read did not
+ * have. One read at a time, and once per set of unknown ids: a deleted
+ * repository stays unknown, and asking again for it after every answer would
+ * never stop. A failed read leaves the last answer in place, says why in
+ * `status`, and is retried on the next ask after `REPOSITORY_RETRY_MS`, or at
+ * once by `refresh`.
+ */
+export function createRegisteredRepositories(
+  read: () => Promise<{ repositories: Repository[]; complete?: boolean }> = () => readRegisteredRepositories(),
+  now: () => number = () => Date.now(),
+): RegisteredRepositories {
+  const store = writable<readonly Repository[]>([]);
+  const status = writable<RegisteredRepositoriesStatus>({ complete: true, error: "" });
+  let known = new Set<string>();
+  let tried: string | null = null;
+  let retryAt: number | null = null;
+  let reading = false;
+  let lastIds: readonly string[] = [];
+
+  function start(unknown: string): void {
+    tried = unknown;
+    reading = true;
+    void read()
+      .then(
+        (found) => {
+          known = new Set(found.repositories.map((repository) => repository.id));
+          retryAt = null;
+          store.set(found.repositories);
+          status.set({ complete: found.complete !== false, error: "" });
+        },
+        (cause: unknown) => {
+          // Unread stays unread until the retry: task rows say the repository was not resolved.
+          retryAt = now() + REPOSITORY_RETRY_MS;
+          status.update((last) => ({ ...last, error: explainError(cause) }));
+        },
+      )
+      .finally(() => {
+        reading = false;
+      });
+  }
+
+  function unknownOf(repositoryIds: readonly string[]): string {
+    return [...new Set(repositoryIds.filter((id) => id && !known.has(id)))].sort().join("\n");
+  }
+
+  function want(repositoryIds: readonly string[]): void {
+    lastIds = repositoryIds;
+    if (reading) return;
+    const unknown = unknownOf(repositoryIds);
+    const retryDue = retryAt !== null && now() >= retryAt;
+    if (tried !== null && !retryDue && (unknown === "" || unknown === tried)) return;
+    start(unknown);
+  }
+
+  function refresh(): void {
+    if (!reading) start(unknownOf(lastIds));
+  }
+
+  return { subscribe: store.subscribe, status: { subscribe: status.subscribe }, want, refresh };
 }
 
 export function taskProbeFromBoard(board: TaskBoardRead, watch: TaskBoardWatch): TaskProbe {
