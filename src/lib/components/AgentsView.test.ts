@@ -41,7 +41,7 @@ describe("AgentsView", () => {
     expect(source).toContain('aria-label="Open task for {row.session}"');
     expect(source).toContain("openTaskForRun(row.taskRunId)");
     expect(source).toContain("repoStore.openRepo(row.checkoutPath)");
-    expect(source).toContain("kindLabel(row.kind)");
+    expect(source).toContain("agentKindLabel(row.kind)");
   });
 
   it("watches task attempts only while this surface is showing", () => {

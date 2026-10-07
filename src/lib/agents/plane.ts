@@ -28,6 +28,7 @@ import type { InsightsSnapshot, WorktreeSummary } from "../insights/types";
 import { identityKey, type PathIdentityOptions } from "../repos/paths";
 import { agentKind } from "../work/agentWorktree";
 import { nearestContaining } from "./cwd";
+import { plural } from "../format";
 
 /** Repositories one sweep will read. The rest are reported as skipped. */
 export const MAX_AGENT_REPOS = 64;
@@ -298,29 +299,6 @@ function clean(value: string, max = MAX_TEXT): string {
 
 function keyOf(path: string, paths: PathIdentityOptions): string {
   return identityKey(path, paths) || path;
-}
-
-/**
- * A GitPulse task-run worktree (`.gitpulse/worktrees/<slug>`). The lane's
- * own kind names the launcher, not the agent working in it.
- */
-const isGitPulseLane = (kind: string): boolean => kind.trim().toLowerCase() === "gitpulse";
-
-const KIND_LABELS: Readonly<Record<string, string>> = {
-  claude: "Claude Code",
-  codex: "Codex",
-  shell: "Shell",
-  agent: "Agent",
-};
-
-/**
- * The words a person reads for a row's kind. A kind this table does not
- * know is shown as it was found: a prettier name would claim knowledge of a
- * tool we have only seen a folder of.
- */
-export function kindLabel(kind: string): string {
-  if (isGitPulseLane(kind)) return "GitPulse task";
-  return KIND_LABELS[kind.trim().toLowerCase()] ?? kind;
 }
 
 /** Where a terminal is: its directory when the OS said, else the tab it was opened from. */
@@ -960,10 +938,28 @@ export function applyAgentFilter(rows: readonly AgentRow[], filter: AgentFilter)
   return rows.filter((row) => wantsAttention(row.attention));
 }
 
-/** `1 agent checkout`, `2 agent checkouts`. */
-export function plural(count: number, one: string, many: string): string {
-  return `${count} ${count === 1 ? one : many}`;
+/**
+ * The rows of one repository, for a view opened from that repository (Fleet's
+ * agent count). A row belongs when its repository — or the checkout it sits
+ * in — is the scope path under the same identity rule the tab strip uses, so
+ * a scope named by any checkout of the repository finds the same rows. A row
+ * whose repository was not resolved belongs to no scope. A null scope keeps
+ * every row.
+ */
+export function scopeToRepository(
+  rows: readonly AgentRow[],
+  scope: string | null,
+  paths: PathIdentityOptions,
+): AgentRow[] {
+  const key = scope ? identityKey(scope, paths) : null;
+  if (!key) return [...rows];
+  return rows.filter((row) =>
+    (row.repoPath !== "" && identityKey(row.repoPath, paths) === key) ||
+    (row.checkoutPath !== null && identityKey(row.checkoutPath, paths) === key));
 }
+
+/** `1 agent checkout`, `2 agent checkouts` — the app's one pluralizer, re-exported for the view. */
+export { plural };
 
 /**
  * One line naming what the rows are: agent checkouts, live terminals and task

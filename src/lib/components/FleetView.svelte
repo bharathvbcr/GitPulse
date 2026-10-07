@@ -1,16 +1,18 @@
 <script module lang="ts">
   import type { FleetRow, ScanFamily } from "../fleet/types";
   import { agentKindLabel } from "../work/agentWorktree";
+  import { setAgentsRepositoryScope } from "../agents/scope";
+  import { plural } from "../format";
 
-  /** "1 agent", "3 agents": the Fleet work cell's session count. */
+  /** "1 agent", "3 agents": the Fleet work cell's count of agent checkouts. */
   export function agentSessionsLabel(count: number): string {
-    return `${count} ${count === 1 ? "agent" : "agents"}`;
+    return plural(count, "agent");
   }
 
   /** The kinds behind that count, named the way the Worktrees panel names them. */
   export function agentKindsTitle(kinds: readonly string[]): string {
     const named = kinds.map(agentKindLabel).filter(Boolean);
-    return named.length ? `Agent sessions: ${named.join(", ")}. Open the Agents view.` : "Open the Agents view.";
+    return named.length ? `Agent checkouts: ${named.join(", ")}. Show them in Agents.` : "Show this repository in Agents.";
   }
 
   /** Which rows the grid shows. */
@@ -112,7 +114,6 @@
   } from "../fleet/sort";
   import { FAMILY_LABEL, SCAN_FAMILIES } from "../fleet/types";
   import { disambiguateLabels, displayName, isPathAmong, isCaseInsensitiveFs } from "../repos/paths";
-  import { plural } from "../format";
   import { formatAge, humanBytes } from "../storage/format";
   import { formatAuditCounts } from "../health/format";
   import { firstFailure, isCleanSweep, summarizeRun } from "../repos/workspaceOps";
@@ -545,12 +546,13 @@
   }
 
   /**
-   * The Agents view lists the sessions of every open repository and has no
-   * per-repository scope, so the repository is opened first — that is what
-   * puts its sessions on the plane — and the plane shown only once it did.
+   * The Agents view reads the open repositories, so the repository is opened
+   * first — that is what puts its rows on the plane — and the view is shown
+   * narrowed to it only once it did. The scope chip there clears it.
    */
   async function openAgents(row: FleetRow) {
     if (!(await repoStore.openRepo(row.path))) return;
+    setAgentsRepositoryScope(row.path);
     interfaceStore.setGlobalSurface("agents");
   }
 

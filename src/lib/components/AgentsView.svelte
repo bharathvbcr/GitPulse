@@ -33,15 +33,18 @@
   import { queuedTerminalNote, showTaskTerminal } from "../workbench/taskTerminal";
   import { agentCwdTargets, agentDirectories, readAgentCwds } from "../agents/cwd";
   import { agentPlaneStore, sweepTargets } from "../agents/store";
+  import { agentKindLabel } from "../work/agentWorktree";
+  import { agentsRepositoryScope, setAgentsRepositoryScope } from "../agents/scope";
+  import { displayName } from "../repos/paths";
   import { repositoryPaths, taskProbeFromBoard } from "../agents/tasks";
   import {
     AGENT_COLUMNS,
     applyAgentFilter,
     isAgentFilter,
-    kindLabel,
     planeHeadline,
     plural,
     projectAgentPlane,
+    scopeToRepository,
     type AgentColumnKey,
     type AgentFilter,
     type AgentRow,
@@ -100,7 +103,9 @@
     tasks: taskProbe,
     paths: pathOpts,
   }));
-  const visible = $derived(applyAgentFilter(plane.rows, filter));
+  const scoped = $derived(scopeToRepository(plane.rows, $agentsRepositoryScope, pathOpts));
+  const visible = $derived(applyAgentFilter(scoped, filter));
+  const scopeLabel = $derived($agentsRepositoryScope ? displayName($agentsRepositoryScope) : "");
   const headline = $derived(planeHeadline(plane, visible.length));
   const scanning = $derived($agentPlaneStore.scanning);
   const notes = $derived([
@@ -312,6 +317,24 @@
     </div>
 
     <div class="flex flex-wrap items-center gap-1.5">
+      {#if scopeLabel}
+        <span
+          class="inline-flex items-center gap-1 rounded-full border border-accent/40 bg-accent/10 pl-2 pr-0.5 py-0.5 text-[11px] text-textPrimary"
+          data-testid="agents-scope"
+        >
+          <span>Only {scopeLabel}</span>
+          <button
+            type="button"
+            class="gp-icon-btn h-4! w-4!"
+            aria-label="Show every repository"
+            title="Show every repository"
+            onclick={() => setAgentsRepositoryScope(null)}
+          >
+            <X size={10} />
+          </button>
+        </span>
+        <span class="mx-1 h-3 w-px bg-border" aria-hidden="true"></span>
+      {/if}
       {#each FILTERS as item (item.id)}
         <button
           type="button"
@@ -356,7 +379,9 @@
   <div class="flex-1 min-h-0 min-w-0 overflow-auto">
     {#if visible.length === 0}
       <p class="px-4 py-8 text-[12px] text-textMuted max-w-xl" data-testid="agents-empty">
-        {#if plane.rows.length > 0}
+        {#if scopeLabel && plane.rows.length > 0 && scoped.length === 0}
+          No agent checkouts, terminals or task attempts in {scopeLabel}. Other repositories have {plural(plane.rows.length, "row", "rows")}; clear the scope to see them.
+        {:else if plane.rows.length > 0}
           Nothing matches this filter. The headline still counts the {plural(plane.rows.length, "row", "rows")} it hid.
         {:else if plane.gaps.some((gap) => gap.kind === "failed" || gap.kind === "skipped")}
           Sessions could not be read. The notes above are the reason, not an empty workspace.
@@ -384,7 +409,7 @@
             <tr class="border-b border-border/60 hover:bg-surfaceHover/60" data-testid="agents-row">
               <th scope="row" class="px-4 py-2 font-normal text-left align-top">
                 <span class="block font-medium text-textPrimary">{row.session}</span>
-                <span class="block text-textMuted">{kindLabel(row.kind)} · {row.repoLabel}</span>
+                <span class="block text-textMuted">{agentKindLabel(row.kind)} · {row.repoLabel}</span>
                 <span class="mt-1 flex flex-wrap gap-1" data-testid="agents-row-actions">
                   {#if row.liveKey || row.taskRunId}
                     <button

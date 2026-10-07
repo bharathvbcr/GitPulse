@@ -785,9 +785,9 @@ describe("FleetView agent sessions", () => {
 
   it("names the kinds the way the Worktrees panel does", () => {
     expect(agentKindsTitle(["claude", "gitpulse"])).toBe(
-      "Agent sessions: Claude Code, GitPulse task. Open the Agents view.",
+      "Agent checkouts: Claude Code, GitPulse task. Show them in Agents.",
     );
-    expect(agentKindsTitle([])).toBe("Open the Agents view.");
+    expect(agentKindsTitle([])).toBe("Show this repository in Agents.");
   });
 
   it("is a button that opens the Agents view for that repository", () => {
@@ -800,6 +800,9 @@ describe("FleetView agent sessions", () => {
     const fn = source.slice(source.indexOf("async function openAgents"), source.indexOf("async function removeRow"));
     expect(fn).toContain("if (!(await repoStore.openRepo(row.path))) return;");
     expect(fn).toContain('interfaceStore.setGlobalSurface("agents");');
+    // The view opens narrowed to this repository, scoped before it is shown.
+    expect(fn.indexOf("setAgentsRepositoryScope(row.path);")).toBeGreaterThan(-1);
+    expect(fn.indexOf("setAgentsRepositoryScope(row.path);")).toBeLessThan(fn.indexOf("setGlobalSurface"));
     expect(fn).not.toContain("setFleetOpen");
   });
 });

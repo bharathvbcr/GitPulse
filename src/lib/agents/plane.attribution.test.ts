@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { applyAgentFilter, kindLabel, uniqueRowId } from "./plane";
+import { applyAgentFilter, uniqueRowId } from "./plane";
+import { agentKindLabel as kindLabel } from "../work/agentWorktree";
 import { family, listing, probe, project, snapshot, task, tasks, terminal, worktree } from "./__tests__/fixtures";
 
 const ALPHA = "/repo/.claude/worktrees/alpha";
@@ -168,12 +169,13 @@ describe("rows backed by a task run", () => {
     expect(kindLabel(plane.rows[0].kind)).toBe("Codex");
   });
 
-  it("label kinds for people and leave an unknown one as it was found", () => {
+  it("label kinds for people through the one owner the Worktrees panel also uses", () => {
     expect(kindLabel("claude")).toBe("Claude Code");
     expect(kindLabel("Codex")).toBe("Codex");
     expect(kindLabel("GitPulse")).toBe("GitPulse task");
     expect(kindLabel("shell")).toBe("Shell");
-    expect(kindLabel("agy")).toBe("agy");
+    expect(kindLabel("agy")).toBe("Antigravity");
+    expect(kindLabel("agent")).toBe("Agent");
   });
 });
 
