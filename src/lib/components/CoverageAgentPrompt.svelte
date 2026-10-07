@@ -8,6 +8,7 @@
   import { PROMPT_LAUNCHERS, terminalLaunchRequests, type PromptLauncher } from "../terminal/launchRequests";
   import { PROVIDER_LABELS } from "../workbench/taskHandoff";
   import { formatError } from "../ui/formatError";
+  import { isCaseInsensitiveFs, sameRepo } from "../repos/paths";
 
   let { repoPath, report, exclusions = [], scanFailed = false, focus, selectedScope = $bindable(false), onRescan, scanning = false }: {
     repoPath: string | null;
@@ -22,7 +23,12 @@
 
   const prompt = $derived(formatCoverageAgentPrompt(report, repoPath ?? "Open a repository first", exclusions, scanFailed, selectedScope ? focus : undefined));
   const agentSessions = terminalLaunchRequests.sessions;
-  const recentSession = $derived($agentSessions.filter(session => session.repoPath === repoPath).at(-1));
+  // One checkout, however it is spelled: the same rule the tab strip and the
+  // terminal registry match on.
+  const pathOptions = { caseInsensitive: isCaseInsensitiveFs() };
+  const recentSession = $derived(repoPath
+    ? $agentSessions.filter(session => sameRepo(session.repoPath, repoPath, pathOptions)).at(-1)
+    : undefined);
   let launcher = $state<PromptLauncher>("claude");
   const actionLabel = $derived(selectedScope && focus ? "Improve this file" : report && report.overall.lines_found > 0 ? "Improve coverage" : "Generate coverage");
   let copied = $state(false);

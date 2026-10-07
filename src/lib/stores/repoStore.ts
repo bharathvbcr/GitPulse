@@ -774,7 +774,7 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
   const graph = deps.graph ?? graphStore;
   const filters = deps.filter ?? filterStore;
   const terminals = deps.terminals ?? {
-    countFor: (repoPath: string) => sessionsByRepo(get(terminalSessions)).get(repoPath) ?? 0,
+    countFor: (repoPath: string) => sessionsByRepo(get(terminalSessions), options).get(repoPath) ?? 0,
   };
 
   /**
