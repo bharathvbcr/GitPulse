@@ -12,12 +12,18 @@
 //!
 //! Here it is one native step owned next to the preparation that uses it:
 //!
-//! - The location is the main checkout's `.gitpulse/worktrees/<slug>-<id>` —
-//!   the layout the Worktrees panel's agent lane already uses, which the agent
-//!   worktree detector recognises — and `.gitpulse/worktrees/` is excluded
-//!   through `$GIT_COMMON_DIR/info/exclude` with the same verified writer
-//!   DevMap uses. Only `worktrees/` is excluded: `.gitpulse/hooks.toml` is
-//!   repository configuration a team may commit.
+//! - The location is the main checkout's `.gitpulse/worktrees/<slug>-<id>`,
+//!   built from the same segments the agent-worktree detector reads
+//!   (`engine::worktree::gitpulse_lane_container`), so it is reported as a
+//!   GitPulse task worktree (`is_gitpulse_lane`) — and `.gitpulse/worktrees/`
+//!   is excluded through `$GIT_COMMON_DIR/info/exclude` with the same
+//!   verified writer DevMap uses. Only `worktrees/` is excluded:
+//!   `.gitpulse/hooks.toml` is repository configuration a team may commit.
+//! - This is the only creator there. The Worktrees panel's "agent lane"
+//!   preset filled the hand-made form with a path in this container, which
+//!   skipped the exclusion and nested inside whichever checkout was selected;
+//!   it is gone, and `cmd_add_worktree` refuses such a target
+//!   (`engine::worktree::refuse_gitpulse_lane_target`).
 //! - The path and branch derive from the attempt id, so a retried preparation
 //!   (the same request after a lost reply) reuses the worktree it already
 //!   made instead of failing on an existing directory or making a second.
@@ -33,9 +39,9 @@
 
 use super::WorkbenchError;
 use crate::engine::git_cli::{git_captured, resolve_git_common_dir};
+use crate::engine::worktree::{gitpulse_lane_container, GITPULSE_LANE_DIR as EXCLUDED};
 use std::path::{Path, PathBuf};
 
-const EXCLUDED: &str = ".gitpulse/worktrees";
 const EXCLUDE_MARKER: &str =
     "# GitPulse: task agent worktrees (machine-generated, never committed)";
 const MAX_SLUG: usize = 40;
@@ -137,7 +143,7 @@ pub(super) fn provision(
     let source = Path::new(selected);
     let root = main_checkout(source)?;
     let name = format!("{}-{}", slug(title), short(run_id)?);
-    let path = root.join(".gitpulse").join("worktrees").join(&name);
+    let path = gitpulse_lane_container(&root).join(&name);
     let branch = format!("gitpulse/{name}");
     let path_text = path
         .to_str()
@@ -285,6 +291,73 @@ mod tests {
         assert_eq!(left, 0, "the refused attempt's worktree was left behind");
         let branches = git_text(&root, &["branch", "--list", "gitpulse/*"]).unwrap();
         assert!(branches.trim().is_empty(), "branch left behind: {branches}");
+    }
+
+    /// A provisioned task worktree never shows up in the main checkout's
+    /// `git status` — where `git add -A` would stage it — and is reported as
+    /// GitPulse's own task worktree rather than as an external agent.
+    #[test]
+    fn a_provisioned_worktree_is_excluded_from_status_and_named_a_gitpulse_task() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("repo");
+        git_global(&["init", "-b", "main", root.to_str().unwrap()]).unwrap();
+        crate::test_support::trust_repo(&root);
+        std::fs::write(root.join("README.md"), "x\n").unwrap();
+        git_text(&root, &["add", "."]).unwrap();
+        git_text(
+            &root,
+            &[
+                "-c",
+                "user.name=Workbench Test",
+                "-c",
+                "user.email=workbench@example.invalid",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-m",
+                "init",
+            ],
+        )
+        .unwrap();
+        let made = provision(root.to_str().unwrap(), "c0ffee00-1", "Fix the watcher").unwrap();
+        assert!(std::path::Path::new(&made.path).is_dir(), "{}", made.path);
+        let status = git_text(&root, &["status", "--porcelain", "--untracked-files=all"]).unwrap();
+        // The command gate's ledger also writes into the repository; only the
+        // worktree container is this test's concern. Unexcluded, it reads
+        // `?? .gitpulse/` here.
+        assert!(
+            !status.contains(".gitpulse"),
+            "the task worktree leaked into git status:\n{status}"
+        );
+        // And the exclusion really is what hides it: with the rule removed
+        // from info/exclude, the container shows up.
+        let exclude = std::path::Path::new(
+            &git_text(&root, &["rev-parse", "--git-common-dir"])
+                .unwrap()
+                .trim()
+                .to_string(),
+        )
+        .join("info/exclude");
+        let exclude = if exclude.is_absolute() {
+            exclude
+        } else {
+            root.join(exclude)
+        };
+        let rules = std::fs::read_to_string(&exclude).unwrap();
+        assert!(rules.contains(".gitpulse/worktrees"), "{rules}");
+        std::fs::write(&exclude, rules.replace(".gitpulse/worktrees", "")).unwrap();
+        let unexcluded = git_text(&root, &["status", "--porcelain"]).unwrap();
+        assert!(unexcluded.contains(".gitpulse/"), "{unexcluded}");
+        std::fs::write(&exclude, rules).unwrap();
+        let layout = crate::engine::worktree::agent_layout(&made.path).expect("agent layout");
+        assert!(
+            crate::engine::worktree::is_gitpulse_lane(&layout.kind),
+            "{layout:?}"
+        );
+        assert_eq!(layout.slug, "fix-the-watcher-c0ffee00");
+        assert_eq!(made.branch, "gitpulse/fix-the-watcher-c0ffee00");
+        // The hand-made path into the same container is refused.
+        assert!(crate::engine::worktree::refuse_gitpulse_lane_target(&made.path).is_err());
     }
 
     #[test]
