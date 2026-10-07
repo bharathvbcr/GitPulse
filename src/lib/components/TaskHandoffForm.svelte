@@ -18,11 +18,9 @@
   import { onDestroy, untrack } from "svelte";
   import { invoke } from "../ipc/invoke";
   import { FolderOpen } from "@lucide/svelte";
-  import { interfaceStore } from "../stores/interfaceStore";
-  import { toastStore } from "../stores/toastStore";
   import { isCaseInsensitiveFs } from "../repos/paths";
   import { PERMISSION_LABELS } from "../terminal/agentDefaults";
-  import { showTaskTerminal, startTaskTerminal, queuedTerminalNote } from "../workbench/taskTerminal";
+  import { startPreparedAttempt } from "../workbench/taskTerminal";
   import { bounded } from "../workbench/taskActions";
   import {
     PERMISSION_MODES,
@@ -30,7 +28,6 @@
     getRepository,
     getTask,
     listHoldingRuns,
-    launchManagedRun,
     newID,
     prepareTaskRun,
     WorkbenchError,
@@ -54,6 +51,7 @@
     type HandoffSettings,
   } from "../workbench/taskHandoff";
   import type { OpenTabRef } from "../workbench/openMembership";
+  import type { AgentProvider, RunKind } from "../workbench/vocabulary";
 
   let {
     taskId,
@@ -70,6 +68,7 @@
     onGate,
     onBusy,
     onPending,
+    onPreparing,
   }: {
     taskId: string;
     revision: number;
@@ -95,6 +94,12 @@
     onBusy?: (busy: boolean) => void;
     /** True while a preparation outcome is unknown and must be retried as-is. */
     onPending?: (pending: boolean) => void;
+    /**
+     * A preparation is being asked for (its id is the run's id), then null
+     * once it is accepted or refused — so a host can show the attempt from
+     * the moment Launch is pressed, keyed as the run it becomes.
+     */
+    onPreparing?: (draft: { id: string; provider: AgentProvider; kind: RunKind; worktree: boolean } | null) => void;
   } = $props();
 
   let repositoryId = $state(untrack(() => primaryRepositoryId));
@@ -180,22 +185,18 @@
   }
 
   /**
-   * Starts the attempt's terminal where the reader stands: true when it is
-   * starting now, false when it waits for its checkout to open. It never
-   * moves the reader. The sheet that launched it stays on screen, and the
-   * toast and the task's Agents pane offer the terminal instead.
-   */
-  async function startTerminalFor(run: TaskRun): Promise<boolean> {
-    return (await startTaskTerminal(run)) === "started";
-  }
-
-  /**
-   * Prepare, then start.
+   * Prepare, then hand the accepted attempt to its owner.
    *
    * The task is re-read first: the caller carries the revision it last loaded,
    * and launching an agent against a revision that has since changed elsewhere
    * would hand it a brief nobody wrote. `pending` keeps one preparation
    * identity across a retry so a lost reply cannot create two runs.
+   *
+   * Once the store accepts the preparation, starting it is not this form's
+   * business: `startPreparedAttempt` runs to the end whether or not this form
+   * is still mounted (closing the sheet or switching task tabs destroys it),
+   * and reports on the attempt's row. `disposed` guards only this form's own
+   * writes.
    */
   export async function launch() {
     if (!gate.ok || busy) return;
@@ -205,6 +206,10 @@
     // read after it (the `finally` below) dereferences a host that is gone.
     // `disposed` cannot guard that window: it is set on destroy, not on hand-back.
     const repository = selected;
+    // The settings this launch is made with, for the owner to remember after
+    // acceptance — never a read of the bound prop after an await.
+    const chosen: HandoffSettings = { ...settings };
+    const preparing = onPreparing;
     busy = true; error = ""; note = "";
     try {
       if (!pending) {
@@ -235,39 +240,26 @@
           acknowledge_bypass: acknowledged,
         };
       }
-      const run = await bounded(prepareTaskRun(pending));
+      const preparation = pending;
+      preparing?.({ id: preparation.id, provider: preparation.provider, kind: preparation.kind ?? "external_terminal", worktree: preparation.worktree === true });
+      const run = await bounded(prepareTaskRun(preparation));
       pending = null;
-      if (disposed) return;
-      // Remembered only after a preparation the store accepted, and never
-      // with `bypass`. Every other mode is remembered, because re-picking
-      // "Allow workspace edits" before each launch is the friction this form
-      // exists to remove — but a mode that turns off the agent's sandbox has
-      // to be chosen again, with its acknowledgement, every single time.
-      if (settings.permission === "bypass") settings = { ...settings, permission: defaultHandoff().permission };
-      acknowledged = false;
-      interfaceStore.setTaskHandoff(settings);
-      // The attempt is real the moment the store accepts it, so publish it
-      // before anything can fail. Everything after this point is recoverable
-      // from the row it produces.
-      onPrepared?.(run);
-      if (run.kind === "managed") {
-        const started = await bounded(launchManagedRun(run.id));
-        if (disposed) return;
-        toastStore.success(
-          `Managed ${PROVIDER_LABELS[settings.provider]} ${started.state === "running" ? "started" : started.state}.`,
-        );
-        onLaunched(started);
-        return;
+      // Accepted: from here on the attempt exists, and its start belongs to
+      // the module owner — begun before any check of whether this form still
+      // exists, so a closed sheet cannot abandon it.
+      const starting = startPreparedAttempt(run, { remember: chosen });
+      if (!disposed) {
+        // Mirrors what the owner remembers: `bypass` is never carried over.
+        if (settings.permission === "bypass") settings = { ...settings, permission: defaultHandoff().permission };
+        acknowledged = false;
+        // The attempt is real the moment the store accepts it, so the host
+        // learns of it before its start can fail.
+        onPrepared?.(run);
       }
-      note = "Starting the agent's terminal…";
-      const started = await startTerminalFor(run);
-      if (disposed) return;
-      note = started ? "" : queuedTerminalNote(run.cwd);
-      toastStore.success(
-        `${PROVIDER_LABELS[run.provider]} ${started ? "started" : "is waiting to start"} on revision ${run.source_revision}.`,
-        { label: "Show terminal", onClick: () => showTaskTerminal(run).then(() => undefined, (cause: unknown) => { toastStore.error(explainError(cause)); }) },
-      );
-      onLaunched(run);
+      const result = await starting;
+      // Success or not, the outcome is on the attempt's row and in a toast;
+      // the form has nothing left to say about an accepted attempt.
+      if (!disposed && result.ok) onLaunched(result.run);
     } catch (cause) {
       if (disposed) return;
       error = explainError(cause);
@@ -279,6 +271,8 @@
         error = `${error} A new worktree is now selected for this attempt; launch again to run it beside that one.`;
       }
     } finally {
+      // The optimistic row is replaced by the run itself, or withdrawn.
+      preparing?.(null);
       if (!disposed) busy = false;
       // Whatever happened, this repository's occupancy may have changed.
       if (!disposed) void loadHolding(repository);

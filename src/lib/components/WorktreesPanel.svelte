@@ -27,6 +27,10 @@
   import { agentKind, agentKindLabel, agentSessionSlug, isAgentWorktree, isGitPulseLane } from "../work/agentWorktree";
   import { isCaseInsensitiveFs, sameRepo } from "../repos/paths";
   import { trustExtended } from "../repos/trustExtension";
+  import { listAllLiveRuns, type TaskRun } from "../workbench/client";
+  import { liveRunIn } from "../workbench/attemptWorktree";
+  import { runStateLabel } from "../workbench/taskHandoff";
+  import { openTaskForRun } from "../workbench/taskOpen";
 
 
   let worktrees = $state<WorktreeInfo[]>([]);
@@ -56,6 +60,13 @@
   let aiSummaries = $state<Record<string, string>>({});
   let loadingSummaries = $state<Record<string, boolean>>({});
   let inflight: AsyncGuard | null = null;
+  /**
+   * Live task attempts, read once per load when this repository has a
+   * GitPulse task worktree (the host's own attempt worktrees), so its row can say
+   * which task it is and what its agent is doing — and open that task. Not a
+   * poll: the panel reloads on the same triggers it always did.
+   */
+  let liveRuns = $state<TaskRun[]>([]);
   let confirmTimer: ReturnType<typeof setTimeout> | null = null;
 
   // Load trigger keyed on the real dependencies: active repo + its hydration
@@ -107,7 +118,7 @@
       const next = await invoke<WorktreeInfo[]>("cmd_list_worktrees", { repoPath: repo });
       if (!guard.isLive()) return;
       worktrees = next;
-      await loadTaskState(repo, next, guard);
+      await Promise.all([loadTaskState(repo, next, guard), loadLaneRuns(next, guard)]);
     } catch (err: unknown) {
       if (!guard.isLive()) return;
       error = reportPanelError("worktrees", err);
@@ -149,6 +160,35 @@
       // an enrichment, and losing it must not read as "the worktrees failed".
       reportPanelError("worktrees", err);
       taskView = null;
+    }
+  }
+
+  /**
+   * The live attempts GitPulse's own task worktrees belong to. Read only when
+   * one is listed; a failed read is an enrichment lost, reported to
+   * diagnostics, and the rows fall back to naming the worktree kind.
+   */
+  async function loadLaneRuns(list: WorktreeInfo[], guard: AsyncGuard) {
+    if (!list.some((wt) => isGitPulseLane(agentKind(wt.path)))) {
+      liveRuns = [];
+      return;
+    }
+    try {
+      const { runs } = await listAllLiveRuns();
+      if (!guard.isLive()) return;
+      liveRuns = runs;
+    } catch (err: unknown) {
+      if (!guard.isLive()) return;
+      reportPanelError("worktrees", err);
+      liveRuns = [];
+    }
+  }
+
+  async function showLaneTask(run: TaskRun) {
+    try {
+      await openTaskForRun(run.id);
+    } catch (err: unknown) {
+      error = `That worktree's task could not be opened: ${reportPanelError("worktrees", err)}`;
     }
   }
 
@@ -646,10 +686,23 @@
             {#if isAgentWorktree(wt.path)}
               {@const kind = agentKind(wt.path)}
               {@const slug = agentSessionSlug(wt.path)}
-              <span
-                class="shrink-0 text-[9px] rounded-full bg-accent/10 px-1 text-accent"
-                title="{isGitPulseLane(kind) ? 'GitPulse task worktree' : `Agent worktree (${agentKindLabel(kind)})`}{slug ? `: ${slug}` : ''}"
-              >{agentKindLabel(kind)}</span>
+              {@const lane = isGitPulseLane(kind) ? liveRunIn(wt.path, liveRuns) : undefined}
+              {#if lane}
+                <!-- A GitPulse task worktree with a live attempt: which task,
+                     what its agent is doing, and the way back to it. -->
+                <button
+                  type="button"
+                  class="shrink-0 min-w-0 max-w-[60%] truncate text-[9px] rounded-full bg-accent/10 px-1 text-accent hover:bg-accent/20"
+                  data-testid="worktree-task"
+                  title="Open the task this worktree's agent is working on: {lane.task_title} ({runStateLabel(lane.state)})"
+                  onclick={() => void showLaneTask(lane)}
+                >{lane.task_title || "Task"} · {runStateLabel(lane.state)}</button>
+              {:else}
+                <span
+                  class="shrink-0 text-[9px] rounded-full bg-accent/10 px-1 text-accent"
+                  title="{isGitPulseLane(kind) ? 'GitPulse task worktree' : `Agent worktree (${agentKindLabel(kind)})`}{isGitPulseLane(kind) ? ' — no agent is running in it' : ''}{slug ? `: ${slug}` : ''}"
+                >{agentKindLabel(kind)}</span>
+              {/if}
             {/if}
             {#if wt.is_bare}
               <span class="shrink-0 text-[9px] uppercase rounded-full bg-surfaceHover border border-border/80 px-1 text-textMuted">bare</span>

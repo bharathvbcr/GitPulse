@@ -263,3 +263,18 @@ describe("WorktreesPanel legacy-trust extension", () => {
     expect(source).not.toContain("cmd_repository_trust");
   });
 });
+
+describe("WorktreesPanel GitPulse task worktrees", () => {
+  it("names a task worktree's task and run state, links back to it, and reads runs only when one is listed", () => {
+    // Read once per load, gated on a GitPulse lane being listed, so a
+    // repository without one sends no run read (the uncommitted harness pins
+    // the IPC surface).
+    expect(source).toContain("if (!list.some((wt) => isGitPulseLane(agentKind(wt.path)))) {");
+    expect(source).toContain("const { runs } = await listAllLiveRuns();");
+    expect(source).toContain("await Promise.all([loadTaskState(repo, next, guard), loadLaneRuns(next, guard)]);");
+    expect(source).toContain("liveRunIn(wt.path, liveRuns)");
+    expect(source).toContain('data-testid="worktree-task"');
+    expect(source).toContain("await openTaskForRun(run.id);");
+    expect(source).toContain("{lane.task_title || \"Task\"} · {runStateLabel(lane.state)}");
+  });
+});

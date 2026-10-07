@@ -11,6 +11,9 @@
   let active = $state(true);
   let working = $state(0);
   let asking = $state(0);
+  // TaskBoard remounts the editor (and this pane) when the reader switches
+  // task tabs: {#key session.pane}. A launch must survive that.
+  let paneKey = $state(0);
   // As SessionNotificationBridge does in the app: announcements feed the pane.
   onMount(() => { let stop: (() => void) | null = null; void bindAttention(listen).then((unlisten) => { stop = unlisten; }); return () => stop?.(); });
   const load = () => import("../src/lib/components/TerminalPanel.svelte");
@@ -22,7 +25,10 @@
     <p>Disposable browser fixture. Native process and database transport are simulated.</p>
     <button class="gp-btn" onclick={() => active = !active}>{active ? "Suspend run updates" : "Resume run updates"}</button>
     <span data-testid="host-working" data-count={working} data-asking={asking}>Agents badge: {working} ({asking} asking)</span>
-    <TaskAgentPanel {task} {repositories} {openTabs} {active} onCount={(count) => { working = count; }} onAttention={(count) => { asking = count; }} />
+    <button class="gp-btn" onclick={() => paneKey += 1}>Remount pane</button>
+    {#key paneKey}
+      <TaskAgentPanel {task} {repositories} {openTabs} {active} onCount={(count) => { working = count; }} onAttention={(count) => { asking = count; }} />
+    {/key}
   </aside>
   <div class="flex flex-col flex-1 min-w-0 min-h-0">
     <div class="flex-1 p-4 text-textMuted">The selected task’s terminal opens here.</div>

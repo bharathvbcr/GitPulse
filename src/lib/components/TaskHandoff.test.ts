@@ -6,6 +6,7 @@ const read = (name: string) => readFileSync(new URL(`./${name}.svelte`, import.m
 const form = read("TaskHandoffForm");
 const sheet = read("TaskHandoffSheet");
 const panel = read("TaskAgentPanel");
+const owner = readFileSync(new URL("../workbench/taskTerminal.ts", import.meta.url), "utf8");
 
 describe("the agent handoff has one implementation", () => {
   it("compiles all three without warnings", () => {
@@ -45,9 +46,14 @@ describe("the agent handoff has one implementation", () => {
     // which queues before opening so a superseded open cannot lose the
     // terminal. The form only ever STARTS one: a launch must never take the
     // reader off the sheet that launched it. Showing is the pane's button.
-    expect(form).toContain("startTaskTerminal(run)");
-    expect(form).not.toMatch(/await showTaskTerminal\(/);
-    expect(panel).toContain("showTaskTerminal(run)");
+    // The form hands an accepted attempt to the module owner, which starts
+    // (never shows) its terminal; showing is the pane's button.
+    expect(form).toContain("startPreparedAttempt(run, { remember: chosen })");
+    expect(form).not.toContain("startTaskTerminal(");
+    expect(form).not.toContain("showTaskTerminal(");
+    expect(owner).toContain("startTerminal: startTaskTerminal,");
+    expect(owner.slice(owner.indexOf("export async function startPreparedAttempt"))).not.toMatch(/await (deps\.show|showTaskTerminal|showAttemptTerminal)\(/);
+    expect(panel).toContain("showAttemptTerminal(run)");
     for (const [name, host] of [["TaskHandoffForm", form], ["TaskAgentPanel", panel], ["TaskHandoffSheet", sheet]] as const) {
       expect(host, name).not.toContain("enqueueTaskTerminal(");
       expect(host, name).not.toContain("repoStore.openRepo(");
@@ -91,10 +97,16 @@ describe("the agent handoff has one implementation", () => {
   it("publishes a prepared run before anything that can fail afterwards", () => {
     const launch = form.slice(form.indexOf("const run = await bounded(prepareTaskRun"));
     expect(launch.indexOf("onPrepared?.(run)")).toBeGreaterThan(-1);
-    expect(launch.indexOf("onPrepared?.(run)")).toBeLessThan(launch.indexOf("launchManagedRun"));
-    expect(launch.indexOf("onPrepared?.(run)")).toBeLessThan(launch.indexOf("startTerminalFor"));
-    // The panel treats both signals the same way; it dedups on run id.
-    expect(panel).toContain("onPrepared={launched}");
+    expect(launch.indexOf("onPrepared?.(run)")).toBeLessThan(launch.indexOf("await starting"));
+    // An accepted attempt is started before anything asks whether this form
+    // still exists: closing the sheet or switching task tabs must not
+    // abandon it (it used to `if (disposed) return` right here).
+    expect(launch.indexOf("startPreparedAttempt(run")).toBeGreaterThan(-1);
+    expect(launch.indexOf("startPreparedAttempt(run")).toBeLessThan(launch.indexOf("disposed"));
+    expect(form).not.toContain("launchManagedRun");
+    // Both signals reach the panel, which dedups on run id.
+    expect(panel).toContain("onPrepared={prepared}");
+    expect(panel).toContain("onLaunched={launched}");
     expect(panel).toContain("runs.filter((item) => item.id !== run.id)");
     // The sheet stops offering a launch once one exists, so a failure after
     // preparation cannot be answered by making a second attempt.
@@ -105,9 +117,10 @@ describe("the agent handoff has one implementation", () => {
   it("never lets bypass survive the attempt it was authorized for", () => {
     expect(form).toContain('if (settings.permission === "bypass") settings = { ...settings, permission: defaultHandoff().permission };');
     expect(form).toContain("acknowledged = false;");
-    // Remembering happens after the downgrade, so storage never sees bypass
-    // even before `sanitizeHandoff` refuses to restore it.
-    expect(form.indexOf('permission: defaultHandoff().permission')).toBeLessThan(form.indexOf("interfaceStore.setTaskHandoff(settings)"));
+    // Remembering belongs to the owner, which downgrades bypass before it
+    // stores anything — even before `sanitizeHandoff` refuses to restore it.
+    expect(form).not.toContain("setTaskHandoff");
+    expect(owner).toContain('deps.remember(settings.permission === "bypass" ? { ...settings, permission: defaultHandoff().permission } : settings);');
   });
 
   it("shows the run before the form once one is live", () => {
