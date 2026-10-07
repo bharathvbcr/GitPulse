@@ -9,7 +9,9 @@ use crate::diff::conflict_session::{
 use crate::diff::{
     compute_word_diff, ConflictDocument, ConflictResolver, FilePatch, IntraLineDiff, PatchBuilder,
 };
-use crate::engine::git_cli::{git_text, resolve_repo, sandbox_write, validate_repo, ResolvedRepo};
+use crate::engine::git_cli::{
+    git_text, resolve_repo, sandbox_write_edited_text, validate_repo, ResolvedRepo,
+};
 use crate::engine::git_reader::{
     BlameLine, CommitDetails, CommitFileChange, DiffPayload, DoraReport, FileBlob, KnowledgeReport,
     LanguageStatsReport, PulseReport, ReflogEntry,
@@ -639,8 +641,9 @@ pub async fn cmd_get_file_blob(
 }
 
 /// Writes a file inside the repository, after the write gate has judged the
-/// path. This is the conflict editor's save path, so it is a real edit and is
-/// gated as one.
+/// path. This is the file editor's save path, so it is a real edit and is
+/// gated as one, and it keeps the file's CRLF endings and refuses to replace
+/// bytes the editor could not decode (see `sandbox_write_edited_text`).
 #[tauri::command(async)]
 pub async fn cmd_write_file_content(
     repo_path: String,
@@ -649,7 +652,7 @@ pub async fn cmd_write_file_content(
 ) -> Result<Guarded<()>, String> {
     off_thread(move || {
         let policy = crate::harness::guard_file(&repo_path, &file_path, "modify")?;
-        sandbox_write(&repo_path, &file_path, &content)?;
+        sandbox_write_edited_text(&repo_path, &file_path, &content)?;
         Ok(Guarded { policy, output: () })
     })
     .await

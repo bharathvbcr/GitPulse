@@ -15,6 +15,7 @@
   } from "@lucide/svelte";
   import { openInDefaultApp } from "../../desktop/openInShell";
   import { repoStore } from "../../stores/repoStore";
+  import type { LineEnding } from "../../files/types";
   import { formatError } from "../../ui/formatError";
   import { copyText } from "../../desktop/clipboard";
   import {
@@ -49,6 +50,8 @@
       mime: string;
       text?: string | null;
       base64?: string | null;
+      invalid_utf8_bytes?: number;
+      eol?: LineEnding | null;
     };
     draftContent?: string | null;
     dirty?: boolean;
@@ -374,6 +377,8 @@
         <CodeViewer
           {filePath}
           content={sourceContent}
+          eol={blob.eol ?? null}
+          invalidUtf8Bytes={blob.invalid_utf8_bytes ?? 0}
           {draftContent}
           {dirty}
           {onSave}
@@ -389,6 +394,8 @@
           <CodeViewer
             {filePath}
             content={sourceContent}
+            eol={blob.eol ?? null}
+            invalidUtf8Bytes={blob.invalid_utf8_bytes ?? 0}
             {draftContent}
             {dirty}
             {onSave}

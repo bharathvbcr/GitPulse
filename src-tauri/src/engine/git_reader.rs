@@ -7,6 +7,7 @@ use crate::engine::git_cli::{
 };
 use crate::engine::git_writer::validate_ref_name;
 use crate::engine::ref_cache::{self, FileIdentity};
+use crate::engine::text_shape::{self, LineEnding};
 use crate::graph::lane_solver::RawCommitNode;
 use crate::graph::RefScope;
 use serde::{Deserialize, Serialize};
@@ -447,6 +448,11 @@ pub struct FileBlob {
     pub mime: String,
     pub text: Option<String>,
     pub base64: Option<String>,
+    /// Bytes that `text` shows as U+FFFD because they are not valid UTF-8.
+    /// Non-zero means `text` is not a faithful copy and must not be saved.
+    pub invalid_utf8_bytes: usize,
+    /// The file's line-ending style; `None` for binary files.
+    pub eol: Option<LineEnding>,
 }
 
 pub struct GitReader;
@@ -1357,6 +1363,12 @@ impl GitReader {
             } else {
                 None
             },
+            invalid_utf8_bytes: if is_binary {
+                0
+            } else {
+                text_shape::invalid_utf8_bytes(&bytes)
+            },
+            eol: (!is_binary).then(|| text_shape::line_ending(&bytes)),
         })
     }
 
@@ -3612,7 +3624,7 @@ fn check_working_tree_size(path: &Path, max_bytes: u64) -> Result<(), String> {
 /// Read a regular file with a hard allocation bound, including if it grows
 /// after stat. Never open a FIFO in blocking mode on Unix, and recheck the
 /// opened handle so replacing a file cannot bypass the metadata check.
-fn read_working_tree_file(path: &Path, max_bytes: u64) -> Result<Vec<u8>, String> {
+pub(crate) fn read_working_tree_file(path: &Path, max_bytes: u64) -> Result<Vec<u8>, String> {
     let meta = std::fs::symlink_metadata(path)
         .map_err(|e| format!("Cannot inspect '{}': {e}", path.display()))?;
     if !meta.is_file() {
