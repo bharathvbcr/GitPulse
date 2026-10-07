@@ -2581,6 +2581,23 @@ mod tests {
         let conn = open(&ledger_path(&repo)).expect("open the ledger");
         let shm = dir.path().join(".devcouncil").join("ledger.sqlite-shm");
         assert!(shm.exists(), "a WAL ledger in use has an index file");
+        // Securing no longer runs after the connection, so the files SQLite
+        // creates must already be private: they inherit the database's mode.
+        {
+            use std::os::unix::fs::PermissionsExt;
+            for name in ["ledger.sqlite-wal", "ledger.sqlite-shm"] {
+                let path = dir.path().join(".devcouncil").join(name);
+                let mode = std::fs::metadata(&path)
+                    .unwrap_or_else(|e| panic!("{name}: {e}"))
+                    .permissions()
+                    .mode();
+                assert_eq!(
+                    mode & 0o777,
+                    0o600,
+                    "{name} was created wider than the ledger"
+                );
+            }
+        }
 
         let output = std::process::Command::new(std::env::current_exe().expect("test binary"))
             .args([
