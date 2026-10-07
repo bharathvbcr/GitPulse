@@ -63,6 +63,10 @@ function snapshot(fields: Partial<InsightsSnapshot> = {}): InsightsSnapshot {
   };
 }
 
+/** The default facets with a few fields changed, so a new facet field needs no edit here. */
+const agentsFacet = (fields: Partial<InsightsSnapshot["agents"]>) => ({ ...snapshot().agents, ...fields });
+const collisionsFacet = (fields: Partial<InsightsSnapshot["collisions"]>) => ({ ...snapshot().collisions, ...fields });
+
 function probe(fields: Partial<PlaneProbe> = {}): PlaneProbe {
   return {
     path: "/repo",
@@ -461,7 +465,7 @@ describe("checkout attribution", () => {
         worktree({ path: "/repo/.claude/worktrees/beta", session_slug: "beta", name: "beta" }),
       ],
     },
-    agents: { ok: true, sessions: 2, kinds: [{ kind: "claude", sessions: 2 }], truncated: false },
+    agents: agentsFacet({ sessions: 2, kinds: [{ kind: "claude", sessions: 2 }] }),
   });
 
   it("P1: two tab paths of one repository yield one row per checkout", () => {
@@ -487,11 +491,8 @@ describe("checkout attribution", () => {
   it("P1: two tabs of one repository give one set of notes, from the more complete listing", () => {
     const partial = snapshot({
       ...two,
-      agents: { ok: true, sessions: 2, kinds: [], truncated: true },
-      collisions: {
-        ok: true, error: "", overlapping_files: 0, worktrees_involved: 0, scanned_worktrees: 1,
-        unscanned_worktrees: 2, failed_worktrees: 0, truncated: false, items: [],
-      },
+      agents: agentsFacet({ sessions: 2, truncated: true }),
+      collisions: collisionsFacet({ scanned_worktrees: 1, unscanned_worktrees: 2 }),
     });
     for (const order of [[0, 1], [1, 0]]) {
       const probes = [
@@ -663,7 +664,7 @@ describe("one definition of each agent count", () => {
         ok: true, error: "", count: items.length, scanned: items.length, dirty: 0, dirty_unknown: 0,
         blocked: 0, blocked_unknown: 0, truncated: false, items,
       },
-      agents: { ok: true, sessions: facetSessions, kinds: [], truncated: false },
+      agents: agentsFacet({ sessions: facetSessions, kinds: [] }),
     });
     const records = [
       { key: "a", label: "Claude", status: "running", repoPath: "/repo", sessionId: "s-a" },
@@ -768,12 +769,9 @@ describe("filters and the headline", () => {
             ok: true, error: "", count: 3, scanned: 3, dirty: 0, dirty_unknown: 0,
             blocked: 0, blocked_unknown: 1, truncated: false, items,
           },
-          agents: { ok: true, sessions: 3, kinds: [], truncated: false },
+          agents: agentsFacet({ sessions: 3, kinds: [] }),
           // A partial collision scan marks every checkout `unscanned`.
-          collisions: {
-            ok: true, error: "", overlapping_files: 0, worktrees_involved: 0, scanned_worktrees: 2,
-            unscanned_worktrees: 1, failed_worktrees: 0, truncated: false, items: [],
-          },
+          collisions: collisionsFacet({ scanned_worktrees: 2, unscanned_worktrees: 1 }),
         }),
       })],
       terminals: [terminal({ cwd: "/repo/.claude/worktrees/alpha", attention: "needs-you" })],
