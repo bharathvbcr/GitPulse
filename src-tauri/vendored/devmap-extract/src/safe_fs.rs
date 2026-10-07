@@ -494,8 +494,11 @@ pub fn resolve_file_alias(path: &Path) -> io::Result<PathBuf> {
                 };
             }
             Ok(_) => {
-                // On Windows non-symlink reparse points must also be refused.
-                let _file = SafeFile::open(&path, Access::Read, Creation::Never)?;
+                // Refuses a non-regular file, and on Windows a non-symlink
+                // reparse point. Not an open: the path is a live store, and a
+                // handle dropped here would release this process's SQLite
+                // locks on it — see `inspect_regular`.
+                inspect_regular(&path)?;
                 return path.canonicalize();
             }
             Err(error) if links == 0 && error.kind() == io::ErrorKind::NotFound => return Ok(path),
@@ -503,6 +506,128 @@ pub fn resolve_file_alias(path: &Path) -> io::Result<PathBuf> {
         }
     }
     Err(refused("database alias chain exceeds 40 links"))
+}
+
+/// What a regular file's directory entry says, read without opening it.
+///
+/// `links`, `len` and `modified` on every platform; owner, mode and identity
+/// only where they exist.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EntryStatus {
+    pub links: u64,
+    pub len: u64,
+    pub modified: std::time::SystemTime,
+    #[cfg(unix)]
+    pub uid: u32,
+    #[cfg(unix)]
+    pub mode: u32,
+    #[cfg(unix)]
+    pub dev: u64,
+    #[cfg(unix)]
+    pub ino: u64,
+}
+
+impl EntryStatus {
+    #[cfg(unix)]
+    pub fn is_owned_by_current_user(&self) -> bool {
+        // SAFETY: geteuid has no preconditions.
+        self.uid == unsafe { libc::geteuid() }
+    }
+}
+
+/// Check that `path` names a regular file reached without following a link,
+/// and report its entry — without ever holding a descriptor on the file.
+///
+/// The same refusals as [`SafeFile::open`]: every ancestor is pinned and must
+/// not be a link, the final name is not followed, and anything but a regular
+/// file is refused. What differs is that nothing is opened on unix, and that
+/// matters for one kind of file in particular: a SQLite database or its WAL
+/// sidecars.
+///
+/// POSIX record locks belong to the process and the inode, so `close()` on
+/// *any* descriptor for a file releases every lock the process holds on it.
+/// SQLite's own VFS never closes a descriptor while another connection in the
+/// process has the file open, but it cannot know about one opened beside it.
+/// Opening a live store's database or `-shm` to inspect it and then dropping
+/// the handle silently stripped every connection in the process of its locks,
+/// after which another process could checkpoint over pages a reader's snapshot
+/// still used: the reader then answered from a mix of two generations, or with
+/// "database disk image is malformed" (SQLite's "How To Corrupt An SQLite
+/// Database File", §2.2). `fstatat` answers the same questions with no
+/// descriptor to close.
+///
+/// Windows has no such semantics — its byte-range locks belong to the handle
+/// that took them — and reparse points can only be told apart from an open
+/// handle, so there it opens as [`SafeFile::open`] does.
+pub fn inspect_regular(path: &Path) -> io::Result<EntryStatus> {
+    let name = path
+        .file_name()
+        .ok_or_else(|| refused("managed file has no filename"))?;
+    check_name(name)?;
+    let parent = PinnedDir::open(path.parent().unwrap_or_else(|| Path::new(".")), false)?;
+    parent.inspect_child(name)
+}
+
+impl PinnedDir {
+    #[cfg(unix)]
+    fn inspect_child(&self, name: &OsStr) -> io::Result<EntryStatus> {
+        use std::os::fd::AsRawFd;
+        check_child_name(name)?;
+        let directory = self
+            .chain
+            .last()
+            .ok_or_else(|| refused("managed directory is missing"))?;
+        let name = c_name(name)?;
+        let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+        // SAFETY: the directory descriptor and NUL-terminated name are live, and
+        // `stat` is a valid destination that fstatat fully initializes on success.
+        let status = unsafe {
+            libc::fstatat(
+                directory.as_raw_fd(),
+                name.as_ptr(),
+                stat.as_mut_ptr(),
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        };
+        if status != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: fstatat returned 0, so it wrote the whole struct.
+        let stat = unsafe { stat.assume_init() };
+        // `st_mode`'s width differs by platform (u16 on macOS, u32 on Linux).
+        #[allow(clippy::unnecessary_cast)]
+        let mode = stat.st_mode as u32;
+        #[allow(clippy::unnecessary_cast)]
+        if mode & (libc::S_IFMT as u32) != (libc::S_IFREG as u32) {
+            return Err(refused("managed file is not a regular file"));
+        }
+        let seconds = u64::try_from(stat.st_mtime)
+            .map_err(|_| refused("managed file is stamped before 1970"))?;
+        #[allow(clippy::unnecessary_cast)]
+        let nanos = stat.st_mtime_nsec as u32;
+        let modified = std::time::UNIX_EPOCH + std::time::Duration::new(seconds, nanos);
+        #[allow(clippy::unnecessary_cast)]
+        Ok(EntryStatus {
+            links: stat.st_nlink as u64,
+            len: stat.st_size.max(0) as u64,
+            modified,
+            uid: stat.st_uid as u32,
+            mode,
+            dev: stat.st_dev as u64,
+            ino: stat.st_ino as u64,
+        })
+    }
+
+    #[cfg(windows)]
+    fn inspect_child(&self, name: &OsStr) -> io::Result<EntryStatus> {
+        let file = self.open_file(name, Access::Read, Creation::Never)?;
+        let metadata = file.metadata()?;
+        Ok(EntryStatus {
+            links: file_link_count(&file)?,
+            len: metadata.len(),
+            modified: metadata.modified()?,
+        })
+    }
 }
 
 pub fn file_link_count(file: &File) -> io::Result<u64> {

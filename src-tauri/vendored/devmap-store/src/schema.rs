@@ -860,6 +860,15 @@ CREATE INDEX IF NOT EXISTS idx_edge_rows_closed
 -- store, to serve nothing. `classification` could not have earned it in any
 -- case: eight distinct values over 180,679 rows is a key that selects a
 -- twentieth of the table.
+--
+-- **Superseded for `callee_name` in v24.** "No production statement filters
+-- this relation on `callee_name`" stopped being true when `impact` began
+-- listing the unresolved call sites that name its target:
+-- `Store::unresolved_sites_naming` filters `WHERE u.callee_name IN (…)`, and
+-- without an index `EXPLAIN QUERY PLAN` shows it as `SCAN u` over the whole
+-- ledger on every `impact`. `MIGRATION_V23_TO_V24` re-adds
+-- `idx_unresolved_rows_callee`; the measurement is recorded there. The
+-- `classification` index stays dropped: nothing filters on it.
 CREATE INDEX IF NOT EXISTS idx_unresolved_rows_closed
     ON unresolved_rows(valid_to) WHERE valid_to IS NOT NULL;
 
@@ -1270,7 +1279,41 @@ UPDATE pending_paths SET revision = 1;
 /// those rows as neighbouring tiers. No DDL changes.
 pub const MIGRATION_V22_TO_V23: &str = "";
 
-pub const CURRENT_SCHEMA_VERSION: i32 = 23;
+/// Re-add the `callee_name` index v21 dropped, because a reader now needs it.
+///
+/// `impact` lists the unresolved call sites that name its target, through
+/// `Store::unresolved_sites_naming` — `WHERE u.callee_name IN (…)` against the
+/// whole ledger. v21 dropped `idx_unresolved_rows_callee` when nothing filtered
+/// on that column (see the comment beside `idx_unresolved_rows_closed`); the
+/// reader arrived afterwards, and the comment went on asserting otherwise.
+///
+/// Query plan for that statement, recorded on this repository's store
+/// (155,711 ledger rows):
+///
+/// ```text
+/// before:  SCAN u
+///          SEARCH p USING INTEGER PRIMARY KEY (rowid=?)
+///          SEARCH c USING INTEGER PRIMARY KEY (rowid=?)
+///          USE TEMP B-TREE FOR ORDER BY
+/// after:   SEARCH u USING INDEX idx_unresolved_rows_callee (callee_name=?)
+///          SEARCH p USING INTEGER PRIMARY KEY (rowid=?)
+///          SEARCH c USING INTEGER PRIMARY KEY (rowid=?)
+///          USE TEMP B-TREE FOR LAST 3 TERMS OF ORDER BY
+/// ```
+///
+/// `devmap-query/examples/unresolved_callee_index_ab.rs`, release, two copies of
+/// that store differing only in this index, answers checked identical, 21
+/// interleaved rounds of five `impact` calls: min 36.50 ms → 11.74 ms, p50
+/// 37.77 ms → 12.69 ms, so 7.55 ms → 2.54 ms per call at p50; a second run gave
+/// 8.55 ms → 3.00 ms. The index adds 2.4 MB (1.6%) to the file and took 42 to
+/// 88 ms to build over the existing rows. What it costs a cold build — one more
+/// b-tree insertion per ledger row — was not re-measured.
+pub const MIGRATION_V23_TO_V24: &str = r#"
+CREATE INDEX IF NOT EXISTS idx_unresolved_rows_callee
+    ON unresolved_rows(callee_name);
+"#;
+
+pub const CURRENT_SCHEMA_VERSION: i32 = 24;
 
 /// The `user_version` the Python engine's `index.sqlite` carries — a database
 /// this kernel never wrote and cannot read. Named once, here, so the store's
@@ -1308,6 +1351,9 @@ pub const FRESH_SCHEMA_BATCHES: &[&str] = &[
     // Empty: v23 only stamps `user_version`. Listed so a fresh store and a
     // migrated one land on the same version by the same batch list.
     MIGRATION_V22_TO_V23,
+    // After `MIGRATION_V20_TO_V21`, which drops this same index: the order is
+    // the ladder's, so a fresh store ends where a migrated one does.
+    MIGRATION_V23_TO_V24,
 ];
 
 /// Strip SQL line comments so a scan of DDL text cannot read prose as code.

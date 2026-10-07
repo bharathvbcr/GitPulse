@@ -8,18 +8,18 @@ import { expect, it } from "vitest";
 function fixture() {
   const root = realpathSync(mkdtempSync(path.join(tmpdir(), "gitpulse-vendor-regression-")));
   const upstream = path.join(root, "upstream");
-  for (const dir of ["scripts", "src-tauri/vendored", "upstream/rust/dc-glob/src"]) mkdirSync(path.join(root, dir), { recursive: true });
+  for (const dir of ["scripts", "src-tauri/vendored", "upstream/rust/dc-redact/src"]) mkdirSync(path.join(root, dir), { recursive: true });
   for (const file of ["vendor-crates.mjs", "usage.mjs", "columns.mjs"]) cpSync(new URL(file, import.meta.url), path.join(root, "scripts", file));
   writeFileSync(path.join(upstream, "rust/Cargo.toml"), '[workspace]\n[workspace.package]\nversion = "1.0.0"\n');
-  writeFileSync(path.join(upstream, "rust/dc-glob/Cargo.toml"), '[package]\nname = "dc-glob"\nversion.workspace = true\n');
-  writeFileSync(path.join(upstream, "rust/dc-glob/src/lib.rs"), "pub const VALUE: u8 = 7;\n");
+  writeFileSync(path.join(upstream, "rust/dc-redact/Cargo.toml"), '[package]\nname = "dc-redact"\nversion.workspace = true\n');
+  writeFileSync(path.join(upstream, "rust/dc-redact/src/lib.rs"), "pub const VALUE: u8 = 7;\n");
   const manifest = path.join(root, "src-tauri/vendored/VENDOR.json");
   writeFileSync(manifest, '{"crates":[]}');
   const run = (...args: string[]) => spawnSync(process.execPath, [path.join(root, "scripts/vendor-crates.mjs"), ...args, "--json"], {
     encoding: "utf8", timeout: 15_000,
     env: { ...process.env, GITPULSE_ALLOW_DRIFT: "0", GITPULSE_DEVCOUNCIL_ROOT: upstream, GITPULSE_MARKDEV_ROOT: "/missing" },
   });
-  const initial = run("--crate=dc-glob");
+  const initial = run("--crate=dc-redact");
   expect(initial.status, initial.stderr).toBe(0);
   return { root, upstream, manifest, run, cleanup: () => rmSync(root, { recursive: true, force: true }) };
 }
@@ -27,7 +27,7 @@ function fixture() {
 it("detects upstream deletions and inherited manifest changes", () => {
   const f = fixture();
   try {
-    rmSync(path.join(f.upstream, "rust/dc-glob/src/lib.rs"));
+    rmSync(path.join(f.upstream, "rust/dc-redact/src/lib.rs"));
     writeFileSync(path.join(f.upstream, "rust/Cargo.toml"), '[workspace]\n[workspace.package]\nversion = "2.0.0"\n');
     const result = f.run("--check");
     expect(result.status, result.stderr).toBe(1);
@@ -71,14 +71,14 @@ it("refuses a missing framework tree required by the application manifest", () =
   } finally { f.cleanup(); }
 });
 
-it.each(["--crate=dc-glob", "full"])("preserves every old byte when %s preparation fails", (mode) => {
+it.each(["--crate=dc-redact", "full"])("preserves every old byte when %s preparation fails", (mode) => {
   const f = fixture();
   try {
     const oldManifest = readFileSync(f.manifest, "utf8");
-    const library = path.join(f.root, "src-tauri/vendored/dc-glob/src/lib.rs");
+    const library = path.join(f.root, "src-tauri/vendored/dc-redact/src/lib.rs");
     const oldLibrary = readFileSync(library, "utf8");
-    writeFileSync(path.join(f.upstream, "rust/dc-glob/src/lib.rs"), "changed bytes\n");
-    if (mode !== "full") writeFileSync(path.join(f.upstream, "rust/dc-glob/Cargo.toml"), '[package]\nname = "dc-glob"\nmissing.workspace = true\n');
+    writeFileSync(path.join(f.upstream, "rust/dc-redact/src/lib.rs"), "changed bytes\n");
+    if (mode !== "full") writeFileSync(path.join(f.upstream, "rust/dc-redact/Cargo.toml"), '[package]\nname = "dc-redact"\nmissing.workspace = true\n');
     const result = mode === "full" ? f.run() : f.run(mode);
     expect(result.status).toBe(2);
     expect(readFileSync(f.manifest, "utf8")).toBe(oldManifest);
@@ -91,7 +91,7 @@ it("refuses a concurrent refresh and leaves the old snapshot intact", () => {
   try {
     const oldManifest = readFileSync(f.manifest, "utf8");
     mkdirSync(path.join(f.root, "src-tauri/.vendor-lock"));
-    const result = f.run("--crate=dc-glob");
+    const result = f.run("--crate=dc-redact");
     expect(result.status).toBe(2);
     expect(result.stderr).toContain("vendor-lock");
     expect(readFileSync(f.manifest, "utf8")).toBe(oldManifest);
@@ -102,9 +102,9 @@ it.runIf(process.platform !== "win32")("rejects source symlinks instead of copyi
   const f = fixture();
   try {
     writeFileSync(path.join(f.root, "outside.rs"), "external bytes");
-    symlinkSync(path.join(f.root, "outside.rs"), path.join(f.upstream, "rust/dc-glob/src/escape.rs"));
+    symlinkSync(path.join(f.root, "outside.rs"), path.join(f.upstream, "rust/dc-redact/src/escape.rs"));
     const before = readFileSync(f.manifest, "utf8");
-    const result = f.run("--crate=dc-glob");
+    const result = f.run("--crate=dc-redact");
     expect(result.status).toBe(2);
     expect(result.stderr).toMatch(/symlink|symbolic/i);
     expect(readFileSync(f.manifest, "utf8")).toBe(before);
@@ -115,21 +115,21 @@ it("keeps repeated source, manifest, and deletion updates coherent", () => {
   const f = fixture();
   try {
     for (let generation = 0; generation < 12; generation++) {
-      const source = path.join(f.upstream, "rust/dc-glob");
+      const source = path.join(f.upstream, "rust/dc-redact");
       const optional = path.join(source, "build.rs");
       if (generation % 2 === 0) writeFileSync(optional, `fn main() { println!("generation ${generation}"); }`);
       else rmSync(optional);
       writeFileSync(path.join(source, "src/lib.rs"), `pub const GENERATION: usize = ${generation};\n`);
       writeFileSync(path.join(f.upstream, "rust/Cargo.toml"), `[workspace]\n[workspace.package]\nversion = "1.0.${generation}"\n`);
       expect(f.run("--check").status).toBe(1);
-      const update = f.run("--crate=dc-glob");
+      const update = f.run("--crate=dc-redact");
       expect(update.status, update.stderr).toBe(0);
       const check = f.run("--check");
       expect(check.status, check.stderr).toBe(0);
       expect(JSON.parse(check.stdout).crates[0]).toMatchObject({ edited: [], upstream: "matches", drifted: [] });
     }
     const before = readFileSync(f.manifest, "utf8");
-    expect(f.run("--crate=dc-glob").status).toBe(0);
+    expect(f.run("--crate=dc-redact").status).toBe(0);
     expect(readFileSync(f.manifest, "utf8")).toBe(before);
   } finally { f.cleanup(); }
 }, 30_000);
@@ -137,13 +137,13 @@ it("keeps repeated source, manifest, and deletion updates coherent", () => {
 it("excludes local state and upstream tests from both snapshot and comparison", () => {
   const f = fixture();
   try {
-    const source = path.join(f.upstream, "rust/dc-glob");
+    const source = path.join(f.upstream, "rust/dc-redact");
     mkdirSync(path.join(source, "src/.devcouncil"));
     mkdirSync(path.join(source, "tests"));
     writeFileSync(path.join(source, "src/.devcouncil/session"), "local state");
     writeFileSync(path.join(source, "tests/upstream.rs"), "test-only");
     expect(f.run("--check").status).toBe(0);
-    expect(f.run("--crate=dc-glob").status).toBe(0);
+    expect(f.run("--crate=dc-redact").status).toBe(0);
     expect(readFileSync(f.manifest, "utf8")).not.toContain("session");
     expect(readFileSync(f.manifest, "utf8")).not.toContain("upstream.rs");
   } finally { f.cleanup(); }
@@ -152,11 +152,11 @@ it("excludes local state and upstream tests from both snapshot and comparison", 
 it("updates one crate without reading or rewriting unrelated upstreams", () => {
   const root = realpathSync(mkdtempSync(path.join(tmpdir(), "gitpulse-vendor-scope-")));
   try {
-    for (const dir of ["scripts", "src-tauri/vendored/untouched", "upstream/rust/dc-glob/src"]) mkdirSync(path.join(root, dir), { recursive: true });
+    for (const dir of ["scripts", "src-tauri/vendored/untouched", "upstream/rust/dc-redact/src"]) mkdirSync(path.join(root, dir), { recursive: true });
     for (const file of ["vendor-crates.mjs", "usage.mjs", "columns.mjs"]) cpSync(new URL(file, import.meta.url), path.join(root, "scripts", file));
     writeFileSync(path.join(root, "upstream/rust/Cargo.toml"), "[workspace]\n[workspace.package]\nversion = \"1.0.0\"\n");
-    writeFileSync(path.join(root, "upstream/rust/dc-glob/Cargo.toml"), "[package]\nname = \"dc-glob\"\nversion.workspace = true\n");
-    writeFileSync(path.join(root, "upstream/rust/dc-glob/src/lib.rs"), "pub const VALUE: u8 = 7;\n");
+    writeFileSync(path.join(root, "upstream/rust/dc-redact/Cargo.toml"), "[package]\nname = \"dc-redact\"\nversion.workspace = true\n");
+    writeFileSync(path.join(root, "upstream/rust/dc-redact/src/lib.rs"), "pub const VALUE: u8 = 7;\n");
     const untouched = { name: "untouched", origin: { commit: "preserved" }, files: { "lib.rs": "preserved" } };
     writeFileSync(path.join(root, "src-tauri/vendored/untouched/lib.rs"), "original bytes");
     const manifestPath = path.join(root, "src-tauri/vendored/VENDOR.json");
@@ -164,12 +164,12 @@ it("updates one crate without reading or rewriting unrelated upstreams", () => {
     const run = (crate: string) => spawnSync(process.execPath, [path.join(root, "scripts/vendor-crates.mjs"), `--crate=${crate}`, "--json"], {
       encoding: "utf8", env: { ...process.env, GITPULSE_DEVCOUNCIL_ROOT: path.join(root, "upstream"), GITPULSE_MARKDEV_ROOT: "/missing" },
     });
-    const result = run("dc-glob");
+    const result = run("dc-redact");
     expect(result.status, result.stderr).toBe(0);
     expect(readFileSync(path.join(root, "src-tauri/vendored/untouched/lib.rs"), "utf8")).toBe("original bytes");
     const manifest = JSON.parse(readFileSync(manifestPath, "utf8"));
     expect(manifest.crates.find((c: {name: string}) => c.name === "untouched")).toEqual(untouched);
-    expect(readFileSync(path.join(root, "src-tauri/vendored/dc-glob/src/lib.rs"), "utf8")).toContain("VALUE: u8 = 7");
+    expect(readFileSync(path.join(root, "src-tauri/vendored/dc-redact/src/lib.rs"), "utf8")).toContain("VALUE: u8 = 7");
     const before = readFileSync(manifestPath, "utf8");
     expect(run("../escape").status).toBe(2);
     expect(readFileSync(manifestPath, "utf8")).toBe(before);
@@ -202,21 +202,21 @@ it("says so when a crate was vendored from an uncommitted tree", () => {
     expect(git("commit", "-q", "-m", "upstream", "--no-gpg-sign").status).toBe(0);
 
     // Committed: the commit really does contain these bytes, so no flag.
-    expect(f.run("--crate=dc-glob").status).toBe(0);
+    expect(f.run("--crate=dc-redact").status).toBe(0);
     const clean = JSON.parse(readFileSync(f.manifest, "utf8"));
     expect(clean.crates[0].origin.commit_is_not_the_source).toBeUndefined();
 
     // A dirty file somewhere else upstream says nothing about this crate.
     writeFileSync(path.join(f.upstream, "rust/Cargo.lock"), "unrelated\n");
-    expect(f.run("--crate=dc-glob").status).toBe(0);
+    expect(f.run("--crate=dc-redact").status).toBe(0);
     expect(
       JSON.parse(readFileSync(f.manifest, "utf8")).crates[0].origin.commit_is_not_the_source,
     ).toBeUndefined();
 
     // The crate's own subtree is dirty: the recorded commit is no longer where
     // these bytes came from, and the entry has to say it.
-    writeFileSync(path.join(f.upstream, "rust/dc-glob/src/lib.rs"), "pub const VALUE: u8 = 9;\n");
-    expect(f.run("--crate=dc-glob").status).toBe(0);
+    writeFileSync(path.join(f.upstream, "rust/dc-redact/src/lib.rs"), "pub const VALUE: u8 = 9;\n");
+    expect(f.run("--crate=dc-redact").status).toBe(0);
     const dirty = JSON.parse(readFileSync(f.manifest, "utf8"));
     expect(dirty.crates[0].origin.commit_is_not_the_source).toBe(true);
     expect(dirty.crates[0].origin.commit).toMatch(/^[0-9a-f]{40}$/);
@@ -224,7 +224,7 @@ it("says so when a crate was vendored from an uncommitted tree", () => {
     // And the check surfaces it: a flag nothing reports is no better than none.
     const checked = f.run("--check");
     const entry = JSON.parse(checked.stdout).crates.find(
-      (c: { name: string }) => c.name === "dc-glob",
+      (c: { name: string }) => c.name === "dc-redact",
     );
     expect(entry.reason).toMatch(/uncommitted tree/);
   } finally {

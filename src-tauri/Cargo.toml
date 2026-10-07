@@ -94,11 +94,14 @@ rusqlite = { version = "0.40.2", features = ["bundled"] }
 # `bun run vendor:check` compares each copy against its upstream when that
 # repository is present, and says so plainly when it is not.
 #
-# Credential redaction on the ledger write path. `SECRET_PATTERNS` in dc-verify
-# is the single seam through which every consumer decides what counts as a
-# credential, and a second table is how a key redacted by one gate leaks out of
-# another — so this is a copy of that table, re-vendored, never a reimplementation.
-dc-verify = { path = "vendored/dc-verify" }
+# Credential redaction on the ledger write path. `SECRET_PATTERNS` in dc-redact
+# is the single seam through which every consumer — dc-verify's secret gate
+# included — decides what counts as a credential, and a second table is how a
+# key redacted by one gate leaks out of another — so this is a copy of that
+# table, re-vendored, never a reimplementation. dc-redact has no dependencies;
+# dc-verify, where the table used to live, links tree-sitter 0.25 and cannot
+# resolve beside markdev-highlight's 0.26.
+dc-redact = { path = "vendored/dc-redact" }
 
 # Manvi owns storage schemas and transactions. Repository execution tasks and
 # leases remain read-only in GitPulse; profile workspaces/items use the separate

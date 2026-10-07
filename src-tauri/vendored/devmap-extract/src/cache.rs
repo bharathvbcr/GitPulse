@@ -436,7 +436,69 @@ pub const ANALYZER_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// nothing depends on, and a cached Go field key would keep producing a
 /// fabricated `SamePackage` edge — from a cache, with no degraded marker to say
 /// why.
-pub const EXTRACTION_SCHEMA_VERSION: &str = "58";
+///
+/// v59 records a Python module loaded **by file path** —
+/// `importlib.util.spec_from_file_location`, `runpy.run_path`,
+/// `SourceFileLoader(...)`, `imp.load_source` — as an import carrying
+/// `path_load`, with the local handle it is bound to and that handle's scope;
+/// see `pyload`. A v58 row has no such import, so the loaded file has no edge
+/// from its loader and every `module.fn()` through the handle stays an
+/// `uninferred_receiver` — `impact fn` answers "no callers" for functions whose
+/// only callers are those scripts and tests. Served from a v58 cache the gap
+/// would persist with nothing to say why.
+///
+/// v60 records a Go file's unexported field and interface-method names
+/// (`Extraction::go_member_names`), the veto the resolver's
+/// unexported-selector rung needs before it may bind `job.recordReplayEvent()`
+/// to the package's one `recordReplayEvent` method. A v59 row carries `None`
+/// there, and the rung abstains for any package holding one — so without the
+/// bump a warm cache would silently keep the rung off, not make it unsound.
+///
+/// v61 reads two more Python path-load shapes — see `pyload`: a module-level
+/// path constant (`BUILDER = ROOT / "scripts/x.py"` then
+/// `spec_from_file_location(name, BUILDER)`), and a parameterised loader
+/// function (`def load(name, relative): ... ROOT / relative ...`) bound at each
+/// call site to its `.py` literal. A v60 row has neither import, so those loads
+/// keep abstaining from a warm cache with nothing to say why.
+///
+/// v62 records every directory a Python file puts on `sys.path` at module
+/// level, anchored on `__file__`, as a `SearchDirectory` path load — the
+/// evidence the resolver needs to place `import analyse_wave20` after
+/// `sys.path.insert(0, str(ROOT / "scripts" / "aws"))`. A v61 row has none, so
+/// those imports would stay unresolved from a warm cache.
+///
+/// v63 also records `sys.path` inserts made inside a function or class body,
+/// scoped to where they run, as vetoes: such an insert may run before any
+/// import in the file, so a module its directory also holds is not linked. A
+/// v62 row has no vetoes and would link those imports confidently.
+///
+/// v64 stops filing a C++ template callee (`f<T>(…)`) or template type use
+/// (`Tiles<4>::BR`) as a local binding of the enclosing function, and records
+/// a Python function decorated with a parameter of its enclosing callable as
+/// a `RuntimeEntryPoint`. A v63 row carries the spurious local binding — so
+/// the resolver classifies every such call `local_binding` and the helper is
+/// published confidently dead — and lacks the annotation.
+///
+/// v65 records the scope of `Plain::K` as a Type reference, and records the
+/// calls written inside a function-like `#define` body with the macro as
+/// their caller. A v64 row has neither, so a struct reached only as
+/// `T::member` and a helper called only from a macro body would stay
+/// confidently dead from a warm cache with nothing to say why.
+///
+/// v66 emits every Python module-scope binding as a `Variable` (`__all__` now
+/// decides only `is_exported`), including bindings under a module-level
+/// `try`/`if`/`with`/`for` and every name an unpacking target binds; emits
+/// type aliases in Python, Rust and Go, every name of a multi-name Go spec, and
+/// each name a TS/JS destructuring pattern binds instead of one symbol named by
+/// the pattern's text; keeps a TS/JS binding published by `export { … }` or
+/// `export default`; reads Python and TS/JS import names off the tree, so a
+/// comment or an inline `type` is no longer bound as a name and the name after
+/// it is no longer lost; splits `import a, b` into one import per module; and
+/// stops filing an emitted module binding as a module-scope local, which
+/// dropped every module-level read of it. A v65 row lacks all of this — most
+/// sharply, a constant `__all__` omitted has no node and its importers no
+/// target — so it must not be served to this build.
+pub const EXTRACTION_SCHEMA_VERSION: &str = "66";
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct CacheKey {
@@ -447,10 +509,13 @@ pub struct CacheKey {
 }
 
 /// Building a key means asking "may a payload extracted by *this* build be
-/// reused", and only a build with grammars can answer it. The struct itself
-/// stays available with `parse` off: a query-only consumer reads
-/// `grammar_version` / `analyzer_version` off stored rows, it just cannot
-/// compute what its own build would stamp, because it stamps nothing.
+/// reused", which only the extraction cache asks, and the extraction cache is
+/// build-path code that a build without grammars does not link. That is the
+/// whole reason for the gate: [`current_payload_identity`] answers in both
+/// configurations, so a query-only build could compute the key, it just has
+/// nothing to look up with it. The struct itself stays available with `parse`
+/// off, because a query-only consumer reads `grammar_version` /
+/// `analyzer_version` off stored rows.
 #[cfg(feature = "parse")]
 impl CacheKey {
     pub fn for_source(language: &str, source: &str) -> Self {
@@ -485,18 +550,27 @@ impl CacheKey {
 /// `save_generation_with_metadata` — 65,615 stored against 65,798 analysed.
 /// Anything that decides whether a stored payload may be reused must ask this
 /// function rather than assemble the string itself.
-/// Needs a compiled grammar to answer, so it exists only with `parse` on.
 ///
-/// `devmap-store` already guards this: its own `current_payload_identity`
-/// returns `Option` and documents that this one is `#[cfg(feature = "parse")]`.
-/// The gate that comment relies on had been lost, so `--no-default-features`
-/// did not build and the wrapper guarded a condition that could not arise.
-#[cfg(feature = "parse")]
+/// Answers in both configurations. With `parse` on, the grammar half is
+/// computed from the linked grammar. Without it, the answer comes from
+/// [`crate::languages::PAYLOAD_GRAMMAR_IDENTITIES`], which a test pins to that
+/// computation for every declared language, so a query-only build can still
+/// tell a current store from a stale one.
 pub fn current_payload_identity(language: &str) -> (String, String) {
     (
-        grammar_version_for(language),
+        stamped_grammar_identity(language),
         format!("{ANALYZER_VERSION}:extract-v{EXTRACTION_SCHEMA_VERSION}"),
     )
+}
+
+#[cfg(feature = "parse")]
+fn stamped_grammar_identity(language: &str) -> String {
+    grammar_version_for(language)
+}
+
+#[cfg(not(feature = "parse"))]
+fn stamped_grammar_identity(language: &str) -> String {
+    crate::languages::payload_grammar_identity(language)
 }
 
 /// Real compiled grammar semver — never a constant placeholder (closes S14).
@@ -780,6 +854,56 @@ mod tests {
     /// matches means silent full re-extraction; a key that *collides* across
     /// languages means one language's payload can be served for another's file.
     /// The existing test only compared Python against JavaScript.
+    /// The committed table a query-only build answers from is the one a
+    /// parsing build computes, for every language `detect_language` can return.
+    ///
+    /// On a mismatch the message is the whole replacement table, so a grammar
+    /// bump costs a paste rather than an investigation.
+    #[test]
+    #[cfg(feature = "parse")]
+    fn the_committed_grammar_identities_are_the_compiled_ones() {
+        let mut languages = crate::languages::declared_language_ids();
+        // Detected by extension and declared through the fallback table, but
+        // named here as well: its identity is the one composed from kernel
+        // grammars, and a declaration change must not silently drop it.
+        if !languages.contains(&"notebook") {
+            languages.push("notebook");
+        }
+        let mut expected = Vec::new();
+        let mut mismatched = Vec::new();
+        for language in &languages {
+            let compiled = grammar_version_for(language);
+            if compiled != format!("unavailable:{language}") {
+                expected.push(format!("    ({language:?}, {compiled:?}),"));
+            }
+            let committed = crate::languages::payload_grammar_identity(language);
+            if committed != compiled {
+                mismatched.push(format!(
+                    "{language}: committed {committed:?}, compiled {compiled:?}"
+                ));
+            }
+        }
+        // A table row for a language this build does not declare is a row
+        // nothing can ever look up — and a sign the registry renamed one.
+        for (name, _) in crate::languages::PAYLOAD_GRAMMAR_IDENTITIES {
+            if !languages.contains(name) {
+                mismatched.push(format!("{name}: in the table but not a declared language"));
+            }
+        }
+        assert!(
+            mismatched.is_empty(),
+            "PAYLOAD_GRAMMAR_IDENTITIES disagrees with the compiled grammars:\n  {}\n\n\
+             Replace the table in languages.rs with:\n\
+             pub const PAYLOAD_GRAMMAR_IDENTITIES: &[(&str, &str)] = &[\n{}\n];",
+            mismatched.join("\n  "),
+            expected.join("\n")
+        );
+        assert!(
+            !crate::languages::PAYLOAD_GRAMMAR_IDENTITIES.is_empty(),
+            "an empty table would agree with a build that linked no grammar"
+        );
+    }
+
     #[test]
     #[cfg(feature = "parse")]
     fn every_linked_grammar_has_a_distinct_real_identity() {

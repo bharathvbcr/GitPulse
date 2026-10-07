@@ -783,72 +783,63 @@ pub struct ExtractedImport {
     pub local_names: Vec<String>,
     pub alias: Option<String>,
     pub span: Span,
-}
-
-/// Parse `a`, `a as b`, or `{ a as b, c }` import lists into parallel name vectors.
-pub fn parse_import_bindings(raw: &str) -> (Vec<String>, Vec<String>) {
-    let mut imported_names = Vec::new();
-    let mut local_names = Vec::new();
-    let raw = raw
-        .trim()
-        .trim_start_matches(['{', '('])
-        .trim_end_matches(['}', ')']);
-    for part in raw.split(',') {
-        let part = part.trim().trim_matches(['{', '}', '(', ')']).trim();
-        if part.is_empty() || part == "*" {
-            continue;
-        }
-        let mut words = part.split_whitespace();
-        let name = words.next().unwrap_or(part);
-        let name = name.trim_matches(['{', '}', '(', ')']);
-        if name.is_empty() {
-            continue;
-        }
-        let local = if words.next() == Some("as") {
-            words.next().unwrap_or(name)
-        } else {
-            name
-        };
-        imported_names.push(name.to_string());
-        local_names.push(local.to_string());
-    }
-    (imported_names, local_names)
-}
-
-#[cfg(test)]
-mod import_binding_tests {
-    use super::parse_import_bindings;
-
-    /// A wildcard import contributes no named binding.
+    /// Set when this import is a Python module loaded **by file path** —
+    /// `importlib.util.spec_from_file_location`, `runpy.run_path`,
+    /// `SourceFileLoader(...)`, `imp.load_source` — rather than by name.
     ///
-    /// `part.is_empty() || part == "*"` was mutable to `&&` without a failure:
-    /// the empty case is caught again downstream, but the wildcard is not, so
-    /// `*` gets pushed as a literal imported name. The resolver then binds the
-    /// local name `*` and every later reference to a real symbol from that
-    /// module resolves against a binding that does not exist.
-    #[test]
-    fn wildcards_and_blanks_contribute_no_bindings() {
-        let (names, locals) = parse_import_bindings("{ *, first }");
-        assert_eq!(names, ["first"], "`*` must not become an imported name");
-        assert_eq!(locals, ["first"]);
+    /// `module_specifier` is then the literal path tail as written
+    /// (`scripts/build_supplement.py`), never a dotted module name, and `alias`
+    /// is the local handle the loaded module is bound to (`None` when nothing
+    /// is bound: `run_path` returns a globals dict, not a module).
+    ///
+    /// Resolution is the resolver's, not the extractor's: the extraction
+    /// cache keys on `(path, source)` alone, so which indexed file a path names
+    /// can only be decided where the whole corpus is in hand.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path_load: Option<PathLoad>,
+}
 
-        let (names, locals) = parse_import_bindings("*");
-        assert!(names.is_empty(), "a bare wildcard binds nothing: {names:?}");
-        assert!(locals.is_empty());
+/// Where a path-loaded Python module's handle lives, and what its path is
+/// relative to. See [`ExtractedImport::path_load`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PathLoad {
+    /// Graph identity of the callable the handle is a local of — the same
+    /// string a call inside it records as `ExtractedCall::caller_symbol` and a
+    /// use site records as `LocalBinding::scope`. `None` at module level.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<String>,
+    /// `Some(n)`: the path is relative to the loading file's own directory
+    /// climbed `n` levels, because its base was written in terms of `__file__`
+    /// (`Path(__file__).parent`, `.parents[1]`, `os.path.dirname(__file__)`).
+    /// `None`: the base is not known — an opaque variable, or a bare literal,
+    /// which Python resolves against the process's working directory.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anchor_up: Option<u32>,
+    /// What the path names: a module file (the default), or a directory the
+    /// file put on `sys.path`.
+    #[serde(default, skip_serializing_if = "PathLoadKind::is_module")]
+    pub kind: PathLoadKind,
+}
 
-        let (names, _) = parse_import_bindings("{ first, , second }");
-        assert_eq!(names, ["first", "second"], "an empty part is skipped");
-    }
+/// See [`PathLoad::kind`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PathLoadKind {
+    /// `module_specifier` is a `.py` file loaded by path.
+    #[default]
+    Module,
+    /// `module_specifier` is a directory — possibly empty, meaning the anchor
+    /// directory itself — inserted on `sys.path` at module level by this file
+    /// (`sys.path.insert(0, str(ROOT / "scripts"))`). Not an import of
+    /// anything: it widens where this file's *later* imports may resolve, and
+    /// `span` is where it happened, so an import before it is untouched. Only
+    /// ever emitted with an anchor (`anchor_up` is `Some`), and never for a
+    /// file that also removes or reassigns `sys.path`.
+    SearchDirectory,
+}
 
-    #[test]
-    fn braced_and_parenthesized_aliases_preserve_every_binding() {
-        let (names, locals) = parse_import_bindings("{ first as runFirst, second }");
-        assert_eq!(names, ["first", "second"]);
-        assert_eq!(locals, ["runFirst", "second"]);
-
-        let (names, locals) = parse_import_bindings("(first as runFirst, second)");
-        assert_eq!(names, ["first", "second"]);
-        assert_eq!(locals, ["runFirst", "second"]);
+impl PathLoadKind {
+    pub fn is_module(&self) -> bool {
+        *self == PathLoadKind::Module
     }
 }
 
@@ -1332,6 +1323,26 @@ pub struct Extraction {
     /// cross-file interface join can compare arity and not just name.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub go_method_params: Vec<GoMethodParams>,
+    /// Every **unexported** name a Go selector could reach that is not a
+    /// concrete method: struct field names (embedded fields by their type's
+    /// name) and interface method names, from *every* struct and interface
+    /// literal in the file — named types, generic constraints, anonymous
+    /// structs alike. Sorted and deduplicated.
+    ///
+    /// The veto half of the resolver's unexported-selector rung. Inside
+    /// package P, `x.m()` with a lowercase `m` can only name something P
+    /// declares — Go refuses an unexported selector from another package even
+    /// through embedding — so exactly one concrete method `m` in P is the
+    /// callee *unless* a field or an interface method of P shares the name.
+    /// Exported names are not recorded: the rung never answers for them,
+    /// because an exported selector can name another package's method.
+    ///
+    /// `None` means "not collected" — a non-Go file, or an extraction cached
+    /// before this field existed — and the rung abstains for the whole package
+    /// rather than read absence as "no namesake". `Some(vec![])` is a real
+    /// answer: this file declares no such name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub go_member_names: Option<Vec<String>>,
     /// `(qualified scope, local name)` for every value a callable binds itself:
     /// parameters, `let`/`:=`/`=` targets, loop variables, `with … as` handles.
     ///
@@ -1708,6 +1719,7 @@ mod gate_and_binding_tests {
                 start_byte: 0,
                 end_byte: 0,
             },
+            path_load: None,
         };
 
         let import = ExtractedImport {

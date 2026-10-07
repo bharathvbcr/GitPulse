@@ -203,7 +203,59 @@ pub struct Response<T> {
     /// them would report a complete dead-symbol list as partial.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dead_clusters_incomplete: Option<String>,
+    /// Call sites the resolver could **not** bind whose callee has the target's
+    /// name — the candidates an edge walk cannot show. Set by `impact` alone.
+    ///
+    /// `impact` walks edges, and a caller that never became an edge is absent
+    /// from `items` without any marker: `job.recordReplayEvent(cancelled)` with
+    /// `job` from an untyped return, `module.fn()` with `module` loaded by file
+    /// path. The ledger holds every such site by name, so an agent asking "who
+    /// calls this?" was told a subset and had to grep for the rest. These are
+    /// candidates, not callers — a namesake on another type lands here too —
+    /// and `classification` says why each was not bound.
+    ///
+    /// `None` when the question was not about a symbol (a file target) or the
+    /// ledger could not be read; `Some` with no sites is a checked absence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unresolved_namesakes: Option<UnresolvedNamesakes>,
 }
+
+/// The unresolved call sites that name an `impact` target. See
+/// [`Response::unresolved_namesakes`].
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct UnresolvedNamesakes {
+    /// The generation the ledger was read at.
+    pub generation_id: u32,
+    /// The bare callee names looked up — one per distinct traversal start.
+    pub names: Vec<String>,
+    /// Start names **not** looked up because of [`MAX_NAMESAKE_NAMES`].
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub names_not_checked: usize,
+    pub sites: Vec<UnresolvedSite>,
+    /// Sites dropped because they are in another language family than the
+    /// target — a Go `run` is not a caller of a Python `run`.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub other_language_sites: usize,
+    /// True when a per-name cap cut the ledger read, so `sites` is a prefix.
+    pub truncated: bool,
+}
+
+/// One unresolved call site naming the target.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct UnresolvedSite {
+    pub source_file: String,
+    pub source_symbol: String,
+    pub callee_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub receiver: Option<String>,
+    pub classification: String,
+}
+
+/// Distinct target names an `impact` answer looks up in the ledger.
+pub const MAX_NAMESAKE_NAMES: usize = 8;
+/// Ledger rows read per name. A generic name (`get`, `run`) matches thousands;
+/// the cap keeps the answer bounded and `truncated` says it bit.
+pub const MAX_NAMESAKE_SITES_PER_NAME: usize = 50;
 
 fn is_zero(value: &usize) -> bool {
     *value == 0
@@ -394,6 +446,16 @@ pub struct SymbolHit {
     /// Serialized only when it happened, so existing consumers see no new key.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_span_omitted_bytes: Option<u32>,
+    /// The whitespace before the symbol on its first line, when the span
+    /// starts mid-line — a method inside a class, a function inside a module
+    /// block. `source_span` is verbatim from the symbol's first byte, so its
+    /// first line has lost this indentation while every later line kept its
+    /// own; a reader that prepends this sees the lines as the file has them.
+    /// `None` at column zero, when anything but spaces and tabs precedes the
+    /// symbol, or when the source was unavailable; omitted then, so existing
+    /// consumers see no new key for top-level symbols.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_indent: Option<String>,
     pub score: f32,
 }
 

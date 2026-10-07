@@ -886,29 +886,6 @@ impl GenerationEdges {
         edges: Arc<Vec<StoredEdge>>,
         analysis: Option<AnalysisDisclosure>,
     ) -> Result<Self, UnknownEdgeKind> {
-        Self::build_with_resolutions(edges, analysis, None)
-    }
-
-    /// [`Self::build`] with the generation's decoded resolution column.
-    ///
-    /// `resolutions` is one entry per edge, in the same order. `None` means the
-    /// generation carries no resolution column at all, and every edge's tier is
-    /// then reconstructed — which each entry says of itself. A length mismatch
-    /// is refused rather than zipped short: a shifted alignment would attach
-    /// one edge's evidence to another's, which is worse than having none.
-    pub fn build_with_resolutions(
-        edges: Arc<Vec<StoredEdge>>,
-        analysis: Option<AnalysisDisclosure>,
-        resolutions: Option<Vec<EdgeResolution>>,
-    ) -> Result<Self, UnknownEdgeKind> {
-        if let Some(resolutions) = &resolutions {
-            assert_eq!(
-                resolutions.len(),
-                edges.len(),
-                "a resolution column that does not line up with its edges would \
-                 attribute one edge's evidence to another"
-            );
-        }
         let mut builder = GenerationEdgesBuilder::with_capacity(edges.len());
         for edge in edges.iter() {
             let source_file = builder.intern_file(&edge.source_file);
@@ -923,28 +900,7 @@ impl GenerationEdges {
                 edge.resolution.as_deref(),
             )?;
         }
-        let mut index = builder.finish(analysis, EdgeOrder::AsPushed);
-        // A caller-supplied resolution column overrides what the rows' own
-        // labels decode to. It is the same decoding — `Store` reads it from the
-        // same column in the same pass — but the parameter exists so a caller
-        // that already holds the generation's tiers does not decode them twice,
-        // and the length check above is what keeps the two aligned.
-        if let Some(resolutions) = resolutions {
-            index.resolutions = resolutions;
-            index.confidence_mismatches = index.recount_confidence_mismatches();
-        }
-        Ok(index)
-    }
-
-    fn recount_confidence_mismatches(&self) -> usize {
-        self.confidence
-            .iter()
-            .zip(&self.resolutions)
-            .filter(|(value, resolution)| {
-                resolution.source == ResolutionSource::Stored
-                    && confidence_millis(**value) != resolution.kind.confidence().to_millis()
-            })
-            .count()
+        Ok(builder.finish(analysis, EdgeOrder::AsPushed))
     }
 
     /// The coverage disclosure of the generation these edges came from.

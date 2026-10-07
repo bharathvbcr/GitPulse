@@ -273,7 +273,7 @@ impl<'a> StoreQueryEngine<'a> {
         devmap_store::checked_min_confidence(req.min_confidence)?;
         let layer_budget = req.token_budget / 2;
         let edge_budget = req.token_budget.saturating_sub(layer_budget);
-        let Some(index) = self.generation_edges()? else {
+        let Some((generation, index)) = self.store.generation_edges_with_id()? else {
             let reason = "no persisted generation is available".to_string();
             return Ok(LayeredImpact {
                 edges: unavailable_response(ResolutionAvailability::Unavailable {
@@ -288,7 +288,9 @@ impl<'a> StoreQueryEngine<'a> {
             });
         };
         let direction = index.directed(true, req.min_confidence);
-        let (edges, bands) = self.traverse_walked(
+        let target = req.query.clone();
+        let min_confidence = req.min_confidence;
+        let (mut edges, bands) = self.traverse_walked(
             &index,
             &direction,
             Request {
@@ -298,6 +300,7 @@ impl<'a> StoreQueryEngine<'a> {
             None,
             Some(layer_budget),
         )?;
+        self.attach_unresolved_namesakes(generation, &index, &target, min_confidence, &mut edges)?;
         Ok(LayeredImpact {
             edges,
             // `Some` by construction: `band_budget` was `Some` on the call
@@ -762,13 +765,174 @@ impl<'a> StoreQueryEngine<'a> {
         // locks, reads and drops — so nothing below this line holds it. An
         // abandoned traversal therefore cannot block the drain loop's writes
         // while it unwinds.
-        let Some(index) = self.generation_edges()? else {
+        let Some((generation, index)) = self.store.generation_edges_with_id()? else {
             return Ok(self.unavailable(ResolutionAvailability::Unavailable {
                 reason: "no persisted generation is available".to_string(),
             }));
         };
         let direction = index.directed(reverse, req.min_confidence);
-        self.traverse_over(&index, &direction, req, min_rung)
+        if !reverse {
+            return self.traverse_over(&index, &direction, req, min_rung);
+        }
+        let target = req.query.clone();
+        let min_confidence = req.min_confidence;
+        let mut response = self.traverse_over(&index, &direction, req, min_rung)?;
+        self.attach_unresolved_namesakes(
+            generation,
+            &index,
+            &target,
+            min_confidence,
+            &mut response,
+        )?;
+        Ok(response)
+    }
+
+    /// Attach the ledger's unresolved sites that name `target` to an `impact`
+    /// answer, and say so in `walk_incomplete` when there are any.
+    ///
+    /// The names come from the walk's own starts when it has them, and from the
+    /// query text when it has none — the second is not a corner case. A method
+    /// whose every caller went unresolved has no inbound edge, so it is no
+    /// traversal start, and that is precisely the method whose callers are all
+    /// in the ledger.
+    ///
+    /// `generation` is the one `index` was built from. The ledger is read at
+    /// that generation, so the edges and the candidates describe one state of
+    /// the repository even when a daemon commits between the two reads.
+    fn attach_unresolved_namesakes<T>(
+        &self,
+        generation: u32,
+        index: &GenerationEdges,
+        target: &str,
+        min_confidence: f32,
+        response: &mut Response<T>,
+    ) -> anyhow::Result<()> {
+        // A refused start query (an ambiguous bare name) has already been
+        // reported by the walk; the names below then come from the query text.
+        let starts = indexed_traversal_starts(index, target, true, min_confidence, &self.cancel)
+            .unwrap_or_default();
+        let namesakes = match self.unresolved_namesakes(generation, target, &starts)? {
+            NamesakeRead::NotApplicable => return Ok(()),
+            NamesakeRead::GenerationGone => {
+                // Checked, and could not be answered consistently: saying
+                // nothing here would read as "the ledger holds no candidates".
+                let note = format!(
+                    "the unresolved ledger could not be read at generation {generation}, the one \
+                     these edges came from (it was pruned mid-query); callers the resolver could \
+                     not bind are not listed — ask again"
+                );
+                response.walk_incomplete =
+                    devmap_analyze::combine_reasons(response.walk_incomplete.take(), Some(note));
+                return Ok(());
+            }
+            NamesakeRead::Read(namesakes) => namesakes,
+        };
+        if !namesakes.sites.is_empty() || namesakes.truncated {
+            let note = format!(
+                "{}{} unresolved call site(s) name {} and are not edges — an untyped receiver, a \
+                 module loaded by path; they are listed in `unresolved_namesakes` as candidates \
+                 to verify, not as callers",
+                if namesakes.truncated { "at least " } else { "" },
+                namesakes.sites.len(),
+                namesakes.names.join(", "),
+            );
+            response.walk_incomplete =
+                devmap_analyze::combine_reasons(response.walk_incomplete.take(), Some(note));
+        }
+        // A capped check must not read as a clean one: an empty `sites` with
+        // names left unchecked is "not looked", not "none there".
+        if namesakes.names_not_checked > 0 {
+            let note = format!(
+                "the unresolved ledger was checked for {} name(s) only; {} more were not looked up \
+                 (`unresolved_namesakes.names_not_checked`)",
+                namesakes.names.len(),
+                namesakes.names_not_checked,
+            );
+            response.walk_incomplete =
+                devmap_analyze::combine_reasons(response.walk_incomplete.take(), Some(note));
+        }
+        response.unresolved_namesakes = Some(namesakes);
+        Ok(())
+    }
+
+    /// The unresolved call sites at `generation` whose callee is the bare name
+    /// of a target — one ledger read for every name.
+    ///
+    /// `starts` are `(qualified symbol, file)`. With none, the name is read off
+    /// the query itself; a path query names no callee. Sites in another
+    /// language family than the start that named them are counted and dropped.
+    /// With no start there is no family to compare, and every site is kept.
+    fn unresolved_namesakes(
+        &self,
+        generation: u32,
+        target: &str,
+        starts: &[(String, String)],
+    ) -> anyhow::Result<NamesakeRead> {
+        // name → the families of the starts that carry it; empty = unknown.
+        let mut wanted: BTreeMap<String, BTreeSet<LangFamily>> = BTreeMap::new();
+        for (symbol, file) in starts {
+            if !symbol.contains("::") {
+                continue; // a file node: it is not called by name
+            }
+            if let Some(name) = bare_callee_name(symbol) {
+                wanted
+                    .entry(name.to_string())
+                    .or_default()
+                    .insert(family_of_path(file));
+            }
+        }
+        if wanted.is_empty() {
+            let (name, families) = match crate::query_match::classify(target.trim()) {
+                crate::query_match::StartQuery::Qualified { file, symbol } => (
+                    bare_callee_name(symbol),
+                    BTreeSet::from([family_of_path(file)]),
+                ),
+                crate::query_match::StartQuery::Symbol(name) => {
+                    (bare_callee_name(name), BTreeSet::new())
+                }
+                crate::query_match::StartQuery::Path(_)
+                | crate::query_match::StartQuery::Nothing => (None, BTreeSet::new()),
+            };
+            let Some(name) = name else {
+                return Ok(NamesakeRead::NotApplicable);
+            };
+            wanted.insert(name.to_string(), families);
+        }
+        let names_not_checked = wanted.len().saturating_sub(MAX_NAMESAKE_NAMES);
+        let wanted: Vec<(String, BTreeSet<LangFamily>)> =
+            wanted.into_iter().take(MAX_NAMESAKE_NAMES).collect();
+        let names: Vec<String> = wanted.iter().map(|(name, _)| name.clone()).collect();
+        self.cancel.check()?;
+        let Some(mut found) =
+            self.store
+                .unresolved_sites_naming(generation, &names, MAX_NAMESAKE_SITES_PER_NAME)?
+        else {
+            return Ok(NamesakeRead::GenerationGone);
+        };
+        let mut namesakes = UnresolvedNamesakes {
+            generation_id: generation,
+            names_not_checked,
+            ..UnresolvedNamesakes::default()
+        };
+        for (name, families) in wanted {
+            let (rows, truncated) = found.remove(&name).unwrap_or_default();
+            namesakes.truncated |= truncated;
+            for row in rows {
+                if !families.is_empty() && !families.contains(&family_of_path(&row.source_file)) {
+                    namesakes.other_language_sites += 1;
+                    continue;
+                }
+                namesakes.sites.push(UnresolvedSite {
+                    source_file: row.source_file,
+                    source_symbol: row.source_symbol,
+                    callee_name: name.clone(),
+                    receiver: row.receiver,
+                    classification: row.classification,
+                });
+            }
+            namesakes.names.push(name);
+        }
+        Ok(NamesakeRead::Read(namesakes))
     }
 
     /// The traversal itself, over an index the caller already holds.
@@ -1194,6 +1358,10 @@ impl<'a> StoreQueryEngine<'a> {
             ));
         };
         let walk = self.blast_walk(&index, targets, max_depth, min_confidence)?;
+        // A test is a symbol in a test file or one a test runner invokes, so a
+        // `#[test] fn` beside the code it tests is named too; its file is the
+        // entry's `path`, like any other test's.
+        let test_symbols = self.store.latest_test_entry_symbols()?;
 
         // Derived from the *complete* walk, never from the budgeted layers.
         // Reading the presentation back would drop every test whose band the
@@ -1207,11 +1375,11 @@ impl<'a> StoreQueryEngine<'a> {
         // counts as an affected test.
         let mut nearest: BTreeMap<String, (usize, BTreeSet<String>)> = BTreeMap::new();
         for (symbol, file) in &walk.seeds {
-            record_test_hit(&mut nearest, symbol, file, 0);
+            record_test_hit(&mut nearest, &test_symbols, symbol, file, 0);
         }
         for band in &walk.bands {
             for (symbol, file) in &band.members {
-                record_test_hit(&mut nearest, symbol, file, band.depth);
+                record_test_hit(&mut nearest, &test_symbols, symbol, file, band.depth);
             }
         }
 
@@ -1658,7 +1826,7 @@ impl<'a> StoreQueryEngine<'a> {
         // all of them. The ranking is already sorted, so the page bound is the
         // same one keyword search uses.
         let mut hits = Vec::new();
-        for (position, score) in scored.into_iter().take(budget_page_size(token_budget)) {
+        for (position, score) in scored.into_iter().take(search_page_size(token_budget)) {
             self.cancel.check()?;
             hits.push(hit_from_stored(
                 symbols[position].clone(),
@@ -1701,19 +1869,167 @@ impl<'a> StoreQueryEngine<'a> {
         token_budget: u32,
         min_confidence: f32,
     ) -> anyhow::Result<Response<SymbolHit>> {
+        Ok(self
+            .ask_ranked(query, token_budget, min_confidence, false)?
+            .0)
+    }
+
+    /// [`Self::ask`], answered as an evidence pack: hits grouped by file in
+    /// rank order, each file marked test or implementation, the call edges
+    /// that connect the hits, a nested hit's source folded into the hit that
+    /// already shows it, and the test files that reach the implementation
+    /// hits. See [`crate::evidence`].
+    ///
+    /// The budget is split: a [`EVIDENCE_TEST_BUDGET_SHARE`]th of it is held
+    /// for the related-test list and the rest goes to the hits, so the pack as
+    /// a whole never exceeds `token_budget`.
+    pub fn ask_evidence(
+        &self,
+        query: &str,
+        token_budget: u32,
+        min_confidence: f32,
+    ) -> anyhow::Result<crate::evidence::EvidencePack> {
+        let test_budget = token_budget / EVIDENCE_TEST_BUDGET_SHARE;
+        let (response, qualified) =
+            self.ask_ranked(query, token_budget - test_budget, min_confidence, true)?;
+        let (edges, test_symbols) = if response.items.is_empty() {
+            (None, std::collections::HashSet::new())
+        } else {
+            (
+                self.generation_edges()?,
+                self.store.latest_test_entry_symbols()?,
+            )
+        };
+        let (related_tests, coverage_gap) = match edges.as_deref() {
+            Some(edges) => self.evidence_related_tests(
+                edges,
+                &response,
+                &qualified,
+                &test_symbols,
+                test_budget,
+                min_confidence,
+            )?,
+            None => (
+                self.finish(budget_take(Vec::new(), test_budget, |_| 0)),
+                None,
+            ),
+        };
+        let mut pack = crate::evidence::assemble(
+            response,
+            &qualified,
+            edges.as_deref(),
+            min_confidence,
+            &test_symbols,
+            related_tests,
+            &self.cancel,
+        )?;
+        pack.coverage_gap = coverage_gap;
+        Ok(pack)
+    }
+
+    /// Test files reaching the pack's implementation hits, nearest first.
+    ///
+    /// The same inbound walk as [`Self::affected_tests`], seeded with the
+    /// implementation hits' qualified names (at most [`MAX_NEIGHBOR_TARGETS`],
+    /// best-ranked first). A reached symbol is a test when its file is a test
+    /// path — `affected_tests`' rule — *or* a test runner invokes it, so a
+    /// `#[test] fn` beside the code it tests is found too. Tests that are
+    /// already hits are dropped *before* budgeting, so the counters describe
+    /// the list as returned.
+    ///
+    /// Returns the repository-wide attribution gap separately from the list's
+    /// own `walk_incomplete`. It is the same sentence on every query, and
+    /// folded into the list it buried the one clause about *this* walk — where
+    /// it stopped — under a paragraph about the whole repository.
+    fn evidence_related_tests(
+        &self,
+        edges: &GenerationEdges,
+        response: &Response<SymbolHit>,
+        qualified: &[String],
+        test_symbols: &std::collections::HashSet<String>,
+        token_budget: u32,
+        min_confidence: f32,
+    ) -> anyhow::Result<(Response<AffectedTest>, Option<String>)> {
+        let mut targets: Vec<String> = Vec::new();
+        let mut hits: BTreeSet<(&str, &str)> = BTreeSet::new();
+        for (hit, name) in response.items.iter().zip(qualified) {
+            hits.insert((hit.file_path.as_str(), name.as_str()));
+            let is_test = is_test_path(&hit.file_path) || test_symbols.contains(name);
+            if !is_test && targets.len() < MAX_NEIGHBOR_TARGETS && !targets.contains(name) {
+                targets.push(name.clone());
+            }
+        }
+        if targets.is_empty() {
+            return Ok((
+                self.finish(budget_take(Vec::new(), token_budget, |_| 0)),
+                None,
+            ));
+        }
+        let walk = self.blast_walk(edges, &targets, EVIDENCE_TEST_DEPTH, min_confidence)?;
+        // Seeds are implementation hits by construction, so only the bands can
+        // hold a test.
+        let mut nearest: BTreeMap<String, (usize, BTreeSet<String>)> = BTreeMap::new();
+        for band in &walk.bands {
+            for (symbol, file) in &band.members {
+                let is_test = is_test_path(file) || test_symbols.contains(symbol);
+                if !is_test || hits.contains(&(file.as_str(), symbol.as_str())) {
+                    continue;
+                }
+                let entry = nearest
+                    .entry(file.clone())
+                    .or_insert((band.depth, BTreeSet::new()));
+                entry.0 = entry.0.min(band.depth);
+                entry.1.insert(symbol.clone());
+            }
+        }
+        let mut tests: Vec<AffectedTest> = nearest
+            .into_iter()
+            .map(|(path, (depth, symbols))| AffectedTest {
+                path,
+                depth,
+                reached_symbols: u32::try_from(symbols.len()).unwrap_or(u32::MAX),
+                symbols: symbols.into_iter().take(AFFECTED_SYMBOL_SAMPLE).collect(),
+            })
+            .collect();
+        tests.sort_by(|a, b| a.depth.cmp(&b.depth).then_with(|| a.path.cmp(&b.path)));
+        let mut related = budget_take(tests, token_budget, affected_test_tokens);
+        related.walk_incomplete = walk.stop.reason(walk.depth_cap, TRAVERSAL_MAX_NODES);
+        Ok((self.finish(related), walk.coverage_gap))
+    }
+
+    /// The ask walk, with each shown hit's qualified name alongside it.
+    ///
+    /// `SymbolHit` carries the bare name, and a bare name cannot be joined
+    /// against call edges — two files can each define `run`. The second vector
+    /// is index-aligned with `response.items` and exists for that join.
+    ///
+    /// `fold_aware` budgets the page as the evidence pack will print it: a hit
+    /// inside an earlier hit's whole source costs only its lead
+    /// ([`crate::evidence::fold_aware_take`]). Plain `ask` prints every hit's
+    /// source and budgets it so.
+    fn ask_ranked(
+        &self,
+        query: &str,
+        token_budget: u32,
+        min_confidence: f32,
+        fold_aware: bool,
+    ) -> anyhow::Result<(Response<SymbolHit>, Vec<String>)> {
         self.cancel.check()?;
         let min_confidence = devmap_store::checked_min_confidence(min_confidence)?;
         let Some(snapshot) = self.store.all_symbols_page()? else {
-            return Ok(self.unavailable(ResolutionAvailability::Unavailable {
-                reason: "no persisted generation is available".to_string(),
-            }));
+            return Ok((
+                self.unavailable(ResolutionAvailability::Unavailable {
+                    reason: "no persisted generation is available".to_string(),
+                }),
+                Vec::new(),
+            ));
         };
         let coverage_gap = search_coverage_gap(analysis_status_gap(snapshot.analysis.as_ref()));
         let symbols = snapshot.rows;
         if symbols.is_empty() || query.trim().is_empty() {
             let mut response = budget_take(Vec::new(), token_budget, |_| 0);
             response.walk_incomplete = coverage_gap;
-            return Ok(self.finish(response));
+            return Ok((self.finish(response), Vec::new()));
         }
 
         let docstrings = crate::ask::docstring_by_qualified_name(&self.store.latest_extractions()?);
@@ -1733,7 +2049,7 @@ impl<'a> StoreQueryEngine<'a> {
             let mut response = budget_take(Vec::new(), token_budget, |_| 0);
             response.walk_incomplete =
                 devmap_analyze::combine_reasons(coverage_gap, empty_ask_gap(query));
-            return Ok(self.finish(response));
+            return Ok((self.finish(response), Vec::new()));
         }
 
         let seed_positions: Vec<usize> = scored.iter().map(|(position, _)| *position).collect();
@@ -1752,6 +2068,7 @@ impl<'a> StoreQueryEngine<'a> {
                 token_budget,
                 coverage_gap,
                 None,
+                fold_aware,
             );
         };
 
@@ -1784,7 +2101,7 @@ impl<'a> StoreQueryEngine<'a> {
                 coverage_gap,
                 Some(crate::ask::confidence_withheld_reason()),
             );
-            return Ok(self.finish(response));
+            return Ok((self.finish(response), Vec::new()));
         }
 
         let mut personalization = vec![0.0; nodes.len()];
@@ -1822,9 +2139,11 @@ impl<'a> StoreQueryEngine<'a> {
             token_budget,
             coverage_gap,
             None,
+            fold_aware,
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn ask_hits_from_seeds(
         &self,
         symbols: &[StoredSymbol],
@@ -1833,11 +2152,14 @@ impl<'a> StoreQueryEngine<'a> {
         token_budget: u32,
         coverage_gap: Option<String>,
         extra_gap: Option<String>,
-    ) -> anyhow::Result<Response<SymbolHit>> {
+        fold_aware: bool,
+    ) -> anyhow::Result<(Response<SymbolHit>, Vec<String>)> {
         let total = u32::try_from(ordered.len()).unwrap_or(u32::MAX);
         let mut hits = Vec::new();
-        for &(position, score) in ordered.iter().take(budget_page_size(token_budget)) {
+        let mut qualified = Vec::new();
+        for &(position, score) in ordered.iter().take(search_page_size(token_budget)) {
             self.cancel.check()?;
+            qualified.push(symbols[position].qualified_name.clone());
             hits.push(hit_from_stored(
                 symbols[position].clone(),
                 repo_root,
@@ -1845,12 +2167,18 @@ impl<'a> StoreQueryEngine<'a> {
                 score,
             ));
         }
-        let mut response = budget_take(hits, token_budget, search_hit_tokens);
+        let mut response = if fold_aware {
+            crate::evidence::fold_aware_take(hits, token_budget)
+        } else {
+            budget_take(hits, token_budget, search_hit_tokens)
+        };
         response.total = total;
         response.hidden = total.saturating_sub(response.shown);
         response.truncated = response.hidden > 0;
         response.walk_incomplete = devmap_analyze::combine_reasons(coverage_gap, extra_gap);
-        Ok(self.finish(response))
+        // Both takes keep a prefix, so the names stay aligned by truncation.
+        qualified.truncate(response.items.len());
+        Ok((self.finish(response), qualified))
     }
 
     /// What the map cost against what reading files would have.
@@ -1976,6 +2304,7 @@ impl<'a> StoreQueryEngine<'a> {
             dead_clusters: None,
             dead_clusters_truncated: 0,
             dead_clusters_incomplete: None,
+            unresolved_namesakes: None,
         };
 
         // `Skipped` is here for the same reason `Failed` is, and the reason is
@@ -2457,6 +2786,12 @@ pub fn link_candidates(
         let extractions = store.latest_extractions()?;
         for extraction in &extractions {
             for import in &extraction.imports {
+                // A Python module loaded by file path names a file beside its
+                // loader, never a module another repository provides — and
+                // `scripts/x.py` would otherwise match a provider of `scripts`.
+                if import.path_load.is_some() {
+                    continue;
+                }
                 let specifier = import.module_specifier.trim();
                 if specifier.is_empty() || specifier.starts_with('.') {
                     continue;
@@ -3076,6 +3411,7 @@ impl<'a> QueryEngine<'a> {
                 dead_clusters: None,
                 dead_clusters_truncated: 0,
                 dead_clusters_incomplete: None,
+                unresolved_namesakes: None,
             };
         }
         let q_lower = req.query.to_lowercase();
@@ -3129,6 +3465,7 @@ impl<'a> QueryEngine<'a> {
                     source_span,
                     source_unavailable_reason,
                     source_span_omitted_bytes,
+                    source_indent: None,
                     score,
                 });
             }
@@ -3433,6 +3770,16 @@ fn node_id_of(file_path: &str, symbol_name: &str) -> String {
     if symbol_name.is_empty() {
         return file_path.to_string();
     }
+    // A stored symbol is usually qualified already (`file::name`). Prefixing
+    // it again produced `file::file::name` — an id no traversal accepts, and
+    // the one the ambiguous-name refusal told agents to paste back.
+    if symbol_name == file_path
+        || symbol_name
+            .strip_prefix(file_path)
+            .is_some_and(|rest| rest.starts_with("::"))
+    {
+        return symbol_name.to_string();
+    }
     format!("{file_path}::{symbol_name}")
 }
 
@@ -3515,6 +3862,29 @@ fn indexed_traversed_edges(
 /// Lifted out of `traverse` so the blast radius resolves its seeds through the
 /// same matcher the traversal does. Resolving them two ways is how a radius
 /// ends up seeded from a symbol the trace never visits.
+/// What a ledger read for `impact` came back with.
+enum NamesakeRead {
+    /// The target names no callee (a file or blank query).
+    NotApplicable,
+    /// The walk's generation is no longer retained, so no consistent read.
+    GenerationGone,
+    Read(UnresolvedNamesakes),
+}
+
+/// The name a call site would record for a symbol: the last segment of a
+/// qualified name, past `::` and past `.`. `a/job.go::YoloJob.record` and
+/// `YoloJob.record` both call `record`. `None` for an empty tail.
+fn bare_callee_name(symbol: &str) -> Option<&str> {
+    let tail = symbol.rsplit("::").next().unwrap_or(symbol);
+    let tail = tail.rsplit('.').next().unwrap_or(tail).trim();
+    (!tail.is_empty()).then_some(tail)
+}
+
+/// The resolution family a repository path belongs to, by its language.
+fn family_of_path(path: &str) -> LangFamily {
+    LangFamily::from_lang(devmap_extract::languages::detect_language(Path::new(path)))
+}
+
 fn indexed_traversal_starts(
     index: &GenerationEdges,
     target: &str,
@@ -3937,11 +4307,12 @@ fn is_test_file_name(file_name: &str) -> bool {
 /// same scope it is built in.
 fn record_test_hit(
     nearest: &mut BTreeMap<String, (usize, BTreeSet<String>)>,
+    test_symbols: &std::collections::HashSet<String>,
     symbol: &str,
     file: &str,
     depth: usize,
 ) {
-    if !is_test_path(file) {
+    if !is_test_path(file) && !test_symbols.contains(symbol) {
         return;
     }
     let entry = nearest
@@ -3968,6 +4339,7 @@ fn unavailable_response<T>(resolution: ResolutionAvailability) -> Response<T> {
         dead_clusters: None,
         dead_clusters_truncated: 0,
         dead_clusters_incomplete: None,
+        unresolved_namesakes: None,
     }
 }
 
@@ -4018,7 +4390,7 @@ pub(crate) fn byte_span_to_line_range_in(
 /// Kept next to [`cap_source_span`] because the cap must invert the same
 /// arithmetic the packer uses, and a drift between the two reintroduces the
 /// oversized-hit bug in a form no test names.
-const SEARCH_HIT_OVERHEAD_TOKENS: u32 = 20;
+pub(crate) const SEARCH_HIT_OVERHEAD_TOKENS: u32 = 20;
 
 /// Bytes of source per token, matching the `len / 4` estimate in the search
 /// cost function.
@@ -4058,6 +4430,10 @@ fn budget_page_size(token_budget: u32) -> usize {
 /// `explore_reads_one_file_per_definition_it_returns_not_per_candidate` pins
 /// that — so capping its candidate page would cost ranking quality on a
 /// high-match query and buy no bounded-ness at all.
+///
+/// `search_semantic` and `ask` (and so the evidence pack) materialise their
+/// pages the same way — one verified file read per hit — and share the cap;
+/// `ask_and_semantic_search_share_the_page_ceiling` pins all three.
 ///
 /// The cap trims the page, never the count: `total` is still measured over the
 /// whole index and a trimmed page still reports `truncated` and `hidden`.
@@ -4509,7 +4885,15 @@ fn name_match_score(row: &devmap_store::StoredSymbol, query_lower: &str) -> f32 
 /// Shared by keyword and semantic search so the two spend the budget at the
 /// same rate; two copies of this arithmetic would let the same result cost
 /// different amounts depending on which command asked for it.
-fn search_hit_tokens(hit: &SymbolHit) -> u32 {
+/// Share of an evidence pack's budget held for its related-test list: a
+/// quarter, so the hits keep most of the budget and a few test files still
+/// fit beside them.
+pub const EVIDENCE_TEST_BUDGET_SHARE: u32 = 4;
+
+/// Inbound depth of the related-test walk: the `devmap affected` default.
+pub const EVIDENCE_TEST_DEPTH: usize = 3;
+
+pub(crate) fn search_hit_tokens(hit: &SymbolHit) -> u32 {
     u32::try_from(hit.source_span.len() / BYTES_PER_TOKEN as usize)
         .unwrap_or(u32::MAX)
         .saturating_add(SEARCH_HIT_OVERHEAD_TOKENS)
@@ -4644,6 +5028,9 @@ fn hit_from_stored(
             .line_range(text)
         })
         .unwrap_or((0, 0));
+    let source_indent = source
+        .as_deref()
+        .and_then(|text| line_indent_before(text, row.span_start));
     let (source_span, source_span_omitted_bytes) = cap_source_span(source_span, token_budget);
     SymbolHit {
         symbol_name: row.name,
@@ -4653,8 +5040,25 @@ fn hit_from_stored(
         source_span,
         source_unavailable_reason,
         source_span_omitted_bytes,
+        source_indent,
         score,
     }
+}
+
+/// Longest indentation [`SymbolHit::source_indent`] carries. Past this the
+/// prefix is not indentation anyone reads, and it is not worth its bytes.
+const MAX_SOURCE_INDENT: usize = 256;
+
+/// The spaces and tabs between the start of `offset`'s line and `offset`, or
+/// `None` at column zero or when anything else precedes it on the line.
+fn line_indent_before(text: &str, offset: usize) -> Option<String> {
+    let before = text.get(..offset)?;
+    let line_start = before.rfind('\n').map_or(0, |newline| newline + 1);
+    let prefix = &before[line_start..];
+    (!prefix.is_empty()
+        && prefix.len() <= MAX_SOURCE_INDENT
+        && prefix.bytes().all(|byte| byte == b' ' || byte == b'\t'))
+    .then(|| prefix.to_string())
 }
 
 /// Cap a hit's source span so one hit can never exceed the whole token budget.
@@ -4742,6 +5146,7 @@ where
         dead_clusters: None,
         dead_clusters_truncated: 0,
         dead_clusters_incomplete: None,
+        unresolved_namesakes: None,
     }
 }
 
@@ -4770,6 +5175,7 @@ where
             dead_clusters: None,
             dead_clusters_truncated: 0,
             dead_clusters_incomplete: None,
+            unresolved_namesakes: None,
         };
     }
     Response {
@@ -4788,6 +5194,7 @@ where
         dead_clusters: None,
         dead_clusters_truncated: 0,
         dead_clusters_incomplete: None,
+        unresolved_namesakes: None,
     }
 }
 
@@ -6162,6 +6569,62 @@ mod search_bounds_tests {
             response.total,
             response.hidden
         );
+    }
+    /// K-B1 again, for the other two surfaces that materialise a page of hits:
+    /// `ask` (and the evidence pack built on it) and `search_semantic`. Each
+    /// hit is a verified whole-file read, so the same page ceiling applies.
+    #[test]
+    fn ask_and_semantic_search_share_the_page_ceiling() {
+        const SYMBOLS: usize = 4_000;
+        let mut source = String::new();
+        for index in 0..SYMBOLS {
+            source.push_str(&format!("def widget_{index:05}():\n    return {index}\n"));
+        }
+        let store = store_of("things.py", &source);
+        let engine = StoreQueryEngine::new(&store);
+
+        // A surface under test: runs one query, reports its `total` and `truncated`.
+        type Probe<'a> = dyn Fn() -> (u32, bool) + 'a;
+        let reads_for = |run: &Probe| {
+            SOURCE_SPAN_READS.with(|reads| reads.set(0));
+            let (total, truncated) = run();
+            (
+                SOURCE_SPAN_READS.with(|reads| reads.get()),
+                total,
+                truncated,
+            )
+        };
+        let cases: [(&str, &Probe); 3] = [
+            ("ask", &|| {
+                let r = engine.ask("widget", 100_000, 0.0).expect("ask");
+                (r.total, r.truncated)
+            }),
+            ("ask_evidence", &|| {
+                let r = engine
+                    .ask_evidence("widget", 100_000, 0.0)
+                    .expect("ask_evidence");
+                (r.total, r.truncated)
+            }),
+            ("search_semantic", &|| {
+                let r = engine
+                    .search_semantic("widget", 100_000)
+                    .expect("search_semantic");
+                (r.total, r.truncated)
+            }),
+        ];
+        for (name, run) in cases {
+            let (reads, total, truncated) = reads_for(run);
+            assert!(
+                reads <= SEARCH_PAGE_MAX,
+                "{name}: a 100,000-token budget opened {reads} files; the page \
+                 ceiling is {SEARCH_PAGE_MAX}"
+            );
+            assert!(
+                total as usize >= SYMBOLS && truncated,
+                "{name}: the count stays index-wide and a capped page says so: \
+                 total={total} truncated={truncated}"
+            );
+        }
     }
 }
 

@@ -72,11 +72,11 @@ const MAX_VERSION_CHARS = 32;
 const SEVERITIES: readonly DiagnosticSeverity[] = ["error", "warning"];
 
 /**
- * Credential shapes mirrored from the native dc-verify redaction boundary.
+ * Credential shapes mirrored from the native dc-redact redaction boundary.
  *
  * The frontend ring is synchronous and can be written before Tauri IPC is
  * available (including during boot failures), so it cannot delegate this
- * first write to Rust. Native logs and the ledger still use dc-verify as the
+ * first write to Rust. Native logs and the ledger still use dc-redact as the
  * canonical detector; this defensive mirror keeps the same common vendor
  * tokens out of localStorage before any asynchronous boundary exists.
  */

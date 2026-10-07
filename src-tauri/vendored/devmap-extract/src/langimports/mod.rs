@@ -208,6 +208,7 @@ pub(crate) fn named_import(
         local_names: Vec::new(),
         alias: None,
         span,
+        path_load: None,
     }
 }
 

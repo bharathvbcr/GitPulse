@@ -236,6 +236,42 @@ pub fn is_wiring_decorator(decorator: &str) -> bool {
 // function that merely lives near an entry point.
 // ---------------------------------------------------------------------------
 
+/// Why a test runner invokes a symbol: the `RuntimeEntryPoint` details the
+/// reason functions below return for test code, one constant per phrasing.
+///
+/// Named so the one reader that needs to tell a test from any other entry
+/// point, [`is_test_harness_reason`], reads the same strings the writers emit
+/// rather than a copy that could drift. A benchmark counts: the harness that
+/// collects `#[bench]` is the test harness.
+pub const RUST_TEST_HARNESS: &str = "test harness invokes it";
+pub const SWIFT_TEST_RUNNER: &str = "collected by the swift-testing runner";
+pub const XCTEST_RUNNER: &str = "the test runner instantiates the case by reflection";
+pub const JVM_TEST_RUNNER: &str = "collected and invoked by the test runner";
+pub const PYTHON_TEST_BY_NAME: &str = "pytest/unittest collects test_* by name";
+pub const PYTEST_XUNIT_HOOK: &str = "pytest xunit-style fixture hook";
+pub const UNITTEST_LIFECYCLE_HOOK: &str = "unittest lifecycle hook";
+
+const TEST_HARNESS_REASONS: [&str; 7] = [
+    RUST_TEST_HARNESS,
+    SWIFT_TEST_RUNNER,
+    XCTEST_RUNNER,
+    JVM_TEST_RUNNER,
+    PYTHON_TEST_BY_NAME,
+    PYTEST_XUNIT_HOOK,
+    UNITTEST_LIFECYCLE_HOOK,
+];
+
+/// Whether a `RuntimeEntryPoint` annotation's details say a test runner
+/// invokes the symbol — a test, or a fixture hook the runner calls around one.
+///
+/// This is how a `#[test] fn` inside `src/lib.rs` is told apart from the code
+/// beside it, which a path rule ([`is_test_path`]) cannot do. Exact matches
+/// only: a pytest *plugin* hook is runner infrastructure, not a test, and an
+/// unknown phrasing is not guessed at.
+pub fn is_test_harness_reason(details: &str) -> bool {
+    TEST_HARNESS_REASONS.contains(&details)
+}
+
 /// Rust attribute that hands a function to a runner, the linker, or the
 /// compiler rather than to a caller.
 ///
@@ -250,7 +286,7 @@ pub fn rust_attribute_entry_reason(attribute_path: &str) -> Option<&'static str>
         .trim();
     Some(match last {
         "test" | "bench" | "rstest" | "test_case" | "should_panic" | "quickcheck" | "proptest" => {
-            "test harness invokes it"
+            RUST_TEST_HARNESS
         }
         "main" => "async runtime entry point",
         "ctor" | "dtor" => "static initializer run before/after main",
@@ -743,7 +779,7 @@ pub fn swift_attribute_entry_reason(attribute: &str) -> Option<&'static str> {
         "_cdecl" | "_silgen_name" | "_expose" | "_alwaysEmitIntoClient" => {
             "published under a C symbol name and called from outside Swift"
         }
-        "Test" | "Suite" => "collected by the swift-testing runner",
+        "Test" | "Suite" => SWIFT_TEST_RUNNER,
         _ => return None,
     })
 }
@@ -771,7 +807,7 @@ pub fn swift_runtime_supertype_reason(supertype: &str) -> Option<&'static str> {
         | "UNUserNotificationCenterDelegate" => {
             "the application lifecycle instantiates the delegate by class name"
         }
-        "XCTestCase" => "the test runner instantiates the case by reflection",
+        "XCTestCase" => XCTEST_RUNNER,
         _ => return None,
     })
 }
@@ -786,9 +822,7 @@ pub fn kotlin_annotation_entry_reason(annotation: &str) -> Option<&'static str> 
     Some(match annotation {
         "Composable" | "Preview" => "invoked by the Jetpack Compose runtime",
         "Test" | "Before" | "After" | "BeforeEach" | "AfterEach" | "BeforeClass" | "AfterClass"
-        | "BeforeAll" | "AfterAll" | "ParameterizedTest" | "RepeatedTest" => {
-            "collected and invoked by the test runner"
-        }
+        | "BeforeAll" | "AfterAll" | "ParameterizedTest" | "RepeatedTest" => JVM_TEST_RUNNER,
         "Inject" | "Provides" | "Binds" | "Module" | "Component" | "HiltAndroidApp"
         | "AndroidEntryPoint" | "HiltViewModel" | "Singleton" | "Factory" | "Assisted"
         | "AssistedInject" => "constructed by the dependency-injection container",
@@ -806,7 +840,7 @@ pub fn kotlin_annotation_entry_reason(annotation: &str) -> Option<&'static str> 
 /// Python functions a test runner or plugin system collects by name.
 pub fn python_harness_entry_reason(name: &str) -> Option<&'static str> {
     if name.starts_with("test_") {
-        return Some("pytest/unittest collects test_* by name");
+        return Some(PYTHON_TEST_BY_NAME);
     }
     if name.starts_with("pytest_") {
         return Some("pytest plugin hook called by name");
@@ -814,10 +848,10 @@ pub fn python_harness_entry_reason(name: &str) -> Option<&'static str> {
     Some(match name {
         "setup_module" | "teardown_module" | "setup_function" | "teardown_function"
         | "setup_class" | "teardown_class" | "setup_method" | "teardown_method" => {
-            "pytest xunit-style fixture hook"
+            PYTEST_XUNIT_HOOK
         }
         "setUp" | "tearDown" | "setUpClass" | "tearDownClass" | "setUpModule"
-        | "tearDownModule" | "runTest" => "unittest lifecycle hook",
+        | "tearDownModule" | "runTest" => UNITTEST_LIFECYCLE_HOOK,
         _ => return None,
     })
 }
@@ -946,17 +980,44 @@ const CALLEE_IN_REASON_MAX: usize = 60;
 /// act on". Every callback interface of every other library had the same
 /// problem, and the shape they share is written in the syntax.
 pub fn js_object_literal_argument_reason(callee: &str) -> String {
-    let callee = callee.trim();
-    let shown: String = if callee.chars().count() > CALLEE_IN_REASON_MAX {
-        callee
-            .chars()
+    let shown = bounded_for_reason(callee);
+    format!("declared in an object literal passed to `{shown}` — that callee decides when it runs")
+}
+
+/// Why a Python function decorated with a callable its enclosing function
+/// received as a parameter is exempt.
+///
+/// The same statement about the evidence as
+/// [`js_object_literal_argument_reason`], for the decorator spelling of it:
+/// `@test def case(): …` inside `def register(test, …)` is `case = test(case)`,
+/// and `test` is whatever the caller of `register` passed. The syntax shows the
+/// function being handed to an injected callable; it does not show that the
+/// callable runs it, and the reason says exactly that.
+///
+/// Both names are bounded the same way the callee above is: a decorator can be
+/// an arbitrarily long member chain, and the reason is provenance a human
+/// reads, not an identity anything matches on.
+pub fn python_injected_decorator_reason(decorator: &str, owner: &str) -> String {
+    let decorator = bounded_for_reason(decorator);
+    let owner = bounded_for_reason(owner);
+    format!(
+        "decorated by `{decorator}`, a parameter of the enclosing `{owner}` — that callee decides when it runs"
+    )
+}
+
+/// `text`, trimmed and cut to [`CALLEE_IN_REASON_MAX`] characters with a
+/// marker when it was cut — the one bound every reason that quotes source
+/// text goes through.
+fn bounded_for_reason(text: &str) -> String {
+    let text = text.trim();
+    if text.chars().count() > CALLEE_IN_REASON_MAX {
+        text.chars()
             .take(CALLEE_IN_REASON_MAX)
             .chain("…".chars())
             .collect()
     } else {
-        callee.to_string()
-    };
-    format!("declared in an object literal passed to `{shown}` — that callee decides when it runs")
+        text.to_string()
+    }
 }
 
 fn looks_like_reexport_init(path: &str, source: &str) -> bool {
@@ -1800,6 +1861,32 @@ fn build_script_input_specs(path: &str, source: &str) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn test_harness_reasons_are_read_back_from_the_writers() {
+        for reason in [
+            rust_attribute_entry_reason("test"),
+            rust_attribute_entry_reason("tokio::test"),
+            swift_attribute_entry_reason("Test"),
+            swift_runtime_supertype_reason("XCTestCase"),
+            kotlin_annotation_entry_reason("Test"),
+            python_harness_entry_reason("test_parse"),
+            python_harness_entry_reason("setup_method"),
+            python_harness_entry_reason("setUp"),
+        ] {
+            let reason = reason.expect("a test entry has a reason");
+            assert!(is_test_harness_reason(reason), "{reason}");
+        }
+        for reason in [
+            rust_attribute_entry_reason("main"),
+            rust_attribute_entry_reason("no_mangle"),
+            python_harness_entry_reason("pytest_configure"),
+            kotlin_annotation_entry_reason("Composable"),
+        ] {
+            let reason = reason.expect("an entry point has a reason");
+            assert!(!is_test_harness_reason(reason), "{reason}");
+        }
+    }
+
     use super::*;
 
     #[test]

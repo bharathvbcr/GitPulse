@@ -255,8 +255,9 @@ pub fn scan_declarations(file_path: &str, source: &str) -> FallbackScan {
 /// reader ran and found nothing, the file genuinely declares nothing — an
 /// `.html` page with no ids, a stylesheet with no rules — and that is a complete
 /// answer, not a missing grammar. Reporting it as a missing grammar is the K5
-/// defect (`devmap-store/tests/kernel_defects.rs`): 294 of 1,310 files counted as
-/// parse failures, every one of them prose or data, hiding the 16 real ones.
+/// defect (`devmap-store/tests/kernel_defects_from_source.rs`): 294 of 1,310
+/// files counted as parse failures, every one of them prose or data, hiding the
+/// 16 real ones.
 pub fn has_dedicated_reader(language: &str) -> bool {
     matches!(language, "css" | "html")
 }

@@ -1,6 +1,6 @@
 [package]
 name = "devmap-query"
-version = "1.3.5"
+version = "0.2.4"
 edition = "2021"
 license = "Apache-2.0"
 repository = "https://github.com/bharathvbcr/DevCouncil"
@@ -230,6 +230,18 @@ name = "ask_ranking"
 required-features = ["parse"]
 
 [[test]]
+name = "ask_evidence"
+required-features = ["parse"]
+
+[[test]]
+name = "affected_counts_inline_tests"
+required-features = ["parse"]
+
+[[test]]
 name = "ambiguous_impact_seeds"
 required-features = ["parse"]
 
+
+[[test]]
+name = "impact_names_its_unresolved_callers"
+required-features = ["parse"]

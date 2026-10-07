@@ -81,6 +81,17 @@ input:focus, select:focus { outline:none; border-color:var(--accent); }
 .detail .mini { display:flex; height:6px; border-radius:3px; overflow:hidden; gap:1px; margin:6px 0 4px; }
 .detail .mini span { display:block; height:100%; min-width:2px; }
 
+.about { padding:10px 14px; border-bottom:1px solid var(--line); font-size:12px; color:var(--muted); line-height:1.55; }
+.about summary { cursor:pointer; color:var(--fg); font-weight:600; font-size:12px; }
+.about p { margin:8px 0 0; }
+.about dl { margin:8px 0 0; display:grid; grid-template-columns:auto 1fr; gap:4px 10px; }
+.about dt { color:var(--fg); font-weight:600; white-space:nowrap; }
+.about dd { margin:0; }
+.about code { font:11px ui-monospace,SFMono-Regular,Menlo,monospace; background:#0d1117; border:1px solid var(--line); border-radius:3px; padding:0 4px; color:var(--fg); }
+.blurb { color:var(--muted); font-size:11px; line-height:1.5; margin:-2px 0 8px; }
+.detail .grp > .d { color:var(--muted); font-size:11px; line-height:1.45; margin:-1px 0 5px; }
+.stat { cursor:help; }
+.badge { cursor:help; }
 footer.bot { padding:10px 14px; border-top:1px solid var(--line); font-size:11px; color:var(--muted); display:flex; justify-content:space-between; gap:8px; }
 a.link { color:var(--accent); text-decoration:none; }
 a.link:hover { text-decoration:underline; }
@@ -114,11 +125,25 @@ a.link:hover { text-decoration:underline; }
   <header class="top">
     <h1>DevCouncil Repo Map</h1>
     <div class="sub" id="headLine"></div>
+    <div class="blurb" style="margin:8px 0 0">A static, offline picture of how this repository is organised: its main subsystems, how they connect, which languages they are written in, and where code looks unused. Built from the DevMap index, with no model call.</div>
   </header>
   <div class="stats" id="stats"></div>
+  <details class="about">
+    <summary>How to read this map</summary>
+    <p>Each dot is a <strong>subsystem</strong>: an area of the repository that DevMap picked out as a unit. The map shows a <em>selected</em> set, not every directory, so the coverage note under Languages says how much of the repository falls inside it.</p>
+    <dl>
+      <dt>Colour</dt><dd>The subsystem&rsquo;s dominant language, in GitHub Linguist&rsquo;s colours.</dd>
+      <dt>Size</dt><dd>Roughly how many files it holds (switch to degree or constant under Layout). The exact count is in the list.</dd>
+      <dt>Green ring</dt><dd>Contains entry points, such as a <code>main</code> or a route handler.</dd>
+      <dt>Blue edge</dt><dd>Neighbour: the two areas sit next to each other in the import and call graph.</dd>
+      <dt>Purple edge</dt><dd>Handoff: a path where work passes from one area into another through specific files.</dd>
+    </dl>
+    <p>Everything here is static analysis. Treat it as a guide for where to look, then confirm against current source. Capped lists are samples, and the page says &ldquo;N of M&rdquo; when it is showing one.</p>
+  </details>
   <div class="scroll">
     <section class="block">
       <div class="block-head">Languages <span class="aside" id="langMeta"></span></div>
+      <div class="blurb">Share of indexed files by language. Hover a segment for its file count; click a language below to filter the subsystems.</div>
       <div class="langbar" id="langBar"></div>
       <div class="langlegend" id="langLegend"></div>
       <div class="note" id="coverage"></div>
@@ -129,10 +154,13 @@ a.link:hover { text-decoration:underline; }
         <select id="langFilter" aria-label="Filter by language"></select>
       </div>
       <label class="inline" title="Hide subsystems whose indexed files are all notes or documentation; mixed subsystems stay visible"><input type="checkbox" id="hideNotes"/> Hide notes &amp; Markdown</label>
-      <div class="badges" id="livenessBadges" style="margin-top:10px"></div>
+      <div class="blurb" style="margin-top:10px">Static liveness signals for the whole repository. Hover a badge for what it counts.</div>
+      <div class="badges" id="livenessBadges"></div>
+      <div class="note">These are candidates, not verdicts. Runtime entry points, registries, generated code, reflection and outside consumers can all make live code look unused, so check before deleting anything.</div>
     </section>
     <section class="block">
       <div class="block-head">Subsystems <span class="aside" id="counts"></span></div>
+      <div class="blurb">Largest first. The number is indexed files; the strip under each name is its language mix. A &#9733; marks a subsystem with entry points.</div>
       <ul class="list" id="subList"></ul>
     </section>
     <section class="block" style="border-bottom:none">
@@ -141,7 +169,7 @@ a.link:hover { text-decoration:underline; }
     </section>
   </div>
   <footer class="bot">
-    <span>Click a node or row for detail</span>
+    <span>Click a dot or row for detail</span>
     <a class="link" href="graph/graph.html">code graph &rarr;</a>
   </footer>
 </aside>
@@ -260,13 +288,13 @@ function renderLanguages() {
 function renderStats() {
   const cov = META.coverage || {};
   const tiles = [
-    [(DATA.nodes || []).length, 'subsystems'],
-    [(DATA.links || []).length, 'edges'],
-    [cov.indexed_total || 0, 'files'],
-    [(META.language_totals || []).length, 'languages']
+    [(DATA.nodes || []).length, 'subsystems', 'Subsystems drawn on this map. A selected set of areas, not every directory.'],
+    [(DATA.links || []).length, 'edges', 'Connections between drawn subsystems: neighbour links and handoff paths, each counted once.'],
+    [cov.indexed_total || 0, 'files', 'Source and document files in the DevMap index, including those outside any drawn subsystem.'],
+    [(META.language_totals || []).length, 'languages', 'Distinct languages found across the indexed files.']
   ];
   document.getElementById('stats').innerHTML = tiles.map(t =>
-    '<div class="stat"><div class="n">' + fmt(t[0]) + '</div><div class="k">' + t[1] + '</div></div>'
+    '<div class="stat" title="' + escapeHtml(t[2]) + '"><div class="n">' + fmt(t[0]) + '</div><div class="k">' + t[1] + '</div></div>'
   ).join('');
   const head = String(META.generated_head || '');
   document.getElementById('headLine').textContent = head
@@ -300,8 +328,9 @@ function filtered() {
 
 /* ---- detail pane -------------------------------------------------------- */
 
-function group(title, body) {
-  return '<div class="grp"><div class="t">' + escapeHtml(title) + '</div>' + body + '</div>';
+function group(title, body, desc) {
+  return '<div class="grp"><div class="t">' + escapeHtml(title) + '</div>'
+    + (desc ? '<div class="d">' + escapeHtml(desc) + '</div>' : '') + body + '</div>';
 }
 function bullets(items, cap) {
   const list = (items || []).slice(0, cap);
@@ -347,28 +376,33 @@ function showDetail(id) {
     html += '<div class="none">No indexed files attributed to this subsystem.</div>';
   }
 
-  html += group('Entry points', bullets(s.entry_points, 10) || '<div class="none">none</div>');
-  html += group('Critical files', bullets(s.critical_files, 10) || '<div class="none">none</div>');
-  html += group('Neighbors', chips(s.neighbors) || '<div class="none">none</div>');
+  html += group('Entry points', bullets(s.entry_points, 10) || '<div class="none">none</div>',
+    'Where execution or requests begin: main functions, CLI commands, route handlers.');
+  html += group('Critical files', bullets(s.critical_files, 10) || '<div class="none">none</div>',
+    'Files the rest of this subsystem leans on most. Read these first.');
+  html += group('Neighbors', chips(s.neighbors) || '<div class="none">none</div>',
+    'Adjacent areas in the import and call graph. Click one to jump to it.');
 
   const handoffFallback = META.handoff_paths_computed
     ? '<div class="none">none</div>'
     : '<div class="none">not computed for this map</div>';
-  html += group('Handoffs', bullets(s.handoff_paths, 8) || handoffFallback);
+  html += group('Handoffs', bullets(s.handoff_paths, 8) || handoffFallback,
+    'How work passes from this subsystem into another, written as source file \u2192 target file.');
 
   const roles = s.role_files || {};
   const roleKeys = Object.keys(roles);
   if (roleKeys.length) {
     html += group('Roles', '<ul>' + roleKeys.map(r =>
       '<li><span class="muted">' + escapeHtml(r) + ':</span> ' + escapeHtml((roles[r] || []).slice(0, 6).join(', ')) + '</li>'
-    ).join('') + '</ul>');
+    ).join('') + '</ul>', 'Files grouped by the part they play, such as entry points, routes or tests. Up to six per role.');
   } else if (!META.role_files_computed) {
     html += group('Roles', '<div class="none">not computed for this map</div>');
   }
 
   const unresolved = (DATA.unresolved_handoffs || []).filter(u => u.from === id);
   if (unresolved.length) {
-    html += group('Unresolved handoffs (text only)', bullets(unresolved.map(u => u.text), 8));
+    html += group('Unresolved handoffs (text only)', bullets(unresolved.map(u => u.text), 8),
+      'Handoffs whose target did not match any drawn subsystem, so they have no edge on the canvas.');
   }
   d.innerHTML = html;
   d.querySelectorAll('button[data-goto]').forEach(b => b.addEventListener('click', () => select(b.getAttribute('data-goto'))));
@@ -400,14 +434,14 @@ function renderLiveness() {
     return fmt(shown) + ' shown · total unknown';
   };
   const parts = [
-    '<span class="badge entry">entry roots <b>' + count('entry_roots') + '</b></span>',
-    '<span class="badge dead">unwired <b>' + count('unwired_candidates') + '</b></span>',
-    '<span class="badge dead">dead symbols <b>' + count('dead_symbol_candidates') + '</b></span>'
+    '<span class="badge entry" title="Files treated as starting points (main, CLI, routes, tests). Reachability is measured from these.">entry roots <b>' + count('entry_roots') + '</b></span>',
+    '<span class="badge dead" title="Files with no resolved inbound reference: nothing in the index imports or calls them.">unwired <b>' + count('unwired_candidates') + '</b></span>',
+    '<span class="badge dead" title="Symbols with no resolved inbound caller. Ambiguous names and unresolved receivers weaken the signal.">dead symbols <b>' + count('dead_symbol_candidates') + '</b></span>'
   ];
   if (live.liveness_unreachable_unreliable) {
-    parts.push('<span class="badge warn">unreachable unreliable</span>');
+    parts.push('<span class="badge warn" title="Reachability from entry roots was not trustworthy for this repository (for example, no entry roots were found), so the unreachable count is withheld.">unreachable unreliable</span>');
   } else {
-    parts.push('<span class="badge">unreachable <b>' + count('unreachable_files') + '</b></span>');
+    parts.push('<span class="badge" title="Files that no path from an entry root reaches.">unreachable <b>' + count('unreachable_files') + '</b></span>');
   }
   document.getElementById('livenessBadges').innerHTML = parts.join('');
 }
@@ -559,9 +593,10 @@ function renderLegend(fd) {
     '<div class="leg-row"><span class="dot' + (isOfficial(l) ? '' : ' unofficial') + '" style="background:' + colorFor(l) + '"></span> ' + escapeHtml(labelFor(l)) + '</div>'
   ).join('');
   document.getElementById('legend').innerHTML =
-    '<div class="leg-row"><span class="swatch edge-neighbor"></span> neighbor edge</div>'
-    + '<div class="leg-row"><span class="swatch edge-handoff"></span> handoff edge</div>'
-    + '<div class="leg-row"><span class="swatch entry"></span> ring = has entry points</div>'
+    '<div class="leg-row" title="The two areas are adjacent in the import and call graph"><span class="swatch edge-neighbor"></span> neighbor edge</div>'
+    + '<div class="leg-row" title="Work passes from one area into the other through specific files"><span class="swatch edge-handoff"></span> handoff edge</div>'
+    + '<div class="leg-row" title="This subsystem contains entry points"><span class="swatch entry"></span> ring = has entry points</div>'
+    + '<div class="leg-row muted">dot size = file count by default</div>'
     + (langRows ? '<div class="leg-sec">' + langRows + (seen.length > 6 ? '<div class="leg-row muted">+' + (seen.length - 6) + ' more</div>' : '') + '</div>' : '');
 }
 

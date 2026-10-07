@@ -102,7 +102,7 @@ pub fn export_site(vault_root: &Path, output_root: &Path) -> Result<SiteReport, 
                 vault_root: &vault,
                 output_root: &output,
             }),
-            file_access: FileAccess::Unrestricted,
+            file_access: FileAccess::Vault,
             remote_media: false,
             max_embedded_bytes: None,
         };
