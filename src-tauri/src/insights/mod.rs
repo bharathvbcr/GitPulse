@@ -17,9 +17,7 @@ use crate::engine::git_cli::git_text;
 use crate::engine::git_reader::{FileStatus, GitReader};
 use crate::engine::repo_op::{self, RepoOperation};
 use crate::engine::validate_repo;
-use crate::engine::worktree::{
-    self, agent_kind, agent_layout, changed_paths, ScanDepth, WorktreeInfo,
-};
+use crate::engine::worktree::{self, agent_layout, changed_paths, ScanDepth, WorktreeInfo};
 use crate::ledger::{FleetMetrics, LedgerStatus};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -378,15 +376,27 @@ fn failed_changes(repo_path: &str, worktree_path: &str, error: String) -> Active
 /// deliberately skipped the probe (the fleet facet, or a snapshot past its
 /// deadline) passes `false` so the empty `operation_kind` cannot be read as
 /// "nothing parked".
+/// The agent kind and session slug for a worktree path, both empty when it is
+/// not an agent worktree.
+///
+/// The one place a worktree row or a collision party gets its agent labels.
+/// One scan for both: asking twice would re-walk the path for every worktree
+/// of every repository in a fleet sweep, and — worse — would let the kind and
+/// the slug come from two different matches.
+fn agent_labels(path: &str) -> (String, String) {
+    agent_layout(path)
+        .map(|layout| (layout.kind, layout.slug))
+        .unwrap_or_default()
+}
+
+/// The one builder of [`WorktreeSummary`]. A checkout the listing did not
+/// describe comes through here too, as [`unlisted_info`].
 fn summarise_worktree(
     info: &WorktreeInfo,
     operation_kind: String,
     operation_ok: bool,
 ) -> WorktreeSummary {
-    // One scan for both labels. Asking twice would re-walk the path for every
-    // worktree of every repository in a fleet sweep, and — worse — would let
-    // the kind and the slug come from two different matches.
-    let layout = agent_layout(&info.path);
+    let (agent_kind, session_slug) = agent_labels(&info.path);
     WorktreeSummary {
         path: info.path.clone(),
         name: info.name.clone(),
@@ -395,8 +405,8 @@ fn summarise_worktree(
         is_main: info.is_main,
         is_bare: info.is_bare,
         dirty_files: info.dirty_files.map(|n| n as u32),
-        agent_kind: layout.as_ref().map(|l| l.kind.clone()).unwrap_or_default(),
-        session_slug: layout.map(|l| l.slug).unwrap_or_default(),
+        agent_kind,
+        session_slug,
         operation_kind,
         operation_ok,
     }
@@ -1225,7 +1235,7 @@ fn collision_from_list(list: &[WorktreeInfo]) -> CollisionRisk {
                 let party = CollisionParty {
                     path: wt.path.clone(),
                     branch: wt.branch.clone(),
-                    agent_kind: agent_kind(&wt.path).unwrap_or_default(),
+                    agent_kind: agent_labels(&wt.path).0,
                 };
                 for path in paths {
                     by_path.entry(path).or_default().push(party.clone());
@@ -1415,26 +1425,33 @@ fn changes_in(repo_path: &str, target: &str, limit: Option<u32>) -> ActiveChange
 /// Everything git would have supplied is left unset rather than defaulted to a
 /// value that reads as read; the context's `worktree_ok` says why. The agent
 /// labels are derived from the path text alone, so they are as true here as
-/// anywhere.
+/// anywhere. Built by [`summarise_worktree`], so this row cannot drift from a
+/// listed one.
 fn unlisted_worktree(target: &str, operation_kind: String, operation_ok: bool) -> WorktreeSummary {
-    let layout = agent_layout(target);
-    WorktreeSummary {
+    summarise_worktree(&unlisted_info(target), operation_kind, operation_ok)
+}
+
+/// A listing entry for a checkout git did not describe: its path and
+/// directory name, and nothing git would have supplied.
+fn unlisted_info(target: &str) -> WorktreeInfo {
+    WorktreeInfo {
         path: target.to_string(),
         name: Path::new(target)
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| target.to_string()),
+        head: String::new(),
         branch: None,
+        is_bare: false,
         is_detached: false,
         is_main: false,
-        is_bare: false,
+        is_locked: false,
+        is_prunable: false,
         dirty_files: None,
-        // One scan, so the kind and the slug on this summary can never come
-        // from two different matches in the same path.
-        agent_kind: layout.as_ref().map(|l| l.kind.clone()).unwrap_or_default(),
-        session_slug: layout.map(|l| l.slug).unwrap_or_default(),
-        operation_kind,
-        operation_ok,
+        diff_stat: None,
+        main_divergence: None,
+        active_routes: Vec::new(),
+        scan_note: None,
     }
 }
 
@@ -1713,6 +1730,77 @@ mod tests {
         git_in(dir.path(), &["add", "."]);
         git_in(dir.path(), &["commit", "-m", "init"]);
         dir
+    }
+
+    /// A listing entry carrying exactly what an unlisted checkout is known
+    /// to have: a path, its directory name, and nothing git would supply.
+    fn bare_listing(path: &str, name: &str) -> WorktreeInfo {
+        WorktreeInfo {
+            path: path.into(),
+            name: name.into(),
+            head: String::new(),
+            branch: None,
+            is_bare: false,
+            is_detached: false,
+            is_main: false,
+            is_locked: false,
+            is_prunable: false,
+            dirty_files: None,
+            diff_stat: None,
+            main_divergence: None,
+            active_routes: Vec::new(),
+            scan_note: None,
+        }
+    }
+
+    /// One builder per fact. Two hand-written `WorktreeSummary` literals and a
+    /// third agent-kind scan in the collision path each had to be kept in step
+    /// by hand; a new field, or a change to how a path is labelled, landed in
+    /// one and not the others.
+    #[test]
+    fn worktree_rows_and_agent_labels_each_have_one_builder() {
+        let source = include_str!("mod.rs");
+        let production = &source[..source
+            .find("#[cfg(test)]\nmod tests")
+            .expect("test module marker")];
+        // A struct literal opens on a line of its own; signatures returning
+        // the type and the definition do not.
+        assert_eq!(
+            production
+                .lines()
+                .filter(|line| line.trim() == "WorktreeSummary {")
+                .count(),
+            1,
+            "summarise_worktree is the only WorktreeSummary literal"
+        );
+        assert_eq!(
+            production.matches("agent_layout(").count(),
+            1,
+            "agent_labels is the one scan"
+        );
+        assert!(!production.contains("agent_kind(&"));
+    }
+
+    /// The snapshot row and the change-context row for an unlisted checkout
+    /// come from one builder. Pinned to the bytes the two separate builders
+    /// produced before they converged, so the convergence changed no output.
+    #[test]
+    fn listed_and_unlisted_worktree_rows_are_built_identically() {
+        let path = "/repo/.gitpulse/worktrees/fix-1a2b3c4d";
+        let pinned = r#"{"path":"/repo/.gitpulse/worktrees/fix-1a2b3c4d","name":"fix-1a2b3c4d","branch":null,"is_detached":false,"is_main":false,"is_bare":false,"dirty_files":null,"agent_kind":"gitpulse","session_slug":"fix-1a2b3c4d","operation_kind":"rebase","operation_ok":true}"#;
+        let unlisted = unlisted_worktree(path, "rebase".into(), true);
+        assert_eq!(serde_json::to_string(&unlisted).unwrap(), pinned);
+        let listed = summarise_worktree(&bare_listing(path, "fix-1a2b3c4d"), "rebase".into(), true);
+        assert_eq!(serde_json::to_string(&listed).unwrap(), pinned);
+        // A path with no file name falls back to the path itself.
+        // A collision party carries the same kind the row for that path does.
+        assert_eq!(agent_labels(path).0, listed.agent_kind);
+        assert_eq!(agent_labels("/repo"), (String::new(), String::new()));
+        let root = unlisted_worktree("/", String::new(), false);
+        assert_eq!(
+            serde_json::to_string(&root).unwrap(),
+            r#"{"path":"/","name":"/","branch":null,"is_detached":false,"is_main":false,"is_bare":false,"dirty_files":null,"agent_kind":"","session_slug":"","operation_kind":"","operation_ok":false}"#
+        );
     }
 
     #[test]

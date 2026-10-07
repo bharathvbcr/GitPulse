@@ -27,7 +27,7 @@
  * is exactly the change a preference must not be able to make on its own.
  */
 
-import { asAgentProvider, PERMISSION_MODES, supportsManaged, type AgentProvider, type PermissionMode, type RunKind } from "./vocabulary";
+import { asAgentProvider, PERMISSION_MODES, PROVIDER_LABELS, supportsManaged, type AgentProvider, type PermissionMode, type RunKind } from "./vocabulary";
 import { identityCommonDir, tabMatchesRegistered, type OpenTabRef, type RegisteredRef } from "./openMembership";
 import { identityKey, normalizeRepoPath, type PathIdentityOptions } from "../repos/paths";
 
@@ -130,12 +130,7 @@ export function reconcileHandoff(settings: HandoffSettings): HandoffSettings {
   };
 }
 
-export const PROVIDER_LABELS: Record<AgentProvider, string> = {
-  claude: "Claude Code",
-  codex: "Codex",
-  grok: "Grok",
-  agy: "Antigravity",
-};
+export { PROVIDER_LABELS };
 
 /** Display order on the handoff control. Claude Code first because it is the default. */
 export const PROVIDER_CHOICES: readonly AgentProvider[] = ["claude", "codex", "grok", "agy"];

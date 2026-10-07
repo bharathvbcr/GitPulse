@@ -420,6 +420,56 @@ pub fn agent_session_slug(path: &str) -> Option<String> {
         .filter(|slug| !slug.is_empty())
 }
 
+/// The agent kind GitPulse's own task worktrees carry: the hidden directory
+/// `workbench::agent_worktree` places them under, without its dot.
+///
+/// The layout rule accepts any hidden directory, so `.gitpulse/worktrees/<slug>`
+/// was reported as kind `gitpulse` only because nothing excluded it. Naming it
+/// here makes it a decision: the provisioner builds its path from this
+/// constant, and [`is_gitpulse_lane`] is how a reader recognises the result.
+pub const GITPULSE_LANE_KIND: &str = "gitpulse";
+
+/// Whether an agent kind names a worktree GitPulse provisioned for a task,
+/// rather than one an external agent made for itself.
+///
+/// Case-insensitive: on the case-insensitive volumes macOS and Windows ship by
+/// default, `.GitPulse/worktrees` is the same directory. Held to the shared
+/// corpus with `isGitPulseLane` in `src/lib/work/agentWorktree.ts`.
+pub fn is_gitpulse_lane(kind: &str) -> bool {
+    kind.eq_ignore_ascii_case(GITPULSE_LANE_KIND)
+}
+
+/// GitPulse's task-worktree container relative to the main checkout, in the
+/// `/`-separated form an `info/exclude` pattern takes. Always
+/// `.<GITPULSE_LANE_KIND>/<WORKTREES_SEGMENT>`; a test holds the two together.
+pub const GITPULSE_LANE_DIR: &str = ".gitpulse/worktrees";
+
+/// The task-worktree container under a main checkout, built from the same
+/// segments the layout rule reads, so the place GitPulse creates them and the
+/// rule that recognises them cannot drift.
+pub fn gitpulse_lane_container(main_checkout: &Path) -> PathBuf {
+    main_checkout
+        .join(format!(".{GITPULSE_LANE_KIND}"))
+        .join(WORKTREES_SEGMENT)
+}
+
+/// Refuses a hand-made worktree inside GitPulse's task-worktree container.
+///
+/// `workbench::agent_worktree` is the one creator of worktrees there: it
+/// excludes the container from `git status` before adding, names the branch
+/// after the attempt, and removes what a refused attempt made. A worktree added
+/// there by hand got none of that — `git add -A` in the main checkout would
+/// stage it — and was then labelled "GitPulse task" with no task behind it.
+/// Read from the path text, so it holds whether or not the target exists yet.
+pub fn refuse_gitpulse_lane_target(target_path: &str) -> Result<(), String> {
+    match agent_layout(target_path) {
+        Some(layout) if is_gitpulse_lane(&layout.kind) => Err(format!(
+            "{target_path} is inside {GITPULSE_LANE_DIR}/, where GitPulse places the worktrees it creates for task attempts. Start the task from the task board to get one, or choose a path outside {GITPULSE_LANE_DIR}/."
+        )),
+        _ => Ok(()),
+    }
+}
+
 /// Ceiling on paths returned by [`changed_paths`]. Collision detection only
 /// needs identity, and a worktree that dirtied tens of thousands of files
 /// must not turn one insights call into an unbounded allocation.
@@ -2175,6 +2225,9 @@ some-future-field whatever
         kind: String,
         slug: String,
         why: String,
+        /// Absent means false: only a GitPulse task worktree sets it.
+        #[serde(default)]
+        gitpulse_lane: bool,
     }
 
     #[test]
@@ -2225,6 +2278,59 @@ some-future-field whatever
                 "agent_session_slug {:?}",
                 case.path
             );
+            // Whether the kind names GitPulse's own task worktree is a
+            // decision both implementations make from the same kind.
+            assert_eq!(
+                is_gitpulse_lane(&kind),
+                case.gitpulse_lane,
+                "is_gitpulse_lane {:?} — {}",
+                case.path,
+                case.why
+            );
+        }
+        assert!(
+            corpus.cases.iter().any(|case| case.gitpulse_lane),
+            "the corpus must keep a GitPulse task worktree case"
+        );
+    }
+
+    #[test]
+    fn the_gitpulse_lane_location_is_the_one_the_layout_rule_recognises() {
+        // The exclude pattern, the directory the provisioner joins, and the
+        // kind the detector reports are one fact spelled three ways.
+        assert_eq!(
+            GITPULSE_LANE_DIR,
+            format!(".{GITPULSE_LANE_KIND}/{WORKTREES_SEGMENT}")
+        );
+        let container = gitpulse_lane_container(Path::new("/repo"));
+        let inside = container.join("fix-x-1a2b3c4d");
+        let layout = agent_layout(inside.to_str().unwrap()).expect("a lane is an agent layout");
+        assert!(is_gitpulse_lane(&layout.kind), "{layout:?}");
+        assert_eq!(layout.slug, "fix-x-1a2b3c4d");
+    }
+
+    #[test]
+    fn a_hand_made_worktree_is_refused_inside_the_gitpulse_lane_container() {
+        for target in [
+            "/repo/.gitpulse/worktrees/agent-lr3k2",
+            "/repo/.gitpulse/worktrees",
+            ".gitpulse/worktrees/x",
+            "/repo/.GitPulse/worktrees/x",
+            "C:\\repo\\.gitpulse\\worktrees\\x",
+            "/repo/sub/../.gitpulse/worktrees/x",
+        ] {
+            let refused = refuse_gitpulse_lane_target(target)
+                .expect_err(&format!("{target} must be refused"));
+            assert!(refused.contains(GITPULSE_LANE_DIR), "{refused}");
+        }
+        for target in [
+            "/repo-feature",
+            "/repo/.claude/worktrees/session",
+            "/repo/.gitpulse/hooks",
+            "/repo/.gitpulsex/worktrees/x",
+            "/repo/gitpulse/worktrees/x",
+        ] {
+            assert_eq!(refuse_gitpulse_lane_target(target), Ok(()), "{target}");
         }
     }
 

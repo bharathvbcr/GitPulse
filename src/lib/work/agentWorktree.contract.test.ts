@@ -1,7 +1,7 @@
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
-import { agentKind, agentLayout, agentSessionSlug, isAgentWorktree } from "./agentWorktree";
+import { agentKind, agentLayout, agentSessionSlug, isAgentWorktree, isGitPulseLane } from "./agentWorktree";
 import cases from "./agentWorktree.cases.json" with { type: "json" };
 
 /**
@@ -38,7 +38,12 @@ describe("agent worktree layout contract", () => {
       // layout would put an agent chip on a human's checkout.
       expect(isAgentWorktree(item.path), item.path).toBe(item.kind !== "");
       expect(layout === null, item.path).toBe(item.kind === "");
+      // GitPulse's own task worktree is a decision made from the kind, the
+      // same decision `is_gitpulse_lane` makes in Rust.
+      const lane = "gitpulse_lane" in item ? item.gitpulse_lane === true : false;
+      expect(isGitPulseLane(agentKind(item.path)), `isGitPulseLane ${item.path}`).toBe(lane);
     }
+    expect(cases.cases.some((c) => "gitpulse_lane" in c && c.gitpulse_lane === true)).toBe(true);
   });
 
   it("is a corpus, not a handful of happy paths", () => {

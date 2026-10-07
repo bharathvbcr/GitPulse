@@ -2242,6 +2242,9 @@ pub async fn cmd_add_worktree(
     cow_caches: Option<bool>,
 ) -> Result<Guarded<crate::engine::worktree::WorktreeCreated>, String> {
     off_thread(move || {
+        // GitPulse's task-worktree container has one creator, the task
+        // provisioner, which keeps it out of `git status` first.
+        crate::engine::worktree::refuse_gitpulse_lane_target(&target_path)?;
         let argv_owned = crate::engine::worktree::add_worktree_argv(
             &target_path,
             new_branch.as_deref(),

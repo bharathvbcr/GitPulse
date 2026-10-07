@@ -45,6 +45,21 @@ export const AGENT_PROVIDERS = ["claude", "codex", "grok", "agy"] as const;
 export type AgentProvider = (typeof AGENT_PROVIDERS)[number];
 
 /**
+ * What each provider is called on screen.
+ *
+ * Here rather than in `taskHandoff.ts` (which re-exports it) because this
+ * module imports nothing: the path parser in `work/agentWorktree.ts` names
+ * agent worktrees with these labels, and reaching them through the handoff
+ * module would pull the workbench client into every path check.
+ */
+export const PROVIDER_LABELS: Record<AgentProvider, string> = {
+  claude: "Claude Code",
+  codex: "Codex",
+  grok: "Grok",
+  agy: "Antigravity",
+};
+
+/**
  * The providers a *managed* run may use.
  *
  * The limit is mechanical, not editorial: a managed run needs an adapter in

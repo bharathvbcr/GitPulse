@@ -1,5 +1,17 @@
 <script module lang="ts">
   import type { FleetRow, ScanFamily } from "../fleet/types";
+  import { agentKindLabel } from "../work/agentWorktree";
+
+  /** "1 agent", "3 agents": the Fleet work cell's session count. */
+  export function agentSessionsLabel(count: number): string {
+    return `${count} ${count === 1 ? "agent" : "agents"}`;
+  }
+
+  /** The kinds behind that count, named the way the Worktrees panel names them. */
+  export function agentKindsTitle(kinds: readonly string[]): string {
+    const named = kinds.map(agentKindLabel).filter(Boolean);
+    return named.length ? `Agent sessions: ${named.join(", ")}. Open the Agents view.` : "Open the Agents view.";
+  }
 
   /** Which rows the grid shows. */
   export type FleetFilter = "all" | "attention";
@@ -530,6 +542,16 @@
     if (!row) return;
     await repoStore.openRepo(row.path);
     interfaceStore.setFleetOpen(false);
+  }
+
+  /**
+   * The Agents view lists the sessions of every open repository and has no
+   * per-repository scope, so the repository is opened first — that is what
+   * puts its sessions on the plane — and the plane shown only once it did.
+   */
+  async function openAgents(row: FleetRow) {
+    if (!(await repoStore.openRepo(row.path))) return;
+    interfaceStore.setGlobalSurface("agents");
   }
 
   async function removeRow(row: FleetRow | undefined) {
@@ -1143,10 +1165,16 @@
                       <Trees size={10} class="shrink-0" />{row.work.value.worktrees}
                     </span>
                     {#if row.work.value.agentSessions > 0}
-                      <span
-                        class="text-[10px] text-textMuted"
-                        title="Agent sessions: {row.work.value.agentKinds.join(', ')}"
-                        >{row.work.value.agentSessions} agent</span
+                      <button
+                        type="button"
+                        class="rounded-full px-1 text-[10px] text-textMuted hover:bg-surfaceHover hover:text-accent"
+                        data-testid="fleet-open-agents"
+                        title={agentKindsTitle(row.work.value.agentKinds)}
+                        onclick={(e) => {
+                          e.stopPropagation();
+                          void openAgents(row);
+                        }}
+                        >{agentSessionsLabel(row.work.value.agentSessions)}</button
                       >
                     {/if}
                   {/if}
