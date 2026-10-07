@@ -25,7 +25,7 @@
   import { terminalSessions } from "../terminal/sessionRegistry";
   import { sessionActivity } from "../terminal/sessionActivity";
   import { focusTerminalSession } from "../terminal/sessionFocus";
-  import { taskTerminalRequests } from "../terminal/taskLaunches";
+  import { attemptNotices, taskTerminalRequests } from "../terminal/taskLaunches";
   import { terminalSessionLimit } from "../terminal/sessionLimit";
   import { createBoardAgents } from "../workbench/boardAgents";
   import { explainError, getTaskRun, listRepositories, type Repository } from "../workbench/client";
@@ -92,6 +92,7 @@
     records: $terminalSessions,
     requests: $taskTerminalRequests,
     activity: (sessionId) => $sessionActivity.get(sessionId),
+    notices: (runId) => $attemptNotices.get(runId),
     sessionLimit: $terminalSessionLimit,
     now,
     repositoryPath: (id) => repoPaths.get(id) ?? null,

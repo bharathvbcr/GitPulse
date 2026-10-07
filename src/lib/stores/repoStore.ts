@@ -738,6 +738,13 @@ function project(internal: InternalState, options: PathIdentityOptions): RepoSta
 
 const REPOSITORY_TRUST_REQUIRED = "REPOSITORY_TRUST_REQUIRED";
 
+/** What a person reads when a tab cannot be opened at all. */
+function openRefusalMessage(reason: "invalid" | "capacity"): string {
+  return reason === "capacity"
+    ? `Too many open repositories (max ${MAX_OPEN_TABS}). Close a tab to open another.`
+    : "Invalid repository path";
+}
+
 export function repositoryTrustRefused(message: string): boolean {
   return message.includes(REPOSITORY_TRUST_REQUIRED);
 }
@@ -1595,6 +1602,61 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
     applyToSession(id, generation, { commonDir, name, isBare });
   }
 
+  /**
+   * Asks the person to trust a tab that is waiting for it, and on a grant
+   * loads it — wherever it is. The one owner of that sequence: a click on the
+   * tab (activateTab) and an agent waiting on its checkout from the task sheet
+   * (trustTab) both come here, so a grant always carries the family and only
+   * the tab on screen counts as an activation.
+   */
+  async function grantTrust(id: string): Promise<boolean> {
+    const current = internal.sessions[id];
+    if (!current?.trustRequired) return false;
+    const trustedPath = await requestRepositoryTrust(current.path, "Trust and Open", invokeFn);
+    const live = internal.sessions[id];
+    if (!live?.trustRequired) return false;
+    if (!trustedPath) return false;
+    let granted: ReturnType<typeof resolvedFields>;
+    try {
+      granted = resolvedFields(id, await resolvePath(trustedPath));
+    } catch (err: unknown) {
+      const message = formatError(err);
+      applyToSession(id, live.generation, {
+        isLoading: false,
+        error: message,
+        trustRequired: repositoryTrustRefused(message) || live.trustRequired,
+      });
+      return false;
+    }
+    const latest = internal.sessions[id];
+    if (!latest) return false;
+    // The grant is the first resolve this tab has had: it carries the
+    // family, not only the path. Copying the path alone left every
+    // checkout restored untrusted outside its repository's stack.
+    const path = granted.path;
+    const activation = bumped({ ...latest, ...granted });
+    const onScreen = internal.workspace.activeId === id;
+    putSession({ ...activation, isLoading: true });
+    if (onScreen) {
+      syncFilterFromSession(activation);
+      revealGraph(activation);
+    }
+    publish();
+    const watchState = await watch(path);
+    applyToSession(id, activation.generation, { watch: watchState });
+    if (onScreen) {
+      watcherRefreshPolicy.onActivated(path);
+      await noteTabActivated(path);
+    }
+    await hydrate(id, path, activation.generation);
+    const after = internal.sessions[id];
+    if (after && after.generation === activation.generation && !after.trustRequired) {
+      ensureStatusPoll();
+      flushPersist();
+    }
+    return true;
+  }
+
   async function hydrate(id: string, path: string, generation: number) {
     const run = (snapshotRuns.get(id) ?? 0) + 1;
     snapshotRuns.set(id, run);
@@ -1865,6 +1927,22 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
       publish();
     },
     trustRepo: (path: string) => requestRepositoryTrust(path, "Trust Repository", invokeFn),
+    /**
+     * Asks to trust a tab waiting for it without bringing it on screen — for
+     * a surface (the task sheet) whose reader is not looking at that tab.
+     * Resolves to whether trust was granted and the tab loaded.
+     */
+    trustTab: (id: string) => grantTrust(id),
+    /**
+     * Why `openRepo(rawPath)` would be refused before anything is resolved,
+     * or null. Only refusals that waiting cannot fix are knowable here: an
+     * invalid path, or every tab slot taken by other repositories. Same rule
+     * and words as the refusal itself, so a caller never re-derives the bound.
+     */
+    openRefusal: (rawPath: string): string | null => {
+      const probe = openTab(internal.workspace, rawPath, options, { activate: false });
+      return probe.ok ? null : openRefusalMessage(probe.reason);
+    },
     openRepo: async (
       rawPath: string,
       extras: {
@@ -1996,10 +2074,7 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
       if (!opened.ok) {
         internal = {
           ...internal,
-          workspaceError:
-            opened.reason === "capacity"
-              ? `Too many open repositories (max ${MAX_OPEN_TABS}). Close a tab to open another.`
-              : "Invalid repository path",
+          workspaceError: openRefusalMessage(opened.reason),
         };
         publish();
         return false;
@@ -2150,45 +2225,7 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
         }
         syncFilterFromSession(current);
         publish();
-        const trustedPath = await requestRepositoryTrust(current.path, "Trust and Open", invokeFn);
-        const live = internal.sessions[id];
-        if (!live?.trustRequired) return;
-        if (!trustedPath) return;
-        let granted: ReturnType<typeof resolvedFields>;
-        try {
-          granted = resolvedFields(id, await resolvePath(trustedPath));
-        } catch (err: unknown) {
-          const message = formatError(err);
-          applyToSession(id, live.generation, {
-            isLoading: false,
-            error: message,
-            trustRequired: repositoryTrustRefused(message) || live.trustRequired,
-          });
-          return;
-        }
-        const latest = internal.sessions[id];
-        if (!latest) return;
-        // The grant is the first resolve this tab has had: it carries the
-        // family, not only the path. Copying the path alone left every
-        // checkout restored untrusted outside its repository's stack.
-        const path = granted.path;
-        const activation = bumped({ ...latest, ...granted });
-        putSession({ ...activation, isLoading: true });
-        if (internal.workspace.activeId === id) {
-          syncFilterFromSession(activation);
-          revealGraph(activation);
-        }
-        publish();
-        const watchState = await watch(path);
-        applyToSession(id, activation.generation, { watch: watchState });
-        watcherRefreshPolicy.onActivated(path);
-        await noteTabActivated(path);
-        await hydrate(id, path, activation.generation);
-        const after = internal.sessions[id];
-        if (after && after.generation === activation.generation && !after.trustRequired) {
-          ensureStatusPoll();
-          flushPersist();
-        }
+        await grantTrust(id);
         return;
       }
       if (!extras.force && internal.workspace.activeId === id) return;

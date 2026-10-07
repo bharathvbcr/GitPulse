@@ -6,7 +6,15 @@ const setTerminalOpen = vi.fn();
 const setGlobalSurface = vi.fn();
 const repoState = writable<{ currentPath: string | null; openTabs?: { id: string; path: string; trustRequired?: boolean }[] }>({ currentPath: "/work/current" });
 const activateTab = vi.fn();
-vi.mock("../stores/repoStore", () => ({ repoStore: { subscribe: repoState.subscribe, openRepo: (...args: unknown[]) => openRepo(...args), setTerminalOpen: (...args: unknown[]) => setTerminalOpen(...args), activateTab: (...args: unknown[]) => activateTab(...args) } }));
+const trustTab = vi.fn();
+// The store's capacity answer, as repoStore.openRefusal gives it for the published tabs.
+const openRefusal = (path: string): string | null => {
+  const tabs = (get(repoState) as { openTabs?: { path: string }[] }).openTabs ?? [];
+  return tabs.length >= 24 && !tabs.some((tab) => tab.path === path)
+    ? "Too many open repositories (max 24). Close a tab to open another."
+    : null;
+};
+vi.mock("../stores/repoStore", () => ({ repoStore: { subscribe: repoState.subscribe, openRepo: (...args: unknown[]) => openRepo(...args), setTerminalOpen: (...args: unknown[]) => setTerminalOpen(...args), activateTab: (...args: unknown[]) => activateTab(...args), trustTab: (...args: unknown[]) => trustTab(...args), openRefusal: (path: string) => openRefusal(path) } }));
 vi.mock("../stores/interfaceStore", () => ({ interfaceStore: { setGlobalSurface: (...args: unknown[]) => setGlobalSurface(...args) } }));
 const findConversation = vi.fn();
 vi.mock("./client", async (importOriginal) => ({ ...(await importOriginal<typeof import("./client")>()), findConversation: (...args: unknown[]) => findConversation(...args), explainError: (cause: unknown) => (cause instanceof Error ? cause.message : String(cause)), launchManagedRun: vi.fn() }));
@@ -34,7 +42,7 @@ function liveSession(fields: { key: string; taskRunId?: string; continuesRunId?:
 
 beforeEach(() => {
   repoState.set({ currentPath: "/work/current" });
-  openRepo.mockReset(); activateTab.mockReset(); setTerminalOpen.mockReset(); setGlobalSurface.mockReset(); findConversation.mockReset(); focusTerminalSession.mockReset();
+  openRepo.mockReset(); activateTab.mockReset(); trustTab.mockReset(); setTerminalOpen.mockReset(); setGlobalSurface.mockReset(); findConversation.mockReset(); focusTerminalSession.mockReset();
   // A checkout root resolves to itself.
   resolveGitRoot.mockReset(); resolveGitRoot.mockImplementation(async (path: string) => path);
 });
@@ -298,7 +306,9 @@ describe("a checkout that opened waiting to be trusted", () => {
     expect(await startTaskTerminal(run("a", "/work/a"))).toEqual({ kind: "waiting", reason: "trust", checkout: "/work/a" });
     expect(get(taskTerminalRequests).map((r) => r.runId)).toEqual(["a"]);
     expect(await trustAttemptCheckout({ cwd: "/work/a" })).toBe(true);
-    expect(activateTab).toHaveBeenCalledWith("tab-a");
+    // Trust is asked for in place: the repository behind the task sheet stays put.
+    expect(trustTab).toHaveBeenCalledWith("tab-a");
+    expect(activateTab).not.toHaveBeenCalled();
     repoState.set({ currentPath: "/work/current", openTabs: [] });
     expect(await trustAttemptCheckout({ cwd: "/work/a" })).toBe(false);
   });

@@ -9,7 +9,7 @@
 
 import type { SessionActivity } from "../terminal/sessionActivity";
 import type { TerminalSessionRecord } from "../terminal/sessionRegistry";
-import type { TaskTerminalRequest } from "../terminal/taskLaunches";
+import type { AttemptNotice, TaskTerminalRequest } from "../terminal/taskLaunches";
 import { identityKey, type PathIdentityOptions } from "../repos/paths";
 import type { Repository, TaskRun } from "../workbench/client";
 import { identityCommonDir, tabMatchesRegistered } from "../workbench/openMembership";
@@ -30,6 +30,8 @@ export interface TaskBoardWatch {
   records: readonly TerminalSessionRecord[];
   requests: readonly TaskTerminalRequest[];
   activity: (sessionId: string) => SessionActivity | undefined;
+  /** A start that failed out of sight (`taskLaunches.ts::attemptNotices`), so the row says so. */
+  notices?: (runId: string) => AttemptNotice | undefined;
   /** Terminal slots this window will open. Full when the registry has that many. */
   sessionLimit: number;
   now: number;
@@ -81,6 +83,7 @@ export function taskProbeFromBoard(board: TaskBoardRead, watch: TaskBoardWatch):
     requests: watch.requests,
     capacityFull: watch.sessionLimit > 0 && watch.records.length >= watch.sessionLimit,
     activity: watch.activity,
+    notices: watch.notices,
     pending: (runId) => board.pending.get(runId),
     now: watch.now,
     clock,

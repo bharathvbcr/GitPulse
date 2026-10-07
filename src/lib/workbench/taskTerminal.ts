@@ -37,7 +37,6 @@ import { terminalSessions, type TerminalSessionRecord } from "../terminal/sessio
 import { explainError, findConversation, launchManagedRun, type TaskRun } from "./client";
 import { resolveGitRoot } from "../desktop/nativeShell";
 import { identityKey, isCaseInsensitiveFs, normalizeRepoPath } from "../repos/paths";
-import { MAX_OPEN_TABS } from "../repos/tabModel";
 import { relativeStartDir } from "../terminal/tabs";
 import { formatError } from "../ui/formatError";
 import { PROVIDER_LABELS } from "./vocabulary";
@@ -117,16 +116,12 @@ function tabFor(root: string): { id: string; path: string; trustRequired?: boole
 
 /**
  * Why the repository store will refuse to open `root`, when that is knowable
- * before asking: every tab slot is taken and none of them is this checkout.
- * The store's own refusal (`openRepo` → false) carries no reason a caller
- * can read, so the one refusal that never resolves by waiting is checked
- * against the same bound the store applies (`tabModel.ts::MAX_OPEN_TABS`).
+ * before asking — the store's own answer (`repoStore.openRefusal`), so the
+ * bound and its words have one owner.
  */
 function openRefusal(root: string): string | null {
-  if (tabFor(root)) return null;
-  return openTabs().length >= MAX_OPEN_TABS
-    ? `Too many open repositories (max ${MAX_OPEN_TABS}). Close a repository tab, then Show terminal starts it.`
-    : null;
+  const refused = repoStore.openRefusal(root);
+  return refused ? `${refused} Show terminal starts it once one is free.` : null;
 }
 
 /** The checkout opened as a repository GitPulse has not been told to trust. */
@@ -136,14 +131,14 @@ function trustPending(root: string): boolean {
 
 /**
  * Asks the reader to trust the checkout an attempt is waiting for — the
- * existing prompt on its repository tab. Resolves to whether a tab was there
- * to ask about.
+ * repository's own trust prompt, without switching the repository behind the
+ * task sheet. Resolves to whether a tab was there to ask about.
  */
 export async function trustAttemptCheckout(run: Pick<TaskRun, "cwd">): Promise<boolean> {
   const place = await checkoutFor(run.cwd);
   const tab = tabFor(place.root);
   if (!tab) return false;
-  await repoStore.activateTab(tab.id);
+  await repoStore.trustTab(tab.id);
   return true;
 }
 
