@@ -75,6 +75,22 @@ describe("TerminalPanel session ownership", () => {
     expect(source).toContain("await onGoToSession(session)");
   });
 
+  it("names each listed session by repository and checkout, matched by identity", () => {
+    // Rows used to show `repoPath.split(...).pop()` — an agent worktree's
+    // slug with no repository — and decided "other repository" by exact
+    // string, so the panel's own checkout spelled differently read as
+    // elsewhere. Both now come from `sessionRow` (terminal/checkoutLabel.ts).
+    expect(source).toContain("sessionRow(session, repoPath, checkouts, pathOpts)");
+    expect(source).not.toContain("session.repoPath.split(");
+    expect(source).not.toMatch(/session\.repoPath\s*[!=]==\s*repoPath/);
+    expect(source).toContain('data-testid="session-agent"');
+  });
+
+  it("links a resumed conversation's session back to its task, as it does an attempt's", () => {
+    expect(source).toContain("{#if row.taskRunId}");
+    expect(source).toContain("openListedTask(row.taskRunId)");
+  });
+
   it("refits the visible session when its host is shown again", () => {
     const body = source.slice(source.indexOf("$effect(() => {", source.indexOf("function handleChord")));
     expect(body).toContain("if (!visible || mode !== \"shell\") return");

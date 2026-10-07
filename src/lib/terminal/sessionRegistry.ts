@@ -1,11 +1,18 @@
 import { writable } from "svelte/store";
 import { currentSessionLimit } from "./sessionLimit";
 import { identityKey, isCaseInsensitiveFs, type PathIdentityOptions } from "../repos/paths";
+import type { LauncherKind } from "./tabs";
 
 export interface TerminalSessionRecord {
   key: string;
   repoPath: string;
   label: string;
+  /**
+   * What the process is: a shell or an agent CLI. `label` is that kind as
+   * display text; surfaces that decide on it (an agent chip) read this.
+   * Absent only on a record a caller built without one.
+   */
+  launcher?: LauncherKind;
   status: string;
   /**
    * The backend's own id for the PTY, once one has started.

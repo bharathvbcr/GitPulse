@@ -124,6 +124,7 @@ export async function adoptDetachedSessions(deps: {
       key,
       repoPath: listing.repo,
       label,
+      launcher,
       ...(listing.run_id ? { title: "Task attempt", taskRunId: listing.run_id } : {}),
       status: DETACHED_STATUS,
       sessionId: listing.id,

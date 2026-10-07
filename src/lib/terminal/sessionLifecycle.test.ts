@@ -25,6 +25,22 @@ function fixture(overrides: Partial<SessionTransport> = {}, registry = createSes
   }, error: (message: string) => handlers?.onError?.(message), exit: () => handlers?.onExit({ id: "native-a", exit_code: 0, signal: "", error: null, reaped: true }) };
 }
 
+describe("the session record", () => {
+  it("names the launcher, so the Sessions list can tell an agent from a shell", async () => {
+    // The label is display text ("Claude"); the kind is what a chip and any
+    // other surface decide on, and it was not on the record at all.
+    const registry = createSessionRegistry();
+    const transport = { spawn: vi.fn(async () => ({ id: "native-l", shell: "/bin/sh", cwd: "/repo" })), write: vi.fn(async () => {}), resize: vi.fn(async () => {}), kill: vi.fn(async () => {}) };
+    const hooks = { state: vi.fn(), started: vi.fn(), output: vi.fn(), exit: vi.fn(), reset: vi.fn(), warning: vi.fn() };
+    const owner = createSessionLifecycle({ key: "tab-l", repoPath: "/repo", label: "Claude", launcher: "claude", registry, transport, hooks,
+      bus: { prepare: async () => () => {}, pendingCount: () => 0, subscribe: () => () => {} },
+    });
+    await owner.start();
+    expect(get(registry)[0]).toMatchObject({ launcher: "claude", label: "Claude" });
+    owner.dispose(); await flush();
+  });
+});
+
 describe("terminal lifecycle races", () => {
   it("reconnects a task attempt without killing its live process or clearing output", async () => {
     const f = fixture({}, createSessionRegistry(), "task", true);

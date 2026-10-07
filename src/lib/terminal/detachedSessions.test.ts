@@ -76,7 +76,7 @@ describe("sessions a reloaded page left running", () => {
   it("a task attempt's is shown through its own launch path, which takes its session over", async () => {
     const { registry, adopt } = setup([row({ run_id: "run-1" })]);
     await adopt();
-    expect(get(registry)[0]).toMatchObject({ taskRunId: "run-1", title: "Task attempt" });
+    expect(get(registry)[0]).toMatchObject({ taskRunId: "run-1", title: "Task attempt", launcher: "claude" });
     get(registry)[0].reveal?.();
     expect(get(taskTerminalRequests)).toEqual([{ runId: "run-1", repoPath: "/repos/app", provider: "claude", title: "Task attempt" }]);
   });
