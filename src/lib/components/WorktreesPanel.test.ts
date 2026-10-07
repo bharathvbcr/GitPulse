@@ -80,10 +80,15 @@ describe("WorktreesPanel removal safety", () => {
   });
 
   it("closes the stranded tab instead of leaving it on the removed directory (T-F09)", () => {
-    const guardIdx = source.indexOf("$repoStore.currentPath === targetPath");
-    expect(guardIdx).toBeGreaterThan(-1);
-    const closeIdx = source.indexOf("repoStore.closeTab(stranded.id)");
-    expect(closeIdx).toBeGreaterThan(guardIdx);
+    // Any tab on the removed directory, not only the active one: a background
+    // tab used to stay open on a deleted path, holding a tab slot.
+    const fn = source.slice(source.indexOf("async function remove"), source.indexOf("function open"));
+    expect(fn).not.toContain("$repoStore.currentPath === targetPath");
+    const removed = fn.indexOf("removeCompleted = true");
+    const closeIdx = fn.indexOf("repoStore.closeTab(stranded.id)");
+    const staleReturn = fn.indexOf("$repoStore.currentPath !== repo", removed);
+    expect(closeIdx).toBeGreaterThan(removed);
+    expect(closeIdx).toBeLessThan(staleReturn);
   });
 
   it("preserves the concurrent-session currentPath guards after the await", () => {

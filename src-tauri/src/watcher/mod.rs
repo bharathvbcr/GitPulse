@@ -1014,7 +1014,16 @@ fn panic_payload_text(panic: &(dyn std::any::Any + Send)) -> String {
         .unwrap_or_else(|| "<non-string panic payload>".to_string())
 }
 
-/// Debounced git-directory watcher that emits `repo-changed` after writes settle.
+/// Emitted once when a watched repository's git directory is confirmed gone
+/// (the checkout was deleted or moved). The watch has already ended; nothing
+/// further arrives for `path` until it is watched again.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct RepoGonePayload {
+    pub path: String,
+}
+
+/// Debounced git-directory watcher that emits `repo-changed` after writes
+/// settle, and `repo-gone` once if the repository disappears.
 ///
 /// Concurrent watches are keyed by canonical repository path. Re-watching an
 /// existing path is idempotent. Returns the canonical path used as the map key.
@@ -1023,13 +1032,25 @@ pub fn start_watch(
     state: &WatcherState,
     repo_path: String,
 ) -> Result<String, String> {
-    start_watch_inner(state, repo_path, move |payload| {
-        if let Err(e) = app.emit("repo-changed", &payload) {
-            log::warn!(target: "watcher", "repo-changed emit failed for {}: {e}", payload.path);
-        }
-    })
+    let gone_app = app.clone();
+    start_watch_observed(
+        state,
+        repo_path,
+        move |payload| {
+            if let Err(e) = app.emit("repo-changed", &payload) {
+                log::warn!(target: "watcher", "repo-changed emit failed for {}: {e}", payload.path);
+            }
+        },
+        move |payload| {
+            if let Err(e) = gone_app.emit("repo-gone", &payload) {
+                log::warn!(target: "watcher", "repo-gone emit failed for {}: {e}", payload.path);
+            }
+        },
+    )
 }
 
+/// [`start_watch_observed`] for a caller that does not need `repo-gone`.
+#[cfg(test)]
 pub(crate) fn start_watch_inner<F>(
     state: &WatcherState,
     repo_path: String,
@@ -1037,6 +1058,24 @@ pub(crate) fn start_watch_inner<F>(
 ) -> Result<String, String>
 where
     F: Fn(RepoChangedPayload) + Send + 'static,
+{
+    start_watch_observed(state, repo_path, on_change, |_| {})
+}
+
+/// [`start_watch_inner`] plus `on_gone`, called once, after the session is
+/// reaped, when the loop ends because the repository disappeared. Without it
+/// the UI never learned: a dead path is deliberately never announced as a
+/// change, so a tab on a deleted worktree stayed open, held a tab slot, and
+/// was re-reported by every later workspace sync.
+pub(crate) fn start_watch_observed<F, G>(
+    state: &WatcherState,
+    repo_path: String,
+    on_change: F,
+    on_gone: G,
+) -> Result<String, String>
+where
+    F: Fn(RepoChangedPayload) + Send + 'static,
+    G: FnOnce(RepoGonePayload) + Send + 'static,
 {
     #[cfg(test)]
     eprintln!("watch setup {repo_path}: validate repository");
@@ -1141,6 +1180,11 @@ where
                 }
                 Ok(WatchLoopExit::DeadRepo) => {
                     log::info!(target: "watcher", "watch on {emit_path} ended: repository disappeared");
+                    // One announcement, not a change: nothing may refresh a
+                    // path that no longer exists.
+                    on_gone(RepoGonePayload {
+                        path: emit_path.clone(),
+                    });
                 }
                 Ok(WatchLoopExit::EventStreamClosed) => {
                     log::warn!(
@@ -2930,11 +2974,15 @@ mod tests {
         git_init(dir.path(), false);
         let state = WatcherState::default();
         let (tx, rx) = std::sync::mpsc::channel();
-        let key = start_watch_inner(
+        let (gone_tx, gone_rx) = std::sync::mpsc::channel();
+        let key = start_watch_observed(
             &state,
             dir.path().to_string_lossy().into_owned(),
             move |_| {
                 let _ = tx.send(());
+            },
+            move |payload| {
+                let _ = gone_tx.send(payload);
             },
         )
         .expect("watch live repo");
@@ -2992,6 +3040,16 @@ mod tests {
             state.watch_count().unwrap(),
             0,
             "session for a dead repo must be reaped"
+        );
+        // Silent toward `repo-changed`, but the UI must still learn the tab
+        // is dead: exactly one `repo-gone`, naming the watched key.
+        let announced = gone_rx
+            .recv_timeout(Duration::from_secs(6))
+            .expect("a dead repository must be announced as gone");
+        assert_eq!(announced, RepoGonePayload { path: key.clone() });
+        assert!(
+            gone_rx.recv_timeout(Duration::from_millis(500)).is_err(),
+            "repo-gone must fire once"
         );
         let _ = std::fs::remove_dir_all(&gone);
     }

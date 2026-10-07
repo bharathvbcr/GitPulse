@@ -138,6 +138,23 @@ export function createAutoInit(opts?: {
   let inFlight: Promise<void> | null = null;
   /** Last scope actually flushed, so an invalidation has something to re-run. */
   let lastScope: { activeKey: string; retained: string[] } | null = null;
+  /**
+   * Registry omissions already warned about. The registry is shared by every
+   * open tab, so each activation's report names the same omitted tab again:
+   * one deleted worktree produced 22 identical warnings in one session, one
+   * per repository switched to. An entry is reported when it first appears
+   * and forgotten once a registry is written without it, so a recurrence is
+   * reported again.
+   */
+  const reportedOmissions = { untrusted: new Set<string>(), unavailable: new Set<string>() };
+
+  function newlyOmitted(seen: Set<string>, current: readonly string[]): string[] {
+    const now = new Set(current);
+    for (const entry of [...seen]) if (!now.has(entry)) seen.delete(entry);
+    const fresh = current.filter((entry) => !seen.has(entry));
+    for (const entry of fresh) seen.add(entry);
+    return fresh;
+  }
 
   function patch(repoPath: string, next: Partial<AutoInitSnapshot>) {
     snapshots.update((map) => ({
@@ -192,17 +209,19 @@ export function createAutoInit(opts?: {
           "devcouncil-init",
           `${activeKey}: cross-repository search has no registry — ${report.workspace_reason}`,
         );
-      } else {
-        if (report.skipped_untrusted.length > 0) {
+      } else if (report.workspace_registry !== null) {
+        const untrusted = newlyOmitted(reportedOmissions.untrusted, report.skipped_untrusted);
+        if (untrusted.length > 0) {
           warn(
             "devcouncil-init",
-            `${activeKey}: cross-repository search omitted untrusted repositories — ${report.skipped_untrusted.join(", ")}`,
+            `${activeKey}: cross-repository search omitted untrusted repositories — ${untrusted.join(", ")}`,
           );
         }
-        if (report.skipped_unavailable.length > 0) {
+        const unavailable = newlyOmitted(reportedOmissions.unavailable, report.skipped_unavailable);
+        if (unavailable.length > 0) {
           warn(
             "devcouncil-init",
-            `${activeKey}: cross-repository search omitted open tabs it could not register — ${report.skipped_unavailable.join("; ")}`,
+            `${activeKey}: cross-repository search omitted open tabs it could not register — ${unavailable.join("; ")}`,
           );
         }
       }
@@ -295,6 +314,8 @@ export function createAutoInit(opts?: {
       lastScope = null;
       applied.clear();
       held.clear();
+      reportedOmissions.untrusted.clear();
+      reportedOmissions.unavailable.clear();
       snapshots.set({});
     },
   };

@@ -34,3 +34,11 @@ export interface RepoChangedPayload {
   path: string;
   change: RepoChange;
 }
+
+/**
+ * Emitted once when a watched repository's git directory disappears; its
+ * watch has ended. `RepoGonePayload` in `watcher/mod.rs`.
+ */
+export interface RepoGonePayload {
+  path: string;
+}

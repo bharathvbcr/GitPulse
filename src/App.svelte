@@ -1,5 +1,5 @@
 <script lang="ts">
-  import type { RepoChangedPayload } from "./lib/repos/events";
+  import type { RepoChangedPayload, RepoGonePayload } from "./lib/repos/events";
   import { readRepoChange, routeRepoChange } from "./lib/repos/changeScope";
   import type { LedgerAppended } from "./lib/ledger/types";
   import { onDestroy, onMount, tick, untrack } from "svelte";
@@ -683,6 +683,17 @@
     }).then(
       (unlisten) => track(unlisten),
       (err) => diagnostics.warn("boot:devmap-build-progress", err),
+    );
+
+    // A watched checkout vanished (worktree removed, directory moved). The
+    // watcher never announces a dead path as a change, so this is the only
+    // way its tab learns it is gone.
+    void listen<RepoGonePayload>("repo-gone", (event) => {
+      const path = event.payload?.path;
+      if (path) repoStore.markRepoGone(path);
+    }).then(
+      (unlisten) => track(unlisten),
+      (err) => diagnostics.warn("boot:repo-gone", err),
     );
 
     // The action journal follows the durable ledger rather than accumulating

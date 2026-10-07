@@ -235,6 +235,8 @@ export interface OpenRepoTab {
    * work skips these paths so a refusal stays one state, not a stream.
    */
   trustRequired?: boolean;
+  /** The checkout was deleted or moved while open; see `RepoSession.missing`. */
+  missing?: boolean;
   currentBranch: string | null;
   conflictedCount: number;
   changedCount: number;
@@ -343,6 +345,12 @@ export interface RepoSession {
    * Schedulers treat it as "do not call the backend for this path".
    */
   trustRequired: boolean;
+  /**
+   * The watcher saw this checkout's git directory disappear (`repo-gone`).
+   * Background work skips it, as it does `trustRequired`; a later successful
+   * hydrate (the checkout was recreated) clears it.
+   */
+  missing: boolean;
   generation: number;
   /** True once this session's first snapshot has landed and rendered. */
   hasHydrated: boolean;
@@ -643,6 +651,7 @@ function createSession(
     isLoading: extras.isLoading ?? false,
     error: extras.error ?? null,
     trustRequired: extras.trustRequired ?? false,
+    missing: extras.missing ?? false,
     generation: extras.generation ?? nextSessionGeneration(),
     hasHydrated: extras.hasHydrated ?? false,
     statsPending: extras.statsPending ?? false,
@@ -682,6 +691,7 @@ function project(internal: InternalState, options: PathIdentityOptions): RepoSta
       isLoading: session?.isLoading ?? false,
       error: session?.error ?? null,
       trustRequired: session?.trustRequired === true,
+      missing: session?.missing === true,
       currentBranch: session?.currentBranch ?? null,
       conflictedCount: statuses.filter((file) => file.is_conflicted).length,
       changedCount: new Set(statuses.map((file) => file.path)).size,
@@ -744,16 +754,18 @@ export function repositoryTrustRefused(message: string): boolean {
 
 /**
  * Open paths that may receive background work. A session with
- * `trustRequired` is omitted, and it is not used as the active key.
+ * `trustRequired`, or one whose checkout is `missing`, is omitted, and it is
+ * not used as the active key. A missing checkout used to stay in: every
+ * workspace sync re-tried it and re-reported it, once per activation.
  */
 export function pathsTrustedForBackground(
-  tabs: readonly { path: string; trustRequired?: boolean }[],
+  tabs: readonly { path: string; trustRequired?: boolean; missing?: boolean }[],
   activePath: string | null,
 ): { activeKey: string | null; retainedKeys: string[] } {
   const retainedKeys: string[] = [];
   let activeBlocked = false;
   for (const tab of tabs) {
-    if (tab.trustRequired) {
+    if (tab.trustRequired || tab.missing) {
       if (tab.path === activePath) activeBlocked = true;
       continue;
     }
@@ -1128,6 +1140,7 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
       internal.workspace.tabs.map((tab) => ({
         path: tab.path,
         trustRequired: internal.sessions[tab.id]?.trustRequired === true,
+        missing: internal.sessions[tab.id]?.missing === true,
       })),
       active?.path ?? null,
     );
@@ -1533,6 +1546,7 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
         isLoading: false,
         error: null,
         trustRequired: false,
+        missing: false,
         hasHydrated: true,
       });
       // Stats re-drain even when the snapshot was a no-op: a previously
@@ -2460,6 +2474,23 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
       if (echoUntil !== undefined && Date.now() < echoUntil) return;
       bindRefreshVisibility();
       watcherRefreshPolicy.onChange(session.path);
+    },
+    /**
+     * The watcher's `repo-gone`: this checkout's git directory was deleted or
+     * moved, and its watch has ended. The tab stays (with its pin, group and
+     * terminals) and says what happened; background work stops visiting it.
+     * Nothing else would ever tell it: a dead path never emits a change.
+     */
+    markRepoGone: (gonePath: string) => {
+      const session = Object.values(internal.sessions).find((item) =>
+        sameRepo(item.path, gonePath, options),
+      );
+      if (!session || session.missing) return;
+      applyToSession(session.id, session.generation, {
+        missing: true,
+        isLoading: false,
+        error: `This checkout no longer exists at ${session.path}. Close the tab, or recreate the checkout and refresh.`,
+      });
     },
     restoreWorkspace: async () => {
       stopStatusPoll();

@@ -247,6 +247,48 @@ describe("autoInit", () => {
     index.reset();
   });
 
+  it("names an omitted tab once across activations, and again only if it recurs", async () => {
+    // The registry is shared, so every activation's report lists the same
+    // omission. Field case: one deleted worktree, 22 identical warnings.
+    const warn = vi.fn();
+    let skipped = ["/gone: Cannot access path '/gone'"];
+    const index = createAutoInit({
+      debounceMs: 0,
+      warn,
+      initialize: async (repo) => report({ repo, skipped_unavailable: skipped }),
+    });
+    const omitted = () =>
+      warn.mock.calls.filter(([, message]) => String(message).includes("could not register"));
+
+    for (const active of ["/a", "/b", "/c"]) {
+      index.setScope(scope(active, ["/a", "/b", "/c", "/gone"]));
+      await vi.advanceTimersByTimeAsync(0);
+    }
+    expect(omitted()).toHaveLength(1);
+    expect(omitted()[0][1]).toBe(
+      "/a: cross-repository search omitted open tabs it could not register — /gone: Cannot access path '/gone'",
+    );
+
+    // A second, different omission is its own fact and is named alone.
+    skipped = ["/gone: Cannot access path '/gone'", "/also: Cannot access path '/also'"];
+    index.setScope(scope("/a", ["/a", "/b", "/c", "/gone", "/also"]));
+    await vi.advanceTimersByTimeAsync(0);
+    expect(omitted()).toHaveLength(2);
+    expect(omitted()[1][1]).toBe(
+      "/a: cross-repository search omitted open tabs it could not register — /also: Cannot access path '/also'",
+    );
+
+    // Registered cleanly, then lost again: that recurrence is reported.
+    skipped = [];
+    index.setScope(scope("/b", ["/a", "/b"]));
+    await vi.advanceTimersByTimeAsync(0);
+    skipped = ["/gone: Cannot access path '/gone'"];
+    index.setScope(scope("/c", ["/a", "/b", "/c", "/gone"]));
+    await vi.advanceTimersByTimeAsync(0);
+    expect(omitted()).toHaveLength(3);
+    index.reset();
+  });
+
   it("forgets a repository once its tab closes", async () => {
     const initialize = vi.fn(async () => report());
     const index = createAutoInit({ debounceMs: 0, initialize });

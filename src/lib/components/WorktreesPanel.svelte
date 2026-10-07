@@ -296,15 +296,13 @@
       await invoke("cmd_remove_worktree", { repoPath: repo, targetPath, force });
       removeCompleted = true;
       harnessStore.recordAction({ repoPath: repo, kind: "worktree-remove", label: targetPath, ok: true });
+      // T-F09: a tab on the removed directory is stranded on a deleted path,
+      // active or not. Only the active one used to close; a background tab
+      // stayed open, held a tab slot, and was re-reported by every workspace
+      // sync. Closing the active one activates a surviving neighbor.
+      const stranded = $repoStore.openTabs.find((tab) => tab.path === targetPath);
+      if (stranded) await repoStore.closeTab(stranded.id);
       if ($repoStore.currentPath !== repo) return;
-      if ($repoStore.currentPath === targetPath) {
-        // T-F09: the active tab points INTO the removed directory. Close it —
-        // which activates a surviving neighbor — instead of stranding the
-        // workspace on a deleted path.
-        const stranded = $repoStore.openTabs.find((tab) => tab.path === targetPath);
-        if (stranded) await repoStore.closeTab(stranded.id);
-        return;
-      }
       await load();
     } catch (err: unknown) {
       if (!removeCompleted) {

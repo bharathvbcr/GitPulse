@@ -1006,6 +1006,51 @@ describe("repoStore tabs", () => {
     expect(resolveCount).toBe(2);
   });
 
+  it("marks a tab whose checkout vanished and drops it from background work", async () => {
+    const init = vi.spyOn(autoInit, "setScope");
+    const { store } = makeStore();
+    await store.openRepo("/r/kept");
+    await store.openRepo("/r/removed");
+    await store.activateTab(get(store).openTabs[0].id);
+    init.mockClear();
+
+    store.markRepoGone("/r/removed");
+
+    const tabs = get(store).openTabs;
+    // Flagged, not closed: pin, group and terminals stay with the tab.
+    expect(tabs.map((tab) => tab.path)).toEqual(["/r/kept", "/r/removed"]);
+    const gone = tabs.find((tab) => tab.path === "/r/removed");
+    expect(gone?.missing).toBe(true);
+    expect(gone?.error).toMatch(/no longer exists/);
+    expect(tabs.find((tab) => tab.path === "/r/kept")?.missing).toBe(false);
+    // The scope every background consumer reads (auto-init, live index,
+    // workspace sync) no longer carries it, so nothing re-reports it.
+    expect([...(init.mock.calls.at(-1)?.[0]?.retainedKeys ?? [])]).toEqual(["/r/kept"]);
+    expect(pathsTrustedForBackground(tabs, "/r/removed")).toEqual({
+      activeKey: null,
+      retainedKeys: ["/r/kept"],
+    });
+    init.mockRestore();
+  });
+
+  it("clears the vanished mark when the checkout comes back and hydrates", async () => {
+    const { store } = makeStore();
+    await store.openRepo("/r/back");
+    store.markRepoGone("/r/back");
+    expect(get(store).openTabs[0].missing).toBe(true);
+    await store.refresh("/r/back");
+    expect(get(store).openTabs[0].missing).toBe(false);
+    expect(get(store).openTabs[0].error).toBeNull();
+  });
+
+  it("ignores a vanished path that no tab holds", async () => {
+    const { store } = makeStore();
+    await store.openRepo("/r/alpha");
+    store.markRepoGone("/r/other");
+    expect(get(store).openTabs[0].missing).toBe(false);
+    expect(get(store).openTabs[0].error).toBeNull();
+  });
+
   it("ignores watcher events for repos that are not open", async () => {
     const { store } = makeStore();
     await store.openRepo("/r/alpha");
