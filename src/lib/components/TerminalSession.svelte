@@ -106,6 +106,7 @@
   import { linksForRow, resolveLinkAction, type LinkBuffer } from "../terminal/links";
   import { requestReveal } from "../files/revealRequests";
   import { openTaskForRun } from "../workbench/taskOpen";
+  import { noteAttempt } from "../terminal/taskLaunches";
   import { toastStore } from "../stores/toastStore";
   import {
     clampTerminalFontSize, hasRenderedBox, macLineEditing, spawnGridSize, terminalViewChord, terminalSearchSummary,
@@ -584,6 +585,7 @@
           exited = status === "exited";
           error = status === "error" ? message ?? "Terminal failed" : null;
           onStatus(status);
+          if (taskRunId) reportAttemptStart(taskRunId, status, message);
         },
         started(spawned) {
           shellPath = spawned.shell;
@@ -644,6 +646,33 @@
         warning(message) { warning = message; },
       },
     });
+  }
+
+  /**
+   * Tells the attempt's row what became of its start. This tab is usually
+   * hidden (a launch starts the agent out of sight), so a spawn the host
+   * refused — the CLI missing or too old, a bad argument — was said only in
+   * here, and the failed start then released its registry slot, leaving the
+   * Agents pane to say a quiet "not connected". Only a failure before this
+   * tab ever had a process counts as a failed start; a later one is a live
+   * session's problem, which the pane already shows from the registry.
+   *
+   * A failed start is one whose registry slot is gone once the lifecycle
+   * has finished with it (it releases the slot right after this hook). A
+   * spawn still pending past its watchdog also reports an error, but keeps
+   * its slot and may yet start, so it is not one.
+   */
+  function reportAttemptStart(runId: string, status: "starting" | "running" | "exited" | "error", message?: string) {
+    if (status === "running") noteAttempt(runId, "running", `${launcherLabel(launcher)} is running.`);
+    else if (status === "starting") noteAttempt(runId, "starting", `Starting ${launcherLabel(launcher)}…`);
+    else if (status === "error" && !nativeSessionId) {
+      // The lifecycle stringifies the rejection; its "Error: " says nothing.
+      const cause = (message ?? "").replace(/^Error:\s*/, "").trim() || "The terminal failed to start.";
+      queueMicrotask(() => {
+        if (nativeSessionId || get(terminalSessions).some((record) => record.key === tabId)) return;
+        noteAttempt(runId, "failed", cause);
+      });
+    }
   }
 
   async function spawnPty() { await lifecycle?.start(); }

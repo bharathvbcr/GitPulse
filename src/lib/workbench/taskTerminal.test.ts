@@ -4,17 +4,18 @@ import { get, writable } from "svelte/store";
 const openRepo = vi.fn();
 const setTerminalOpen = vi.fn();
 const setGlobalSurface = vi.fn();
-const repoState = writable<{ currentPath: string | null }>({ currentPath: "/work/current" });
-vi.mock("../stores/repoStore", () => ({ repoStore: { subscribe: repoState.subscribe, openRepo: (...args: unknown[]) => openRepo(...args), setTerminalOpen: (...args: unknown[]) => setTerminalOpen(...args) } }));
+const repoState = writable<{ currentPath: string | null; openTabs?: { id: string; path: string; trustRequired?: boolean }[] }>({ currentPath: "/work/current" });
+const activateTab = vi.fn();
+vi.mock("../stores/repoStore", () => ({ repoStore: { subscribe: repoState.subscribe, openRepo: (...args: unknown[]) => openRepo(...args), setTerminalOpen: (...args: unknown[]) => setTerminalOpen(...args), activateTab: (...args: unknown[]) => activateTab(...args) } }));
 vi.mock("../stores/interfaceStore", () => ({ interfaceStore: { setGlobalSurface: (...args: unknown[]) => setGlobalSurface(...args) } }));
 const findConversation = vi.fn();
-vi.mock("./client", () => ({ findConversation: (...args: unknown[]) => findConversation(...args) }));
+vi.mock("./client", async (importOriginal) => ({ ...(await importOriginal<typeof import("./client")>()), findConversation: (...args: unknown[]) => findConversation(...args), explainError: (cause: unknown) => (cause instanceof Error ? cause.message : String(cause)), launchManagedRun: vi.fn() }));
 const resolveGitRoot = vi.fn();
 vi.mock("../desktop/nativeShell", () => ({ resolveGitRoot: (...args: unknown[]) => resolveGitRoot(...args) }));
 const focusTerminalSession = vi.fn();
 vi.mock("../terminal/sessionFocus", () => ({ focusTerminalSession: (...args: unknown[]) => focusTerminalSession(...args) }));
 
-const { openAttemptCheckout, queuedTerminalNote, resumeTaskConversation, showTaskTerminal, startTaskTerminal } = await import("./taskTerminal");
+const { openAttemptCheckout, queuedTerminalNote, resumeTaskConversation, showAttemptTerminal, showTaskTerminal, startTaskTerminal, trustAttemptCheckout } = await import("./taskTerminal");
 const { consumeTaskTerminalRequest, taskTerminalRequests } = await import("../terminal/taskLaunches");
 const { terminalSessions } = await import("../terminal/sessionRegistry");
 
@@ -33,7 +34,7 @@ function liveSession(fields: { key: string; taskRunId?: string; continuesRunId?:
 
 beforeEach(() => {
   repoState.set({ currentPath: "/work/current" });
-  openRepo.mockReset(); setTerminalOpen.mockReset(); setGlobalSurface.mockReset(); findConversation.mockReset(); focusTerminalSession.mockReset();
+  openRepo.mockReset(); activateTab.mockReset(); setTerminalOpen.mockReset(); setGlobalSurface.mockReset(); findConversation.mockReset(); focusTerminalSession.mockReset();
   // A checkout root resolves to itself.
   resolveGitRoot.mockReset(); resolveGitRoot.mockImplementation(async (path: string) => path);
 });
@@ -47,10 +48,10 @@ describe("startTaskTerminal", () => {
     openRepo.mockImplementation(async (_path: string, options: { activate?: boolean }) => {
       // The request is already waiting when the dock could first host it.
       expect(get(taskTerminalRequests).map((r) => r.runId)).toEqual(["a"]);
-      expect(options).toEqual({ activate: false });
+      expect(options).toEqual({ activate: false, deferTrust: true });
       return true;
     });
-    expect(await startTaskTerminal(run("a", "/work/a"))).toBe("started");
+    expect(await startTaskTerminal(run("a", "/work/a"))).toEqual({ kind: "started" });
   });
 
   it("never takes the reader off the task: no surface change, no dock opened", async () => {
@@ -71,18 +72,18 @@ describe("startTaskTerminal", () => {
     // would wait for a dock that never mounts: the agent would never start.
     repoState.set({ currentPath: null });
     openRepo.mockResolvedValue(true);
-    expect(await startTaskTerminal(run("a", "/work/a"))).toBe("started");
-    expect(openRepo).toHaveBeenCalledWith("/work/a", { activate: true });
+    expect(await startTaskTerminal(run("a", "/work/a"))).toEqual({ kind: "started" });
+    expect(openRepo).toHaveBeenCalledWith("/work/a", { activate: true, deferTrust: true });
     expect(setGlobalSurface).not.toHaveBeenCalled();
     expect(setTerminalOpen).not.toHaveBeenCalled();
     findConversation.mockResolvedValueOnce({ resumable: true, sessionId: SESSION, cwd: "/work/a", mode: "ask", reason: "saved" });
     expect(await resumeTaskConversation({ id: "a", task_title: "Fix" })).toEqual({ outcome: "started" });
-    expect(openRepo).toHaveBeenLastCalledWith("/work/a", { activate: true });
+    expect(openRepo).toHaveBeenLastCalledWith("/work/a", { activate: true, deferTrust: true });
   });
 
-  it("keeps the terminal queued when the checkout cannot be opened", async () => {
+  it("keeps the terminal waiting, and says for which checkout, when an open is answered without a reason", async () => {
     openRepo.mockResolvedValueOnce(false);
-    expect(await startTaskTerminal(run("c", "/work/c"))).toBe("queued");
+    expect(await startTaskTerminal(run("c", "/work/c"))).toEqual({ kind: "waiting", reason: "checkout", checkout: "/work/c" });
     expect(get(taskTerminalRequests)).toEqual([{ runId: "c", repoPath: "/work/c", provider: "claude", title: "Task c" }]);
   });
 
@@ -95,8 +96,8 @@ describe("startTaskTerminal", () => {
     // Both opens are in flight (each first resolves its checkout root).
     await vi.waitFor(() => expect(openRepo).toHaveBeenCalledTimes(2));
     release(false);
-    expect(await first).toBe("queued");
-    expect(await second).toBe("started");
+    expect(await first).toEqual({ kind: "waiting", reason: "checkout", checkout: "/work/a" });
+    expect(await second).toEqual({ kind: "started" });
     expect(get(taskTerminalRequests).map((r) => r.runId)).toEqual(["a", "b"]);
   });
 
@@ -120,8 +121,8 @@ describe("an attempt whose directory is below its checkout's root", () => {
       expect(get(taskTerminalRequests)).toEqual([{ runId: "a", repoPath: "/work/a", provider: "claude", title: "Task a", startDir: "packages/web" }]);
       return path === "/work/a";
     });
-    expect(await startTaskTerminal(run("a", SUB))).toBe("started");
-    expect(openRepo).toHaveBeenCalledWith("/work/a", { activate: false });
+    expect(await startTaskTerminal(run("a", SUB))).toEqual({ kind: "started" });
+    expect(openRepo).toHaveBeenCalledWith("/work/a", { activate: false, deferTrust: true });
   });
 
   it("shows it the same way", async () => {
@@ -226,8 +227,8 @@ describe("showTaskTerminal", () => {
   });
 
   it("says where the waiting terminal will start", () => {
-    expect(queuedTerminalNote("/work/repo/.gitpulse/worktrees/fix-a1b2c3d4")).toContain("waiting for fix-a1b2c3d4 to open");
-    expect(queuedTerminalNote("C:\\work\\repo\\")).toContain("waiting for repo to open");
+    expect(queuedTerminalNote("/work/repo/.gitpulse/worktrees/fix-a1b2c3d4")).toMatch(/^Waiting for fix-a1b2c3d4 to open\./);
+    expect(queuedTerminalNote("C:\\work\\repo\\")).toMatch(/^Waiting for repo to open\./);
   });
 });
 
@@ -236,7 +237,7 @@ describe("resumeTaskConversation", () => {
     findConversation.mockResolvedValueOnce({ resumable: true, sessionId: SESSION, cwd: "/work/a/.gitpulse/worktrees/fix-1", mode: "inspect", reason: "saved" });
     openRepo.mockResolvedValueOnce(true);
     expect(await resumeTaskConversation({ id: "a", task_title: "Fix" })).toEqual({ outcome: "started" });
-    expect(openRepo).toHaveBeenCalledWith("/work/a/.gitpulse/worktrees/fix-1", { activate: false });
+    expect(openRepo).toHaveBeenCalledWith("/work/a/.gitpulse/worktrees/fix-1", { activate: false, deferTrust: true });
     expect(setGlobalSurface).not.toHaveBeenCalled();
     expect(get(taskTerminalRequests)).toEqual([
       { runId: "a", repoPath: "/work/a/.gitpulse/worktrees/fix-1", provider: "claude", title: "Fix", resume: { sessionId: SESSION, mode: "inspect", runId: "a" } },
@@ -260,5 +261,51 @@ describe("resumeTaskConversation", () => {
     expect(await resumeTaskConversation({ id: "a", task_title: "Fix" })).toEqual({ outcome: "unavailable", reason: "Claude Code has no saved conversation for this attempt." });
     expect(openRepo).not.toHaveBeenCalled();
     expect(get(taskTerminalRequests)).toEqual([]);
+  });
+});
+
+describe("an open the repository store will refuse", () => {
+  const full = (paths: string[]) => paths.map((path, index) => ({ id: `t${index}`, path }));
+
+  it("is a failure with the reason when every tab slot is taken, and queues nothing", async () => {
+    // Pre-fix this was "queued": a request that waited for a tab the store
+    // would refuse to open for as long as the slots stayed full.
+    repoState.set({ currentPath: "/work/current", openTabs: full(Array.from({ length: 24 }, (_, i) => `/other/${i}`)) });
+    openRepo.mockResolvedValue(false);
+    const outcome = await startTaskTerminal(run("a", "/work/a"));
+    expect(outcome).toMatchObject({ kind: "failed", checkout: "/work/a" });
+    expect(outcome.kind === "failed" && outcome.reason).toMatch(/Too many open repositories \(max 24\)/);
+    expect(get(taskTerminalRequests)).toEqual([]);
+    expect(openRepo).not.toHaveBeenCalled();
+    await expect(showTaskTerminal(run("a", "/work/a"))).rejects.toThrow(/Could not open a: Too many open repositories/);
+    findConversation.mockResolvedValueOnce({ resumable: true, sessionId: SESSION, cwd: "/work/a", mode: "ask", reason: "saved" });
+    expect(await resumeTaskConversation({ id: "a", task_title: "Fix" })).toMatchObject({ outcome: "unavailable" });
+  });
+
+  it("is not refused for capacity when the checkout already has a tab", async () => {
+    repoState.set({ currentPath: "/work/current", openTabs: full(["/work/a", ...Array.from({ length: 23 }, (_, i) => `/other/${i}`)]) });
+    openRepo.mockResolvedValue(true);
+    expect(await startTaskTerminal(run("a", "/work/a"))).toEqual({ kind: "started" });
+  });
+});
+
+describe("a checkout that opened waiting to be trusted", () => {
+  it("is what the start waits for, and the trust button asks on its tab", async () => {
+    openRepo.mockImplementation(async () => {
+      repoState.set({ currentPath: "/work/current", openTabs: [{ id: "tab-a", path: "/work/a", trustRequired: true }] });
+      return true;
+    });
+    expect(await startTaskTerminal(run("a", "/work/a"))).toEqual({ kind: "waiting", reason: "trust", checkout: "/work/a" });
+    expect(get(taskTerminalRequests).map((r) => r.runId)).toEqual(["a"]);
+    expect(await trustAttemptCheckout({ cwd: "/work/a" })).toBe(true);
+    expect(activateTab).toHaveBeenCalledWith("tab-a");
+    repoState.set({ currentPath: "/work/current", openTabs: [] });
+    expect(await trustAttemptCheckout({ cwd: "/work/a" })).toBe(false);
+  });
+
+  it("shows the same answer when the reader asks to see the terminal", async () => {
+    repoState.set({ currentPath: "/work/current", openTabs: [{ id: "tab-a", path: "/work/a", trustRequired: true }] });
+    openRepo.mockResolvedValue(true);
+    expect(await showAttemptTerminal(run("a", "/work/a"))).toEqual({ kind: "waiting", reason: "trust", checkout: "/work/a" });
   });
 });

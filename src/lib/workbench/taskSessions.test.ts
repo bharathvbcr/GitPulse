@@ -38,17 +38,17 @@ describe("attemptTerminalView", () => {
   });
 
   it("reports a request no session has taken, and why it waits", () => {
-    expect(attemptTerminalView("a", [], [request({})], false).waiting).toEqual({ role: "attempt", reason: "checkout" });
-    expect(attemptTerminalView("a", [], [request({})], true).waiting).toEqual({ role: "attempt", reason: "capacity" });
+    expect(attemptTerminalView("a", [], [request({})], false).waiting).toEqual({ role: "attempt", reason: "checkout", checkout: "/work/a" });
+    expect(attemptTerminalView("a", [], [request({})], true).waiting).toEqual({ role: "attempt", reason: "capacity", checkout: "/work/a" });
     expect(attemptTerminalView("a", [], [request({ resume: { sessionId: SESSION, mode: "ask", runId: "a" } })], false).waiting)
-      .toEqual({ role: "resumed", reason: "checkout" });
+      .toEqual({ role: "resumed", reason: "checkout", checkout: "/work/a" });
   });
 
   it("does not call a request waiting once its session exists", () => {
     expect(attemptTerminalView("a", [record({ key: "t", taskRunId: "a" })], [request({})], true).waiting).toBeNull();
     // The attempt's own session does not serve a resume request, nor the reverse.
     expect(attemptTerminalView("a", [record({ key: "t", taskRunId: "a" })], [request({ resume: { sessionId: SESSION, mode: "ask" } })], false).waiting)
-      .toEqual({ role: "resumed", reason: "checkout" });
+      .toEqual({ role: "resumed", reason: "checkout", checkout: "/work/a" });
   });
 
   it("ignores another attempt's requests, a reload's attach requests, and an empty id", () => {
@@ -64,9 +64,19 @@ describe("attemptTerminalView", () => {
 });
 
 describe("waitingLabel", () => {
-  it("sends the reader to the limit when slots are full, and to the checkout otherwise", () => {
-    expect(waitingLabel({ role: "attempt", reason: "capacity" }, 32)).toContain("all 32 are in use");
-    expect(waitingLabel({ role: "resumed", reason: "checkout" }, 32)).toMatch(/^The resumed conversation is waiting for its checkout/);
+  it("names what the start waits for: a terminal slot, the named checkout, or the reader's trust", () => {
+    expect(waitingLabel({ role: "attempt", reason: "capacity", checkout: "/work/a" }, 32)).toMatch(/^Waiting for a terminal slot — all 32 are in use/);
+    expect(waitingLabel({ role: "attempt", reason: "checkout", checkout: "/work/repo/.gitpulse/worktrees/fix-a1b2c3d4" }, 32)).toBe("Waiting for fix-a1b2c3d4 to open.");
+    expect(waitingLabel({ role: "resumed", reason: "checkout", checkout: "/work/a/" }, 32)).toBe("Resumed conversation · Waiting for a to open.");
+    expect(waitingLabel({ role: "attempt", reason: "trust", checkout: "/work/a" }, 32)).toMatch(/^Waiting for you to trust a\./);
+  });
+});
+
+describe("attemptTerminalView trust", () => {
+  it("says a request waits for trust before it says it waits for a slot or the checkout", () => {
+    const untrusted = (path: string) => path === "/work/a";
+    expect(attemptTerminalView("a", [], [request({})], true, untrusted).waiting).toEqual({ role: "attempt", reason: "trust", checkout: "/work/a" });
+    expect(attemptTerminalView("a", [], [request({ repoPath: "/work/b" })], false, untrusted).waiting?.reason).toBe("checkout");
   });
 });
 
