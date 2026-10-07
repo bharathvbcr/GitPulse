@@ -6,7 +6,31 @@
  * also had it optional, though Rust always sends it.
  */
 
+/** What a settled change touched; see `ChangeKind` in `watcher/mod.rs`. */
+export type ChangeKind =
+  | "refs"
+  | "index"
+  | "config"
+  | "ignore"
+  | "objects"
+  | "git_state"
+  | "worktree"
+  | "documents"
+  | "unknown";
+
+/**
+ * Read from the same paths the watcher's noise gate admitted. `paths` names
+ * top-level worktree entries only (the worktree watch is non-recursive), so
+ * it means "at least these", never "only these".
+ */
+export interface RepoChange {
+  kinds: ChangeKind[];
+  paths: string[];
+  paths_truncated: boolean;
+}
+
 /** Emitted when the filesystem watcher sees the repository change. */
 export interface RepoChangedPayload {
   path: string;
+  change: RepoChange;
 }

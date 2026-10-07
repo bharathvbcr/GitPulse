@@ -43,9 +43,148 @@ pub struct WatcherState {
     sessions: std::sync::Arc<Mutex<HashMap<String, WatchSession>>>,
 }
 
-#[derive(Clone, Serialize)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct RepoChangedPayload {
     pub path: String,
+    /// What moved since the previous emission, so a view that depends on
+    /// none of it can skip its refresh.
+    pub change: RepoChange,
+}
+
+/// What a settled change touched, read from the same paths the noise gate
+/// admitted — never a second admission rule, which is how a self-echo loop
+/// would come back.
+///
+/// The worktree watch is non-recursive, so `paths` names the top-level
+/// entries that fired, not every file below them; deeper edits surface as
+/// [`ChangeKind::Index`] or [`ChangeKind::Refs`] writes. A consumer must read
+/// `paths` as "at least these", never as "only these".
+#[derive(Clone, Debug, Default, PartialEq, Serialize)]
+pub struct RepoChange {
+    /// Sorted and deduplicated.
+    pub kinds: Vec<ChangeKind>,
+    /// Worktree-relative, `/`-separated, sorted; at most [`MAX_CHANGED_PATHS`].
+    pub paths: Vec<String>,
+    /// More worktree paths fired than `paths` holds.
+    pub paths_truncated: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChangeKind {
+    /// `HEAD`, `refs/`, `packed-refs` or a reflog of this checkout.
+    Refs,
+    /// This checkout's index. Also written by every git command that
+    /// rewrites tracked files (checkout, reset, merge, stash), so it must be
+    /// read as "the worktree may have changed".
+    Index,
+    /// Repository configuration.
+    Config,
+    /// `info/` — exclude rules and sparse-checkout patterns.
+    Ignore,
+    /// The object store.
+    Objects,
+    /// Anything else inside a git directory: merge/rebase state, another
+    /// linked worktree's private directory, hooks, shallow, modules.
+    GitState,
+    /// A worktree entry, named in [`RepoChange::paths`].
+    Worktree,
+    /// A worktree entry that is, or may contain, a Markdown document: a
+    /// Markdown name as the document vault reads it, a directory, or a removed
+    /// entry with no extension (it may have been one). Decided here so the
+    /// extension list has one owner, `markdev_vault`.
+    Documents,
+    /// The backend could not say what changed (an error, or an event naming
+    /// no path). Every view must treat it as touching everything.
+    Unknown,
+}
+
+pub const MAX_CHANGED_PATHS: usize = 64;
+
+/// Accumulates one debounce window's [`RepoChange`].
+#[derive(Default)]
+struct ChangeAccumulator {
+    kinds: std::collections::BTreeSet<ChangeKind>,
+    paths: std::collections::BTreeSet<String>,
+    truncated: bool,
+}
+
+impl ChangeAccumulator {
+    fn kind(&mut self, kind: ChangeKind) {
+        self.kinds.insert(kind);
+    }
+
+    fn worktree(&mut self, relative: &Path) {
+        self.kinds.insert(ChangeKind::Worktree);
+        let spelled = relative
+            .components()
+            .map(|c| c.as_os_str().to_string_lossy())
+            .collect::<Vec<_>>()
+            .join("/");
+        if self.paths.contains(&spelled) {
+            return;
+        }
+        if self.paths.len() >= MAX_CHANGED_PATHS {
+            self.truncated = true;
+        } else {
+            self.paths.insert(spelled);
+        }
+    }
+
+    fn take(&mut self) -> RepoChange {
+        let taken = std::mem::take(self);
+        RepoChange {
+            kinds: taken.kinds.into_iter().collect(),
+            paths: taken.paths.into_iter().collect(),
+            paths_truncated: taken.truncated,
+        }
+    }
+}
+
+/// See [`ChangeKind::Documents`]. Fails toward "may": an entry whose kind
+/// cannot be read and that has no extension is assumed to be a directory.
+fn may_hold_documents(path: &Path, relative: &Path) -> bool {
+    if markdev_vault::note::has_markdown_extension(&relative.to_string_lossy()) {
+        return true;
+    }
+    // Followed: a symlinked docs directory holds documents too.
+    match std::fs::metadata(path) {
+        Ok(meta) => meta.is_dir(),
+        Err(_) => relative.extension().is_none(),
+    }
+}
+
+/// The class of a git-directory path the noise gate already admitted.
+///
+/// `internal_roots[0]` is this checkout's own git directory. A path inside it
+/// is classified by name. A path that is only under the common directory is
+/// shared state (refs, objects, config) — except under `worktrees/<name>/`,
+/// another linked worktree's private directory, which moves this
+/// repository's worktree list and never this checkout's files. A linked
+/// checkout's own directory is that shape too, but it is `internal_roots[0]`
+/// and matched first, so the rule only ever sees its siblings.
+fn git_path_kind(path: &Path, internal_roots: &[PathBuf]) -> ChangeKind {
+    let Some((relative, is_own)) = internal_roots.iter().enumerate().find_map(|(i, root)| {
+        path.strip_prefix(root)
+            .ok()
+            .map(|relative| (relative, i == 0))
+    }) else {
+        return ChangeKind::GitState;
+    };
+    match relative
+        .components()
+        .next()
+        .and_then(|c| c.as_os_str().to_str())
+    {
+        Some("worktrees") => ChangeKind::GitState,
+        Some("HEAD" | "packed-refs" | "refs" | "logs") => ChangeKind::Refs,
+        // The common directory's `index` is the main checkout's, not ours.
+        Some("index") if is_own => ChangeKind::Index,
+        Some("config" | "config.worktree") => ChangeKind::Config,
+        Some("info") => ChangeKind::Ignore,
+        Some("objects") => ChangeKind::Objects,
+        _ => ChangeKind::GitState,
+    }
 }
 
 impl WatcherState {
@@ -324,6 +463,7 @@ fn event_updates_ignore_rules(event: &Event) -> bool {
 /// under `internal_roots` are never generated-state noise (they are either
 /// git noise or signal by construction), so the alias walk is skipped for
 /// them entirely.
+#[cfg(test)]
 fn event_has_signal(
     event: &Event,
     internal_roots: &[PathBuf],
@@ -331,30 +471,69 @@ fn event_has_signal(
     worktree_canonical: Option<&Path>,
     rules: &IgnoreRules,
 ) -> bool {
+    let mut ignored = ChangeAccumulator::default();
+    record_event_signal(
+        event,
+        internal_roots,
+        worktree,
+        worktree_canonical,
+        rules,
+        &mut ignored,
+    )
+}
+
+/// [`event_has_signal`]'s one implementation: also records, into `change`,
+/// the class of every path it admits — and only of those.
+fn record_event_signal(
+    event: &Event,
+    internal_roots: &[PathBuf],
+    worktree: &Path,
+    worktree_canonical: Option<&Path>,
+    rules: &IgnoreRules,
+    change: &mut ChangeAccumulator,
+) -> bool {
     if event.paths.is_empty() {
+        change.kind(ChangeKind::Unknown);
         return true;
     }
-    event.paths.iter().any(|path| {
+    let mut significant = false;
+    for path in &event.paths {
         if is_git_internal_noise(path, internal_roots) {
-            return false;
+            continue;
         }
         // Linked-worktree ref/object writes live under the common git dir,
         // outside the worktree checkout. They are never `.devcouncil` noise
         // and must not trigger the path-alias canonicalize walk.
         if internal_roots.iter().any(|root| path.starts_with(root)) {
-            return true;
+            change.kind(git_path_kind(path, internal_roots));
+            significant = true;
+            continue;
         }
         if is_generated_state_noise_cached(path, worktree, worktree_canonical) {
-            return false;
+            continue;
         }
         match worktree_relative(path, worktree, worktree_canonical) {
-            Some(relative) => !is_build_or_ignored_path(&relative, rules),
+            Some(relative) => {
+                if !is_build_or_ignored_path(&relative, rules) {
+                    change.worktree(&relative);
+                    if may_hold_documents(path, &relative) {
+                        change.kind(ChangeKind::Documents);
+                    }
+                    significant = true;
+                }
+            }
             // The worktree directory itself is what FSEvents reports when a
             // storm coalesces. It names no file. A `..` path still fails open:
             // refusing to classify an escape is not the same as calling it noise.
-            None => !is_worktree_root(path, worktree, worktree_canonical),
+            None => {
+                if !is_worktree_root(path, worktree, worktree_canonical) {
+                    change.kind(ChangeKind::Unknown);
+                    significant = true;
+                }
+            }
         }
-    })
+    }
+    significant
 }
 
 /// True when `path` is generated per-worktree state that GitPulse (or a
@@ -656,7 +835,7 @@ fn run_watch_loop<F>(
     on_change: F,
 ) -> WatchLoopExit
 where
-    F: Fn(String),
+    F: Fn(RepoChangedPayload),
 {
     let WatchLoopContext {
         git_dir,
@@ -667,6 +846,12 @@ where
     let mut last_event = Instant::now();
     let mut first_pending: Option<Instant> = None;
     let mut last_scan: Option<Instant> = None;
+    // What the pending window has touched; taken by each emission.
+    let mut change = ChangeAccumulator::default();
+    let emit = |change: &mut ChangeAccumulator| RepoChangedPayload {
+        path: path.clone(),
+        change: change.take(),
+    };
     let mut rules = IgnoreRules::load(Path::new(&path));
     let mut last_rules_load = Instant::now();
     // When the watched git directory is deleted (repo moved/removed), notify
@@ -701,26 +886,31 @@ where
                 // One canonicalize per batch — never per drained leftover.
                 let worktree_canonical = worktree.canonicalize().ok();
                 let mut reload_rules = event_updates_ignore_rules(&event);
-                let mut significant = event_has_signal(
+                let mut significant = record_event_signal(
                     &event,
                     &internal_roots,
                     worktree,
                     worktree_canonical.as_deref(),
                     &rules,
+                    &mut change,
                 );
                 for leftover in watcher.receiver.try_iter() {
                     significant |= match leftover {
                         Ok(event) => {
                             reload_rules |= event_updates_ignore_rules(&event);
-                            event_has_signal(
+                            record_event_signal(
                                 &event,
                                 &internal_roots,
                                 worktree,
                                 worktree_canonical.as_deref(),
                                 &rules,
+                                &mut change,
                             )
                         }
-                        Err(_) => true,
+                        Err(_) => {
+                            change.kind(ChangeKind::Unknown);
+                            true
+                        }
                     };
                 }
                 if rules_due(&rules, last_rules_load, Instant::now(), reload_rules) {
@@ -746,7 +936,7 @@ where
                         exit = WatchLoopExit::DeadRepo;
                         break 'outer;
                     }
-                    on_change(path.clone());
+                    on_change(emit(&mut change));
                     pending = false;
                     first_pending = None;
                     last_scan = Some(Instant::now());
@@ -756,6 +946,7 @@ where
             // fail-open rule above it counts as signal — open or extend the
             // pending window so the missed-events repo still refreshes.
             Ok(Err(_)) => {
+                change.kind(ChangeKind::Unknown);
                 if !pending {
                     first_pending = Some(Instant::now());
                 }
@@ -778,7 +969,7 @@ where
                         exit = WatchLoopExit::DeadRepo;
                         break 'outer;
                     }
-                    on_change(path.clone());
+                    on_change(emit(&mut change));
                     pending = false;
                     first_pending = None;
                     last_scan = Some(Instant::now());
@@ -832,9 +1023,9 @@ pub fn start_watch(
     state: &WatcherState,
     repo_path: String,
 ) -> Result<String, String> {
-    start_watch_inner(state, repo_path, move |path| {
-        if let Err(e) = app.emit("repo-changed", RepoChangedPayload { path: path.clone() }) {
-            log::warn!(target: "watcher", "repo-changed emit failed for {path}: {e}");
+    start_watch_inner(state, repo_path, move |payload| {
+        if let Err(e) = app.emit("repo-changed", &payload) {
+            log::warn!(target: "watcher", "repo-changed emit failed for {}: {e}", payload.path);
         }
     })
 }
@@ -845,7 +1036,7 @@ pub(crate) fn start_watch_inner<F>(
     on_change: F,
 ) -> Result<String, String>
 where
-    F: Fn(String) + Send + 'static,
+    F: Fn(RepoChangedPayload) + Send + 'static,
 {
     #[cfg(test)]
     eprintln!("watch setup {repo_path}: validate repository");
@@ -1377,9 +1568,182 @@ mod tests {
     fn test_repo_changed_payload_is_path_object() {
         let payload = RepoChangedPayload {
             path: "/tmp/example-repo".into(),
+            change: RepoChange {
+                kinds: vec![ChangeKind::Refs, ChangeKind::GitState, ChangeKind::Worktree],
+                paths: vec!["docs/a.md".into()],
+                paths_truncated: false,
+            },
         };
         let value = serde_json::to_value(&payload).expect("serialize");
-        assert_eq!(value, serde_json::json!({ "path": "/tmp/example-repo" }));
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "path": "/tmp/example-repo",
+                "change": {
+                    "kinds": ["refs", "git_state", "worktree"],
+                    "paths": ["docs/a.md"],
+                    "paths_truncated": false,
+                },
+            })
+        );
+    }
+
+    #[test]
+    fn git_paths_are_classified_by_what_they_move() {
+        let git = PathBuf::from("/repo/.git");
+        let own = std::slice::from_ref(&git);
+        for (relative, kind) in [
+            ("HEAD", ChangeKind::Refs),
+            ("refs/heads/main", ChangeKind::Refs),
+            ("packed-refs", ChangeKind::Refs),
+            ("logs/HEAD", ChangeKind::Refs),
+            ("index", ChangeKind::Index),
+            ("config", ChangeKind::Config),
+            ("info/exclude", ChangeKind::Ignore),
+            ("objects/ab/cdef", ChangeKind::Objects),
+            ("MERGE_HEAD", ChangeKind::GitState),
+            ("rebase-merge/done", ChangeKind::GitState),
+            // A linked worktree's private directory, seen from the main one.
+            ("worktrees/feature/HEAD", ChangeKind::GitState),
+            ("worktrees/feature/index", ChangeKind::GitState),
+        ] {
+            assert_eq!(git_path_kind(&git.join(relative), own), kind, "{relative}");
+        }
+
+        // A linked worktree: its own private dir first, the common dir second.
+        let private = git.join("worktrees/feature");
+        let linked = [private.clone(), git.clone()];
+        for (path, kind) in [
+            (private.join("index"), ChangeKind::Index),
+            (private.join("HEAD"), ChangeKind::Refs),
+            (git.join("refs/heads/feature"), ChangeKind::Refs),
+            (git.join("objects/ab/cdef"), ChangeKind::Objects),
+            // The main checkout's index, and a sibling's private state, move
+            // this repository's worktree list, never this checkout's files.
+            (git.join("index"), ChangeKind::GitState),
+            (git.join("worktrees/other/index"), ChangeKind::GitState),
+            (git.join("worktrees/other/HEAD"), ChangeKind::GitState),
+        ] {
+            assert_eq!(git_path_kind(&path, &linked), kind, "{}", path.display());
+        }
+    }
+
+    /// The classes come from the paths the noise gate admitted and from no
+    /// others. A noise-only event — the fsmonitor cookie and split-index
+    /// touches every `git status` makes — must record nothing, or a refresh
+    /// would announce itself again.
+    #[test]
+    fn only_admitted_paths_are_recorded() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let git = root.join(".git");
+        std::fs::create_dir_all(&git).unwrap();
+        let roots = vec![git.clone()];
+        let rules = IgnoreRules::load(&root);
+        let event = |paths: Vec<PathBuf>| {
+            let mut event = Event::new(notify::EventKind::Any);
+            event.paths = paths;
+            event
+        };
+
+        let mut change = ChangeAccumulator::default();
+        let noise = event(vec![
+            git.join("index.lock"),
+            git.join("fsmonitor--daemon/cookies/1234-0"),
+            git.join("sharedindex.0123456789abcdef"),
+            root.join(".devcouncil/codeintel/devmap.sqlite"),
+            root.clone(),
+        ]);
+        assert!(!record_event_signal(
+            &noise,
+            &roots,
+            &root,
+            Some(&root),
+            &rules,
+            &mut change
+        ));
+        assert_eq!(change.take(), RepoChange::default());
+
+        let mixed = event(vec![
+            git.join("index.lock"),
+            git.join("refs/heads/main"),
+            root.join("README.md"),
+        ]);
+        assert!(record_event_signal(
+            &mixed,
+            &roots,
+            &root,
+            Some(&root),
+            &rules,
+            &mut change
+        ));
+        assert_eq!(
+            change.take(),
+            RepoChange {
+                kinds: vec![
+                    ChangeKind::Refs,
+                    ChangeKind::Worktree,
+                    ChangeKind::Documents
+                ],
+                paths: vec!["README.md".into()],
+                paths_truncated: false,
+            }
+        );
+
+        // Only an entry that is, or may hold, a document says so.
+        std::fs::write(root.join("main.rs"), "fn main() {}\n").unwrap();
+        std::fs::create_dir(root.join("guides")).unwrap();
+        for (entry, documents) in [
+            ("main.rs", false),
+            ("NOTES.MDX", true),
+            ("guides", true),
+            // Removed before the event was read: no extension, may have
+            // been a directory of notes.
+            ("gone", true),
+            ("gone.rs", false),
+        ] {
+            let source = event(vec![root.join(entry)]);
+            assert!(record_event_signal(
+                &source,
+                &roots,
+                &root,
+                Some(&root),
+                &rules,
+                &mut change
+            ));
+            assert_eq!(
+                change.take().kinds.contains(&ChangeKind::Documents),
+                documents,
+                "{entry}"
+            );
+        }
+
+        // No path: the backend cannot say, so every view must refresh.
+        assert!(record_event_signal(
+            &event(vec![]),
+            &roots,
+            &root,
+            Some(&root),
+            &rules,
+            &mut change
+        ));
+        assert_eq!(change.take().kinds, vec![ChangeKind::Unknown]);
+    }
+
+    #[test]
+    fn changed_paths_are_bounded_and_say_so() {
+        let mut change = ChangeAccumulator::default();
+        for i in 0..MAX_CHANGED_PATHS + 6 {
+            change.worktree(Path::new(&format!("file-{i:03}")));
+        }
+        // A repeat of a kept path is not an overflow.
+        change.worktree(Path::new("file-000"));
+        let taken = change.take();
+        assert_eq!(taken.paths.len(), MAX_CHANGED_PATHS);
+        assert!(taken.paths_truncated);
+        assert_eq!(taken.kinds, vec![ChangeKind::Worktree]);
+        // Taking resets the window.
+        assert_eq!(change.take(), RepoChange::default());
     }
 
     #[test]
@@ -1838,7 +2202,13 @@ mod tests {
 
     /// Spawns the real debounce loop over a real watcher and returns a
     /// receiver of `repo-changed` paths plus a stop handle.
-    fn spawn_loop(dir: &Path) -> (std::sync::mpsc::Receiver<String>, Arc<AtomicBool>, PathBuf) {
+    fn spawn_loop(
+        dir: &Path,
+    ) -> (
+        std::sync::mpsc::Receiver<RepoChangedPayload>,
+        Arc<AtomicBool>,
+        PathBuf,
+    ) {
         use std::process::Command;
 
         let output = Command::new("git")
@@ -1993,7 +2363,7 @@ mod tests {
             let Ok(first) = rx.recv_timeout(Duration::from_secs(10)) else {
                 continue; // whole batch dropped by the backend: retry
             };
-            assert!(!first.is_empty());
+            assert!(!first.path.is_empty());
 
             // Quiet window well past the 400ms settle: no further callbacks
             // may arrive for this burst, because no further events exist to
@@ -2032,10 +2402,21 @@ mod tests {
         loop {
             std::fs::write(root.join(format!("unstaged-edit-{n}.txt")), "dirty\n").unwrap();
             n += 1;
-            if rx
-                .recv_timeout(DEBOUNCE_QUIET + Duration::from_millis(200))
-                .is_ok()
-            {
+            if let Ok(payload) = rx.recv_timeout(DEBOUNCE_QUIET + Duration::from_millis(200)) {
+                // The emission names what it touched, not only that
+                // something did.
+                assert!(
+                    payload.change.kinds.contains(&ChangeKind::Worktree),
+                    "{payload:?}"
+                );
+                assert!(
+                    payload
+                        .change
+                        .paths
+                        .iter()
+                        .any(|p| p.starts_with("unstaged-edit-")),
+                    "{payload:?}"
+                );
                 break;
             }
             assert!(
@@ -2057,10 +2438,11 @@ mod tests {
         loop {
             std::fs::write(root.join(".git").join(format!("gitpulse-probe-{n}")), "x").unwrap();
             n += 1;
-            if rx
-                .recv_timeout(DEBOUNCE_QUIET + Duration::from_millis(200))
-                .is_ok()
-            {
+            if let Ok(payload) = rx.recv_timeout(DEBOUNCE_QUIET + Duration::from_millis(200)) {
+                assert!(
+                    payload.change.kinds.contains(&ChangeKind::GitState),
+                    "{payload:?}"
+                );
                 break;
             }
             assert!(
@@ -3613,7 +3995,7 @@ mod tests {
             let Ok(first) = rx.recv_timeout(Duration::from_secs(10)) else {
                 continue; // backend delivered nothing yet: retry
             };
-            assert!(!first.is_empty());
+            assert!(!first.path.is_empty());
 
             // Quiet window well past the 400ms settle: no further callbacks
             // may arrive, because the noise half produced nothing to debounce.

@@ -180,11 +180,33 @@ Local evidence: `/tmp/gitpulse-docs-timing-before.log`,
 `/tmp/gitpulse-exit-observation-baseline.log`.
 
 Still open in the overall audit: finer-grained stutter recording and unfinished
-operation diagnostics, path-aware watcher invalidation, and measured native
-macOS rendering/idle-power behavior with the updated build. Scope deferral
-does not yet govern repository-state or subscribed metric refreshes. Physical
-Windows/Linux execution and native Mac sleep/wake/display testing remain
-separate from these deterministic queue and filesystem tests.
+operation diagnostics, and measured native macOS rendering/idle-power behavior
+with the updated build. Physical Windows/Linux execution and native Mac
+sleep/wake/display testing remain separate from these deterministic queue and
+filesystem tests.
+
+Closed since (2026-10-07):
+
+- **Scope deferral covers repository state and metrics.** Repository-state
+  refreshes follow `src/lib/repos/watcherRefresh.ts`: the active tab of a shown
+  window after the 200 ms debounce; a background tab at most once per 30 s
+  (once per 5 s across all tabs) so its tab-strip badges stay roughly current —
+  bounded, deliberately not zero; nothing while the window is hidden, owed once
+  when it is shown; activation hydrates in full. Subscribed metrics measure
+  automatically only for the visible, active repository
+  (`canMeasureAutomatically` in `src/lib/metrics/freshness.ts`) and resume on
+  activation. The sentence this replaces predated both.
+- **Watcher invalidation is path-aware.** `repo-changed` carries what moved —
+  `refs`, `index`, `config`, `ignore`, `objects`, `git_state`, `worktree`
+  (with up to 64 top-level paths), `documents`, or `unknown` — classified in
+  `src-tauri/src/watcher/mod.rs` from the same paths the noise gate admitted,
+  so fsmonitor cookies and split-index touches still record nothing.
+  `src/lib/repos/changeScope.ts` routes it: a `git fetch` (refs and objects)
+  refreshes repository state and disk usage, not line counts, coverage, the
+  code index or the document vault; a source edit skips the vault. An index
+  write counts as content (git writes it whenever it rewrites tracked files),
+  and an unknown or unreadable change refreshes everything. The worktree watch
+  stays non-recursive, so a path list means "at least these".
 
 ## Earlier validation and remaining gates
 
@@ -231,6 +253,44 @@ unverified. A previous browser run of `harness/responsiveness.html` detected a
 canary could not be evaluated in this pass: the in-app browser repeatedly
 returned `target closed while handling command`, and Chrome automation was
 unavailable. That is an unavailable check, not a passing canary.
+
+**Browser harnesses, 2026-10-07** (Chromium in the desktop app's browser pane,
+`bunx vite --config vite.harness.config.ts`; the harness served the main
+checkout, which then held another session's uncommitted workbench edits):
+
+- `harness/responsiveness.html`: the deliberate 900 ms block was reported as
+  `1 delayed UI timer sample(s); max_delay_ms=404`. The probe measures timer
+  lateness, not the block's length; the detector is live.
+- Stress canary (`harness/stress.html`, `tabs=5`, `cycles=12` — a short run,
+  not the 40–45-cycle sweep): `LoopCanary` tripped first (`depth=1`,
+  `effect_update_depth_exceeded`; it needs at least two tabs, and at `tabs=1`
+  it reads 0, which is a dead detector, not a pass). Then, each with
+  `depthExceeded=0`, `mountError=null`, `otherCrashes=[]`: `PulseView/chaos`,
+  `StoragePanel/switch`, `HealthPanel/chaos`, `CoverageViewer/chaos`,
+  `FleetView/chaos`, `StatusBar/chaos`.
+- **Not clean:** `ManviOpsPanel/chaos` reported `otherCrashes: ["TypeError:
+  Cannot read properties of undefined (reading 'unregisterListener')"]` —
+  probably the harness's Tauri event mock lacking unlisten internals, but not
+  established, so this component is unexamined, not clean.
+- **Did not arm:** `TerminalPanel/termtabs` ended with 0 terminal tabs and 0
+  xterm screens. The harness mounts the panel with no repository ("Open a
+  repository to start a shell") and the scenario's opener filter skips buttons
+  with an `aria-label`, which the launcher now has. No terminal tab was ever
+  opened, so its `depthExceeded=0` says nothing.
+
+**Installed build, not measured.** Native WKWebView frame pacing, cold/warm
+navigation, idle CPU/memory and the eight-hour soak were not run: the release
+build was not installed over the user's app (their choice), and no number here
+stands in for them. `scripts/native-sample.mjs` records the installed app's
+resident memory and CPU over a soak (`--duration 8h --interval 60 --out
+soak.jsonl`) and prints the least-squares memory slope. It keeps the app, its
+bundled helpers and the processes it hosts (agent CLIs and shells in terminal
+tabs) apart, and it cannot see the WKWebView content processes, which launchd
+starts. Frame pacing comes from the app's own responsiveness monitor
+(`performance:ui` entries in the diagnostics log during the soak); cold and
+warm navigation need a stopwatch or an instrumented build. A two-second smoke
+run against the running 1.4.0 app read 167 MiB resident for the app process —
+a wiring check, not an idle measurement: agents were working in its tabs.
 
 The semaphore saturation test initially used the global gate and interfered
 with unrelated concurrent tests. It now drives the same production runner

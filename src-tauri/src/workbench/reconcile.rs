@@ -317,6 +317,9 @@ pub(super) fn release(state: &WorkbenchState, input: &str) -> Result<Value, Work
             "Select a saved attempt.",
         ));
     }
+    // A receipt its own observer could not store is better evidence than
+    // anything judged here, so it goes in first.
+    super::receipts::replay(state, Some(&request.id));
     let (verdict, item) = settle(state, &request.id)?;
     Ok(match verdict {
         Verdict::Release(_) => {
@@ -326,11 +329,31 @@ pub(super) fn release(state: &WorkbenchState, input: &str) -> Result<Value, Work
     })
 }
 
+/// Removes the task brief directories a crashed GitPulse left in the temp
+/// root, judged by the same writer-liveness evidence a native owner is.
+///
+/// Separate from [`sweep`] because it needs no task store: a profile that was
+/// never created can still have briefs on disk from a launch that crashed
+/// before anything else was saved.
+pub(super) fn sweep_briefs() -> usize {
+    let removed = super::terminal_command::remove_abandoned_briefs(
+        &std::env::temp_dir(),
+        process_birth::running_since,
+    );
+    if removed > 0 {
+        log::info!(target: "workbench", "removed {removed} task brief(s) left behind by an earlier session");
+    }
+    removed
+}
+
 /// Every held run, judged; the ones the evidence allows are released.
 ///
 /// Returns how many were released. Bounded by `MAX_PAGES` per state, and a
 /// failure on one run never stops the others.
 pub(super) fn sweep(state: &WorkbenchState) -> Result<usize, WorkbenchError> {
+    // Receipts that storage refused when their runs ended are stored first,
+    // so a recorded exit code is never overwritten by `outcome_uncertain`.
+    super::receipts::replay(state, None);
     let mut ids = Vec::new();
     for held in HELD {
         let mut cursor: Option<String> = None;

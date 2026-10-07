@@ -694,11 +694,11 @@ pub fn command_gate_decision(verdict: &PolicyVerdict) -> HookOutput {
         // ignore this channel, and this channel is where the *real*
         // non-checks are announced.
         //
-        // The scope rungs are a separate and additional gap: a hook cannot pass
-        // the task scope `harness::guard_command` passes (`scope_for` is
-        // private to that module), so `scope.unplanned` and friends are never
-        // reached here at all. What this gate does catch is the hard rungs —
-        // force-push and the destructive commands — which refuse above.
+        // A checkout bound to a task sends its scope (`run_command_gate`), and
+        // a scope violation is not demoted, so it refuses above. What a scope
+        // reaches is the command line's *redirection targets*: Manvi does not
+        // read a write out of a command's arguments, so `sed -i` on a file
+        // outside the plan still comes back here as a demoted allow.
         PolicyStatus::Allowed
         | PolicyStatus::Demoted
         | PolicyStatus::Granted
@@ -709,6 +709,21 @@ pub fn command_gate_decision(verdict: &PolicyVerdict) -> HookOutput {
 
 /// Gathers, then decides. The impure half of command-gate.
 pub fn run_command_gate(input: &HookInput) -> HookOutput {
+    command_gate_with(input, |job| within_budget(BUDGET, job))
+}
+
+/// One harness judgement, built on the caller's thread and run on whichever
+/// thread `run` chooses.
+type CommandJob = Box<dyn FnOnce() -> PolicyVerdict + Send>;
+
+/// [`run_command_gate`] with the budgeted runner injected. The tests run the
+/// job on their own thread, because the sidecar's test serial guard is
+/// reentrant only on the thread that holds it — the budget's worker thread
+/// would wait on it until the budget expired.
+fn command_gate_with(
+    input: &HookInput,
+    run: impl FnOnce(CommandJob) -> Option<PolicyVerdict>,
+) -> HookOutput {
     if input.command.is_empty() {
         return HookOutput::notice(
             "GitPulse did not gate this call: the tool input carried no command.",
@@ -720,20 +735,28 @@ pub fn run_command_gate(input: &HookInput) -> HookOutput {
              It ran UNGATED.",
         );
     }
-    let root = find_git_root(Path::new(&input.cwd))
-        .map(|p| p.to_string_lossy().into_owned())
-        .unwrap_or_else(|| input.cwd.clone());
-
     let command = input.command.clone();
-    // No `HostScope`: this process has no bound task, and `harness::scope_for`
-    // is private to that module. Without it the ladder stops at `task.absent`,
-    // which the host posture demotes to an allow — so this gate reliably
-    // catches the hard rungs (force-push, destructive commands) and cannot
-    // reach the scope rungs. That is a smaller gate than the desktop app's, and
-    // it is a real one.
-    let judged = within_budget(BUDGET, move || {
-        harness::check_command(&root, &command, None)
-    });
+    // A checkout bound to a task is judged against that task's scope, resolved
+    // by the same owner `harness::guard_command` uses — so a redirection into a
+    // file outside the plan reaches `scope.unplanned`, which Manvi does not
+    // demote once a scope is declared. Resolving it opens the ledger and the
+    // task store, so it runs inside the budget the host's timeout allows.
+    //
+    // Outside a Git repository there is no checkout to be bound, and asking the
+    // ledger about a bare directory would fail closed — refusing every command
+    // an agent runs anywhere else. That case is judged with no scope, as it
+    // always was.
+    let job: CommandJob = match find_git_root(Path::new(&input.cwd)) {
+        Some(root) => {
+            let root = root.to_string_lossy().into_owned();
+            Box::new(move || harness::check_command_in_scope(&root, &command))
+        }
+        None => {
+            let root = input.cwd.clone();
+            Box::new(move || harness::check_command(&root, &command, None))
+        }
+    };
+    let judged = run(job);
     if let Some(verdict) = judged.as_ref() {
         // The verdict is the only record of why this hook stayed silent, and
         // silence is its most common answer. Without this line an operator
@@ -2173,6 +2196,191 @@ mod tests {
             .expect("a warning must reach the user");
         assert!(message.contains("command.slow"));
         assert!(message.contains("this rewrites history"));
+    }
+
+    /// A `manvi serve` stand-in that behaves as Manvi does since 31ecc70:
+    /// with a declared scope, a redirect outside it is a `scope.unplanned`
+    /// denial that posture=host does not demote; without one, the same command
+    /// is a demoted allow. Every policy request is recorded.
+    #[cfg(unix)]
+    const FAKE_SCOPED_MANVI: &str = r#"#!/bin/sh
+reply() {
+  id=$(printf '%s' "$1" | sed -n 's/^{"id":"\([0-9]*\)".*/\1/p')
+  printf '{"id":"%s","ok":true,"result":%s}\n' "$id" "$2"
+}
+IFS= read -r line || exit 1
+reply "$line" '{"protocol":1,"ops":["hello","policy.check.command","policy.check.file"],"posture":"host"}'
+while IFS= read -r line; do
+  printf '%s\n' "$line" >> "@REQUESTS@"
+  case "$line" in
+    *'"scope"'*) reply "$line" '{"action":"deny","rule":"scope.unplanned","severity":"soft","reason":"Task TASK-HOOK does not authorize changes to docs/elsewhere.md","target":"docs/elsewhere.md","task_id":"TASK-HOOK","demoted":"","degraded":[]}' ;;
+    *) reply "$line" '{"action":"allow","rule":"task.absent","severity":"soft","reason":"No running DevCouncil task authorizes this file write.","target":"docs/elsewhere.md","task_id":"","demoted":"serve.posture=host: no task model in the embedding host","degraded":[]}' ;;
+  esac
+done
+"#;
+
+    #[cfg(unix)]
+    fn scoped_hook_fixture(bind: bool) -> (tempfile::TempDir, String, std::path::PathBuf) {
+        use crate::test_support::git_in;
+        let dir = tempfile::tempdir().expect("repository");
+        git_in(dir.path(), &["init", "-b", "main"]);
+        std::fs::write(dir.path().join("seed.txt"), "seed").expect("seed");
+        git_in(dir.path(), &["add", "seed.txt"]);
+        git_in(dir.path(), &["commit", "-m", "seed"]);
+        let repo = dir
+            .path()
+            .canonicalize()
+            .expect("canonical repository")
+            .to_string_lossy()
+            .into_owned();
+        if bind {
+            let db = crate::tasks::store_path(&repo);
+            std::fs::create_dir_all(db.parent().expect("store parent")).expect("store dir");
+            let store = dc_store::Store::open(&db).expect("task store");
+            store
+                .connection()
+                .execute(
+                    "INSERT INTO tasks (id, title, description, planned_files_json, status)
+                     VALUES ('TASK-HOOK', 'Hook scope', '',
+                         '[{\"path\":\"src/planned.rs\",\"allowed_change\":\"modify\"}]', 'in_progress')",
+                    [],
+                )
+                .expect("task row");
+            crate::ledger::bindings::bind(&repo, &repo, "TASK-HOOK").expect("bind");
+        }
+        let requests = dir.path().join("requests.ndjson");
+        (dir, repo, requests)
+    }
+
+    #[cfg(unix)]
+    fn bash_call(cwd: &str, command: &str) -> HookInput {
+        HookInput {
+            hook_event_name: PRE_TOOL_USE.to_string(),
+            tool_name: "Bash".to_string(),
+            cwd: cwd.to_string(),
+            command: command.to_string(),
+            ..Default::default()
+        }
+    }
+
+    /// The production gate, judged on this thread (see [`command_gate_with`]).
+    #[cfg(unix)]
+    fn gate_here(input: &HookInput) -> HookOutput {
+        command_gate_with(input, |job| Some(job()))
+    }
+
+    #[cfg(unix)]
+    fn install_scoped_manvi(
+        dir: &Path,
+        requests: &Path,
+        serial: &crate::harness::sidecar::SidecarTestGuard,
+    ) -> crate::harness::sidecar::TestBinaryBinding {
+        use std::os::unix::fs::PermissionsExt;
+        let script = dir.join("scoped-manvi");
+        let body = FAKE_SCOPED_MANVI.replace("@REQUESTS@", &requests.display().to_string());
+        std::fs::write(&script, body).expect("write fake sidecar");
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        crate::harness::sidecar::bind_test_binary(serial, script.to_string_lossy())
+    }
+
+    /// The agent's Bash call is judged against the task its checkout is bound
+    /// to. Before, the hook sent no scope at all, so a redirect outside the
+    /// plan was measured against no task and came back a demoted allow.
+    #[cfg(unix)]
+    #[test]
+    fn a_task_bound_session_is_refused_a_redirect_outside_its_scope() {
+        let (dir, repo, requests) = scoped_hook_fixture(true);
+        let serial = crate::harness::sidecar::test_serial();
+        let _binary = install_scoped_manvi(dir.path(), &requests, &serial);
+
+        // From a subdirectory: the scope belongs to the checkout, not the cwd.
+        let sub = Path::new(&repo).join("docs");
+        std::fs::create_dir_all(&sub).expect("subdirectory");
+        let output = gate_here(&bash_call(
+            sub.to_str().expect("utf8"),
+            "echo x > ../docs/elsewhere.md",
+        ));
+
+        let sent = std::fs::read_to_string(&requests).unwrap_or_default();
+        let request: Value = serde_json::from_str(sent.lines().next().expect("a policy request"))
+            .expect("the request is JSON");
+        assert_eq!(
+            request["params"]["scope"]["task_id"], "TASK-HOOK",
+            "the bound task's scope never reached the harness: {request}"
+        );
+        assert_eq!(
+            request["params"]["scope"]["planned_files"][0],
+            "src/planned.rs"
+        );
+        assert_eq!(request["params"]["root"], repo.as_str());
+
+        let rendered = output.render().unwrap_or_default();
+        let decision = output
+            .hook_specific_output
+            .unwrap_or_else(|| panic!("an out-of-scope write must be decided: {rendered}"));
+        assert!(
+            matches!(decision.permission_decision, Some(PermissionDecision::Deny)),
+            "{rendered}"
+        );
+        assert!(rendered.contains("scope.unplanned"), "{rendered}");
+    }
+
+    /// An unbound checkout declares nothing, and the same command keeps the
+    /// answer it always had.
+    #[cfg(unix)]
+    #[test]
+    fn an_unbound_session_sends_no_scope_and_stays_silent() {
+        let (dir, repo, requests) = scoped_hook_fixture(false);
+        let serial = crate::harness::sidecar::test_serial();
+        let _binary = install_scoped_manvi(dir.path(), &requests, &serial);
+
+        let output = gate_here(&bash_call(&repo, "echo x > docs/elsewhere.md"));
+        let sent = std::fs::read_to_string(&requests).unwrap_or_default();
+        assert!(!sent.is_empty(), "the command was not judged at all");
+        assert!(
+            !sent.contains("\"scope\""),
+            "an unbound checkout declared a scope: {sent}"
+        );
+        assert!(output.is_silent(), "{:?}", output.render());
+    }
+
+    /// A repository GitPulse is not trusted in has no binding it may read —
+    /// resolving one runs Git, which the trust gate refuses. Failing closed
+    /// there denied every Bash call in every repository the person never
+    /// opened in GitPulse (`hook_protocol_stress` caught it as a deny with no
+    /// harness installed). It is judged as it was before scopes: unscoped.
+    #[cfg(unix)]
+    #[test]
+    fn an_untrusted_repository_is_judged_without_scope_not_refused() {
+        let (dir, repo, requests) = scoped_hook_fixture(false);
+        crate::repository_trust::revoke(&repo).expect("revoke trust");
+        let serial = crate::harness::sidecar::test_serial();
+        let _binary = install_scoped_manvi(dir.path(), &requests, &serial);
+
+        let output = gate_here(&bash_call(&repo, "echo x > docs/elsewhere.md"));
+        assert!(output.is_silent(), "{:?}", output.render());
+        let sent = std::fs::read_to_string(&requests).unwrap_or_default();
+        assert!(!sent.is_empty(), "the command was not judged at all");
+        assert!(!sent.contains("\"scope\""), "{sent}");
+    }
+
+    /// Outside any repository there is no binding to look up. Asking the ledger
+    /// anyway would fail closed and refuse every command an agent ran there.
+    #[cfg(unix)]
+    #[test]
+    fn a_session_outside_any_repository_is_not_refused_for_having_no_binding() {
+        let (dir, _repo, requests) = scoped_hook_fixture(false);
+        let serial = crate::harness::sidecar::test_serial();
+        let _binary = install_scoped_manvi(dir.path(), &requests, &serial);
+        let elsewhere = tempfile::tempdir().expect("non-repository directory");
+
+        let output = gate_here(&bash_call(
+            elsewhere.path().to_str().expect("utf8"),
+            "echo x > notes.txt",
+        ));
+        assert!(output.is_silent(), "{:?}", output.render());
+        let sent = std::fs::read_to_string(&requests).unwrap_or_default();
+        assert!(!sent.contains("\"scope\""), "{sent}");
     }
 
     #[test]

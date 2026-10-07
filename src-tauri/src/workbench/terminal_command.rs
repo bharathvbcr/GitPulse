@@ -44,7 +44,7 @@ impl BriefFile {
             .map_err(|e| error("file_error", e.to_string()))?
             .as_nanos();
         let dir = root.join(format!(
-            "gitpulse-task-{}-{tick}-{}",
+            "{BRIEF_DIR_PREFIX}{}-{tick}-{}",
             std::process::id(),
             FILE_SEQUENCE.fetch_add(1, Ordering::Relaxed)
         ));
@@ -59,7 +59,7 @@ impl BriefFile {
         builder
             .create(&dir)
             .map_err(|e| error("file_error", e.to_string()))?;
-        let path = dir.join("task-brief.md");
+        let path = dir.join(BRIEF_FILE_NAME);
         let mut options = OpenOptions::new();
         options.write(true).create_new(true);
         #[cfg(unix)]
@@ -88,6 +88,111 @@ impl BriefFile {
         Ok(brief)
     }
 }
+/// The directory-name prefix [`BriefFile::under`] writes.
+const BRIEF_DIR_PREFIX: &str = "gitpulse-task-";
+const BRIEF_FILE_NAME: &str = "task-brief.md";
+/// Bounds one sweep of a shared temp root.
+const MAX_BRIEF_DIRS_PER_SWEEP: usize = 1024;
+
+/// `gitpulse-task-{pid}-{nanos}-{seq}`: the GitPulse process that wrote a
+/// brief directory, and when.
+fn brief_owner(name: &str) -> Option<(u32, u128)> {
+    let mut parts = name.strip_prefix(BRIEF_DIR_PREFIX)?.split('-');
+    let pid = parts.next()?.parse::<u32>().ok().filter(|p| *p > 0)?;
+    let stamp = parts.next()?.parse::<u128>().ok()?;
+    parts.next()?.parse::<u64>().ok()?;
+    parts.next().is_none().then_some((pid, stamp))
+}
+
+/// Removes brief directories whose writer is provably gone.
+///
+/// [`BriefFile`]'s `Drop` is the normal cleanup, and a GitPulse that crashed,
+/// was force-quit or SIGKILLed never runs it — every brief it had handed an
+/// agent stays in the temp root, holding task text, until the OS clears it.
+/// The directory's name records its writer's pid and the instant it was
+/// written, which is exactly what `owner_since` judges: `Gone` means no
+/// process with that pid had started by then, so the writer is dead (a pid
+/// reused since is a later process and does not count). `Alive` and `Unknown`
+/// keep the directory; a check that could not run never deletes.
+///
+/// Only the exact shape `BriefFile` makes is removed: a real directory (not a
+/// symlink), owned by this user, holding nothing but the brief. Anything else
+/// at a matching name is left, and logged, rather than recursed into. Returns
+/// how many directories were removed.
+pub(super) fn remove_abandoned_briefs(
+    root: &Path,
+    owner_since: impl Fn(u32, u128) -> super::process_birth::Liveness,
+) -> usize {
+    use super::process_birth::Liveness;
+    let entries = match std::fs::read_dir(root) {
+        Ok(entries) => entries,
+        Err(error) => {
+            log::warn!(target: "workbench", "could not scan {} for abandoned task briefs: {error}", root.display());
+            return 0;
+        }
+    };
+    let mut removed = 0;
+    let mut considered = 0;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some((pid, stamp)) = name.to_str().and_then(brief_owner) else {
+            continue;
+        };
+        considered += 1;
+        if considered > MAX_BRIEF_DIRS_PER_SWEEP {
+            log::warn!(target: "workbench", "more than {MAX_BRIEF_DIRS_PER_SWEEP} task brief directories in {}; the rest wait for the next sweep", root.display());
+            break;
+        }
+        match owner_since(pid, stamp) {
+            Liveness::Gone => {}
+            Liveness::Alive => continue,
+            Liveness::Unknown(reason) => {
+                log::info!(target: "workbench", "kept task brief {}: could not check its writer (pid {pid}): {reason}", name.to_string_lossy());
+                continue;
+            }
+        }
+        let dir = entry.path();
+        match remove_brief_dir(&dir) {
+            Ok(()) => removed += 1,
+            Err(why) => {
+                log::warn!(target: "workbench", "kept abandoned task brief {}: {why}", dir.display());
+            }
+        }
+    }
+    removed
+}
+
+fn remove_brief_dir(dir: &Path) -> Result<(), String> {
+    let meta = std::fs::symlink_metadata(dir).map_err(|e| e.to_string())?;
+    if !meta.file_type().is_dir() {
+        return Err("it is not a directory".into());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        // SAFETY: getuid has no preconditions and cannot fail.
+        if meta.uid() != unsafe { libc::getuid() } {
+            return Err("it belongs to another user".into());
+        }
+    }
+    for entry in std::fs::read_dir(dir).map_err(|e| e.to_string())? {
+        let entry = entry.map_err(|e| e.to_string())?;
+        let kind = entry.file_type().map_err(|e| e.to_string())?;
+        if entry.file_name() != BRIEF_FILE_NAME || !kind.is_file() {
+            return Err(format!(
+                "it holds {:?}, which a task brief directory never does",
+                entry.file_name()
+            ));
+        }
+    }
+    match std::fs::remove_file(dir.join(BRIEF_FILE_NAME)) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.to_string()),
+    }
+    std::fs::remove_dir(dir).map_err(|e| e.to_string())
+}
+
 impl Drop for BriefFile {
     fn drop(&mut self) {
         for (what, result) in [
@@ -1676,6 +1781,82 @@ mod tests {
         assert!(BriefFile::under(root.path(), "").is_err());
         drop(other);
         assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
+    }
+
+    /// A GitPulse that is SIGKILLed never runs `BriefFile`'s `Drop`, so its
+    /// briefs outlive it. Before this sweep nothing removed them.
+    #[test]
+    fn a_crashed_writers_briefs_are_removed_and_nothing_else_is() {
+        use super::remove_abandoned_briefs;
+        use crate::workbench::process_birth::Liveness;
+
+        let root = tempfile::tempdir().unwrap();
+        // What a crash leaves: the brief on disk, the destructor never run.
+        let crashed = BriefFile::under(root.path(), "# Task brief v1\n").unwrap();
+        let crashed_dir = crashed.dir.clone();
+        std::mem::forget(crashed);
+
+        // A matching name holding something a brief directory never does.
+        let decoy = root.path().join("gitpulse-task-7-1-1");
+        std::fs::create_dir(&decoy).unwrap();
+        std::fs::write(decoy.join("task-brief.md"), "x").unwrap();
+        std::fs::write(decoy.join("someone-elses.txt"), "keep me").unwrap();
+        // A name that only looks like one, and a symlink at a matching name.
+        let unrelated = root.path().join("gitpulse-task-notes");
+        std::fs::create_dir(&unrelated).unwrap();
+        #[cfg(unix)]
+        let link = {
+            let target = tempfile::tempdir().unwrap();
+            let link = root.path().join("gitpulse-task-8-1-1");
+            std::os::unix::fs::symlink(target.path(), &link).unwrap();
+            (link, target)
+        };
+
+        // A writer that cannot be checked keeps everything.
+        let kept = remove_abandoned_briefs(root.path(), |_, _| Liveness::Unknown("denied".into()));
+        assert_eq!(kept, 0);
+        assert!(
+            crashed_dir.exists(),
+            "an unchecked writer must never lose its brief"
+        );
+        // So does one that is still running.
+        assert_eq!(
+            remove_abandoned_briefs(root.path(), |_, _| Liveness::Alive),
+            0
+        );
+        assert!(crashed_dir.exists());
+
+        // A gone writer loses exactly the directory BriefFile made.
+        let removed = remove_abandoned_briefs(root.path(), |_, _| Liveness::Gone);
+        assert_eq!(removed, 1);
+        assert!(!crashed_dir.exists(), "the crashed writer's brief survived");
+        assert!(
+            decoy.join("someone-elses.txt").exists(),
+            "a foreign file was deleted"
+        );
+        assert!(unrelated.exists());
+        #[cfg(unix)]
+        {
+            assert!(
+                link.0.symlink_metadata().is_ok(),
+                "a symlink was followed or removed"
+            );
+            assert!(link.1.path().exists());
+        }
+    }
+
+    /// Against the real process table: this process wrote the brief and is
+    /// alive, so its live brief is never swept from under it.
+    #[test]
+    fn a_live_writers_brief_is_kept_by_the_real_liveness_check() {
+        let root = tempfile::tempdir().unwrap();
+        let live = BriefFile::under(root.path(), "# Task brief v1\n").unwrap();
+        let removed = super::remove_abandoned_briefs(
+            root.path(),
+            crate::workbench::process_birth::running_since,
+        );
+        assert_eq!(removed, 0);
+        assert!(live.path.exists());
     }
 
     #[test]

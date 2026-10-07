@@ -7,6 +7,7 @@ import {
   type MetricClock,
   type MetricSnapshot,
 } from "./freshness";
+import { dependsOnStorage, dependsOnWorktreeContent } from "../repos/changeScope";
 
 /**
  * A clock the test drives. Timers fire only when `advance` reaches their
@@ -299,6 +300,61 @@ describe("metric freshness", () => {
     expect(metric.snapshot(REPO).stale).toBe("repository-changed");
     expect(metric.snapshot(REPO).value).toBe(1);
     expect(source.calls).toHaveLength(1);
+  });
+
+  it("ignores a change it does not depend on, and still honours one it does or one unknown", async () => {
+    const c = fakeClock();
+    const source = counting([1, 2, 3, 4]);
+    const metric = createMetric(
+      { name: "loc", measure: source.measure, debounceMs: 300, minIntervalMs: 0, dependsOn: dependsOnWorktreeContent },
+      c.clock,
+    );
+    metric.subscribe(REPO, () => {});
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(source.calls).toHaveLength(1);
+
+    // A fetch: remote refs and objects, nothing in the checkout.
+    metric.invalidate(REPO, { kinds: ["refs", "objects"], paths: [], paths_truncated: false });
+    expect(metric.snapshot(REPO).stale).toBeNull();
+    c.advance(1_000);
+    await Promise.resolve();
+    expect(source.calls).toHaveLength(1);
+
+    metric.invalidate(REPO, { kinds: ["worktree"], paths: ["src"], paths_truncated: false });
+    expect(metric.snapshot(REPO).stale).toBe("repository-changed");
+    c.advance(1_000);
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(source.calls).toHaveLength(2);
+
+    // No change information at all is every change.
+    metric.invalidate(REPO, null);
+    expect(metric.snapshot(REPO).stale).toBe("repository-changed");
+    metric.invalidate(REPO);
+    c.advance(1_000);
+    await Promise.resolve();
+    expect(source.calls).toHaveLength(3);
+  });
+
+  it("routes a registry change only to the metrics that depend on it", async () => {
+    const loc = counting();
+    const storage = counting();
+    const registry = createMetricRegistry();
+    const c = fakeClock();
+    const locMetric = createMetric({ name: "loc", measure: loc.measure, debounceMs: 0, minIntervalMs: 0, dependsOn: dependsOnWorktreeContent }, c.clock);
+    const storageMetric = createMetric({ name: "storage", measure: storage.measure, debounceMs: 0, minIntervalMs: 0, dependsOn: dependsOnStorage }, c.clock);
+    registry.register(locMetric as never);
+    registry.register(storageMetric as never);
+    locMetric.subscribe(REPO, () => {});
+    storageMetric.subscribe(REPO, () => {});
+    await Promise.resolve();
+    await Promise.resolve();
+
+    // `git gc`: only the object store moved.
+    registry.invalidate(REPO, { kinds: ["objects"], paths: [], paths_truncated: false });
+    expect(locMetric.snapshot(REPO).stale).toBeNull();
+    expect(storageMetric.snapshot(REPO).stale).toBe("repository-changed");
   });
 
   it("coalesces a storm of change events into one refresh", async () => {

@@ -427,7 +427,7 @@ GitPulse enforces compile-time and pre-commit contract safety across the Rust/Ty
 | Contract Tool | Command | Description |
 | --- | --- | --- |
 | **IPC Checker** | `bun run check:ipc` | Verifies all 245 Rust `cmd_*` handlers match frontend `invoke()` calls with zero untracked orphans. |
-| **Type Sync Checker** | `bun run check:types` | Asserts Rust Serde structs match TypeScript interfaces field-for-field and wire-type-for-wire-type across 1320 data fields, over 189 structs, in 75 contracts. The IPC payload types that remain unchecked are enumerated with a reason each in `scripts/ipc-type-coverage-contract.test.ts`. |
+| **Type Sync Checker** | `bun run check:types` | Asserts Rust Serde structs match TypeScript interfaces field-for-field and wire-type-for-wire-type across 1324 data fields, over 190 structs, in 75 contracts. The IPC payload types that remain unchecked are enumerated with a reason each in `scripts/ipc-type-coverage-contract.test.ts`. |
 | **Release Version Gate** | `bun run check:release` | Validates that `package.json`, `tauri.conf.json`, `Cargo.toml`, `Cargo.lock`, and every discovered plugin manifest agree. Plugin manifests are found under `plugins/<name>/` rather than hardcoded, because one package ships a manifest per agent client and the newest one is the likeliest to be missed. |
 | **MCP Install Doctor** | `bun run mcp:doctor` | Handshakes the `gitpulse-mcp` on PATH — the binary the plugin manifests spawn — and asserts both its version and its manifest's store schema match this tree, then asks what source both binaries were built from against the digest `mcp:install` recorded. Version is the release identity and cannot see a fix that landed between releases; the digest can. Missing schema identity is unresponsive, never a pass, and an unrecorded install is *unverifiable*, never an OK. Reports *absent*, *unresponsive*, *stale*, and *unverifiable* as distinct failures. |
 
@@ -805,7 +805,21 @@ Process reaping evidence is carried separately from exit status. An unconfirmed
 exit stays unresolved in the store. During shutdown, new work is refused while
 already-owned native observers may persist receipts into the existing store; PTY
 cleanup retains its slot until the callback returns. Private brief files are
-removed on normal cleanup.
+removed on normal cleanup, and a crashed GitPulse's are removed at the next
+startup: the brief directory's name records its writer's pid and creation
+instant, and `reconcile::sweep_briefs` removes it only when
+`process_birth::running_since` says that writer is gone — never a symlink,
+never recursively, never a directory holding anything but the brief.
+
+A receipt the store refuses — closed, locked, a full disk — is not lost.
+`workbench/receipts.rs` owns the observer's start/finish decision and, on a
+refused write, journals the *observation* (start identity, exit, spawn
+failure) to `run-receipts/{run_id}.json` beside the profile database. A store
+request cannot be journaled instead: it needs the run's current revision, and
+the read that supplies it fails with the store. Reconciliation replays the
+journal through the same decision before it judges anything, so an observed
+exit code beats `outcome_uncertain`; replay is idempotent through the fixed
+per-owner request ids and the early returns for an ended run.
 
 An owner that crashed never finishes its attempt, so `workbench/reconcile.rs`
 releases attempts whose owner can no longer report, through the store's
@@ -825,9 +839,16 @@ provider before recording such an attempt `unresolved` (released at once), and
 abandons one not activated within five minutes (`starting` is released
 `MANAGED_ACTIVATION_GRACE_SECS`, ten minutes, after `claimed_at`). Before that,
 an owner of the form `manvi-{pid}-{nanos}-{token}` is released once that Manvi
-is gone. A provider driven as Manvi drives it exits when its driver is killed
-(measured for Claude Code and Codex before any turn). Crash-file
-cleanup and durable retries after receipt storage failure remain open. Run
+is gone — a rule only for attempts never activated, which have run no turn.
+A provider driven as Manvi drives it exits when its driver is killed, but not
+always at once (measured 2026-10-07 by SIGKILLing a driver speaking Manvi's
+argv and frames at each point, over real accounts): before any turn
+and with the model request in flight it goes within about ten seconds (Claude
+Code 2.1.292: 8.9 s; Codex 0.153.4: 1.0 s), and Claude Code with an approval
+pending in 12 s — but while a tool is running it lives until the tool returns
+(53.6 s for a `sleep 45`). Codex's tool and approval cases are unmeasured: its
+configured model is refused on this machine's account. An activated attempt is
+therefore judged by its recorded provider process, never by its Manvi. Run
 history uses bounded newest-first metadata pages and polls active attempts only
 while the inspector is visible.
 
