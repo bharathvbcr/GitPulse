@@ -2,11 +2,16 @@ import { describe, expect, it } from "vitest";
 import {
   dependabotBadgeClass,
   formatAuditCounts,
+  issueClass,
   normalizeSeverity,
   severityClass,
+  toneCardClass,
+  toneChipClass,
+  toneLabel,
   updateKind,
   updateKindClass,
 } from "./format";
+import type { HealthTone } from "./summary";
 
 describe("health format", () => {
   it("normalizes npm and cargo severity labels", () => {
@@ -228,5 +233,28 @@ describe("dependabotBadgeClass — severity casing (regression)", () => {
     expect(
       dependabotBadgeClass([{ severity: "low" }, { severity: "CRITICAL" }]),
     ).toBe("text-rose-300");
+  });
+});
+
+describe("health tone presentation", () => {
+  const tones: HealthTone[] = ["clear", "note", "unknown", "warn", "critical"];
+
+  it("gives every tone its own chip, card and accessible label", () => {
+    for (const render of [toneChipClass, toneCardClass, toneLabel]) {
+      expect(new Set(tones.map(render)).size).toBe(tones.length);
+    }
+  });
+
+  it("never renders a check that could not run like one that came back clear", () => {
+    expect(toneLabel("unknown")).toBe("not established");
+    expect(toneChipClass("unknown")).toContain("border-dashed");
+    expect(toneChipClass("unknown")).not.toBe(toneChipClass("clear"));
+    expect(toneCardClass("unknown")).not.toBe(toneCardClass("clear"));
+  });
+
+  it("styles issues by trimmed, case-insensitive severity", () => {
+    expect(issueClass(" ERROR ")).toContain("rose");
+    expect(issueClass("Warning")).toContain("amber");
+    expect(issueClass("info")).toBe(issueClass("anything else"));
   });
 });

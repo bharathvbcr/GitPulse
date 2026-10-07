@@ -1,8 +1,9 @@
 import { describe, expect, it } from "vitest";
-import { ACTIVE_WINDOW_MS, GLANCE_RANK, agentGlance, asksForReader, attemptTerminalView, attemptUrgency, checkoutChanges, mostUrgent, pendingRequests, releasedNote, requestsLine, shortSpan, waitingLabel, type AttemptSession } from "./taskSessions";
+import { ACTIVE_WINDOW_MS, GLANCE_RANK, agentGlance, asksForReader, attemptTerminalView, attemptUrgency, checkoutChanges, mostUrgent, orderMonitored, pendingRequests, releasedNote, requestsLine, shortSpan, waitingLabel, type AttemptSession } from "./taskSessions";
 import type { SessionActivity } from "../terminal/sessionActivity";
 import type { TerminalSessionRecord } from "../terminal/sessionRegistry";
 import type { TaskTerminalRequest } from "../terminal/taskLaunches";
+import type { TaskRun } from "./client";
 
 const close = async () => {};
 const record = (fields: Partial<TerminalSessionRecord> & { key: string }): TerminalSessionRecord =>
@@ -228,5 +229,23 @@ describe("pendingRequests", () => {
     const unread = requestsLine({ count: 0, more: true });
     expect(unread?.tone).not.toBe("needs-you");
     expect(unread?.text).not.toMatch(/^0/);
+  });
+});
+
+describe("orderMonitored", () => {
+  const base: TaskRun = { kind: "external_terminal", id: "run", revision: 1, updated_at: 100, task_id: "task", source_revision: 2, task_title: "Task", repository_id: "repo", provider: "codex", permission_mode: "ask", state: "running", cwd: "/repo", created_at: 0, expires_at: 400, session_id: null, exit_code: null, reason: "", outcome_uncertain: false };
+  const row = (id: string, tone: keyof typeof GLANCE_RANK | null, created_at: number) =>
+    ({ id, tone, run: { ...base, id, created_at } });
+
+  it("puts the most urgent first and, among equals, the newest attempt first", () => {
+    const rows = [row("quiet-old", "quiet", 1), row("none", null, 9), row("error", "error", 2), row("quiet-new", "quiet", 5), row("needs-you", "needs-you", 0)];
+    expect(orderMonitored(rows).map((r) => r.id)).toEqual(["needs-you", "error", "quiet-new", "quiet-old", "none"]);
+  });
+
+  it("returns a new array and leaves its input in place", () => {
+    const rows = [row("b", "quiet", 1), row("a", "error", 2)];
+    const ordered = orderMonitored(rows);
+    expect(ordered).not.toBe(rows);
+    expect(rows.map((r) => r.id)).toEqual(["b", "a"]);
   });
 });
