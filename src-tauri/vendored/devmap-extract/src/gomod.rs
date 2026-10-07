@@ -190,6 +190,61 @@ pub fn collect_go_modules(root: &Path) -> anyhow::Result<Vec<GoModule>> {
     Ok(modules)
 }
 
+/// Directories (repo-relative, `/`-separated) that hold an indexed `.go` file
+/// **and** a `.go` file the index does not hold.
+///
+/// Go compiles every `.go` file in a package directory, indexed or not — a
+/// gitignored `*.pb.go`, a mock generator's output — so a package whose
+/// directory holds one the index never read has declarations no rung can
+/// see. The resolver's unexported-selector rung proves "exactly one method of
+/// this name in the package" from the index, and that proof needs the index
+/// to *be* the package. This is the disk half of that check, kept out of the
+/// resolver so resolution stays a pure function of its inputs.
+///
+/// Reads only the directories that already hold an indexed Go file, one level
+/// each, so the cost is one `read_dir` per Go package. A directory that
+/// cannot be listed is reported too: unreadable is not evidence of complete.
+pub fn go_dirs_with_unindexed_files<'a>(
+    root: &Path,
+    indexed: impl IntoIterator<Item = &'a str>,
+) -> Vec<String> {
+    let mut by_dir: std::collections::BTreeMap<String, std::collections::BTreeSet<String>> =
+        std::collections::BTreeMap::new();
+    for path in indexed {
+        let path = path.replace('\\', "/");
+        if !path.ends_with(".go") {
+            continue;
+        }
+        let (dir, name) = match path.rsplit_once('/') {
+            Some((dir, name)) => (dir.to_string(), name.to_string()),
+            None => (".".to_string(), path.clone()),
+        };
+        by_dir.entry(dir).or_default().insert(name);
+    }
+    let mut incomplete = Vec::new();
+    for (dir, names) in by_dir {
+        let listing = if dir == "." {
+            root.to_path_buf()
+        } else {
+            root.join(&dir)
+        };
+        let Ok(entries) = fs::read_dir(&listing) else {
+            incomplete.push(dir);
+            continue;
+        };
+        let unread = entries.flatten().any(|entry| {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            name.ends_with(".go")
+                && !names.contains(&name)
+                && entry.file_type().is_ok_and(|kind| !kind.is_dir())
+        });
+        if unread {
+            incomplete.push(dir);
+        }
+    }
+    incomplete
+}
+
 /// Git worktree root containing `start`, if any. `.git` may be a directory or
 /// a gitlink file (worktrees).
 pub fn git_worktree_root(start: &Path) -> Option<PathBuf> {
@@ -207,6 +262,44 @@ pub fn git_worktree_root(start: &Path) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A directory whose `.go` files the index holds only in part is reported;
+    /// one it holds wholly is not; a directory named `x.go` is not a file; and
+    /// a directory that cannot be listed is reported rather than trusted.
+    #[test]
+    fn a_package_directory_with_an_unindexed_go_file_is_reported() {
+        let root = std::env::temp_dir().join(format!("devmap-go-unindexed-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        for dir in ["whole", "partial", "dirnamed", "dirnamed/fake.go"] {
+            fs::create_dir_all(root.join(dir)).unwrap();
+        }
+        for file in [
+            "top.go",
+            "whole/a.go",
+            "whole/a_test.go",
+            "whole/README.md",
+            "partial/a.go",
+            "partial/api.pb.go",
+            "dirnamed/a.go",
+        ] {
+            fs::write(root.join(file), "package p\n").unwrap();
+        }
+        let indexed = [
+            "top.go",
+            "whole/a.go",
+            "whole/a_test.go",
+            "partial/a.go",
+            "dirnamed/a.go",
+            "gone/a.go",
+        ];
+        let reported = go_dirs_with_unindexed_files(&root, indexed);
+        assert_eq!(
+            reported,
+            vec!["gone".to_string(), "partial".to_string()],
+            "`partial` holds an unread api.pb.go; `gone` cannot be listed"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
 
     #[test]
     fn module_discovery_prunes_build_caches_like_source_discovery() {

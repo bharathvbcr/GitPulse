@@ -1,6 +1,6 @@
 [package]
 name = "devmap-resolve"
-version = "1.3.5"
+version = "0.2.4"
 edition = "2021"
 license = "Apache-2.0"
 repository = "https://github.com/bharathvbcr/DevCouncil"
@@ -39,7 +39,23 @@ name = "adversarial_resolve"
 required-features = ["parse"]
 
 [[test]]
+name = "python_module_constants"
+required-features = ["parse"]
+
+[[test]]
+name = "type_aliases_are_not_call_targets"
+required-features = ["parse"]
+
+[[test]]
+name = "same_file_type_position"
+required-features = ["parse"]
+
+[[test]]
 name = "rust_qualified_super_calls"
+required-features = ["parse"]
+
+[[test]]
+name = "rust_qualified_path_calls"
 required-features = ["parse"]
 
 [[test]]
@@ -166,4 +182,20 @@ required-features = ["parse"]
 
 [[test]]
 name = "deref_transparent_receivers"
+required-features = ["parse"]
+
+[[test]]
+name = "go_unexported_selector"
+required-features = ["parse"]
+
+[[test]]
+name = "python_modules_loaded_by_path"
+required-features = ["parse"]
+
+[[test]]
+name = "python_path_constants_and_loaders"
+required-features = ["parse"]
+
+[[test]]
+name = "python_sys_path_imports"
 required-features = ["parse"]

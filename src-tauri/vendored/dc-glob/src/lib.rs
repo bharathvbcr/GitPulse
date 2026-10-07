@@ -26,14 +26,25 @@ const MAX_UNITS: usize = 16_384;
 ///
 /// Matching is case-sensitive, matching Python's `fnmatchcase`.
 pub fn matches(pattern: &str, name: &str) -> bool {
+    try_matches(pattern, name).unwrap_or(false)
+}
+
+/// [`matches`], saying when it could not decide.
+///
+/// `None` means the input was past [`MAX_UNITS`] or the walk exhausted its
+/// step budget. [`matches`] reads that as false; Go's `fnmatch` reads it as
+/// false for `Match` and as true for `MatchFold`, the deny-list entry point,
+/// where a false would let a write through. A caller answering for either one
+/// needs the distinction, which a bool erases.
+pub fn try_matches(pattern: &str, name: &str) -> Option<bool> {
     // Reject on bytes before allocating a `Vec<char>` for a multi-megabyte input.
     if pattern.len() > MAX_UNITS * 4 || name.len() > MAX_UNITS * 4 {
-        return false;
+        return None;
     }
     let pat: Vec<char> = pattern.chars().collect();
     let text: Vec<char> = name.chars().collect();
     if pat.len() > MAX_UNITS || text.len() > MAX_UNITS {
-        return false;
+        return None;
     }
     match_from(&pat, &text)
 }
@@ -48,7 +59,7 @@ pub fn matches_any<S: AsRef<str>>(patterns: &[S], name: &str) -> bool {
 /// `*` is handled with a saved-position loop rather than recursion per
 /// character, so a pattern of many stars against a long path stays linear in
 /// the common case instead of exponential.
-fn match_from(pat: &[char], text: &[char]) -> bool {
+fn match_from(pat: &[char], text: &[char]) -> Option<bool> {
     let (mut pi, mut ti) = (0usize, 0usize);
     // Saved backtrack point: the star we most recently expanded, and how far
     // the text pointer had advanced when we chose that expansion.
@@ -66,7 +77,7 @@ fn match_from(pat: &[char], text: &[char]) -> bool {
     loop {
         steps += 1;
         if steps > limit {
-            return false;
+            return None;
         }
         if pi < pat.len() {
             match pat[pi] {
@@ -106,7 +117,7 @@ fn match_from(pat: &[char], text: &[char]) -> bool {
                 _ => {}
             }
         } else if ti == text.len() {
-            return true;
+            return Some(true);
         }
 
         // Mismatch: give the last star one more character and retry.
@@ -116,7 +127,7 @@ fn match_from(pat: &[char], text: &[char]) -> bool {
                 ti = star_ti + 1;
                 star = Some((star_pi, ti));
             }
-            _ => return false,
+            _ => return Some(false),
         }
     }
 }
@@ -222,6 +233,19 @@ mod tests {
         assert!(
             checked >= 800,
             "only {checked} cases loaded from the fixture"
+        );
+    }
+
+    #[test]
+    fn try_matches_says_when_it_could_not_decide() {
+        assert_eq!(try_matches("*.py", "a.py"), Some(true));
+        assert_eq!(try_matches("*.py", "a.rs"), Some(false));
+        let long = "a".repeat(MAX_UNITS + 1);
+        assert_eq!(try_matches(&long, "a"), None);
+        assert_eq!(try_matches("a", &long), None);
+        assert!(
+            !matches(&long, "a"),
+            "matches keeps reading undecided as false"
         );
     }
 

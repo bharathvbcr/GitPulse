@@ -49,6 +49,38 @@ fn refusal(message: impl Into<String>) -> rusqlite::Error {
     rusqlite::Error::ToSqlConversionFailure(Box::new(StoreRefusal(message.into())))
 }
 
+/// What a reader is told about a damaged full-text index, and what to do.
+///
+/// Two causes produce the same symptom, and the remedy differs, so both are
+/// named. Damage in `nodes_fts` is what `devmap repair --fts` rebuilds. But a
+/// long-lived reader whose SQLite locks were stripped (fixed in 7cdd0249, still
+/// true of any process started before it) sees a store that looks corrupt while
+/// a fresh process reads the same file cleanly — and no repair reaches that
+/// process's view.
+fn fts_damage_reason(what: &str) -> String {
+    format!(
+        "{what}; rebuild the full-text index with `devmap repair --fts`. If a fresh \
+         `devmap status` on this store reports it healthy, this process's view of the \
+         store is stale rather than the index damaged: restart it. If the damage \
+         survives the repair, the database itself is damaged: rebuild it with \
+         `devmap build --full`"
+    )
+}
+
+/// Name a corrupt read of the full-text index as that, not as a damaged database.
+///
+/// Applied only to statements that read `nodes_fts`, so a genuinely corrupt
+/// symbol table is never sent to a repair that cannot touch it. Every other
+/// error passes through unchanged.
+fn fts_failure(error: rusqlite::Error) -> rusqlite::Error {
+    if error.sqlite_error_code() != Some(rusqlite::ErrorCode::DatabaseCorrupt) {
+        return error;
+    }
+    refusal(fts_damage_reason(&format!(
+        "the full-text index (`nodes_fts`) could not be read: {error}"
+    )))
+}
+
 /// Typed refusal when a store's stamped schema is not this binary's.
 ///
 /// Carried inside `rusqlite::Error::ToSqlConversionFailure` so existing
@@ -121,9 +153,10 @@ use crate::schema::{
     MIGRATION_V16_TO_V17, MIGRATION_V17_TO_V18_BACKFILL_EDGES,
     MIGRATION_V17_TO_V18_BACKFILL_UNRESOLVED, MIGRATION_V17_TO_V18_RENAME_EDGES,
     MIGRATION_V17_TO_V18_RENAME_UNRESOLVED, MIGRATION_V18_TO_V19, MIGRATION_V19_TO_V20,
-    MIGRATION_V20_TO_V21, MIGRATION_V21_TO_V22, MIGRATION_V3_TO_V4, MIGRATION_V4_TO_V5,
-    MIGRATION_V4_TO_V5_EDGE_INDEXES, MIGRATION_V5_TO_V6, MIGRATION_V6_TO_V7, MIGRATION_V7_TO_V8,
-    MIGRATION_V8_TO_V9, MIGRATION_V9_TO_V10, PYTHON_INDEX_SCHEMA_VERSION, VALIDITY_RANGE_TABLES,
+    MIGRATION_V20_TO_V21, MIGRATION_V21_TO_V22, MIGRATION_V23_TO_V24, MIGRATION_V3_TO_V4,
+    MIGRATION_V4_TO_V5, MIGRATION_V4_TO_V5_EDGE_INDEXES, MIGRATION_V5_TO_V6, MIGRATION_V6_TO_V7,
+    MIGRATION_V7_TO_V8, MIGRATION_V8_TO_V9, MIGRATION_V9_TO_V10, PYTHON_INDEX_SCHEMA_VERSION,
+    VALIDITY_RANGE_TABLES,
 };
 
 /// Failed drain attempts after which a pending path stops being retried.
@@ -741,6 +774,17 @@ pub struct Store {
     /// generation's. Only the newest asked-about generation is held, so this is
     /// three words of memory rather than a map that grows with history.
     generation_counts: Mutex<Option<(u32, usize, usize)>>,
+    /// `(generation, symbols reachable through the full-text index)` for the
+    /// generation last checked by `status`.
+    ///
+    /// Memoized for the reason `generation_counts` is — the count is a join
+    /// over every symbol of the generation, 6.5 ms warm and 74 ms cold on this
+    /// repository's 15,034, against a `status` that otherwise costs ~3 ms. Unlike
+    /// those counts it is not immutable: index damage can arrive mid-generation.
+    /// The per-call readability probe in `fts_health_locked` still runs, so
+    /// what the memo can hide is a *partial* loss arriving after the first
+    /// check, until the next generation or the next process.
+    fts_reachable: Mutex<Option<(u32, usize)>>,
     /// The analysis status of the generation last asked about.
     ///
     /// Immutable for the same reason the counts are — a generation's
@@ -1619,11 +1663,10 @@ impl WriteBreakdown {
 /// leave the one build worth profiling as the one build with no profile.
 ///
 /// Gated on `parse` because its only caller is: `save_generation_timed` is the
-/// write path and needs the grammar-identity stamps. With the feature off this
-/// is dead code, and `cargo clippy -p devmap-query --no-default-features`
-/// refuses it -- the store's own feature-off check cannot, because
-/// `devmap-serve` is a dev-dependency that pulls default features straight back
-/// in. [`WriteBreakdown`] itself stays ungated: it is public, an embedder that
+/// write path, which a build without grammars does not carry (see
+/// [`Store::save_generation`]). With the feature off this is dead code, and
+/// `cargo check -p devmap-store --no-default-features` warns about it.
+/// [`WriteBreakdown`] itself stays ungated: it is public, an embedder that
 /// reads a persisted map can name the type, and gating it would gate the
 /// re-export too.
 #[cfg(feature = "parse")]
@@ -1645,6 +1688,21 @@ fn charge(sink: &mut f64) -> Charge<'_> {
         sink,
         started: std::time::Instant::now(),
     }
+}
+
+/// Per name: its sites, and whether the per-name cap cut them.
+pub type UnresolvedSitesByName = BTreeMap<String, (Vec<UnresolvedSiteRow>, bool)>;
+
+/// One unresolved call site, as [`Store::unresolved_sites_naming`] returns it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnresolvedSiteRow {
+    pub source_file: String,
+    pub source_symbol: String,
+    /// The receiver expression as written, when the call had one.
+    pub receiver: Option<String>,
+    /// The ledger's own class: `uninferred_receiver`, `unresolved`,
+    /// `external`, … — why the resolver did not bind it.
+    pub classification: String,
 }
 
 /// One committed build, as recorded by [`Store::build_history`].
@@ -1772,6 +1830,66 @@ impl std::fmt::Display for VacuumAction {
 /// One owner for the rule. Four bounded readers each carried their own copy of
 /// this clamp and a fifth, `latest_unresolved`, was written without it; that is
 /// the shape a shared helper exists to prevent.
+/// What a WAL sidecar's link count says about it, read from an open handle.
+#[derive(Debug, PartialEq, Eq)]
+enum SidecarLinks {
+    /// The ordinary case: one name, this one.
+    Single,
+    /// Deleted after it was opened — SQLite removes `-wal` when the last
+    /// writer connection closes, so a reader racing a committing build sees
+    /// this. It is the missing-sidecar case, and refusing it failed reads
+    /// exactly while a build committed (`queries_succeed_while_a_build_is_committing`).
+    Unlinked,
+    /// A second name for the same inode: the alias the check exists to refuse,
+    /// because WAL and writer ownership could then diverge.
+    Aliased,
+}
+
+fn sidecar_links(count: u64) -> SidecarLinks {
+    match count {
+        0 => SidecarLinks::Unlinked,
+        1 => SidecarLinks::Single,
+        _ => SidecarLinks::Aliased,
+    }
+}
+
+#[cfg(test)]
+mod sidecar_link_tests {
+    use super::{sidecar_links, SidecarLinks};
+
+    #[test]
+    fn only_a_second_name_is_an_alias() {
+        assert_eq!(sidecar_links(0), SidecarLinks::Unlinked);
+        assert_eq!(sidecar_links(1), SidecarLinks::Single);
+        assert_eq!(sidecar_links(2), SidecarLinks::Aliased);
+        assert_eq!(sidecar_links(u64::MAX), SidecarLinks::Aliased);
+    }
+
+    /// The race is real, not hypothetical: a handle opened before the file is
+    /// deleted reports zero links, which the old `!= 1` test called "multiple".
+    #[cfg(unix)]
+    #[test]
+    fn a_sidecar_deleted_after_open_reports_zero_links() {
+        let dir = std::env::temp_dir().join(format!(
+            "devmap-sidecar-unlinked-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let wal = dir.join("index.sqlite-wal");
+        std::fs::write(&wal, b"").unwrap();
+        let handle = std::fs::File::open(&wal).unwrap();
+        std::fs::remove_file(&wal).unwrap();
+        let links = devmap_extract::safe_fs::file_link_count(&handle).unwrap();
+        assert_eq!(links, 0);
+        assert_eq!(sidecar_links(links), SidecarLinks::Unlinked);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
 fn sqlite_limit(limit: usize) -> i64 {
     limit.min(i64::MAX as usize) as i64
 }
@@ -2166,34 +2284,6 @@ const REQUIRED_SCHEMA: &[(&str, &[&str])] = &[
         ],
     ),
 ];
-
-/// The identity a payload written by *this* build would carry, or `None` when
-/// this build cannot know.
-///
-/// The answer is the compiled grammar versions, so without the `parse` feature
-/// there is no answer — not "current" and not "stale", but *unknown*. That
-/// distinction is the whole reason this is one function: both callers previously
-/// reached straight into `devmap_extract::cache`, which is `#[cfg(feature =
-/// "parse")]`, so `--no-default-features` did not compile at all and the
-/// feature's own documentation ("Off, this crate builds without tree-sitter and
-/// answers questions about a persisted map rather than building one") was false.
-/// That configuration is not hypothetical: `devmap-extract/Cargo.toml` records
-/// GitPulse linking `devmap-query` to answer impact queries in-process, never
-/// indexing, and paying 49 crates and 32 C-compiled grammars for it.
-///
-/// Neither caller may turn `None` into a match. A payload whose currency was
-/// never checked must not be reported as current.
-fn current_payload_identity(language: &str) -> Option<(String, String)> {
-    #[cfg(feature = "parse")]
-    {
-        Some(devmap_extract::cache::current_payload_identity(language))
-    }
-    #[cfg(not(feature = "parse"))]
-    {
-        let _ = language;
-        None
-    }
-}
 
 impl Store {
     /// Page cache for a write connection, in KiB (negative = KiB, per SQLite).
@@ -2754,6 +2844,8 @@ impl Store {
             // to hold: a store built from scratch and one walked up the ladder
             // are indistinguishable.
             tx.execute_batch(MIGRATION_V21_TO_V22)?;
+            // After v21's drop of the same index, as on the ladder.
+            tx.execute_batch(MIGRATION_V23_TO_V24)?;
             Self::validate_schema(tx)?;
             tx.execute(
                 &format!("PRAGMA user_version = {}", CURRENT_SCHEMA_VERSION),
@@ -3124,6 +3216,13 @@ impl Store {
             // stamp makes an older binary refuse the store rather than
             // reconstructing those rows as neighbouring tiers.
             conn.execute("PRAGMA user_version = 23", [])?;
+            version = 23;
+        }
+        if version == 23 {
+            // `CREATE INDEX IF NOT EXISTS`, so a racing opener that already
+            // built it makes this a no-op rather than a failure.
+            conn.execute_batch(MIGRATION_V23_TO_V24)?;
+            conn.execute("PRAGMA user_version = 24", [])?;
             version = CURRENT_SCHEMA_VERSION;
         }
         if version != CURRENT_SCHEMA_VERSION {
@@ -3239,6 +3338,7 @@ impl Store {
             conn: Mutex::new(conn),
             edge_index: Mutex::new(None),
             generation_counts: Mutex::new(None),
+            fts_reachable: Mutex::new(None),
             generation_analysis_status: Mutex::new(None),
             source_freshness_cache: Mutex::new(None),
             db_path: Some(path.to_path_buf()),
@@ -3364,6 +3464,7 @@ impl Store {
             conn: Mutex::new(conn),
             edge_index: Mutex::new(None),
             generation_counts: Mutex::new(None),
+            fts_reachable: Mutex::new(None),
             generation_analysis_status: Mutex::new(None),
             source_freshness_cache: Mutex::new(None),
             db_path: Some(path.to_path_buf()),
@@ -3427,8 +3528,16 @@ impl Store {
     /// kernel's to keep consistent. Best-effort and owner-only: a sidecar
     /// another user owns is left for that user, and the write that follows
     /// reports it.
-    fn checked_sidecars(db_path: &Path) -> Result<Vec<devmap_extract::safe_fs::SafeFile>> {
-        use devmap_extract::safe_fs::{Access, Creation, SafeFile};
+    /// Validate both WAL sidecars and report the ones present.
+    ///
+    /// Inspected through their directory entries, never opened: this runs on
+    /// every open, in processes that already hold connections to this store,
+    /// and closing a descriptor on `-shm` releases every SQLite lock the
+    /// process holds on it. See `safe_fs::inspect_regular` and
+    /// `tests/a_second_open_keeps_the_first_connections_locks.rs`.
+    fn checked_sidecars(
+        db_path: &Path,
+    ) -> Result<Vec<(std::path::PathBuf, devmap_extract::safe_fs::EntryStatus)>> {
         // Validate both siblings before SQLite or permission repair touches
         // either. A missing sibling is normal; an unsafe one is a refusal.
         let mut sidecars = Vec::new();
@@ -3436,18 +3545,23 @@ impl Store {
             let mut name = db_path.as_os_str().to_os_string();
             name.push(suffix);
             let path = std::path::PathBuf::from(name);
-            match SafeFile::open(&path, Access::Read, Creation::Never) {
-                Ok(file) => {
-                    if devmap_extract::safe_fs::file_link_count(&file)
-                        .map_err(|error| refusal(error.to_string()))?
-                        != 1
-                    {
-                        return Err(refusal(format!(
-                            "sidecar {} has multiple hard links",
-                            path.display()
-                        )));
+            match devmap_extract::safe_fs::inspect_regular(&path) {
+                Ok(entry) => {
+                    match sidecar_links(entry.links) {
+                        SidecarLinks::Single => sidecars.push((path, entry)),
+                        // A directory entry never reports zero links — a
+                        // sidecar SQLite deleted between the lookup and the
+                        // stat arrives as `NotFound` below — but the count is
+                        // the classifier's to read, and an unlinked file is the
+                        // missing-sibling case, not an alias.
+                        SidecarLinks::Unlinked => {}
+                        SidecarLinks::Aliased => {
+                            return Err(refusal(format!(
+                                "sidecar {} has multiple hard links",
+                                path.display()
+                            )));
+                        }
                     }
-                    sidecars.push(file);
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                 Err(error) => {
@@ -3464,34 +3578,74 @@ impl Store {
     fn repair_sidecar_modes(db_path: &Path) -> Result<()> {
         #[cfg(unix)]
         {
-            use devmap_extract::safe_fs::{Access, Creation, SafeFile};
+            use devmap_extract::safe_fs::{Access, Creation, EntryStatus, SafeFile};
             use std::os::unix::fs::{MetadataExt, PermissionsExt};
             let sidecars = Self::checked_sidecars(db_path)?;
             const OWNER_WRITE: u32 = 0o200;
+            // Decided from directory entries, with no descriptor on the store:
+            // this runs before every writable open, usually in a process that
+            // already holds a connection to this store, and closing a handle on
+            // it would release that connection's locks. See `checked_sidecars`.
+            let own = match devmap_extract::safe_fs::inspect_regular(db_path) {
+                Ok(entry) => entry,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+                Err(error) => return Err(refusal(error.to_string())),
+            };
+            // Only our own writable database authorizes repairing our sidecars.
+            if own.mode & OWNER_WRITE == 0 || !own.is_owned_by_current_user() {
+                return Ok(());
+            }
+            let needing: Vec<(std::path::PathBuf, EntryStatus)> = sidecars
+                .into_iter()
+                .filter(|(_, entry)| entry.uid == own.uid && entry.mode & OWNER_WRITE == 0)
+                .collect();
+            if needing.is_empty() {
+                return Ok(());
+            }
+            // The repair itself needs handles: `fchmod` and the replacement
+            // checks below are descriptor operations. Reaching here means a
+            // sidecar this user owns lacks the owner-write bit, which SQLite
+            // never leaves on a sidecar a writable connection created — it
+            // takes a read of a store that was read-only at the time. A
+            // connection this process opened *then* and still holds is the one
+            // whose locks these handles' close can release; that is named here
+            // rather than handled, because the alternative is chmod by path.
+            let same_entry = |file: &SafeFile, entry: &EntryStatus| -> Result<bool> {
+                let held = file
+                    .metadata()
+                    .map_err(|error| refusal(error.to_string()))?;
+                Ok(held.dev() == entry.dev && held.ino() == entry.ino)
+            };
             let database = match SafeFile::open(db_path, Access::Read, Creation::Never) {
                 Ok(file) => file,
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
                 Err(error) => return Err(refusal(error.to_string())),
             };
-            let own = database
-                .metadata()
-                .map_err(|error| refusal(error.to_string()))?;
-            // Only our own writable database authorizes repairing our sidecars.
-            if own.mode() & OWNER_WRITE == 0
-                || !database
-                    .is_owned_by_current_user()
-                    .map_err(|error| refusal(error.to_string()))?
-            {
-                return Ok(());
+            if !same_entry(&database, &own)? {
+                return Err(refusal(format!(
+                    "database {} was replaced while its sidecars were being examined",
+                    db_path.display()
+                )));
             }
             let mut repairs = Vec::new();
-            for file in sidecars {
-                let metadata = file
-                    .metadata()
-                    .map_err(|error| refusal(error.to_string()))?;
-                if metadata.uid() == own.uid() && metadata.mode() & OWNER_WRITE == 0 {
-                    repairs.push((file, metadata.permissions()));
+            for (path, entry) in needing {
+                let file = match SafeFile::open(&path, Access::Read, Creation::Never) {
+                    Ok(file) => file,
+                    // Deleted by SQLite since it was inspected: nothing to repair.
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(error) => return Err(refusal(error.to_string())),
+                };
+                if !same_entry(&file, &entry)? {
+                    return Err(refusal(format!(
+                        "sidecar {} was replaced while being examined",
+                        path.display()
+                    )));
                 }
+                let permissions = file
+                    .metadata()
+                    .map_err(|error| refusal(error.to_string()))?
+                    .permissions();
+                repairs.push((file, permissions));
             }
             if repairs.is_empty() {
                 return Ok(());
@@ -3794,6 +3948,7 @@ impl Store {
             conn: Mutex::new(conn),
             edge_index: Mutex::new(None),
             generation_counts: Mutex::new(None),
+            fts_reachable: Mutex::new(None),
             generation_analysis_status: Mutex::new(None),
             source_freshness_cache: Mutex::new(None),
             db_path: None,
@@ -4464,8 +4619,18 @@ impl Store {
         ((gen_id as i64) << 32) | (node_ord as i64)
     }
 
-    /// Writes a generation. Part of the build path, so it needs the parsing
-    /// frontend's grammar-identity stamps and is gated with it.
+    /// Writes a generation.
+    ///
+    /// Gated on `parse` by scope, not by need: a build without grammars answers
+    /// questions about a persisted map and never builds one, so it does not
+    /// link the write path. Nothing here calls a grammar. The identity each
+    /// payload is stamped with comes from
+    /// `devmap_extract::cache::current_payload_identity`, which answers in both
+    /// configurations, and with these gates and the `CacheKey` constructors' gate
+    /// removed the store compiles feature-off without a warning (checked
+    /// 2026-10-06). Ungating is therefore a decision about what an
+    /// embedder links, and it should come with a feature-off test that writes a
+    /// generation, not just with the gates removed.
     #[cfg(feature = "parse")]
     pub fn save_generation(
         &self,
@@ -4647,16 +4812,10 @@ impl Store {
                     if deleted.contains(&path) || affected.contains(&path) {
                         continue;
                     }
-                    // `None` (no parsing frontend) is deliberately not a
-                    // match: carrying a row forward on an identity this build
-                    // could not compute would claim a currency nothing checked.
-                    // Not carrying is merely conservative.
-                    let identity_matches = current_payload_identity(&language).is_some_and(
-                        |(current_grammar, current_analyzer)| {
-                            grammar.as_deref() == Some(current_grammar.as_str())
-                                && analyzer.as_deref() == Some(current_analyzer.as_str())
-                        },
-                    );
+                    let (current_grammar, current_analyzer) =
+                        devmap_extract::cache::current_payload_identity(&language);
+                    let identity_matches = grammar.as_deref() == Some(current_grammar.as_str())
+                        && analyzer.as_deref() == Some(current_analyzer.as_str());
                     // A content hash that moved without the path being declared
                     // affected means the caller's affected set is wrong; the
                     // stored payload describes different bytes either way.
@@ -6105,6 +6264,101 @@ impl Store {
         Ok(rows)
     }
 
+    /// Unresolved call sites at `generation` whose callee is one of `names`, at
+    /// most `limit_per_name` per name, each name's rows ordered by
+    /// `(file, symbol)` and flagged when the cap cut them.
+    ///
+    /// The ledger is where a caller the resolver could not bind is kept — an
+    /// untyped receiver, a module loaded by path — and until this existed no
+    /// query read it by name: `impact` answered from edges alone, and a method
+    /// whose only production caller sat here reported no such caller.
+    ///
+    /// **One scan for every name.** The ledger is not indexed on `callee_name`
+    /// (an index is a schema change), so each read is a pass over the ledger —
+    /// measured on scholarlm's 558,288 rows at ~40 ms warm. A read per name
+    /// made a file-target `impact` pay eight of them: +218 ms end to end.
+    /// `ROW_NUMBER()` partitioned by name applies the per-name cap inside the
+    /// one pass, and one row past each cap says whether it bit.
+    ///
+    /// **At the caller's generation, not the latest.** `impact` walks one
+    /// generation's edges and reads this beside it; a daemon can commit
+    /// between the two. Ledger rows carry `valid_from`/`valid_to`, so any
+    /// retained generation is readable exactly. `None` when `generation` is no
+    /// longer retained — the pair cannot be made consistent, and the caller
+    /// must say so rather than mix two states of the repository.
+    pub fn unresolved_sites_naming(
+        &self,
+        generation: u32,
+        names: &[String],
+        limit_per_name: usize,
+    ) -> Result<Option<UnresolvedSitesByName>> {
+        let conn = lock_conn(&self.conn)?;
+        let retained: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM generations WHERE id = ?1)",
+            params![generation],
+            |row| row.get(0),
+        )?;
+        if !retained {
+            return Ok(None);
+        }
+        let mut found: UnresolvedSitesByName = names
+            .iter()
+            .map(|name| (name.clone(), (Vec::new(), false)))
+            .collect();
+        if names.is_empty() {
+            return Ok(Some(found));
+        }
+        let placeholders = vec!["?"; names.len()].join(", ");
+        let sql = format!(
+            "SELECT callee_name, path, source_symbol, receiver, class, rn FROM (
+                 SELECT u.callee_name AS callee_name, p.path AS path,
+                        u.source_symbol AS source_symbol, u.receiver AS receiver,
+                        c.text AS class,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY u.callee_name
+                            ORDER BY p.path, u.source_symbol, u.unresolved_id
+                        ) AS rn
+                 FROM unresolved_rows u
+                 JOIN paths p            ON p.id = u.source_file_id
+                 JOIN unresolved_texts c ON c.id = u.classification_id
+                 WHERE u.callee_name IN ({placeholders})
+                   AND u.valid_from <= ?
+                   AND (u.valid_to IS NULL OR u.valid_to > ?)
+             )
+             WHERE rn <= ?
+             ORDER BY callee_name, rn"
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let generation = i64::from(generation);
+        let cap = sqlite_limit(limit_per_name.saturating_add(1));
+        let mut values: Vec<rusqlite::types::Value> = names
+            .iter()
+            .map(|name| rusqlite::types::Value::Text(name.clone()))
+            .collect();
+        values.push(rusqlite::types::Value::Integer(generation));
+        values.push(rusqlite::types::Value::Integer(generation));
+        values.push(rusqlite::types::Value::Integer(cap));
+        let mut rows = stmt.query(rusqlite::params_from_iter(values.iter()))?;
+        while let Some(row) = rows.next()? {
+            let name: String = row.get(0)?;
+            let rank: i64 = row.get(5)?;
+            let Some((sites, truncated)) = found.get_mut(&name) else {
+                continue;
+            };
+            if usize::try_from(rank).unwrap_or(usize::MAX) > limit_per_name {
+                *truncated = true;
+                continue;
+            }
+            sites.push(UnresolvedSiteRow {
+                source_file: row.get(1)?,
+                source_symbol: row.get(2)?,
+                receiver: row.get(3)?,
+                classification: row.get(4)?,
+            });
+        }
+        Ok(Some(found))
+    }
+
     /// Total unresolved rows across every retained generation. Test-facing:
     /// the point is to prove the table is pruned, not just written.
     pub fn count_unresolved_rows(&self) -> Result<usize> {
@@ -6235,19 +6489,12 @@ impl Store {
         })?;
         for row in rows {
             let (language, grammar, analyzer) = row?;
-            let Some((current_grammar, current_analyzer)) = current_payload_identity(&language)
-            else {
-                // Loud, not `false`. `false` means "rebuild", and a build with
-                // no parsing frontend cannot rebuild — the caller would loop.
-                // `true` would be worse: a currency claim from a check that did
-                // not run.
-                return Err(refusal(format!(
-                    "whether the stored payload is current cannot be decided by this build: \
-                     the answer is the compiled grammar version for {language:?}, and this \
-                     binary was built without the parsing frontend. Build with \
-                     `--features parse` to ask."
-                )));
-            };
+            // Answers without the parsing frontend too, from the identities a
+            // parsing build of this version stamps (`PAYLOAD_GRAMMAR_IDENTITIES`,
+            // pinned to the compiled grammars by a test). A query-only reader
+            // such as GitPulse's could otherwise never call a store current.
+            let (current_grammar, current_analyzer) =
+                devmap_extract::cache::current_payload_identity(&language);
             // A NULL version predates these columns: unknown identity is not a
             // matching one.
             if grammar.as_deref() != Some(current_grammar.as_str())
@@ -6463,6 +6710,113 @@ impl Store {
             *cache = Some((generation, nodes, edges));
         }
         Ok((nodes, edges))
+    }
+
+    /// Why the latest generation's full-text index cannot be trusted, if it
+    /// cannot.
+    ///
+    /// `status` never read the index, so a store whose `nodes_fts` was
+    /// unreadable — every search failing with "database disk image is
+    /// malformed" — or half gone — every search silently returning a subset —
+    /// reported itself healthy. Two checks, priced differently:
+    ///
+    /// - **Readable**, on every call: one MATCH for one of the generation's own
+    ///   symbols, which has to walk the index structure and its postings. A
+    ///   corrupt read is the unreadable case; ~0.1 ms.
+    /// - **Whole**, once per generation (see `fts_reachable`): how many of the
+    ///   generation's symbols the map and the index together still reach,
+    ///   against how many it has. Fewer is the partial loss
+    ///   `require_searchable_index` documents it cannot see.
+    ///
+    /// A MATCH that finds nothing for a symbol whose row is still reachable is
+    /// reported too: the rows survived and the postings that find them did not.
+    fn fts_health_locked(
+        &self,
+        snapshot: &rusqlite::Transaction<'_>,
+        generation: u32,
+        node_count: usize,
+    ) -> Result<Option<String>> {
+        if node_count == 0 {
+            return Ok(None);
+        }
+        let unreadable = |error: rusqlite::Error| -> Result<Option<String>> {
+            if error.sqlite_error_code() == Some(rusqlite::ErrorCode::DatabaseCorrupt) {
+                Ok(Some(fts_damage_reason(&format!(
+                    "the full-text index (`nodes_fts`) could not be read: {error}"
+                ))))
+            } else {
+                Err(error)
+            }
+        };
+
+        let probe: Option<String> = snapshot
+            .query_row(
+                "SELECT name FROM generation_nodes
+                 WHERE generation_id = ?1 ORDER BY ordinal LIMIT 1",
+                params![generation],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let probe_hits = match &probe {
+            Some(name) => {
+                let match_query = fts_match_query(name)?;
+                match snapshot.query_row(
+                    "SELECT COUNT(*)
+                     FROM nodes_fts
+                     CROSS JOIN nodes_fts_map m
+                       ON m.rowid_ref = nodes_fts.rowid AND m.generation_id = ?1
+                     WHERE nodes_fts MATCH ?2",
+                    params![generation, match_query],
+                    |row| row.get::<_, i64>(0),
+                ) {
+                    Ok(hits) => Some(hits),
+                    Err(error) => return unreadable(error),
+                }
+            }
+            None => None,
+        };
+
+        let memo = self
+            .fts_reachable
+            .lock()
+            .ok()
+            .and_then(|cache| *cache)
+            .filter(|(cached, _)| *cached == generation)
+            .map(|(_, reachable)| reachable);
+        let reachable = match memo {
+            Some(reachable) => reachable,
+            None => {
+                let counted = snapshot.query_row(
+                    "SELECT COUNT(*) FROM nodes_fts_map m
+                     JOIN nodes_fts f ON f.rowid = m.rowid_ref
+                     WHERE m.generation_id = ?1",
+                    params![generation],
+                    |row| row.get::<_, i64>(0),
+                );
+                let reachable = match counted {
+                    Ok(count) => usize::try_from(count).unwrap_or(0),
+                    Err(error) => return unreadable(error),
+                };
+                if let Ok(mut cache) = self.fts_reachable.lock() {
+                    *cache = Some((generation, reachable));
+                }
+                reachable
+            }
+        };
+        if reachable < node_count {
+            return Ok(Some(fts_damage_reason(&format!(
+                "the full-text index reaches {reachable} of {node_count} symbols of \
+                 generation {generation}, so searches answer with a subset and report it \
+                 as the whole"
+            ))));
+        }
+        if let (Some(name), Some(0)) = (&probe, probe_hits) {
+            return Ok(Some(fts_damage_reason(&format!(
+                "the full-text index holds generation {generation}'s rows but finds none \
+                 of them: a search for its symbol {name:?} matched nothing"
+            ))));
+        }
+        Ok(None)
     }
 
     /// The latest generation's analysis **status**, without its summary.
@@ -6759,6 +7113,33 @@ generation {latest}; run `devmap status` to re-verify",
             // not a claim that a generation read everything.
             None => CoverageGaps::default(),
         };
+        // Inside the same snapshot as the node count it is compared against.
+        let fts_reason = match latest {
+            Some(generation) => self.fts_health_locked(&snapshot, generation, node_count)?,
+            None => None,
+        };
+        let quarantine_reason = if quarantined_count > 0 {
+            // Name the paths. See `StoreStatus::quarantined_paths`: the
+            // count alone made a permanently degraded store undiagnosable
+            // without opening the database by hand.
+            let shown = quarantined_paths.join(", ");
+            let elided = quarantined_count.saturating_sub(quarantined_paths.len());
+            Some(if elided > 0 {
+                format!(
+                    "{quarantined_count} path(s) exceeded the retry threshold \
+                         (attempts >= {MAX_PENDING_ATTEMPTS}): {shown}, and {elided} more \
+                         — `devmap repair --pending` drops them"
+                )
+            } else {
+                format!(
+                    "{quarantined_count} path(s) exceeded the retry threshold \
+                         (attempts >= {MAX_PENDING_ATTEMPTS}): {shown} \
+                         — `devmap repair --pending` drops them"
+                )
+            })
+        } else {
+            None
+        };
         Ok(StoreStatus {
             db_path: db_path.to_string(),
             latest_generation: latest,
@@ -6768,28 +7149,7 @@ generation {latest}; run `devmap status` to re-verify",
             source_freshness: None,
             source_delta: None,
             analyzer_freshness: None,
-            degraded_reason: if quarantined_count > 0 {
-                // Name the paths. See `StoreStatus::quarantined_paths`: the
-                // count alone made a permanently degraded store undiagnosable
-                // without opening the database by hand.
-                let shown = quarantined_paths.join(", ");
-                let elided = quarantined_count.saturating_sub(quarantined_paths.len());
-                Some(if elided > 0 {
-                    format!(
-                        "{quarantined_count} path(s) exceeded the retry threshold \
-                         (attempts >= {MAX_PENDING_ATTEMPTS}): {shown}, and {elided} more \
-                         — `devmap repair --pending` drops them"
-                    )
-                } else {
-                    format!(
-                        "{quarantined_count} path(s) exceeded the retry threshold \
-                         (attempts >= {MAX_PENDING_ATTEMPTS}): {shown} \
-                         — `devmap repair --pending` drops them"
-                    )
-                })
-            } else {
-                None
-            },
+            degraded_reason: devmap_analyze::combine_reasons(quarantine_reason, fts_reason),
             quarantined_count,
             quarantined_paths,
             coverage_gaps,
@@ -6980,30 +7340,33 @@ generation {latest}; run `devmap status` to re-verify",
             Some(pinned) => pinned,
             None => return Ok(vec![]),
         };
-        let mut stmt = snapshot.prepare(
-            "SELECT name, qualified_name, path
-             FROM nodes_fts
-             WHERE rowid IN (SELECT rowid_ref FROM nodes_fts_map WHERE generation_id = ?1)
-               AND nodes_fts MATCH ?2
-             ORDER BY rowid
-             LIMIT ?3",
-        )?;
-        let match_q = fts_match_query(query)?;
-        let rows = stmt.query_map(params![gen, match_q, sqlite_limit(limit)], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-            ))
-        })?;
-        let mut out = Vec::new();
-        for r in rows {
-            out.push(r?);
-        }
-        if out.is_empty() {
-            Self::require_searchable_index(&snapshot, gen)?;
-        }
-        Ok(out)
+        let read = || -> Result<Vec<(String, String, String)>> {
+            let mut stmt = snapshot.prepare(
+                "SELECT name, qualified_name, path
+                 FROM nodes_fts
+                 WHERE rowid IN (SELECT rowid_ref FROM nodes_fts_map WHERE generation_id = ?1)
+                   AND nodes_fts MATCH ?2
+                 ORDER BY rowid
+                 LIMIT ?3",
+            )?;
+            let match_q = fts_match_query(query)?;
+            let rows = stmt.query_map(params![gen, match_q, sqlite_limit(limit)], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })?;
+            let mut out = Vec::new();
+            for r in rows {
+                out.push(r?);
+            }
+            if out.is_empty() {
+                Self::require_searchable_index(&snapshot, gen)?;
+            }
+            Ok(out)
+        };
+        read().map_err(fts_failure)
     }
 
     /// Search only the latest persisted generation. This never reads or parses
@@ -7134,8 +7497,9 @@ generation {latest}; run `devmap status` to re-verify",
             return Ok(Vec::new());
         }
         let match_query = fts_match_query(query)?;
-        let mut stmt = conn.prepare(
-            "SELECT n.name, n.qualified_name, n.kind, p.path,
+        let mut stmt = conn
+            .prepare(
+                "SELECT n.name, n.qualified_name, n.kind, p.path,
                     n.span_start, n.span_end, n.is_exported, f.content_hash
              FROM nodes_fts
              CROSS JOIN nodes_fts_map m ON m.rowid_ref = nodes_fts.rowid
@@ -7147,25 +7511,28 @@ generation {latest}; run `devmap status` to re-verify",
              WHERE m.generation_id = ?1 AND nodes_fts MATCH ?2
              ORDER BY bm25(nodes_fts), p.path, n.name, n.span_start
              LIMIT ?3",
-        )?;
-        let rows = stmt.query_map(params![gen, match_query, sqlite_limit(limit)], |row| {
-            let name: String = row.get(0)?;
-            let path: String = row.get(3)?;
-            let (span_start, span_end) = checked_span(&path, &name, row.get(4)?, row.get(5)?)?;
-            Ok(StoredSymbol {
-                name,
-                qualified_name: row.get(1)?,
-                kind: row.get(2)?,
-                path,
-                span_start,
-                span_end,
-                is_exported: row.get::<_, i64>(6)? != 0,
-                content_hash: row.get::<_, i64>(7)? as u64,
+            )
+            .map_err(fts_failure)?;
+        let rows = stmt
+            .query_map(params![gen, match_query, sqlite_limit(limit)], |row| {
+                let name: String = row.get(0)?;
+                let path: String = row.get(3)?;
+                let (span_start, span_end) = checked_span(&path, &name, row.get(4)?, row.get(5)?)?;
+                Ok(StoredSymbol {
+                    name,
+                    qualified_name: row.get(1)?,
+                    kind: row.get(2)?,
+                    path,
+                    span_start,
+                    span_end,
+                    is_exported: row.get::<_, i64>(6)? != 0,
+                    content_hash: row.get::<_, i64>(7)? as u64,
+                })
             })
-        })?;
-        let page = rows.collect::<Result<Vec<_>>>()?;
+            .map_err(fts_failure)?;
+        let page = rows.collect::<Result<Vec<_>>>().map_err(fts_failure)?;
         if page.is_empty() {
-            Self::require_searchable_index(conn, gen)?;
+            Self::require_searchable_index(conn, gen).map_err(fts_failure)?;
         }
         Ok(page)
     }
@@ -7189,17 +7556,19 @@ generation {latest}; run `devmap status` to re-verify",
         // 12.7s at 200k rows, against 1.7ms for the match alone. A subquery
         // does not help because the planner flattens it. `search_symbols`
         // avoids this only by accident, via `ORDER BY bm25(...)`.
-        let count: i64 = conn.query_row(
-            "SELECT COUNT(*)
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*)
              FROM nodes_fts
              CROSS JOIN nodes_fts_map m
                ON m.rowid_ref = nodes_fts.rowid AND m.generation_id = ?1
              WHERE nodes_fts MATCH ?2",
-            params![gen, match_query],
-            |row| row.get(0),
-        )?;
+                params![gen, match_query],
+                |row| row.get(0),
+            )
+            .map_err(fts_failure)?;
         if count == 0 {
-            Self::require_searchable_index(conn, gen)?;
+            Self::require_searchable_index(conn, gen).map_err(fts_failure)?;
         }
         u32::try_from(count).map_err(|_| rusqlite::Error::IntegralValueOutOfRange(0, count))
     }
@@ -7263,6 +7632,51 @@ generation {latest}; run `devmap status` to re-verify",
 
     /// Load the canonical extraction payloads for the latest generation. This
     /// supports differential re-resolution without touching unchanged files.
+    /// Qualified names a test runner invokes in the latest generation.
+    ///
+    /// The `RuntimeEntryPoint` wiring annotations whose details
+    /// [`devmap_extract::wiring::is_test_harness_reason`] recognises, read
+    /// without decoding whole extractions: SQLite pulls out only the
+    /// `wiring` array, and only from files whose payload mentions an entry
+    /// point at all. `affected_tests` runs on every hook-driven query, and a
+    /// full [`Self::latest_extractions`] decode there would cost more than the
+    /// walk it serves.
+    pub fn latest_test_entry_symbols(&self) -> Result<std::collections::HashSet<String>> {
+        let conn = lock_conn(&self.conn)?;
+        let Some((snapshot, gen)) = Self::latest_snapshot(&conn)? else {
+            return Ok(std::collections::HashSet::new());
+        };
+        let mut stmt = snapshot.prepare(
+            "SELECT json_extract(f.extraction_json, '$.wiring'), p.path
+             FROM generation_files f
+             JOIN paths p ON p.id = f.file_id
+             WHERE f.generation_id = ?1
+               AND instr(f.extraction_json, 'RuntimeEntryPoint') > 0",
+        )?;
+        let rows = stmt.query_map(params![gen], |row| {
+            Ok((row.get::<_, Option<String>>(0)?, row.get::<_, String>(1)?))
+        })?;
+        let mut symbols = std::collections::HashSet::new();
+        for row in rows {
+            let (json, path) = row?;
+            let Some(json) = json else { continue };
+            let wiring: Vec<devmap_extract::model::WiringAnnotation> = serde_json::from_str(&json)
+                .map_err(|error| {
+                    refusal(format!("stored wiring for {path} is invalid: {error}"))
+                })?;
+            symbols.extend(
+                wiring
+                    .into_iter()
+                    .filter(|annotation| {
+                        annotation.kind == devmap_extract::model::WiringKind::RuntimeEntryPoint
+                            && devmap_extract::wiring::is_test_harness_reason(&annotation.details)
+                    })
+                    .map(|annotation| annotation.target_symbol),
+            );
+        }
+        Ok(symbols)
+    }
+
     pub fn latest_extractions(&self) -> Result<Vec<Extraction>> {
         let conn = lock_conn(&self.conn)?;
         let Some((snapshot, gen)) = Self::latest_snapshot(&conn)? else {
@@ -7638,6 +8052,17 @@ generation {latest}; run `devmap status` to re-verify",
     /// until the next load rewrote it. Labelling the entry with the generation
     /// its rows came from makes the key mean what it says.
     pub fn generation_edges(&self) -> Result<Option<std::sync::Arc<GenerationEdges>>> {
+        Ok(self.generation_edges_with_id()?.map(|(_, index)| index))
+    }
+
+    /// [`Self::generation_edges`], with the generation the index was built from.
+    ///
+    /// For a caller that pairs the walk with a second read — the unresolved
+    /// ledger — and must make that read at the same generation, not at
+    /// whichever one a daemon committed in between.
+    pub fn generation_edges_with_id(
+        &self,
+    ) -> Result<Option<(u32, std::sync::Arc<GenerationEdges>)>> {
         let current = {
             let conn = lock_conn(&self.conn)?;
             Self::latest_generation_id_locked(&conn)?
@@ -7648,7 +8073,7 @@ generation {latest}; run `devmap status` to re-verify",
         if let Ok(cache) = self.edge_index.lock() {
             if let Some((generation, index)) = cache.as_ref() {
                 if *generation == current {
-                    return Ok(Some(std::sync::Arc::clone(index)));
+                    return Ok(Some((current, std::sync::Arc::clone(index))));
                 }
             }
         }
@@ -7659,7 +8084,7 @@ generation {latest}; run `devmap status` to re-verify",
         if let Ok(mut cache) = self.edge_index.lock() {
             *cache = Some((loaded, std::sync::Arc::clone(&index)));
         }
-        Ok(Some(index))
+        Ok(Some((loaded, index)))
     }
 
     /// The latest generation's adjacency, read fresh, and the generation it
@@ -8154,9 +8579,11 @@ generation {latest}; run `devmap status` to re-verify",
     /// as the whole answer, and this check passes that store. Catching a
     /// partial loss means counting the generation's index rows against its
     /// symbol rows on every query, which is O(symbols) on a path that is
-    /// otherwise a bounded FTS lookup. `devmap repair --fts` rebuilds the index
-    /// unconditionally and is the complete answer; this is the cheap one that
-    /// turns the total loss from silence into a refusal.
+    /// otherwise a bounded FTS lookup. `status` makes that count instead, once
+    /// per generation (`fts_health_locked`), and reports a partial loss there;
+    /// `devmap repair --fts` rebuilds the index unconditionally and is the
+    /// complete answer. This is the cheap one that turns the total loss from
+    /// silence into a refusal at the moment a search would have hidden it.
     ///
     /// Called only when a search came back empty, so a query that matched
     /// nothing pays two `EXISTS` probes — both primary-key range lookups on
@@ -8544,10 +8971,34 @@ generation {latest}; run `devmap status` to re-verify",
         }
     }
 
+    /// Rebuild the full-text index from the latest generation's symbol rows.
+    ///
+    /// The index is dropped and recreated rather than emptied. `DELETE FROM
+    /// nodes_fts` has to read the index to remove each row's postings, so on
+    /// exactly the damage this exists for — a corrupt structure record, the
+    /// "database disk image is malformed" that `status` and search now name —
+    /// it failed with the same error. Dropping an FTS5 table drops its shadow
+    /// tables without reading them. The definition is taken from the store's
+    /// own `sqlite_master`, so the table comes back as this store had it rather
+    /// than as a second copy of the DDL here would say.
     pub fn repair_fts(&self) -> Result<()> {
         let mut conn = lock_conn(&self.conn)?;
         let tx = conn.transaction()?;
-        tx.execute("DELETE FROM nodes_fts", [])?;
+        let definition: String = tx
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'nodes_fts'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?
+            .ok_or_else(|| {
+                refusal(
+                    "this store has no `nodes_fts` table to repair; it is not a current \
+                     DevMap store — run `devmap build`",
+                )
+            })?;
+        tx.execute_batch("DROP TABLE nodes_fts")?;
+        tx.execute_batch(&definition)?;
         tx.execute("DELETE FROM nodes_fts_map", [])?;
         let gen: Option<u32> = tx
             .query_row(
@@ -8586,6 +9037,10 @@ generation {latest}; run `devmap status` to re-verify",
             }
         }
         tx.commit()?;
+        // The memo described the index this just replaced.
+        if let Ok(mut cache) = self.fts_reachable.lock() {
+            *cache = None;
+        }
         Ok(())
     }
 

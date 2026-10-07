@@ -1167,6 +1167,69 @@ pub fn is_indexable_source(rel_path: &str) -> bool {
     !matches!(lang, "generic")
 }
 
+/// The grammar identity a parsing build stamps on each language's payloads,
+/// written down so a build without grammars can compare against it.
+///
+/// A parsing build computes these at runtime (`cache::grammar_version_for`):
+/// the grammar package and version from `Cargo.lock`, the parser's ABI from the
+/// linked grammar, and the embedded grammars a template language routes to.
+/// A query-only build — GitPulse links `devmap-query` with `parse` off — has
+/// none of the three, so it could never say whether a store was current: every
+/// `status` it answered carried `analyzer_freshness: null` for a store the CLI
+/// reported fresh.
+///
+/// `cache::tests::the_committed_grammar_identities_are_the_compiled_ones`
+/// compares every declared language against the runtime answer, so a grammar
+/// bump fails that test with the replacement table in its message rather than
+/// drifting. A language absent from this table has no linked grammar and is
+/// `unavailable:{language}`, the same answer `grammar_version_for` gives it.
+pub const PAYLOAD_GRAMMAR_IDENTITIES: &[(&str, &str)] = &[
+    ("astro", "tree-sitter-astro-next@0.1.1:astro:abi14+embedded[tree-sitter-typescript@0.23.2:typescript:abi14,tree-sitter-javascript@0.23.1:javascript:abi14]"),
+    ("c", "tree-sitter-c@0.24.2:c:abi15"),
+    ("cfml", "tree-sitter-cfml@0.26.36:cfml:abi15"),
+    ("cpp", "tree-sitter-cpp@0.23.4:cpp:abi14"),
+    ("csharp", "tree-sitter-c-sharp@0.23.5:csharp:abi15"),
+    ("cuda", "tree-sitter-cuda@0.21.2:cuda:abi15"),
+    ("dart", "tree-sitter-dart@0.2.0:dart:abi15"),
+    ("erlang", "tree-sitter-erlang@0.20.0:erlang:abi14"),
+    ("go", "tree-sitter-go@0.23.4:go:abi14"),
+    ("hcl", "tree-sitter-hcl@1.1.0:hcl:abi15"),
+    ("java", "tree-sitter-java@0.23.5:java:abi14"),
+    ("javascript", "tree-sitter-javascript@0.23.1:javascript:abi14"),
+    ("kotlin", "tree-sitter-kotlin-ng@1.1.0:kotlin:abi14"),
+    ("liquid", "vendored/tree-sitter-liquid@depth1:liquid:abi14+embedded[tree-sitter-javascript@0.23.1:javascript:abi14]"),
+    ("lua", "tree-sitter-lua@0.5.0:lua:abi15"),
+    ("luau", "tree-sitter-luau@1.2.0:luau:abi14"),
+    ("nix", "tree-sitter-nix@0.3.0:nix:abi13"),
+    ("notebook", "unavailable:notebook+embedded[tree-sitter-python@0.23.6:python:abi14,tree-sitter-r@1.3.0:r:abi14,unavailable:julia,tree-sitter-typescript@0.23.2:typescript:abi14,tree-sitter-rust@0.23.3:rust:abi14,tree-sitter-scala@0.26.2:scala:abi15]"),
+    ("objc", "tree-sitter-objc@3.0.2:objc:abi14"),
+    ("pascal", "tree-sitter-pascal@0.10.2:pascal:abi14"),
+    ("php", "tree-sitter-php@0.24.2:php:abi15"),
+    ("python", "tree-sitter-python@0.23.6:python:abi14"),
+    ("r", "tree-sitter-r@1.3.0:r:abi14"),
+    ("ruby", "tree-sitter-ruby@0.23.1:ruby:abi14"),
+    ("rust", "tree-sitter-rust@0.23.3:rust:abi14"),
+    ("scala", "tree-sitter-scala@0.26.2:scala:abi15"),
+    ("shell", "tree-sitter-bash@0.25.1:shell:abi15"),
+    ("solidity", "tree-sitter-solidity@1.2.13:solidity:abi15"),
+    ("sql", "tree-sitter-sequel@0.3.11:sql:abi14"),
+    ("svelte", "tree-sitter-svelte-ng@1.0.2:svelte:abi14+embedded[tree-sitter-typescript@0.23.2:typescript:abi14,tree-sitter-javascript@0.23.1:javascript:abi14]"),
+    ("swift", "tree-sitter-swift@0.7.3:swift:abi15"),
+    ("tsx", "tree-sitter-typescript@0.23.2:tsx:abi14"),
+    ("typescript", "tree-sitter-typescript@0.23.2:typescript:abi14"),
+    ("vue", "vendored/tree-sitter-vue@ce8011a:vue:abi15+embedded[tree-sitter-typescript@0.23.2:typescript:abi14,tree-sitter-typescript@0.23.2:tsx:abi14,tree-sitter-javascript@0.23.1:javascript:abi14]"),
+];
+
+/// The grammar identity a parsing build of this version stamps for `language`,
+/// answered without linking a grammar. See [`PAYLOAD_GRAMMAR_IDENTITIES`].
+pub fn payload_grammar_identity(language: &str) -> String {
+    PAYLOAD_GRAMMAR_IDENTITIES
+        .iter()
+        .find(|(name, _)| *name == language)
+        .map(|(_, identity)| (*identity).to_string())
+        .unwrap_or_else(|| format!("unavailable:{language}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

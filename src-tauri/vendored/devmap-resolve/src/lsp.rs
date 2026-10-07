@@ -1074,4 +1074,73 @@ mod session_bounds {
         }
         assert!(started.elapsed() < Duration::from_secs(10));
     }
+
+    /// A header promising a body, then one byte and silence. The read of the
+    /// body must end at the deadline, not wait for the other 99 bytes.
+    #[test]
+    fn a_server_that_stalls_mid_body_times_out_at_the_deadline() {
+        let script = "printf 'Content-Length: 100\\r\\n\\r\\n{'; cat > /dev/null".to_string();
+        let started = Instant::now();
+        let result = LspClient::spawn(
+            &spec(script),
+            Path::new("sh"),
+            &std::env::temp_dir(),
+            started + Duration::from_secs(1),
+        );
+        assert!(
+            matches!(result, Err(LspDidNotRun::TimedOut)),
+            "a stalled body must time out, got {:?}",
+            result.err()
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "took {:?} against a 1s deadline",
+            started.elapsed()
+        );
+    }
+
+    /// Answers `initialize`, then ignores `shutdown` and `exit`, with a
+    /// background child holding its pipes. Shutdown must still return, and
+    /// the background child must die with the group.
+    #[test]
+    fn a_server_that_ignores_exit_is_killed_with_its_children() {
+        let dir = std::env::temp_dir().join(format!("lsp-ignores-exit-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let pidfile = dir.join("child.pid");
+        let script = format!(
+            "sleep 1000 & echo $! > {}; \
+             printf 'Content-Length: 36\\r\\n\\r\\n{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{}}}}'; \
+             cat > /dev/null",
+            pidfile.display()
+        );
+        let mut client = LspClient::spawn(
+            &spec(script),
+            Path::new("sh"),
+            &dir,
+            Instant::now() + Duration::from_secs(2),
+        )
+        .unwrap_or_else(|e| panic!("initialize was answered: {e:?}"));
+        let started = Instant::now();
+        client.shutdown().unwrap();
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "shutdown took {:?}",
+            started.elapsed()
+        );
+        drop(client);
+        let pid: i32 = std::fs::read_to_string(&pidfile)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let reaped_by = Instant::now() + Duration::from_secs(2);
+        while alive(pid) && Instant::now() < reaped_by {
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            !alive(pid),
+            "the server's background child {pid} outlived it"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

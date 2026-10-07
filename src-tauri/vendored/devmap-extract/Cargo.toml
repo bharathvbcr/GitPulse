@@ -1,6 +1,6 @@
 [package]
 name = "devmap-extract"
-version = "1.3.5"
+version = "0.2.4"
 edition = "2021"
 license = "Apache-2.0"
 repository = "https://github.com/bharathvbcr/DevCouncil"
@@ -305,3 +305,15 @@ required-features = ["parse"]
 name = "markup_under_stress"
 required-features = ["parse"]
 
+
+[[test]]
+name = "python_path_loads"
+required-features = ["parse"]
+
+[[test]]
+name = "python_path_loads_under_stress"
+required-features = ["parse"]
+
+[[test]]
+name = "module_bindings_and_import_names"
+required-features = ["parse"]

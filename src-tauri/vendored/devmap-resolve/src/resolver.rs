@@ -26,6 +26,28 @@ type CandidateSet = Arc<[(String, String)]>;
 /// target when an indexed subtype overrides the same name, because `self` can
 /// be that subtype at runtime. Call-site emission must abstain into the
 /// unresolved ledger rather than fall through to `SameFile`.
+/// Where a Rust path's first segment can be placed.
+///
+/// `Keyword` is `crate` / `self` / `super`. `Crate` is one indexed crate
+/// root of that name. `Child` is a module file under this module and not
+/// a crate. `Ambiguous` is a name two crates claim, or a name that is both
+/// a child module and a crate. `Unknown` is everything else — `std`, an
+/// external crate, a path this file does not contain — and the call ladder
+/// leaves it for classification.
+enum RustPathRoot {
+    Keyword,
+    Crate(String),
+    Child,
+    Ambiguous,
+    Unknown,
+}
+
+enum RustModulePlace {
+    Unique(String),
+    Ambiguous,
+    Absent,
+}
+
 enum ImplicitReceiverAnswer {
     Unique {
         target_file: String,
@@ -176,6 +198,23 @@ struct SelectorDeclaration {
     in_global_sheet: bool,
 }
 
+/// One Python file's `sys.path`, as far as its own source fixes it.
+#[derive(Debug, Clone, Default)]
+struct PySearchPath {
+    /// Module-level inserts: the byte offset of each, and its repo-relative
+    /// directory. An import after the offset resolves through it.
+    entries: Vec<(usize, String)>,
+    /// Directories inserted inside a function or class body. Such an insert
+    /// may run before any import in the file, so it only vetoes: a module it
+    /// could supply is not linked through `entries` unless both name the
+    /// same file.
+    vetoes: Vec<String>,
+    /// An insert this file makes somewhere the source does not fix — an
+    /// unreadable in-function directory, or one above the repository root —
+    /// could supply any module, so no `sys.path`-derived link is made.
+    veto_all: bool,
+}
+
 pub struct Resolver {
     symbol_index: BTreeMap<String, Vec<IndexedSymbol>>,
     file_symbols: BTreeMap<String, Vec<String>>, // file_path -> symbol_names
@@ -212,6 +251,23 @@ pub struct Resolver {
     /// `file_symbols` takes an entry per extraction unconditionally, including
     /// files that declare no symbol.
     files_by_dir: BTreeMap<String, Vec<String>>,
+    /// Indexed `.py` files grouped by file name, for the suffix rung of a
+    /// Python path load (see [`Self::resolve_path_load`]). Built once, so a
+    /// file of thousands of loads costs one lookup each rather than a scan of
+    /// the corpus each.
+    py_files_by_name: BTreeMap<String, Vec<String>>,
+    /// Per-file `(scope, local)` → the file a path-loaded Python module
+    /// handle names (`module = module_from_spec(spec)` and friends).
+    ///
+    /// Deliberately not `import_bindings`, which is per file with **no scope
+    /// test**: a handle bound inside one function would bind the same name in
+    /// every other function of the file. `scope` is the binding's
+    /// `LocalBinding::scope` identity, `None` for a module global.
+    path_module_bindings: BTreeMap<String, BTreeMap<(Option<String>, String), String>>,
+    /// Per-file `sys.path` entries of a Python file, resolved to
+    /// repo-relative directories. Read only for that file — see
+    /// [`Self::resolve_via_search_dirs`].
+    py_search_dirs: BTreeMap<String, PySearchPath>,
     /// Rust crate name, spelled as a `use` spells it, -> that crate's `src`
     /// root. `None` where two indexed crates claim the same name.
     ///
@@ -364,6 +420,21 @@ pub struct Resolver {
     /// declared on its type, not in the package block, so a bare name cannot
     /// reach it.
     go_package_symbols: BTreeMap<(String, String, String), Vec<PackageDecl>>,
+    /// The unexported-selector rung's index: `(directory, package clause,
+    /// method name)` → every concrete method of that **unexported** name the
+    /// package declares, as `(file, qualified name)`. See
+    /// [`Resolver::unexported_selector_target`].
+    go_package_methods: BTreeMap<(String, String, String), Vec<(String, String)>>,
+    /// `(directory, package clause, name)` for every unexported struct field or
+    /// interface method the package declares. A name here vetoes the rung: the
+    /// selector may be the field or the interface method, not the concrete one.
+    go_package_member_vetoes: BTreeSet<(String, String, String)>,
+    /// Directories holding a `.go` file whose extraction cannot vouch for the
+    /// package's complete declaration set — not a clean parse, or no
+    /// `go_member_names` (a payload cached before they were collected). A
+    /// package here gets no unexported-selector answers at all: one unseen file
+    /// could declare the second method or the vetoing field.
+    go_package_dirs_unvouched: BTreeSet<String>,
     /// file_path → Swift module name derived from the path.
     ///
     /// A Swift target is one unqualified namespace. Computed from the path
@@ -436,6 +507,9 @@ impl Resolver {
             file_symbols: BTreeMap::new(),
             selector_symbols: BTreeMap::new(),
             files_by_dir: BTreeMap::new(),
+            py_files_by_name: BTreeMap::new(),
+            path_module_bindings: BTreeMap::new(),
+            py_search_dirs: BTreeMap::new(),
             rust_crate_roots: BTreeMap::new(),
             reexport_chains: BTreeMap::new(),
             receiver_types: BTreeMap::new(),
@@ -456,6 +530,9 @@ impl Resolver {
             go_modules_fresh: false,
             go_package_by_file: BTreeMap::new(),
             go_package_symbols: BTreeMap::new(),
+            go_package_methods: BTreeMap::new(),
+            go_package_member_vetoes: BTreeSet::new(),
+            go_package_dirs_unvouched: BTreeSet::new(),
             swift_module_by_file: BTreeMap::new(),
             swift_module_files: BTreeMap::new(),
             swift_module_symbols: BTreeMap::new(),
@@ -1376,6 +1453,9 @@ impl Resolver {
         self.file_symbols.clear();
         self.selector_symbols.clear();
         self.files_by_dir.clear();
+        self.py_files_by_name.clear();
+        self.path_module_bindings.clear();
+        self.py_search_dirs.clear();
         self.rust_crate_roots.clear();
         self.reexport_chains.clear();
         self.receiver_types.clear();
@@ -1394,6 +1474,9 @@ impl Resolver {
         self.symbol_parents.clear();
         self.go_package_by_file.clear();
         self.go_package_symbols.clear();
+        self.go_package_methods.clear();
+        self.go_package_member_vetoes.clear();
+        self.go_package_dirs_unvouched.clear();
         self.swift_module_by_file.clear();
         self.swift_module_files.clear();
         self.swift_module_symbols.clear();
@@ -1533,6 +1616,36 @@ impl Resolver {
                         .or_default()
                         .push((ext.file_path.clone(), sym.qualified_name.clone(), sym.kind));
                 }
+                for sym in &ext.symbols {
+                    if sym.kind == SymbolKind::Method && Self::go_name_is_unexported(&sym.name) {
+                        self.go_package_methods
+                            .entry((dir.clone(), pkg.to_string(), sym.name.clone()))
+                            .or_default()
+                            .push((ext.file_path.clone(), sym.qualified_name.clone()));
+                    }
+                }
+                for name in ext.go_member_names.iter().flatten() {
+                    self.go_package_member_vetoes.insert((
+                        dir.clone(),
+                        pkg.to_string(),
+                        name.clone(),
+                    ));
+                }
+            }
+            // Keyed on the directory, not the package clause: a file that
+            // failed to parse has no clause to key on, and it may belong to
+            // any package in its directory.
+            // A `Partial` parse vouches only because its extraction vetoes every
+            // unexported token in the file (see `go_unexported_tokens`); every
+            // other non-clean outcome contributed no member list worth trusting.
+            if ext.file_path.ends_with(".go")
+                && (!matches!(
+                    ext.parse_outcome,
+                    ParseOutcome::Clean | ParseOutcome::Partial { .. }
+                ) || ext.go_member_names.is_none())
+            {
+                self.go_package_dirs_unvouched
+                    .insert(Self::parent_dir(&ext.file_path));
             }
             if ext.language == "swift" {
                 if let Some(module) = devmap_extract::languages::swift_module_of(&ext.file_path) {
@@ -1582,6 +1695,19 @@ impl Resolver {
             files.sort();
         }
         self.files_by_dir = files_by_dir;
+        let mut py_files_by_name: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        for path in self
+            .file_symbols
+            .keys()
+            .filter(|path| path.ends_with(".py"))
+        {
+            let name = path.rsplit('/').next().unwrap_or(path);
+            py_files_by_name
+                .entry(name.to_string())
+                .or_default()
+                .push(path.clone());
+        }
+        self.py_files_by_name = py_files_by_name;
 
         // Which crate each indexed `src/lib.rs` or `src/main.rs` is the root
         // of, keyed by the name a `use` would spell. Built here for the same
@@ -1656,7 +1782,30 @@ impl Resolver {
                     file_external.insert(local, specifier.to_string());
                 }
             };
+            let mut file_path_modules: BTreeMap<(Option<String>, String), String> = BTreeMap::new();
+            // Before this file's imports are read: they consult it.
+            let search_path = self.search_dirs_of(ext);
+            if !search_path.entries.is_empty() {
+                self.py_search_dirs
+                    .insert(ext.file_path.clone(), search_path);
+            }
             for imp in &ext.imports {
+                // A Python module loaded by file path binds a *scoped* handle,
+                // so it goes to its own table and never to `file_bindings`. A
+                // load that binds nothing (`run_path`) contributes only the
+                // file edge, which the resolution pass emits.
+                if let Some(load) = &imp.path_load {
+                    if let Some(local) = imp.alias.as_ref() {
+                        if let Some(target) = self.resolve_path_load(
+                            &ext.file_path,
+                            &imp.module_specifier,
+                            load.anchor_up,
+                        ) {
+                            file_path_modules.insert((load.scope.clone(), local.clone()), target);
+                        }
+                    }
+                    continue;
+                }
                 if !imp.imported_names.is_empty() {
                     for (idx, name) in imp.imported_names.iter().enumerate() {
                         // A legacy singular alias is safe only for a single
@@ -1683,6 +1832,9 @@ impl Resolver {
                             self.swift_file_declaring(&imp.module_specifier, name)
                         } else {
                             self.resolve_import_path(&ext.file_path, &ext.language, &spec)
+                                .or_else(|| {
+                                    self.resolve_via_search_dirs(ext, imp.span.start_byte, &spec)
+                                })
                         };
                         // `from pkg import cmd` binds an attribute of
                         // `pkg/__init__.py` when that file defines one, and the
@@ -1731,11 +1883,15 @@ impl Resolver {
                             Some(file)
                         } else {
                             let submodule = (ext.language == "python").then(|| {
-                                self.resolve_import_path(
-                                    &ext.file_path,
-                                    &ext.language,
-                                    &format!("{}.{}", imp.module_specifier, name),
-                                )
+                                let dotted = format!("{}.{}", imp.module_specifier, name);
+                                self.resolve_import_path(&ext.file_path, &ext.language, &dotted)
+                                    .or_else(|| {
+                                        self.resolve_via_search_dirs(
+                                            ext,
+                                            imp.span.start_byte,
+                                            &dotted,
+                                        )
+                                    })
                             });
                             submodule.flatten().or(direct)
                         };
@@ -1750,11 +1906,7 @@ impl Resolver {
                     if alias == Some("_") {
                         continue;
                     }
-                    let targets = self.resolve_import_targets(
-                        &ext.file_path,
-                        &ext.language,
-                        &imp.module_specifier,
-                    );
+                    let targets = self.resolve_import_targets_or_search_dirs(ext, imp);
                     let Some(target_f) = targets.first().cloned() else {
                         // A whole-module import that named no indexed file:
                         // `import "strings"`, `import react from "react"`. The
@@ -1851,6 +2003,10 @@ impl Resolver {
             if !file_bindings.is_empty() {
                 self.import_bindings
                     .insert(ext.file_path.clone(), file_bindings);
+            }
+            if !file_path_modules.is_empty() {
+                self.path_module_bindings
+                    .insert(ext.file_path.clone(), file_path_modules);
             }
 
             let family = LangFamily::from_lang(&ext.language);
@@ -2378,12 +2534,27 @@ impl Resolver {
                 }
 
                 // Resolve imports
+                //
+                // One path-loaded file is often named by several imports in the
+                // same loader — the handle, and the loader function that
+                // returns it — but it is one dependency, so one edge.
+                let mut path_loaded: BTreeSet<String> = BTreeSet::new();
                 for imp in &ext.imports {
-                    let targets = self.resolve_import_targets(
-                        &ext.file_path,
-                        &ext.language,
-                        &imp.module_specifier,
-                    );
+                    let targets = match &imp.path_load {
+                        // A `sys.path` entry is not an import of anything.
+                        Some(load) if load.kind == PathLoadKind::SearchDirectory => continue,
+                        Some(load) => match self.resolve_path_load(
+                            &ext.file_path,
+                            &imp.module_specifier,
+                            load.anchor_up,
+                        ) {
+                            // Already linked: neither a second edge nor a
+                            // spurious "resolved to nothing" row.
+                            Some(target) if !path_loaded.insert(target.clone()) => continue,
+                            resolved => resolved.into_iter().collect(),
+                        },
+                        None => self.resolve_import_targets_or_search_dirs(ext, imp),
+                    };
                     // R5. A relative specifier that named no indexed file is an
                     // index gap: the `Imports` edge that should exist is
                     // missing, and emitting only on success made that
@@ -2634,6 +2805,28 @@ impl Resolver {
                         }
                     }
 
+                    // 2b'. A Python module handle loaded by file path —
+                    // `module = module_from_spec(spec)`. Scoped: the handle
+                    // is read through the use site's own binding, so a
+                    // same-named local in another function never matches.
+                    if resolution.is_none() {
+                        if let Some(recv) = call.receiver_expr.as_deref() {
+                            if let Some(target_f) =
+                                self.path_module_for(ext, call.span.start_byte, recv)
+                            {
+                                if let Some((resolved_file, resolved_sym)) =
+                                    self.lookup_in_package(target_f, &call.callee_name)
+                                {
+                                    resolution = Some(Arc::new(Resolution::ImportScoped {
+                                        target_symbol: resolved_sym,
+                                        target_file: resolved_file,
+                                        imported_from: recv.to_string(),
+                                    }));
+                                }
+                            }
+                        }
+                    }
+
                     // 2c. Same-file symbol resolution.
                     //
                     // Runs *after* the import rungs and only for a call this file
@@ -2774,6 +2967,26 @@ impl Resolver {
                         }
                     }
 
+                    // 2d'. A Rust path written at the call.
+                    //
+                    // `crate::resolver::Resolver::resolve_all()` does not name
+                    // an import and it does not name a bare type, so every
+                    // rung above leaves it for `ModulePath`. The path is the
+                    // evidence: it places one module, and either a free
+                    // function in that file or a method of a type that file
+                    // declares. After 2d so an import in this file still wins,
+                    // and only for Rust — `work::helper()` in C++ is not this
+                    // module system.
+                    if resolution.is_none() && family == LangFamily::Rust {
+                        if let Some(recv) = call.receiver_expr.as_deref() {
+                            if let Some(found) =
+                                self.rust_qualified_call(&ext.file_path, recv, &call.callee_name)
+                            {
+                                resolution = Some(Arc::new(found));
+                            }
+                        }
+                    }
+
                     // 2e. X45. The package block. A bare `Trim(raw)` in
                     // `search/rank.go` names `search/provider.go`'s `Trim`
                     // because Go's package-level scope spans the package's
@@ -2798,6 +3011,28 @@ impl Resolver {
                                 target_file,
                                 package_name,
                             }));
+                        }
+                    }
+                    // 2f. An unexported Go selector on a receiver no rung above
+                    // could type. `SamePackage` because the evidence is the
+                    // package block again — this time Go's rule that an
+                    // unexported selector cannot leave it. See
+                    // `unexported_selector_target` for every abstention.
+                    if resolution.is_none() && family == LangFamily::Go {
+                        if let Some(recv) = call.receiver_expr.as_deref() {
+                            if let Some((target_file, target_symbol, package_name)) = self
+                                .unexported_selector_target(
+                                    &ext.file_path,
+                                    recv,
+                                    &call.callee_name,
+                                )
+                            {
+                                resolution = Some(Arc::new(Resolution::SamePackage {
+                                    target_symbol,
+                                    target_file,
+                                    package_name,
+                                }));
+                            }
                         }
                     }
                     // A Swift module is the same scope rule as a Go package:
@@ -3335,8 +3570,9 @@ impl Resolver {
             "candidate visits",
         )?;
         let mut candidates = Vec::new();
-        for (path, _, candidate_family, identity) in hits {
+        for (path, kind, candidate_family, identity) in hits {
             if family.admits(*candidate_family)
+                && !Self::never_a_call_target(family, *kind)
                 && (*candidate_family != LangFamily::Go
                     || Self::go_symbol_visible_from(file, path, name))
                 && (!Self::family_needs_explicit_receiver(family)
@@ -3369,12 +3605,49 @@ impl Resolver {
         Ok(candidates)
     }
 
+    /// Whether a declaration of `kind` can never be what a bare call in
+    /// `family` names, so the global rung must not offer it.
+    ///
+    /// `Interface` is an interface or a type alias. In Rust a type alias is not
+    /// a constructor (`type HWND = isize; HWND(0)` is E0423) and a trait is its
+    /// own kind; a Python `type V = …` alias raises when called; a TypeScript
+    /// interface or alias has no runtime value. So for these families an
+    /// `Interface` namesake is never the callee — yet once type aliases became
+    /// symbols, `HWND(ptr)` building the external `windows` crate's tuple
+    /// struct bound to a framework's `pub type HWND = isize` at `UniqueGlobal`,
+    /// thirteen fabricated callers on one corpus. Kotlin (`fun interface`
+    /// SAM conversions) and Java (`new Listener() { … }`) can name an interface
+    /// in call position, so they keep the candidate.
+    fn never_a_call_target(family: LangFamily, kind: SymbolKind) -> bool {
+        kind == SymbolKind::Interface
+            && matches!(
+                family,
+                LangFamily::Rust | LangFamily::Python | LangFamily::JsTs
+            )
+    }
+
     fn parent_dir(current_file: &str) -> String {
         Path::new(current_file)
             .parent()
             .map(|p| p.to_string_lossy().replace('\\', "/"))
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| ".".to_string())
+    }
+
+    /// Mark Go package directories whose files on disk the index does not
+    /// fully hold, so the unexported-selector rung abstains there.
+    ///
+    /// The extractions can vouch for the files they are; they cannot say that
+    /// no other `.go` file shares their directory — a gitignored generated
+    /// file is compiled into the package and read by nobody. The builder
+    /// supplies that fact from disk (`devmap_extract::go_dirs_with_unindexed_files`).
+    /// Call it **after** [`Self::index_extractions`], which resets the set.
+    pub fn mark_go_dirs_incomplete(&mut self, dirs: impl IntoIterator<Item = String>) {
+        self.go_package_dirs_unvouched.extend(dirs);
+    }
+
+    fn go_name_is_unexported(name: &str) -> bool {
+        !name.is_empty() && !Self::go_name_is_exported(name)
     }
 
     fn go_name_is_exported(name: &str) -> bool {
@@ -3467,6 +3740,282 @@ impl Resolver {
             components.pop();
         }
         "src".to_string()
+    }
+
+    /// The directory this file's own child modules live in.
+    ///
+    /// The first reading of [`Self::rust_module_dirs`]: a `mod.rs` / `lib.rs` /
+    /// `main.rs` keeps children beside itself, and a leaf keeps them in its
+    /// nested directory. The second reading is the parent directory, which the
+    /// import rung still tries so an old `use` does not go missing. A *call*
+    /// must not use it. `helper::run()` in `ledger/bindings.rs` is not the
+    /// sibling `ledger/helper.rs`; that path is `super::helper`.
+    fn rust_call_base(file: &str) -> String {
+        Self::rust_module_dirs(file)
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| Self::parent_dir(file))
+    }
+
+    fn rust_path_within_index(&self, path: &str) -> bool {
+        let segments = path.split("::").count();
+        segments > 0 && segments <= self.max_indexed_path_depth.saturating_add(2)
+    }
+
+    fn rust_child_shapes(&self, file: &str, name: &str) -> usize {
+        if !Self::is_plain_ident(name) {
+            return 0;
+        }
+        let Some(joined) = Self::normalize_rel(&Self::rust_call_base(file), name) else {
+            return 0;
+        };
+        let mut shapes = 0usize;
+        if self.file_symbols.contains_key(&format!("{joined}.rs")) {
+            shapes += 1;
+        }
+        if self.file_symbols.contains_key(&format!("{joined}/mod.rs")) {
+            shapes += 1;
+        }
+        shapes
+    }
+
+    fn rust_path_root(&self, file: &str, path: &str) -> RustPathRoot {
+        let root = path.split("::").next().unwrap_or("");
+        if matches!(root, "crate" | "self" | "super") {
+            return RustPathRoot::Keyword;
+        }
+        let child = self.rust_child_shapes(file, root) > 0;
+        match self.rust_crate_roots.get(root) {
+            Some(None) => RustPathRoot::Ambiguous,
+            Some(Some(_)) if child => RustPathRoot::Ambiguous,
+            Some(Some(src)) => RustPathRoot::Crate(src.clone()),
+            None if child => RustPathRoot::Child,
+            None => RustPathRoot::Unknown,
+        }
+    }
+
+    fn consider_indexed(&self, found: &mut Vec<String>, candidate: String) {
+        if self.file_symbols.contains_key(&candidate) {
+            found.push(candidate);
+        }
+    }
+
+    fn consider_crate_root_files(&self, found: &mut Vec<String>, src_root: &str) {
+        self.consider_indexed(found, format!("{src_root}/lib.rs"));
+        self.consider_indexed(found, format!("{src_root}/main.rs"));
+    }
+
+    /// Every conventional file of the module whose directory is `dir`.
+    ///
+    /// More than one hit is ambiguity, not a preference: `work.rs` and
+    /// `work/mod.rs` are both the module `work`, and picking either would
+    /// invent the call's target.
+    fn consider_module_dir(&self, found: &mut Vec<String>, dir: &str) {
+        let dir = dir.trim_end_matches('/');
+        for candidate in [
+            format!("{dir}/mod.rs"),
+            format!("{dir}.rs"),
+            format!("{dir}/lib.rs"),
+            format!("{dir}/main.rs"),
+        ] {
+            self.consider_indexed(found, candidate);
+        }
+    }
+
+    fn consider_module_rel(&self, found: &mut Vec<String>, base: &str, tail: &str) {
+        if tail.is_empty() || !tail.split("::").all(Self::is_plain_ident) {
+            return;
+        }
+        let rel = tail.replace("::", "/");
+        let Some(joined) = Self::normalize_rel(base, &rel) else {
+            return;
+        };
+        self.consider_indexed(found, format!("{joined}.rs"));
+        self.consider_indexed(found, format!("{joined}/mod.rs"));
+    }
+
+    /// Indexed files the whole path names, with no segment popped.
+    ///
+    /// `resolve_import_path` walks a `use` by dropping a trailing type name
+    /// until a file appears. A call must not: `crate::resolver::Resolver`
+    /// would land on `resolver.rs` and then look the callee up there, which
+    /// is a different path from the one the author wrote.
+    fn rust_module_files(&self, file: &str, path: &str) -> Vec<String> {
+        let mut found = Vec::new();
+        if path == "self" {
+            self.consider_indexed(&mut found, file.to_string());
+            return found;
+        }
+        if path == "crate" {
+            self.consider_crate_root_files(&mut found, &Self::rust_crate_src_root(file));
+            return found;
+        }
+        if path == "super" {
+            let parent = Self::parent_dir(&Self::rust_call_base(file));
+            self.consider_module_dir(&mut found, &parent);
+            return found;
+        }
+        if let Some(tail) = path.strip_prefix("crate::") {
+            self.consider_module_rel(&mut found, &Self::rust_crate_src_root(file), tail);
+            return found;
+        }
+        if let Some(tail) = path.strip_prefix("self::") {
+            self.consider_module_rel(&mut found, &Self::rust_call_base(file), tail);
+            return found;
+        }
+        if let Some(rest) = path.strip_prefix("super::") {
+            let mut hops = 1usize;
+            let mut tail = rest;
+            while let Some(more) = tail.strip_prefix("super::") {
+                hops += 1;
+                tail = more;
+            }
+            let mut base = Self::rust_call_base(file);
+            for _ in 0..hops {
+                base = Self::parent_dir(&base);
+            }
+            if tail.is_empty() {
+                self.consider_module_dir(&mut found, &base);
+            } else {
+                self.consider_module_rel(&mut found, &base, tail);
+            }
+            return found;
+        }
+        match self.rust_path_root(file, path) {
+            RustPathRoot::Crate(src_root) => {
+                if let Some((_, tail)) = path.split_once("::") {
+                    self.consider_module_rel(&mut found, &src_root, tail);
+                } else {
+                    self.consider_crate_root_files(&mut found, &src_root);
+                }
+            }
+            RustPathRoot::Child => {
+                self.consider_module_rel(&mut found, &Self::rust_call_base(file), path);
+            }
+            RustPathRoot::Keyword | RustPathRoot::Ambiguous | RustPathRoot::Unknown => {}
+        }
+        found
+    }
+
+    fn rust_exact_module(&self, file: &str, path: &str) -> RustModulePlace {
+        if !self.rust_path_within_index(path) || !path.split("::").all(Self::is_plain_ident) {
+            return RustModulePlace::Absent;
+        }
+        match self.rust_path_root(file, path) {
+            RustPathRoot::Unknown => RustModulePlace::Absent,
+            RustPathRoot::Ambiguous => RustModulePlace::Ambiguous,
+            RustPathRoot::Keyword | RustPathRoot::Crate(_) | RustPathRoot::Child => {
+                let mut hits = self.rust_module_files(file, path);
+                hits.sort();
+                hits.dedup();
+                match hits.len() {
+                    0 => RustModulePlace::Absent,
+                    1 => RustModulePlace::Unique(hits.remove(0)),
+                    _ => RustModulePlace::Ambiguous,
+                }
+            }
+        }
+    }
+
+    fn rust_type_kind(kind: SymbolKind) -> bool {
+        matches!(
+            kind,
+            SymbolKind::Struct
+                | SymbolKind::Enum
+                | SymbolKind::Class
+                | SymbolKind::Trait
+                | SymbolKind::Interface
+        )
+    }
+
+    fn rust_module_resolution(
+        caller: &str,
+        target_file: &str,
+        target_symbol: &str,
+        path: &str,
+    ) -> Resolution {
+        if caller == target_file {
+            Resolution::SameFile {
+                target_symbol: target_symbol.to_string(),
+                target_file: target_file.to_string(),
+            }
+        } else {
+            Resolution::ImportScoped {
+                target_symbol: target_symbol.to_string(),
+                target_file: target_file.to_string(),
+                imported_from: path.to_string(),
+            }
+        }
+    }
+
+    /// A Rust call whose receiver is a module path: `crate::work::helper()`,
+    /// `super::helper()`, `other_crate::Resolver::resolve_all()`.
+    ///
+    /// Two shapes, and the first one wins so they cannot both fire. The whole
+    /// receiver is a module and the callee is a free function in that file, or
+    /// the receiver's last segment is a type declared in the module the prefix
+    /// names and the callee is a method of that type in that file. Either
+    /// shape binds only when exactly one indexed file is the module. A second
+    /// file, a second method, or a prefix that had to be popped is no target.
+    fn rust_qualified_call(&self, file: &str, receiver: &str, callee: &str) -> Option<Resolution> {
+        if !Self::is_plain_ident(callee) {
+            return None;
+        }
+        if !Self::receiver_is_module_path(receiver)
+            && !matches!(receiver, "crate" | "self" | "super")
+        {
+            return None;
+        }
+        match self.rust_exact_module(file, receiver) {
+            RustModulePlace::Ambiguous => return None,
+            RustModulePlace::Unique(module_file) => {
+                let (target_file, target_symbol) = self.lookup_in_package(&module_file, callee)?;
+                if self.symbol_kind_in(&target_file, callee) != Some(SymbolKind::Function) {
+                    return None;
+                }
+                return Some(Self::rust_module_resolution(
+                    file,
+                    &target_file,
+                    &target_symbol,
+                    receiver,
+                ));
+            }
+            RustModulePlace::Absent => {}
+        }
+        let (module_path, type_name) = receiver.rsplit_once("::")?;
+        if !Self::is_plain_ident(type_name) {
+            return None;
+        }
+        let module_file = match self.rust_exact_module(file, module_path) {
+            RustModulePlace::Unique(module_file) => module_file,
+            RustModulePlace::Ambiguous | RustModulePlace::Absent => return None,
+        };
+        if !self
+            .symbol_kind_in(&module_file, type_name)
+            .is_some_and(Self::rust_type_kind)
+        {
+            return None;
+        }
+        let hits = self.type_methods.get(&(
+            LangFamily::Rust,
+            type_name.to_string(),
+            callee.to_string(),
+        ))?;
+        let mut matched: Vec<&(String, String)> = hits
+            .iter()
+            .filter(|(path, _)| path == &module_file)
+            .collect();
+        matched.sort();
+        matched.dedup();
+        if matched.len() != 1 {
+            return None;
+        }
+        let (target_file, target_symbol) = matched[0];
+        Some(Resolution::ReceiverType {
+            target_symbol: target_symbol.clone(),
+            target_file: target_file.clone(),
+            receiver_type: type_name.to_string(),
+        })
     }
 
     fn import_local_name(lang: &str, specifier: &str) -> String {
@@ -3911,6 +4460,69 @@ impl Resolver {
             .then(|| (target_file.clone(), target_symbol.clone(), package.clone()))
     }
 
+    /// Where `x.name()` goes when `name` is an **unexported** Go method and the
+    /// type of `x` could not be inferred.
+    ///
+    /// Go's own visibility rule makes this a proof rather than a guess. An
+    /// unexported selector is resolvable only inside the package that declares
+    /// it — the compiler refuses `x.m` for another package's unexported `m`
+    /// even when `x`'s type embeds that package's type — so whatever `x` is,
+    /// `.name` names something *this* package declares: a concrete method, a
+    /// struct field, or an interface method. With exactly one concrete method
+    /// of that name visible and no field or interface method sharing it, that
+    /// method is the callee.
+    ///
+    /// Measured on scholarlm: 13,143 of 104,696 Go `uninferred_receiver` rows
+    /// have an unexported callee, and `job.recordReplayEvent(cancelled)` in
+    /// `WisDevJobCancelHandler` — `job` bound by `yoloJobStore.get(id)`, a
+    /// return type the receiver rungs cannot read — was one of them.
+    ///
+    /// Abstains, never guesses:
+    /// * the package is keyed on `(directory, package clause)`, so an external
+    ///   `package foo_test` sees nothing of `package foo`;
+    /// * a non-test file does not see a method a `_test.go` file declares;
+    /// * two concrete methods of the name (two types, or two build-constrained
+    ///   variants of one) — the receiver's type decides and is unknown;
+    /// * any field or interface method of the name, from any struct or
+    ///   interface literal in the package;
+    /// * any `.go` file in the directory whose extraction cannot vouch for the
+    ///   whole declaration set (a failed or pattern-recovered parse, or cached
+    ///   before `go_member_names` existed) — the missing namesake could be
+    ///   there. A `Partial` parse is not one of them: its extraction vetoes
+    ///   every unexported token in the file, so it blocks exactly the names it
+    ///   could be hiding;
+    /// * cgo's `C.name()`, which names a C function, not a Go method.
+    fn unexported_selector_target(
+        &self,
+        file: &str,
+        receiver: &str,
+        name: &str,
+    ) -> Option<(String, String, String)> {
+        if !Self::go_name_is_unexported(name) || Self::path_root(receiver) == "C" {
+            return None;
+        }
+        let dir = Self::parent_dir(file);
+        if self.go_package_dirs_unvouched.contains(&dir) {
+            return None;
+        }
+        let package = self.go_package_by_file.get(file)?;
+        let key = (dir, package.clone(), name.to_string());
+        if self.go_package_member_vetoes.contains(&key) {
+            return None;
+        }
+        let source_is_test = file.ends_with("_test.go");
+        let mut visible = self
+            .go_package_methods
+            .get(&key)?
+            .iter()
+            .filter(|(path, _)| source_is_test || !path.ends_with("_test.go"));
+        let (target_file, target_symbol) = visible.next()?;
+        visible
+            .next()
+            .is_none()
+            .then(|| (target_file.clone(), target_symbol.clone(), package.clone()))
+    }
+
     /// Where a bare `name` written in `file` goes by Swift's module-scope rule.
     ///
     /// A Swift target is one unqualified namespace spanning every file that
@@ -4305,6 +4917,209 @@ impl Resolver {
             .collect()
     }
 
+    /// The indexed file a Python path load names, or `None`.
+    ///
+    /// `specifier` is the literal path tail the extractor read
+    /// (`scripts/build_supplement.py`); `anchor_up` says what it is relative
+    /// to (see `devmap_extract::model::PathLoad`).
+    ///
+    /// * **Anchored** (`Path(__file__).parents[1] / "x.py"`): exactly one
+    ///   candidate, the loader's directory climbed `anchor_up` levels. It is
+    ///   indexed or the load abstains; nothing else is tried, because the
+    ///   source said where the file is.
+    /// * **Unanchored** (`ROOT / "x.py"` with `ROOT` opaque, or a bare
+    ///   literal, which Python reads against the working directory): (a) the
+    ///   loader's own directory and (b) the repository root, and if both name
+    ///   different indexed files that is "one of several" and abstains; then
+    ///   (c) the one indexed `.py` file whose path ends with the specifier.
+    ///   Two such files abstain. A specifier that climbs (`..`) is only
+    ///   meaningful against (a) and never suffix-matched.
+    fn resolve_path_load(
+        &self,
+        current_file: &str,
+        specifier: &str,
+        anchor_up: Option<u32>,
+    ) -> Option<String> {
+        let indexed = |path: &str| self.file_symbols.contains_key(path);
+        let dir = Self::parent_dir(current_file);
+        if let Some(up) = anchor_up {
+            let mut base = dir;
+            for _ in 0..up {
+                if base.is_empty() {
+                    // Above the repository root: not a file this corpus has.
+                    return None;
+                }
+                base = base
+                    .rsplit_once('/')
+                    .map(|(parent, _)| parent.to_string())
+                    .unwrap_or_default();
+            }
+            let candidate = Self::normalize_rel(&base, specifier)?;
+            return indexed(&candidate).then_some(candidate);
+        }
+        let climbs = specifier.split('/').any(|part| part == "..");
+        let mut hits: BTreeSet<String> = BTreeSet::new();
+        for base in [dir.as_str(), ""] {
+            if climbs && base.is_empty() {
+                continue;
+            }
+            if let Some(candidate) = Self::normalize_rel(base, specifier) {
+                if indexed(&candidate) {
+                    hits.insert(candidate);
+                }
+            }
+        }
+        match hits.len() {
+            0 => {}
+            1 => return hits.pop_first(),
+            _ => return None,
+        }
+        if climbs {
+            return None;
+        }
+        let name = specifier.rsplit('/').next()?;
+        let suffix = format!("/{specifier}");
+        let mut matches = self
+            .py_files_by_name
+            .get(name)?
+            .iter()
+            .filter(|path| path.as_str() == specifier || path.ends_with(&suffix));
+        let only = matches.next()?;
+        matches.next().is_none().then(|| only.clone())
+    }
+
+    /// This file's `sys.path` as repo-relative directories: module-level
+    /// entries with the offset of each insert, and the vetoes of inserts made
+    /// inside functions. An entry that climbs above the repository root, or
+    /// a veto with no readable directory, names a directory outside what the
+    /// corpus can check and vetoes every `sys.path`-derived link.
+    fn search_dirs_of(&self, ext: &Extraction) -> PySearchPath {
+        let mut out = PySearchPath::default();
+        if ext.language != "python" {
+            return out;
+        }
+        let dir = Self::parent_dir(&ext.file_path);
+        let mut count = 0usize;
+        for imp in &ext.imports {
+            let Some(load) = imp
+                .path_load
+                .as_ref()
+                .filter(|load| load.kind == PathLoadKind::SearchDirectory)
+            else {
+                continue;
+            };
+            count += 1;
+            let directory = load.anchor_up.and_then(|up| {
+                let mut base = Some(dir.clone());
+                for _ in 0..up {
+                    base = base.and_then(|base| {
+                        (!base.is_empty()).then(|| {
+                            base.rsplit_once('/')
+                                .map(|(parent, _)| parent.to_string())
+                                .unwrap_or_default()
+                        })
+                    });
+                }
+                Self::normalize_rel(&base?, &imp.module_specifier)
+            });
+            match (directory, load.scope.is_some()) {
+                (Some(directory), false) => out.entries.push((imp.span.start_byte, directory)),
+                (Some(directory), true) => out.vetoes.push(directory),
+                (None, _) => out.veto_all = true,
+            }
+        }
+        // The extractor emits at most 64 per file; a payload that carries
+        // more — hand-built, or from elsewhere — is refused here too, so each
+        // import's cost stays bounded whatever arrives.
+        if count > 64 {
+            return PySearchPath::default();
+        }
+        out
+    }
+
+    /// The one indexed file a Python module name reaches through this file's
+    /// own `sys.path` entries: `<dir>/X.py` or `<dir>/X/__init__.py`, over the
+    /// entries inserted **before** `at`. Asked only after ordinary resolution
+    /// found nothing, so an import the ordinary rules answer keeps that answer.
+    /// Two candidates — two entries, or a module and a package of one name in
+    /// one entry — are one of several, and abstain. A relative import names
+    /// its own package, never a `sys.path` entry.
+    ///
+    /// An insert inside a function may have run before this import, whatever
+    /// their order in the file, so a directory it inserted that also holds
+    /// the module vetoes the link unless it names the same file; and an
+    /// insert whose directory the source does not fix vetoes every link.
+    fn resolve_via_search_dirs(&self, ext: &Extraction, at: usize, module: &str) -> Option<String> {
+        let search = self.py_search_dirs.get(&ext.file_path)?;
+        if search.veto_all {
+            return None;
+        }
+        let module = module.trim_matches(|c| c == '\'' || c == '"');
+        if module.is_empty() || module.starts_with('.') {
+            return None;
+        }
+        let relative = module.replace('.', "/");
+        let candidates = [format!("{relative}.py"), format!("{relative}/__init__.py")];
+        let found = |directory: &str| {
+            candidates
+                .iter()
+                .filter_map(|candidate| Self::normalize_rel(directory, candidate))
+                .filter(|path| self.file_symbols.contains_key(path))
+                .collect::<Vec<_>>()
+        };
+        let mut hits: BTreeSet<String> = BTreeSet::new();
+        for (inserted, directory) in &search.entries {
+            if *inserted < at {
+                hits.extend(found(directory));
+            }
+        }
+        if hits.len() != 1 {
+            return None;
+        }
+        let target = hits.pop_first()?;
+        let vetoed = search
+            .vetoes
+            .iter()
+            .any(|directory| found(directory).iter().any(|path| *path != target));
+        (!vetoed).then_some(target)
+    }
+
+    /// Ordinary import resolution, then — for Python only, and only when that
+    /// found nothing — this file's `sys.path` entries.
+    fn resolve_import_targets_or_search_dirs(
+        &self,
+        ext: &Extraction,
+        imp: &ExtractedImport,
+    ) -> Vec<String> {
+        let targets =
+            self.resolve_import_targets(&ext.file_path, &ext.language, &imp.module_specifier);
+        if !targets.is_empty() || ext.language != "python" {
+            return targets;
+        }
+        self.resolve_via_search_dirs(ext, imp.span.start_byte, &imp.module_specifier)
+            .into_iter()
+            .collect()
+    }
+
+    /// The file a path-loaded Python module handle names, read at a use site.
+    ///
+    /// The key is the use site's own binding scope: inside the function that
+    /// bound the handle (or a closure over it) the extractor's
+    /// `LocalBinding::scope` names that function; with no site binding the
+    /// name is a module global. A binding of an anonymous callable has no
+    /// scope identity to join on and abstains. `load().fn()` — a call through
+    /// a same-file loader function — records the receiver identity `load`
+    /// (the inner call's callee, arguments dropped), and the extractor keys
+    /// the loader at module level under that same name.
+    fn path_module_for(&self, ext: &Extraction, site: usize, receiver: &str) -> Option<&String> {
+        let table = self.path_module_bindings.get(&ext.file_path)?;
+        let scope = match ext.local_binding_at(site, receiver) {
+            Some(binding) => Some(binding.scope.clone()?),
+            None => None,
+        };
+        table.get(&(scope, receiver.to_string()))
+    }
+
     /// Every indexed file in the directory a JVM package name maps to.
     fn resolve_package_wildcard(&self, lang: &str, package: &str) -> Vec<String> {
         let Some(rule) = crate::importpath::rule_for(lang) else {
@@ -4472,6 +5287,23 @@ impl Resolver {
             }
         }
 
+        // A Python module handle loaded by file path. Before the local-binding
+        // refusal below, because a function-scoped handle *is* a local
+        // binding — the one local whose value is known.
+        if let Some(module_file) = self.path_module_for(ext, reference.span.start_byte, receiver) {
+            let (resolved_file, resolved_symbol) = self.lookup_in_package(module_file, name)?;
+            return Some(self.reference_edge(
+                ext,
+                &resolved_file,
+                &resolved_symbol,
+                reference,
+                Resolution::ImportScoped {
+                    target_symbol: self.qualified_for(&resolved_file, &resolved_symbol),
+                    target_file: resolved_file.clone(),
+                    imported_from: receiver.to_string(),
+                },
+            ));
+        }
         if ext
             .local_binding_at(reference.span.start_byte, receiver)
             .is_some()
@@ -4618,6 +5450,35 @@ impl Resolver {
                     | SymbolKind::Trait
             )
         };
+        // What the same-file rung accepts in type and heritage position.
+        //
+        // TypeScript and Rust keep types and values in separate namespaces, so
+        // a `const Foo` and a `type Foo` coexist and an annotation means the
+        // type — the kind filter is what chooses between them. Python has one
+        // namespace: a type is whatever a module-scope name is bound to, and
+        // the aliases a typed codebase writes most are assignments —
+        // `Purpose = Literal[…]`, `T = TypeVar("T")`, `UserId = NewType(…)` —
+        // as is a base class built at runtime (`Base = declarative_base()`).
+        // The binding lexical scope found is the only candidate there is, so
+        // refusing it left every one of them with no reader and reported dead.
+        //
+        // JavaScript and TypeScript keep the filter for annotations, but a
+        // class's `extends` is not one: it takes an expression, evaluated at
+        // runtime, and `class Admin extends Mixed` with
+        // `const Mixed = mixin(Base)` is the mixin idiom. The extractor files
+        // heritage for a `class` only — an interface's `extends` never arrives
+        // as `Heritage` — and `implements`, which does name a type, is
+        // `HeritageInterface` and stays filtered.
+        //
+        // Same-file only. The global rung below has no scope proof, and the
+        // import rung never filtered by kind.
+        let is_lexical_type = |kind: SymbolKind| {
+            is_type(kind)
+                || (kind == SymbolKind::Variable
+                    && (family == LangFamily::Python
+                        || (family == LangFamily::JsTs
+                            && reference.kind == ReferenceKind::Heritage)))
+        };
 
         // X45. A *qualified* type is resolved by its qualifier, before any
         // rung that reads the bare name.
@@ -4690,10 +5551,9 @@ impl Resolver {
                 reference.enclosing_symbol.as_deref(),
                 name,
             ) {
-                if self
-                    .symbol_kind_in(&ext.file_path, &identity)
-                    .is_some_and(|kind| !prefer_types || is_type(kind))
-                {
+                if self.file_declares_as(&ext.file_path, &identity, |kind| {
+                    !prefer_types || is_lexical_type(kind)
+                }) {
                     return Some(self.reference_edge(
                         ext,
                         &ext.file_path,
@@ -4883,6 +5743,35 @@ impl Resolver {
             // confident-dead. Agreeing kinds are one kind.
             let first = *file_hits.first()?;
             file_hits.iter().all(|kind| *kind == first).then_some(first)
+        })
+    }
+
+    /// Whether `file` declares `identity` as at least one kind `admits`.
+    ///
+    /// `identity` is the qualified name [`Self::lexical_target`] answered
+    /// with, and `symbol_index` holds every declaration under its qualified
+    /// name as well as its bare one, so the hits are the declarations of that
+    /// one identity and never a same-named member elsewhere in the file.
+    ///
+    /// The same-file rung's question, which is not [`Self::symbol_kind_in`]'s.
+    /// That one answers "what kind is this?" and abstains when the file's
+    /// declarations disagree — right for a caller that dispatches on the kind.
+    /// The rung only asks whether a declaration the reference may name is
+    /// there, and lexical scope has already proved which identity it is. A
+    /// name declared twice with two kinds on purpose is TypeScript's companion
+    /// idiom — `const User = z.object(…)` beside
+    /// `type User = z.infer<typeof User>` — and the abstention left every
+    /// annotation of `User` in its own file, and every value read of it, with
+    /// no target.
+    fn file_declares_as(
+        &self,
+        file: &str,
+        identity: &str,
+        admits: impl Fn(SymbolKind) -> bool,
+    ) -> bool {
+        self.symbol_index.get(identity).is_some_and(|hits| {
+            hits.iter()
+                .any(|(path, kind, _, _)| path == file && admits(*kind))
         })
     }
 

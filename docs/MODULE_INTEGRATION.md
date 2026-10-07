@@ -333,8 +333,10 @@ query can run. Consumers requiring current results must refuse a stale index.
 
 Status also carries nullable `source_freshness` and `analyzer_freshness`.
 `true` means that check passed, `false` means a mismatch was observed, and
-`null` means it was not verified. A parser-free MCP reader checks source bytes
-without certifying a grammar identity it does not contain. Overall `is_fresh`
+`null` means it was not verified. A parser-free reader such as GitPulse links
+no grammar, so it compares stored payload stamps against devmap-extract's
+recorded grammar identities (`PAYLOAD_GRAMMAR_IDENTITIES`, pinned upstream to
+the compiled grammars) and can certify analyzer identity. Overall `is_fresh`
 requires both checks to pass, no pending edits, and no store degradation.
 Retain `freshness_reason` in GitPulse responses (the CLI calls it
 `degraded_reason`); analyzer uncertainty must not hide a source mismatch.

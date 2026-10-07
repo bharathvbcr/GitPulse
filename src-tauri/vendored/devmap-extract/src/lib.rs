@@ -50,6 +50,10 @@ pub use git_metadata::{git_metadata, GitMetadata};
 pub mod notebook;
 #[cfg(feature = "parse")]
 mod parent_index;
+// Python modules loaded by file path. Walks a parse tree, and its one caller is
+// `treesitter::extract_treesitter`.
+#[cfg(feature = "parse")]
+mod pyload;
 #[cfg(feature = "parse")]
 pub mod treesitter;
 pub mod wiring;
@@ -62,7 +66,9 @@ use std::path::{Path, PathBuf};
 // frontend is compiled in, so `scan_tree` needs rayon in both shapes.
 use rayon::prelude::*;
 
-pub use gomod::{collect_go_modules, git_worktree_root, parse_go_mod, GoModule};
+pub use gomod::{
+    collect_go_modules, git_worktree_root, go_dirs_with_unindexed_files, parse_go_mod, GoModule,
+};
 pub use languages::{
     declared_language_ids, detect_language, is_default_index_excluded, is_ignored_path,
     is_indexable_source, DEFAULT_INDEX_EXCLUDE_PREFIXES, INDEX_EXCLUDES_ENV,

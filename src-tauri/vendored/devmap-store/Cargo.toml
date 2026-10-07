@@ -1,6 +1,6 @@
 [package]
 name = "devmap-store"
-version = "1.3.5"
+version = "0.2.4"
 edition = "2021"
 license = "Apache-2.0"
 repository = "https://github.com/bharathvbcr/DevCouncil"
@@ -36,12 +36,68 @@ required-features = ["parse"]
 name = "symbols_for_file"
 required-features = ["parse"]
 
-# The carry-forward guards these tests exercise only exist when an identity can
-# be computed: with `parse` off, `current_payload_identity` returns `None`, no
-# payload is ever carried, and the partial-extraction write is refused outright
-# rather than reaching the decision under test. Gated rather than listed as
-# feature-off-safe because the tests would not merely fail to compile -- they
-# would assert something else.
+# The carry-forward guards these tests exercise live in `save_generation_timed`,
+# which is `#[cfg(feature = "parse")]`: a build without grammars writes no
+# generation, so the decision under test is never reached. Gated rather than
+# listed as feature-off-safe because the tests would not merely fail to compile
+# -- they would assert something else.
 [[test]]
 name = "a_differential_write_trusts_what_it_read"
+required-features = ["parse"]
+
+# These build their fixtures by extracting source (`extract_file`,
+# `extract_tree_with_report`) and then write a generation from it. They were
+# listed as feature-off-safe while `devmap-serve` was a dev-dependency here,
+# which switched `parse` back on for the whole test build, so none of them had
+# ever compiled without grammars. Each one that mixed in grammar-free cases had
+# those moved to a `*_without_grammars` target, which is not gated.
+[[test]]
+name = "adversarial_store"
+required-features = ["parse"]
+
+[[test]]
+name = "coverage_gap_inventory"
+required-features = ["parse"]
+
+[[test]]
+name = "digest_scoped_delta"
+required-features = ["parse"]
+
+[[test]]
+name = "head_stamp"
+required-features = ["parse"]
+
+[[test]]
+name = "kernel_defects_from_source"
+required-features = ["parse"]
+
+[[test]]
+name = "ledger_write"
+required-features = ["parse"]
+
+[[test]]
+name = "read_only_store"
+required-features = ["parse"]
+
+[[test]]
+name = "store_hardening"
+required-features = ["parse"]
+
+[[test]]
+name = "test_fault_injection"
+required-features = ["parse"]
+
+[[test]]
+name = "validity_ranges"
+required-features = ["parse"]
+
+[[test]]
+name = "write_breakdown"
+required-features = ["parse"]
+
+# Builds the generation whose index it then damages from `extract_file`, and
+# writes it with `save_generation`, which a build without grammars does not
+# link.
+[[test]]
+name = "a_damaged_full_text_index_is_named"
 required-features = ["parse"]

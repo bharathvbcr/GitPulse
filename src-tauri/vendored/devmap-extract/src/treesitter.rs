@@ -534,12 +534,31 @@ fn extract_treesitter_before_deadline(
                     );
                 }
 
-                let (go_interface_methods, go_method_params) = if lang == "go" {
-                    let sets = go_method_sets(root, source, &file_symbol_name);
-                    go_interface_method_exemptions(&symbols, &sets.0, &sets.1, &mut wiring);
-                    sets
+                let (go_interface_methods, go_method_params, go_member_names) = if lang == "go" {
+                    let (interface_methods, method_params, mut member_names) =
+                        go_method_sets(root, source, &file_symbol_name);
+                    // A file tree-sitter could not parse cleanly may hold a
+                    // declaration the walk never saw. Every declaration spells
+                    // its name, so each unexported token in the text is a
+                    // possible namesake: vetoing all of them keeps the
+                    // unexported-selector rung sound for this package without
+                    // switching it off for names this file never mentions. (One
+                    // `Partial` file among scholarlm's 471 in `internal/api` had
+                    // silenced the rung for the whole package.)
+                    if !matches!(parse_outcome, ParseOutcome::Clean) {
+                        member_names.extend(go_unexported_tokens(source));
+                        member_names.sort();
+                        member_names.dedup();
+                    }
+                    go_interface_method_exemptions(
+                        &symbols,
+                        &interface_methods,
+                        &method_params,
+                        &mut wiring,
+                    );
+                    (interface_methods, method_params, Some(member_names))
                 } else {
-                    (Vec::new(), Vec::new())
+                    (Vec::new(), Vec::new(), None)
                 };
                 if extraction_overran(deadline) {
                     // Labelled by what actually ran for *this* language. The
@@ -576,26 +595,63 @@ fn extract_treesitter_before_deadline(
                             }
                         }
                     }
-                    // Module-level bindings survive when `__all__` names
-                    // them, or when they are a second name for something
-                    // already referenceable. Emitting the rest would add a
-                    // symbol for every private module constant in the
-                    // repository, whose only graph effect is dead-code noise;
-                    // dropping an alias, on the other hand, deletes a name other
-                    // modules import.
-                    let aliases = python_module_aliases(root, source);
+                    // Every module-scope binding is kept. A Python module's
+                    // names are its attributes, and `from mod import NAME`
+                    // imports any of them: `__all__` governs only
+                    // `from mod import *`. Keeping only the names `__all__`
+                    // listed dropped `REQUIRED_CONTROLS` from a module whose
+                    // `__all__` omitted it while a test imported it by name,
+                    // and dropped every constant of a module with no `__all__`
+                    // at all — unsearchable, with no target for its importers
+                    // and no blast radius. `__all__` still decides
+                    // `is_exported`, exactly as it does for functions and
+                    // classes, so liveness judges a constant as it judges a
+                    // function: by its edges.
+                    //
+                    // One symbol per name. `try: X = a` / `except: X = b`
+                    // binds one module attribute, not two, and `f = wrap(f)`
+                    // rebinds the attribute `def f` already declares.
+                    let mut seen: BTreeSet<String> = symbols
+                        .iter()
+                        .filter(|symbol| symbol.kind != SymbolKind::Variable)
+                        .map(|symbol| symbol.qualified_name.clone())
+                        .collect();
                     symbols.retain(|symbol| {
                         symbol.kind != SymbolKind::Variable
-                            || declared.contains(&symbol.name)
-                            || aliases.contains(&symbol.name)
+                            || seen.insert(symbol.qualified_name.clone())
                     });
                 }
 
+                if matches!(lang, "javascript" | "typescript" | "tsx") {
+                    // A binding exported by `export { local }` or
+                    // `export default local` is exported as surely as one
+                    // whose declaration says `export`; mark it, then keep the
+                    // module-level bindings that are exported by either route.
+                    // Private module constants stay out, as they do for Rust
+                    // and Go.
+                    let clause_exported = js_locally_exported_names(root, source, &exports);
+                    for symbol in symbols.iter_mut() {
+                        if symbol.kind != SymbolKind::File
+                            && symbol.parent_symbol.as_deref() == Some(file_symbol_name.as_str())
+                            && clause_exported.contains(&symbol.name)
+                        {
+                            symbol.is_exported = true;
+                        }
+                    }
+                    symbols
+                        .retain(|symbol| symbol.kind != SymbolKind::Variable || symbol.is_exported);
+                }
+
                 for symbol in symbols.iter().filter(|symbol| symbol.is_exported) {
-                    if !exports
-                        .iter()
-                        .any(|export| export.exported_name == symbol.name)
-                    {
+                    // A symbol already published under another name —
+                    // `export { local as Public }` — is not also exported as
+                    // itself. Matching on `exported_name` alone fabricated a
+                    // second export, `local`, that the module never declared.
+                    if !exports.iter().any(|export| {
+                        export.exported_name == symbol.name
+                            || (export.module_specifier.is_none()
+                                && export.local_name.as_deref() == Some(symbol.name.as_str()))
+                    }) {
                         exports.push(ExtractedExport {
                             exported_name: symbol.name.clone(),
                             local_name: Some(symbol.name.clone()),
@@ -644,6 +700,16 @@ fn extract_treesitter_before_deadline(
                     &references,
                     &imports,
                 );
+                // Python modules loaded by file path (`spec_from_file_location`
+                // and friends) — see `pyload`. Before the gate below, so the
+                // walk's deadline bounds it like every other stage.
+                if lang == "python" {
+                    imports.extend(crate::pyload::python_path_loads(
+                        root,
+                        source,
+                        &file_symbol_name,
+                    ));
+                }
 
                 // The last gate before the file is published. Everything above
                 // has either finished or latched `WALK_OVERRAN`; this is what
@@ -683,6 +749,7 @@ fn extract_treesitter_before_deadline(
                     go_build_constrained: lang == "go" && go_build_constrained(path, source),
                     go_interface_methods,
                     go_method_params,
+                    go_member_names,
                     // After `walk_tree`, so the per-scope cache it warmed is
                     // reused rather than every callable's subtree being walked
                     // a second time.
@@ -1300,87 +1367,268 @@ fn python_all_exports(source: &str) -> std::collections::BTreeSet<String> {
     exported
 }
 
-/// Whether `node` is a **pure dotted name** — `Other`, `widgets.Widget`,
-/// `pkg.mod.Thing` — and not an expression that merely ends in one.
+/// Whether a Python node executes in its module's namespace.
 ///
-/// The distinction is the whole of the alias rule. An alias is a second *name*
-/// for something another module can already import, which is why dropping one
-/// would delete a name other modules use. A computed value is not that, however
-/// dotted it looks.
+/// Python's scopes are functions, lambdas and class bodies — never blocks. A
+/// binding under a module-level `if`, `try`, `with`, `for`, `while` or `match`
+/// is a module attribute exactly like one written at the top:
+/// `try: import numpy; HAS_NUMPY = True` is how an optional dependency is
+/// declared, and `from mod import HAS_NUMPY` imports it. The shared
+/// [`is_module_level`] treats every `block` as a scope, which is right for the
+/// brace languages it serves and dropped every such Python binding — even one
+/// `__all__` named.
 ///
-/// Asking only whether the outermost node was an `identifier` or an `attribute`
-/// admitted every computed value whose last step happened to be an attribute
-/// access. `OUT = Path(__file__).resolve().parent` is an `attribute` whose
-/// object is a `call`: it passed, survived the `__all__` filter as an "alias",
-/// and became a symbol nothing can reference — because nothing can import it —
-/// and was therefore reported dead at 0.9. Measured on this repository that was
-/// 54 of 54 Python `Variable` symbols and six of the eight findings in the
-/// confident tier.
-///
-/// Iterative rather than recursive, for the reason every walk in this file is:
-/// `a.b.c.…` nested adversarially deep must not overflow the stack. The loop
-/// strictly descends the `object` chain, so it terminates.
-fn is_python_dotted_name(node: Node) -> bool {
+/// The walk ends at the tree's root, which must be Python's `module`, so a
+/// caller that cannot otherwise tell the grammar apart — another language's
+/// `assignment` — gets `false`.
+fn python_is_module_scope(node: Node) -> bool {
     let mut current = node;
-    loop {
-        match current.kind() {
-            "identifier" => return true,
-            "attribute" => match current.child_by_field_name("object") {
-                Some(object) => current = object,
-                None => return false,
-            },
-            _ => return false,
+    let mut ancestor = bounded_parent(node);
+    while let Some(parent) = ancestor {
+        if is_callable_node(parent) || parent.kind() == "class_definition" {
+            return false;
         }
+        current = parent;
+        ancestor = bounded_parent(parent);
+    }
+    current.kind() == "module"
+}
+
+/// Every name a Python assignment target binds, in source order.
+///
+/// `A, B = …`, `(A, B) = …`, `[A, B] = …` and `A, *REST = …` bind each name;
+/// `obj.attr = …` and `table[k] = …` bind none, because they write into an
+/// existing object rather than into the namespace. Reading only an
+/// `identifier` target emitted nothing for every unpacking assignment.
+///
+/// An explicit stack rather than recursion, so an adversarially nested target
+/// cannot overflow the call stack; every node is visited once, so the walk is
+/// linear in the target's size.
+fn python_bound_names(target: Node, source: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    let mut stack = vec![target];
+    while let Some(node) = stack.pop() {
+        match node.kind() {
+            "identifier" => {
+                let name = get_node_text(node, source);
+                if !name.is_empty() {
+                    names.push(name);
+                }
+            }
+            "pattern_list" | "tuple_pattern" | "list_pattern" | "list_splat_pattern" => {
+                let mut cursor = node.walk();
+                let children: Vec<Node> = node.named_children(&mut cursor).collect();
+                stack.extend(children.into_iter().rev());
+            }
+            _ => {}
+        }
+    }
+    names
+}
+
+/// A Python module path as the import system reads it — `pkg.mod`, `.sibling`,
+/// `..` — built from the path's identifiers rather than from the node's text,
+/// so whitespace or a line continuation inside the path cannot leak into it.
+fn python_module_path(node: Node, source: &str) -> String {
+    match node.kind() {
+        "dotted_name" => {
+            let mut cursor = node.walk();
+            node.named_children(&mut cursor)
+                .filter(|part| part.kind() == "identifier")
+                .map(|part| get_node_text(part, source))
+                .collect::<Vec<_>>()
+                .join(".")
+        }
+        "relative_import" => {
+            let mut path = String::new();
+            let mut cursor = node.walk();
+            for part in node.named_children(&mut cursor) {
+                match part.kind() {
+                    "import_prefix" => {
+                        path.extend(get_node_text(part, source).chars().filter(|c| *c == '.'));
+                    }
+                    "dotted_name" => path.push_str(&python_module_path(part, source)),
+                    _ => {}
+                }
+            }
+            path
+        }
+        _ => get_node_text(node, source),
     }
 }
 
-/// Module-level names a Python file declares as another name for something
-/// already referenceable — `TestEvidence = VerificationEvidence`.
+/// The `(imported, local)` names a Python import binds, read off the
+/// statement's `name` fields — each a `dotted_name` or an `aliased_import`.
 ///
-/// Python has no `export` keyword, so a re-export alias is written as a plain
-/// module-level assignment and is indistinguishable by node kind from a private
-/// constant. Every module-level binding is emitted as a candidate and then
-/// dropped unless `__all__` names it, which is right for constants and wrong for
-/// aliases: an alias is a *symbol other files import by that name*.
-/// `src/devcouncil/domain/evidence.py` declares no `__all__`, so `TestEvidence`
-/// existed nowhere in the graph, and the twenty import bindings that name it
-/// resolved to a file which — as far as the resolver could see — does not
-/// declare it, and fell off the resolution ladder entirely.
-///
-/// The rule is deliberately narrow: the right-hand side must be a bare name or a
-/// dotted name, so this admits aliases and re-exports and nothing else. Keeping
-/// every module-level assignment instead would add a node for every private
-/// constant in the repository, whose only graph effect is dead-code noise, which
-/// is the reason the `__all__` filter exists at all.
-fn python_module_aliases(root: Node, source: &str) -> std::collections::BTreeSet<String> {
-    let mut aliases = std::collections::BTreeSet::new();
-    let mut cursor = root.walk();
-    for statement in root.children(&mut cursor) {
-        // Module level only. A class-body or function-body assignment is a
-        // field or a local, neither of which another module can import.
-        let assignment = match statement.kind() {
-            "assignment" => statement,
-            "expression_statement" => match statement.named_child(0) {
-                Some(inner) if inner.kind() == "assignment" => inner,
-                _ => continue,
-            },
-            _ => continue,
+/// These used to come from splitting the statement's *text* on commas and
+/// taking the first word of each part. A comment is a word, so
+/// `from m import (  # noqa: E402\n    FIRST,  # why\n    second,\n)` bound
+/// `#` twice and lost both real names — no edge, and no unresolved row either,
+/// because the reference that named `FIRST` never met a binding for it. The
+/// grammar keeps comments out of these fields, so nothing but a name is read.
+/// A wildcard is a `wildcard_import` child, not a `name`, so it binds nothing.
+fn python_import_bindings(node: Node, source: &str) -> (Vec<String>, Vec<String>) {
+    let mut imported = Vec::new();
+    let mut locals = Vec::new();
+    let mut cursor = node.walk();
+    for target in node.children_by_field_name("name", &mut cursor) {
+        let (name_node, alias_node) = match target.kind() {
+            "aliased_import" => (
+                target.child_by_field_name("name"),
+                target.child_by_field_name("alias"),
+            ),
+            _ => (Some(target), None),
         };
-        let (Some(left), Some(right)) = (
-            assignment.child_by_field_name("left"),
-            assignment.child_by_field_name("right"),
-        ) else {
+        let Some(name) = name_node
+            .map(|name| python_module_path(name, source))
+            .filter(|name| !name.is_empty())
+        else {
             continue;
         };
-        if left.kind() != "identifier" || !is_python_dotted_name(right) {
+        let local = alias_node
+            .map(|alias| get_node_text(alias, source))
+            .filter(|alias| !alias.is_empty())
+            .unwrap_or_else(|| name.clone());
+        imported.push(name);
+        locals.push(local);
+    }
+    (imported, locals)
+}
+
+/// The `(imported, local)` names a TS/JS binding clause declares, read off its
+/// `import_specifier` / `export_specifier` children.
+///
+/// The text-splitting reader this replaced took the first word of each
+/// comma-separated part, so any token that is not a name became one: a comment
+/// (`{ a, // why\n b }` bound `//` and lost `b`) and an inline `type` modifier
+/// (`{ type Foo, bar }` bound `type` and lost `Foo`). A specifier's `name` and
+/// `alias` fields hold only an identifier or a string, so nothing else is read.
+fn js_clause_bindings(clause: Node, source: &str) -> (Vec<String>, Vec<String>) {
+    let mut names = Vec::new();
+    let mut locals = Vec::new();
+    let mut cursor = clause.walk();
+    for specifier in clause.named_children(&mut cursor) {
+        if !matches!(specifier.kind(), "import_specifier" | "export_specifier") {
             continue;
         }
-        let name = get_node_text(left, source);
-        if !name.is_empty() && name != "__all__" {
-            aliases.insert(name);
+        let Some(name) = specifier
+            .child_by_field_name("name")
+            .map(|name| js_specifier_name(name, source))
+            .filter(|name| !name.is_empty())
+        else {
+            continue;
+        };
+        let local = specifier
+            .child_by_field_name("alias")
+            .map(|alias| js_specifier_name(alias, source))
+            .filter(|alias| !alias.is_empty())
+            .unwrap_or_else(|| name.clone());
+        names.push(name);
+        locals.push(local);
+    }
+    (names, locals)
+}
+
+/// A specifier name: an identifier verbatim, or the contents of a string name
+/// (`import { "a-b" as ab }`), which is how ES2022 spells a non-identifier one.
+fn js_specifier_name(node: Node, source: &str) -> String {
+    let text = get_node_text(node, source);
+    if node.kind() == "string" {
+        text.trim_matches(['"', '\'']).to_string()
+    } else {
+        text
+    }
+}
+
+/// Every name a TS/JS declarator's `name` binds, in source order.
+///
+/// A destructuring declarator binds each name in its pattern —
+/// `const { a, b: renamed, c = 1, ...rest } = obj` binds `a`, `renamed`, `c`
+/// and `rest`. Reading the `name` field as text instead emitted one symbol
+/// literally named `{ a, b: renamed, c = 1, ...rest }`: a name no program can
+/// reference, so a fabricated node that every consumer could only report dead.
+/// A member target (`[obj.x] = …`) binds nothing new and is skipped.
+///
+/// An explicit stack, for the same reason as [`python_bound_names`].
+fn js_pattern_bound_names(target: Node, source: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    let mut stack = vec![target];
+    while let Some(node) = stack.pop() {
+        match node.kind() {
+            "identifier" | "shorthand_property_identifier_pattern" => {
+                let name = get_node_text(node, source);
+                if !name.is_empty() {
+                    names.push(name);
+                }
+            }
+            "object_pattern" | "array_pattern" | "rest_pattern" => {
+                let mut cursor = node.walk();
+                let children: Vec<Node> = node.named_children(&mut cursor).collect();
+                stack.extend(children.into_iter().rev());
+            }
+            "pair_pattern" => stack.extend(node.child_by_field_name("value")),
+            "assignment_pattern" | "object_assignment_pattern" => {
+                stack.extend(node.child_by_field_name("left"));
+            }
+            _ => {}
         }
     }
-    aliases
+    names
+}
+
+/// Local names a TS/JS module exports by a statement other than the
+/// declaration's own `export` keyword: `export { local }`,
+/// `export { local as Public }` and `export default local`.
+///
+/// A clause names a *local* binding, and a module-level binding was only kept
+/// when its declaration carried `export`, so `const local = 1; export { local };`
+/// left `local` out of the graph while another file imported it. Read from the
+/// already-extracted exports (a clause with no `from`) plus the root's
+/// `export default <identifier>` statements, which bind no clause.
+fn js_locally_exported_names(
+    root: Node,
+    source: &str,
+    exports: &[ExtractedExport],
+) -> BTreeSet<String> {
+    let mut names: BTreeSet<String> = exports
+        .iter()
+        .filter(|export| export.module_specifier.is_none())
+        .filter_map(|export| export.local_name.clone())
+        .collect();
+    let mut cursor = root.walk();
+    for statement in root.named_children(&mut cursor) {
+        if statement.kind() != "export_statement" {
+            continue;
+        }
+        if let Some(value) = statement.child_by_field_name("value") {
+            if value.kind() == "identifier" {
+                names.insert(get_node_text(value, source));
+            }
+        }
+    }
+    names
+}
+
+/// The `Variable` symbol for a module-level binding, built in one place for the
+/// languages that emit them.
+fn module_binding_symbol(
+    file_symbol_name: &str,
+    name: String,
+    is_exported: bool,
+    span: Span,
+) -> ExtractedSymbol {
+    ExtractedSymbol {
+        qualified_name: format!("{file_symbol_name}::{name}"),
+        name,
+        kind: SymbolKind::Variable,
+        span,
+        is_exported,
+        docstring: None,
+        signature: None,
+        parent_symbol: Some(file_symbol_name.to_string()),
+        body_signature: None,
+        declaration_hash: None,
+    }
 }
 
 /// Extraction for a language with no linked grammar.
@@ -1499,6 +1747,7 @@ fn unparsed_extraction(
         go_build_constrained: false,
         go_interface_methods: Vec::new(),
         go_method_params: Vec::new(),
+        go_member_names: None,
         scope_locals: Vec::new(),
         local_bindings: Vec::new(),
         source_code: Some(source.to_string()),
@@ -1704,6 +1953,7 @@ fn unavailable_extraction(path: &str, lang: &str, source: &str) -> Extraction {
         go_build_constrained: false,
         go_interface_methods: Vec::new(),
         go_method_params: Vec::new(),
+        go_member_names: None,
         scope_locals: Vec::new(),
         local_bindings: Vec::new(),
         source_code: Some(source.to_string()),
@@ -2532,13 +2782,27 @@ fn go_param_count(parameters: Node) -> usize {
 /// carried on the `Extraction` and joined in `devmap-analyze`. Embedded
 /// interfaces (`interface { io.Reader }`) parse as `type_elem`, not
 /// `method_elem`, so their methods are not represented here.
+///
+/// The third list is [`Extraction::go_member_names`]: every unexported field
+/// and interface-method name in the file, from **any** struct or interface
+/// literal. Collected on the `struct_type` / `interface_type` node itself rather
+/// than under `type_spec`, because a generic constraint
+/// (`[T interface{ flush() }]`) and an anonymous struct (`var cfg struct{ run
+/// func() }`) declare selectors too, and missing one would let the resolver
+/// bind `x.flush()` to a concrete method it does not name.
 fn go_method_sets(
     root: Node,
     source: &str,
     file_symbol_name: &str,
-) -> (Vec<GoInterfaceMethod>, Vec<GoMethodParams>) {
+) -> (Vec<GoInterfaceMethod>, Vec<GoMethodParams>, Vec<String>) {
     let mut interface_methods = Vec::new();
     let mut method_params = Vec::new();
+    let mut member_names = Vec::new();
+    let mut record_member = |name: &str| {
+        if go_name_is_unexported(name) {
+            member_names.push(name.to_string());
+        }
+    };
     let mut worklist = vec![root];
     // Same stride idiom as `walk_tree`. This pass runs *after* the walk has
     // returned, over the whole tree again, and until now had no deadline at
@@ -2555,6 +2819,34 @@ fn go_method_sets(
             }
         }
         match node.kind() {
+            "interface_type" => {
+                let mut member_cursor = node.walk();
+                for member in node.named_children(&mut member_cursor) {
+                    if matches!(member.kind(), "method_elem" | "method_spec") {
+                        if let Some(method) = member.child_by_field_name("name") {
+                            record_member(get_node_text(method, source).as_str());
+                        }
+                    }
+                }
+            }
+            "field_declaration" => {
+                let mut name_cursor = node.walk();
+                let mut named = false;
+                for name in node.children_by_field_name("name", &mut name_cursor) {
+                    named = true;
+                    record_member(get_node_text(name, source).as_str());
+                }
+                // An embedded field is named by its type: `*pkg.recorder[T]`
+                // declares the field `recorder`.
+                if !named {
+                    if let Some(embedded) = node.child_by_field_name("type") {
+                        let text = get_node_text(embedded, source);
+                        let head = text.split('[').next().unwrap_or(&text);
+                        let bare = head.rsplit('.').next().unwrap_or(head);
+                        record_member(bare.trim_start_matches('*').trim());
+                    }
+                }
+            }
             "type_spec" => {
                 if let (Some(name), Some(declared)) = (
                     node.child_by_field_name("name"),
@@ -2608,7 +2900,46 @@ fn go_method_sets(
         ))
     });
     method_params.sort_by(|a, b| a.qualified_name.cmp(&b.qualified_name));
-    (interface_methods, method_params)
+    member_names.sort();
+    member_names.dedup();
+    (interface_methods, method_params, member_names)
+}
+
+/// Every identifier-shaped token in `source` that Go would keep unexported.
+///
+/// Deliberately lexical and over-inclusive — comments, strings and keywords
+/// contribute too. It is the veto list for a file whose syntax tree cannot be
+/// trusted to have shown every declaration, and a spare veto only costs an
+/// answer, never a wrong one. Linear in the source, one pass.
+fn go_unexported_tokens(source: &str) -> Vec<String> {
+    let mut tokens = BTreeSet::new();
+    let mut start: Option<usize> = None;
+    for (index, character) in source
+        .char_indices()
+        .chain(std::iter::once((source.len(), ' ')))
+    {
+        let continues = character == '_' || character.is_alphanumeric();
+        match (start, continues) {
+            (None, true) if !character.is_numeric() => start = Some(index),
+            (Some(from), false) => {
+                let token = &source[from..index];
+                if go_name_is_unexported(token) {
+                    tokens.insert(token);
+                }
+                start = None;
+            }
+            _ => {}
+        }
+    }
+    tokens.into_iter().map(str::to_string).collect()
+}
+
+/// A Go identifier the language keeps inside its package: its first character
+/// is not an uppercase letter. `_` and non-ASCII lowercase are unexported too.
+pub(crate) fn go_name_is_unexported(name: &str) -> bool {
+    name.chars()
+        .next()
+        .is_some_and(|first| !first.is_uppercase())
 }
 
 /// Same-file half of the interface exemption, as a symbol-scoped annotation.
@@ -2667,19 +2998,19 @@ fn is_module_level(node: Node) -> bool {
     true
 }
 
-/// Emit an exported module-level binding as a `Variable` symbol.
+/// Emit an exported module-level Rust or Go binding as a `Variable` symbol.
 ///
 /// The frozen Python baseline emits these too (misclassified as `function`);
 /// devmap records them with the correct kind. Without them an exported
 /// constant is invisible: it cannot be searched, nothing can reference it, and
 /// it can be neither confirmed live nor reported dead — it simply is not in
-/// the map. Only *exported* bindings are emitted, because a private
-/// module-local constant is an implementation detail whose main effect on the
-/// graph would be dead-code noise.
-#[allow(clippy::too_many_arguments)]
+/// the map. Only *exported* bindings are emitted here: these languages enforce
+/// visibility, so a private constant is unreachable from any other file.
+/// Python binds every module-scope name and TS/JS filters after the walk, once
+/// `export { … }` clauses have been seen; both build the same symbol through
+/// [`module_binding_symbol`].
 fn push_module_binding(
     node: Node,
-    source: &str,
     file_symbol_name: &str,
     name: String,
     is_exported: bool,
@@ -2689,19 +3020,12 @@ fn push_module_binding(
     if !is_exported || name.is_empty() || !is_module_level(node) {
         return;
     }
-    let _ = source;
-    symbols.push(ExtractedSymbol {
-        qualified_name: format!("{file_symbol_name}::{name}"),
+    symbols.push(module_binding_symbol(
+        file_symbol_name,
         name,
-        kind: SymbolKind::Variable,
-        span,
         is_exported,
-        docstring: None,
-        signature: None,
-        parent_symbol: Some(file_symbol_name.to_string()),
-        body_signature: None,
-        declaration_hash: None,
-    });
+        span,
+    ));
 }
 
 /// Terraform address for an HCL block: `resource.aws_s3_bucket.b`.
@@ -2851,6 +3175,66 @@ fn metal_shader_entry_reason_of(node: Node, source: &str) -> Option<&'static str
     crate::wiring::metal_shader_entry_reason(&word)
 }
 
+/// The decorator on a Python function whose root name is a parameter of an
+/// enclosing callable, and that callable's name — or `None`.
+///
+/// `@test` and `@test.skip(…)` both qualify when `test` is a parameter: the
+/// value is injected either way, and whatever it registers, the decision is
+/// the caller's. The **nearest** enclosing callable that binds the root
+/// decides, in either direction: as a parameter the decorator is injected; as
+/// a local (`test = functools.lru_cache` one scope in) it is rebound and the
+/// outer parameter is shadowed, so no claim is made. A root that is bound
+/// nowhere on the way up — an import, a module-level function, `other` in
+/// `@other.test` — is not injected, whatever an outer parameter is called.
+///
+/// Keyed on the binding rather than on the spelling on purpose. The decorator
+/// hint table (`crate::wiring::is_wiring_decorator`) is pinned equal to the
+/// Python kernel's and exempts the whole *file*; this claims one function, on
+/// evidence the syntax carries.
+fn python_injected_decorator(node: Node, source: &str) -> Option<(String, String)> {
+    let decorated =
+        bounded_parent(node).filter(|parent| parent.kind() == "decorated_definition")?;
+    let mut cursor = decorated.walk();
+    let decorators: Vec<String> = decorated
+        .named_children(&mut cursor)
+        .filter(|child| child.kind() == "decorator")
+        .map(|decorator| get_node_text(decorator, source))
+        .collect();
+    for text in decorators {
+        let base = text
+            .trim()
+            .trim_start_matches('@')
+            .split('(')
+            .next()
+            .unwrap_or("")
+            .trim();
+        let root = base.split('.').next().unwrap_or("").trim();
+        if !is_user_ident(root) {
+            continue;
+        }
+        let mut ancestor = bounded_parent(decorated);
+        while let Some(scope) = ancestor {
+            if is_callable_node(scope) {
+                let mut parameters = BTreeSet::new();
+                collect_parameter_names(scope, source, &mut parameters);
+                if parameters.contains(root) {
+                    let owner = scope
+                        .child_by_field_name("name")
+                        .map(|name| get_node_text(name, source))
+                        .filter(|name| !name.is_empty())
+                        .unwrap_or_else(|| "<anonymous>".to_string());
+                    return Some((base.to_string(), owner));
+                }
+                if with_scope_locals(scope, source, |locals| locals.contains(root)) {
+                    break;
+                }
+            }
+            ancestor = bounded_parent(scope);
+        }
+    }
+    None
+}
+
 /// Nearest enclosing type-like declaration, so a method is owned by its type.
 pub(crate) fn generic_enclosing_type(node: Node, source: &str) -> Option<String> {
     let mut ancestor = bounded_parent(node);
@@ -2945,29 +3329,52 @@ fn extract_node(
 
     match lang {
         "python" => match kind {
-            // A module-level binding is a candidate public constant. Python has
-            // no export keyword, so the only principled test is `__all__`
-            // membership — applied after the walk, once the whole file has been
-            // seen. Candidates not declared there are dropped, so a module
-            // without `__all__` contributes none.
-            "assignment" if is_module_level(node) => {
+            // A module-scope binding is a module attribute, importable by name,
+            // and so a symbol. `is_exported` is decided after the walk, from
+            // `__all__`, once the whole file has been seen.
+            "assignment" if python_is_module_scope(node) => {
                 if let Some(target) = node.child_by_field_name("left") {
-                    if target.kind() == "identifier" {
-                        let name = get_node_text(target, source);
-                        if name != "__all__" && !name.is_empty() {
-                            symbols.push(ExtractedSymbol {
-                                qualified_name: format!("{file_symbol_name}::{name}"),
+                    for name in python_bound_names(target, source) {
+                        if name != "__all__" {
+                            symbols.push(module_binding_symbol(
+                                file_symbol_name,
                                 name,
-                                kind: SymbolKind::Variable,
-                                span,
-                                is_exported: false,
-                                docstring: None,
-                                signature: None,
-                                parent_symbol: Some(file_symbol_name.to_string()),
-                                body_signature: None,
-                                declaration_hash: None,
-                            });
+                                false,
+                                span.clone(),
+                            ));
                         }
+                    }
+                }
+            }
+            // PEP 695 `type Vec = list[float]` / `type Pair[T] = tuple[T, T]`:
+            // a named type, so a type-like kind that `Type` references bind to.
+            // `Interface` is what a TypeScript `type` alias already is.
+            "type_alias_statement" if python_is_module_scope(node) => {
+                let named = node.child_by_field_name("left").and_then(|left| {
+                    let mut current = left;
+                    for _ in 0..3 {
+                        match current.kind() {
+                            "identifier" => return Some(current),
+                            "type" | "generic_type" => current = current.named_child(0)?,
+                            _ => return None,
+                        }
+                    }
+                    None
+                });
+                if let Some(name) = named.map(|name| get_node_text(name, source)) {
+                    if !name.is_empty() {
+                        symbols.push(ExtractedSymbol {
+                            qualified_name: format!("{file_symbol_name}::{name}"),
+                            name,
+                            kind: SymbolKind::Interface,
+                            span,
+                            is_exported: false,
+                            docstring: None,
+                            signature: None,
+                            parent_symbol: Some(file_symbol_name.to_string()),
+                            body_signature: None,
+                            declaration_hash: None,
+                        });
                     }
                 }
             }
@@ -3009,6 +3416,19 @@ fn extract_node(
                             });
                         }
                     }
+                    // The structural rule the name tables above cannot
+                    // express: `@test` inside `def register(test, …)` hands
+                    // the function to a callable the caller injected, and
+                    // that callable — not this corpus — decides when it runs.
+                    if let Some((decorator, owner)) = python_injected_decorator(node, source) {
+                        wiring.push(WiringAnnotation {
+                            kind: WiringKind::RuntimeEntryPoint,
+                            target_symbol: qualified_name.clone(),
+                            details: crate::wiring::python_injected_decorator_reason(
+                                &decorator, &owner,
+                            ),
+                        });
+                    }
                     symbols.push(ExtractedSymbol {
                         name: n.clone(),
                         qualified_name,
@@ -3043,36 +3463,55 @@ fn extract_node(
                     });
                 }
             }
-            "import_statement" | "import_from_statement" => {
+            // One import per module. `import os, sys` binds two modules and
+            // `import a.b as c, d` binds `a.b` as `c` and `d` as itself; read as
+            // text, the first was one module named `os, sys` and the second
+            // aliased `a.b` to `c, d` and lost `d`.
+            "import_statement" => {
                 let text = get_node_text(node, source);
-                let mut module_specifier = "".to_string();
-                let mut imported_names = vec![];
-                let mut local_names = vec![];
-                let mut alias = None;
-
-                if text.starts_with("from ") {
-                    if let Some(import_idx) = text.find(" import ") {
-                        module_specifier = text[5..import_idx].trim().to_string();
-                        let names_str = &text[import_idx + 8..];
-                        let (names, locals) = crate::model::parse_import_bindings(names_str);
-                        imported_names = names;
-                        local_names = locals;
-                    }
-                } else if let Some(stripped) = text.strip_prefix("import ") {
-                    module_specifier = stripped.trim().to_string();
-                    if let Some(as_idx) = module_specifier.find(" as ") {
-                        alias = Some(module_specifier[as_idx + 4..].trim().to_string());
-                        module_specifier = module_specifier[..as_idx].trim().to_string();
-                    }
+                let mut cursor = node.walk();
+                for target in node.children_by_field_name("name", &mut cursor) {
+                    let (module_node, alias) = match target.kind() {
+                        "aliased_import" => (
+                            target.child_by_field_name("name"),
+                            target
+                                .child_by_field_name("alias")
+                                .map(|alias| get_node_text(alias, source))
+                                .filter(|alias| !alias.is_empty()),
+                        ),
+                        _ => (Some(target), None),
+                    };
+                    let Some(module_specifier) = module_node
+                        .map(|module| python_module_path(module, source))
+                        .filter(|module| !module.is_empty())
+                    else {
+                        continue;
+                    };
+                    imports.push(ExtractedImport {
+                        raw_import: text.clone(),
+                        module_specifier,
+                        imported_names: Vec::new(),
+                        local_names: Vec::new(),
+                        alias,
+                        span: span.clone(),
+                        path_load: None,
+                    });
                 }
-
+            }
+            "import_from_statement" => {
+                let module_specifier = node
+                    .child_by_field_name("module_name")
+                    .map(|module| python_module_path(module, source))
+                    .unwrap_or_default();
+                let (imported_names, local_names) = python_import_bindings(node, source);
                 imports.push(ExtractedImport {
-                    raw_import: text,
+                    raw_import: get_node_text(node, source),
                     module_specifier,
                     imported_names,
                     local_names,
-                    alias,
+                    alias: None,
                     span,
+                    path_load: None,
                 });
             }
             "call" => {
@@ -3175,21 +3614,28 @@ fn extract_node(
                 }
             }
             "variable_declarator" => {
-                if let Some(val) = node.child_by_field_name("value") {
-                    let vk = val.kind();
-                    if !matches!(vk, "arrow_function" | "function_expression") {
-                        if let Some(n) = get_child_text(node, "name", source) {
-                            push_module_binding(
-                                node,
-                                source,
+                let value_kind = node.child_by_field_name("value").map(|value| value.kind());
+                // A module-level binding — with or without an initializer
+                // (`export let U: number;`), and every name a destructuring
+                // pattern binds. Kept as a candidate whatever its own keyword
+                // says: `export { local }` may publish it further down, so the
+                // export filter runs after the walk.
+                if !matches!(value_kind, Some("arrow_function" | "function_expression"))
+                    && is_module_level(node)
+                {
+                    if let Some(target) = node.child_by_field_name("name") {
+                        let is_exported = js_symbol_is_exported(node, source);
+                        for name in js_pattern_bound_names(target, source) {
+                            symbols.push(module_binding_symbol(
                                 file_symbol_name,
-                                n,
-                                js_symbol_is_exported(node, source),
+                                name,
+                                is_exported,
                                 span.clone(),
-                                symbols,
-                            );
+                            ));
                         }
                     }
+                }
+                if let Some(vk) = value_kind {
                     if vk == "arrow_function" || vk == "function_expression" {
                         if let Some(n) = get_child_text(node, "name", source) {
                             let is_exported = js_symbol_is_exported(node, source);
@@ -3312,9 +3758,7 @@ fn extract_node(
                         span: span.clone(),
                     });
                 } else if let Some(clause) = js_binding_clause(node) {
-                    // `parse_import_bindings` strips the braces itself.
-                    let inner = get_node_text(clause, source);
-                    let (names, locals) = crate::model::parse_import_bindings(&inner);
+                    let (names, locals) = js_clause_bindings(clause, source);
                     imported_names = names;
                     local_names = locals;
                     if text.trim_start().starts_with("export") {
@@ -3354,6 +3798,7 @@ fn extract_node(
                         local_names,
                         alias,
                         span,
+                        path_load: None,
                     });
                 }
             }
@@ -3423,6 +3868,7 @@ fn extract_node(
                                             local_names: vec![],
                                             alias: None,
                                             span: span.clone(),
+                                            path_load: None,
                                         });
                                     }
                                 }
@@ -3698,18 +4144,40 @@ fn extract_node(
                     });
                 }
             }
+            // `pub type Result<T> = …`: a named type, so a type-like kind that
+            // `Type` references bind to — `Interface`, as a TypeScript `type`
+            // alias is. Module level only: a `type Output = …` inside an
+            // `impl` is an associated type, reached through the trait, and
+            // naming every `Output`/`Item`/`Error` would flood the graph with
+            // symbols no path reaches by name.
+            "type_item" if is_module_level(node) => {
+                if let Some(name) = get_child_text(node, "name", source) {
+                    symbols.push(ExtractedSymbol {
+                        name: name.clone(),
+                        qualified_name: scoped_qualified_name(
+                            node,
+                            source,
+                            file_symbol_name,
+                            &name,
+                        ),
+                        kind: SymbolKind::Interface,
+                        span,
+                        is_exported: rust_item_is_pub(node, source),
+                        docstring: None,
+                        signature: None,
+                        parent_symbol: Some(file_symbol_name.to_string()),
+                        body_signature: None,
+                        declaration_hash: None,
+                    });
+                }
+            }
             "const_item" | "static_item" => {
                 if let Some(name) = get_child_text(node, "name", source) {
-                    let exported = node.children(&mut node.walk()).any(|child| {
-                        child.kind() == "visibility_modifier"
-                            && get_node_text(child, source).starts_with("pub")
-                    });
                     push_module_binding(
                         node,
-                        source,
                         file_symbol_name,
                         name,
-                        exported,
+                        rust_item_is_pub(node, source),
                         span.clone(),
                         symbols,
                     );
@@ -3959,18 +4427,45 @@ fn extract_node(
                     });
                 }
             }
+            // `const P, Q = 1, 2` declares two constants. `name` is a repeated
+            // field (its siblings include the `,` tokens), and reading only the
+            // first dropped every later name.
             "const_spec" | "var_spec" => {
-                if let Some(name) = get_child_text(node, "name", source) {
+                let mut cursor = node.walk();
+                let names: Vec<String> = node
+                    .children_by_field_name("name", &mut cursor)
+                    .filter(|name| name.kind() == "identifier")
+                    .map(|name| get_node_text(name, source))
+                    .collect();
+                for name in names {
                     let exported = name.chars().next().is_some_and(char::is_uppercase);
                     push_module_binding(
                         node,
-                        source,
                         file_symbol_name,
                         name,
                         exported,
                         span.clone(),
                         symbols,
                     );
+                }
+            }
+            // `type A = B`: the grammar spells an alias `type_alias`, not
+            // `type_spec`, so the arm above never saw it. A named type like any
+            // other `type` declaration here.
+            "type_alias" => {
+                if let Some(n) = get_child_text(node, "name", source) {
+                    symbols.push(ExtractedSymbol {
+                        name: n.clone(),
+                        qualified_name: scoped_qualified_name(node, source, file_symbol_name, &n),
+                        kind: SymbolKind::Struct,
+                        span,
+                        is_exported: n.chars().next().is_some_and(|c| c.is_uppercase()),
+                        docstring: None,
+                        signature: None,
+                        parent_symbol: Some(file_symbol_name.to_string()),
+                        body_signature: None,
+                        declaration_hash: None,
+                    });
                 }
             }
             "import_spec" => {
@@ -3987,6 +4482,7 @@ fn extract_node(
                         local_names: vec![],
                         alias,
                         span,
+                        path_load: None,
                     });
                 }
             }
@@ -4088,7 +4584,7 @@ fn extract_node(
         _ => {
             let c_family = is_c_family_grammar(lang);
             if c_family {
-                extract_c_family_call(node, source, file_symbol_name, calls, references);
+                extract_c_family_call(lang, node, source, file_symbol_name, calls, references);
                 extract_c_header_export(node, source, file_symbol_name, exports);
             } else {
                 // Every other language reaching this arm gets declarations only
@@ -4942,6 +5438,7 @@ fn extract_c_header_export(
 /// are all `call_expression` with a `function` field, so they need no separate
 /// handling, while `new` and Objective-C messages are distinct node kinds.
 fn extract_c_family_call(
+    lang: &str,
     node: Node,
     source: &str,
     file_symbol_name: &str,
@@ -4949,6 +5446,10 @@ fn extract_c_family_call(
     references: &mut Vec<ExtractedReference>,
 ) {
     if is_inside_c_attribute(node) {
+        return;
+    }
+    if node.kind() == "preproc_function_def" {
+        extract_c_macro_body_calls(lang, node, source, file_symbol_name, calls, references);
         return;
     }
     let span = node_span(node);
@@ -5010,6 +5511,164 @@ fn extract_c_family_call(
         receiver_expr,
         span,
     });
+}
+
+thread_local! {
+    /// One parser per grammar, reused for C-family macro-body probes — the
+    /// same economy as `MACRO_PROBE_PARSER`, keyed by grammar because a Metal
+    /// body is C++ and a CUDA body is CUDA.
+    static C_MACRO_PROBE_PARSER: RefCell<Option<(&'static str, Parser)>> =
+        const { RefCell::new(None) };
+}
+
+/// Longest `#define` body the probe parses.
+///
+/// Past it the macro is simply not read, which is the fail-open direction for
+/// this rule: a missing edge is one more finding a reader sees, never a hidden
+/// one. No function-like macro in any corpus measured here comes within two
+/// orders of magnitude of it.
+const C_MACRO_BODY_MAX_BYTES: usize = 64 * 1024;
+
+/// Most probe-tree nodes one macro body is walked for.
+const C_MACRO_PROBE_MAX_NODES: usize = 50_000;
+
+/// The name the statement-shaped probe wraps a body in, and never a callee.
+const C_MACRO_PROBE: &str = "__devmap_macro_probe";
+
+/// Calls written inside a function-like macro's body, attributed to the macro.
+///
+/// The grammar leaves a `#define` body as one `preproc_arg` token, so nothing
+/// inside it is a node and no call in it was ever recorded. The macro itself is
+/// a symbol (`c_family_declaration` emits `preproc_function_def` as a
+/// function), and every use of it is recorded as a call, so a helper the macro
+/// body calls had a live caller with no edge to it. Measured on MLSystemsLab:
+/// nine Metal `inline` template helpers, each stamped into a kernel by a
+/// `KERNEL(...)` macro and each published confidently dead.
+///
+/// The body is parsed, not scanned — the way [`probe_macro_body`] treats a
+/// Rust macro invocation — by the file's own grammar, twice: bare, for a
+/// declaration-shaped body (`kernel void NAME(…) { … }`), and wrapped in a
+/// function, for a statement-shaped one. A `call_expression` outside any
+/// `ERROR` subtree in either parse is a syntactic call; a name inside a comment
+/// or a string, a keyword before `(`, and a token the grammar could not place
+/// are not. The macro's own parameters are excluded: `NAME(float *p)` is the
+/// stamped kernel's declarator, not a call to `NAME`.
+///
+/// Line continuations are removed and `##` is pasted first, which is exactly
+/// what the preprocessor does with them. Stringification (`#x`) is left as
+/// written and parses as an error around the one token, costing at most the
+/// calls in that statement.
+fn extract_c_macro_body_calls(
+    lang: &str,
+    node: Node,
+    source: &str,
+    file_symbol_name: &str,
+    calls: &mut Vec<ExtractedCall>,
+    references: &mut Vec<ExtractedReference>,
+) {
+    let Some(name) = get_child_text(node, "name", source).filter(|name| is_user_ident(name)) else {
+        return;
+    };
+    let Some(value) = node.child_by_field_name("value") else {
+        return;
+    };
+    let raw = get_node_text(value, source);
+    if raw.len() > C_MACRO_BODY_MAX_BYTES {
+        return;
+    }
+    let mut parameters = BTreeSet::new();
+    if let Some(params) = node.child_by_field_name("parameters") {
+        let mut cursor = params.walk();
+        for child in params.named_children(&mut cursor) {
+            if child.kind() == "identifier" {
+                parameters.insert(get_node_text(child, source));
+            }
+        }
+    }
+    let Some((grammar, language)) = grammar_for(lang) else {
+        return;
+    };
+    let body = raw
+        .replace("\\\r\n", "\n")
+        .replace("\\\n", "\n")
+        .replace("##", "");
+    let mut found: BTreeSet<(String, Option<String>)> = BTreeSet::new();
+    for probe in [
+        body.clone(),
+        format!("void {C_MACRO_PROBE}() {{\n{body}\n}}\n"),
+    ] {
+        let parsed = C_MACRO_PROBE_PARSER.with(|cell| {
+            let mut slot = cell.borrow_mut();
+            if slot.as_ref().is_none_or(|(held, _)| *held != grammar) {
+                let mut parser = Parser::new();
+                if parser.set_language(&language).is_err() {
+                    return None;
+                }
+                *slot = Some((grammar, parser));
+            }
+            slot.as_mut()
+                .and_then(|(_, parser)| parser.parse(&probe, None))
+        });
+        let Some(tree) = parsed else {
+            continue;
+        };
+        collect_c_probe_calls(tree.root_node(), &probe, &parameters, &mut found);
+    }
+    let caller = format!("{file_symbol_name}::{name}");
+    let span = node_span(value);
+    for (callee, receiver) in found {
+        references.push(ExtractedReference {
+            name: callee.clone(),
+            kind: ReferenceKind::Call,
+            span: span.clone(),
+            enclosing_symbol: Some(caller.clone()),
+            assigned_to: None,
+            receiver_expr: receiver.clone(),
+        });
+        calls.push(ExtractedCall {
+            caller_symbol: Some(caller.clone()),
+            callee_name: callee,
+            receiver_expr: receiver,
+            span: span.clone(),
+        });
+    }
+}
+
+/// Every `call_expression` in a probe tree that sits outside an `ERROR`
+/// subtree and names something other than a macro parameter or the probe
+/// wrapper itself.
+fn collect_c_probe_calls(
+    root: Node,
+    probe: &str,
+    parameters: &BTreeSet<String>,
+    found: &mut BTreeSet<(String, Option<String>)>,
+) {
+    let mut stack = vec![root];
+    let mut visited = 0usize;
+    while let Some(current) = stack.pop() {
+        visited += 1;
+        if visited > C_MACRO_PROBE_MAX_NODES {
+            break;
+        }
+        // Nothing under a node the grammar could not place is a syntactic
+        // fact; a fabricated call is worse than a missing one.
+        if current.is_error() {
+            continue;
+        }
+        if current.kind() == "call_expression" {
+            if let Some(function) = current.child_by_field_name("function") {
+                if let Some((callee, receiver)) = split_call_target(function, probe) {
+                    if is_user_ident(&callee)
+                        && callee != C_MACRO_PROBE
+                        && !parameters.contains(&callee)
+                    {
+                        found.insert((callee, receiver));
+                    }
+                }
+            }
+        }
+        push_named_children(current, &mut stack);
+    }
 }
 
 /// The callee's identity — its name, and the receiver expression it is reached
@@ -6031,22 +6690,51 @@ fn collect_rust_use_leaves(
 /// same answer by the same rule: once the nesting absorbs the `super`, the
 /// target is this file's own module, spelled `self`.
 ///
-/// Deliberately restricted to a receiver that is *exactly* `super`. A receiver
-/// with segments left over (`super::Thing`) names something this function
-/// cannot place without the file's own inline-module table, so it is returned
-/// unchanged — losing an edge rather than inventing one.
+/// Leading `super` segments are spent against the inline-module depth, the
+/// same accounting [`rust_use_specifier`] uses. `super::helper()` inside
+/// `mod tests` becomes `self`. `super::Thing::build()` becomes `self::Thing`:
+/// one `super` paid for the inline module, and `Thing` is still this file's
+/// type. A `super` that outlasts the nesting is left in the receiver
+/// (`super::super::helper` at depth one stays `super::helper`) so the resolver
+/// can walk out of the file. Anything that is not a path of plain identifiers
+/// is returned unchanged.
 ///
 /// Depth beyond one is treated the same way because the extractor flattens
 /// inline modules: a `fn` inside `mod a { mod b { … } }` is extracted with the
 /// file-level qualified name, so every `super` that stays inside the file lands
 /// in the one namespace the file has.
 fn rust_absorb_inline_super(node: Node, receiver: Option<String>) -> Option<String> {
-    match receiver {
-        Some(receiver) if receiver == "super" && rust_inline_module_depth(node) > 0 => {
-            Some("self".to_string())
-        }
-        other => other,
+    let receiver = receiver?;
+    let depth = rust_inline_module_depth(node);
+    if depth == 0
+        || !receiver.split("::").all(|segment| {
+            !segment.is_empty()
+                && segment
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_')
+        })
+    {
+        return Some(receiver);
     }
+    let mut segments: Vec<&str> = receiver.split("::").collect();
+    if segments.first() != Some(&"super") {
+        return Some(receiver);
+    }
+    let mut spent = 0usize;
+    while spent < depth && segments.first() == Some(&"super") {
+        segments.remove(0);
+        spent += 1;
+    }
+    if spent == 0 {
+        return Some(receiver);
+    }
+    if segments.is_empty() {
+        return Some("self".to_string());
+    }
+    if segments.first() == Some(&"super") {
+        return Some(segments.join("::"));
+    }
+    Some(format!("self::{}", segments.join("::")))
 }
 
 fn rust_inline_module_depth(node: Node) -> usize {
@@ -6213,6 +6901,7 @@ fn rust_use_imports(
             local_names,
             alias: None,
             span: span.clone(),
+            path_load: None,
         });
     }
     for (specifier, alias) in whole_module {
@@ -6223,6 +6912,7 @@ fn rust_use_imports(
             local_names: vec![],
             alias,
             span: span.clone(),
+            path_load: None,
         });
     }
     Some(())
@@ -6742,7 +7432,14 @@ fn maybe_push_name_reference(
     references: &mut Vec<ExtractedReference>,
 ) {
     let mut ref_kind = match node.kind() {
-        "type_identifier" | "nested_type_identifier" => ReferenceKind::Type,
+        // `namespace_identifier` is how tree-sitter-cpp spells the scope of
+        // `Plain::K`: a use of `Plain`, which a struct mentioned no other way
+        // — `MmaTiles::kThreads`, `MmaTiles::BR` — had no reference for at
+        // all. A `namespace ns { … }` head is on the definition's `name`
+        // field, which `is_defining_name` below already refuses.
+        "type_identifier" | "nested_type_identifier" | "namespace_identifier" => {
+            ReferenceKind::Type
+        }
         "identifier"
         | "shorthand_property_identifier"
         | "property_identifier"
@@ -6772,7 +7469,11 @@ fn maybe_push_name_reference(
     {
         ref_kind = ReferenceKind::Type;
     }
-    if is_defining_name(node) || is_inside_import_or_export(node) || is_call_callee(node) {
+    if is_argument_label(node)
+        || is_defining_name(node)
+        || is_inside_import_or_export(node)
+        || is_call_callee(node)
+    {
         return;
     }
     let name = get_node_text(node, source);
@@ -6948,10 +7649,42 @@ fn node_contains(haystack: Node, needle: Node) -> bool {
 /// are genuine references. Returns the outermost node of the chain — the
 /// declaration itself — so callers can tell a function definition from a
 /// variable or parameter binding.
+/// Whether `parent` is a C++ template wrapper whose `name` field is `node`.
+///
+/// `template_function` (`f<T>` as a callee, or an explicit specialization's
+/// declarator), `template_method` (`obj.f<T>`) and `template_type`
+/// (`Tiles<4>`) all put the name they wrap on a `name` field, and none of
+/// them binds anything: the wrapper is transparent, and whether the name
+/// declares or uses is decided one level up. The generic "a `name` field is a
+/// binding" rule in [`is_defining_name`] read the wrapper itself as the
+/// declaration, so every template *call* filed its callee as a local of the
+/// calling function — the resolver then classified the site `local_binding`
+/// and the helper was published confidently dead. Measured on MLSystemsLab:
+/// every `__device__` helper and every Metal `inline` helper reached through
+/// `f<T>(…)`, and every template struct whose only mentions were
+/// instantiations.
+fn is_template_wrapper_name(parent: Node, node: Node) -> bool {
+    matches!(
+        parent.kind(),
+        "template_function" | "template_method" | "template_type"
+    ) && parent
+        .child_by_field_name("name")
+        .is_some_and(|name| name.id() == node.id())
+}
+
 fn c_declarator_declaration(node: Node) -> Option<Node> {
     let mut current = node;
     let mut climbed = false;
     while let Some(parent) = bounded_parent(current) {
+        // `spec<float>` in `template <> void spec<float>(float *p) {…}`: the
+        // declarator chain runs through the wrapper, and stopping at it would
+        // leave the specialization's own name looking like a use of the
+        // primary template — the self-reference shape
+        // `c_family_declarations_do_not_reference_themselves` pins.
+        if is_template_wrapper_name(parent, current) {
+            current = parent;
+            continue;
+        }
         if parent
             .child_by_field_name("declarator")
             .is_none_or(|declarator| declarator.id() != current.id())
@@ -6964,7 +7697,38 @@ fn c_declarator_declaration(node: Node) -> Option<Node> {
     climbed.then_some(current)
 }
 
+/// Whether `node` is a call's argument label — the `x` of Python `f(x=…)`,
+/// C# `F(x: …)` and `[A(x = …)]`, R and PHP `f(x = …)` / `f(x: …)`, Solidity
+/// `f({x: …})`, Scala `T[x = …]`.
+///
+/// A label names a parameter of the *callee*: it neither binds anything where
+/// it is written nor reads anything. These grammars put it on a `name` field,
+/// so [`is_defining_name`] read it as a declaration and filed it as a local of
+/// the enclosing scope — after which every read of a same-named symbol there
+/// was dropped as shadowed. `register(handler=handler)` lost its only reference
+/// to `handler`, and `dict(codegraph="CodeGraph")` at module level hid every
+/// later module-level read of the constant `codegraph`, reported dead at 0.9.
+/// Reference emission must refuse it too, or the label would become a
+/// fabricated read of whatever shares its name.
+fn is_argument_label(node: Node) -> bool {
+    bounded_parent(node).is_some_and(|parent| {
+        matches!(
+            parent.kind(),
+            "keyword_argument"
+                | "argument"
+                | "attribute_argument"
+                | "call_struct_argument"
+                | "named_type_argument"
+        ) && parent
+            .child_by_field_name("name")
+            .is_some_and(|label| label.id() == node.id())
+    })
+}
+
 fn is_defining_name(node: Node) -> bool {
+    if is_argument_label(node) {
+        return false;
+    }
     // A grammar's `name` field is not necessarily a declaration. Java/Lua
     // invocation nodes use it for the callee; recording that use as a local
     // binding suppresses the very call it names (RA1).
@@ -7046,6 +7810,13 @@ fn is_defining_name(node: Node) -> bool {
         // contract looks confidently dead.
         if parent.kind() == "generic_type" {
             return false;
+        }
+        // The C++ spelling of the same shape, but transparent rather than a
+        // verdict: `f<T>(x)` is a use and `template <> struct Tiles<8> {…}` is
+        // a declaration, and only the node above the wrapper can tell which.
+        if is_template_wrapper_name(parent, current) {
+            current = parent;
+            continue;
         }
         if field_contains(parent, "name", node)
             || field_contains(parent, "alias", node)
@@ -7328,6 +8099,83 @@ fn enclosing_scope_node(node: Node) -> Node {
     current
 }
 
+/// Whether a defining identifier is a module-level binding the extractor emits
+/// as a `Variable` — the mirror of the emitting arms, so "binds a symbol" and
+/// "is emitted as one" cannot disagree.
+///
+/// Filed as a *local*, such a binding shadowed itself: every read of it at
+/// module level — each line of a script, another constant's initializer — was
+/// dropped before the resolver saw it, so a constant read only there had no
+/// inbound edge and was reported dead at 0.9 (`OUT = Path(__file__)…`, then
+/// `OUT / "x"`). Every arm requires module scope, so a function's own locals are
+/// untouched.
+///
+/// The climb passes only through destructuring patterns, and at each step the
+/// node it came from must be the *binding* part of its parent — a default
+/// value or a computed key is a use. Every comparison is a direct child
+/// identity, so the check is linear in the pattern's depth.
+fn module_binding_is_symbol(node: Node, source: &str) -> bool {
+    let is_field_child = |parent: Node, field: &str, child: Node| {
+        parent
+            .child_by_field_name(field)
+            .is_some_and(|bound| bound.id() == child.id())
+    };
+    let mut current = node;
+    let mut ancestor = bounded_parent(node);
+    while let Some(parent) = ancestor {
+        match parent.kind() {
+            "pattern_list" | "tuple_pattern" | "list_pattern" | "list_splat_pattern"
+            | "object_pattern" | "array_pattern" | "rest_pattern" => {}
+            "pair_pattern" => {
+                if !is_field_child(parent, "value", current) {
+                    return false;
+                }
+            }
+            "assignment_pattern" | "object_assignment_pattern" => {
+                if !is_field_child(parent, "left", current) {
+                    return false;
+                }
+            }
+            // Python. The root check inside `python_is_module_scope` keeps
+            // other grammars' `assignment` out.
+            "assignment" => {
+                return is_field_child(parent, "left", current) && python_is_module_scope(parent);
+            }
+            "variable_declarator" => {
+                return is_field_child(parent, "name", current)
+                    && is_module_level(parent)
+                    && js_symbol_is_exported(parent, source);
+            }
+            "const_spec" | "var_spec" => {
+                let mut cursor = parent.walk();
+                return parent
+                    .children_by_field_name("name", &mut cursor)
+                    .any(|name| name.id() == node.id())
+                    && !go_name_is_unexported(&get_node_text(node, source))
+                    && is_module_level(parent);
+            }
+            "const_item" | "static_item" => {
+                return is_field_child(parent, "name", current)
+                    && rust_item_is_pub(parent, source)
+                    && is_module_level(parent);
+            }
+            _ => return false,
+        }
+        current = parent;
+        ancestor = bounded_parent(parent);
+    }
+    false
+}
+
+/// Whether a Rust item carries a `pub` visibility of any reach.
+fn rust_item_is_pub(node: Node, source: &str) -> bool {
+    let mut cursor = node.walk();
+    let is_pub = node.children(&mut cursor).any(|child| {
+        child.kind() == "visibility_modifier" && get_node_text(child, source).starts_with("pub")
+    });
+    is_pub
+}
+
 fn is_symbol_binding(node: Node) -> bool {
     // A C-family function name binds a symbol, not a local. Without this the
     // `declarator` arm of `is_defining_name` would file every function's own
@@ -7382,6 +8230,12 @@ fn is_symbol_binding(node: Node) -> bool {
 
 fn collect_non_symbol_locals(scope: Node, source: &str) -> HashSet<String> {
     let mut locals = HashSet::new();
+    // Names a module-level `Variable` binds. Filtered out at the end rather
+    // than per occurrence: `lines = [...]` binds the symbol and a later
+    // `lines += [...]` is not itself a symbol binding, but both name the one
+    // module attribute, so neither may make `lines` a local that shadows the
+    // module-level reads of it. Only module scope can contain these.
+    let mut module_bindings = HashSet::new();
     let mut worklist = Vec::new();
     push_children(scope, &mut worklist);
     let mut since_check = 0u32;
@@ -7405,15 +8259,19 @@ fn collect_non_symbol_locals(scope: Node, source: &str) -> HashSet<String> {
                 | "shorthand_property_identifier"
                 | "shorthand_property_identifier_pattern"
         ) && is_defining_name(node)
-            && !is_symbol_binding(node)
         {
             let name = get_node_text(node, source);
             if is_user_ident(&name) {
-                locals.insert(name);
+                if module_binding_is_symbol(node, source) {
+                    module_bindings.insert(name);
+                } else if !is_symbol_binding(node) {
+                    locals.insert(name);
+                }
             }
         }
         push_children_reversed(node, &mut worklist);
     }
+    locals.retain(|name| !module_bindings.contains(name));
     locals
 }
 
@@ -7989,6 +8847,17 @@ fn is_inside_import_or_export(node: Node) -> bool {
 fn is_call_callee(node: Node) -> bool {
     let Some(parent) = bounded_parent(node) else {
         return false;
+    };
+    // `f<T>(x)`: the call's `function` field is the wrapper, and the name
+    // inside it is the callee. Without this the name was also emitted as a
+    // `Name` reference beside the `Call` one — two references for one site.
+    let (node, parent) = if is_template_wrapper_name(parent, node) {
+        match bounded_parent(parent) {
+            Some(grand) => (parent, grand),
+            None => return false,
+        }
+    } else {
+        (node, parent)
     };
     // An Objective-C keyword message has one `method` field per selector part,
     // so the single-field lookup below would only ever recognise the first.
@@ -8838,6 +9707,360 @@ mod tests {
         assert!(qualified.contains(&"a.c::caller"), "{qualified:?}");
     }
 
+    /// A C-family template call names its callee; it binds no local.
+    ///
+    /// `dev_t<T>(p)` puts the callee identifier on the `name` field of a
+    /// `template_function`, and the generic "a `name` field is a binding"
+    /// rule in `is_defining_name` filed it as a local of the calling
+    /// function. The resolver then classified the recorded call as
+    /// `local_binding` — "the callee is a local binding whose value is not
+    /// known" — and `analyze_liveness` reported the helper confidently dead.
+    /// Measured on MLSystemsLab: every `__device__` helper and every Metal
+    /// `inline` template helper called through `f<T>(…)` — `load_b`,
+    /// `copy_wait`, `stage_tile`, `norm_rope_row` — was published at 0.9 with
+    /// no reason, while the plain-call twins beside them resolved.
+    #[test]
+    fn a_c_family_template_call_names_its_callee_and_binds_no_local() {
+        for (path, lang, source) in [
+            (
+                "k.cu",
+                "cuda",
+                "template <typename T>\n__device__ __forceinline__ void dev_t(T *p) { p[0] = 1; }\n\
+                 template <typename T>\n__global__ void kern(T *p) {\n    dev_t<T>(p);\n}\n",
+            ),
+            (
+                "a.metal",
+                "cpp",
+                "template <bool B>\ninline void dev_t(device float *row, uint n) { row[0] = n; }\n\
+                 kernel void entry_k(device float *row [[buffer(0)]], uint gid [[thread_position_in_grid]]) {\n\
+                 \x20   dev_t<false>(row, gid);\n}\n",
+            ),
+        ] {
+            let extraction = extract_treesitter(path, lang, source);
+            let call = extraction
+                .calls
+                .iter()
+                .find(|call| call.callee_name == "dev_t")
+                .unwrap_or_else(|| panic!("{path}: the template call is recorded: {:?}", extraction.calls));
+            assert!(
+                extraction.local_binding_at(call.span.start_byte, "dev_t").is_none(),
+                "{path}: a template callee is a use of the helper, not a local of the caller: {:?}",
+                extraction.local_bindings
+            );
+            assert!(
+                !name_refs(&extraction).contains(&"dev_t"),
+                "{path}: the callee position is a Call reference, not also a Name one: {:?}",
+                extraction.references
+            );
+        }
+    }
+
+    /// The template wrapper is transparent in both directions.
+    ///
+    /// An explicit specialization `spec<float>` is a declaration: its name
+    /// sits on the same `template_function` node a call uses, and clearing
+    /// that node blanket-wise would have the specialization *reference* the
+    /// primary template — the self-reference shape
+    /// `c_family_declarations_do_not_reference_themselves` pins. A
+    /// `template_type` use, `Tiles<4>::BR`, is the mirror image: it was
+    /// suppressed as a declaration, so a template struct whose only mentions
+    /// were instantiations looked confidently dead (`Tiles`, `MmaTiles` in
+    /// `flash_attn_cuda.cu`). The partial specialization keeps declaring.
+    #[test]
+    fn a_template_specialization_declares_and_a_template_type_use_references() {
+        let specialised = extract_treesitter(
+            "s.cu",
+            "cuda",
+            "template <typename T>\n__device__ void spec(T *p) { p[0] = 2; }\n\
+             template <>\n__device__ void spec<float>(float *p) { p[0] = 3; }\n",
+        );
+        assert!(
+            !name_refs(&specialised).contains(&"spec"),
+            "an explicit specialization declares its name; it does not reference the primary: {:?}",
+            specialised.references
+        );
+        assert!(
+            specialised.local_bindings.is_empty(),
+            "a specialization's own name is a symbol binding, not a local: {:?}",
+            specialised.local_bindings
+        );
+
+        let used = extract_treesitter(
+            "t.cu",
+            "cuda",
+            "template <int N>\nstruct Tiles { static constexpr int BR = N; };\n\
+             __global__ void kern(float *p) { int x = Tiles<4>::BR; p[0] = x; }\n",
+        );
+        assert!(
+            used.references
+                .iter()
+                .any(|reference| reference.name == "Tiles"
+                    && matches!(reference.kind, ReferenceKind::Type | ReferenceKind::Name)),
+            "`Tiles<4>::BR` is a use of the template struct: {:?}",
+            used.references
+        );
+
+        let partial = extract_treesitter(
+            "u.cu",
+            "cuda",
+            "template <int N>\nstruct Tiles { static constexpr int BR = N; };\n\
+             template <>\nstruct Tiles<8> { static constexpr int BR = 1; };\n",
+        );
+        assert!(
+            !partial
+                .references
+                .iter()
+                .any(|reference| reference.name == "Tiles"),
+            "a specialization's head declares; it is not a use of the primary: {:?}",
+            partial.references
+        );
+    }
+
+    /// A nested function decorated with a parameter of its enclosing function
+    /// is handed to that parameter — a callable the caller injected — and the
+    /// callee decides when it runs.
+    ///
+    /// The `register(test, Skip)` seam: `nanolab/tests.py` calls each test
+    /// module's `register(test, Skip)`, and inside it every test is
+    /// `@test def name(): …`. Nothing else in the module names the function;
+    /// 26 of them were published at 0.9 with no reason. The gate is the
+    /// *binding* of the decorator's root, not its spelling: an imported
+    /// decorator, a module-level function of the same name reached from a
+    /// sibling scope, a member access whose root is not the parameter, and a
+    /// nearer scope that rebinds the name all stay ordinary decorated
+    /// functions — and `never_passed_anywhere` stays dead.
+    #[test]
+    fn an_injected_decorator_hands_the_nested_function_to_its_caller() {
+        let extraction = extract_treesitter(
+            "c.py",
+            "python",
+            "import functools\n\
+             \n\
+             def register(test, Skip):\n\
+             \x20   @test\n\
+             \x20   def collected_by_injected_decorator():\n\
+             \x20       pass\n\
+             \n\
+             \x20   @test.skip('reason')\n\
+             \x20   def collected_through_a_member_of_the_parameter():\n\
+             \x20       pass\n\
+             \n\
+             \x20   @functools.lru_cache\n\
+             \x20   def decorated_by_import_dead():\n\
+             \x20       pass\n\
+             \n\
+             \x20   def never_passed_anywhere():\n\
+             \x20       pass\n\
+             \n\
+             \x20   def inner():\n\
+             \x20       test = functools.lru_cache\n\
+             \x20       @test\n\
+             \x20       def rebound_in_the_nearer_scope():\n\
+             \x20           pass\n\
+             \n\
+             def test(fn):\n\
+             \x20   return fn\n\
+             \n\
+             def sibling_collision(unrelated):\n\
+             \x20   @test\n\
+             \x20   def decorated_by_the_module_function():\n\
+             \x20       pass\n\
+             \n\
+             def qualified_collision(test):\n\
+             \x20   @other.test\n\
+             \x20   def decorated_by_a_member_named_like_the_parameter():\n\
+             \x20       pass\n\
+             \n\
+             @test\n\
+             def module_level_decorated():\n\
+             \x20   pass\n",
+        );
+        let mut targets: Vec<&str> = extraction
+            .wiring
+            .iter()
+            .filter(|annotation| annotation.kind == WiringKind::RuntimeEntryPoint)
+            .map(|annotation| annotation.target_symbol.as_str())
+            .collect();
+        targets.sort_unstable();
+        assert_eq!(
+            targets,
+            [
+                "c.py::register.collected_by_injected_decorator",
+                "c.py::register.collected_through_a_member_of_the_parameter",
+            ],
+            "only a decorator rooted at a parameter of an enclosing callable is injected: {:?}",
+            extraction.wiring
+        );
+        let reason = extraction
+            .wiring
+            .iter()
+            .find(|annotation| {
+                annotation.target_symbol == "c.py::register.collected_by_injected_decorator"
+            })
+            .map(|annotation| annotation.details.as_str())
+            .expect("annotated");
+        assert!(
+            reason.contains("`test`") && reason.contains("`register`"),
+            "the reason names the decorator and the function that received it: {reason}"
+        );
+    }
+
+    /// `Plain::K` reaches into `Plain`; the scope half is a use of the type.
+    ///
+    /// tree-sitter-cpp spells the scope of a `qualified_identifier` as a
+    /// `namespace_identifier`, a node kind the name-reference walk never
+    /// visited, so a struct whose only mentions were `MmaTiles::kThreads`
+    /// and `MmaTiles::BR` had no inbound reference at all — not an
+    /// unresolved one, none — and was published confidently dead. A
+    /// `namespace ns { … }` head is the declaration of `ns`, not a use.
+    #[test]
+    fn a_qualified_scope_is_a_use_of_the_type_it_reaches_into() {
+        let extraction = extract_treesitter(
+            "q.cu",
+            "cuda",
+            "struct Plain { static constexpr int K = 4; };\n\
+             __global__ void kern(float *p) { constexpr int k = Plain::K; p[0] = k; }\n\
+             namespace ns { int x; }\n",
+        );
+        assert!(
+            extraction
+                .references
+                .iter()
+                .any(|reference| reference.name == "Plain"
+                    && matches!(reference.kind, ReferenceKind::Type | ReferenceKind::Name)),
+            "`Plain::K` names Plain: {:?}",
+            extraction.references
+        );
+        assert!(
+            !extraction
+                .references
+                .iter()
+                .any(|reference| reference.name == "ns"),
+            "a namespace head declares; it is not a use: {:?}",
+            extraction.references
+        );
+    }
+
+    /// A function-like macro's body calls what it names, and the macro is the
+    /// caller.
+    ///
+    /// The grammar leaves a `#define` body as one `preproc_arg` token, so a
+    /// helper whose only call sites sit inside macro bodies — every
+    /// `mm_bf16_*`, `mm_nn_coop_f32acc` and `mm_i8_dequant_coop` in
+    /// MLSystemsLab's Metal kernels, each stamped out by a `KERNEL(...)`
+    /// macro — had no inbound edge and was published confidently dead. The
+    /// body is parsed by the file's own grammar, the way `probe_macro_body`
+    /// already does for Rust, so a name inside a comment or a string, a
+    /// keyword before `(`, and the macro's own parameters contribute nothing.
+    ///
+    /// The bodies are shaped to what the grammar's preprocessor scanner
+    /// accepts: measured, a block comment closing a continuation line that is
+    /// followed by a keyword line (`if`) or a template-call line (`f<T>(…)`)
+    /// makes tree-sitter drop the whole macro into `preproc_def` + `ERROR`,
+    /// in both the C++ and CUDA grammars. That macro is then not a symbol at
+    /// all — fail-open, one more finding per helper it calls — and nothing
+    /// here can reach it, so the comment and the template call live in
+    /// different macros.
+    #[test]
+    fn a_function_like_macro_body_calls_what_it_names() {
+        let extraction = extract_treesitter(
+            "k.cu",
+            "cuda",
+            "#define STAMP(NAME) \\\n\
+             \x20 __global__ void NAME(float *p) { \\\n\
+             \x20   dev_plain(p); /* dead_in_comment(p) */ \\\n\
+             \x20   dev_plain(p); \\\n\
+             \x20 }\n\
+             #define STAMP2(NAME) \\\n\
+             \x20 __global__ void NAME(float *p) { \\\n\
+             \x20   macro_only_helper<float>(p); p[0] = sizeof(\"dead_in_string(p)\"); \\\n\
+             \x20   constexpr int k = Plain::K; p[1] = k; \\\n\
+             \x20 }\n\
+             #define GUARD(x) if (!(x)) return;\n\
+             #define APPLY(f, x) f(x)\n\
+             #define TORN(x) torn_helper(x) +\n\
+             __device__ void dev_plain(float *p) { p[1] = 1; }\n\
+             __device__ int torn_helper(float *p) { return 1; }\n\
+             template <typename T> __device__ void macro_only_helper(T *p) { p[3] = 1; }\n\
+             __device__ void dead_in_comment(float *p) { p[4] = 1; }\n\
+             __device__ void dead_in_string(float *p) { p[5] = 1; }\n\
+             struct Plain { static constexpr int K = 4; };\n\
+             STAMP(stamped_kernel)\n\
+             STAMP2(stamped_kernel2)\n",
+        );
+        let calls_from = |caller: &str| -> Vec<&str> {
+            let mut names: Vec<&str> = extraction
+                .calls
+                .iter()
+                .filter(|call| call.caller_symbol.as_deref() == Some(caller))
+                .map(|call| call.callee_name.as_str())
+                .collect();
+            names.sort_unstable();
+            names.dedup();
+            names
+        };
+        assert_eq!(
+            calls_from("k.cu::STAMP"),
+            ["dev_plain"],
+            "a name inside a comment is not a callee: {:?}",
+            extraction.calls
+        );
+        assert_eq!(
+            calls_from("k.cu::STAMP2"),
+            ["macro_only_helper"],
+            "a template call is a call; a name inside a string and `sizeof` are not: {:?}",
+            extraction.calls
+        );
+        assert!(
+            calls_from("k.cu::GUARD").is_empty(),
+            "a keyword before `(` is not a callee: {:?}",
+            extraction.calls
+        );
+        assert!(
+            calls_from("k.cu::APPLY").is_empty(),
+            "a macro parameter in callee position is the caller's argument, not a symbol: {:?}",
+            extraction.calls
+        );
+        // `torn_helper(x) +` is an expression fragment: both probe parses can
+        // only place the call inside an `ERROR` node. Refusing it is the
+        // fail-open direction — the helper shows up as one finding too many
+        // rather than being resurrected by a token the grammar could not
+        // place.
+        assert!(
+            calls_from("k.cu::TORN").is_empty(),
+            "a call the grammar could only place under an ERROR node is not a syntactic fact: {:?}",
+            extraction.calls
+        );
+        assert!(
+            extraction
+                .references
+                .iter()
+                .any(|reference| reference.name == "macro_only_helper"
+                    && reference.kind == ReferenceKind::Call
+                    && reference.enclosing_symbol.as_deref() == Some("k.cu::STAMP2")),
+            "the call is also a reference the resolver can attribute: {:?}",
+            extraction.references
+        );
+        // The Metal spelling: `kernel void` plus `[[buffer(n)]]` attributes
+        // inside the body, parsed by the C++ grammar.
+        let metal = extract_treesitter(
+            "a.metal",
+            "cpp",
+            "#define TUNE(NAME, SM) \\\n\
+             \x20 kernel void NAME(device float *A [[buffer(0)]], uint tg [[threadgroup_position_in_grid]]) { \\\n\
+             \x20   mm_tune<SM>(A, tg); \\\n\
+             \x20 }\n\
+             template <int SM> inline void mm_tune(device float *A, uint tg) { A[tg] = SM; }\n\
+             TUNE(mm_64, 64)\n",
+        );
+        assert!(
+            metal.calls.iter().any(|call| call.callee_name == "mm_tune"
+                && call.caller_symbol.as_deref() == Some("a.metal::TUNE")),
+            "a Metal kernel-stamping macro calls its template helper: {:?}",
+            metal.calls
+        );
+    }
+
     /// The declarator suppression follows `declarator` identity, not subtree
     /// containment.
     ///
@@ -9196,9 +10419,9 @@ mod tests {
     ///
     /// Exported module-level bindings *are* emitted now (`f.go::Limit`); this
     /// golden previously pinned their absence as deliberate, which is how the
-    /// omission survived unnoticed. Python module constants and class fields
-    /// still produce no symbol — Python has no export marker, so the principled
-    /// rule is `__all__` membership, and that is not implemented yet.
+    /// omission survived unnoticed. A Python module constant is a symbol too —
+    /// every module-scope name is importable, so `__all__` decides only
+    /// `is_exported` — while a Python class field still produces none.
     #[test]
     fn each_grammar_extracts_its_exact_symbol_set() {
         /// `(kind, qualified_name, is_exported)`.
@@ -9213,6 +10436,7 @@ mod tests {
                 "import os\n\nCONST = 1\n\nclass Widget:\n    attr: int = 0\n                     def render(self):\n        return helper()\n\ndef helper():\n    return 1\n",
                 &[
                     (SymbolKind::File, "f.py", true),
+                    (SymbolKind::Variable, "f.py::CONST", false),
                     (SymbolKind::Class, "f.py::Widget", false),
                     (SymbolKind::Method, "f.py::Widget.render", false),
                     (SymbolKind::Function, "f.py::helper", false),
@@ -11625,15 +12849,23 @@ mod tests {
         );
     }
 
-    /// A Python module constant is public exactly when `__all__` says so.
+    /// Every Python module-scope binding is a symbol; `__all__` decides only
+    /// whether it is exported.
     ///
-    /// Python has no export keyword, so `__all__` is the only declaration of
-    /// public surface the language offers. Emitting every module-level binding
-    /// would add a symbol for every private constant in a repository, whose
-    /// only graph effect is dead-code noise; emitting none leaves genuinely
-    /// public constants invisible. Membership is the principled line.
+    /// This test used to pin the opposite — "public exactly when `__all__` says
+    /// so", with a module lacking `__all__` contributing no constants at all —
+    /// on the premise that `__all__` is Python's only declaration of public
+    /// surface and that the remaining bindings' only graph effect is dead-code
+    /// noise. Both halves were wrong. `__all__` governs `from m import *` and
+    /// nothing else: `from m import OTHER` imports any module-scope name, and
+    /// real code does exactly that with constants `__all__` omits. And a
+    /// binding's graph effect is not only liveness — without a symbol it is
+    /// unsearchable and its importers have no target. Functions and classes
+    /// were never filtered this way; constants now follow the same rule, and
+    /// liveness judges them by their edges. A class attribute and a function
+    /// local are still not module bindings.
     #[test]
-    fn a_python_module_constant_is_public_exactly_when_all_declares_it() {
+    fn a_python_module_binding_is_a_symbol_and_all_decides_only_export() {
         let declared = extract_treesitter(
             "m.py",
             "python",
@@ -11647,25 +12879,22 @@ mod tests {
             .collect();
         assert_eq!(
             variables,
-            [("CONST", true)],
-            "only the `__all__` member is a symbol: `OTHER` and `_priv` are private, \
-             `ATTR` is a class attribute and `LOCAL` is a function local"
+            [("CONST", true), ("OTHER", false), ("_priv", false)],
+            "every module-scope binding is a symbol and only the `__all__` member \
+             is exported; `ATTR` is a class attribute and `LOCAL` a function local"
         );
 
-        // A module with no `__all__` declares no public surface, so it
-        // contributes no constants rather than all of them.
         let undeclared = extract_treesitter("n.py", "python", "CONST = 1\nOTHER = 2\n");
-        assert!(
-            !undeclared
-                .symbols
-                .iter()
-                .any(|symbol| symbol.kind == SymbolKind::Variable),
-            "no `__all__` means no declared constants: {:?}",
-            undeclared
-                .symbols
-                .iter()
-                .map(|s| &s.name)
-                .collect::<Vec<_>>()
+        let variables: Vec<(&str, bool)> = undeclared
+            .symbols
+            .iter()
+            .filter(|symbol| symbol.kind == SymbolKind::Variable)
+            .map(|symbol| (symbol.name.as_str(), symbol.is_exported))
+            .collect();
+        assert_eq!(
+            variables,
+            [("CONST", false), ("OTHER", false)],
+            "a module with no `__all__` still binds its constants"
         );
     }
 

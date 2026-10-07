@@ -114,6 +114,11 @@ export function sources(env = process.env, from = REPO) {
         "dc-regress",
         "dc-regress-store",
         "dc-store",
+        // Held at 4efeecfd, so `--check` reports it drifted. From c17fd379
+        // upstream it links tree-sitter 0.25 unconditionally, MarkDev's
+        // markdev-highlight links 0.26, and cargo admits one package per
+        // `links = "tree-sitter"`. A refresh of it fails to resolve until one
+        // side moves; GitPulse only calls `rigor::redact_secrets`.
         "dc-verify",
         "devmap-analyze",
         "devmap-extract",

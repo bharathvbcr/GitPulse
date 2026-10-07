@@ -3074,17 +3074,46 @@ mod tests {
         repo
     }
 
+    /// Restamps every payload with the identity this build computes, so the
+    /// fixture describes a store the current analyzer wrote.
+    fn stamp_current_payload_identity(repo: &std::path::Path) {
+        let (grammar, analyzer) = devmap_extract::cache::current_payload_identity("rust");
+        let conn = rusqlite::Connection::open(map_path(repo)).unwrap();
+        conn.execute(
+            "UPDATE file_payloads SET grammar_version = ?1, analyzer_version = ?2",
+            (&grammar, &analyzer),
+        )
+        .unwrap();
+    }
+
     #[test]
-    fn freshness_audit_matching_bytes_do_not_certify_analyzer_identity() {
+    fn freshness_audit_matching_bytes_do_not_certify_an_obsolete_analyzer() {
+        // The fixture's payloads carry `v1` stamps no analyzer ever wrote.
+        // Matching source bytes must not carry them to `is_fresh`.
         let repo = freshness_audit_matching_source_fixture();
         let response = status(repo.path().to_str().unwrap());
         assert_eq!(response.source_freshness, Some(true), "{response:?}");
-        assert_eq!(response.analyzer_freshness, None);
+        assert_eq!(response.analyzer_freshness, Some(false));
         assert_eq!(response.is_fresh, Some(false));
         assert!(response
             .freshness_reason
             .unwrap()
-            .contains("analyzer freshness unverified"));
+            .contains("stored extraction payload is obsolete"));
+    }
+
+    /// GitPulse links devmap without the parsing frontend. Until the vendored
+    /// store could compute a payload identity in that configuration, no store
+    /// was ever fresh here: analyzer freshness was always unverified, so
+    /// `is_fresh` could not be true even for a store the current analyzer
+    /// had just written.
+    #[test]
+    fn freshness_audit_a_current_analyzer_identity_is_certified_without_grammars() {
+        let repo = freshness_audit_matching_source_fixture();
+        stamp_current_payload_identity(repo.path());
+        let response = status(repo.path().to_str().unwrap());
+        assert_eq!(response.source_freshness, Some(true), "{response:?}");
+        assert_eq!(response.analyzer_freshness, Some(true), "{response:?}");
+        assert_eq!(response.is_fresh, Some(true), "{response:?}");
     }
 
     #[test]
@@ -3124,7 +3153,7 @@ mod tests {
             std::fs::write(&path, CALLER_SOURCE).unwrap();
             let current = status(root);
             assert_eq!(current.source_freshness, Some(true));
-            assert_eq!(current.analyzer_freshness, None);
+            assert_eq!(current.analyzer_freshness, Some(false));
             assert_eq!(current.is_fresh, Some(false));
         }
     }
