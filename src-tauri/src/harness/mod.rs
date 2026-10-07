@@ -863,7 +863,10 @@ done
         let failure = scope_for(&worktree).expect_err("still a scope failure");
         let verdict = failure.verdict("src/planned.rs");
         assert_eq!(verdict.status, PolicyStatus::Blocked);
-        assert!(!verdict.checked, "the harness never ran, so it did not check");
+        assert!(
+            !verdict.checked,
+            "the harness never ran, so it did not check"
+        );
         assert!(!verdict.gate_failed(), "a refusal, not a gate outage");
         // And the agent hook, which judges through the same owner, refuses too.
         let judged = check_command_in_scope(&worktree, "echo x > src/planned.rs");

@@ -140,7 +140,11 @@ fn a_reply_written_at_accept_is_read_even_when_the_request_write_fails() {
         let request = vec![b' '; 512 * 1024];
         let outcome = client::ask(&path, &request, DEADLINE);
         refuser.join().expect("refuser thread");
-        assert_eq!(outcome.reading(), "backend_failed", "round {round}: {outcome:?}");
+        assert_eq!(
+            outcome.reading(),
+            "backend_failed",
+            "round {round}: {outcome:?}"
+        );
     }
 }
 

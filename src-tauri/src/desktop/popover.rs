@@ -210,7 +210,14 @@ fn validate_action(state: &MenuState, id: &str, repo_path: Option<&str>) -> Resu
     }
     let workspace = matches!(
         id,
-        "open" | "clone" | "fleet" | "agents" | "palette" | "toggle-theme" | "shortcuts" | "diagnostics"
+        "open"
+            | "clone"
+            | "fleet"
+            | "agents"
+            | "palette"
+            | "toggle-theme"
+            | "shortcuts"
+            | "diagnostics"
     ) || id.starts_with(super::actions::REPOSITORY_PREFIX);
     if !workspace && state.active_path.as_deref() != repo_path {
         return Err("Repository changed. Review the current status and try again.".into());
