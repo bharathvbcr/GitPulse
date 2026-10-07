@@ -2276,15 +2276,43 @@ pub async fn cmd_remove_worktree(
     repo_path: String,
     target_path: String,
     force: bool,
+    workbench: State<'_, crate::workbench::WorkbenchState>,
 ) -> Result<Guarded<()>, String> {
+    let workbench = workbench.inner().clone();
     off_thread(move || {
-        let argv_owned = crate::engine::worktree::remove_worktree_argv(&target_path, force);
-        let refs: Vec<&str> = argv_owned.iter().map(String::as_str).collect();
-        let policy = guard(&repo_path, &refs)?;
-        crate::engine::worktree::remove_worktree(&repo_path, &target_path, force)?;
-        Ok(Guarded { policy, output: () })
+        remove_worktree_guarded(
+            &workbench,
+            &repo_path,
+            &target_path,
+            force,
+            &|repo, argv| guard(repo, argv),
+        )
     })
     .await
+}
+
+/// The command gate as a worktree teardown is handed it: the repository and
+/// the full argv (program first). The command supplies [`guard`]; a test
+/// supplies the harness gate without the user-action mark.
+pub(crate) type WorktreeGate<'a> =
+    &'a dyn Fn(&str, &[&str]) -> Result<crate::harness::PolicyVerdict, String>;
+
+/// Body of [`cmd_remove_worktree`].
+pub(crate) fn remove_worktree_guarded(
+    workbench: &crate::workbench::WorkbenchState,
+    repo_path: &str,
+    target_path: &str,
+    force: bool,
+    gate: WorktreeGate<'_>,
+) -> Result<Guarded<()>, String> {
+    // A task run's agent may be working in it; removal would pull its files
+    // out from under it.
+    workbench.refuse_if_run_working_in(target_path)?;
+    let argv_owned = crate::engine::worktree::remove_worktree_argv(target_path, force);
+    let refs: Vec<&str> = argv_owned.iter().map(String::as_str).collect();
+    let policy = gate(repo_path, &refs)?;
+    crate::engine::worktree::remove_worktree(repo_path, target_path, force)?;
+    Ok(Guarded { policy, output: () })
 }
 
 #[tauri::command(async)]
@@ -2339,32 +2367,55 @@ pub async fn cmd_worktree_merge_teardown(
     worktree_path: String,
     target_branch: Option<String>,
     squash: Option<bool>,
+    workbench: State<'_, crate::workbench::WorkbenchState>,
 ) -> Result<Guarded<crate::engine::worktree::MergeTeardownResult>, String> {
+    let workbench = workbench.inner().clone();
     off_thread(move || {
-        let is_squash = squash.unwrap_or(false);
-        // Each step is judged as it runs, with what runs (see the engine's
-        // doc). The verdict reported is the merge's: the first mutation, and
-        // the one the rest depend on.
-        let mut policy = None;
-        let mut gate = |args: &[&str]| -> Result<(), String> {
-            let argv: Vec<&str> = std::iter::once("git").chain(args.iter().copied()).collect();
-            let verdict = guard(&repo_path, &argv)?;
-            policy.get_or_insert(verdict);
-            Ok(())
-        };
-        let result = crate::engine::worktree::merge_and_teardown_worktree(
+        merge_teardown_guarded(
+            &workbench,
             &repo_path,
             &worktree_path,
             target_branch.as_deref(),
-            is_squash,
-            &mut gate,
-        )?;
-        Ok(Guarded {
-            policy: policy.ok_or("The merge ran without being judged by the policy gate.")?,
-            output: result,
-        })
+            squash.unwrap_or(false),
+            &|repo, argv| guard(repo, argv),
+        )
     })
     .await
+}
+
+/// Body of [`cmd_worktree_merge_teardown`].
+pub(crate) fn merge_teardown_guarded(
+    workbench: &crate::workbench::WorkbenchState,
+    repo_path: &str,
+    worktree_path: &str,
+    target_branch: Option<&str>,
+    is_squash: bool,
+    judge: WorktreeGate<'_>,
+) -> Result<Guarded<crate::engine::worktree::MergeTeardownResult>, String> {
+    // Before the merge, not only before the removal: merging a branch an
+    // agent is still committing to takes half its work.
+    workbench.refuse_if_run_working_in(worktree_path)?;
+    // Each step is judged as it runs, with what runs (see the engine's
+    // doc). The verdict reported is the merge's: the first mutation, and
+    // the one the rest depend on.
+    let mut policy = None;
+    let mut gate = |args: &[&str]| -> Result<(), String> {
+        let argv: Vec<&str> = std::iter::once("git").chain(args.iter().copied()).collect();
+        let verdict = judge(repo_path, &argv)?;
+        policy.get_or_insert(verdict);
+        Ok(())
+    };
+    let result = crate::engine::worktree::merge_and_teardown_worktree(
+        repo_path,
+        worktree_path,
+        target_branch,
+        is_squash,
+        &mut gate,
+    )?;
+    Ok(Guarded {
+        policy: policy.ok_or("The merge ran without being judged by the policy gate.")?,
+        output: result,
+    })
 }
 
 /// Reflink-copies standard ignored build caches from anchor to target worktree.

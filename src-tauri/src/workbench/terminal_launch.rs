@@ -260,10 +260,40 @@ fn prepare_kind(state: &WorkbenchState, input: &str, kind: &str) -> Result<Value
     if !input.worktree {
         return prepare_in(state, &input, kind, &input.repo_path);
     }
+    // Held across the whole build, hook included, so a retry of this attempt
+    // never meets a tree that is still being set up — and so a cancel cannot
+    // reclaim it halfway.
+    let _place = state
+        .0
+        .preparations
+        .try_enter(&input.id)
+        .map_err(|_| setting_up())?;
+    let accepted = match state
+        .with_store(|store| query(store, "runs.get", &json!({"id":input.id}).to_string()))
+    {
+        Ok(saved) if saved["item"]["state"] == "prepared" => true,
+        // Building a tree for an attempt that has ended would only leave one
+        // behind for nothing to use.
+        Ok(saved) => {
+            return Err(WorkbenchError::new(
+                "launch_consumed",
+                format!(
+                    "This attempt is already {}. Prepare a new attempt.",
+                    saved["item"]["state"].as_str().unwrap_or("over")
+                ),
+            ))
+        }
+        Err(error) if error.code == "not_found" => false,
+        Err(error) => return Err(error),
+    };
+    if !accepted {
+        ensure_room(state)?;
+    }
     let task = state
         .with_store(|store| query(store, "items.get", &json!({"id":input.task_id}).to_string()))?;
     let title = task["item"]["title"].as_str().unwrap_or_default();
-    let provisioned = super::agent_worktree::provision(&input.repo_path, &input.id, title)?;
+    let provisioned =
+        super::agent_worktree::provision(&input.repo_path, &input.id, title, accepted)?;
     let prepared = prepare_in(state, &input, kind, &provisioned.path);
     if let Err(refusal) = prepared {
         // The attempt does not exist, so neither may the worktree made for it.
@@ -318,6 +348,81 @@ fn prepare_in(
         }
         other => other,
     })
+}
+
+fn setting_up() -> WorkbenchError {
+    WorkbenchError::new(
+        "busy",
+        "This attempt is still setting up its worktree; the repository's setup hook can take several minutes. Wait for it to finish rather than starting it again.",
+    )
+}
+
+/// Refuses a preparation the profile has no room for, before a worktree is
+/// built for it: the store only counts at the very end, after `git worktree
+/// add` and the whole `post_create` hook. Read-only, with the same one
+/// release of provably stranded attempts the store refusal gets; the store
+/// still decides, since this count can only be low.
+fn ensure_room(state: &WorkbenchState) -> Result<(), WorkbenchError> {
+    let limit = state.live_runs();
+    if super::reconcile::live_count(state)? < u64::from(limit) {
+        return Ok(());
+    }
+    match super::reconcile::sweep(state) {
+        Ok(released) if released > 0 => {
+            if super::reconcile::live_count(state)? < u64::from(limit) {
+                return Ok(());
+            }
+        }
+        Ok(_) => {}
+        Err(sweep) => {
+            log::warn!(target: "workbench", "run reconciliation before a launch failed: {}: {}", sweep.code, sweep.message);
+        }
+    }
+    capacity_hint(Err(WorkbenchError::new(
+        "capacity_reached",
+        // The store's sentence (dc-store `runs::prepare`), word for word; a
+        // test holds the two together.
+        format!(
+            "{limit} runs are already prepared, active or unresolved; finish or reconcile one before launching another"
+        ),
+    )))
+    .map(|_| ())
+}
+
+/// `runs.cancel`, and then the worktree made for the attempt, when it was
+/// never claimed: the store's cancel is unchanged and decides first; only
+/// once it succeeded is the tree given back (`agent_worktree::reclaim`,
+/// never forced). What happened to it is the optional `worktree` field
+/// beside `item`; it is absent when the attempt had no worktree of its own.
+pub(super) fn cancel(state: &WorkbenchState, input: &str) -> Result<Value, WorkbenchError> {
+    let id = serde_json::from_str::<Value>(input)
+        .ok()
+        .and_then(|request| request["id"].as_str().map(str::to_owned))
+        .filter(|id| !id.is_empty() && id.len() <= 128);
+    let Some(id) = id else {
+        // Malformed: the store's own validation says how.
+        return state.with_store(|store| query(store, "runs.cancel", input));
+    };
+    let _place = state
+        .0
+        .preparations
+        .try_enter(&id)
+        .map_err(|_| setting_up())?;
+    let before = state
+        .with_store(|store| query(store, "runs.get", &json!({"id":id}).to_string()))
+        .ok();
+    let mut cancelled = state.with_store(|store| query(store, "runs.cancel", input))?;
+    let unclaimed = before.is_some_and(|before| {
+        before["item"]["state"] == "prepared" && before["item"]["owner_id"].is_null()
+    });
+    if unclaimed && cancelled["item"]["state"] == "cancelled" {
+        let open_files = |path: &Path| state.open_files(path);
+        if let Some(outcome) = super::agent_worktree::reclaim(&cancelled["item"], &open_files) {
+            log::info!(target: "workbench", "cancelled attempt {id}: {}", outcome.describe());
+            cancelled["worktree"] = outcome.to_json();
+        }
+    }
+    Ok(cancelled)
 }
 
 /// Says where the limit is set when the profile is full. The store's own
@@ -409,9 +514,27 @@ mod tests {
     use std::path::Path;
     use std::sync::Arc;
 
+    /// Nothing has files open anywhere: the open-file scan is `lsof`, which a
+    /// Linux CI image may not have, and its verdict is not what these tests
+    /// are about. `an_open_worktree_is_kept_when_its_attempt_is_cancelled`
+    /// drives the other answer.
+    fn nothing_open(_: &Path) -> Result<(), String> {
+        Ok(())
+    }
+
     fn host(path: &Path) -> WorkbenchState {
         WorkbenchState(Arc::new(Inner {
             path: Some(path.into()),
+            open_files: Some(nothing_open),
+            ..Inner::default()
+        }))
+    }
+
+    fn limited(path: &Path, live_runs: u32) -> WorkbenchState {
+        WorkbenchState(Arc::new(Inner {
+            path: Some(path.into()),
+            live_runs: Some(live_runs),
+            open_files: Some(nothing_open),
             ..Inner::default()
         }))
     }
@@ -970,6 +1093,328 @@ mod tests {
                 .count(),
             2
         );
+    }
+
+    /// Commits a `post_create` hook, so a provisioned worktree runs it.
+    fn post_create(root: &Path, command: &str) {
+        std::fs::create_dir_all(root.join(".gitpulse")).unwrap();
+        std::fs::write(
+            root.join(".gitpulse/hooks.json"),
+            json!({"worktree":{"post_create":[command]}}).to_string(),
+        )
+        .unwrap();
+        git_text(root, &["add", ".gitpulse/hooks.json"]).unwrap();
+        commit(root);
+    }
+
+    fn lane(root: &Path, name: &str) -> std::path::PathBuf {
+        root.canonicalize()
+            .unwrap()
+            .join(".gitpulse/worktrees")
+            .join(name)
+    }
+
+    fn gitpulse_branches(root: &Path) -> String {
+        git_text(
+            root,
+            &[
+                "for-each-ref",
+                "--format=%(refname:short)",
+                "refs/heads/gitpulse/",
+            ],
+        )
+        .unwrap()
+        .trim()
+        .to_owned()
+    }
+
+    fn cancel(state: &WorkbenchState, id: &str) -> Value {
+        state
+            .request(
+                "runs.cancel",
+                &json!({"id":id,"request_id":format!("cancel-{id}"),"expected_revision":1})
+                    .to_string(),
+            )
+            .unwrap()
+    }
+
+    /// A full profile is refused before anything is built: the worktree, its
+    /// branch and the repository's whole setup hook used to run first, only
+    /// to be torn down again when the store said no. The refusal is the
+    /// store's own sentence, word for word.
+    #[cfg(unix)]
+    #[test]
+    fn a_full_profile_refuses_before_building_a_worktree() {
+        let dir = tempfile::tempdir().unwrap();
+        let sentinel = dir.path().join("setup-ran");
+        let root = dir.path().join("repo");
+        init(&root);
+        commit(&root);
+        post_create(&root, &format!("touch '{}'", sentinel.display()));
+        let other = dir.path().join("other");
+        git_text(
+            &root,
+            &["worktree", "add", "--detach", other.to_str().unwrap()],
+        )
+        .unwrap();
+        crate::test_support::trust_repo(&other);
+        let state = limited(&dir.path().join("profile.sqlite"), 1);
+        seed(&state, &root);
+        state
+            .request("runs.prepare_terminal", &prepare(&root).to_string())
+            .unwrap();
+        // The store's refusal, for a checkout that needs no worktree.
+        let mut elsewhere = prepare(&other);
+        elsewhere["id"] = json!("elsewhere");
+        elsewhere["request_id"] = json!("prepare-elsewhere");
+        let store = state
+            .request("runs.prepare_terminal", &elsewhere.to_string())
+            .unwrap_err();
+        assert_eq!(store.code, "capacity_reached");
+        let refused = state
+            .request(
+                "runs.prepare_terminal",
+                &with_worktree(&root, "f00dcafe-1").to_string(),
+            )
+            .unwrap_err();
+        assert_eq!(refused.code, "capacity_reached");
+        assert_eq!(refused.message, store.message);
+        assert!(
+            !sentinel.exists(),
+            "the setup hook ran for an attempt the profile had no room for"
+        );
+        assert!(!lane(&root, "preserve-e42-f00dcafe").exists());
+        assert_eq!(gitpulse_branches(&root), "");
+    }
+
+    /// A retry that arrives while the first preparation is still running the
+    /// repository's setup hook is told so. It used to find the half-built
+    /// tree, adopt it as "already made", and admit the attempt — and when the
+    /// first preparation's hook then failed, that tree was removed under the
+    /// agent the retry had started in it.
+    #[cfg(unix)]
+    #[test]
+    fn a_retry_during_worktree_setup_is_refused_rather_than_handed_the_half_built_tree() {
+        let dir = tempfile::tempdir().unwrap();
+        let started = dir.path().join("setup-started");
+        let root = dir.path().join("repo");
+        init(&root);
+        commit(&root);
+        post_create(&root, &format!("touch '{}'; sleep 3", started.display()));
+        let state = host(&dir.path().join("profile.sqlite"));
+        seed(&state, &root);
+        let input = with_worktree(&root, "c0c0a123-q").to_string();
+        std::thread::scope(|scope| {
+            let first = scope.spawn(|| state.request("runs.prepare_terminal", &input));
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+            while !started.exists() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the setup hook never started"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            let retry = state.request("runs.prepare_terminal", &input);
+            let first = first.join().unwrap();
+            let refusal =
+                retry.expect_err("a retry was handed a worktree whose setup was still running");
+            assert_eq!(refusal.code, "busy");
+            assert!(
+                refusal.message.contains("still setting up its worktree"),
+                "{}",
+                refusal.message
+            );
+            assert_eq!(first.unwrap()["item"]["state"], "prepared");
+        });
+    }
+
+    /// A worktree whose setup never finished — GitPulse quit during the hook —
+    /// is set up again before an agent is given it. It used to be adopted as
+    /// this attempt's finished tree, so the agent started without the
+    /// dependencies the hook installs.
+    #[cfg(unix)]
+    #[test]
+    fn a_worktree_left_half_built_is_set_up_again_before_an_agent_gets_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let ran = dir.path().join("setup-ran");
+        let root = dir.path().join("repo");
+        init(&root);
+        commit(&root);
+        post_create(&root, &format!("touch '{}'", ran.display()));
+        // What a preparation that died during its hook leaves behind.
+        let path = lane(&root, "preserve-e42-deadc0de");
+        git_text(
+            &root,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "gitpulse/preserve-e42-deadc0de",
+                path.to_str().unwrap(),
+            ],
+        )
+        .unwrap();
+        std::fs::write(path.join("half-installed"), "x").unwrap();
+        let state = host(&dir.path().join("profile.sqlite"));
+        seed(&state, &root);
+        let run = state
+            .request(
+                "runs.prepare_terminal",
+                &with_worktree(&root, "deadc0de-h").to_string(),
+            )
+            .unwrap();
+        assert_eq!(Path::new(run["item"]["cwd"].as_str().unwrap()), path);
+        assert!(
+            ran.exists(),
+            "the agent was given a tree whose setup never ran"
+        );
+        assert!(!path.join("half-installed").exists());
+    }
+
+    /// Cancelling an attempt that was never claimed gives back the worktree
+    /// and branch made for it. Both used to stay forever, one more per
+    /// cancel-and-retry.
+    #[test]
+    fn cancelling_an_unclaimed_attempt_removes_the_worktree_made_for_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("repo");
+        init(&root);
+        commit(&root);
+        let state = host(&dir.path().join("profile.sqlite"));
+        seed(&state, &root);
+        let run = state
+            .request(
+                "runs.prepare_terminal",
+                &with_worktree(&root, "abad1dea-c").to_string(),
+            )
+            .unwrap();
+        let cwd = run["item"]["cwd"].as_str().unwrap().to_owned();
+        assert!(Path::new(&cwd).is_dir());
+        let cancelled = cancel(&state, "abad1dea-c");
+        assert_eq!(cancelled["item"]["state"], "cancelled");
+        assert!(
+            !Path::new(&cwd).exists(),
+            "the cancelled attempt's worktree stayed"
+        );
+        assert_eq!(gitpulse_branches(&root), "");
+        assert_eq!(cancelled["worktree"]["removed"], true, "{cancelled}");
+        assert_eq!(cancelled["worktree"]["path"], json!(cwd));
+    }
+
+    /// Work in the tree is never thrown away to tidy up: a cancelled attempt
+    /// whose worktree has changes keeps it, and says why.
+    #[test]
+    fn cancelling_keeps_a_worktree_that_holds_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("repo");
+        init(&root);
+        commit(&root);
+        let state = host(&dir.path().join("profile.sqlite"));
+        seed(&state, &root);
+        let run = state
+            .request(
+                "runs.prepare_terminal",
+                &with_worktree(&root, "5afe0001-k").to_string(),
+            )
+            .unwrap();
+        let cwd = Path::new(run["item"]["cwd"].as_str().unwrap()).to_path_buf();
+        std::fs::write(cwd.join("notes.txt"), "mine").unwrap();
+        let cancelled = cancel(&state, "5afe0001-k");
+        assert_eq!(cancelled["item"]["state"], "cancelled");
+        assert_eq!(
+            std::fs::read_to_string(cwd.join("notes.txt")).unwrap(),
+            "mine"
+        );
+        assert_eq!(gitpulse_branches(&root), "gitpulse/preserve-e42-5afe0001");
+        assert_eq!(cancelled["worktree"]["removed"], false, "{cancelled}");
+        assert!(
+            cancelled["worktree"]["kept_because"]
+                .as_str()
+                .is_some_and(|why| !why.is_empty()),
+            "{cancelled}"
+        );
+    }
+
+    /// A clean tree that something still has open — a shell started in it, an
+    /// editor — is kept, and the scan's answer is the reason given.
+    #[test]
+    fn an_open_worktree_is_kept_when_its_attempt_is_cancelled() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("repo");
+        init(&root);
+        commit(&root);
+        let state = WorkbenchState(Arc::new(Inner {
+            path: Some(dir.path().join("profile.sqlite")),
+            open_files: Some(|_| Err("pid 4242 has its working directory here".into())),
+            ..Inner::default()
+        }));
+        seed(&state, &root);
+        let run = state
+            .request(
+                "runs.prepare_terminal",
+                &with_worktree(&root, "0be00be0-o").to_string(),
+            )
+            .unwrap();
+        let cancelled = cancel(&state, "0be00be0-o");
+        assert!(Path::new(run["item"]["cwd"].as_str().unwrap()).is_dir());
+        assert_eq!(cancelled["worktree"]["removed"], false);
+        assert!(
+            cancelled["worktree"]["kept_because"]
+                .as_str()
+                .unwrap()
+                .contains("pid 4242"),
+            "{cancelled}"
+        );
+        // A cancel of an attempt that never had its own worktree reports none.
+        state
+            .request("runs.prepare_terminal", &prepare(&root).to_string())
+            .unwrap();
+        let plain = cancel(&state, "run");
+        assert_eq!(plain["item"]["state"], "cancelled");
+        assert!(plain.get("worktree").is_none(), "{plain}");
+    }
+
+    /// A preparation that expired unclaimed gives its worktree back when
+    /// GitPulse next reconciles; one still within its five minutes keeps it.
+    #[test]
+    fn an_expired_unclaimed_attempt_gives_its_worktree_back_on_reconciliation() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("repo");
+        init(&root);
+        commit(&root);
+        let state = host(&dir.path().join("profile.sqlite"));
+        seed(&state, &root);
+        let mut cwds = Vec::new();
+        for id in ["e1e1e1e1-x", "f2f2f2f2-y"] {
+            let run = state
+                .request(
+                    "runs.prepare_terminal",
+                    &with_worktree(&root, id).to_string(),
+                )
+                .unwrap();
+            cwds.push(run["item"]["cwd"].as_str().unwrap().to_owned());
+        }
+        state
+            .with_store(|store| {
+                store
+                    .connection()
+                    .execute(
+                        "UPDATE work_runs SET body=json_set(body,'$.expires_at',1) WHERE id='e1e1e1e1-x'",
+                        [],
+                    )
+                    .map_err(|e| super::super::WorkbenchError::new("store_error", e.to_string()))
+            })
+            .unwrap();
+        state.reconcile_stale_runs().unwrap();
+        assert!(
+            !Path::new(&cwds[0]).exists(),
+            "the expired attempt's worktree stayed"
+        );
+        assert!(
+            Path::new(&cwds[1]).is_dir(),
+            "a live preparation lost its worktree"
+        );
+        assert_eq!(gitpulse_branches(&root), "gitpulse/preserve-e42-f2f2f2f2");
     }
 
     #[test]

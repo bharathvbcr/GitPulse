@@ -32,6 +32,9 @@ const MAX_MODEL_ID: usize = 128;
 
 /// Identity of the Manvi child environment. Changing it retires the worker.
 type WorkerFingerprint = Option<(String, String)>;
+/// An open-file scan of a directory: `Ok` only when nothing is open in it.
+#[cfg(test)]
+type OpenFiles = fn(&std::path::Path) -> Result<(), String>;
 
 #[derive(Debug, Serialize)]
 pub struct WorkbenchError {
@@ -72,6 +75,15 @@ struct Inner {
     /// Attempts whose launch is in flight, per lane (see `in_flight.rs`).
     managed_launches: in_flight::Attempts,
     terminal_launches: in_flight::Attempts,
+    /// Attempts whose preparation is in flight: held across building a task
+    /// worktree, whose `post_create` hook may run for many minutes, and
+    /// across cancelling one. Its own set, because a launch waits on its
+    /// lane's place (30s) and would otherwise queue behind a whole setup.
+    preparations: in_flight::Attempts,
+    /// Stands in for the open-file scan when a test needs a verdict that
+    /// does not depend on `lsof` being installed.
+    #[cfg(test)]
+    open_files: Option<OpenFiles>,
     /// How many attempts may be live at once. Only tests supply one; the app
     /// reads the user's setting at each launch, so a change applies to the
     /// next launch without a restart.
@@ -101,6 +113,52 @@ impl WorkbenchState {
         self.0.terminals.get()
     }
 
+    /// Whether anything has a file or working directory open under a path,
+    /// before GitPulse removes a worktree there on its own initiative.
+    fn open_files(&self, path: &std::path::Path) -> Result<(), String> {
+        #[cfg(test)]
+        if let Some(check) = self.0.open_files {
+            return check(path);
+        }
+        crate::storage::hygiene::open_files_under(path)
+    }
+
+    /// Refuses to tear down `worktree_path` while a task run is working in
+    /// it, naming the run and its task. "Working" is what run reconciliation
+    /// would keep: a held run that is not provably over. A profile that does
+    /// not exist yet has no runs, and is not created by asking.
+    pub(crate) fn refuse_if_run_working_in(&self, worktree_path: &str) -> Result<(), String> {
+        let exists = self
+            .profile_path()
+            .map_err(|e| {
+                format!(
+                    "Could not check for task runs in this worktree: {}",
+                    e.message
+                )
+            })?
+            .exists();
+        if !exists {
+            return Ok(());
+        }
+        let target = std::path::Path::new(worktree_path);
+        let target = target
+            .canonicalize()
+            .unwrap_or_else(|_| target.to_path_buf());
+        match reconcile::working_in(self, &target) {
+            Ok(None) => Ok(()),
+            Ok(Some((run, why))) => Err(format!(
+                "Task run {} for \"{}\" is still working in this worktree ({}). Stop it, or wait for it to finish, before removing the worktree.",
+                run["id"].as_str().unwrap_or("?"),
+                run["task_title"].as_str().unwrap_or("an untitled task"),
+                why.trim_end_matches('.'),
+            )),
+            Err(error) => Err(format!(
+                "Could not check whether a task run is still working in this worktree, so it was left alone: {}",
+                error.message
+            )),
+        }
+    }
+
     /// The limit the next preparation passes to the store.
     ///
     /// A state with a test-supplied profile and no test-supplied limit uses
@@ -126,7 +184,11 @@ impl WorkbenchState {
         if !self.profile_path()?.exists() {
             return Ok(0);
         }
-        reconcile::sweep(self)
+        let released = reconcile::sweep(self);
+        // Startup only, not every capacity sweep: each candidate costs an
+        // open-file scan, and a launch must not wait on that.
+        reconcile::reclaim_expired(self);
+        released
     }
 
     fn check_open(&self) -> Result<(), WorkbenchError> {
@@ -277,6 +339,9 @@ impl WorkbenchState {
         }
         if method == "runs.claim" {
             return terminal_launch::claim(self, input);
+        }
+        if method == "runs.cancel" {
+            return terminal_launch::cancel(self, input);
         }
         if method == "runs.release" {
             return reconcile::release(self, input);

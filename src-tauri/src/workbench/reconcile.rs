@@ -90,11 +90,7 @@ pub(crate) fn judge(
     child: impl Fn(u32, &str) -> Liveness,
     owner_since: impl Fn(u32, u128) -> Liveness,
 ) -> Verdict {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or_default();
-    judge_at(run, tracked_here, child, owner_since, now)
+    judge_at(run, tracked_here, child, owner_since, now_secs())
 }
 
 /// The pure decision, with every observation injected — the clock included,
@@ -350,29 +346,154 @@ pub(super) fn sweep_briefs() -> usize {
 ///
 /// Returns how many were released. Bounded by `MAX_PAGES` per state, and a
 /// failure on one run never stops the others.
+/// Walks the runs in `run_state`, at most `MAX_PAGES` pages of `PAGE`,
+/// newest first when `newest`. `visit` returns false to stop early. Returns
+/// whether every run in the state was seen — false when the walk stopped at
+/// the page cap, which a caller must not read as "there are no more".
+fn walk(
+    state: &WorkbenchState,
+    run_state: &str,
+    newest: bool,
+    mut visit: impl FnMut(&Value) -> bool,
+) -> Result<bool, WorkbenchError> {
+    let mut cursor: Option<String> = None;
+    for _ in 0..MAX_PAGES {
+        let mut input = json!({"state": run_state, "limit": PAGE, "newest": newest});
+        if let Some(cursor) = &cursor {
+            input["cursor"] = json!(cursor);
+        }
+        let page = state.with_store(|store| query(store, "runs.list", &input.to_string()))?;
+        for run in page["items"].as_array().into_iter().flatten() {
+            if !visit(run) {
+                return Ok(true);
+            }
+        }
+        match page["next_cursor"].as_str() {
+            Some(next) if page["has_more"] == true => cursor = Some(next.to_owned()),
+            _ => return Ok(true),
+        }
+    }
+    Ok(false)
+}
+
+fn now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or_default()
+}
+
+/// How many attempts the store counts against the live-run limit: held runs,
+/// and preparations not yet expired. Read-only. It can only undercount (a
+/// preparation past the page cap is not seen), so a caller may refuse early
+/// on it but never admit in the store's place: the store's own count is the
+/// one that decides.
+pub(super) fn live_count(state: &WorkbenchState) -> Result<u64, WorkbenchError> {
+    let mut live = 0;
+    for held in HELD {
+        let page = state.with_store(|store| {
+            query(
+                store,
+                "runs.list",
+                &json!({"state": held, "limit": 1}).to_string(),
+            )
+        })?;
+        live += page["total"].as_u64().unwrap_or(0);
+    }
+    // A preparation expires a fixed time after it is made, so newest first,
+    // the first expired one means every older one has expired too.
+    let now = now_secs();
+    walk(state, "prepared", true, |run| {
+        let open = run["expires_at"].as_u64().is_some_and(|at| at > now);
+        live += u64::from(open);
+        open
+    })?;
+    Ok(live)
+}
+
+/// Gives back the worktrees of preparations that expired without ever being
+/// claimed (see `agent_worktree::reclaim`). The run rows are left as they
+/// are: an expired preparation already holds nothing, and the store keeps
+/// its history. Returns how many worktrees were removed; one that cannot be
+/// removed is logged with the reason and tried again next time.
+pub(super) fn reclaim_expired(state: &WorkbenchState) -> usize {
+    let now = now_secs();
+    let mut expired = Vec::new();
+    let walked = walk(state, "prepared", true, |run| {
+        if run["expires_at"].as_u64().is_some_and(|at| at <= now) {
+            expired.push(run.clone());
+        }
+        true
+    });
+    if let Err(error) = walked {
+        log::warn!(target: "workbench", "expired preparations could not be listed: {}: {}", error.code, error.message);
+    }
+    let mut removed = 0;
+    for run in expired {
+        let id = run["id"].as_str().unwrap_or_default();
+        // A retry of this very attempt may be rebuilding its tree right now.
+        let Ok(_place) = state.0.preparations.try_enter(id) else {
+            continue;
+        };
+        let open_files = |path: &std::path::Path| state.open_files(path);
+        if let Some(outcome) = super::agent_worktree::reclaim(&run, &open_files) {
+            log::info!(target: "workbench", "expired attempt {id}: {}", outcome.describe());
+            removed += usize::from(outcome.removed());
+        }
+    }
+    removed
+}
+
+/// The held run whose checkout is `target` or inside it and which the
+/// evidence says may still be working, with that evidence. A run that
+/// reconciliation would release (its owner and process provably gone) does
+/// not count. Every held run must be seen: a listing cut short is an error,
+/// because "not found in what was read" is not "not there".
+pub(super) fn working_in(
+    state: &WorkbenchState,
+    target: &std::path::Path,
+) -> Result<Option<(Value, String)>, WorkbenchError> {
+    let mut inside = Vec::new();
+    for held in HELD {
+        let complete = walk(state, held, false, |run| {
+            if run["cwd"]
+                .as_str()
+                .is_some_and(|cwd| std::path::Path::new(cwd).starts_with(target))
+            {
+                inside.push(run.clone());
+            }
+            true
+        })?;
+        if !complete {
+            return Err(WorkbenchError::new(
+                "too_many_runs",
+                format!(
+                    "more than {} {held} runs are recorded",
+                    MAX_PAGES as u64 * PAGE
+                ),
+            ));
+        }
+    }
+    Ok(inside
+        .into_iter()
+        .find_map(|run| match observe(state, &run) {
+            Verdict::Keep(why) => Some((run, why)),
+            Verdict::Release(_) => None,
+        }))
+}
+
 pub(super) fn sweep(state: &WorkbenchState) -> Result<usize, WorkbenchError> {
     // Receipts that storage refused when their runs ended are stored first,
     // so a recorded exit code is never overwritten by `outcome_uncertain`.
     super::receipts::replay(state, None);
     let mut ids = Vec::new();
     for held in HELD {
-        let mut cursor: Option<String> = None;
-        for _ in 0..MAX_PAGES {
-            let mut input = json!({"state": held, "limit": PAGE});
-            if let Some(cursor) = &cursor {
-                input["cursor"] = json!(cursor);
+        walk(state, held, false, |run| {
+            if let Some(id) = run["id"].as_str() {
+                ids.push(id.to_owned());
             }
-            let page = state.with_store(|store| query(store, "runs.list", &input.to_string()))?;
-            for run in page["items"].as_array().into_iter().flatten() {
-                if let Some(id) = run["id"].as_str() {
-                    ids.push(id.to_owned());
-                }
-            }
-            match page["next_cursor"].as_str() {
-                Some(next) if page["has_more"] == true => cursor = Some(next.to_owned()),
-                _ => break,
-            }
-        }
+            true
+        })?;
     }
     let mut released = 0;
     for id in ids {

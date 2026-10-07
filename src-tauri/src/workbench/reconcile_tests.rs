@@ -324,6 +324,65 @@ fn a_live_agent_keeps_its_checkout_and_says_so() {
     prepare(&state, &root, "second").unwrap();
 }
 
+/// A worktree a task run is still working in is neither merged away nor
+/// removed under it; both used to go ahead without looking. Once the agent
+/// is provably gone, removal is allowed again.
+#[cfg(test)]
+#[cfg(unix)]
+#[test]
+fn a_worktree_with_a_live_run_in_it_is_not_torn_down() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("repo");
+    repo(&root);
+    let lane = dir.path().join("lane");
+    git_text(
+        &root,
+        &["worktree", "add", "-b", "feature", lane.to_str().unwrap()],
+    )
+    .unwrap();
+    crate::test_support::trust_repo(&lane);
+    let state = host(&dir.path().join("profile.sqlite"));
+    seed(&state, &root);
+    prepare(&state, &lane, "busy").unwrap();
+    let mut agent = std::process::Command::new("sh")
+        .args(["-c", "read line"])
+        .stdin(std::process::Stdio::piped())
+        .spawn_locked()
+        .unwrap();
+    let pid = agent.id();
+    let birth = process_birth::read(pid).unwrap();
+    let (gone_owner, _) = reaped();
+    strand(
+        &state,
+        "busy",
+        &format!("native-{gone_owner}-1-1"),
+        Some((pid, birth)),
+    );
+    let (repo_path, lane_path) = (root.to_str().unwrap(), lane.to_str().unwrap());
+    let gate = |repo: &str, argv: &[&str]| crate::harness::guard_command(repo, argv);
+    let removal =
+        crate::commands::remove_worktree_guarded(&state, repo_path, lane_path, true, &gate)
+            .expect_err("a worktree was removed under a running agent");
+    let merge =
+        crate::commands::merge_teardown_guarded(&state, repo_path, lane_path, None, false, &gate)
+            .expect_err("a worktree was merged away under a running agent");
+    for refusal in [&removal, &merge] {
+        assert!(
+            refusal.contains("still working in this worktree")
+                && refusal.contains("busy")
+                && refusal.contains("Ship it")
+                && refusal.contains(&format!("pid {pid}")),
+            "{refusal}"
+        );
+    }
+    assert!(lane.is_dir());
+    assert!(git_text(&root, &["rev-parse", "--verify", "refs/heads/feature"]).is_ok());
+    drop(agent.stdin.take());
+    agent.wait().unwrap();
+    crate::commands::remove_worktree_guarded(&state, repo_path, lane_path, true, &gate).unwrap();
+    assert!(!lane.exists());
+}
+
 #[cfg(unix)]
 #[test]
 fn a_sweep_releases_only_the_attempts_with_proof_and_is_idempotent() {

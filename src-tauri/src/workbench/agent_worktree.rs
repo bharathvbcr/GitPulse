@@ -34,17 +34,32 @@
 //!   the selected checkout's HEAD, so `-d` succeeds, and if anything did
 //!   commit to it in between, `-d` refuses rather than losing that work.
 //!
-//! A worktree whose attempt was accepted is never removed here. The agent's
-//! work lives in it; ending the run does not end the need for it.
+//! - Setup is finished only when the `post_create` hook succeeded, and that is
+//!   recorded in the worktree's private Git directory ([`SETUP_COMPLETE`]).
+//!   A tree found without it was left by a preparation that died mid-setup;
+//!   it is rebuilt rather than handed to an agent as if it were ready. (The
+//!   preparation in flight holds its attempt's place for the whole setup, so
+//!   a retry never meets a tree another call is still building.)
+//!
+//! A worktree whose attempt was claimed is never removed here. The agent's
+//! work lives in it; ending the run does not end the need for it. A worktree
+//! whose attempt ended *unclaimed* — cancelled, or expired — is given back by
+//! [`reclaim`], without force: Git keeps a tree with changes, `branch -d`
+//! keeps a branch with commits, and a tree something still has open is kept.
 
 use super::WorkbenchError;
-use crate::engine::git_cli::{git_captured, resolve_git_common_dir};
+use crate::engine::git_cli::{git_captured, resolve_git_common_dir, resolve_git_dir};
 use crate::engine::worktree::{gitpulse_lane_container, GITPULSE_LANE_DIR as EXCLUDED};
+use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 
 const EXCLUDE_MARKER: &str =
     "# GitPulse: task agent worktrees (machine-generated, never committed)";
 const MAX_SLUG: usize = 40;
+/// Written into the worktree's private Git directory (never its files, where
+/// `git status` would show it) once the `post_create` hook has succeeded.
+/// `git worktree remove` takes it with the rest of that directory.
+const SETUP_COMPLETE: &str = "gitpulse-setup-complete";
 
 pub(super) struct Provisioned {
     /// The checkout the worktree was branched from, which runs the git.
@@ -135,33 +150,70 @@ fn existing(selected: &Path, path: &Path, branch: &str) -> Result<bool, Workbenc
     Ok(false)
 }
 
+/// The one naming rule: an attempt's worktree directory name, from the task
+/// title it was prepared for and its id. Its branch is `gitpulse/<name>`.
+fn lane_name(title: &str, run_id: &str) -> Result<String, WorkbenchError> {
+    Ok(format!("{}-{}", slug(title), short(run_id)?))
+}
+
+fn lane_branch(name: &str) -> String {
+    format!("gitpulse/{name}")
+}
+
+/// Whether this worktree's `post_create` setup finished.
+fn setup_complete(path: &Path) -> bool {
+    resolve_git_dir(path).is_ok_and(|dir| dir.join(SETUP_COMPLETE).is_file())
+}
+
+/// `accepted`: the store already holds this attempt, so its worktree was set
+/// up in full before it was accepted (preparation is only stored after the
+/// hook succeeds) and is reused whatever the marker says — builds before the
+/// marker existed wrote none.
 pub(super) fn provision(
     selected: &str,
     run_id: &str,
     title: &str,
+    accepted: bool,
 ) -> Result<Provisioned, WorkbenchError> {
     let source = Path::new(selected);
     let root = main_checkout(source)?;
-    let name = format!("{}-{}", slug(title), short(run_id)?);
+    let name = lane_name(title, run_id)?;
     let path = gitpulse_lane_container(&root).join(&name);
-    let branch = format!("gitpulse/{name}");
+    let branch = lane_branch(&name);
     let path_text = path
         .to_str()
         .ok_or_else(|| refused("The worktree path is not valid Unicode."))?
         .to_owned();
     if path.exists() {
-        if existing(source, &path, &branch)? {
-            return Ok(Provisioned {
-                source: selected.into(),
-                path: path_text,
-                branch,
-                created: false,
-            });
+        if !existing(source, &path, &branch)? {
+            return Err(refused(format!(
+                "{} already exists and is not this attempt's worktree. Remove it or prepare a new attempt.",
+                path.display()
+            )));
         }
-        return Err(refused(format!(
-            "{} already exists and is not this attempt's worktree. Remove it or prepare a new attempt.",
-            path.display()
-        )));
+        let found = Provisioned {
+            source: selected.into(),
+            path: path_text.clone(),
+            branch: branch.clone(),
+            created: false,
+        };
+        if accepted || setup_complete(&path) {
+            return Ok(found);
+        }
+        // Made for this attempt, never accepted, and its setup never
+        // finished: the preparation that built it died during the hook.
+        // Nothing was started in it, so it is rebuilt from the beginning.
+        log::warn!(target: "workbench", "agent worktree {} was left half set up by an earlier preparation; rebuilding it", found.path);
+        discard(&Provisioned {
+            created: true,
+            ..found
+        })
+        .map_err(|e| {
+            refused(format!(
+                "{} was left half set up by an earlier preparation of this attempt and could not be removed to set it up again: {e}",
+                path.display()
+            ))
+        })?;
     }
     let exclude = crate::devmap::init::ensure_dir_excluded(&root, EXCLUDED, EXCLUDE_MARKER);
     if !exclude.is_clean() {
@@ -210,7 +262,151 @@ pub(super) fn provision(
             "The repository's post_create hook failed in the new worktree, so the agent was not started: {hook}.{cleanup}"
         )));
     }
+    // Without the record, a later retry of this same attempt rebuilds the
+    // tree instead of trusting it: slower, never wrong.
+    if let Err(error) = resolve_git_dir(Path::new(&provisioned.path))
+        .and_then(|dir| std::fs::write(dir.join(SETUP_COMPLETE), b"").map_err(|e| e.to_string()))
+    {
+        log::warn!(target: "workbench", "agent worktree {} is set up but could not record it: {error}", provisioned.path);
+    }
     Ok(provisioned)
+}
+
+/// What [`reclaim`] did with an unclaimed attempt's worktree.
+pub(super) struct Reclaimed {
+    path: String,
+    branch: String,
+    removed: bool,
+    branch_deleted: bool,
+    kept_because: Option<String>,
+}
+
+impl Reclaimed {
+    fn kept(path: &str, branch: &str, why: String) -> Self {
+        Self {
+            path: path.into(),
+            branch: branch.into(),
+            removed: false,
+            branch_deleted: false,
+            kept_because: Some(why),
+        }
+    }
+
+    /// The optional `worktree` field beside a cancel's `item`.
+    pub(super) fn to_json(&self) -> Value {
+        json!({
+            "path": self.path,
+            "branch": self.branch,
+            "removed": self.removed,
+            "branch_deleted": self.branch_deleted,
+            "kept_because": self.kept_because,
+        })
+    }
+
+    pub(super) fn removed(&self) -> bool {
+        self.removed
+    }
+
+    pub(super) fn describe(&self) -> String {
+        match (&self.kept_because, self.removed) {
+            (None, _) => format!("removed {} and its branch {}", self.path, self.branch),
+            (Some(why), true) => format!("removed {}; {why}", self.path),
+            (Some(why), false) => format!("kept {}: {why}", self.path),
+        }
+    }
+}
+
+/// The main checkout, path and branch [`provision`] made for `run`, when the
+/// run's checkout is that worktree. Derived from the run's own
+/// snapshot (its task title as prepared, its id and its recorded Git
+/// directory), so a task renamed since does not lose track of it, and a run
+/// prepared in any other checkout is never mistaken for one.
+fn made_for(run: &Value) -> Option<(PathBuf, String, String)> {
+    let name = lane_name(run["task_title"].as_str()?, run["id"].as_str()?).ok()?;
+    let common = Path::new(run["git_common_dir"].as_str()?);
+    if common.file_name().and_then(|n| n.to_str()) != Some(".git") {
+        return None;
+    }
+    let main = common.parent()?.to_path_buf();
+    let path = gitpulse_lane_container(&main).join(&name);
+    let branch = lane_branch(&name);
+    // The run's directory is the tree itself, or a folder inside it when the
+    // attempt was prepared for a subdirectory of its checkout.
+    if !Path::new(run["cwd"].as_str()?).starts_with(&path)
+        || run["head_ref"].as_str() != Some(format!("refs/heads/{branch}").as_str())
+    {
+        return None;
+    }
+    Some((main, path.to_str()?.to_owned(), branch))
+}
+
+/// Gives back the worktree made for an attempt that ended without ever being
+/// claimed. `None` when the run has no such worktree, or it is already gone.
+///
+/// Never forced. It is kept, and the result says why, when it is no longer
+/// this attempt's worktree, when `open_files` cannot show that nothing has a
+/// file or a working directory in it, or when `git worktree remove` refuses
+/// (changes or untracked files). Its branch goes with `-d`, which keeps one
+/// that has commits of its own.
+pub(super) fn reclaim(
+    run: &Value,
+    open_files: &dyn Fn(&Path) -> Result<(), String>,
+) -> Option<Reclaimed> {
+    if !run["owner_id"].is_null() {
+        return None;
+    }
+    let (main, path, branch) = made_for(run)?;
+    if !Path::new(&path).exists() {
+        return None;
+    }
+    let source = main.to_str()?.to_owned();
+    match existing(&main, Path::new(&path), &branch) {
+        Ok(true) => {}
+        Ok(false) => {
+            return Some(Reclaimed::kept(
+                &path,
+                &branch,
+                format!(
+                    "it is no longer a worktree on {branch}, so it is not this attempt's to remove"
+                ),
+            ))
+        }
+        Err(error) => {
+            return Some(Reclaimed::kept(
+                &path,
+                &branch,
+                format!("its worktree could not be confirmed: {}", error.message),
+            ))
+        }
+    }
+    if let Err(why) = open_files(Path::new(&path)) {
+        return Some(Reclaimed::kept(
+            &path,
+            &branch,
+            format!("something may still be using it ({why})"),
+        ));
+    }
+    let remove = crate::engine::worktree::remove_worktree_argv(&path, false);
+    let refs: Vec<&str> = remove.iter().map(String::as_str).collect();
+    if let Err(why) = crate::harness::guard_command(&source, &refs)
+        .and_then(|_| crate::engine::worktree::remove_worktree(&source, &path, false))
+    {
+        return Some(Reclaimed::kept(&path, &branch, why));
+    }
+    let delete = ["git", "branch", "-d", branch.as_str()];
+    let deleted = crate::harness::guard_command(&source, &delete).and_then(|_| {
+        crate::engine::git_writer::GitWriter::delete_branch(&source, &branch, false).map(|_| ())
+    });
+    Some(Reclaimed {
+        kept_because: deleted
+            .as_ref()
+            .err()
+            .map(|why| format!("its branch {branch} was kept: {why}")),
+        branch_deleted: deleted.is_ok(),
+        path,
+        branch,
+        removed: true,
+    })
 }
 
 /// Undoes `provision` after the store refused the attempt. A worktree a retry
@@ -271,7 +467,8 @@ mod tests {
             ],
         )
         .unwrap();
-        let Err(refused) = provision(root.to_str().unwrap(), "f00dcafe-1", "Preserve E42") else {
+        let Err(refused) = provision(root.to_str().unwrap(), "f00dcafe-1", "Preserve E42", false)
+        else {
             panic!("an agent worktree whose setup hook failed was provisioned");
         };
         assert_eq!(refused.code, "worktree_unavailable");
@@ -319,7 +516,13 @@ mod tests {
             ],
         )
         .unwrap();
-        let made = provision(root.to_str().unwrap(), "c0ffee00-1", "Fix the watcher").unwrap();
+        let made = provision(
+            root.to_str().unwrap(),
+            "c0ffee00-1",
+            "Fix the watcher",
+            false,
+        )
+        .unwrap();
         assert!(std::path::Path::new(&made.path).is_dir(), "{}", made.path);
         let status = git_text(&root, &["status", "--porcelain", "--untracked-files=all"]).unwrap();
         // The command gate's ledger also writes into the repository; only the
