@@ -2344,6 +2344,26 @@ done
         assert!(output.is_silent(), "{:?}", output.render());
     }
 
+    /// A repository GitPulse is not trusted in has no binding it may read —
+    /// resolving one runs Git, which the trust gate refuses. Failing closed
+    /// there denied every Bash call in every repository the person never
+    /// opened in GitPulse (`hook_protocol_stress` caught it as a deny with no
+    /// harness installed). It is judged as it was before scopes: unscoped.
+    #[cfg(unix)]
+    #[test]
+    fn an_untrusted_repository_is_judged_without_scope_not_refused() {
+        let (dir, repo, requests) = scoped_hook_fixture(false);
+        crate::repository_trust::revoke(&repo).expect("revoke trust");
+        let serial = crate::harness::sidecar::test_serial();
+        let _binary = install_scoped_manvi(dir.path(), &requests, &serial);
+
+        let output = gate_here(&bash_call(&repo, "echo x > docs/elsewhere.md"));
+        assert!(output.is_silent(), "{:?}", output.render());
+        let sent = std::fs::read_to_string(&requests).unwrap_or_default();
+        assert!(!sent.is_empty(), "the command was not judged at all");
+        assert!(!sent.contains("\"scope\""), "{sent}");
+    }
+
     /// Outside any repository there is no binding to look up. Asking the ledger
     /// anyway would fail closed and refuse every command an agent ran there.
     #[cfg(unix)]

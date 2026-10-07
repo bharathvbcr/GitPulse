@@ -94,7 +94,10 @@ pub(crate) fn guard_command_allowing(
     allowed: &[String],
 ) -> Result<PolicyVerdict, String> {
     let command = render_command(argv);
-    let verdict = judge_command(repo_path, &command, allowed);
+    let verdict = match scope_for(repo_path) {
+        Ok(scope) => check_command_allowing(repo_path, &command, scope.as_ref(), allowed),
+        Err(failure) => failure.verdict(&command),
+    };
     let action = crate::ledger::action_for_argv(argv);
     let argv_json = serde_json::to_string(argv).ok();
     record_gate(repo_path, &action, &command, argv_json, &verdict);
@@ -111,13 +114,22 @@ pub(crate) fn guard_command_allowing(
 /// whose scope cannot be read. It does not write a ledger row: the hook runs on
 /// every Bash call an agent makes, and the gate rows record GitPulse's own
 /// actions, which an agent's shell is not.
+///
+/// One case is not failed closed here, where [`guard_command`] would: a
+/// repository GitPulse is not trusted in. Resolving a binding runs Git, which
+/// the trust gate refuses there, and a binding can only have been made through
+/// a trusted path — so an untrusted checkout has no scope GitPulse may read,
+/// and failing closed would refuse every command an agent runs in every
+/// repository the person never opened in GitPulse. It is judged without a
+/// scope, exactly as before scopes reached the hook. That is silent per call
+/// on purpose: the hook answers every Bash call, and a standing condition the
+/// person chose (not trusting the repository) announced on each one would
+/// train them to ignore the channel the real non-checks use. `guard_command`
+/// keeps failing closed because the app never acts in an untrusted repository.
 pub(crate) fn check_command_in_scope(repo_path: &str, command: &str) -> PolicyVerdict {
-    judge_command(repo_path, command, &[])
-}
-
-fn judge_command(repo_path: &str, command: &str, allowed: &[String]) -> PolicyVerdict {
     match scope_for(repo_path) {
-        Ok(scope) => check_command_allowing(repo_path, command, scope.as_ref(), allowed),
+        Ok(scope) => check_command(repo_path, command, scope.as_ref()),
+        Err(failure) if failure.untrusted => check_command(repo_path, command, None),
         Err(failure) => failure.verdict(command),
     }
 }
@@ -162,6 +174,9 @@ pub(crate) fn guard_file(
 struct ScopeFailure {
     task_id: String,
     reason: String,
+    /// The binding could not be looked up because GitPulse is not trusted in
+    /// this repository — not because a binding is broken.
+    untrusted: bool,
 }
 
 impl ScopeFailure {
@@ -190,6 +205,7 @@ fn scope_for(repo_path: &str) -> Result<Option<HostScope>, ScopeFailure> {
         crate::ledger::bindings::resolve_binding(repo_path, repo_path).map_err(|error| {
             ScopeFailure {
                 task_id: String::new(),
+                untrusted: error.code == "untrusted_worktree",
                 reason: format!("could not resolve this worktree's task binding: {error}"),
             }
         })?;
@@ -199,10 +215,12 @@ fn scope_for(repo_path: &str) -> Result<Option<HostScope>, ScopeFailure> {
     let scope = crate::tasks::scope(&binding.anchor, &binding.task_id)
         .map_err(|error| ScopeFailure {
             task_id: binding.task_id.clone(),
+            untrusted: false,
             reason: format!("could not read the bound task's scope: {error}"),
         })?
         .ok_or_else(|| ScopeFailure {
             task_id: binding.task_id.clone(),
+            untrusted: false,
             reason: "the bound task's scope is no longer available".to_string(),
         })?;
     Ok(Some(HostScope {
