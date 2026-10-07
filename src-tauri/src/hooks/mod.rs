@@ -39,7 +39,7 @@ use serde_json::{json, Value};
 
 use crate::engine::agent_session_slug;
 use crate::engine::git_cli::find_git_root;
-use crate::harness::{self, PolicyStatus, PolicyVerdict};
+use crate::harness::{self, PolicyStatus, ScopedVerdict};
 use crate::insights::{self, CollisionRisk, InsightsSnapshot};
 
 /// Wall-clock ceiling for the work behind one hook invocation.
@@ -639,7 +639,39 @@ fn unchecked(target: &str, why: &str) -> HookOutput {
 /// the user chose, while "the harness is installed and could not answer" is
 /// transient and self-inflicted — because they read very differently to
 /// somebody deciding whether to trust the next command.
-pub fn command_gate_decision(verdict: &PolicyVerdict) -> HookOutput {
+pub(crate) fn command_gate_decision(judged: &ScopedVerdict) -> HookOutput {
+    let verdict = &judged.verdict;
+    // Ahead of the refusal: a block that only says "I could not read this line"
+    // is not judgement, and in an unbound checkout it is not this hook's to
+    // enforce. It is not rendered as an approval either — no decision is taken,
+    // so the host's own permission rules run, and the note says the gate did
+    // not judge it. `ask` was considered and refused: in a `claude -p` run,
+    // which is how GitPulse launches agents, the host turns `ask` into a deny,
+    // so it would have softened nothing where it matters most.
+    if !judged.bound && verdict.is_unreadable_construct() {
+        let note = format!(
+            "GitPulse could not judge this command [{}]: {}. It was left to your own \
+             permission rules.",
+            verdict.rule,
+            clause(&verdict.reason)
+        );
+        return HookOutput {
+            hook_specific_output: Some(HookSpecificOutput {
+                hook_event_name: PRE_TOOL_USE.to_string(),
+                permission_decision: None,
+                permission_decision_reason: None,
+                // For the model: it is what can choose a form the gate reads
+                // (paths from the repository root, no `cd`), so the next
+                // command is judged rather than waved through again.
+                additional_context: Some(format!(
+                    "{note} To have GitPulse judge commands, run them from the repository \
+                     root with root-relative paths instead of changing directory, and write \
+                     file contents with the editing tools rather than heredocs."
+                )),
+            }),
+            system_message: Some(note),
+        };
+    }
     if verdict.blocks() {
         return HookOutput {
             hook_specific_output: Some(decision(
@@ -714,7 +746,7 @@ pub fn run_command_gate(input: &HookInput) -> HookOutput {
 
 /// One harness judgement, built on the caller's thread and run on whichever
 /// thread `run` chooses.
-type CommandJob = Box<dyn FnOnce() -> PolicyVerdict + Send>;
+type CommandJob = Box<dyn FnOnce() -> ScopedVerdict + Send>;
 
 /// [`run_command_gate`] with the budgeted runner injected. The tests run the
 /// job on their own thread, because the sidecar's test serial guard is
@@ -722,7 +754,7 @@ type CommandJob = Box<dyn FnOnce() -> PolicyVerdict + Send>;
 /// would wait on it until the budget expired.
 fn command_gate_with(
     input: &HookInput,
-    run: impl FnOnce(CommandJob) -> Option<PolicyVerdict>,
+    run: impl FnOnce(CommandJob) -> Option<ScopedVerdict>,
 ) -> HookOutput {
     if input.command.is_empty() {
         return HookOutput::notice(
@@ -753,34 +785,38 @@ fn command_gate_with(
         }
         None => {
             let root = input.cwd.clone();
-            Box::new(move || harness::check_command(&root, &command, None))
+            Box::new(move || ScopedVerdict {
+                verdict: harness::check_command(&root, &command, None),
+                bound: false,
+            })
         }
     };
     let judged = run(job);
-    if let Some(verdict) = judged.as_ref() {
+    if let Some(ScopedVerdict { verdict, bound }) = judged.as_ref() {
         // The verdict is the only record of why this hook stayed silent, and
         // silence is its most common answer. Without this line an operator
         // cannot tell a clean allow from a demoted one, which is the same
         // confusion the rest of this module exists to prevent.
         log::debug!(
             target: "hooks",
-            "command gate: status={:?} checked={} rule={} detail_code={} demoted={} degraded={:?}",
+            "command gate: status={:?} checked={} rule={} detail_code={} demoted={} degraded={:?} bound={}",
             verdict.status,
             verdict.checked,
             verdict.rule,
             verdict.detail_code,
             verdict.demoted,
             verdict.degraded,
+            bound,
         );
     }
-    let Some(verdict) = judged else {
+    let Some(judged) = judged else {
         return HookOutput::notice(format!(
             "The MANVI harness did not answer within {}s, so GitPulse could not judge \
              this command. It ran UNGATED.",
             BUDGET.as_secs()
         ));
     };
-    command_gate_decision(&verdict)
+    command_gate_decision(&judged)
 }
 
 /* ── 3. session-brief: SessionStart ───────────────────────────────────────── */
@@ -1323,6 +1359,7 @@ fn truncate_marked(mut text: String, limit: usize) -> String {
 mod tests {
     use super::*;
     use crate::codeintel::CodeintelStatus;
+    use crate::harness::PolicyVerdict;
     use crate::insights::{
         AgentSummary, ChangesFacet, CollisionItem, CollisionParty, WorktreeFacet, WorktreeSummary,
     };
@@ -1353,6 +1390,15 @@ mod tests {
             branch: Some(branch.to_string()),
             agent_kind: "claude".to_string(),
         }
+    }
+
+    /// The command-gate decision for a checkout bound to no task — the case
+    /// every test below that does not name a binding is about.
+    fn decide(verdict: &PolicyVerdict) -> HookOutput {
+        command_gate_decision(&ScopedVerdict {
+            verdict: verdict.clone(),
+            bound: false,
+        })
     }
 
     fn allowed_verdict() -> PolicyVerdict {
@@ -2106,7 +2152,7 @@ mod tests {
         verdict.reason = "force-push to a shared branch".to_string();
         verdict.target = "git push --force".to_string();
 
-        let output = command_gate_decision(&verdict);
+        let output = decide(&verdict);
         let specific = output.hook_specific_output.expect("a block decides");
         assert_eq!(specific.permission_decision, Some(PermissionDecision::Deny));
         assert_eq!(
@@ -2116,9 +2162,138 @@ mod tests {
         );
     }
 
+    /// The shape `manvi serve` really sends for a refused command, measured:
+    /// every command decision carries the `host-scope` placeholder task,
+    /// whether or not a scope was declared. A fixture with an empty `task_id`
+    /// passed these tests while the real binary still got denied — the binding
+    /// has to come from GitPulse, never from the verdict.
+    fn unreadable(rule: &str) -> PolicyVerdict {
+        let mut verdict = allowed_verdict();
+        verdict.status = PolicyStatus::Blocked;
+        verdict.rule = rule.to_string();
+        verdict.severity = "hard".to_string();
+        verdict.reason = "the gate could not read this line.".to_string();
+        verdict.target = "cd src".to_string();
+        verdict.task_id = "host-scope".to_string();
+        verdict.degraded = vec![crate::harness::policy::UNREADABLE_ONLY_MARKER.to_string()];
+        verdict
+    }
+
+    /// A harness that predates the marker cannot promise that nothing else in
+    /// the line was refused — measured: it answered `cd src && git push
+    /// --force` with `command.directory_change`. Without the marker the hook
+    /// refuses as it always did, so a new hook with an old `manvi` is safe.
+    #[test]
+    fn an_unreadable_construct_without_the_harness_marker_still_refuses() {
+        for rule in crate::harness::policy::UNREADABLE_CONSTRUCT_RULES {
+            let mut verdict = unreadable(rule);
+            verdict.degraded.clear();
+            let output = decide_in(&verdict, false);
+            assert_eq!(
+                output
+                    .hook_specific_output
+                    .and_then(|s| s.permission_decision),
+                Some(PermissionDecision::Deny),
+                "{rule}: no marker, no softening"
+            );
+            verdict.degraded = vec!["repo_map.unavailable".to_string()];
+            assert_eq!(
+                decide_in(&verdict, false)
+                    .hook_specific_output
+                    .and_then(|s| s.permission_decision),
+                Some(PermissionDecision::Deny),
+                "{rule}: only the marker itself counts"
+            );
+        }
+    }
+
+    fn decide_in(verdict: &PolicyVerdict, bound: bool) -> HookOutput {
+        command_gate_decision(&ScopedVerdict {
+            verdict: verdict.clone(),
+            bound,
+        })
+    }
+
+    /// The measured complaint: `cd src && ls`, a heredoc, and `echo "$(date)"`
+    /// were each a hard deny the agent had to write around, while `rm -rf /`
+    /// was a silent demoted allow. A block that only says the gate could not
+    /// read the line takes no decision in an unbound checkout — and is not
+    /// silent either, so it can never pass for a clean check.
+    #[test]
+    fn an_unreadable_construct_in_an_unbound_checkout_is_announced_not_refused() {
+        for rule in crate::harness::policy::UNREADABLE_CONSTRUCT_RULES {
+            let output = decide_in(&unreadable(rule), false);
+            let specific = output
+                .hook_specific_output
+                .clone()
+                .expect("the model is told why the gate did not judge it");
+            assert_eq!(
+                specific.permission_decision, None,
+                "{rule}: no decision, so the host's own permission rules run"
+            );
+            assert!(
+                specific
+                    .additional_context
+                    .as_deref()
+                    .is_some_and(|c| c.contains(rule)),
+                "{rule}: the model must learn which rule it hit: {specific:?}"
+            );
+            let note = output.system_message.unwrap_or_default();
+            assert!(
+                note.contains("could not judge") && note.contains(rule),
+                "{rule}: the person must be told it was not judged: {note:?}"
+            );
+            assert!(
+                !note.contains(".."),
+                "{rule}: the reason's own full stop was doubled: {note:?}"
+            );
+        }
+    }
+
+    /// What does not soften. A declared task scope is a person asking for
+    /// enforcement, `eval` hides every clause, git safety is behaviour rather
+    /// than reach, and a soft rule is the posture's to demote — each keeps its
+    /// existing answer.
+    #[test]
+    fn only_unbound_unreadable_constructs_soften() {
+        let deny = |verdict: &PolicyVerdict, bound: bool| {
+            decide_in(verdict, bound)
+                .hook_specific_output
+                .and_then(|s| s.permission_decision)
+        };
+        for rule in crate::harness::policy::UNREADABLE_CONSTRUCT_RULES {
+            assert_eq!(
+                deny(&unreadable(rule), true),
+                Some(PermissionDecision::Deny),
+                "{rule}: a bound checkout keeps the refusal"
+            );
+        }
+        for rule in [
+            "command.reparse",
+            "command.force_push",
+            "path.outside_root",
+            "path.secret",
+            "command.too_long",
+        ] {
+            assert_eq!(
+                deny(&unreadable(rule), false),
+                Some(PermissionDecision::Deny),
+                "{rule} must still refuse"
+            );
+        }
+        let mut soft = unreadable("command.directory_change");
+        soft.severity = "soft".to_string();
+        assert_eq!(deny(&soft, false), Some(PermissionDecision::Deny));
+        // A local block GitPulse made without asking the harness is not the
+        // harness failing to read a line.
+        let mut local = unreadable("command.directory_change");
+        local.checked = false;
+        assert_eq!(deny(&local, false), Some(PermissionDecision::Deny));
+    }
+
     #[test]
     fn a_clean_allow_renders_nothing_so_the_users_own_permission_rules_decide() {
-        assert!(command_gate_decision(&allowed_verdict()).is_silent());
+        assert!(decide(&allowed_verdict()).is_silent());
     }
 
     #[test]
@@ -2130,7 +2305,7 @@ mod tests {
         verdict.detail_code = "timeout".to_string();
         assert!(verdict.gate_failed());
 
-        let output = command_gate_decision(&verdict);
+        let output = decide(&verdict);
         assert!(
             output.hook_specific_output.is_none(),
             "a failed gate never decides"
@@ -2155,8 +2330,8 @@ mod tests {
         let mut failed = verdict.clone();
         failed.detail_code = "timeout".to_string();
 
-        let absent = command_gate_decision(&verdict);
-        let broken = command_gate_decision(&failed);
+        let absent = decide(&verdict);
+        let broken = decide(&failed);
         assert!(absent
             .system_message
             .as_deref()
@@ -2173,15 +2348,15 @@ mod tests {
         let mut verdict = allowed_verdict();
         verdict.status = PolicyStatus::Degraded;
         verdict.degraded = vec!["repo_map".to_string()];
-        let output = command_gate_decision(&verdict);
+        let output = decide(&verdict);
         assert!(output.hook_specific_output.is_none());
         assert!(output
             .system_message
             .unwrap_or_default()
             .contains("repo_map"));
         assert_ne!(
-            command_gate_decision(&verdict).render(),
-            command_gate_decision(&allowed_verdict()).render()
+            decide(&verdict).render(),
+            decide(&allowed_verdict()).render()
         );
     }
 
@@ -2191,7 +2366,7 @@ mod tests {
         verdict.status = PolicyStatus::Warned;
         verdict.rule = "command.slow".to_string();
         verdict.reason = "this rewrites history".to_string();
-        let message = command_gate_decision(&verdict)
+        let message = decide(&verdict)
             .system_message
             .expect("a warning must reach the user");
         assert!(message.contains("command.slow"));

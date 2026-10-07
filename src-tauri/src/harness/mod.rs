@@ -96,6 +96,9 @@ pub(crate) fn guard_command_allowing(
     let command = render_command(argv);
     let verdict = match scope_for(repo_path) {
         Ok(scope) => check_command_allowing(repo_path, &command, scope.as_ref(), allowed),
+        Err(failure) if failure.kind == ScopeFailureKind::Missing => {
+            return Err(failure.missing_checkout(&command));
+        }
         Err(failure) => failure.verdict(&command),
     };
     let action = crate::ledger::action_for_argv(argv);
@@ -126,12 +129,46 @@ pub(crate) fn guard_command_allowing(
 /// person chose (not trusting the repository) announced on each one would
 /// train them to ignore the channel the real non-checks use. `guard_command`
 /// keeps failing closed because the app never acts in an untrusted repository.
-pub(crate) fn check_command_in_scope(repo_path: &str, command: &str) -> PolicyVerdict {
+///
+/// A checkout that vanished between finding its root and resolving its binding
+/// is judged the same way, for the same reason: there is no binding to read,
+/// and the command will meet a missing directory on its own.
+///
+/// Whether a scope was declared comes back beside the verdict, because the
+/// verdict cannot say: the harness stamps every command decision with its
+/// `host-scope` placeholder task, scope or no scope.
+pub(crate) fn check_command_in_scope(repo_path: &str, command: &str) -> ScopedVerdict {
     match scope_for(repo_path) {
-        Ok(scope) => check_command(repo_path, command, scope.as_ref()),
-        Err(failure) if failure.untrusted => check_command(repo_path, command, None),
-        Err(failure) => failure.verdict(command),
+        Ok(scope) => ScopedVerdict {
+            bound: scope.is_some(),
+            verdict: check_command(repo_path, command, scope.as_ref()),
+        },
+        Err(failure)
+            if matches!(
+                failure.kind,
+                ScopeFailureKind::Untrusted | ScopeFailureKind::Missing
+            ) =>
+        {
+            ScopedVerdict {
+                bound: false,
+                verdict: check_command(repo_path, command, None),
+            }
+        }
+        // A binding exists, or could not be ruled out.
+        Err(failure) => ScopedVerdict {
+            bound: true,
+            verdict: failure.verdict(command),
+        },
     }
+}
+
+/// A command verdict and whether it was measured against a declared task scope.
+#[derive(Debug, Clone)]
+pub(crate) struct ScopedVerdict {
+    pub verdict: PolicyVerdict,
+    /// True when the checkout is bound to a task, or a binding could not be
+    /// ruled out. Never inferred from `verdict.task_id`.
+    pub bound: bool,
 }
 
 /// Evaluates one file write, on the same terms as [`guard_command`].
@@ -143,6 +180,9 @@ pub(crate) fn guard_file(
     let action = format!("file.{}", if op.is_empty() { "write" } else { op });
     let scope = match scope_for(repo_path) {
         Ok(scope) => scope,
+        Err(failure) if failure.kind == ScopeFailureKind::Missing => {
+            return Err(failure.missing_checkout(file_path));
+        }
         Err(failure) => {
             let verdict = failure.verdict(file_path);
             record_gate(repo_path, &action, file_path, None, &verdict);
@@ -170,22 +210,44 @@ pub(crate) fn guard_file(
 /// unbound one; inventing an empty scope would misreport the dependency outage
 /// as a valid plan. The explicit error blocks before either ambiguity reaches
 /// the sidecar.
+///
+/// That block is GitPulse's, not the harness's, and the verdict says so with
+/// `checked: false`: the harness was never asked. It used to claim
+/// `checked: true` and render as "Blocked by the MANVI harness", which blamed
+/// MANVI for a lookup GitPulse could not complete — on a worktree that had
+/// merely been deleted, among others.
 #[derive(Debug)]
 struct ScopeFailure {
     task_id: String,
     reason: String,
-    /// The binding could not be looked up because GitPulse is not trusted in
-    /// this repository — not because a binding is broken.
-    untrusted: bool,
+    kind: ScopeFailureKind,
 }
+
+/// Why a scope could not be resolved. The kinds degrade differently, so they are
+/// told apart where the failure is first seen rather than re-parsed later.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ScopeFailureKind {
+    /// GitPulse is not trusted in this repository, so the binding was never
+    /// looked up — not because a binding is broken.
+    Untrusted,
+    /// The checkout is not on disk any more (removed or moved). There is no
+    /// binding to enforce and no directory for the action to run in.
+    Missing,
+    /// A binding exists, or could not be ruled out, and its scope could not be
+    /// produced. The case the fail-closed rule exists for.
+    Broken,
+}
+
+/// The rule a scope failure is reported under.
+pub(crate) const TASK_SCOPE_UNAVAILABLE: &str = "task.scope_unavailable";
 
 impl ScopeFailure {
     fn verdict(self, target: &str) -> PolicyVerdict {
         PolicyVerdict {
             status: PolicyStatus::Blocked,
-            checked: true,
+            checked: false,
             target: target.to_string(),
-            rule: "task.scope_unavailable".to_string(),
+            rule: TASK_SCOPE_UNAVAILABLE.to_string(),
             severity: "hard".to_string(),
             reason: self.reason,
             demoted: String::new(),
@@ -194,18 +256,40 @@ impl ScopeFailure {
             widened: String::new(),
             degraded: Vec::new(),
             task_id: self.task_id,
-            detail: String::new(),
-            detail_code: String::new(),
+            detail: "GitPulse refused before asking the harness: the task scope this \
+                     checkout is bound to could not be resolved."
+                .to_string(),
+            detail_code: "scope_unavailable".to_string(),
         }
+    }
+
+    /// The error for an action aimed at a checkout that no longer exists.
+    ///
+    /// Not a policy verdict and not recorded: nothing was judged, the action
+    /// cannot run in a directory that is gone, and a ledger row would have to
+    /// be written under that same missing path — which is how a deleted
+    /// worktree used to add a `mkdir_failed` warning to every refused action.
+    fn missing_checkout(self, target: &str) -> String {
+        log::info!(target: "harness", "refused an action on a missing checkout: {}", self.reason);
+        format!(
+            "This checkout no longer exists on disk — it was removed or moved — so GitPulse \
+             did not run this.\n  target: {target}\n  detail: {}",
+            self.reason
+        )
     }
 }
 
 fn scope_for(repo_path: &str) -> Result<Option<HostScope>, ScopeFailure> {
     let binding =
         crate::ledger::bindings::resolve_binding(repo_path, repo_path).map_err(|error| {
+            let kind = match error.code {
+                "untrusted_worktree" => ScopeFailureKind::Untrusted,
+                crate::ledger::bindings::MISSING_WORKTREE => ScopeFailureKind::Missing,
+                _ => ScopeFailureKind::Broken,
+            };
             ScopeFailure {
                 task_id: String::new(),
-                untrusted: error.code == "untrusted_worktree",
+                kind,
                 reason: format!("could not resolve this worktree's task binding: {error}"),
             }
         })?;
@@ -215,12 +299,12 @@ fn scope_for(repo_path: &str) -> Result<Option<HostScope>, ScopeFailure> {
     let scope = crate::tasks::scope(&binding.anchor, &binding.task_id)
         .map_err(|error| ScopeFailure {
             task_id: binding.task_id.clone(),
-            untrusted: false,
+            kind: ScopeFailureKind::Broken,
             reason: format!("could not read the bound task's scope: {error}"),
         })?
         .ok_or_else(|| ScopeFailure {
             task_id: binding.task_id.clone(),
-            untrusted: false,
+            kind: ScopeFailureKind::Broken,
             reason: "the bound task's scope is no longer available".to_string(),
         })?;
     Ok(Some(HostScope {
@@ -580,6 +664,14 @@ done
         let serial = sidecar::test_serial();
         let _binary = sidecar::bind_test_binary(&serial, script.to_string_lossy());
 
+        // The hook learns the binding from here, never from the verdict's
+        // task id (the harness stamps `host-scope` on every command decision).
+        assert!(
+            check_command_in_scope(repo, "ls").bound,
+            "a bound checkout must report that it is bound"
+        );
+        std::fs::remove_file(&requests).ok();
+
         let before = crate::ledger::latest_cursor(repo).expect("cursor");
         let refused = guard_file(repo, "docs/elsewhere.md", "modify");
         assert!(
@@ -758,9 +850,83 @@ done
         let _binary = sidecar::bind_test_binary(&serial, script.to_string_lossy());
 
         let result = guard_file(&worktree, "src/planned.rs", "modify");
-        assert!(
-            result.is_err(),
-            "a durable binding whose scope vanished must not degrade to unbound permission"
+        let refusal = result.expect_err(
+            "a durable binding whose scope vanished must not degrade to unbound permission",
         );
+        // Still refused, and now attributed to the one that refused: the
+        // harness was never asked.
+        assert!(
+            refusal.starts_with("Blocked by GitPulse") && !refusal.contains("by the MANVI harness"),
+            "a local refusal must not be blamed on MANVI: {refusal}"
+        );
+        assert!(refusal.contains(TASK_SCOPE_UNAVAILABLE), "{refusal}");
+        let failure = scope_for(&worktree).expect_err("still a scope failure");
+        let verdict = failure.verdict("src/planned.rs");
+        assert_eq!(verdict.status, PolicyStatus::Blocked);
+        assert!(!verdict.checked, "the harness never ran, so it did not check");
+        assert!(!verdict.gate_failed(), "a refusal, not a gate outage");
+        // And the agent hook, which judges through the same owner, refuses too.
+        let judged = check_command_in_scope(&worktree, "echo x > src/planned.rs");
+        assert!(judged.verdict.blocks() && judged.bound, "{judged:?}");
+    }
+
+    /// The reported incident: a worktree deleted from disk while GitPulse still
+    /// had it open. `git switch --guess main` against it came back "Blocked by
+    /// the MANVI harness [task.scope_unavailable/hard]", and the gate's ledger
+    /// row then failed to create `.devcouncil` under the missing path.
+    #[cfg(unix)]
+    #[test]
+    fn a_deleted_worktree_is_named_as_missing_not_blamed_on_the_harness() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (main, _parent, worktree) = linked_repo();
+        let main_path_buf = main.path().canonicalize().expect("canonical repository");
+        let main_path = main_path_buf.to_str().expect("utf8 repository");
+        std::fs::remove_dir_all(&worktree).expect("delete the worktree from disk");
+
+        let requests = main.path().join("requests.ndjson");
+        let script = main.path().join("recording-manvi");
+        let body = FAKE_RECORDER.replace("@REQUESTS@", &requests.display().to_string());
+        std::fs::write(&script, body).expect("write fake sidecar");
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let serial = sidecar::test_serial();
+        let _binary = sidecar::bind_test_binary(&serial, script.to_string_lossy());
+
+        let before = crate::ledger::latest_cursor(main_path).expect("family cursor");
+        for refusal in [
+            guard_command(&worktree, &["git", "switch", "--guess", "main"])
+                .expect_err("nothing can run in a directory that is gone"),
+            guard_file(&worktree, "src/lib.rs", "modify").expect_err("nor be written there"),
+        ] {
+            assert!(
+                refusal.contains("no longer exists"),
+                "the cause must be named: {refusal}"
+            );
+            assert!(
+                !refusal.contains("MANVI") && !refusal.contains(TASK_SCOPE_UNAVAILABLE),
+                "a deleted checkout is not a policy decision: {refusal}"
+            );
+        }
+        assert!(
+            !std::path::Path::new(&worktree).exists(),
+            "refusing must not recreate the deleted worktree (or its .devcouncil)"
+        );
+        assert!(
+            std::fs::read_to_string(&requests)
+                .unwrap_or_default()
+                .is_empty(),
+            "nothing was judged, so nothing may be sent to the harness"
+        );
+        assert_eq!(
+            crate::ledger::latest_cursor(main_path).expect("family cursor"),
+            before,
+            "no gate row for an action that was never judged"
+        );
+
+        // The agent hook path: no binding to read, so judged unscoped rather
+        // than refused for want of one.
+        let ScopedVerdict { verdict, bound } = check_command_in_scope(&worktree, "ls");
+        assert!(!bound, "a missing checkout declares no scope");
+        assert_ne!(verdict.rule, TASK_SCOPE_UNAVAILABLE, "{verdict:?}");
     }
 }

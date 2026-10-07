@@ -26,6 +26,28 @@ use super::sidecar::{self, HarnessError, DEFAULT_CALL_TIMEOUT};
 
 const POLICY_TIMEOUT: Duration = DEFAULT_CALL_TIMEOUT;
 
+/// The harness rules that refuse a command line because the gate could not read
+/// it rather than because of what it read. See
+/// [`PolicyVerdict::is_unreadable_construct`]. Names are DevCouncil's
+/// (`policy/decision.go`), which owns them.
+pub const UNREADABLE_CONSTRUCT_RULES: &[&str] = &[
+    "command.directory_change",
+    "command.heredoc",
+    "command.substitution",
+];
+
+/// The `degraded` entry the harness adds to a refusal when every refusal in
+/// the command line was one of [`UNREADABLE_CONSTRUCT_RULES`], every other
+/// clause was judged, and its redirection targets were judged too.
+///
+/// The rule alone is not enough to soften on. The ladder used to return the
+/// first refused clause, so `cd src && git push --force` came back as
+/// `command.directory_change` and the force push was never reported — a hook
+/// softening on the rule would have let it through. A harness that predates
+/// the marker never sends it, so against an older `manvi` nothing softens.
+/// Name owned by DevCouncil (`policy.DegradedUnreadableOnly`).
+pub const UNREADABLE_ONLY_MARKER: &str = "policy.unreadable_only";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum PolicyStatus {
@@ -198,15 +220,66 @@ impl PolicyVerdict {
         )
     }
 
+    /// True when the harness refused only because it could not read the command
+    /// line, not because it read it and found something wrong.
+    ///
+    /// Whether the checkout is bound to a task is the caller's to supply (see
+    /// `harness::ScopedVerdict`): `task_id` cannot answer it, because the
+    /// harness stamps every command decision with its `host-scope` placeholder
+    /// whether or not a scope was sent.
+    ///
+    /// Each rule in [`UNREADABLE_CONSTRUCT_RULES`] is a statement about the
+    /// gate's own reach: a `cd` moves where relative paths land, a heredoc body
+    /// has no static end, a substitution span could not be bounded. DevCouncil
+    /// classes them hard because, enforcing an agent it hosts itself, it cannot
+    /// let an unexamined line run. GitPulse's agent hook judges someone else's
+    /// agent, whose host has its own permission rules and owns the working
+    /// directory — and in that position a hard refusal of `cd src && ls` is the
+    /// gate being intrusive, not safe. The hook therefore reports these as
+    /// commands it could not judge and leaves them to the host's own rules.
+    ///
+    /// It requires the harness's own [`UNREADABLE_ONLY_MARKER`]: the guarantee
+    /// that nothing else in the line was refused, which the rule cannot give.
+    ///
+    /// What it does not cover is deliberate:
+    ///
+    /// * a checkout bound to a task, which the caller excludes. Someone declared
+    ///   a scope there, and a line the gate cannot place may write outside it,
+    ///   so the refusal stands — the agent rewrites it in a form the gate reads;
+    /// * `command.reparse` (`eval` and friends). Every other rule still runs on
+    ///   a `cd` line clause by clause, so `cd x && git push --force` is refused
+    ///   by git safety regardless; an `eval` string is the one construct whose
+    ///   every clause is invisible, which makes it the shape an evasion takes;
+    /// * anything that is not a block, or is a soft one, which is already the
+    ///   posture's to demote.
+    pub fn is_unreadable_construct(&self) -> bool {
+        self.status == PolicyStatus::Blocked
+            && self.checked
+            && self.severity == "hard"
+            && UNREADABLE_CONSTRUCT_RULES.contains(&self.rule.as_str())
+            && self.degraded.iter().any(|d| d == UNREADABLE_ONLY_MARKER)
+    }
+
     /// The refusal, rendered for an error dialog.
+    ///
+    /// Attributed to whoever actually decided. A refusal GitPulse makes before
+    /// asking the harness — a bound task whose scope cannot be read — carries
+    /// `checked: false`, and saying "Blocked by the MANVI harness" for it blamed
+    /// a gate that never ran for a lookup GitPulse could not complete.
     pub fn refusal(&self) -> String {
         let rule = if self.rule.is_empty() {
             "policy"
         } else {
             &self.rule
         };
+        let decider = if self.checked {
+            "the MANVI harness"
+        } else {
+            "GitPulse, before the MANVI harness was asked,"
+        };
         format!(
-            "Blocked by the MANVI harness [{}{}]: {}\n  target: {}",
+            "Blocked by {} [{}{}]: {}\n  target: {}",
+            decider,
             rule,
             if self.severity.is_empty() {
                 String::new()
