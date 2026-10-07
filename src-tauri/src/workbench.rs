@@ -303,7 +303,16 @@ impl WorkbenchState {
             return self.worker_call(&format!("work.{method}"), params, selection);
         }
         let result = self.with_store(|store| query(store, method, input));
-        if result.is_ok() && method == "notifications.settings.put" {
+        // An inbox read, dismiss or snooze, or answering the agent's request in
+        // the inspector, may resolve a banner still on screen; the wake lets
+        // the coordinator withdraw it now rather than on its next timer, which
+        // a disabled profile does not have.
+        if result.is_ok()
+            && matches!(
+                method,
+                "notifications.settings.put" | "attention.update" | "decisions.decide"
+            )
+        {
             if let Some(notifications) = self.0.notifications.get() {
                 notifications.wake();
             }

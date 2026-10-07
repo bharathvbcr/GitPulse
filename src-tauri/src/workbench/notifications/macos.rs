@@ -55,7 +55,15 @@ define_class!(
             completion: &DynBlock<dyn Fn()>,
         ) {
             let native = response.notification().request().identifier().to_string();
-            if let Err(error) = self.ivars().sender.try_send(Event::Activate(native)) {
+            // Snooze is the only action that is not an open: the body click
+            // (UNNotificationDefaultActionIdentifier) and the Open button both
+            // open. Dismiss never arrives — no category sets CustomDismissAction.
+            let event = if response.actionIdentifier().to_string() == SNOOZE_ACTION {
+                Event::Snooze(native)
+            } else {
+                Event::Activate(native)
+            };
+            if let Err(error) = self.ivars().sender.try_send(event) {
                 log::warn!(target:"workbench","notification activation could not be queued: {error}");
                 if let Ok(mut status) = self.ivars().status.lock() {
                     status.error = Some(
@@ -103,20 +111,33 @@ pub(super) fn install(
     // one category with a generic verb would make the button lie about one of
     // them. `setNotificationCategories` replaces the whole set, so both are
     // registered in the same call rather than in two.
+    //
+    // Only an activity notice can be snoozed: it is a durable inbox row with a
+    // snooze field. A session banner has nothing behind it to defer. Snooze is
+    // a background action (no Foreground option), so pressing it does not
+    // bring GitPulse forward.
+    let snooze_title = format!("Snooze {} hour", super::SNOOZE_SECONDS / 3600);
     let categories: Vec<_> = [
-        (WORKBENCH_CATEGORY, "Open task"),
-        (SESSION_CATEGORY, "Open session"),
+        (WORKBENCH_CATEGORY, "Open task", true),
+        (SESSION_CATEGORY, "Open session", false),
     ]
     .into_iter()
-    .map(|(identifier, verb)| {
-        let action = UNNotificationAction::actionWithIdentifier_title_options(
+    .map(|(identifier, verb, snoozes)| {
+        let mut actions = vec![UNNotificationAction::actionWithIdentifier_title_options(
             &NSString::from_str("open"),
             &NSString::from_str(verb),
             UNNotificationActionOptions::Foreground,
-        );
+        )];
+        if snoozes {
+            actions.push(UNNotificationAction::actionWithIdentifier_title_options(
+                &NSString::from_str(SNOOZE_ACTION),
+                &NSString::from_str(&snooze_title),
+                UNNotificationActionOptions::empty(),
+            ));
+        }
         UNNotificationCategory::categoryWithIdentifier_actions_intentIdentifiers_options(
             &NSString::from_str(identifier),
-            &NSArray::from_retained_slice(&[action]),
+            &NSArray::from_retained_slice(&actions),
             &NSArray::<NSString>::new(),
             UNNotificationCategoryOptions::empty(),
         )
@@ -132,6 +153,8 @@ pub(super) const WORKBENCH_CATEGORY: &str = "gitpulse-workbench";
 /// thread so macOS groups a noisy session apart from task activity instead of
 /// collapsing both into one stack.
 pub(super) const SESSION_CATEGORY: &str = "gitpulse-session";
+/// Action identifier of an activity banner's Snooze button.
+const SNOOZE_ACTION: &str = "snooze";
 
 fn timeout() -> WorkbenchError {
     WorkbenchError::new("timeout","macOS notification reply was not confirmed. Recheck status; a delivery will not be sent again automatically.")
@@ -221,6 +244,39 @@ pub(super) fn post(
     receiver
         .recv_timeout(Duration::from_secs(5))
         .map_err(|_| timeout())
+}
+
+/// Identifiers of the activity banners Notification Center still shows.
+/// Session banners are filtered out here by category; the coordinator then
+/// refuses anything whose identity is not this profile's saved claim.
+pub(super) fn delivered() -> Result<Vec<String>, WorkbenchError> {
+    let center = center()?;
+    let (sender, receiver) = mpsc::sync_channel(1);
+    let callback = RcBlock::new(move |list: std::ptr::NonNull<NSArray<UNNotification>>| {
+        // SAFETY: Apple's callback supplies a live array during this
+        // invocation. Copy the identifiers out; never retain the borrow.
+        let list = unsafe { list.as_ref() };
+        let identifiers: Vec<String> = list
+            .iter()
+            .filter(|n| {
+                n.request().content().categoryIdentifier().to_string() == WORKBENCH_CATEGORY
+            })
+            .map(|n| n.request().identifier().to_string())
+            .collect();
+        let _ = sender.try_send(identifiers);
+    });
+    center.getDeliveredNotificationsWithCompletionHandler(&callback);
+    receiver
+        .recv_timeout(Duration::from_secs(5))
+        .map_err(|_| timeout())
+}
+
+/// Take banners down. Fire-and-forget by Apple's design (no completion
+/// handler); an identifier no longer delivered is ignored by the center.
+pub(super) fn withdraw(natives: &[String]) {
+    let Ok(center) = center() else { return };
+    let identifiers: Vec<_> = natives.iter().map(|n| NSString::from_str(n)).collect();
+    center.removeDeliveredNotificationsWithIdentifiers(&NSArray::from_retained_slice(&identifiers));
 }
 
 pub(super) fn local_minute() -> Result<u16, WorkbenchError> {
