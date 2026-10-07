@@ -1064,15 +1064,40 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
   }
 
   /**
-   * Moves a newly opened checkout to just after the last open checkout of the
-   * same repository in the same group. Without it an agent's worktree tab
-   * landed at the far end of the strip, as far from its repository as the
-   * strip allowed, and with stacking turned off nothing tied the two together.
+   * Seats a newly opened checkout with the open checkouts of its repository:
+   * in their group, just after the last of them. Without it an agent's
+   * worktree tab landed at the far end of the strip, and when the repository
+   * sat in a user group the worktree opened ungrouped — a stack is keyed by
+   * (group, family), so it could never join and read as a second repository.
+   *
+   * The group comes from the family's checkout the reader used last, else the
+   * last one on the strip. An explicit group from the caller always wins.
    */
-  function placeBesideFamily(id: string, commonDir: string | null | undefined) {
+  function placeBesideFamily(
+    id: string,
+    commonDir: string | null | undefined,
+    explicitGroup: boolean,
+    activate: boolean,
+  ) {
     const family = familyFromCommonDir(commonDir, options);
     if (!family) return;
-    const ws = internal.workspace;
+    let ws = internal.workspace;
+    const members = ws.tabs.filter(
+      (tab) => tab.id !== id && familyOfTab(tab.id)?.key === family.key,
+    );
+    if (members.length === 0) return;
+    if (!explicitGroup) {
+      const lastUsedId = lastUsedCheckouts().get(family.key);
+      const anchor =
+        members.find((tab) => tab.id === lastUsedId) ?? members[members.length - 1];
+      const anchorGroup = anchor.group ?? null;
+      const current = ws.tabs.find((tab) => tab.id === id);
+      if (current && (current.group ?? null) !== anchorGroup) {
+        ws = setWorkspaceTabGroup(ws, id, anchorGroup);
+        // Shown means visible: a folded group would hide the tab just opened.
+        if (activate && anchorGroup) ws = setWorkspaceGroupCollapsed(ws, anchorGroup, false);
+      }
+    }
     const from = ws.tabs.findIndex((tab) => tab.id === id);
     if (from < 0) return;
     const group = ws.tabs[from].group ?? null;
@@ -1081,8 +1106,8 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
       if (tab.id === id || (tab.group ?? null) !== group) return;
       if (familyOfTab(tab.id)?.key === family.key) last = index;
     });
-    if (last < 0) return;
-    replaceWorkspace(moveWorkspaceTabTo(ws, id, from > last ? last + 1 : last));
+    if (last >= 0) ws = moveWorkspaceTabTo(ws, id, from > last ? last + 1 : last);
+    if (ws !== internal.workspace) replaceWorkspace(ws);
   }
 
   function beginShortcut(): boolean {
@@ -1475,6 +1500,30 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
   }
 
   /**
+   * What a successful resolve says about a session — the one place those
+   * fields are copied, so no path that resolves (open, a trust grant, a
+   * re-resolve on hydrate) can update the path and forget the family.
+   */
+  function resolvedFields(id: string, resolved: ResolvedRepo) {
+    familyUnknown.delete(id);
+    return {
+      path: resolved.path,
+      name: resolved.name,
+      isBare: resolved.is_bare,
+      commonDir: resolved.common_dir ?? null,
+    };
+  }
+
+  /**
+   * Tab ids whose family is unknown because no resolve has succeeded for them
+   * yet (restored untrusted, or unreachable at restore). A resolve that
+   * answered "no common directory" is an answer and is not listed. `hydrate`
+   * asks again for these, once per hydrate: without it a family split at
+   * restore stayed split until the app restarted.
+   */
+  const familyUnknown = new Set<string>();
+
+  /**
    * Ordering token for snapshot fetches. `activateTab` starts a hydrate at
    * generation N; `refresh()` and watcher events start more at the SAME N
    * (refresh never bumps). Generation alone cannot order those, so the older
@@ -1520,9 +1569,41 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
     return { ...snapshot, branches };
   }
 
+  /**
+   * Asks the backend which repository a session belongs to when no resolve
+   * has answered yet. A failure leaves it listed for the next hydrate; it
+   * never retries on its own.
+   */
+  async function learnFamily(id: string, path: string, generation: number) {
+    if (!familyUnknown.has(id)) return;
+    familyUnknown.delete(id);
+    let resolved: ResolvedRepo;
+    try {
+      resolved = await resolvePath(path);
+    } catch {
+      if (internal.sessions[id]) familyUnknown.add(id);
+      return;
+    }
+    const session = internal.sessions[id];
+    if (!session || session.generation !== generation) {
+      if (session) familyUnknown.add(id);
+      return;
+    }
+    // The path stays the tab's: a canonical spelling that differs is an alias
+    // only openRepo may adopt, since it re-keys the tab.
+    const { commonDir, name, isBare } = resolvedFields(id, resolved);
+    applyToSession(id, generation, { commonDir, name, isBare });
+  }
+
   async function hydrate(id: string, path: string, generation: number) {
     const run = (snapshotRuns.get(id) ?? 0) + 1;
     snapshotRuns.set(id, run);
+    // Synchronous unless there is something to learn: an extra yield on every
+    // hydrate would reorder the snapshot fetches the run token arbitrates.
+    if (familyUnknown.has(id)) {
+      await learnFamily(id, path, generation);
+      if (snapshotRuns.get(id) !== run) return;
+    }
     try {
       const raw = await loadSnapshot(path);
       if (snapshotRuns.get(id) !== run) return;
@@ -1889,7 +1970,10 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
             ),
           };
           const sessions = { ...internal.sessions };
-          for (const id of aliasIds) delete sessions[id];
+          for (const id of aliasIds) {
+            delete sessions[id];
+            familyUnknown.delete(id);
+          }
           internal = { ...internal, sessions };
         }
       }
@@ -1924,18 +2008,21 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
       // A restore keeps the order it was saved in; anything else opened
       // beside an open checkout of the same repository lands next to it.
       if (opened.created && !extras.keepEpoch) {
-        placeBesideFamily(opened.id, resolved?.common_dir);
+        placeBesideFamily(opened.id, resolved?.common_dir, extras.group !== undefined, activate);
       }
       const existing = internal.sessions[opened.id];
+      // A fresh resolve is the answer, including "could not read it"; a
+      // failed one keeps what the last good resolve said, and leaves a family
+      // never learned for the next hydrate to ask about.
+      const fromResolve = resolved ? resolvedFields(opened.id, resolved) : null;
+      if (!resolved && !existing?.commonDir) familyUnknown.add(opened.id);
       const session = existing
         ? {
             ...bumped(existing),
             path,
-            name: resolved?.name ?? existing.name,
-            isBare: resolved?.is_bare ?? existing.isBare,
-            // A fresh resolve is the answer, including "could not read it";
-            // a failed one keeps what the last good resolve said.
-            commonDir: resolved ? resolved.common_dir ?? null : existing.commonDir,
+            name: fromResolve?.name ?? existing.name,
+            isBare: fromResolve?.isBare ?? existing.isBare,
+            commonDir: fromResolve ? fromResolve.commonDir : existing.commonDir,
             pinned:
               opened.workspace.tabs.find((tab) => tab.id === opened.id)
                 ?.pinned ?? existing.pinned,
@@ -1955,9 +2042,9 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
               pinned: (extras.pinned ?? carriedPinned) === true,
             },
             {
-              name: resolved?.name,
-              isBare: resolved?.is_bare,
-              commonDir: resolved?.common_dir ?? null,
+              name: fromResolve?.name,
+              isBare: fromResolve?.isBare,
+              commonDir: fromResolve?.commonDir ?? null,
               // An adopted alias tab hands over its state; an explicit
               // restore payload always wins over what the alias carried.
               activeTab: extras.restore?.viewTab ?? carriedSession?.activeTab,
@@ -2059,10 +2146,9 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
         const live = internal.sessions[id];
         if (!live?.trustRequired) return;
         if (!trustedPath) return;
-        let path = trustedPath;
+        let granted: ReturnType<typeof resolvedFields>;
         try {
-          const resolved = await resolvePath(trustedPath);
-          path = resolved.path;
+          granted = resolvedFields(id, await resolvePath(trustedPath));
         } catch (err: unknown) {
           const message = formatError(err);
           applyToSession(id, live.generation, {
@@ -2074,8 +2160,12 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
         }
         const latest = internal.sessions[id];
         if (!latest) return;
-        const activation = bumped({ ...latest, path });
-        putSession({ ...activation, path, isLoading: true });
+        // The grant is the first resolve this tab has had: it carries the
+        // family, not only the path. Copying the path alone left every
+        // checkout restored untrusted outside its repository's stack.
+        const path = granted.path;
+        const activation = bumped({ ...latest, ...granted });
+        putSession({ ...activation, isLoading: true });
         if (internal.workspace.activeId === id) {
           syncFilterFromSession(activation);
           revealGraph(activation);
@@ -2135,6 +2225,7 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
       commitEdit(result.closedPath ? [result.closedPath] : []);
       replaceWorkspace(result.workspace);
       const { [id]: _removed, ...rest } = internal.sessions;
+      familyUnknown.delete(id);
       internal = { ...internal, sessions: rest };
       stopStatusPoll();
       if (session) {
@@ -2474,6 +2565,7 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
           lastClosed: persisted.lastClosed,
         });
         internal = { ...internal, sessions: {} };
+        familyUnknown.clear();
         // Preserve persisted tab order, but activate the previously-active
         // session the moment ITS hydration lands — not after every remaining
         // tab finishes restoring — so the workspace becomes usable without
