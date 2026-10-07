@@ -65,13 +65,12 @@ interface Placement {
  * When no checkout holds the directory at all, that is said now, and nothing
  * is queued — a request nothing can ever take is not "waiting".
  *
- * `exact` asks for the subdirectory to be known exactly (a resumed
- * conversation must start where it ran). When the host's canonical root and
- * the recorded directory are spelled through different links, the relative
- * part cannot be read off the two strings, and that is refused rather than
- * guessed.
+ * The host returns the canonical root. A recorded directory that names it
+ * through a link (`/tmp` for `/private/tmp`) is the root itself: the host only
+ * ever spawned a session in a canonical checkout root, so that is where the
+ * work ran, and no start directory is carried.
  */
-async function checkoutFor(cwd: string, exact = false): Promise<Placement> {
+async function checkoutFor(cwd: string): Promise<Placement> {
   let root: string;
   try {
     root = await resolveGitRoot(cwd);
@@ -86,11 +85,7 @@ async function checkoutFor(cwd: string, exact = false): Promise<Placement> {
   const normalizedRoot = normalizeRepoPath(root) ?? root;
   const normalizedCwd = normalizeRepoPath(cwd) ?? cwd;
   const startDir = cwdKey.startsWith(`${rootKey}/`) ? relativeStartDir(normalizedCwd.slice(normalizedRoot.length + 1)) : null;
-  if (startDir) return { root, startDir };
-  if (exact) {
-    throw new Error(`${cwd} is inside the checkout ${root}, but under a different spelling of its path, so the conversation cannot be started where it ran.`);
-  }
-  return { root };
+  return startDir ? { root, startDir } : { root };
 }
 
 /**
@@ -168,8 +163,9 @@ export async function resumeTaskConversation(
     const live = get(terminalSessions).find((record) => record.continuesRunId === run.id && record.reveal);
     if (live && (await focusTerminalSession(live)).ok) return { outcome: "opened" };
   }
-  // Exact: Claude Code keeps the conversation under the directory it ran in.
-  const place = await checkoutFor(conversation.cwd, true);
+  // Claude Code keeps the conversation under the directory it ran in, which
+  // `startDir` carries when that is below the root.
+  const place = await checkoutFor(conversation.cwd);
   const request: TaskTerminalRequest = {
     runId: run.id,
     repoPath: place.root,

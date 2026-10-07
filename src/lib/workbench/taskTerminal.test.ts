@@ -138,6 +138,18 @@ describe("an attempt whose directory is below its checkout's root", () => {
     expect(get(taskTerminalRequests)[0]).toMatchObject({ repoPath: "/work/a", startDir: "packages/web" });
   });
 
+  it("resumes at the root when the host's canonical root spells the recorded checkout through a link", async () => {
+    // find_git_root canonicalizes (/tmp -> /private/tmp). The recorded
+    // directory naming the same checkout through the link is the root itself,
+    // not a reason to refuse the resume.
+    resolveGitRoot.mockResolvedValue("/private/tmp/repo");
+    findConversation.mockResolvedValueOnce({ resumable: true, sessionId: SESSION, cwd: "/tmp/repo", mode: "ask", reason: "saved" });
+    openRepo.mockResolvedValue(true);
+    expect(await resumeTaskConversation({ id: "a", task_title: "Fix" })).toEqual({ outcome: "started" });
+    expect(get(taskTerminalRequests)[0]).toMatchObject({ repoPath: "/private/tmp/repo" });
+    expect(get(taskTerminalRequests)[0]).not.toHaveProperty("startDir");
+  });
+
   it("says so, and queues nothing, when no checkout contains the directory", async () => {
     resolveGitRoot.mockRejectedValue(new Error("Not a Git repository: /tmp/loose"));
     await expect(startTaskTerminal(run("z", "/tmp/loose"))).rejects.toThrow(/No Git checkout contains \/tmp\/loose/);
