@@ -41,3 +41,24 @@ export function appBuild() {
   }
   return { id: randomUUID(), version: appVersion(), builtAt: new Date().toISOString(), revision, dirty };
 }
+
+/**
+ * Every commit a tag points at, peeled through annotated tags, or null when
+ * Git cannot answer.
+ *
+ * All of `refs/tags/`, not only `v*`: a `safety/…-before-retag` tag marks a
+ * commit a release was built from before it was retagged, and that build may
+ * have shipped. Null is not an empty set — a caller that cannot tell a release
+ * commit from any other must keep every clean snapshot.
+ * @returns {Set<string> | null}
+ */
+export function releaseRevisions() {
+  try {
+    const out = execFileSync("git", ["for-each-ref", "--format=%(objectname) %(*objectname)", "refs/tags/"], {
+      cwd: REPO_ROOT, encoding: "utf8", timeout: 2_000, stdio: ["ignore", "pipe", "ignore"],
+    });
+    return new Set(out.split(/\s+/).filter((oid) => /^[0-9a-f]{40,64}$/.test(oid)));
+  } catch {
+    return null;
+  }
+}

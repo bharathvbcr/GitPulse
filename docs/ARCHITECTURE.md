@@ -490,6 +490,13 @@ from `dist/`. This directory is ignored and stays local. The distributable
 `build-info.json` contains only build ID, version, time, Git revision, and
 dirty-state metadata. Retain the matching evidence directory for any build
 being diagnosed; no remote source-map upload is configured.
+Retention runs only after a build has written every output file, so a failed
+build prunes nothing. It keeps the three newest dirty (dev) snapshots younger
+than 14 days, every clean snapshot whose revision a tag points at (any tag,
+including `safety/…-before-retag`), and the five newest other clean ones. A
+snapshot whose manifest is unreadable or does not name its own directory is
+never pruned, nor is any clean one while tags cannot be listed
+(`pruneEvidence` in `scripts/build-evidence.mjs`).
 
 `bun run test:browser` and the macOS `bun run test:webkit` mount the actual
 Code components and Diagnostics window with explicit IPC fixtures. Both
