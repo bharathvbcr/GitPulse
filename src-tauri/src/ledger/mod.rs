@@ -734,6 +734,15 @@ fn open(db_path: &Path) -> Result<Connection, LedgerError> {
     validate_ledger_files(db_path, repo)?;
     precreate_private_ledger(db_path, repo)?;
     validate_ledger_files(db_path, repo)?;
+    // Before the connection, never after it. Securing a file opens and closes
+    // a descriptor to it, and on POSIX closing ANY descriptor to a file drops
+    // every fcntl lock this process holds on that file — including the WAL
+    // index lock a live connection depends on. Another process then believes
+    // it is alone, reinitialises `-shm`, and this one faults with SIGBUS in
+    // `walFindFrame` (sixteen concurrent hook processes reading one ledger died
+    // 12–14 at a time). The `-wal`/`-shm` SQLite creates later inherit the
+    // database file's mode, so 0600 here is 0600 for them too.
+    secure_ledger_files(db_path, repo)?;
     let conn = Connection::open(db_path)
         .map_err(|e| LedgerError::new("open_failed", format!("{}: {e}", db_path.display())))?;
     // Opening by pathname is the one SQLite API available without widening
@@ -754,7 +763,6 @@ fn open(db_path: &Path) -> Result<Connection, LedgerError> {
         .map_err(|e| LedgerError::new("schema_failed", e.to_string()))?;
     checked_state_directory(dir, Some(repo), false)?;
     validate_ledger_files(db_path, repo)?;
-    secure_ledger_files(db_path, repo)?;
     Ok(conn)
 }
 
@@ -830,6 +838,15 @@ fn validate_ledger_files(db_path: &Path, repo: &Path) -> Result<(), LedgerError>
 fn secure_ledger_files(db_path: &Path, repo: &Path) -> Result<(), LedgerError> {
     use std::os::unix::fs::PermissionsExt;
     for path in ledger_files(db_path) {
+        // Already private: nothing to change, so no descriptor is opened. A
+        // close can cost a connection elsewhere in this process its locks (see
+        // `open`), so the open-and-fchmod below runs only for a file an older
+        // build left wider — once, not on every process start.
+        match checked_state_file_metadata(&path, Some(repo))? {
+            Some(metadata) if metadata.permissions().mode() & 0o777 == 0o600 => continue,
+            Some(_) => {}
+            None => continue,
+        }
         let Some(file) = open_checked_state_file(&path, Some(repo), true)? else {
             continue;
         };
@@ -2507,6 +2524,93 @@ mod tests {
         /// Ledger queries this thread has issued through [`read_after`] or
         /// [`latest_binding`]; a test reads it to count what a lookup costs.
         pub(super) static LEDGER_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    /// The env var that turns [`shm_lock_probe_child`] from a no-op into the
+    /// probe, naming the `-shm` file it inspects.
+    #[cfg(unix)]
+    const SHM_PROBE_ENV: &str = "GITPULSE_LEDGER_SHM_LOCK_PROBE";
+
+    /// SQLite's unix VFS takes a shared lock on the WAL index's "DMS" byte for
+    /// as long as a connection uses it: byte `UNIX_SHM_BASE + SQLITE_SHM_NLOCK`
+    /// = `(22 + 8) * 4 + 8` = 128. A process that sees no lock there treats the
+    /// index as abandoned and reinitialises it.
+    #[cfg(unix)]
+    const SHM_DMS_BYTE: libc::off_t = 128;
+
+    /// Not a test on its own: the child half of
+    /// [`a_live_ledger_connection_keeps_its_wal_index_lock`]. A lock held by
+    /// another process is only visible from another process, so the parent
+    /// re-runs this binary on exactly this test with the path set.
+    #[cfg(unix)]
+    #[test]
+    fn shm_lock_probe_child() {
+        use std::os::unix::io::AsRawFd;
+        let Ok(path) = std::env::var(SHM_PROBE_ENV) else {
+            return;
+        };
+        let file = std::fs::File::open(&path).expect("open -shm");
+        // SAFETY: a zeroed flock is a valid value of a plain C struct, and
+        // every field the call reads is set below before it is made.
+        let mut lock: libc::flock = unsafe { std::mem::zeroed() };
+        lock.l_type = libc::F_WRLCK as _;
+        lock.l_whence = libc::SEEK_SET as _;
+        lock.l_start = SHM_DMS_BYTE;
+        lock.l_len = 1;
+        // SAFETY: the descriptor is open for the call's duration and `lock`
+        // is a valid, exclusively borrowed flock.
+        let rc = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETLK, &mut lock) };
+        assert_eq!(rc, 0, "F_GETLK failed: {}", std::io::Error::last_os_error());
+        println!("PROBE type={} pid={}", lock.l_type, lock.l_pid);
+    }
+
+    /// Opening the ledger used to secure its files AFTER the connection
+    /// existed, opening and closing a descriptor to `-shm` — and on POSIX that
+    /// close drops every fcntl lock this process holds on the file, the
+    /// connection's WAL-index lock included. Other processes then reinitialised
+    /// the index under it: concurrent `gitpulse-hook` processes reading one
+    /// ledger died with SIGBUS in `walFindFrame`. The lock must survive open.
+    #[cfg(unix)]
+    #[test]
+    fn a_live_ledger_connection_keeps_its_wal_index_lock() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path().to_string_lossy().into_owned();
+        // `open` itself, holding the connection here: the cached registry
+        // connection is shared with every other test, any of which may reset
+        // the registry and close it — and the last close deletes `-shm`.
+        let conn = open(&ledger_path(&repo)).expect("open the ledger");
+        let shm = dir.path().join(".devcouncil").join("ledger.sqlite-shm");
+        assert!(shm.exists(), "a WAL ledger in use has an index file");
+
+        let output = std::process::Command::new(std::env::current_exe().expect("test binary"))
+            .args([
+                "--exact",
+                "ledger::tests::shm_lock_probe_child",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(SHM_PROBE_ENV, &shm)
+            .output_locked()
+            .expect("run the probe");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        // libtest prints the child's line after its own "test … " prefix.
+        let line = stdout
+            .split("PROBE ")
+            .nth(1)
+            .and_then(|rest| rest.lines().next())
+            .map(|rest| format!("PROBE {}", rest.trim_end()))
+            .unwrap_or_else(|| {
+                panic!(
+                    "the probe printed nothing: {stdout} {}",
+                    String::from_utf8_lossy(&output.stderr)
+                )
+            });
+        assert_eq!(
+            line,
+            format!("PROBE type={} pid={}", libc::F_RDLCK, std::process::id()),
+            "this process no longer holds the WAL index lock its live connection needs"
+        );
+        drop(conn);
     }
 
     /// A read must never bring the thing it is reading into existence.
