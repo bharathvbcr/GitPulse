@@ -74,7 +74,7 @@ already on disk, in a file that gets backed up, synced, and read by every
 future consumer including ones that do not know to redact. Write-time
 redaction is the only kind that bounds the blast radius.
 
-The credential patterns are DevCouncil's, in `rust/dc-redact/src/lib.rs`. They
+The credential patterns are Manvi's, in `crates/dc-verify/src/rigor.rs`. They
 are reused rather than reimplemented, for the ordinary reason: two copies of a
 secret-detection regex means one of them is out of date and nobody knows which.
 
