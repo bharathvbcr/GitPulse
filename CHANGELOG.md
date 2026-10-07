@@ -41,6 +41,18 @@ before that tag is pushed.
 - **The home workspace is editable** in the task sheet; it could only be set
   when a task was created.
 
+### Fixed
+
+- **The code graph opens maps the current devmap CLI writes.** The vendored
+  store read schema 23 and the CLI writes 24, so every code-intel answer in
+  GitPulse was "unavailable". DevCouncil's crates are re-vendored from
+  `c17fd37`, except `dc-verify`, which stays at `4efeecf` because upstream now
+  links a tree-sitter version that conflicts with the Markdown highlighter's.
+  The same refresh lets GitPulse, which links no grammar, check that a map was
+  written by the current analyzer, so a current map now reads as fresh rather
+  than "analyzer freshness unverified". `markdev-html` is re-vendored from
+  MarkDev `20dec7a`.
+
 ## [1.4.0] - 2026-10-06
 
 Agents that start in the background with a pane showing every one at work,

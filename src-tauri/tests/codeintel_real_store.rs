@@ -51,8 +51,14 @@ fn answers_impact_from_the_real_map_in_process() {
         "a readable map has a generation"
     );
     eprintln!(
-        "codeintel status: generation={:?} files={:?} edges={:?}",
-        status.generation_id, status.total_files, status.total_edges
+        "codeintel status: generation={:?} files={:?} edges={:?} source_fresh={:?} analyzer_fresh={:?} is_fresh={:?} reason={:?}",
+        status.generation_id,
+        status.total_files,
+        status.total_edges,
+        status.source_freshness,
+        status.analyzer_freshness,
+        status.is_fresh,
+        status.freshness_reason
     );
 
     let started = std::time::Instant::now();
