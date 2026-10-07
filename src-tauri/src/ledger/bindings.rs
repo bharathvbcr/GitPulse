@@ -18,6 +18,9 @@ pub const BIND: &str = "worktree.bind";
 /// The action name an unbinding event carries.
 pub const UNBIND: &str = "worktree.unbind";
 
+/// The error code for a checkout path that no longer exists on disk.
+pub const MISSING_WORKTREE: &str = "missing_worktree";
+
 /// The authenticated repository-wide address behind one binding lookup.
 ///
 /// The ledger and DevCouncil task store live at `anchor`; `worktree` remains
@@ -43,6 +46,19 @@ fn resolve_address(repo_path: &str, worktree_path: &str) -> Result<FamilyAddress
             members: family.members,
         })
         .map_err(|message| {
+            // A checkout that is no longer on disk is neither untrusted nor
+            // broken: it was removed or moved. Named first and on its own,
+            // because "could not resolve this worktree's task binding" read as
+            // a policy failure and was rendered as a hard harness block on a
+            // worktree that had simply been deleted. `try_exists` answers
+            // `Ok(false)` only for a definite absence; a path that could not
+            // be examined (permissions) is left to the codes below.
+            if [repo_path, worktree_path]
+                .iter()
+                .any(|path| std::path::Path::new(path).try_exists().ok() == Some(false))
+            {
+                return LedgerError::new(MISSING_WORKTREE, message);
+            }
             // Trust first, and not merely for tidiness: resolution runs Git,
             // so an untrusted checkout fails before anything about the
             // worktree has been examined. Reading that refusal as one of the
@@ -302,17 +318,21 @@ mod tests {
             "and it must still carry the refusal the user has to act on: {error}"
         );
 
-        // The sibling arms still mean what they did: a path that is not a
+        // The sibling arms still mean what they did: a directory that is not a
         // repository at all is `invalid_worktree` whether or not trust is in
         // play, so the new arm cannot be swallowing them.
-        let missing = repository_address(
-            dir.path()
-                .join("not-a-repository")
-                .to_str()
-                .expect("utf8 path"),
-        )
-        .expect_err("a non-repository must not resolve");
-        assert_eq!(missing.code, "invalid_worktree", "{missing}");
+        let plain = dir.path().join("not-a-repository");
+        std::fs::create_dir(&plain).expect("plain directory");
+        let invalid = repository_address(plain.to_str().expect("utf8 path"))
+            .expect_err("a non-repository must not resolve");
+        assert_eq!(invalid.code, "invalid_worktree", "{invalid}");
+
+        // And a path with nothing on disk is the absence it is.
+        let gone = dir.path().join("deleted-worktree");
+        let missing = repository_address(gone.to_str().expect("utf8 path"))
+            .expect_err("a missing path must not resolve");
+        assert_eq!(missing.code, MISSING_WORKTREE, "{missing}");
+        assert!(!gone.exists(), "resolving it must not create it");
     }
 
     #[test]

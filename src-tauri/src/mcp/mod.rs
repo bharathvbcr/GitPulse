@@ -2123,7 +2123,12 @@ mod tests {
     fn gitpulse_status_refuses_an_invalid_repository_instead_of_creating_state() {
         let error = handle_tool_call("gitpulse_status", &json!({ "repo_path": "/no/such/repo" }))
             .expect_err("an MCP read must validate its repository boundary");
-        assert!(error.contains("invalid_worktree"), "{error}");
+        // Named as the absence it is, not as a malformed checkout.
+        assert!(error.contains("missing_worktree"), "{error}");
+        assert!(
+            !std::path::Path::new("/no/such/repo").exists(),
+            "refusing the read must not have created the repository"
+        );
     }
 
     #[test]
