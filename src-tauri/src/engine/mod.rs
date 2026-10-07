@@ -12,6 +12,7 @@ pub mod remotes;
 pub mod repo_op;
 pub mod stash;
 pub mod submodules;
+pub mod text_shape;
 pub mod worktree;
 pub mod worktree_hooks;
 

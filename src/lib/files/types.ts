@@ -18,6 +18,13 @@ export interface BlameLine {
   content: string;
 }
 
+/**
+ * A text file's line-ending style (Rust `text_shape::LineEnding`). `mixed`
+ * includes any lone CR: the editor's textarea turns all of them into LF, so
+ * a mixed file cannot be saved without rewriting its endings.
+ */
+export type LineEnding = "lf" | "crlf" | "mixed";
+
 /** A single file's contents, as text or base64 depending on `is_binary`. */
 export interface FileBlob {
   path: string;
@@ -26,6 +33,10 @@ export interface FileBlob {
   mime: string;
   text?: string | null;
   base64?: string | null;
+  /** Bytes `text` shows as U+FFFD; non-zero means `text` is not faithful. */
+  invalid_utf8_bytes: number;
+  /** Absent for binary files. */
+  eol?: LineEnding | null;
 }
 
 /**

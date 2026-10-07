@@ -7,6 +7,7 @@
   } from "@lucide/svelte";
   import { openInDefaultApp } from "../../desktop/openInShell";
   import { repoStore } from "../../stores/repoStore";
+  import type { LineEnding } from "../../files/types";
   import { formatError } from "../../ui/formatError";
   import { bytesFromBase64Prefix, hexDumpRows } from "../../files/hexDump";
   import CodeViewer from "./CodeViewer.svelte";
@@ -34,6 +35,8 @@
       mime: string;
       text?: string | null;
       base64?: string | null;
+      invalid_utf8_bytes?: number;
+      eol?: LineEnding | null;
     };
     draftContent?: string | null;
     dirty?: boolean;
@@ -217,6 +220,8 @@
   <CodeViewer
     {filePath}
     content={blob.text || ""}
+    eol={blob.eol ?? null}
+    invalidUtf8Bytes={blob.invalid_utf8_bytes ?? 0}
     {draftContent}
     {dirty}
     {onSave}

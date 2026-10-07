@@ -48,8 +48,40 @@ describe("CodeViewer", () => {
     expect(source).toContain("draftContent");
     expect(source).toContain("onDraftChange");
     expect(source).toContain("onEditInput");
-    expect(source).toContain("onDraftChange?.(value, content)");
+    // The source is the text as the textarea can hold it (CRLF -> LF), so a
+    // CRLF file is not dirty until something other than its endings changes.
+    expect(source).toContain("onDraftChange?.(value, editBaseline)");
+    expect(source).toContain('content.replace(/\\r\\n/g, "\\n")');
     expect(source).toContain("Unsaved");
+  });
+
+  it("shows the file's line endings", () => {
+    const crlf = render(CodeViewer, { props: { filePath: "win.txt", content: "a\r\nb\r\n", eol: "crlf" } }).body;
+    expect(crlf).toMatch(/data-testid="code-eol"[^>]*>CRLF</);
+    expect(crlf).toContain("<span>Edit</span>");
+    const lf = render(CodeViewer, { props: { filePath: "unix.txt", content: "a\n", eol: "lf" } }).body;
+    expect(lf).toMatch(/data-testid="code-eol"[^>]*>LF</);
+  });
+
+  it("names a lossy decode and refuses to edit it", () => {
+    const { body } = render(CodeViewer, {
+      props: { filePath: "latin1.txt", content: "caf\u{FFFD}\n", eol: "lf", invalidUtf8Bytes: 2 },
+    });
+    expect(body).toContain("Not UTF-8 · 2 bytes shown as \u{FFFD}");
+    expect(body).toMatch(/<button[^>]*disabled[^>]*title="2 bytes in this file are not valid UTF-8[^"]*saving would replace them permanently/);
+  });
+
+  it("refuses to edit a file with mixed line endings", () => {
+    const { body } = render(CodeViewer, { props: { filePath: "mixed.txt", content: "a\r\nb\n", eol: "mixed" } });
+    expect(body).toMatch(/data-testid="code-eol"[^>]*>Mixed EOL</);
+    expect(body).toMatch(/<button[^>]*disabled[^>]*title="This file mixes line endings/);
+  });
+
+  it("never saves while the file cannot be edited faithfully", () => {
+    const save = source.slice(source.indexOf("async function saveChanges"));
+    expect(save.indexOf("if (editBlockedReason)")).toBeGreaterThan(-1);
+    expect(save.indexOf("if (editBlockedReason)")).toBeLessThan(save.indexOf("cmd_write_file_content"));
+    expect(source).toContain("if (readOnly || editBlockedReason) return;");
   });
 
   it("restores drafts by file identity during rapid prop switches", () => {

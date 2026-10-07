@@ -40,10 +40,13 @@
   import { debounce } from "../../async/debounce";
   import { SEARCH_DEBOUNCE_MS } from "../../files/searchLimits";
   import { consumeReveal } from "../../files/revealRequests";
+  import type { LineEnding } from "../../files/types";
 
   let {
     filePath,
     content,
+    eol = null,
+    invalidUtf8Bytes = 0,
     readOnly = false,
     draftContent = null,
     dirty = false,
@@ -53,6 +56,10 @@
   }: {
     filePath: string;
     content: string;
+    /** The file's line endings as read from disk; null when unknown. */
+    eol?: LineEnding | null;
+    /** Bytes `content` shows as U+FFFD because the file is not valid UTF-8. */
+    invalidUtf8Bytes?: number;
     readOnly?: boolean;
     draftContent?: string | null;
     dirty?: boolean;
@@ -100,7 +107,27 @@
   let scrollTop = $state(0);
 
   let language = $derived<SupportedLanguage>(detectLanguageFromPath(filePath));
-  let hasUnsavedChanges = $derived(dirty || (isEditing && editDraft !== content));
+  /**
+   * Why this file must not be edited here, or null. The textarea cannot hold
+   * the bytes a lossy decode replaced, nor keep mixed line endings per line,
+   * so saving either would silently rewrite the file. The backend refuses
+   * the same writes; this keeps the editor from offering them at all.
+   */
+  let editBlockedReason = $derived(
+    invalidUtf8Bytes > 0
+      ? `${invalidUtf8Bytes} byte${invalidUtf8Bytes === 1 ? "" : "s"} in this file ${invalidUtf8Bytes === 1 ? "is" : "are"} not valid UTF-8 and show as \u{FFFD}. Editing is off because saving would replace them permanently.`
+      : eol === "mixed"
+        ? "This file mixes line endings. Editing is off because saving would rewrite every one of them."
+        : null,
+  );
+  /**
+   * The text as the textarea will hand it back: its value turns CRLF into LF.
+   * Comparing drafts against `content` itself would mark every CRLF file
+   * dirty on the first keystroke; the backend restores CRLF on save.
+   */
+  let editBaseline = $derived(content.replace(/\r\n/g, "\n"));
+  let eolLabel = $derived(eol === "mixed" ? "Mixed EOL" : eol ? eol.toUpperCase() : null);
+  let hasUnsavedChanges = $derived(dirty || (isEditing && editDraft !== editBaseline));
 
   // One split, not two. `linesTruncated` used to re-split the whole file just
   // to compare a length and then throw the array away — a second full pass and
@@ -235,8 +262,8 @@
   }
 
   function startEdit() {
-    if (readOnly) return;
-    editDraft = draftContent ?? content;
+    if (readOnly || editBlockedReason) return;
+    editDraft = draftContent ?? editBaseline;
     isEditing = true;
   }
 
@@ -255,17 +282,21 @@
       if (!confirmed || filePath !== path || editorGeneration !== generation) return;
     }
     isEditing = false;
-    editDraft = content;
+    editDraft = editBaseline;
   }
 
   function onEditInput(event: Event) {
     const value = (event.currentTarget as HTMLTextAreaElement).value;
     editDraft = value;
-    onDraftChange?.(value, content);
+    onDraftChange?.(value, editBaseline);
   }
 
   async function saveChanges() {
     if (readOnly || !isEditing || isSaving) return;
+    if (editBlockedReason) {
+      repoStore.setError(`Not saved: ${editBlockedReason}`);
+      return;
+    }
     const path = filePath;
     const generation = editorGeneration;
     const contentToSave = editDraft;
@@ -342,7 +373,7 @@
   $effect(() => {
     const path = filePath;
     const restored = draftContent;
-    const source = content;
+    const source = editBaseline;
     if (path !== previousFilePath) {
       previousFilePath = path;
       untrack(() => {
@@ -439,6 +470,22 @@
       <span class="text-[11px] font-mono text-textMuted">{(byteSize / 1024).toFixed(1)} KB</span>
       <span class="text-textMuted/40">•</span>
       <span class="text-[10px] font-mono uppercase px-1.5 py-0.5 rounded bg-accent/15 text-accent font-semibold">{language}</span>
+      {#if eolLabel}
+        <span class="text-textMuted/40">•</span>
+        <span
+          class="text-[11px] font-mono {eol === 'mixed' ? 'text-amber-400 font-semibold' : 'text-textMuted'}"
+          title={eol === "mixed" ? editBlockedReason : `Line endings: ${eolLabel}, kept on save`}
+          data-testid="code-eol"
+        >{eolLabel}</span>
+      {/if}
+      {#if invalidUtf8Bytes > 0}
+        <span
+          class="text-[10px] font-semibold px-1.5 py-0.5 rounded bg-amber-500/15 text-amber-400"
+          role="status"
+          title={editBlockedReason}
+          data-testid="code-lossy"
+        >Not UTF-8 · {invalidUtf8Bytes} byte{invalidUtf8Bytes === 1 ? "" : "s"} shown as {"\u{FFFD}"}</span>
+      {/if}
       {#if hasUnsavedChanges}
         <span class="text-[10px] font-semibold text-amber-400" role="status">Unsaved</span>
       {/if}
@@ -507,6 +554,8 @@
         <button
           type="button"
           onclick={startEdit}
+          disabled={editBlockedReason !== null}
+          title={editBlockedReason ?? undefined}
           class="gp-btn py-1! px-2.5! flex items-center gap-1 text-[11px]"
         >
           <Edit3 size={12} class="text-accent" />

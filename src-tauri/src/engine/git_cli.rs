@@ -265,6 +265,31 @@ pub fn sandbox_write(repo_path: &str, file_path: &str, content: &str) -> Result<
     crate::diff::write_regular(&dest, content.as_bytes())
 }
 
+/// Saves text that came out of the file editor. Unlike [`sandbox_write`],
+/// which writes bytes it was given verbatim, this restores the file's CRLF
+/// line endings the editor's textarea dropped, and refuses to overwrite a file
+/// whose bytes the editor could not show faithfully (invalid UTF-8, or mixed
+/// line endings it cannot keep per line).
+pub fn sandbox_write_edited_text(
+    repo_path: &str,
+    file_path: &str,
+    content: &str,
+) -> Result<(), String> {
+    let repo = validate_repo(repo_path)?;
+    let dest = sandbox_join_canonical(&repo, file_path)?;
+    let existing = match std::fs::symlink_metadata(&dest) {
+        Ok(_) => Some(crate::engine::git_reader::read_working_tree_file(
+            &dest,
+            crate::engine::budget::MAX_FILE_BYTES,
+        )?),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+        Err(err) => return Err(format!("Cannot inspect '{file_path}': {err}")),
+    };
+    let bytes =
+        crate::engine::text_shape::encode_edited_text(file_path, existing.as_deref(), content)?;
+    crate::diff::write_regular(&dest, &bytes)
+}
+
 /// True for inherited environment names that can redirect git's config,
 /// transport, or credential resolution away from what the user picked.
 ///
@@ -7813,6 +7838,127 @@ mod tests {
             std::fs::read_to_string(dir.path().join("real").join("sub.txt")).unwrap(),
             "kept inside"
         );
+    }
+
+    /// What the file editor's `<textarea>` hands back: the HTML spec's value
+    /// sanitization turns every CRLF pair and every lone CR into LF.
+    fn textarea_value(text: &str) -> String {
+        text.replace("\r\n", "\n").replace('\r', "\n")
+    }
+
+    /// Open → edit one line → save, exactly as the file viewer does it.
+    fn editor_round_trip(
+        dir: &Path,
+        file: &str,
+        edit: impl Fn(&str) -> String,
+    ) -> Result<(), String> {
+        let raw = dir.to_string_lossy().into_owned();
+        let blob = crate::engine::GitReader::get_file_blob(&raw, file, None)?;
+        let shown = textarea_value(blob.text.as_deref().expect("text file"));
+        sandbox_write_edited_text(&raw, file, &edit(&shown))
+    }
+
+    #[test]
+    fn editor_round_trip_keeps_crlf_outside_and_inside_the_edit() {
+        let dir = tempfile::TempDir::new().unwrap();
+        init_plain_git_repo(dir.path());
+        std::fs::write(dir.path().join("win.txt"), b"one\r\ntwo\r\nthree\r\n").unwrap();
+        let raw = dir.path().to_string_lossy().into_owned();
+        let blob = crate::engine::GitReader::get_file_blob(&raw, "win.txt", None).unwrap();
+        assert_eq!(blob.eol, Some(crate::engine::text_shape::LineEnding::Crlf));
+        assert_eq!(blob.invalid_utf8_bytes, 0);
+
+        editor_round_trip(dir.path(), "win.txt", |text| {
+            text.replace("two", "TWO\nand more")
+        })
+        .expect("save");
+
+        assert_eq!(
+            std::fs::read(dir.path().join("win.txt")).unwrap(),
+            b"one\r\nTWO\r\nand more\r\nthree\r\n"
+        );
+    }
+
+    #[test]
+    fn editor_round_trip_keeps_lf_files_byte_exact() {
+        let dir = tempfile::TempDir::new().unwrap();
+        init_plain_git_repo(dir.path());
+        std::fs::write(dir.path().join("unix.txt"), "one\ntwo\ncafé\n").unwrap();
+
+        editor_round_trip(dir.path(), "unix.txt", |text| text.replace("two", "TWO")).expect("save");
+
+        assert_eq!(
+            std::fs::read(dir.path().join("unix.txt")).unwrap(),
+            "one\nTWO\ncafé\n".as_bytes()
+        );
+    }
+
+    #[test]
+    fn editor_round_trip_never_rewrites_latin1_bytes() {
+        let dir = tempfile::TempDir::new().unwrap();
+        init_plain_git_repo(dir.path());
+        let original = b"caf\xe9\nna\xefve\n".to_vec();
+        std::fs::write(dir.path().join("latin1.txt"), &original).unwrap();
+        let raw = dir.path().to_string_lossy().into_owned();
+        let blob = crate::engine::GitReader::get_file_blob(&raw, "latin1.txt", None).unwrap();
+        assert_eq!(
+            blob.invalid_utf8_bytes, 2,
+            "the reader must report the lossy decode"
+        );
+
+        let err = editor_round_trip(dir.path(), "latin1.txt", |text| text.replace("na", "NA"))
+            .expect_err("a lossy decode must not be saved");
+        assert!(
+            err.contains("2 byte(s)") && err.contains("not valid UTF-8"),
+            "got: {err}"
+        );
+
+        assert_eq!(
+            std::fs::read(dir.path().join("latin1.txt")).unwrap(),
+            original,
+            "a lossy decode must never be written back over the original bytes"
+        );
+    }
+
+    #[test]
+    fn editor_round_trip_refuses_mixed_line_endings_untouched() {
+        let dir = tempfile::TempDir::new().unwrap();
+        init_plain_git_repo(dir.path());
+        let original = b"one\r\ntwo\nthree\r\n".to_vec();
+        std::fs::write(dir.path().join("mixed.txt"), &original).unwrap();
+        let raw = dir.path().to_string_lossy().into_owned();
+        let blob = crate::engine::GitReader::get_file_blob(&raw, "mixed.txt", None).unwrap();
+        assert_eq!(blob.eol, Some(crate::engine::text_shape::LineEnding::Mixed));
+
+        let err = editor_round_trip(dir.path(), "mixed.txt", |text| text.replace("two", "TWO"))
+            .expect_err("mixed endings cannot be kept per line");
+        assert!(err.contains("mixes line endings"), "got: {err}");
+        assert_eq!(
+            std::fs::read(dir.path().join("mixed.txt")).unwrap(),
+            original
+        );
+    }
+
+    #[test]
+    fn edited_text_write_still_creates_new_files() {
+        // The file tree's New File / New Folder (.gitkeep) go through the same
+        // command with empty content and no existing file.
+        let dir = tempfile::TempDir::new().unwrap();
+        init_plain_git_repo(dir.path());
+        let raw = dir.path().to_string_lossy().into_owned();
+        sandbox_write_edited_text(&raw, "pkg/.gitkeep", "").expect("create");
+        assert_eq!(std::fs::read(dir.path().join("pkg/.gitkeep")).unwrap(), b"");
+    }
+
+    #[test]
+    fn get_file_blob_reports_no_text_shape_for_binary_files() {
+        let dir = tempfile::TempDir::new().unwrap();
+        init_plain_git_repo(dir.path());
+        std::fs::write(dir.path().join("data.bin"), b"\x00\xff\r\n").unwrap();
+        let raw = dir.path().to_string_lossy().into_owned();
+        let blob = crate::engine::GitReader::get_file_blob(&raw, "data.bin", None).unwrap();
+        assert!(blob.is_binary);
+        assert_eq!((blob.invalid_utf8_bytes, blob.eol), (0, None));
     }
 
     #[test]
