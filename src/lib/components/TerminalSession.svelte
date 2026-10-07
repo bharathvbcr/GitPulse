@@ -673,11 +673,17 @@
 
   export function restart() { void lifecycle?.restart(); }
 
-  /** Opens the task this attempt belongs to, where a new attempt starts. */
+  /**
+   * The attempt this tab belongs to: its own, or the one a resumed
+   * conversation continues. Its task lists both, so both link back to it.
+   */
+  const linkedRunId = $derived(taskRunId ?? resume?.runId ?? null);
+
+  /** Opens the task this tab's attempt belongs to, where a new attempt starts. */
   async function openOwnTask() {
-    if (!taskRunId) return;
+    if (!linkedRunId) return;
     try {
-      await openTaskForRun(taskRunId);
+      await openTaskForRun(linkedRunId);
     } catch (cause) {
       toastStore.error(`This attempt's task could not be opened: ${formatError(cause)}`);
     }
@@ -1162,7 +1168,7 @@
         </button>
       {:else if exited}
         <span class="text-textMuted flex-1 text-[11px]">This session ended.</span>
-        {#if taskRunId}
+        {#if linkedRunId}
           <!-- The task details are where a new attempt starts, so the way
                there is here rather than only named in a tooltip. -->
           <button type="button" class="gp-btn py-1! text-[11px]!" data-testid="terminal-open-task" onclick={() => void openOwnTask()}>
