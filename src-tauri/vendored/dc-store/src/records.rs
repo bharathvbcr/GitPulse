@@ -124,6 +124,9 @@ pub struct GapRow {
     pub suggested_command: Option<String>,
     pub acceptance_criterion_id: Option<String>,
     pub expected_verification_method: Option<String>,
+    /// Where a failed verification command's captured output was written.
+    pub stdout_path: Option<String>,
+    pub stderr_path: Option<String>,
 }
 
 /// One row of `gap_history`: what became of one gap across a task's runs.
@@ -279,8 +282,8 @@ pub fn gap_upsert(conn: &Connection, gap: &GapRow) -> Result<()> {
         "INSERT INTO gaps
             (id, severity, gap_type, requirement_id, task_id, description, evidence_json,
              recommended_fix, blocking, file, line, suggested_command,
-             acceptance_criterion_id, expected_verification_method)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+             acceptance_criterion_id, expected_verification_method, stdout_path, stderr_path)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
          ON CONFLICT(id) DO UPDATE SET
             severity = excluded.severity,
             gap_type = excluded.gap_type,
@@ -294,7 +297,9 @@ pub fn gap_upsert(conn: &Connection, gap: &GapRow) -> Result<()> {
             line = excluded.line,
             suggested_command = excluded.suggested_command,
             acceptance_criterion_id = excluded.acceptance_criterion_id,
-            expected_verification_method = excluded.expected_verification_method",
+            expected_verification_method = excluded.expected_verification_method,
+            stdout_path = excluded.stdout_path,
+            stderr_path = excluded.stderr_path",
         params![
             gap.id,
             gap.severity,
@@ -310,6 +315,8 @@ pub fn gap_upsert(conn: &Connection, gap: &GapRow) -> Result<()> {
             gap.suggested_command,
             gap.acceptance_criterion_id,
             gap.expected_verification_method,
+            gap.stdout_path,
+            gap.stderr_path,
         ],
     )?;
     tx.commit()?;
@@ -353,8 +360,8 @@ pub fn gaps_replace(conn: &Connection, task_id: &str, gaps: &[GapRow]) -> Result
             "INSERT INTO gaps
                 (id, severity, gap_type, requirement_id, task_id, description, evidence_json,
                  recommended_fix, blocking, file, line, suggested_command,
-                 acceptance_criterion_id, expected_verification_method)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                 acceptance_criterion_id, expected_verification_method, stdout_path, stderr_path)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
             params![
                 gap.id,
                 gap.severity,
@@ -370,6 +377,8 @@ pub fn gaps_replace(conn: &Connection, task_id: &str, gaps: &[GapRow]) -> Result
                 gap.suggested_command,
                 gap.acceptance_criterion_id,
                 gap.expected_verification_method,
+                gap.stdout_path,
+                gap.stderr_path,
             ],
         )?;
     }
@@ -523,13 +532,16 @@ pub fn gaps_list(conn: &Connection, task_id: Option<&str>) -> Result<(Vec<GapRow
             suggested_command: row.get(11)?,
             acceptance_criterion_id: row.get(12)?,
             expected_verification_method: row.get(13)?,
+            stdout_path: row.get(14)?,
+            stderr_path: row.get(15)?,
         })
     };
     let rows: Vec<GapRow> = if let Some(tid) = task_id {
         let mut stmt = conn.prepare(
             "SELECT id, severity, gap_type, requirement_id, task_id, description, evidence_json,
                     recommended_fix, blocking, file, line, suggested_command,
-                    acceptance_criterion_id, expected_verification_method
+                    acceptance_criterion_id, expected_verification_method,
+                    stdout_path, stderr_path
              FROM gaps WHERE task_id = ?1 ORDER BY id LIMIT ?2",
         )?;
         stmt.query_map(params![tid, limit], map_row)?
@@ -538,7 +550,8 @@ pub fn gaps_list(conn: &Connection, task_id: Option<&str>) -> Result<(Vec<GapRow
         let mut stmt = conn.prepare(
             "SELECT id, severity, gap_type, requirement_id, task_id, description, evidence_json,
                     recommended_fix, blocking, file, line, suggested_command,
-                    acceptance_criterion_id, expected_verification_method
+                    acceptance_criterion_id, expected_verification_method,
+                    stdout_path, stderr_path
              FROM gaps ORDER BY id LIMIT ?1",
         )?;
         stmt.query_map(params![limit], map_row)?
@@ -724,6 +737,8 @@ mod tests {
                 suggested_command: None,
                 acceptance_criterion_id: None,
                 expected_verification_method: None,
+                stdout_path: None,
+                stderr_path: None,
             })
             .collect()
     }

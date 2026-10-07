@@ -120,6 +120,10 @@ CREATE TABLE IF NOT EXISTS gaps (
     suggested_command VARCHAR,
     acceptance_criterion_id VARCHAR,
     expected_verification_method VARCHAR,
+    -- Added after schema 9 shipped, so a store created earlier gains them in
+    -- `ensure_gap_output_columns`, not here.
+    stdout_path VARCHAR,
+    stderr_path VARCHAR,
     PRIMARY KEY (id)
 );
 
@@ -377,6 +381,51 @@ fn normalise_ddl(sql: &str) -> String {
         .chars()
         .filter(|c| !c.is_whitespace() && *c != '"' && *c != '`' && *c != '[' && *c != ']')
         .collect()
+}
+
+/// Columns added to `gaps` after schema 9 shipped, with their types.
+const GAP_OUTPUT_COLUMNS: &[(&str, &str)] =
+    &[("stdout_path", "VARCHAR"), ("stderr_path", "VARCHAR")];
+
+/// Adds the gap output-path columns to a `gaps` table created without them.
+///
+/// `CREATE TABLE IF NOT EXISTS` leaves an existing table as it is, so without
+/// this a store in use before the columns existed would refuse every
+/// `gap-upsert` with "no such column" — the longest-lived stores first.
+///
+/// The change is additive and nullable, and it deliberately does not move
+/// `SCHEMA_VERSION`. That number is asserted by the Go client and shared with
+/// DevCouncil's planner; it exists to stop a binary reading rows through the
+/// wrong column layout. Two optional columns that older binaries never name in
+/// an INSERT or SELECT cannot produce that, while bumping it would make every
+/// installed client refuse every store this build has opened.
+///
+/// Two processes opening the same old store can both see a column missing and
+/// both add it; the loser's "duplicate column" is re-checked rather than
+/// reported, the same way `ensure_schema_version` treats its insert race.
+pub fn ensure_gap_output_columns(conn: &Connection) -> rusqlite::Result<()> {
+    for (name, ty) in GAP_OUTPUT_COLUMNS {
+        if gaps_has_column(conn, name)? {
+            continue;
+        }
+        if let Err(err) = conn.execute_batch(&format!("ALTER TABLE gaps ADD COLUMN {name} {ty}"))
+            && !gaps_has_column(conn, name)?
+        {
+            return Err(err);
+        }
+    }
+    Ok(())
+}
+
+fn gaps_has_column(conn: &Connection, name: &str) -> rusqlite::Result<bool> {
+    let mut stmt = conn.prepare("PRAGMA table_info(gaps)")?;
+    let mut rows = stmt.query([])?;
+    while let Some(row) = rows.next()? {
+        if row.get::<_, String>("name")? == name {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// Ensures `schema_version` matches this build, refusing a newer unknown row.

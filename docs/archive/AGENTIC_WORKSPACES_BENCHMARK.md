@@ -3,8 +3,8 @@
 ## 2026-10-07 stress search checkpoint
 
 **Stress broad search now meets the 100 ms target on the committed benchmark.**
-DevCouncil commit `3bf19415` (branch `perf/workbench-search-p95`) against its
-`main` at `a284d14f`. The benchmark is `BenchmarkWorkbenchProfileStress` in
+DevCouncil commit `3bf19415` (branch `perf/workbench-search-p95`, since merged
+to DevCouncil `main`) against its `main` at `a284d14f`. The benchmark is `BenchmarkWorkbenchProfileStress` in
 DevCouncil's `backend/go_orchestrator/dc/store/workbench_bench_test.go`, which
 now lives there rather than in Manvi; it still execs a **debug** `dcstore`
 through the real Go client. Same host as below (Apple M5 Pro, macOS 27.0).
@@ -49,10 +49,40 @@ materialize their candidates once and count and page from that set; and a
 build, in-process, on disk: broad search 14.0 ms and workspace-scoped broad
 search 30.5 ms p95.
 
-Not yet in GitPulse: the app vendors `dc-store`, and the vendored copy is being
-re-vendored from DevCouncil's unmerged repository-relink branch in another
-session. Re-vendor (`scripts/vendor-crates.mjs --crate=dc-store`) once both
-DevCouncil branches are on its `main`.
+**In GitPulse since `0af6bff7`.** GitPulse vendors `dc-store` at DevCouncil
+`e9175c42`, whose `dc-store` tree is identical to DevCouncil `main` at
+`c17fd379`: this change, plus the repository relink and the stored-gap fields.
+Neither of those touches a measured path. The relink adds one method, and the
+gap fields change the gap commands and a column check that runs once when the
+store opens.
+
+That source was measured against `3bf19415` alone in five interleaved pairs on
+the same benchmark: three with `3bf19415` first, then two with the order
+reversed. Other agent sessions were compiling throughout, and one commit's p95
+swung up to 5× between runs. p95 in ms, minimum of five runs:
+
+| Operation | `3bf19415` | `c17fd379` (vendored source) |
+|---|---:|---:|
+| Broad global search | 51.93 | 55.50 |
+| Workspace-scoped broad search | 74.16 | 90.15 |
+| Repository-scoped broad search | 35.27 | 44.31 |
+| Workspace | 40.11 | 45.87 |
+| Global | 6.432 | 6.973 |
+| Rare global search | 0.272 | 0.371 |
+| Committed task text edit | 0.745 | 0.923 |
+
+The vendored source meets the 100 ms target. Workspace-scoped search has the
+least headroom, at about 10 ms. `3bf19415`'s own numbers here are above the
+morning's A/B (44.60 and 70.48 ms) on the same commit, which is the host load,
+not a change.
+
+Repository-scoped search was slower on `c17fd379` in all five pairs, and
+workspace-scoped search in four of five, by roughly 10–30%. The cause is not
+established: no code on those paths differs. Edit looked 4× slower while
+`c17fd379` always ran second, straight after the other side had written its
+690 MB profile. With the order reversed it was faster (0.923 against
+1.009 ms), so that gap was run order. Treat the scoped-search gap as unexplained
+until a quiet host confirms or clears it.
 
 Reproduce, from DevCouncil's `backend/go_orchestrator`:
 

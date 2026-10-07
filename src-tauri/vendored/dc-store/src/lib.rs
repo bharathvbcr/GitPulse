@@ -315,6 +315,7 @@ impl Store {
         conn.busy_timeout(BUSY_TIMEOUT)?;
         ensure_wal(&conn)?;
         conn.execute_batch(schema::SCHEMA)?;
+        schema::ensure_gap_output_columns(&conn)?;
         // Applying the DDL is not evidence that it took: every statement in it
         // is `IF NOT EXISTS`, and for the exclusion index that match is on the
         // name alone. Reading back what the file actually holds is what turns
@@ -1765,6 +1766,24 @@ mod tests {
         )
         .expect("plant the incumbent's spelling");
         Store::prepare(conn).expect("the incumbent's own index was refused");
+    }
+
+    /// The gap output-path upgrade forgives exactly one failure — another
+    /// process having added the column first — and re-reads the table to tell
+    /// that apart. Any other failure to add a column must surface, or a store
+    /// that cannot hold the paths would open as if it could and fail later on
+    /// the first gap-upsert instead.
+    #[test]
+    fn a_gap_column_that_cannot_be_added_is_an_error_not_skipped() {
+        let conn = Connection::open_in_memory().expect("open");
+        // No `gaps` table at all: every ALTER fails, and the column is still
+        // absent when re-read.
+        let err = schema::ensure_gap_output_columns(&conn)
+            .expect_err("an ALTER that failed for a reason other than the race was swallowed");
+        assert!(
+            err.to_string().contains("gaps"),
+            "the error does not name the table: {err}"
+        );
     }
 
     /// A task id nothing was planned under gets a routable answer rather than a
