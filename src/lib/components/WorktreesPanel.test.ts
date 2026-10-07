@@ -59,6 +59,59 @@ describe("WorktreesPanel agent worktree affordances", () => {
     expect(source).toContain("agentKind");
     expect(source).toContain("agentSessionSlug");
   });
+
+  it("labels the agent chip for a person, and a GitPulse task worktree as one", () => {
+    // The chip used to print the raw directory name, so GitPulse's own task
+    // worktrees read as an agent called "gitpulse".
+    expect(source).toContain("{agentKindLabel(kind)}</span>");
+    expect(source).toContain("isGitPulseLane(kind) ? 'GitPulse task worktree'");
+    expect(source).not.toContain("Agent session ");
+    expect(source).toContain("Agent worktree (");
+  });
+
+  it("does not create worktrees in GitPulse's task container from the renderer", () => {
+    // The task provisioner is the one creator under .gitpulse/worktrees/: it
+    // excludes the directory from git status first and names the branch after
+    // the attempt. The panel's "agent lane" preset skipped both, nested inside
+    // whichever checkout was selected, and cmd_add_worktree now refuses it.
+    expect(source).not.toContain("spawnAgentLane");
+    expect(source).not.toContain(".gitpulse/worktrees");
+    expect(source).not.toContain("Agent Lane");
+    expect(source).not.toMatch(/\bZap\b/);
+  });
+});
+
+describe("WorktreesPanel controls say what they do", () => {
+  const header = source.slice(source.indexOf("<FolderGit2 size={11} />"), source.indexOf("{#if showAddForm}"));
+
+  it("gives prune and AI summary different icons", () => {
+    expect(header).toContain("<Eraser size={11} />");
+    expect(header).not.toContain("<Sparkles");
+    const rail = source.slice(source.indexOf("fetchAiSummary(wt)}"));
+    expect(rail).toContain("<Sparkles size={10} />");
+  });
+
+  it("names open by whether a tab for the worktree is already open", () => {
+    // openRepo focuses an existing tab rather than opening another, so "Open
+    // in a new tab" was false whenever one was open.
+    expect(source).not.toContain("in a new tab");
+    expect(source).toContain('title={hasOpenTab(wt) ? "Show tab" : "Open"}');
+    expect(source).toMatch(/hasOpenTab = \$derived\(\(wt: WorktreeInfo\) =>\s*\$repoStore\.openTabs\.some\(\(tab\) => sameRepo\(tab\.path, wt\.path/);
+  });
+
+  it("states the merge confirm once, inline, not again in the button title", () => {
+    expect(source).not.toContain("Click GitMerge icon again");
+    expect(source).not.toContain("Click again to confirm merge");
+    expect(source.match(/again to confirm/g)?.length).toBe(1);
+    expect(source).toContain("Press merge again to confirm.");
+  });
+
+  it("explains an empty list and offers the next step", () => {
+    expect(source).toContain('data-testid="worktrees-empty"');
+    expect(source).toMatch(/onlyMain = \$derived\(\s*!isLoading && !error && worktrees\.length > 0 && worktrees\.every\(\(wt\) => wt\.is_main\)/);
+    const empty = source.slice(source.indexOf('data-testid="worktrees-empty"'));
+    expect(empty.slice(0, 600)).toContain("onclick={() => (showAddForm = true)}");
+  });
 });
 
 describe("WorktreesPanel removal safety", () => {
@@ -80,10 +133,27 @@ describe("WorktreesPanel removal safety", () => {
   });
 
   it("closes the stranded tab instead of leaving it on the removed directory (T-F09)", () => {
-    const guardIdx = source.indexOf("$repoStore.currentPath === targetPath");
-    expect(guardIdx).toBeGreaterThan(-1);
-    const closeIdx = source.indexOf("repoStore.closeTab(stranded.id)");
-    expect(closeIdx).toBeGreaterThan(guardIdx);
+    // Any tab on the removed directory, not only the active one: a background
+    // tab used to stay open on a deleted path, holding a tab slot.
+    const fn = source.slice(source.indexOf("async function remove"), source.indexOf("function open"));
+    expect(fn).not.toContain("$repoStore.currentPath === targetPath");
+    const removed = fn.indexOf("removeCompleted = true");
+    const closeIdx = fn.indexOf("repoStore.closeTab(stranded.id)");
+    const staleReturn = fn.indexOf("$repoStore.currentPath !== repo", removed);
+    expect(closeIdx).toBeGreaterThan(removed);
+    expect(closeIdx).toBeLessThan(staleReturn);
+  });
+
+  it("closes a stranded tab after merge-and-teardown too, active or not", () => {
+    // The same directory removal, reached through the merge button, carried
+    // the same active-only check.
+    const fn = source.slice(source.indexOf("async function mergeTeardown"), source.indexOf("async function fetchAiSummary"));
+    expect(fn).not.toContain("$repoStore.currentPath === wt.path");
+    const merged = fn.indexOf("mergeCompleted = true");
+    const closeIdx = fn.indexOf("repoStore.closeTab(stranded.id)");
+    const staleReturn = fn.indexOf("$repoStore.currentPath !== repo", merged);
+    expect(closeIdx).toBeGreaterThan(merged);
+    expect(closeIdx).toBeLessThan(staleReturn);
   });
 
   it("preserves the concurrent-session currentPath guards after the await", () => {

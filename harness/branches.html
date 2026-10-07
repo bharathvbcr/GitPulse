@@ -175,7 +175,9 @@ if(params.has("check")) {
     const wtPanel = mount(WorktreesPanel,{target:wtHost});
     await waitFor(() => wtHost.textContent.includes(LONG_WORKTREE));
     const wtRows = [...wtHost.querySelectorAll("div.rounded-2xl")]
-      .filter(r => r.querySelector('button[aria-label^="Open "]'));
+      // The open control is named by what it will do: "Open X", or "Show the
+      // open tab for X" when a tab is already on that worktree.
+      .filter(r => r.querySelector('button[aria-label^="Open "], button[aria-label^="Show the open tab for "]'));
     const wtLines = row => [...(row?.children ?? [])].filter(c => c.getBoundingClientRect().height > 0);
     const longRow = wtRows.find(r => r.textContent.includes(LONG_WORKTREE));
     const wtName = longRow?.querySelector(".truncate");
