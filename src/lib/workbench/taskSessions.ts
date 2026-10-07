@@ -18,8 +18,7 @@ import type { TerminalSessionRecord } from "../terminal/sessionRegistry";
 import type { TaskTerminalRequest } from "../terminal/taskLaunches";
 import type { SessionActivity } from "../terminal/sessionActivity";
 import type { OpenRepoTab } from "../stores/repoStore";
-import { identityKey, type PathIdentityOptions } from "../repos/paths";
-import { isAgentWorktree } from "../work/agentWorktree";
+import { identityKey, pathSegments, type PathIdentityOptions } from "../repos/paths";
 import { runExpired, runHoldsCheckout } from "./taskHandoff";
 import type { TaskRun } from "./client";
 
@@ -273,17 +272,64 @@ export function taskAgentSummaries(runs: readonly TaskRun[], context: MonitorCon
  */
 export interface CheckoutChanges { files: number; branch: string | null; shared: boolean }
 
+/** Which attempt is asking, and the other attempts the caller knows are live. */
+export interface AttemptIdentity {
+  runId: string;
+  /** Live attempts as read; the asking one may be among them. */
+  peers?: readonly Pick<TaskRun, "id" | "cwd">[];
+}
+
+/**
+ * Whether `cwd` is the worktree the host made for this attempt.
+ *
+ * Read from the run, not from the layout: the host places an attempt's own
+ * worktree at `<main checkout>/.gitpulse/worktrees/<slug>-<short>`, where
+ * `short` is the first 8 ASCII letters and digits of the run id, lowercased
+ * (`src-tauri/src/workbench/agent_worktree.rs`, `short` and `provision`). A
+ * worktree any agent made — `.claude/worktrees/…`, or another attempt's —
+ * does not carry this run's id, so it is not this attempt's own. Transcribed
+ * from the host; the run record carries no ownership field to read instead.
+ */
+export function isAttemptWorktree(cwd: string, runId: string): boolean {
+  const short = [...runId].filter((ch) => /[A-Za-z0-9]/.test(ch)).slice(0, 8).join("").toLowerCase();
+  if (short.length < 4) return false;
+  const segments = pathSegments(cwd);
+  if (segments.length < 3) return false;
+  const [container, worktrees, name] = segments.slice(-3);
+  return container === ".gitpulse" && worktrees === "worktrees" && name.toLowerCase().endsWith(`-${short}`);
+}
+
+/**
+ * What to say once the host has released an attempt's hold on its checkout.
+ *
+ * Releasing ends the hold, not the directory: the host never removes a
+ * worktree whose attempt it accepted (`agent_worktree.rs` — the agent's work
+ * lives there), so for the attempt's own worktree the reader is told it is
+ * still on disk, and where, rather than left to think it went.
+ */
+export function releasedNote(run: Pick<TaskRun, "id" | "cwd">): string {
+  return isAttemptWorktree(run.cwd, run.id)
+    ? `Released. The attempt's worktree stays on disk at ${run.cwd}, with its changes and branch, and its checkout is free for another attempt.`
+    : "Released. The checkout is free for another attempt.";
+}
+
 export function checkoutChanges(
   cwd: string,
-  tabs: readonly Pick<OpenRepoTab, "path" | "isLoading" | "error" | "trustRequired" | "changedCount" | "currentBranch">[],
+  tabs: readonly Pick<OpenRepoTab, "path" | "familyRoot" | "isLoading" | "error" | "trustRequired" | "changedCount" | "currentBranch">[],
   options: PathIdentityOptions,
+  attempt: AttemptIdentity,
 ): CheckoutChanges | null {
   const key = identityKey(cwd, options);
   if (!key) return null;
   const tab = tabs.find((candidate) => identityKey(candidate.path, options) === key);
   if (!tab || tab.isLoading || tab.error || tab.trustRequired) return null;
   if (!Number.isFinite(tab.changedCount) || tab.changedCount < 0) return null;
-  return { files: tab.changedCount, branch: tab.currentBranch, shared: !isAgentWorktree(cwd) };
+  // Shared unless it is this run's own worktree and no other live attempt is
+  // working in it. The main checkout is never an attempt's own.
+  const mainCheckout = !!tab.familyRoot && identityKey(tab.familyRoot, options) === key;
+  const crowded = (attempt.peers ?? []).some((peer) => peer.id !== attempt.runId && identityKey(peer.cwd, options) === key);
+  const own = !mainCheckout && !crowded && isAttemptWorktree(cwd, attempt.runId);
+  return { files: tab.changedCount, branch: tab.currentBranch, shared: !own };
 }
 
 /**

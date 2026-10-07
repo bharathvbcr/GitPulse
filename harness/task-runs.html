@@ -105,6 +105,8 @@
     }
     switch (cmd) {
       case "cmd_resolve_repo":return {path:args.repoPath,name:"GitPulse",is_bare:false};
+      // The fixture's attempt directories are checkout roots.
+      case "cmd_resolve_git_root":return args.path;
       case "cmd_terminal_spawn":
         if (args.args?.[0]==="--resume") { report.resumes.push({program:args.program,args:args.args,permissionMode:args.permissionMode??null}); show(); return {id:`resume-${report.resumes.length}`,cwd:args.repoPath,shell:"claude"}; }
         report.shellSpawns++;show();return {id:`shell-${report.shellSpawns}`,cwd:args.repoPath,shell:"/bin/sh"};

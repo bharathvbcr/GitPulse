@@ -127,6 +127,26 @@ export async function showTaskTerminal(run: RunRef): Promise<TaskTerminalOutcome
   return showCheckout(place.root);
 }
 
+/**
+ * Opens the checkout an attempt runs in as the active repository tab and
+ * brings the repository surface forward — the reader asked to go there. It
+ * starts nothing: the attempt's terminal is `showTaskTerminal`'s business.
+ * Resolves to whether the checkout opened; throws when no checkout holds the
+ * attempt's directory.
+ */
+export async function openAttemptCheckout(run: Pick<TaskRun, "cwd">): Promise<boolean> {
+  const place = await checkoutFor(run.cwd);
+  let ready = false;
+  const opened = await repoStore.openRepo(place.root, {
+    activate: true,
+    onReady: () => {
+      ready = true;
+      interfaceStore.setGlobalSurface("repository");
+    },
+  });
+  return opened && ready;
+}
+
 /** Which way a resumed conversation should arrive. */
 export type ResumeDisposition = "background" | "show";
 

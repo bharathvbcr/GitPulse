@@ -14,7 +14,7 @@ vi.mock("../desktop/nativeShell", () => ({ resolveGitRoot: (...args: unknown[]) 
 const focusTerminalSession = vi.fn();
 vi.mock("../terminal/sessionFocus", () => ({ focusTerminalSession: (...args: unknown[]) => focusTerminalSession(...args) }));
 
-const { queuedTerminalNote, resumeTaskConversation, showTaskTerminal, startTaskTerminal } = await import("./taskTerminal");
+const { openAttemptCheckout, queuedTerminalNote, resumeTaskConversation, showTaskTerminal, startTaskTerminal } = await import("./taskTerminal");
 const { consumeTaskTerminalRequest, taskTerminalRequests } = await import("../terminal/taskLaunches");
 const { terminalSessions } = await import("../terminal/sessionRegistry");
 
@@ -145,6 +145,27 @@ describe("an attempt whose directory is below its checkout's root", () => {
     expect(openRepo).not.toHaveBeenCalled();
     // Never "queued": nothing would ever open it.
     expect(get(taskTerminalRequests)).toEqual([]);
+  });
+});
+
+describe("openAttemptCheckout", () => {
+  it("opens the attempt's checkout as the active tab, in front, without touching its terminal", async () => {
+    resolveGitRoot.mockImplementation(async (path: string) => (path === "/work/a/pkg" ? "/work/a" : path));
+    openRepo.mockImplementation(async (_path: string, options: { onReady: () => void }) => { options.onReady(); return true; });
+    expect(await openAttemptCheckout({ cwd: "/work/a/pkg" })).toBe(true);
+    expect(openRepo).toHaveBeenCalledWith("/work/a", expect.objectContaining({ activate: true }));
+    expect(setGlobalSurface).toHaveBeenCalledWith("repository");
+    // Opening a checkout is not starting or showing an agent.
+    expect(get(taskTerminalRequests)).toEqual([]);
+    expect(setTerminalOpen).not.toHaveBeenCalled();
+  });
+
+  it("stays where it is when the checkout cannot be opened, and says why when none holds it", async () => {
+    openRepo.mockResolvedValueOnce(false);
+    expect(await openAttemptCheckout({ cwd: "/work/a" })).toBe(false);
+    expect(setGlobalSurface).not.toHaveBeenCalled();
+    resolveGitRoot.mockRejectedValueOnce(new Error("Not a Git repository: /gone"));
+    await expect(openAttemptCheckout({ cwd: "/gone" })).rejects.toThrow(/No Git checkout contains \/gone/);
   });
 });
 
