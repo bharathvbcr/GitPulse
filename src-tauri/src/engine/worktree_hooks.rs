@@ -14,8 +14,6 @@ use std::fs;
 use std::path::Path;
 use std::process::Command;
 
-pub const HOOK_TIMEOUT_SECS: u64 = 90;
-
 /// Configuration read from `.gitpulse/hooks.toml` or `.gitpulse/hooks.json`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WorktreeHooksConfig {

@@ -137,9 +137,21 @@ export function nextLabels(current: readonly string[], label: string, add: boole
   return [...kept, wanted];
 }
 
-export async function bounded<T>(work: Promise<T>): Promise<T> {
+/**
+ * How long an attempt that makes its own worktree may take to be prepared.
+ *
+ * The host builds the worktree and runs the repository's post_create setup
+ * inside that one call, and each setup command may run for 15 minutes
+ * (`worktree_hooks.rs::HOOK_TIMEOUT`) — a dependency install. The 30-second
+ * bound gave up while setup was still running, and the retry it invited was
+ * refused as "still setting up its worktree". An hour covers several setup
+ * commands; past it the answer is still on the attempt's row once it lands.
+ */
+export const WORKTREE_PREPARE_TIMEOUT_MS = 60 * 60_000;
+
+export async function bounded<T>(work: Promise<T>, ms: number = TASK_ACTION_TIMEOUT_MS): Promise<T> {
   let timer: ReturnType<typeof setTimeout> | undefined;
-  try { return await Promise.race([work, new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new WorkbenchError("transport_error", "Task action timed out. Retry to confirm its result.")), TASK_ACTION_TIMEOUT_MS); })]); }
+  try { return await Promise.race([work, new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new WorkbenchError("transport_error", "Task action timed out. Retry to confirm its result.")), ms); })]); }
   finally { clearTimeout(timer); }
 }
 

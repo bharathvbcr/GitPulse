@@ -21,7 +21,7 @@
   import { isCaseInsensitiveFs } from "../repos/paths";
   import { PERMISSION_LABELS } from "../terminal/agentDefaults";
   import { startPreparedAttempt } from "../workbench/taskTerminal";
-  import { bounded } from "../workbench/taskActions";
+  import { bounded, WORKTREE_PREPARE_TIMEOUT_MS } from "../workbench/taskActions";
   import {
     PERMISSION_MODES,
     explainError,
@@ -224,7 +224,7 @@
         if (disposed) return;
         // The host makes the worktree, inside the same step that prepares the
         // attempt, and removes it again if the attempt is refused.
-        if (useWorktree) note = "Creating a worktree for this attempt…";
+        if (useWorktree) note = "Creating a worktree and running this repository's setup. A dependency install can take several minutes; the attempt appears here when it is ready.";
         pending = {
           kind: settings.kind,
           id: newID(),
@@ -242,7 +242,9 @@
       }
       const preparation = pending;
       preparing?.({ id: preparation.id, provider: preparation.provider, kind: preparation.kind ?? "external_terminal", worktree: preparation.worktree === true });
-      const run = await bounded(prepareTaskRun(preparation));
+      // A worktree attempt runs the repository's setup inside this call: give
+      // it the setup's own bound, not the 30 s a store read gets.
+      const run = await bounded(prepareTaskRun(preparation), preparation.worktree ? WORKTREE_PREPARE_TIMEOUT_MS : undefined);
       pending = null;
       // Accepted: from here on the attempt exists, and its start belongs to
       // the module owner — begun before any check of whether this form still
