@@ -458,6 +458,10 @@ export function noteworthyStatuses(tally: VerdictTally): [PolicyStatus, number][
 /** Counts the Work view can show without another IPC round trip. */
 export interface WorkInsightSummary {
   worktrees: number;
+  /**
+   * Agent checkouts on disk, not running processes: the quantity Fleet's
+   * agent count and the Agents plane's "agent checkouts" also report.
+   */
   agentSessions: number;
   agentKinds: string[];
   dirtyWorktrees: number;

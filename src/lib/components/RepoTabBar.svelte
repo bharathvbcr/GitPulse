@@ -48,6 +48,7 @@
   } from "../repos/tabColors";
   import { terminalSessions, sessionsByRepo } from "../terminal/sessionRegistry";
   import { liveAgentCount } from "../agents/plane";
+  import { agentDirectories } from "../agents/cwd";
   import WorkspaceActions from "./WorkspaceActions.svelte";
   import ScrollCue from "./ScrollCue.svelte";
   import { taskChrome } from "../workbench/taskTabs";
@@ -206,7 +207,9 @@
   );
   const tasksOpen = $derived($interfaceStore.globalSurface === "tasks");
   const agentsOpen = $derived($interfaceStore.globalSurface === "agents");
-  const liveAgents = $derived(liveAgentCount($terminalSessions));
+  // The plane's headline counts live terminals with this same call and the
+  // same directories, so the chip and the headline say one number.
+  const liveAgents = $derived(liveAgentCount($terminalSessions, $agentDirectories));
 
   function closeStripMenu(options?: { restoreFocus?: boolean }) {
     const opener = stripMenuOpener;

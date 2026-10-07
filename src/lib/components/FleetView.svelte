@@ -1145,7 +1145,7 @@
                     {#if row.work.value.agentSessions > 0}
                       <span
                         class="text-[10px] text-textMuted"
-                        title="Agent sessions: {row.work.value.agentKinds.join(', ')}"
+                        title="Agent checkouts on disk, not running processes: {row.work.value.agentKinds.join(', ')}"
                         >{row.work.value.agentSessions} agent</span
                       >
                     {/if}

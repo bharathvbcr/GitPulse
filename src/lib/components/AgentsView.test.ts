@@ -13,7 +13,7 @@ describe("AgentsView", () => {
     expect(html).toContain('data-testid="agents-view"');
     expect(html).toContain("Task attempts have not been read yet");
     expect(html).toContain("Still reading");
-    expect(html).not.toContain("No agent sessions");
+    expect(html).not.toContain("No agent checkouts");
     expect(html).not.toContain("could not be read");
   });
 
@@ -22,7 +22,7 @@ describe("AgentsView", () => {
     const table = source.indexOf("<table");
     expect(gaps).toBeGreaterThan(-1);
     expect(table).toBeGreaterThan(gaps);
-    expect(source).toContain("Sessions could not be read");
+    expect(source).toContain("Repositories could not be read");
     expect(source).toContain("Still reading");
   });
 
@@ -47,7 +47,21 @@ describe("AgentsView", () => {
 
   it("asks the terminal where it is, and does not invent a directory", () => {
     expect(source).toContain("readAgentCwds");
-    expect(source).toContain("directories.get(record.sessionId)");
+    expect(source).toContain("$agentDirectories.get(record.sessionId)");
     expect(source).not.toContain("cwd: null");
+  });
+
+  it("reads directories again only when the set of sessions changes", () => {
+    const effect = source.slice(source.indexOf("readAgentCwds(ids)") - 400, source.indexOf("readAgentCwds(ids)"));
+    expect(source).toContain("const cwdTargets = $derived(agentCwdTargets($terminalSessions)");
+    expect(effect).toContain("cwdTargets");
+    // Reading the whole registry here would re-run the sweep on every title or status change.
+    expect(effect).not.toContain("$terminalSessions");
+    expect(source).toContain("agentDirectories.set(found)");
+  });
+
+  it("names a task's repository from its registered id", () => {
+    expect(source).toContain("repositoryPath: (id) => repoPaths.get(id) ?? null");
+    expect(source).toContain("registered.want($board.runs.map((run) => run.repository_id))");
   });
 });

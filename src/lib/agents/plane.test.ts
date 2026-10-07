@@ -1,5 +1,7 @@
 import { describe, expect, it } from "vitest";
 import type { InsightsSnapshot, WorktreeSummary } from "../insights/types";
+import { isAgentWorktree } from "../work/agentWorktree";
+import { readAgentCwds } from "./cwd";
 import {
   MAX_AGENT_ROWS,
   applyAgentFilter,
@@ -128,7 +130,7 @@ describe("projectAgentPlane", () => {
     expect(plane.gaps).toEqual([]);
   });
 
-  it("drops a path that names no session", () => {
+  it("keeps an agent checkout with no slug, and drops a path that is not an agent checkout", () => {
     const plane = project({
       probes: [probe({
         snapshot: snapshot({
@@ -143,7 +145,11 @@ describe("projectAgentPlane", () => {
         }),
       })],
     });
-    expect(plane.rows).toEqual([]);
+    // The slugless checkout is a worktree an agent layout holds. Fleet and the
+    // Work view count it, so the plane shows it too. `/repo/human` is not one.
+    expect(plane.rows).toHaveLength(1);
+    expect(plane.rows[0]).toMatchObject({ worktreePath: "/repo/.claude/worktrees", kind: "claude", session: "claude" });
+    expect(plane.checkouts).toBe(1);
     expect(plane.read).toBe(1);
   });
 
@@ -335,13 +341,14 @@ describe("projectAgentPlane", () => {
     expect(terminalInScope({ label: "Shell", repoPath: "/repo", cwd: "/repo" })).toBe(false);
     expect(terminalInScope({ label: "Claude", repoPath: "/repo", cwd: null })).toBe(true);
     expect(liveAgentCount([
-      { label: "Shell", status: "running", repoPath: "/repo" },
-      { label: "Claude", status: "running", repoPath: "/repo" },
-      { label: "Claude", status: "exited", repoPath: "/repo" },
+      { key: "a", label: "Shell", status: "running", repoPath: "/repo" },
+      { key: "b", label: "Claude", status: "running", repoPath: "/repo" },
+      { key: "c", label: "Claude", status: "exited", repoPath: "/repo" },
+      { key: "", label: "Claude", status: "running", repoPath: "/repo" },
     ])).toBe(1);
   });
 
-  it("folds a task onto its attempt and does not invent a row for a quiet unmatched one", () => {
+  it("folds a task onto its attempt, and keeps a quiet attempt with no checkout off the plane (P2: kept)", () => {
     const folded = project({
       terminals: [terminal({ taskRunId: "run-1", cwd: "/repo/.claude/worktrees/alpha" })],
       tasks: tasks({ tasks: [task({ tone: "needs-you", pendingCount: 2 })] }),
@@ -442,6 +449,205 @@ describe("projectAgentPlane", () => {
   });
 });
 
+describe("checkout attribution", () => {
+  const two = snapshot({
+    worktrees: {
+      ok: true, error: "", count: 3, scanned: 3, dirty: 0, dirty_unknown: 0,
+      blocked: 0, blocked_unknown: 0, truncated: false,
+      items: [
+        worktree({ path: "/repo", name: "repo", agent_kind: "", session_slug: "", is_main: true, branch: "main" }),
+        worktree(),
+        worktree({ path: "/repo/.claude/worktrees/beta", session_slug: "beta", name: "beta" }),
+      ],
+    },
+    agents: { ok: true, sessions: 2, kinds: [{ kind: "claude", sessions: 2 }], truncated: false },
+  });
+
+  it("P1: two tab paths of one repository yield one row per checkout", () => {
+    // Both tabs belong to one family whose common directory was not read, so
+    // the sweep probed both, and each snapshot lists every worktree.
+    const plane = project({
+      probes: [
+        probe({ path: "/repo", label: "Repo", snapshot: two }),
+        probe({ path: "/repo/.claude/worktrees/alpha", label: "alpha", snapshot: two }),
+      ],
+      terminals: [terminal({ repoPath: "/repo/.claude/worktrees/alpha", cwd: null, title: "in alpha" })],
+    });
+    expect(plane.rows.map((row) => row.worktreePath).sort()).toEqual([
+      "/repo/.claude/worktrees/alpha",
+      "/repo/.claude/worktrees/beta",
+    ]);
+    expect(new Set(plane.rows.map((row) => row.repoPath))).toEqual(new Set(["/repo"]));
+    expect(plane.rows.every((row) => row.parallelCount === 2)).toBe(true);
+    expect(plane.rows.find((row) => row.liveKey === "t1")?.worktreePath).toBe("/repo/.claude/worktrees/alpha");
+    expect(plane.checkouts).toBe(2);
+  });
+
+  it("P4: a terminal in a subdirectory of a checkout attaches to that checkout", () => {
+    const plane = project({
+      probes: [probe({ snapshot: two })],
+      terminals: [terminal({ cwd: "/repo/.claude/worktrees/beta/src/lib", title: "deep" })],
+    });
+    expect(plane.rows).toHaveLength(2);
+    const beta = plane.rows.find((row) => row.worktreePath === "/repo/.claude/worktrees/beta");
+    expect(beta).toMatchObject({ presence: "live", liveKey: "t1" });
+  });
+
+  it("P3: a known cwd outside every checkout does not bind to the tab's checkout", () => {
+    const plane = project({
+      probes: [probe({ snapshot: two })],
+      terminals: [terminal({ repoPath: "/repo/.claude/worktrees/alpha", cwd: "/elsewhere/project", label: "Codex", title: "away" })],
+    });
+    const alpha = plane.rows.find((row) => row.worktreePath === "/repo/.claude/worktrees/alpha");
+    expect(alpha).toMatchObject({ presence: "on-disk", liveKey: null });
+    const away = plane.rows.find((row) => row.liveKey === "t1");
+    // Kind and checkout come from where the process is, not the tab it was opened from.
+    expect(away).toMatchObject({ worktreePath: "/elsewhere/project", kind: "Codex" });
+    expect(away?.checkout).not.toBe("Agent checkout");
+  });
+
+  it("P3: an unknown cwd still falls back to the tab's checkout", () => {
+    const plane = project({
+      probes: [probe({ snapshot: two })],
+      terminals: [terminal({ repoPath: "/repo/.claude/worktrees/alpha", cwd: null })],
+    });
+    expect(plane.rows.find((row) => row.worktreePath === "/repo/.claude/worktrees/alpha")?.liveKey).toBe("t1");
+  });
+
+  it("P5: a task folds only into its own run's host, never an unrelated live terminal", () => {
+    const plane = project({
+      probes: [probe({ snapshot: two })],
+      terminals: [terminal({ cwd: "/repo/.claude/worktrees/alpha", title: "someone else" })],
+      tasks: tasks({ tasks: [task({ runId: "run-9", cwd: "/repo/.claude/worktrees/alpha", tone: "problem", disconnected: true })] }),
+    });
+    const live = plane.rows.find((row) => row.liveKey === "t1");
+    expect(live?.taskRunId).toBeNull();
+    expect(live?.attention).not.toContain("disconnected");
+    const attempt = plane.rows.find((row) => row.taskRunId === "run-9");
+    expect(attempt).toMatchObject({ presence: "missing", liveKey: null });
+    for (const row of plane.rows) {
+      expect(row.presence === "live" && row.attention.includes("disconnected")).toBe(false);
+    }
+  });
+
+  it("P5: a task still folds into an on-disk checkout it is running in", () => {
+    const plane = project({
+      probes: [probe({ snapshot: two })],
+      tasks: tasks({ tasks: [task({ runId: "run-9", cwd: "/repo/.claude/worktrees/alpha/src", tone: "problem", disconnected: true })] }),
+    });
+    expect(plane.rows).toHaveLength(2);
+    expect(plane.rows.find((row) => row.worktreePath === "/repo/.claude/worktrees/alpha")).toMatchObject({
+      presence: "on-disk",
+      taskRunId: "run-9",
+    });
+  });
+
+  it("P5: the terminal of a task's own run does not also call it disconnected", () => {
+    const plane = project({
+      terminals: [terminal({ taskRunId: "run-1", cwd: "/repo/.claude/worktrees/alpha" })],
+      tasks: tasks({ tasks: [task({ disconnected: true, tone: "problem" })] }),
+    });
+    expect(plane.rows).toHaveLength(1);
+    expect(plane.rows[0]).toMatchObject({ presence: "live", taskRunId: "run-1" });
+    expect(plane.rows[0].attention).not.toContain("disconnected");
+  });
+
+  it("P6: a task row carries the repository it belongs to, not its working directory", () => {
+    const plane = project({
+      probes: [],
+      tasks: tasks({ tasks: [task({ repoPath: "/repo", cwd: "/scratch/run-1", tone: "needs-you" })] }),
+    });
+    expect(plane.rows[0]).toMatchObject({ repoPath: "/repo", worktreePath: "/scratch/run-1" });
+
+    const unresolved = project({
+      probes: [],
+      tasks: tasks({ tasks: [task({ repoPath: "", cwd: "/scratch/run-1", tone: "needs-you" })] }),
+    });
+    expect(unresolved.rows[0].repoPath).toBe("");
+    expect(unresolved.rows[0].repoLabel).toBe("Repository not resolved");
+  });
+
+  it("an exited process that still needs the reader is not called live", () => {
+    const plane = project({
+      terminals: [terminal({ status: "exited", attention: "needs-you", cwd: "/repo/.claude/worktrees/alpha" })],
+    });
+    expect(plane.rows[0]).toMatchObject({ presence: "exited", liveKey: "t1" });
+    expect(plane.live).toBe(0);
+    expect(applyAgentFilter(plane.rows, "live")).toEqual([]);
+  });
+
+  it("counts each live process once, however many probes or keys repeat it", () => {
+    const plane = project({
+      probes: [probe({ snapshot: two }), probe({ path: "/repo/.claude/worktrees/beta", snapshot: two })],
+      terminals: [
+        terminal({ cwd: "/repo/.claude/worktrees/alpha" }),
+        terminal({ cwd: "/repo/.claude/worktrees/alpha" }),
+        terminal({ key: "shell", label: "Shell", cwd: "/repo/.claude/worktrees/beta/src" }),
+        terminal({ key: "plain", label: "Shell", cwd: "/repo" }),
+      ],
+    });
+    expect(plane.live).toBe(2);
+  });
+});
+
+describe("a directory read by readAgentCwds", () => {
+  it("binds the process to the checkout that contains it", async () => {
+    const found = await readAgentCwds(["s1"], {
+      read: async () => ({ process: "claude", busy: false, cwd: "/repo/.claude/worktrees/alpha/src", repo_dir: null }),
+    });
+    const plane = project({ terminals: [terminal({ repoPath: "/repo", cwd: found.get("s1") ?? null })] });
+    expect(plane.rows).toHaveLength(1);
+    expect(plane.rows[0]).toMatchObject({ worktreePath: "/repo/.claude/worktrees/alpha", presence: "live", liveKey: "t1" });
+  });
+});
+
+describe("one definition of each agent count", () => {
+  it("Fleet, the Work view, the plane and the tab chip agree on one fixture", () => {
+    const items = [
+      worktree({ path: "/repo", name: "repo", agent_kind: "", session_slug: "", is_main: true }),
+      worktree(),
+      worktree({ path: "/repo/.codex/worktrees/b", agent_kind: "codex", session_slug: "b", name: "b" }),
+      worktree({ path: "/repo/.claude/worktrees", agent_kind: "claude", session_slug: "", name: "worktrees" }),
+      worktree({ path: "/repo/feature", agent_kind: "", session_slug: "", name: "feature" }),
+    ];
+    // What `agent_summary` in insights/mod.rs computes: every item with a kind.
+    const facetSessions = items.filter((item) => item.agent_kind !== "").length;
+    const fixture = snapshot({
+      worktrees: {
+        ok: true, error: "", count: items.length, scanned: items.length, dirty: 0, dirty_unknown: 0,
+        blocked: 0, blocked_unknown: 0, truncated: false, items,
+      },
+      agents: { ok: true, sessions: facetSessions, kinds: [], truncated: false },
+    });
+    const records = [
+      { key: "a", label: "Claude", status: "running", repoPath: "/repo", sessionId: "s-a" },
+      { key: "a", label: "Claude", status: "running", repoPath: "/repo", sessionId: "s-a" },
+      { key: "b", label: "Shell", status: "running", repoPath: "/repo", sessionId: "s-b" },
+      { key: "c", label: "Shell", status: "running", repoPath: "/repo", sessionId: "s-c" },
+      { key: "d", label: "Codex", status: "exited", repoPath: "/repo", sessionId: "s-d" },
+    ];
+    const directories = new Map([["s-b", "/repo/.codex/worktrees/b/src"], ["s-c", "/repo"]]);
+    const plane = project({
+      probes: [probe({ snapshot: fixture })],
+      terminals: records.map((record) => terminal({
+        key: record.key,
+        label: record.label,
+        status: record.status,
+        repoPath: record.repoPath,
+        sessionId: record.sessionId,
+        cwd: directories.get(record.sessionId) ?? null,
+      })),
+    });
+    // Agent checkouts on disk: Fleet's facet, the Work view's tile, the plane.
+    expect(plane.checkouts).toBe(facetSessions);
+    expect(items.map((item) => item.path).filter(isAgentWorktree).length).toBe(facetSessions);
+    // Live agent terminals: the tab chip and the plane's headline.
+    expect(liveAgentCount(records, directories)).toBe(2);
+    expect(plane.live).toBe(liveAgentCount(records, directories));
+    expect(planeHeadline(plane, plane.rows.length)).toMatch(/^3 agent checkouts · 2 live terminals · /);
+  });
+});
+
 describe("filters and the headline", () => {
   it("accepts only the four filters", () => {
     expect(isAgentFilter("all")).toBe(true);
@@ -487,7 +693,39 @@ describe("filters and the headline", () => {
     const visible = applyAgentFilter(plane.rows, "live");
     expect(planeHeadline(plane, visible.length)).toContain("1 hidden by the filter");
     expect(planeHeadline(plane, plane.rows.length)).not.toContain("hidden");
-    expect(planeHeadline(plane, plane.rows.length)).toBe("1 session · 0 need attention");
+    expect(planeHeadline(plane, plane.rows.length)).toBe("1 agent checkout · 0 live terminals · 0 need attention");
+    const watched = project({ tasks: tasks({ complete: false, tasks: [task({ cwd: "/nowhere", tone: "needs-you" })] }) });
+    expect(planeHeadline(watched, watched.rows.length)).toBe("1 agent checkout · 0 live terminals · at least 1 task attempt · 1 need attention");
+  });
+
+  it("counts unread rows apart from rows that need the reader, and the filter holds both", () => {
+    const items = [
+      worktree(),
+      worktree({ path: "/repo/.claude/worktrees/beta", session_slug: "beta", name: "beta" }),
+      worktree({ path: "/repo/.claude/worktrees/gamma", session_slug: "gamma", name: "gamma", operation_ok: false }),
+    ];
+    const plane = project({
+      probes: [probe({
+        snapshot: snapshot({
+          worktrees: {
+            ok: true, error: "", count: 3, scanned: 3, dirty: 0, dirty_unknown: 0,
+            blocked: 0, blocked_unknown: 1, truncated: false, items,
+          },
+          agents: { ok: true, sessions: 3, kinds: [], truncated: false },
+          // A partial collision scan marks every checkout `unscanned`.
+          collisions: {
+            ok: true, error: "", overlapping_files: 0, worktrees_involved: 0, scanned_worktrees: 2,
+            unscanned_worktrees: 1, failed_worktrees: 0, truncated: false, items: [],
+          },
+        }),
+      })],
+      terminals: [terminal({ cwd: "/repo/.claude/worktrees/alpha", attention: "needs-you" })],
+    });
+    const headline = planeHeadline(plane, plane.rows.length);
+    expect(headline).toContain("1 need attention");
+    expect(headline).toContain("2 not fully read");
+    expect(applyAgentFilter(plane.rows, "attention")).toHaveLength(3);
+    expect(plane.attention).toEqual({ needing: 1, unread: 2 });
   });
 
   it("counts repositories that were not read", () => {

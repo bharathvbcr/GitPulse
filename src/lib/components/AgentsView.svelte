@@ -1,6 +1,7 @@
 <script lang="ts">
   /**
-   * The Agents plane: every session the open repositories are holding.
+   * The Agents plane: the agent checkouts, the terminals this window
+   * started, and the task attempts across the open repositories.
    *
    * It stays mounted once opened, the same way Fleet and Tasks do. The
    * parent hides it. Unmounting it would drop the sweep and the task
@@ -21,9 +22,9 @@
   import { taskTerminalRequests } from "../terminal/taskLaunches";
   import { terminalSessionLimit } from "../terminal/sessionLimit";
   import { createBoardAgents } from "../workbench/boardAgents";
-  import { readAgentCwds } from "../agents/cwd";
+  import { agentCwdTargets, agentDirectories, readAgentCwds } from "../agents/cwd";
   import { agentPlaneStore, sweepTargets } from "../agents/store";
-  import { taskProbeFromBoard } from "../agents/tasks";
+  import { createRegisteredRepositories, repositoryPaths, taskProbeFromBoard } from "../agents/tasks";
   import {
     AGENT_COLUMNS,
     applyAgentFilter,
@@ -39,9 +40,16 @@
   const board = createBoardAgents();
   let now = $state(Date.now());
   let sweepKey = "";
-  /** Directories `cmd_terminal_context` accepted. Absent means unknown. */
-  let directories = $state(new Map<string, string>());
   let cwdGeneration = $state(0);
+  /** Registered repositories, so a task names its repository and not its cwd. */
+  const registered = createRegisteredRepositories();
+  /**
+   * The sessions whose directory is read, as one string: it changes when a
+   * session opens, closes, or is relabelled, and not when a title or a
+   * status does, so those updates do not start another sweep.
+   */
+  const cwdTargets = $derived(agentCwdTargets($terminalSessions).join("\n"));
+  const repoPaths = $derived(repositoryPaths($registered, $repoStore.openTabs, pathOpts));
 
   const showing = $derived($interfaceStore.globalSurface === "agents");
   const hidden = $derived(new Set($interfaceStore.agentsHiddenColumns));
@@ -61,7 +69,7 @@
       continuesRunId: record.continuesRunId ?? "",
       // Unknown stays unknown. The registry has no directory, and a failed
       // context read must not be filled in with the repository root.
-      cwd: record.sessionId ? directories.get(record.sessionId) ?? null : null,
+      cwd: record.sessionId ? $agentDirectories.get(record.sessionId) ?? null : null,
       attention: activity?.attention?.kind ?? null,
     };
   }));
@@ -72,6 +80,7 @@
     activity: (sessionId) => $sessionActivity.get(sessionId),
     sessionLimit: $terminalSessionLimit,
     now,
+    repositoryPath: (id) => repoPaths.get(id) ?? null,
   }));
 
   const plane = $derived(projectAgentPlane({
@@ -143,14 +152,21 @@
   $effect(() => {
     if (!showing) return;
     const ticket = cwdGeneration;
-    const ids = $terminalSessions.map((record) => record.sessionId ?? "");
+    const ids = cwdTargets ? cwdTargets.split("\n") : [];
     let cancelled = false;
     void readAgentCwds(ids).then((found) => {
-      if (!cancelled && ticket === cwdGeneration) directories = found;
+      if (!cancelled && ticket === cwdGeneration) agentDirectories.set(found);
     });
     return () => {
       cancelled = true;
     };
+  });
+
+  $effect(() => {
+    if (!showing) return;
+    // A run naming a repository the last read did not have asks again, so a
+    // repository registered after the plane opened is still named.
+    registered.want($board.runs.map((run) => run.repository_id));
   });
 </script>
 
@@ -252,18 +268,18 @@
     {#if visible.length === 0}
       <p class="px-4 py-8 text-[12px] text-textMuted max-w-xl" data-testid="agents-empty">
         {#if plane.rows.length > 0}
-          Nothing matches this filter. The headline still counts the sessions it hid.
+          Nothing matches this filter. The headline still counts the rows it hid.
         {:else if plane.gaps.some((gap) => gap.kind === "failed" || gap.kind === "skipped")}
-          Sessions could not be read. The notes above are the reason, not an empty workspace.
+          Repositories could not be read. The notes above are the reason, not an empty workspace.
         {:else if plane.gaps.length > 0 || scanning}
           Still reading. A note above says what has not come back, and an empty list is not a quiet workspace.
         {:else}
-          No agent sessions in the open repositories. A checkout appears when its path is an agent worktree. A process appears when this window started it.
+          No agent checkouts, terminals or task attempts in the open repositories. A checkout appears when its path is an agent worktree. A process appears when this window started it.
         {/if}
       </p>
     {:else}
       <table class="w-full text-left border-collapse {compact ? 'text-[11px]' : 'text-[12px]'}">
-        <caption class="sr-only">Agent sessions across open repositories</caption>
+        <caption class="sr-only">Agent checkouts, terminals and task attempts across open repositories</caption>
         <thead class="sticky top-0 bg-background text-textMuted">
           <tr class="border-b border-border">
             <th scope="col" class="px-4 py-2 font-medium">Session</th>
@@ -288,7 +304,7 @@
               {/if}
               {#if columnVisible("presence")}
                 <td class="px-3 py-2 align-top" title={row.presenceDetail}>
-                  {row.presence === "live" ? "Live" : row.presence === "on-disk" ? "On disk" : "Not in this window"}
+                  {row.presence === "live" ? "Live" : row.presence === "exited" ? "Exited" : row.presence === "on-disk" ? "On disk" : "Not in this window"}
                 </td>
               {/if}
               {#if columnVisible("attention")}

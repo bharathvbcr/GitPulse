@@ -8,8 +8,10 @@
  * its time does not start another read.
  */
 
+import { writable } from "svelte/store";
 import { mapWithConcurrency } from "../async/pool";
 import { invoke } from "../ipc/invoke";
+import { identityKey, type PathIdentityOptions } from "../repos/paths";
 import { parseTerminalContext } from "../terminal/sessionContext";
 
 /** How long a directory sweep may keep starting reads. */
@@ -22,6 +24,60 @@ export const MAX_AGENT_CWD_READS = 64;
 export interface AgentCwdDeps {
   readonly read?: (sessionId: string) => Promise<unknown>;
   readonly now?: () => number;
+}
+
+/**
+ * The last directories a sweep read, by session id.
+ *
+ * The Agents plane reads them; the tab bar's live-agent chip uses the same
+ * answer, so a shell sitting in an agent checkout counts the same in both.
+ * Empty until the plane has looked, which leaves such a shell uncounted
+ * rather than guessed.
+ */
+export const agentDirectories = writable<ReadonlyMap<string, string>>(new Map());
+
+/**
+ * The sessions whose directory is worth a read, agents first.
+ *
+ * A shell matters only when it sits in an agent checkout, and the cap is the
+ * same for both, so shells take what the agents leave. Only the id and the
+ * launcher name decide the list, so a title or status change keeps it equal.
+ */
+export function agentCwdTargets(
+  records: readonly { sessionId?: string | null; label: string }[],
+): string[] {
+  const agents: string[] = [];
+  const shells: string[] = [];
+  for (const record of records) {
+    const id = record.sessionId?.trim() ?? "";
+    if (!id) continue;
+    const label = record.label.trim().toLowerCase();
+    (label === "" || label === "shell" ? shells : agents).push(id);
+  }
+  return uniqueIds([...agents, ...shells]);
+}
+
+/**
+ * The entry for `path` or its nearest ancestor in an index keyed by
+ * `identityKey`. A worktree holds every directory under it, so a shell in
+ * `src/lib` of a checkout is in that checkout. Ancestors are cut at a
+ * separator, so `/repo/alphabet` is never inside `/repo/alpha`.
+ */
+export function nearestContaining<T>(
+  index: ReadonlyMap<string, T>,
+  path: string,
+  paths: PathIdentityOptions,
+): T | undefined {
+  let key = identityKey(path, paths);
+  while (key) {
+    const found = index.get(key);
+    if (found !== undefined) return found;
+    const cut = key.lastIndexOf("/");
+    if (cut <= 0) return undefined;
+    key = key.slice(0, cut);
+    if (key === "/") return undefined;
+  }
+  return undefined;
 }
 
 function uniqueIds(sessionIds: readonly string[]): string[] {
