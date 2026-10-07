@@ -86,7 +86,8 @@ pub struct ExportOptions<'a> {
     /// Which files the render may read — the pictures it embeds and the
     /// notes it transcludes. Unrestricted by default, which is right for a
     /// user's own notes; an embedder rendering Markdown nobody vetted, such
-    /// as a cloned repository's README, should use [`FileAccess::Vault`].
+    /// as a cloned repository's README, and whole-vault site exports
+    /// ([`crate::site::export_site`]), use [`FileAccess::Vault`].
     pub file_access: FileAccess,
     /// Whether pictures, audio and video may load from `http(s)` URLs. Off by
     /// default: a remote picture is a request the reader never made, which a
@@ -119,6 +120,9 @@ pub enum FileAccess {
     /// to nothing, exactly as a missing file does. Without an explicit vault
     /// root nothing is read: the vault is never guessed from the folders
     /// above the note, because that guess could climb out of what was vetted.
+    ///
+    /// Whole-vault website export ([`crate::site::export_site`]) uses this to
+    /// prevent leaking files from outside the vault into published HTML.
     ///
     /// Confinement is of *contents*: resolving a name may ask whether a path
     /// outside the vault exists, but nothing outside is ever opened, and the

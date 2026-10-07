@@ -528,7 +528,7 @@
         "repo": "markdev",
         "root_env": "GITPULSE_MARKDEV_ROOT",
         "path": "core/crates/markdev-html",
-        "commit": "e3ec3b0550c464e4b2be32420a1463c1c9ee382c"
+        "commit": "20dec7a820923411b21b9dc5acb25ac4ca3ef746"
       },
       "omitted": [
         "tests/",
@@ -544,8 +544,8 @@
       ],
       "files": {
         "Cargo.toml": "432d2112a894d80e44b09c5c321337bbd9532a9cbeeae6b4142c347aa1a4e1e2",
-        "src/lib.rs": "81b80fc68cc00b079e6bcec81f3654d4e8fc429087678b15583d011c9711f39c",
-        "src/site.rs": "44d275b3282809817358c9b39042840f96bdd5973211b61d0c5cec20b1943461"
+        "src/lib.rs": "d171b33448bb9afc0f0a1f8bed1d16bc8c5951a39a58d3d0003472034736cfe1",
+        "src/site.rs": "b4f43c11e5d7b48d1750616b5bee727efa22bb6fd38518ab0a6d713f240a14eb"
       }
     },
     {
