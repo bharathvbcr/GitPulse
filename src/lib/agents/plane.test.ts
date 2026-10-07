@@ -1,3 +1,4 @@
+import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 import type { InsightsSnapshot, WorktreeSummary } from "../insights/types";
 import { isAgentWorktree } from "../work/agentWorktree";
@@ -645,6 +646,15 @@ describe("one definition of each agent count", () => {
     expect(liveAgentCount(records, directories)).toBe(2);
     expect(plane.live).toBe(liveAgentCount(records, directories));
     expect(planeHeadline(plane, plane.rows.length)).toMatch(/^3 agent checkouts · 2 live terminals · /);
+  });
+
+  it("transcribes the facet's rule from the Rust that computes it", () => {
+    // `facetSessions` above restates `agent_summary`: every listed worktree
+    // with a kind counts, slug or none. If that rule changes, so must the plane.
+    const rust = readFileSync(new URL("../../../src-tauri/src/insights/mod.rs", import.meta.url), "utf8");
+    const body = rust.slice(rust.indexOf("fn agent_summary("), rust.indexOf("let sessions = counts"));
+    expect(body).toMatch(/for item in items \{\s*if item\.agent_kind\.is_empty\(\) \{\s*continue;\s*\}/);
+    expect(body).not.toContain("session_slug");
   });
 });
 
