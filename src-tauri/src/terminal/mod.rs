@@ -796,6 +796,51 @@ fn resolve_start_dir(
     Ok(joined)
 }
 
+/// A directory inside a checkout, resolved: its canonical path, the root of
+/// the checkout holding it (the nearest enclosing work tree, by
+/// `find_git_root`), and the directory relative to that root (`None` at the
+/// root itself). Grants nothing: the root still has to be validated and
+/// trusted, and the relative part is held inside it by `resolve_start_dir`.
+pub(crate) fn checkout_root(
+    path: &str,
+) -> Result<(std::path::PathBuf, std::path::PathBuf, Option<String>), String> {
+    let dir = std::path::Path::new(path)
+        .canonicalize()
+        .map_err(|e| format!("Cannot access path '{path}': {e}"))?;
+    if !dir.is_dir() {
+        return Err(format!("Not a directory: {}", dir.display()));
+    }
+    let root = crate::engine::git_cli::find_git_root(&dir)
+        .ok_or_else(|| format!("Not inside a Git checkout: {}", dir.display()))?;
+    let relative = dir
+        .strip_prefix(&root)
+        .map_err(|_| format!("{} is outside its checkout", dir.display()))?
+        .to_str()
+        .ok_or("The directory path is not valid Unicode")?
+        .to_owned();
+    Ok((dir, root, (!relative.is_empty()).then_some(relative)))
+}
+
+/// The checkout root and start directory of a task attempt whose working
+/// directory was recorded, canonical, at preparation. A recorded directory
+/// that now resolves anywhere else — replaced by a link, or a link swapped
+/// above it — is refused, never followed: the root found from where it
+/// points would be some other repository's, trusted or not.
+fn task_start(cwd: &str) -> Result<(String, Option<String>), String> {
+    let (dir, root, relative) = checkout_root(cwd)?;
+    if dir != std::path::Path::new(cwd) {
+        return Err(format!(
+            "The task's working directory {cwd} now resolves to {}. Prepare a new attempt.",
+            dir.display()
+        ));
+    }
+    let root = root
+        .to_str()
+        .ok_or("The checkout path is not valid Unicode")?
+        .to_owned();
+    Ok((root, relative))
+}
+
 /// What a live session is doing, read once, on request.
 ///
 /// Every field is optional because the OS can decline to describe a process
@@ -1030,22 +1075,27 @@ fn repaint(master: &Arc<Mutex<Box<dyn MasterPty + Send>>>, rows: u16, cols: u16)
     }
 }
 
+/// Starts a task attempt's agent in its recorded working directory: the
+/// checkout's root is what is validated and trusted, and the PTY starts in
+/// the directory inside it — a subdirectory when the attempt was prepared
+/// for one.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn spawn_tracked_session<R: tauri::Runtime>(
     app: &AppHandle<R>,
     state: &TerminalSessions,
-    repo_path: &str,
+    cwd: &str,
     rows: u16,
     cols: u16,
     program: String,
     args: Vec<String>,
     observer: Arc<dyn SessionObserver>,
 ) -> Result<TerminalSpawned, String> {
+    let (root, start) = task_start(cwd)?;
     spawn_session_inner(
         app,
         state,
-        repo_path,
-        None,
+        &root,
+        start.as_deref(),
         rows,
         cols,
         Some(program),
@@ -4278,6 +4328,42 @@ mod tests {
             Some(0),
             "the fixture has no package.json test script"
         );
+    }
+
+    /// A task attempt starts in its recorded directory inside the checkout,
+    /// with the checkout's root as the repository. A recorded directory that
+    /// has since become a link — here into another trusted repository — is
+    /// refused rather than followed to that repository's root.
+    #[cfg(unix)]
+    #[test]
+    fn task_start_is_the_checkout_root_and_never_follows_a_swapped_link() {
+        let dir = TempDir::new().unwrap();
+        init_test_repo(dir.path());
+        let root = dir.path().canonicalize().unwrap();
+        std::fs::create_dir_all(root.join("pkg/web")).unwrap();
+        let folder = root.join("pkg/web");
+        assert_eq!(
+            super::task_start(folder.to_str().unwrap()).unwrap(),
+            (
+                root.to_str().unwrap().to_owned(),
+                Some("pkg/web".to_owned())
+            )
+        );
+        assert_eq!(
+            super::task_start(root.to_str().unwrap()).unwrap(),
+            (root.to_str().unwrap().to_owned(), None)
+        );
+
+        let elsewhere = TempDir::new().unwrap();
+        init_test_repo(elsewhere.path());
+        let recorded = root.join("pkg/api");
+        std::os::unix::fs::symlink(elsewhere.path(), &recorded).unwrap();
+        let err = super::task_start(recorded.to_str().unwrap()).unwrap_err();
+        assert!(err.contains("now resolves to"), "{err}");
+        // And the start directory itself is held inside the root.
+        let start = super::resolve_start_dir(&root, Some("pkg/api")).unwrap_err();
+        assert!(start.contains("refused"), "{start}");
+        assert!(super::task_start(elsewhere.path().join("nope").to_str().unwrap()).is_err());
     }
 
     #[cfg(unix)]

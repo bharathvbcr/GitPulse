@@ -140,30 +140,35 @@ struct Checkout {
     head_ref: Option<String>,
 }
 
+/// The observed identity of the checkout holding `repo_path`, which may be
+/// the checkout's root or a directory inside it. Everything Git is asked is
+/// asked of the root, and the root is what must be trusted; `cwd` is the
+/// directory itself, canonical, where the agent will start.
 fn checkout(repo_path: &str) -> Result<Checkout, WorkbenchError> {
-    let resolved = resolve_repo(repo_path).map_err(unavailable)?;
+    let (dir, root, _) = crate::terminal::checkout_root(repo_path).map_err(unavailable)?;
+    let resolved = resolve_repo(&native_path(&root)?).map_err(unavailable)?;
     if resolved.is_bare {
         return Err(unavailable(
             "A terminal task requires a working checkout; this repository is bare.",
         ));
     }
-    let cwd = Path::new(&resolved.path);
-    let cwd_text = native_path(cwd)?;
-    let (status, top) = observed(cwd, &["rev-parse", "--show-toplevel"])?;
+    let root = Path::new(&resolved.path);
+    let cwd_text = native_path(&dir)?;
+    let (status, top) = observed(root, &["rev-parse", "--show-toplevel"])?;
     if status != 0
         || Path::new(&top)
             .canonicalize()
             .map_err(|e| unavailable(e.to_string()))?
-            != cwd
+            != root
     {
         return Err(unavailable(
-            "The selected directory is not the checkout root.",
+            "Git does not report this directory's checkout as its working tree.",
         ));
     }
-    let git_dir = native_path(&resolve_git_dir(cwd).map_err(unavailable)?)?;
-    let git_common_dir = native_path(&resolve_git_common_dir(cwd).map_err(unavailable)?)?;
-    let head_oid = head(cwd)?;
-    let (status, branch) = observed(cwd, &["symbolic-ref", "--quiet", "HEAD"])?;
+    let git_dir = native_path(&resolve_git_dir(root).map_err(unavailable)?)?;
+    let git_common_dir = native_path(&resolve_git_common_dir(root).map_err(unavailable)?)?;
+    let head_oid = head(root)?;
+    let (status, branch) = observed(root, &["symbolic-ref", "--quiet", "HEAD"])?;
     let head_ref = match status {
         0 if branch.starts_with("refs/heads/") => Some(branch),
         1 if head_oid.is_some() => None,
@@ -257,8 +262,26 @@ fn prepare_kind(state: &WorkbenchState, input: &str, kind: &str) -> Result<Value
     if kind == "managed" {
         managed_adapter_gate(state, &input.provider)?;
     }
-    if !input.worktree {
+    if !input.worktree && kind != "managed" {
         return prepare_in(state, &input, kind, &input.repo_path);
+    }
+    let (_, root, inside) =
+        crate::terminal::checkout_root(&input.repo_path).map_err(unavailable)?;
+    if kind == "managed" {
+        if let Some(inside) = inside {
+            // Manvi is handed one directory as the provider's workspace and
+            // sandbox; nothing here shows it accepts one below the checkout
+            // root, so this is refused rather than tried.
+            return Err(WorkbenchError::new(
+                "unsupported_operation",
+                format!(
+                    "A managed agent works in its whole checkout, not in {inside}. Choose the checkout itself, or hand this task to an agent in a terminal to start it there."
+                ),
+            ));
+        }
+        if !input.worktree {
+            return prepare_in(state, &input, kind, &input.repo_path);
+        }
     }
     // Held across the whole build, hook included, so a retry of this attempt
     // never meets a tree that is still being set up — and so a cancel cannot
@@ -293,8 +316,16 @@ fn prepare_kind(state: &WorkbenchState, input: &str, kind: &str) -> Result<Value
         .with_store(|store| query(store, "items.get", &json!({"id":input.task_id}).to_string()))?;
     let title = task["item"]["title"].as_str().unwrap_or_default();
     let provisioned =
-        super::agent_worktree::provision(&input.repo_path, &input.id, title, accepted)?;
-    let prepared = prepare_in(state, &input, kind, &provisioned.path);
+        super::agent_worktree::provision(&native_path(&root)?, &input.id, title, accepted)?;
+    // The same folder, in the new tree: an attempt chosen for a package of a
+    // monorepo works in that package of its own worktree. A folder the new
+    // branch does not have (untracked here) is refused by `checkout`, and
+    // the tree goes with the refusal.
+    let cwd = match &inside {
+        Some(inside) => native_path(&Path::new(&provisioned.path).join(inside))?,
+        None => provisioned.path.clone(),
+    };
+    let prepared = prepare_in(state, &input, kind, &cwd);
     if let Err(refusal) = prepared {
         // The attempt does not exist, so neither may the worktree made for it.
         return Err(match super::agent_worktree::discard(&provisioned) {
@@ -1333,6 +1364,75 @@ mod tests {
                 .is_some_and(|why| !why.is_empty()),
             "{cancelled}"
         );
+    }
+
+    /// A subdirectory of the checkout is recorded as the attempt's directory,
+    /// with the root's identity; claiming it revalidates the same way. A
+    /// managed agent is refused one, and a worktree attempt works in the same
+    /// folder of its own tree — whose cancel still gives that tree back.
+    #[test]
+    fn a_subdirectory_is_prepared_with_its_checkouts_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("repo");
+        init(&root);
+        std::fs::create_dir_all(root.join("pkg/web")).unwrap();
+        std::fs::write(root.join("pkg/web/index.js"), "x\n").unwrap();
+        git_text(&root, &["add", "pkg"]).unwrap();
+        commit(&root);
+        let state = host(&dir.path().join("profile.sqlite"));
+        seed(&state, &root);
+        let folder = root.join("pkg/web");
+        let prepared = state
+            .request("runs.prepare_terminal", &prepare(&folder).to_string())
+            .unwrap();
+        assert_eq!(
+            prepared["item"]["cwd"],
+            json!(folder.canonicalize().unwrap())
+        );
+        assert_eq!(
+            prepared["item"]["git_dir"],
+            json!(root.join(".git").canonicalize().unwrap())
+        );
+        // One agent per working tree, wherever in it: the root is busy now.
+        let mut again = prepare(&root);
+        again["id"] = json!("again");
+        again["request_id"] = json!("prepare-again");
+        assert_eq!(
+            state
+                .request("runs.prepare_terminal", &again.to_string())
+                .unwrap_err()
+                .code,
+            "checkout_busy"
+        );
+        let claim = r#"{"id":"run","request_id":"claim","expected_revision":1,"owner_id":"host","session_id":"session"}"#;
+        assert_eq!(
+            state.request("runs.claim", claim).unwrap()["item"]["state"],
+            "starting"
+        );
+
+        let mut managed = with_worktree(&folder, "d00dfeed-m");
+        managed["provider"] = json!("codex");
+        managed["worktree"] = json!(false);
+        let refused = state
+            .request("runs.prepare_managed", &managed.to_string())
+            .unwrap_err();
+        assert_eq!(refused.code, "unsupported_operation");
+        assert!(refused.message.contains("pkg/web"), "{}", refused.message);
+
+        let lane_run = state
+            .request(
+                "runs.prepare_terminal",
+                &with_worktree(&folder, "feed0123-w").to_string(),
+            )
+            .unwrap();
+        let tree = lane(&root, "preserve-e42-feed0123");
+        assert_eq!(
+            Path::new(lane_run["item"]["cwd"].as_str().unwrap()),
+            tree.join("pkg/web")
+        );
+        let cancelled = cancel(&state, "feed0123-w");
+        assert_eq!(cancelled["worktree"]["removed"], true, "{cancelled}");
+        assert!(!tree.exists());
     }
 
     /// A clean tree that something still has open — a shell started in it, an
