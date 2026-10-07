@@ -222,7 +222,7 @@ impl Drop for SessionReservation {
 fn reserve_session(state: &TerminalSessions) -> Result<SessionReservation, String> {
     state
         .active_sessions
-        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+        .try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
             (current < state.session_limit()).then_some(current + 1)
         })
         .map_err(|_| {

@@ -236,7 +236,7 @@ impl WorkbenchState {
         self.check_open()?;
         self.0
             .in_flight
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |n| {
                 (n < MAX_IN_FLIGHT).then_some(n + 1)
             })
             .map_err(|_| WorkbenchError::new("busy", "Task storage is busy. Try again shortly."))?;
