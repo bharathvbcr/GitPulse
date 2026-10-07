@@ -19,6 +19,7 @@ pub(crate) mod intake;
 mod managed_run;
 pub(crate) mod notifications;
 mod process_birth;
+mod receipts;
 mod reconcile;
 pub(crate) mod terminal_command;
 mod terminal_launch;

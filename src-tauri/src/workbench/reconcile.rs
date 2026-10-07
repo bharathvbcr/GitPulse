@@ -317,6 +317,9 @@ pub(super) fn release(state: &WorkbenchState, input: &str) -> Result<Value, Work
             "Select a saved attempt.",
         ));
     }
+    // A receipt its own observer could not store is better evidence than
+    // anything judged here, so it goes in first.
+    super::receipts::replay(state, Some(&request.id));
     let (verdict, item) = settle(state, &request.id)?;
     Ok(match verdict {
         Verdict::Release(_) => {
@@ -348,6 +351,9 @@ pub(super) fn sweep_briefs() -> usize {
 /// Returns how many were released. Bounded by `MAX_PAGES` per state, and a
 /// failure on one run never stops the others.
 pub(super) fn sweep(state: &WorkbenchState) -> Result<usize, WorkbenchError> {
+    // Receipts that storage refused when their runs ended are stored first,
+    // so a recorded exit code is never overwritten by `outcome_uncertain`.
+    super::receipts::replay(state, None);
     let mut ids = Vec::new();
     for held in HELD {
         let mut cursor: Option<String> = None;
