@@ -1,11 +1,47 @@
-//! Durable human decisions for one live provider callback. Recording a decision
-//! is separate from consuming delivery authority and from provider resolution.
-//! The owning protocol adapter computes and rechecks the SHA-256 payload digest;
-//! this store also preserves the complete immutable payload and run binding.
+//! Durable human decisions. Two families share one table and one lifecycle:
+//!
+//! * `permission` and `question` capture one live provider callback. Recording
+//!   a decision is separate from consuming delivery authority and from
+//!   provider resolution. The owning protocol adapter computes and rechecks the
+//!   SHA-256 payload digest; this store also preserves the complete immutable
+//!   payload and run binding.
+//! * `change_review` and `merge_unreviewed` are raised by the host after an
+//!   attempt has ended, about the exact commit range it produced (see
+//!   `HOST_KINDS`).
 use super::{
     Entity, Error, Input, MAX_INTEGER, Result, collect_page, page, page_response, put_body,
 };
 use rusqlite::{OptionalExtension, params};
+
+/// Kinds the host raises for an ended run's commit range, never a provider.
+///
+/// The host passes the run's own `owner_id` and `session_id`, and synthetic
+/// provider identities that `create` enforces: `provider_thread_id` is
+/// `host`, `provider_turn_id` is the kind, and `protocol_request_id` is the
+/// payload's `head_oid`. The unique provider-request index therefore holds one
+/// decision per kind per head commit per run.
+///
+/// * `change_review` records the person's verdict (`approve`,
+///   `request_changes` or `deny`) on that range. It is a durable record, not
+///   one-time authority: `claim` refuses it, so an approval survives a failed
+///   merge, and the payload digest already binds the exact range.
+/// * `merge_unreviewed` is the explicit override to merge that range without
+///   an approval: `allow_once` with a non-empty reason, or `deny`. An
+///   `allow_once` is consumed exactly once through `claim` then `resolve`.
+const HOST_KINDS: [&str; 2] = ["change_review", "merge_unreviewed"];
+/// A live provider callback cannot outlast five minutes.
+const LIVE_TTL: i64 = 300;
+/// A review waits for a person, not a turn, but still expires.
+const HOST_TTL: i64 = 30 * 86_400;
+/// The question kind's answer field carries a host decision's note, bounded
+/// tighter than a free-form answer.
+const HOST_NOTE_MAX: usize = 4096;
+const ANSWER_MAX: usize = 16384;
+const BRANCH_MAX: usize = 1024;
+
+pub(super) fn host_kind(kind: &str) -> bool {
+    HOST_KINDS.contains(&kind)
+}
 
 fn stale() -> Error {
     Error {
@@ -15,22 +51,75 @@ fn stale() -> Error {
                 .into(),
     }
 }
-fn digest(input: &Input<'_>) -> Result<String> {
-    let value = input.required_text("payload_digest", 64)?;
-    if value.len() != 64
-        || !value
+fn refuse(message: &str) -> Error {
+    Error {
+        code: "invalid_state",
+        message: message.into(),
+    }
+}
+fn lower_hex(value: &str, lengths: &[usize]) -> bool {
+    lengths.contains(&value.len())
+        && value
             .bytes()
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-    {
+}
+fn digest(input: &Input<'_>) -> Result<String> {
+    let value = input.required_text("payload_digest", 64)?;
+    if !lower_hex(&value, &[64]) {
         return Err(Error::invalid(
             "payload_digest must be a lowercase SHA-256 digest",
         ));
     }
     Ok(value)
 }
-// Time is always supplied by the store clock. The request carries a snapshot,
-// not authority to keep acting after a task/repository changes or the run ends.
-const FRESH: &str = "r.state='running' AND t.deleted=0
+fn object_id(input: &Input<'_>, key: &str) -> Result<String> {
+    let value = input.required_text(key, 64)?;
+    if !lower_hex(&value, &[40, 64]) {
+        return Err(Error::invalid(format!(
+            "{key} must be a lowercase 40- or 64-hex object id"
+        )));
+    }
+    Ok(value)
+}
+/// Validates a host review payload and returns its head commit.
+fn review_payload(payload: &Input<'_>, repository: &str) -> Result<String> {
+    payload.fields(&[
+        "repository_id",
+        "base_oid",
+        "head_oid",
+        "branch",
+        "files_changed",
+        "diff_digest",
+    ])?;
+    if payload.id("repository_id")? != repository {
+        return Err(Error::invalid(
+            "the reviewed range must belong to the run's repository",
+        ));
+    }
+    object_id(payload, "base_oid")?;
+    payload.required_text("branch", BRANCH_MAX)?;
+    payload.integer("files_changed", None, MAX_INTEGER)?;
+    let diff = payload.required_text("diff_digest", 64)?;
+    if !lower_hex(&diff, &[64]) {
+        return Err(Error::invalid(
+            "diff_digest must be a lowercase SHA-256 digest",
+        ));
+    }
+    object_id(payload, "head_oid")
+}
+
+// Time is always supplied by the store clock. A provider callback carries a
+// snapshot, not authority to keep acting after a task/repository changes or
+// the run ends. A host review is about an ended run's fixed commit range, so
+// only its own expiry bounds it; the run, task and checkout moving on do not.
+fn fresh() -> String {
+    let host = HOST_KINDS.map(|k| format!("'{k}'")).join(",");
+    format!(
+        "(json_extract(d.body,'$.kind') IN ({host}) AND json_extract(d.body,'$.expires_at')>?1
+ OR json_extract(d.body,'$.kind') NOT IN ({host}) AND {LIVE_FRESH})"
+    )
+}
+const LIVE_FRESH: &str = "r.state='running' AND t.deleted=0
  AND t.revision=json_extract(d.body,'$.source_revision')
  AND json_extract(r.body,'$.owner_id')=json_extract(d.body,'$.owner_id')
  AND json_extract(r.body,'$.session_id')=json_extract(d.body,'$.session_id')
@@ -44,12 +133,13 @@ const FROM: &str = "work_decisions d JOIN work_runs r ON r.id=d.run_id
 // The inbox uses this same validity predicate. Its static SQL aliases the
 // callback q; only a trusted parameter index varies between the read paths.
 pub(super) fn fresh_notice(clock_parameter: u8) -> String {
-    let fresh = FRESH.replace("?1", &format!("?{clock_parameter}"));
+    let fresh = fresh().replace("?1", &format!("?{clock_parameter}"));
     format!("EXISTS(SELECT 1 FROM {FROM} WHERE d.id=q.id AND d.state='pending' AND {fresh})")
 }
 fn body() -> String {
     format!(
-        "json_set(d.body,'$.actionable',json(CASE WHEN d.state='pending' AND {FRESH} THEN 'true' ELSE 'false' END))"
+        "json_set(d.body,'$.actionable',json(CASE WHEN d.state='pending' AND {} THEN 'true' ELSE 'false' END))",
+        fresh()
     )
 }
 pub(super) fn projection(conn: &rusqlite::Connection, id: &str, now: i64) -> Result<String> {
@@ -63,7 +153,10 @@ pub(super) fn projection(conn: &rusqlite::Connection, id: &str, now: i64) -> Res
 }
 fn require_fresh(input: &Input<'_>, id: &str, now: i64) -> Result<()> {
     let valid: bool = input.conn.query_row(
-        &format!("SELECT EXISTS(SELECT 1 FROM {FROM} WHERE d.id=?2 AND {FRESH})"),
+        &format!(
+            "SELECT EXISTS(SELECT 1 FROM {FROM} WHERE d.id=?2 AND {})",
+            fresh()
+        ),
         params![now, id],
         |r| r.get(0),
     )?;
@@ -119,17 +212,38 @@ pub(super) fn mutate(
             }
             let decision = input.required_text("decision", 20)?;
             let kind = prior.required_text("kind", 20)?;
-            let answer = input.text("answer", 16384)?;
-            if !(decision == "deny"
-                || kind == "permission" && decision == "allow_once"
-                || kind == "question" && decision == "answer")
-                || (decision == "answer") != answer.as_ref().is_some_and(|s| !s.trim().is_empty())
-                || decision != "answer" && answer.is_some()
-            {
-                return Err(Error::invalid(
-                    "choose a one-time permission decision or provide the requested answer",
-                ));
-            }
+            let answer = if host_kind(&kind) {
+                // `answer` carries the note. It is optional except as the
+                // reason for an unreviewed merge, and never blank.
+                let note = input.text("answer", HOST_NOTE_MAX)?;
+                let blank = note.as_ref().is_some_and(|s| s.trim().is_empty());
+                let valid = match (kind.as_str(), decision.as_str()) {
+                    ("change_review", "approve" | "request_changes" | "deny") => true,
+                    ("merge_unreviewed", "allow_once") => note.is_some(),
+                    ("merge_unreviewed", "deny") => true,
+                    _ => false,
+                };
+                if blank || !valid {
+                    return Err(Error::invalid(
+                        "a change review takes approve, request_changes or deny; an unreviewed merge takes allow_once with a reason, or deny",
+                    ));
+                }
+                note
+            } else {
+                let answer = input.text("answer", ANSWER_MAX)?;
+                if !(decision == "deny"
+                    || kind == "permission" && decision == "allow_once"
+                    || kind == "question" && decision == "answer")
+                    || (decision == "answer")
+                        != answer.as_ref().is_some_and(|s| !s.trim().is_empty())
+                    || decision != "answer" && answer.is_some()
+                {
+                    return Err(Error::invalid(
+                        "choose a one-time permission decision or provide the requested answer",
+                    ));
+                }
+                answer
+            };
             input.conn.query_row("SELECT json_set(?1,'$.state','decided','$.decision',?2,'$.answer',?3,'$.decided_at',?4)",params![raw,decision,answer,now],|r|r.get::<_,String>(0))?
         }
         "decisions.claim" => {
@@ -145,6 +259,12 @@ pub(super) fn mutate(
                 "payload_digest",
             ])?;
             owns(input, &prior)?;
+            let kind = prior.required_text("kind", 20)?;
+            if kind == "change_review" {
+                return Err(refuse(
+                    "a change review is a durable record, not one-time authority; read it instead of claiming it",
+                ));
+            }
             require_fresh(input, id, now)?;
             if state != "decided" || digest(input)? != prior.required_text("payload_digest", 64)? {
                 return Err(stale());
@@ -157,6 +277,13 @@ pub(super) fn mutate(
                 if input.required_text(key, 256)? != prior.required_text(key, 256)? {
                     return Err(stale());
                 }
+            }
+            // A denied override is not merge authority; only allow_once is
+            // consumed. Resolve or cancel the denial instead.
+            if kind == "merge_unreviewed"
+                && prior.text("decision", 20)?.as_deref() != Some("allow_once")
+            {
+                return Err(refuse("only an allowed unreviewed merge can be claimed"));
             }
             input.conn.query_row(
                 "SELECT json_set(?1,'$.state','dispatching','$.dispatched_at',?2)",
@@ -234,7 +361,17 @@ fn create(input: &Input<'_>, id: &str, revision: i64, now: i64) -> Result<()> {
         raw: &raw,
     };
     owns(input, &run)?;
-    if run.required_text("state", 32)? != "running" {
+    // Branch without validating the kind yet, so a provider request keeps its
+    // original refusal order.
+    let host = input.text("kind", 20)?.as_deref().is_some_and(host_kind);
+    let run_state = run.required_text("state", 32)?;
+    if host {
+        if !super::runs::TERMINAL.contains(&run_state.as_str()) {
+            return Err(refuse(
+                "a review is raised only for a run that has ended; this run can still change its range",
+            ));
+        }
+    } else if run_state != "running" {
         return Err(stale());
     }
     let task = run.id("task_id")?;
@@ -244,14 +381,22 @@ fn create(input: &Input<'_>, id: &str, revision: i64, now: i64) -> Result<()> {
     let turn = input.required_text("provider_turn_id", 256)?;
     let protocol = input.required_text("protocol_request_id", 256)?;
     let kind = input.required_text("kind", 20)?;
-    if !["permission", "question"].contains(&kind.as_str()) {
+    if !["permission", "question"].contains(&kind.as_str()) && !host {
         return Err(Error::invalid("unsupported decision kind"));
     }
     let payload = input.required_text("payload", 65536)?;
-    Input::new(input.conn, &payload)?;
+    let parsed = Input::new(input.conn, &payload)?;
+    if host {
+        let head = review_payload(&parsed, &repo)?;
+        if thread != "host" || turn != kind || protocol != head {
+            return Err(Error::invalid(
+                "a host review names provider_thread_id host, provider_turn_id its kind and protocol_request_id its head_oid",
+            ));
+        }
+    }
     let digest = digest(input)?;
     let deadline = input.integer("deadline", None, MAX_INTEGER)?;
-    let expires = deadline.min(now.saturating_add(300));
+    let expires = deadline.min(now.saturating_add(if host { HOST_TTL } else { LIVE_TTL }));
     if expires <= now {
         return Err(stale());
     }

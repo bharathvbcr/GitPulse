@@ -54,6 +54,11 @@ describe("agent request review", () => {
     native.mockResolvedValueOnce(JSON.stringify(page));
     await expect(listAgentDecisions("other")).rejects.toMatchObject({code:"protocol_error"});
   });
+  it("leaves an attempt's host review records out of the provider list instead of failing the page",async()=>{
+    const review={...item,id:"review",kind:"change_review",provider_thread_id:"host",provider_turn_id:"change_review",state:"decided",decision:"approve",answer:null,actionable:false,expires_at:1000+30*86400};
+    native.mockResolvedValueOnce(JSON.stringify({ok:true,items:[review,item],total:2,shown:2,has_more:false,next_cursor:null}));
+    expect(await listAgentDecisions("run")).toMatchObject({shown:1,items:[{id:"decision"}]});
+  });
   it("recognizes private permission and question notices without inventing resolved work",()=>{
     const notice={id:"event-45",revision:1,updated_at:1000,source_sequence:45,task_id:"task",task_revision:2,target_type:"decision",target_id:"decision",target_revision:1,target_status:"current",kind:"decision_permission",title:"Coding agent needs permission",created_at:1000,read_at:null,dismissed_at:null,snoozed_until:null};
     expect(attention(notice)).toMatchObject({target_type:"decision"});

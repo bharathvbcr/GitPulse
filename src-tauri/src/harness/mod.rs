@@ -11,6 +11,7 @@
 
 pub mod policy;
 pub mod protocol;
+pub(crate) mod review;
 pub mod sidecar;
 
 use serde::{Deserialize, Serialize};
@@ -94,6 +95,17 @@ pub(crate) fn guard_command_allowing(
     allowed: &[String],
 ) -> Result<PolicyVerdict, String> {
     let command = render_command(argv);
+    if let Err(refused) = review::gate(repo_path, argv) {
+        let action = crate::ledger::action_for_argv(argv);
+        record_gate(
+            repo_path,
+            &action,
+            &command,
+            serde_json::to_string(argv).ok(),
+            &refused,
+        );
+        return gated(*refused);
+    }
     let verdict = match scope_for(repo_path) {
         Ok(scope) => check_command_allowing(repo_path, &command, scope.as_ref(), allowed),
         Err(failure) if failure.kind == ScopeFailureKind::Missing => {

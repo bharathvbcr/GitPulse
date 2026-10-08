@@ -5156,6 +5156,47 @@ pub async fn cmd_lappi_settings_save(
     .await
 }
 
+/// One agent attempt's review, for its task panel (`docs/AGENT_OUTPUT_REVIEW.md`).
+#[tauri::command(async)]
+pub async fn cmd_attempt_review(
+    run_id: String,
+    workbench: State<'_, crate::workbench::WorkbenchState>,
+) -> Result<crate::workbench::review::AttemptReview, String> {
+    let workbench = workbench.inner().clone();
+    off_thread(move || crate::workbench::review::attempt_review(&workbench, &run_id, None)).await
+}
+
+/// Records a person's decision on an ended attempt's current commit range:
+/// `approve`, `request_changes`, `deny`, or `merge_unreviewed` (which needs a
+/// note saying why).
+#[tauri::command(async)]
+pub async fn cmd_attempt_review_record(
+    run_id: String,
+    decision: String,
+    note: Option<String>,
+    workbench: State<'_, crate::workbench::WorkbenchState>,
+) -> Result<crate::workbench::review::AttemptReview, String> {
+    let workbench = workbench.inner().clone();
+    off_thread(move || {
+        crate::workbench::review::attempt_review(
+            &workbench,
+            &run_id,
+            Some((&decision, note.as_deref())),
+        )
+    })
+    .await
+}
+
+/// Turns the review gate on or off for the repository `repo_path` belongs to.
+#[tauri::command(async)]
+pub async fn cmd_review_gate_save(repo_path: String, enabled: bool) -> Result<(), String> {
+    off_thread(move || {
+        let dir = crate::harness::review::common_dir(std::path::Path::new(&repo_path))?;
+        crate::tool_config::set_review_gate(Some(&dir), Some(enabled))
+    })
+    .await
+}
+
 /// Reports which terminal sessions the user can actually see.
 ///
 /// Plural because a split terminal shows two at once. Only the renderer knows

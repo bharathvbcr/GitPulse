@@ -29,6 +29,12 @@ const STATES: &[&str] = &[
     "cancelled",
     "unresolved",
 ];
+/// States no lifecycle method leaves: `mutate` only moves a run out of
+/// `prepared`, `starting`, `running` or `unresolved`. A run here holds no
+/// checkout (see `ACTIVE`), so nothing it launched can still move its branch.
+/// `unresolved` is deliberately absent: its outcome is uncertain and it keeps
+/// its slot because the writer may still be alive.
+pub(super) const TERMINAL: &[&str] = &["exited", "failed", "cancelled"];
 
 /// Whether any attempt still holds a checkout of this repository. A relink
 /// must not move the identity out from under a run that is prepared or live.

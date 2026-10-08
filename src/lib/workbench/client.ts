@@ -170,8 +170,20 @@ export function agentDecision(value: unknown): AgentDecision {
     provider: named, permission_mode: mode, policy_revision: 1, cwd, kind, payload, payload_digest: digest, created_at: created, expires_at: expires,
     state, decision, answer, actionable, reason: text(raw.reason) };
 }
+/**
+ * Review records the host raises on an ended attempt share its run's decision
+ * list but are not provider requests: nothing answers them here, and they are
+ * read through `cmd_attempt_review`. They are left out of the provider list
+ * rather than refused as malformed, which would fail the whole page.
+ */
+const HOST_REVIEW_KINDS: ReadonlySet<unknown> = new Set(["change_review", "merge_unreviewed"]);
+function providerDecisions(value: unknown): Page<AgentDecision> {
+  const result = page(value, (raw) => (HOST_REVIEW_KINDS.has(object(raw).kind) ? null : agentDecision(raw)));
+  const items = result.items.filter((item): item is AgentDecision => item !== null);
+  return { ...result, items, shown: items.length };
+}
 export async function listAgentDecisions(runID: string, cursor?: string): Promise<Page<AgentDecision>> {
-  const result = page(await request("decisions.list", { run_id: runID, limit: 30, ...(cursor ? { cursor } : {}) }), agentDecision);
+  const result = providerDecisions(await request("decisions.list", { run_id: runID, limit: 30, ...(cursor ? { cursor } : {}) }));
   return result.items.every((item) => item.run_id === runID) ? result : invalid();
 }
 /**
@@ -180,7 +192,7 @@ export async function listAgentDecisions(runID: string, cursor?: string): Promis
  * oldest, long-answered requests, and the ones waiting now are past it.
  */
 export async function listPendingDecisions(runID: string): Promise<Page<AgentDecision>> {
-  const result = page(await request("decisions.list", { run_id: runID, state: "pending", limit: 30 }), agentDecision);
+  const result = providerDecisions(await request("decisions.list", { run_id: runID, state: "pending", limit: 30 }));
   return result.items.every((item) => item.run_id === runID && item.state === "pending") ? result : invalid();
 }
 

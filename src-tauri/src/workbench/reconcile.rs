@@ -36,7 +36,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 /// The states the store counts as holding a checkout, apart from `prepared`
 /// (which expires on its own and is ended with `cancel`).
-const HELD: [&str; 3] = ["starting", "running", "unresolved"];
+pub(super) const HELD: [&str; 3] = ["starting", "running", "unresolved"];
 /// How long after its claim a managed attempt that recorded no process could
 /// still become active.
 ///
@@ -405,7 +405,7 @@ pub(super) fn sweep_briefs() -> usize {
 /// newest first when `newest`. `visit` returns false to stop early. Returns
 /// whether every run in the state was seen — false when the walk stopped at
 /// the page cap, which a caller must not read as "there are no more".
-fn walk(
+pub(super) fn walk(
     state: &WorkbenchState,
     run_state: &str,
     newest: bool,
