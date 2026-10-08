@@ -13,6 +13,15 @@ before that tag is pushed.
 
 ### Added
 
+- Task checklists with a done state per item, and links between tasks
+  (parent, blocks, related, duplicate of), edited in the task sheet and read
+  from both ends in the agent brief.
+- The archive's **Deleted** view restores a deleted task with its id, checked
+  against the revision its deletion wrote.
+- **Merge…** on the board's selection bar, running the same merge as
+  `gitpulse_merge_tasks`.
+- **Model for this launch** in a terminal handoff: model, effort and advisor
+  for one attempt, recorded on the attempt and shown on its row.
 - **Board views: swimlanes, saved views and work-in-progress limits.** Lanes
   group cards by owner or first label on the board, and by status in the list.
   A board's current arrangement — layout, lanes, columns, card chips, filters
@@ -27,6 +36,17 @@ before that tag is pushed.
   relink, a check that could not run says so, and a repository known only by
   its remote is shown as Remote only and can be linked to a checkout.
 
+### Changed
+
+- Archived is its own flag, independent of status (dc-store schema 11).
+  Finishing a task leaves it in Done; Archive files a task away from any column
+  and Restore brings it back with its status unchanged. Upgrading a profile
+  archives every task that was Done, keeping when it was completed.
+- The archive lists most recently completed first and refreshes its loaded
+  pages in place after a change.
+- A merge whose source's delete fails after its reason is recorded now reports
+  a partial merge naming that source, not a bare error.
+
 ### Fixed
 
 - **Unsaved edits to a suggestion are asked about.** Editing a Manvi or Apple
@@ -39,6 +59,12 @@ before that tag is pushed.
   also collapsed back to one page every second while a suggestion ran.
 - **Every task in a column can be reached in the list layout**, which had no
   paging; a repository's board links to the Tasks board for everything.
+
+### Upgrade
+
+- dc-store schema 11 is a one-way migration, and a host built against schema
+  10 refuses a migrated profile. Rebuild GitPulse, Manvi and DevCouncil from a
+  schema 11 dc-store before any of them opens the profile.
 
 ## [1.4.0] - 2026-10-07
 

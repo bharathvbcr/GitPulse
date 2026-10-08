@@ -18,6 +18,28 @@
 //! delete both: whichever delete lands first, the other side's write to the
 //! card it deleted fails, and that side stops holding both cards' content.
 //!
+//! # The one window it cannot close
+//!
+//! Before each source's delete the target is read again, and the merge stops
+//! if it is gone. That check and the delete are two store requests, and
+//! nothing groups two, so a person (or another agent) deleting the *target*
+//! between them is not seen: the source is deleted too. The window is one
+//! request wide and is documented rather than closed, because closing it
+//! needs a store transaction spanning requests that dc-store does not offer.
+//! What it cannot do is lose work: the source's content is already in the
+//! target's last revision, and the target, like every deleted task, comes
+//! back with `items.restore` (the board's Archive dock, Deleted view) with
+//! that content in it.
+//!
+//! # A delete that fails after its reason is recorded
+//!
+//! Each source is deleted in two writes: its merge reason appended to its
+//! logs, then the delete. When the delete fails for any reason but a
+//! conflict, the source is live and carries the reason. That is reported as a
+//! partial merge naming the source and saying so — never as a bare error,
+//! which would read as "nothing changed" — and running the same call again
+//! finishes it without recording the reason twice.
+//!
 //! # What the target gets
 //!
 //! A `## Merged from <item_id>: <title>` section per source, with its status,
@@ -36,6 +58,11 @@ pub(crate) const MAX_MERGE_SOURCES: usize = MAX_RELATED;
 /// as not merged.
 const MAX_ROUNDS: usize = 3;
 const SECTION: &str = "## Merged from ";
+/// The store's caps on a task's checklist and links (dc-store
+/// `workbench/items.rs`), checked here so an over-full merge is refused
+/// before anything is written rather than by the target's write.
+const MAX_MERGED_CHECKLIST: usize = 128;
+const MAX_MERGED_LINKS: usize = 64;
 
 /// A task named by an agent: its task_id or board item_id, and the revision
 /// it read it at, when it wants the merge refused if the task changed since.
@@ -148,6 +175,7 @@ fn strings(item: &Value, key: &str) -> Vec<String> {
 /// The target with every pending source folded in, checked against the
 /// store's bounds before anything is written.
 fn plan(
+    store: &Store,
     target_id: &str,
     target: &Value,
     pending: &[(&str, &Value)],
@@ -262,6 +290,62 @@ fn plan(
             fields.insert("due_at".into(), json!(due));
         }
     }
+    // Checklist entries join by their text; the target's own entry, and its
+    // done state, wins over a source's entry with the same text.
+    let mut texts = std::collections::BTreeSet::new();
+    let mut checklist = Vec::new();
+    for entry in all().flat_map(|item| item["checklist"].as_array().cloned().unwrap_or_default()) {
+        if let Some(text) = entry["text"].as_str() {
+            if texts.insert(text.trim().to_owned()) {
+                checklist.push(entry);
+            }
+        }
+    }
+    // Links join too, minus every link to a card in this merge: the target
+    // cannot link to itself, and the sources are about to be deleted. The
+    // target keeps its own parent; a source's parent would be a second one,
+    // which the store refuses, so it is dropped rather than failing the merge.
+    let merging: std::collections::BTreeSet<&str> = std::iter::once(target_id)
+        .chain(pending.iter().map(|(id, _)| *id))
+        .collect();
+    let mut seen = std::collections::BTreeSet::new();
+    let mut links = Vec::new();
+    let mut has_parent = false;
+    for (index, item) in all().enumerate() {
+        for link in item["links"].as_array().cloned().unwrap_or_default() {
+            let (Some(kind), Some(to)) = (link["kind"].as_str(), link["item_id"].as_str()) else {
+                continue;
+            };
+            if merging.contains(to) || !seen.insert((kind.to_owned(), to.to_owned())) {
+                continue;
+            }
+            if kind == "parent" {
+                if has_parent || index > 0 {
+                    continue;
+                }
+                has_parent = true;
+            }
+            // A source's link to a task deleted since cannot become a new
+            // link on the target; the target's own may stay (the store
+            // keeps a link a task already holds).
+            if index > 0 && get_item(store, to)?.is_none() {
+                continue;
+            }
+            links.push(link);
+        }
+    }
+    if checklist.len() > MAX_MERGED_CHECKLIST || links.len() > MAX_MERGED_LINKS {
+        return Err(WorkbenchError::new(
+            "merge_too_large",
+            format!("Merged, {target_id} would have {} checklist entries and {} links; a task holds at most {MAX_MERGED_CHECKLIST} and {MAX_MERGED_LINKS}. Merge fewer tasks at once.", checklist.len(), links.len()),
+        ));
+    }
+    if target["checklist"].as_array().map_or(0, Vec::len) != checklist.len() {
+        fields.insert("checklist".into(), json!(checklist));
+    }
+    if target["links"].as_array().map_or(0, Vec::len) != links.len() {
+        fields.insert("links".into(), json!(links));
+    }
     Ok(Plan { fields, appended })
 }
 
@@ -279,7 +363,17 @@ fn check(
         if let Some((id, _)) = pending.iter().find(|(_, item)| item["status"] != "done") {
             return Err(WorkbenchError::new(
                 "target_done",
-                format!("{target_id} is done, and {id} is still open: merged, its work would disappear into the archive. Merge into an open task instead."),
+                format!("{target_id} is done, and {id} is still open: merged, its open work would read as finished. Merge into an open task instead."),
+            ));
+        }
+    }
+    // Archived is its own flag now, in any column: work merged into an
+    // archived card leaves the board as surely as work merged into Done did.
+    if target["archived"] == true {
+        if let Some((id, _)) = pending.iter().find(|(_, item)| item["archived"] != true) {
+            return Err(WorkbenchError::new(
+                "target_archived",
+                format!("{target_id} is archived, and {id} is on the board: merged, its work would disappear into the archive. Restore {target_id} first, or merge into a task on the board."),
             ));
         }
     }
@@ -380,7 +474,7 @@ fn rounds(
                 reason,
                 even_if_running,
             )?;
-            plan(target_id, target, &pending, reason, now_millis())?
+            plan(store, target_id, target, &pending, reason, now_millis())?
         };
         if !checked {
             checked = true;
@@ -440,6 +534,17 @@ fn rounds(
                 // It changed after it was copied: the next round copies what
                 // it is now, then deletes that.
                 Removal::Changed { recorded } => progress.wrote |= recorded,
+                // Its reason is on it and it is still live: a write happened,
+                // so this is a partial merge to report, never a bare error
+                // that reads as "nothing changed".
+                Removal::Interrupted { wrote, error } => {
+                    progress.wrote |= wrote;
+                    source.state = State::NotMerged {
+                        title: item["title"].clone(),
+                        detail: format!("Its merge reason is recorded on it, but deleting it failed ({}: {}); it is still on the board with its work. Run the same call again to finish.", error.code, error.message),
+                    };
+                    return Err(error);
+                }
             }
         }
     }
@@ -478,13 +583,114 @@ pub(crate) fn merge_with(
     step: &mut dyn FnMut(Step<'_>, &Store),
 ) -> Result<Value, WorkbenchError> {
     let reason = check_reason(reason, "these tasks are being merged")?;
+    check_sources(sources)?;
+    let repository = board_repository(store, repo_path)?;
+    merge_core(
+        store,
+        repository,
+        into,
+        sources,
+        reason,
+        even_if_running,
+        step,
+    )
+}
+
+/// Merge for the board: the same merge, in a repository the board names by
+/// its record id rather than by a checkout path. The person is acting on
+/// their own board, so there is no agent trust gate to pass; everything else
+/// — the order of writes, every refusal, the partial report — is
+/// [`merge_tasks`]'s, because it is the same code.
+pub(crate) fn merge_on_board(
+    store: &Store,
+    repository_id: &str,
+    into: &MergeTask,
+    sources: &[MergeTask],
+    reason: &str,
+) -> Result<Value, WorkbenchError> {
+    let reason = check_reason(reason, "these tasks are being merged")?;
+    check_sources(sources)?;
+    let repository = query(
+        store,
+        "repositories.get",
+        &json!({ "id": repository_id }).to_string(),
+    )?["item"]
+        .clone();
+    // A merge is refused for a task an agent may still be working on; on the
+    // board the person sees those cards and can stop the agent first, so the
+    // refusal stands rather than being overridden from a button.
+    merge_core(
+        store,
+        repository,
+        into,
+        sources,
+        reason,
+        false,
+        &mut |_, _| {},
+    )
+}
+
+/// The board's `items.merge` request: `{repository_id, into: {id,
+/// expected_revision}, sources: [{id, expected_revision}], reason}`. Every
+/// task is named with the revision the board drew it at, so a card someone
+/// changed since is refused rather than merged as it no longer looks.
+pub(crate) fn merge_request(store: &Store, input: &str) -> Result<Value, WorkbenchError> {
+    let input: Value = serde_json::from_str(input).map_err(|_| {
+        WorkbenchError::new("invalid_input", "The merge request is not valid JSON.")
+    })?;
+    let invalid = |what: &str| {
+        WorkbenchError::new("invalid_input", format!("The merge request needs {what}."))
+    };
+    let named = |value: &Value| -> Result<MergeTask, WorkbenchError> {
+        let task = value["id"]
+            .as_str()
+            .filter(|id| !id.is_empty() && id.len() <= 128)
+            .ok_or_else(|| invalid("a task id for every task"))?;
+        let revision = value["expected_revision"]
+            .as_i64()
+            .filter(|r| *r >= 1)
+            .ok_or_else(|| invalid("the revision each task was read at"))?;
+        Ok(MergeTask {
+            task: task.to_owned(),
+            expected_revision: Some(revision),
+        })
+    };
+    let repository_id = input["repository_id"]
+        .as_str()
+        .filter(|id| !id.is_empty() && id.len() <= 128)
+        .ok_or_else(|| invalid("a repository_id"))?;
+    let into = named(&input["into"])?;
+    let sources = input["sources"]
+        .as_array()
+        .ok_or_else(|| invalid("a list of sources"))?
+        .iter()
+        .map(named)
+        .collect::<Result<Vec<_>, _>>()?;
+    let reason = input["reason"]
+        .as_str()
+        .ok_or_else(|| invalid("a reason"))?;
+    merge_on_board(store, repository_id, &into, &sources, reason)
+}
+
+fn check_sources(sources: &[MergeTask]) -> Result<(), WorkbenchError> {
     if sources.is_empty() || sources.len() > MAX_MERGE_SOURCES {
         return Err(WorkbenchError::new(
             "invalid_input",
             format!("Name between 1 and {MAX_MERGE_SOURCES} tasks to merge."),
         ));
     }
-    let repository = board_repository(store, repo_path)?;
+    Ok(())
+}
+
+fn merge_core(
+    store: &Store,
+    repository: Value,
+    into: &MergeTask,
+    sources: &[MergeTask],
+    reason: &str,
+    even_if_running: bool,
+    step: &mut dyn FnMut(Step<'_>, &Store),
+) -> Result<Value, WorkbenchError> {
     let repository_id = repository["id"].as_str().unwrap_or_default().to_owned();
     let (target_id, original) = find_live_task(store, &repository_id, &into.task)?;
     let target_revision = original["revision"].as_i64().unwrap_or_default();
