@@ -33,10 +33,7 @@ const MAX_MODEL_ID: usize = 128;
 /// The workbench schema the vendored dc-store opens, and so the only one a
 /// `dcstore` Manvi runs against this profile may open: an older one refuses
 /// the profile, a newer one would migrate it past what GitPulse can read.
-/// Mirrors the `version != 11` check in `vendored/dc-store/src/workbench/mod.rs`
-/// (pinned by a test) until the vendored crate exports it as
-/// `dc_store::workbench::WORKBENCH_SCHEMA`.
-pub(crate) const WORKBENCH_SCHEMA: i64 = 11;
+pub(crate) use dc_store::workbench::WORKBENCH_SCHEMA;
 
 /// Identity of the Manvi child environment. Changing it retires the worker.
 type WorkerFingerprint = Option<(String, String)>;
@@ -797,22 +794,7 @@ pub async fn cmd_workbench_relink_repository(
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        generation_input, worker_error, Inner, WorkbenchState, MAX_IN_FLIGHT, WORKBENCH_SCHEMA,
-    };
-
-    /// `WORKBENCH_SCHEMA` is what GitPulse demands of the `dcstore` Manvi
-    /// runs. It must be the schema the vendored store actually opens, or a
-    /// re-vendor would leave the component check accepting the wrong one.
-    #[test]
-    fn the_required_workbench_schema_is_the_one_the_vendored_store_opens() {
-        let source = include_str!("../vendored/dc-store/src/workbench/mod.rs");
-        let check = format!("if version != {WORKBENCH_SCHEMA} {{");
-        assert!(
-            source.contains(&check),
-            "vendored dc-store no longer checks `{check}`: update WORKBENCH_SCHEMA"
-        );
-    }
+    use super::{generation_input, worker_error, Inner, WorkbenchState, MAX_IN_FLIGHT};
     use crate::procguard::LockedSpawn;
     use serde_json::json;
     use std::sync::Arc;

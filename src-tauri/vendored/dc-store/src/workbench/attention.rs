@@ -47,6 +47,17 @@ pub(super) fn record_event(
     let exit_failed = input.integer("exit_code", Some(0), MAX_INTEGER)? != 0
         || input.text("provider_state", 32)?.as_deref() == Some("failed");
     let (target_type, kind, title) = match (method, state.as_str()) {
+        // A host review raises no notice. The person is already looking at the
+        // range when the host raises it, the run's own exit notice points at
+        // the ended attempt, and consumers decode a closed set of kinds.
+        ("decisions.create", _)
+            if input
+                .text("kind", 20)?
+                .as_deref()
+                .is_some_and(super::decisions::host_kind) =>
+        {
+            return Ok(());
+        }
         ("decisions.create", "pending")
             if input.text("kind", 20)?.as_deref() == Some("question") =>
         {
