@@ -29,7 +29,7 @@
         "repo": "devcouncil",
         "root_env": "GITPULSE_DEVCOUNCIL_ROOT",
         "path": "rust/dc-redact",
-        "commit": "1a956bf8edc5efd4bccf491f486d43932dd6790e"
+        "commit": "a8826e535b14e890005232ad28c5980fc747b161"
       },
       "omitted": [
         "tests/",
@@ -42,7 +42,7 @@
       ],
       "files": {
         "Cargo.toml": "0f4f9ff9d48cdb0924d4ddce9c53ed56ab5a799b115c2e3aa3e0a98039a9cf48",
-        "src/lib.rs": "87f3d3404ffe3c66eeb92726f5459f800816c587cf0daf0cf1ad476c9c00ce30"
+        "src/lib.rs": "b32ef184c6a8cc2faabb232ff27f64dd532409f76210ad9b361fd45461e355ed"
       }
     },
     {
