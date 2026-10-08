@@ -1,3 +1,4 @@
+import { asksForReader as sharedAsksForReader } from "../terminal/sessionActivity";
 import { describe, expect, it } from "vitest";
 import { ACTIVE_WINDOW_MS, GLANCE_RANK, agentGlance, asksForReader, attemptTerminalView, attemptUrgency, checkoutChanges, mostUrgent, orderMonitored, pendingRequests, releasedNote, requestsLine, shortSpan, waitingLabel, type AttemptSession } from "./taskSessions";
 import type { SessionActivity } from "../terminal/sessionActivity";
@@ -145,10 +146,20 @@ describe("attemptUrgency", () => {
     expect(attemptUrgency([])).toBeNull();
     expect(attemptUrgency([glance("error")], { pendingRequests: 0 })).toBe("error");
   });
-  it("puts only a request or an error on the reader's plate", () => {
+  it("puts only a request, an error or a bell on the reader's plate", () => {
+    // A bell counts. The notifier folds a hooked agent's bell into the reason
+    // its hook gave, so one that still reads "signalled" came from an agent
+    // with no hooks — for which the bell is the only way to say it is blocked.
+    // The board and the tray count it the same way.
     expect(asksForReader("needs-you")).toBe(true);
     expect(asksForReader("error")).toBe(true);
-    for (const tone of ["finished", "signalled", "active", "quiet", "problem", "starting", "adopted", null] as const) expect(asksForReader(tone)).toBe(false);
+    expect(asksForReader("signalled")).toBe(true);
+    for (const tone of ["finished", "active", "quiet", "problem", "starting", "adopted", null] as const) expect(asksForReader(tone)).toBe(false);
+    // One rule: the pane's tones that are attention kinds answer as the
+    // shared rule does.
+    for (const kind of ["needs-you", "error", "signalled", "finished"] as const) {
+      expect(asksForReader(kind), kind).toBe(sharedAsksForReader(kind));
+    }
   });
 });
 

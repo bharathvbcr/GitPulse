@@ -334,6 +334,19 @@ describe("projectAgentPlane", () => {
     expect(plane.rows.find((row) => row.liveKey === "ask")?.attention).toContain("needs-you");
   });
 
+  it("shows a live agent that finished as waiting for the reader, below one that is blocked", () => {
+    const plane = project({
+      terminals: [
+        terminal({ key: "done", attention: "finished", label: "Claude", title: "done", cwd: "/tmp/done", repoPath: "/tmp/done" }),
+        terminal({ key: "ask", attention: "needs-you", label: "Claude", title: "asking", cwd: "/tmp/ask", repoPath: "/tmp/ask" }),
+      ],
+    });
+    const done = plane.rows.find((row) => row.liveKey === "done");
+    expect(done?.attention).toEqual(["finished"]);
+    expect(plane.attention.needing).toBe(2);
+    expect(applyAgentFilter(plane.rows, "attention").map((row) => row.liveKey)).toEqual(["ask", "done"]);
+  });
+
   it("keeps a shell that is sitting in an agent checkout", () => {
     expect(terminalInScope({ label: "Shell", repoPath: "/repo", cwd: "/repo/.claude/worktrees/alpha" })).toBe(true);
     expect(terminalInScope({ label: "Shell", repoPath: "/repo", cwd: "/repo" })).toBe(false);

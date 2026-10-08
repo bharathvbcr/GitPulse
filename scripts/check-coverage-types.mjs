@@ -13,8 +13,8 @@
  *   (c) a shared field whose normalized wire type or backend-required
  *       presence no longer agrees.
  *
- * SCOPE: see CONTRACTS below for exactly what is checked — 79 contracts over
- * 207 structs, spanning both wire surfaces: command returns and event payloads.
+ * SCOPE: see CONTRACTS below for exactly what is checked — 80 contracts over
+ * 208 structs, spanning both wire surfaces: command returns and event payloads.
  * Enums are still skipped here and covered separately, by
  * scripts/enum-variant-contract.test.ts. That is most, not all, of the named types crossing the IPC
  * boundary: the ones still missing declare their TypeScript interface inside a
@@ -197,6 +197,9 @@ export const CONTRACTS = Object.freeze([
   // subsystem exists to avoid.
   { label: "session-alerts", rustPath: rust("commands", "mod.rs"), tsPath: ts("stores", "sessionAlertsStore.ts"), structs: ["SessionAlertsView"] },
   { label: "session-alert-status", rustPath: rust("alerts", "mod.rs"), tsPath: ts("stores", "sessionAlertsStore.ts"), structs: ["SessionAlertStatus"] },
+  // What an agent stood asking for while no page listened. A renamed field
+  // here would replay every waiting agent as asking nothing.
+  { label: "session-attention-standing", rustPath: rust("alerts", "mod.rs"), tsPath: ts("terminal", "sessionActivity.ts"), structs: ["StandingAttention"] },
   { label: "session-alert-settings", rustPath: rust("tool_config.rs"), tsPath: ts("stores", "sessionAlertsStore.ts"), structs: ["SessionAlertSettings"] },
   { label: "lappi", rustPath: rust("lappi", "mod.rs"), tsPath: ts("stores", "lappiStore.ts"), structs: ["LappiView"] },
   { label: "lappi-store", rustPath: rust("lappi", "record.rs"), tsPath: ts("stores", "lappiStore.ts"), structs: ["StoreStatus"] },

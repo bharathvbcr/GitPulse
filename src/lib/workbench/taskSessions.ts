@@ -16,7 +16,7 @@
 import { isAdoptedSession } from "../terminal/detachedSessions";
 import type { TerminalSessionRecord } from "../terminal/sessionRegistry";
 import type { AttemptNotice, TaskTerminalRequest } from "../terminal/taskLaunches";
-import type { SessionActivity } from "../terminal/sessionActivity";
+import { asksForReader as attentionAsks, type SessionActivity } from "../terminal/sessionActivity";
 import type { OpenRepoTab } from "../stores/repoStore";
 import { identityKey, pathSegments, type PathIdentityOptions } from "../repos/paths";
 import { runExpired, runHoldsCheckout } from "./taskHandoff";
@@ -207,9 +207,14 @@ export function attemptUrgency(
   return best;
 }
 
-/** Tones that put an attempt on the reader's plate. */
+/**
+ * Tones that put an attempt on the reader's plate: the agent's attention
+ * asks for the reader (`sessionActivity.asksForReader`, the rule the board
+ * and the tray count by) — a bell included, since it is how an agent with no
+ * hooks says it is blocked.
+ */
 export function asksForReader(tone: GlanceTone | null): boolean {
-  return tone === "needs-you" || tone === "error";
+  return (tone === "needs-you" || tone === "error" || tone === "signalled" || tone === "finished") && attentionAsks(tone);
 }
 
 // ---- One attempt, as every surface sees it --------------------------------

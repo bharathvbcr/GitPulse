@@ -437,25 +437,103 @@ fn handle(mut stream: std::os::unix::net::UnixStream) {
     let _ = stream.flush();
 }
 
+/// What an event asks of the user. The renderer's `ATTENTION_EVENTS` maps each
+/// one to its own kind, and `sessionActivity.test.ts` reads this table to fail
+/// if the two ever disagree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Need {
+    /// The agent is blocked on the user: a permission, a question, input.
+    Ask,
+    /// The agent stopped because something failed.
+    Error,
+    /// The agent finished and is waiting to be read.
+    Finished,
+    /// Whatever the session was asking for has been answered.
+    Clear,
+}
+
+/// What GitPulse does with an event.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Role {
+    /// The host chose to notify: a banner, subject to policy, and a state.
+    Banner,
+    /// A state the board shows at once, never a banner by itself. The host
+    /// decides when a moment is worth interrupting someone for, and these
+    /// events fire before (or instead of) that decision.
+    State,
+    /// Ends whatever stands, if it is what this event answers.
+    Resolve,
+}
+
+/// One event an agent hook may report.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Event {
+    /// Spelled as the plugin manifest passes it.
+    pub name: &'static str,
+    /// How GitPulse words it.
+    pub phrase: &'static str,
+    pub need: Need,
+    pub role: Role,
+}
+
 /// Events an agent hook may report, and how GitPulse words each one.
 ///
 /// A closed vocabulary rather than free text: the reason is GitPulse's
 /// sentence, and a peer that could choose it could write a banner that looks
 /// like it came from somewhere else.
-/// The first five are Claude Code's `Notification` matchers, spelled exactly as
-/// the host spells them, because the plugin manifest routes one hook entry per
-/// matcher and `hooks::tests` fails if the two lists stop matching. `error` is
-/// `StopFailure`, which has its own matchers for *why* the API call failed and
-/// is registered without one: a turn that ended on an error is worth the same
-/// single sentence whichever error it was.
-pub const EVENTS: &[(&str, &str)] = &[
-    ("permission_prompt", "needs your permission"),
-    ("idle_prompt", "is waiting for you"),
-    ("agent_needs_input", "needs your input"),
-    ("agent_completed", "finished its work"),
-    ("elicitation_dialog", "is asking a question"),
-    ("error", "stopped on an error"),
+///
+/// The banner events are Claude Code's `Notification` matchers, spelled exactly
+/// as the host spells them, because the plugin manifest routes one hook entry
+/// per matcher and `hooks::tests` fails if the two lists stop matching. `error`
+/// is `StopFailure`, which has its own matchers for *why* the API call failed
+/// and is registered without one: a turn that ended on an error is worth the
+/// same single sentence whichever error it was.
+///
+/// The rest come from lifecycle hooks and exist because a `Notification` says
+/// when to interrupt, not what the session is doing. `permission_prompt` fires
+/// about six seconds after the dialog appears; `PermissionRequest` fires as it
+/// appears and names the tool. And nothing in `Notification` ever says the
+/// question was answered — without `UserPromptSubmit`, `PostToolUse` and
+/// `SessionEnd`, an agent approved from anywhere but its own GitPulse tab kept
+/// "needs your permission" until someone typed into that tab.
+pub const EVENTS: &[Event] = &[
+    Event { name: "permission_prompt", phrase: "needs your permission", need: Need::Ask, role: Role::Banner },
+    Event { name: "idle_prompt", phrase: "is waiting for you", need: Need::Ask, role: Role::Banner },
+    Event { name: "agent_needs_input", phrase: "needs your input", need: Need::Ask, role: Role::Banner },
+    Event { name: "agent_completed", phrase: "finished its work", need: Need::Finished, role: Role::Banner },
+    Event { name: "elicitation_dialog", phrase: "is asking a question", need: Need::Ask, role: Role::Banner },
+    Event { name: "elicitation_url_dialog", phrase: "is asking you to open a link", need: Need::Ask, role: Role::Banner },
+    Event { name: "error", phrase: "stopped on an error", need: Need::Error, role: Role::Banner },
+    // `PermissionRequest`. Also fires when another hook is about to approve
+    // the call itself, which is why it is never a banner: the `Notification`
+    // that follows six seconds later, only if the dialog is still up, is.
+    Event { name: "permission_request", phrase: "needs your permission", need: Need::Ask, role: Role::State },
+    // `Stop`: the turn ended. `idle_prompt` follows a minute later if nobody
+    // answers, and that one may interrupt.
+    Event { name: "turn_finished", phrase: "finished its turn", need: Need::Finished, role: Role::State },
+    // `UserPromptSubmit`: the user answered, from wherever they answered.
+    Event { name: "prompt_submitted", phrase: "is working again", need: Need::Clear, role: Role::Resolve },
+    // `PostToolUse` / `PostToolUseFailure`: a tool ran, so the call it names
+    // is no longer waiting for approval.
+    Event { name: "tool_finished", phrase: "is working again", need: Need::Clear, role: Role::Resolve },
+    // `SessionEnd`, or the PTY's process exiting: nobody can answer a
+    // question from a session that is gone.
+    Event { name: "session_ended", phrase: "ended its session", need: Need::Clear, role: Role::Resolve },
 ];
+
+/// The event named `name`, if it is one.
+pub fn event(name: &str) -> Option<&'static Event> {
+    EVENTS.iter().find(|event| event.name == name)
+}
+
+/// The longest tool-call fingerprint a report may carry.
+pub const MAX_SUBJECT_CHARS: usize = 32;
+
+fn valid_subject(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= MAX_SUBJECT_CHARS
+        && value.bytes().all(|b| b.is_ascii_hexdigit())
+}
 
 /// Agent identities a report may claim, and their display names.
 pub const AGENTS: &[(&str, &str)] = &[
@@ -467,7 +545,7 @@ pub const AGENTS: &[(&str, &str)] = &[
     ("cursor", "Cursor"),
 ];
 
-fn valid_key(value: &str) -> bool {
+pub(crate) fn valid_key(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= 96
         && value
@@ -493,18 +571,38 @@ pub fn parse_report(bytes: &[u8]) -> Result<Notice, &'static str> {
     }
     let text = |key: &str| -> Option<&str> { object.get(key).and_then(serde_json::Value::as_str) };
 
-    let event = text("event").ok_or("no event")?;
-    let reason = EVENTS
-        .iter()
-        .find(|(name, _)| *name == event)
-        .map(|(_, phrase)| *phrase)
-        .ok_or("unknown event")?;
+    let event = event(text("event").ok_or("no event")?).ok_or("unknown event")?;
+    // Which tool call a permission or a tool result is about, as a digest the
+    // hook computed. Optional; a malformed one is refused rather than dropped,
+    // because a report that cannot be matched to its request would clear the
+    // wrong one or none.
+    let subject = match object.get("subject") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(value) => Some(
+            value
+                .as_str()
+                .filter(|s| valid_subject(s))
+                .ok_or("malformed subject")?
+                .to_owned(),
+        ),
+    };
+    let subagent = match object.get("subagent") {
+        None | Some(serde_json::Value::Null) => false,
+        Some(value) => value.as_bool().ok_or("malformed subagent")?,
+    };
     let agent = text("agent").unwrap_or("claude");
     let label = AGENTS
         .iter()
         .find(|(name, _)| *name == agent)
         .map(|(_, display)| *display)
         .ok_or("unknown agent")?;
+    // A state or a resolution is about a session GitPulse can show. With no
+    // GitPulse session there is nothing for it to change, and accepting it
+    // would only spend the rate limit.
+    let session_named = text("session").is_some_and(valid_key);
+    if event.role != Role::Banner && !session_named {
+        return Err("state report outside a session");
+    }
 
     // The GitPulse PTY this hook is running under, when it is running under
     // one. Keying to it is what lets "you are looking at this tab" suppress
@@ -546,11 +644,13 @@ pub fn parse_report(bytes: &[u8]) -> Result<Notice, &'static str> {
         origin: Origin::Hook,
         label: label.to_owned(),
         place,
-        reason: Some(reason.to_owned()),
+        event: Some(event.name),
         detail,
         // A hook only exists because an agent installed it.
         is_agent: true,
         channel: "hook",
+        subject,
+        subagent,
     })
 }
 
@@ -570,7 +670,7 @@ mod tests {
         assert_eq!(notice.key, "term-9-1a");
         assert_eq!(notice.label, "Claude Code");
         assert_eq!(notice.place.as_deref(), Some("GitPulse"));
-        assert_eq!(notice.reason.as_deref(), Some("needs your permission"));
+        assert_eq!(notice.reason(), Some("needs your permission"));
         assert_eq!(notice.detail.as_deref(), Some("Bash(rm -rf)"));
         assert!(notice.is_agent);
     }
@@ -586,7 +686,7 @@ mod tests {
         let notice = report(r#"{"v":1,"event":"error","message":"Sign in at evil.example"}"#)
             .expect("valid report");
         assert_eq!(notice.label, "Claude Code");
-        assert_eq!(notice.reason.as_deref(), Some("stopped on an error"));
+        assert_eq!(notice.reason(), Some("stopped on an error"));
     }
 
     #[test]
@@ -860,12 +960,74 @@ mod tests {
 
     #[test]
     fn the_event_and_agent_vocabularies_have_no_duplicates() {
-        for (list, what) in [(EVENTS, "event"), (AGENTS, "agent")] {
-            let mut names: Vec<&str> = list.iter().map(|(name, _)| *name).collect();
+        for (mut names, what) in [
+            (EVENTS.iter().map(|e| e.name).collect::<Vec<_>>(), "event"),
+            (AGENTS.iter().map(|(name, _)| *name).collect(), "agent"),
+        ] {
             names.sort_unstable();
             let before = names.len();
             names.dedup();
             assert_eq!(names.len(), before, "duplicate {what}");
+        }
+    }
+
+    #[test]
+    fn every_event_is_a_clear_exactly_when_it_resolves() {
+        // A resolving event that asked for something, or a banner that said
+        // "answered", would contradict itself on the board.
+        for event in EVENTS {
+            assert_eq!(
+                event.need == Need::Clear,
+                event.role == Role::Resolve,
+                "{}",
+                event.name
+            );
+        }
+    }
+
+    #[test]
+    fn a_report_names_the_tool_call_it_is_about() {
+        let notice = report(
+            r#"{"v":1,"event":"permission_request","session":"term-1","message":"Bash: cargo test","subject":"00ff00ff00ff00ff","subagent":true}"#,
+        )
+        .unwrap();
+        assert_eq!(notice.event, Some("permission_request"));
+        assert_eq!(notice.subject.as_deref(), Some("00ff00ff00ff00ff"));
+        assert!(notice.subagent);
+        let plain = report(r#"{"v":1,"event":"tool_finished","session":"term-1"}"#).unwrap();
+        assert_eq!(plain.subject, None);
+        assert!(!plain.subagent);
+    }
+
+    #[test]
+    fn a_subject_or_scope_that_is_not_one_is_refused() {
+        for json in [
+            r#"{"v":1,"event":"tool_finished","session":"term-1","subject":"../etc"}"#,
+            r#"{"v":1,"event":"tool_finished","session":"term-1","subject":""}"#,
+            r#"{"v":1,"event":"tool_finished","session":"term-1","subject":7}"#,
+            r#"{"v":1,"event":"tool_finished","session":"term-1","subject":"0123456789abcdef0123456789abcdef0"}"#,
+            r#"{"v":1,"event":"tool_finished","session":"term-1","subagent":"yes"}"#,
+        ] {
+            assert!(report(json).is_err(), "accepted {json}");
+        }
+    }
+
+    #[test]
+    fn a_state_or_resolution_outside_a_session_is_refused() {
+        // A banner from a Claude Code outside GitPulse is still worth showing;
+        // a state about no session would only spend the rate limit.
+        for event in EVENTS.iter().filter(|e| e.role != Role::Banner) {
+            for session in ["", r#","session":"../x""#] {
+                let json = format!(r#"{{"v":1,"event":"{}"{session}}}"#, event.name);
+                assert_eq!(
+                    report(&json),
+                    Err("state report outside a session"),
+                    "{json}"
+                );
+            }
+        }
+        for event in EVENTS.iter().filter(|e| e.role == Role::Banner) {
+            assert!(report(&format!(r#"{{"v":1,"event":"{}"}}"#, event.name)).is_ok());
         }
     }
 }

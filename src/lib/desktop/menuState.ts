@@ -5,7 +5,8 @@ import { REGISTERED_VIEWS, resolveSection } from "../views/viewRegistry";
 import { actionLabel, blocksOtherMutations, headline } from "../repos/operation";
 import type { NativeEvent } from "./nativeActions";
 import { hasUnstagedChanges } from "../files/fileStatus";
-import { byteLength, MENU_LIMITS, MENU_WATCH_STATUSES } from "./menuContract";
+import { asksForReader, type SessionActivity } from "../terminal/sessionActivity";
+import { byteLength, clampCount, MENU_LIMITS, MENU_WATCH_STATUSES } from "./menuContract";
 import {
   identityKey,
   isCaseInsensitiveFs,
@@ -82,6 +83,12 @@ export interface MenuState {
   trayDetails: string[];
   traySummary: MenuLabel;
   trayDetail: string;
+  /**
+   * Terminal sessions whose agent is waiting on the reader, by the shared
+   * `asksForReader` rule. The tray marks its glyph and names the count, because
+   * it is the one GitPulse surface still on screen while the window is not.
+   */
+  agentsWaiting: number;
   status: StatusCard;
 }
 
@@ -119,6 +126,21 @@ function switcherPath(raw: string): string | null {
 function switcherCount(value: number): number | null {
   if (!Number.isFinite(value)) return null;
   return Math.min(Math.max(Math.trunc(value), 0), MENU_LIMITS.count);
+}
+
+/**
+ * How many sessions have an agent waiting on the reader.
+ *
+ * The rule is `asksForReader`, the one the task pane and the board chip count
+ * by, so the tray cannot say an agent needs you while the pane says it does
+ * not. A session that finished is worth showing but not worth chasing, and one
+ * that has asked nothing is not counted at all. Unbounded here: the ceiling is
+ * the payload's, and `buildMenuState` applies it.
+ */
+export function countAgentsWaiting(activity: ReadonlyMap<string, SessionActivity>): number {
+  let waiting = 0;
+  for (const session of activity.values()) if (asksForReader(session.attention?.kind)) waiting += 1;
+  return waiting;
 }
 
 /**
@@ -162,6 +184,11 @@ export function buildMenuState(
   // testing only whichever host they happen to run on — the divergence this
   // guards against never reproduced on the Linux and macOS machines CI uses.
   options: PathIdentityOptions = { caseInsensitive: isCaseInsensitiveFs() },
+  // Last, and defaulted, so every caller that predates it keeps its meaning:
+  // nobody waiting. Bounded here because serde refuses a negative or fractional
+  // `u32` outright and state.rs refuses one past its ceiling, and either
+  // refusal freezes the menu bar, the tray and the popover together.
+  agentsWaiting = 0,
 ): MenuState {
   const enabled = new Set(GLOBAL_ACTIONS);
   const checked = new Set([`theme-${theme}`]);
@@ -379,6 +406,7 @@ export function buildMenuState(
       repo.watch.status === "degraded" ? "Not live" : "", elsewhere ? `${elsewhere} running elsewhere` : ""].filter(Boolean).join(" · "), 72) },
     trayDetail: hasRepo ? [menuText(activeRepo?.label ?? repo.currentPath?.split(/[\\/]/).pop() ?? "Repository", 32),
       menuText(branch, 36)].join(" · ") : "GitPulse",
+    agentsWaiting: clampCount(agentsWaiting, MENU_LIMITS.agentsWaiting) ?? 0,
   };
 }
 

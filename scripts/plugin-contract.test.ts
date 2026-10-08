@@ -107,14 +107,43 @@ describe("plugin hooks", () => {
     // An event named here that the binary has no subcommand for spawns a
     // process per matching tool call to do nothing. Spelled out rather than
     // derived so adding an event is a deliberate act: each one costs the user
-    // a process, and `Notification` and `StopFailure` are the two that report
-    // rather than decide.
+    // a process. Everything but `PreToolUse` and `SessionStart` reports rather
+    // than decides.
     expect(Object.keys(hooks.hooks).sort()).toEqual([
       "Notification",
+      "PermissionRequest",
+      "PostToolUse",
+      "PostToolUseFailure",
       "PreToolUse",
+      "SessionEnd",
       "SessionStart",
+      "Stop",
       "StopFailure",
+      "UserPromptSubmit",
     ]);
+  });
+
+  it("never makes the agent wait on a report it could have sent in the background", () => {
+    // `PostToolUse` runs after every tool call and `UserPromptSubmit` before
+    // every prompt; a report holding either would tax every turn for a side
+    // effect. Async hooks cannot decide anything — which a report never does.
+    // `Notification` is already off the agent's path, and `SessionEnd` runs at
+    // teardown, where a background hook may be killed before it reports.
+    const mustBeAsync = new Set(["PermissionRequest", "PostToolUse", "PostToolUseFailure", "Stop", "UserPromptSubmit"]);
+    for (const [event, groups] of Object.entries(hooks.hooks)) {
+      for (const group of groups) {
+        for (const handler of group.hooks) {
+          const reports = String(handler.command).split(/\s+/)[1] === "notify";
+          if (mustBeAsync.has(event)) expect(handler.async, `${event} blocks the agent on a report`).toBe(true);
+          // A deciding hook that ran in the background would decide nothing.
+          if (!reports) expect(handler.async, `${event} decides in the background`).toBeUndefined();
+        }
+      }
+    }
+    // A matcher on these would silently skip calls; each must see every one.
+    for (const event of ["PermissionRequest", "PostToolUse", "PostToolUseFailure"]) {
+      for (const group of hooks.hooks[event]) expect(group.matcher, event).toBeUndefined();
+    }
   });
 
   it("spawns a bounded command for every entry", () => {

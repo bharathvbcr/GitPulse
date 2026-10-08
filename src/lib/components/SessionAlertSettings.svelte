@@ -68,6 +68,7 @@
     { label: "quiet hours", count: view.status.suppressed_quiet },
     { label: "the rate limit", count: view.status.rate_limited },
     { label: "another notice replaced it", count: view.status.coalesced },
+    { label: "it was answered before it was due", count: view.status.resolved },
   ]);
   const suppressedTotal = $derived(suppressed.reduce((sum, row) => sum + row.count, 0));
   /**
@@ -218,6 +219,9 @@
         {/if}
         {#if view.status.bridge_rejected > 0}
           <p>{view.status.bridge_rejected} hook reports were refused as malformed or not yours.</p>
+        {/if}
+        {#if view.status.deferred > 0}
+          <p>{view.status.deferred} notifications were delayed by the rate limit and sent when it allowed.</p>
         {/if}
       {/if}
       {#if view.status.last_error}<p role="alert">{view.status.last_error}</p>{/if}

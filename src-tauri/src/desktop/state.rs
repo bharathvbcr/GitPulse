@@ -3,6 +3,14 @@ use super::actions::{self, NativeAction};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 
+/// The most agents the tray will report as waiting on the reader.
+///
+/// Far above the terminal sessions that can be open at once, so it never
+/// truncates a real count; a figure past it is a defect upstream, refused like
+/// any other out-of-range field. `menuContract.ts` mirrors it as
+/// `MENU_LIMITS.agentsWaiting`, and the renderer clamps to it before sending.
+pub const MAX_AGENTS_WAITING: u32 = 999;
+
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 pub struct MenuLabel {
     pub id: String,
@@ -89,6 +97,12 @@ pub struct MenuState {
     pub tray_details: Vec<String>,
     pub tray_summary: MenuLabel,
     pub tray_detail: String,
+    /// Terminal sessions whose agent is waiting on the reader (`asksForReader`
+    /// in `sessionActivity.ts`). Defaulted because a renderer built before the
+    /// field existed omits it, and a payload serde refuses applies nothing:
+    /// absent means nobody is waiting, not a frozen menu.
+    #[serde(default)]
+    pub agents_waiting: u32,
     pub status: StatusCard,
 }
 
@@ -133,6 +147,7 @@ impl Default for MenuState {
                 text: "Open a repository…".into(),
             },
             tray_detail: String::new(),
+            agents_waiting: 0,
             status: StatusCard::default(),
         }
     }
@@ -279,6 +294,9 @@ impl MenuState {
         {
             return Err("Native menu text exceeds its limit".into());
         }
+        if self.agents_waiting > MAX_AGENTS_WAITING {
+            return Err("Native menu agent count exceeds its limit".into());
+        }
         Ok(())
     }
 }
@@ -366,5 +384,37 @@ mod tests {
         state.status.stashes = Some(2);
         state.status.elsewhere = 1;
         state.validate().unwrap();
+    }
+
+    #[test]
+    fn agents_waiting_crosses_ipc_in_camel_case_and_defaults_when_absent() {
+        let mut state = MenuState::default();
+        assert_eq!(state.agents_waiting, 0);
+        state.agents_waiting = 2;
+        let mut wire = serde_json::to_value(&state).unwrap();
+        assert_eq!(wire["agentsWaiting"], 2);
+        // A renderer from before the field existed sends no such key. That
+        // payload must still parse, as nobody waiting, rather than be refused
+        // and leave every native surface frozen on its last accepted state.
+        wire.as_object_mut().unwrap().remove("agentsWaiting");
+        let older: MenuState = serde_json::from_value(wire).unwrap();
+        assert_eq!(older.agents_waiting, 0);
+        older.validate().unwrap();
+    }
+
+    #[test]
+    fn agents_waiting_is_bounded() {
+        let mut state = MenuState::default();
+        state.agents_waiting = MAX_AGENTS_WAITING;
+        state.validate().unwrap();
+        state.agents_waiting = MAX_AGENTS_WAITING + 1;
+        assert_eq!(
+            state.validate(),
+            Err("Native menu agent count exceeds its limit".into())
+        );
+        let negative = serde_json::json!({ "agentsWaiting": -1 });
+        let mut wire = serde_json::to_value(MenuState::default()).unwrap();
+        wire["agentsWaiting"] = negative["agentsWaiting"].clone();
+        assert!(serde_json::from_value::<MenuState>(wire).is_err());
     }
 }

@@ -20,7 +20,8 @@
   import { adoptDetachedSessions } from "../terminal/detachedSessions";
   import { repoStore } from "../stores/repoStore";
   import { focusTerminalSession } from "../terminal/sessionFocus";
-  import { bindAttention } from "../terminal/sessionActivity";
+  import { bindAttention, sessionActivity } from "../terminal/sessionActivity";
+  import { standingAttention } from "../stores/sessionAlertsStore";
   import { LAYERS } from "../ui/layers";
 
   let missed = $state<string | null>(null);
@@ -71,8 +72,10 @@
       .catch(() => {
         missed = "Session notification clicks cannot be delivered. Open the terminal directly.";
       });
-    // What each agent last asked for, for a task's Agents pane.
-    void bindAttention(listen)
+    // What each agent last asked for, for a task's Agents pane — and, once
+    // listening, what stood while this page was not (start-up, a reload).
+    void bindAttention(listen, sessionActivity, standingAttention, (error: unknown) =>
+      say(`Agents that asked for you before the window loaded cannot be shown: ${String(error)}`, 15000))
       .then((unlisten) => listeners.track(unlisten))
       .catch((error: unknown) => say(`Agents asking for you cannot be shown in their task: ${String(error)}`, 15000));
     return () => {

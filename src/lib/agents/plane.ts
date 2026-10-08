@@ -68,6 +68,7 @@ export const ATTENTION_REASONS = [
   "disconnected",
   "unstarted",
   "signalled",
+  "finished",
   "unscanned",
   "unprobed",
   "unmeasured",
@@ -88,6 +89,7 @@ const FILTER_ATTENTION = new Set<AttentionReason>([
   "disconnected",
   "unstarted",
   "signalled",
+  "finished",
   "unscanned",
   "unprobed",
   "unmeasured",
@@ -102,6 +104,7 @@ const REASON_LABEL: Record<AttentionReason, string> = {
   disconnected: "Running, not shown in this window",
   unstarted: "Prepared, not started",
   signalled: "Asked for attention",
+  finished: "Finished, waiting for you",
   unscanned: "Collisions not fully read",
   unprobed: "Parked operation not read",
   unmeasured: "Changes not read",
@@ -451,6 +454,8 @@ function terminalReasons(terminal: PlaneTerminal): AttentionReason[] {
   if (terminal.attention === "needs-you") return ["needs-you"];
   if (terminal.attention === "error") return ["error"];
   if (terminal.attention === "signalled") return ["signalled"];
+  // A live agent that finished is waiting for its next instruction.
+  if (terminal.attention === "finished") return ["finished"];
   return [];
 }
 
@@ -461,6 +466,7 @@ function taskReasons(task: PlaneTask): AttentionReason[] {
   // That fact is `disconnected`. Calling it an error says the attempt stopped.
   if (task.tone === "error" || (task.tone === "problem" && !task.disconnected)) reasons.push("error");
   if (task.tone === "signalled") reasons.push("signalled");
+  if (task.tone === "finished") reasons.push("finished");
   // A capped page that reported no rows still has requests behind it.
   // `pendingCount === 0` is then a floor, not an empty queue.
   if (task.pendingCount > 0 || task.pendingMore) reasons.push("pending");
@@ -472,7 +478,9 @@ function taskReasons(task: PlaneTask): AttentionReason[] {
 function keepTerminal(terminal: PlaneTerminal): boolean {
   if (!terminal.key) return false;
   if (LIVE_STATUS.has(terminal.status)) return true;
-  return terminalReasons(terminal).length > 0;
+  // An exited process that finished has said its last word and is waiting
+  // for nothing; one that still asks, or failed, has something to say.
+  return terminalReasons(terminal).some((reason) => reason !== "finished");
 }
 
 function attach(draft: Draft, terminal: PlaneTerminal): void {

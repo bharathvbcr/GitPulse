@@ -4,7 +4,8 @@ import { interfaceStore } from "../stores/interfaceStore";
 import { themeStore } from "../stores/themeStore";
 import { updateCheckInFlight } from "../updates/updateCheck";
 import { diagnostics } from "../diagnostics/diagnostics";
-import { buildMenuState } from "./menuState";
+import { sessionActivity } from "../terminal/sessionActivity";
+import { buildMenuState, countAgentsWaiting } from "./menuState";
 import { sendableMenuState } from "./menuContract";
 
 /** Dialog/read activity before a Git command starts; the store owns actual mutations. */
@@ -21,9 +22,13 @@ export const menuActivity = writable<Record<string, string[]>>({});
 const reported = new Set<string>();
 
 export const nativeMenuState = derived(
-  [repoStore, interfaceStore, themeStore.preferenceState, repoStore.mutationActivity, menuActivity, updateCheckInFlight],
-  ([repo, prefs, theme, activity, pending, checking]) => {
-    const built = buildMenuState(repo, prefs, theme, { ...pending, ...activity }, checking, activity);
+  [repoStore, interfaceStore, themeStore.preferenceState, repoStore.mutationActivity, menuActivity, updateCheckInFlight,
+    sessionActivity],
+  ([repo, prefs, theme, activity, pending, checking, sessions]) => {
+    // `undefined` keeps the platform's own path identity; the agent count is
+    // the only argument this projection adds to the builder's defaults.
+    const built = buildMenuState(repo, prefs, theme, { ...pending, ...activity }, checking, activity, undefined,
+      countAgentsWaiting(sessions));
     // The last thing before the IPC boundary. `buildMenuState` is held to
     // producing only sendable payloads, and this is what keeps a lapse in that
     // from costing the menu bar, the tray and the popover at once: the native

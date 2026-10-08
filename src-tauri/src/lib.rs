@@ -472,6 +472,8 @@ pub fn run() {
             cmd_session_alerts,
             cmd_session_alerts_save,
             cmd_session_alerts_visible,
+            cmd_session_attention_standing,
+            cmd_session_attention_answered,
             cmd_lappi_settings,
             cmd_lappi_settings_save,
             cmd_tool_ladder,

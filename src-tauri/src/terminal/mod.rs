@@ -495,15 +495,35 @@ impl SessionWatcher {
                 // A terminal signal carries no reason of its own; only the
                 // hook bridge knows why. Saying "needs your attention" here
                 // would be inventing one.
-                reason: None,
+                event: None,
                 detail: signal.title.or(signal.body),
                 is_agent: self.is_agent,
                 channel: signal.channel.label(),
+                subject: None,
+                subagent: false,
             });
         }
         let dropped = self.scanner.dropped();
         crate::alerts::record_scan_drops(dropped.saturating_sub(self.reported_drops));
         self.reported_drops = dropped;
+    }
+
+    /// The session's output has ended. Whatever it was asking can no longer
+    /// be answered, whether or not its agent's own `SessionEnd` hook ran — a
+    /// killed process runs no hooks.
+    fn ended(&self) {
+        crate::alerts::offer(crate::alerts::Notice {
+            key: self.key.clone(),
+            origin: crate::alerts::Origin::Terminal,
+            label: self.label.clone(),
+            place: self.place.clone(),
+            event: Some("session_ended"),
+            detail: None,
+            is_agent: self.is_agent,
+            channel: "exit",
+            subject: None,
+            subagent: false,
+        });
     }
 }
 
@@ -1350,6 +1370,7 @@ fn spawn_session_inner<R: tauri::Runtime>(
 
             dead_flag.store(true, Ordering::SeqCst);
             output_flow.stop();
+            watcher.ended();
 
             // Reap the shell and report its real exit status.
             finalize_pty_session(

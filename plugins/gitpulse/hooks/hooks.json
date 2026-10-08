@@ -22,6 +22,77 @@
         ]
       }
     ],
+    "PermissionRequest": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "gitpulse-hook notify permission_request",
+            "timeout": 5,
+            "async": true
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "gitpulse-hook notify tool_finished",
+            "timeout": 5,
+            "async": true
+          }
+        ]
+      }
+    ],
+    "PostToolUseFailure": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "gitpulse-hook notify tool_finished",
+            "timeout": 5,
+            "async": true
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "gitpulse-hook notify prompt_submitted",
+            "timeout": 5,
+            "async": true
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "gitpulse-hook notify turn_finished",
+            "timeout": 5,
+            "async": true
+          }
+        ]
+      }
+    ],
+    "StopFailure": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "gitpulse-hook notify error",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
     "SessionStart": [
       {
         "hooks": [
@@ -29,6 +100,17 @@
             "type": "command",
             "command": "gitpulse-hook session-brief",
             "timeout": 10
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "gitpulse-hook notify session_ended",
+            "timeout": 5
           }
         ]
       }
@@ -83,14 +165,13 @@
             "timeout": 5
           }
         ]
-      }
-    ],
-    "StopFailure": [
+      },
       {
+        "matcher": "elicitation_url_dialog",
         "hooks": [
           {
             "type": "command",
-            "command": "gitpulse-hook notify error",
+            "command": "gitpulse-hook notify elicitation_url_dialog",
             "timeout": 5
           }
         ]

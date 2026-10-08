@@ -2,7 +2,9 @@ import { describe, expect, it } from "vitest";
 import { get } from "svelte/store";
 import { createRepoStore, type RepoState } from "../stores/repoStore";
 import { interfaceStore } from "../stores/interfaceStore";
-import { buildMenuState, menuActionEnabled, statusDetailRows, statusInsights, statusKeepsPopover, statusKeyAction, statusShortcuts } from "./menuState";
+import { buildMenuState, countAgentsWaiting, menuActionEnabled, statusDetailRows, statusInsights, statusKeepsPopover, statusKeyAction, statusShortcuts } from "./menuState";
+import { MENU_LIMITS } from "./menuContract";
+import type { AttentionKind, SessionActivity } from "../terminal/sessionActivity";
 
 const empty = () => get(createRepoStore({ storage: null }));
 const prefs = () => get(interfaceStore);
@@ -187,4 +189,57 @@ describe("native menu projection", () => {
 it("keeps stage-all available for the remaining edits of a partially staged file", () => {
   const state = model({ ...loaded(), statuses: [{ path: "mixed", status_code: "MM", is_staged: true, is_conflicted: false, additions: 3, deletions: 2 }] });
   expect(menuActionEnabled(state, "stage-all")).toBe(true);
+});
+
+/**
+ * The tray is the one surface that is on screen while GitPulse is not, so it is
+ * where an agent blocked on the reader has to show. The count is the shared
+ * `asksForReader` rule applied to every tracked session — not a second rule.
+ */
+describe("agents waiting on the reader", () => {
+  const session = (kind: AttentionKind | null): SessionActivity => ({
+    lastOutputAt: 1,
+    title: "claude",
+    attention: kind === null ? null : { kind, label: kind, detail: null, at: 1 },
+  });
+  const waiting = (count: number) =>
+    buildMenuState(empty(), prefs(), "system", {}, false, undefined, undefined, count).agentsWaiting;
+
+  it("counts the sessions that ask for the reader, and not the ones that finished or ask nothing", () => {
+    const activity = new Map<string, SessionActivity>([
+      ["needs", session("needs-you")],
+      ["done", session("finished")],
+      ["quiet", session(null)],
+      ["broke", session("error")],
+      ["bell", session("signalled")],
+      ["also-done", session("finished")],
+    ]);
+    expect(countAgentsWaiting(activity)).toBe(3);
+    expect(countAgentsWaiting(new Map())).toBe(0);
+    expect(countAgentsWaiting(new Map([["done", session("finished")], ["quiet", session(null)]]))).toBe(0);
+  });
+
+  it("emits zero when nobody is waiting, so an older caller's payload is unchanged", () => {
+    expect(model().agentsWaiting).toBe(0);
+    expect(model(loaded()).agentsWaiting).toBe(0);
+  });
+
+  it("carries the count without moving anything the repository decides", () => {
+    const repo = loaded();
+    const plain = buildMenuState(repo, prefs(), "system", {}, false);
+    const asked = buildMenuState(repo, prefs(), "system", {}, false, undefined, undefined, 2);
+    expect(asked.agentsWaiting).toBe(2);
+    expect({ ...asked, agentsWaiting: 0 }).toEqual(plain);
+  });
+
+  it("bounds the count to a non-negative integer under the ceiling", () => {
+    expect(waiting(1)).toBe(1);
+    expect(waiting(MENU_LIMITS.agentsWaiting)).toBe(MENU_LIMITS.agentsWaiting);
+    expect(waiting(MENU_LIMITS.agentsWaiting + 1)).toBe(MENU_LIMITS.agentsWaiting);
+    expect(waiting(1e12)).toBe(MENU_LIMITS.agentsWaiting);
+    expect(waiting(-4)).toBe(0);
+    expect(waiting(2.9)).toBe(2);
+    expect(waiting(Number.NaN)).toBe(0);
+    expect(waiting(Number.POSITIVE_INFINITY)).toBe(0);
+  });
 });

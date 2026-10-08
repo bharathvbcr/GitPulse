@@ -1,0 +1,70 @@
+#!/usr/bin/env bash
+#
+# Refuse a commit whose author or committer is a test fixture.
+#
+# Fixture suites commit in throwaway repositories as contract@gitpulse.test,
+# gitpulse@test.local, and other reserved addresses. Those are not people.
+# Writing one into this checkout's local user.name or user.email makes every
+# later commit look like the fixture. `git var` is the identity this commit
+# would record, including an amend that keeps the previous author.
+#
+# Keep the domain rules in lockstep with is_fixture_author_email in
+# src-tauri/src/engine/git_writer.rs. The contract test runs this file.
+#
+# Installed with:  git config core.hooksPath .githooks
+# Bypassed with:   git commit --no-verify
+
+set -euo pipefail
+
+ident_email() {
+  local ident=$1 kind=$2
+  local email
+  email=$(printf '%s\n' "$ident" | sed -n 's/.*<\([^<>]*\)>.*/\1/p' | tr '[:upper:]' '[:lower:]')
+  if [ -z "$email" ]; then
+    echo "pre-commit: could not read the $kind email from: $ident" >&2
+    exit 1
+  fi
+  printf '%s' "$email"
+}
+
+is_fixture_email() {
+  local email=$1
+  local domain=${email##*@}
+  local local=${email%@*}
+  if [ -z "$local" ] || [ -z "$domain" ] || [ "$local" = "$email" ]; then
+    return 0
+  fi
+  case "$domain" in
+    test | *.test | invalid | *.invalid | example | *.example | example.com | example.org | example.net)
+      return 0
+      ;;
+  esac
+  case "$email" in
+    gitpulse@test.local | test@gitpulse.local | t@t | t@e.com | test@test.com)
+      return 0
+      ;;
+  esac
+  return 1
+}
+
+refuse_if_fixture() {
+  local kind=$1 ident=$2
+  local email
+  email=$(ident_email "$ident" "$kind")
+  if is_fixture_email "$email"; then
+    echo "pre-commit: refusing to record the $kind as <$email>." >&2
+    echo "That address is a test fixture. This checkout's git identity was overwritten with it," >&2
+    echo "so the commit would be attributed to the fixture instead of you." >&2
+    echo "Unset the local override:" >&2
+    echo "  git config --local --unset-all user.name" >&2
+    echo "  git config --local --unset-all user.email" >&2
+    echo "If GIT_AUTHOR_* or GIT_COMMITTER_* is set in the environment, unset that too." >&2
+    echo "Bypass for a deliberate exception: git commit --no-verify" >&2
+    exit 1
+  fi
+}
+
+author=$(git var GIT_AUTHOR_IDENT)
+committer=$(git var GIT_COMMITTER_IDENT)
+refuse_if_fixture author "$author"
+refuse_if_fixture committer "$committer"

@@ -123,7 +123,7 @@ flowchart TB
     end
 
     subgraph IPC["Tauri 2 IPC Seam"]
-        Bridge["invoke('cmd_*') — 254 Handlers<br/>Zero-Drift Pre-Commit & CI Contracts"]
+        Bridge["invoke('cmd_*') — 256 Handlers<br/>Zero-Drift Pre-Commit & CI Contracts"]
     end
 
     subgraph Backend["Rust Backend (Tauri 2 / Rayon)"]

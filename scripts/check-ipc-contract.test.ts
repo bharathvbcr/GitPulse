@@ -293,9 +293,10 @@ describe("annotated but unregistered commands", () => {
     ]);
     // Cross-checked three ways against the real crate: the generate_handler!
     // list, a raw attribute count, and this scanner all report the same total.
-    // 254 since cmd_search_content arrived; `bun run check:ipc` prints all three
-    // numbers, so a bump made without re-running it will not agree.
-    expect(found.size).toBe(254);
+    // 256 since cmd_session_attention_standing and cmd_session_attention_answered
+    // arrived; `bun run check:ipc` prints all three numbers, so a bump made
+    // without re-running it will not agree.
+    expect(found.size).toBe(256);
     expect(found.has("cmd_repository_trust")).toBe(true);
     expect(found.has("cmd_grant_repository_trust")).toBe(true);
     expect(found.has("cmd_revoke_repository_trust")).toBe(true);

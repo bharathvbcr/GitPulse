@@ -52,6 +52,12 @@ export const MENU_LIMITS = {
   trayTitleChars: 24,
   /** Maximum value of a switcher row's changed/conflicts badge. */
   count: 1_000_000,
+  /**
+   * Maximum agents reported as waiting on the reader (`MAX_AGENTS_WAITING`).
+   * Far above the sessions that can be open at once; a figure past it is a
+   * defect upstream, and the tray only ever says whether and roughly how many.
+   */
+  agentsWaiting: 999,
 } as const;
 
 export const MENU_TONES = ["neutral", "warning", "busy", "changed", "clean"] as const;
@@ -192,6 +198,9 @@ export function menuStateProblem(state: MenuState): string | null {
   ) {
     return "Native menu text exceeds its limit";
   }
+  if (state.agentsWaiting > MENU_LIMITS.agentsWaiting) {
+    return "Native menu agent count exceeds its limit";
+  }
   return null;
 }
 
@@ -216,6 +225,7 @@ export function menuStateWireProblem(state: MenuState): string | null {
     [card.behind, "status.behind"],
     [card.stashes, "status.stashes"],
     [card.elsewhere, "status.elsewhere"],
+    [state.agentsWaiting, "agentsWaiting"],
     ...state.repositories.flatMap<[number | null, string]>((repo) => [
       [repo.changed, `repositories[${repo.path}].changed`],
       [repo.conflicts, `repositories[${repo.path}].conflicts`],
@@ -258,7 +268,7 @@ export function clampText(text: string, max: number): string {
 }
 
 /** A count serde will take as `u32` and `validate` will accept, or null. */
-function clampCount(value: number | null, max = MENU_LIMITS.count): number | null {
+export function clampCount(value: number | null, max: number = MENU_LIMITS.count): number | null {
   if (value === null || !Number.isFinite(value)) return null;
   return Math.min(Math.max(Math.trunc(value), 0), max);
 }
@@ -322,6 +332,7 @@ export function sendableMenuState(state: MenuState): { state: MenuState; problem
       text: clampText(state.traySummary.text, MENU_LIMITS.text),
     },
     trayDetail: clampText(state.trayDetail, MENU_LIMITS.text),
+    agentsWaiting: clampCount(state.agentsWaiting, MENU_LIMITS.agentsWaiting) ?? 0,
     trayTitle:
       state.trayTitle === null
         ? null
@@ -375,6 +386,9 @@ export function fallbackMenuState(state: MenuState): MenuState {
     trayDetails: [],
     traySummary: { id: "open", text: "Open a repository…" },
     trayDetail: "GitPulse",
+    // Startup knows of no agent. Unlike the two preferences above, a count from
+    // a payload that could not be repaired is not one to trust.
+    agentsWaiting: 0,
     status: {
       repository: "GitPulse",
       branch: "",

@@ -92,8 +92,25 @@ hidden tab still raises an alert. The same notice also reaches the task's
 Agents pane, as `gitpulse-session-attention`: every agent notice is announced
 there within a second, whether or not a banner was shown (you were looking,
 banners are off, quiet hours), so the pane can say "Needs your permission"
-and what was asked. Typing into that terminal clears it; the terminal's own
-automatic replies (focus, cursor reports, mouse) do not. Which of Claude Code's settings files an
+and what was asked.
+
+With the GitPulse plugin installed, Claude Code's hooks say more than its bell
+can. `PermissionRequest` shows "Needs your permission · Bash: cargo test" on
+the board the moment the dialog opens — the `Notification` that raises the
+banner comes about six seconds later, and only if the dialog is still up, so a
+call another hook approves never banners. `Stop` shows the turn as finished.
+And a request ends when it is answered, wherever it was answered: typing into
+the terminal, a prompt submitted from anywhere (`UserPromptSubmit`), the
+approved tool running (`PostToolUse`, matched to the exact call it was asked
+for, so another call in the same batch finishing does not end it), or the
+session ending — including a process killed before its own hooks could run.
+An answered request's banner is taken down from Notification Center. The
+terminal's own automatic replies (focus, cursor reports, mouse) answer
+nothing. A bell rung for the same moment as a hook report is folded into it
+rather than becoming a second, reasonless banner, and the rate limit delays a
+banner rather than discarding it, most urgent first. A window that reloads
+reads what stood while it was not listening, with its real age. The tray shows
+the attention mark while an agent is waiting on you. Which of Claude Code's settings files an
 agent loads is **Settings → Agents → Claude Code settings files** (user,
 project, local; all three — Claude Code's own default — until you change it).
 It applies to task attempts and new Claude tabs alike, as `--setting-sources`.

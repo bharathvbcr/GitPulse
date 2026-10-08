@@ -22,16 +22,55 @@ pub enum TrayClick {
     Right,
 }
 
-/// Attention when the workspace needs a glance: warning tone, parked op, or degraded watch.
+/// Attention when something needs a glance: warning tone, parked op, degraded
+/// watch — or an agent waiting on the reader. The last is the one signal here
+/// that is not about the repository, and the reason the dot matters most: the
+/// tray is what is still on screen when the agent's terminal is not.
 pub fn glyph_variant(state: &MenuState) -> GlyphVariant {
     if state.status.tone == "warning"
         || state.status.operation.is_some()
         || state.status.watch_status == "degraded"
+        || state.agents_waiting > 0
     {
         GlyphVariant::Attention
     } else {
         GlyphVariant::Plain
     }
+}
+
+/// The status item's hover text. The dot says only that something wants a
+/// glance; when an agent is waiting, this is where the tray says which kind of
+/// something, and how many. Unchanged when nobody is waiting.
+pub fn tray_tooltip(state: &MenuState) -> String {
+    let agents = match state.agents_waiting {
+        0 => String::new(),
+        1 => "1 agent needs you\n".into(),
+        n => format!("{n} agents need you\n"),
+    };
+    format!(
+        "GitPulse\n{agents}{}\n{}",
+        state.tray_detail, state.tray_summary.text
+    )
+}
+
+/// Whether `next` changes anything the status item shows, so `apply` must run.
+///
+/// Kept beside `apply` and `tray_tooltip` rather than in `set_menu_state`: a
+/// field the tray starts reading is a field this has to compare, and the two
+/// drift apart when they live in different files. An agent count that moved
+/// from one to two keeps the dot but changes the tooltip, which is exactly
+/// the case a glyph-only comparison leaves stale.
+pub fn needs_apply(previous: &MenuState, next: &MenuState) -> bool {
+    previous.show_status_icon != next.show_status_icon
+        || previous.tray_summary != next.tray_summary
+        || previous.tray_detail != next.tray_detail
+        || previous.tray_details != next.tray_details
+        || previous.tray_title != next.tray_title
+        || previous.repositories != next.repositories
+        || previous.enabled(actions::REFRESH) != next.enabled(actions::REFRESH)
+        || previous.status.primary_label != next.status.primary_label
+        || previous.agents_waiting != next.agents_waiting
+        || glyph_variant(previous) != glyph_variant(next)
 }
 
 /// Maps a tray-icon event onto the single click dispatcher. Only mouse-up clicks route.
@@ -311,10 +350,7 @@ pub fn apply<R: Runtime>(app: &AppHandle<R>, state: &MenuState) -> Result<(), St
         }
         return Ok(());
     }
-    let tooltip = format!(
-        "GitPulse\n{}\n{}",
-        state.tray_detail, state.tray_summary.text
-    );
+    let tooltip = tray_tooltip(state);
     let variant = glyph_variant(state);
     // tray-icon's macOS `set_title` ignores `None` outright — it only calls
     // `setTitle:` inside an `if let Some`. Sending `None` to clear the count
@@ -508,6 +544,53 @@ mod tests {
         state.status.operation = None;
         state.status.watch_status = "degraded".into();
         assert_eq!(glyph_variant(&state), GlyphVariant::Attention);
+    }
+
+    #[test]
+    fn glyph_variant_shows_agents_waiting_on_a_clean_repository() {
+        let mut state = MenuState::default();
+        state.status.tone = "clean".into();
+        state.status.watch_status = "watching".into();
+        assert_eq!(glyph_variant(&state), GlyphVariant::Plain);
+        state.agents_waiting = 1;
+        assert_eq!(glyph_variant(&state), GlyphVariant::Attention);
+        state.agents_waiting = 0;
+        assert_eq!(glyph_variant(&state), GlyphVariant::Plain);
+    }
+
+    #[test]
+    fn tray_tooltip_names_the_agents_waiting_and_is_unchanged_without_them() {
+        let mut state = MenuState {
+            tray_detail: "GitPulse · main".into(),
+            ..Default::default()
+        };
+        state.tray_summary.text = "Clean".into();
+        assert_eq!(tray_tooltip(&state), "GitPulse\nGitPulse · main\nClean");
+        state.agents_waiting = 1;
+        assert_eq!(
+            tray_tooltip(&state),
+            "GitPulse\n1 agent needs you\nGitPulse · main\nClean"
+        );
+        state.agents_waiting = 2;
+        assert_eq!(
+            tray_tooltip(&state),
+            "GitPulse\n2 agents need you\nGitPulse · main\nClean"
+        );
+    }
+
+    #[test]
+    fn tray_reapplies_when_the_agent_count_moves_under_an_unchanged_dot() {
+        let previous = MenuState {
+            agents_waiting: 1,
+            ..Default::default()
+        };
+        let mut next = previous.clone();
+        assert!(!needs_apply(&previous, &next));
+        next.agents_waiting = 2;
+        assert_eq!(glyph_variant(&previous), glyph_variant(&next));
+        assert!(needs_apply(&previous, &next), "the tooltip count is stale");
+        next.agents_waiting = 0;
+        assert!(needs_apply(&previous, &next));
     }
 
     #[test]

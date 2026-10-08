@@ -48,10 +48,12 @@ fn notice(key: &str, channel: &'static str) -> Notice {
         origin: Origin::Terminal,
         label: "Claude Code".into(),
         place: Some("GitPulse".into()),
-        reason: None,
+        event: None,
         detail: None,
         is_agent: true,
         channel,
+        subject: None,
+        subagent: false,
     }
 }
 
@@ -74,7 +76,7 @@ fn drive(offered: Vec<Notice>, threads: usize) -> (SessionAlertStatus, usize) {
     let worker = {
         let counters = counters.clone();
         let last_error = last_error.clone();
-        std::thread::spawn(move || run(receiver, host, counters, last_error))
+        std::thread::spawn(move || run(receiver, host, counters, last_error, Arc::default()))
     };
 
     let work: Vec<Vec<Notice>> = offered
@@ -110,8 +112,10 @@ fn drive(offered: Vec<Notice>, threads: usize) -> (SessionAlertStatus, usize) {
         suppressed_attended: c.suppressed_attended.load(Ordering::Relaxed),
         suppressed_quiet: c.suppressed_quiet.load(Ordering::Relaxed),
         coalesced: c.coalesced.load(Ordering::Relaxed),
+        resolved: c.resolved.load(Ordering::Relaxed),
         displaced: c.displaced.load(Ordering::Relaxed),
         rate_limited: c.rate_limited.load(Ordering::Relaxed),
+        deferred: c.deferred.load(Ordering::Relaxed),
         dropped_queue: dropped.load(Ordering::Relaxed),
         dropped_scan: 0,
         failed: c.failed.load(Ordering::Relaxed),
@@ -131,6 +135,7 @@ fn accounted(status: &SessionAlertStatus) -> u64 {
         + status.suppressed_attended
         + status.suppressed_quiet
         + status.coalesced
+        + status.resolved
         + status.displaced
         + status.rate_limited
         + status.failed
@@ -244,7 +249,7 @@ fn a_thousand_interleaved_sessions_share_one_bounded_hub() {
     let counters = Counters::default();
     let start = Instant::now();
     for index in 0..1_000u64 {
-        admit(
+        let _ = admit(
             notice(&format!("term-{index}"), "hook"),
             start + Duration::from_millis(index),
             &mut tracked,
@@ -254,4 +259,243 @@ fn a_thousand_interleaved_sessions_share_one_bounded_hub() {
     }
     let held: usize = tracked.keys().map(String::len).sum();
     assert!(held < 8 * 1024, "{held} bytes of session keys retained");
+}
+
+// ---- A fleet doing everything at once, in a random order -------------------
+//
+// The tests above load one dimension each. This one interleaves every kind of
+// notice the worker can receive — hook banners, states, resolutions, bells,
+// typed answers, plain shells, sessions outside GitPulse — across a fleet,
+// with the clock jumping irregularly and the user looking at random tabs,
+// and checks after every single step the invariants the rest of this module
+// promises piecemeal. Seeded, so a failure names a step that replays.
+
+/// xorshift64*: deterministic, dependency-free, good enough to shuffle.
+struct Rng(u64);
+
+impl Rng {
+    fn next(&mut self) -> u64 {
+        self.0 ^= self.0 >> 12;
+        self.0 ^= self.0 << 25;
+        self.0 ^= self.0 >> 27;
+        self.0.wrapping_mul(0x2545_f491_4f6c_dd1d)
+    }
+    fn below(&mut self, n: u64) -> u64 {
+        self.next() % n
+    }
+}
+
+#[derive(Default)]
+struct Observer {
+    attended: Mutex<Option<String>>,
+    /// Banners currently believed to be in the notification centre.
+    shown: Mutex<std::collections::HashSet<String>>,
+    /// What a renderer that applied every announcement would show.
+    view: Mutex<HashMap<String, &'static str>>,
+    /// Sessions announced since the harness last looked.
+    announced: Mutex<std::collections::HashSet<String>>,
+    spurious_withdrawals: Mutex<Vec<String>>,
+}
+
+impl Host for Observer {
+    fn submit(&self, native: &str, _: &str, _: &str, _: bool) -> Result<bool, String> {
+        self.shown.lock().unwrap().insert(native.to_owned());
+        Ok(true)
+    }
+    fn attended(&self, key: &str) -> bool {
+        self.attended.lock().unwrap().as_deref() == Some(key)
+    }
+    fn config(&self) -> SessionAlertSettings {
+        SessionAlertSettings {
+            enabled: true,
+            ..SessionAlertSettings::default()
+        }
+    }
+    fn minute(&self) -> Option<u16> {
+        Some(12 * 60)
+    }
+    fn announce(&self, attention: &Attention) {
+        self.announced.lock().unwrap().insert(attention.session.clone());
+        let mut view = self.view.lock().unwrap();
+        let clears = attention
+            .event
+            .and_then(bridge::event)
+            .is_some_and(|event| event.need == bridge::Need::Clear);
+        if clears {
+            view.remove(&attention.session);
+        } else {
+            view.insert(attention.session.clone(), attention.event.unwrap_or("signal"));
+        }
+    }
+    fn withdraw(&self, native: &str) {
+        if !self.shown.lock().unwrap().remove(native) {
+            self.spurious_withdrawals.lock().unwrap().push(native.to_owned());
+        }
+    }
+}
+
+fn random_notice(rng: &mut Rng, sessions: u64) -> Notice {
+    let index = rng.below(sessions);
+    // A few keys the renderer can never show: a plain shell and a Claude
+    // Code outside any GitPulse terminal.
+    let (key, is_agent) = match index {
+        0 => ("term-shell".to_owned(), false),
+        1 => ("hook-claude-outside".to_owned(), true),
+        n => (format!("term-{n}"), true),
+    };
+    let subject = format!("{:x}", rng.below(4));
+    let mut notice = match rng.below(10) {
+        0..=2 => super::stress::notice(&key, "bell"),
+        3 => Notice {
+            origin: Origin::Reader,
+            channel: "reader",
+            event: Some("prompt_submitted"),
+            ..super::stress::notice(&key, "reader")
+        },
+        _ => {
+            let event = bridge::EVENTS[rng.below(bridge::EVENTS.len() as u64) as usize];
+            Notice {
+                origin: Origin::Hook,
+                channel: "hook",
+                event: Some(event.name),
+                detail: Some(format!("detail {}", rng.below(100))),
+                subject: matches!(event.name, "permission_request" | "tool_finished")
+                    .then_some(subject),
+                subagent: rng.below(4) == 0,
+                ..super::stress::notice(&key, "hook")
+            }
+        }
+    };
+    notice.key = key;
+    notice.is_agent = is_agent;
+    notice
+}
+
+#[test]
+fn a_fleet_doing_everything_at_once_keeps_every_promise() {
+    // Two fleet sizes: one the tracker holds whole, and one past its bound,
+    // so eviction — and what it costs — is exercised as well.
+    let past_the_bound = MAX_TRACKED as u64 * 2;
+    for (seed, sessions) in [(1u64, 24), (7, 24), (42, 24), (1_000_003, past_the_bound), (0xdead_beef, past_the_bound)] {
+        let mut rng = Rng(seed);
+        let observer = Arc::new(Observer::default());
+        let host: Arc<dyn Host> = observer.clone();
+        let counters = Counters::default();
+        let last_error = Mutex::new(None);
+        let mut tracked: HashMap<String, Tracked> = HashMap::new();
+        let start = Instant::now();
+        let mut bucket = Bucket::new(start);
+        let mut now = start;
+        let mut banner_offers = 0u64;
+        let mut amnesic = std::collections::HashSet::new();
+        for step in 0..60_000u32 {
+            // Irregular time: bursts inside one window, gaps across several.
+            // Past the bound, a storm: everything inside a few windows, so
+            // sessions are evicted while banners are still held.
+            now += Duration::from_millis(if sessions > MAX_TRACKED as u64 {
+                rng.below(20)
+            } else {
+                match rng.below(10) {
+                    0..=5 => rng.below(200),
+                    6..=8 => rng.below(3_000),
+                    _ => rng.below(120_000),
+                }
+            });
+            if rng.below(20) == 0 {
+                *observer.attended.lock().unwrap() =
+                    (rng.below(3) == 0).then(|| format!("term-{}", rng.below(sessions)));
+            }
+            let notice = random_notice(&mut rng, sessions);
+            if notice.role() == bridge::Role::Banner {
+                banner_offers += 1;
+            }
+            let standing_before: std::collections::HashSet<String> = tracked
+                .iter()
+                .filter(|(_, e)| e.standing.is_some())
+                .map(|(k, _)| k.clone())
+                .collect();
+            if let Some(last) = admit(notice, now, &mut tracked, &counters) {
+                host.announce(&last);
+            }
+            flush(now, false, &mut tracked, &mut bucket, &host, &counters, &last_error);
+            prune(now, &mut tracked);
+            // A session evicted while it stood asking leaves the pane holding
+            // what the worker forgot. Until the worker next speaks about it,
+            // the two may differ — that is what eviction costs, and why it
+            // takes idle sessions first. Pruning never does this: it keeps
+            // every session a hook says is asking.
+            for key in standing_before {
+                if !tracked.contains_key(&key) {
+                    amnesic.insert(key);
+                }
+            }
+            for key in observer.announced.lock().unwrap().drain() {
+                amnesic.remove(&key);
+            }
+
+            let at = |what: &str| format!("seed {seed} step {step}: {what}");
+            assert!(tracked.len() <= MAX_TRACKED, "{}", at("the map outgrew its bound"));
+            // Liveness: anything held has a time it will go out, so the
+            // worker can never sleep on work.
+            for (key, entry) in &tracked {
+                if entry.pending.is_some() {
+                    assert!(entry.due_at().is_some(), "{}", at(&format!("{key} held with no due time")));
+                }
+                if let Some(standing) = &entry.standing {
+                    assert!(
+                        !key.starts_with("hook-") && key != "term-shell",
+                        "{}",
+                        at(&format!("{key} stands asking, but no pane can show it: {:?}", standing.attention))
+                    );
+                }
+            }
+            if tracked.values().any(Tracked::holds_work) {
+                assert!(next_wake(&tracked).is_some(), "{}", at("work held and nothing to wake for"));
+            }
+            // Every banner offered is in exactly one outcome or still held.
+            let held = tracked.values().filter(|e| e.pending.is_some()).count() as u64;
+            let c = &counters;
+            let outcomes = c.delivered.load(Ordering::Relaxed)
+                + c.suppressed_disabled.load(Ordering::Relaxed)
+                + c.suppressed_not_agent.load(Ordering::Relaxed)
+                + c.suppressed_attended.load(Ordering::Relaxed)
+                + c.suppressed_quiet.load(Ordering::Relaxed)
+                + c.coalesced.load(Ordering::Relaxed)
+                + c.resolved.load(Ordering::Relaxed)
+                + c.displaced.load(Ordering::Relaxed)
+                + c.rate_limited.load(Ordering::Relaxed)
+                + c.failed.load(Ordering::Relaxed);
+            assert_eq!(outcomes + held, banner_offers, "{}", at("a banner went unaccounted for"));
+            // What a renderer would show agrees with what the worker holds,
+            // for every session with nothing still waiting to be said. (An
+            // evicted session leaves the map, and with it this comparison.)
+            let view = observer.view.lock().unwrap();
+            for (key, entry) in &tracked {
+                if entry.unannounced.is_some() || amnesic.contains(key) {
+                    continue;
+                }
+                let worker = entry.standing.as_ref().map(|s| s.attention.event.unwrap_or("signal"));
+                assert_eq!(view.get(key).copied(), worker, "{}", at(&format!("{key}: pane and worker disagree")));
+            }
+            drop(view);
+            assert!(
+                observer.spurious_withdrawals.lock().unwrap().is_empty(),
+                "{}",
+                at("withdrew a banner that was never shown")
+            );
+        }
+        // Drain: everything held goes out or is counted, nothing is lost.
+        flush(now + Duration::from_secs(3_600), true, &mut tracked, &mut bucket, &host, &counters, &last_error);
+        assert!(tracked.values().all(|e| e.pending.is_none()), "seed {seed}: held after the final pass");
+        assert!(
+            counters.delivered.load(Ordering::Relaxed) > 100,
+            "seed {seed}: the run delivered too little to have exercised anything"
+        );
+        if sessions > MAX_TRACKED as u64 {
+            assert!(
+                counters.displaced.load(Ordering::Relaxed) > 0,
+                "seed {seed}: a fleet past the bound displaced nothing, so eviction was not exercised"
+            );
+        }
+    }
 }

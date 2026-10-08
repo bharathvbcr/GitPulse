@@ -110,15 +110,25 @@ pub struct HookInput {
     /// and Codex do not. The stdout schema splits on this, not on event-name
     /// casing: camelCase `sessionStart` is not a host signal.
     pub is_cursor: bool,
-    /// The host's own wording for a `Notification` event, when it sends one.
+    /// The host's own wording for a `Notification` event (`message`).
     ///
-    /// Read best-effort and never required. The hook reference documents the
-    /// `Notification` event's *matchers* — which is how `notify` learns the
-    /// reason, from its own argument — but does not publish a field carrying
-    /// the message text. So this is used when it is there and its absence
-    /// changes nothing: the reason GitPulse shows comes from the matcher the
-    /// host routed through, not from a field that may not exist.
+    /// Never required. The reason GitPulse shows comes from the matcher the
+    /// host routed through — the argument `notify` is given — and this is only
+    /// what the banner adds after it.
     pub message: String,
+    /// Which tool call a `PermissionRequest` or `PostToolUse` is about, as a
+    /// digest of `tool_name` and `tool_input`. Empty without a tool. The same
+    /// call digests the same way in both events, which is how the result of
+    /// one call clears the request for that call and no other.
+    pub tool_subject: String,
+    /// `tool_input`, said in a line: `Bash: cargo test`.
+    pub tool_summary: String,
+    /// Set inside a subagent (`agent_id`).
+    pub agent_id: String,
+    /// `Stop`'s `last_assistant_message`: what the agent ended its turn on.
+    pub last_assistant_message: String,
+    /// `StopFailure`'s `error`: `rate_limit`, `overloaded`, ….
+    pub error: String,
 }
 
 impl HookInput {
@@ -153,8 +163,98 @@ impl HookInput {
             source: string_at(Some(value), "source"),
             is_cursor: is_cursor_payload(value),
             message: string_at(Some(value), "message"),
+            tool_subject: tool_subject(value),
+            tool_summary: tool_summary(value),
+            agent_id: string_at(Some(value), "agent_id"),
+            last_assistant_message: string_at(Some(value), "last_assistant_message"),
+            error: string_at(Some(value), "error"),
         }
     }
+}
+
+/// Writes `value` with every object's keys in sorted order, so one tool call
+/// digests the same way whatever order a host serialized its input in.
+fn canonical(value: &Value, out: &mut String) {
+    match value {
+        Value::Object(map) => {
+            let mut keys: Vec<&String> = map.keys().collect();
+            keys.sort_unstable();
+            out.push('{');
+            for (index, key) in keys.into_iter().enumerate() {
+                if index > 0 {
+                    out.push(',');
+                }
+                out.push_str(&Value::String(key.clone()).to_string());
+                out.push(':');
+                canonical(&map[key], out);
+            }
+            out.push('}');
+        }
+        Value::Array(items) => {
+            out.push('[');
+            for (index, item) in items.iter().enumerate() {
+                if index > 0 {
+                    out.push(',');
+                }
+                canonical(item, out);
+            }
+            out.push(']');
+        }
+        other => out.push_str(&other.to_string()),
+    }
+}
+
+/// The digest naming one tool call: FNV-1a over the tool's name and its
+/// canonical input. Not a security boundary — a collision would clear one
+/// waiting request early, and the peer able to cause it is the same user —
+/// so the cheapest stable hash that needs no dependency is the right one.
+fn tool_subject(value: &Value) -> String {
+    let name = string_at(Some(value), "tool_name");
+    if name.is_empty() {
+        return String::new();
+    }
+    let mut text = name;
+    text.push('\0');
+    if let Some(input) = value.get("tool_input") {
+        canonical(input, &mut text);
+    }
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in text.bytes() {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("{hash:016x}")
+}
+
+/// The longest tool summary a report carries.
+const TOOL_SUMMARY_CHARS: usize = 160;
+
+/// `tool_input`, said in a line, for the board: the tool and the one field a
+/// person would read to decide — a command, a path, a URL.
+fn tool_summary(value: &Value) -> String {
+    let name = string_at(Some(value), "tool_name");
+    if name.is_empty() {
+        return String::new();
+    }
+    let input = value.get("tool_input");
+    let what = [
+        "command",
+        "file_path",
+        "notebook_path",
+        "url",
+        "pattern",
+        "query",
+        "description",
+        "prompt",
+    ]
+    .into_iter()
+    .map(|key| string_at(input, key))
+    .find(|text| !text.trim().is_empty());
+    let line = match what {
+        Some(text) => format!("{name}: {}", text.lines().next().unwrap_or_default().trim()),
+        None => name,
+    };
+    line.chars().take(TOOL_SUMMARY_CHARS).collect()
 }
 
 /// Cursor native payloads name `cursor_version`. Event-name casing is not a
@@ -1131,12 +1231,11 @@ const NOTIFY_BUDGET: Duration = Duration::from_millis(1500);
 
 /// Tells the running GitPulse that this agent wants the user.
 ///
-/// The argument, not the payload, carries the reason: the hook reference
-/// documents `Notification`'s matchers (`permission_prompt`, `idle_prompt`,
-/// `agent_completed`, …) but publishes no input field naming which one fired,
-/// so the plugin registers one entry per matcher and each passes its own word
-/// here. That makes the reason a fact about which hook the host chose to run,
-/// rather than a string parsed out of a payload.
+/// The argument, not the payload, carries the reason. The plugin registers
+/// one entry per `Notification` matcher, and one per lifecycle event, and each
+/// passes its own word here; that makes the reason a fact about which hook the
+/// host chose to run, rather than a string parsed out of a payload (the host's
+/// `notification_type` names the same thing, and is not needed).
 ///
 /// This never produces a `systemMessage`, and that is a deliberate departure
 /// from the rest of this module. Everything else here is a *check*, where
@@ -1151,22 +1250,27 @@ fn run_notify(
     input: &HookInput,
     send: impl FnOnce(&std::path::Path, &str) -> Result<(), String> + Send + 'static,
 ) -> Result<HookOutput, String> {
-    let event = argument.unwrap_or_default();
-    if !crate::alerts::bridge::EVENTS
-        .iter()
-        .any(|(name, _)| *name == event)
-    {
+    let Some(event) = argument.and_then(crate::alerts::bridge::event) else {
         // An Err rather than silence: an unknown reason means the plugin
         // manifest and this binary have drifted, which is exactly the kind of
         // mismatch that otherwise presents as "notifications stopped working".
         return Err(format!(
-            "unknown notify event '{event}'; expected one of {}",
+            "unknown notify event '{}'; expected one of {}",
+            argument.unwrap_or_default(),
             crate::alerts::bridge::EVENTS
                 .iter()
-                .map(|(name, _)| *name)
+                .map(|event| event.name)
                 .collect::<Vec<_>>()
                 .join(", ")
         ));
+    };
+    // A state or a resolution is about a GitPulse terminal, and the socket
+    // refuses one that names none. Outside a GitPulse terminal — the common
+    // case for a plugin installed once for every session — there is nothing
+    // to tell, so this costs a process start and nothing else: no socket, no
+    // error. `PostToolUse` runs on every tool call, which is why that matters.
+    if event.role != crate::alerts::bridge::Role::Banner && session_env().is_none() {
+        return Ok(HookOutput::silent());
     }
     let path = match std::env::var_os(crate::alerts::bridge::SOCKET_ENV) {
         Some(value) if !value.is_empty() => std::path::PathBuf::from(value),
@@ -1183,8 +1287,32 @@ fn run_notify(
     }
 }
 
+/// The GitPulse PTY this hook runs under, when it runs under one.
+fn session_env() -> Option<String> {
+    std::env::var(crate::alerts::bridge::SESSION_ENV)
+        .ok()
+        .filter(|session| !session.is_empty())
+}
+
+/// The most of an agent's own text one report carries. The socket refuses a
+/// report over [`crate::alerts::bridge::MAX_REPORT_BYTES`] whole, and the
+/// board shows a line of it, so a long final message must be cut here rather
+/// than cost the report.
+const NOTIFY_MESSAGE_BYTES: usize = 1024;
+
+fn clip(text: &str, bytes: usize) -> &str {
+    if text.len() <= bytes {
+        return text;
+    }
+    let mut end = bytes;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    &text[..end]
+}
+
 /// The JSON one report carries, matching `alerts::bridge::parse_report`.
-fn notify_payload(event: &str, input: &HookInput) -> String {
+fn notify_payload(event: &crate::alerts::bridge::Event, input: &HookInput) -> String {
     let agent = match std::env::var(AGENT_KIND_ENV) {
         Ok(kind)
             if crate::alerts::bridge::AGENTS
@@ -1202,40 +1330,85 @@ fn notify_payload(event: &str, input: &HookInput) -> String {
     };
     let mut report = serde_json::Map::new();
     report.insert("v".into(), json!(1));
-    report.insert("event".into(), json!(event));
+    report.insert("event".into(), json!(event.name));
     report.insert("agent".into(), json!(agent));
-    if let Ok(session) = std::env::var(crate::alerts::bridge::SESSION_ENV) {
-        if !session.is_empty() {
-            report.insert("session".into(), json!(session));
-        }
+    if let Some(session) = session_env() {
+        report.insert("session".into(), json!(session));
     }
-    if !input.cwd.is_empty() {
+    if !input.cwd.is_empty() && input.cwd.len() <= 4096 {
         report.insert("cwd".into(), json!(input.cwd));
     }
-    if !input.message.is_empty() {
-        report.insert("message".into(), json!(input.message));
+    // What the agent said with it: the host's notification text, or for an
+    // event that has none, the field that says the same thing.
+    let message = [
+        input.message.as_str(),
+        input.tool_summary.as_str(),
+        input.last_assistant_message.as_str(),
+        input.error.as_str(),
+    ]
+    .into_iter()
+    .find(|text| !text.trim().is_empty())
+    .unwrap_or_default();
+    // A resolution says nothing the board shows.
+    if !message.is_empty() && event.role != crate::alerts::bridge::Role::Resolve {
+        report.insert("message".into(), json!(clip(message, NOTIFY_MESSAGE_BYTES)));
+    }
+    if !input.tool_subject.is_empty() {
+        report.insert("subject".into(), json!(input.tool_subject));
+    }
+    if !input.agent_id.is_empty() {
+        report.insert("subagent".into(), json!(true));
     }
     Value::Object(report).to_string()
 }
 
 #[cfg(unix)]
 fn notify_send(path: &std::path::Path, payload: &str) -> Result<(), String> {
-    use std::io::Write;
+    use std::io::{Read, Write};
     use std::os::unix::net::UnixStream;
     let mut stream = UnixStream::connect(path).map_err(|e| format!("{}: {e}", path.display()))?;
     stream
         .set_write_timeout(Some(NOTIFY_BUDGET))
         .map_err(|e| e.to_string())?;
     stream
+        .set_read_timeout(Some(NOTIFY_BUDGET))
+        .map_err(|e| e.to_string())?;
+    stream
         .write_all(payload.as_bytes())
         .map_err(|e| e.to_string())?;
     stream.flush().map_err(|e| e.to_string())?;
     // Half-close so the reader sees EOF and answers rather than waiting for
-    // its own timeout. The ack itself is not read: nothing here can act on it,
-    // and GitPulse's settings panel is where an undelivered report is visible.
+    // its own timeout.
     stream
         .shutdown(std::net::Shutdown::Write)
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+    // Then read the answer. A report GitPulse refused was not delivered, and
+    // saying it was is the exact confusion this module exists to prevent: the
+    // refusal is the drift between this binary and the app it reports to.
+    let mut reply = Vec::with_capacity(16);
+    (&mut stream)
+        .take(64)
+        .read_to_end(&mut reply)
+        .map_err(|e| format!("no answer from GitPulse: {e}"))?;
+    acknowledged(&reply)
+}
+
+/// Whether the socket's one-line answer accepted the report.
+fn acknowledged(reply: &[u8]) -> Result<(), String> {
+    match serde_json::from_slice::<Value>(reply)
+        .ok()
+        .and_then(|value| value.get("ok").and_then(Value::as_bool))
+    {
+        Some(true) => Ok(()),
+        Some(false) => Err(
+            "GitPulse refused the report; this gitpulse-hook and the running app may be different versions"
+                .into(),
+        ),
+        None => Err(format!(
+            "GitPulse answered with something other than an acknowledgement: {:?}",
+            String::from_utf8_lossy(reply)
+        )),
+    }
 }
 
 #[cfg(not(unix))]
@@ -3111,7 +3284,7 @@ done
         assert_eq!(notice.key, "term-4-1");
         assert_eq!(notice.label, "Claude Code");
         assert_eq!(notice.place.as_deref(), Some("GitPulse"));
-        assert_eq!(notice.reason.as_deref(), Some("needs your permission"));
+        assert_eq!(notice.reason(), Some("needs your permission"));
         assert_eq!(
             notice.detail.as_deref(),
             Some("Claude needs your permission to use Bash")
@@ -3125,13 +3298,14 @@ done
             .set(AGENT_KIND_ENV, "codex")
             .set(crate::alerts::bridge::SESSION_ENV, "term-4-1")
             .set(crate::alerts::bridge::SOCKET_ENV, "/tmp/gitpulse-test.sock");
-        for (event, phrase) in crate::alerts::bridge::EVENTS {
-            let (result, seen) = captured(event, &notify_input());
-            assert!(result.is_ok(), "{event}: {result:?}");
+        for event in crate::alerts::bridge::EVENTS {
+            let (result, seen) = captured(event.name, &notify_input());
+            assert!(result.is_ok(), "{}: {result:?}", event.name);
             let payload = seen.lock().unwrap().clone().expect("a report was sent");
-            let notice = crate::alerts::bridge::parse_report(payload.as_bytes())
-                .unwrap_or_else(|e| panic!("{event} produced a report the socket refused: {e}"));
-            assert_eq!(notice.reason.as_deref(), Some(*phrase));
+            let notice = crate::alerts::bridge::parse_report(payload.as_bytes()).unwrap_or_else(
+                |e| panic!("{} produced a report the socket refused: {e}", event.name),
+            );
+            assert_eq!(notice.reason(), Some(event.phrase));
             assert_eq!(notice.label, "Codex");
         }
     }
@@ -3224,7 +3398,7 @@ done
             .expect("hooks.json has a hooks object");
         let known: Vec<&str> = crate::alerts::bridge::EVENTS
             .iter()
-            .map(|(name, _)| *name)
+            .map(|event| event.name)
             .collect();
 
         let mut notify_entries = 0;
@@ -3274,6 +3448,159 @@ done
              serves that nothing routes to it is a sentence no user can ever see",
             known.len()
         );
+    }
+
+    /// What the host sends for one tool call, in `PermissionRequest` and
+    /// again in `PostToolUse`.
+    fn tool_event(event: &str, input: Value) -> HookInput {
+        HookInput::from_value(&json!({
+            "hook_event_name": event,
+            "session_id": "claude-abc",
+            "cwd": "/Users/me/GitPulse",
+            "tool_name": "Bash",
+            "tool_input": input,
+        }))
+    }
+
+    #[test]
+    fn one_tool_call_is_named_the_same_way_when_asked_for_and_when_run() {
+        let asked = tool_event(
+            "PermissionRequest",
+            json!({"command":"cargo test","description":"Run tests","timeout":120000}),
+        );
+        // The same call, its keys serialized in another order.
+        let ran = tool_event(
+            "PostToolUse",
+            json!({"timeout":120000,"description":"Run tests","command":"cargo test"}),
+        );
+        let other = tool_event("PostToolUse", json!({"command":"cargo build"}));
+        assert_eq!(asked.tool_subject.len(), 16);
+        assert_eq!(asked.tool_subject, ran.tool_subject);
+        assert_ne!(asked.tool_subject, other.tool_subject);
+        assert_eq!(asked.tool_summary, "Bash: cargo test");
+        // No tool, no subject: a Notification is about no call in particular.
+        assert_eq!(notify_input().tool_subject, "");
+    }
+
+    #[test]
+    fn a_tool_summary_is_one_bounded_line() {
+        let long = tool_event(
+            "PermissionRequest",
+            json!({"command": format!("echo start\n{}", "x".repeat(4000))}),
+        );
+        assert_eq!(long.tool_summary, "Bash: echo start");
+        let wide = tool_event("PermissionRequest", json!({"command": "y".repeat(4000)}));
+        assert_eq!(wide.tool_summary.chars().count(), TOOL_SUMMARY_CHARS);
+        let mcp = HookInput::from_value(&json!({"tool_name":"mcp__github__create_issue","tool_input":{"title":7}}));
+        assert_eq!(mcp.tool_summary, "mcp__github__create_issue");
+    }
+
+    #[test]
+    fn a_permission_request_and_its_result_reach_the_socket_as_one_subject() {
+        let serial = notify_serial();
+        let _env = crate::test_support::env::bind_env(&serial)
+            .set(AGENT_KIND_ENV, "claude")
+            .set(crate::alerts::bridge::SESSION_ENV, "term-4-1")
+            .set(crate::alerts::bridge::SOCKET_ENV, "/tmp/gitpulse-test.sock");
+        let report = |event: &str, input: &HookInput| {
+            let (result, seen) = captured(event, input);
+            assert!(result.is_ok(), "{event}: {result:?}");
+            let payload = seen.lock().unwrap().clone().expect("a report was sent");
+            crate::alerts::bridge::parse_report(payload.as_bytes()).expect("accepted")
+        };
+        let call = json!({"command":"cargo test"});
+        let asked = report("permission_request", &tool_event("PermissionRequest", call.clone()));
+        let ran = report("tool_finished", &tool_event("PostToolUse", call));
+        assert_eq!(asked.detail.as_deref(), Some("Bash: cargo test"));
+        assert!(asked.subject.is_some());
+        assert_eq!(asked.subject, ran.subject);
+        assert!(!asked.subagent);
+        // A resolution carries no text for the board to show.
+        assert_eq!(ran.detail, None);
+
+        let mut inside = tool_event("PostToolUse", json!({"command":"ls"}));
+        inside.agent_id = "agent-7".into();
+        assert!(report("tool_finished", &inside).subagent);
+    }
+
+    #[test]
+    fn a_state_outside_a_gitpulse_terminal_never_touches_the_socket() {
+        let serial = notify_serial();
+        let _env = crate::test_support::env::bind_env(&serial)
+            .remove(crate::alerts::bridge::SESSION_ENV)
+            .set(crate::alerts::bridge::SOCKET_ENV, "/tmp/gitpulse-test.sock");
+        for event in crate::alerts::bridge::EVENTS
+            .iter()
+            .filter(|e| e.role != crate::alerts::bridge::Role::Banner)
+        {
+            let result = run_notify(Some(event.name), &notify_input(), |_, _| {
+                panic!("a state with no session reached the socket")
+            });
+            let output = result.unwrap_or_else(|e| panic!("{}: {e}", event.name));
+            assert!(output.is_silent());
+        }
+    }
+
+    #[test]
+    fn a_long_final_message_is_cut_rather_than_costing_the_report() {
+        let serial = notify_serial();
+        let _env = crate::test_support::env::bind_env(&serial)
+            .set(crate::alerts::bridge::SESSION_ENV, "term-4-1")
+            .set(crate::alerts::bridge::SOCKET_ENV, "/tmp/gitpulse-test.sock");
+        let mut input = notify_input();
+        input.message.clear();
+        // Multi-byte, so a cut at a byte count lands mid-character.
+        input.last_assistant_message = "é".repeat(20_000);
+        let (result, seen) = captured("turn_finished", &input);
+        assert!(result.is_ok(), "{result:?}");
+        let payload = seen.lock().unwrap().clone().unwrap();
+        assert!(payload.len() <= crate::alerts::bridge::MAX_REPORT_BYTES);
+        let notice = crate::alerts::bridge::parse_report(payload.as_bytes())
+            .expect("the socket accepts a clipped report");
+        assert!(notice.detail.unwrap().starts_with("éé"));
+        // StopFailure has no message; its error type says what happened.
+        let mut failed = notify_input();
+        failed.message.clear();
+        failed.error = "rate_limit".into();
+        let (_, seen) = captured("error", &failed);
+        let notice =
+            crate::alerts::bridge::parse_report(seen.lock().unwrap().clone().unwrap().as_bytes())
+                .unwrap();
+        assert_eq!(notice.detail.as_deref(), Some("rate_limit"));
+    }
+
+    #[test]
+    fn a_refused_or_garbled_answer_is_not_reported_as_delivered() {
+        assert_eq!(acknowledged(b"{\"ok\":true}\n"), Ok(()));
+        let refused = acknowledged(b"{\"ok\":false}\n").unwrap_err();
+        assert!(refused.contains("refused"), "{refused}");
+        for garbage in [&b""[..], b"ok", b"{\"ok\":1}", b"{\"ok\":tr"] {
+            assert!(acknowledged(garbage).is_err(), "{garbage:?}");
+        }
+    }
+
+    /// The real send against a real listener: the answer decides the result.
+    #[cfg(unix)]
+    #[test]
+    fn notify_send_reports_what_the_socket_answered() {
+        use std::io::{Read, Write};
+        let base = std::fs::canonicalize("/tmp").unwrap();
+        for (answer, ok) in [(&b"{\"ok\":true}\n"[..], true), (b"{\"ok\":false}\n", false)] {
+            let path = base.join(format!("gph-ack-{}-{ok}.sock", std::process::id()));
+            let _ = std::fs::remove_file(&path);
+            let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+            let server = thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut seen = Vec::new();
+                stream.read_to_end(&mut seen).unwrap();
+                stream.write_all(answer).unwrap();
+                seen
+            });
+            let result = notify_send(&path, r#"{"v":1,"event":"error"}"#);
+            assert_eq!(server.join().unwrap(), br#"{"v":1,"event":"error"}"#);
+            assert_eq!(result.is_ok(), ok, "{result:?}");
+            let _ = std::fs::remove_file(&path);
+        }
     }
 
     #[test]

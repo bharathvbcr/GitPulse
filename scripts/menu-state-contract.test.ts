@@ -75,6 +75,19 @@ describe("the frontend mirror matches MenuState::validate", () => {
       Number(match[1].replace(/_/g, "")),
     );
     expect(counts).toEqual([MENU_LIMITS.count, MENU_LIMITS.count]);
+    // The agent ceiling is named once and applied by name, so both the constant
+    // and its use in validate() are read: a ceiling nobody checks is no ceiling.
+    const agents = state.match(/pub const MAX_AGENTS_WAITING: u32 = (\d[\d_]*);/);
+    expect(agents, "state.rs no longer names MAX_AGENTS_WAITING").not.toBeNull();
+    expect(state).toContain("self.agents_waiting > MAX_AGENTS_WAITING");
+    expect(MENU_LIMITS.agentsWaiting).toBe(Number((agents as RegExpMatchArray)[1].replace(/_/g, "")));
+  });
+
+  it("lets an older renderer omit the agent count", () => {
+    // A renderer built before the field existed sends no `agentsWaiting`; serde
+    // must default it rather than refuse the payload and freeze the menu.
+    const field = state.slice(state.indexOf("pub struct MenuState"), state.indexOf("impl Default for MenuState"));
+    expect(field).toMatch(/#\[serde\(default\)\]\s*(?:\/\/\/[^\n]*\n\s*)*pub agents_waiting: u32,/);
   });
 
   it("agrees on the status-card enums", () => {
@@ -163,6 +176,7 @@ describe("the frontend mirror matches MenuState::validate", () => {
       trayDetails: [],
       traySummary: { id: "open", text: "Open a repository…" },
       trayDetail: "GitPulse",
+      agentsWaiting: 0,
       status: {
         repository: "GitPulse", branch: "", changed: null, staged: null, conflicts: null,
         ahead: null, behind: null, upstream: null, headline: "Your work, at a glance",
@@ -214,6 +228,9 @@ describe("the frontend mirror matches MenuState::validate", () => {
     );
     expect(broken((draft) => draft.labels.push({ id: "fetch", text: "a" }, { id: "fetch", text: "b" }))).toBe(
       "Native menu state contains an invalid label",
+    );
+    expect(broken((draft) => (draft.agentsWaiting = MENU_LIMITS.agentsWaiting + 1))).toBe(
+      "Native menu agent count exceeds its limit",
     );
     expect(broken((draft) => (draft.status.tone = "excited"))).toBe("Invalid status card presentation");
     expect(broken((draft) => (draft.status.watchStatus = "wedged"))).toBe("Invalid status card presentation");

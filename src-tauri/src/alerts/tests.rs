@@ -15,6 +15,7 @@ struct Recorder {
     minute: Mutex<Option<u16>>,
     refuse: Mutex<bool>,
     announced: Mutex<Vec<Attention>>,
+    withdrawn: Mutex<Vec<String>>,
 }
 
 impl Recorder {
@@ -78,6 +79,9 @@ impl Host for Recorder {
     fn announce(&self, attention: &Attention) {
         self.announced.lock().unwrap().push(attention.clone());
     }
+    fn withdraw(&self, native: &str) {
+        self.withdrawn.lock().unwrap().push(native.to_owned());
+    }
 }
 
 fn notice(key: &str) -> Notice {
@@ -86,10 +90,12 @@ fn notice(key: &str) -> Notice {
         origin: Origin::Terminal,
         label: "Claude Code".into(),
         place: Some("GitPulse".into()),
-        reason: None,
+        event: None,
         detail: None,
         is_agent: true,
         channel: "bell",
+        subject: None,
+        subagent: false,
     }
 }
 
@@ -118,7 +124,9 @@ impl Driver {
     }
     fn tick(&mut self, notice: Option<Notice>, now: Instant) {
         if let Some(notice) = notice {
-            admit(notice, now, &mut self.tracked, &self.counters);
+            if let Some(last) = admit(notice, now, &mut self.tracked, &self.counters) {
+                self.host.announce(&last);
+            }
         }
         flush(
             now,
@@ -286,16 +294,31 @@ fn many_sessions_ringing_at_once_cannot_outrun_the_rate_limit() {
         driver.tick(Some(notice(&format!("term-{session}"))), now);
     }
     assert_eq!(driver.recorder.count(), RATE_CAPACITY as usize);
+    // Held, not dropped: each over the limit is counted once as delayed, and
+    // none as lost.
     assert_eq!(
-        driver.counters.rate_limited.load(Ordering::Relaxed),
+        driver.counters.deferred.load(Ordering::Relaxed),
         40 - u64::from(RATE_CAPACITY)
     );
+    assert_eq!(driver.counters.rate_limited.load(Ordering::Relaxed), 0);
     // The bucket refills, so this is a delay and not a permanent gag.
     driver.tick(
         Some(notice("term-100")),
         now + RATE_REFILL + Duration::from_secs(1),
     );
     assert_eq!(driver.recorder.count(), RATE_CAPACITY as usize + 1);
+    // And every one of them goes out in time, one token at a time, without a
+    // new signal to prompt it.
+    let mut at = now + RATE_REFILL + Duration::from_secs(1);
+    for _ in 0..40 {
+        at += RATE_REFILL;
+        driver.tick(None, at);
+    }
+    assert_eq!(driver.recorder.count(), 41);
+    assert_eq!(
+        driver.counters.deferred.load(Ordering::Relaxed),
+        41 - u64::from(RATE_CAPACITY)
+    );
 }
 
 #[test]
@@ -360,7 +383,7 @@ fn a_bell_with_nothing_to_say_still_says_something() {
 fn a_reason_and_an_identical_detail_are_not_printed_twice() {
     let mut driver = Driver::new();
     let mut n = notice("term-1");
-    n.reason = Some("finished its work".into());
+    n.event = Some("agent_completed");
     n.detail = Some("finished its work".into());
     driver.tick(Some(n), Instant::now());
     assert_eq!(
@@ -400,16 +423,19 @@ fn a_workbench_activity_identifier_is_not_a_session_identifier() {
 
 // ---- Announcements: what the task's Agents pane is told ------------------
 
-fn hook(key: &str, reason: &str, detail: Option<&str>) -> Notice {
+/// A hook report of `event`, by its name in [`bridge::EVENTS`].
+fn hook(key: &str, event: &str, detail: Option<&str>) -> Notice {
     Notice {
         key: key.to_owned(),
         origin: Origin::Hook,
         label: "Claude Code".into(),
         place: None,
-        reason: Some(reason.into()),
+        event: Some(bridge::event(event).unwrap_or_else(|| panic!("{event}")).name),
         detail: detail.map(str::to_owned),
         is_agent: true,
         channel: "hook",
+        subject: None,
+        subagent: false,
     }
 }
 
@@ -439,7 +465,7 @@ fn an_agent_notice_is_announced_at_once_even_when_its_banner_is_suppressed() {
         driver.tick(
             Some(hook(
                 "term-1",
-                "needs your permission",
+                "permission_prompt",
                 Some("Bash: cargo test"),
             )),
             Instant::now(),
@@ -461,9 +487,9 @@ fn an_agent_notice_is_announced_at_once_even_when_its_banner_is_suppressed() {
 fn announcements_are_not_held_for_the_banner_window() {
     let mut driver = Driver::new();
     let start = Instant::now();
-    driver.tick(Some(hook("term-1", "finished its work", None)), start);
+    driver.tick(Some(hook("term-1", "agent_completed", None)), start);
     driver.tick(
-        Some(hook("term-1", "needs your permission", None)),
+        Some(hook("term-1", "permission_prompt", None)),
         start + ANNOUNCE_GAP + Duration::from_millis(1),
     );
     // Two announcements a second apart, while the banner for the second is
@@ -499,10 +525,12 @@ fn a_burst_is_one_announcement_now_and_the_newest_after_the_gap() {
 fn every_hook_event_is_announced_by_its_name() {
     // Derived from the bridge's own table, so an event added there cannot
     // reach the pane as an unnamed signal.
-    for (name, phrase) in bridge::EVENTS {
+    // A resolving event announces only when something stood for it to end,
+    // which `answering_*` below covers.
+    for event in bridge::EVENTS.iter().filter(|e| e.role != bridge::Role::Resolve) {
         let mut driver = Driver::new();
-        driver.tick(Some(hook("term-1", phrase, None)), Instant::now());
-        assert_eq!(driver.recorder.announcements()[0].event, Some(*name));
+        driver.tick(Some(hook("term-1", event.name, None)), Instant::now());
+        assert_eq!(driver.recorder.announcements()[0].event, Some(event.name));
     }
 }
 
@@ -514,7 +542,7 @@ fn a_plain_shell_or_a_session_outside_gitpulse_is_never_announced() {
     shell.is_agent = false;
     driver.tick(Some(shell), now);
     driver.tick(
-        Some(hook("hook-claude-GitPulse", "finished its work", None)),
+        Some(hook("hook-claude-GitPulse", "agent_completed", None)),
         now,
     );
     assert_eq!(driver.recorder.announcements(), vec![]);
@@ -525,7 +553,7 @@ fn announced_text_is_sanitized_and_bounded() {
     let mut driver = Driver::new();
     let hostile = format!("\u{1b}]0;spoof\u{7}{}\u{1b}[31m", "y".repeat(5000));
     driver.tick(
-        Some(hook("term-1", "needs your input", Some(&hostile))),
+        Some(hook("term-1", "agent_needs_input", Some(&hostile))),
         Instant::now(),
     );
     let said = driver.recorder.announcements();
@@ -538,7 +566,7 @@ fn announced_text_is_sanitized_and_bounded() {
     // Blank text is absence, not an empty string the pane would render.
     let mut driver = Driver::new();
     driver.tick(
-        Some(hook("term-2", "needs your input", Some("   "))),
+        Some(hook("term-2", "agent_needs_input", Some("   "))),
         Instant::now(),
     );
     assert_eq!(driver.recorder.announcements()[0].detail, None);
@@ -548,9 +576,9 @@ fn announced_text_is_sanitized_and_bounded() {
 fn a_closing_worker_makes_the_announcement_it_holds() {
     let mut driver = Driver::new();
     let start = Instant::now();
-    driver.tick(Some(hook("term-1", "finished its work", None)), start);
-    admit(
-        hook("term-1", "stopped on an error", None),
+    driver.tick(Some(hook("term-1", "agent_completed", None)), start);
+    let _ = admit(
+        hook("term-1", "error", None),
         start,
         &mut driver.tracked,
         &driver.counters,
@@ -572,9 +600,9 @@ fn a_closing_worker_makes_the_announcement_it_holds() {
 fn a_held_announcement_survives_pruning_until_it_is_made() {
     let mut driver = Driver::new();
     let start = Instant::now();
-    driver.tick(Some(hook("term-1", "finished its work", None)), start);
-    admit(
-        hook("term-1", "needs your input", None),
+    driver.tick(Some(hook("term-1", "agent_completed", None)), start);
+    let _ = admit(
+        hook("term-1", "agent_needs_input", None),
         start,
         &mut driver.tracked,
         &driver.counters,
@@ -606,4 +634,393 @@ fn attention_crosses_to_the_renderer_in_the_shape_it_parses() {
         detail: None,
     };
     assert_eq!(serde_json::to_string(&signal).unwrap(), WIRE_SIGNAL);
+}
+
+// ---- One request, two channels -------------------------------------------
+//
+// A GitPulse-launched Claude Code rings the terminal bell
+// (`preferredNotifChannel: terminal_bell`) at the same moment its
+// `Notification` hook reports over the socket, and both are keyed to the same
+// PTY. Which lands first is a scheduling accident. Neither order may cost the
+// reason the hook carried, and neither may cost the user a second banner.
+
+#[test]
+fn a_bell_behind_a_hook_report_does_not_erase_its_reason() {
+    let mut driver = Driver::new();
+    let start = Instant::now();
+    driver.tick(
+        Some(hook("term-1", "permission_prompt", Some("Bash: cargo test"))),
+        start,
+    );
+    driver.tick(Some(notice("term-1")), start + Duration::from_millis(20));
+    driver.tick(None, start + COALESCE * 3);
+    assert_eq!(
+        driver.recorder.bodies(),
+        vec!["needs your permission — Bash: cargo test".to_string()],
+        "the bell became a second, reasonless banner"
+    );
+    let said = driver.recorder.announcements();
+    assert_eq!(said.len(), 1, "{said:?}");
+    assert_eq!(said[0].event, Some("permission_prompt"));
+}
+
+#[test]
+fn a_bell_racing_ahead_of_its_hook_report_yields_one_banner_with_the_reason() {
+    let mut driver = Driver::new();
+    let start = Instant::now();
+    // The session has shown that its hooks report.
+    driver.tick(Some(hook("term-1", "agent_completed", None)), start);
+    let later = start + Duration::from_secs(120);
+    driver.tick(Some(notice("term-1")), later);
+    driver.tick(
+        Some(hook("term-1", "permission_prompt", Some("Bash: rm -rf target"))),
+        later + Duration::from_millis(40),
+    );
+    driver.tick(None, later + COALESCE * 3);
+    assert_eq!(
+        driver.recorder.bodies(),
+        vec![
+            "finished its work".to_string(),
+            "needs your permission — Bash: rm -rf target".to_string()
+        ],
+        "a reasonless banner went out ahead of the report that explained it"
+    );
+}
+
+#[test]
+fn a_rate_limited_banner_is_delayed_not_lost() {
+    let mut driver = Driver::new();
+    let start = Instant::now();
+    for session in 0..RATE_CAPACITY {
+        driver.tick(Some(notice(&format!("term-{session}"))), start);
+    }
+    driver.tick(
+        Some(hook("term-x", "permission_prompt", Some("Bash: deploy"))),
+        start,
+    );
+    assert_eq!(driver.recorder.count(), RATE_CAPACITY as usize);
+    assert!(
+        next_wake(&driver.tracked).is_some(),
+        "a held-back banner must wake the worker when a token returns"
+    );
+    driver.tick(None, start + RATE_REFILL + Duration::from_millis(1));
+    assert_eq!(
+        driver.recorder.bodies().last().map(String::as_str),
+        Some("needs your permission — Bash: deploy"),
+        "the rate limit discarded a permission prompt instead of delaying it"
+    );
+}
+
+// ---- What stands, and what answers it ------------------------------------
+
+fn tool(key: &str, event: &str, subject: &str, subagent: bool) -> Notice {
+    let mut notice = hook(key, event, Some("Bash: cargo test"));
+    notice.subject = Some(subject.to_owned());
+    notice.subagent = subagent;
+    notice
+}
+
+fn reader(key: &str) -> Notice {
+    let mut notice = hook(key, "prompt_submitted", None);
+    notice.origin = Origin::Reader;
+    notice.channel = "reader";
+    notice
+}
+
+impl Driver {
+    fn standing(&self) -> Option<&'static str> {
+        self.tracked
+            .get("term-1")
+            .and_then(|entry| entry.standing.as_ref())
+            .and_then(|standing| standing.attention.event)
+    }
+    fn last_announced(&self) -> Option<&'static str> {
+        self.recorder.announcements().last().and_then(|a| a.event)
+    }
+}
+
+#[test]
+fn a_permission_request_is_shown_at_once_and_never_bannered_by_itself() {
+    let mut driver = Driver::new();
+    let start = Instant::now();
+    driver.tick(Some(tool("term-1", "permission_request", "aa", false)), start);
+    driver.tick(None, start + COALESCE * 4);
+    assert_eq!(driver.recorder.count(), 0, "a state became a banner");
+    assert_eq!(driver.last_announced(), Some("permission_request"));
+    assert_eq!(driver.standing(), Some("permission_request"));
+}
+
+#[test]
+fn the_notification_that_follows_a_permission_request_banners_it_with_the_tool() {
+    let mut driver = Driver::new();
+    let start = Instant::now();
+    driver.tick(Some(tool("term-1", "permission_request", "aa", false)), start);
+    let mut late = hook(
+        "term-1",
+        "permission_prompt",
+        Some("Claude needs your permission to use Bash"),
+    );
+    late.subject = None;
+    driver.tick(Some(late), start + Duration::from_secs(6));
+    assert_eq!(
+        driver.recorder.bodies(),
+        vec!["needs your permission — Bash: cargo test".to_string()]
+    );
+    // Same dialog, so the pane is not told twice and keeps the subject that
+    // lets the tool's result end it.
+    assert_eq!(driver.recorder.announcements().len(), 1);
+    driver.tick(
+        Some(tool("term-1", "tool_finished", "aa", false)),
+        start + Duration::from_secs(9),
+    );
+    assert_eq!(driver.standing(), None);
+    assert_eq!(driver.last_announced(), Some("tool_finished"));
+}
+
+#[test]
+fn a_permission_ends_only_on_its_own_tool_call() {
+    let mut driver = Driver::new();
+    let start = Instant::now();
+    driver.tick(Some(tool("term-1", "permission_request", "aa", false)), start);
+    // Another call in the same batch, and a subagent's, finish meanwhile.
+    for (subject, subagent) in [("bb", false), ("cc", true)] {
+        driver.tick(
+            Some(tool("term-1", "tool_finished", subject, subagent)),
+            start + Duration::from_secs(2),
+        );
+        assert_eq!(driver.standing(), Some("permission_request"), "{subject}");
+    }
+    // A result that names no call cannot be matched, so it cannot end one.
+    let mut unnamed = hook("term-1", "tool_finished", None);
+    unnamed.subject = None;
+    driver.tick(Some(unnamed), start + Duration::from_secs(3));
+    assert_eq!(driver.standing(), Some("permission_request"));
+    // The subagent's own permission ends on the subagent's own result.
+    driver.tick(
+        Some(tool("term-1", "tool_finished", "aa", true)),
+        start + Duration::from_secs(4),
+    );
+    assert_eq!(driver.standing(), None);
+}
+
+#[test]
+fn the_main_agent_working_again_ends_a_finished_turn_but_a_subagent_does_not() {
+    let mut driver = Driver::new();
+    let start = Instant::now();
+    driver.tick(Some(hook("term-1", "turn_finished", None)), start);
+    driver.tick(
+        Some(tool("term-1", "tool_finished", "aa", true)),
+        start + Duration::from_secs(1),
+    );
+    assert_eq!(driver.standing(), Some("turn_finished"));
+    driver.tick(
+        Some(tool("term-1", "tool_finished", "bb", false)),
+        start + Duration::from_secs(2),
+    );
+    assert_eq!(driver.standing(), None);
+}
+
+#[test]
+fn an_answer_from_anywhere_ends_the_question_and_takes_its_banner_down() {
+    for answer in [hook("term-1", "prompt_submitted", None), reader("term-1")] {
+        let mut driver = Driver::new();
+        let start = Instant::now();
+        driver.tick(Some(hook("term-1", "idle_prompt", None)), start);
+        assert_eq!(driver.recorder.count(), 1);
+        driver.tick(Some(answer), start + Duration::from_secs(2));
+        assert_eq!(driver.standing(), None);
+        assert_eq!(driver.last_announced(), Some("prompt_submitted"));
+        assert_eq!(
+            *driver.recorder.withdrawn.lock().unwrap(),
+            vec!["gitpulse.session.term-1".to_string()]
+        );
+        // Answered once; a second answer has nothing to end or take down.
+        driver.tick(Some(reader("term-1")), start + Duration::from_secs(4));
+        assert_eq!(driver.recorder.withdrawn.lock().unwrap().len(), 1);
+        assert_eq!(driver.recorder.announcements().len(), 2);
+    }
+}
+
+#[test]
+fn a_banner_answered_before_it_was_due_is_never_shown() {
+    let mut driver = Driver::new();
+    let start = Instant::now();
+    driver.tick(Some(hook("term-1", "agent_completed", None)), start);
+    // Inside the window: held.
+    driver.tick(
+        Some(hook("term-1", "idle_prompt", None)),
+        start + Duration::from_secs(1),
+    );
+    driver.tick(Some(reader("term-1")), start + Duration::from_secs(2));
+    driver.tick(None, start + COALESCE * 3);
+    assert_eq!(driver.recorder.count(), 1, "an answered question was asked");
+    assert_eq!(driver.counters.resolved.load(Ordering::Relaxed), 1);
+}
+
+#[test]
+fn a_session_that_ends_drops_its_question_but_keeps_its_last_word() {
+    let ended = |key: &str| {
+        let mut notice = hook(key, "session_ended", None);
+        notice.origin = Origin::Terminal;
+        notice.channel = "exit";
+        notice
+    };
+    let mut driver = Driver::new();
+    let start = Instant::now();
+    driver.tick(Some(hook("term-1", "permission_prompt", None)), start);
+    driver.tick(Some(ended("term-1")), start + Duration::from_secs(2));
+    assert_eq!(driver.standing(), None, "a dead process still asks");
+    for last in ["agent_completed", "error", "turn_finished"] {
+        let mut driver = Driver::new();
+        driver.tick(Some(hook("term-1", last, None)), start);
+        driver.tick(Some(ended("term-1")), start + Duration::from_secs(2));
+        assert_eq!(driver.standing(), Some(last), "{last} was erased by the exit");
+    }
+}
+
+#[test]
+fn a_later_bell_reminds_of_the_hooks_question_instead_of_replacing_it() {
+    let mut driver = Driver::new();
+    let start = Instant::now();
+    driver.tick(
+        Some(hook("term-1", "permission_prompt", Some("Bash: deploy"))),
+        start,
+    );
+    let later = start + Duration::from_secs(60);
+    driver.tick(Some(notice("term-1")), later);
+    driver.tick(None, later + HOOK_GRACE + Duration::from_millis(1));
+    assert_eq!(
+        driver.recorder.bodies(),
+        vec![
+            "needs your permission — Bash: deploy".to_string(),
+            "needs your permission — Bash: deploy".to_string()
+        ]
+    );
+    assert_eq!(driver.standing(), Some("permission_prompt"));
+    assert_eq!(driver.recorder.announcements().len(), 1);
+}
+
+#[test]
+fn a_session_without_hooks_still_bells_at_once() {
+    // The grace is for a report that is coming. A session that never sent
+    // one must not pay for it.
+    let mut driver = Driver::new();
+    driver.tick(Some(notice("term-1")), Instant::now());
+    assert_eq!(driver.recorder.count(), 1);
+}
+
+#[test]
+fn a_bell_whose_report_never_comes_is_still_delivered() {
+    let mut driver = Driver::new();
+    let start = Instant::now();
+    driver.tick(Some(hook("term-1", "agent_completed", None)), start);
+    let later = start + Duration::from_secs(600);
+    driver.tick(Some(notice("term-1")), later);
+    assert_eq!(driver.recorder.count(), 1, "held for its report");
+    let wake = next_wake(&driver.tracked).expect("the held bell must wake the worker");
+    assert!(wake <= HOOK_GRACE + Duration::from_secs(600));
+    driver.tick(None, later + HOOK_GRACE);
+    assert_eq!(driver.recorder.count(), 2, "the bell was lost waiting");
+}
+
+#[test]
+fn under_the_rate_limit_a_stalled_agent_goes_before_a_finished_one() {
+    let mut driver = Driver::new();
+    let start = Instant::now();
+    for session in 0..RATE_CAPACITY {
+        driver.tick(Some(notice(&format!("term-{session}"))), start);
+    }
+    // Offered in the worse order: the finished one first.
+    driver.tick(Some(hook("term-a", "agent_completed", None)), start);
+    driver.tick(Some(hook("term-b", "permission_prompt", None)), start);
+    driver.tick(None, start + RATE_REFILL);
+    assert_eq!(
+        driver.recorder.natives().last().map(String::as_str),
+        Some("gitpulse.session.term-b")
+    );
+    driver.tick(None, start + RATE_REFILL * 2);
+    assert_eq!(
+        driver.recorder.natives().last().map(String::as_str),
+        Some("gitpulse.session.term-a")
+    );
+}
+
+#[test]
+fn what_stands_is_what_a_page_that_was_not_listening_reads() {
+    let mut driver = Driver::new();
+    let start = Instant::now();
+    driver.tick(Some(tool("term-1", "permission_request", "aa", false)), start);
+    driver.tick(Some(hook("term-2", "turn_finished", None)), start);
+    driver.tick(Some(hook("term-3", "idle_prompt", None)), start);
+    driver.tick(Some(reader("term-3")), start + Duration::from_secs(1));
+    let standing = standing_of(&driver.tracked, start + Duration::from_secs(5));
+    let events: Vec<_> = standing
+        .iter()
+        .map(|s| (s.session.as_str(), s.event.as_deref()))
+        .collect();
+    assert_eq!(
+        events,
+        vec![
+            ("term-1", Some("permission_request")),
+            ("term-2", Some("turn_finished"))
+        ]
+    );
+    // Each says how long ago it was asked, so a page that missed it does not
+    // call a five-second-old prompt new.
+    assert_eq!(standing[0].age_ms, 5000);
+    // A hook's question outlives the idle timeout that releases the rest.
+    driver.tick(None, start + TRACK_TTL * 3);
+    assert_eq!(standing_of(&driver.tracked, start).len(), 2);
+}
+
+/// What a page that was not listening reads, as it crosses into the renderer.
+/// `sessionActivity.test.ts` parses this literal and replays it.
+const WIRE_STANDING: &str = r#"[{"session":"term-1","channel":"hook","event":"permission_request","detail":"Bash: cargo test","age_ms":5000}]"#;
+
+#[test]
+fn what_stands_crosses_to_the_renderer_in_the_shape_it_replays() {
+    let mut driver = Driver::new();
+    let start = Instant::now();
+    driver.tick(Some(tool("term-1", "permission_request", "aa", false)), start);
+    let standing = standing_of(&driver.tracked, start + Duration::from_secs(5));
+    assert_eq!(serde_json::to_string(&standing).unwrap(), WIRE_STANDING);
+}
+
+#[test]
+fn every_resolution_is_counted_so_the_outcomes_still_reconcile() {
+    // Offered: 3. Delivered: 1. Coalesced into it: 1. Resolved before shown: 1.
+    let mut driver = Driver::new();
+    let start = Instant::now();
+    driver.tick(Some(hook("term-1", "idle_prompt", None)), start);
+    driver.tick(
+        Some(hook("term-1", "agent_needs_input", None)),
+        start + Duration::from_millis(100),
+    );
+    driver.tick(
+        Some(hook("term-1", "idle_prompt", None)),
+        start + Duration::from_millis(200),
+    );
+    driver.tick(Some(reader("term-1")), start + Duration::from_millis(300));
+    let c = &driver.counters;
+    assert_eq!(c.delivered.load(Ordering::Relaxed), 1);
+    assert_eq!(c.coalesced.load(Ordering::Relaxed), 1);
+    assert_eq!(c.resolved.load(Ordering::Relaxed), 1);
+}
+
+#[test]
+fn an_answer_to_a_session_the_worker_forgot_still_clears_its_pane() {
+    // Evicted past the bound, or asked before this process started: the pane
+    // may still show the question, and the user's answer must still end it.
+    let mut driver = Driver::new();
+    driver.tick(Some(reader("term-1")), Instant::now());
+    assert_eq!(driver.last_announced(), Some("prompt_submitted"));
+    // Once known to be asking nothing, a second answer says nothing.
+    driver.tick(Some(reader("term-1")), Instant::now() + Duration::from_secs(2));
+    assert_eq!(driver.recorder.announcements().len(), 1);
+    // A plain shell, or a session outside GitPulse, has no pane to clear.
+    let mut shell = reader("term-shell");
+    shell.is_agent = false;
+    driver.tick(Some(shell), Instant::now());
+    driver.tick(Some(reader("hook-claude-x")), Instant::now());
+    assert_eq!(driver.recorder.announcements().len(), 1);
 }

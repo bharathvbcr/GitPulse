@@ -61,6 +61,14 @@ before that tag is pushed.
   it stood in that commit's parent — following a rename to the old path — to
   get past a reformat or move to the change that really wrote a line. Back and
   Working tree return; picking another file ends the walk.
+- **An agent's question survives a reload.** What a session stands asking for
+  is read once the page is listening, so a permission asked while the window
+  reloaded is still shown, and typing an answer withdraws it.
+- **Agents waiting on you show on the tray.** A session that needs an answer
+  is counted with the same rule as the task pane, including a permission asked
+  through the agent hook, and the menu-bar glyph names that count while the
+  window is closed. A session that has finished is shown and is not counted.
+
 ### Changed
 - **More than 24 repositories can be open at once.** Opening a twenty-fifth
   used to be refused with "Too many open repositories (max 24)", because every

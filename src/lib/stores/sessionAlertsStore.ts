@@ -29,8 +29,12 @@ export interface SessionAlertStatus {
   suppressed_attended: number;
   suppressed_quiet: number;
   coalesced: number;
+  /** Answered before its banner was due, so never shown. */
+  resolved: number;
   displaced: number;
   rate_limited: number;
+  /** Banners the rate limit delayed. Not an outcome: each also lands in another counter. */
+  deferred: number;
   dropped_queue: number;
   dropped_scan: number;
   failed: number;
@@ -72,6 +76,8 @@ const EMPTY_STATUS: SessionAlertStatus = {
   suppressed_attended: 0,
   suppressed_quiet: 0,
   coalesced: 0,
+  resolved: 0,
+  deferred: 0,
   displaced: 0,
   rate_limited: 0,
   dropped_queue: 0,
@@ -170,3 +176,22 @@ export const terminalAttendance = createAttendance(async (sessionIds) => {
   if (!isTauri()) return;
   await invoke("cmd_session_alerts_visible", { sessionIds });
 });
+
+/**
+ * Tells the notifier the reader answered what `sessionId` was asking, so it
+ * is not replayed to the next page and its banner comes down. Best effort:
+ * the pane has already cleared, and a failure is logged rather than shown,
+ * because the reader is mid-keystroke and cannot act on it.
+ */
+export function reportAttentionAnswered(sessionId: string): void {
+  if (!isTauri()) return;
+  invoke("cmd_session_attention_answered", { sessionId }).catch((error: unknown) => {
+    console.warn("[gitpulse-alerts] answered attention not reported:", error);
+  });
+}
+
+/** What every agent session stands asking for, for a page that just started listening. */
+export async function standingAttention(): Promise<unknown> {
+  if (!isTauri()) return [];
+  return invoke<unknown>("cmd_session_attention_standing");
+}

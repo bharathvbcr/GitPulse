@@ -5168,6 +5168,32 @@ pub async fn cmd_session_alerts_visible(session_ids: Vec<String>) -> Result<(), 
     Ok(())
 }
 
+/// What every agent session stands asking for right now.
+///
+/// The renderer hears attention as events, and an event emitted while no page
+/// was listening — before the listener bound, or across a window reload — is
+/// gone. A page reads this once it is listening, so an agent that asked for
+/// permission while the window reloaded is still shown asking.
+#[tauri::command(async)]
+pub async fn cmd_session_attention_standing(
+) -> Result<Vec<crate::alerts::StandingAttention>, String> {
+    Ok(crate::alerts::standing())
+}
+
+/// The user typed into a session that was asking for something.
+///
+/// Tells the notifier, which owns what stands: without this, an answered
+/// question was replayed to the next page, and its banner stayed in the
+/// notification centre asking it.
+#[tauri::command(async)]
+pub async fn cmd_session_attention_answered(session_id: String) -> Result<(), String> {
+    if crate::alerts::answered(&session_id) {
+        Ok(())
+    } else {
+        Err("Not a terminal session id.".into())
+    }
+}
+
 #[tauri::command(async)]
 pub async fn cmd_tool_ladder(
     tool: crate::tool_install::ExternalTool,
