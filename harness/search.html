@@ -1,0 +1,188 @@
+<!doctype html>
+<html lang="en">
+  <head><meta charset="utf-8" /><title>GitPulse content search checks</title></head>
+  <body style="margin:0">
+    <div id="app"></div>
+    <pre id="result" style="position:fixed;bottom:8px;right:8px;max-height:30vh;overflow:auto;font:11px monospace;background:#141a29;color:#e9edf8;z-index:100"></pre>
+    <script type="module">
+      /**
+       * Content search, rendered.
+       *
+       * The backend's bounds are pinned by real-git tests. What only a page can
+       * settle is that the reader is told: a partial answer must look partial,
+       * Cancel must reach the backend with the token the search was sent with,
+       * a newer search must retire the older one, and a result must open its
+       * file. Nothing here runs git; every answer is a fixture.
+       */
+      import { mockIPCWithEvents } from "./tauriMocks";
+      import "../src/app.css";
+
+      const params = new URLSearchParams(location.search);
+      const errors = [];
+      addEventListener("error", event => errors.push(event.message));
+      addEventListener("unhandledrejection", event => errors.push(String(event.reason)));
+
+      const match = (path, line, text, clipped = false) => ({ path, line, column: 1, text, text_clipped: clipped });
+      const complete = { matches: [match("src/a.ts", 3, "const needle = 1;"), match("src/a.ts", 9, "needle()"), match("lib/b.rs", 1, "x".repeat(40), true)],
+        files: 2, truncated: false, truncated_reason: null, revision: null };
+      const searches = [];
+      const cancels = [];
+      /** Pending searches by token, so a test can hold one open and settle it. */
+      const held = new Map();
+      let mode = "complete";
+
+      mockIPCWithEvents((cmd, args) => {
+        switch (cmd) {
+          case "cmd_resolve_repo": return { path: args.repoPath, name: "GitPulse", is_bare: false };
+          case "cmd_search_content":
+            searches.push(args);
+            if (mode === "complete") return complete;
+            if (mode === "capped") return { ...complete, truncated: true, truncated_reason: "match_limit" };
+            if (mode === "none") return { matches: [], files: 0, truncated: false, truncated_reason: null, revision: null };
+            if (mode === "revision") return { ...complete, revision: "e".repeat(40) };
+            if (mode === "error") throw new Error("Search failed: fatal: invalid regex");
+            return new Promise(resolve => held.set(args.cancelToken, resolve));
+          case "cmd_codeintel_cancel":
+            cancels.push(args.cancelToken);
+            held.get(args.cancelToken)?.({ matches: [match("src/a.ts", 3, "partial")], files: 1, truncated: true, truncated_reason: "cancelled", revision: null });
+            held.delete(args.cancelToken);
+            return true;
+          case "cmd_list_branches": return [];
+          case "cmd_get_status": case "cmd_list_remotes": case "cmd_list_submodules": return [];
+          case "cmd_stash_list": return { entries: [], truncated: false };
+          case "cmd_list_tags": return { tags: [], truncated: false };
+          case "cmd_branch_stats": return {};
+          case "cmd_repo_operation": case "cmd_workspace_sync": return null;
+          default: throw new Error(`Unimplemented fixture: ${cmd}`);
+        }
+      });
+
+      const { mount, tick } = await import("svelte");
+      const { get } = await import("svelte/store");
+      const { repoStore } = await import("../src/lib/stores/repoStore");
+      const { createChecks } = await import("./checks.ts");
+      const Host = (await import("./SearchHost.svelte")).default;
+      await repoStore.openRepo("/fixture/GitPulse");
+      mount(Host, { target: document.querySelector("#app") });
+
+      const wait = () => new Promise(resolve => setTimeout(resolve, 40));
+      const until = async test => {
+        const end = Date.now() + 8000;
+        while (!test() && Date.now() < end) await wait();
+        if (!test()) throw new Error("Fixture condition timed out");
+      };
+      const text = () => document.body.textContent;
+      const input = () => document.querySelector('input[aria-label="Search file contents"]');
+      const revisionInput = () => document.querySelector('input[aria-label="Revision to search"]');
+      const button = name => [...document.querySelectorAll("button")].find(node => node.textContent.trim() === name);
+      const toggle = label => [...document.querySelectorAll("label")].find(node => node.textContent.trim() === label).querySelector("input");
+      const summary = () => document.querySelector("[data-search-summary]");
+      const matches = () => [...document.querySelectorAll("[data-search-match]")];
+      const set = async (node, value) => { node.value = value; node.dispatchEvent(new Event("input", { bubbles: true })); await tick(); };
+      const submit = async () => { document.querySelector("form").requestSubmit(); await tick(); };
+      const last = () => searches[searches.length - 1];
+
+      const { results, check, stopped } = createChecks();
+      const report = () => { document.getElementById("result").textContent = results.map(row => `${row.pass ? "ok  " : "FAIL"} ${row.name}`).join("\n"); };
+
+      await (async () => {
+        try {
+          await until(() => !!input());
+          check("an empty pane says what search covers", () => text().includes("never ignored ones"));
+          check("Search waits for a pattern", () => button("Search").disabled);
+
+          // --- a complete answer ---------------------------------------------
+          await set(input(), "needle");
+          await submit();
+          await until(() => !!summary());
+          check("the pattern is sent as typed", () => last().pattern === "needle");
+          check("literal and case-insensitive by default", () =>
+            last().options.fixed_strings === true && last().options.ignore_case === true);
+          check("the working tree by default", () => last().options.revision === null);
+          check("every search carries a cancel token", () => typeof last().cancelToken === "string" && last().cancelToken.length > 0);
+          check("a complete answer is stated without hedging", () =>
+            summary().textContent.trim() === "3 matches in 2 files in the working tree");
+          check("and is not styled as a warning", () => !summary().className.includes("amber"));
+          check("matches are grouped under their file", () => text().includes("src/a.ts (2)") && text().includes("lib/b.rs (1)"));
+          check("each match shows its line number", () => matches()[1].textContent.includes("9"));
+          check("a clipped line says it was clipped", () => matches()[2].textContent.trim().endsWith("…"));
+
+          // --- options --------------------------------------------------------
+          toggle("regex").click(); toggle("match case").click(); await tick();
+          await set(revisionInput(), "  v1.2.0  ");
+          mode = "revision";
+          await submit();
+          await until(() => summary()?.textContent.includes("at eeeeeee"));
+          check("regex mode is sent as not-literal", () => last().options.fixed_strings === false);
+          check("match case is sent as case-sensitive", () => last().options.ignore_case === false);
+          check("the revision is sent trimmed", () => last().options.revision === "v1.2.0");
+          check("and the answer names the commit searched", () => summary().textContent.includes("at eeeeeee"));
+          await set(revisionInput(), "");
+
+          // --- a partial answer -------------------------------------------------
+          mode = "capped";
+          await submit();
+          await until(() => summary()?.textContent.includes("partial"));
+          check("a capped answer is marked partial with its reason", () =>
+            summary().textContent.includes("the match limit was reached") && summary().textContent.includes("more matches may exist"));
+          check("and styled as a warning", () => summary().className.includes("amber"));
+
+          // --- cancel ------------------------------------------------------------
+          mode = "hold";
+          await submit();
+          await until(() => !!button("Cancel"));
+          const heldToken = last().cancelToken;
+          check("a running search offers Cancel instead of Search", () => !button("Search"));
+          button("Cancel").click();
+          await until(() => cancels.length === 1);
+          check("Cancel reaches the backend with the search's own token", () => cancels[0] === heldToken);
+          await until(() => summary()?.textContent.includes("cancelled"));
+          check("the cancelled partial answer still lands, marked cancelled", () =>
+            summary().textContent.includes("partial: the search was cancelled") && matches().length === 1);
+          check("and Search comes back", () => !!button("Search"));
+
+          // --- a newer search retires the older one ---------------------------
+          await submit();
+          await until(() => held.size === 1);
+          const olderToken = last().cancelToken;
+          mode = "complete";
+          await submit();
+          await until(() => cancels.includes(olderToken) && summary()?.textContent.includes("3 matches"));
+          check("a newer search cancels the older one's token", () => cancels.includes(olderToken));
+          await wait(); await tick();
+          check("and the older answer never overwrites the newer", () =>
+            summary().textContent.trim() === "3 matches in 2 files in the working tree");
+
+          // --- empty and failed ------------------------------------------------
+          mode = "none";
+          await submit();
+          await until(() => text().includes("No matches"));
+          check("no match is stated as no match", () => summary().textContent.includes("0 matches"));
+          mode = "error";
+          await submit();
+          await until(() => !!document.querySelector('[role="alert"]'));
+          check("a failed search shows git's reason", () => document.querySelector('[role="alert"]').textContent.includes("invalid regex"));
+          check("and drops the previous answer", () => !summary());
+
+          // --- opening a result ----------------------------------------------------
+          mode = "complete";
+          await submit();
+          await until(() => matches().length === 3);
+          matches()[2].click(); await tick();
+          check("a match opens its file in Explorer", () => {
+            const state = get(repoStore);
+            return state.selectedFilePath === "lib/b.rs" && state.activeTab === "code" && state.viewSections.code === "explorer";
+          });
+
+          check("no unhandled runtime errors", () => errors.length === 0);
+          report();
+        } catch (error) {
+          stopped(error);
+          report();
+        }
+        document.documentElement.dataset.gpResult = encodeURIComponent(JSON.stringify({ results, errors }));
+        const reportPath = params.get("report");
+        if (reportPath?.startsWith("/__gp_result/")) await fetch(reportPath, { method: "POST", body: document.documentElement.outerHTML });
+      })();
+    </script>
+  </body>

@@ -278,6 +278,7 @@ pub fn run() {
             cmd_list_tags,
             cmd_get_reflog,
             cmd_reset_preview,
+            cmd_search_content,
             cmd_get_language_stats,
             cmd_get_pulse_report,
             cmd_get_knowledge_report,

@@ -13,8 +13,8 @@
  *   (c) a shared field whose normalized wire type or backend-required
  *       presence no longer agrees.
  *
- * SCOPE: see CONTRACTS below for exactly what is checked — 78 contracts over
- * 204 structs, spanning both wire surfaces: command returns and event payloads.
+ * SCOPE: see CONTRACTS below for exactly what is checked — 79 contracts over
+ * 207 structs, spanning both wire surfaces: command returns and event payloads.
  * Enums are still skipped here and covered separately, by
  * scripts/enum-variant-contract.test.ts. That is most, not all, of the named types crossing the IPC
  * boundary: the ones still missing declare their TypeScript interface inside a
@@ -227,6 +227,7 @@ export const CONTRACTS = Object.freeze([
   { label: "repo-operation", rustPath: rust("engine", "repo_op.rs"), tsPath: ts("repos", "operation.ts"), structs: ["RepoOperation"] },
   { label: "stash-options", rustPath: rust("engine", "git_writer.rs"), tsPath: ts("repos", "stash.ts"), structs: ["StashSaveOptions"] },
   { label: "file-delete", rustPath: rust("engine", "git_writer.rs"), tsPath: ts("files", "types.ts"), structs: ["DeleteOutcome"] },
+  { label: "content-search", rustPath: rust("engine", "content_search.rs"), tsPath: ts("search", "types.ts"), structs: ["ContentMatch", "ContentSearchReport", "ContentSearchOptions"] },
   { label: "stash", rustPath: rust("engine", "stash.rs"), tsPath: ts("repos", "stash.ts"), structs: ["StashEntry", "StashList"] },
   { label: "remotes", rustPath: rust("engine", "remotes.rs"), tsPath: ts("repos", "remotes.ts"), structs: ["RemoteInfo", "RemoteList"] },
   { label: "submodules", rustPath: rust("engine", "submodules.rs"), tsPath: ts("repos", "submodules.ts"), structs: ["SubmoduleInfo", "SubmoduleList"] },

@@ -1250,6 +1250,31 @@ pub async fn cmd_get_reflog(
     off_thread(move || GitReader::get_reflog(&repo_path, max_entries.unwrap_or(200))).await
 }
 
+/// Repository-wide content search (`git grep`) over the working tree or one
+/// revision. Bounded, with the reason named when the answer is partial.
+/// `cancel_token` joins the shared query registry, so `cmd_codeintel_cancel`
+/// stops a running search the same way it stops a code-graph query.
+#[tauri::command(async)]
+pub async fn cmd_search_content(
+    repo_path: String,
+    pattern: String,
+    options: Option<crate::engine::content_search::ContentSearchOptions>,
+    cancel_token: Option<String>,
+) -> Result<crate::engine::content_search::ContentSearchReport, String> {
+    off_thread(move || {
+        let cancel = crate::codeintel::begin_cancellable_query(cancel_token.as_deref());
+        let result = crate::engine::content_search::search(
+            &repo_path,
+            &pattern,
+            &options.unwrap_or_default(),
+            &|| cancel.is_cancelled(),
+        );
+        crate::codeintel::finish_cancellable_query(cancel_token.as_deref());
+        result
+    })
+    .await
+}
+
 /// What resetting HEAD's branch to `target` would take off it. Read-only and
 /// ungated; the reset itself goes through the guarded [`cmd_reset`].
 #[tauri::command(async)]

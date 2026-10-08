@@ -1282,6 +1282,69 @@ fn test_get_status_copy_record_keeps_cursor_aligned() {
     assert_eq!(modified.status_code, "M ");
 }
 
+/// Content search over real `git grep`: the explorer's file set (tracked and
+/// untracked, never ignored), a revision's tree, and every bounded answer
+/// marked with why.
+#[test]
+fn content_search_is_bounded_and_says_why() {
+    use gitpulse_lib::engine::content_search::{search, ContentSearchOptions};
+    let repo = TestRepo::init();
+    repo.write(".gitignore", "*.log\n");
+    repo.write("src/a.rs", "let needle = 1;\nother\n");
+    repo.commit_all("seed");
+    repo.write("src/a.rs", "let needle = 2;\nother\n");
+    repo.write("notes with space.txt", "-dash needle here\n");
+    repo.write("build.log", "needle in ignored\n");
+    let never = || false;
+    let opts = ContentSearchOptions::default();
+
+    let found = search(&repo.path_str(), "needle", &opts, &never).expect("search");
+    assert!(!found.truncated && found.truncated_reason.is_none(), "{found:?}");
+    let mut paths: Vec<_> = found.matches.iter().map(|m| m.path.as_str()).collect();
+    paths.sort();
+    assert_eq!(paths, ["notes with space.txt", "src/a.rs"], "untracked yes, ignored no");
+    let a = found.matches.iter().find(|m| m.path == "src/a.rs").unwrap();
+    assert_eq!((a.line, a.column, a.text.as_str()), (1, 5, "let needle = 2;"));
+    assert_eq!(found.files, 2);
+
+    let at_head = search(
+        &repo.path_str(),
+        "needle = 1",
+        &ContentSearchOptions { revision: Some("HEAD".into()), fixed_strings: true, ..Default::default() },
+        &never,
+    )
+    .expect("revision search");
+    assert_eq!(at_head.matches.len(), 1);
+    assert_eq!(at_head.matches[0].path, "src/a.rs");
+    assert_eq!(at_head.revision.as_deref().map(str::len), Some(40));
+
+    let dash = search(&repo.path_str(), "-dash", &ContentSearchOptions { fixed_strings: true, ..Default::default() }, &never)
+        .expect("a leading dash is a pattern");
+    assert_eq!(dash.matches.len(), 1);
+
+    let none = search(&repo.path_str(), "zzz-not-here", &opts, &never).expect("no match is an answer");
+    assert!(none.matches.is_empty() && !none.truncated);
+
+    repo.write("many.txt", &"hit\n".repeat(200));
+    let capped = search(&repo.path_str(), "hit", &ContentSearchOptions { max_matches: Some(10), ..Default::default() }, &never)
+        .expect("capped");
+    assert_eq!(capped.matches.len(), 10);
+    assert_eq!((capped.truncated, capped.truncated_reason.as_deref()), (true, Some("match_limit")));
+
+    let exact = search(&repo.path_str(), "hit", &ContentSearchOptions { max_matches: Some(200), ..Default::default() }, &never)
+        .expect("exactly at the limit");
+    assert_eq!(exact.matches.len(), 200);
+    assert!(!exact.truncated, "200 matches under a 200 limit is complete");
+
+    let always = || true;
+    let stopped = search(&repo.path_str(), "hit", &opts, &always).expect("a cancel is an answer");
+    assert_eq!((stopped.truncated, stopped.truncated_reason.as_deref()), (true, Some("cancelled")));
+
+    assert!(search(&repo.path_str(), "(", &opts, &never).unwrap_err().contains("Search failed"));
+    assert!(search(&repo.path_str(), "x", &ContentSearchOptions { revision: Some("nosuch".into()), ..Default::default() }, &never).is_err());
+    assert!(search(&repo.path_str(), "", &opts, &never).is_err());
+}
+
 fn staged_names(repo: &TestRepo) -> String {
     gitpulse_lib::engine::git_cli::git_text(repo.dir.path(), &["diff", "--cached", "--name-status", "-M"])
         .unwrap()
