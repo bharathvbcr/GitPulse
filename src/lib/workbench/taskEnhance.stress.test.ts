@@ -7,7 +7,7 @@ const task: Task = {
   id: "t", revision: 4, updated_at: 1, title: "Fix E42", description: "Keep evidence",
   kind: "bug", status: "ready", priority: 1, severity: null, owner: null, due_at: null,
   labels: [], acceptance_criteria: [], repository_ids: ["r"], primary_repository_id: "r",
-  home_workspace_id: null, position: 1, locked_fields: [],
+  home_workspace_id: null, position: 1, archived: false, completed_at: null, checklist: [], links: [], locked_fields: [],
 };
 const proposal: Enhancement = {
   id: "e", revision: 3, updated_at: 1, task_id: "t", source_revision: 4, source: task,

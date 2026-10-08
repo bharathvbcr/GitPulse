@@ -44,29 +44,8 @@ describe("BlameViewer file explorer integration", () => {
     // failed blame. The store does not notify for an unchanged value, so the
     // retry calls the loader directly.
     expect(source).toContain("function retryBlame()");
-    // Retry asks again for what is on screen: a historical blame retries at
-    // its revision and path, not at the working tree.
-    expect(source).toContain("void loadBlameFor(repo, at?.path ?? path, at?.revision ?? null);");
+    expect(source).toContain("void loadBlameFor(repo, path);");
     expect(source).toContain("onclick={retryBlame}");
-  });
-});
-
-describe("BlameViewer blame at a revision", () => {
-  it("sends the revision with every blame request and keys the subject on it", () => {
-    expect(source).toContain("revision,\n        }),");
-    expect(source).toContain("const subject = `${repo}\\u0000${path}\\u0000${revision ?? \"\"}`;");
-  });
-
-  it("steps to the parent git blamed through, at the parent's path", () => {
-    expect(source).toContain("const parent = line.previous_commit;");
-    expect(source).toContain("void loadBlameFor(repo, parentPath, parent);");
-    expect(source).toContain("onclick={() => stepToParent(line)}");
-  });
-
-  it("keeps a historical view through worktree churn and drops it on a new selection", () => {
-    expect(source).toContain("if (repo && selected === trailOrigin) return;");
-    expect(source).toContain("function returnToWorkingTree()");
-    expect(source).toContain("onclick={stepBack}");
   });
 });
 

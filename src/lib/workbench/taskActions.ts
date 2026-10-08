@@ -23,6 +23,8 @@ export type TaskChanges = {
   position?: number;
   owner?: string | null;
   due_at?: number | null;
+  /** Archive or restore; the status is left as it is (`taskArchive.ts`). */
+  archived?: boolean;
 };
 export type TaskAction =
   | { kind: "delete" }
@@ -46,8 +48,8 @@ export type TaskAction =
    */
   | { kind: "restore"; fields: Record<string, RestoreFields> };
 /** The fields a board action can change, and so the fields an undo restores. */
-export type RestoreFields = Partial<Pick<TaskDraft, "status" | "priority" | "position" | "owner" | "due_at" | "labels">>;
-const RESTORABLE = ["status", "priority", "position", "owner", "due_at", "labels"] as const;
+export type RestoreFields = Partial<Pick<TaskDraft, "status" | "priority" | "position" | "owner" | "due_at" | "labels" | "archived">>;
+const RESTORABLE = ["status", "priority", "position", "owner", "due_at", "labels", "archived"] as const;
 /** The least a batch needs to know about a card: which task, which revision. */
 export type BatchCard = Pick<TaskCard, "id" | "title" | "revision">;
 /** A batch that undoes another, ready to run. */
@@ -69,8 +71,9 @@ function validLabel(label: unknown): label is string {
 }
 
 function validChanges(changes: TaskChanges): boolean {
-  const {status,priority,position,owner,due_at} = changes;
+  const {status,priority,position,owner,due_at,archived} = changes;
   if (status !== undefined && !STATUSES.includes(status)) return false;
+  if (archived !== undefined && typeof archived !== "boolean") return false;
   if (priority !== undefined && (!Number.isInteger(priority) || priority < 0 || priority > 3)) return false;
   if (position !== undefined && (!Number.isSafeInteger(position) || position < 0)) return false;
   // Owner and due date reach the wire from a menu, so they are checked to
@@ -82,19 +85,15 @@ function validChanges(changes: TaskChanges): boolean {
   return true;
 }
 
-/**
- * One line saying what a batch did, for the undo offer and the live region.
- *
- * Archiving is a status change to Done (`taskArchive.ts`), so it reads as a
- * move to that column — which is exactly what its undo reverses.
- */
+/** One line saying what a batch did, for the undo offer and the live region. */
 export function describeTaskAction(action: TaskAction, count: number): string {
   const tasks = plural(count, "task");
   if (action.kind === "delete") return `Deleted ${tasks}`;
   if (action.kind === "restore") return `Restored ${tasks}`;
   if (action.kind === "label") return action.add ? `Added label “${action.label}” to ${tasks}` : `Removed label “${action.label}” from ${tasks}`;
   if (action.kind === "reorder") return `Reordered ${tasks} in ${STATUS_LABELS[action.status]}`;
-  const { status, priority, owner, due_at } = action.changes;
+  const { status, priority, owner, due_at, archived } = action.changes;
+  if (archived !== undefined) return archived ? `Archived ${tasks}` : `Restored ${tasks} from the archive`;
   if (status !== undefined) return `Moved ${tasks} to ${STATUS_LABELS[status]}`;
   if (priority !== undefined) return `Changed priority of ${tasks}`;
   if (owner !== undefined) return owner === null ? `Cleared the owner of ${tasks}` : `Assigned ${tasks} to ${owner}`;

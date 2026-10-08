@@ -515,26 +515,6 @@ fn git_captured_inner(
     )
 }
 
-/// [`git_captured`] with a caller-owned observer, timeout and stdout cap: the
-/// observer sees output as it streams and can stop the child (its
-/// `cancelled()`), which is how a search halts at its match limit or on a
-/// user cancel instead of reading to the end. Same trust check, environment
-/// scrub and spawn gate as every other git read; the finished run comes back
-/// whatever its exit status, with `cancelled` and `incomplete` set.
-pub(crate) fn git_observed(
-    repo: &Path,
-    args: &[&str],
-    timeout: Duration,
-    stdout_cap: usize,
-    observer: &mut dyn ProcessObserver,
-) -> Result<BoundedRun, String> {
-    crate::repository_trust::require(repo)?;
-    let label = format!("git {}", subcommand(args));
-    let mut cmd = git_command(Some(repo), args);
-    let _keep_deadline_prefix = KeepDeadlinePrefix::enter();
-    run_observed(&mut cmd, &label, timeout, None, stdout_cap, observer)
-}
-
 pub fn git_global(args: &[&str]) -> Result<Vec<u8>, String> {
     git_timeout(None, args, DEFAULT_TIMEOUT, None)
 }

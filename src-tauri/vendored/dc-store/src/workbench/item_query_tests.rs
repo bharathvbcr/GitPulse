@@ -57,7 +57,12 @@ fn sparse_queries_do_not_visit_unrelated_profile_rows() {
             15,
         ),
     ] {
-        let (query, values) = item_query(workspace, repo, status, search, false);
+        let filter = super::ItemFilter {
+            status,
+            archived: None,
+            deleted: false,
+        };
+        let (query, values) = item_query(workspace, repo, filter, search, false);
         let mut statement = store
             .connection()
             .prepare(&format!("SELECT count(*) {query}"))

@@ -32,7 +32,7 @@
  * reader never saves a task that quietly lost half of what they typed.
  */
 
-import type { EnhancementField, TaskDraft, TaskStatus } from "./client";
+import { freshTaskFields, type EnhancementField, type TaskDraft, type TaskStatus } from "./client";
 
 /** Longest quick-add line accepted. Past this the input is refused, not truncated. */
 export const MAX_QUICK_ADD_LENGTH = 4_096;
@@ -557,6 +557,7 @@ export function quickAddDraft(
     home_workspace_id: defaults.homeWorkspaceId,
     position: defaults.position,
     locked_fields: [],
+    ...freshTaskFields(),
   };
 }
 

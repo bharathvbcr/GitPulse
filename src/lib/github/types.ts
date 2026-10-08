@@ -162,38 +162,6 @@ export interface PullRequestInfo {
   first_review_at: string;
 }
 
-/** Mirrors `PullRequestDetail` in src-tauri/src/github/mod.rs (`gh pr view`). */
-export interface PullRequestDetail {
-  number: number;
-  title: string;
-  state: string;
-  url: string;
-  is_draft: boolean;
-  author: string;
-  head_ref: string;
-  base_ref: string;
-  /** The head a merge is pinned to with `--match-head-commit`. */
-  head_oid: string;
-  body: string;
-  body_truncated: boolean;
-  additions: number;
-  deletions: number;
-  changed_files: number;
-  mergeable: string;
-  merge_state: string;
-  review_decision: string;
-  ci_status: string;
-}
-
-export type PrReviewVerdict = "approve" | "request_changes" | "comment";
-export type PrMergeMethod = "merge" | "squash" | "rebase";
-
-/** Mirrors the `PrAction` enum `cmd_github_pr_action` takes. */
-export type PrAction =
-  | { kind: "create"; title: string; body: string; base: string; draft: boolean }
-  | { kind: "review"; number: number; verdict: PrReviewVerdict; body: string }
-  | { kind: "merge"; number: number; method: PrMergeMethod; delete_branch: boolean; head_oid: string };
-
 /**
  * The full context payload. Declared inside GitHubPanel until `check:types`
  * grew `extends` resolution and could read it here, next to the base whose

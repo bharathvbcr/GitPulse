@@ -101,7 +101,6 @@
     import("./lib/components/RegressionSuspectsPanel.svelte");
   const loadBlameViewer = () => import("./lib/components/BlameViewer.svelte");
   const loadRepoMapPanel = () => import("./lib/components/RepoMapPanel.svelte");
-  const loadContentSearch = () => import("./lib/components/ContentSearch.svelte");
   const loadConflictEditor = () => import("./lib/components/ConflictEditor.svelte");
   const loadPulseView = () => import("./lib/components/pulse/PulseView.svelte");
   const loadFleetView = () => import("./lib/components/FleetView.svelte");
@@ -1089,7 +1088,7 @@
                   loadManvi={loadManviOpsPanel}
                 />
               {:else if $repoStore.activeTab === "code"}
-                <CodeView loadBlame={loadBlameViewer} loadMap={loadRepoMapPanel} loadSearch={loadContentSearch} />
+                <CodeView loadBlame={loadBlameViewer} loadMap={loadRepoMapPanel} />
               {:else if $repoStore.activeTab === "history"}
                 <HistoryView
                   loadReflog={loadReflogViewer}

@@ -192,31 +192,6 @@ export interface ReflogEntry {
   timestamp: number;
 }
 
-/** One commit named in a `ResetPreview` (Rust `git_reader::PreviewCommit`). */
-export interface PreviewCommit {
-  commit_id: string;
-  summary: string;
-  author_name: string;
-  timestamp: number;
-}
-
-/**
- * What resetting HEAD's branch to `target` would take off it (Rust
- * `git_reader::ResetPreview`). `leaving` is capped; `leaving_total` is not.
- */
-export interface ResetPreview {
-  /** Null when HEAD is detached: only HEAD moves. */
-  branch: string | null;
-  head: string;
-  /** The target peeled to a commit oid — reset to this, not the name. */
-  target: string;
-  leaving: PreviewCommit[];
-  leaving_total: number;
-  /** Leaving commits no other branch, tag or remote ref reaches. */
-  unreachable_total: number;
-  gaining_total: number;
-}
-
 export interface WorktreeDiffStat {
   files_changed: number;
   insertions: number;

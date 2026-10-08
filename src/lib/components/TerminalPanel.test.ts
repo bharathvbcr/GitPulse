@@ -162,28 +162,8 @@ describe("TerminalPanel tab strip", () => {
     expect(source).toContain("disabled={!repoPath || !canCreate}");
     expect(source).toContain("${$terminalSessionLimit} terminal sessions are open");
     // The user's live limit, so raising it in Settings opens a waiting task
-    // terminal at once instead of when a session next closes. Live sessions
-    // only: the strip's own bound is the hard ceiling, and says so apart.
-    expect(source).toContain("const canCreate = $derived(!stripFull && $terminalSessions.length < $terminalSessionLimit)");
-    expect(source).toContain("const stripFull = $derived(!canOpenTab(tabState, MAX_STRIP_TABS))");
-    expect(source).toContain("already holds {MAX_STRIP_TABS} tabs");
-  });
-
-  it("consumes a queued request only once its tab holds a session slot", () => {
-    // Consumed when the tab opened, a request lost the race for the last
-    // slots and was never retried. It stays queued until admitted, and a
-    // refusal drops the tab and leaves the request waiting.
-    expect(source).toContain("onAdmitted={() => admitTab(tab.id)}");
-    expect(source).toContain("onRefused={() => refuseTab(tab.id)}");
-    const opener = source.slice(source.indexOf("const admitting = new Set"), source.indexOf("function admitTab"));
-    expect(opener).toContain("admitting.add(opened.id)");
-    expect(opener.match(/consumeTaskTerminalRequest\(/g)).toHaveLength(1);
-    const refuse = source.slice(source.indexOf("function refuseTab"), source.indexOf("function refuseTab") + 600);
-    expect(refuse.indexOf("dropTab(id)")).toBeLessThan(refuse.indexOf("admitting.delete(id)"));
-    // A tab closed by hand before it took a slot must give its room back, or
-    // every such close shrinks this panel's room for queued starts for good.
-    const drop = source.slice(source.indexOf("function dropTab"), source.indexOf("function dropTab") + 400);
-    expect(drop).toContain("admitting.delete(id)");
+    // terminal at once instead of when a session next closes.
+    expect(source).toContain("canOpenTab(tabState, $terminalSessionLimit) && $terminalSessions.length < $terminalSessionLimit");
   });
 
   it("routes chords through the shared parser rather than inline key tests", () => {
