@@ -1282,6 +1282,53 @@ fn test_get_status_copy_record_keeps_cursor_aligned() {
     assert_eq!(modified.status_code, "M ");
 }
 
+/// Blame at a revision reads the file as that commit recorded it, and each
+/// line carries the parent to step to — including across a rename, where the
+/// parent's path is the old name.
+#[test]
+fn blame_at_revision_steps_to_the_parent_across_a_rename() {
+    let repo = TestRepo::init();
+    repo.write("old name.txt", "one\ntwo\n");
+    repo.commit_all("c1");
+    run_git(repo.dir.path(), &["mv", "old name.txt", "new \"q\".txt"]);
+    repo.write("new \"q\".txt", "one\nTWO\n");
+    repo.commit_all("c2");
+    // The working tree moves on; a revision blame must not see it.
+    repo.write("new \"q\".txt", "one\nTWO\nthree\n");
+
+    let at_head =
+        GitReader::get_file_blame(&repo.path_str(), "new \"q\".txt", Some("HEAD")).expect("blame");
+    assert_eq!(at_head.len(), 2, "HEAD has two lines, the worktree three");
+    assert_eq!(at_head[1].content, "TWO");
+    let parent = at_head[1].previous_commit.clone().expect("c2 has a parent");
+    assert_eq!(at_head[1].previous_path.as_deref(), Some("old name.txt"));
+    // c1 is a root commit: nothing to step to.
+    assert!(at_head[0].previous_commit.is_none());
+    assert!(at_head[0].previous_path.is_none());
+
+    let at_parent =
+        GitReader::get_file_blame(&repo.path_str(), "old name.txt", Some(&parent)).expect("parent");
+    assert_eq!(
+        at_parent.iter().map(|l| l.content.as_str()).collect::<Vec<_>>(),
+        ["one", "two"]
+    );
+
+    // The working-tree form is unchanged by the new argument.
+    assert_eq!(
+        GitReader::get_file_blame(&repo.path_str(), "new \"q\".txt", None)
+            .expect("worktree")
+            .len(),
+        3
+    );
+    for bad in ["-p", "HEAD..main", "HEAD:old name.txt", "", "nosuchref"] {
+        assert!(
+            GitReader::get_file_blame(&repo.path_str(), "old name.txt", Some(bad)).is_err(),
+            "{bad:?} must be refused"
+        );
+    }
+    assert!(GitReader::get_file_blame(&repo.path_str(), "../x", Some("HEAD")).is_err());
+}
+
 /// Regression (m2): blame header detection hardcoded SHA-1's 40-char oid and
 /// rejected every record in a SHA-256 repository.
 #[test]
@@ -1290,7 +1337,7 @@ fn test_get_file_blame_sha256_repo() {
     repo.write("story.txt", "first line\nsecond line\n");
     repo.commit_all("feat: sha256 story");
 
-    let blame = GitReader::get_file_blame(&repo.path_str(), "story.txt").expect("blame");
+    let blame = GitReader::get_file_blame(&repo.path_str(), "story.txt", None).expect("blame");
     assert_eq!(blame.len(), 2);
     for line in &blame {
         assert_eq!(
@@ -1324,7 +1371,7 @@ fn blame_new_files_are_uncommitted_without_mutating_the_index() {
                 run_git(repo.dir.path(), &["add", "--", path]);
             }
             let before = git_out(repo.dir.path(), &["status", "--porcelain=v1"]);
-            let lines = GitReader::get_file_blame(&repo.path_str(), path).expect("new file blame");
+            let lines = GitReader::get_file_blame(&repo.path_str(), path, None).expect("new file blame");
             assert_eq!(
                 lines.iter().map(|l| l.content.as_str()).collect::<Vec<_>>(),
                 ["first", "", "last"]
@@ -1348,12 +1395,12 @@ fn blame_new_files_are_uncommitted_without_mutating_the_index() {
 fn blame_new_empty_files_succeed_but_missing_and_binary_files_do_not() {
     let repo = TestRepo::init();
     repo.write("empty.txt", "");
-    assert!(GitReader::get_file_blame(&repo.path_str(), "empty.txt")
+    assert!(GitReader::get_file_blame(&repo.path_str(), "empty.txt", None)
         .expect("empty file")
         .is_empty());
-    assert!(GitReader::get_file_blame(&repo.path_str(), "absent.txt").is_err());
+    assert!(GitReader::get_file_blame(&repo.path_str(), "absent.txt", None).is_err());
     repo.write("binary.dat", "a\0b");
-    assert!(GitReader::get_file_blame(&repo.path_str(), "binary.dat").is_err());
+    assert!(GitReader::get_file_blame(&repo.path_str(), "binary.dat", None).is_err());
 }
 
 #[test]
@@ -1372,7 +1419,7 @@ fn blame_new_paths_and_hash_formats_preserve_content() {
         for path in paths {
             repo.write(path, "alpha\r\n\r\nω-last");
             let lines =
-                GitReader::get_file_blame(&repo.path_str(), path).expect("literal new path");
+                GitReader::get_file_blame(&repo.path_str(), path, None).expect("literal new path");
             assert_eq!(
                 lines.iter().map(|l| l.content.as_str()).collect::<Vec<_>>(),
                 ["alpha", "", "ω-last"]
@@ -1384,7 +1431,7 @@ fn blame_new_paths_and_hash_formats_preserve_content() {
         repo.write(".gitignore", "ignored.txt\n");
         repo.write("ignored.txt", "ignored content\n");
         assert_eq!(
-            GitReader::get_file_blame(&repo.path_str(), "ignored.txt").unwrap()[0].content,
+            GitReader::get_file_blame(&repo.path_str(), "ignored.txt", None).unwrap()[0].content,
             "ignored content"
         );
     }
@@ -1397,7 +1444,7 @@ fn blame_keeps_committed_authorship_through_edits() {
     repo.commit_all("seed");
     let head = git_out(repo.dir.path(), &["rev-parse", "HEAD"]);
     repo.write("old.txt", "kept\nchanged\n");
-    let lines = GitReader::get_file_blame(&repo.path_str(), "old.txt").expect("edited blame");
+    let lines = GitReader::get_file_blame(&repo.path_str(), "old.txt", None).expect("edited blame");
     assert_eq!(lines.len(), 2);
     assert_eq!(lines[0].commit_id, head);
     assert!(lines[1].commit_id.chars().all(|c| c == '0'));
@@ -1409,18 +1456,18 @@ fn blame_new_file_budgets_and_invalid_inputs_fail_explicitly() {
     let repo = TestRepo::init();
     let large = std::fs::File::create(repo.dir.path().join("large.txt")).unwrap();
     large.set_len(9 * 1024 * 1024).unwrap();
-    assert!(GitReader::get_file_blame(&repo.path_str(), "large.txt")
+    assert!(GitReader::get_file_blame(&repo.path_str(), "large.txt", None)
         .unwrap_err()
         .contains("limit"));
     repo.write("many.txt", &"\n".repeat(200_000));
-    let result = GitReader::get_file_blame(&repo.path_str(), "many.txt");
+    let result = GitReader::get_file_blame(&repo.path_str(), "many.txt", None);
     assert!(matches!(result, Err(error) if error.contains("budget")));
     fs::write(repo.dir.path().join("invalid.txt"), [0xff, 0xfe]).unwrap();
-    assert!(GitReader::get_file_blame(&repo.path_str(), "invalid.txt")
+    assert!(GitReader::get_file_blame(&repo.path_str(), "invalid.txt", None)
         .unwrap_err()
         .contains("UTF-8"));
-    assert!(GitReader::get_file_blame(&repo.path_str(), ".").is_err());
-    assert!(GitReader::get_file_blame(&repo.path_str(), "../escape.txt").is_err());
+    assert!(GitReader::get_file_blame(&repo.path_str(), ".", None).is_err());
+    assert!(GitReader::get_file_blame(&repo.path_str(), "../escape.txt", None).is_err());
 }
 
 #[test]
@@ -1438,7 +1485,7 @@ fn blame_corrupt_history_is_not_misclassified_as_a_new_file() {
     )
     .unwrap();
     repo.write("new.txt", "new\n");
-    assert!(GitReader::get_file_blame(&repo.path_str(), "new.txt").is_err());
+    assert!(GitReader::get_file_blame(&repo.path_str(), "new.txt", None).is_err());
 }
 
 /// Regression (item 5): glob metacharacters in a filename must not widen the
@@ -1485,7 +1532,7 @@ fn test_glob_shaped_paths_match_literally() {
 
     // blame treats its <file> argument literally already; it must keep doing
     // so (and NOT receive pathspec magic, which git rejects there).
-    let blame = GitReader::get_file_blame(&path, globbish).expect("blame");
+    let blame = GitReader::get_file_blame(&path, globbish, None).expect("blame");
     assert_eq!(blame.len(), 2);
     assert!(blame
         .iter()
@@ -1520,7 +1567,7 @@ fn test_reader_read_paths_refuse_symlink_escape() {
     )
     .expect("Git-only history query")
     .is_empty());
-    assert!(GitReader::get_file_blame(&path, "leak/secret.txt").is_err());
+    assert!(GitReader::get_file_blame(&path, "leak/secret.txt", None).is_err());
     assert!(GitReader::get_file_content(&path, "leak/secret.txt", None).is_err());
     assert_eq!(
         fs::read_to_string(outside.path().join("secret.txt")).unwrap(),

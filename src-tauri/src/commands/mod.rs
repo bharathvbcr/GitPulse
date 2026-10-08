@@ -1083,8 +1083,10 @@ pub fn cmd_parse_conventional_commit(message: String) -> Option<ConventionalComm
 pub async fn cmd_get_file_blame(
     repo_path: String,
     file_path: String,
+    revision: Option<String>,
 ) -> Result<Vec<BlameLine>, String> {
-    off_thread(move || GitReader::get_file_blame(&repo_path, &file_path)).await
+    off_thread(move || GitReader::get_file_blame(&repo_path, &file_path, revision.as_deref()))
+        .await
 }
 
 #[tauri::command(async)]

@@ -16,6 +16,10 @@ export interface BlameLine {
   author_email: string;
   timestamp: number;
   content: string;
+  /** The parent of `commit_id` git blamed through; absent for root or uncommitted lines. */
+  previous_commit?: string;
+  /** The file's path in `previous_commit` (differs across a rename). */
+  previous_path?: string;
 }
 
 /**

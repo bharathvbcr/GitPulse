@@ -7,7 +7,7 @@
   import { rowHeight } from "../ui/density";
   import { repoStore } from "../stores/repoStore";
   import { invoke } from "../ipc/invoke";
-  import { FileCode, PanelLeftClose, PanelLeftOpen, Search, X } from "@lucide/svelte";
+  import { CornerLeftUp, FileCode, PanelLeftClose, PanelLeftOpen, Search, Undo2, X } from "@lucide/svelte";
   import { createAsyncGuard, type AsyncGuard } from "../async/guard";
   import { coverageHitClass } from "../coverage/format";
   import { buildHitMap, fetchFileCoverage, hitBadgeClass } from "../coverage/fileCoverage";
@@ -72,8 +72,23 @@
   let explorerOpen = $state(true);
   let inflight: AsyncGuard | null = null;
   const contentRevisions = repoStore.contentRevisions;
-  let running: { repo: string; path: string } | null = null;
-  let queued: { repo: string; path: string } | null = null;
+  /**
+   * One blame request: a path, and the revision it is read at — `null` for
+   * the working tree. The path differs from the selected file once a step
+   * crosses a rename, which is why it travels with the revision.
+   */
+  type BlameTarget = { repo: string; path: string; revision: string | null };
+  let running: BlameTarget | null = null;
+  let queued: BlameTarget | null = null;
+  /**
+   * The steps taken back through history from the selected file, newest
+   * last. Empty means the working tree is shown. Owned per selection: picking
+   * another file returns to the working tree.
+   */
+  let revisionTrail = $state<{ revision: string; path: string; from: string }[]>([]);
+  /** The selection the trail was started from, so a new pick can clear it. */
+  let trailOrigin: string | null = null;
+  const atRevision = $derived(revisionTrail.at(-1) ?? null);
   let disposed = false;
   const detailScope = paneDetails.register("blame");
   let requestCount = 0;
@@ -98,13 +113,13 @@
     return true;
   }
 
-  async function loadBlameFor(repo: string, path: string) {
+  async function loadBlameFor(repo: string, path: string, revision: string | null = null) {
     if (!repo || !path) return;
-    const subject = `${repo}\u0000${path}`;
+    const subject = `${repo}\u0000${path}\u0000${revision ?? ""}`;
     if (running) {
       // One IPC pair at a time, plus the latest requested refresh. Content
       // storms cannot cancel/restart the same slow request indefinitely.
-      if (running.repo !== repo || running.path !== path) {
+      if (running.repo !== repo || running.path !== path || running.revision !== revision) {
         inflight?.cancel();
         if (loadedSubject !== subject) {
           blameLines = [];
@@ -115,7 +130,7 @@
           coverageFailed = false;
         }
       }
-      queued = { repo, path };
+      queued = { repo, path, revision };
       if (loadedSubject !== subject || blameLines.length === 0) {
         isLoading = true;
       }
@@ -123,7 +138,7 @@
       coverageFailed = false;
       return;
     }
-    running = { repo, path };
+    running = { repo, path, revision };
     detailScope.update(repo, "blame", { blame: ++requestCount });
     inflight?.cancel();
     const guard = createAsyncGuard();
@@ -140,10 +155,15 @@
         invoke<BlameLine[]>("cmd_get_file_blame", {
           repoPath: repo,
           filePath: path,
+          revision,
         }),
-        fetchFileCoverage(repo, path)
-          .then((res) => ({ ok: true as const, hits: buildHitMap(res.lines) }))
-          .catch(() => ({ ok: false as const, hits: new Map<number, number>() })),
+        // Coverage describes the working tree; a historical blame has none,
+        // and that is not a failed lookup.
+        revision !== null
+          ? Promise.resolve({ ok: true as const, hits: new Map<number, number>() })
+          : fetchFileCoverage(repo, path)
+              .then((res) => ({ ok: true as const, hits: buildHitMap(res.lines) }))
+              .catch(() => ({ ok: false as const, hits: new Map<number, number>() })),
       ]);
       if (!guard.isLive()) return;
       const isSubjectChange = loadedSubject !== subject;
@@ -185,7 +205,7 @@
       running = null;
       const next = queued;
       queued = null;
-      if (next && !disposed) void loadBlameFor(next.repo, next.path);
+      if (next && !disposed) void loadBlameFor(next.repo, next.path, next.revision);
     }
   }
 
@@ -204,7 +224,42 @@
     const repo = $repoStore.currentPath;
     const path = $repoStore.selectedFilePath;
     if (!repo || !path) return;
-    void loadBlameFor(repo, path);
+    const at = atRevision;
+    void loadBlameFor(repo, at?.path ?? path, at?.revision ?? null);
+  }
+
+  /**
+   * Blame the file as it stood just before `line`'s commit — the parent git
+   * blamed through, at the path the file had there. This is how a reader
+   * gets past a reformat or a move to the change that really wrote the line.
+   */
+  function stepToParent(line: BlameLine) {
+    const repo = $repoStore.currentPath;
+    const parent = line.previous_commit;
+    const parentPath = line.previous_path;
+    if (!repo || !parent || !parentPath) return;
+    if (revisionTrail.length === 0) trailOrigin = $repoStore.selectedFilePath;
+    revisionTrail = [...revisionTrail, { revision: parent, path: parentPath, from: line.commit_id }];
+    void loadBlameFor(repo, parentPath, parent);
+  }
+
+  /** Undo one step; undoing the first lands back on the working tree. */
+  function stepBack() {
+    const repo = $repoStore.currentPath;
+    const path = $repoStore.selectedFilePath;
+    if (!repo || !path || revisionTrail.length === 0) return;
+    revisionTrail = revisionTrail.slice(0, -1);
+    const at = revisionTrail.at(-1);
+    if (!at) trailOrigin = null;
+    void loadBlameFor(repo, at?.path ?? path, at?.revision ?? null);
+  }
+
+  function returnToWorkingTree() {
+    const repo = $repoStore.currentPath;
+    const path = $repoStore.selectedFilePath;
+    revisionTrail = [];
+    trailOrigin = null;
+    if (repo && path) void loadBlameFor(repo, path, null);
   }
 
   $effect(() => {
@@ -243,6 +298,13 @@
       const selected = $repoStore.selectedFilePath;
       const repo = $repoStore.currentPath;
       filePath = selected ?? "";
+      if (revisionTrail.length > 0) {
+        // A historical blame is fixed; worktree churn cannot change it. Only
+        // a different selection ends the walk back through history.
+        if (repo && selected === trailOrigin) return;
+        revisionTrail = [];
+        trailOrigin = null;
+      }
       if (!repo || !selected) {
         queued = null;
         inflight?.cancel();
@@ -257,7 +319,7 @@
         loadedSubject = null;
         return;
       }
-      const subject = `${repo}\u0000${selected}`;
+      const subject = `${repo}\u0000${selected}\u0000`;
       if (loadedSubject !== subject) {
         blameLines = [];
         selection = null;
@@ -384,6 +446,32 @@
       <span data-blame-path class="truncate font-mono text-xs text-textPrimary" title={filePath || undefined}>
         {filePath || "No file selected"}
       </span>
+      {#if atRevision}
+        <span
+          data-blame-revision
+          class="shrink-0 flex items-center gap-1 rounded-md border border-accent/40 bg-accent/10 px-1.5 py-0.5 font-sans text-[10px] text-textPrimary"
+          title="Blaming {atRevision.path} as it stood at {atRevision.revision}, the parent of {shortHash(atRevision.from)}"
+        >
+          at {shortHash(atRevision.revision)}{atRevision.path !== filePath ? ` · ${atRevision.path}` : ""}
+        </span>
+        <button
+          type="button"
+          onclick={stepBack}
+          class="shrink-0 flex items-center gap-1 px-1.5 py-0.5 rounded-md font-sans text-[11px] text-textMuted hover:text-textPrimary hover:bg-surfaceHover transition-colors"
+          title={revisionTrail.length > 1 ? "Undo the last step back" : "Back to the working tree"}
+        >
+          <Undo2 size={11} /> Back
+        </button>
+        {#if revisionTrail.length > 1}
+          <button
+            type="button"
+            onclick={returnToWorkingTree}
+            class="shrink-0 px-1.5 py-0.5 rounded-md font-sans text-[11px] text-textMuted hover:text-textPrimary hover:bg-surfaceHover transition-colors"
+          >
+            Working tree
+          </button>
+        {/if}
+      {/if}
     </div>
 
     <!-- min-w-0, not shrink-0: the summary is the longest string in this row,
@@ -633,6 +721,18 @@
                       repoStore.inspectCommitInHistory(line.commit_id);
                     }}
                   >{shortHash(line.commit_id)}</button>
+                {/if}
+                {#if line.previous_commit && !grouped}
+                  <button
+                    type="button"
+                    data-blame-parent
+                    class="w-4 shrink-0 flex items-center justify-center text-textMuted/60 hover:text-accent focus-visible:text-accent"
+                    title="Blame the parent of {shortHash(line.commit_id)} ({shortHash(line.previous_commit)}{line.previous_path && line.previous_path !== (atRevision?.path ?? filePath) ? `, ${line.previous_path}` : ''})"
+                    aria-label="Blame the parent of commit {shortHash(line.commit_id)}"
+                    onclick={() => stepToParent(line)}
+                  ><CornerLeftUp size={11} /></button>
+                {:else}
+                  <span class="w-4 shrink-0"></span>
                 {/if}
                 <span class="w-24 px-2 text-[10px] text-textMuted truncate font-sans shrink-0">{grouped ? "" : line.author_name}</span>
                 <span

@@ -185,6 +185,15 @@ pub struct BlameLine {
     pub author_email: String,
     pub timestamp: i64,
     pub content: String,
+    /// The parent of `commit_id` that git blamed through, from porcelain's
+    /// `previous <oid> <path>`. Absent when the line was introduced by a root
+    /// commit or is uncommitted, so "blame the parent" has nowhere to go.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_commit: Option<String>,
+    /// The file's path in `previous_commit`, which differs from the blamed
+    /// path across a rename. Present exactly when `previous_commit` is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_path: Option<String>,
 }
 
 /// Diff text plus whether it was cut at [`budget::MAX_DIFF_BYTES`].
@@ -1050,8 +1059,22 @@ impl GitReader {
         Ok(statuses)
     }
 
-    pub fn get_file_blame(repo_path: &str, file_path: &str) -> Result<Vec<BlameLine>, String> {
+    /// Blames `file_path` in the working tree, or as it stood at `revision`.
+    ///
+    /// The revision form reads only the object database: the working-tree
+    /// file may be gone, renamed, or differ, so none of the on-disk checks or
+    /// the uncommitted-file fallback apply. The revision is peeled to a
+    /// commit oid first, so a branch moving mid-read cannot change which
+    /// commit the answer describes.
+    pub fn get_file_blame(
+        repo_path: &str,
+        file_path: &str,
+        revision: Option<&str>,
+    ) -> Result<Vec<BlameLine>, String> {
         let repo = validate_repo(repo_path)?;
+        if let Some(revision) = revision {
+            return blame_at_revision(&repo, file_path, revision);
+        }
         // Canonical join resolves existing prefixes through symlinks so a
         // symlinked directory cannot redirect the read outside the repository;
         // not-yet-tracked leaves stay lexical.
@@ -3754,6 +3777,35 @@ fn parse_status_records(bytes: &[u8]) -> Vec<RawStatusRecord> {
     records
 }
 
+/// [`GitReader::get_file_blame`] at a revision: peel to a commit oid, then
+/// blame the path as recorded in that commit.
+fn blame_at_revision(
+    repo: &Path,
+    file_path: &str,
+    revision: &str,
+) -> Result<Vec<BlameLine>, String> {
+    crate::engine::git_writer::validate_oid_or_revision(revision)?;
+    // Lexical containment only: the path is read from a tree object, never
+    // from disk, so a symlinked directory in the checkout cannot redirect it.
+    sandbox_join(repo, file_path)?;
+    let spec = format!("{revision}^{{commit}}");
+    let oid = git_text(repo, &["rev-parse", "--verify", "--quiet", spec.as_str()])
+        .map_err(|_| format!("Blame unavailable: '{revision}' does not name a commit"))?;
+    let oid = oid.trim();
+    validate_oid(oid).map_err(|_| format!("Blame unavailable: '{revision}' does not name a commit"))?;
+    // Same literal-path note as the working-tree form: `git blame` takes a
+    // path, not a pathspec, and rejects `:(literal)` magic.
+    let (stdout, incomplete) = git_text_capped(
+        repo,
+        &["blame", "--line-porcelain", oid, "--", file_path],
+        budget::MAX_BLAME_BYTES,
+    )?;
+    if let Some(reason) = incomplete {
+        return Err(format!("Blame unavailable: {}", reason.describe()));
+    }
+    Ok(parse_blame_porcelain(&stdout))
+}
+
 /// A new file has content but no committed author. Preserve every line while
 /// using the same zero-OID convention as Git's uncommitted porcelain records.
 fn uncommitted_file_blame(repo: &Path, path: &Path) -> Result<Vec<BlameLine>, String> {
@@ -3804,6 +3856,8 @@ fn uncommitted_file_blame(repo: &Path, path: &Path) -> Result<Vec<BlameLine>, St
             author_email: String::new(),
             timestamp: 0,
             content: content.into(),
+            previous_commit: None,
+            previous_path: None,
         };
         payload_bytes += serde_json::to_vec(&line)
             .map_err(|e| format!("Blame unavailable: cannot encode line: {e}"))?
@@ -3845,10 +3899,19 @@ fn parse_blame_porcelain(stdout: &str) -> Vec<BlameLine> {
     let mut current_time: i64 = 0;
     let mut line_no = 0usize;
     let mut oid_len: Option<usize> = None;
+    // `previous` is emitted only when the commit has a parent to blame
+    // through, so it is reset at every header: `--line-porcelain` repeats the
+    // whole block per line, and a stale value would point a root commit's
+    // line at an unrelated parent.
+    let mut current_previous: Option<(String, String)> = None;
 
     for line in stdout.lines() {
         if let Some(content) = line.strip_prefix('\t') {
             line_no += 1;
+            let (previous_commit, previous_path) = match &current_previous {
+                Some((oid, path)) => (Some(oid.clone()), Some(path.clone())),
+                None => (None, None),
+            };
             blame_lines.push(BlameLine {
                 line_no,
                 commit_id: current_sha.clone(),
@@ -3856,6 +3919,8 @@ fn parse_blame_porcelain(stdout: &str) -> Vec<BlameLine> {
                 author_email: current_email.clone(),
                 timestamp: current_time,
                 content: content.to_string(),
+                previous_commit,
+                previous_path,
             });
         } else if let Some(author) = line.strip_prefix("author ") {
             current_author = author.to_string();
@@ -3863,12 +3928,83 @@ fn parse_blame_porcelain(stdout: &str) -> Vec<BlameLine> {
             current_email = mail.trim_matches(|c| c == '<' || c == '>').to_string();
         } else if let Some(time) = line.strip_prefix("author-time ") {
             current_time = time.parse().unwrap_or(0);
+        } else if let Some(rest) = line.strip_prefix("previous ") {
+            current_previous = parse_blame_previous(rest, oid_len);
         } else if let Some(oid) = blame_header_oid(line, oid_len) {
             oid_len = Some(oid.len());
             current_sha = oid.to_string();
+            current_previous = None;
         }
     }
     blame_lines
+}
+
+/// Parses the `<oid> <path>` tail of a porcelain `previous` line. The oid must
+/// match the stream's pinned length; the path is C-quoted by git when it holds
+/// a quote, backslash or control character (even under `core.quotepath=off`).
+fn parse_blame_previous(rest: &str, oid_len: Option<usize>) -> Option<(String, String)> {
+    let (oid, path) = rest.split_once(' ')?;
+    if oid_len.is_some_and(|len| len != oid.len())
+        || !(32..=64).contains(&oid.len())
+        || !oid.chars().all(|c| c.is_ascii_hexdigit())
+    {
+        return None;
+    }
+    let path = if path.starts_with('"') {
+        unquote_c_style(path)?
+    } else {
+        path.to_string()
+    };
+    if path.is_empty() {
+        return None;
+    }
+    Some((oid.to_string(), path))
+}
+
+/// Reverses git's `quote_c_style`: a double-quoted string with `\a \b \t \n
+/// \v \f \r \" \\` escapes and `\ooo` octal bytes. `None` for anything that is
+/// not a well-formed quoted name, so a malformed path never becomes a target.
+fn unquote_c_style(quoted: &str) -> Option<String> {
+    let inner = quoted.strip_prefix('"')?.strip_suffix('"')?;
+    let bytes = inner.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let byte = bytes[i];
+        if byte != b'\\' {
+            out.push(byte);
+            i += 1;
+            continue;
+        }
+        let escape = *bytes.get(i + 1)?;
+        let decoded = match escape {
+            b'a' => 0x07,
+            b'b' => 0x08,
+            b't' => b'\t',
+            b'n' => b'\n',
+            b'v' => 0x0b,
+            b'f' => 0x0c,
+            b'r' => b'\r',
+            b'"' => b'"',
+            b'\\' => b'\\',
+            b'0'..=b'3' => {
+                let digits = bytes.get(i + 1..i + 4)?;
+                if !digits.iter().all(|d| (b'0'..=b'7').contains(d)) {
+                    return None;
+                }
+                let value = digits
+                    .iter()
+                    .fold(0u16, |acc, d| acc * 8 + u16::from(d - b'0'));
+                i += 4;
+                out.push(u8::try_from(value).ok()?);
+                continue;
+            }
+            _ => return None,
+        };
+        out.push(decoded);
+        i += 2;
+    }
+    String::from_utf8(out).ok()
 }
 
 /// True when `token` is a `git diff --numstat -z` header (`add\tdel\tpath`
@@ -6185,6 +6321,34 @@ mod tests {
         let oid40 = "a".repeat(40);
         let lines = parse_blame_porcelain(&blame_block(&oid40, "gamma"));
         assert_eq!(lines[0].commit_id.len(), 40);
+    }
+
+    /// `previous` belongs to the header it follows. `--line-porcelain`
+    /// repeats every block, so a root commit's line after a non-root one must
+    /// not inherit the earlier line's parent.
+    #[test]
+    fn test_blame_porcelain_previous_is_per_header_and_unquoted() {
+        let a = "a".repeat(40);
+        let p = "1".repeat(40);
+        let with_previous = blame_block(&a, "child").replace(
+            "filename f.txt",
+            &format!("previous {p} \"dir/sp\\303\\251c \\\"x\\\".txt\"\nfilename f.txt"),
+        );
+        let lines = parse_blame_porcelain(&format!("{with_previous}{}", blame_block(&a, "root")));
+        assert_eq!(lines[0].previous_commit.as_deref(), Some(p.as_str()));
+        assert_eq!(lines[0].previous_path.as_deref(), Some("dir/spéc \"x\".txt"));
+        assert_eq!(lines[1].previous_commit, None);
+        assert_eq!(lines[1].previous_path, None);
+
+        // A wrong-length oid or a malformed quoted name never becomes a target.
+        let bad = blame_block(&a, "x").replace(
+            "filename f.txt",
+            &format!("previous {} f.txt\nfilename f.txt", "1".repeat(64)),
+        );
+        assert_eq!(parse_blame_porcelain(&bad)[0].previous_commit, None);
+        assert_eq!(unquote_c_style("\"bad\\q\""), None);
+        assert_eq!(unquote_c_style("\"trailing\\\""), None);
+        assert_eq!(unquote_c_style("\"tab\\there\"").as_deref(), Some("tab\there"));
     }
 
     #[test]

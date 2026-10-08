@@ -154,7 +154,7 @@ fn blame_on_a_large_file_stays_within_its_budget() {
     // Vec<BlameLine> cannot carry a truncation verdict. Returning a prefix
     // used to satisfy this budget test while claiming a complete file in UI.
     let error =
-        GitReader::get_file_blame(repo, "big.txt").expect_err("partial blame must be explicit");
+        GitReader::get_file_blame(repo, "big.txt", None).expect_err("partial blame must be explicit");
     assert!(
         error.contains("Blame unavailable") && error.contains("exceeded"),
         "the incomplete read must explain its limit: {error}"
