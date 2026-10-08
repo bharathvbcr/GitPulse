@@ -1,4 +1,4 @@
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -124,10 +124,17 @@ describe("advisory-sensitive lockfiles stay on the fixed parents", () => {
     expect(appIndicator).not.toMatch(/unsafe extern fn\b/);
     expect(appIndicator).toMatch(/#\[cfg\(not\(feature = "backcompat"\)\)\]\s*\n\s*panic!/s);
 
-    const jscValue = readFileSync(join(framework, "javascriptcore-rs", "src", "value.rs"), "utf8");
-    expect(jscValue).toMatch(/fn typed_array_get_data\(&self\) -> TypedArrayData<'_>/);
-    const jscAuto = readFileSync(join(framework, "javascriptcore-rs", "src", "auto", "mod.rs"), "utf8");
-    expect(jscAuto).toMatch(/^pub mod builders \{/m);
+    // javascriptcore-rs 2.0 published the GLib 0.22 line, so its port was
+    // retired: the registry crate is capped by --cap-lints like any other,
+    // and the lint fixes the port carried no longer apply.
+    expect(existsSync(join(framework, "javascriptcore-rs"))).toBe(false);
+    expect(existsSync(join(framework, "javascriptcore-rs-sys"))).toBe(false);
+    for (const name of ["javascriptcore-rs", "javascriptcore-rs-sys"]) {
+      const block = LOCK.split("[[package]]\n").find((entry) => entry.startsWith(`name = "${name}"\n`));
+      expect(block, `${name} is in Cargo.lock`).toBeDefined();
+      expect(block).toMatch(/^version = "2\.\d+\.\d+"$/m);
+      expect(block).toContain('source = "registry+https://github.com/rust-lang/crates.io-index"');
+    }
 
     const webkit = readFileSync(join(framework, "webkit2gtk", "src", "lib.rs"), "utf8");
     expect(webkit).not.toMatch(/feature = "cargo-clippy"/);

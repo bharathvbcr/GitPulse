@@ -225,6 +225,10 @@ tauri-build = { git = "https://github.com/tauri-apps/tauri", rev = "30da1fd6e17d
 
 [dev-dependencies]
 tempfile = "3.27"
+# Property tests for the git output parsers (engine/git_reader.rs). Default
+# features are off: `fork` and `timeout` add rusty-fork and a second tempfile
+# path that these pure, in-process parser properties never need.
+proptest = { version = "1.11", default-features = false, features = ["std"] }
 # Tauri's own headless test runtime (MockRuntime). Not a new third-party
 # dependency — it enables a feature of the tauri crate already in
 # [dependencies] — and it is what lets tests drive commands through the real
@@ -290,6 +294,7 @@ strip = "debuginfo"
 # GTK3 0.19 uses maintained GLib 0.22 and removes proc-macro-error. Carry the
 # consumer port until Tauri/WRY/TAO adopt that line. Keep a single Runtime trait
 # and a single GTK/GLib native links graph for the app and registry plugins.
+# javascriptcore-rs 2.0 published the GLib 0.22 line, so it comes from crates.io.
 # These are source patches, not republished crates or advisory exclusions.
 [patch.crates-io]
 tauri-build = { git = "https://github.com/tauri-apps/tauri", rev = "30da1fd6e17de6107ecc850c95dfb16b5729f2dd" }
@@ -297,8 +302,6 @@ tauri-codegen = { git = "https://github.com/tauri-apps/tauri", rev = "30da1fd6e1
 tauri-macros = { git = "https://github.com/tauri-apps/tauri", rev = "30da1fd6e17de6107ecc850c95dfb16b5729f2dd" }
 tauri-plugin = { git = "https://github.com/tauri-apps/tauri", rev = "30da1fd6e17de6107ecc850c95dfb16b5729f2dd" }
 tauri-utils = { git = "https://github.com/tauri-apps/tauri", rev = "30da1fd6e17de6107ecc850c95dfb16b5729f2dd" }
-javascriptcore-rs = { path = "framework/javascriptcore-rs" }
-javascriptcore-rs-sys = { path = "framework/javascriptcore-rs-sys" }
 libappindicator = { path = "framework/libappindicator" }
 libappindicator-sys = { path = "framework/libappindicator-sys" }
 muda = { path = "framework/muda" }

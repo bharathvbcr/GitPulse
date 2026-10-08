@@ -142,7 +142,7 @@
    }
 --- a/wry/Cargo.toml
 +++ b/wry/Cargo.toml
-@@ -201,11 +201,11 @@
+@@ -201,15 +201,15 @@
  version = "7"
  
  [target.'cfg(any(target_os = "linux", target_os = "dragonfly", target_os = "freebsd", target_os = "openbsd", target_os = "netbsd"))'.dependencies.gdkx11]
@@ -156,6 +156,11 @@
  optional = true
  
  [target.'cfg(any(target_os = "linux", target_os = "dragonfly", target_os = "freebsd", target_os = "openbsd", target_os = "netbsd"))'.dependencies.javascriptcore-rs]
+-version = "=1.1.2"
++version = "2"
+ features = ["v2_28"]
+ optional = true
+ 
 @@ -217,7 +217,7 @@
  version = "2.3"
  
@@ -604,7 +609,7 @@
  mod rt;
 --- a/webkit2gtk/Cargo.toml
 +++ b/webkit2gtk/Cargo.toml
-@@ -135,38 +135,38 @@
+@@ -135,41 +135,41 @@
  version = "^1.0"
  
  [dependencies.cairo-rs]
@@ -652,7 +657,11 @@
 +version = "0.19"
  
  [dependencies.java_script_core]
- version = "=1.1"
+-version = "=1.1"
++version = "2"
+ package = "javascriptcore-rs"
+ 
+ [dependencies.libc]
 @@ -179,5 +179,5 @@
  version = "1.8"
  
@@ -693,7 +702,7 @@
      assert_initialized_main_thread!();
 --- a/webkit2gtk-sys/Cargo.toml
 +++ b/webkit2gtk-sys/Cargo.toml
-@@ -140,27 +140,27 @@
+@@ -140,38 +140,38 @@
  version = "^1.0"
  
  [dependencies.cairo]
@@ -727,7 +736,11 @@
  package = "gtk-sys"
  
  [dependencies.java_script_core]
-@@ -171,7 +171,7 @@
+-version = "=1.1"
++version = "2"
+ package = "javascriptcore-rs-sys"
+ 
+ [dependencies.libc]
  version = "0.2"
  
  [dependencies.soup]
@@ -736,60 +749,6 @@
  package = "soup3-sys"
  
  [dev-dependencies.shell-words]
---- a/javascriptcore-rs/Cargo.toml
-+++ b/javascriptcore-rs/Cargo.toml
-@@ -45,7 +45,7 @@
- package = "javascriptcore-rs-sys"
- 
- [dependencies.glib]
--version = "^0.18.0"
-+version = "0.22"
- 
- [features]
- default = ["v2_38"]
---- a/javascriptcore-rs/src/auto/mod.rs
-+++ b/javascriptcore-rs/src/auto/mod.rs
-@@ -37,7 +37,7 @@
-   pub use super::value::ValueExt;
-   pub use super::weak_value::WeakValueExt;
- }
--pub(crate) mod builders {
-+pub mod builders {
-   pub use super::context::ContextBuilder;
-   pub use super::value::ValueBuilder;
-   pub use super::weak_value::WeakValueBuilder;
---- a/javascriptcore-rs/src/value.rs
-+++ b/javascriptcore-rs/src/value.rs
-@@ -41,7 +41,7 @@
-   #[cfg(any(feature = "v2_38", docsrs))]
-   #[cfg_attr(docsrs, doc(cfg(feature = "v2_38")))]
-   #[doc(alias = "jsc_value_typed_array_get_data")]
--  fn typed_array_get_data(&self) -> TypedArrayData;
-+  fn typed_array_get_data(&self) -> TypedArrayData<'_>;
- }
-@@ -61,7 +61,7 @@
- 
-   #[cfg(any(feature = "v2_38", docsrs))]
-   #[cfg_attr(docsrs, doc(cfg(feature = "v2_38")))]
--  fn typed_array_get_data(&self) -> TypedArrayData {
-+  fn typed_array_get_data(&self) -> TypedArrayData<'_> {
-     use crate::TypedArrayType::*;
---- a/javascriptcore-rs-sys/Cargo.toml
-+++ b/javascriptcore-rs-sys/Cargo.toml
-@@ -50,11 +50,11 @@
- name = "javascriptcore_rs_sys"
- 
- [dependencies.glib]
--version = "^0.18"
-+version = "0.22"
- package = "glib-sys"
- 
- [dependencies.gobject]
--version = "^0.18"
-+version = "0.22"
- package = "gobject-sys"
- 
- [dependencies.libc]
 --- a/libappindicator/Cargo.toml
 +++ b/libappindicator/Cargo.toml
 @@ -23,13 +23,13 @@

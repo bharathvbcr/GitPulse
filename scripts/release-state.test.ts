@@ -1,6 +1,7 @@
+import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
-import { expectedAssetNames } from "./check-release-assets.mjs";
+import { expectedAssetNames, expectedInstallerNames, supplementNames } from "./check-release-assets.mjs";
 import { runReleaseStage, runCommand, main, resolveReleaseContext, type Runner } from "./release-state.mjs";
 
 const commit = "a".repeat(40);
@@ -8,7 +9,9 @@ const tag = "v1.2.3";
 const options = { stage: "prepare", repo: "owner/repo", tag, commit };
 function draft() {
   return {id: 42, tag_name: tag, name: `GitPulse ${tag}`, target_commitish: commit, draft: true, prerelease: false,
-    immutable: false, published_at: null, body: "pending", assets: expectedAssetNames("1.2.3")
+    immutable: false, published_at: null, body: "pending",
+    upload_url: "https://uploads.github.com/repos/owner/repo/releases/42/assets{?name,label}",
+    assets: expectedAssetNames("1.2.3")
       .map((name, index) => ({id: index + 1, name, size: 123, state: "uploaded", digest: `sha256:${"b".repeat(64)}`}))};
 }
 function fixture(change: {
@@ -25,6 +28,7 @@ function fixture(change: {
   downloadDuringFinalize?: boolean;
   crlfNotes?: boolean;
   list?: unknown[];
+  corruptUpload?: boolean;
 } = {}) {
   let release = change.release === undefined ? draft() : change.release;
   const calls: string[][] = [];
@@ -50,6 +54,14 @@ function fixture(change: {
         release = {...release, assets: release.assets.filter(asset => asset.id !== id)};
       }
       return {status: 0, failed: false, stdout: "HTTP/2.0 204 No Content\r\n\r\n"};
+    }
+    if (args[3] === "POST" && endpoint.startsWith("https://uploads.github.com/")) {
+      const name = decodeURIComponent(endpoint.slice(endpoint.indexOf("?name=") + "?name=".length));
+      const hash = createHash("sha256").update(change.corruptUpload ? `${input}!` : input ?? "", "utf8").digest("hex");
+      const assets = release && Array.isArray(release.assets) ? release.assets : [];
+      const asset = {id: 1000 + assets.length, name, size: Buffer.byteLength(input ?? ""), state: "uploaded", digest: `sha256:${hash}`};
+      release = {...release, assets: [...assets, asset]};
+      return respond(asset, 201);
     }
     if (args[3] === "POST") { release = {...draft(), ...JSON.parse(input ?? "{}")}; return change.uncertainPost ? {status: null, failed: true, stdout: ""} : respond(release, 201); }
     if (args[3] === "PATCH") {
@@ -389,5 +401,93 @@ describe("remote release lifecycle", () => {
     // The exit-code contract the removed end-to-end case was really asserting,
     // without a network round trip: a refusal prints and returns 1.
     expect(main(["prepare", "extra"])).toBe(1);
+  });
+});
+
+describe("attest stage", () => {
+  const sboms = {spdx: '{"spdxVersion":"SPDX-2.3"}', cargo: '{"bomFormat":"CycloneDX"}'};
+  const attest = {stage: "attest", repo: "owner/repo", tag, commit, releaseId: "42", sboms};
+  const names = supplementNames("1.2.3");
+  const sha = (text: string) => createHash("sha256").update(text, "utf8").digest("hex");
+  function installersOnly(extra: {id: number, name: string}[] = []) {
+    const release = draft();
+    const installers = new Set(expectedInstallerNames("1.2.3"));
+    return {...release, assets: [...release.assets.filter(asset => installers.has(asset.name)),
+      ...extra.map(asset => ({...asset, size: 1, state: "uploaded", digest: `sha256:${"d".repeat(64)}`}))]};
+  }
+  const uploads = (calls: string[][]) => calls.filter(call => String(call[5] ?? "").startsWith("https://uploads.github.com/"));
+
+  it("uploads both SBOMs and a SHA-256 manifest covering every installer and SBOM", () => {
+    const {run, calls} = fixture({release: installersOnly()});
+    expect(runReleaseStage(attest, run).release_id).toBe("42");
+    const posted = uploads(calls).map(call => decodeURIComponent(call[5].split("?name=")[1]));
+    expect(posted).toEqual([names.spdx, names.cargo, names.checksums]);
+
+    const sumsCall = calls.find(call => String(call[5] ?? "").endsWith(encodeURIComponent(names.checksums)));
+    expect(sumsCall).toContain("Content-Type: text/plain");
+  });
+
+  it("writes a sha256sum -c manifest whose lines are the GitHub installer digests and local SBOM hashes", () => {
+    let manifest = "";
+    const {run} = fixture({release: installersOnly()});
+    const spy: Runner = (program, args, input) => {
+      if (String(args[4] ?? "").endsWith(encodeURIComponent(names.checksums))) manifest = input ?? "";
+      return run(program, args, input);
+    };
+    runReleaseStage(attest, spy);
+    const lines = manifest.trimEnd().split("\n");
+    expect(lines).toHaveLength(expectedInstallerNames("1.2.3").length + 2);
+    expect(lines).toContain(`${"b".repeat(64)}  GitPulse_1.2.3_arm64_en-US.msi`);
+    expect(lines).toContain(`${sha(sboms.spdx)}  ${names.spdx}`);
+    expect(lines).toContain(`${sha(sboms.cargo)}  ${names.cargo}`);
+    expect(lines.every(line => /^[a-f0-9]{64} {2}GitPulse[-_]1\.2\.3[-_]/.test(line))).toBe(true);
+    expect([...lines].sort((a, b) => a.slice(66).localeCompare(b.slice(66)))).toEqual(lines);
+  });
+
+  it("replaces its own earlier uploads on a rerun and never deletes an installer", () => {
+    const {run, calls} = fixture({release: installersOnly([{id: 900, name: names.checksums}, {id: 901, name: names.spdx}])});
+    runReleaseStage(attest, run);
+    const deleted = calls.filter(call => call.includes("DELETE")).map(call => call[5]);
+    expect(deleted.sort()).toEqual(["repos/owner/repo/releases/assets/900", "repos/owner/repo/releases/assets/901"]);
+    expect(uploads(calls)).toHaveLength(3);
+  });
+
+  it("refuses before uploading when a platform's installers are missing", () => {
+    const release = installersOnly();
+    release.assets = release.assets.filter(asset => !asset.name.includes("arm64"));
+    const {run, calls} = fixture({release});
+    expect(() => runReleaseStage(attest, run)).toThrow(/missing: GitPulse_1\.2\.3_arm64-setup\.exe/);
+    expect(uploads(calls)).toHaveLength(0);
+  });
+
+  it("refuses an unknown asset rather than leaving it outside the manifest", () => {
+    const {run, calls} = fixture({release: installersOnly([{id: 950, name: "stray.zip"}])});
+    expect(() => runReleaseStage(attest, run)).toThrow(/unexpected: stray\.zip/);
+    expect(uploads(calls)).toHaveLength(0);
+  });
+
+  it("fails when GitHub's digest of an upload differs from the local SHA-256", () => {
+    const {run} = fixture({release: installersOnly(), corruptUpload: true});
+    expect(() => runReleaseStage(attest, run)).toThrow(/does not match its local SHA-256/);
+  });
+
+  it("refuses an upload URL that names another release", () => {
+    const release = {...installersOnly(), upload_url: "https://uploads.github.com/repos/owner/repo/releases/7/assets{?name,label}"};
+    const {run, calls} = fixture({release});
+    expect(() => runReleaseStage(attest, run)).toThrow(/upload URL/);
+    expect(uploads(calls)).toHaveLength(0);
+  });
+
+  it.each([{spdx: "", cargo: "{}"}, {spdx: "{}", cargo: ""}, undefined])("refuses a missing SBOM before reaching GitHub", missing => {
+    const {run, calls} = fixture({release: installersOnly()});
+    expect(() => runReleaseStage({...attest, sboms: missing}, run)).toThrow(/SBOM/);
+    expect(calls).toHaveLength(0);
+  });
+
+  it("leaves finalize an exact inventory of installers plus supplements", () => {
+    const {run} = fixture({release: installersOnly()});
+    expect(() => runReleaseStage({...attest, stage: "finalize", notes: "notes"}, run)).toThrow(/missing: GitPulse_1\.2\.3_SHA256SUMS\.txt/);
+    runReleaseStage(attest, run);
+    expect(runReleaseStage({...attest, stage: "finalize", notes: "notes"}, run).release_id).toBe("42");
   });
 });

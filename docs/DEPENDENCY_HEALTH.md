@@ -1,6 +1,8 @@
 # Dependency health — 2026-09-10
 
 Current follow-up: [2026-09-13 remediation and all 57 candidate references](DEPENDENCY_HEALTH_2026-09-13.md).
+CI and release hardening, and the latest framework port re-check:
+[2026-10-08](#ci-and-release-hardening--2026-10-08).
 Lucide is now 1.45.0; the dated results below describe the earlier migration.
 
 The Health panel report of 2026-09-10 (44 CodeQL alerts, three outdated npm
@@ -60,13 +62,14 @@ ports those consumers together, including JavaScriptCore and the optional
 AppIndicator chain, so all their native `links` dependencies and Rust types agree.
 The application continues using GTK3 and WebKitGTK 4.1.
 
-`src-tauri/framework/` contains thirteen local consumer snapshots, with upstream
-revisions/archive checksums, changed-file provenance, licenses and full file
-hashes in `PATCHES.json`. `changes.patch` presents the reviewable port after
-Tauri's workspace inheritance is resolved: **590 lines added / 116 removed**
-across the port, within **601** retained framework files. The ten registry archives were
-verified against their crates.io checksums and copied source; the three
-Tauri snapshots were checked against their pinned Git objects.
+`src-tauri/framework/` contains eleven local consumer snapshots (thirteen
+until 2026-10-08, when javascriptcore-rs 2.0.0 let its two ports retire), with
+upstream revisions/archive checksums, changed-file provenance, licenses and
+full file hashes in `PATCHES.json`. `changes.patch` presents the reviewable port
+after Tauri's workspace inheritance is resolved: **587 lines added / 113
+removed** across the port, within **556** retained framework files. The eight
+registry archives were verified against their crates.io checksums and copied
+source; the three Tauri snapshots were checked against their pinned Git objects.
 
 The ported Tauri crates are at the `tauri-v2.12.1` tag,
 `30da1fd6e17de6107ecc850c95dfb16b5729f2dd`, on WRY 0.57.0 and Muda 0.20.0, and
@@ -185,3 +188,120 @@ build attempt exited 1 without diagnostics. The sibling GitNexus index was used
 with source comparison for existing scripts (vendor checker impact LOW). Newly
 vendored framework symbols were absent from that index; source callers and
 Cargo/compiler checks provided the migration's impact evidence.
+
+## CI and release hardening — 2026-10-08
+
+### Rust advisories and licences in CI
+
+`cargo deny check` runs on `src-tauri` in `.github/workflows/bun-audit.yml`
+(job `cargo-deny`) on push and pull request when a Cargo manifest, the lockfile
+or `src-tauri/deny.toml` changes, and on the Monday 06:00 UTC cron. The policy
+denies vulnerabilities, unsound, unmaintained and yanked crates (the strict
+`cargo audit --deny warnings` equivalent) with nothing ignored, allows only the
+licences the graph actually uses (MPL-2.0 is the one file-level copyleft, for
+cssparser, selectors, dtoa-short and option-ext), and restricts sources to
+crates.io plus the pinned Tauri Git revision. Duplicate versions are reported
+as warnings (29 today), not gated. Path dependencies — every
+`src-tauri/framework` port — are never matched against RustSec; that is a
+cargo-deny/cargo-audit property, so a port refresh still needs the manual
+advisory check in `src-tauri/framework/README.md`.
+
+Locally, cargo-deny 0.20.2: `cargo deny --manifest-path src-tauri/Cargo.toml
+check` → `advisories ok, bans ok, licenses ok, sources ok`, exit 0. Removing
+MPL-2.0 from the allow-list made `check licenses` fail with exit 4 and 10
+rejections, so the licence gate is live.
+
+### Release SBOMs and checksums
+
+A new `attest` job in `release.yml` runs after every platform has uploaded and
+before `verify`. It adds three assets, which the exact-asset manifest
+(`scripts/check-release-assets.mjs`) now requires:
+
+- `GitPulse_<v>_sbom.spdx.json`: Syft (`anchore/sbom-action`) over the checked-out
+  tree with installed `node_modules`. Syft's `bun.lock` reader alone produced
+  28 npm packages out of 179 locked entries, so the installed-package cataloger
+  is enabled. Locally (Syft 1.54.1) that gave 523 Cargo, about 110–120 npm, 41
+  GitHub Actions and 11 Go entries.
+- `GitPulse_<v>_sbom.cargo.cdx.json`: `cargo cyclonedx --target all`
+  (CycloneDX 1.5; 550 components locally). The job fails if cargo rewrites
+  `Cargo.lock`.
+- `GitPulse_<v>_SHA256SUMS.txt`: `sha256sum -c` format, one line per installer
+  and SBOM. Installer lines are GitHub's own `digest` for the stored bytes; SBOM
+  lines are hashed locally and must equal GitHub's digest after upload, or the
+  stage fails. A rerun replaces only these three files.
+
+Check a download with `sha256sum -c --ignore-missing GitPulse_<v>_SHA256SUMS.txt`.
+
+### ARM release targets — decided yes
+
+Linux aarch64 (`ubuntu-22.04-arm`, keeping the 22.04 glibc floor) and Windows
+arm64 (`windows-11-arm`, native because `libsqlite3-sys` does not cross-build
+to MSVC) are in the release matrix. That brings the release to twelve installers: the
+ARM legs add `GitPulse-<v>-1.aarch64.rpm`, `GitPulse_<v>_aarch64.AppImage`,
+`GitPulse_<v>_arm64.deb`, `GitPulse_<v>_arm64-setup.exe` and
+`GitPulse_<v>_arm64_en-US.msi` (the Tauri 2.12.1 bundler's own arch names). A
+release would fail on an ARM leg only after every other platform had
+uploaded, so `ci.yml` has a dispatch-only `arm-bundle` job that bundles both
+legs on their real runners through the same tauri-action and checks the
+installer names against the manifest.
+
+Verified on 2026-10-08 by dispatching `ci.yml` on `chore/ci-release-hardening`
+([run 37825161381](https://github.com/bharathvbcr/GitPulse/actions/runs/37825161381)).
+`ARM Bundle (ubuntu-22.04-arm)` built and bundled `GitPulse-1.4.0-1.aarch64.rpm`,
+`GitPulse_1.4.0_aarch64.AppImage` and `GitPulse_1.4.0_arm64.deb`, and
+`ARM Bundle (windows-11-arm)` built `GitPulse_1.4.0_arm64-setup.exe` and
+`GitPulse_1.4.0_arm64_en-US.msi`. Both name checks printed `OK`. The same
+run's Build & Test legs failed on fmt, clippy (`desktop/`), the
+`agent_notify_socket` compile error and frontend checks. The Rust failures and
+both Vitest failures reproduce on a clean checkout of `0d3e9f77`, before any
+of this work; the Svelte and browser failures are in frontend files this work
+does not touch. No upload path was exercised: the real `release.yml`
+ARM upload and the `attest` stage run first on the next tag.
+
+### Property tests
+
+`proptest` 1.11 (dev-only, default features off) drives
+`engine::git_reader::tests::parse_status_records_prop`: round trip over every
+porcelain v1 `XY` code including worktree-side rename/copy pairs and arbitrary
+NUL-free UTF-8 paths, the prefix property for a stream cut at any byte, and
+panic-freedom with well-formed records on arbitrary bytes. Run
+`cargo test --manifest-path src-tauri/Cargo.toml parse_status_records_prop`;
+`PROPTEST_CASES=100000` widens the search. With the worktree-side copy field
+deliberately left unread, two properties failed and shrank to
+`" C" 0 -> ¡`-style records, so the properties have teeth. They run in CI as
+ordinary unit tests.
+
+### Framework port removal criteria
+
+Re-checked against crates.io on 2026-10-08. A port can retire once its
+latest upstream release accepts GTK 0.19 / GLib 0.22, or for notify a release
+carrying the FSEvents fixes.
+
+| Port | Latest upstream | Upstream requires | Result |
+| --- | --- | --- | --- |
+| tauri, tauri-runtime, tauri-runtime-wry | 2.12.1 | `gtk ^0.18` | keep |
+| wry | 0.57.0 | `gtk ^0.18`, `soup3 ^0.5` | keep |
+| tao | 0.37.1 | `gtk ^0.18` | keep |
+| muda | 0.21.1 | `gtk ^0.18` | keep |
+| webkit2gtk, webkit2gtk-sys | 2.0.2 | `gtk ^0.18`, `glib ^0.18` | keep |
+| libappindicator, libappindicator-sys | 0.9.0 (2023) | `gtk ^0.18` | keep |
+| notify | 8.2.0, our patched version | — | keep: no release carries the fixes |
+| javascriptcore-rs, javascriptcore-rs-sys | 2.0.0 (2026-09-22) | `glib ^0.22` | **retired** |
+
+javascriptcore-rs 2.0.0 matches the retired port except for regenerated
+bindings: its `ContextExt` is no longer sealed, and it uses system-deps 9,
+which is already in the graph. The port's other two edits (a public
+`builders` module and `TypedArrayData<'_>`) were lint fixes needed only
+because path dependencies are not capped by `--cap-lints`; a registry crate
+is. WebKitGTK, WebKitGTK-sys and WRY now require `2` instead of `=1.1`/`=1.1.2`,
+which is recorded in `PATCHES.json` and `changes.patch`. The graph still holds
+one GLib (0.22.9) and one GTK (0.19.0), and neither `proc-macro-error` crate.
+
+### CodeQL configuration
+
+Not attachable from here: the custom-property endpoint still returns 404 for
+this personal repository. Default setup is `configured` (weekly, last updated
+2026-09-22) and had **0** open alerts on 2026-10-08. A person must attach
+`.github/codeql/codeql-config.yml` in Settings → Code security, or record that
+they decline to.
+

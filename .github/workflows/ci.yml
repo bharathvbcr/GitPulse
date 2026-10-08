@@ -168,6 +168,66 @@ jobs:
             cargo test --manifest-path src-tauri/Cargo.toml --locked --no-fail-fast -- --nocapture --test-threads=1
           fi
 
+  # release.yml builds Linux aarch64 and Windows arm64 only on a tag, so a
+  # broken ARM leg would first fail with every other platform already on the
+  # draft. This bundles both on their real runners, through the same
+  # tauri-action, and checks the installer names against the release manifest.
+  # Dispatch-only: each leg is a full release build. Run it on a branch that
+  # touches the release matrix, bundling, or native dependencies.
+  arm-bundle:
+    name: ARM Bundle (${{ matrix.platform }})
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ${{ matrix.platform }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: [ubuntu-22.04-arm, windows-11-arm]
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v7
+
+      - name: Install System Dependencies (Linux)
+        if: startsWith(matrix.platform, 'ubuntu-')
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev build-essential curl wget file libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev pkg-config
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: 22
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+
+      - name: Setup Rust Toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Key the Rust cache to this runner image
+        shell: bash
+        run: echo "RUST_CACHE_PREFIX=${ImageOS:-unknown}-${ImageVersion:-unknown}-gp3" >> "$GITHUB_ENV"
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+          prefix-key: ${{ env.RUST_CACHE_PREFIX }}
+
+      - name: Install Frontend Dependencies
+        run: bun install --frozen-lockfile
+
+      # No release inputs: tauri-action builds and bundles without uploading.
+      - name: Build Tauri Bundles
+        id: tauri
+        uses: tauri-apps/tauri-action@v1
+
+      - name: Installer Names Match The Release Manifest
+        shell: bash
+        env:
+          ARTIFACT_PATHS: ${{ steps.tauri.outputs.artifactPaths }}
+        run: node scripts/check-release-assets.mjs --bundles "$ARTIFACT_PATHS" --platform "${{ matrix.platform }}"
+
   # go/ is GitPulse's Go import of the shared Gusset engine. Its go.mod
   # replaces DevCouncil and gusset with ../../DevCouncil and ../../gusset, so
   # without the siblings nothing in go/ was ever compiled here. The pins are

@@ -6280,6 +6280,114 @@ mod tests {
         assert!(parse_status_records(b"M ").is_empty());
     }
 
+    /// Property tests for [`parse_status_records`]. The examples above pin
+    /// known wire shapes; these hold for every stream Git can emit and every
+    /// byte prefix of one, which is what a pipe cut at an output budget
+    /// produces. Run locally with `cargo test parse_status_records_prop`;
+    /// `PROPTEST_CASES=100000` widens the search.
+    mod parse_status_records_prop {
+        use super::super::parse_status_records;
+        use proptest::prelude::*;
+
+        /// `XY` pairs `git status --porcelain=v1` emits, including the
+        /// worktree-side rename/copy forms that carry a second field.
+        const CODES: &[&str] = &[
+            "M ", " M", "MM", "T ", " T", "A ", "AM", "AD", "D ", " D", "R ", "RM", "RD", " R",
+            "C ", "CM", " C", "UU", "AA", "DD", "AU", "UA", "DU", "UD", "??", "!!",
+        ];
+
+        #[derive(Debug, Clone)]
+        struct Record {
+            code: &'static str,
+            path: String,
+            old_path: Option<String>,
+        }
+
+        fn is_paired(code: &str) -> bool {
+            code.contains('R') || code.contains('C')
+        }
+
+        fn record() -> impl Strategy<Value = Record> {
+            // Any non-empty NUL-free UTF-8 path: spaces, arrows, newlines and
+            // non-ASCII are all legal file names under `-z`.
+            let path = "[^\u{0}]{1,24}";
+            (prop::sample::select(CODES), path, path).prop_map(|(code, path, old)| Record {
+                code,
+                path,
+                old_path: is_paired(code).then_some(old),
+            })
+        }
+
+        /// Encodes records exactly as Git does, returning the stream and the
+        /// byte offset at which each record ends.
+        fn encode(records: &[Record]) -> (Vec<u8>, Vec<usize>) {
+            let mut bytes = Vec::new();
+            let mut ends = Vec::new();
+            for record in records {
+                bytes.extend_from_slice(record.code.as_bytes());
+                bytes.push(b' ');
+                bytes.extend_from_slice(record.path.as_bytes());
+                bytes.push(0);
+                if let Some(old) = &record.old_path {
+                    bytes.extend_from_slice(old.as_bytes());
+                    bytes.push(0);
+                }
+                ends.push(bytes.len());
+            }
+            (bytes, ends)
+        }
+
+        fn assert_decodes(parsed: &[super::super::RawStatusRecord], expected: &[Record]) {
+            assert_eq!(parsed.len(), expected.len(), "{parsed:?}");
+            for (got, want) in parsed.iter().zip(expected) {
+                let mut code = want.code.chars();
+                assert_eq!(got.index_status, code.next().unwrap());
+                assert_eq!(got.work_status, code.next().unwrap());
+                assert_eq!(got.path, want.path);
+                assert_eq!(got.old_path, want.old_path);
+            }
+        }
+
+        proptest! {
+            #[test]
+            fn round_trips_every_record(records in prop::collection::vec(record(), 0..12)) {
+                let (bytes, _) = encode(&records);
+                assert_decodes(&parse_status_records(&bytes), &records);
+            }
+
+            /// A stream cut anywhere yields exactly the records that ended
+            /// before the cut: a truncated tail is dropped whole and never
+            /// shifts or corrupts an earlier record.
+            #[test]
+            fn any_prefix_yields_only_complete_records(
+                records in prop::collection::vec(record(), 1..10),
+                cut in any::<prop::sample::Index>(),
+            ) {
+                let (bytes, ends) = encode(&records);
+                let cut = cut.index(bytes.len() + 1);
+                let complete = ends.iter().take_while(|&&end| end <= cut).count();
+                assert_decodes(&parse_status_records(&bytes[..cut]), &records[..complete]);
+            }
+
+            /// Arbitrary bytes never panic, and every decoded record keeps the
+            /// invariants callers rely on.
+            #[test]
+            fn arbitrary_bytes_decode_to_well_formed_records(
+                bytes in prop::collection::vec(any::<u8>(), 0..256),
+            ) {
+                for record in parse_status_records(&bytes) {
+                    prop_assert!(!record.path.is_empty());
+                    prop_assert!(!record.path.contains('\0'));
+                    if let Some(old) = &record.old_path {
+                        prop_assert!(!old.is_empty() && !old.contains('\0'));
+                        let code: String = [record.index_status, record.work_status].iter().collect();
+                        prop_assert!(is_paired(&code), "{code:?} carried a pre-image");
+                    }
+                }
+            }
+        }
+    }
+
     #[test]
     fn test_parse_numstat_keys_rename_on_post_image() {
         // Verified wire shapes: `add\tdel\t<path>\0` and, for renames,

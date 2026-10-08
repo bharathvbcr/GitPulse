@@ -164,7 +164,7 @@ version = "0.19"
 package = "gtk-sys"
 
 [dependencies.java_script_core]
-version = "=1.1"
+version = "2"
 package = "javascriptcore-rs-sys"
 
 [dependencies.libc]
