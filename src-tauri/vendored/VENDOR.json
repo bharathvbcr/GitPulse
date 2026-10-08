@@ -109,7 +109,7 @@
         "repo": "devcouncil",
         "root_env": "GITPULSE_DEVCOUNCIL_ROOT",
         "path": "rust/dc-store",
-        "commit": "ef0180b0e76aec82779fa744cb67c46a1b829da8"
+        "commit": "9de7d7cdb5da64508d853943c2c80e1da43922ce"
       },
       "omitted": [
         "tests/",
@@ -142,7 +142,7 @@
         "src/workbench/input.rs": "f1f97d6114180fd0fcdda7c437faadab601a09c4edfcedabbebee15dd718361c",
         "src/workbench/item_query_tests.rs": "e09e587de78a27c93326446b53c2ea03410ec2d54c09c3dffc989df3f04dd690",
         "src/workbench/items.rs": "cbca9d0774f788bbb0c7f3d1235c24ec73fe856f797c525fbc22f37dd7c6ecff",
-        "src/workbench/items.sql": "876e73ac779c4655b1a0bc64b05603d84766ac7cb11c0835a47e0a7a084379b0",
+        "src/workbench/items.sql": "9b05410a9e84351e20559177901b4595b39ce472994aa56390fa1ee0104982cc",
         "src/workbench/logs_tests.rs": "352308cfbe50d1a74cb4e84b0c78cbb474e15036f29f3cc8938f7624b5419053",
         "src/workbench/mod.rs": "fa8f2d1846ad0658eaca41ae47d0b5131e998589c40e10a7a6a557260818c10a",
         "src/workbench/notifications.rs": "b845ec5c599f621a3c57f5b807f75c09c911d1c01df3fce60d39e107c6f60e8e",

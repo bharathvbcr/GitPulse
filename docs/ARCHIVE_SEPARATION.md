@@ -14,7 +14,7 @@ pins each claim below to the vendored source.
 
 `dc-store` is vendored from DevCouncil
 ([`src-tauri/vendored/VENDOR.json`](../src-tauri/vendored/VENDOR.json), crate
-`dc-store` at commit `ef0180b`). The change was made upstream on DevCouncil's
+`dc-store` at commit `9de7d7c`). The change was made upstream on DevCouncil's
 `feat/workbench-schema-11` branch and re-vendored with
 `node scripts/vendor-crates.mjs --crate=dc-store`, never edited here.
 
@@ -37,7 +37,18 @@ Schema version is **11**. The 10 → 11 rung (`workbench/items.sql`):
   revision of its *current* Done streak (the first revision after the last one
   whose status was not Done), falling back to `updated_at` when there is no
   such history. No revision is spent, so a host holding a pre-upgrade revision
-  can still save.
+  can still save;
+- gives **every other row** the same keys a schema 11 write gives it —
+  `archived: false`, `completed_at: null`, an empty `checklist` and no
+  `links` — so a reader sees one shape for a task written before the upgrade
+  and one written after. Upgrading a real profile showed why: every open task
+  otherwise read back with `archived` missing, which the board defaults but an
+  agent reading over MCP would have to guess at.
+
+`src-tauri/src/workbench/profile_upgrade_tests.rs` upgrades a copy of a real
+profile through the host and checks each of these against the pre-upgrade
+file read directly (see its header for how to run it; it refuses the live
+profile's path).
 
 The ladder is a hard fence: a host built against schema 10 refuses a schema 11
 profile (`schema_unsupported`). That is deliberate — a host that builds a task

@@ -1998,3 +1998,7 @@ mod tests;
 #[cfg(test)]
 #[path = "intake_merge_tests.rs"]
 mod merge_tests;
+
+#[cfg(test)]
+#[path = "profile_upgrade_tests.rs"]
+mod profile_upgrade_tests;
