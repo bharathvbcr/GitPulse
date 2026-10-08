@@ -1,5 +1,6 @@
 pub mod budget;
 pub mod churn_store;
+pub mod content_search;
 pub mod cow_clone;
 pub mod deadbranch;
 pub mod git_cli;

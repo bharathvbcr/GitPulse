@@ -1957,6 +1957,28 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
       const probe = openTab(internal.workspace, rawPath, options, { activate: false });
       return probe.ok ? null : openRefusalMessage(probe.reason);
     },
+    /**
+     * The repository family a checkout belongs to (see repos/repoFamily.ts),
+     * without opening a tab for it: an open tab's own answer, else the
+     * backend's resolve. Null when it cannot be read — no repository, not
+     * trusted, or a failed resolve — which callers treat as "stands alone",
+     * never as a guess.
+     */
+    familyOf: async (rawPath: string): Promise<string | null> => {
+      const key = identityKey(rawPath, options);
+      if (!key) return null;
+      const open = internal.workspace.tabs.find((tab) => tab.id === key);
+      if (open) {
+        const known = familyFromCommonDir(internal.sessions[open.id]?.commonDir, options);
+        if (known) return known.key;
+      }
+      try {
+        const resolved = await resolvePath(rawPath);
+        return familyFromCommonDir(resolved?.common_dir, options)?.key ?? null;
+      } catch {
+        return null;
+      }
+    },
     openRepo: async (
       rawPath: string,
       extras: {

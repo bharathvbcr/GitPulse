@@ -12,7 +12,7 @@ import { describe, expect, it } from "vitest";
 const updates = readFileSync(new URL("../src-tauri/src/updates/mod.rs", import.meta.url), "utf8");
 
 function bodyOf(name: string): string {
-  const start = updates.indexOf(`pub fn ${name}`);
+  const start = updates.indexOf(`pub fn ${name}(`);
   expect(start, `${name} must exist`).toBeGreaterThanOrEqual(0);
   const end = updates.indexOf("\n}\n", start);
   expect(end, `${name} must be closed`).toBeGreaterThan(start);

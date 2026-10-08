@@ -185,6 +185,15 @@ pub struct BlameLine {
     pub author_email: String,
     pub timestamp: i64,
     pub content: String,
+    /// The parent of `commit_id` that git blamed through, from porcelain's
+    /// `previous <oid> <path>`. Absent when the line was introduced by a root
+    /// commit or is uncommitted, so "blame the parent" has nowhere to go.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_commit: Option<String>,
+    /// The file's path in `previous_commit`, which differs from the blamed
+    /// path across a rename. Present exactly when `previous_commit` is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_path: Option<String>,
 }
 
 /// Diff text plus whether it was cut at [`budget::MAX_DIFF_BYTES`].
@@ -248,6 +257,42 @@ pub struct ReflogEntry {
     pub message: String,
     pub timestamp: i64,
 }
+
+/// One commit named in a [`ResetPreview`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PreviewCommit {
+    pub commit_id: String,
+    pub summary: String,
+    pub author_name: String,
+    pub timestamp: i64,
+}
+
+/// What moving the current branch (or a detached HEAD) to `target` would
+/// take off it, read before the reset so the confirmation can name it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResetPreview {
+    /// The branch that would move; `None` when HEAD is detached, in which
+    /// case only HEAD moves.
+    pub branch: Option<String>,
+    pub head: String,
+    /// `target` peeled to a commit oid: the reset should run against this,
+    /// not the name, so a ref moving after the preview cannot change it.
+    pub target: String,
+    /// Newest first: the commits in `target..HEAD`, at most
+    /// [`RESET_PREVIEW_LIMIT`] of them.
+    pub leaving: Vec<PreviewCommit>,
+    /// Every commit in `target..HEAD`, so a capped list is never read as all.
+    pub leaving_total: usize,
+    /// Of those, the ones no other branch, tag or remote-tracking ref
+    /// reaches: after the reset only the reflog still holds them.
+    pub unreachable_total: usize,
+    /// Commits in `HEAD..target` the branch would gain (a forward or
+    /// sideways move rather than a rewind).
+    pub gaining_total: usize,
+}
+
+/// How many leaving commits a [`ResetPreview`] lists by name.
+pub const RESET_PREVIEW_LIMIT: usize = 20;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RepoLanguageStat {
@@ -1050,8 +1095,22 @@ impl GitReader {
         Ok(statuses)
     }
 
-    pub fn get_file_blame(repo_path: &str, file_path: &str) -> Result<Vec<BlameLine>, String> {
+    /// Blames `file_path` in the working tree, or as it stood at `revision`.
+    ///
+    /// The revision form reads only the object database: the working-tree
+    /// file may be gone, renamed, or differ, so none of the on-disk checks or
+    /// the uncommitted-file fallback apply. The revision is peeled to a
+    /// commit oid first, so a branch moving mid-read cannot change which
+    /// commit the answer describes.
+    pub fn get_file_blame(
+        repo_path: &str,
+        file_path: &str,
+        revision: Option<&str>,
+    ) -> Result<Vec<BlameLine>, String> {
         let repo = validate_repo(repo_path)?;
+        if let Some(revision) = revision {
+            return blame_at_revision(&repo, file_path, revision);
+        }
         // Canonical join resolves existing prefixes through symlinks so a
         // symlinked directory cannot redirect the read outside the repository;
         // not-yet-tracked leaves stay lexical.
@@ -1540,6 +1599,110 @@ impl GitReader {
             });
         }
         Ok(entries)
+    }
+
+    /// The branch HEAD is on, validated as a ref name; `None` when detached.
+    ///
+    /// Exit 1 is git's answer "HEAD is detached"; any other failure is a read
+    /// that did not happen and is an error, never reported as detached.
+    pub fn current_branch(repo_path: &str) -> Result<Option<String>, String> {
+        let repo = validate_repo(repo_path)?;
+        let run = git_cli::git_captured(&repo, &["symbolic-ref", "--quiet", "--short", "HEAD"])?;
+        match run.status_code {
+            0 => {
+                let name = String::from_utf8_lossy(&run.stdout).trim().to_string();
+                validate_ref_name(&name)?;
+                Ok(Some(name))
+            }
+            1 => Ok(None),
+            code => Err(format!(
+                "Could not read the current branch (git exited {code}): {}",
+                String::from_utf8_lossy(&run.stderr).trim()
+            )),
+        }
+    }
+
+    /// Reads what a reset of HEAD's branch to `target` would take off it.
+    ///
+    /// Read-only and ungated: it answers the question the confirmation must
+    /// ask before the guarded `cmd_reset` runs.
+    pub fn reset_preview(repo_path: &str, target: &str) -> Result<ResetPreview, String> {
+        let repo = validate_repo(repo_path)?;
+        crate::engine::git_writer::validate_oid_or_revision(target)?;
+        let peel = |rev: &str| -> Result<String, String> {
+            let spec = format!("{rev}^{{commit}}");
+            let oid = git_text(&repo, &["rev-parse", "--verify", "--quiet", spec.as_str()])
+                .map_err(|_| format!("'{rev}' does not name a commit"))?;
+            let oid = oid.trim().to_string();
+            validate_oid(&oid).map_err(|_| format!("'{rev}' does not name a commit"))?;
+            Ok(oid)
+        };
+        let target_oid = peel(target)?;
+        let head = peel("HEAD")?;
+        let branch = Self::current_branch(repo_path)?;
+
+        let count = |args: &[&str]| -> Result<usize, String> {
+            let text = git_text(&repo, args)?;
+            git_cli::parse_count_saturating(text.trim())
+                .ok_or_else(|| format!("git rev-list returned an unreadable count: {text}"))
+        };
+        let not_target = format!("^{target_oid}");
+        let leaving_total = count(&["rev-list", "--count", &head, &not_target])?;
+        let gaining_total = count(&["rev-list", "--count", &target_oid, &format!("^{head}")])?;
+        // Every other ref keeps its commits alive; the moving branch itself
+        // must not, or nothing would ever count as left behind.
+        let exclude = branch.as_ref().map(|name| format!("--exclude={name}"));
+        let mut unreachable_args = vec![
+            "rev-list",
+            "--count",
+            head.as_str(),
+            not_target.as_str(),
+            "--not",
+        ];
+        if let Some(exclude) = &exclude {
+            unreachable_args.push(exclude);
+        }
+        unreachable_args.extend_from_slice(&["--branches", "--tags", "--remotes"]);
+        let unreachable_total = count(&unreachable_args)?;
+
+        let limit = format!("--max-count={RESET_PREVIEW_LIMIT}");
+        let listed = git_text(
+            &repo,
+            &[
+                "log",
+                limit.as_str(),
+                "--no-show-signature",
+                "--format=%H%x00%ct%x00%an%x00%s",
+                &head,
+                &not_target,
+            ],
+        )?;
+        let leaving = listed
+            .lines()
+            .filter_map(|line| {
+                let mut parts = line.splitn(4, '\0');
+                let commit_id = parts.next()?.to_string();
+                let timestamp = parts.next()?.parse().unwrap_or(0);
+                let author_name = parts.next()?.to_string();
+                let summary = parts.next().unwrap_or("").to_string();
+                validate_oid(&commit_id).ok()?;
+                Some(PreviewCommit {
+                    commit_id,
+                    summary,
+                    author_name,
+                    timestamp,
+                })
+            })
+            .collect();
+        Ok(ResetPreview {
+            branch,
+            head,
+            target: target_oid,
+            leaving,
+            leaving_total,
+            unreachable_total,
+            gaining_total,
+        })
     }
 
     pub fn get_repo_language_stats(repo_path: &str) -> Result<LanguageStatsReport, String> {
@@ -3754,6 +3917,36 @@ fn parse_status_records(bytes: &[u8]) -> Vec<RawStatusRecord> {
     records
 }
 
+/// [`GitReader::get_file_blame`] at a revision: peel to a commit oid, then
+/// blame the path as recorded in that commit.
+fn blame_at_revision(
+    repo: &Path,
+    file_path: &str,
+    revision: &str,
+) -> Result<Vec<BlameLine>, String> {
+    crate::engine::git_writer::validate_oid_or_revision(revision)?;
+    // Lexical containment only: the path is read from a tree object, never
+    // from disk, so a symlinked directory in the checkout cannot redirect it.
+    sandbox_join(repo, file_path)?;
+    let spec = format!("{revision}^{{commit}}");
+    let oid = git_text(repo, &["rev-parse", "--verify", "--quiet", spec.as_str()])
+        .map_err(|_| format!("Blame unavailable: '{revision}' does not name a commit"))?;
+    let oid = oid.trim();
+    validate_oid(oid)
+        .map_err(|_| format!("Blame unavailable: '{revision}' does not name a commit"))?;
+    // Same literal-path note as the working-tree form: `git blame` takes a
+    // path, not a pathspec, and rejects `:(literal)` magic.
+    let (stdout, incomplete) = git_text_capped(
+        repo,
+        &["blame", "--line-porcelain", oid, "--", file_path],
+        budget::MAX_BLAME_BYTES,
+    )?;
+    if let Some(reason) = incomplete {
+        return Err(format!("Blame unavailable: {}", reason.describe()));
+    }
+    Ok(parse_blame_porcelain(&stdout))
+}
+
 /// A new file has content but no committed author. Preserve every line while
 /// using the same zero-OID convention as Git's uncommitted porcelain records.
 fn uncommitted_file_blame(repo: &Path, path: &Path) -> Result<Vec<BlameLine>, String> {
@@ -3804,6 +3997,8 @@ fn uncommitted_file_blame(repo: &Path, path: &Path) -> Result<Vec<BlameLine>, St
             author_email: String::new(),
             timestamp: 0,
             content: content.into(),
+            previous_commit: None,
+            previous_path: None,
         };
         payload_bytes += serde_json::to_vec(&line)
             .map_err(|e| format!("Blame unavailable: cannot encode line: {e}"))?
@@ -3845,10 +4040,19 @@ fn parse_blame_porcelain(stdout: &str) -> Vec<BlameLine> {
     let mut current_time: i64 = 0;
     let mut line_no = 0usize;
     let mut oid_len: Option<usize> = None;
+    // `previous` is emitted only when the commit has a parent to blame
+    // through, so it is reset at every header: `--line-porcelain` repeats the
+    // whole block per line, and a stale value would point a root commit's
+    // line at an unrelated parent.
+    let mut current_previous: Option<(String, String)> = None;
 
     for line in stdout.lines() {
         if let Some(content) = line.strip_prefix('\t') {
             line_no += 1;
+            let (previous_commit, previous_path) = match &current_previous {
+                Some((oid, path)) => (Some(oid.clone()), Some(path.clone())),
+                None => (None, None),
+            };
             blame_lines.push(BlameLine {
                 line_no,
                 commit_id: current_sha.clone(),
@@ -3856,6 +4060,8 @@ fn parse_blame_porcelain(stdout: &str) -> Vec<BlameLine> {
                 author_email: current_email.clone(),
                 timestamp: current_time,
                 content: content.to_string(),
+                previous_commit,
+                previous_path,
             });
         } else if let Some(author) = line.strip_prefix("author ") {
             current_author = author.to_string();
@@ -3863,12 +4069,83 @@ fn parse_blame_porcelain(stdout: &str) -> Vec<BlameLine> {
             current_email = mail.trim_matches(|c| c == '<' || c == '>').to_string();
         } else if let Some(time) = line.strip_prefix("author-time ") {
             current_time = time.parse().unwrap_or(0);
+        } else if let Some(rest) = line.strip_prefix("previous ") {
+            current_previous = parse_blame_previous(rest, oid_len);
         } else if let Some(oid) = blame_header_oid(line, oid_len) {
             oid_len = Some(oid.len());
             current_sha = oid.to_string();
+            current_previous = None;
         }
     }
     blame_lines
+}
+
+/// Parses the `<oid> <path>` tail of a porcelain `previous` line. The oid must
+/// match the stream's pinned length; the path is C-quoted by git when it holds
+/// a quote, backslash or control character (even under `core.quotepath=off`).
+fn parse_blame_previous(rest: &str, oid_len: Option<usize>) -> Option<(String, String)> {
+    let (oid, path) = rest.split_once(' ')?;
+    if oid_len.is_some_and(|len| len != oid.len())
+        || !(32..=64).contains(&oid.len())
+        || !oid.chars().all(|c| c.is_ascii_hexdigit())
+    {
+        return None;
+    }
+    let path = if path.starts_with('"') {
+        unquote_c_style(path)?
+    } else {
+        path.to_string()
+    };
+    if path.is_empty() {
+        return None;
+    }
+    Some((oid.to_string(), path))
+}
+
+/// Reverses git's `quote_c_style`: a double-quoted string with `\a \b \t \n
+/// \v \f \r \" \\` escapes and `\ooo` octal bytes. `None` for anything that is
+/// not a well-formed quoted name, so a malformed path never becomes a target.
+fn unquote_c_style(quoted: &str) -> Option<String> {
+    let inner = quoted.strip_prefix('"')?.strip_suffix('"')?;
+    let bytes = inner.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let byte = bytes[i];
+        if byte != b'\\' {
+            out.push(byte);
+            i += 1;
+            continue;
+        }
+        let escape = *bytes.get(i + 1)?;
+        let decoded = match escape {
+            b'a' => 0x07,
+            b'b' => 0x08,
+            b't' => b'\t',
+            b'n' => b'\n',
+            b'v' => 0x0b,
+            b'f' => 0x0c,
+            b'r' => b'\r',
+            b'"' => b'"',
+            b'\\' => b'\\',
+            b'0'..=b'3' => {
+                let digits = bytes.get(i + 1..i + 4)?;
+                if !digits.iter().all(|d| (b'0'..=b'7').contains(d)) {
+                    return None;
+                }
+                let value = digits
+                    .iter()
+                    .fold(0u16, |acc, d| acc * 8 + u16::from(d - b'0'));
+                i += 4;
+                out.push(u8::try_from(value).ok()?);
+                continue;
+            }
+            _ => return None,
+        };
+        out.push(decoded);
+        i += 2;
+    }
+    String::from_utf8(out).ok()
 }
 
 /// True when `token` is a `git diff --numstat -z` header (`add\tdel\tpath`
@@ -6185,6 +6462,40 @@ mod tests {
         let oid40 = "a".repeat(40);
         let lines = parse_blame_porcelain(&blame_block(&oid40, "gamma"));
         assert_eq!(lines[0].commit_id.len(), 40);
+    }
+
+    /// `previous` belongs to the header it follows. `--line-porcelain`
+    /// repeats every block, so a root commit's line after a non-root one must
+    /// not inherit the earlier line's parent.
+    #[test]
+    fn test_blame_porcelain_previous_is_per_header_and_unquoted() {
+        let a = "a".repeat(40);
+        let p = "1".repeat(40);
+        let with_previous = blame_block(&a, "child").replace(
+            "filename f.txt",
+            &format!("previous {p} \"dir/sp\\303\\251c \\\"x\\\".txt\"\nfilename f.txt"),
+        );
+        let lines = parse_blame_porcelain(&format!("{with_previous}{}", blame_block(&a, "root")));
+        assert_eq!(lines[0].previous_commit.as_deref(), Some(p.as_str()));
+        assert_eq!(
+            lines[0].previous_path.as_deref(),
+            Some("dir/spéc \"x\".txt")
+        );
+        assert_eq!(lines[1].previous_commit, None);
+        assert_eq!(lines[1].previous_path, None);
+
+        // A wrong-length oid or a malformed quoted name never becomes a target.
+        let bad = blame_block(&a, "x").replace(
+            "filename f.txt",
+            &format!("previous {} f.txt\nfilename f.txt", "1".repeat(64)),
+        );
+        assert_eq!(parse_blame_porcelain(&bad)[0].previous_commit, None);
+        assert_eq!(unquote_c_style("\"bad\\q\""), None);
+        assert_eq!(unquote_c_style("\"trailing\\\""), None);
+        assert_eq!(
+            unquote_c_style("\"tab\\there\"").as_deref(),
+            Some("tab\there")
+        );
     }
 
     #[test]

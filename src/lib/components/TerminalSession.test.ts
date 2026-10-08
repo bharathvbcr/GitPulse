@@ -278,8 +278,8 @@ describe("TerminalSession linkification", () => {
     expect(activations.length).toBeGreaterThanOrEqual(2);
     for (const body of activations) expect(body).toContain("activateLink(");
     // `activateLink` is the only caller of the openers, and it asks first.
-    expect(source).toContain("const action = resolveLinkAction(text, repoPath)");
-    expect(source.indexOf("resolveLinkAction(text, repoPath)"))
+    expect(source).toContain("const action = resolveLinkAction(text, workPath)");
+    expect(source.indexOf("resolveLinkAction(text, workPath)"))
       .toBeLessThan(source.indexOf("await openExternal("));
   });
 

@@ -9,7 +9,7 @@
   import { loadAgentDefaults } from "../stores/agentDefaultsStore";
   import type { FocusOutcome } from "../terminal/sessionFocus";
   import { isPromptLauncher, terminalLaunchRequests } from "../terminal/launchRequests";
-  import { taskTerminalRequests, consumeTaskTerminalRequest, requestFor } from "../terminal/taskLaunches";
+  import { taskTerminalRequests, consumeTaskTerminalRequest, launchFor, requestFor, type HostCandidate } from "../terminal/taskLaunches";
   import { isCaseInsensitiveFs, sameRepo } from "../repos/paths";
   import { consoleLaunchRequests, consumeConsoleLaunch } from "../terminal/consoleLaunches";
   import { boundedCommand, retainCommand, retainExecutions, followsConsoleOutput } from "../terminal/consoleHistory";
@@ -55,6 +55,7 @@
     LAUNCHERS,
     activateTab,
     canOpenTab,
+    MAX_STRIP_TABS,
     closeTab,
     cycleTab,
     initialState,
@@ -116,11 +117,13 @@
     onGoToSession?: (session: TerminalSessionRecord) => Promise<FocusOutcome>;
     /**
      * The open repository tabs, for naming the checkout each listed session
-     * runs in (repository, checkout, agent worktree). Handed in by the dock
-     * for the same reason as `onGoToSession`; without it a row falls back to
-     * what its path alone says.
+     * runs in (repository, checkout, agent worktree), and for deciding which
+     * queued task terminals this panel hosts (`taskLaunches.hostTabFor`).
+     * Handed in by the dock for the same reason as `onGoToSession`; without
+     * it a row falls back to what its path alone says, and the panel takes
+     * only requests for its own checkout.
      */
-    checkouts?: readonly CheckoutTab[];
+    checkouts?: readonly (CheckoutTab & HostCandidate)[];
   } = $props();
 
   interface ExecutionEntry {
@@ -182,8 +185,10 @@
   function initialTabs(): TabState {
     const launch = get(terminalLaunchRequests);
     if (launch && repoPath && sameRepo(launch.repoPath, repoPath, pathOpts)) return { tabs: [], activeId: null };
-    const request = requestFor(get(taskTerminalRequests), repoPath, pathOpts);
-    return request ? initialState(request.provider, request) : initialState();
+    // A panel mounted for a queued request starts empty: the request opener
+    // below opens its tab, through the same admission as every other.
+    if (requestFor(get(taskTerminalRequests), repoPath, pathOpts, checkouts)) return { tabs: [], activeId: null };
+    return initialState();
   }
   let tabState = $state<TabState>(untrack(initialTabs));
   const activeId = $derived(tabState.activeId);
@@ -208,8 +213,13 @@
   let unread = $state(new Set<string>());
   // Reads the live limit, so raising it in Settings lets a waiting task
   // terminal open at once rather than when a session next closes.
-  const canCreate = $derived(canOpenTab(tabState, $terminalSessionLimit) && $terminalSessions.length < $terminalSessionLimit);
-  const capacityTitle = $derived(canCreate ? "New terminal session" : `All ${$terminalSessionLimit} terminal sessions are open — close one in Sessions, or raise the limit in Settings → Agents`);
+  // Two bounds, each saying itself: live sessions (the user's limit, across
+  // repositories) and this strip's tabs, ended ones included (`MAX_STRIP_TABS`).
+  const stripFull = $derived(!canOpenTab(tabState, MAX_STRIP_TABS));
+  const canCreate = $derived(!stripFull && $terminalSessions.length < $terminalSessionLimit);
+  const capacityTitle = $derived(canCreate ? "New terminal session" : stripFull
+    ? `This repository's terminal holds ${MAX_STRIP_TABS} tabs, the most it can — close ended ones to open another`
+    : `All ${$terminalSessionLimit} terminal sessions are open — close one in Sessions, or raise the limit in Settings → Agents`);
   let shortcutsOpen = $state(false);
   let focusTabStrip = false;
   const tabExtras = $derived.by(() => {
@@ -352,19 +362,73 @@
    * agent seemed never to have started.
    */
   const waitingForCapacity = $derived.by(() => {
-    const request = requestFor($taskTerminalRequests, repoPath, pathOpts);
+    const request = requestFor($taskTerminalRequests, repoPath, pathOpts, checkouts);
     return request && !canCreate && !tabFor(tabState, request) ? request : null;
   });
 
+  /**
+   * Tabs opened for a queued request that do not hold a session slot yet.
+   *
+   * A slot is reserved when the process starts, after this panel — and every
+   * other repository's panel — has already judged one free. Consuming the
+   * request when its tab opened lost it whenever starts raced for the last
+   * slots: the losers showed "All N terminal sessions are in use", and
+   * nothing retried them when slots freed. So a request stays queued until
+   * its tab holds a slot (`admitTab`), and a tab refused one is closed and
+   * its request left to wait (`refuseTab`).
+   */
+  const admitting = new Set<string>();
+  /** Bumped on a refusal, so the opener runs again once a slot frees. */
+  let refusals = $state(0);
+
   $effect(() => {
-    const request = requestFor($taskTerminalRequests, repoPath, pathOpts);
-    if (!request || (!canCreate && !tabFor(tabState, request))) return;
+    const here = repoPath;
+    const hosted = here ? $taskTerminalRequests.filter((request) => requestFor([request], here, pathOpts, checkouts)) : [];
+    const limit = $terminalSessionLimit;
+    const used = $terminalSessions.length;
+    void refusals;
+    if (!here || !hosted.length) return;
     untrack(() => {
-      tabState = openTab(tabState, request.provider, request);
-      mode = "shell";
-      consumeTaskTerminalRequest(request);
+      let room = Math.min(limit - used, MAX_STRIP_TABS - tabState.tabs.length) - admitting.size;
+      for (const request of hosted) {
+        const tab = tabFor(tabState, request);
+        if (tab && admitting.has(tab.id)) continue;
+        if (tab) {
+          // Already this panel's: bring it forward, as a reveal asks.
+          tabState = openTab(tabState, request.provider, request);
+          mode = "shell";
+          consumeTaskTerminalRequest(request);
+          continue;
+        }
+        if (room <= 0) break;
+        const next = openTab(tabState, request.provider, launchFor(request, here, pathOpts));
+        const opened = next.tabs.find((candidate) => !tabState.tabs.includes(candidate));
+        if (!opened) break;
+        tabState = next;
+        mode = "shell";
+        admitting.add(opened.id);
+        room -= 1;
+      }
     });
   });
+
+  function admitTab(id: string) {
+    if (!admitting.delete(id)) return;
+    const tab = tabState.tabs.find((candidate) => candidate.id === id);
+    if (!tab) return;
+    const one = { tabs: [tab], activeId: null };
+    const request = get(taskTerminalRequests).find((candidate) => tabFor(one, candidate));
+    if (request) consumeTaskTerminalRequest(request);
+  }
+
+  function refuseTab(id: string): boolean {
+    if (!admitting.has(id)) return false;
+    // After the session's own start returns: it is still inside that call.
+    // Still marked until it is gone, or an opener run in between would take
+    // the refused tab for a running one and consume its request.
+    queueMicrotask(() => { dropTab(id); admitting.delete(id); refusals += 1; });
+    return true;
+  }
 
   $effect(() => {
     const queued = $consoleLaunchRequests[0];
@@ -532,6 +596,9 @@
    */
   function dropTab(id: string) {
     terminalLaunchRequests.forget(id);
+    // A tab closed before it took a slot no longer counts against the room
+    // this panel leaves for queued starts.
+    admitting.delete(id);
     focusTabStrip = false;
     const partner = splitIds?.includes(id) ? splitIds.find((other) => other !== id) ?? null : null;
     if (splitIds?.includes(id)) splitIds = null;
@@ -934,7 +1001,11 @@
   {/if}
   {#if waitingForCapacity && mode === "shell"}
     <div class="px-3 py-1.5 border-b border-border/60 text-[11px] text-amber-300 bg-amber-500/10" role="status" data-testid="terminal-waiting-for-capacity">
-      {waitingForCapacity.title} is waiting to open here: all {$terminalSessionLimit} terminal sessions are in use. Close one in Sessions, or raise the limit in Settings → Agents, and it opens.
+      {#if stripFull}
+        {waitingForCapacity.title} is waiting to open here: this repository's terminal already holds {MAX_STRIP_TABS} tabs. Close ended ones and it opens.
+      {:else}
+        {waitingForCapacity.title} is waiting to open here: all {$terminalSessionLimit} terminal sessions are in use. Close one in Sessions, or raise the limit in Settings → Agents, and it opens.
+      {/if}
     </div>
   {/if}
   {#if shortcutsOpen}
@@ -1153,6 +1224,9 @@
               attachSessionId={tab.attachSessionId}
               bind:this={sessions[tab.id]}
               repoPath={repoPath}
+              checkout={tab.checkout}
+              onAdmitted={() => admitTab(tab.id)}
+              onRefused={() => refuseTab(tab.id)}
               tabId={tab.id}
               launcher={tab.launcher}
               initialPrompt={tab.initialPrompt}

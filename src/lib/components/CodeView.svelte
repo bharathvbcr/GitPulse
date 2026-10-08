@@ -24,9 +24,12 @@
     loadBlame,
     /** Map navigator loader — same stability rule as Blame. */
     loadMap,
+    /** Content search loader — same stability rule as Blame. */
+    loadSearch,
   }: {
     loadBlame: ViewLoader;
     loadMap: ViewLoader;
+    loadSearch: ViewLoader;
   } = $props();
 
   const section = $derived(activeSectionFor("code", $repoStore.viewSections));
@@ -55,6 +58,8 @@
       <LazyView load={loadBlame} name="blame" />
     {:else if section === "map"}
       <LazyView load={loadMap} name="Map" />
+    {:else if section === "search"}
+      <LazyView load={loadSearch} name="Search" />
     {:else}
       <FileViewer />
     {/if}

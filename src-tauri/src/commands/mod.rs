@@ -14,7 +14,7 @@ use crate::engine::git_cli::{
 };
 use crate::engine::git_reader::{
     BlameLine, CommitDetails, CommitFileChange, DiffPayload, DoraReport, FileBlob, KnowledgeReport,
-    LanguageStatsReport, PulseReport, ReflogEntry,
+    LanguageStatsReport, PulseReport, ReflogEntry, ResetPreview,
 };
 use crate::engine::git_writer::{
     reworded_message, validate_oid_or_revision, validate_ref_name, IndexAction, RebaseStep,
@@ -1083,8 +1083,9 @@ pub fn cmd_parse_conventional_commit(message: String) -> Option<ConventionalComm
 pub async fn cmd_get_file_blame(
     repo_path: String,
     file_path: String,
+    revision: Option<String>,
 ) -> Result<Vec<BlameLine>, String> {
-    off_thread(move || GitReader::get_file_blame(&repo_path, &file_path)).await
+    off_thread(move || GitReader::get_file_blame(&repo_path, &file_path, revision.as_deref())).await
 }
 
 #[tauri::command(async)]
@@ -1246,6 +1247,38 @@ pub async fn cmd_get_reflog(
     max_entries: Option<usize>,
 ) -> Result<Vec<ReflogEntry>, String> {
     off_thread(move || GitReader::get_reflog(&repo_path, max_entries.unwrap_or(200))).await
+}
+
+/// Repository-wide content search (`git grep`) over the working tree or one
+/// revision. Bounded, with the reason named when the answer is partial.
+/// `cancel_token` joins the shared query registry, so `cmd_codeintel_cancel`
+/// stops a running search the same way it stops a code-graph query.
+#[tauri::command(async)]
+pub async fn cmd_search_content(
+    repo_path: String,
+    pattern: String,
+    options: Option<crate::engine::content_search::ContentSearchOptions>,
+    cancel_token: Option<String>,
+) -> Result<crate::engine::content_search::ContentSearchReport, String> {
+    off_thread(move || {
+        let cancel = crate::codeintel::begin_cancellable_query(cancel_token.as_deref());
+        let result = crate::engine::content_search::search(
+            &repo_path,
+            &pattern,
+            &options.unwrap_or_default(),
+            &|| cancel.is_cancelled(),
+        );
+        crate::codeintel::finish_cancellable_query(cancel_token.as_deref());
+        result
+    })
+    .await
+}
+
+/// What resetting HEAD's branch to `target` would take off it. Read-only and
+/// ungated; the reset itself goes through the guarded [`cmd_reset`].
+#[tauri::command(async)]
+pub async fn cmd_reset_preview(repo_path: String, target: String) -> Result<ResetPreview, String> {
+    off_thread(move || GitReader::reset_preview(&repo_path, &target)).await
 }
 
 #[tauri::command(async)]
@@ -1965,6 +1998,40 @@ pub async fn cmd_github_checkout_pr(
         let refs: Vec<&str> = argv_owned.iter().map(String::as_str).collect();
         let policy = guard(&repo_path, &refs)?;
         let output = checkout_pull_request(&repo_path, &remote, number)?;
+        Ok(Guarded { policy, output })
+    })
+    .await
+}
+
+/// One pull request in detail (`gh pr view`). Read-only and ungated, like the
+/// listings in [`cmd_github_context`].
+#[tauri::command(async)]
+pub async fn cmd_github_pr_view(
+    repo_path: String,
+    number: u64,
+) -> Result<crate::github::PullRequestDetail, String> {
+    off_thread(move || crate::github::view_pull_request(&repo_path, number)).await
+}
+
+/// Creates, reviews or merges a pull request through gh. Each is published
+/// on GitHub, so the frontend confirms first. The argv is built once, judged,
+/// and that same argv is what runs.
+#[tauri::command(async)]
+pub async fn cmd_github_pr_action(
+    repo_path: String,
+    action: crate::github::PrAction,
+) -> Result<Guarded<String>, String> {
+    off_thread(move || {
+        let remote = discover_github_remote(&repo_path)?
+            .ok_or_else(|| "No GitHub remote configured".to_string())?;
+        let head = match action {
+            crate::github::PrAction::Create { .. } => GitReader::current_branch(&repo_path)?,
+            _ => None,
+        };
+        let argv = crate::github::pr_action_argv(&remote, &action, head.as_deref())?;
+        let refs: Vec<&str> = argv.iter().map(String::as_str).collect();
+        let policy = guard(&repo_path, &refs)?;
+        let output = crate::github::run_pr_action(&repo_path, &argv)?;
         Ok(Guarded { policy, output })
     })
     .await
@@ -4786,13 +4853,85 @@ pub async fn cmd_docs_rename(
     to: String,
 ) -> Result<Guarded<crate::docs::DocRenameOutcome>, String> {
     off_thread(move || {
-        let argv = ["git", "mv", "--", from.as_str(), to.as_str()];
-        let policy = guard(&repo_path, &argv)?;
-        let outcome = crate::docs::rename_doc(&repo_path, &from, &to)?;
+        let mut policy = None;
+        let outcome = crate::docs::rename_doc(&repo_path, &from, &to, |plan| {
+            policy = Some(guard_move(&repo_path, plan)?);
+            Ok(())
+        })?;
+        let policy = policy.ok_or("Doc rename did not produce a verdict")?;
         Ok(Guarded {
             policy,
             output: outcome,
         })
+    })
+    .await
+}
+
+/// Judges what [`GitWriter::move_path`] is about to do: the `git mv` line it
+/// will run, or — for an untracked source, where no git command applies —
+/// the delete of the source and the write of the destination.
+fn guard_move(
+    repo_path: &str,
+    plan: &crate::engine::git_writer::MovePlan,
+) -> Result<crate::harness::PolicyVerdict, String> {
+    use crate::engine::git_writer::MovePlan;
+    match plan {
+        MovePlan::Git { argv } => {
+            let refs: Vec<&str> = argv.iter().map(String::as_str).collect();
+            guard(repo_path, &refs)
+        }
+        MovePlan::Untracked { from, to } => {
+            crate::engine::git_cli::mark_user_action(repo_path);
+            let source = crate::harness::guard_file(repo_path, from, "delete")?;
+            let destination = crate::harness::guard_file(repo_path, to, "modify")?;
+            Ok(strictest_verdict(source, destination))
+        }
+    }
+}
+
+/// Renames or moves a file or directory from the file tree. Tracked content
+/// moves with `git mv` (staged); untracked content with a filesystem rename.
+#[tauri::command(async)]
+pub async fn cmd_move_path(
+    repo_path: String,
+    from: String,
+    to: String,
+) -> Result<Guarded<()>, String> {
+    off_thread(move || {
+        let mut policy = None;
+        GitWriter::move_path(&repo_path, &from, &to, |plan| {
+            policy = Some(guard_move(&repo_path, plan)?);
+            Ok(())
+        })?;
+        let policy = policy.ok_or("Move did not produce a verdict")?;
+        Ok(Guarded { policy, output: () })
+    })
+    .await
+}
+
+/// Deletes a file or directory from the file tree: `git rm -r` for tracked
+/// content, `git clean -f -d` for untracked content, every line judged before
+/// the first runs. The frontend confirms first; this does not second-guess.
+#[tauri::command(async)]
+pub async fn cmd_delete_path(
+    repo_path: String,
+    path: String,
+) -> Result<Guarded<crate::engine::git_writer::DeleteOutcome>, String> {
+    off_thread(move || {
+        let mut policy: Option<crate::harness::PolicyVerdict> = None;
+        let output = GitWriter::delete_path(&repo_path, &path, |plan| {
+            for argv in plan {
+                let refs: Vec<&str> = argv.iter().map(String::as_str).collect();
+                let verdict = guard(&repo_path, &refs)?;
+                policy = Some(match policy.take() {
+                    Some(previous) => strictest_verdict(previous, verdict),
+                    None => verdict,
+                });
+            }
+            Ok(())
+        })?;
+        let policy = policy.ok_or("Delete did not produce a verdict")?;
+        Ok(Guarded { policy, output })
     })
     .await
 }

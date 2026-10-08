@@ -31,13 +31,13 @@ flowchart TB
     subgraph IPC["Tauri 2 IPC Seam (snake_case ↔ camelCase)"]
         direction TB
         Invoke["<code>invoke('cmd_*', args)</code>"]
-        ContractCheck["248 Handlers Enforced by <code>check:ipc</code>"]
+        ContractCheck["254 Handlers Enforced by <code>check:ipc</code>"]
         Invoke -.-> ContractCheck
     end
 
     subgraph Backend["Rust Backend (Tauri 2 / Rayon)"]
         direction TB
-        CmdRegistry["Command Registry (248 Handlers)<br/><code>src-tauri/src/commands/</code>"]
+        CmdRegistry["Command Registry (254 Handlers)<br/><code>src-tauri/src/commands/</code>"]
         
         subgraph Subsystems["Core Subsystems & In-Process Modules"]
             GitEngine["Git Engine & Sandbox<br/><code>src-tauri/src/engine/</code>"]
@@ -199,7 +199,7 @@ When switching between repositories or triggering fast refilters, in-flight IPC 
 ```mermaid
 classDiagram
     class CommandRegistry {
-        +248 Registered Handlers
+        +254 Registered Handlers
         +Checked by scripts/check-ipc-contract.mjs
     }
     class GitEngine {
@@ -426,8 +426,8 @@ GitPulse enforces compile-time and pre-commit contract safety across the Rust/Ty
 
 | Contract Tool | Command | Description |
 | --- | --- | --- |
-| **IPC Checker** | `bun run check:ipc` | Verifies all 248 Rust `cmd_*` handlers match frontend `invoke()` calls with zero untracked orphans. |
-| **Type Sync Checker** | `bun run check:types` | Asserts Rust Serde structs match TypeScript interfaces field-for-field and wire-type-for-wire-type across 1393 data fields, over 200 structs, in 77 contracts. The IPC payload types that remain unchecked are enumerated with a reason each in `scripts/ipc-type-coverage-contract.test.ts`. |
+| **IPC Checker** | `bun run check:ipc` | Verifies all 254 Rust `cmd_*` handlers match frontend `invoke()` calls with zero untracked orphans. |
+| **Type Sync Checker** | `bun run check:types` | Asserts Rust Serde structs match TypeScript interfaces field-for-field and wire-type-for-wire-type across 1442 data fields, over 207 structs, in 79 contracts. The IPC payload types that remain unchecked are enumerated with a reason each in `scripts/ipc-type-coverage-contract.test.ts`. |
 | **Release Version Gate** | `bun run check:release` | Validates that `package.json`, `tauri.conf.json`, `Cargo.toml`, `Cargo.lock`, and every discovered plugin manifest agree. Plugin manifests are found under `plugins/<name>/` rather than hardcoded, because one package ships a manifest per agent client and the newest one is the likeliest to be missed. |
 | **MCP Install Doctor** | `bun run mcp:doctor` | Handshakes the `gitpulse-mcp` on PATH — the binary the plugin manifests spawn — and asserts both its version and its manifest's store schema match this tree, then asks what source both binaries were built from against the digest `mcp:install` recorded. Version is the release identity and cannot see a fix that landed between releases; the digest can. Missing schema identity is unresponsive, never a pass, and an unrecorded install is *unverifiable*, never an OK. Reports *absent*, *unresponsive*, *stale*, and *unverifiable* as distinct failures. |
 
@@ -718,10 +718,20 @@ identical clone substituted at the same path.
 `TaskHandoffForm.svelte` prepares a selected saved revision and starts a
 task-bound tab in the existing terminal dock without changing what is on
 screen: `workbench/taskTerminal.ts::startTaskTerminal` queues the request and
-opens the checkout as a background repository tab, and `TerminalDock` hosts
-any open tab a queued task terminal waits for (`repoHosts.ts`, matched by
-`taskLaunches.ts::awaitedTabIds`), so the agent starts with the dock closed
-and the reader stays on the task. A terminal started out of sight spawns at
+`TerminalDock` hosts the open tab it waits for (`repoHosts.ts`, chosen by
+`taskLaunches.ts::hostTabFor` for both `awaitedTabIds` and the panel's
+`requestFor`), so the agent starts with the dock closed and the reader stays
+on the task. The host is the checkout's own tab when open, else a trusted,
+on-disk checkout of the same repository (`repoStore.familyOf`, by common Git
+directory), so an agent in a fresh worktree opens no repository tab and is
+bounded by the run and session limits, not the reader's tabs; the tab's
+`checkout` makes a resumed conversation spawn and resolve links in its own
+worktree. Only with no such checkout open is the checkout opened as a
+background repository tab. A panel consumes a queued request only once its
+tab holds a session slot (`sessionLifecycle` `admitted`/`refused`), so starts
+racing for the last slots wait instead of being lost, and one strip holds up
+to `MAX_STRIP_TABS` tabs, ended ones included, apart from the live session
+limit (harness: `agent-capacity`). A terminal started out of sight spawns at
 24 × 80 rather than at what xterm measures inside `display: none`
 (`viewControls.ts::spawnGridSize`). Only `showTaskTerminal` — the pane's Show
 terminal and the launch toast's action — brings it on screen, through

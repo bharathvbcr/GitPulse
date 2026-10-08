@@ -13,8 +13,8 @@
  *   (c) a shared field whose normalized wire type or backend-required
  *       presence no longer agrees.
  *
- * SCOPE: see CONTRACTS below for exactly what is checked — 77 contracts over
- * 200 structs, spanning both wire surfaces: command returns and event payloads.
+ * SCOPE: see CONTRACTS below for exactly what is checked — 79 contracts over
+ * 207 structs, spanning both wire surfaces: command returns and event payloads.
  * Enums are still skipped here and covered separately, by
  * scripts/enum-variant-contract.test.ts. That is most, not all, of the named types crossing the IPC
  * boundary: the ones still missing declare their TypeScript interface inside a
@@ -141,7 +141,7 @@ export const CONTRACTS = Object.freeze([
   { label: "file-content", rustPath: rust("engine", "git_reader.rs"), tsPath: ts("files", "types.ts"), structs: ["BlameLine", "FileBlob"] },
   { label: "markdown-render", rustPath: rust("markdown", "mod.rs"), tsPath: ts("files", "markdevRender.ts"), structs: ["RenderedMarkdown", "MarkdownHeading", "FrontmatterField"] },
   { label: "language-detect", rustPath: rust("analyzer", "language.rs"), tsPath: ts("files", "types.ts"), structs: ["LanguageInfo"] },
-  { label: "reflog", rustPath: rust("engine", "git_reader.rs"), tsPath: ts("branches", "types.ts"), structs: ["ReflogEntry"] },
+  { label: "reflog", rustPath: rust("engine", "git_reader.rs"), tsPath: ts("branches", "types.ts"), structs: ["ReflogEntry", "ResetPreview", "PreviewCommit"] },
   { label: "worktrees", rustPath: rust("engine", "worktree.rs"), tsPath: ts("branches", "types.ts"), structs: ["WorktreeInfo", "WorktreeCreated", "MergeTeardownResult"] },
   { label: "insights", rustPath: rust("insights", "mod.rs"), tsPath: ts("insights", "types.ts"), structs: [
     "WorktreeSummary", "AgentKindCount", "AgentSummary", "WorktreeFacet", "ChangesFacet",
@@ -168,7 +168,7 @@ export const CONTRACTS = Object.freeze([
   { label: "repository trust", rustPath: rust("repository_trust.rs"), tsPath: ts("repos", "repositoryTrust.ts"), structs: ["TrustPreview"] },
   { label: "ci-local", rustPath: rust("ci_local.rs"), tsPath: ts("github", "types.ts"), structs: ["CiLocalReport"] },
   { label: "workflows", rustPath: rust("github", "actions.rs"), tsPath: ts("github", "types.ts"), structs: ["WorkflowsReport"] },
-  { label: "github", rustPath: rust("github", "mod.rs"), tsPath: ts("github", "types.ts"), structs: ["GitHubContext", "PullRequestInfo", "WorkflowRunInfo", "GitHubRunsReport"] },
+  { label: "github", rustPath: rust("github", "mod.rs"), tsPath: ts("github", "types.ts"), structs: ["GitHubContext", "PullRequestInfo", "WorkflowRunInfo", "GitHubRunsReport", "PullRequestDetail"] },
   // Firebase deployment state. `RolloutCommit.hash` is the join key to local
   // history, so a rename there would silently stop every commit matching and
   // render as "nothing is deployed" rather than as an error.
@@ -226,6 +226,8 @@ export const CONTRACTS = Object.freeze([
   // the operation banner, the stash list, or the remotes panel.
   { label: "repo-operation", rustPath: rust("engine", "repo_op.rs"), tsPath: ts("repos", "operation.ts"), structs: ["RepoOperation"] },
   { label: "stash-options", rustPath: rust("engine", "git_writer.rs"), tsPath: ts("repos", "stash.ts"), structs: ["StashSaveOptions"] },
+  { label: "file-delete", rustPath: rust("engine", "git_writer.rs"), tsPath: ts("files", "types.ts"), structs: ["DeleteOutcome"] },
+  { label: "content-search", rustPath: rust("engine", "content_search.rs"), tsPath: ts("search", "types.ts"), structs: ["ContentMatch", "ContentSearchReport", "ContentSearchOptions"] },
   { label: "stash", rustPath: rust("engine", "stash.rs"), tsPath: ts("repos", "stash.ts"), structs: ["StashEntry", "StashList"] },
   { label: "remotes", rustPath: rust("engine", "remotes.rs"), tsPath: ts("repos", "remotes.ts"), structs: ["RemoteInfo", "RemoteList"] },
   { label: "submodules", rustPath: rust("engine", "submodules.rs"), tsPath: ts("repos", "submodules.ts"), structs: ["SubmoduleInfo", "SubmoduleList"] },

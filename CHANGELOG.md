@@ -13,6 +13,7 @@ before that tag is pushed.
 
 ### Added
 
+<<<<<<< HEAD
 - Task checklists with a done state per item, and links between tasks
   (parent, blocks, related, duplicate of), edited in the task sheet and read
   from both ends in the agent brief.
@@ -65,6 +66,34 @@ before that tag is pushed.
 - dc-store schema 11 is a one-way migration, and a host built against schema
   10 refuses a migrated profile. Rebuild GitPulse, Manvi and DevCouncil from a
   schema 11 dc-store before any of them opens the profile.
+=======
+- **Search file contents across the repository.** Code → Search (also in the
+  palette and the View menu) runs `git grep` over the working tree — tracked
+  and untracked files, never ignored ones — or over a revision. Results are
+  capped, can be cancelled, and a capped, cut, timed-out or cancelled answer
+  says it is partial and why instead of showing a count that looks complete.
+- **Rename, move and delete from the file tree.** Tracked files move with a
+  staged `git mv` and are deleted with `git rm` (restorable until you
+  commit); untracked files are moved with a plain rename and removed with
+  `git clean`, which the delete confirmation names as unrecoverable. Ignored
+  files are never deleted. The doc-vault rename now goes through the same
+  path, and every move or delete is judged by the policy gate before it runs.
+- **Open, review and merge pull requests.** Each pull request expands to its
+  description, size, CI and merge state, with Approve, Comment, Request
+  changes and Merge; the panel can also open a new pull request from the
+  current branch. Every action is confirmed first and says what it publishes
+  where. A merge is pinned to the head commit you were shown, so a push after
+  you looked makes gh refuse rather than merge it; opening a pull request
+  never pushes.
+- **Act on a reflog entry.** Create a branch at an entry, or reset the current
+  branch to it. The reset confirmation lists the commits that would leave the
+  branch and how many no other branch, tag or remote still holds, and it uses
+  `git reset --keep`, so uncommitted work is never discarded.
+- **Blame at a revision.** Each commit block in Blame can step to the file as
+  it stood in that commit's parent — following a rename to the old path — to
+  get past a reformat or move to the change that really wrote a line. Back and
+  Working tree return; picking another file ends the walk.
+>>>>>>> 4cde4ab34bf3e4feba0846864975377c570670b4
 
 ## [1.4.0] - 2026-10-07
 

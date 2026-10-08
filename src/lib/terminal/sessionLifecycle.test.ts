@@ -337,3 +337,53 @@ it("waits for the old renderer to drain before starting a replacement", async ()
   expect(f.transport.spawn).toHaveBeenCalledTimes(2);
   f.owner.dispose(); await flush();
 });
+
+describe("admission to a session slot", () => {
+  function owner(registry: ReturnType<typeof createSessionRegistry>, key: string, hooks: { admitted?: () => void; refused?: (m: string) => boolean }) {
+    const transport = { spawn: vi.fn(async () => ({ id: `native-${key}`, shell: "/bin/sh", cwd: "/repo" })), write: vi.fn(async () => {}), resize: vi.fn(async () => {}), kill: vi.fn(async () => {}) };
+    const state = vi.fn();
+    const lifecycle = createSessionLifecycle({ key, repoPath: "/repo", label: "Claude", registry, transport,
+      hooks: { state, started: vi.fn(), output: vi.fn(), exit: vi.fn(), reset: vi.fn(), warning: vi.fn(), ...hooks },
+      bus: { prepare: async () => () => {}, pendingCount: () => 0, subscribe: () => () => {} },
+    });
+    return { lifecycle, transport, state };
+  }
+
+  it("says once when a tab takes a slot, before anything spawns", async () => {
+    const registry = createSessionRegistry();
+    const order: string[] = [];
+    const a = owner(registry, "a", { admitted: () => order.push("admitted") });
+    a.transport.spawn.mockImplementation(async () => { order.push("spawn"); return { id: "native-a", shell: "/bin/sh", cwd: "/repo" }; });
+    await a.lifecycle.start();
+    expect(order).toEqual(["admitted", "spawn"]);
+    a.lifecycle.dispose(); await flush();
+  });
+
+  it("hands a refusal for capacity back to a caller that will retry, and starts nothing", async () => {
+    const registry = createSessionRegistry();
+    const held = Array.from({ length: DEFAULT_TERMINAL_SESSIONS }, (_, i) => registry.reserve({ key: `held-${i}`, repoPath: "/repo", label: "Shell", status: "running", close: async () => {} }));
+    const refused = vi.fn(() => true), admitted = vi.fn();
+    const late = owner(registry, "late", { refused, admitted });
+    await late.lifecycle.start();
+    expect(refused).toHaveBeenCalledWith(`All ${DEFAULT_TERMINAL_SESSIONS} terminal sessions are in use across repositories`);
+    expect(admitted).not.toHaveBeenCalled();
+    expect(late.transport.spawn).not.toHaveBeenCalled();
+    expect(late.state).not.toHaveBeenCalledWith("error", expect.anything());
+    expect(get(registry)).toHaveLength(DEFAULT_TERMINAL_SESSIONS);
+    for (const slot of held) slot.release();
+    late.lifecycle.dispose(); await flush();
+  });
+
+  it("still reports the refusal as the tab's error to a caller that will not retry", async () => {
+    const registry = createSessionRegistry();
+    const held = Array.from({ length: DEFAULT_TERMINAL_SESSIONS }, (_, i) => registry.reserve({ key: `held-${i}`, repoPath: "/repo", label: "Shell", status: "running", close: async () => {} }));
+    for (const hooks of [{}, { refused: () => false }]) {
+      const late = owner(registry, "late", hooks);
+      await late.lifecycle.start();
+      expect(late.state).toHaveBeenCalledWith("error", expect.stringContaining("terminal sessions are in use"));
+      expect(late.transport.spawn).not.toHaveBeenCalled();
+      late.lifecycle.dispose(); await flush();
+    }
+    for (const slot of held) slot.release();
+  });
+});

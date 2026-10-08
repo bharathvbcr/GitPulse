@@ -137,6 +137,13 @@ export const VIEW_REGISTRY: Readonly<Record<ViewTab, ViewRegistration>> = {
         paletteCommand: "Open Blame — line authorship and code age",
       },
       {
+        id: "search",
+        label: "Search",
+        summary:
+          "Search file contents across the working tree or a revision. A capped, cut or cancelled result says it is partial.",
+        paletteCommand: "Open Search — find text across the repository",
+      },
+      {
         id: "map",
         label: "Map",
         summary:

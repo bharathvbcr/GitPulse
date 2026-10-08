@@ -130,6 +130,7 @@
    */
   let {
     repoPath,
+    checkout,
     tabId,
     launcher,
     initialPrompt,
@@ -143,15 +144,24 @@
     onChord,
     onStatus = () => {},
     onActivity = () => {},
+    onAdmitted,
+    onRefused,
     revealSelf,
     confirmCloseSelf,
     title,
   }: {
+    /** The repository tab hosting this session: its slot, its Sessions row, its close. */
     repoPath: string;
+    /**
+     * The checkout the process runs in and whose files its links name, when
+     * that is another checkout of the same repository (a hosted agent; see
+     * `taskLaunches.hostTabFor`). Absent means `repoPath`.
+     */
+    checkout?: string;
     tabId: string;
     launcher: LauncherKind;
     initialPrompt?: string;
-    /** Repository-relative directory to start in; absent starts at the root. */
+    /** Directory below the checkout to start in; absent starts at its root. */
     startDir?: string;
     taskRunId?: string;
     /** Pick an ended attempt's Claude Code conversation back up, in its own mode. */
@@ -171,6 +181,10 @@
     onTitle: (title: string) => void;
     onStatus?: (status: string) => void;
     onActivity?: () => void;
+    /** This tab took a session slot (see `SessionHooks.admitted`). */
+    onAdmitted?: () => void;
+    /** Every slot was taken; true takes the refusal back (see `SessionHooks.refused`). */
+    onRefused?: (message: string) => boolean;
     /** Returns true when the panel consumed the event; xterm then ignores it. */
     onChord: (event: KeyboardEvent) => boolean;
     /**
@@ -185,6 +199,9 @@
     /** What this session is about (a task title), for the Sessions list. */
     title?: string;
   } = $props();
+
+  /** Where the process runs and whose files its output names. */
+  const workPath = $derived(checkout ?? repoPath);
 
   /**
    * The backend's id for this PTY, once it has one.
@@ -312,7 +329,7 @@
    * something GitPulse will not do.
    */
   async function activateLink(text: string) {
-    const action = resolveLinkAction(text, repoPath);
+    const action = resolveLinkAction(text, workPath);
     if (action.kind === "refused") {
       warning = action.reason;
       return;
@@ -330,7 +347,16 @@
     // checkout. Refuse instead of opening someone else's file.
     const state = get(repoStore);
     const activePath = state.openTabs.find((tab) => tab.id === state.activeTabId)?.path ?? "";
-    if (activePath !== repoPath) {
+    if (checkout && activePath !== checkout) {
+      // A hosted agent's files are in its own checkout, which has no tab
+      // until someone asks for one. This click is that ask.
+      let ready = false;
+      const opened = await repoStore.openRepo(checkout, { onReady: () => { ready = true; } });
+      if (!opened || !ready) {
+        warning = `Could not open ${checkout.split(/[\\/]/).pop()} to show ${action.path}.`;
+        return;
+      }
+    } else if (!checkout && activePath !== repoPath) {
       warning = "Switch to this terminal's repository to open its files.";
       return;
     }
@@ -344,7 +370,7 @@
 
   /** Hover text for a link, so the target is readable before it is clicked. */
   function linkTitle(text: string): string {
-    const action = resolveLinkAction(text, repoPath);
+    const action = resolveLinkAction(text, workPath);
     if (action.kind === "url") return `Open ${action.url} in your browser`;
     if (action.kind === "file") {
       const at = action.line === null ? "" : ` (line ${action.line}${action.column === null ? "" : `, column ${action.column}`})`;
@@ -410,7 +436,7 @@
           // already decided against, and a user who clicks twice learns to
           // distrust the underline rather than the output.
           const found = linksForRow(linkBuffer(created), bufferLineNumber)
-            .filter((link) => resolveLinkAction(link.text, repoPath).kind !== "refused");
+            .filter((link) => resolveLinkAction(link.text, workPath).kind !== "refused");
           callback(found.length ? found.map((link) => ({
             range: link.range,
             text: link.text,
@@ -564,7 +590,7 @@
             input: JSON.stringify({ id: taskRunId, expected_revision: 1, rows, cols }),
           });
           return invoke<TerminalSpawned>("cmd_terminal_spawn", {
-            repoPath, rows, cols,
+            repoPath: workPath, rows, cols,
             program: cfg.program, args: cfg.args,
             startDir: startDir ?? null,
             permissionMode,
@@ -644,6 +670,8 @@
           });
         },
         warning(message) { warning = message; },
+        admitted() { onAdmitted?.(); },
+        refused(message) { return onRefused?.(message) ?? false; },
       },
     });
   }
@@ -1157,7 +1185,7 @@
           Your saved default for {launcherLabel(launcher)} is
           <span class="text-textPrimary">{PERMISSION_LABELS.bypass.label}</span>. This session will
           run without permission prompts and without a sandbox, in
-          <span class="font-mono">{repoPath.split(/[\\/]/).pop()}</span>. GitPulse asks every time
+          <span class="font-mono">{workPath.split(/[\\/]/).pop()}</span>. GitPulse asks every time
           rather than remembering the answer.
         </p>
         <div class="flex items-center gap-2 mt-1">
@@ -1213,7 +1241,7 @@
         <span class="text-[10px] text-textMuted truncate" title={hoveredLink}>{hoveredLink}</span>
       {:else}
         <span class="w-1.5 h-1.5 rounded-full bg-emerald-400 shrink-0" aria-hidden="true"></span>
-        <span class="text-[10px] text-textMuted font-mono truncate" title={`${shellPath} · Started in ${startedIn || repoPath}`}>{shellPath.split(/[\\/]/).pop()} · {repoPath.split(/[\\/]/).pop()}{startDir ? `/${startDir}` : ""}</span>
+        <span class="text-[10px] text-textMuted font-mono truncate" title={`${shellPath} · Started in ${startedIn || workPath}`}>{shellPath.split(/[\\/]/).pop()} · {workPath.split(/[\\/]/).pop()}{startDir ? `/${startDir}` : ""}</span>
       {/if}
       <div class="ml-auto flex items-center gap-1 shrink-0" role="group" aria-label="Terminal text size">
 

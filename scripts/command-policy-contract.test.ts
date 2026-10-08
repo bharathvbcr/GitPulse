@@ -4,7 +4,7 @@ import { describe, expect, it } from "vitest";
 const source = readFileSync(new URL("../src-tauri/src/commands/mod.rs", import.meta.url), "utf8");
 
 function functionSource(name: string): string {
-  const start = source.indexOf(`pub async fn ${name}`);
+  const start = source.indexOf(`pub async fn ${name}(`);
   expect(start, `${name} must exist`).toBeGreaterThanOrEqual(0);
   const end = source.indexOf("\n}\n", start);
   expect(end, `${name} must have a closed body`).toBeGreaterThan(start);
@@ -45,9 +45,20 @@ describe("native mutation policy contract", () => {
       // `guard` judges a rendered command line; `guard_file` judges a path.
       // Both are the canonical harness entry points; anything else is a
       // command that reports a verdict it never actually obtained.
-      const judged = body.includes("guard(") || body.includes("guard_file(");
+      // `guard_move` is the move delegate: it judges a MovePlan with exactly
+      // those two, which the next test pins so it cannot become a bypass.
+      const judged = body.includes("guard(") || body.includes("guard_file(") || body.includes("guard_move(");
       expect(judged, `${name} returns Guarded<..> but never calls the write gate`).toBe(true);
     }
+  });
+
+  it("keeps the move delegate a real gate call for both kinds of move", () => {
+    const start = source.indexOf("fn guard_move(");
+    expect(start).toBeGreaterThanOrEqual(0);
+    const body = source.slice(start, source.indexOf("\n}\n", start));
+    expect(body).toContain("guard(repo_path, &refs)");
+    expect(body).toContain('guard_file(repo_path, from, "delete")');
+    expect(body).toContain('guard_file(repo_path, to, "modify")');
   });
 
   it("keeps the historically hand-listed commands covered", () => {

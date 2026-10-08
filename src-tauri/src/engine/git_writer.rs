@@ -109,6 +109,30 @@ fn literal_paths(repo: &Path, files: &[String]) -> Result<Vec<String>, String> {
     Ok(paths)
 }
 
+/// What [`GitWriter::move_path`] decided to run, handed to its gate before
+/// anything moves.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MovePlan {
+    /// The source has tracked content: `git mv`, program name included.
+    Git { argv: Vec<String> },
+    /// Nothing at the source is tracked, so no git command applies; a
+    /// filesystem rename, judged as a delete of `from` and a write of `to`.
+    Untracked { from: String, to: String },
+}
+
+/// What [`GitWriter::delete_path`] removed.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DeleteOutcome {
+    pub path: String,
+    /// Index entries removed with `git rm` (restorable from HEAD).
+    pub tracked_removed: usize,
+    /// Untracked files removed with `git clean` (not recoverable from git).
+    pub untracked_removed: usize,
+    /// True when something is still on disk at `path`: ignored files or a
+    /// nested repository, which this never deletes.
+    pub left_behind: bool,
+}
+
 /// How much of the working state a reset discards.
 ///
 /// An enum rather than a passthrough string: no caller can invent a mode, and
@@ -232,29 +256,168 @@ impl GitWriter {
         Ok((verdicts, completed))
     }
 
-    /// Moves a tracked file with `git mv` and stages the rename.
+    /// Moves or renames a file or directory, tracked or not, under one
+    /// mutation-lock acquisition.
     ///
-    /// Used by the doc-vault rename path so link rewrites land beside a
-    /// reviewable rename in the index rather than an opaque filesystem move.
-    /// Paths are sandbox-checked first; `git mv` takes path arguments (not
-    /// pathspecs), so `:(literal)` cannot be used here the way `git add` can.
-    pub fn mv_file(repo_path: &str, from: &str, to: &str) -> Result<(), String> {
+    /// The one rename path: the file tree and the doc-vault rename both come
+    /// here. Whether git knows the source is decided *inside* the lock and
+    /// handed to `gate` as a [`MovePlan`] before anything moves, so the line
+    /// judged is the operation that runs. A source with tracked content moves
+    /// with `git mv`, which stages the rename (a directory moves whole,
+    /// untracked files inside it included); a purely untracked source has no
+    /// git command and moves with a filesystem rename. `git mv` takes path
+    /// arguments, not pathspecs, so `:(literal)` cannot be used here the way
+    /// `git add` can.
+    pub fn move_path(
+        repo_path: &str,
+        from: &str,
+        to: &str,
+        gate: impl FnOnce(&MovePlan) -> Result<(), String>,
+    ) -> Result<MovePlan, String> {
         let repo = validate_repo(repo_path)?;
         let _repo_lock = repo_mutation_lock(&repo);
         let _guard = _repo_lock
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let _from_abs = crate::engine::git_cli::sandbox_join_canonical(&repo, from)?;
+        let from = from.trim_end_matches('/');
+        let to = to.trim_end_matches('/');
+        if from.is_empty() || to.is_empty() {
+            return Err("Source and destination must name a path inside the repository".into());
+        }
+        if from == to {
+            return Err("Source and destination are the same path".into());
+        }
+        if to.starts_with(&format!("{from}/")) {
+            return Err(format!("Cannot move {from} into itself"));
+        }
+        let from_abs = crate::engine::git_cli::sandbox_join_canonical(&repo, from)?;
         let to_abs = crate::engine::git_cli::sandbox_join_canonical(&repo, to)?;
-        if to_abs.exists() {
+        if std::fs::symlink_metadata(&from_abs).is_err() {
+            return Err(format!("{from} does not exist"));
+        }
+        if std::fs::symlink_metadata(&to_abs).is_ok() {
             return Err(format!("destination already exists: {to}"));
         }
+        let plan = if Self::tracked_count(&repo, from)? > 0 {
+            MovePlan::Git {
+                argv: ["git", "mv", "--", from, to].map(String::from).to_vec(),
+            }
+        } else {
+            MovePlan::Untracked {
+                from: from.to_string(),
+                to: to.to_string(),
+            }
+        };
+        gate(&plan)?;
         if let Some(parent) = to_abs.parent() {
             std::fs::create_dir_all(parent)
                 .map_err(|e| format!("Failed to create destination parent: {e}"))?;
         }
-        git_text(&repo, &["mv", "--", from, to])?;
-        Ok(())
+        match &plan {
+            MovePlan::Git { argv } => {
+                let args: Vec<&str> = argv.iter().skip(1).map(String::as_str).collect();
+                git_text(&repo, &args)?;
+            }
+            MovePlan::Untracked { .. } => {
+                std::fs::rename(&from_abs, &to_abs)
+                    .map_err(|e| format!("Failed to move {from} to {to}: {e}"))?;
+            }
+        }
+        Ok(plan)
+    }
+
+    /// Deletes a file or directory from the working tree, under one
+    /// mutation-lock acquisition.
+    ///
+    /// Tracked content goes with `git rm -r`, which stages the deletion (so a
+    /// commit can still restore it) and refuses — removing nothing — when a
+    /// file has changes the index or HEAD does not hold. Untracked content
+    /// goes with `git clean -f -d`, which leaves ignored files and nested
+    /// repositories alone; whatever is left is reported, not swept with a
+    /// recursive filesystem delete. Every command is handed to `gate` before
+    /// the first one runs.
+    pub fn delete_path(
+        repo_path: &str,
+        path: &str,
+        gate: impl FnOnce(&[Vec<String>]) -> Result<(), String>,
+    ) -> Result<DeleteOutcome, String> {
+        let repo = validate_repo(repo_path)?;
+        let _repo_lock = repo_mutation_lock(&repo);
+        let _guard = _repo_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let path = path.trim_end_matches('/');
+        if path.is_empty() || path == "." {
+            return Err("Refusing to delete the repository root".into());
+        }
+        let abs = crate::engine::git_cli::sandbox_join_canonical(&repo, path)?;
+        if std::fs::symlink_metadata(&abs).is_err() {
+            return Err(format!("{path} does not exist"));
+        }
+        let spec = literal_paths(&repo, &[path.to_string()])?.remove(0);
+        let tracked = Self::tracked_count(&repo, path)?;
+        let untracked = Self::untracked_count(&repo, &spec)?;
+        let mut plan: Vec<Vec<String>> = Vec::new();
+        if tracked > 0 {
+            plan.push(
+                ["git", "rm", "-r", "-q", "--", spec.as_str()]
+                    .map(String::from)
+                    .to_vec(),
+            );
+        }
+        if untracked > 0 {
+            plan.push(
+                ["git", "clean", "-f", "-d", "-q", "--", spec.as_str()]
+                    .map(String::from)
+                    .to_vec(),
+            );
+        }
+        if plan.is_empty() {
+            return Err(format!(
+                "{path} holds only ignored files or nested repositories; GitPulse does not delete those"
+            ));
+        }
+        gate(&plan)?;
+        for (index, argv) in plan.iter().enumerate() {
+            let args: Vec<&str> = argv.iter().skip(1).map(String::as_str).collect();
+            git_text(&repo, &args).map_err(|error| {
+                if index == 0 {
+                    error
+                } else {
+                    format!("The tracked files were removed, but removing the untracked ones failed: {error}")
+                }
+            })?;
+        }
+        Ok(DeleteOutcome {
+            path: path.to_string(),
+            tracked_removed: tracked,
+            untracked_removed: untracked,
+            left_behind: std::fs::symlink_metadata(&abs).is_ok(),
+        })
+    }
+
+    /// Index entries at or under `path` (a file, or a directory's contents).
+    fn tracked_count(repo: &Path, path: &str) -> Result<usize, String> {
+        let spec = literal_paths(repo, &[path.to_string()])?.remove(0);
+        let listed = git_text(repo, &["ls-files", "-z", "--", spec.as_str()])?;
+        Ok(listed.split('\0').filter(|entry| !entry.is_empty()).count())
+    }
+
+    /// Untracked, non-ignored files at or under `spec` — exactly what
+    /// `git clean -f -d` (without `-x`) would remove.
+    fn untracked_count(repo: &Path, spec: &str) -> Result<usize, String> {
+        let listed = git_text(
+            repo,
+            &[
+                "ls-files",
+                "-z",
+                "--others",
+                "--exclude-standard",
+                "--",
+                spec,
+            ],
+        )?;
+        Ok(listed.split('\0').filter(|entry| !entry.is_empty()).count())
     }
 
     pub fn commit(repo_path: &str, message: &str, amend: bool) -> Result<String, String> {

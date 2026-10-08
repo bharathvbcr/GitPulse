@@ -41,8 +41,11 @@
     Plus,
     Search,
     X,
+    ChevronDown,
   } from "@lucide/svelte";
   import { openExternal as openExternalUrl } from "../desktop/openExternal";
+  import PullRequestDetail from "./github/PullRequestDetail.svelte";
+  import PullRequestCreate from "./github/PullRequestCreate.svelte";
   import FreshnessBadge from "./FreshnessBadge.svelte";
   import FirebasePanel from "./FirebasePanel.svelte";
   import { freshnessStore } from "../provenance/store";
@@ -153,6 +156,10 @@
 
   /** Panel-scoped feedback for the last attempted action; cleared on reload. */
   let actionNotice = $state<string | null>(null);
+  /** The pull request whose detail (view, review, merge) is open, if any. */
+  let expandedPr = $state<number | null>(null);
+  let creatingPr = $state(false);
+  const currentBranch = $derived($repoStore.branches.find((b) => b.is_current)?.name ?? null);
   let actionError = $state<string | null>(null);
 
   /* --- narrowing ----------------------------------------------------------
@@ -916,12 +923,30 @@
         <section>
           <div class="flex items-center justify-between gap-3 mb-2">
             <h3 class="text-[11px] uppercase tracking-wider text-textMuted">Open pull requests</h3>
-            {#if prFilterOn}
-              <span class="text-[11px] text-textMuted font-mono">
-                {visiblePrs.length} of {ctx.pull_requests.length}
-              </span>
-            {/if}
+            <div class="flex items-center gap-2">
+              {#if prFilterOn}
+                <span class="text-[11px] text-textMuted font-mono">
+                  {visiblePrs.length} of {ctx.pull_requests.length}
+                </span>
+              {/if}
+              <button
+                type="button"
+                class="gp-btn py-0.5! px-2! text-[11px]! flex items-center gap-1"
+                aria-expanded={creatingPr}
+                onclick={() => (creatingPr = !creatingPr)}
+              ><Plus size={12} /> New pull request</button>
+            </div>
           </div>
+          {#if creatingPr && $repoStore.currentPath}
+            <PullRequestCreate
+              repoPath={$repoStore.currentPath}
+              slug="{ctx.owner}/{ctx.repo}"
+              headBranch={currentBranch}
+              defaultBase={$repoStore.defaultBranch ?? "main"}
+              onCreated={(message) => { creatingPr = false; actionNotice = message; void loadAll(); }}
+              onCancel={() => (creatingPr = false)}
+            />
+          {/if}
           {#if ctx.pull_requests.length === 0 && !ctx.prs_truncated}
             <EmptyState icon={GitPullRequest} title="No open pull requests" compact />
           {:else if ctx.pull_requests.length === 0}
@@ -998,7 +1023,8 @@
             {:else}
               <div class="space-y-2">
                 {#each visiblePrs as pr (pr.number)}
-                  <div class="p-3.5 bg-surface border border-border/70 rounded-2xl shadow-card flex items-start justify-between gap-3 transition-[border-color,box-shadow] duration-150 hover:border-accent/40">
+                  <div class="p-3.5 bg-surface border border-border/70 rounded-2xl shadow-card transition-[border-color,box-shadow] duration-150 hover:border-accent/40">
+                  <div class="flex items-start justify-between gap-3">
                     <div class="min-w-0">
                       <div class="flex items-center gap-2 text-textPrimary font-medium flex-wrap">
                         <GitPullRequest size={14} class="text-accent shrink-0" />
@@ -1026,6 +1052,16 @@
                     <div class="flex items-center gap-1 shrink-0">
                       <button
                         type="button"
+                        onclick={() => (expandedPr = expandedPr === pr.number ? null : pr.number)}
+                        class="gp-icon-btn hover:text-accent"
+                        aria-expanded={expandedPr === pr.number}
+                        title={expandedPr === pr.number ? "Hide details" : "Details, review and merge"}
+                        aria-label={`${expandedPr === pr.number ? "Hide" : "Show"} details for pull request #${pr.number}`}
+                      >
+                        {#if expandedPr === pr.number}<ChevronDown size={14} />{:else}<ChevronRight size={14} />{/if}
+                      </button>
+                      <button
+                        type="button"
                         onclick={() => void checkoutPr(pr.number)}
                         disabled={checkingOut.size > 0}
                         class="gp-icon-btn hover:text-accent disabled:opacity-40 disabled:cursor-not-allowed"
@@ -1044,6 +1080,15 @@
                         <ExternalLink size={14} />
                       </button>
                     </div>
+                  </div>
+                  {#if expandedPr === pr.number && $repoStore.currentPath}
+                    <PullRequestDetail
+                      repoPath={$repoStore.currentPath}
+                      number={pr.number}
+                      slug="{ctx.owner}/{ctx.repo}"
+                      onChanged={() => void loadAll()}
+                    />
+                  {/if}
                   </div>
                 {/each}
               </div>

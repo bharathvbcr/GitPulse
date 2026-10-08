@@ -1,7 +1,7 @@
 import { mergeTerminalNotice, type PtyBus, type TerminalExitEvent } from "./ptyBus";
 import type { TerminalSpawned } from "./runResult";
 import { createTerminalInput, terminalDeadline } from "./inputQueue";
-import type { createSessionRegistry } from "./sessionRegistry";
+import { SessionCapacityError, type createSessionRegistry } from "./sessionRegistry";
 import type { LauncherKind } from "./tabs";
 
 export interface SessionTransport {
@@ -17,6 +17,14 @@ export interface SessionHooks {
   exit(event: TerminalExitEvent): void;
   reset(): void | Promise<void>;
   warning(message: string): void;
+  /** This tab now holds a session slot; called once per slot taken. */
+  admitted?(): void;
+  /**
+   * Every session slot was taken when this tab asked for one. Return true to
+   * take the refusal back — the tab will be retried later, so nothing is
+   * shown — or false to have it reported as the tab's error.
+   */
+  refused?(message: string): boolean;
 }
 
 /** One canonical owner of a tab's native process, even after its view is gone. */
@@ -129,14 +137,25 @@ export function createSessionLifecycle(options: {
     let watchdog: ReturnType<typeof setTimeout> | null = null;
     let timedOut = false;
     try {
-      slot ??= registry.reserve({
-        key: options.key, repoPath: options.repoPath, label: options.label, status: "starting", close,
-        ...(options.launcher ? { launcher: options.launcher } : {}),
-        reveal: options.reveal, confirmClose: options.confirmClose,
-        ...(options.title ? { title: options.title } : {}),
-        ...(options.taskRunId ? { taskRunId: options.taskRunId } : {}),
-        ...(options.continuesRunId ? { continuesRunId: options.continuesRunId } : {}),
-      });
+      if (!slot) {
+        try {
+          slot = registry.reserve({
+            key: options.key, repoPath: options.repoPath, label: options.label, status: "starting", close,
+            ...(options.launcher ? { launcher: options.launcher } : {}),
+            reveal: options.reveal, confirmClose: options.confirmClose,
+            ...(options.title ? { title: options.title } : {}),
+            ...(options.taskRunId ? { taskRunId: options.taskRunId } : {}),
+            ...(options.continuesRunId ? { continuesRunId: options.continuesRunId } : {}),
+          });
+        } catch (error) {
+          // Every slot is taken. A caller that can wait for one takes the
+          // refusal back (nothing started, nothing to report); anyone else
+          // sees it as this tab's error, as before.
+          if (error instanceof SessionCapacityError && hooks.refused?.(error.message)) return;
+          throw error;
+        }
+        hooks.admitted?.();
+      }
       state("starting");
       ready = await bus.prepare();
       if (disposed) { release(); return; }
