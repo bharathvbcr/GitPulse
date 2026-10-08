@@ -225,6 +225,10 @@ tauri-build = { git = "https://github.com/tauri-apps/tauri", rev = "30da1fd6e17d
 
 [dev-dependencies]
 tempfile = "3.27"
+# Property tests for the git output parsers (engine/git_reader.rs). Default
+# features are off: `fork` and `timeout` add rusty-fork and a second tempfile
+# path that these pure, in-process parser properties never need.
+proptest = { version = "1.11", default-features = false, features = ["std"] }
 # Tauri's own headless test runtime (MockRuntime). Not a new third-party
 # dependency — it enables a feature of the tauri crate already in
 # [dependencies] — and it is what lets tests drive commands through the real
