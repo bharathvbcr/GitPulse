@@ -295,10 +295,12 @@ describe("annotated but unregistered commands", () => {
     // list, a raw attribute count, and this scanner all report the same total.
     // 262 since the git write-path commands (cmd_auto_fetch,
     // cmd_pull_rebase_config, cmd_git_preflight, cmd_cancel_git_hooks,
-    // cmd_git_identity, cmd_set_git_identity) arrived; `bun run check:ipc`
+    // cmd_git_identity, cmd_set_git_identity) arrived, and 265 since the
+    // attempt-review commands (cmd_attempt_review, cmd_attempt_review_record,
+    // cmd_review_gate_save) joined them; `bun run check:ipc`
     // prints all three numbers, so a bump made without re-running it will not
     // agree.
-    expect(found.size).toBe(262);
+    expect(found.size).toBe(265);
     expect(found.has("cmd_repository_trust")).toBe(true);
     expect(found.has("cmd_grant_repository_trust")).toBe(true);
     expect(found.has("cmd_revoke_repository_trust")).toBe(true);

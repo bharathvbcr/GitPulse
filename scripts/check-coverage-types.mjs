@@ -13,8 +13,8 @@
  *   (c) a shared field whose normalized wire type or backend-required
  *       presence no longer agrees.
  *
- * SCOPE: see CONTRACTS below for exactly what is checked — 82 contracts over
- * 210 structs, spanning both wire surfaces: command returns and event payloads.
+ * SCOPE: see CONTRACTS below for exactly what is checked — 83 contracts over
+ * 211 structs, spanning both wire surfaces: command returns and event payloads.
  * Enums are still skipped here and covered separately, by
  * scripts/enum-variant-contract.test.ts. That is most, not all, of the named types crossing the IPC
  * boundary: the ones still missing declare their TypeScript interface inside a
@@ -112,6 +112,7 @@ export const CONTRACTS = Object.freeze([
   { label: "global-hygiene", rustPath: rust("storage", "hygiene", "global.rs"), tsPath: ts("storage", "hygiene", "globalTypes.ts"), structs: ["CleanerConfig", "CleanerCandidate", "CleanerInventory", "CleanerItem", "CleanerRun", "CleanerState"] },
   { label: "hygiene", rustPath: rust("storage", "hygiene", "mod.rs"), tsPath: ts("storage", "hygiene", "types.ts"), structs: ["CacheEntry", "CacheInventory", "HygienePlan", "HygieneOutcome"] },
   { label: "workbench", rustPath: rust("workbench.rs"), tsPath: ts("workbench", "client.ts"), structs: ["WorkbenchError"] },
+  { label: "attempt-review", rustPath: rust("workbench", "review.rs"), tsPath: ts("workbench", "attemptReview.ts"), structs: ["AttemptReview"] },
   { label: "coverage", rustPath: DEFAULT_RUST_SOURCE, tsPath: DEFAULT_TS_SOURCE, structs: CHECKED_STRUCTS },
   { label: "terminal", rustPath: TERMINAL_RUST_SOURCE, tsPath: TERMINAL_TS_SOURCE, structs: TERMINAL_STRUCTS },
   { label: "ai", rustPath: rust("ai", "mod.rs"), tsPath: ts("stores", "harnessStore.ts"), structs: ["AiGeneration", "AiStatus"] },

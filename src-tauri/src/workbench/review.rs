@@ -95,7 +95,7 @@ pub(crate) fn ended(run: &Value) -> bool {
 /// What has been decided about landing `head_oid` from a run.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
-pub enum Review {
+pub enum ReviewStatus {
     /// A person approved exactly this range.
     Approved { note: Option<String> },
     /// A person chose to land exactly this range unreviewed, and said why.
@@ -120,7 +120,7 @@ pub(crate) fn review_of(
     state: &WorkbenchState,
     run_id: &str,
     head_oid: &str,
-) -> Result<Review, WorkbenchError> {
+) -> Result<ReviewStatus, WorkbenchError> {
     let mut decisions = Vec::new();
     let mut cursor: Option<String> = None;
     loop {
@@ -165,16 +165,16 @@ pub(crate) fn review_of(
         .collect();
     let review = here.iter().find(|item| item["kind"] == "change_review");
     match review.map(|item| (item["decision"].as_str().unwrap_or(""), note(item))) {
-        Some(("request_changes", note)) => return Ok(Review::ChangesRequested { note }),
-        Some(("deny", note)) => return Ok(Review::Denied { note }),
-        Some(("approve", note)) => return Ok(Review::Approved { note }),
+        Some(("request_changes", note)) => return Ok(ReviewStatus::ChangesRequested { note }),
+        Some(("deny", note)) => return Ok(ReviewStatus::Denied { note }),
+        Some(("approve", note)) => return Ok(ReviewStatus::Approved { note }),
         _ => {}
     }
     if let Some(item) = here
         .iter()
         .find(|item| item["kind"] == "merge_unreviewed" && item["decision"] == "allow_once")
     {
-        return Ok(Review::Overridden {
+        return Ok(ReviewStatus::Overridden {
             note: note(item).unwrap_or_default(),
         });
     }
@@ -185,9 +185,9 @@ pub(crate) fn review_of(
         .filter_map(head_of)
         .next_back()
     {
-        return Ok(Review::Stale { reviewed_head });
+        return Ok(ReviewStatus::Stale { reviewed_head });
     }
-    Ok(Review::Unreviewed)
+    Ok(ReviewStatus::Unreviewed)
 }
 
 /// Records a person's decision on landing `payload`'s range from `run`.
@@ -291,7 +291,7 @@ pub struct AttemptReview {
     pub files_changed: u64,
     /// Whether the attempt has ended, so its range can be decided.
     pub ended: bool,
-    pub review: Review,
+    pub review: ReviewStatus,
     /// Whether the review gate applies to this repository; `None` with
     /// `gate_error` set when that could not be read.
     pub gate_on: Option<bool>,
@@ -489,7 +489,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             review_of(&state, "attempt", &tip).unwrap(),
-            Review::Approved {
+            ReviewStatus::Approved {
                 note: Some("looks right".into())
             }
         );

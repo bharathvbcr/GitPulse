@@ -274,12 +274,12 @@ pub(crate) fn gate(repo_path: &str, argv: &[&str]) -> Result<(), Box<super::Poli
                     ),
                 )
             })?;
-        use crate::workbench::review::Review;
+        use crate::workbench::review::ReviewStatus;
         let with_note =
             |note: Option<String>| note.map(|n| format!(" Note: {n}")).unwrap_or_default();
         match review {
-            Review::Approved { .. } | Review::Overridden { .. } => {}
-            Review::Unreviewed => {
+            ReviewStatus::Approved { .. } | ReviewStatus::Overridden { .. } => {}
+            ReviewStatus::Unreviewed => {
                 return Err(refuse(
                     RULE_UNREVIEWED,
                     format!(
@@ -289,7 +289,7 @@ pub(crate) fn gate(repo_path: &str, argv: &[&str]) -> Result<(), Box<super::Poli
                     ),
                 ))
             }
-            Review::Stale { reviewed_head } => {
+            ReviewStatus::Stale { reviewed_head } => {
                 return Err(refuse(
                     RULE_STALE,
                     format!(
@@ -299,13 +299,13 @@ pub(crate) fn gate(repo_path: &str, argv: &[&str]) -> Result<(), Box<super::Poli
                     ),
                 ))
             }
-            Review::ChangesRequested { note } => {
+            ReviewStatus::ChangesRequested { note } => {
                 return Err(refuse(
                     RULE_REFUSED,
                     format!("changes were requested on {}@{short}.{}", attempt.branch, with_note(note)),
                 ))
             }
-            Review::Denied { note } => {
+            ReviewStatus::Denied { note } => {
                 return Err(refuse(
                     RULE_REFUSED,
                     format!("{}@{short} was denied in review.{}", attempt.branch, with_note(note)),
