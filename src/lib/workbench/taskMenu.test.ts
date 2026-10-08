@@ -1,6 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { STATUS_LABELS, type TaskCard } from "./client";
-import { ARCHIVE_STATUS } from "./taskArchive";
+import type { TaskCard } from "./client";
 import { MAX_TASK_ISSUE_BATCH } from "./taskIssue";
 import {
   cardsById,
@@ -21,7 +20,7 @@ function card(over: Partial<TaskCard> = {}): TaskCard {
   return {
     id: "t1", revision: 1, updated_at: 1, title: "A", kind: "bug", status: "inbox",
     priority: 2, severity: null, owner: null, due_at: null, labels: [],
-    repository_ids: ["r"], primary_repository_id: "r", home_workspace_id: null, position: 1,
+    repository_ids: ["r"], primary_repository_id: "r", home_workspace_id: null, position: 1, archived: false, completed_at: null,
     ...over,
   };
 }
@@ -156,7 +155,7 @@ describe("taskMenuItems", () => {
   // Archive anywhere, so "archive this task" had no answer in the product and
   // the panel called Archive offered only Restore.
   describe("the Archive row", () => {
-    it("sits beside Delete on every card, and says where an archived task goes", () => {
+    it("sits beside Delete on every card, and says archiving keeps the status", () => {
       const items = taskMenuItems({ cards: [card({ status: "ready" })], column: "ready" });
       const ids = items.map((item) => item.id);
       expect(ids).toContain("archive");
@@ -165,18 +164,18 @@ describe("taskMenuItems", () => {
       const archive = items.find((item) => item.id === "archive");
       expect(archive).toMatchObject({ label: "Archive", icon: "archive", disabled: false });
       expect(archive?.separatorBefore).toBe(true);
-      // Named from the vocabulary, never spelled: this hint is the only place
-      // the board tells a reader which column archiving files a task into.
-      expect(archive?.hint).toBe(STATUS_LABELS[ARCHIVE_STATUS]);
+      // Archiving once meant moving to Done; the hint is where the menu says
+      // it no longer does.
+      expect(archive?.hint).toBe("Keeps status");
       // Not styled as destructive. Archiving is the ordinary end of a task.
       expect(archive?.danger).toBeUndefined();
     });
 
-    it("refuses the write that would store the status already there", () => {
-      const archived = taskMenuItems({ cards: [card({ status: ARCHIVE_STATUS })] })
+    it("refuses the write that would store the flag already there", () => {
+      const archived = taskMenuItems({ cards: [card({ archived: true })] })
         .find((item) => item.id === "archive");
       expect(archived?.disabled).toBe(true);
-      expect(archived?.hint).toBe(`Already in ${STATUS_LABELS[ARCHIVE_STATUS]}`);
+      expect(archived?.hint).toBe("Already archived");
       // Disabled, not hidden — the same rule the Move and Priority rows
       // follow, so the menu keeps its shape whichever card it opened on.
       expect(archived?.label).toBe("Archive");
@@ -184,12 +183,21 @@ describe("taskMenuItems", () => {
 
     it("still offers a mixed selection, and counts what it would archive", () => {
       const items = taskMenuItems({
-        cards: [card({ id: "a", status: "ready" }), card({ id: "b", status: ARCHIVE_STATUS })],
+        cards: [card({ id: "a", status: "ready" }), card({ id: "b", archived: true })],
       });
       const archive = items.find((item) => item.id === "archive");
       expect(archive?.disabled).toBe(false);
       expect(archive?.label).toBe("Archive 2 tasks");
-      expect(archive?.hint).toBe(STATUS_LABELS[ARCHIVE_STATUS]);
+      expect(archive?.hint).toBe("Keeps status");
+    });
+
+    // The status no longer decides: a Done card that is not archived is
+    // offered, and an archived Ready card is not.
+    it("reads the archived flag, not the Done status", () => {
+      const done = taskMenuItems({ cards: [card({ status: "done", archived: false })] }).find((item) => item.id === "archive");
+      expect(done?.disabled).toBe(false);
+      const ready = taskMenuItems({ cards: [card({ status: "ready", archived: true })] }).find((item) => item.id === "archive");
+      expect(ready?.disabled).toBe(true);
     });
 
     it("goes away while a write is in flight, like every other action", () => {

@@ -23,8 +23,6 @@
     FoldVertical,
     SlidersHorizontal,
     X,
-    PencilLine,
-    Trash2,
   } from "@lucide/svelte";
   import { createAsyncGuard, type AsyncGuard } from "../../async/guard";
   import { debounce } from "../../async/debounce";
@@ -41,7 +39,6 @@
   import {
     classifyFileChange,
     hasUnstagedChanges,
-    isUntrackedStatusCode,
     dirtyAncestorCounts,
     mergeListedAndStatusPaths,
     statusBadgeClass,
@@ -53,9 +50,6 @@
   import { copyText } from "../../desktop/clipboard";
   import { openInDefaultApp, revealInFileManager } from "../../desktop/openInShell";
   import { askConfirm, askText } from "../../stores/modalStore";
-  import { harnessStore, type Guarded } from "../../stores/harnessStore";
-  import type { DeleteOutcome } from "../../files/types";
-  import { describeDelete, isAtOrUnder, remapPath } from "../../files/fileOps";
   import Skeleton from "../Skeleton.svelte";
   import { portal } from "../../dom/portal";
   import { LAYERS } from "../../ui/layers";
@@ -567,80 +561,6 @@
       await repoStore.refresh();
     } catch (err: unknown) {
       repoStore.setError(formatError(err));
-    }
-  }
-
-  /**
-   * Rename or move a file or folder. The backend decides between a staged
-   * `git mv` (tracked) and a plain rename (untracked) and gates whichever it
-   * runs; a selection inside what moved follows it to the new place.
-   */
-  async function movePath(row: FileRow) {
-    closeContextMenu();
-    const repo = $repoStore.currentPath;
-    if (!repo) return;
-    const answer = await askText({
-      title: row.kind === "dir" ? "Rename or Move Folder" : "Rename or Move File",
-      message: `New repository-relative path for ${row.path}`,
-      initialValue: row.path,
-      confirmLabel: "Move",
-    });
-    const to = answer?.trim().replace(/\/+$/, "");
-    if (!to || to === row.path) return;
-    try {
-      const result = await invoke<Guarded<null>>("cmd_move_path", { repoPath: repo, from: row.path, to });
-      harnessStore.recordVerdict(result.policy, repo);
-      harnessStore.recordAction({ repoPath: repo, kind: "move", label: `${row.path} → ${to}`, ok: true });
-    } catch (err: unknown) {
-      harnessStore.recordAction({ repoPath: repo, kind: "move", label: `${row.path} → ${to}`, ok: false });
-      repoStore.setError(formatError(err));
-      return;
-    }
-    const selected = $repoStore.selectedFilePath;
-    await loadFiles(repo);
-    await repoStore.refresh();
-    if (row.kind === "file") chooseFile(to);
-    else if (selected && isAtOrUnder(selected, row.path)) chooseFile(remapPath(selected, row.path, to));
-  }
-
-  /**
-   * Delete a file or folder after a confirmation that separates what git can
-   * restore (tracked, removed with `git rm`) from what it cannot (untracked,
-   * removed with `git clean`). Ignored files are never deleted.
-   */
-  async function deletePath(row: FileRow) {
-    closeContextMenu();
-    const repo = $repoStore.currentPath;
-    if (!repo) return;
-    const untracked = new Set(
-      $repoStore.statuses.filter((s) => isUntrackedStatusCode(s.status_code)).map((s) => s.path),
-    );
-    const confirmed = await askConfirm({
-      title: row.kind === "dir" ? "Delete Folder" : "Delete File",
-      message: describeDelete(row.path, row.kind === "dir" ? "dir" : "file", files, untracked),
-      confirmLabel: "Delete",
-      destructive: true,
-    });
-    if (!confirmed || repo !== $repoStore.currentPath) return;
-    let outcome: DeleteOutcome;
-    try {
-      const result = await invoke<Guarded<DeleteOutcome>>("cmd_delete_path", { repoPath: repo, path: row.path });
-      harnessStore.recordVerdict(result.policy, repo);
-      harnessStore.recordAction({ repoPath: repo, kind: "delete", label: row.path, ok: true });
-      outcome = result.output;
-    } catch (err: unknown) {
-      harnessStore.recordAction({ repoPath: repo, kind: "delete", label: row.path, ok: false });
-      repoStore.setError(formatError(err));
-      return;
-    }
-    const selected = $repoStore.selectedFilePath;
-    if (selected && isAtOrUnder(selected, row.path) && typeof onSelectFile !== "function") {
-      repoStore.selectFilePath(null);
-    }
-    await loadFiles(repo);
-    await repoStore.refresh();
-    if (outcome.left_behind) {
-      repoStore.setError(`${row.path} still holds ignored files, which GitPulse does not delete.`);
     }
   }
 
@@ -1243,15 +1163,6 @@
         <FolderPlus size={13} class="text-accent" />
         <span>New Folder in folder…</span>
       </button>
-      <div class="gp-menu-sep" role="separator"></div>
-      <button type="button" role="menuitem" class="gp-menu-item" onclick={() => movePath(row)}>
-        <PencilLine size={13} class="text-textMuted" />
-        <span>Rename or Move Folder…</span>
-      </button>
-      <button type="button" role="menuitem" class="gp-menu-item text-rose-300" onclick={() => deletePath(row)}>
-        <Trash2 size={13} />
-        <span>Delete Folder…</span>
-      </button>
     {:else}
       <button type="button" role="menuitem" class="gp-menu-item" onclick={() => { chooseFile(row.path); repoStore.setActiveTab('code', 'explorer'); closeContextMenu(); }}>
         <FileCode size={13} class="text-accent" />
@@ -1286,17 +1197,6 @@
       <button type="button" role="menuitem" class="gp-menu-item" onclick={() => { repoStore.selectFilePath(row.path); repoStore.setActiveTab('code', 'blame'); closeContextMenu(); }}>
         <GitCommit size={13} class="text-purple-400" />
         <span>View Git Blame</span>
-      </button>
-
-      <div class="gp-menu-sep" role="separator"></div>
-
-      <button type="button" role="menuitem" class="gp-menu-item" onclick={() => movePath(row)}>
-        <PencilLine size={13} class="text-textMuted" />
-        <span>Rename or Move…</span>
-      </button>
-      <button type="button" role="menuitem" class="gp-menu-item text-rose-300" onclick={() => deletePath(row)}>
-        <Trash2 size={13} />
-        <span>Delete File…</span>
       </button>
     {/if}
 

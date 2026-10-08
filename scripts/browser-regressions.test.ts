@@ -4,13 +4,24 @@ import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { BROWSER_HARNESSES, chromeBinary, readBrowserVerdict } from "./browser-regressions.mjs";
+import { BROWSER_HARNESSES, DEFAULT_DEADLINE_SECONDS, HARNESS_DEADLINE_SECONDS, chromeBinary, harnessDeadlineSeconds, readBrowserVerdict } from "./browser-regressions.mjs";
 
 describe("browser regression gate", () => {
   it("keeps the native WebKit entrypoint aligned with every supported harness", () => {
     const native = readFileSync(new URL("./webkit-regressions.swift", import.meta.url), "utf8");
     const paths = [...native.matchAll(/"\/harness\/([^"/]+)\.html"/g)].map(match => match[1]);
     expect(paths.sort()).toEqual([...BROWSER_HARNESSES].sort());
+  });
+  it("gives a long page its own deadline and keeps the minute for every other page", () => {
+    expect(harnessDeadlineSeconds("tasks")).toBe(150);
+    for (const harness of BROWSER_HARNESSES.filter(name => !(name in HARNESS_DEADLINE_SECONDS))) expect(harnessDeadlineSeconds(harness)).toBe(DEFAULT_DEADLINE_SECONDS);
+    expect(DEFAULT_DEADLINE_SECONDS).toBe(60);
+    // Every override names a real page, and the WebKit runner is told the number.
+    expect(Object.keys(HARNESS_DEADLINE_SECONDS).every(name => BROWSER_HARNESSES.includes(name))).toBe(true);
+    const runner = readFileSync(new URL("./browser-regressions.mjs", import.meta.url), "utf8");
+    expect(runner).toContain("url, String(seconds + 5)");
+    const native = readFileSync(new URL("./webkit-regressions.swift", import.meta.url), "utf8");
+    expect(native).toContain("withTimeInterval: deadline");
   });
   const html = (rows: unknown[]) => `<html data-gp-result="${encodeURIComponent(JSON.stringify({ results: rows }))}">`;
   it("requires an executed complete verdict", () => {

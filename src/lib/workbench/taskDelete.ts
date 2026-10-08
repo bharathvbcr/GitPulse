@@ -163,7 +163,7 @@ export async function runBoundedSerial<T>(
   return { done, failed, skipped };
 }
 
-export async function withTimeout<T>(work: Promise<T>, ms: number): Promise<T> {
+export async function withTimeout<T>(work: Promise<T>, ms: number, message = "Delete timed out. Retry to confirm its result."): Promise<T> {
   const cap = Number.isFinite(ms) && ms > 0 ? Math.min(ms, 120_000) : DELETE_ATTEMPT_TIMEOUT_MS;
   let timer: ReturnType<typeof setTimeout> | undefined;
   try {
@@ -171,7 +171,7 @@ export async function withTimeout<T>(work: Promise<T>, ms: number): Promise<T> {
       work,
       new Promise<never>((_, reject) => {
         timer = setTimeout(
-          () => reject(new WorkbenchError("transport_error", "Delete timed out. Retry to confirm its result.")),
+          () => reject(new WorkbenchError("transport_error", message)),
           cap,
         );
       }),
@@ -186,6 +186,50 @@ export async function deleteTasks(
   run: (attempt: DeleteAttempt) => Promise<void>,
   options: { newID: () => string; limit?: number; cancelled?: () => boolean; timeout?: number },
 ): Promise<DeleteBatchResult> {
+  return writeEach(tasks, run, { ...options, settled: deleteAlreadyGone, timeoutMessage: "Delete timed out. Retry to confirm its result." });
+}
+
+/**
+ * Bring deleted tasks back, one at a time, under the same bound, timeout and
+ * single same-request retry as a delete pass — a restore takes exactly the
+ * attempt a delete does (`id`, `request_id`, `expected_revision`), checked
+ * against the revision the deletion produced.
+ *
+ * `invalid_state` is the store saying the task is already live: an earlier
+ * reply was lost after it landed, or someone else restored it. The board is
+ * then already where the reader wanted it, so it counts as restored.
+ */
+export async function restoreTasks(
+  tasks: readonly DeletableTask[],
+  run: (attempt: DeleteAttempt) => Promise<void>,
+  options: { newID: () => string; limit?: number; cancelled?: () => boolean; timeout?: number },
+): Promise<DeleteBatchResult> {
+  return writeEach(tasks, run, {
+    ...options,
+    settled: (error) => classifyDeleteError(error).code === "invalid_state",
+    timeoutMessage: "Restore timed out. Retry to confirm its result.",
+  });
+}
+
+/** Restore's counterpart of `deleteSummary`. */
+export function restoreSummary(result: DeleteBatchResult): string {
+  const parts: string[] = [];
+  if (result.deleted.length) parts.push(`Restored ${result.deleted.length === 1 ? "1 task" : `${result.deleted.length} tasks`}.`);
+  if (result.failed.length) {
+    const first = result.failed[0];
+    parts.push(result.failed.length > 1
+      ? `${result.failed.length} failed (${first.code}: ${first.message}).`
+      : `Could not restore “${first.title}” (${first.code}: ${first.message}).`);
+  }
+  if (result.skipped > 0) parts.push(`Held ${result.skipped} more — restore again to continue (cap ${MAX_DELETE_BATCH} per pass).`);
+  return parts.length ? parts.join(" ") : "Nothing was restored.";
+}
+
+async function writeEach(
+  tasks: readonly DeletableTask[],
+  run: (attempt: DeleteAttempt) => Promise<void>,
+  options: { newID: () => string; limit?: number; cancelled?: () => boolean; timeout?: number; settled: (error: unknown) => boolean; timeoutMessage: string },
+): Promise<DeleteBatchResult> {
   const items = uniqueDeletable(tasks);
   const attempts = items
     .map((task) => {
@@ -193,13 +237,13 @@ export async function deleteTasks(
       return attempt ? { task, attempt } : null;
     })
     .filter((row): row is { task: DeletableTask; attempt: DeleteAttempt } => row !== null);
-  const exec = (attempt: DeleteAttempt) => withTimeout(run(attempt), options.timeout ?? DELETE_ATTEMPT_TIMEOUT_MS);
+  const exec = (attempt: DeleteAttempt) => withTimeout(run(attempt), options.timeout ?? DELETE_ATTEMPT_TIMEOUT_MS, options.timeoutMessage);
 
   const serial = await runBoundedSerial(attempts, async (row) => {
     try {
       await exec(row.attempt);
     } catch (error) {
-      if (deleteAlreadyGone(error)) return;
+      if (options.settled(error)) return;
       if (!isRetryableDelete(error)) throw error;
       await exec(row.attempt);
     }

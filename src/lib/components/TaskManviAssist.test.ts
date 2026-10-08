@@ -49,7 +49,7 @@ describe("TaskManviAssist", () => {
     expect(source).toContain("{apple?.detail}");
     // Both engines create the proposal in the same store, so the "one live
     // attempt" check must not sit inside either branch.
-    expect(source).toMatch(/const page = await bounded\(listEnhancements\(saved\.id\)\)[\s\S]*?runAppleEnhancement/);
+    expect(source).toMatch(/const existing = await bounded\(latestEnhancement\(saved\.id, LIVE_ENHANCEMENT_STATES\)\)[\s\S]*?runAppleEnhancement/);
   });
 
   it("speaks compose copy only when the sheet says this is a new task", () => {

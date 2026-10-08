@@ -162,18 +162,6 @@ export async function closeWithConfirmation(
   return true;
 }
 
-/**
- * A reservation refused because every session slot is taken. Its own type so
- * a caller that can wait (a queued task terminal) tells it apart from a
- * reservation that can never succeed, without matching the sentence.
- */
-export class SessionCapacityError extends Error {
-  constructor(readonly limit: number) {
-    super(`All ${limit} terminal sessions are in use across repositories`);
-    this.name = "SessionCapacityError";
-  }
-}
-
 /** Capacity belongs to the app, including starts and closes still in flight. */
 export function createSessionRegistry() {
   const records = new Map<string, TerminalSessionRecord>();
@@ -184,7 +172,7 @@ export function createSessionRegistry() {
     reserve(record: TerminalSessionRecord) {
       if (records.has(record.key)) throw new Error("This terminal already owns a session slot");
       const limit = currentSessionLimit();
-      if (records.size >= limit) throw new SessionCapacityError(limit);
+      if (records.size >= limit) throw new Error(`All ${limit} terminal sessions are in use across repositories`);
       records.set(record.key, record);
       publish();
       let released = false;

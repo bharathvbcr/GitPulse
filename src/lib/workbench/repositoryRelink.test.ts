@@ -1,7 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { invoke } from "@tauri-apps/api/core";
 import { relinkRepository, WorkbenchError, type Repository } from "./client";
-import { currentLocation, relinkCheckout, relinkConfirmation, type RelinkIO } from "./repositoryRelink";
+import { checkoutFlag, currentLocation, readCheckout, readCheckouts, relinkCheckout, relinkConfirmation, CHECKOUT_READ_CONCURRENCY, type RelinkIO } from "./repositoryRelink";
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
 const native = vi.mocked(invoke);
@@ -86,5 +86,60 @@ describe("relinkCheckout", () => {
     expect(second.kind).toBe("relinked");
     expect(flaky.calls).toHaveLength(2);
     expect(flaky.calls[0]).toBe(flaky.calls[1]);
+  });
+});
+
+describe("readCheckout", () => {
+  const options = { caseInsensitive: false };
+  it("is available when the host finds the checkout where the store says it is", async () => {
+    const asked: string[] = [];
+    const health = await readCheckout(repo, async (path) => { asked.push(path); return path; }, options);
+    expect(health).toMatchObject({ state: "available", path: "/old/GitPulse" });
+    expect(asked).toEqual(["/old/GitPulse"]);
+  });
+  it("is missing when the host says the folder holds no repository", async () => {
+    const health = await readCheckout(repo, async (path) => { throw `Not a Git repository: ${path}`; }, options);
+    expect(health.state).toBe("missing");
+    expect(health.detail).toContain("/old/GitPulse");
+  });
+  it("is missing when the walk up lands in a different, enclosing repository", async () => {
+    expect((await readCheckout(repo, async () => "/old", options)).state).toBe("missing");
+  });
+  it("is unknown — never available or missing — when the check itself fails", async () => {
+    const health = await readCheckout(repo, async () => { throw new Error("Operation not permitted"); }, options);
+    expect(health.state).toBe("unknown");
+    expect(health.detail).toContain("Operation not permitted");
+    expect(checkoutFlag(health)).toBeNull();
+  });
+  it("is remote for a repository registered without a local path, and asks the host nothing", async () => {
+    let asked = false;
+    const remote = { ...repo, identity_key: "remote:github.com/x/y", remote_url: "https://github.com/x/y.git" };
+    const health = await readCheckout(remote, async (path) => { asked = true; return path; }, options);
+    expect(health).toMatchObject({ state: "remote", path: null });
+    expect(health.detail).toContain("https://github.com/x/y.git");
+    expect(asked).toBe(false);
+    expect(checkoutFlag(health)?.label).toBe("Remote only");
+  });
+  it("follows the host's case rule when comparing where it found the checkout", async () => {
+    expect((await readCheckout(repo, async () => "/OLD/gitpulse", { caseInsensitive: true })).state).toBe("available");
+    expect((await readCheckout(repo, async () => "/OLD/gitpulse", { caseInsensitive: false })).state).toBe("missing");
+  });
+  it("reads a whole catalog with a bounded number of checks in flight", async () => {
+    let inFlight = 0, peak = 0;
+    const repos = Array.from({ length: 20 }, (_, i) => ({ ...repo, id: `r${i}`, identity_key: `local:/w/r${i}/.git` }));
+    const read = await readCheckouts(repos, async (path) => {
+      inFlight++; peak = Math.max(peak, inFlight);
+      await new Promise((resolve) => setTimeout(resolve, 2));
+      inFlight--;
+      return path;
+    }, options);
+    expect(read.size).toBe(20);
+    expect([...read.values()].every((health) => health.state === "available")).toBe(true);
+    expect(peak).toBeLessThanOrEqual(CHECKOUT_READ_CONCURRENCY);
+  });
+  it("says a remote-only repository had no local checkout when a relink gives it one", () => {
+    const remote = { ...repo, identity_key: "remote:github.com/x/y", remote_url: "https://github.com/x/y.git" };
+    expect(relinkConfirmation(remote, "/new/y").message).toContain("had no local checkout (known by its remote, https://github.com/x/y.git)");
+    expect(relinkConfirmation(repo, "/new/GitPulse").message).toContain(`It was registered at ${currentLocation(repo)}.`);
   });
 });

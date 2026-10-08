@@ -8,7 +8,7 @@
 use crate::engine::git_cli::{
     git_text, sandbox_join, sandbox_join_canonical, sandbox_write, validate_repo,
 };
-use crate::engine::git_writer::{GitWriter, MovePlan};
+use crate::engine::git_writer::GitWriter;
 use markdev_vault::note::{
     has_markdown_extension, stem, strip_markdown_extension, MARKDOWN_EXTENSIONS,
 };
@@ -194,17 +194,11 @@ pub fn status(repo_path: &str) -> Result<DocsStatus, String> {
     Ok(load_vault(repo_path, false)?.status.clone())
 }
 
-/// [`GitWriter::move_path`] plus staged link rewrites via `rewrite_links_in`.
+/// `git mv` plus staged link rewrites via `rewrite_links_in`.
 ///
 /// Reviewable in the diff viewer before commit. Does **not** call
-/// `Vault::rename_note`. `gate` judges the move `move_path` decided on, before
-/// anything moves.
-pub fn rename_doc(
-    repo_path: &str,
-    from: &str,
-    to: &str,
-    gate: impl FnOnce(&MovePlan) -> Result<(), String>,
-) -> Result<DocRenameOutcome, String> {
+/// `Vault::rename_note`.
+pub fn rename_doc(repo_path: &str, from: &str, to: &str) -> Result<DocRenameOutcome, String> {
     let repo = validate_repo(repo_path)?;
     let from = normalize_rel(from)?;
     let to = normalize_rel(to)?;
@@ -285,7 +279,7 @@ pub fn rename_doc(
     }
 
     // Move first so a failed mv leaves rewrites unapplied.
-    GitWriter::move_path(repo_path, &from, &to, gate)?;
+    GitWriter::mv_file(repo_path, &from, &to)?;
 
     let mut links_rewritten = 0u32;
     let mut rewritten_paths = Vec::with_capacity(edits.len());
@@ -791,8 +785,7 @@ mod tests {
     fn rename_rewrites_links_and_protects_fenced_samples() {
         let dir = fixture_repo();
         let path = dir.path().to_str().unwrap();
-        let outcome =
-            rename_doc(path, "docs/Roadmap.md", "docs/Plan.md", |_| Ok(())).expect("rename");
+        let outcome = rename_doc(path, "docs/Roadmap.md", "docs/Plan.md").expect("rename");
         assert_eq!(outcome.from, "docs/Roadmap.md");
         assert_eq!(outcome.to, "docs/Plan.md");
         assert!(outcome.links_rewritten >= 1, "{outcome:?}");
