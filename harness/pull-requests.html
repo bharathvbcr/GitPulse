@@ -1,0 +1,179 @@
+<!doctype html>
+<html lang="en">
+  <head><meta charset="utf-8" /><title>GitPulse pull-request action checks</title></head>
+  <body style="margin:0">
+    <div id="app"></div>
+    <pre id="result" style="position:fixed;bottom:8px;right:8px;max-height:30vh;overflow:auto;font:11px monospace;background:#141a29;color:#e9edf8;z-index:100"></pre>
+    <script type="module">
+      /**
+       * Pull-request actions, rendered.
+       *
+       * Every create, review and merge is published on GitHub. What only a
+       * real page can settle is the order: the confirmation must be asked
+       * BEFORE anything is sent, a cancel must send nothing, and a merge must
+       * carry the head commit the reader was shown. Nothing here runs gh;
+       * every IPC answer is a fixture and every request is recorded.
+       */
+      import { mockIPCWithEvents } from "./tauriMocks";
+      import "../src/app.css";
+
+      const params = new URLSearchParams(location.search);
+      const errors = [];
+      addEventListener("error", event => errors.push(event.message));
+      addEventListener("unhandledrejection", event => errors.push(String(event.reason)));
+
+      const HEAD = "c".repeat(40);
+      const LONG_BODY = "word ".repeat(40);
+      const detail = number => ({
+        number, title: number === 7 ? "Add search" : `PR ${number}`, state: number === 9 ? "CLOSED" : "OPEN",
+        url: `https://github.com/acme/gitpulse/pull/${number}`, is_draft: number === 8, author: "ada",
+        head_ref: "feat/search", base_ref: "main", head_oid: HEAD,
+        body: number === 8 ? LONG_BODY : number === 9 ? "" : "Adds repository search.", body_truncated: number === 8,
+        additions: 12, deletions: 3, changed_files: 2, mergeable: "MERGEABLE", merge_state: "CLEAN",
+        review_decision: number === 7 ? "" : "APPROVED", ci_status: "success",
+      });
+      const sent = [];
+      let views = 0;
+      /** The next action gh refuses, with gh's own words. */
+      let refuseNext = null;
+      mockIPCWithEvents((cmd, args) => {
+        switch (cmd) {
+          case "cmd_github_pr_view":
+            views += 1;
+            return detail(args.number);
+          case "cmd_github_pr_action":
+            if (refuseNext) { const message = refuseNext; refuseNext = null; throw new Error(message); }
+            sent.push(args.action);
+            return { policy: null, output: `done ${args.action.kind}` };
+          default: throw new Error(`Unimplemented fixture: ${cmd}`);
+        }
+      });
+
+      const { mount, tick } = await import("svelte");
+      const { get } = await import("svelte/store");
+      const { promptState, completePrompt } = await import("../src/lib/stores/modalStore");
+      const { createChecks } = await import("./checks.ts");
+      const Host = (await import("./PullRequestHost.svelte")).default;
+      let changed = 0;
+      let created = null;
+      mount(Host, {
+        target: document.querySelector("#app"),
+        props: { onChanged: () => { changed += 1; }, onCreated: message => { created = message; } },
+      });
+
+      const wait = () => new Promise(resolve => setTimeout(resolve, 40));
+      const until = async test => {
+        const end = Date.now() + 8000;
+        while (!test() && Date.now() < end) await wait();
+        if (!test()) throw new Error("Fixture condition timed out");
+      };
+      const pane = number => document.querySelector(`[data-pr-detail="${number}"]`);
+      const button = (root, name) => [...root.querySelectorAll("button")].find(node => node.textContent.trim() === name);
+      const prompt = () => get(promptState);
+      const set = async (node, value, event = "input") => {
+        if (node.type === "checkbox") node.checked = value; else node.value = value;
+        node.dispatchEvent(new Event(event, { bubbles: true }));
+        await tick();
+      };
+      const branchCreate = () => document.querySelector('[data-create="branch"]');
+      const detachedCreate = () => document.querySelector('[data-create="detached"]');
+
+      const { results, check, stopped } = createChecks();
+      const report = () => { document.getElementById("result").textContent = results.map(row => `${row.pass ? "ok  " : "FAIL"} ${row.name}`).join("\n"); };
+
+      await (async () => {
+        try {
+          await until(() => [7, 8, 9].every(n => pane(n)?.textContent.includes("by ada")));
+          const open = pane(7);
+
+          // --- what the reader is shown ---------------------------------------
+          check("the detail states the head a merge would be pinned to", () => open.textContent.includes("@ ccccccc"));
+          check("and the size of the change", () => open.textContent.includes("+12") && open.textContent.includes("in 2 files"));
+          check("a cut description says so", () => pane(8).textContent.includes("longer than shown here"));
+          check("a whole description does not", () => !open.textContent.includes("longer than shown here"));
+          check("a closed pull request offers no actions", () =>
+            !button(pane(9), "Merge…") && !button(pane(9), "Approve…") && pane(9).textContent.includes("closed"));
+          check("a draft cannot be merged", () => button(pane(8), "Merge…").disabled);
+          check("comment and request-changes wait for review text", () =>
+            button(open, "Comment…").disabled && button(open, "Request changes…").disabled && !button(open, "Approve…").disabled);
+
+          // --- merge: asked first, cancel sends nothing ---------------------
+          button(open, "Merge…").click();
+          await until(() => !!prompt());
+          check("merge asks before sending anything", () => sent.length === 0 && prompt().options.mode === "confirm");
+          check("and marks the merge destructive", () => prompt().options.destructive === true);
+          check("and names the pinned head", () => prompt().options.message.includes("Only if its head is still ccccccc"));
+          completePrompt(false); await wait(); await tick();
+          check("a cancelled merge sends nothing", () => sent.length === 0 && changed === 0);
+
+          await set(open.querySelector('select[aria-label="Merge method for #7"]'), "rebase", "change");
+          await set(open.querySelector('input[type="checkbox"]'), true, "change");
+          button(open, "Merge…").click();
+          await until(() => !!prompt());
+          check("deleting the branch is named before it happens", () =>
+            prompt().options.message.includes("deleted on GitHub and locally") && prompt().options.message.includes("rebased commits"));
+          completePrompt(true);
+          await until(() => sent.length === 1);
+          check("a confirmed merge sends the head it showed", () =>
+            sent[0].kind === "merge" && sent[0].number === 7 && sent[0].head_oid === HEAD);
+          check("with the method and branch choice it named", () => sent[0].method === "rebase" && sent[0].delete_branch === true);
+          await until(() => changed === 1);
+          check("and tells the list to reload", () => changed === 1 && views >= 4);
+
+          // --- review --------------------------------------------------------
+          button(open, "Approve…").click();
+          await until(() => !!prompt());
+          check("approving asks too", () => prompt().options.confirmLabel === "Approve" && sent.length === 1);
+          completePrompt(true);
+          await until(() => sent.length === 2);
+          check("and sends an approval with no body", () => sent[1].verdict === "approve" && sent[1].body === "");
+
+          await set(open.querySelector('textarea[aria-label="Review comment for #7"]'), "Please add tests");
+          button(open, "Request changes…").click();
+          await until(() => !!prompt());
+          check("a review quotes its text before sending", () =>
+            prompt().options.message.includes("Please add tests") && sent.length === 2);
+          completePrompt(true);
+          await until(() => sent.length === 3);
+          check("and sends the verdict and body it quoted", () =>
+            sent[2].kind === "review" && sent[2].verdict === "request_changes" && sent[2].body === "Please add tests");
+
+          // --- gh's refusal is shown, not swallowed -----------------------------
+          refuseNext = "gh: Pull request #7 is not mergeable: the head branch was modified";
+          button(open, "Merge…").click();
+          await until(() => !!prompt());
+          completePrompt(true);
+          await until(() => !!open.querySelector('[role="alert"]'));
+          check("a refused merge shows gh's own reason", () =>
+            open.querySelector('[role="alert"]').textContent.includes("head branch was modified") && sent.length === 3);
+
+          // --- create ---------------------------------------------------------
+          const form = branchCreate();
+          check("create waits for a title", () => button(form, "Open pull request…").disabled);
+          await set(form.querySelector('input[aria-label="Base branch"]'), "feat/search");
+          await set(form.querySelector('input[aria-label="Pull request title"]'), "Add search");
+          check("and refuses a base equal to the head", () => button(form, "Open pull request…").disabled);
+          await set(form.querySelector('input[aria-label="Base branch"]'), "main");
+          button(form, "Open pull request…").click();
+          await until(() => !!prompt());
+          check("create says it never pushes, before sending", () =>
+            prompt().options.message.includes("GitPulse does not push") && sent.length === 3);
+          completePrompt(true);
+          await until(() => sent.length === 4 && created !== null);
+          check("and sends the branch's base and title", () =>
+            sent[3].kind === "create" && sent[3].base === "main" && sent[3].title === "Add search");
+          check("a detached HEAD cannot open one", () =>
+            detachedCreate().textContent.includes("HEAD is detached") && !button(detachedCreate(), "Open pull request…"));
+
+          check("no unhandled runtime errors", () => errors.length === 0);
+          report();
+        } catch (error) {
+          stopped(error);
+          report();
+        }
+        document.documentElement.dataset.gpResult = encodeURIComponent(JSON.stringify({ results, errors }));
+        const reportPath = params.get("report");
+        if (reportPath?.startsWith("/__gp_result/")) await fetch(reportPath, { method: "POST", body: document.documentElement.outerHTML });
+      })();
+    </script>
+  </body>

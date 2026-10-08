@@ -1979,6 +1979,40 @@ pub async fn cmd_github_checkout_pr(
     .await
 }
 
+/// One pull request in detail (`gh pr view`). Read-only and ungated, like the
+/// listings in [`cmd_github_context`].
+#[tauri::command(async)]
+pub async fn cmd_github_pr_view(
+    repo_path: String,
+    number: u64,
+) -> Result<crate::github::PullRequestDetail, String> {
+    off_thread(move || crate::github::view_pull_request(&repo_path, number)).await
+}
+
+/// Creates, reviews or merges a pull request through gh. Each is published
+/// on GitHub, so the frontend confirms first. The argv is built once, judged,
+/// and that same argv is what runs.
+#[tauri::command(async)]
+pub async fn cmd_github_pr_action(
+    repo_path: String,
+    action: crate::github::PrAction,
+) -> Result<Guarded<String>, String> {
+    off_thread(move || {
+        let remote = discover_github_remote(&repo_path)?
+            .ok_or_else(|| "No GitHub remote configured".to_string())?;
+        let head = match action {
+            crate::github::PrAction::Create { .. } => GitReader::current_branch(&repo_path)?,
+            _ => None,
+        };
+        let argv = crate::github::pr_action_argv(&remote, &action, head.as_deref())?;
+        let refs: Vec<&str> = argv.iter().map(String::as_str).collect();
+        let policy = guard(&repo_path, &refs)?;
+        let output = crate::github::run_pr_action(&repo_path, &argv)?;
+        Ok(Guarded { policy, output })
+    })
+    .await
+}
+
 /// The repository's Actions workflows (`gh workflow list`). A separate,
 /// lazily-loaded command rather than another section of
 /// [`cmd_github_context`]: that call already serializes four gh round trips,

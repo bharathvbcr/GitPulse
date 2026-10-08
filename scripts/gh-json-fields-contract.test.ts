@@ -30,6 +30,8 @@ const GH_FIELDS: Record<string, string[]> = {
   issue: "assignees author blockedBy blocking body closed closedAt closedByPullRequestsReferences comments createdAt id isPinned issueType labels milestone number parent projectCards projectItems reactionGroups state stateReason subIssues subIssuesSummary title updatedAt url".split(" "),
   run: "attempt conclusion createdAt databaseId displayTitle event headBranch headSha name number startedAt status updatedAt url workflowDatabaseId workflowName".split(" "),
   workflow: "id name path state".split(" "),
+  // `gh pr view --json`, captured from gh 2.102.0.
+  pr: "additions assignees author autoMergeRequest baseRefName baseRefOid body changedFiles closed closedAt closingIssuesReferences comments commits createdAt deletions files fullDatabaseId headRefName headRefOid headRepository headRepositoryOwner id isCrossRepository isDraft labels latestReviews maintainerCanModify mergeCommit mergeStateStatus mergeable mergedAt mergedBy milestone number potentialMergeCommit projectCards projectItems reactionGroups reviewDecision reviewRequests reviews state statusCheckRollup title updatedAt url".split(" "),
 };
 
 /** Each listing: where its argv is built, and the struct that parses the reply. */
@@ -42,11 +44,12 @@ const LISTINGS = [
     source: "github/actions.rs",
     struct: "GhWorkflow",
   },
+  { subcommand: "pr", fn: "pr_view_leading_args", source: "github/mod.rs", struct: "GhPullRequestDetail" },
 ] as const;
 
 /** The comma-separated field list passed to `--json` inside `fn`. */
 function requestedFields(source: string, fn: string): string[] {
-  const start = source.indexOf(`fn ${fn}`);
+  const start = source.indexOf(`fn ${fn}(`);
   expect(start, `${fn} must exist`).toBeGreaterThanOrEqual(0);
   const marker = source.indexOf('"--json"', start);
   expect(marker, `${fn} must pass --json`).toBeGreaterThanOrEqual(0);

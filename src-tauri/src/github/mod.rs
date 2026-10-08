@@ -1568,25 +1568,34 @@ const BIDI_OVERRIDE_CHARS: &[char] = &[
     '\u{2069}',
 ];
 
-pub fn validate_issue_payload(title: &str, body: &str, labels: &[String]) -> Result<(), String> {
+/// The title rule every text payload sent to GitHub shares: non-empty, at
+/// most 256 characters, no control characters, no bidi overrides. `subject`
+/// names the thing in the error ("Issue", "Pull request").
+fn validate_gh_title(subject: &str, title: &str) -> Result<(), String> {
     let title = title.trim();
     if title.is_empty() {
-        return Err("Issue title must not be empty".into());
+        return Err(format!("{subject} title must not be empty"));
     }
     if title.chars().count() > 256 {
-        return Err("Issue title exceeds the 256 character limit".into());
+        return Err(format!("{subject} title exceeds the 256 character limit"));
     }
     if title.chars().any(|c| c.is_control()) {
-        return Err("Issue title must not contain control characters".into());
+        return Err(format!("{subject} title must not contain control characters"));
     }
     if let Some(bidi) = title.chars().find(|c| BIDI_OVERRIDE_CHARS.contains(c)) {
         return Err(format!(
-            "Issue title must not contain the bidirectional override U+{:04X}",
+            "{subject} title must not contain the bidirectional override U+{:04X}",
             bidi as u32
         ));
     }
+    Ok(())
+}
+
+/// The body rule every text payload sent to GitHub shares: at most 64 KiB,
+/// and no control characters other than the newlines and tabs markdown uses.
+fn validate_gh_body(subject: &str, body: &str) -> Result<(), String> {
     if body.len() > 64 * 1024 {
-        return Err("Issue body exceeds the 64 KiB limit".into());
+        return Err(format!("{subject} body exceeds the 64 KiB limit"));
     }
     // Newlines and tabs shape markdown; every other control character
     // (NUL included) corrupts argv or rendering and has no legitimate use.
@@ -1595,10 +1604,16 @@ pub fn validate_issue_payload(title: &str, body: &str, labels: &[String]) -> Res
         .find(|c| c.is_control() && !matches!(c, '\n' | '\r' | '\t'))
     {
         return Err(format!(
-            "Issue body must not contain control characters (found U+{:04X})",
+            "{subject} body must not contain control characters (found U+{:04X})",
             ctrl as u32
         ));
     }
+    Ok(())
+}
+
+pub fn validate_issue_payload(title: &str, body: &str, labels: &[String]) -> Result<(), String> {
+    validate_gh_title("Issue", title)?;
+    validate_gh_body("Issue", body)?;
     if labels.len() > 10 {
         return Err("At most 10 issue labels may be supplied".into());
     }
@@ -1676,6 +1691,285 @@ pub fn create_issue(
     let refs: Vec<&str> = args.iter().skip(1).map(String::as_str).collect();
     let stdout =
         run_command_in("gh", &refs, Duration::from_secs(90), Some(&repo)).map_err(bounded_error)?;
+    Ok(String::from_utf8_lossy(&stdout).trim().to_string())
+}
+
+/// One pull request in detail, from `gh pr view`: what a reader needs before
+/// reviewing or merging it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PullRequestDetail {
+    pub number: u64,
+    pub title: String,
+    pub state: String,
+    pub url: String,
+    pub is_draft: bool,
+    pub author: String,
+    pub head_ref: String,
+    pub base_ref: String,
+    /// The head commit as gh saw it. A merge passes it back as
+    /// `--match-head-commit`, so a push after the reader looked refuses the
+    /// merge instead of merging commits nobody reviewed here.
+    pub head_oid: String,
+    pub body: String,
+    /// True when `body` was cut at [`PR_BODY_DISPLAY_BYTES`].
+    pub body_truncated: bool,
+    pub additions: u64,
+    pub deletions: u64,
+    pub changed_files: u64,
+    /// GitHub's MERGEABLE / CONFLICTING / UNKNOWN.
+    pub mergeable: String,
+    /// GitHub's mergeStateStatus (CLEAN, BLOCKED, BEHIND, DIRTY, ...).
+    pub merge_state: String,
+    pub review_decision: String,
+    pub ci_status: String,
+}
+
+/// How much of a pull request's description the detail view carries.
+pub const PR_BODY_DISPLAY_BYTES: usize = 16 * 1024;
+
+#[derive(Debug, Deserialize)]
+struct GhPullRequestDetail {
+    number: u64,
+    title: String,
+    state: String,
+    url: String,
+    #[serde(rename = "isDraft", default)]
+    is_draft: bool,
+    author: Option<GhAuthor>,
+    #[serde(rename = "headRefName", default)]
+    head_ref_name: String,
+    #[serde(rename = "baseRefName", default)]
+    base_ref_name: String,
+    #[serde(rename = "headRefOid", default)]
+    head_ref_oid: String,
+    #[serde(default)]
+    body: String,
+    #[serde(default)]
+    additions: u64,
+    #[serde(default)]
+    deletions: u64,
+    #[serde(rename = "changedFiles", default)]
+    changed_files: u64,
+    #[serde(default)]
+    mergeable: String,
+    #[serde(rename = "mergeStateStatus", default)]
+    merge_state_status: String,
+    #[serde(rename = "reviewDecision")]
+    review_decision: Option<String>,
+    #[serde(rename = "statusCheckRollup")]
+    status_check_rollup: Option<Value>,
+}
+
+/// The `gh pr view` arguments for one pull request. Every field name is from
+/// `gh pr view --json` with no value (gh 2.102.0), which prints the valid set;
+/// `scripts/gh-json-fields-contract.test.ts` pins both directions.
+fn pr_view_leading_args(number: &str) -> Vec<&str> {
+    vec![
+        "pr",
+        "view",
+        number,
+        "--json",
+        "number,title,state,url,isDraft,author,headRefName,baseRefName,headRefOid,body,additions,deletions,changedFiles,mergeable,mergeStateStatus,reviewDecision,statusCheckRollup",
+    ]
+}
+
+fn parse_pr_view(stdout: &[u8]) -> Result<PullRequestDetail, String> {
+    let pr: GhPullRequestDetail = serde_json::from_slice(stdout)
+        .map_err(|e| format!("could not parse gh pull-request detail: {e}"))?;
+    let body_truncated = pr.body.len() > PR_BODY_DISPLAY_BYTES;
+    let body = if body_truncated {
+        let mut cut = PR_BODY_DISPLAY_BYTES;
+        while !pr.body.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        pr.body[..cut].to_string()
+    } else {
+        pr.body
+    };
+    Ok(PullRequestDetail {
+        number: pr.number,
+        title: pr.title,
+        state: pr.state,
+        url: pr.url,
+        is_draft: pr.is_draft,
+        author: pr.author.map(|a| a.login).unwrap_or_default(),
+        head_ref: pr.head_ref_name,
+        base_ref: pr.base_ref_name,
+        head_oid: pr.head_ref_oid,
+        body,
+        body_truncated,
+        additions: pr.additions,
+        deletions: pr.deletions,
+        changed_files: pr.changed_files,
+        mergeable: pr.mergeable,
+        merge_state: pr.merge_state_status,
+        review_decision: pr.review_decision.unwrap_or_default(),
+        ci_status: summarize_checks(&pr.status_check_rollup),
+    })
+}
+
+/// Reads one pull request with `gh pr view`. Read-only, like the listings.
+pub fn view_pull_request(repo_path: &str, number: u64) -> Result<PullRequestDetail, String> {
+    if number == 0 {
+        return Err("Invalid pull request number".into());
+    }
+    let repo = validate_repo(repo_path)?;
+    if let Some(reason) = gh_unavailable_reason(&probe_gh_cli()) {
+        return Err(reason);
+    }
+    let remote = discover_github_remote(repo_path)?
+        .ok_or_else(|| "No GitHub remote configured".to_string())?;
+    let number = number.to_string();
+    let stdout = run_gh(&remote, &pr_view_leading_args(&number), Duration::from_secs(45), Some(&repo))?;
+    parse_pr_view(&stdout)
+}
+
+/// What a review says.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PrReviewVerdict {
+    Approve,
+    RequestChanges,
+    Comment,
+}
+
+/// How a merge lands on the base branch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PrMergeMethod {
+    Merge,
+    Squash,
+    Rebase,
+}
+
+/// An outward-facing pull-request action. Every variant publishes something
+/// on GitHub, so the frontend confirms each one before sending it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum PrAction {
+    /// Opens a pull request from the current branch. `--head` is always
+    /// passed, which makes gh skip its push-or-fork prompt: this never pushes.
+    Create {
+        title: String,
+        body: String,
+        base: String,
+        draft: bool,
+    },
+    Review {
+        number: u64,
+        verdict: PrReviewVerdict,
+        body: String,
+    },
+    /// Merges only if the head is still `head_oid` (`--match-head-commit`).
+    Merge {
+        number: u64,
+        method: PrMergeMethod,
+        delete_branch: bool,
+        head_oid: String,
+    },
+}
+
+/// The exact argv a [`PrAction`] runs, program name included — the single
+/// value both the command gate judges and [`run_pr_action`] executes.
+/// `head_branch` is the current branch, needed only by `Create`.
+pub fn pr_action_argv(
+    remote: &GitHubRepoRef,
+    action: &PrAction,
+    head_branch: Option<&str>,
+) -> Result<Vec<String>, String> {
+    let mut args: Vec<String> = vec!["gh".into(), "pr".into()];
+    match action {
+        PrAction::Create {
+            title,
+            body,
+            base,
+            draft,
+        } => {
+            validate_gh_title("Pull request", title)?;
+            validate_gh_body("Pull request", body)?;
+            crate::engine::git_writer::validate_ref_name(base)
+                .map_err(|e| format!("Base branch: {e}"))?;
+            let head = head_branch
+                .ok_or("A pull request is opened from a branch; HEAD is detached")?;
+            crate::engine::git_writer::validate_ref_name(head)
+                .map_err(|e| format!("Head branch: {e}"))?;
+            if head == base {
+                return Err(format!("The head and base branch are both {head}"));
+            }
+            args.extend(
+                ["create", "--title", title.trim(), "--body", body, "--base", base, "--head", head]
+                    .map(String::from),
+            );
+            if *draft {
+                args.push("--draft".into());
+            }
+        }
+        PrAction::Review {
+            number,
+            verdict,
+            body,
+        } => {
+            if *number == 0 {
+                return Err("Invalid pull request number".into());
+            }
+            validate_gh_body("Review", body)?;
+            let flag = match verdict {
+                PrReviewVerdict::Approve => "--approve",
+                PrReviewVerdict::RequestChanges => "--request-changes",
+                PrReviewVerdict::Comment => "--comment",
+            };
+            // gh requires a body for these two and would otherwise prompt.
+            if !matches!(verdict, PrReviewVerdict::Approve) && body.trim().is_empty() {
+                return Err("A review that comments or requests changes needs a body".into());
+            }
+            args.extend(["review".to_string(), number.to_string(), flag.to_string()]);
+            if !body.trim().is_empty() {
+                args.extend(["--body".to_string(), body.clone()]);
+            }
+        }
+        PrAction::Merge {
+            number,
+            method,
+            delete_branch,
+            head_oid,
+        } => {
+            if *number == 0 {
+                return Err("Invalid pull request number".into());
+            }
+            if !matches!(head_oid.len(), 40 | 64) || !head_oid.chars().all(|c| c.is_ascii_hexdigit()) {
+                return Err("Merge needs the head commit the pull request was reviewed at".into());
+            }
+            let flag = match method {
+                PrMergeMethod::Merge => "--merge",
+                PrMergeMethod::Squash => "--squash",
+                PrMergeMethod::Rebase => "--rebase",
+            };
+            args.extend(
+                ["merge", &number.to_string(), flag, "--match-head-commit", head_oid]
+                    .map(|s| s.to_string()),
+            );
+            if *delete_branch {
+                args.push("--delete-branch".into());
+            }
+        }
+    }
+    args.extend(gh_repo_flags(remote));
+    Ok(args)
+}
+
+/// Runs an argv [`pr_action_argv`] built — the same value the gate judged,
+/// never a rebuild of it.
+pub fn run_pr_action(repo_path: &str, argv: &[String]) -> Result<String, String> {
+    let repo = validate_repo(repo_path)?;
+    if argv.first().map(String::as_str) != Some("gh") || argv.get(1).map(String::as_str) != Some("pr") {
+        return Err("Not a pull-request command".into());
+    }
+    if let Some(reason) = gh_unavailable_reason(&probe_gh_cli()) {
+        return Err(reason);
+    }
+    let refs: Vec<&str> = argv.iter().skip(1).map(String::as_str).collect();
+    let stdout =
+        run_command_in("gh", &refs, Duration::from_secs(120), Some(&repo)).map_err(bounded_error)?;
     Ok(String::from_utf8_lossy(&stdout).trim().to_string())
 }
 
@@ -2498,6 +2792,130 @@ mod tests {
             pr_checkout_argv(&remote, 7).unwrap(),
             vec!["gh", "pr", "checkout", "7", "--repo", "acme/gitpulse"]
         );
+    }
+
+    fn acme() -> GitHubRepoRef {
+        GitHubRepoRef {
+            host: "github.com".into(),
+            owner: "acme".into(),
+            name: "gitpulse".into(),
+        }
+    }
+
+    /// Each outward action renders to one exact argv. Create always passes
+    /// `--head` (so gh never pushes or forks) and merge always pins the head.
+    #[test]
+    fn pr_action_argv_renders_each_action_exactly() {
+        let create = PrAction::Create {
+            title: "  Add search ".into(),
+            body: "Body\nline".into(),
+            base: "main".into(),
+            draft: true,
+        };
+        assert_eq!(
+            pr_action_argv(&acme(), &create, Some("feat/search")).unwrap(),
+            [
+                "gh", "pr", "create", "--title", "Add search", "--body", "Body\nline", "--base",
+                "main", "--head", "feat/search", "--draft", "--repo", "acme/gitpulse"
+            ]
+        );
+        let review = PrAction::Review {
+            number: 12,
+            verdict: PrReviewVerdict::Approve,
+            body: String::new(),
+        };
+        assert_eq!(
+            pr_action_argv(&acme(), &review, None).unwrap(),
+            ["gh", "pr", "review", "12", "--approve", "--repo", "acme/gitpulse"]
+        );
+        let changes = PrAction::Review {
+            number: 12,
+            verdict: PrReviewVerdict::RequestChanges,
+            body: "-- not a flag".into(),
+        };
+        assert_eq!(
+            pr_action_argv(&acme(), &changes, None).unwrap(),
+            ["gh", "pr", "review", "12", "--request-changes", "--body", "-- not a flag", "--repo", "acme/gitpulse"]
+        );
+        let oid = "a".repeat(40);
+        let merge = PrAction::Merge {
+            number: 9,
+            method: PrMergeMethod::Squash,
+            delete_branch: true,
+            head_oid: oid.clone(),
+        };
+        assert_eq!(
+            pr_action_argv(&acme(), &merge, None).unwrap(),
+            [
+                "gh", "pr", "merge", "9", "--squash", "--match-head-commit", oid.as_str(),
+                "--delete-branch", "--repo", "acme/gitpulse"
+            ]
+        );
+    }
+
+    #[test]
+    fn pr_action_argv_refuses_what_would_prompt_or_mislead() {
+        let create = |title: &str, base: &str| PrAction::Create {
+            title: title.into(),
+            body: String::new(),
+            base: base.into(),
+            draft: false,
+        };
+        assert!(pr_action_argv(&acme(), &create("t", "main"), None).unwrap_err().contains("detached"));
+        assert!(pr_action_argv(&acme(), &create("", "main"), Some("f")).unwrap_err().contains("Pull request title"));
+        assert!(pr_action_argv(&acme(), &create("t\u{202E}", "main"), Some("f")).is_err());
+        assert!(pr_action_argv(&acme(), &create("t", "-evil"), Some("f")).is_err());
+        assert!(pr_action_argv(&acme(), &create("t", "main"), Some("main")).is_err());
+        let comment = PrAction::Review { number: 3, verdict: PrReviewVerdict::Comment, body: " ".into() };
+        assert!(pr_action_argv(&acme(), &comment, None).unwrap_err().contains("needs a body"));
+        let zero = PrAction::Review { number: 0, verdict: PrReviewVerdict::Approve, body: String::new() };
+        assert!(pr_action_argv(&acme(), &zero, None).is_err());
+        for head_oid in ["", "HEAD", &"g".repeat(40), &"a".repeat(39)] {
+            let merge = PrAction::Merge {
+                number: 1,
+                method: PrMergeMethod::Merge,
+                delete_branch: false,
+                head_oid: head_oid.to_string(),
+            };
+            assert!(pr_action_argv(&acme(), &merge, None).is_err(), "{head_oid:?}");
+        }
+        // The issue messages kept their wording through the generalization.
+        assert_eq!(validate_issue_payload("", "", &[]).unwrap_err(), "Issue title must not be empty");
+        assert!(run_pr_action("/nonexistent", &["gh".into(), "issue".into()]).is_err());
+    }
+
+    /// The action enum's wire shape is what the frontend sends.
+    #[test]
+    fn pr_action_deserializes_the_frontend_shape() {
+        let merge: PrAction = serde_json::from_str(
+            r#"{"kind":"merge","number":4,"method":"rebase","delete_branch":false,"head_oid":"abc"}"#,
+        )
+        .unwrap();
+        assert!(matches!(merge, PrAction::Merge { method: PrMergeMethod::Rebase, .. }));
+        let review: PrAction =
+            serde_json::from_str(r#"{"kind":"review","number":4,"verdict":"request_changes","body":"x"}"#).unwrap();
+        assert!(matches!(review, PrAction::Review { verdict: PrReviewVerdict::RequestChanges, .. }));
+    }
+
+    #[test]
+    fn parse_pr_view_reads_detail_and_caps_the_body_on_a_char_boundary() {
+        let body = format!("{}é", "x".repeat(PR_BODY_DISPLAY_BYTES - 1));
+        let json = serde_json::json!({
+            "number": 5, "title": "T", "state": "OPEN", "url": "https://github.com/acme/gitpulse/pull/5",
+            "isDraft": false, "author": {"login": "ada"}, "headRefName": "feat", "baseRefName": "main",
+            "headRefOid": "b".repeat(40), "body": body, "additions": 3, "deletions": 1, "changedFiles": 2,
+            "mergeable": "MERGEABLE", "mergeStateStatus": "CLEAN", "reviewDecision": null,
+            "statusCheckRollup": [{"conclusion": "SUCCESS", "status": "COMPLETED"}]
+        });
+        let detail = parse_pr_view(json.to_string().as_bytes()).unwrap();
+        assert_eq!(detail.author, "ada");
+        assert_eq!(detail.head_oid, "b".repeat(40));
+        assert_eq!((detail.additions, detail.deletions, detail.changed_files), (3, 1, 2));
+        assert_eq!(detail.merge_state, "CLEAN");
+        assert_eq!(detail.review_decision, "");
+        assert!(detail.body_truncated);
+        assert_eq!(detail.body.len(), PR_BODY_DISPLAY_BYTES - 1, "cut before the 2-byte é");
+        assert!(parse_pr_view(b"not json").is_err());
     }
 
     /// The matcher must trust exactly github.com, *.github.com and *.ghe.com.

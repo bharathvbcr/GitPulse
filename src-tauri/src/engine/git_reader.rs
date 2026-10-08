@@ -1601,6 +1601,27 @@ impl GitReader {
         Ok(entries)
     }
 
+    /// The branch HEAD is on, validated as a ref name; `None` when detached.
+    ///
+    /// Exit 1 is git's answer "HEAD is detached"; any other failure is a read
+    /// that did not happen and is an error, never reported as detached.
+    pub fn current_branch(repo_path: &str) -> Result<Option<String>, String> {
+        let repo = validate_repo(repo_path)?;
+        let run = git_cli::git_captured(&repo, &["symbolic-ref", "--quiet", "--short", "HEAD"])?;
+        match run.status_code {
+            0 => {
+                let name = String::from_utf8_lossy(&run.stdout).trim().to_string();
+                validate_ref_name(&name)?;
+                Ok(Some(name))
+            }
+            1 => Ok(None),
+            code => Err(format!(
+                "Could not read the current branch (git exited {code}): {}",
+                String::from_utf8_lossy(&run.stderr).trim()
+            )),
+        }
+    }
+
     /// Reads what a reset of HEAD's branch to `target` would take off it.
     ///
     /// Read-only and ungated: it answers the question the confirmation must
@@ -1618,22 +1639,7 @@ impl GitReader {
         };
         let target_oid = peel(target)?;
         let head = peel("HEAD")?;
-        // Exit 1 is git's answer "HEAD is detached"; any other failure is a
-        // read that did not happen and must not be reported as detached.
-        let symbolic = git_cli::git_captured(&repo, &["symbolic-ref", "--quiet", "--short", "HEAD"])?;
-        let branch = match symbolic.status_code {
-            0 => Some(String::from_utf8_lossy(&symbolic.stdout).trim().to_string()),
-            1 => None,
-            code => {
-                return Err(format!(
-                    "Could not read the current branch (git exited {code}): {}",
-                    String::from_utf8_lossy(&symbolic.stderr).trim()
-                ))
-            }
-        };
-        if let Some(name) = &branch {
-            validate_ref_name(name)?;
-        }
+        let branch = Self::current_branch(repo_path)?;
 
         let count = |args: &[&str]| -> Result<usize, String> {
             let text = git_text(&repo, args)?;
