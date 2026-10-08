@@ -1375,11 +1375,16 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
     internal = { ...internal, workspace: next };
   }
 
+  /**
+   * Writes one session in place. The map used to be copied on every write,
+   * one object spread over every open repository per change, which is
+   * quadratic over a restore of a large workspace. Nothing outside the store
+   * sees the map and nothing inside holds an old one across an await (every
+   * whole-map replacement below copies and assigns in one synchronous step),
+   * and a changed row is still detected by the session object, which is new.
+   */
   function putSession(session: RepoSession) {
-    internal = {
-      ...internal,
-      sessions: { ...internal.sessions, [session.id]: session },
-    };
+    internal.sessions[session.id] = session;
   }
 
   function activeSession(): RepoSession | undefined {
