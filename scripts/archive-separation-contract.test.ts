@@ -39,10 +39,18 @@ describe("the store the record describes", () => {
   });
 
   it("migrates every Done task into the archive, without spending a revision", () => {
-    expect(migration).toContain("'$.archived',json('true')");
-    expect(migration).toMatch(/WHERE status='done';/);
+    expect(migration).toContain("'$.archived',json(CASE WHEN status='done' THEN 'true' ELSE 'false' END)");
     expect(migration).not.toMatch(/SET\s+revision/);
     expect(record).toContain("migrates every Done task to archived");
+  });
+
+  // Every row, not only Done ones, so a task written before the upgrade reads
+  // in the same shape as one written after.
+  it("gives every row the new keys, as a schema 11 write would", () => {
+    const update = migration.slice(migration.indexOf("UPDATE work_items SET body=json_set(body,"), migration.indexOf("UPDATE work_meta"));
+    expect(update).not.toMatch(/\bWHERE status='done';/);
+    for (const key of ["$.archived", "$.completed_at", "$.checklist", "$.links"]) expect(update).toContain(`'${key}'`);
+    expect(record).toContain("gives **every other row** the same keys");
   });
 
   it("writes the new fields and never accepts the store-owned completion time", () => {
