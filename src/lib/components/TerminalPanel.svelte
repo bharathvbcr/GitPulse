@@ -596,6 +596,9 @@
    */
   function dropTab(id: string) {
     terminalLaunchRequests.forget(id);
+    // A tab closed before it took a slot no longer counts against the room
+    // this panel leaves for queued starts.
+    admitting.delete(id);
     focusTabStrip = false;
     const partner = splitIds?.includes(id) ? splitIds.find((other) => other !== id) ?? null : null;
     if (splitIds?.includes(id)) splitIds = null;

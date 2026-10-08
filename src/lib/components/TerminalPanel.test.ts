@@ -180,6 +180,10 @@ describe("TerminalPanel tab strip", () => {
     expect(opener.match(/consumeTaskTerminalRequest\(/g)).toHaveLength(1);
     const refuse = source.slice(source.indexOf("function refuseTab"), source.indexOf("function refuseTab") + 600);
     expect(refuse.indexOf("dropTab(id)")).toBeLessThan(refuse.indexOf("admitting.delete(id)"));
+    // A tab closed by hand before it took a slot must give its room back, or
+    // every such close shrinks this panel's room for queued starts for good.
+    const drop = source.slice(source.indexOf("function dropTab"), source.indexOf("function dropTab") + 400);
+    expect(drop).toContain("admitting.delete(id)");
   });
 
   it("routes chords through the shared parser rather than inline key tests", () => {
