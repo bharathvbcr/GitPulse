@@ -278,3 +278,32 @@ describe("FileTreePanel", () => {
     expect(source).toContain("max-h-[min(16rem,45%)]");
   });
 });
+
+describe("FileTreePanel rename and delete", () => {
+  const body = (name: string) => source.slice(source.indexOf(`async function ${name}`), source.indexOf("async function", source.indexOf(`async function ${name}`) + 1));
+
+  it("offers rename/move and delete for both files and folders", () => {
+    expect(source.match(/onclick=\{\(\) => movePath\(row\)\}/g)?.length).toBe(2);
+    expect(source.match(/onclick=\{\(\) => deletePath\(row\)\}/g)?.length).toBe(2);
+    expect(source).toContain("<span>Delete Folder…</span>");
+    expect(source).toContain("<span>Delete File…</span>");
+  });
+
+  it("moves through the one gated backend path and journals the verdict", () => {
+    const move = body("movePath");
+    expect(move).toContain('invoke<Guarded<null>>("cmd_move_path"');
+    expect(move).toContain("harnessStore.recordVerdict(result.policy, repo)");
+    expect(move).toContain("remapPath(selected, row.path, to)");
+  });
+
+  it("deletes only after a destructive confirmation that names what cannot be restored", () => {
+    const remove = body("deletePath");
+    const asked = remove.indexOf("await askConfirm(");
+    expect(asked).toBeGreaterThan(-1);
+    expect(remove).toContain("destructive: true");
+    expect(remove).toContain("describeDelete(");
+    expect(remove).toContain("if (!confirmed || repo !== $repoStore.currentPath) return;");
+    expect(remove.indexOf('"cmd_delete_path"')).toBeGreaterThan(asked);
+    expect(remove).toContain("outcome.left_behind");
+  });
+});

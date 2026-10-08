@@ -293,9 +293,9 @@ describe("annotated but unregistered commands", () => {
     ]);
     // Cross-checked three ways against the real crate: the generate_handler!
     // list, a raw attribute count, and this scanner all report the same total.
-    // 249 since cmd_reset_preview arrived; `bun run check:ipc` prints all three
+    // 251 since cmd_move_path and cmd_delete_path arrived; `bun run check:ipc` prints all three
     // numbers, so a bump made without re-running it will not agree.
-    expect(found.size).toBe(249);
+    expect(found.size).toBe(251);
     expect(found.has("cmd_repository_trust")).toBe(true);
     expect(found.has("cmd_grant_repository_trust")).toBe(true);
     expect(found.has("cmd_revoke_repository_trust")).toBe(true);

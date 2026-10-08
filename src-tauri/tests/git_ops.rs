@@ -1282,6 +1282,111 @@ fn test_get_status_copy_record_keeps_cursor_aligned() {
     assert_eq!(modified.status_code, "M ");
 }
 
+fn staged_names(repo: &TestRepo) -> String {
+    gitpulse_lib::engine::git_cli::git_text(repo.dir.path(), &["diff", "--cached", "--name-status", "-M"])
+        .unwrap()
+}
+
+/// The file tree's rename: tracked content moves with a staged `git mv`,
+/// untracked content with a plain rename, and the gate sees which one before
+/// anything moves — a refusal leaves the tree untouched.
+#[test]
+fn move_path_picks_git_mv_or_a_rename_and_gates_it_first() {
+    use gitpulse_lib::engine::git_writer::MovePlan;
+    let repo = TestRepo::init();
+    repo.write("src/a.txt", "a\n");
+    repo.commit_all("seed");
+    repo.write("src/untracked.txt", "u\n");
+    repo.write("loose.txt", "l\n");
+
+    let refused = GitWriter::move_path(&repo.path_str(), "src/a.txt", "src/b.txt", |_| {
+        Err("blocked by policy".into())
+    });
+    assert_eq!(refused.unwrap_err(), "blocked by policy");
+    assert!(repo.dir.path().join("src/a.txt").exists(), "a refusal moves nothing");
+
+    let mut seen = None;
+    let plan = GitWriter::move_path(&repo.path_str(), "src/a.txt", "lib/b.txt", |plan| {
+        seen = Some(plan.clone());
+        Ok(())
+    })
+    .expect("tracked move");
+    assert_eq!(Some(&plan), seen.as_ref());
+    assert_eq!(
+        plan,
+        MovePlan::Git { argv: ["git", "mv", "--", "src/a.txt", "lib/b.txt"].map(String::from).to_vec() }
+    );
+    assert!(staged_names(&repo).contains("R100\tsrc/a.txt\tlib/b.txt"), "{}", staged_names(&repo));
+
+    let plan = GitWriter::move_path(&repo.path_str(), "loose.txt", "dir/loose.txt", |_| Ok(()))
+        .expect("untracked move");
+    assert!(matches!(plan, MovePlan::Untracked { .. }));
+    assert_eq!(fs::read_to_string(repo.dir.path().join("dir/loose.txt")).unwrap(), "l\n");
+
+    for (from, to) in [
+        ("lib/b.txt", "dir/loose.txt"),
+        ("missing.txt", "x.txt"),
+        ("lib", "lib/inner"),
+        ("lib/b.txt", "../escape.txt"),
+        ("lib/b.txt", "lib/b.txt"),
+    ] {
+        assert!(
+            GitWriter::move_path(&repo.path_str(), from, to, |_| Ok(())).is_err(),
+            "{from} -> {to} must be refused"
+        );
+    }
+}
+
+/// The file tree's delete: tracked files leave with a staged `git rm`, the
+/// untracked ones with `git clean`, ignored files are never touched, and a
+/// file with unsaved-to-git changes refuses the whole delete.
+#[test]
+fn delete_path_removes_tracked_and_untracked_but_never_ignored() {
+    let repo = TestRepo::init();
+    repo.write(".gitignore", "*.log\n");
+    repo.write("dir/tracked.txt", "t\n");
+    repo.write("keep.txt", "k\n");
+    repo.commit_all("seed");
+    repo.write("dir/new.txt", "n\n");
+    repo.write("dir/build.log", "ignored\n");
+
+    let mut plans = Vec::new();
+    let refused = GitWriter::delete_path(&repo.path_str(), "dir", |plan| {
+        plans = plan.to_vec();
+        Err("blocked".into())
+    });
+    assert!(refused.is_err());
+    assert_eq!(
+        plans,
+        [
+            ["git", "rm", "-r", "-q", "--", ":(literal)dir"].map(String::from).to_vec(),
+            ["git", "clean", "-f", "-d", "-q", "--", ":(literal)dir"].map(String::from).to_vec(),
+        ]
+    );
+    assert!(repo.dir.path().join("dir/new.txt").exists(), "a refusal deletes nothing");
+
+    let outcome = GitWriter::delete_path(&repo.path_str(), "dir", |_| Ok(())).expect("delete dir");
+    assert_eq!((outcome.tracked_removed, outcome.untracked_removed), (1, 1));
+    assert!(outcome.left_behind, "the ignored log stays, and is reported");
+    assert!(repo.dir.path().join("dir/build.log").exists());
+    assert!(!repo.dir.path().join("dir/new.txt").exists());
+    assert!(staged_names(&repo).contains("D\tdir/tracked.txt"));
+
+    repo.write("keep.txt", "edited\n");
+    let modified = GitWriter::delete_path(&repo.path_str(), "keep.txt", |_| Ok(()));
+    assert!(modified.is_err(), "git rm refuses a file with local changes");
+    assert_eq!(fs::read_to_string(repo.dir.path().join("keep.txt")).unwrap(), "edited\n");
+
+    repo.write("scratch.txt", "s\n");
+    let untracked = GitWriter::delete_path(&repo.path_str(), "scratch.txt", |_| Ok(())).expect("untracked");
+    assert_eq!((untracked.tracked_removed, untracked.untracked_removed, untracked.left_behind), (0, 1, false));
+
+    assert!(GitWriter::delete_path(&repo.path_str(), "dir", |_| Ok(())).is_err(), "only ignored files left");
+    for bad in ["", ".", "../x", "nope.txt"] {
+        assert!(GitWriter::delete_path(&repo.path_str(), bad, |_| Ok(())).is_err(), "{bad:?}");
+    }
+}
+
 /// The reset preview names the commits a rewind takes off the branch, says
 /// how many no other ref still reaches, and refuses to call a failed read
 /// "detached".

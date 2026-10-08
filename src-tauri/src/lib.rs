@@ -453,6 +453,8 @@ pub fn run() {
             cmd_docs_backlinks,
             cmd_docs_graph,
             cmd_docs_rename,
+            cmd_move_path,
+            cmd_delete_path,
             cmd_mcp_info,
             cmd_external_tools_status,
             cmd_external_tool_install,

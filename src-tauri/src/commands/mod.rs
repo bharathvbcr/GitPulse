@@ -4795,13 +4795,85 @@ pub async fn cmd_docs_rename(
     to: String,
 ) -> Result<Guarded<crate::docs::DocRenameOutcome>, String> {
     off_thread(move || {
-        let argv = ["git", "mv", "--", from.as_str(), to.as_str()];
-        let policy = guard(&repo_path, &argv)?;
-        let outcome = crate::docs::rename_doc(&repo_path, &from, &to)?;
+        let mut policy = None;
+        let outcome = crate::docs::rename_doc(&repo_path, &from, &to, |plan| {
+            policy = Some(guard_move(&repo_path, plan)?);
+            Ok(())
+        })?;
+        let policy = policy.ok_or("Doc rename did not produce a verdict")?;
         Ok(Guarded {
             policy,
             output: outcome,
         })
+    })
+    .await
+}
+
+/// Judges what [`GitWriter::move_path`] is about to do: the `git mv` line it
+/// will run, or — for an untracked source, where no git command applies —
+/// the delete of the source and the write of the destination.
+fn guard_move(
+    repo_path: &str,
+    plan: &crate::engine::git_writer::MovePlan,
+) -> Result<crate::harness::PolicyVerdict, String> {
+    use crate::engine::git_writer::MovePlan;
+    match plan {
+        MovePlan::Git { argv } => {
+            let refs: Vec<&str> = argv.iter().map(String::as_str).collect();
+            guard(repo_path, &refs)
+        }
+        MovePlan::Untracked { from, to } => {
+            crate::engine::git_cli::mark_user_action(repo_path);
+            let source = crate::harness::guard_file(repo_path, from, "delete")?;
+            let destination = crate::harness::guard_file(repo_path, to, "modify")?;
+            Ok(strictest_verdict(source, destination))
+        }
+    }
+}
+
+/// Renames or moves a file or directory from the file tree. Tracked content
+/// moves with `git mv` (staged); untracked content with a filesystem rename.
+#[tauri::command(async)]
+pub async fn cmd_move_path(
+    repo_path: String,
+    from: String,
+    to: String,
+) -> Result<Guarded<()>, String> {
+    off_thread(move || {
+        let mut policy = None;
+        GitWriter::move_path(&repo_path, &from, &to, |plan| {
+            policy = Some(guard_move(&repo_path, plan)?);
+            Ok(())
+        })?;
+        let policy = policy.ok_or("Move did not produce a verdict")?;
+        Ok(Guarded { policy, output: () })
+    })
+    .await
+}
+
+/// Deletes a file or directory from the file tree: `git rm -r` for tracked
+/// content, `git clean -f -d` for untracked content, every line judged before
+/// the first runs. The frontend confirms first; this does not second-guess.
+#[tauri::command(async)]
+pub async fn cmd_delete_path(
+    repo_path: String,
+    path: String,
+) -> Result<Guarded<crate::engine::git_writer::DeleteOutcome>, String> {
+    off_thread(move || {
+        let mut policy: Option<crate::harness::PolicyVerdict> = None;
+        let output = GitWriter::delete_path(&repo_path, &path, |plan| {
+            for argv in plan {
+                let refs: Vec<&str> = argv.iter().map(String::as_str).collect();
+                let verdict = guard(&repo_path, &refs)?;
+                policy = Some(match policy.take() {
+                    Some(previous) => strictest_verdict(previous, verdict),
+                    None => verdict,
+                });
+            }
+            Ok(())
+        })?;
+        let policy = policy.ok_or("Delete did not produce a verdict")?;
+        Ok(Guarded { policy, output })
     })
     .await
 }

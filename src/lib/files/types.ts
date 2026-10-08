@@ -22,6 +22,17 @@ export interface BlameLine {
   previous_path?: string;
 }
 
+/** What a file-tree delete removed (Rust `git_writer::DeleteOutcome`). */
+export interface DeleteOutcome {
+  path: string;
+  /** Removed with `git rm` — restorable from HEAD until committed. */
+  tracked_removed: number;
+  /** Removed with `git clean` — not recoverable from git. */
+  untracked_removed: number;
+  /** Ignored files or a nested repository are still on disk at `path`. */
+  left_behind: boolean;
+}
+
 /**
  * A text file's line-ending style (Rust `text_shape::LineEnding`). `mixed`
  * includes any lone CR: the editor's textarea turns all of them into LF, so
