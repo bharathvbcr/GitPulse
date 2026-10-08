@@ -67,6 +67,10 @@
   let pendingDelete = $state<{ id: string; request_id: string; expected_revision: number } | null>(null);
   let dirty = $state(false);
   let enhancementBusy = $state(false);
+  /** Unsaved edits to a suggestion; also part of `enhancementBusy` (see `onEditing`). */
+  let suggestionEditing = $state(false);
+  /** Busy for a reason only waiting can end: a model run or an unconfirmed result. */
+  const enhancementWorking = $derived(enhancementBusy && !suggestionEditing);
   let copying = $state(false);
   let extras = $state<Repository[]>([]);
   let adding = $state(false);
@@ -220,16 +224,30 @@
     } catch (cause) { error = explainError(cause); }
     finally { adding = false; }
   }
+  /**
+   * Whether the task may be left, asking first when leaving would lose edits.
+   *
+   * Every board route that replaces this sheet comes through here. Edits to
+   * a suggestion count as edits: they used to make this answer a silent
+   * `false` (they hold `enhancementBusy`), so the board ignored the click and
+   * nothing on screen said why. A model run still refuses — waiting is the
+   * only way out — but it now says so.
+   */
   export async function canLeave(): Promise<boolean> {
-    if (saving || adding || reloading || confirming || enhancementBusy) return false;
+    if (saving || adding || reloading || confirming) return false;
+    if (enhancementWorking) { shortcutBlocked = `Wait for ${assistName} to finish before leaving this task.`; return false; }
     if (pending || pendingDelete) { error = "Retry the pending action before closing this task."; return false; }
-    if (!dirty && !notes.trim()) return true;
+    const edited = dirty || Boolean(notes.trim());
+    if (!edited && !suggestionEditing) return true;
     confirming = true;
-    try { return await askConfirm({title:"Discard task edits?",message:"Your unsaved changes will be lost.",confirmLabel:"Discard edits",cancelLabel:"Keep editing",destructive:true}); }
+    try {
+      return await askConfirm(suggestionEditing && !edited
+        ? {title:"Discard suggestion edits?",message:`Your edits to the ${assistName} suggestion have not been saved and will be lost.`,confirmLabel:"Discard edits",cancelLabel:"Keep editing",destructive:true}
+        : {title:"Discard task edits?",message:suggestionEditing ? `Your unsaved changes, including your edits to the ${assistName} suggestion, will be lost.` : "Your unsaved changes will be lost.",confirmLabel:"Discard edits",cancelLabel:"Keep editing",destructive:true});
+    }
     finally { confirming = false; }
   }
   async function close() {
-    if (enhancementBusy) { shortcutBlocked = `Wait for ${assistName} to finish before closing.`; return; }
     if (await canLeave()) onClose();
   }
   function membership(id: string, checked: boolean) {
@@ -464,7 +482,6 @@
     if (!active || !(e.target instanceof Node) || !owns(e.target)) return;
     if (e.key === "Escape") {
       e.preventDefault();
-      if (enhancementBusy) { shortcutBlocked = `Wait for ${assistName} to finish before closing.`; return; }
       void close();
       return;
     }
@@ -489,7 +506,7 @@
       <button type="button" class="gp-btn" onclick={() => void copyForAgent()} disabled={!copyable || copying || saving || enhancementBusy || pending !== null} aria-label="Copy task for an AI agent" title={copyable ? "Copy a packet an AI agent can paste" : "Add a title, description, notes, or logs first"}>
         <Clipboard size={12} /> {copying ? "Copying…" : copied ? "Copied" : "Copy for agent"}
       </button>
-      <button type="button" class="gp-icon-btn" onclick={close} disabled={enhancementBusy || saving || adding || reloading || confirming || pending !== null || pendingDelete !== null} aria-label="Close task details">✕</button>
+      <button type="button" class="gp-icon-btn" onclick={close} disabled={enhancementWorking || saving || adding || reloading || confirming || pending !== null || pendingDelete !== null} aria-label="Close task details">✕</button>
     </div>
   </header>
   {#if tabs.length > 1}
@@ -635,6 +652,7 @@
                     prepareTask={prepareForManvi}
                     onApplied={applied}
                     onBusy={(busy) => { enhancementBusy = busy; }}
+                    onEditing={(editing) => { suggestionEditing = editing; }}
                     onFlash={(fields) => { flash = fields; }}
                     onReview={(ready) => { reviewable = ready; }}
                     onEngine={(name) => { assistName = name; }}
