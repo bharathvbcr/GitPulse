@@ -135,11 +135,7 @@ export function menuStateProblem(state: MenuState): string | null {
     state.enabled.length > MENU_LIMITS.enabled ||
     state.checked.length > MENU_LIMITS.checked ||
     state.labels.length > MENU_LIMITS.labels ||
-    state.repositories.length > MENU_LIMITS.repositories ||
-    !Number.isInteger(state.repositoriesHidden) ||
-    state.repositoriesHidden < 0 ||
-    state.repositoriesHidden > MENU_LIMITS.count ||
-    (state.repositoriesHidden > 0 && state.repositories.length < MENU_LIMITS.repositories)
+    state.repositories.length > MENU_LIMITS.repositories
   ) {
     return "Native menu state exceeds its entry limit";
   }
@@ -310,7 +306,6 @@ export function sendableMenuState(state: MenuState): { state: MenuState; problem
       .slice(0, MENU_LIMITS.checked),
     labels,
     repositories: [],
-    repositoriesHidden: 0,
     activePath: null,
     trayDetails: state.trayDetails
       .slice(0, MENU_LIMITS.trayDetails)
@@ -367,7 +362,6 @@ export function fallbackMenuState(state: MenuState): MenuState {
     checked: [],
     labels: [],
     repositories: [],
-    repositoriesHidden: 0,
     activePath: null,
     showStatusIcon: state.showStatusIcon,
     hideDockWhenClosed: state.hideDockWhenClosed,

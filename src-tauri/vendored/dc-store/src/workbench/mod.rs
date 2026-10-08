@@ -8,6 +8,7 @@ mod briefs;
 mod decisions;
 mod enhancements;
 mod input;
+mod items;
 mod notifications;
 mod runs;
 
@@ -132,6 +133,7 @@ impl Store {
                 | "repositories.relink"
                 | "items.put"
                 | "items.delete"
+                | "items.restore"
                 | "enhancements.create"
                 | "enhancements.complete"
                 | "enhancements.accept"
@@ -354,7 +356,19 @@ fn ensure_schema(conn: &Connection) -> Result<()> {
         }
         tx.commit()?;
     }
-    if version != 10 {
+    if version == 10 {
+        let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+        version = conn.query_row("SELECT version FROM work_meta WHERE id=1", [], |r| r.get(0))?;
+        if version == 10 {
+            // Archive, completion time, checklists and task links. A host that
+            // builds a task body without them would unarchive and unlink every
+            // task it saves, so older hosts must refuse this profile.
+            conn.execute_batch(include_str!("items.sql"))?;
+            version = 11;
+        }
+        tx.commit()?;
+    }
+    if version != 11 {
         return Err(Error {
             code: "schema_unsupported",
             message: format!("workbench schema {version} is not supported"),
@@ -425,6 +439,14 @@ fn mutate(input: &Input<'_>, method: &str, now: i64, now_ms: i64) -> Result<Stri
     }
     let id = input.id("id")?;
     let expected = input.integer("expected_revision", None, MAX_INTEGER)?;
+    // A restore is checked against the deleted row's revision, which is the
+    // one the caller read from history; every other write against the live row.
+    let live = if method == "items.restore" {
+        items::refuse_live_restore(input.conn, &id)?;
+        "deleted=1"
+    } else {
+        ""
+    };
     let entity = match method {
         "workspaces.put" | "workspaces.delete" => Entity::Workspace,
         "repositories.put" | "repositories.relink" => Entity::Repository,
@@ -457,7 +479,7 @@ fn mutate(input: &Input<'_>, method: &str, now: i64, now_ms: i64) -> Result<Stri
             &format!(
                 "SELECT revision FROM {} WHERE id=?1 AND {}",
                 entity.table(),
-                entity.live()
+                if live.is_empty() { entity.live() } else { live }
             ),
             [&id],
             |r| r.get(0),
@@ -507,6 +529,10 @@ fn mutate(input: &Input<'_>, method: &str, now: i64, now_ms: i64) -> Result<Stri
         }
         "items.put" => {
             put_item(input, &id, revision, now, now_ms)?;
+            Affected::none()
+        }
+        "items.restore" => {
+            items::restore(input, &id, revision, now)?;
             Affected::none()
         }
         "automation.put" => {
@@ -807,6 +833,9 @@ fn put_item(input: &Input<'_>, id: &str, revision: i64, now: i64, now_ms: i64) -
         "position",
         "locked_fields",
         "logs",
+        "archived",
+        "checklist",
+        "links",
     ])?;
     enhancements::fields(input, "locked_fields", false)?;
     input.text("logs", input::MAX_LOGS_BYTES)?;
@@ -867,8 +896,11 @@ fn put_item(input: &Input<'_>, id: &str, revision: i64, now: i64, now_ms: i64) -
         |r| r.get(0),
     )?;
     if deleted {
-        return Err(Error::invalid("deleted task IDs cannot be reused"));
+        return Err(Error::invalid(
+            "deleted task IDs cannot be reused; restore the task instead",
+        ));
     }
+    let (body, links) = items::apply(input, id, &status, body, now)?;
     let text_changed: bool = input.conn.query_row(
         "SELECT NOT EXISTS(SELECT 1 FROM work_items WHERE id=?1 AND title=?2 AND description=?3)",
         params![id, title, description],
@@ -876,6 +908,9 @@ fn put_item(input: &Input<'_>, id: &str, revision: i64, now: i64, now_ms: i64) -
     )?;
     input.conn.execute("INSERT INTO work_items(id,revision,body,home_workspace_id,primary_repository_id) VALUES(?1,?2,?3,?4,?5) ON CONFLICT(id) DO UPDATE SET revision=excluded.revision,body=excluded.body,home_workspace_id=excluded.home_workspace_id,primary_repository_id=excluded.primary_repository_id",params![id,revision,body,home,primary])?;
     replace_links(input.conn, "work_item_repositories", "item_id", id, &ids)?;
+    if let Some(links) = &links {
+        items::replace_links(input.conn, id, links)?;
+    }
     automation::after_save(input, id, &body, text_changed, now_ms)?;
     Ok(())
 }
@@ -1001,13 +1036,68 @@ struct Page {
     position: i64,
     id: String,
 }
+
+/// The order a task list is read in. Each has its own cursor prefix, so a
+/// cursor from one order is refused by the other instead of resuming at a
+/// position that means something else there.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Order {
+    /// Board order: `position`, then id, ascending. Cursor `1:`.
+    Board,
+    /// Most recently completed first: `completed_at` (0 for a task not
+    /// Done), then id, both descending. Cursor `2:`.
+    Completed,
+    /// Most recently changed first: `updated_at`, then id, both descending.
+    /// For deleted tasks that is when they were deleted. Cursor `3:`. Not
+    /// indexed: it is meant for the deleted list, not a whole board.
+    Updated,
+}
+impl Order {
+    fn cursor(self) -> u8 {
+        match self {
+            Self::Board => 1,
+            Self::Completed => 2,
+            Self::Updated => 3,
+        }
+    }
+    /// The task column the page is keyed and ordered on.
+    fn key(self) -> &'static str {
+        match self {
+            Self::Board => "t.position",
+            Self::Completed => "t.completed_at",
+            Self::Updated => "coalesce(json_extract(t.body,'$.updated_at'),0)",
+        }
+    }
+    /// How a row compares with the cursor to come after it.
+    fn after(self) -> &'static str {
+        match self {
+            Self::Board => ">",
+            Self::Completed | Self::Updated => "<",
+        }
+    }
+    fn direction(self) -> &'static str {
+        match self {
+            Self::Board => "",
+            Self::Completed | Self::Updated => " DESC",
+        }
+    }
+}
+
 fn page(input: &Input<'_>) -> Result<Page> {
+    page_in(input, Order::Board)
+}
+
+fn page_in(input: &Input<'_>, order: Order) -> Result<Page> {
     let limit = input.integer("limit", Some(100), 200)?;
     if limit == 0 {
         return Err(Error::invalid("limit must be at least one"));
     }
     let (position, id) = if let Some(cursor) = input.text("cursor", 180)? {
-        let Some((position, id)) = cursor.strip_prefix("1:").and_then(|c| c.split_once(':')) else {
+        let prefix = format!("{}:", order.cursor());
+        let Some((position, id)) = cursor
+            .strip_prefix(prefix.as_str())
+            .and_then(|c| c.split_once(':'))
+        else {
             return Err(Error::invalid("invalid cursor"));
         };
         let position = position
@@ -1023,6 +1113,10 @@ fn page(input: &Input<'_>) -> Result<Page> {
             return Err(Error::invalid("invalid cursor"));
         }
         (position, id.to_string())
+    } else if order != Order::Board {
+        // Descending: start above every key. Ids are ASCII, so DEL sorts
+        // after every one of them.
+        (MAX_INTEGER, "\u{7f}".into())
     } else {
         (0, String::new())
     };
@@ -1084,11 +1178,15 @@ fn collect_page_with(
 }
 
 fn page_response(conn: &Connection, page: PageRows, total: i64) -> Result<String> {
+    page_response_in(conn, page, total, Order::Board)
+}
+
+fn page_response_in(conn: &Connection, page: PageRows, total: i64, order: Order) -> Result<String> {
     let PageRows { records, has_more } = page;
     let cursor = if has_more {
         records
             .last()
-            .map(|(_, position, id)| format!("1:{position}:{id}"))
+            .map(|(_, position, id)| format!("{}:{position}:{id}", order.cursor()))
     } else {
         None
     };
@@ -1179,8 +1277,26 @@ fn list_items(input: &Input<'_>) -> Result<String> {
         "repository_id",
         "status",
         "query",
+        "archived",
+        "order",
+        "deleted",
     ])?;
-    let p = page(input)?;
+    let order = match input.text("order", 32)?.as_deref() {
+        None | Some("board") => Order::Board,
+        Some("completed") => Order::Completed,
+        Some("updated") => Order::Updated,
+        Some(_) => {
+            return Err(Error::invalid("order must be board, completed or updated"));
+        }
+    };
+    let p = page_in(input, order)?;
+    // None reads both; the archive and the board each name the side they show.
+    let archived = match input.kind("archived")?.as_deref() {
+        None | Some("null") => None,
+        Some(_) => Some(input.boolean("archived", false)?),
+    };
+    // Deleted tasks instead of live ones: what a restore is chosen from.
+    let deleted = input.boolean("deleted", false)?;
     let workspace = input.optional_id("workspace_id")?;
     let repo = input.optional_id("repository_id")?;
     if workspace.is_some() && repo.is_some() {
@@ -1210,18 +1326,25 @@ fn list_items(input: &Input<'_>) -> Result<String> {
             tokens.join(" AND ")
         }
     });
+    let filter = ItemFilter {
+        status: status.as_deref(),
+        archived,
+        deleted,
+    };
     let (query, values) = item_query(
         workspace.as_deref(),
         repo.as_deref(),
-        status.as_deref(),
+        filter,
         fts.as_deref(),
         false,
     );
     if workspace.is_some() || (repo.is_some() && fts.is_some()) {
-        return list_scoped_items(input, &query, values, p);
+        return list_scoped_items(input, &query, values, p, order);
     }
     let total = match fts.as_deref() {
-        Some(fts) if repo.is_none() && status.is_none() => global_search_total(input.conn, fts)?,
+        Some(fts) if repo.is_none() && status.is_none() && archived.is_none() && !deleted => {
+            global_search_total(input.conn, fts)?
+        }
         _ => input.conn.query_row(
             &format!("SELECT count(*) {query}"),
             rusqlite::params_from_iter(values.iter()),
@@ -1234,7 +1357,7 @@ fn list_items(input: &Input<'_>) -> Result<String> {
     // ordered candidate is substantially slower, especially for absent hits.
     let (query, mut values) =
         if fts.is_some() && workspace.is_none() && repo.is_none() && total > 200 {
-            item_query(None, None, status.as_deref(), fts.as_deref(), true)
+            item_query(None, None, filter, fts.as_deref(), true)
         } else {
             (query, values)
         };
@@ -1243,13 +1366,14 @@ fn list_items(input: &Input<'_>) -> Result<String> {
     // FTS and membership candidates may arrive in reverse board order, causing
     // a top-N sorter to replace every candidate. The materialization fence
     // prevents discarded candidates from paying JSON projection costs.
+    let (key, after, dir) = (order.key(), order.after(), order.direction());
     let mut stmt = input.conn.prepare(&format!(
         "WITH page AS MATERIALIZED (
-            SELECT t.rowid AS item_rowid,t.position,t.id {query}
-            AND (t.position,t.id)>(?{},?{}) ORDER BY t.position,t.id LIMIT ?{}
-        ) SELECT json_remove(t.body,'$.description','$.acceptance_criteria','$.logs'),page.position,page.id
+            SELECT t.rowid AS item_rowid,{key} AS position,t.id {query}
+            AND ({key},t.id){after}(?{},?{}) ORDER BY {key}{dir},t.id{dir} LIMIT ?{}
+        ) SELECT json_remove(t.body,{CARD_OMITS}),page.position,page.id
           FROM page CROSS JOIN work_items t ON t.rowid=page.item_rowid
-          ORDER BY page.position,page.id",
+          ORDER BY page.position{dir},page.id{dir}",
         bound + 1,
         bound + 2,
         bound + 3
@@ -1263,7 +1387,19 @@ fn list_items(input: &Input<'_>) -> Result<String> {
         &mut stmt.query(rusqlite::params_from_iter(values.iter()))?,
         p.limit,
     )?;
-    page_response(input.conn, rows, total)
+    page_response_in(input.conn, rows, total, order)
+}
+
+/// Body fields a card leaves out: read in full with `items.get`.
+const CARD_OMITS: &str = "'$.description','$.acceptance_criteria','$.logs','$.checklist','$.links'";
+
+/// The filters a task list applies besides its scope and search.
+#[derive(Clone, Copy)]
+struct ItemFilter<'a> {
+    status: Option<&'a str>,
+    archived: Option<bool>,
+    /// Read deleted tasks instead of live ones.
+    deleted: bool,
 }
 
 /// Live tasks matching an unscoped, unfiltered search.
@@ -1305,18 +1441,20 @@ fn list_scoped_items(
     query: &str,
     values: Vec<rusqlite::types::Value>,
     p: Page,
+    order: Order,
 ) -> Result<String> {
     let bound = values.len();
+    let (key, after, dir) = (order.key(), order.after(), order.direction());
     let mut stmt = input.conn.prepare(&format!(
         "WITH candidates AS MATERIALIZED (
-            SELECT t.rowid AS item_rowid,t.position,t.id {query}
+            SELECT t.rowid AS item_rowid,{key} AS position,t.id {query}
         ), page AS MATERIALIZED (
             SELECT item_rowid,position,id FROM candidates
-            WHERE (position,id)>(?{},?{}) ORDER BY position,id LIMIT ?{}
-        ) SELECT json_remove(t.body,'$.description','$.acceptance_criteria','$.logs'),page.position,page.id,
+            WHERE (position,id){after}(?{},?{}) ORDER BY position{dir},id{dir} LIMIT ?{}
+        ) SELECT json_remove(t.body,{CARD_OMITS}),page.position,page.id,
                  (SELECT count(*) FROM candidates)
           FROM page CROSS JOIN work_items t ON t.rowid=page.item_rowid
-          ORDER BY page.position,page.id",
+          ORDER BY page.position{dir},page.id{dir}",
         bound + 1,
         bound + 2,
         bound + 3
@@ -1348,7 +1486,7 @@ fn list_scoped_items(
             |r| r.get(0),
         )?,
     };
-    page_response(input.conn, rows, total)
+    page_response_in(input.conn, rows, total, order)
 }
 
 // One query owner supplies both total and page selection. Tests measure the
@@ -1356,7 +1494,7 @@ fn list_scoped_items(
 fn item_query(
     workspace: Option<&str>,
     repo: Option<&str>,
-    status: Option<&str>,
+    filter: ItemFilter<'_>,
     fts: Option<&str>,
     ordered_search: bool,
 ) -> (String, Vec<rusqlite::types::Value>) {
@@ -1365,14 +1503,16 @@ fn item_query(
         values.push(rusqlite::types::Value::Text(value.into()));
         format!("?{}", values.len())
     };
-    let mut filters = vec!["t.deleted=0".to_string()];
+    // A literal: one of two program constants, which keeps the board index usable.
+    let deleted = i64::from(filter.deleted);
+    let mut filters = vec![format!("t.deleted={deleted}")];
     let source = if let Some(workspace) = workspace {
         let parameter = bind(workspace);
         // UNION deduplicates home membership and every matching linked repo.
         // CROSS JOIN keeps indexed members as the outer loop: an absent or
         // small workspace must not walk the entire profile's live tasks.
         format!(
-            "(SELECT id FROM work_items WHERE home_workspace_id={parameter} AND deleted=0 UNION SELECT ir.item_id FROM work_workspace_repositories wr CROSS JOIN work_item_repositories ir ON ir.repository_id=wr.repository_id WHERE wr.workspace_id={parameter}) selected CROSS JOIN work_items t ON t.id=selected.id"
+            "(SELECT id FROM work_items WHERE home_workspace_id={parameter} AND deleted={deleted} UNION SELECT ir.item_id FROM work_workspace_repositories wr CROSS JOIN work_item_repositories ir ON ir.repository_id=wr.repository_id WHERE wr.workspace_id={parameter}) selected CROSS JOIN work_items t ON t.id=selected.id"
         )
     } else if let Some(repo) = repo {
         filters.push(format!("selected.repository_id={}", bind(repo)));
@@ -1382,8 +1522,13 @@ fn item_query(
     } else {
         "work_items t".into()
     };
-    if let Some(status) = status {
+    if let Some(status) = filter.status {
         filters.push(format!("t.status={}", bind(status)));
+    }
+    if let Some(archived) = filter.archived {
+        // A literal, not a parameter: it is one of two program constants, and
+        // the planner can then use the archive index for it.
+        filters.push(format!("t.archived={}", i64::from(archived)));
     }
     if let Some(fts) = fts {
         let parameter = bind(fts);

@@ -40,6 +40,18 @@ import {
   type TaskDensity,
 } from "../ui/taskView";
 import type { TaskStatus } from "../workbench/vocabulary";
+import {
+  deleteView,
+  isSwimlane,
+  sanitizeBoards,
+  saveView,
+  setWipLimit,
+  type BoardPrefs,
+  type SaveViewResult,
+  type SavedTaskView,
+  type Swimlane,
+  type TaskViewSnapshot,
+} from "../ui/taskBoardViews";
 import { defaultHandoff, reconcileHandoff, sanitizeHandoff, type HandoffSettings } from "../workbench/taskHandoff";
 import type { CodePercentageMode } from "../language/barStats";
 
@@ -176,6 +188,17 @@ export interface InterfacePrefs {
    * a card without them cannot be read or triaged at a glance.
    */
   taskCardFields: TaskCardField[];
+  /**
+   * How the Tasks board groups cards into lanes. Saved with a view, like the
+   * layout; `effectiveSwimlane` decides what the current layout can draw.
+   */
+  taskSwimlane: Swimlane;
+  /**
+   * Saved views and work-in-progress limits, per board (`boardKey`): the
+   * global board, each workspace's and each repository's. Bounded and
+   * sanitized by `sanitizeBoards`.
+   */
+  taskBoards: Record<string, BoardPrefs>;
   /** Whether the scope navigator lists archived workspaces. */
   taskShowArchivedWorkspaces: boolean;
   /**
@@ -297,6 +320,8 @@ const DEFAULTS: InterfacePrefs = {
   taskDensity: "comfortable",
   taskHiddenColumns: [],
   taskCardFields: [...DEFAULT_TASK_CARD_FIELDS],
+  taskSwimlane: "none",
+  taskBoards: {},
   taskShowArchivedWorkspaces: true,
   taskQuickAddAssist: false,
   taskHandoff: defaultHandoff(),
@@ -325,6 +350,7 @@ function freshDefaults(): InterfacePrefs {
     agentsHiddenColumns: [...DEFAULTS.agentsHiddenColumns],
     taskHiddenColumns: [...DEFAULTS.taskHiddenColumns],
     taskCardFields: [...DEFAULTS.taskCardFields],
+    taskBoards: {},
     taskHandoff: { ...DEFAULTS.taskHandoff },
     seenCoachMarks: { ...DEFAULTS.seenCoachMarks },
   };
@@ -439,6 +465,8 @@ function readPrefs(): InterfacePrefs {
       // return a board with no columns or a card shape the board cannot draw.
       taskHiddenColumns: sanitizeHiddenStatuses(parsed.taskHiddenColumns),
       taskCardFields: sanitizeCardFields(parsed.taskCardFields),
+      taskSwimlane: isSwimlane(parsed.taskSwimlane) ? parsed.taskSwimlane : DEFAULTS.taskSwimlane,
+      taskBoards: sanitizeBoards(parsed.taskBoards),
       taskShowArchivedWorkspaces: bool(
         parsed.taskShowArchivedWorkspaces,
         DEFAULTS.taskShowArchivedWorkspaces,
@@ -617,6 +645,33 @@ function createInterfaceStore() {
             : [...prefs.taskCardFields, field],
         ),
       })),
+    setTaskSwimlane: (lane: Swimlane) => patch({ taskSwimlane: isSwimlane(lane) ? lane : "none" }),
+    /** A column's work-in-progress limit on one board; null removes it. */
+    setTaskWipLimit: (board: string, status: TaskStatus, limit: number | null) =>
+      patch((prefs) => ({ taskBoards: setWipLimit(prefs.taskBoards, board, status, limit) })),
+    /**
+     * Save the board's current view under a name, or replace the view of
+     * that name. The result says what happened, including a refusal.
+     */
+    saveTaskView: (board: string, name: string, snapshot: TaskViewSnapshot, newId: () => string): SaveViewResult => {
+      let result: SaveViewResult = { ok: false, reason: "The view was not saved." };
+      patch((prefs) => {
+        result = saveView(prefs.taskBoards, board, name, snapshot, newId);
+        return result.ok ? { taskBoards: result.boards } : {};
+      });
+      return result;
+    },
+    deleteTaskView: (board: string, id: string) =>
+      patch((prefs) => ({ taskBoards: deleteView(prefs.taskBoards, board, id) })),
+    /** Put a saved view's layout preferences back; the board restores its own filters. */
+    applyTaskView: (view: SavedTaskView) =>
+      patch({
+        taskLayout: view.layout,
+        taskDensity: view.density,
+        taskSwimlane: view.swimlane,
+        taskHiddenColumns: [...view.hiddenColumns],
+        taskCardFields: [...view.cardFields],
+      }),
     setTaskShowArchivedWorkspaces: (show: boolean) => patch({ taskShowArchivedWorkspaces: show }),
     setTaskQuickAddAssist: (assist: boolean) => patch({ taskQuickAddAssist: assist }),
     /**
@@ -635,6 +690,9 @@ function createInterfaceStore() {
         taskDensity: DEFAULTS.taskDensity,
         taskHiddenColumns: [],
         taskCardFields: [...DEFAULT_TASK_CARD_FIELDS],
+        // Saved views and limits are the reader's records, not a view
+        // setting, so resetting the view keeps them.
+        taskSwimlane: DEFAULTS.taskSwimlane,
         taskShowArchivedWorkspaces: DEFAULTS.taskShowArchivedWorkspaces,
         taskQuickAddAssist: DEFAULTS.taskQuickAddAssist,
         taskHandoff: defaultHandoff(),

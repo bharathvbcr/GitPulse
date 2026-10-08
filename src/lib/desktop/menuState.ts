@@ -73,8 +73,6 @@ export interface MenuState {
   checked: string[];
   labels: MenuLabel[];
   repositories: MenuRepository[];
-  /** Open repositories past the switcher's limit, so the menu says it left some out. */
-  repositoriesHidden: number;
   activePath: string | null;
   showStatusIcon: boolean;
   hideDockWhenClosed: boolean;
@@ -290,7 +288,7 @@ export function buildMenuState(
     repo.openTabs.find((tab) => tab.isActive) ??
     repo.openTabs.find((tab) => sameRepo(tab.path, repo.currentPath ?? "", options)) ??
     null;
-  const listed: { tab: (typeof repo.openTabs)[number]; path: string }[] = [];
+  const repositories: MenuRepository[] = [];
   const switcherPaths = new Set<string>();
   for (const tab of repo.openTabs) {
     const path = switcherPath(tab.path);
@@ -298,31 +296,18 @@ export function buildMenuState(
     // made two rows distinct is gone by the time the payload is built, so the
     // second row could never be activated anyway.
     if (path === null || switcherPaths.has(path)) continue;
+    if (repositories.length >= MENU_LIMITS.repositories) break;
     switcherPaths.add(path);
-    listed.push({ tab, path });
-  }
-  // More repositories can be open than the switcher lists. The ones it drops
-  // are counted, never silently gone, and the active one always keeps its
-  // row: state.rs refuses an active path the switcher does not list, so
-  // dropping it would leave the menu with no current repository at all.
-  const shown = listed.slice(0, MENU_LIMITS.repositories);
-  const activeRow = listed.findIndex((row) => row.tab === activeTab);
-  if (activeRow >= shown.length && shown.length > 0) shown[shown.length - 1] = listed[activeRow];
-  const repositoriesHidden = listed.length - shown.length;
-  const repositories: MenuRepository[] = shown.map(({ tab, path }) => {
-    // A parked tab's counts are as old as its last read, and a tab restore
-    // never read has none: neither is a number worth showing.
-    const countsKnown = !tab.isLoading && !tab.error && !tab.isBare &&
-      tab.countsKnown !== false && tab.watch !== "parked";
-    return {
+    const countsKnown = !tab.isLoading && !tab.error && !tab.isBare;
+    repositories.push({
       path,
       label: menuText(tab.label),
       active: tab === activeTab,
       changed: countsKnown ? switcherCount(tab.changedCount) : null,
       conflicts: countsKnown ? switcherCount(tab.conflictedCount) : null,
       busy: repoBusy(tab.path).length > 0 || tab.isLoading,
-    };
-  });
+    });
+  }
   // Read back from the surviving rows rather than from `currentPath`: a pointer
   // at a repository the switcher does not list is the other half of the same
   // rejection.
@@ -339,7 +324,6 @@ export function buildMenuState(
     checked: [...checked].slice(0, MENU_LIMITS.checked),
     labels: [...labels.values()].slice(0, MENU_LIMITS.labels),
     repositories,
-    repositoriesHidden,
     activePath,
     showStatusIcon: prefs.showStatusIcon,
     hideDockWhenClosed: prefs.hideDockWhenClosed,

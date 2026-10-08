@@ -330,42 +330,32 @@ describe("the contract-test table in CONTRIBUTING stays honest", () => {
 
 describe("cross-boundary caps", () => {
   /**
-   * The Rust watch table must hold the frontend's whole watch pool, with room
-   * to spare.
+   * The Rust watch table must be at least as large as the frontend's tab cap.
    *
-   * They sit in different languages with no shared source. Open tabs are not
-   * bounded by watches any more — the pool (src/lib/repos/watchPool.ts) holds
-   * the most recently used repositories and parks the rest — so the pool is
-   * what has to fit. Strictly, with slack: an eviction admits the newcomer
-   * before the evicted session finishes retiring, so the table briefly holds
-   * one more than the pool, and an exact fit would refuse the repository a
-   * person just opened whenever a slot leaked.
+   * They sit in different languages with no shared source, and today they are
+   * both 24 — an exact fit with zero slack. If `MAX_OPEN_TABS` were ever
+   * raised alone, a full workspace would deterministically leave its last
+   * repositories unwatched: they would keep refreshing file statuses on the
+   * poll while their branches, graph, parked-operation banner and stash went
+   * stale, which is the failure `watchState` exists to make visible. Better to
+   * fail the build than to ship a workspace with a guaranteed blind spot.
    */
-  it("gives the watch table more slots than the watch pool holds", () => {
+  it("gives the watch table at least one slot per openable tab", () => {
     const watcher = read("src-tauri/src/watcher/mod.rs");
     const rustCap = /pub const MAX_WATCHES:\s*usize\s*=\s*(\d+)/.exec(watcher);
     expect(rustCap, "MAX_WATCHES must be findable in the watcher").toBeTruthy();
 
-    const pool = read("src/lib/repos/watchPool.ts");
-    const poolCap = /export const WATCH_POOL_SIZE\s*=\s*(\d+)/.exec(pool);
-    expect(poolCap, "WATCH_POOL_SIZE must be findable in the watch pool").toBeTruthy();
-
-    const maxWatches = Number(rustCap![1]);
-    const poolSize = Number(poolCap![1]);
-    expect(poolSize).toBeGreaterThan(0);
-    expect(
-      maxWatches,
-      `MAX_WATCHES (${maxWatches}) must exceed WATCH_POOL_SIZE (${poolSize}), or an ` +
-        `eviction can refuse the repository being opened`,
-    ).toBeGreaterThan(poolSize);
-  });
-
-  it("no longer bounds open tabs by the watch table", () => {
     const tabs = read("src/lib/repos/tabModel.ts");
     const tsCap = /export const MAX_OPEN_TABS\s*=\s*(\d+)/.exec(tabs);
     expect(tsCap, "MAX_OPEN_TABS must be findable in the tab model").toBeTruthy();
-    const watcher = read("src-tauri/src/watcher/mod.rs");
-    const rustCap = Number(/pub const MAX_WATCHES:\s*usize\s*=\s*(\d+)/.exec(watcher)![1]);
-    expect(Number(tsCap![1])).toBeGreaterThan(rustCap);
+
+    const maxWatches = Number(rustCap![1]);
+    const maxTabs = Number(tsCap![1]);
+    expect(maxWatches).toBeGreaterThan(0);
+    expect(
+      maxWatches,
+      `MAX_WATCHES (${maxWatches}) must be >= MAX_OPEN_TABS (${maxTabs}), or a ` +
+        `full workspace is guaranteed to contain unwatched repositories`,
+    ).toBeGreaterThanOrEqual(maxTabs);
   });
 });

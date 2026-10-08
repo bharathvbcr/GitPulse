@@ -6,7 +6,9 @@ const pending = { id: "e", revision: 1, updated_at: 10, created_at: 10, expires_
 
 describe("versioned enhancement boundary", () => {
   it("requires full source for review and keeps summaries separate", () => {
-    expect(enhancement(pending).source).toEqual(source);
+    // A snapshot written before schema 11 has none of its fields; it decodes
+    // as a task that is not archived, not completed, with no checklist or links.
+    expect(enhancement(pending).source).toEqual({ ...source, archived: false, completed_at: null, checklist: [], links: [] });
     const { source: _source, ...summary } = pending;
     expect(enhancementSummary(summary)).not.toHaveProperty("source");
     expect(() => enhancement(summary)).toThrow();

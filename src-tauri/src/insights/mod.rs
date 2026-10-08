@@ -862,11 +862,10 @@ fn snapshot_observed(
 
 /// How many repositories one fleet sweep will visit.
 ///
-/// Open tabs are no longer capped near this (the workspace holds up to 1000,
-/// with live watches pooled separately), so a large workspace can ask for more.
-/// This bounds one sweep's git work and IPC payload, not what is open: anything
-/// past it is dropped and reported through `truncated` rather than silently
-/// ignored, and the 10-second deadline below bounds it again.
+/// The workspace caps open tabs at 24 and recents at 24, so 48 is the real
+/// ceiling; the extra headroom is for a caller that passes both plus a
+/// duplicate or two, and anything past it is dropped and reported through
+/// `truncated` rather than silently ignored.
 pub const MAX_FLEET_REPOS: usize = 64;
 
 /// Soft deadline for one whole sweep, not per repository.

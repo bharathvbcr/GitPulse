@@ -46,16 +46,6 @@ function step(world: World, hosted: ReadonlySet<string>): Set<string> {
   );
 }
 
-/**
- * The world the randomized walks below draw tabs from. It used to be
- * `MAX_OPEN_TABS`, back when that was 24. Now that the workspace holds up to
- * 1000 repositories, forty seeds of four hundred steps over that many would
- * only make every walk slower, not different, so the walks keep a world of
- * their own: still well past the old cap. The single-pass checks further
- * down still run at the full bound.
- */
-const CHURN_WORLD = 64;
-
 describe("terminal hosting under churn", () => {
   // Forty seeds of four hundred steps is a few thousand set walks. On a
   // loaded Ubuntu runner that crossed Vitest's 5s default by a hair and
@@ -63,7 +53,7 @@ describe("terminal hosting under churn", () => {
   it("never hosts a repository whose dock the user never opened", { timeout: 20_000 }, () => {
     for (let seed = 1; seed <= 40; seed += 1) {
       const random = mulberry32(seed);
-      const all = Array.from({ length: CHURN_WORLD }, (_, i) => `tab-${i}`);
+      const all = Array.from({ length: MAX_OPEN_TABS }, (_, i) => `tab-${i}`);
       const world: World = { openTabs: [...all], activeTabId: all[0], docks: new Set() };
       let hosted: ReadonlySet<string> = new Set<string>();
       /** Every tab that was ever active while ITS dock was open. */
@@ -221,7 +211,7 @@ describe("terminal hosting under churn", () => {
   it("hosts every waited-for tab, and nothing nobody asked for, under churn", { timeout: 20_000 }, () => {
     for (let seed = 1; seed <= 40; seed += 1) {
       const random = mulberry32(seed * 7919);
-      const all = Array.from({ length: CHURN_WORLD }, (_, i) => `tab-${i}`);
+      const all = Array.from({ length: MAX_OPEN_TABS }, (_, i) => `tab-${i}`);
       const world: World = { openTabs: all.slice(0, 4), activeTabId: all[0], docks: new Set() };
       const waiting = new Set<string>();
       let hosted: ReadonlySet<string> = new Set<string>();
@@ -234,7 +224,7 @@ describe("terminal hosting under churn", () => {
           // A task launch: queue, then open the checkout in the background.
           const target = pick();
           waiting.add(target);
-          if (!world.openTabs.includes(target) && world.openTabs.length < CHURN_WORLD) world.openTabs.push(target);
+          if (!world.openTabs.includes(target) && world.openTabs.length < MAX_OPEN_TABS) world.openTabs.push(target);
         } else if (roll < 0.4) {
           // The panel consumed a request (only a hosted panel can).
           for (const id of waiting) if (hosted.has(id)) { waiting.delete(id); break; }
@@ -249,7 +239,7 @@ describe("terminal hosting under churn", () => {
           if (world.activeTabId === victim) world.activeTabId = world.openTabs[0] ?? null;
         } else {
           const candidate = pick();
-          if (!world.openTabs.includes(candidate) && world.openTabs.length < CHURN_WORLD) world.openTabs.push(candidate);
+          if (!world.openTabs.includes(candidate) && world.openTabs.length < MAX_OPEN_TABS) world.openTabs.push(candidate);
         }
         if (world.activeTabId && world.docks.has(world.activeTabId)) asked.add(world.activeTabId);
         for (const id of waiting) if (world.openTabs.includes(id)) asked.add(id);
