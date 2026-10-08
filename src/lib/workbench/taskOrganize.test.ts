@@ -22,13 +22,14 @@ function card(over: Partial<TaskCard> = {}): TaskCard {
   return {
     id: "t1", revision: 1, updated_at: 1, title: "A", kind: "bug", status: "inbox",
     priority: 1, severity: "high", owner: "Pat", due_at: 100, labels: ["ui", "drag", "extra"],
-    repository_ids: ["r1", "r2"], primary_repository_id: "r1", home_workspace_id: null, position: 1,
+    repository_ids: ["r1", "r2"], primary_repository_id: "r1", home_workspace_id: null, position: 1, archived: false, completed_at: null,
     ...over,
   };
 }
 
 const task: Task = {
   ...card(),
+  checklist: [], links: [],
   description: "Keep the original error E42",
   acceptance_criteria: ["Reproduce", " "],
   locked_fields: ["title"],

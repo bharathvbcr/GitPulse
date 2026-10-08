@@ -4,7 +4,7 @@
   import { onMount, untrack } from "svelte";
   import { invoke } from "../ipc/invoke";
   import { listen } from "@tauri-apps/api/event";
-  import { AlertTriangle, Archive, Bot, ChevronDown, ChevronUp, Clipboard, EyeOff, FolderSync, Import, Inbox, LayoutGrid, List, Plus, RefreshCw, Search, Sparkles, SquarePen, Trash2, Undo2, X } from "@lucide/svelte";
+  import { AlertTriangle, Archive, Bot, ChevronDown, ChevronUp, Clipboard, EyeOff, FolderSync, Import, Inbox, LayoutGrid, List, Merge, Plus, RefreshCw, Search, Sparkles, SquarePen, Trash2, Undo2, X } from "@lucide/svelte";
   import { isMacOS, isTauri } from "../platform";
   import { createListenerTracker } from "../dom/listenerTracker";
   import { createAdaptiveTimer } from "../runtime/adaptiveTimer";
@@ -18,9 +18,9 @@
   import { popover, restoreFocusTo } from "../ui/popover";
   import { cardFace, dragExceeded, insertIndexFromY, insertionNeighbors, insertionPosition, neighborStatus, parseColumnStatus, shouldCommitMove } from "../workbench/boardDrag";
   import {
-    explainError, getTask, getTaskBrief, getWorkspace, listAttention, listRepositories, listTasks, listWorkspaces, newID, putTask, registerRepository,
+    explainError, getTask, getTaskBrief, getWorkspace, listAttention, listRepositories, listTasks, listWorkspaces, newID, putTask, registerRepository, restoreDeletedTask,
     STATUSES, STATUS_LABELS, TASK_PAGE_SIZE, taskDraft, taskWrite,
-    type Page, type Repository, type Scope, type Task, type TaskCard, type TaskDraft, type TaskStatus, type Workspace, type WorkspaceCard,
+    type Page, type Repository, type Scope, type Task, type TaskCard, type TaskDraft, type TaskListFilter, type TaskStatus, type Workspace, type WorkspaceCard,
   } from "../workbench/client";
   import { addableOpenTabs, attachRepositories, openAddActionLabel, openMembershipCandidates, pickerSelectionIds } from "../workbench/openMembership";
   import { quickAddRefusal, taskCreation } from "../workbench/taskCreation";
@@ -36,14 +36,14 @@
   import { openExternal } from "../desktop/openExternal";
   import { cardChrome, cardMatchesFacet, collectFacetOptions, emptyFacet, facetActive, allLoadedCards, reorderPlan, partitionLanes, type TaskFacet, type TaskLane } from "../workbench/taskOrganize";
   import { plural } from "../format";
-  import { ARCHIVE_STATUS, archiveAction, archivable, archiveState, offersArchive } from "../workbench/taskArchive";
+  import { archiveAction, archivable, archiveState } from "../workbench/taskArchive";
   import { interfaceStore } from "../stores/interfaceStore";
   import { hiddenColumnReport, visibleBoardStatuses } from "../ui/taskView";
   import { boardKey as viewBoardKey, boardPrefs, effectiveSwimlane, wipState, type SavedTaskView, type TaskViewSnapshot } from "../ui/taskBoardViews";
   import TaskSavedViews from "./TaskSavedViews.svelte";
   import { consumeTaskOpen, taskOpenRequest } from "../workbench/taskOpen";
   import { parseQuickAddDue, quickAddDraft, type QuickAddMode, type QuickAddResult } from "../workbench/taskQuickAdd";
-  import { removeFromColumns } from "../workbench/taskDelete";
+  import { removeFromColumns, restoreSummary, restoreTasks } from "../workbench/taskDelete";
   import { joinAgentCopies, MAX_AGENT_COPY_TASKS, wrapSavedBriefForAgent } from "../workbench/taskCompose";
   import { createBoardAgents } from "../workbench/boardAgents";
   import { taskAgentSummaries, type TaskAgentSummary } from "../workbench/taskSessions";
@@ -70,6 +70,8 @@
   import { focusTabAt, handleTablistKeydown } from "../dom/tablist";
   import ScrollCue from "./ScrollCue.svelte";
   import TaskActionDialog from "./TaskActionDialog.svelte";
+  import TaskMergeDialog from "./TaskMergeDialog.svelte";
+  import { mergeEligibility } from "../workbench/taskMerge";
   import TaskEditor from "./TaskEditor.svelte";
   import WorkspaceEditor from "./WorkspaceEditor.svelte";
   import AutomaticEnhancements from "./AutomaticEnhancements.svelte";
@@ -137,6 +139,8 @@
   let showInbox = $state(false);
   let showArchive = $state(false);
   let archiveToken = $state(0);
+  /** What every board column reads: live tasks that are not archived. */
+  const BOARD: TaskListFilter = { archived: false };
   let unread = $state(0);
   let addMenu = $state(false);
   let addRepoTriggerEl: HTMLButtonElement | undefined = $state();
@@ -268,6 +272,10 @@
   const selectedCards = $derived(cardsById(displayColumns, selected));
   /** Whether the selection bar's Archive would change anything. */
   const selectionArchived = $derived(archiveState(selectedCards));
+  /** Whether the selection can be merged, and in which repository. */
+  const selectionMerge = $derived(mergeEligibility(selectedCards));
+  /** The merge dialog's cards and repository while it is open. */
+  let mergeDialog = $state<{ cards: TaskCard[]; repositoryId: string } | null>(null);
   /** Tasks are being filed as GitHub issues; one run at a time, since each issue is published. */
   let filingIssue = $state(false);
   /** Which issue of the run is being created, for the progress line. */
@@ -280,11 +288,11 @@
    * label, so this is also what stops a re-run filing it twice.
    */
   let relinks = $state<{ taskId: string; number: number; title: string }[]>([]);
-  const busy = $derived(moving || opening || deleting || deletesRunning > 0 || filingIssue || actionDialog !== null || pendingUpdate !== null);
+  const busy = $derived(moving || opening || deleting || deletesRunning > 0 || filingIssue || actionDialog !== null || mergeDialog !== null || pendingUpdate !== null);
   const openCardIds = $derived(openSavedTaskIds(taskTabs));
   const inProgressCount = $derived(displayColumns.in_progress?.total ?? 0);
-  /** The server's count for this scope, so the badge is not a page size. */
-  const completedCount = $derived(displayColumns[ARCHIVE_STATUS]?.total ?? 0);
+  /** The server's count of archived tasks in this scope, so the badge is not a page size. */
+  let archivedCount = $state(0);
   $effect(() => {
     if (repositoryPath) return;
     publishTaskChrome({ openTabs: taskTabs.tabs.length, inProgress: inProgressCount });
@@ -342,9 +350,15 @@
   async function loadBoard(target: Scope = scope, query: string = search) {
     const generation = ++revision, key = JSON.stringify([target, query]); loading = true; error = "";
     try {
-      const pages = await Promise.all(STATUSES.map(async (status) => [status, await listTasks(target, status, query)] as const));
+      // Columns hold what is on the board: an archived task leaves them
+      // whatever its status. The badge is the archive's own total for the
+      // scope — the board's search does not narrow it; the dock has its own.
+      const [pages, archive] = await Promise.all([
+        Promise.all(STATUSES.map(async (status) => [status, await listTasks(target, status, query, undefined, TASK_PAGE_SIZE, BOARD)] as const)),
+        listTasks(target, null, "", undefined, 1, { archived: true }),
+      ]);
       if (generation !== revision || disposed || key !== boardKey) return;
-      columns = Object.fromEntries(pages); loadedKey = key;
+      columns = Object.fromEntries(pages); loadedKey = key; archivedCount = archive.total;
       selected = new Set([...selected].filter((id) => loadedHas(id, Object.fromEntries(pages))));
     } catch (cause) { if (generation === revision && !disposed) error = explainError(cause); }
     finally { if (generation === revision && !disposed) loading = false; }
@@ -824,7 +838,7 @@
     const generation = revision, key = boardKey;
     loading = true; error = "";
     try {
-      const result = await listTasks(scope, status, search, cursor);
+      const result = await listTasks(scope, status, search, cursor, TASK_PAGE_SIZE, BOARD);
       if (generation !== revision || disposed || key !== boardKey) return;
       const items = cursor ? [...new Map([...(columns[status]?.items ?? []), ...result.items].map((item) => [item.id, item])).values()] : result.items;
       columns = { ...columns, [status]: { ...result, items, shown: items.length } };
@@ -1351,6 +1365,22 @@
    * one confirm step, one batch, one interrupted-write recovery path for
    * every task mutation this board performs, wherever it was started.
    */
+  /**
+   * Bring deleted tasks back from the archive dock's Deleted view.
+   *
+   * The bounded pass in `taskDelete.ts`, the same one a delete runs, so the
+   * cap, the timeout and the single same-request retry are one policy. Each
+   * card's revision is the one its deletion produced, which is what the store
+   * checks a restore against.
+   */
+  async function restoreDeleted(cards: TaskCard[]): Promise<string> {
+    if (busy || !cards.length) return "";
+    const result = await restoreTasks(cards, async (attempt) => { await restoreDeletedTask(attempt.id, attempt.expected_revision, attempt.request_id); }, { newID });
+    if (result.deleted.length) { taskWritten(); void loadBoard(); }
+    const line = restoreSummary(result);
+    announce = line;
+    return line;
+  }
   async function archiveDockAction(cards: TaskCard[], action: TaskAction) {
     if (busy || !cards.length) return;
     if (cards.length > MAX_TASK_SELECTION) { error = `Select at most ${MAX_TASK_SELECTION} loaded tasks per action.`; return; }
@@ -1805,9 +1835,9 @@
             <Inbox size={13} />
             {#if !unreadError && unread > 0}<span class="gp-pill">{unread}</span>{/if}
           </button>
-          <button type="button" class="gp-icon-btn" aria-pressed={showArchive} aria-controls="task-archive-dock" aria-label="Archive" title={`Archive — tasks in this scope that reached ${STATUS_LABELS[ARCHIVE_STATUS]}`} onclick={() => { showArchive = !showArchive; }}>
+          <button type="button" class="gp-icon-btn" aria-pressed={showArchive} aria-controls="task-archive-dock" aria-label="Archive" title="Archive — tasks filed away from this board, and deleted tasks to restore" onclick={() => { showArchive = !showArchive; }}>
             <Archive size={13} />
-            {#if completedCount > 0}<span class="gp-pill">{completedCount}</span>{/if}
+            {#if archivedCount > 0}<span class="gp-pill">{archivedCount}</span>{/if}
           </button>
         {/if}
         <button type="button" class="gp-icon-btn" aria-label="Refresh" title="Refresh" onclick={() => { void boardAgents.refresh(); checkoutToken++; if (initialized) void refresh(); else void initialize(); }} disabled={loading}><RefreshCw size={13} /></button>
@@ -1885,11 +1915,6 @@
       <p class="hidden-note" role="status" data-testid="task-hidden-columns">
         <EyeOff size={11} />
         {hiddenWork.summary} hidden from this board.
-        {#if offersArchive(hiddenWork.statuses)}
-          <!-- Completed work is the one hidden column with somewhere else to
-               be read, so it is the one that earns a second door here. -->
-          <button type="button" class="link" onclick={() => { showArchive = true; }}>Open archive</button>
-        {/if}
         <button type="button" class="link" onclick={() => interfaceStore.showAllTaskColumns()}>Show all columns</button>
       </p>
     {/if}
@@ -1933,18 +1958,26 @@
           onclick={(e) => { const rect = e.currentTarget.getBoundingClientRect(); menu = { cards: selectedCards, column: null, x: rect.left, y: rect.bottom + 4 }; }}
         >Change…</button>
         <!-- The bulk half of the card menu's Archive row, disabled for the
-             same reason and titled with where the work goes. Without it the
-             only bulk end-of-life action on this bar was Delete. -->
+             same reason. Without it the only bulk end-of-life action on this
+             bar was Delete. -->
         <button
           type="button"
           class="gp-btn"
           data-testid="task-archive-selected"
           onclick={() => void archiveCards(selectedCards)}
           disabled={busy || selectionArchived === "all"}
-          title={selectionArchived === "all"
-            ? `Already in ${STATUS_LABELS[ARCHIVE_STATUS]}`
-            : `Archive — moves to ${STATUS_LABELS[ARCHIVE_STATUS]}`}
+          title={selectionArchived === "all" ? "Already archived" : "Archive — files the tasks away, keeping their status"}
         ><Archive size={12} /> Archive</button>
+        <!-- The merge gitpulse_merge_tasks runs, offered only for a
+             selection it would not refuse on sight (taskMerge.ts). -->
+        <button
+          type="button"
+          class="gp-btn"
+          data-testid="task-merge-selected"
+          disabled={busy || !selectionMerge.ok}
+          title={selectionMerge.ok ? "Merge — fold these into one task and delete the rest" : selectionMerge.reason}
+          onclick={() => { if (selectionMerge.ok) mergeDialog = { cards: [...selectedCards], repositoryId: selectionMerge.repositoryId }; }}
+        ><Merge size={12} /> Merge…</button>
         <button type="button" class="gp-btn-danger" onclick={() => void removeSelected()} disabled={busy}><Trash2 size={12} /> Delete</button>
         <button type="button" class="gp-btn" onclick={() => { selected = new Set(); selectionAnchor = null; }}>Clear</button>
       </div>
@@ -1956,12 +1989,11 @@
         {scope}
         {active}
         {busy}
-        {hiddenColumns}
         refreshToken={archiveToken}
         hiddenIds={pendingDelete?.ids}
         onopen={openTask}
         onaction={(cards, action) => void archiveDockAction(cards, action)}
-        ontogglecolumn={() => interfaceStore.toggleTaskColumn(ARCHIVE_STATUS)}
+        onrestoredeleted={restoreDeleted}
       />
     {/if}
     {#if relinkPending}<div class="banner error" role="alert" data-testid="repository-relink-uncertain"><span>{relinkPending.message}</span><button type="button" class="gp-btn" disabled={relinking} onclick={() => void retryRelink()}>Retry relink</button></div>{/if}
@@ -2187,6 +2219,7 @@
   {#if workspaceEditor}{#key workspaceEditor}<WorkspaceEditor bind:this={workspaceHandle} value={workspaceEditor.value} {repositories} openTabs={openTabRefs} onSaved={() => { scope = { kind: "global" }; void refresh(); }} onClose={() => { workspaceEditor = null; }} />{/key}{/if}
 </div>
 
+{#if mergeDialog}<TaskMergeDialog cards={mergeDialog.cards} repositoryId={mergeDialog.repositoryId} onClose={() => { mergeDialog = null; }} onMerged={(result) => { tasksChanged(result.sources.filter((row) => row.outcome !== "not_merged").map((row) => row.item_id)); announce = result.ok ? `Merged ${result.sources.length} ${result.sources.length === 1 ? "task" : "tasks"}.` : "Merged part of the selection; see the merge dialog."; }} />{/if}
 {#if actionDialog}<TaskActionDialog tasks={actionDialog.cards} action={actionDialog.action} batch={actionDialog.batch} onDefer={actionDialog.action.kind === "delete" && !actionDialog.batch ? deferDialogDeletion : undefined} onChanged={tasksChanged} onClose={() => { actionDialog = null; }} />{/if}
 {#if handoff}
   <TaskHandoffSheet

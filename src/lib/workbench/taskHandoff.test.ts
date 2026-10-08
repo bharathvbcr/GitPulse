@@ -7,6 +7,10 @@ import {
   describeHandoff,
   handoffGate,
   isAgentProvider,
+  launchModelOverride,
+  modelChoiceLabel,
+  modelOverrideFields,
+  NO_MODEL_OVERRIDE,
   normalizeCheckout,
   preferredCheckout,
   reconcileHandoff,
@@ -366,5 +370,43 @@ describe("runStatusLabel", () => {
     expect(runStatusLabel(row("prepared", false, 1), 5_000)).toBe("Preparation expired");
     expect(runStatusLabel(row("prepared"), 5_000)).toBe("Prepared");
     expect(runStatusLabel(row("unresolved", true))).toBe("Unresolved");
+  });
+});
+
+describe("a model for one launch", () => {
+  const terminal = (provider: "claude" | "codex" | "grok" | "agy") => ({ provider, kind: "external_terminal" as const });
+  const typed = (model = "", effort = "", advisor = "") => ({ model, effort, advisor });
+
+  it("sends nothing when nothing is typed, so the saved default applies untouched", () => {
+    expect(launchModelOverride(terminal("claude"), NO_MODEL_OVERRIDE)).toEqual({ ok: true, choice: undefined });
+    expect(launchModelOverride(terminal("claude"), typed("  ", "", " "))).toEqual({ ok: true, choice: undefined });
+  });
+
+  it("sends only the fields typed, and only those this launcher takes", () => {
+    expect(launchModelOverride(terminal("claude"), typed(" opus ", "high", "fable"))).toEqual({ ok: true, choice: { model: "opus", effort: "high", advisor: "fable" } });
+    expect(launchModelOverride(terminal("claude"), typed("", "max"))).toEqual({ ok: true, choice: { effort: "max" } });
+    // Codex takes a model and nothing else: an effort left in the state is not sent.
+    expect(launchModelOverride(terminal("codex"), typed("gpt-6", "high", "fable"))).toEqual({ ok: true, choice: { model: "gpt-6" } });
+    expect(modelOverrideFields("agy")).toEqual(["model", "effort"]);
+    expect(modelOverrideFields("grok")).toEqual(["model"]);
+  });
+
+  it("refuses a value it would otherwise have dropped, and says which", () => {
+    expect(launchModelOverride(terminal("claude"), typed("opus 4"))).toMatchObject({ ok: false, reason: expect.stringContaining("opus 4") });
+    expect(launchModelOverride(terminal("claude"), typed("", "extreme"))).toMatchObject({ ok: false, reason: expect.stringContaining("effort") });
+    expect(launchModelOverride(terminal("claude"), typed("", "", "-x"))).toMatchObject({ ok: false, reason: expect.stringContaining("advisor") });
+    const gate = handoffGate({ checkout: "/work/a", settings: { ...defaultHandoff(), provider: "claude", kind: "external_terminal" }, acknowledgedBypass: false, dirty: false, busy: false, model: typed("opus 4") });
+    expect(gate).toMatchObject({ ok: false, reason: expect.stringContaining("opus 4") });
+  });
+
+  it("refuses any model for a managed attempt, whose model is Manvi's", () => {
+    expect(launchModelOverride({ provider: "claude", kind: "managed" }, typed("opus"))).toMatchObject({ ok: false, reason: expect.stringContaining("Manvi") });
+    expect(launchModelOverride({ provider: "claude", kind: "managed" }, NO_MODEL_OVERRIDE)).toEqual({ ok: true, choice: undefined });
+  });
+
+  it("reads a recorded run model in settings order, whatever order the record keeps", () => {
+    expect(modelChoiceLabel({ advisor: "fable", effort: "high", model: "opus" })).toBe("opus · high effort · advisor fable");
+    expect(modelChoiceLabel({ fallback: "sonnet,haiku", model: "opus" })).toBe("opus · fallback sonnet,haiku");
+    expect(modelChoiceLabel({ zeta: "1", model: "m" })).toBe("m · zeta 1");
   });
 });

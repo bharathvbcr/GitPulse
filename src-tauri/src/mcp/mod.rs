@@ -2959,7 +2959,13 @@ mod tests {
             .unwrap()["item"]
             .clone();
         let mut edit = current.clone();
-        for key in ["revision", "updated_at", "created_at", "locked_fields"] {
+        for key in [
+            "revision",
+            "updated_at",
+            "created_at",
+            "completed_at",
+            "locked_fields",
+        ] {
             edit.as_object_mut().unwrap().remove(key);
         }
         edit["request_id"] = json!("person-edit");
@@ -3277,7 +3283,13 @@ mod tests {
             .board_request("items.get", &json!({"id": id}).to_string())
             .unwrap()["item"]
             .clone();
-        for key in ["revision", "updated_at", "created_at", "locked_fields"] {
+        for key in [
+            "revision",
+            "updated_at",
+            "created_at",
+            "completed_at",
+            "locked_fields",
+        ] {
             edit.as_object_mut().unwrap().remove(key);
         }
         edit["request_id"] = json!("person-edit");
@@ -3339,7 +3351,13 @@ mod tests {
             .board_request("items.get", &json!({"id": id}).to_string())
             .unwrap()["item"]
             .clone();
-        for key in ["revision", "updated_at", "created_at", "locked_fields"] {
+        for key in [
+            "revision",
+            "updated_at",
+            "created_at",
+            "completed_at",
+            "locked_fields",
+        ] {
             edit.as_object_mut().unwrap().remove(key);
         }
         edit["request_id"] = json!("earlier-attempt");

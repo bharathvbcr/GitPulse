@@ -188,7 +188,7 @@ describe("isIssueInTask and findTaskForIssue", () => {
     repository_ids: ["repo-1"],
     primary_repository_id: "repo-1",
     home_workspace_id: null,
-    position: 0,
+    position: 0, archived: false, completed_at: null,
   };
 
   const card2: TaskCard = {
@@ -206,7 +206,7 @@ describe("isIssueInTask and findTaskForIssue", () => {
     repository_ids: ["repo-1"],
     primary_repository_id: "repo-1",
     home_workspace_id: null,
-    position: 1,
+    position: 1, archived: false, completed_at: null,
   };
 
   it("matches by label or title", () => {
@@ -239,7 +239,7 @@ describe("isIssueInTask and findTaskForIssue", () => {
       repository_ids: ["repo-1"],
       primary_repository_id: "repo-1",
       home_workspace_id: null,
-      position: 0,
+      position: 0, archived: false, completed_at: null,
     };
     expect(isIssueInTask(cardReferencing42, 100)).toBe(true);
     // Crucial check: Issue #42 must NOT match cardReferencing42!
@@ -387,7 +387,7 @@ describe("createTaskFromIssue and batchCreateTasksFromIssues", () => {
       repository_ids: ["repo-abc"],
       primary_repository_id: "repo-abc",
       home_workspace_id: null,
-      position: 0,
+      position: 0, archived: false, completed_at: null,
     };
 
     const issues: IssueInfo[] = [
@@ -431,7 +431,7 @@ describe("listAllRepositoryTasks", () => {
       repository_ids: ["repo-x"],
       primary_repository_id: "repo-x",
       home_workspace_id: null,
-      position: 0,
+      position: 0, archived: false, completed_at: null,
     };
     const cardB: TaskCard = {
       id: "task-b",
@@ -448,7 +448,7 @@ describe("listAllRepositoryTasks", () => {
       repository_ids: ["repo-x"],
       primary_repository_id: "repo-x",
       home_workspace_id: null,
-      position: 1,
+      position: 1, archived: false, completed_at: null,
     };
 
     vi.mocked(invoke).mockImplementation(async (cmd: string, args?: unknown) => {
@@ -501,7 +501,7 @@ describe("listAllRepositoryTasks", () => {
       repository_ids: ["repo-x"],
       primary_repository_id: "repo-x",
       home_workspace_id: null,
-      position: i,
+      position: i, archived: false, completed_at: null,
     });
 
     vi.mocked(invoke).mockImplementation(async () => {
