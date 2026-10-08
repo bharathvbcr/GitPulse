@@ -3302,9 +3302,10 @@ done
             let (result, seen) = captured(event.name, &notify_input());
             assert!(result.is_ok(), "{}: {result:?}", event.name);
             let payload = seen.lock().unwrap().clone().expect("a report was sent");
-            let notice = crate::alerts::bridge::parse_report(payload.as_bytes()).unwrap_or_else(
-                |e| panic!("{} produced a report the socket refused: {e}", event.name),
-            );
+            let notice =
+                crate::alerts::bridge::parse_report(payload.as_bytes()).unwrap_or_else(|e| {
+                    panic!("{} produced a report the socket refused: {e}", event.name)
+                });
             assert_eq!(notice.reason(), Some(event.phrase));
             assert_eq!(notice.label, "Codex");
         }
@@ -3491,7 +3492,9 @@ done
         assert_eq!(long.tool_summary, "Bash: echo start");
         let wide = tool_event("PermissionRequest", json!({"command": "y".repeat(4000)}));
         assert_eq!(wide.tool_summary.chars().count(), TOOL_SUMMARY_CHARS);
-        let mcp = HookInput::from_value(&json!({"tool_name":"mcp__github__create_issue","tool_input":{"title":7}}));
+        let mcp = HookInput::from_value(
+            &json!({"tool_name":"mcp__github__create_issue","tool_input":{"title":7}}),
+        );
         assert_eq!(mcp.tool_summary, "mcp__github__create_issue");
     }
 
@@ -3509,7 +3512,10 @@ done
             crate::alerts::bridge::parse_report(payload.as_bytes()).expect("accepted")
         };
         let call = json!({"command":"cargo test"});
-        let asked = report("permission_request", &tool_event("PermissionRequest", call.clone()));
+        let asked = report(
+            "permission_request",
+            &tool_event("PermissionRequest", call.clone()),
+        );
         let ran = report("tool_finished", &tool_event("PostToolUse", call));
         assert_eq!(asked.detail.as_deref(), Some("Bash: cargo test"));
         assert!(asked.subject.is_some());
@@ -3585,7 +3591,10 @@ done
     fn notify_send_reports_what_the_socket_answered() {
         use std::io::{Read, Write};
         let base = std::fs::canonicalize("/tmp").unwrap();
-        for (answer, ok) in [(&b"{\"ok\":true}\n"[..], true), (b"{\"ok\":false}\n", false)] {
+        for (answer, ok) in [
+            (&b"{\"ok\":true}\n"[..], true),
+            (b"{\"ok\":false}\n", false),
+        ] {
             let path = base.join(format!("gph-ack-{}-{ok}.sock", std::process::id()));
             let _ = std::fs::remove_file(&path);
             let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();

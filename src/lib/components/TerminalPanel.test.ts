@@ -178,12 +178,17 @@ describe("TerminalPanel tab strip", () => {
     const opener = source.slice(source.indexOf("const admitting = new Set"), source.indexOf("function admitTab"));
     expect(opener).toContain("admitting.add(opened.id)");
     expect(opener.match(/consumeTaskTerminalRequest\(/g)).toHaveLength(1);
+    // The refusal unmarks the tab only by dropping it, so the tab is never on
+    // the strip unmarked, and it keeps the request for the next free slot.
     const refuse = source.slice(source.indexOf("function refuseTab"), source.indexOf("function refuseTab") + 600);
-    expect(refuse.indexOf("dropTab(id)")).toBeLessThan(refuse.indexOf("admitting.delete(id)"));
+    expect(refuse).toContain("dropTab(id, true)");
+    expect(refuse).not.toContain("admitting.delete(id)");
     // A tab closed by hand before it took a slot must give its room back, or
     // every such close shrinks this panel's room for queued starts for good.
-    const drop = source.slice(source.indexOf("function dropTab"), source.indexOf("function dropTab") + 400);
+    const drop = source.slice(source.indexOf("function dropTab"), source.indexOf("function handleChord"));
     expect(drop).toContain("admitting.delete(id)");
+    expect(drop).toContain("if (keepRequest) releaseTaskTerminal(holder, request);");
+    expect(drop).toContain("else consumeTaskTerminalRequest(request);");
   });
 
   it("routes chords through the shared parser rather than inline key tests", () => {

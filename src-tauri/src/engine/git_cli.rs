@@ -6632,6 +6632,11 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn concurrent_deadline_prefixes_are_reaped() {
+        // A gate of its own with a slot per reader. The process-wide gate
+        // sizes itself from the machine (`spawn_limit`): a 3-core runner gets
+        // 6 slots, so two readers spent their whole 400ms queued and failed
+        // as slot waits, never reaching the deadline prefix under test.
+        let gate: &'static SpawnGate = Box::leak(Box::new(SpawnGate::new(8)));
         let dir = tempfile::tempdir().unwrap();
         let mut handles = Vec::new();
         for index in 0..8 {
@@ -6643,15 +6648,16 @@ mod tests {
                 );
                 let _kept = KeepDeadlinePrefix::enter();
                 let started = Instant::now();
-                let run = run_bounded(
-                    {
-                        let mut cmd = Command::new("sh");
-                        cmd.args(["-c", &script]);
-                        cmd
-                    },
+                let mut cmd = Command::new("sh");
+                cmd.args(["-c", &script]);
+                let run = run_with_gate(
+                    &mut cmd,
                     "git log",
                     Duration::from_millis(400),
                     None,
+                    MAX_OUTPUT_BYTES,
+                    &mut (),
+                    gate,
                 )
                 .expect("prefix");
                 assert!(

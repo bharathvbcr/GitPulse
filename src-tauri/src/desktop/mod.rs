@@ -468,17 +468,7 @@ pub fn set_menu_state<R: Runtime>(app: &AppHandle<R>, next: MenuState) -> Result
         app.menu().ok_or("Native menu is unavailable")?
     };
     menu::apply_presentation(&menu, &next).map_err(|error| error.to_string())?;
-    let glyph_changed = tray::glyph_variant(&previous) != tray::glyph_variant(&next);
-    if previous.show_status_icon != next.show_status_icon
-        || previous.tray_summary != next.tray_summary
-        || previous.tray_detail != next.tray_detail
-        || previous.tray_details != next.tray_details
-        || previous.tray_title != next.tray_title
-        || previous.repositories != next.repositories
-        || previous.enabled(actions::REFRESH) != next.enabled(actions::REFRESH)
-        || previous.status.primary_label != next.status.primary_label
-        || glyph_changed
-    {
+    if tray::needs_apply(&previous, &next) {
         tray::apply(app, &next)?;
     }
     *app.state::<DesktopState>()

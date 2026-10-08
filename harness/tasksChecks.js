@@ -2410,7 +2410,9 @@ if (params.has("check")) {
       const column = status => root.querySelector(`[data-task-column="${status}"]`);
       const head = status => root.querySelector(`[data-task-column-head="${status}"]`) ?? column(status);
       const wipInput = status => viewMenu().querySelector(`[data-task-wip-input="${status}"]`);
-      const readyTotal = () => tasks.filter(task => !deleted.has(task.id) && task.status === "ready").length;
+      // The column counts what the board reads: live tasks that are not archived.
+      // The archive block above files Ready tasks away without moving them.
+      const readyTotal = () => tasks.filter(task => !deleted.has(task.id) && !task.archived && task.status === "ready").length;
 
       guardStep = "views: wip";
       await openView();

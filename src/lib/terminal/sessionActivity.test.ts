@@ -84,14 +84,14 @@ describe("parseAttention", () => {
   it("turns a hook event into what it asks of the reader", () => {
     expect(parseAttention({ session: "term-1-a", channel: "hook", event: "permission_prompt", detail: "Bash: cargo test" }, 5))
       .toEqual({ session: "term-1-a", attention: { kind: "needs-you", label: "Needs your permission", detail: "Bash: cargo test", at: 5 } });
-    expect(parseAttention({ session: "t", channel: "hook", event: "agent_completed" }, 5)?.attention.kind).toBe("finished");
-    expect(parseAttention({ session: "t", channel: "hook", event: "error" }, 5)?.attention.kind).toBe("error");
+    expect(parseAttention({ session: "t", channel: "hook", event: "agent_completed" }, 5)?.attention?.kind).toBe("finished");
+    expect(parseAttention({ session: "t", channel: "hook", event: "error" }, 5)?.attention?.kind).toBe("error");
   });
 
   it("calls a terminal signal, or an event it does not know, signalled — never needs-you", () => {
     expect(parseAttention({ session: "t", channel: "bell" }, 5)?.attention).toEqual({ kind: "signalled", label: "Signalled", detail: null, at: 5 });
-    expect(parseAttention({ session: "t", channel: "hook", event: "constructor" }, 5)?.attention.kind).toBe("signalled");
-    expect(parseAttention({ session: "t", channel: "hook", event: "future_event" }, 5)?.attention.kind).toBe("signalled");
+    expect(parseAttention({ session: "t", channel: "hook", event: "constructor" }, 5)?.attention?.kind).toBe("signalled");
+    expect(parseAttention({ session: "t", channel: "hook", event: "future_event" }, 5)?.attention?.kind).toBe("signalled");
   });
 
   it("refuses a malformed announcement rather than guessing", () => {
@@ -102,9 +102,9 @@ describe("parseAttention", () => {
 
   it("strips control characters and bounds what the program said", () => {
     const parsed = parseAttention({ session: "t", channel: "osc9", detail: `\x1b[31m${"z".repeat(5000)}\x07` }, 1);
-    expect(parsed?.attention.detail?.length).toBeLessThanOrEqual(240);
-    expect(parsed?.attention.detail).not.toMatch(/[\x00-\x1f]/);
-    expect(parseAttention({ session: "t", channel: "osc9", detail: "   " }, 1)?.attention.detail).toBeNull();
+    expect(parsed?.attention?.detail?.length).toBeLessThanOrEqual(240);
+    expect(parsed?.attention?.detail).not.toMatch(/[\x00-\x1f]/);
+    expect(parseAttention({ session: "t", channel: "osc9", detail: "   " }, 1)?.attention?.detail).toBeNull();
   });
 });
 

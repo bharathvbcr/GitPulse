@@ -404,8 +404,10 @@ mod tests {
 
     #[test]
     fn agents_waiting_is_bounded() {
-        let mut state = MenuState::default();
-        state.agents_waiting = MAX_AGENTS_WAITING;
+        let mut state = MenuState {
+            agents_waiting: MAX_AGENTS_WAITING,
+            ..MenuState::default()
+        };
         state.validate().unwrap();
         state.agents_waiting = MAX_AGENTS_WAITING + 1;
         assert_eq!(
