@@ -739,3 +739,84 @@ fn a_sweep_releases_managed_attempts_by_their_recorded_claim_and_outcome() {
     prepare(&state, &root, "after").unwrap();
     assert_eq!(state.reconcile_stale_runs().unwrap(), 0);
 }
+
+/// The escaped descendant, and the uncertain start: the recorded process (or
+/// the host that launched it) is gone, so `judge` releases — but something is
+/// still working in the attempt's worktree, and the next attempt must not be
+/// admitted on top of it. Before `confirm_vacated` this released.
+#[test]
+fn a_release_waits_for_the_attempt_worktree_to_be_vacated() {
+    use super::confirm_vacated;
+    let lane = json!({"id":"run","cwd":"/repo/.gitpulse/worktrees/fix-1234abcd"});
+    let released = || Verdict::Release("agent process 77 is no longer running".into());
+
+    let kept = confirm_vacated(released(), &lane, |_| Ok(vec![4242]));
+    assert!(
+        matches!(&kept, Verdict::Keep(r) if r.contains("4242") && r.contains("still working")),
+        "{kept:?}"
+    );
+    let unknown = confirm_vacated(released(), &lane, |_| Err("no process table".into()));
+    assert!(
+        matches!(&unknown, Verdict::Keep(r) if r.contains("could not be checked") && r.contains("no process table")),
+        "a scan that could not run is not an empty worktree: {unknown:?}"
+    );
+    assert_eq!(
+        confirm_vacated(released(), &lane, |_| Ok(vec![])),
+        released()
+    );
+
+    // A person's own checkout is not scanned: their shells live there.
+    let own = json!({"id":"run","cwd":"/repo"});
+    assert_eq!(
+        confirm_vacated(released(), &own, |_| panic!("own checkout scanned")),
+        released()
+    );
+    // A keep is never turned into a release, and is not scanned.
+    let keep = Verdict::Keep("still running".into());
+    assert_eq!(
+        confirm_vacated(keep.clone(), &lane, |_| panic!("keep scanned")),
+        keep
+    );
+}
+
+/// End to end against the real process table: an agent's descendant that left
+/// its process group and is still in the attempt worktree holds the checkout.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn an_escaped_descendant_in_the_worktree_holds_the_checkout() {
+    use super::confirm_vacated;
+    use std::os::unix::process::CommandExt;
+    let root = tempfile::tempdir().expect("root");
+    let lane = root
+        .path()
+        .canonicalize()
+        .expect("canonical")
+        .join(".gitpulse/worktrees/fix-1234abcd");
+    std::fs::create_dir_all(&lane).expect("lane");
+    let mut child = std::process::Command::new("/bin/sh")
+        .args(["-c", "exec sleep 30"])
+        .current_dir(&lane)
+        .stdin(std::process::Stdio::null())
+        .process_group(0)
+        .spawn_locked()
+        .expect("spawn");
+    let run = json!({"id":"run","cwd":lane.to_str().expect("utf8")});
+    let mut verdict = Verdict::Release(String::new());
+    for _ in 0..50 {
+        verdict = confirm_vacated(
+            Verdict::Release("the GitPulse process that launched it has exited".into()),
+            &run,
+            crate::terminal::foreground::working_in,
+        );
+        if matches!(verdict, Verdict::Keep(_)) {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    assert!(
+        matches!(&verdict, Verdict::Keep(r) if r.contains(&child.id().to_string())),
+        "{verdict:?}"
+    );
+}

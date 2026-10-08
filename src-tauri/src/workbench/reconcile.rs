@@ -244,12 +244,67 @@ fn observe(state: &WorkbenchState, run: &Value) -> Verdict {
     let tracked = state
         .terminals()
         .map(|terminals| crate::terminal::tracks_run(terminals, run["id"].as_str().unwrap_or("")));
-    judge(
+    let verdict = judge(
         run,
         tracked,
         process_birth::probe,
         process_birth::running_since,
-    )
+    );
+    confirm_vacated(verdict, run, crate::terminal::foreground::working_in)
+}
+
+/// A release, kept only once the attempt's own worktree is empty of processes.
+///
+/// [`judge_at`] proves the *recorded* process gone, or the host that launched
+/// it. Neither is proof about what that process started: a descendant that
+/// left its session (`setsid`, a double fork, `nohup`) survives the hangup
+/// the release reasons lean on, and an uncertain start — a crash between the
+/// fork and the receipt naming the child — records no process at all. Either
+/// way the agent can still be writing when the next attempt is admitted. What
+/// such a process keeps is the directory it was started in, so a release
+/// stands only when no process is working inside the attempt's worktree.
+///
+/// Applied to attempt worktrees (`.gitpulse/worktrees/…`) only. Those are the
+/// agent's own, so anything working in one is the agent's or someone who chose
+/// to stand in it — keeping the slot is right either way. A run in the
+/// person's own checkout is not scanned: their shells and editors live there,
+/// and cannot be told apart from an escaped agent by directory alone.
+pub(crate) fn confirm_vacated(
+    verdict: Verdict,
+    run: &Value,
+    working_in: impl Fn(&std::path::Path) -> Result<Vec<i32>, String>,
+) -> Verdict {
+    let Verdict::Release(why) = verdict else {
+        return verdict;
+    };
+    let Some(cwd) = run["cwd"].as_str().map(std::path::Path::new) else {
+        return Verdict::Release(why);
+    };
+    let lane: Vec<&str> = crate::engine::worktree::GITPULSE_LANE_DIR
+        .split('/')
+        .collect();
+    let names: Vec<&std::ffi::OsStr> = cwd.components().map(|c| c.as_os_str()).collect();
+    let in_lane = names.windows(lane.len()).any(|window| {
+        window
+            .iter()
+            .zip(&lane)
+            .all(|(have, want)| *have == std::ffi::OsStr::new(want))
+    });
+    if !in_lane {
+        return Verdict::Release(why);
+    }
+    match working_in(cwd) {
+        Ok(pids) if pids.is_empty() => Verdict::Release(why),
+        Ok(pids) => Verdict::Keep(format!(
+            "{why}, but process{} {} still working in this attempt's worktree. Stop {} to release it.",
+            if pids.len() == 1 { " is" } else { "es are" },
+            pids.iter().take(8).map(i32::to_string).collect::<Vec<_>>().join(", "),
+            if pids.len() == 1 { "it" } else { "them" },
+        )),
+        Err(reason) => Verdict::Keep(format!(
+            "{why}, but whether anything is still working in this attempt's worktree could not be checked: {reason}"
+        )),
+    }
 }
 
 /// Judges one run and, when the evidence allows, releases it.

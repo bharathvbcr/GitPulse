@@ -14,7 +14,7 @@ use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::Engine;
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
 mod flow;
-mod foreground;
+pub(crate) mod foreground;
 #[cfg(unix)]
 mod input;
 use flow::{OutputFlow, Route};
