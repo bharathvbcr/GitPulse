@@ -22,6 +22,19 @@ before that tag is pushed.
   `gitpulse_merge_tasks`.
 - **Model for this launch** in a terminal handoff: model, effort and advisor
   for one attempt, recorded on the attempt and shown on its row.
+- **Board views: swimlanes, saved views and work-in-progress limits.** Lanes
+  group cards by owner or first label on the board, and by status in the list.
+  A board's current arrangement — layout, lanes, columns, card chips, filters
+  and search — can be saved by name and put back with a click, and each column
+  can carry an optional limit that marks it once the store's count for it goes
+  over. Views and limits belong to one board: the global board, a workspace's
+  or a repository's.
+- **Missing checkouts are marked before you act.** Each registered
+  repository's checkout is checked on the host when the board loads, on
+  Refresh and when the window comes back; one that moved or was deleted is
+  marked on its navigator row and on its tasks' cards before a launch or a
+  relink, a check that could not run says so, and a repository known only by
+  its remote is shown as Remote only and can be linked to a checkout.
 
 ### Changed
 
@@ -33,6 +46,19 @@ before that tag is pushed.
   pages in place after a change.
 - A merge whose source's delete fails after its reason is recorded now reports
   a partial merge naming that source, not a bare error.
+
+### Fixed
+
+- **Unsaved edits to a suggestion are asked about.** Editing a Manvi or Apple
+  Intelligence suggestion made every way off the task — another card, a tab,
+  close, Escape, New task, a terminal's link to another task — do nothing
+  without a word. Each now asks, in the task sheet and in Quick Enhance.
+- **The newest running suggestion is found wherever it sits in the history.**
+  Only the first thirty attempts were looked at, so an older running one was
+  never shown or polled and did not stop a second from starting; the history
+  also collapsed back to one page every second while a suggestion ran.
+- **Every task in a column can be reached in the list layout**, which had no
+  paging; a repository's board links to the Tasks board for everything.
 
 ### Upgrade
 

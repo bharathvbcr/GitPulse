@@ -10,8 +10,11 @@
     automaticUpdates,
     enhancementConfiguration,
     explainError,
+    ACTIVE_ENHANCEMENT_STATES,
     getEnhancement,
+    latestEnhancement,
     listEnhancements,
+    LIVE_ENHANCEMENT_STATES,
     newID,
     type Enhancement,
     type EnhancementConfiguration,
@@ -20,7 +23,7 @@
     type EnhancementSummary,
     type Task,
   } from "../workbench/client";
-  import { acceptEnhancementInput, assistEngineName, draftingKind, draftingVerb, enhancementApplyBlock, enhancementOptionLabel, runAppleEnhancement, startQuickEnhance, DEFAULT_ASSIST_ENGINE, ENHANCEMENT_STATE_LABELS, EnhancementAction, liveEnhancement, type AssistEngine } from "../workbench/taskEnhance";
+  import { acceptEnhancementInput, assistEngineName, draftingKind, draftingVerb, enhancementApplyBlock, enhancementOptionLabel, runAppleEnhancement, startQuickEnhance, DEFAULT_ASSIST_ENGINE, ENHANCEMENT_STATE_LABELS, EnhancementAction, appendedHistory, liveEnhancement, refreshedHistory, type AssistEngine } from "../workbench/taskEnhance";
   import { timestampFormat } from "../ui/timestampFormat";
   import {
     appleBadge,
@@ -67,6 +70,7 @@
     onReview = (_ready: boolean) => {},
     onEngine = (_name: string) => {},
     onStatus = (_status: { state: string | null; uncertain: boolean }) => {},
+    onEditing = (_editing: boolean) => {},
   }: {
     task: Task | null;
     notes?: string;
@@ -111,6 +115,16 @@
     onEngine?: (name: string) => void;
     /** Current proposal state and uncertain flag, so the sheet can latch open or show folded status. */
     onStatus?: (status: { state: string | null; uncertain: boolean }) => void;
+    /**
+     * The reader has unsaved edits to a suggestion.
+     *
+     * Reported apart from `onBusy`, which also covers editing because the
+     * task fields lock while a suggestion is being revised. A host that read
+     * only `onBusy` could not tell "wait for the model" from "these edits will
+     * be lost", so leaving the task refused silently in both cases; this is
+     * what lets it ask instead.
+     */
+    onEditing?: (editing: boolean) => void;
   } = $props();
 
   const labels = ENHANCEMENT_STATE_LABELS;
@@ -138,6 +152,14 @@
   let entries = $state<EnhancementSummary[]>([]);
   let total = $state(0);
   let cursor = $state<string | null>(null);
+  /** Pages read past the first to reach the active attempt: 300 attempts at thirty a page. */
+  const MAX_HISTORY_CATCH_UP = 10;
+  /** Whether Load more has run, so a refresh keeps the older pages (`refreshedHistory`). */
+  let pagedPastFirst = false;
+  /** The newest live or ready attempt, from a filtered read across every page. */
+  let latestActive = $state<EnhancementSummary | null>(null);
+  /** Set once the reader chooses from the picker; until then the review follows `latestActive`. */
+  let readerPicked = false;
   let historyLoading = $state(false);
   let busy = $state(false);
   let preparing = $state(false);
@@ -206,7 +228,7 @@
   );
   /** Why the selected proposal cannot be applied here, or "" when it can. */
   const applyBlock = $derived(enhancementApplyBlock(proposal, task));
-  const liveAttempt = $derived(liveEnhancement(proposal) || entries.some((entry) => liveEnhancement(entry)));
+  const liveAttempt = $derived(liveEnhancement(proposal) || liveEnhancement(latestActive) || entries.some((entry) => liveEnhancement(entry)));
   const stale = $derived(Boolean(proposal && task && proposal.source_revision !== task.revision));
   const ready = $derived(proposal?.state === "ready");
   /**
@@ -303,6 +325,7 @@
   });
 
   $effect(() => { onBusy(controlsLocked); });
+  $effect(() => { onEditing(editing); });
   $effect(() => { onEngine(engineName); });
   $effect(() => { onFlash([...flash]); });
   // Whether something is waiting to be reviewed. The sheet draws a dot on the
@@ -340,6 +363,13 @@
     if (!active || !proposal || !liveEnhancement(proposal)) return;
     const id = proposal.id;
     return createAdaptiveTimer(() => { void poll(id); }, 1000);
+  });
+  // A live attempt the review is not on — the reader picked an older one —
+  // is still followed, through the history read, so the picker's states and
+  // the one-live-attempt guard stay true while it runs.
+  $effect(() => {
+    if (!active || !visible || !latestActive || !liveEnhancement(latestActive) || latestActive.id === proposal?.id) return;
+    return createAdaptiveTimer(() => { if (!acting && !editing) void history(); }, 2000);
   });
   /**
    * Read the model configuration, sharing one request between callers.
@@ -391,14 +421,38 @@
     if (!task || historyLoading || editing) return;
     historyLoading = true;
     try {
-      const result = await bounded(listEnhancements(task.id, append ? cursor ?? undefined : undefined));
+      const id = task.id;
+      // The page and the newest active attempt are read together: the page
+      // is what the picker lists, and the active attempt is what the review
+      // should be on when the reader has not picked one, wherever it sits.
+      const [result, active] = await Promise.all([
+        bounded(listEnhancements(id, append ? cursor ?? undefined : undefined)),
+        append ? Promise.resolve(latestActive) : bounded(latestEnhancement(id, ACTIVE_ENHANCEMENT_STATES)),
+      ]);
       if (disposed) return;
-      entries = append ? [...entries, ...result.items.filter((entry) => !entries.some((old) => old.id === entry.id))] : result.items;
+      const loaded = { entries, cursor, extended: pagedPastFirst };
+      let next = append ? appendedHistory(loaded, result) : refreshedHistory(loaded, result);
+      // The picker must be able to name the attempt the review is on, so the
+      // pages down to an older active attempt are loaded — bounded, and the
+      // count line below still says how many of the total are listed.
+      for (let pages = 0; active && next.cursor && pages < MAX_HISTORY_CATCH_UP && !next.entries.some((entry) => entry.id === active.id); pages++) {
+        next = appendedHistory(next, await bounded(listEnhancements(id, next.cursor)));
+        if (disposed) return;
+      }
+      entries = next.entries; cursor = next.cursor; pagedPastFirst = next.extended;
       total = result.total;
-      cursor = result.next_cursor;
-      if (!proposal && result.items[0]) await choose(result.items[0].id);
+      latestActive = active;
+      const wanted = active?.id ?? result.items[0]?.id;
+      // Follow the newest active attempt until the reader picks one: an older
+      // review on screen must not hide a run that started since.
+      if (wanted && (!proposal || (!readerPicked && proposal.id !== wanted && !liveEnhancement(proposal)))) await choose(wanted);
     } catch (cause) { if (!disposed) error = explainError(cause); }
     finally { if (!disposed) historyLoading = false; }
+  }
+
+  async function pick(id: string) {
+    readerPicked = true;
+    await choose(id);
   }
 
   async function choose(id: string) {
@@ -496,9 +550,8 @@
       }
       // Both engines share the store's "one live attempt per task" rule, so
       // this check belongs to neither of them in particular.
-      const page = await bounded(listEnhancements(saved.id));
+      const existing = await bounded(latestEnhancement(saved.id, LIVE_ENHANCEMENT_STATES));
       if (disposed) return;
-      const existing = page.items.find(liveEnhancement);
       if (existing) {
         const current = await bounded(getEnhancement(existing.id));
         if (!disposed) { proposal = current; note = "A suggestion is already in progress."; await history(); }
@@ -735,7 +788,7 @@
               ? $timestampFormat.title(proposal.created_at)
               : ""}
           aria-describedby="assist-history-count-{uid}"
-          onchange={(event) => void choose(event.currentTarget.value)}
+          onchange={(event) => void pick(event.currentTarget.value)}
         >
           {#if historyLoading && !entries.length}
             <option value="">Loading suggestions…</option>

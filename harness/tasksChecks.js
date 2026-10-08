@@ -11,6 +11,7 @@ import { requestTaskOpen, taskOpenRequest } from "../src/lib/workbench/taskOpen"
 import { themeStore } from "../src/lib/stores/themeStore";
 import { harnessStore } from "../src/lib/stores/harnessStore";
 import { repoStore } from "../src/lib/stores/repoStore";
+import { interfaceStore } from "../src/lib/stores/interfaceStore";
 import { describeForeground, holdForeground } from "./foreground";
 
 const params = new URLSearchParams(location.search);
@@ -63,18 +64,26 @@ let corruptDelete = false, loseDelete = false;
 const deleted = new Set(), deleteWrites = [], restoreWrites = [], mergeWrites = [];
 let mergeFailSource = "";
 let failList = false, corruptSave = false, loseSave = false, holdSave = false, releaseSave, holdSearch = false, heldSearch = [], holdGet = false, releaseGet;
-const receipts = new Map(), proposals = new Map(), enhancementWrites = [];
+const receipts = new Map(), proposals = new Map(), enhancementWrites = [], enhancementReads = [];
 let failConfiguration = false, blankConfiguration = false, loseEnhancement = false, holdDelete = false, releaseDelete;
 // Relinking a moved checkout and importing tab groups (see the end of the run).
 let pickFolderResult = null, registerUnknown = false, loseRelink = false;
 const relinkCalls = [], repoCommandCalls = [];
+const missingCheckouts = new Set(), uncheckableCheckouts = new Set();
 // What `repoStore.openRepo` asks the host for, answered the way an empty,
 // healthy repository would. Only the tab-group checks open tabs.
 const fixtureRepoCommands = {
   cmd_resolve_repo: a => ({ path: a.repoPath, name: a.repoPath.split("/").pop(), is_bare: false }),
   // A task terminal opens the checkout holding the attempt's directory; the
   // fixture's directories are checkout roots.
-  cmd_resolve_git_root: a => a.path,
+  // Board checkout checks go through here too: a folder in `missingCheckouts`
+  // is refused the way the host refuses a folder with no repository, and one in
+  // `uncheckableCheckouts` fails for a reason that says nothing about it.
+  cmd_resolve_git_root: a => {
+    if (missingCheckouts.has(a.path)) throw `Not a Git repository: ${a.path}`;
+    if (uncheckableCheckouts.has(a.path)) throw `Operation not permitted (os error 1): ${a.path}`;
+    return a.path;
+  },
   cmd_watch_repo: () => null, cmd_unwatch_repo: () => null, cmd_set_recent_menu: () => null,
   cmd_list_branches: () => [], cmd_get_status: () => [], cmd_list_tags: () => ({ tags: [], truncated: false }),
   cmd_stash_list: () => ({ entries: [], truncated: false }),
@@ -207,8 +216,15 @@ mockIPCWithEvents(async (cmd, args) => {
       if(failConfiguration) throw {code:"worker_error",message:"Manvi temporarily unavailable"};
       return JSON.stringify({ok:true,provider:"local",model:blankConfiguration ? "" : "quick-fixture",model_source:"fixture",providers:["local"]});
     }
-    case "enhancements.list": return JSON.stringify(page([...proposals.values()].filter(p=>p.task_id===input.task_id)));
-    case "enhancements.get": return JSON.stringify({ok:true,item:proposals.get(input.id)});
+    // As the store lists them: `newest` is newest first, `states` filters, and
+    // the page is `limit` long with a cursor past it. The fixture used to return
+    // every attempt in one page, so nothing here could ever be on page two.
+    case "enhancements.list": {
+      let items = [...proposals.values()].filter(p => p.task_id === input.task_id && (!input.states || input.states.includes(p.state)));
+      if (input.newest) items = items.reverse();
+      return JSON.stringify(page(items, Number(input.cursor ?? 0), input.limit ?? 200));
+    }
+    case "enhancements.get": enhancementReads.push(input.id); return JSON.stringify({ok:true,item:proposals.get(input.id)});
     case "enhancements.create": case "enhancements.generate": case "enhancements.complete": case "enhancements.accept": case "enhancements.undo": case "enhancements.dismiss": {
       enhancementWrites.push({method:args.method,...structuredClone(input)});
       if(receipts.has(input.request_id)) return receipts.get(input.request_id);
@@ -2200,6 +2216,313 @@ if (params.has("check")) {
         && repos.find(repo => repo.id === "repo-0").revision === 3);
       await click("Global fixture"); await settle(200);
     } catch (error) { check(`the repository relink checks ran to the end (${error.message})`, false); }
+
+    // ---- Unsaved suggestion edits are asked about on every board route -----
+    // Editing a suggestion holds the assist busy, and the sheet used to treat
+    // that busy as "cannot leave" without a word: every route below did
+    // nothing, and the close button was disabled. Each must now ask.
+    const nowSec = () => Math.floor(Date.now() / 1000);
+    const proposalFor = (taskId, id, extra = {}) => {
+      const source = structuredClone(tasks.find(task => task.id === taskId));
+      return { id, revision: 1, updated_at: 1, task_id: taskId, source_revision: source.revision, source, fields: ["title", "description"], state: "ready", provider: "local", model: "quick-fixture", automatic: false, created_at: nowSec(), expires_at: nowSec() + 3600, failure: "", accepted_fields: [], edited_fields: [], outcome_uncertain: false, proposed: { title: "Guarded title", description: "Guarded description" }, rationale: "", ...extra };
+    };
+    const openAssist = async () => { if (assistToggle() && assistToggle().getAttribute("aria-expanded") === "false") { assistToggle().click(); await settle(100); } };
+    const revisedTitle = (within = root) => [...within.querySelectorAll("textarea")].find(el => el.closest("label")?.textContent.trim().startsWith("Revised title"));
+    let guardStep = "start";
+    const showAllScopes = async () => { button("All", root.querySelector('nav[aria-label="Task scopes"]')).click(); await wait(() => card("task-3") && card("task-1")); };
+    try {
+      // The relink checks leave the board on one repository's scope.
+      guardStep = "scopes";
+      await showAllScopes();
+      proposals.set("enhancement-guard", proposalFor("task-3", "enhancement-guard"));
+      card("task-1").click(); await wait(editor);
+      guardStep = "open task-3";
+      card("task-3").click(); await wait(() => editor()?.querySelector("input[name=task-title]")?.value === "Review the agent handoff");
+      guardStep = "find Edit suggestion";
+      await openAssist();
+      await wait(() => button("Edit suggestion", editor()));
+      button("Edit suggestion", editor()).click(); await settle();
+      await change(revisedTitle(), "A revised title nobody saved");
+      const stillEditing = () => revisedTitle()?.value === "A revised title nobody saved";
+      const routes = [
+        ["opening another card", () => card("task-1").click()],
+        ["switching task tabs", () => root.querySelector('[data-task-tab="task-1"]').click()],
+        ["the sheet's close button", () => button("Close task details").click()],
+        ["Escape in the sheet", () => revisedTitle().dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true }))],
+        ["New task", () => button("New task").click()],
+        ["New workspace", () => button("New workspace").click()],
+        ["a terminal's back link to another task", () => requestTaskOpen("task-1")],
+      ];
+      confirmAnswer = false;
+      for (const [name, go] of routes) {
+        confirmations = 0;
+        go(); await settle(200);
+        check(`${name} asks before dropping unsaved suggestion edits, and Keep editing keeps them`, confirmations === 1 && stillEditing());
+      }
+      guardStep = "discard";
+      confirmAnswer = true; confirmations = 0;
+      card("task-1").click();
+      await wait(() => root.querySelector('[data-task-tab="task-1"][aria-selected="true"]') && editor() && !revisedTitle());
+      check("Discard edits on that prompt leaves for the task asked for", confirmations === 1 && !revisedTitle());
+      await click("Close task details"); await settle(100);
+      for (const tab of [...root.querySelectorAll('[data-testid="task-tab-close"]')]) { tab.click(); await settle(80); }
+
+      // The same edits in Quick Enhance, which hosts the same assist.
+      guardStep = "quick enhance";
+      const sheet = () => document.querySelector('[aria-labelledby="quick-enhance-title"]');
+      card("task-3").focus(); card("task-3").dispatchEvent(new KeyboardEvent("keydown", { key: "e", bubbles: true, cancelable: true }));
+      await wait(() => sheet() && button("Edit suggestion", sheet()));
+      button("Edit suggestion", sheet()).click(); await settle();
+      await change(revisedTitle(sheet()), "A revised title nobody saved");
+      const sheetEditing = () => Boolean(sheet()) && revisedTitle(sheet())?.value === "A revised title nobody saved";
+      const sheetRoutes = [
+        ["Quick Enhance's close button", () => button("Close Quick Enhance", sheet()).click()],
+        ["Escape in Quick Enhance", () => revisedTitle(sheet()).dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true }))],
+        ["Quick Enhance's Open full editor", () => button("Open full editor", sheet()).click()],
+        ["a terminal's back link while Quick Enhance is open", () => requestTaskOpen("task-1")],
+      ];
+      confirmAnswer = false;
+      for (const [name, go] of sheetRoutes) {
+        confirmations = 0;
+        go(); await settle(200);
+        check(`${name} asks before dropping unsaved suggestion edits`, confirmations === 1 && sheetEditing());
+      }
+      confirmAnswer = true; confirmations = 0;
+      button("Close Quick Enhance", sheet()).click(); await wait(() => !sheet());
+      check("Discard edits closes Quick Enhance", confirmations === 1);
+      proposals.delete("enhancement-guard");
+    } catch (error) { check(`the suggestion-edit route guard checks ran to the end (${error.message} at ${guardStep}; toggle=${assistToggle()?.getAttribute("aria-expanded")}; assist=${(editor()?.querySelector("[aria-label=\"Manvi task assist\"]")?.textContent ?? "none").replace(/\s+/g, " ").slice(0, 400)})`, false); }
+
+    // ---- The newest active suggestion, wherever it sits in the history ---
+    // Thirty attempts are listed per page. A run older than the first page
+    // was never selected, never polled, and did not stop a second one.
+    try {
+      const pagedTask = "task-3";
+      const at = nowSec() - 500;
+      proposals.set("paged-live", proposalFor(pagedTask, "paged-live", { state: "running", worker_id: "worker", created_at: at, proposed: undefined }));
+      for (let i = 0; i < 32; i++) proposals.set(`paged-${i}`, proposalFor(pagedTask, `paged-${i}`, { state: "dismissed", created_at: at + 1 + i }));
+      const picker = () => editor()?.querySelector('[data-testid="task-assist-history"]');
+      guardStep = "paged: scopes";
+      await showAllScopes();
+      guardStep = `paged: card ${Boolean(card(pagedTask))}`;
+      card(pagedTask).click(); await wait(editor);
+      guardStep = "paged: assist";
+      await openAssist();
+      await wait(() => picker() && picker().options.length >= 30);
+      await settle(300);
+      check("the review opens on the running attempt even though it is past the first page", picker().value === "paged-live" && (editor()?.querySelector('article[aria-label="Enhancement review"]')?.textContent ?? "").length > 0);
+      const readsBefore = enhancementReads.filter(id => id === "paged-live").length;
+      await settle(2200);
+      check("and that attempt is polled while it runs", enhancementReads.filter(id => id === "paged-live").length >= readsBefore + 2);
+      check("a second generation cannot start beside a live attempt on another page", enhanceButton()?.matches(":disabled") === true);
+      guardStep = "paged: refresh";
+      check("the picker lists the pages down to that attempt, so it can name it", picker().options.length === 33 && !button("Load more", editor()));
+      await settle(1600);
+      check("the history refresh a live attempt drives keeps the pages already loaded", picker().options.length === 33);
+      proposals.set("paged-live", { ...proposals.get("paged-live"), state: "dismissed", revision: 2 });
+      await settle(1200);
+      await click("Close task details"); await settle(100);
+      for (const tab of [...root.querySelectorAll('[data-testid="task-tab-close"]')]) { tab.click(); await settle(80); }
+      for (const id of [...proposals.keys()]) if (id.startsWith("paged-")) proposals.delete(id);
+    } catch (error) { check(`the paged suggestion history checks ran to the end (${error.message} at ${guardStep})`, false); }
+
+    // ---- Checkouts that moved, and repositories with only a remote --------
+    // The board header's own Refresh: other panes carry a button of that name.
+    const boardRefresh = () => root.querySelector('header [aria-label="Refresh"]');
+    const refreshBoard = async () => { await wait(() => boardRefresh() && !boardRefresh().disabled); boardRefresh().click(); await settle(150); await wait(() => !boardRefresh().disabled); };
+    try {
+      guardStep = "checkouts: scopes";
+      await showAllScopes();
+      const row = id => root.querySelector(`[data-repository-row="${id}"]`);
+      const chip = id => card(id)?.querySelector('[data-testid="card-checkout"]');
+      const relinkPrompt = name => [...document.querySelectorAll('[role="dialog"]')].find(node => node.getAttribute("aria-label") === `Relink ${name}?`);
+      missingCheckouts.add("/fixture/Manvi");
+      repos.push({ id: "repo-remote", name: "Docs site", revision: 1, updated_at: 1, identity_key: "remote:github.com/fixture/docs", remote_url: "https://github.com/fixture/docs.git" });
+      tasks.push(makeTask("task-90", "Publish the docs site", "repo-remote", "backlog"));
+      await refreshBoard();
+      guardStep = "checkouts: missing";
+      await wait(() => row("repo-1")?.dataset.checkout === "missing" && row("repo-remote"));
+      check("a moved checkout is marked on its navigator row before anyone relinks", row("repo-1").textContent.includes("Missing") && row("repo-0").dataset.checkout === "available");
+      check("the mark says where the checkout was expected", row("repo-1").querySelector("button").title.includes("/fixture/Manvi"));
+      check("a card whose repository's checkout is missing says so, before any launch", chip("task-3")?.textContent.includes("Checkout missing") && !chip("task-1"));
+      check("a remote-only repository is listed, marked, and offers to link a local checkout",
+        row("repo-remote").dataset.checkout === "remote" && row("repo-remote").textContent.includes("Remote only")
+        && Boolean(button("Link Docs site to a local checkout")) && !button("Relink Docs site to a moved checkout"));
+      check("its tasks carry no local path: the card says Remote only", chip("task-90")?.textContent.includes("Remote only"));
+      // A check that could not run is neither available nor missing.
+      const gitpulsePath = repos.find(repo => repo.id === "repo-0").identity_key.replace(/^local:/, "").replace(/\/\.git$/, "");
+      uncheckableCheckouts.add(gitpulsePath);
+      await refreshBoard();
+      await wait(() => row("repo-0")?.dataset.checkout === "unknown");
+      check("a checkout that could not be checked says so instead of passing or failing",
+        row("repo-0").textContent.includes("Not checked") && !chip("task-1")
+        && (root.querySelector('[data-testid="checkout-unchecked"]')?.textContent ?? "").includes("Operation not permitted"));
+      uncheckableCheckouts.clear();
+      guardStep = "checkouts: relink";
+      pickFolderResult = "/relocated/Manvi";
+      button("Relink Manvi to a moved checkout").click(); await wait(() => relinkPrompt("Manvi"));
+      button("Relink", relinkPrompt("Manvi")).click();
+      await wait(() => row("repo-1")?.dataset.checkout === "available");
+      check("relinking clears the mark from the row and the cards", !row("repo-1").textContent.includes("Missing") && !chip("task-3"));
+      pickFolderResult = "/fixture/Docs";
+      button("Link Docs site to a local checkout").click(); await wait(() => relinkPrompt("Docs site"));
+      check("linking a remote-only repository says it had no local checkout", relinkPrompt("Docs site").textContent.includes("had no local checkout"));
+      button("Relink", relinkPrompt("Docs site")).click();
+      await wait(() => row("repo-remote")?.dataset.checkout === "available");
+      check("once linked it is an ordinary local repository, with its task still on it", !chip("task-90") && tasks.find(task => task.id === "task-90").repository_ids[0] === "repo-remote");
+      missingCheckouts.clear();
+      tasks = tasks.filter(task => task.id !== "task-90");
+      repos.splice(repos.findIndex(repo => repo.id === "repo-remote"), 1);
+      await refreshBoard(); await wait(() => !row("repo-remote"));
+    } catch (error) { check(`the checkout checks ran to the end (${error.message} at ${guardStep}; rows=${[...root.querySelectorAll("[data-repository-row]")].map(el => `${el.dataset.repositoryRow}:${el.dataset.checkout}:${el.querySelector("button")?.title}`).join(" | ")}; unchecked=${root.querySelector('[data-testid="checkout-unchecked"]')?.textContent})`, false); }
+
+    // ---- Every page of a column, in both layouts -------------------------
+    try {
+      guardStep = "paging";
+      for (let i = 0; i < 35; i++) tasks.push(makeTask(`task-${300 + i}`, `Paged review ${String(i + 1).padStart(2, "0")}`, "repo-0", "review"));
+      await refreshBoard();
+      button("List").click();
+      await wait(() => root.querySelector('[data-task-list] [data-task-paging="review"]'));
+      const paging = () => root.querySelector('[data-task-list] [data-task-paging="review"]');
+      const pagedRows = () => [...root.querySelectorAll("[data-task-list] [data-task-card]")].filter(el => el.textContent.includes("Paged review")).length;
+      const before = pagedRows();
+      check("the list layout pages a column too, and says how much of it is loaded", /^Review: 30 of \d+/.test(paging().querySelector(".paging-count").textContent.trim()) && before < 35);
+      button("Load more Review tasks").click();
+      await wait(() => pagedRows() === 35);
+      check("Load more in the list reaches every task in the column", !button("Load more Review tasks") && pagedRows() === 35);
+      button("Show only the first Review page").click();
+      await wait(() => pagedRows() === before);
+      check("First page goes back to one page", pagedRows() === before);
+      button("Board").click(); await settle(200);
+      const review = () => root.querySelector('[data-task-column="review"]');
+      check("the board's column names its control for what it does", Boolean(button("Load more Review tasks", review())) && !button("Next", review()));
+      tasks = tasks.filter(task => !task.title.startsWith("Paged review"));
+      await refreshBoard(); await settle(200);
+    } catch (error) { check(`the paging checks ran to the end (${error.message} at ${guardStep})`, false); }
+
+    // ---- Work-in-progress limits, lanes and saved views, per board --------
+    try {
+      guardStep = "views: scopes";
+      await showAllScopes();
+      const viewMenu = () => document.querySelector('[data-testid="task-view-menu"]');
+      const openView = async () => { if (!viewMenu()) { root.querySelector("[data-task-view-toggle]").click(); await settle(); } return viewMenu(); };
+      const closeView = async () => { if (viewMenu()) { root.querySelector("[data-task-view-toggle]").click(); await settle(); } };
+      const column = status => root.querySelector(`[data-task-column="${status}"]`);
+      const head = status => root.querySelector(`[data-task-column-head="${status}"]`) ?? column(status);
+      const wipInput = status => viewMenu().querySelector(`[data-task-wip-input="${status}"]`);
+      const readyTotal = () => tasks.filter(task => !deleted.has(task.id) && task.status === "ready").length;
+
+      guardStep = "views: wip";
+      await openView();
+      const limit = readyTotal() - 1;
+      await change(wipInput("ready"), String(limit), "change");
+      await closeView();
+      const loadedReady = column("ready").querySelectorAll("[data-task-card]").length;
+      check("a column over its work-in-progress limit is marked over it, in its head",
+        column("ready").dataset.wip === "over" && Boolean(column("ready").querySelector('[data-testid="task-column-over"]'))
+        && column("ready").querySelector('[data-testid="task-column-count"]').textContent.trim() === `${readyTotal()}/${limit}`);
+      check("over is judged on the column's total, not on the page loaded", loadedReady <= limit || readyTotal() <= 30);
+      check("a column with no limit carries no mark", !column("review")?.dataset.wip && !column("review")?.querySelector('[data-testid="task-column-over"]'));
+      await openView(); await change(wipInput("ready"), String(readyTotal()), "change"); await closeView();
+      check("exactly at the limit is not over it", column("ready").dataset.wip === "at" && !column("ready").querySelector('[data-testid="task-column-over"]'));
+      await openView(); await change(wipInput("ready"), "0", "change");
+      check("a limit the board cannot hold is refused, and the box says none", wipInput("ready").value === "" && !get(interfaceStore).taskBoards.global);
+      await change(wipInput("ready"), String(limit), "change"); await closeView();
+      workspaceTab("Developer tools").click(); await settle(400);
+      await openView();
+      check("limits belong to one board: the workspace's board has none", wipInput("ready").value === "" && get(interfaceStore).taskBoards.global?.wip.ready === limit);
+      await closeView();
+      await showAllScopes(); await settle(200);
+      check("and the global board still has its own", column("ready").dataset.wip === "over");
+      await openView(); await change(wipInput("ready"), "", "change"); await closeView();
+      check("clearing the limit clears the mark", !column("ready").dataset.wip);
+
+      guardStep = "views: lanes";
+      await openView();
+      viewMenu().querySelector('[data-task-lane-option="owner"]').click(); await settle(200);
+      await closeView();
+      const lanes = () => [...root.querySelectorAll(".columns [data-task-lane]")];
+      const laneOf = id => card(id)?.closest("[data-task-lane]")?.dataset.taskLane;
+      const ownerOf2 = tasks.find(task => task.id === "task-2").owner;
+      check("owner lanes put each card in its owner's lane, unassigned last",
+        lanes().length >= 2 && laneOf("task-2") === `owner:${ownerOf2}` && lanes().at(-1).dataset.taskLane === "owner:");
+      const drawnIds = [...root.querySelectorAll(".columns [data-task-card]")].map(el => el.dataset.cardId);
+      check("every card is drawn once across the lanes", drawnIds.length > 0 && new Set(drawnIds).size === drawnIds.length);
+      const heads = root.querySelectorAll("[data-task-column-head]").length;
+      check("the column heads, with counts and limits, are drawn once above the lanes",
+        heads > 0 && lanes().every(lane => lane.querySelectorAll("[data-task-column]").length === heads));
+      guardStep = `views: lane move from ${card("task-2")?.closest("[data-task-column]")?.dataset.taskColumn}`;
+      const order = ["inbox", "backlog", "ready", "in_progress", "review", "done"];
+      const from = card("task-2").closest("[data-task-column]").dataset.taskColumn, to = order[order.indexOf(from) - 1];
+      const before = writes.length;
+      card("task-2").focus(); card("task-2").dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowLeft", bubbles: true, cancelable: true }));
+      await wait(() => writes.length > before && card("task-2")?.closest("[data-task-column]")?.dataset.taskColumn === to);
+      check("a keyboard move in a lane changes the status and keeps the card in its lane", writes.at(-1).status === to && writes.at(-1).owner === ownerOf2 && laneOf("task-2") === `owner:${ownerOf2}`);
+      guardStep = `views: lane move back; now ${card("task-2")?.closest("[data-task-column]")?.dataset.taskColumn} writes=${writes.length}`;
+      card("task-2").focus(); card("task-2").dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowRight", bubbles: true, cancelable: true }));
+      await wait(() => tasks.find(task => task.id === "task-2").status === from);
+      await openView();
+      viewMenu().querySelector('[data-task-lane-option="status"]').click(); await settle(200);
+      check("status lanes are not drawn on the board, and the menu says why", lanes().length === 0 && Boolean(viewMenu().querySelector('[data-testid="task-lanes-note"]')));
+      await closeView();
+      button("List").click(); await settle(200);
+      const listLanes = [...root.querySelectorAll("[data-task-list] [data-task-lane]")].map(el => el.dataset.taskLane);
+      check("in the list, status lanes group the rows by status", listLanes.length >= 2 && [...root.querySelectorAll("[data-task-list] [data-task-card]")].every(row => row.closest("[data-task-lane]")?.dataset.taskLane === `status:${tasks.find(task => task.id === row.dataset.cardId)?.status}`));
+      button("Board").click(); await settle(150);
+
+      guardStep = "views: saved";
+      const showAll = async () => { const all = button("All", root.querySelector('nav[aria-label="Task scopes"]')); all.click(); await wait(() => all.getAttribute("aria-pressed") === "true"); await settle(400); };
+      const viewsPanel = () => document.querySelector('[data-testid="task-saved-views"]');
+      const viewsToggle = () => root.querySelector("[data-task-views-toggle]");
+      const openViews = async () => { if (!viewsPanel()) { viewsToggle().click(); await settle(); } return viewsPanel(); };
+      const closeViews = async () => { if (viewsPanel()) { viewsToggle().click(); await settle(); } };
+      const saveAs = async name => { await openViews(); await change(viewsPanel().querySelector('input[aria-label="View name"]'), name); button("Save", viewsPanel()).click(); await settle(); };
+      await openView(); viewMenu().querySelector('[data-task-lane-option="owner"]').click(); await settle(); await closeView();
+      if (!root.querySelector('[aria-label="Filter by priority"]')) { await click("Filters"); }
+      await change(root.querySelector('[aria-label="Filter by priority"]'), "1", "change");
+      await saveAs("Owners");
+      check("saving a view names it on the control and keeps it for this board", viewsToggle().textContent.trim() === "Owners"
+        && get(interfaceStore).taskBoards.global?.views.some(view => view.name === "Owners" && view.swimlane === "owner" && view.facet.priority === 1));
+      check("a saved view survives a reload: it is in the stored preferences", JSON.stringify({ ...localStorage }).includes("Owners"));
+      await closeViews();
+      await openView(); viewMenu().querySelector('[data-task-lane-option="none"]').click(); await settle(); await closeView();
+      button("List").click(); await settle(150);
+      await click("Clear filters");
+      check("changing what is on screen leaves the saved view, and the control stops naming it", viewsToggle().textContent.trim() === "Views");
+      await openViews();
+      button("Owners", viewsPanel()).click(); await settle(300);
+      check("applying a view puts back its layout, lanes and filters",
+        get(interfaceStore).taskLayout === "board" && get(interfaceStore).taskSwimlane === "owner"
+        && root.querySelector('[aria-label="Filter by priority"]')?.value === "1" && lanes().length >= 1 && viewsToggle().textContent.trim() === "Owners");
+      await closeViews();
+      workspaceTab("Developer tools").click(); await settle(400);
+      await openViews();
+      check("views belong to one board: the workspace's board lists none of the global board's", !button("Owners", viewsPanel()) && viewsPanel().textContent.includes("None yet"));
+      await saveAs("Workspace view");
+      await closeViews();
+      await showAll();
+      await openViews();
+      check("and the global board does not list the workspace's", Boolean(button("Owners", viewsPanel())) && !button("Workspace view", viewsPanel()));
+      viewsPanel().querySelector('[aria-label="Delete view Owners"]').click(); await settle();
+      check("deleting a view removes it from this board only", !button("Owners", viewsPanel())
+        && get(interfaceStore).taskBoards["workspace:workspace"]?.views.some(view => view.name === "Workspace view"));
+      await closeViews();
+      // Leave the board as the next checks expect it.
+      interfaceStore.deleteTaskView("workspace:workspace", get(interfaceStore).taskBoards["workspace:workspace"]?.views[0]?.id ?? "");
+      interfaceStore.setTaskSwimlane("none");
+      await click("Clear filters"); await settle(200);
+    } catch (error) { check(`the board view checks ran to the end (${error.message} at ${guardStep}; error=${root.querySelector(".banner.error")?.textContent ?? ""})`, false); }
+
+    // ---- A repository's board reaches the global board -------------------
+    try {
+      guardStep = "global nav";
+      await click("GitPulse fixture"); await wait(() => root.querySelector('[data-testid="task-board-all"]'));
+      interfaceStore.setGlobalSurface("repository");
+      root.querySelector('[data-testid="task-board-all"]').click(); await settle();
+      check("a repository's board opens the Tasks board for everything", get(interfaceStore).globalSurface === "tasks");
+      await click("Global fixture"); await wait(() => !root.querySelector('[data-testid="task-board-all"]'));
+      check("the global board does not offer a link to itself", !root.querySelector('[data-testid="task-board-all"]'));
+    } catch (error) { check(`the global navigation checks ran to the end (${error.message} at ${guardStep})`, false); }
 
     check(`no runtime errors or unconfigured fixture requests occurred${crashes.length || unknown.length ? ` (${[...crashes, ...unknown].join("; ")})` : ""}`, crashes.length === 0 && unknown.length === 0);
   } catch(error) { results.push({name:error.message, stack:error.stack, pass:false}); }

@@ -599,6 +599,23 @@ export async function getEnhancement(id: string): Promise<Enhancement> { return 
 export async function listEnhancements(taskID: string, cursor?: string): Promise<Page<EnhancementSummary>> {
   return page(await request("enhancements.list", { task_id: taskID, newest: true, limit: 30, ...(cursor ? { cursor } : {}) }), enhancementSummary);
 }
+/** States in which a proposal still has a worker on it. */
+export const LIVE_ENHANCEMENT_STATES = ["pending", "running", "cancel_requested"] as const satisfies readonly EnhancementState[];
+/** Live, or waiting for the reader to accept or dismiss it. */
+export const ACTIVE_ENHANCEMENT_STATES = [...LIVE_ENHANCEMENT_STATES, "ready"] as const satisfies readonly EnhancementState[];
+/**
+ * The task's newest proposal in one of `states`, wherever it sits in the
+ * history, or null when it has none.
+ *
+ * One filtered read rather than a walk of the pages: the history is listed
+ * thirty at a time, so the newest *live* attempt can be on a page nobody has
+ * loaded, and a check that looked only at the first page let a second
+ * generation start beside it.
+ */
+export async function latestEnhancement(taskID: string, states: readonly EnhancementState[]): Promise<EnhancementSummary | null> {
+  const result = page(await request("enhancements.list", { task_id: taskID, newest: true, limit: 1, states: [...states] }), enhancementSummary);
+  return result.items[0] ?? null;
+}
 export async function changeEnhancement(method: EnhancementMutation, input: Record<string, unknown>): Promise<Enhancement> {
   return record(await request(method, input), enhancement);
 }
@@ -643,6 +660,8 @@ export async function enhancementConfiguration(selection?: ModelSelection | null
   return { provider, model, model_source, providers };
 }
 export function scopeParams(scope: Scope): Record<string, string> { return scope.kind === "global" ? {} : scope.kind === "workspace" ? { workspace_id: scope.id } : { repository_id: scope.id }; }
+/** How many tasks one column page holds. */
+export const TASK_PAGE_SIZE = 30;
 /**
  * Which side of the board a list reads, and in what order.
  *
@@ -661,7 +680,7 @@ export async function listTasks(
   status?: TaskStatus | null,
   query = "",
   cursor?: string,
-  limit = 30,
+  limit = TASK_PAGE_SIZE,
   filter: TaskListFilter = {},
 ): Promise<Page<TaskCard>> {
   const result = page(
