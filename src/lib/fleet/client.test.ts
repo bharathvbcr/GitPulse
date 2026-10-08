@@ -234,6 +234,15 @@ describe("the IPC seam", () => {
     expect(seen[0].windowDays).toBe(30);
   });
 
+  it("sends each repository once, so `requested` counts repositories", async () => {
+    let sent: string[] = [];
+    await fetchFleetSnapshot(["/a", "/b", "/a", "", "/b"], null, async (_cmd, args) => {
+      sent = args?.repoPaths as string[];
+      return null as never;
+    });
+    expect(sent).toEqual(["/a", "/b"]);
+  });
+
   it("does not hand the caller's array to the backend by reference", async () => {
     const paths = ["/a"];
     let sent: string[] = [];

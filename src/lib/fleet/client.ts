@@ -68,8 +68,13 @@ export function fetchFleetSnapshot(
   windowDays: number | null = null,
   invokeFn: InvokeFn = invoke,
 ): Promise<FleetSnapshot> {
+  // Each path once, by the backend's own rule (the exact string, no empty
+  // ones). The sweep is open tabs then recents, which overlap; sent twice, a
+  // path inflated `requested` past the rows the backend could ever return, so
+  // a short snapshot could not say whether the repository cap stopped it.
+  const unique = [...new Set(repoPaths.filter((path) => path.length > 0))];
   return invokeFn<FleetSnapshot>("cmd_fleet_snapshot", {
-    repoPaths: [...repoPaths],
+    repoPaths: unique,
     windowDays,
   });
 }

@@ -155,6 +155,7 @@ describe("the frontend mirror matches MenuState::validate", () => {
       checked: ["theme-system"],
       labels: [],
       repositories: [{ path: "/r/a", label: "a", active: true, changed: 1, conflicts: null, busy: false }],
+      repositoriesHidden: 0,
       activePath: "/r/a",
       showStatusIcon: false,
       hideDockWhenClosed: true,
@@ -193,6 +194,14 @@ describe("the frontend mirror matches MenuState::validate", () => {
       .toBe("Native menu state contains an invalid repository");
     expect(broken((draft) => (draft.repositories[0].changed = MENU_LIMITS.count + 1))).toBe(
       "Native menu repository counts exceed their limit",
+    );
+    // A hidden count under a switcher with room left is a dropped list
+    // posing as a summary; Rust refuses it, and so does the mirror.
+    expect(broken((draft) => (draft.repositoriesHidden = 3))).toBe(
+      "Native menu state exceeds its entry limit",
+    );
+    expect(broken((draft) => (draft.repositoriesHidden = -1))).toBe(
+      "Native menu state exceeds its entry limit",
     );
     expect(broken((draft) => draft.enabled.push("not-an-action"))).toBe(
       "Native menu state contains an unknown action",

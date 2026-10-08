@@ -64,6 +64,15 @@ fn item<R: Runtime>(
     }
 }
 
+/// The switcher's last row when more repositories are open than it lists.
+fn hidden_repositories_label(hidden: u32) -> String {
+    if hidden == 1 {
+        "1 More Open Repository in the Tab Bar".to_string()
+    } else {
+        format!("{hidden} More Open Repositories in the Tab Bar")
+    }
+}
+
 fn recent_label(path: &str) -> String {
     std::path::Path::new(path)
         .file_name()
@@ -154,6 +163,15 @@ pub fn build_native_menu<R: Runtime>(
             super::state::menu_text(&repo.label),
             true,
             repo.active,
+            None::<&str>,
+        )?)?;
+    }
+    if state.repositories_hidden > 0 {
+        open_repositories.append(&MenuItem::with_id(
+            app,
+            "repositories:hidden",
+            hidden_repositories_label(state.repositories_hidden),
+            false,
             None::<&str>,
         )?)?;
     }
@@ -522,6 +540,18 @@ pub fn apply_presentation<R: Runtime>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hidden_repositories_label_counts_what_the_switcher_left_out() {
+        assert_eq!(
+            hidden_repositories_label(1),
+            "1 More Open Repository in the Tab Bar"
+        );
+        assert_eq!(
+            hidden_repositories_label(936),
+            "936 More Open Repositories in the Tab Bar"
+        );
+    }
 
     #[test]
     fn recent_label_uses_final_path_component() {

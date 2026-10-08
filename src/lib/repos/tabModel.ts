@@ -15,7 +15,14 @@ import {
   type TabColor,
 } from "./tabColors";
 
-export const MAX_OPEN_TABS = 24;
+/**
+ * The most repositories the workspace holds open, which is what it can
+ * persist and draw — not what it can watch. Watches are pooled separately
+ * (`watchPool.ts`), so this used to be 24, the size of the native watch
+ * table, and is now a sanity bound: reaching it is still refused, never
+ * truncated on save.
+ */
+export const MAX_OPEN_TABS = 1000;
 export const MAX_RECENT_REPOS = 24;
 export const MAX_LAST_CLOSED = 16;
 

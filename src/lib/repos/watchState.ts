@@ -18,6 +18,12 @@
  *
  * Two things follow, and both live here so they cannot drift apart: the user
  * is told, and the poll compensates.
+ *
+ * A watch can also be withheld on purpose. Watches are pooled
+ * (`watchPool.ts`): past the pool, the repositories used least recently are
+ * parked — not watched, by decision rather than by fault — and come back live
+ * when someone opens them. That is its own status so a choice never reads as
+ * a failure, and a failure never hides behind a choice.
  */
 
 export type WatchStatus =
@@ -25,6 +31,8 @@ export type WatchStatus =
   | "watching"
   /** The watch could not be established, or was lost. Reason travels with it. */
   | "degraded"
+  /** Not watched because more repositories are open than the pool holds. */
+  | "parked"
   /** No attempt has settled yet. Not an assertion either way. */
   | "unknown";
 
@@ -36,6 +44,7 @@ export interface WatchState {
 
 export const WATCH_UNKNOWN: WatchState = { status: "unknown", reason: null };
 export const WATCH_ACTIVE: WatchState = { status: "watching", reason: null };
+export const WATCH_PARKED: WatchState = { status: "parked", reason: null };
 
 /** Builds a degraded state, never losing the reason. */
 export function watchFailed(reason: unknown): WatchState {
@@ -76,7 +85,7 @@ export function needsFullPoll(state: WatchState): boolean {
  * flickers on every open trains people to ignore it.
  */
 export function shouldSurface(state: WatchState): boolean {
-  return state.status === "degraded";
+  return state.status === "degraded" || state.status === "parked";
 }
 
 /** Short marker for the status bar. Null when there is nothing to say. */
@@ -84,6 +93,7 @@ export function watchMarker(state: WatchState): string | null {
   // Two words. The status bar is a dense 24px row shared with the branch,
   // sync counts and file counts; the full explanation lives in the tooltip,
   // where there is room to say what it means and what the app is doing.
+  if (state.status === "parked") return "Paused";
   return shouldSurface(state) ? "Not live" : null;
 }
 
@@ -100,6 +110,12 @@ export function describeWatch(state: WatchState): string {
       return "This repository updates live as files change.";
     case "unknown":
       return "Still setting up live updates for this repository.";
+    case "parked":
+      return (
+        "Live updates are paused for this repository: more repositories are open " +
+        "than GitPulse watches at once, and it was used least recently. Opening it " +
+        "reads it in full and resumes live updates."
+      );
     case "degraded":
       return (
         `GitPulse is not receiving live filesystem updates for this repository` +

@@ -13,7 +13,6 @@ before that tag is pushed.
 
 ### Added
 
-<<<<<<< HEAD
 - Task checklists with a done state per item, and links between tasks
   (parent, blocks, related, duplicate of), edited in the task sheet and read
   from both ends in the agent brief.
@@ -36,8 +35,47 @@ before that tag is pushed.
   marked on its navigator row and on its tasks' cards before a launch or a
   relink, a check that could not run says so, and a repository known only by
   its remote is shown as Remote only and can be linked to a checkout.
-
+- **Search file contents across the repository.** Code → Search (also in the
+  palette and the View menu) runs `git grep` over the working tree — tracked
+  and untracked files, never ignored ones — or over a revision. Results are
+  capped, can be cancelled, and a capped, cut, timed-out or cancelled answer
+  says it is partial and why instead of showing a count that looks complete.
+- **Rename, move and delete from the file tree.** Tracked files move with a
+  staged `git mv` and are deleted with `git rm` (restorable until you
+  commit); untracked files are moved with a plain rename and removed with
+  `git clean`, which the delete confirmation names as unrecoverable. Ignored
+  files are never deleted. The doc-vault rename now goes through the same
+  path, and every move or delete is judged by the policy gate before it runs.
+- **Open, review and merge pull requests.** Each pull request expands to its
+  description, size, CI and merge state, with Approve, Comment, Request
+  changes and Merge; the panel can also open a new pull request from the
+  current branch. Every action is confirmed first and says what it publishes
+  where. A merge is pinned to the head commit you were shown, so a push after
+  you looked makes gh refuse rather than merge it; opening a pull request
+  never pushes.
+- **Act on a reflog entry.** Create a branch at an entry, or reset the current
+  branch to it. The reset confirmation lists the commits that would leave the
+  branch and how many no other branch, tag or remote still holds, and it uses
+  `git reset --keep`, so uncommitted work is never discarded.
+- **Blame at a revision.** Each commit block in Blame can step to the file as
+  it stood in that commit's parent — following a rename to the old path — to
+  get past a reformat or move to the change that really wrote a line. Back and
+  Working tree return; picking another file ends the walk.
 ### Changed
+- **More than 24 repositories can be open at once.** Opening a twenty-fifth
+  used to be refused with "Too many open repositories (max 24)", because every
+  tab held one of 24 native file watches. Tabs and watches are now separate:
+  a workspace holds up to 1000 repositories, and the 24 used most recently are
+  watched live. The rest are *parked* — dimmed on the strip, "Paused" in the
+  status bar and fleet, counts hidden in the menu — and are read in full and
+  watched again when you open them. Restoring a large workspace reads only the
+  watched repositories, so it no longer slows with every tab you keep open.
+- The Open Repositories menu keeps the current repository listed past its 64
+  rows and says how many more are open in the tab bar.
+- The fleet view says when its 64-repository sweep limit, not the clock, left
+  rows unscanned, instead of suggesting a refresh that would reach the same
+  ones.
+
 
 - Archived is its own flag, independent of status (dc-store schema 11).
   Finishing a task leaves it in Done; Archive files a task away from any column
@@ -66,34 +104,6 @@ before that tag is pushed.
 - dc-store schema 11 is a one-way migration, and a host built against schema
   10 refuses a migrated profile. Rebuild GitPulse, Manvi and DevCouncil from a
   schema 11 dc-store before any of them opens the profile.
-=======
-- **Search file contents across the repository.** Code → Search (also in the
-  palette and the View menu) runs `git grep` over the working tree — tracked
-  and untracked files, never ignored ones — or over a revision. Results are
-  capped, can be cancelled, and a capped, cut, timed-out or cancelled answer
-  says it is partial and why instead of showing a count that looks complete.
-- **Rename, move and delete from the file tree.** Tracked files move with a
-  staged `git mv` and are deleted with `git rm` (restorable until you
-  commit); untracked files are moved with a plain rename and removed with
-  `git clean`, which the delete confirmation names as unrecoverable. Ignored
-  files are never deleted. The doc-vault rename now goes through the same
-  path, and every move or delete is judged by the policy gate before it runs.
-- **Open, review and merge pull requests.** Each pull request expands to its
-  description, size, CI and merge state, with Approve, Comment, Request
-  changes and Merge; the panel can also open a new pull request from the
-  current branch. Every action is confirmed first and says what it publishes
-  where. A merge is pinned to the head commit you were shown, so a push after
-  you looked makes gh refuse rather than merge it; opening a pull request
-  never pushes.
-- **Act on a reflog entry.** Create a branch at an entry, or reset the current
-  branch to it. The reset confirmation lists the commits that would leave the
-  branch and how many no other branch, tag or remote still holds, and it uses
-  `git reset --keep`, so uncommitted work is never discarded.
-- **Blame at a revision.** Each commit block in Blame can step to the file as
-  it stood in that commit's parent — following a rename to the old path — to
-  get past a reformat or move to the change that really wrote a line. Back and
-  Working tree return; picking another file ends the walk.
->>>>>>> 4cde4ab34bf3e4feba0846864975377c570670b4
 
 ## [1.4.0] - 2026-10-07
 
