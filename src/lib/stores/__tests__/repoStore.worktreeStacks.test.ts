@@ -580,3 +580,26 @@ describe("arrangeTabs and grouping", () => {
     expect(groupOf(OTHER)).toBe("web");
   });
 });
+
+describe("familyOf: a checkout's repository without opening it", () => {
+  it("answers from an open tab without asking the backend, and resolves an unopened checkout without opening it", async () => {
+    const resolves: string[] = [];
+    const store = makeStore(makeInvoke({ cmd_resolve_repo: async (_cmd, args) => { const path = String(args?.repoPath); resolves.push(path); return { path, name: "x", is_bare: false, common_dir: commonDirFor(path) } as never; } }));
+    await store.openRepo(MAIN);
+    const open = get(store).openTabs[0].family;
+    resolves.length = 0;
+    expect(await store.familyOf(MAIN)).toBe(open);
+    expect(resolves).toEqual([]);
+    expect(await store.familyOf(wt("never-opened"))).toBe(open);
+    expect(resolves).toEqual([wt("never-opened")]);
+    expect(ids(store)).toEqual([MAIN]);
+  });
+
+  it("is null, never a guess, when the checkout cannot be resolved or reports no common directory", async () => {
+    const failing = makeStore(makeInvoke({ cmd_resolve_repo: async () => { throw new Error("REPOSITORY_TRUST_REQUIRED"); } }));
+    expect(await failing.familyOf(wt("a"))).toBeNull();
+    const silent = makeStore(makeInvoke({ cmd_resolve_repo: async (_cmd, args) => ({ path: String(args?.repoPath), name: "x", is_bare: false }) as never }));
+    expect(await silent.familyOf(wt("a"))).toBeNull();
+    expect(await silent.familyOf("")).toBeNull();
+  });
+});

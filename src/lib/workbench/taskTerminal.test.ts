@@ -4,7 +4,9 @@ import { get, writable } from "svelte/store";
 const openRepo = vi.fn();
 const setTerminalOpen = vi.fn();
 const setGlobalSurface = vi.fn();
-const repoState = writable<{ currentPath: string | null; openTabs?: { id: string; path: string; trustRequired?: boolean }[] }>({ currentPath: "/work/current" });
+const repoState = writable<{ currentPath: string | null; openTabs?: { id: string; path: string; trustRequired?: boolean; missing?: boolean; family?: string | null; familyRoot?: string | null }[] }>({ currentPath: "/work/current" });
+// The repository family of a checkout, as repoStore.familyOf answers it. None by default: a checkout stands alone.
+const familyOf = vi.fn();
 const activateTab = vi.fn();
 const trustTab = vi.fn();
 // The store's capacity answer, as repoStore.openRefusal gives it for the published tabs.
@@ -14,7 +16,7 @@ const openRefusal = (path: string): string | null => {
     ? "Too many open repositories (max 24). Close a tab to open another."
     : null;
 };
-vi.mock("../stores/repoStore", () => ({ repoStore: { subscribe: repoState.subscribe, openRepo: (...args: unknown[]) => openRepo(...args), setTerminalOpen: (...args: unknown[]) => setTerminalOpen(...args), activateTab: (...args: unknown[]) => activateTab(...args), trustTab: (...args: unknown[]) => trustTab(...args), openRefusal: (path: string) => openRefusal(path) } }));
+vi.mock("../stores/repoStore", () => ({ repoStore: { subscribe: repoState.subscribe, openRepo: (...args: unknown[]) => openRepo(...args), setTerminalOpen: (...args: unknown[]) => setTerminalOpen(...args), activateTab: (...args: unknown[]) => activateTab(...args), trustTab: (...args: unknown[]) => trustTab(...args), openRefusal: (path: string) => openRefusal(path), familyOf: (...args: unknown[]) => familyOf(...args) } }));
 vi.mock("../stores/interfaceStore", () => ({ interfaceStore: { setGlobalSurface: (...args: unknown[]) => setGlobalSurface(...args) } }));
 const findConversation = vi.fn();
 vi.mock("./client", async (importOriginal) => ({ ...(await importOriginal<typeof import("./client")>()), findConversation: (...args: unknown[]) => findConversation(...args), explainError: (cause: unknown) => (cause instanceof Error ? cause.message : String(cause)), launchManagedRun: vi.fn() }));
@@ -45,6 +47,7 @@ beforeEach(() => {
   openRepo.mockReset(); activateTab.mockReset(); trustTab.mockReset(); setTerminalOpen.mockReset(); setGlobalSurface.mockReset(); findConversation.mockReset(); focusTerminalSession.mockReset();
   // A checkout root resolves to itself.
   resolveGitRoot.mockReset(); resolveGitRoot.mockImplementation(async (path: string) => path);
+  familyOf.mockReset(); familyOf.mockResolvedValue(null);
 });
 afterEach(() => {
   for (const request of get(taskTerminalRequests)) consumeTaskTerminalRequest(request);
@@ -317,5 +320,82 @@ describe("a checkout that opened waiting to be trusted", () => {
     repoState.set({ currentPath: "/work/current", openTabs: [{ id: "tab-a", path: "/work/a", trustRequired: true }] });
     openRepo.mockResolvedValue(true);
     expect(await showAttemptTerminal(run("a", "/work/a"))).toEqual({ kind: "waiting", reason: "trust", checkout: "/work/a" });
+  });
+});
+
+describe("an agent in a worktree of a repository that is already open", () => {
+  // Every launch into a fresh worktree used to open that worktree as a
+  // repository tab. Those share the reader's own bound (24), so about ten
+  // agents in, every further launch failed with "Too many open repositories"
+  // while the run and session limits stood mostly unused.
+  const FAMILY = "/work/a/.git";
+  const wt = (name: string) => `/work/a/.gitpulse/worktrees/${name}`;
+  const fullStrip = () => [
+    { id: "main", path: "/work/a", family: FAMILY, familyRoot: "/work/a" },
+    ...Array.from({ length: 23 }, (_, i) => ({ id: `o${i}`, path: `/other/${i}`, family: `/other/${i}/.git`, familyRoot: `/other/${i}` })),
+  ];
+
+  it("starts in that repository's tab without opening one, even with every tab slot taken", async () => {
+    repoState.set({ currentPath: "/work/a", openTabs: fullStrip() });
+    familyOf.mockResolvedValue(FAMILY);
+    for (let i = 0; i < 30; i += 1) {
+      expect(await startTaskTerminal(run(`r${i}`, wt(`w${i}`)))).toEqual({ kind: "started" });
+    }
+    expect(openRepo).not.toHaveBeenCalled();
+    const queued = get(taskTerminalRequests);
+    expect(queued).toHaveLength(30);
+    expect(queued[0]).toEqual({ runId: "r0", repoPath: wt("w0"), provider: "claude", title: "Task r0", family: FAMILY });
+  });
+
+  it("shows it in that repository's tab, never the worktree's", async () => {
+    repoState.set({ currentPath: "/other/1", openTabs: fullStrip() });
+    familyOf.mockResolvedValue(FAMILY);
+    openRepo.mockImplementation(async (_path: string, options: { onReady: () => void }) => { options.onReady(); return true; });
+    expect(await showAttemptTerminal(run("a", wt("w")))).toEqual({ kind: "opened" });
+    expect(openRepo).toHaveBeenCalledTimes(1);
+    expect(openRepo.mock.calls[0][0]).toBe("/work/a");
+    expect(setTerminalOpen).toHaveBeenCalledWith(true);
+  });
+
+  it("resumes a conversation there too, carrying the worktree it ran in", async () => {
+    repoState.set({ currentPath: "/work/a", openTabs: fullStrip() });
+    familyOf.mockResolvedValue(FAMILY);
+    findConversation.mockResolvedValueOnce({ resumable: true, sessionId: SESSION, cwd: wt("w"), mode: "edit", reason: "saved" });
+    expect(await resumeTaskConversation({ id: "a", task_title: "Fix" })).toEqual({ outcome: "started" });
+    expect(openRepo).not.toHaveBeenCalled();
+    expect(get(taskTerminalRequests)[0]).toMatchObject({ repoPath: wt("w"), family: FAMILY, resume: { sessionId: SESSION } });
+  });
+
+  it("opens the worktree as before when no checkout of its repository is open, or its family is unknown", async () => {
+    repoState.set({ currentPath: "/other/1", openTabs: [{ id: "o1", path: "/other/1", family: "/other/1/.git", familyRoot: "/other/1" }] });
+    familyOf.mockResolvedValue(FAMILY);
+    openRepo.mockResolvedValue(true);
+    expect(await startTaskTerminal(run("a", wt("w")))).toEqual({ kind: "started" });
+    expect(openRepo).toHaveBeenCalledWith(wt("w"), { activate: false, deferTrust: true });
+    expect(get(taskTerminalRequests)[0]).not.toHaveProperty("family");
+
+    openRepo.mockClear();
+    repoState.set({ currentPath: "/work/a", openTabs: [{ id: "main", path: "/work/a", family: FAMILY, familyRoot: "/work/a" }] });
+    familyOf.mockResolvedValue(null);
+    expect(await startTaskTerminal(run("b", wt("v")))).toEqual({ kind: "started" });
+    expect(openRepo).toHaveBeenCalledWith(wt("v"), { activate: false, deferTrust: true });
+  });
+
+  it("is not hosted by a sibling the reader has not trusted, or one deleted from disk", async () => {
+    repoState.set({ currentPath: "/work/a", openTabs: [
+      { id: "main", path: "/work/a", family: FAMILY, familyRoot: "/work/a", trustRequired: true },
+      { id: "gone", path: wt("old"), family: FAMILY, familyRoot: "/work/a", missing: true },
+    ] });
+    familyOf.mockResolvedValue(FAMILY);
+    openRepo.mockResolvedValue(true);
+    await startTaskTerminal(run("a", wt("w")));
+    expect(openRepo).toHaveBeenCalledWith(wt("w"), { activate: false, deferTrust: true });
+  });
+
+  it("asks nothing about the family when the worktree's own tab is open", async () => {
+    repoState.set({ currentPath: "/work/a", openTabs: [{ id: "w", path: wt("w"), family: FAMILY, familyRoot: "/work/a" }] });
+    openRepo.mockResolvedValue(true);
+    await startTaskTerminal(run("a", wt("w")));
+    expect(familyOf).not.toHaveBeenCalled();
   });
 });

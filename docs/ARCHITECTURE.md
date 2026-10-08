@@ -718,10 +718,20 @@ identical clone substituted at the same path.
 `TaskHandoffForm.svelte` prepares a selected saved revision and starts a
 task-bound tab in the existing terminal dock without changing what is on
 screen: `workbench/taskTerminal.ts::startTaskTerminal` queues the request and
-opens the checkout as a background repository tab, and `TerminalDock` hosts
-any open tab a queued task terminal waits for (`repoHosts.ts`, matched by
-`taskLaunches.ts::awaitedTabIds`), so the agent starts with the dock closed
-and the reader stays on the task. A terminal started out of sight spawns at
+`TerminalDock` hosts the open tab it waits for (`repoHosts.ts`, chosen by
+`taskLaunches.ts::hostTabFor` for both `awaitedTabIds` and the panel's
+`requestFor`), so the agent starts with the dock closed and the reader stays
+on the task. The host is the checkout's own tab when open, else a trusted,
+on-disk checkout of the same repository (`repoStore.familyOf`, by common Git
+directory), so an agent in a fresh worktree opens no repository tab and is
+bounded by the run and session limits, not the reader's tabs; the tab's
+`checkout` makes a resumed conversation spawn and resolve links in its own
+worktree. Only with no such checkout open is the checkout opened as a
+background repository tab. A panel consumes a queued request only once its
+tab holds a session slot (`sessionLifecycle` `admitted`/`refused`), so starts
+racing for the last slots wait instead of being lost, and one strip holds up
+to `MAX_STRIP_TABS` tabs, ended ones included, apart from the live session
+limit (harness: `agent-capacity`). A terminal started out of sight spawns at
 24 × 80 rather than at what xterm measures inside `display: none`
 (`viewControls.ts::spawnGridSize`). Only `showTaskTerminal` — the pane's Show
 terminal and the launch toast's action — brings it on screen, through

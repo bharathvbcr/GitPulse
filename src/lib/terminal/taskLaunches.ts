@@ -39,6 +39,59 @@ export interface TaskTerminalRequest {
   attach?: { sessionId: string };
   /** See `TaskLaunch.startDir`: where below `repoPath` the work ran. */
   startDir?: string;
+  /**
+   * The repository family of `repoPath` (`repoStore.familyOf`), when known.
+   * Lets another open checkout of the same repository host the terminal, so
+   * an agent in a fresh worktree does not need a repository tab of its own
+   * (see `hostTabFor`).
+   */
+  family?: string;
+}
+
+/** What hosting needs to know about an open repository tab. */
+export interface HostCandidate {
+  id: string;
+  path: string;
+  trustRequired?: boolean;
+  missing?: boolean;
+  family?: string | null;
+  familyRoot?: string | null;
+}
+
+/**
+ * The open repository tab whose dock takes `request`, or undefined.
+ *
+ * The request's own checkout when that is open — trusted or not, so an
+ * untrusted one still waits for trust rather than slipping into a sibling.
+ * Otherwise, when the request names its family, a trusted checkout of the
+ * same repository that is still on disk: the repository's own directory
+ * first, then the first in tab order. A process's working directory is the
+ * attempt's own (the host spawns it there), so the hosting tab decides only
+ * where the panel lives, never where the agent runs.
+ *
+ * This used to be "the checkout's own tab, always", and every agent launched
+ * into a new worktree opened a repository tab for it. Those tabs share one
+ * bound with the reader's own (`MAX_OPEN_TABS`, and the native watcher cap of
+ * the same size), so a reader with fourteen repositories open could start
+ * about ten worktree agents, and every later launch was refused with "Too
+ * many open repositories" while the live-run and session limits stood
+ * mostly unused. Each such tab also paid a full hydrate and an index build.
+ *
+ * Pure and deterministic over the same tab list, so the dock (which panels to
+ * host) and the panel (which request to take) always agree.
+ */
+export function hostTabFor<T extends HostCandidate>(
+  request: Pick<TaskTerminalRequest, "repoPath" | "family">,
+  tabs: readonly T[],
+  options: PathIdentityOptions,
+): T | undefined {
+  const key = identityKey(request.repoPath, options);
+  if (!key) return undefined;
+  const own = tabs.find((tab) => identityKey(tab.path, options) === key);
+  if (own) return own;
+  if (!request.family) return undefined;
+  const kin = tabs.filter((tab) => tab.family === request.family && !tab.trustRequired && !tab.missing);
+  return kin.find((tab) => !!tab.familyRoot && identityKey(tab.path, options) === identityKey(tab.familyRoot, options)) ?? kin[0];
 }
 const pending = writable<TaskTerminalRequest[]>([]);
 export const taskTerminalRequests = { subscribe: pending.subscribe };
@@ -177,10 +230,10 @@ export function clearAttemptNotice(runId: string): void {
 }
 
 /**
- * Open repository tabs that a queued request is waiting for, matched by
- * checkout identity exactly as `requestFor` matches them inside the panel —
- * so the dock hosts precisely the panels that will consume a request, and a
- * request no open tab can take hosts nothing.
+ * Open repository tabs that a queued request is waiting for — each request's
+ * `hostTabFor`, exactly as `requestFor` picks inside the panel — so the dock
+ * hosts precisely the panels that will consume a request, and a request no
+ * open tab can take hosts nothing.
  *
  * A tab whose repository is not trusted yet hosts nothing either. A launch
  * opens its checkout without asking (`deferTrust`), so the first sign of an
@@ -189,27 +242,47 @@ export function clearAttemptNotice(runId: string): void {
  * reader trusts it, and the Agents pane says that is what it waits for.
  */
 export function awaitedTabIds(
-  tabs: readonly { id: string; path: string; trustRequired?: boolean }[],
+  tabs: readonly HostCandidate[],
   requests: readonly TaskTerminalRequest[],
   options: PathIdentityOptions,
 ): Set<string> {
   const wanted = new Set<string>();
-  if (!requests.length) return wanted;
-  const keys = new Set(requests.map((request) => identityKey(request.repoPath, options)).filter(Boolean));
-  for (const tab of tabs) {
-    if (tab.trustRequired) continue;
-    const key = identityKey(tab.path, options);
-    if (key && keys.has(key)) wanted.add(tab.id);
+  for (const request of requests) {
+    const host = hostTabFor(request, tabs, options);
+    if (host && !host.trustRequired) wanted.add(host.id);
   }
   return wanted;
 }
 
-/** The first request whose checkout is `repoPath`, by identity, or undefined. */
+/**
+ * The first request the panel for `repoPath` takes, or undefined: one whose
+ * `hostTabFor` among `tabs` is this checkout. Without `tabs` (or with the
+ * request's own checkout not among them and no family) that is the request
+ * whose checkout is `repoPath`, by identity.
+ */
 export function requestFor(
   requests: readonly TaskTerminalRequest[],
   repoPath: string | null,
   options: PathIdentityOptions,
+  tabs: readonly HostCandidate[] = [],
 ): TaskTerminalRequest | undefined {
   const key = repoPath ? identityKey(repoPath, options) : "";
-  return key ? requests.find((request) => identityKey(request.repoPath, options) === key) : undefined;
+  if (!key) return undefined;
+  return requests.find((request) => identityKey(hostTabFor(request, tabs, options)?.path ?? request.repoPath, options) === key);
+}
+
+/**
+ * The launch a panel opens for a request it took: the request itself, plus
+ * the checkout to run in when the panel belongs to another checkout of the
+ * same repository. A process started in the panel's own directory would run
+ * in the wrong worktree.
+ */
+export function launchFor(
+  request: TaskTerminalRequest,
+  panelPath: string,
+  options: PathIdentityOptions,
+): TaskTerminalRequest & { checkout?: string } {
+  return identityKey(request.repoPath, options) === identityKey(panelPath, options)
+    ? request
+    : { ...request, checkout: request.repoPath };
 }

@@ -6,7 +6,7 @@
  * without a PTY, a webview, or an xterm instance behind it.
  */
 
-import { currentSessionLimit } from "./sessionLimit";
+import { currentSessionLimit, MAX_TERMINAL_SESSIONS } from "./sessionLimit";
 import { isImeComposition } from "../keyboard/imeGuard";
 import type { PermissionMode } from "./agentDefaults";
 
@@ -40,6 +40,12 @@ export interface TerminalTab {
    * the session it was opened beside. Absent means the repository root.
    */
   startDir?: string;
+  /**
+   * The checkout this tab's process runs in, when that is not the panel's
+   * own: an agent hosted in another checkout of the same repository (see
+   * `taskLaunches.hostTabFor`). Absent means the panel's repository.
+   */
+  checkout?: string;
   taskRunId?: string;
   /** Set when this tab picks an ended attempt's Claude Code conversation back up. */
   resume?: ResumeLaunch;
@@ -84,6 +90,8 @@ export interface TaskLaunch {
    * directory it ran in, so it has to start there to be found.
    */
   startDir?: string;
+  /** See `TerminalTab.checkout`; `startDir` is relative to it when set. */
+  checkout?: string;
 }
 
 /**
@@ -148,12 +156,25 @@ export function initialState(launcher: LauncherKind = "shell", task?: TaskLaunch
 }
 
 /**
- * Whether one more tab fits under the session limit. A reactive caller passes
+ * Whether one more tab fits under `limit` tabs. A reactive caller passes
  * `$terminalSessionLimit` so it re-evaluates when the user changes the limit.
  */
 export function canOpenTab(state: TabState, limit: number = currentSessionLimit()): boolean {
   return state.tabs.length < limit;
 }
+
+/**
+ * The most tabs one repository's strip holds, live or ended.
+ *
+ * Not the user's session limit: that bounds live processes, and the session
+ * registry enforces it across every repository. A strip bounded by it too
+ * counted ended tabs as live ones, so once a repository's agents had run and
+ * finished as many times as the limit, no agent could start there — under a
+ * banner saying every session was in use while most slots stood free. Agents
+ * in worktrees share their repository's strip (`taskLaunches.hostTabFor`), so
+ * that was the common case, not an edge. This bounds the strip's memory only.
+ */
+export const MAX_STRIP_TABS = MAX_TERMINAL_SESSIONS;
 
 /** What the panel knows about where a pane stands. */
 export interface PaneVisibility {
@@ -198,7 +219,7 @@ export function openTab(state: TabState, launcher: LauncherKind, launch?: string
     const existing = tabFor(state, task);
     if (existing) return { ...state, activeId: existing.id };
   }
-  if (!canOpenTab(state)) return state;
+  if (!canOpenTab(state, MAX_STRIP_TABS)) return state;
   const tab = createTab(launcher, typeof launch === "string" ? launch : undefined);
   if (task?.attach) {
     if (task.resume || !task.attach.sessionId) return state;
@@ -214,6 +235,7 @@ export function openTab(state: TabState, launcher: LauncherKind, launch?: string
   // A taken-over session is already running wherever it runs.
   const startDir = task && !task.attach ? relativeStartDir(task.startDir) : null;
   if (startDir) tab.startDir = startDir;
+  if (task && !task.attach && task.checkout) tab.checkout = task.checkout;
   return { tabs: [...state.tabs, tab], activeId: tab.id };
 }
 
