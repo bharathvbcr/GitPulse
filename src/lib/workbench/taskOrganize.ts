@@ -206,6 +206,48 @@ export function canQuickEnhance(
   return { ok: true, fields };
 }
 
+export interface TaskLane {
+  /** Stable across renders: `owner:Ada`, `label:ci`, `status:ready`, `none`. */
+  key: string;
+  label: string;
+  cards: TaskCard[];
+}
+
+/**
+ * Cards grouped into lanes, each card in exactly one.
+ *
+ * One lane per card is a choice, not a shortcut: a card drawn twice would be
+ * two drag sources, two focus stops and two selection targets for one task.
+ * So a card with several labels goes in the lane of its first label, and the
+ * lane's title says lanes are by first label. Named lanes sort by name; the
+ * lane for cards without a value comes last. Within a lane cards keep the
+ * order they were given, which is the board's column order.
+ */
+export function partitionLanes(cards: readonly TaskCard[], by: "status" | "owner" | "label", statusLabel: (status: TaskStatus) => string, statusOrder: readonly TaskStatus[]): TaskLane[] {
+  const lanes = new Map<string, TaskLane>();
+  for (const card of cards) {
+    let key: string, label: string;
+    if (by === "status") { key = `status:${card.status}`; label = statusLabel(card.status); }
+    else if (by === "owner") {
+      const owner = card.owner?.trim() ?? "";
+      key = owner ? `owner:${owner}` : "owner:"; label = owner || "Unassigned";
+    } else {
+      const first = card.labels.find((entry) => entry.trim()) ?? "";
+      key = first ? `label:${first}` : "label:"; label = first || "No label";
+    }
+    const lane = lanes.get(key);
+    if (lane) lane.cards.push(card);
+    else lanes.set(key, { key, label, cards: [card] });
+  }
+  const all = [...lanes.values()];
+  if (by === "status") {
+    const rank = (lane: TaskLane) => statusOrder.indexOf(lane.key.slice("status:".length) as TaskStatus);
+    return all.sort((a, b) => rank(a) - rank(b));
+  }
+  const empty = (lane: TaskLane) => lane.key.endsWith(":");
+  return all.sort((a, b) => Number(empty(a)) - Number(empty(b)) || a.label.localeCompare(b.label));
+}
+
 /**
  * Re-space a fully loaded column when its integer positions leave no gap.
  *

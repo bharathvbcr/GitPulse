@@ -56,6 +56,7 @@
     runExpired,
     runHoldsCheckout,
     runStatusLabel,
+    modelChoiceLabel,
     sanitizeHandoff,
     type HandoffGate,
     type HandoffSettings,
@@ -486,6 +487,7 @@
     <small class="facts">
       <span title={run.cwd} data-testid="agent-checkout">{place.repository}{#if place.checkout} / {place.checkout}{/if}</span>
       · Revision {run.source_revision} · {permissionLabel(run)}
+      {#if run.model_choice} · <span data-testid="agent-model">{modelChoiceLabel(run.model_choice)}</span>{/if}
       {#if run.created_at} · started {formatRelativeTime(run.created_at, Math.floor(now / 1000))}{/if}
       {#if run.exit_code !== null} · exit {run.exit_code}{/if}
     </small>

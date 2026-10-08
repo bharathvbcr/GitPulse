@@ -75,28 +75,15 @@
         ],
         empty: () => [],
         error: () => { throw new Error("Blame unavailable: fixture refused"); },
-        // Two commits deep: the worktree blames line 1 on `3`, whose parent
-        // `4` had the file under its old name; `4`'s line has a root parent.
-        history: args => {
-          if (args.revision === oid("4")) return block(1, 2, oid("5"), "Grace", 90);
-          return [
-            ...block(1, 2, oid("3"), "Ada", 4).map(line => ({ ...line, previous_commit: oid("4"), previous_path: "src/old-name.ts" })),
-            ...block(3, 1, oid("6"), "Ada", 30),
-          ];
-        },
       };
 
       let mode = "mixed";
-      /** Every blame request's arguments, so a step can be checked by what it asked for. */
-      const blameCalls = [];
-      let coverageCalls = 0;
 
       mockIPCWithEvents((cmd, args) => {
         switch (cmd) {
           case "cmd_resolve_repo": return { path: args.repoPath, name: args.repoPath.split("/").pop(), is_bare: false };
-          case "cmd_get_file_blame": blameCalls.push(args); return FIXTURES[mode](args);
+          case "cmd_get_file_blame": return FIXTURES[mode]();
           case "cmd_get_file_coverage":
-            coverageCalls += 1;
             return { path: args.filePath, language: "TypeScript", color_hex: "#3178c6", lines: [{ line_no: 1, hits: 3 }, { line_no: 2, hits: 0 }], totals: { lines_found: 2, lines_hit: 1, percentage: 50 }, truncated: false, lines_truncated: false };
           case "cmd_list_repo_files": return ["src/mixed.ts", "src/fresh.ts", "src/other.ts"];
           case "cmd_list_branches": return [{ name: "main", is_current: true, tip_commit_id: oid("7"), is_remote: false, upstream: null, ahead: 0, behind: 0 }];
@@ -368,38 +355,6 @@
           check("a period is selected", () => showing() !== null);
           setMode("fresh"); await until(() => rows().length === 20);
           check("and does not follow the reader into the next file", () => showing() === null);
-
-          // --- stepping back through history --------------------------------
-          setMode("history"); await until(() => rows().length === 3);
-          const lastBlame = () => blameCalls[blameCalls.length - 1];
-          const parentButtons = () => [...document.querySelectorAll("[data-blame-parent]")];
-          check("the worktree blame asks for no revision", () => lastBlame().revision == null);
-          check("only a line with a parent offers the step", () =>
-            parentButtons().length === 1 && !!rowFor(1).querySelector("[data-blame-parent]"));
-          const coverageBefore = coverageCalls;
-          parentButtons()[0].click();
-          await until(() => !!document.querySelector("[data-blame-revision]") && rows().length === 2);
-          check("the step blames the parent commit at the parent's path", () =>
-            lastBlame().revision === oid("4") && lastBlame().filePath === "src/old-name.ts");
-          check("and the toolbar names where it is reading", () =>
-            document.querySelector("[data-blame-revision]").textContent.includes("src/old-name.ts"));
-          check("a historical blame asks for no working-tree coverage", () => coverageCalls === coverageBefore);
-          check("a root commit's lines offer no further step", () => parentButtons().length === 0);
-          const revisionsBefore = JSON.stringify(get(repoStore.contentRevisions));
-          const callsBefore = blameCalls.length;
-          await repoStore.refresh(); await tick(); await wait();
-          check("worktree churn does not pull the reader out of history", () =>
-            JSON.stringify(get(repoStore.contentRevisions)) !== revisionsBefore &&
-            !!document.querySelector("[data-blame-revision]") &&
-            blameCalls.length === callsBefore);
-          buttonNamed("Back").click();
-          await until(() => !document.querySelector("[data-blame-revision]") && rows().length === 3);
-          check("Back returns to the working tree", () => lastBlame().revision == null);
-          parentButtons()[0].click();
-          await until(() => !!document.querySelector("[data-blame-revision]"));
-          setMode("fresh"); await until(() => rows().length === 20);
-          check("a new selection ends the walk back", () =>
-            !document.querySelector("[data-blame-revision]") && lastBlame().revision == null);
 
           // --- the strip must not push the pane sideways ---------------------
           // The toolbar summary is the longest string in its row and the axis

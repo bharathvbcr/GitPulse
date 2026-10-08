@@ -8,7 +8,6 @@ import {
   cycleTab,
   initialState,
   launcherLabel,
-  MAX_STRIP_TABS,
   openTab,
   tabFor,
   setTabTitle,
@@ -75,33 +74,12 @@ describe("terminal tab model", () => {
     expect(shell.tabs).toHaveLength(1);
   });
 
-  it("refuses to open past the strip's ceiling", () => {
+  it("refuses to open past the backend's session ceiling", () => {
     let state = initialState();
-    while (canOpenTab(state, MAX_STRIP_TABS)) state = openTab(state, "shell");
-    expect(state.tabs).toHaveLength(MAX_STRIP_TABS);
+    while (canOpenTab(state)) state = openTab(state, "shell");
+    expect(state.tabs).toHaveLength(DEFAULT_TERMINAL_SESSIONS);
     // Identity, not just length: "nothing happened" has to be observable.
     expect(openTab(state, "shell")).toBe(state);
-  });
-
-  it("does not count ended tabs against the session limit", () => {
-    // The session limit bounds live processes and the registry enforces it.
-    // The strip used to stop at it too, so a repository whose agents had
-    // started and ended as many times as the limit could start no more.
-    let state = initialState();
-    for (let i = 1; i < DEFAULT_TERMINAL_SESSIONS; i += 1) state = openTab(state, "claude", { runId: `ended-${i}`, title: `Ended ${i}` });
-    expect(state.tabs).toHaveLength(DEFAULT_TERMINAL_SESSIONS);
-    const next = openTab(state, "claude", { runId: "fresh", title: "Fresh attempt" });
-    expect(next.tabs).toHaveLength(DEFAULT_TERMINAL_SESSIONS + 1);
-    expect(next.tabs.at(-1)).toMatchObject({ taskRunId: "fresh" });
-  });
-
-  it("carries the checkout a hosted launch runs in, and never onto a reattached session", () => {
-    const hosted = openTab(initialState(), "claude", { runId: "r", title: "T", checkout: "/repo/.gitpulse/worktrees/a", startDir: "pkg" });
-    expect(hosted.tabs.at(-1)).toMatchObject({ checkout: "/repo/.gitpulse/worktrees/a", startDir: "pkg" });
-    const own = openTab(initialState(), "claude", { runId: "r", title: "T" });
-    expect(own.tabs.at(-1)).not.toHaveProperty("checkout");
-    const attached = openTab(initialState(), "shell", { runId: "x", title: "T", attach: { sessionId: "s-1" }, checkout: "/elsewhere" });
-    expect(attached.tabs.at(-1)).not.toHaveProperty("checkout");
   });
 
   it("stops at the user's limit, read when asked", () => {

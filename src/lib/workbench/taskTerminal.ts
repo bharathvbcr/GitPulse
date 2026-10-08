@@ -11,11 +11,7 @@
  * finding the task again. Now a launch starts the agent where it stands: the
  * checkout opens as a background tab, the dock hosts its panel unseen (see
  * `repoHosts.ts`), and the reader stays on the task, which lists the session
- * with a "Show terminal" for when they want it. And when another checkout of
- * the same repository is already open — the usual case for an agent in a
- * fresh worktree — that tab's dock hosts it and no tab is opened at all
- * (`hostFor`), so agents are bounded by the run and session limits rather
- * than by the reader's repository tabs.
+ * with a "Show terminal" for when they want it.
  *
  * The request is queued before the checkout is opened (see `taskLaunches.ts`
  * for why), so an open that is superseded by later navigation, or refused,
@@ -31,10 +27,8 @@ import {
   consumeTaskTerminal,
   enqueueTaskTerminal,
   hasTaskTerminalRequest,
-  hostTabFor,
   noteAttempt,
   type AttemptNotice,
-  type HostCandidate,
   type TaskTerminalRequest,
 } from "../terminal/taskLaunches";
 import { handOverDetachedRun, isAdoptedSession } from "../terminal/detachedSessions";
@@ -83,11 +77,7 @@ export function checkoutLabel(path: string): string {
  * Starts an attempt's terminal without changing what is on screen.
  */
 export async function startTaskTerminal(run: RunRef): Promise<AttemptStart> {
-  const place = await hostFor(await checkoutFor(run.cwd));
-  if (place.host) {
-    queueAttempt(run, place);
-    return { kind: "started" };
-  }
+  const place = await checkoutFor(run.cwd);
   const refused = openRefusal(place.root);
   if (refused) return { kind: "failed", checkout: place.root, reason: refused };
   queueAttempt(run, place);
@@ -114,11 +104,11 @@ function afterOpen(run: Pick<TaskRun, "id">, root: string, opened: boolean, succ
 }
 
 /** Open tabs as the store publishes them; a partial test double may omit them. */
-function openTabs(): readonly HostCandidate[] {
+function openTabs(): readonly { id: string; path: string; trustRequired?: boolean }[] {
   return get(repoStore).openTabs ?? [];
 }
 
-function tabFor(root: string): HostCandidate | undefined {
+function tabFor(root: string): { id: string; path: string; trustRequired?: boolean } | undefined {
   const options = { caseInsensitive: isCaseInsensitiveFs() };
   const key = identityKey(root, options);
   return key ? openTabs().find((tab) => identityKey(tab.path, options) === key) : undefined;
@@ -156,28 +146,6 @@ export async function trustAttemptCheckout(run: Pick<TaskRun, "cwd">): Promise<b
 interface Placement {
   root: string;
   startDir?: string;
-  /** The checkout's repository family, when another open checkout hosts it. */
-  family?: string;
-  /** The open checkout of the same repository whose dock hosts the terminal. */
-  host?: string;
-}
-
-/**
- * Which open tab will host a checkout's terminal (`taskLaunches.hostTabFor`):
- * its own when open, so nothing changes for a checkout already on the strip;
- * otherwise another open checkout of the same repository, so an agent in a
- * fresh worktree starts without a repository tab of its own. A checkout with
- * neither is returned as it came, and the caller opens it as before.
- *
- * Only while some repository is current: the dock lives in the repository
- * view, which App renders only then (see `backgroundOpen`).
- */
-async function hostFor(place: Placement): Promise<Placement> {
-  if (tabFor(place.root) || get(repoStore).currentPath === null) return place;
-  const family = await repoStore.familyOf(place.root);
-  if (!family) return place;
-  const host = hostTabFor({ repoPath: place.root, family }, openTabs(), { caseInsensitive: isCaseInsensitiveFs() });
-  return host ? { ...place, family, host: host.path } : place;
 }
 
 /**
@@ -246,12 +214,7 @@ export async function showAttemptTerminal(run: RunRef): Promise<AttemptStart> {
     const focused = await focusTerminalSession(live);
     if (focused.ok) return { kind: "opened" };
   }
-  const place = await hostFor(await checkoutFor(run.cwd));
-  if (place.host) {
-    queueAttempt(run, place);
-    const shown = await showCheckout(place.host);
-    return shown === "opened" ? { kind: "opened" } : { kind: "waiting", reason: "checkout", checkout: place.host };
-  }
+  const place = await checkoutFor(run.cwd);
   const refused = openRefusal(place.root);
   if (refused) return { kind: "failed", checkout: place.root, reason: refused };
   queueAttempt(run, place);
@@ -323,8 +286,8 @@ export async function resumeTaskConversation(
   }
   // Claude Code keeps the conversation under the directory it ran in, which
   // `startDir` carries when that is below the root.
-  const place = await hostFor(await checkoutFor(conversation.cwd));
-  const refused = place.host ? null : openRefusal(place.root);
+  const place = await checkoutFor(conversation.cwd);
+  const refused = openRefusal(place.root);
   if (refused) return { outcome: "unavailable", reason: `Could not open ${checkoutLabel(place.root)}: ${refused}` };
   const request: TaskTerminalRequest = {
     runId: run.id,
@@ -333,11 +296,9 @@ export async function resumeTaskConversation(
     title: run.task_title,
     resume: { sessionId: conversation.sessionId, mode: conversation.mode, runId: run.id },
     ...(place.startDir ? { startDir: place.startDir } : {}),
-    ...(place.family ? { family: place.family } : {}),
   };
   enqueueTaskTerminal(request);
-  if (disposition === "show") return { outcome: await showCheckout(place.host ?? place.root) };
-  if (place.host) return { outcome: "started" };
+  if (disposition === "show") return { outcome: await showCheckout(place.root) };
   return { outcome: (await repoStore.openRepo(place.root, backgroundOpen())) ? "started" : "queued" };
 }
 
@@ -356,7 +317,6 @@ function queueAttempt(run: RunRef, place: Placement): void {
   enqueueTaskTerminal({
     runId: run.id, repoPath: place.root, provider: run.provider, title: run.task_title,
     ...(place.startDir ? { startDir: place.startDir } : {}),
-    ...(place.family ? { family: place.family } : {}),
   });
   // A session a reloaded page left running for this attempt gives up its
   // adopted record now, before the tab that takes the same process over

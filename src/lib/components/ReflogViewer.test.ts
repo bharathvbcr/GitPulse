@@ -29,25 +29,6 @@ describe("ReflogViewer interaction contract", () => {
     expect(row).not.toContain('<tr\n                aria-label=');
   });
 
-  it("creates a branch at an entry's commit through the guarded store action", () => {
-    expect(source).toContain("onclick={() => branchHere(entry)}");
-    expect(source).toContain("repoStore.createBranch(trimmed, entry.commit_id)");
-  });
-
-  it("previews, confirms, and resets with --keep to the oid it previewed", () => {
-    const reset = source.slice(source.indexOf("async function resetHere"), source.indexOf("$effect(() => {"));
-    // Read before asking, ask before acting, act on what was read.
-    expect(reset.indexOf('invoke<ResetPreview>("cmd_reset_preview"')).toBeGreaterThan(-1);
-    expect(reset.indexOf("await askConfirm(")).toBeGreaterThan(reset.indexOf("cmd_reset_preview"));
-    expect(reset.indexOf('repoStore.resetTo("keep", preview.target)')).toBeGreaterThan(
-      reset.indexOf("await askConfirm("),
-    );
-    expect(reset).toContain("if (!confirmed) return;");
-    expect(reset).toContain("destructive: preview.leaving_total > 0");
-    expect(reset).not.toContain('resetTo("hard"');
-    expect(source).toContain("onclick={() => resetHere(entry)}");
-  });
-
   it("discloses when the 200-entry request ceiling may hide older history", () => {
     expect(source).toContain("const REFLOG_ENTRY_LIMIT = 200;");
     expect(source).toContain("maxEntries: REFLOG_ENTRY_LIMIT");

@@ -56,7 +56,6 @@ const DERIVED_ARGV = Object.freeze({
   cmd_github_trigger_workflow: "shells out to gh, not git",
   cmd_github_rerun_run: "shells out to gh, not git",
   cmd_github_cancel_run: "shells out to gh, not git",
-  cmd_github_pr_action: "shells out to gh, not git; github::pr_action_argv builds the one argv the gate judges and run_pr_action executes",
   cmd_firebase_backends: "shells out to firebase, not git; apphosting::backends_list_argv is the one builder the gate and the executor both read",
   cmd_firebase_rollouts: "shells out to firebase, not git; apphosting::rollouts_list_argv is the one builder the gate and the executor both read",
   cmd_firebase_create_rollout: "shells out to firebase, not git; apphosting::rollout_create_argv is the one builder the gate and the executor both read, and the gate runs before any process is spawned",

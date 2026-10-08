@@ -202,7 +202,7 @@ fn exotic_path_survives_status_numstat_diff_blame_end_to_end() {
         .text;
     assert!(diff.contains("@@"), "diff must contain a hunk: {diff}");
 
-    let blame = GitReader::get_file_blame(path, rel, None).expect("blame");
+    let blame = GitReader::get_file_blame(path, rel).expect("blame");
     // CHARACTERIZED: git blames the WORKTREE file, so the committed line plus
     // the uncommitted append both appear (the latter attributed to
     // "Not Committed Yet").
@@ -226,7 +226,7 @@ fn symlink_loop_is_rejected_cleanly_everywhere() {
     assert!(started.elapsed() < Duration::from_secs(5));
 
     // Every reader that funnels through it fails loudly instead of panicking.
-    assert!(GitReader::get_file_blame(path, "loop/f.txt", None).is_err());
+    assert!(GitReader::get_file_blame(path, "loop/f.txt").is_err());
     assert!(GitReader::get_file_diff(path, "loop/f.txt", false, false).is_err());
     assert!(GitReader::get_file_blob(path, "loop/f.txt", None).is_err());
 
@@ -282,7 +282,7 @@ fn nested_tag_peels_without_panic() {
     assert!(GitReader::get_commit_diff(path, &head).is_ok());
     let files = GitReader::get_commit_files(path, &head).unwrap();
     assert_eq!(files.len(), 1);
-    assert!(GitReader::get_file_blame(path, "f.txt", None).is_ok());
+    assert!(GitReader::get_file_blame(path, "f.txt").is_ok());
 }
 
 #[test]
@@ -315,7 +315,7 @@ fn empty_repo_reader_contract() {
         .is_empty());
 
     // Everything anchored to objects/refs errors without panicking.
-    assert!(GitReader::get_file_blame(path, "seed.txt", None).is_err());
+    assert!(GitReader::get_file_blame(path, "seed.txt").is_err());
     assert!(GitReader::get_commit_files(path, FAKE_OID).is_err());
     assert!(GitReader::get_commit_diff(path, FAKE_OID).is_err());
     assert!(GitReader::get_reflog(path, 10).is_err());
@@ -341,13 +341,13 @@ fn orphan_head_reader_contract() {
     );
     // --orphan stages the seed as a new file on this branch. Its current
     // content remains readable, but no line can claim an author from main.
-    let blame = GitReader::get_file_blame(path, "seed.txt", None).expect("uncommitted orphan file");
+    let blame = GitReader::get_file_blame(path, "seed.txt").expect("uncommitted orphan file");
     assert_eq!(blame.len(), 1);
     assert_eq!(blame[0].line_no, 1);
     assert_eq!(blame[0].content, "seed");
     assert_eq!(blame[0].commit_id, "0".repeat(40));
     assert_eq!(blame[0].author_name, "Not Committed Yet");
-    assert!(GitReader::get_file_blame(path, "missing.txt", None).is_err());
+    assert!(GitReader::get_file_blame(path, "missing.txt").is_err());
     assert_eq!(blame[0].timestamp, 0);
     assert!(GitReader::get_commit_files(path, FAKE_OID).is_err());
 }
@@ -363,7 +363,7 @@ fn corrupted_head_errors_cleanly_never_panics() {
     assert!(GitReader::get_status(path).is_err());
     assert!(GitReader::read_commit_history(path, 50, None).is_err());
     assert!(GitReader::get_file_diff(path, "seed.txt", false, false).is_err());
-    assert!(GitReader::get_file_blame(path, "seed.txt", None).is_err());
+    assert!(GitReader::get_file_blame(path, "seed.txt").is_err());
     assert!(GitReader::get_commit_files(path, FAKE_OID).is_err());
     assert!(GitReader::get_commit_diff(path, FAKE_OID).is_err());
     assert!(GitReader::head_id(path).is_err());

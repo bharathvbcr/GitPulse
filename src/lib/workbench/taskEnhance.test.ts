@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { ENHANCEMENT_STATES, type Enhancement, type EnhancementSummary, type Task } from "./client";
-import { acceptEnhancementInput, createEnhancementInput, runAppleEnhancement,
+import { acceptEnhancementInput, appendedHistory, createEnhancementInput, refreshedHistory, runAppleEnhancement,
   assistEngineName,
   draftingKind,
   draftingVerb,
@@ -16,7 +16,7 @@ const task: Task = {
   id: "t1", revision: 4, updated_at: 1, title: "Keep E42", description: "evidence",
   kind: "bug", status: "ready", priority: 1, severity: null, owner: null, due_at: null,
   labels: [], acceptance_criteria: [], repository_ids: ["r"], primary_repository_id: "r",
-  home_workspace_id: null, position: 1, locked_fields: ["title"],
+  home_workspace_id: null, position: 1, archived: false, completed_at: null, checklist: [], links: [], locked_fields: ["title"],
 };
 
 describe("the drafting kind and the button that names it", () => {
@@ -209,6 +209,25 @@ describe("engine names", () => {
   it("cannot be reached through a polluted prototype", () => {
     expect(assistEngineName("constructor" as never)).toBeUndefined();
     expect(assistEngineName("__proto__" as never)).toBeUndefined();
+  });
+});
+
+describe("paged suggestion history", () => {
+  const entry = (id: string): EnhancementSummary => ({ ...summary(), id });
+  it("a refresh replaces a single loaded page", () => {
+    const next = refreshedHistory({ entries: [entry("a"), entry("b")], cursor: "2", extended: false }, { items: [entry("n"), entry("a")], next_cursor: "2" });
+    expect(next).toEqual({ entries: [entry("n"), entry("a")], cursor: "2", extended: false });
+  });
+  it("a refresh keeps the older pages the reader loaded, and the cursor past them", () => {
+    const loaded = appendedHistory({ entries: [entry("c"), entry("b")], cursor: "2", extended: false }, { items: [entry("a")], next_cursor: null });
+    expect(loaded).toEqual({ entries: [entry("c"), entry("b"), entry("a")], cursor: null, extended: true });
+    const next = refreshedHistory(loaded, { items: [entry("d"), entry("c")], next_cursor: "2" });
+    expect(next.entries.map((item) => item.id)).toEqual(["d", "c", "b", "a"]);
+    expect(next.cursor).toBeNull();
+  });
+  it("appending never lists an entry twice", () => {
+    const next = appendedHistory({ entries: [entry("b")], cursor: "1", extended: false }, { items: [entry("b"), entry("a")], next_cursor: null });
+    expect(next.entries.map((item) => item.id)).toEqual(["b", "a"]);
   });
 });
 
