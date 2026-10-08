@@ -4,7 +4,7 @@
   import { onMount, untrack } from "svelte";
   import { invoke } from "../ipc/invoke";
   import { listen } from "@tauri-apps/api/event";
-  import { Archive, Bot, ChevronDown, ChevronUp, Clipboard, EyeOff, FolderSync, Import, Inbox, LayoutGrid, List, Plus, RefreshCw, Search, Sparkles, SquarePen, Trash2, Undo2, X } from "@lucide/svelte";
+  import { AlertTriangle, Archive, Bot, ChevronDown, ChevronUp, Clipboard, EyeOff, FolderSync, Import, Inbox, LayoutGrid, List, Merge, Plus, RefreshCw, Search, Sparkles, SquarePen, Trash2, Undo2, X } from "@lucide/svelte";
   import { isMacOS, isTauri } from "../platform";
   import { createListenerTracker } from "../dom/listenerTracker";
   import { createAdaptiveTimer } from "../runtime/adaptiveTimer";
@@ -18,13 +18,14 @@
   import { popover, restoreFocusTo } from "../ui/popover";
   import { cardFace, dragExceeded, insertIndexFromY, insertionNeighbors, insertionPosition, neighborStatus, parseColumnStatus, shouldCommitMove } from "../workbench/boardDrag";
   import {
-    explainError, getTask, getTaskBrief, getWorkspace, listAttention, listRepositories, listTasks, listWorkspaces, newID, putTask, registerRepository,
-    STATUSES, STATUS_LABELS, taskDraft, taskWrite,
-    type Page, type Repository, type Scope, type Task, type TaskCard, type TaskDraft, type TaskStatus, type Workspace, type WorkspaceCard,
+    explainError, getTask, getTaskBrief, getWorkspace, listAttention, listRepositories, listTasks, listWorkspaces, newID, putTask, registerRepository, restoreDeletedTask,
+    STATUSES, STATUS_LABELS, TASK_PAGE_SIZE, taskDraft, taskWrite,
+    type Page, type Repository, type Scope, type Task, type TaskCard, type TaskDraft, type TaskListFilter, type TaskStatus, type Workspace, type WorkspaceCard,
   } from "../workbench/client";
   import { addableOpenTabs, attachRepositories, openAddActionLabel, openMembershipCandidates, pickerSelectionIds } from "../workbench/openMembership";
   import { quickAddRefusal, taskCreation } from "../workbench/taskCreation";
-  import { defaultRelinkIO, relinkCheckout, type RelinkOutcome } from "../workbench/repositoryRelink";
+  import { checkoutFlag, defaultRelinkIO, readCheckouts, relinkCheckout, type CheckoutHealth, type RelinkOutcome } from "../workbench/repositoryRelink";
+  import { resolveGitRoot } from "../desktop/nativeShell";
   import { applyMove, moveWrites, navigatorOrder } from "../workbench/workspaceOrder";
   import { importSummary, importTabGroups, tabGroups } from "../workbench/workspaceImport";
   import { workspaceMembershipLabel } from "../workbench/taskRepositories";
@@ -33,14 +34,16 @@
   import { linkTaskToIssue, MAX_TASK_ISSUE_BATCH, prepareTaskIssues, runTaskIssues, summarizeTaskIssues, taskIssuesConfirmation, type TaskIssueResult, type TaskIssueTarget } from "../workbench/taskIssue";
   import { askConfirm } from "../stores/modalStore";
   import { openExternal } from "../desktop/openExternal";
-  import { cardChrome, cardMatchesFacet, collectFacetOptions, emptyFacet, facetActive, allLoadedCards, reorderPlan, type TaskFacet } from "../workbench/taskOrganize";
+  import { cardChrome, cardMatchesFacet, collectFacetOptions, emptyFacet, facetActive, allLoadedCards, reorderPlan, partitionLanes, type TaskFacet, type TaskLane } from "../workbench/taskOrganize";
   import { plural } from "../format";
-  import { ARCHIVE_STATUS, archiveAction, archivable, archiveState, offersArchive } from "../workbench/taskArchive";
+  import { archiveAction, archivable, archiveState } from "../workbench/taskArchive";
   import { interfaceStore } from "../stores/interfaceStore";
   import { hiddenColumnReport, visibleBoardStatuses } from "../ui/taskView";
+  import { boardKey as viewBoardKey, boardPrefs, effectiveSwimlane, wipState, type SavedTaskView, type TaskViewSnapshot } from "../ui/taskBoardViews";
+  import TaskSavedViews from "./TaskSavedViews.svelte";
   import { consumeTaskOpen, taskOpenRequest } from "../workbench/taskOpen";
   import { parseQuickAddDue, quickAddDraft, type QuickAddMode, type QuickAddResult } from "../workbench/taskQuickAdd";
-  import { removeFromColumns } from "../workbench/taskDelete";
+  import { removeFromColumns, restoreSummary, restoreTasks } from "../workbench/taskDelete";
   import { joinAgentCopies, MAX_AGENT_COPY_TASKS, wrapSavedBriefForAgent } from "../workbench/taskCompose";
   import { createBoardAgents } from "../workbench/boardAgents";
   import { taskAgentSummaries, type TaskAgentSummary } from "../workbench/taskSessions";
@@ -67,6 +70,8 @@
   import { focusTabAt, handleTablistKeydown } from "../dom/tablist";
   import ScrollCue from "./ScrollCue.svelte";
   import TaskActionDialog from "./TaskActionDialog.svelte";
+  import TaskMergeDialog from "./TaskMergeDialog.svelte";
+  import { mergeEligibility } from "../workbench/taskMerge";
   import TaskEditor from "./TaskEditor.svelte";
   import WorkspaceEditor from "./WorkspaceEditor.svelte";
   import AutomaticEnhancements from "./AutomaticEnhancements.svelte";
@@ -99,6 +104,7 @@
   let session = $state<{ tabId: string; pane: string; value: Task | null; status?: TaskStatus; seed?: Partial<TaskDraft> } | null>(null);
   let workspaceEditor = $state<{ value: Workspace | null } | null>(null);
   let editorHandle = $state<{ canLeave: () => Promise<boolean> }>();
+  let enhanceHandle = $state<{ canLeave: () => Promise<boolean> }>();
   let tabStrip: HTMLDivElement | undefined = $state();
   let workspaceHandle = $state<{ canLeave: () => Promise<boolean> }>();
   let pendingUpdate = $state<TaskBatch | null>(null);
@@ -128,11 +134,13 @@
   $effect(() => { JSON.stringify(scope); untrack(() => offerUndo(null)); });
   let opening = $state(false); let moving = $state(false); let deleting = $state(false);
   let press = $state<{ card: TaskCard; x: number; y: number } | null>(null);
-  let drag = $state<{ card: TaskCard; over: TaskStatus | null; insertIndex: number; x: number; y: number } | null>(null);
+  let drag = $state<{ card: TaskCard; over: TaskStatus | null; insertIndex: number; lane: string; local: number; x: number; y: number } | null>(null);
   let skipClick = false;
   let showInbox = $state(false);
   let showArchive = $state(false);
   let archiveToken = $state(0);
+  /** What every board column reads: live tasks that are not archived. */
+  const BOARD: TaskListFilter = { archived: false };
   let unread = $state(0);
   let addMenu = $state(false);
   let addRepoTriggerEl: HTMLButtonElement | undefined = $state();
@@ -264,6 +272,10 @@
   const selectedCards = $derived(cardsById(displayColumns, selected));
   /** Whether the selection bar's Archive would change anything. */
   const selectionArchived = $derived(archiveState(selectedCards));
+  /** Whether the selection can be merged, and in which repository. */
+  const selectionMerge = $derived(mergeEligibility(selectedCards));
+  /** The merge dialog's cards and repository while it is open. */
+  let mergeDialog = $state<{ cards: TaskCard[]; repositoryId: string } | null>(null);
   /** Tasks are being filed as GitHub issues; one run at a time, since each issue is published. */
   let filingIssue = $state(false);
   /** Which issue of the run is being created, for the progress line. */
@@ -276,11 +288,11 @@
    * label, so this is also what stops a re-run filing it twice.
    */
   let relinks = $state<{ taskId: string; number: number; title: string }[]>([]);
-  const busy = $derived(moving || opening || deleting || deletesRunning > 0 || filingIssue || actionDialog !== null || pendingUpdate !== null);
+  const busy = $derived(moving || opening || deleting || deletesRunning > 0 || filingIssue || actionDialog !== null || mergeDialog !== null || pendingUpdate !== null);
   const openCardIds = $derived(openSavedTaskIds(taskTabs));
   const inProgressCount = $derived(displayColumns.in_progress?.total ?? 0);
-  /** The server's count for this scope, so the badge is not a page size. */
-  const completedCount = $derived(displayColumns[ARCHIVE_STATUS]?.total ?? 0);
+  /** The server's count of archived tasks in this scope, so the badge is not a page size. */
+  let archivedCount = $state(0);
   $effect(() => {
     if (repositoryPath) return;
     publishTaskChrome({ openTabs: taskTabs.tabs.length, inProgress: inProgressCount });
@@ -290,6 +302,39 @@
     return visibleBoardStatuses(hiddenColumns, counts, drag !== null);
   });
   const listCards = $derived(shown.flatMap((status) => visibleIn(status)));
+  // ---- Saved views, lanes and limits, per board (`taskBoardViews.ts`) -----
+  const viewBoard = $derived(viewBoardKey(scope));
+  const wipLimits = $derived(boardPrefs($interfaceStore.taskBoards, viewBoard).wip);
+  const swimlane = $derived(effectiveSwimlane(layout, $interfaceStore.taskSwimlane));
+  /** Lanes over the cards on screen, or null when the board draws none. */
+  const laneList = $derived(swimlane === "none" ? null : partitionLanes(listCards, swimlane, (status) => STATUS_LABELS[status], STATUSES));
+  /** One grid for the head row and every lane, so a column lines up down the board. */
+  const laneGrid = $derived(`grid-template-columns: repeat(${shown.length}, minmax(196px, 1fr))`);
+  const viewSnapshot = $derived<TaskViewSnapshot>({
+    layout,
+    density: $interfaceStore.taskDensity,
+    swimlane: $interfaceStore.taskSwimlane,
+    hiddenColumns: [...hiddenColumns],
+    cardFields: [...$interfaceStore.taskCardFields],
+    facet: { ...facet },
+    search,
+  });
+  /** Against the store's total for the column, never its loaded page. */
+  function wipOf(status: TaskStatus) {
+    return loadedKey === boardKey ? wipState(displayColumns[status]?.total, wipLimits[status]) : null;
+  }
+  function laneAria(group: TaskLane): string {
+    const by = swimlane === "label" ? "first label" : swimlane;
+    return `${group.label} — ${plural(group.cards.length, "task")}, lane by ${by}`;
+  }
+  /** Put a saved view back: the layout preferences, then this board's filters. */
+  function applyView(view: SavedTaskView) {
+    interfaceStore.applyTaskView(view);
+    facet = { ...view.facet };
+    search = view.search;
+    if (facetActive(view.facet)) showFilters = true;
+    announce = `Showing the saved view ${view.name}`;
+  }
   function repoName(id: string) { return repositories.find((repo) => repo.id === id)?.name; }
   function visibleIn(status: TaskStatus): TaskCard[] {
     return (displayColumns[status]?.items ?? []).filter((card) => cardMatchesFacet(card, facet, now));
@@ -305,9 +350,15 @@
   async function loadBoard(target: Scope = scope, query: string = search) {
     const generation = ++revision, key = JSON.stringify([target, query]); loading = true; error = "";
     try {
-      const pages = await Promise.all(STATUSES.map(async (status) => [status, await listTasks(target, status, query)] as const));
+      // Columns hold what is on the board: an archived task leaves them
+      // whatever its status. The badge is the archive's own total for the
+      // scope — the board's search does not narrow it; the dock has its own.
+      const [pages, archive] = await Promise.all([
+        Promise.all(STATUSES.map(async (status) => [status, await listTasks(target, status, query, undefined, TASK_PAGE_SIZE, BOARD)] as const)),
+        listTasks(target, null, "", undefined, 1, { archived: true }),
+      ]);
       if (generation !== revision || disposed || key !== boardKey) return;
-      columns = Object.fromEntries(pages); loadedKey = key;
+      columns = Object.fromEntries(pages); loadedKey = key; archivedCount = archive.total;
       selected = new Set([...selected].filter((id) => loadedHas(id, Object.fromEntries(pages))));
     } catch (cause) { if (generation === revision && !disposed) error = explainError(cause); }
     finally { if (generation === revision && !disposed) loading = false; }
@@ -424,6 +475,9 @@
     const stopClock = createAdaptiveTimer(() => { now = Math.floor(Date.now() / 1000); }, 30_000);
     const onForeground = () => {
       boardAgents.wake();
+      // A checkout is moved in a file manager, not here; coming back to the
+      // window is when that can have happened.
+      if (!readBackgroundDocument()) checkoutToken++;
       if (readBackgroundDocument()) {
         clearTimeout(refreshTimer);
         refreshTimer = undefined;
@@ -446,6 +500,27 @@
     loading = true;
     const timer = setTimeout(() => { void loadBoard(target, query); void loadUnread(target); }, 250);
     return () => { clearTimeout(timer); revision++; };
+  });
+  // ---- Where each repository's checkout is -------------------------------
+  // Read before anyone acts, so a moved or deleted checkout is marked on its
+  // row and on its cards instead of being discovered by a launch that fails.
+  // Re-read when the catalog changes, on Refresh and when the window comes
+  // back to the front — not on every store change, which says nothing about
+  // the filesystem. Each check is a filesystem walk on the host, no git.
+  let checkouts = $state.raw<ReadonlyMap<string, CheckoutHealth>>(new Map());
+  let checkoutToken = $state(0);
+  let checkoutRevision = 0;
+  const checkoutKey = $derived(repositories.map((repo) => `${repo.id}|${repo.identity_key}`).join("\n"));
+  const uncheckedCheckouts = $derived([...checkouts.values()].filter((health) => health.state === "unknown"));
+  $effect(() => {
+    checkoutToken;
+    void checkoutKey;
+    if (!initialized || !active) return;
+    const list = untrack(() => repositories.slice());
+    const ticket = ++checkoutRevision;
+    void readCheckouts(list, resolveGitRoot, pathOpts).then((read) => {
+      if (!disposed && ticket === checkoutRevision) checkouts = read;
+    });
   });
   // `membershipToken` is what makes this read retryable. Keyed on `scope`
   // alone, a failed membership read could never be repeated: the banner's
@@ -597,7 +672,13 @@
     try { const next = await listWorkspaces(workspaceCursor); workspaces = [...workspaces, ...next.items.filter((r) => !workspaces.some((old) => old.id === r.id))]; workspaceCursor = next.next_cursor; workspaceTotal = next.total; }
     catch (cause) { catalogError = explainError(cause); }
   }
+  /**
+   * Whether the open task, and the Quick Enhance sheet if one is up, may be
+   * replaced. Every route that swaps either comes through here, so unsaved
+   * edits to a task or to a suggestion are asked about by the same door.
+   */
   async function canLeaveSession(): Promise<boolean> {
+    if (enhanceId && enhanceHandle && (await enhanceHandle.canLeave()) === false) return false;
     if (!session) return true;
     return (await editorHandle?.canLeave()) !== false;
   }
@@ -757,29 +838,36 @@
     const generation = revision, key = boardKey;
     loading = true; error = "";
     try {
-      const result = await listTasks(scope, status, search, cursor);
+      const result = await listTasks(scope, status, search, cursor, TASK_PAGE_SIZE, BOARD);
       if (generation !== revision || disposed || key !== boardKey) return;
       const items = cursor ? [...new Map([...(columns[status]?.items ?? []), ...result.items].map((item) => [item.id, item])).values()] : result.items;
       columns = { ...columns, [status]: { ...result, items, shown: items.length } };
     } catch (cause) { if (generation === revision && !disposed) error = explainError(cause); }
     finally { if (generation === revision && !disposed) loading = false; }
   }
-  function statusAtPoint(x: number, y: number): TaskStatus | null {
+  /**
+   * Where a drag at this point would drop.
+   *
+   * The cell under the pointer is the one found, not the first element for
+   * the status: with lanes, a status has one cell per lane, and measuring the
+   * first one put a card dropped in the third lane at a slot computed from
+   * the first. `local` is the slot among the cards drawn in that cell (what
+   * the insertion line shows); `index` is the same slot in the whole loaded
+   * column, which is what the write needs.
+   */
+  function dropAtPoint(x: number, y: number, draggedId: string): { over: TaskStatus | null; lane: string; local: number; index: number } {
     const node = document.elementFromPoint(x, y);
-    if (!(node instanceof Element)) return null;
-    return parseColumnStatus(node.closest("[data-task-column]")?.getAttribute("data-task-column"));
-  }
-  function slotAtPoint(y: number, status: TaskStatus | null, draggedId: string): number {
-    if (!status) return 0;
-    const col = document.querySelector(`[data-task-column="${status}"]`);
-    if (!col) return 0;
-    const mids: number[] = [];
-    for (const el of col.querySelectorAll("[data-task-card]")) {
-      if (!(el instanceof HTMLElement) || el.dataset.cardId === draggedId) continue;
-      const rect = el.getBoundingClientRect();
-      mids.push(rect.top + rect.height / 2);
-    }
-    return insertIndexFromY(mids, y);
+    const cell = node instanceof Element ? node.closest("[data-task-column]") : null;
+    const over = parseColumnStatus(cell?.getAttribute("data-task-column"));
+    const lane = cell?.closest<HTMLElement>("[data-task-lane]")?.dataset.taskLane ?? "";
+    if (!cell || !over) return { over, lane, local: 0, index: 0 };
+    const drawn = [...cell.querySelectorAll<HTMLElement>("[data-task-card]")].filter((el) => el.dataset.cardId !== draggedId);
+    const local = insertIndexFromY(drawn.map((el) => { const rect = el.getBoundingClientRect(); return rect.top + rect.height / 2; }), y);
+    const rest = (displayColumns[over]?.items ?? []).filter((item) => item.id !== draggedId);
+    const at = (id: string | undefined) => rest.findIndex((item) => item.id === id);
+    const before = drawn[local], last = drawn.at(-1);
+    const index = before ? at(before.dataset.cardId) : last ? at(last.dataset.cardId) + 1 : rest.length;
+    return { over, lane, local, index: index < 0 ? rest.length : index };
   }
   function releasePointer(target: EventTarget | null, pointerId: number) {
     if (target instanceof HTMLElement && target.hasPointerCapture(pointerId)) target.releasePointerCapture(pointerId);
@@ -795,10 +883,10 @@
     if (!drag) {
       if (!dragExceeded(e.clientX - press.x, e.clientY - press.y)) return;
       menu = null;
-      drag = { card: press.card, over: press.card.status, insertIndex: 0, x: e.clientX, y: e.clientY };
+      drag = { card: press.card, over: press.card.status, insertIndex: 0, lane: "", local: 0, x: e.clientX, y: e.clientY };
     }
-    const over = statusAtPoint(e.clientX, e.clientY);
-    drag = { card: drag.card, over, insertIndex: slotAtPoint(e.clientY, over, drag.card.id), x: e.clientX, y: e.clientY };
+    const at = dropAtPoint(e.clientX, e.clientY, drag.card.id);
+    drag = { card: drag.card, over: at.over, insertIndex: at.index, lane: at.lane, local: at.local, x: e.clientX, y: e.clientY };
   }
   function onCardPointerUp(e: PointerEvent) {
     const current = drag;
@@ -1277,6 +1365,22 @@
    * one confirm step, one batch, one interrupted-write recovery path for
    * every task mutation this board performs, wherever it was started.
    */
+  /**
+   * Bring deleted tasks back from the archive dock's Deleted view.
+   *
+   * The bounded pass in `taskDelete.ts`, the same one a delete runs, so the
+   * cap, the timeout and the single same-request retry are one policy. Each
+   * card's revision is the one its deletion produced, which is what the store
+   * checks a restore against.
+   */
+  async function restoreDeleted(cards: TaskCard[]): Promise<string> {
+    if (busy || !cards.length) return "";
+    const result = await restoreTasks(cards, async (attempt) => { await restoreDeletedTask(attempt.id, attempt.expected_revision, attempt.request_id); }, { newID });
+    if (result.deleted.length) { taskWritten(); void loadBoard(); }
+    const line = restoreSummary(result);
+    announce = line;
+    return line;
+  }
   async function archiveDockAction(cards: TaskCard[], action: TaskAction) {
     if (busy || !cards.length) return;
     if (cards.length > MAX_TASK_SELECTION) { error = `Select at most ${MAX_TASK_SELECTION} loaded tasks per action.`; return; }
@@ -1521,15 +1625,16 @@
         break;
     }
   }
-  function insertBefore(status: TaskStatus, cardId: string): boolean {
-    if (!drag || drag.over !== status || drag.card.id === cardId) return false;
-    const rest = (columns[status]?.items ?? []).filter((item) => item.id !== drag?.card.id);
-    return rest.findIndex((item) => item.id === cardId) === drag.insertIndex;
+  /** Whether the insertion line goes before `cardId` in the cell drawing `drawn`. */
+  function insertBefore(status: TaskStatus, lane: string, drawn: readonly TaskCard[], cardId: string): boolean {
+    if (!drag || drag.over !== status || drag.lane !== lane || drag.card.id === cardId) return false;
+    const draggedId = drag.card.id;
+    return drawn.filter((item) => item.id !== draggedId).findIndex((item) => item.id === cardId) === drag.local;
   }
-  function insertAtEnd(status: TaskStatus): boolean {
-    if (!drag || drag.over !== status) return false;
-    const rest = (columns[status]?.items ?? []).filter((item) => item.id !== drag?.card.id);
-    return drag.insertIndex >= rest.length;
+  function insertAtEnd(status: TaskStatus, lane: string, drawn: readonly TaskCard[]): boolean {
+    if (!drag || drag.over !== status || drag.lane !== lane) return false;
+    const draggedId = drag.card.id;
+    return drag.local >= drawn.filter((item) => item.id !== draggedId).length;
   }
   function dueLabel(state: ReturnType<typeof cardChrome>["due"]): string | null {
     if (state === "overdue") return "Overdue";
@@ -1538,6 +1643,109 @@
   }
 </script>
 
+{#snippet columnTitle(status: TaskStatus)}
+  {@const limit = wipLimits[status]}
+  {@const wip = wipOf(status)}
+  <span>{STATUS_LABELS[status]}</span>
+  <span class="column-meta">
+    <!-- The store's count for the column, not its loaded page: a column
+         showing thirty of forty is over a limit of thirty-five. -->
+    <span data-testid="task-column-count" title={limit ? `${columns[status]?.total ?? 0} of a work-in-progress limit of ${limit}` : undefined}>{columns[status]?.total ?? "—"}{#if limit}<span class="limit">/{limit}</span>{/if}</span>
+    {#if wip === "over"}<span class="over-badge" data-testid="task-column-over">Over limit<span class="sr-only">: {STATUS_LABELS[status]} holds {columns[status]?.total ?? 0} tasks against a limit of {limit}</span></span>{/if}
+    <button type="button" class="gp-icon-btn" aria-label={`New task in ${STATUS_LABELS[status]}`} title={creation.blocked ?? creation.caveat ?? `New task in ${STATUS_LABELS[status]}`} disabled={!creation.allowed} onclick={() => void createTask(status)}><Plus size={11} /></button>
+  </span>
+{/snippet}
+{#snippet boardCard(card: TaskCard, status: TaskStatus)}
+  {@const face = cardFace(card, repoName)}
+  {@const chrome = cardChrome(card, now)}
+  {@const agents = agentsByTask.get(card.id)}
+  {@const flag = checkoutFlag(checkouts.get(card.primary_repository_id))}
+  <button
+    type="button"
+    class="card bg-surface"
+    class:dragging={drag?.card.id === card.id}
+    class:selected={selected.has(card.id)}
+    class:open={openCardIds.has(card.id)}
+    data-testid="task-card"
+    data-task-card
+    data-card-id={card.id}
+    data-open-task={openCardIds.has(card.id) || undefined}
+    draggable="false"
+    aria-haspopup="menu"
+    aria-expanded={menu?.cards.some((item) => item.id === card.id) ?? false}
+    aria-keyshortcuts="ArrowUp ArrowDown Home End Shift+ArrowUp Shift+ArrowDown Alt+ArrowUp Alt+ArrowDown ArrowLeft ArrowRight X Delete ContextMenu"
+    aria-disabled={opening || undefined}
+    onpointerdown={(e) => onCardPointerDown(e, card)}
+    onpointermove={onCardPointerMove}
+    onpointerup={onCardPointerUp}
+    onpointercancel={onCardPointerCancel}
+    onclick={(e) => onCardClick(e, card)}
+    oncontextmenu={(e) => onCardContextMenu(e, card, status)}
+    onkeydown={(e) => onCardKeydown(e, card, status)}
+  >
+    <div class="card-meta">
+      {#if face.pip !== null}<span class="pip" data-priority={face.pip}></span>{/if}
+      <h3>{face.title}{#if selected.has(card.id)}<span class="sr-only">, selected</span>{/if}</h3>
+      {#if openCardIds.has(card.id)}<span class="open-mark">Open</span>{/if}
+    </div>
+    {#if agents}<span class="agents-chip" data-testid="card-agents" data-tone={agents.tone ?? undefined} data-asking={agents.asking || undefined} title={agentsTitle(agents)}><Bot size={11} aria-hidden="true" />{agents.working}{$boardAgents.complete ? "" : "+"}<span class="sr-only"> {agents.working === 1 ? "agent" : "agents"} working</span>{#if agents.asking}<span class="asking"> · {agents.asking} {agents.asking === 1 ? "needs" : "need"} you</span>{/if}</span>{/if}
+    {#if flag}<span class="checkout-flag" data-testid="card-checkout" title={flag.detail}><AlertTriangle size={10} aria-hidden="true" /> {flag.label}</span>{/if}
+    {#if face.repo && cardFields.has("repo")}<div class="card-repos">{face.repo}{chrome.extraRepos ? ` +${chrome.extraRepos}` : ""}</div>{/if}
+    {#if (chrome.kind && cardFields.has("type")) || (chrome.owner && cardFields.has("owner")) || (dueLabel(chrome.due) && cardFields.has("due"))}
+      <div class="card-extra">
+        {#if chrome.kind && cardFields.has("type")}<span class="muted">{chrome.kind}</span>{/if}
+        {#if chrome.owner && cardFields.has("owner")}<span class="muted">{chrome.owner}</span>{/if}
+        {#if dueLabel(chrome.due) && cardFields.has("due")}<span class="due" data-due={chrome.due}>{dueLabel(chrome.due)}</span>{/if}
+      </div>
+    {/if}
+    {#if face.labels.length && cardFields.has("labels")}<div class="labels">{#each face.labels as label}<span>{label}</span>{/each}{#if chrome.extraLabels}<span>+{chrome.extraLabels}</span>{/if}</div>{/if}
+  </button>
+{/snippet}
+{#snippet listRow(card: TaskCard)}
+  {@const face = cardFace(card, repoName)}
+  {@const chrome = cardChrome(card, now)}
+  {@const agents = agentsByTask.get(card.id)}
+  {@const flag = checkoutFlag(checkouts.get(card.primary_repository_id))}
+  <button
+    type="button"
+    class="row gp-card"
+    class:selected={selected.has(card.id)}
+    class:open={openCardIds.has(card.id)}
+    data-testid="task-card"
+    data-task-card
+    data-card-id={card.id}
+    data-open-task={openCardIds.has(card.id) || undefined}
+    aria-haspopup="menu"
+    aria-expanded={menu?.cards.some((item) => item.id === card.id) ?? false}
+    aria-keyshortcuts="ArrowUp ArrowDown Home End Shift+ArrowUp Shift+ArrowDown Alt+ArrowUp Alt+ArrowDown ArrowLeft ArrowRight X Delete ContextMenu"
+    aria-disabled={opening || undefined}
+    onclick={(e) => onCardClick(e, card)}
+    oncontextmenu={(e) => onCardContextMenu(e, card, card.status)}
+    onkeydown={(e) => onCardKeydown(e, card, card.status)}
+  >
+    <span class="status">{STATUS_LABELS[card.status]}</span>
+    <span class="row-title">{face.title}</span>{#if selected.has(card.id)}<span class="sr-only">, selected</span>{/if}
+    {#if agents}<span class="agents-chip" data-testid="card-agents" data-tone={agents.tone ?? undefined} data-asking={agents.asking || undefined} title={agentsTitle(agents)}><Bot size={11} aria-hidden="true" />{agents.working}{$boardAgents.complete ? "" : "+"}<span class="sr-only"> {agents.working === 1 ? "agent" : "agents"} working</span>{#if agents.asking}<span class="asking"> · {agents.asking} {agents.asking === 1 ? "needs" : "need"} you</span>{/if}</span>{/if}
+    {#if flag}<span class="checkout-flag" data-testid="card-checkout" title={flag.detail}>{flag.label}</span>{/if}
+    {#if openCardIds.has(card.id)}<span class="open-mark">Open</span>{/if}
+    {#if face.repo && cardFields.has("repo")}<span class="muted">{face.repo}{chrome.extraRepos ? ` +${chrome.extraRepos}` : ""}</span>{/if}
+    {#if chrome.owner && cardFields.has("owner")}<span class="muted">{chrome.owner}</span>{/if}
+    {#if dueLabel(chrome.due) && cardFields.has("due")}<span class="due" data-due={chrome.due}>{dueLabel(chrome.due)}</span>{/if}
+  </button>
+{/snippet}
+{#snippet columnPaging(status: TaskStatus, named = false)}
+  <!-- One control for both layouts. The list used to have none, so a task
+       past a column's first page could not be reached from it at all, and the
+       board's said "Next" for what appends rather than turns a page. -->
+  {@const pageOf = columns[status]}
+  {#if pageOf && (pageOf.next_cursor || pageOf.items.length > TASK_PAGE_SIZE)}
+    <div class="paging" data-task-paging={status}>
+      <span class="paging-count">{named ? `${STATUS_LABELS[status]}: ` : ""}{pageOf.items.length} of {pageOf.total}</span>
+      {#if pageOf.next_cursor}<button type="button" class="gp-btn" aria-label={`Load more ${STATUS_LABELS[status]} tasks`} onclick={() => pageColumn(status, pageOf.next_cursor ?? undefined)} disabled={loading}>Load more</button>{/if}
+      {#if pageOf.items.length > TASK_PAGE_SIZE}<button type="button" class="gp-btn" aria-label={`Show only the first ${STATUS_LABELS[status]} page`} onclick={() => pageColumn(status)} disabled={loading}>First page</button>{/if}
+    </div>
+  {/if}
+{/snippet}
 {#snippet scopeSelection(selected: boolean)}
   {#if macos && selected}<span class="gp-liquid-selection gp-gpu" aria-hidden="true" in:receiveScope={{ key: "task-scope" }} out:sendScope={{ key: "task-scope" }}></span>{/if}
 {/snippet}
@@ -1597,9 +1805,12 @@
           <button type="button" class="gp-menu-item" role="menuitem" onclick={() => void pickFolder()}>Choose folder…</button>
         </div>
       {/if}
-      {#each repositories as repo (repo.id)}<div class="nav-row" data-repository-row={repo.id}><button type="button" class="gp-seg-btn" class:selected={scope.kind === "repository" && scope.id === repo.id} aria-pressed={scope.kind === "repository" && scope.id === repo.id} data-active={scope.kind === "repository" && scope.id === repo.id} onclick={() => { scope = { kind: "repository", id: repo.id }; }} title={repo.identity_key}>
-        {@render scopeSelection(scope.kind === "repository" && scope.id === repo.id)}<span>{repo.name}</span>
-      </button><button type="button" class="icon gp-icon-btn" aria-label={`Relink ${repo.name} to a moved checkout`} title={`Relink ${repo.name} — its checkout moved or was cloned again`} disabled={relinking || busy} onclick={() => void relinkRepo(repo)}><FolderSync size={12} /></button></div>{/each}
+      {#each repositories as repo (repo.id)}
+        {@const health = checkouts.get(repo.id)}
+        <div class="nav-row" data-repository-row={repo.id} data-checkout={health?.state ?? "unread"}><button type="button" class="gp-seg-btn" class:selected={scope.kind === "repository" && scope.id === repo.id} aria-pressed={scope.kind === "repository" && scope.id === repo.id} data-active={scope.kind === "repository" && scope.id === repo.id} onclick={() => { scope = { kind: "repository", id: repo.id }; }} title={health && health.state !== "available" ? health.detail : repo.identity_key}>
+        {@render scopeSelection(scope.kind === "repository" && scope.id === repo.id)}<span>{repo.name}{#if health?.state === "missing"}<span class="checkout-mark" data-testid="repository-checkout-missing"> · <AlertTriangle size={10} aria-hidden="true" /> Missing</span>{:else if health?.state === "remote"}<span class="checkout-mark" data-testid="repository-remote-only"> · Remote only</span>{:else if health?.state === "unknown"}<span class="checkout-mark" data-testid="repository-checkout-unknown"> · Not checked</span>{/if}</span>
+      </button>{#if health?.state === "remote"}<button type="button" class="icon gp-icon-btn" aria-label={`Link ${repo.name} to a local checkout`} title={`Link ${repo.name} to a checkout on this machine — its tasks, workspaces and history keep their place`} disabled={relinking || busy} onclick={() => void relinkRepo(repo)}><FolderSync size={12} /></button>{:else}<button type="button" class="icon gp-icon-btn" class:urgent={health?.state === "missing"} aria-label={`Relink ${repo.name} to a moved checkout`} title={health?.state === "missing" ? health.detail : `Relink ${repo.name} — its checkout moved or was cloned again`} disabled={relinking || busy} onclick={() => void relinkRepo(repo)}><FolderSync size={12} /></button>{/if}</div>
+      {/each}
       {#if repositoryCursor}<button type="button" onclick={moreRepositories}>More ({repositories.length}/{repositoryTotal})</button>{/if}
     </nav>
   {/if}
@@ -1608,6 +1819,9 @@
       <div class="heading">
         <h1>{title}{#if !loading && initialized}<span>{total}</span>{/if}</h1>
         {#if inProgressCount > 0}<span class="gp-pill">{inProgressCount} in progress</span>{/if}
+        <!-- A repository's board has no navigator, so this is its one way to
+             the boards for every task and for its workspaces. -->
+        {#if repositoryPath}<button type="button" class="link" data-testid="task-board-all" title="Open the Tasks board for every repository and workspace" onclick={() => interfaceStore.setGlobalSurface("tasks")}>All tasks</button>{/if}
       </div>
       <div class="actions">
         <label class="search"><Search size={12} /><input id="task-search" class="gp-field" aria-label="Search tasks" type="search" bind:value={search} placeholder="Search tasks" maxlength="512" /></label>
@@ -1621,14 +1835,15 @@
             <Inbox size={13} />
             {#if !unreadError && unread > 0}<span class="gp-pill">{unread}</span>{/if}
           </button>
-          <button type="button" class="gp-icon-btn" aria-pressed={showArchive} aria-controls="task-archive-dock" aria-label="Archive" title={`Archive — tasks in this scope that reached ${STATUS_LABELS[ARCHIVE_STATUS]}`} onclick={() => { showArchive = !showArchive; }}>
+          <button type="button" class="gp-icon-btn" aria-pressed={showArchive} aria-controls="task-archive-dock" aria-label="Archive" title="Archive — tasks filed away from this board, and deleted tasks to restore" onclick={() => { showArchive = !showArchive; }}>
             <Archive size={13} />
-            {#if completedCount > 0}<span class="gp-pill">{completedCount}</span>{/if}
+            {#if archivedCount > 0}<span class="gp-pill">{archivedCount}</span>{/if}
           </button>
         {/if}
-        <button type="button" class="gp-icon-btn" aria-label="Refresh" title="Refresh" onclick={() => { void boardAgents.refresh(); if (initialized) void refresh(); else void initialize(); }} disabled={loading}><RefreshCw size={13} /></button>
+        <button type="button" class="gp-icon-btn" aria-label="Refresh" title="Refresh" onclick={() => { void boardAgents.refresh(); checkoutToken++; if (initialized) void refresh(); else void initialize(); }} disabled={loading}><RefreshCw size={13} /></button>
         <button type="button" class="gp-btn" aria-pressed={showFilters || filtering} onclick={() => { showFilters = !showFilters; }}>Filters</button>
-        <TaskViewMenu disabled={!initialized} />
+        <TaskSavedViews disabled={!initialized} board={viewBoard} boardName={title} current={viewSnapshot} onApply={applyView} />
+        <TaskViewMenu disabled={!initialized} board={viewBoard} boardName={title} />
         <button type="button" class="gp-btn-primary" onclick={() => void createTask()} disabled={!creation.allowed} title={creation.blocked ?? creation.caveat ?? "New task"} aria-label="New task">New task</button>
         <!-- A disabled New task always says why, and a caveat says what the
              sheet will ask for. This used to render only for a profile with no
@@ -1700,11 +1915,6 @@
       <p class="hidden-note" role="status" data-testid="task-hidden-columns">
         <EyeOff size={11} />
         {hiddenWork.summary} hidden from this board.
-        {#if offersArchive(hiddenWork.statuses)}
-          <!-- Completed work is the one hidden column with somewhere else to
-               be read, so it is the one that earns a second door here. -->
-          <button type="button" class="link" onclick={() => { showArchive = true; }}>Open archive</button>
-        {/if}
         <button type="button" class="link" onclick={() => interfaceStore.showAllTaskColumns()}>Show all columns</button>
       </p>
     {/if}
@@ -1748,18 +1958,26 @@
           onclick={(e) => { const rect = e.currentTarget.getBoundingClientRect(); menu = { cards: selectedCards, column: null, x: rect.left, y: rect.bottom + 4 }; }}
         >Change…</button>
         <!-- The bulk half of the card menu's Archive row, disabled for the
-             same reason and titled with where the work goes. Without it the
-             only bulk end-of-life action on this bar was Delete. -->
+             same reason. Without it the only bulk end-of-life action on this
+             bar was Delete. -->
         <button
           type="button"
           class="gp-btn"
           data-testid="task-archive-selected"
           onclick={() => void archiveCards(selectedCards)}
           disabled={busy || selectionArchived === "all"}
-          title={selectionArchived === "all"
-            ? `Already in ${STATUS_LABELS[ARCHIVE_STATUS]}`
-            : `Archive — moves to ${STATUS_LABELS[ARCHIVE_STATUS]}`}
+          title={selectionArchived === "all" ? "Already archived" : "Archive — files the tasks away, keeping their status"}
         ><Archive size={12} /> Archive</button>
+        <!-- The merge gitpulse_merge_tasks runs, offered only for a
+             selection it would not refuse on sight (taskMerge.ts). -->
+        <button
+          type="button"
+          class="gp-btn"
+          data-testid="task-merge-selected"
+          disabled={busy || !selectionMerge.ok}
+          title={selectionMerge.ok ? "Merge — fold these into one task and delete the rest" : selectionMerge.reason}
+          onclick={() => { if (selectionMerge.ok) mergeDialog = { cards: [...selectedCards], repositoryId: selectionMerge.repositoryId }; }}
+        ><Merge size={12} /> Merge…</button>
         <button type="button" class="gp-btn-danger" onclick={() => void removeSelected()} disabled={busy}><Trash2 size={12} /> Delete</button>
         <button type="button" class="gp-btn" onclick={() => { selected = new Set(); selectionAnchor = null; }}>Clear</button>
       </div>
@@ -1771,12 +1989,11 @@
         {scope}
         {active}
         {busy}
-        {hiddenColumns}
         refreshToken={archiveToken}
         hiddenIds={pendingDelete?.ids}
         onopen={openTask}
         onaction={(cards, action) => void archiveDockAction(cards, action)}
-        ontogglecolumn={() => interfaceStore.toggleTaskColumn(ARCHIVE_STATUS)}
+        onrestoredeleted={restoreDeleted}
       />
     {/if}
     {#if relinkPending}<div class="banner error" role="alert" data-testid="repository-relink-uncertain"><span>{relinkPending.message}</span><button type="button" class="gp-btn" disabled={relinking} onclick={() => void retryRelink()}>Retry relink</button></div>{/if}
@@ -1786,6 +2003,9 @@
     <!-- Cards carry no agent marks while this stands: an old reading would
          claim agents nobody checked. -->
     {#if $boardAgents.error}<p class="agents-unread" role="status" data-testid="board-agents-error">Agents working on these tasks could not be read: {$boardAgents.error}</p>{/if}
+    <!-- A check that could not run is said, not shown as a healthy checkout:
+         those rows and cards carry no mark either way. -->
+    {#if uncheckedCheckouts.length}<p class="agents-unread" role="status" data-testid="checkout-unchecked">{plural(uncheckedCheckouts.length, "checkout")} could not be checked, so whether {uncheckedCheckouts.length === 1 ? "it is" : "they are"} still there is unknown. {uncheckedCheckouts[0].detail}</p>{/if}
     <!-- Its own banner, not part of `error`: a board reload clears `error`,
          and the issue would still exist with nothing on screen to link it. -->
     {#each relinks as entry (entry.taskId)}<div class="banner error" role="alert" data-testid="task-issue-relink"><span>Issue #{entry.number} exists but is not linked to “{entry.title}”.</span><button type="button" class="gp-btn" disabled={busy} onclick={() => void retryIssueLink(entry)}>Link to #{entry.number}</button></div>{/each}
@@ -1803,107 +2023,84 @@
       <EmptyState icon={Search} title="No tasks match" hint="Clear search or filters to see the rest of this board. Server search only covers the current pages." action={{ label: "Clear filters", onClick: () => { facet = emptyFacet(); search = ""; }, variant: "secondary" }} />
     {:else if layout === "list"}
       <div class="list" role="group" data-testid="task-columns" data-task-list aria-busy={loading || moving} aria-label="Task list">
-        {#each listCards as card (card.id)}
-          {@const face = cardFace(card, repoName)}
-          {@const chrome = cardChrome(card, now)}
-          {@const agents = agentsByTask.get(card.id)}
-          <button
-            type="button"
-            class="row gp-card"
-            class:selected={selected.has(card.id)}
-            class:open={openCardIds.has(card.id)}
-            data-testid="task-card"
-            data-task-card
-            data-card-id={card.id}
-            data-open-task={openCardIds.has(card.id) || undefined}
-            aria-haspopup="menu"
-            aria-expanded={menu?.cards.some((item) => item.id === card.id) ?? false}
-            aria-keyshortcuts="ArrowUp ArrowDown Home End Shift+ArrowUp Shift+ArrowDown Alt+ArrowUp Alt+ArrowDown ArrowLeft ArrowRight X Delete ContextMenu"
-            aria-disabled={opening || undefined}
-            onclick={(e) => onCardClick(e, card)}
-            oncontextmenu={(e) => onCardContextMenu(e, card, card.status)}
-            onkeydown={(e) => onCardKeydown(e, card, card.status)}
-          >
-            <span class="status">{STATUS_LABELS[card.status]}</span>
-            <span class="row-title">{face.title}</span>{#if selected.has(card.id)}<span class="sr-only">, selected</span>{/if}
-            {#if agents}<span class="agents-chip" data-testid="card-agents" data-tone={agents.tone ?? undefined} data-asking={agents.asking || undefined} title={agentsTitle(agents)}><Bot size={11} aria-hidden="true" />{agents.working}{$boardAgents.complete ? "" : "+"}<span class="sr-only"> {agents.working === 1 ? "agent" : "agents"} working</span>{#if agents.asking}<span class="asking"> · {agents.asking} {agents.asking === 1 ? "needs" : "need"} you</span>{/if}</span>{/if}
-            {#if openCardIds.has(card.id)}<span class="open-mark">Open</span>{/if}
-            {#if face.repo && cardFields.has("repo")}<span class="muted">{face.repo}{chrome.extraRepos ? ` +${chrome.extraRepos}` : ""}</span>{/if}
-            {#if chrome.owner && cardFields.has("owner")}<span class="muted">{chrome.owner}</span>{/if}
-            {#if dueLabel(chrome.due) && cardFields.has("due")}<span class="due" data-due={chrome.due}>{dueLabel(chrome.due)}</span>{/if}
-          </button>
+        {#if laneList}
+          {#each laneList as group (group.key)}
+            <div class="list-lane" role="group" aria-label={laneAria(group)} data-task-lane={group.key}>
+              <h3 class="lane-title">{group.label}<span>{group.cards.length}</span></h3>
+              {#each group.cards as card (card.id)}{@render listRow(card)}{/each}
+            </div>
+          {/each}
+        {:else}
+          {#each listCards as card (card.id)}{@render listRow(card)}{/each}
+        {/if}
+        {#each shown as status (status)}{@render columnPaging(status, true)}{/each}
+      </div>
+    {:else if laneList}
+      <!-- Lanes are rows across the status columns. The column heads, with
+           their counts and limits, are drawn once above every lane: a limit
+           is about the whole column, not one lane's share of it. -->
+      <div class="columns laned" aria-busy={loading || moving} data-testid="task-columns">
+        <div class="lane-head" style={laneGrid}>
+          {#each shown as status (status)}
+            <div class="column-head" class:over-limit={wipOf(status) === "over"} data-task-column-head={status} data-wip={wipOf(status) ?? undefined}>{@render columnTitle(status)}</div>
+          {/each}
+        </div>
+        {#each laneList as group (group.key)}
+          <div class="lane" role="group" aria-label={laneAria(group)} data-task-lane={group.key}>
+            <h3 class="lane-title">{group.label}<span>{group.cards.length}</span></h3>
+            <div class="lane-cells" style={laneGrid}>
+              {#each shown as status (status)}
+                {@const drawn = group.cards.filter((card) => card.status === status)}
+                <section
+                  class="column lane-cell"
+                  class:drop-target={drag !== null && drag.over === status && drag.lane === group.key}
+                  class:over-limit={wipOf(status) === "over"}
+                  data-task-column={status}
+                  aria-label={`${STATUS_LABELS[status]} — ${group.label}`}
+                  oncontextmenu={(e) => onColumnContextMenu(e, status)}
+                >
+                  <div class="cards">
+                    {#each drawn as card (card.id)}
+                      {#if insertBefore(status, group.key, drawn, card.id)}<div class="insert" aria-hidden="true"></div>{/if}
+                      {@render boardCard(card, status)}
+                    {/each}
+                    {#if insertAtEnd(status, group.key, drawn)}<div class="insert" aria-hidden="true"></div>{/if}
+                  </div>
+                </section>
+              {/each}
+            </div>
+          </div>
         {/each}
+        <div class="lane-head" style={laneGrid}>
+          {#each shown as status (status)}<div>{@render columnPaging(status)}</div>{/each}
+        </div>
       </div>
     {:else}
       <div class="columns" aria-busy={loading || moving} data-testid="task-columns">
         {#each shown as status (status)}
+          {@const drawn = visibleIn(status)}
           <section
             class="column"
             class:drop-target={drag !== null && drag.over === status}
+            class:over-limit={wipOf(status) === "over"}
             data-task-column={status}
             data-testid="task-column"
+            data-wip={wipOf(status) ?? undefined}
             aria-label={STATUS_LABELS[status]}
             oncontextmenu={(e) => onColumnContextMenu(e, status)}
           >
-            <div class="column-title">
-              <span>{STATUS_LABELS[status]}</span>
-              <span class="column-meta">
-                <span>{columns[status]?.total ?? "—"}</span>
-                <button type="button" class="gp-icon-btn" aria-label={`New task in ${STATUS_LABELS[status]}`} title={creation.blocked ?? creation.caveat ?? `New task in ${STATUS_LABELS[status]}`} disabled={!creation.allowed} onclick={() => void createTask(status)}><Plus size={11} /></button>
-              </span>
-            </div>
+            <div class="column-title">{@render columnTitle(status)}</div>
             <div class="cards">
-              {#each visibleIn(status) as card (card.id)}
-                {@const face = cardFace(card, repoName)}
-                {@const chrome = cardChrome(card, now)}
-                {@const agents = agentsByTask.get(card.id)}
-                {#if insertBefore(status, card.id)}<div class="insert" aria-hidden="true"></div>{/if}
-                <button
-                  type="button"
-                  class="card bg-surface"
-                  class:dragging={drag?.card.id === card.id}
-                  class:selected={selected.has(card.id)}
-                  class:open={openCardIds.has(card.id)}
-                  data-testid="task-card"
-                  data-task-card
-                  data-card-id={card.id}
-                  data-open-task={openCardIds.has(card.id) || undefined}
-                  draggable="false"
-                  aria-haspopup="menu"
-                  aria-expanded={menu?.cards.some((item) => item.id === card.id) ?? false}
-                  aria-keyshortcuts="ArrowUp ArrowDown Home End Shift+ArrowUp Shift+ArrowDown Alt+ArrowUp Alt+ArrowDown ArrowLeft ArrowRight X Delete ContextMenu"
-                  aria-disabled={opening || undefined}
-                  onpointerdown={(e) => onCardPointerDown(e, card)}
-                  onpointermove={onCardPointerMove}
-                  onpointerup={onCardPointerUp}
-                  onpointercancel={onCardPointerCancel}
-                  onclick={(e) => onCardClick(e, card)}
-                  oncontextmenu={(e) => onCardContextMenu(e, card, status)}
-                  onkeydown={(e) => onCardKeydown(e, card, status)}
-                >
-                  <div class="card-meta">
-                    {#if face.pip !== null}<span class="pip" data-priority={face.pip}></span>{/if}
-                    <h3>{face.title}{#if selected.has(card.id)}<span class="sr-only">, selected</span>{/if}</h3>
-                    {#if openCardIds.has(card.id)}<span class="open-mark">Open</span>{/if}
-                  </div>
-                  {#if agents}<span class="agents-chip" data-testid="card-agents" data-tone={agents.tone ?? undefined} data-asking={agents.asking || undefined} title={agentsTitle(agents)}><Bot size={11} aria-hidden="true" />{agents.working}{$boardAgents.complete ? "" : "+"}<span class="sr-only"> {agents.working === 1 ? "agent" : "agents"} working</span>{#if agents.asking}<span class="asking"> · {agents.asking} {agents.asking === 1 ? "needs" : "need"} you</span>{/if}</span>{/if}
-                  {#if face.repo && cardFields.has("repo")}<div class="card-repos">{face.repo}{chrome.extraRepos ? ` +${chrome.extraRepos}` : ""}</div>{/if}
-                  {#if (chrome.kind && cardFields.has("type")) || (chrome.owner && cardFields.has("owner")) || (dueLabel(chrome.due) && cardFields.has("due"))}
-                    <div class="card-extra">
-                      {#if chrome.kind && cardFields.has("type")}<span class="muted">{chrome.kind}</span>{/if}
-                      {#if chrome.owner && cardFields.has("owner")}<span class="muted">{chrome.owner}</span>{/if}
-                      {#if dueLabel(chrome.due) && cardFields.has("due")}<span class="due" data-due={chrome.due}>{dueLabel(chrome.due)}</span>{/if}
-                    </div>
-                  {/if}
-                  {#if face.labels.length && cardFields.has("labels")}<div class="labels">{#each face.labels as label}<span>{label}</span>{/each}{#if chrome.extraLabels}<span>+{chrome.extraLabels}</span>{/if}</div>{/if}
-                </button>
+              {#each drawn as card (card.id)}
+                {#if insertBefore(status, "", drawn, card.id)}<div class="insert" aria-hidden="true"></div>{/if}
+                {@render boardCard(card, status)}
               {/each}
-              {#if insertAtEnd(status)}<div class="insert" aria-hidden="true"></div>{/if}
-              {#if visibleIn(status).length === 0 && drag === null}
+              {#if insertAtEnd(status, "", drawn)}<div class="insert" aria-hidden="true"></div>{/if}
+              {#if drawn.length === 0 && drag === null}
                 <p class="column-empty">Drop a card here, or add one.</p>
               {/if}
             </div>
-            {#if columns[status] && (columns[status]?.total ?? 0) > 30}<div class="paging"><button type="button" class="gp-btn" onclick={() => pageColumn(status)} disabled={loading}>First</button>{#if columns[status]?.next_cursor}<button type="button" class="gp-btn" onclick={() => pageColumn(status, columns[status]?.next_cursor ?? undefined)} disabled={loading}>Next</button>{/if}</div>{/if}
+            {@render columnPaging(status)}
           </section>
         {/each}
       </div>
@@ -1936,6 +2133,7 @@
          sheet. -->
     {#key enhanceId}
     <QuickEnhanceSheet
+      bind:this={enhanceHandle}
       taskId={enhanceId}
       startRequest={enhanceStart}
       {repoName}
@@ -2021,6 +2219,7 @@
   {#if workspaceEditor}{#key workspaceEditor}<WorkspaceEditor bind:this={workspaceHandle} value={workspaceEditor.value} {repositories} openTabs={openTabRefs} onSaved={() => { scope = { kind: "global" }; void refresh(); }} onClose={() => { workspaceEditor = null; }} />{/key}{/if}
 </div>
 
+{#if mergeDialog}<TaskMergeDialog cards={mergeDialog.cards} repositoryId={mergeDialog.repositoryId} onClose={() => { mergeDialog = null; }} onMerged={(result) => { tasksChanged(result.sources.filter((row) => row.outcome !== "not_merged").map((row) => row.item_id)); announce = result.ok ? `Merged ${result.sources.length} ${result.sources.length === 1 ? "task" : "tasks"}.` : "Merged part of the selection; see the merge dialog."; }} />{/if}
 {#if actionDialog}<TaskActionDialog tasks={actionDialog.cards} action={actionDialog.action} batch={actionDialog.batch} onDefer={actionDialog.action.kind === "delete" && !actionDialog.batch ? deferDialogDeletion : undefined} onChanged={tasksChanged} onClose={() => { actionDialog = null; }} />{/if}
 {#if handoff}
   <TaskHandoffSheet
@@ -2080,6 +2279,21 @@
   .columns{display:flex;gap:8px;padding:12px;overflow:auto;flex:1;min-height:0;align-items:stretch}
   .column{width:220px;min-width:196px;flex:1;display:flex;flex-direction:column;border-radius:12px;border:1px solid rgb(var(--c-border) / 0.65);overflow:hidden;min-height:0}
   .column.drop-target{border-color:rgb(var(--c-accent))}
+  /* Over its work-in-progress limit: the column says so in its border and its head, and still accepts work. */
+  .column.over-limit,.column-head.over-limit{border-color:#d15a64}
+  .limit{color:rgb(var(--c-text-muted))}
+  .over-badge{font-size:9px;font-weight:650;letter-spacing:.03em;text-transform:uppercase;padding:1px 5px;border-radius:4px;color:#d15a64;background:rgb(209 90 100 / .14)}
+  /* Lanes: one head row for the columns, then a row of cells per lane. */
+  .columns.laned{flex-direction:column;align-items:stretch;gap:10px}
+  .lane-head,.lane-cells{display:grid;gap:8px}
+  .column-head{display:flex;align-items:center;justify-content:space-between;font-weight:650;font-size:12px;padding:8px 10px;border:1px solid rgb(var(--c-border) / 0.65);border-radius:12px}
+  .lane{flex-shrink:0;display:flex;flex-direction:column;gap:6px}
+  .lane-title{margin:0;font-size:11px;font-weight:650;display:flex;gap:6px;align-items:baseline;color:rgb(var(--c-text))}
+  .lane-title span{font-weight:400;color:rgb(var(--c-text-muted))}
+  .lane-cell{width:auto;min-width:0;flex:none}
+  .lane-cell .cards{min-height:48px;overflow:visible}
+  .list-lane{display:flex;flex-direction:column;margin-bottom:10px}
+  .list-lane .lane-title{padding:4px 2px 6px}
   .column-title{display:flex;align-items:center;justify-content:space-between;font-weight:650;font-size:12px;border-bottom:1px solid rgb(var(--c-border) / 0.65);padding:8px 10px;}
   .column-meta{display:flex;align-items:center;gap:4px;color:rgb(var(--c-text-muted));font-weight:400}
   .cards{padding:6px;overflow:auto;flex:1;min-height:80px}
@@ -2096,6 +2310,11 @@
   .agents-chip[data-asking]{color:#d29922;background:rgb(210 153 34 / .16)}
   .agents-chip[data-tone="error"]{color:#dc6565;background:rgb(220 101 101 / .16)}
   .card .agents-chip{margin-top:4px}
+  /* A task whose primary repository has no checkout here: said on the card, before a launch finds out. */
+  .checkout-flag{display:inline-flex;align-items:center;gap:3px;align-self:flex-start;flex-shrink:0;font-size:10px;font-weight:600;line-height:1;padding:2px 5px;border-radius:999px;color:#d29922;background:rgb(210 153 34 / .16);white-space:nowrap}
+  .card .checkout-flag{margin-top:4px}
+  .checkout-mark{color:#d29922;font-size:10px}
+  .navigator .gp-icon-btn.urgent{color:#d29922}
   .editor-dock{display:flex;flex-direction:column;flex-shrink:0;min-width:0;min-height:0;align-self:stretch}
   /* Same token the sheet below uses (app.css): the strip and the sheet are
      one column and must not be able to disagree about its width. */
@@ -2123,7 +2342,8 @@
   .due[data-due="overdue"]{background:rgb(244 63 94 / 0.15);color:#e11d48}
   .labels{display:flex;gap:4px;margin-top:6px;font-size:9px;flex-wrap:wrap}
   .labels span{padding:1px 5px;border-radius:4px;background:color-mix(in srgb,rgb(var(--c-accent)) 9%,transparent);color:rgb(var(--c-text-muted))}
-  .paging{display:flex;gap:5px;padding:6px}
+  .paging{display:flex;align-items:center;flex-wrap:wrap;gap:5px;padding:6px}
+  .paging-count{font-size:10px;color:rgb(var(--c-text-muted));font-variant-numeric:tabular-nums;margin-right:auto}
   .column-empty{margin:10px 8px;font-size:11px;color:rgb(var(--c-text-muted))}
   .list{padding:12px;overflow:auto;flex:1}
   .banner{padding:7px 14px;font-size:12px;border-bottom:1px solid rgb(var(--c-border) / 0.65);display:flex;align-items:center;justify-content:space-between;gap:10px}

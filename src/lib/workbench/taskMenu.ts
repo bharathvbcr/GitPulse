@@ -1,5 +1,5 @@
 import { PRIORITY_LABELS } from "./boardDrag";
-import { ARCHIVE_STATUS, archiveState } from "./taskArchive";
+import { archiveState } from "./taskArchive";
 import { STATUSES, STATUS_LABELS, type TaskCard, type TaskStatus } from "./client";
 import { displayTitle, isRevision, isTaskId } from "./taskDelete";
 import { linkedIssueNumber } from "./issueTask";
@@ -70,8 +70,8 @@ export type TaskMenuAction =
    * Done` is where a reader goes to change a *status* and the archive is
    * what they go looking for when they want the task off the board. The menu
    * had the first and not the second, so "archive this" had no answer
-   * anywhere in the product. What it does is still exactly one status
-   * change — `archiveAction()` owns that, not this menu.
+   * anywhere in the product. What it writes is the archived flag alone —
+   * `archiveAction()` owns that, not this menu.
    */
   | { kind: "archive" }
   | { kind: "delete" }
@@ -552,8 +552,8 @@ export function taskMenuItems(options: {
   }
 
   // Archiving and deleting are the two ways work leaves the board, so they
-  // are one group. The hint names Done on every row, enabled or not: it is
-  // the only place a reader is told where an archived task actually goes.
+  // are one group. Archiving keeps the task's status; the hint says so, since
+  // it once meant moving to Done.
   const archived = archiveState(cards);
   items.push({
     id: "archive",
@@ -561,9 +561,7 @@ export function taskMenuItems(options: {
     action: { kind: "archive" },
     icon: "archive",
     separatorBefore: true,
-    hint: archived === "all"
-      ? `Already in ${STATUS_LABELS[ARCHIVE_STATUS]}`
-      : STATUS_LABELS[ARCHIVE_STATUS],
+    hint: archived === "all" ? "Already archived" : "Keeps status",
     // Every task in the selection is already archived, so every write would
     // spend a revision storing the value that is already there — the same
     // reason a Move row showing the current status is disabled rather than

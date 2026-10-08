@@ -105,10 +105,19 @@ pub(super) fn spawn<R: tauri::Runtime>(
     // Read once, so the flags the build is checked for are the flags it gets.
     let defaults = crate::tool_config::agent_defaults();
     let sources = defaults.claude_setting_sources_arg();
+    // The model the attempt recorded when it was prepared — the saved default
+    // with that launch's override — not the default as it is now. An attempt
+    // stored before runs recorded one has no `model_choice` key and takes the
+    // default, as it always did.
+    let recorded = match response["item"].get("model_choice") {
+        Some(record) => terminal_command::model_choice_from_record(record)
+            .map_err(|message| WorkbenchError::new("protocol_error", message))?,
+        None => defaults.model_for(&source.provider).cloned(),
+    };
     let options = terminal_command::LaunchOptions {
         notify: crate::tool_config::session_alerts().configure_agents,
         setting_sources: sources.as_deref(),
-        model: defaults.model_for(&source.provider),
+        model: recorded.as_ref(),
     };
     terminal_command::check(
         &program,

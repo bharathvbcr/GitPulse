@@ -3,12 +3,20 @@ import WebKit
 
 // Use the system WKWebView, with an ephemeral profile and the same fixture
 // page as Chrome. The Node runner owns the assertion verdict and deadline.
-guard CommandLine.arguments.count == 2,
+// The optional second argument is the deadline in seconds; the Node runner
+// passes each page its own (`harnessDeadlineSeconds`). It stays bounded so a
+// malformed value can never mean "wait forever".
+guard [2, 3].contains(CommandLine.arguments.count),
       let url = URL(string: CommandLine.arguments[1]),
       url.scheme == "http", url.host == "127.0.0.1",
-      ["/harness/diagnostics.html", "/harness/pull-requests.html", "/harness/search.html", "/harness/conflicts.html", "/harness/uncommitted.html", "/harness/coverage.html", "/harness/health.html", "/harness/blame.html", "/harness/branches.html", "/harness/hygiene.html", "/harness/palette.html", "/harness/status.html", "/harness/tasks.html", "/harness/task-materials.html", "/harness/task-runs.html", "/harness/onboarding.html", "/harness/firebase.html", "/harness/delivery.html", "/harness/terminal.html", "/harness/impact.html", "/harness/secrets.html", "/harness/markdown.html", "/harness/repo-tabs.html", "/harness/agents.html", "/harness/agent-capacity.html"].contains(url.path) else {
+      ["/harness/diagnostics.html", "/harness/conflicts.html", "/harness/uncommitted.html", "/harness/coverage.html", "/harness/health.html", "/harness/blame.html", "/harness/branches.html", "/harness/hygiene.html", "/harness/palette.html", "/harness/status.html", "/harness/tasks.html", "/harness/task-materials.html", "/harness/task-runs.html", "/harness/onboarding.html", "/harness/firebase.html", "/harness/delivery.html", "/harness/terminal.html", "/harness/impact.html", "/harness/secrets.html", "/harness/markdown.html", "/harness/repo-tabs.html", "/harness/agents.html"].contains(url.path) else {
 
     fputs("Expected a supported local GitPulse harness URL\n", stderr)
+    exit(2)
+}
+let requestedDeadline: Double? = CommandLine.arguments.count == 3 ? Double(CommandLine.arguments[2]) : 65
+guard let deadline = requestedDeadline, deadline.isFinite, deadline >= 1, deadline <= 600 else {
+    fputs("Expected a deadline between 1 and 600 seconds\n", stderr)
     exit(2)
 }
 
@@ -34,7 +42,7 @@ window.contentView = webview
 window.makeKeyAndOrderFront(nil)
 if #available(macOS 14.0, *) { app.activate() }
 webview.load(URLRequest(url: url))
-Timer.scheduledTimer(withTimeInterval: 65, repeats: false) { _ in
+Timer.scheduledTimer(withTimeInterval: deadline, repeats: false) { _ in
     fputs("WebKit regression deadline expired\n", stderr)
     exit(1)
 }

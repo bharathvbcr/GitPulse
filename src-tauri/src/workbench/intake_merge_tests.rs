@@ -945,3 +945,221 @@ fn concurrent_merges_and_edits_never_lose_a_cards_work() {
         );
     }
 }
+
+/// Make every soft delete fail with a store error — not a conflict — while
+/// leaving ordinary saves alone: the reason `put` writes `body`, the delete
+/// writes `deleted`.
+fn deletes_fail(store: &Store) {
+    store
+        .connection()
+        .execute_batch(
+            "CREATE TRIGGER IF NOT EXISTS test_deletes_fail BEFORE UPDATE OF deleted ON work_items
+             WHEN new.deleted=1 BEGIN SELECT RAISE(ABORT,'injected delete failure'); END;",
+        )
+        .unwrap();
+}
+
+/// The reported defect: with nothing left to write to the target (it already
+/// holds the source's section), the source's reason `put` succeeded, its
+/// delete then failed with a non-conflict error, and the call returned that
+/// error bare — reading as "nothing changed" while the source now carried a
+/// merge block. It is a partial merge, and must say so.
+#[test]
+fn a_delete_that_fails_after_the_reason_is_recorded_is_a_partial_merge_not_a_bare_error() {
+    let (_dir, path) = profile();
+    let store = Store::open(&path).unwrap();
+    let repo = git_repo();
+    let target = filed_with(&store, &repo, card("gp-t", "Target", "Target body"));
+    let source = filed_with(&store, &repo, card("gp-s", "Source", "token-source"));
+    deletes_fail(&store);
+    // First call: the target is written, then the delete fails.
+    let first = merge(&store, &repo, &target, &[&source], "Same work.").unwrap();
+    assert_eq!(first["outcome"], "partial", "{first:#}");
+    // A person tidies the source's logs, taking the reason block off it, so
+    // the next call has to record it again — and has nothing to write to the
+    // target, which already holds the section.
+    person_edits(&store, &source, |input| {
+        input.insert("logs".into(), json!(""));
+    });
+    let second = merge(&store, &repo, &target, &[&source], "Same work.")
+        .expect("a recorded reason and a failed delete are a partial merge, not a bare error");
+    assert_eq!(
+        (second["ok"].clone(), second["outcome"].clone()),
+        (json!(false), json!("partial")),
+        "{second:#}"
+    );
+    let row = &second["sources"][0];
+    assert_eq!(row["outcome"], "not_merged");
+    let detail = row["detail"].as_str().unwrap();
+    assert!(
+        detail.contains("reason is recorded") && detail.contains("injected delete failure"),
+        "{detail}"
+    );
+    assert!(second["next_step"].as_str().unwrap().contains("Re-run"));
+    // The source is live, with its work and the reason on it.
+    let live_source = live(&store, &source).expect("the source is still on the board");
+    assert!(live_source["logs"].as_str().unwrap().contains("Same work."));
+
+    // Once deletes work again, the same call finishes the merge.
+    store
+        .connection()
+        .execute_batch("DROP TRIGGER test_deletes_fail")
+        .unwrap();
+    let third = merge(&store, &repo, &target, &[&source], "Same work.").unwrap();
+    assert_eq!(third["outcome"], "merged", "{third:#}");
+    assert!(live(&store, &source).is_none());
+}
+
+/// `gitpulse_delete_task` shares the two writes: a failed delete after the
+/// reason is recorded names both facts instead of only the error.
+#[test]
+fn a_delete_task_whose_delete_fails_says_the_reason_was_recorded() {
+    let (_dir, path) = profile();
+    let store = Store::open(&path).unwrap();
+    let repo = git_repo();
+    let id = filed_with(&store, &repo, card("gp-d", "Doomed", "Body"));
+    deletes_fail(&store);
+    let error = delete_task(
+        &store,
+        repo.path().to_str().unwrap(),
+        &id,
+        None,
+        "Not needed.",
+        false,
+    )
+    .unwrap_err();
+    assert_eq!(error.code, "store_error");
+    assert!(
+        error.message.contains("reason was recorded"),
+        "{}",
+        error.message
+    );
+    assert!(
+        error.message.contains("still on the board"),
+        "{}",
+        error.message
+    );
+    assert!(live(&store, &id).is_some());
+}
+
+/// Archived is its own flag: work merged into an archived card would leave
+/// the board, so the merge is refused and nothing is written.
+#[test]
+fn work_on_the_board_is_never_merged_into_an_archived_task() {
+    let (_dir, path) = profile();
+    let store = Store::open(&path).unwrap();
+    let repo = git_repo();
+    let repository = registered(&store, &repo);
+    let target = filed_with(&store, &repo, card("gp-t", "Target", "Target body"));
+    let source = filed_with(&store, &repo, card("gp-s", "Source", "Source body"));
+    person_edits(&store, &target, |input| {
+        input.insert("archived".into(), json!(true));
+    });
+    let before = board(&store, &repository);
+    let error = merge(&store, &repo, &target, &[&source], "Into the archive.").unwrap_err();
+    assert_eq!(error.code, "target_archived", "{}", error.message);
+    assert_eq!(
+        board(&store, &repository),
+        before,
+        "a refusal writes nothing"
+    );
+    // Archived into archived is fine: nothing leaves the board.
+    person_edits(&store, &source, |input| {
+        input.insert("archived".into(), json!(true));
+    });
+    assert_eq!(
+        merge(&store, &repo, &target, &[&source], "Both archived.").unwrap()["outcome"],
+        "merged"
+    );
+}
+
+/// A source's checklist and links are not left behind in its history: they
+/// join the target's, minus links to the cards being merged.
+#[test]
+fn checklists_and_links_are_folded_into_the_target() {
+    let (_dir, path) = profile();
+    let store = Store::open(&path).unwrap();
+    let repo = git_repo();
+    let target = filed_with(&store, &repo, card("gp-t", "Target", "Target body"));
+    let source = filed_with(&store, &repo, card("gp-s", "Source", "Source body"));
+    let blocker = filed_with(&store, &repo, card("gp-b", "Blocker", "Blocker body"));
+    let epic = filed_with(&store, &repo, card("gp-e", "Epic", "Epic body"));
+    person_edits(&store, &target, |input| {
+        input.insert(
+            "checklist".into(),
+            json!([{"text": "Shared step", "done": true}]),
+        );
+    });
+    person_edits(&store, &source, |input| {
+        input.insert(
+            "checklist".into(),
+            json!([{"text": "Shared step", "done": false}, {"text": "Source step", "done": false}]),
+        );
+        input.insert(
+            "links".into(),
+            json!([
+                {"kind": "blocks", "item_id": blocker},
+                {"kind": "related", "item_id": target},
+                {"kind": "parent", "item_id": epic}
+            ]),
+        );
+    });
+    let result = merge(&store, &repo, &target, &[&source], "Same work.").unwrap();
+    assert_eq!(result["outcome"], "merged", "{result:#}");
+    let merged = live(&store, &target).unwrap();
+    // The target's own entry, and its done state, wins over the source's.
+    assert_eq!(
+        merged["checklist"],
+        json!([{"text": "Shared step", "done": true}, {"text": "Source step", "done": false}])
+    );
+    // A link to the target itself is dropped, and the source's parent with it:
+    // the target keeps its own (none) rather than inherit a second one.
+    assert_eq!(
+        merged["links"],
+        json!([{"kind": "blocks", "item_id": blocker}])
+    );
+}
+
+/// The board's Merge is this merge: same writes, same refusals, and every
+/// card named at the revision the board drew it at.
+#[test]
+fn the_board_merge_runs_the_same_merge_and_refuses_stale_cards() {
+    let (_dir, path) = profile();
+    let store = Store::open(&path).unwrap();
+    let repo = git_repo();
+    let repository = registered(&store, &repo);
+    let target = filed_with(&store, &repo, card("gp-t", "Target", "Target body"));
+    let source = filed_with(&store, &repo, card("gp-s", "Source", "token-source"));
+    let at = |id: &str| live(&store, id).unwrap()["revision"].as_i64().unwrap();
+    let request = |source_revision: i64| {
+        json!({
+            "repository_id": repository["id"],
+            "into": {"id": target, "expected_revision": at(&target)},
+            "sources": [{"id": source, "expected_revision": source_revision}],
+            "reason": "Duplicate cards.",
+        })
+        .to_string()
+    };
+    let before = board(&store, &repository);
+    let stale = merge_request(&store, &request(at(&source) + 1)).unwrap_err();
+    assert_eq!(stale.code, "revision_conflict");
+    assert_eq!(
+        board(&store, &repository),
+        before,
+        "a refusal writes nothing"
+    );
+    for bad in [
+        json!({}).to_string(),
+        json!({"repository_id": repository["id"], "into": {"id": target}, "sources": [], "reason": "x"}).to_string(),
+        "not json".to_owned(),
+    ] {
+        assert_eq!(merge_request(&store, &bad).unwrap_err().code, "invalid_input", "{bad}");
+    }
+    let result = merge_request(&store, &request(at(&source))).unwrap();
+    assert_eq!(result["outcome"], "merged", "{result:#}");
+    assert!(live(&store, &source).is_none());
+    assert!(live(&store, &target).unwrap()["description"]
+        .as_str()
+        .unwrap()
+        .contains("## Merged from"));
+}

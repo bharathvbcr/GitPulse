@@ -431,6 +431,85 @@ pub(crate) fn validate_model_choice(provider: &str, choice: &ModelChoice) -> Res
     Ok(())
 }
 
+/// The choice one task launch applies: the saved default for `provider` with
+/// this launch's override laid over it field by field. A field the override
+/// names replaces the default's; one it leaves out keeps it. Validated as a
+/// whole, so an override cannot combine with a default into something the
+/// CLI would not take. `None` when neither chooses anything.
+pub(crate) fn launch_model_choice(
+    provider: &str,
+    default: Option<&ModelChoice>,
+    launch: Option<&ModelChoice>,
+) -> Result<Option<ModelChoice>, String> {
+    let mut choice = default.cloned().unwrap_or_default();
+    if let Some(launch) = launch {
+        let launch = launch.clone();
+        choice.model = launch.model.or(choice.model);
+        choice.effort = launch.effort.or(choice.effort);
+        choice.fallback = launch.fallback.or(choice.fallback);
+        choice.advisor = launch.advisor.or(choice.advisor);
+    }
+    if choice.is_empty() {
+        return Ok(None);
+    }
+    validate_model_choice(provider, &choice)?;
+    Ok(Some(choice))
+}
+
+/// A [`ModelChoice`] as the store records it on a run (`model_choice`): one
+/// string per field, `fallback` joined by commas — a model name never holds
+/// one ([`validate_model_id`]).
+pub(crate) fn model_choice_record(choice: &ModelChoice) -> serde_json::Value {
+    let mut record = serde_json::Map::new();
+    for (field, value) in [
+        ("model", choice.model.clone()),
+        ("effort", choice.effort.clone()),
+        (
+            "fallback",
+            choice.fallback.as_ref().map(|list| list.join(",")),
+        ),
+        ("advisor", choice.advisor.clone()),
+    ] {
+        if let Some(value) = value {
+            record.insert(field.into(), serde_json::Value::String(value));
+        }
+    }
+    serde_json::Value::Object(record)
+}
+
+/// The run's recorded choice back as a [`ModelChoice`]; `None` for a run that
+/// recorded none. A record this build cannot read is refused rather than
+/// launched without the model it names.
+pub(crate) fn model_choice_from_record(
+    record: &serde_json::Value,
+) -> Result<Option<ModelChoice>, String> {
+    if record.is_null() {
+        return Ok(None);
+    }
+    let object = record
+        .as_object()
+        .ok_or("The run's model choice is not an object.")?;
+    let mut choice = ModelChoice::default();
+    for (field, value) in object {
+        let value = value
+            .as_str()
+            .ok_or_else(|| format!("The run's model field {field} is not text."))?
+            .to_owned();
+        match field.as_str() {
+            "model" => choice.model = Some(value),
+            "effort" => choice.effort = Some(value),
+            "fallback" => choice.fallback = Some(value.split(',').map(str::to_owned).collect()),
+            "advisor" => choice.advisor = Some(value),
+            other => {
+                return Err(format!(
+                    "The run records a model field this build does not know: {other}."
+                ))
+            }
+        }
+    }
+    Ok((!choice.is_empty()).then_some(choice))
+}
+
 /// Keys for Claude Code's session-scoped `--settings` object, with their values.
 type ClaudeSettings = Vec<(&'static str, String)>;
 
@@ -2863,5 +2942,78 @@ mod model_tests {
             )
             .unwrap_or_else(|error| panic!("{launcher}: {}", error.message));
         }
+    }
+}
+
+#[cfg(test)]
+mod launch_choice_tests {
+    use super::{launch_model_choice, model_choice_from_record, model_choice_record};
+    use crate::tool_config::ModelChoice;
+    use serde_json::json;
+
+    fn choice(model: Option<&str>, effort: Option<&str>) -> ModelChoice {
+        ModelChoice {
+            model: model.map(str::to_owned),
+            effort: effort.map(str::to_owned),
+            ..ModelChoice::default()
+        }
+    }
+
+    /// The handoff form overrides one launch, field by field, over the saved
+    /// default; what it leaves out still comes from the default.
+    #[test]
+    fn a_launch_override_replaces_only_the_fields_it_names() {
+        let default = ModelChoice {
+            fallback: Some(vec!["sonnet".into()]),
+            ..choice(Some("sonnet"), Some("medium"))
+        };
+        let launch = choice(Some("opus"), None);
+        let effective = launch_model_choice("claude", Some(&default), Some(&launch))
+            .unwrap()
+            .unwrap();
+        assert_eq!(effective.model.as_deref(), Some("opus"));
+        assert_eq!(effective.effort.as_deref(), Some("medium"));
+        assert_eq!(effective.fallback, Some(vec!["sonnet".into()]));
+        // Neither side choosing anything is no choice, recorded as null.
+        assert_eq!(launch_model_choice("claude", None, None).unwrap(), None);
+        assert_eq!(
+            launch_model_choice("codex", None, Some(&choice(Some("gpt-5"), None)))
+                .unwrap()
+                .unwrap()
+                .model
+                .as_deref(),
+            Some("gpt-5")
+        );
+    }
+
+    /// Validated as a whole: an override that names a field the CLI does not
+    /// take, or a level it does not have, is refused before an attempt exists.
+    #[test]
+    fn an_override_the_launcher_cannot_apply_is_refused() {
+        assert!(launch_model_choice("codex", None, Some(&choice(None, Some("high")))).is_err());
+        assert!(launch_model_choice("claude", None, Some(&choice(None, Some("extreme")))).is_err());
+        assert!(
+            launch_model_choice("claude", None, Some(&choice(Some("opus; rm -rf"), None))).is_err()
+        );
+    }
+
+    /// What the store records on the run reads back as the same choice, so
+    /// the launch applies exactly what the attempt says it ran on.
+    #[test]
+    fn the_recorded_choice_round_trips_through_the_run() {
+        let original = ModelChoice {
+            fallback: Some(vec!["sonnet".into(), "haiku".into()]),
+            advisor: Some("opus".into()),
+            ..choice(Some("opus[1m]"), Some("high"))
+        };
+        let record = model_choice_record(&original);
+        assert_eq!(
+            record,
+            json!({"model":"opus[1m]","effort":"high","fallback":"sonnet,haiku","advisor":"opus"})
+        );
+        assert_eq!(model_choice_from_record(&record).unwrap(), Some(original));
+        assert_eq!(model_choice_from_record(&json!(null)).unwrap(), None);
+        assert!(model_choice_from_record(&json!({"temperature":"1"})).is_err());
+        assert!(model_choice_from_record(&json!({"model":7})).is_err());
     }
 }
