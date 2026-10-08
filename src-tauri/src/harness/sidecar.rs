@@ -856,6 +856,25 @@ fn sidecar_command(binary: &str, dir: &Path, selection: Option<&ModelSelection>)
     command
 }
 
+/// Point `manvi serve` at the profile workbench.
+///
+/// Manvi opens the profile through whichever `dcstore` it resolves:
+/// `MANVI_STORE_BINARY`, else the first on `PATH`. A stale one there refuses
+/// the profile's workbench schema, and nothing GitPulse shows would say which
+/// binary did. So when GitPulse has verified a `dcstore` — its identity, and
+/// that it opens the schema the vendored store opens — Manvi is handed that
+/// one. Without one, Manvi resolves as it always did, and the component
+/// inventory reports the stale or missing binary and why.
+fn attach_workbench(command: &mut Command, dir: &Path, profile: &Path, store: Option<&str>) {
+    command.args([std::ffi::OsStr::new("--workbench-db"), profile.as_os_str()]);
+    // The profile path is host-owned. Repository root overrides must not
+    // redirect this session's configuration or initialization elsewhere.
+    command.env("DEVCOUNCIL_ROOT", dir);
+    if let Some(store) = store {
+        command.env("MANVI_STORE_BINARY", store);
+    }
+}
+
 fn spawn() -> Result<Sidecar, HarnessError> {
     spawn_with_profile(None, None)
 }
@@ -870,10 +889,8 @@ fn spawn_with_profile(
     let dir = scratch_dir()?;
     let mut command = sidecar_command(&binary, &dir, selection);
     if let Some(profile) = profile {
-        command.args([std::ffi::OsStr::new("--workbench-db"), profile.as_os_str()]);
-        // The profile path is host-owned. Repository root overrides must not
-        // redirect this session's configuration or initialization elsewhere.
-        command.env("DEVCOUNCIL_ROOT", &dir);
+        let store = crate::tool_install::components::verified_store_binary();
+        attach_workbench(&mut command, &dir, profile, store.as_deref());
     }
     // Its own process group, and registered, so this long-lived child dies
     // with us rather than outliving the app that started it.
@@ -1943,6 +1960,47 @@ done
                 fallback.display()
             );
         }
+    }
+
+    /// The workbench is opened through the `dcstore` GitPulse verified, not
+    /// whichever one Manvi would find first on `PATH`.
+    #[test]
+    fn the_workbench_is_opened_through_the_verified_store_binary() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let profile = dir.path().join("workbench.sqlite");
+        let env = |command: &Command, key: &str| {
+            command
+                .get_envs()
+                .find(|(k, _)| *k == std::ffi::OsStr::new(key))
+                .map(|(_, v)| v.map(std::ffi::OsStr::to_owned))
+        };
+
+        let mut verified = sidecar_command("manvi", dir.path(), None);
+        attach_workbench(
+            &mut verified,
+            dir.path(),
+            &profile,
+            Some("/opt/dc/bin/dcstore"),
+        );
+        assert_eq!(
+            env(&verified, "MANVI_STORE_BINARY"),
+            Some(Some("/opt/dc/bin/dcstore".into()))
+        );
+        let args: Vec<_> = verified.get_args().collect();
+        assert_eq!(
+            &args[args.len() - 2..],
+            [std::ffi::OsStr::new("--workbench-db"), profile.as_os_str()]
+        );
+        assert_eq!(
+            env(&verified, "DEVCOUNCIL_ROOT"),
+            Some(Some(dir.path().as_os_str().to_owned()))
+        );
+
+        // Nothing verified: the host's own resolution is left alone, never
+        // pointed at a binary GitPulse did not check.
+        let mut unverified = sidecar_command("manvi", dir.path(), None);
+        attach_workbench(&mut unverified, dir.path(), &profile, None);
+        assert_eq!(env(&unverified, "MANVI_STORE_BINARY"), None);
     }
 
     #[test]
