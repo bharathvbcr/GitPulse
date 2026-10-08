@@ -52,8 +52,13 @@ impl Drop for ShortDir {
     }
 }
 
+/// The longest the helper waits for a hook that is still running to connect.
+/// Once the hook has exited the wait ends at once; this only bounds a hook that
+/// neither connects nor exits.
+const ACCEPT_DEADLINE: Duration = Duration::from_secs(30);
+
 /// Runs the real hook binary against a listener this test owns, and returns
-/// what reached the socket.
+/// what reached the socket, or `None` when the hook exited without connecting.
 fn report_through_socket(
     event: &str,
     payload: &str,
@@ -93,9 +98,35 @@ fn report_through_socket(
         .write_all(payload.as_bytes())
         .unwrap();
 
-    // Accept on this thread; the hook is already running and will connect.
+    // Accept on another thread while the hook runs, because the hook waits for
+    // the app's answer. The accept is bounded: a hook that exits without
+    // connecting — which `run_notify` does on purpose for a state report with
+    // no session — must come back as "nothing arrived", not as a test that
+    // waits forever on a connection no process will ever make.
+    listener.set_nonblocking(true).unwrap();
+    let hook_exited = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let exited = std::sync::Arc::clone(&hook_exited);
     let accepted = std::thread::spawn(move || {
-        let (mut stream, _) = listener.accept().ok()?;
+        let deadline = std::time::Instant::now() + ACCEPT_DEADLINE;
+        let mut stream = loop {
+            // Read the flag before trying: a connection the hook made before
+            // it exited is already queued, so the try that follows a set flag
+            // is guaranteed to see it.
+            let exited = exited.load(std::sync::atomic::Ordering::Acquire);
+            match listener.accept() {
+                Ok((stream, _)) => break stream,
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    if exited || std::time::Instant::now() >= deadline {
+                        return None;
+                    }
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(_) => return None,
+            }
+        };
+        // BSD hands the listener's O_NONBLOCK to the accepted socket; the read
+        // below must block until the hook closes its half.
+        stream.set_nonblocking(false).ok()?;
         // Best effort: macOS refuses `SO_RCVTIMEO` on an `AF_UNIX` socket with
         // `EINVAL`, which is why the bound that actually matters is structural
         // — the caller waits for the child before joining this thread, so by
@@ -110,6 +141,7 @@ fn report_through_socket(
     });
 
     let status = child.wait().expect("hook exits");
+    hook_exited.store(true, std::sync::atomic::Ordering::Release);
     assert_eq!(
         status.code(),
         Some(0),
@@ -167,17 +199,39 @@ fn every_event_the_shipped_manifest_routes_survives_the_process_boundary() {
                     continue;
                 }
                 let event = words.next().expect("notify names its event");
-                let bytes = report_through_socket(
-                    event,
-                    &claude_payload("/Users/me/work"),
-                    None,
-                    Some("codex"),
-                )
-                .unwrap_or_else(|| panic!("{event} sent nothing"));
-                let notice = gitpulse_lib::alerts::bridge::parse_report(&bytes)
-                    .unwrap_or_else(|e| panic!("{event} was refused by the app: {e}"));
-                assert_eq!(notice.label, "Codex");
-                assert!(notice.key.starts_with("hook-codex-"), "{}", notice.key);
+                let role = gitpulse_lib::alerts::bridge::event(event)
+                    .unwrap_or_else(|| {
+                        panic!("the manifest routes {event}, which the app does not know")
+                    })
+                    .role;
+                let payload = claude_payload("/Users/me/work");
+                if role == gitpulse_lib::alerts::bridge::Role::Banner {
+                    // A banner is worth sending from any session, GitPulse's or not.
+                    let bytes = report_through_socket(event, &payload, None, Some("codex"))
+                        .unwrap_or_else(|| panic!("{event} sent nothing"));
+                    let notice = gitpulse_lib::alerts::bridge::parse_report(&bytes)
+                        .unwrap_or_else(|e| panic!("{event} was refused by the app: {e}"));
+                    assert_eq!(notice.label, "Codex");
+                    assert!(notice.key.starts_with("hook-codex-"), "{}", notice.key);
+                } else {
+                    // A state or a resolution is about a GitPulse terminal: it
+                    // is sent from one and accepted for it…
+                    let bytes =
+                        report_through_socket(event, &payload, Some("term-3-9c"), Some("codex"))
+                            .unwrap_or_else(|| {
+                                panic!("{event} sent nothing from a GitPulse session")
+                            });
+                    let notice = gitpulse_lib::alerts::bridge::parse_report(&bytes)
+                        .unwrap_or_else(|e| panic!("{event} was refused by the app: {e}"));
+                    assert_eq!(notice.label, "Codex");
+                    assert_eq!(notice.key, "term-3-9c");
+                    // …and outside one the hook sends nothing, because the app
+                    // would refuse it ("state report outside a session").
+                    assert!(
+                        report_through_socket(event, &payload, None, Some("codex")).is_none(),
+                        "{event} reached the socket with no GitPulse session"
+                    );
+                }
                 checked += 1;
             }
         }
@@ -185,6 +239,29 @@ fn every_event_the_shipped_manifest_routes_survives_the_process_boundary() {
     assert!(
         checked >= 5,
         "only {checked} notify entries were exercised; the manifest scan is not finding them"
+    );
+}
+
+#[test]
+fn a_hook_that_exits_without_connecting_is_reported_promptly_not_awaited() {
+    // `permission_request` is a state report; with no GitPulse session the hook
+    // exits without connecting. The helper used to block in `accept` for that
+    // connection forever, which hung the whole test binary instead of failing.
+    let started = std::time::Instant::now();
+    let arrived = report_through_socket(
+        "permission_request",
+        &claude_payload("/Users/me/work"),
+        None,
+        Some("claude"),
+    );
+    assert!(
+        arrived.is_none(),
+        "a state report with no session reached the socket"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "waiting for a connection that never came took {:?}",
+        started.elapsed()
     );
 }
 
