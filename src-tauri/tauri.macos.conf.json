@@ -21,6 +21,7 @@
         },
         "additionalBrowserArgs": "--disable-features=msWebOOUI,msPdfOOUI --enable-gpu-rasterization --enable-zero-copy --ignore-gpu-blocklist --enable-features=CanvasOopRasterization",
         "transparent": true,
+        "backgroundColor": "#00000000",
         "windowEffects": {
           "effects": [
             "underWindowBackground"

@@ -24,10 +24,26 @@ fn main() {
     });
     let mut context = gitpulse_lib::context();
     context.config_mut().identifier = "com.gitpulse.tests.status-material".into();
+    // The main window comes from the merged platform config, not from Rust, so
+    // its backdrop is checked by building it from that config, hidden.
+    let mut main_window = context
+        .config()
+        .app
+        .windows
+        .first()
+        .cloned()
+        .expect("the config declares the main window");
+    main_window.visible = false;
     context.config_mut().app.windows.clear();
     let app = tauri::Builder::default()
         .manage(DesktopState::default())
-        .setup(|app| {
+        .setup(move |app| {
+            // Phase 0: the main window's webview backdrop is clear.
+            let main =
+                tauri::WebviewWindowBuilder::from_config(app.handle(), &main_window)?.build()?;
+            assert_clear_backdrop(&main);
+            // Kept, hidden: destroying the last window would end the run with
+            // exit code 0 before a single status check below had executed.
             install_menu(app.handle())?;
             set_menu_state(
                 app.handle(),
@@ -231,4 +247,65 @@ fn inspect_material(window: &tauri::WebviewWindow) {
         let radius: f64 = msg_send![effect, cornerRadius];
         assert_eq!(radius, 18.0, "native and CSS corners align");
     }
+    assert_clear_backdrop(window);
+}
+
+/// The webview's own backdrop sits between the page and the effect view. Left
+/// at WebKit's default it is an opaque appearance colour, and every region the
+/// page has not painted shows it as a dark patch instead of the material.
+#[cfg(target_os = "macos")]
+fn assert_clear_backdrop(window: &tauri::WebviewWindow) {
+    use objc2::{msg_send, runtime::AnyClass, runtime::AnyObject};
+
+    let pointer = window.ns_window().expect("AppKit window handle");
+    assert!(!pointer.is_null());
+    // SAFETY: Tauri provides this live NSWindow, and the caller runs on the
+    // AppKit main thread. All borrowed native views stay owned by that window.
+    unsafe {
+        let native = &*pointer.cast::<AnyObject>();
+        let content: *mut AnyObject = msg_send![native, contentView];
+        assert!(!content.is_null(), "native content view exists");
+        let class = AnyClass::get(c"WKWebView").expect("WebKit view class");
+        let webview = find_subview(content, class);
+        assert!(!webview.is_null(), "{} hosts a WKWebView", window.label());
+        let backdrop: *mut AnyObject = msg_send![webview, underPageBackgroundColor];
+        assert!(
+            !backdrop.is_null(),
+            "WKWebView reports an under-page colour"
+        );
+        let alpha: f64 = msg_send![backdrop, alphaComponent];
+        assert_eq!(
+            alpha,
+            0.0,
+            "{}: the webview's under-page backdrop is clear",
+            window.label()
+        );
+    }
+}
+
+/// Depth-first search of `view`'s subtree for the first view of `class`.
+///
+/// # Safety
+/// `view` must be a live `NSView` and the caller must be on the main thread.
+#[cfg(target_os = "macos")]
+unsafe fn find_subview(
+    view: *mut objc2::runtime::AnyObject,
+    class: &objc2::runtime::AnyClass,
+) -> *mut objc2::runtime::AnyObject {
+    use objc2::{msg_send, runtime::AnyObject};
+
+    let matches: bool = msg_send![view, isKindOfClass: class];
+    if matches {
+        return view;
+    }
+    let children: *mut AnyObject = msg_send![view, subviews];
+    let count: usize = msg_send![children, count];
+    for index in 0..count {
+        let child: *mut AnyObject = msg_send![children, objectAtIndex: index];
+        let found = find_subview(child, class);
+        if !found.is_null() {
+            return found;
+        }
+    }
+    std::ptr::null_mut()
 }

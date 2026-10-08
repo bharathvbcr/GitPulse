@@ -96,6 +96,7 @@ before that tag is pushed.
 
 ### Fixed
 
+- **Black rectangles over the title bar and repository tab strip on macOS, staying until the pointer passed over them.** The WKWebView has a backdrop of its own between the page and the window's material, `underPageBackgroundColor`, and wry clears it only when a background colour is configured — `transparent: true` never reaches it. It stayed WebKit's opaque default (alpha 1.0, read off the live webview), so every region the page had not painted showed near-black instead of glass: tiles discarded while the window was inactive, occluded or on another Space, and the edge an elastic root dragged into view on a vertical swipe over the chrome. Both transparent windows now set a fully clear background colour, and the root no longer rubber-bands. The native material test reads the backdrop's alpha off the main and status webviews and fails against the old config.
 - **Unsaved edits to a suggestion are asked about.** Editing a Manvi or Apple
   Intelligence suggestion made every way off the task — another card, a tab,
   close, Escape, New task, a terminal's link to another task — do nothing

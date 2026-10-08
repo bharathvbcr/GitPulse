@@ -121,8 +121,11 @@ pub fn toggle<R: Runtime>(app: &AppHandle<R>) -> Result<(), String> {
             .shadow(true);
         #[cfg(target_os = "macos")]
         let builder = {
-            use tauri::window::{Effect, EffectState, EffectsBuilder};
-            builder.effects(
+            use tauri::window::{Color, Effect, EffectState, EffectsBuilder};
+            // Clears WKWebView's under-page backdrop as well as the window's.
+            // `transparent` alone leaves that backdrop at WebKit's default,
+            // which shows through wherever the page has not been painted.
+            builder.background_color(Color(0, 0, 0, 0)).effects(
                 EffectsBuilder::new()
                     .effect(Effect::UnderWindowBackground)
                     .state(EffectState::FollowsWindowActiveState)

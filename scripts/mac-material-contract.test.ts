@@ -152,7 +152,7 @@ describe("macOS material", () => {
    * the base window silently fails to reach macOS builds. That is the drift
    * this checks, by deriving the expected object instead of listing keys.
    */
-  const MAC_ONLY_WINDOW_KEYS = ["transparent", "windowEffects"];
+  const MAC_ONLY_WINDOW_KEYS = ["backgroundColor", "transparent", "windowEffects"];
 
   it("restates the base window exactly, adding only the macOS-only keys", () => {
     const base = baseConf.app.windows[0];
@@ -266,6 +266,57 @@ describe("macOS material", () => {
     // tauri-build reads the FIRST dependency table naming the crate and stops,
     // so this has to be the `[dependencies]` entry, not a target-scoped one.
     expect(cargoToml).toMatch(/^\[dependencies\][\s\S]*?^tauri = \{[^}]*macos-private-api/m);
+  });
+
+  /*
+   * The webview has a backdrop of its own, behind the page and in front of the
+   * native material: `WKWebView.underPageBackgroundColor`. wry clears it only
+   * when a background colour is configured (`with_background_color` →
+   * `setUnderPageBackgroundColor`); `transparent: true` alone never reaches it,
+   * so it stays WebKit's appearance default, which is near-black in dark mode.
+   * Every region WebKit has not painted — tiles discarded while the window was
+   * inactive, occluded or on another Space and not yet repainted, and the edge
+   * a rubber-banding root drags into view — shows that backdrop instead of the
+   * material. That is the black patch over the chrome that stayed until the
+   * pointer next repainted it.
+   */
+  function isFullyClear(color: unknown): boolean {
+    if (typeof color === "string") return /^#(?:[0-9a-f]{3}0|[0-9a-f]{6}00)$/i.test(color);
+    if (Array.isArray(color)) return color.length === 4 && color[3] === 0;
+    if (color && typeof color === "object" && "alpha" in color) return color.alpha === 0;
+    return false;
+  }
+
+  it("clears the webview's own backdrop on every transparent window", () => {
+    expect(isFullyClear(macConf.app.windows[0].backgroundColor)).toBe(true);
+    // The status window is built in Rust, so its colour is set there.
+    const native = readFileSync(new URL("../src-tauri/src/desktop/popover.rs", import.meta.url), "utf8");
+    const construction = native.slice(native.indexOf("pub fn toggle"), native.indexOf("fn keeps_popover"));
+    expect(construction).toMatch(/\.background_color\(\s*(?:tauri::window::)?Color\(0,\s*0,\s*0,\s*0\)\s*\)/);
+  });
+
+  it("rejects the predicate's near misses", () => {
+    expect(isFullyClear("#00000000")).toBe(true);
+    expect(isFullyClear("#0000")).toBe(true);
+    expect(isFullyClear([0, 0, 0, 0])).toBe(true);
+    expect(isFullyClear({ red: 0, green: 0, blue: 0, alpha: 0 })).toBe(true);
+    for (const opaque of [undefined, null, "", "#000000", "#000", "#00000001", "#000000ff", [0, 0, 0], [0, 0, 0, 1], { alpha: 255 }]) {
+      expect(isFullyClear(opaque), JSON.stringify(opaque)).toBe(false);
+    }
+  });
+
+  it("keeps the root from rubber-banding the webview's backdrop into view", () => {
+    // A vertical swipe over the chrome rows (overflow-y hidden) chains to the
+    // document, and an elastic root drags its top edge down to reveal what is
+    // behind the page. With nothing to scroll, the bounce has no purpose.
+    // The rule that makes the root transparent is the one that must stop it
+    // bouncing: the two are one decision. Other `html.macos, body` rules
+    // (fonts) are not it.
+    const roots = [...css.matchAll(/html\.macos,\s*html\.macos body\s*\{([^}]*)\}/g)]
+      .map((m) => m[1])
+      .filter((body) => /background-color:\s*transparent/.test(body));
+    expect(roots).toHaveLength(1);
+    expect(roots[0]).toMatch(/overscroll-behavior:\s*none/);
   });
 
   it("also attaches the native material to the separately built status window", () => {
