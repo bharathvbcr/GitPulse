@@ -440,7 +440,10 @@ describe("the board can archive a task", () => {
     expect(bar).toContain('selectionArchived === "all"');
     expect(bar).toContain("disabled={busy ||");
     // The disabled control still says why, rather than sitting there dead.
-    expect(bar).toContain("Already in ${STATUS_LABELS[ARCHIVE_STATUS]}");
+    expect(bar).toContain('"Already archived"');
+    // And the enabled one says archiving keeps the status, since it once
+    // meant moving to Done.
+    expect(bar).toContain("keeping their status");
   });
 
   /**
@@ -456,12 +459,13 @@ describe("the board can archive a task", () => {
       .not.toMatch(/>Show archived<\/label>/);
   });
 
-  it("names the column the header's Archive toggle actually holds", () => {
+  it("names what the header's Archive toggle actually holds", () => {
     // "Archive — completed tasks in this scope" named a category; a reader
-    // hunting for the verb needed the mechanism instead.
+    // hunting for the verb needed the mechanism instead. Reaching Done no
+    // longer archives anything, so the title must not say it does.
     expect(source).toContain("aria-controls=\"task-archive-dock\"");
-    expect(source).toContain("Archive — tasks in this scope that reached ${STATUS_LABELS[ARCHIVE_STATUS]}");
-    expect(source).not.toContain("Archive — completed tasks in this scope");
+    expect(source).toContain('title="Archive — tasks filed away from this board, and deleted tasks to restore"');
+    expect(source).not.toContain("that reached ${STATUS_LABELS");
   });
 
   it("dims and disables the board's quick-add row while the task editor sheet is open", () => {

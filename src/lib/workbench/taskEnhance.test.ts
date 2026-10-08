@@ -16,7 +16,7 @@ const task: Task = {
   id: "t1", revision: 4, updated_at: 1, title: "Keep E42", description: "evidence",
   kind: "bug", status: "ready", priority: 1, severity: null, owner: null, due_at: null,
   labels: [], acceptance_criteria: [], repository_ids: ["r"], primary_repository_id: "r",
-  home_workspace_id: null, position: 1, locked_fields: ["title"],
+  home_workspace_id: null, position: 1, archived: false, completed_at: null, checklist: [], links: [], locked_fields: ["title"],
 };
 
 describe("the drafting kind and the button that names it", () => {

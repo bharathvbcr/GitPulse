@@ -11,6 +11,35 @@ before that tag is pushed.
 
 ## [Unreleased]
 
+### Added
+
+- Task checklists with a done state per item, and links between tasks
+  (parent, blocks, related, duplicate of), edited in the task sheet and read
+  from both ends in the agent brief.
+- The archive's **Deleted** view restores a deleted task with its id, checked
+  against the revision its deletion wrote.
+- **Merge…** on the board's selection bar, running the same merge as
+  `gitpulse_merge_tasks`.
+- **Model for this launch** in a terminal handoff: model, effort and advisor
+  for one attempt, recorded on the attempt and shown on its row.
+
+### Changed
+
+- Archived is its own flag, independent of status (dc-store schema 11).
+  Finishing a task leaves it in Done; Archive files a task away from any column
+  and Restore brings it back with its status unchanged. Upgrading a profile
+  archives every task that was Done, keeping when it was completed.
+- The archive lists most recently completed first and refreshes its loaded
+  pages in place after a change.
+- A merge whose source's delete fails after its reason is recorded now reports
+  a partial merge naming that source, not a bare error.
+
+### Upgrade
+
+- dc-store schema 11 is a one-way migration, and a host built against schema
+  10 refuses a migrated profile. Rebuild GitPulse, Manvi and DevCouncil from a
+  schema 11 dc-store before any of them opens the profile.
+
 ## [1.4.0] - 2026-10-07
 
 Agents that start in the background with a pane showing every one at work,

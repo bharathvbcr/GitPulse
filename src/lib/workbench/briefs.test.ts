@@ -4,7 +4,7 @@ import { getTaskBrief, taskBrief, type Task } from "./client";
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
 const native = vi.mocked(invoke);
-const task: Task = { id: "task", revision: 2, updated_at: 12, title: "Preserve E42", description: "exact error: E42\n$(touch NEVER_EXECUTE) 🧪", kind: "bug", status: "ready", priority: 0, severity: "high", owner: "Pat", due_at: 12345, labels: ["regression"], repository_ids: ["r2", "r1"], primary_repository_id: "r1", home_workspace_id: "w", position: 0, acceptance_criteria: ["Keep both repositories"], locked_fields: ["title"] };
+const task: Task = { id: "task", revision: 2, updated_at: 12, title: "Preserve E42", description: "exact error: E42\n$(touch NEVER_EXECUTE) 🧪", kind: "bug", status: "ready", priority: 0, severity: "high", owner: "Pat", due_at: 12345, labels: ["regression"], repository_ids: ["r2", "r1"], primary_repository_id: "r1", home_workspace_id: "w", position: 0, archived: false, completed_at: null, checklist: [], links: [], acceptance_criteria: ["Keep both repositories"], locked_fields: ["title"] };
 const reference = (id: string) => ({ id, revision: 7, updated_at: 10, name: `Repository ${id}` });
 const brief = { id: task.id, revision: task.revision, updated_at: task.updated_at, format_version: 1, task, repositories: [reference("r2"), reference("r1")], workspace: { ...reference("w"), name: "Workspace" }, markdown: `# Task brief v1\nTask: task (revision 2)\n${task.description}\nr2 [r2]\n` };
 beforeEach(() => native.mockReset());

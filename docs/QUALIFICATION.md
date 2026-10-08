@@ -20,10 +20,11 @@ before treating a row as still open.
 
 ### Task fields against the plan
 
-Checked 2026-10-07 against the plan's section 2 and against what the store
+Checked 2026-10-08 against the plan's section 2 and against what the store
 accepts: `put_item` in `src-tauri/vendored/dc-store/src/workbench/mod.rs`
-takes exactly 19 named fields and refuses any other, so a field the store does
-not name cannot ride along in a task — not even as extra JSON.
+takes exactly 22 named fields (schema 11 added `archived`, `checklist` and
+`links`) and refuses any other, so a field the store does not name cannot ride
+along in a task — not even as extra JSON.
 
 | Plan field | Store | Task sheet | State |
 | --- | --- | --- | --- |
@@ -34,18 +35,19 @@ not name cannot ride along in a task — not even as extra JSON.
 | Linked repositories and a primary one | `repository_ids`, `primary_repository_id` | Repository picker | Closed |
 | Optional home group | `home_workspace_id` | Home workspace select (it was set once, at creation, and could not be changed) | Closed 2026-10-07 |
 | Dates | `due_at` only; `updated_at` is the store's | Due | Due is closed. A start date is **declined**: no field holds it, and when a task changed is already in its revision history |
-| Checklists | None: subtasks are plain lines in `acceptance_criteria`, with no done state | Subtasks list without checkboxes | **Declined here** — needs a store field |
-| Attachments | None | None | **Declined here** — needs a store field and a file store |
-| Source links | None; a GitHub issue is linked by an `issue-N` label | Through labels | **Declined here** — needs a store field |
-| Parent, blocking, related and duplicate links | None; a merge records its sources as `## Merged from <id>` text in the description, not as a link | None | **Declined here** — needs a link table |
-| Per-repository objectives | None: `work_item_repositories` holds only the link and its order | None; intake folds per-repository detail into the description | **Declined here** — needs a column on the link |
+| Checklists | `checklist`: up to 128 `{text, done}` entries, kept when a write omits it (schema 11) | Checklist with checkboxes (`TaskRelations.svelte`); the brief's `## Checklist` | Closed 2026-10-08 |
+| Parent, blocking, related and duplicate links | `links` → `work_item_links` (`parent`, `blocks`, `related`, `duplicate_of`), up to 64; one parent, no parent cycle, a new link must name a live task (schema 11) | Linked tasks with a task search (`TaskRelations.svelte`); the brief's `## Linked tasks`, read from both ends | Closed 2026-10-08 |
+| Completion time | `completed_at`, the store's own: set entering Done, cleared leaving it (schema 11) | Archive sorts by it and stamps each row | Closed 2026-10-08 |
+| Attachments | None | None | **Declined** — needs a file store, not a field: a path would point outside the profile and break on another machine, and copying files into SQLite is a storage decision this board should not make on its own |
+| Source links | None; a GitHub issue is linked by an `issue-N` label | Through labels | **Declined** — the `issue-N` label already round-trips with the GitHub panel; a second field would be a second answer to "which issue is this", and the two would drift |
+| Per-repository objectives | None: `work_item_repositories` holds only the link and its order | None; intake folds per-repository detail into the description | **Declined** — no consumer: neither the brief nor any launch reads per-repository text separately, so a column would be written and never read; revisit when a multi-repository launch needs one |
 
-Each declined row is a dc-store change in DevCouncil first — the field
-whitelist, the body built in `put_item`, and the brief format agents read —
-then a re-vendor, then the sheet. That is a schema migration of its own, not
-a board change, so it is listed here instead of being emulated: a reserved
-label or description heading would look like a field and silently drop on
-the next edit by a host that does not know the convention.
+Checklists, links and completion time shipped as dc-store schema 11, made in
+DevCouncil first (field whitelist, `put_item` body, brief format), re-vendored,
+then surfaced in the sheet — see [ARCHIVE_SEPARATION.md](ARCHIVE_SEPARATION.md).
+A declined row stays out rather than being emulated: a reserved label or
+description heading would look like a field and silently drop on the next
+edit by a host that does not know the convention.
 
 ## Platform coverage
 

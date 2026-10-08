@@ -24,7 +24,7 @@ function task(over: Partial<Task> = {}): Task {
   return {
     id: "t1", revision: 3, updated_at: 1, title: "Fix the flaky watcher", kind: "bug", status: "ready",
     priority: 2, severity: null, owner: "sam", due_at: null, labels: ["p1", "inbox"],
-    repository_ids: ["r"], primary_repository_id: "r", home_workspace_id: null, position: 1,
+    repository_ids: ["r"], primary_repository_id: "r", home_workspace_id: null, position: 1, archived: false, completed_at: null, checklist: [], links: [],
     description: "The watcher drops events.", acceptance_criteria: ["No dropped events", "A regression test"],
     ...over,
   };

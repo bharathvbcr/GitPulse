@@ -3,6 +3,7 @@ import { bindForegroundChanges, readBackgroundDocument } from "../runtime/foregr
 import { decideCadence, readEventLoopDelay } from "../runtime/loadCadence";
 import { selectionWire, type ModelSelection } from "./taskModel";
 import { isSessionId } from "../terminal/tabs";
+import type { ModelChoice as LaunchModelChoice } from "../terminal/agentDefaults";
 import { PERMISSION_MODES, STATUSES, asAgentProvider, supportsManaged, type AgentProvider, type ManagedProvider, type PermissionMode, type RunKind, type TaskStatus } from "./vocabulary";
 
 export type { ModelSelection };
@@ -17,7 +18,18 @@ export interface TaskCard extends RecordVersion {
   title: string; kind: string; status: TaskStatus; priority: number; severity: string | null;
   owner: string | null; due_at: number | null; labels: string[]; repository_ids: string[];
   primary_repository_id: string; home_workspace_id: string | null; position: number;
+  /** In the archive. Independent of `status`: a Done task can stay on the board. */
+  archived: boolean;
+  /** When the task last entered Done (Unix seconds); null while it is not Done. The store's, never sent. */
+  completed_at: number | null;
 }
+/** How one task names another. Read from the other end, `parent` is a subtask and `blocks` is blocked-by. */
+export const LINK_KINDS = ["parent", "blocks", "related", "duplicate_of"] as const;
+export type LinkKind = (typeof LINK_KINDS)[number];
+export interface TaskLink { kind: LinkKind; item_id: string }
+export interface ChecklistEntry { text: string; done: boolean }
+/** The store's caps (dc-store `workbench/items.rs`). */
+export const MAX_CHECKLIST = 128, MAX_CHECKLIST_TEXT = 4096, MAX_TASK_LINKS = 64;
 export type EnhancementField = "title" | "description";
 export const ENHANCEMENT_STATES = ["pending", "running", "cancel_requested", "ready", "failed", "cancelled", "interrupted", "dismissed", "accepted", "undone"] as const;
 export type EnhancementState = (typeof ENHANCEMENT_STATES)[number];
@@ -34,7 +46,7 @@ export interface AutomationSettings extends RecordVersion { enabled: boolean; pr
 export const AUTOMATIC_STATES = ["not_started", "checking", "idle", "disabled", "waiting", "generating", "stopping", "paused", "stopped"] as const;
 export interface AutomaticStatus { state: typeof AUTOMATIC_STATES[number]; reason: string; task_id: string; proposal_id: string; next_check_at: number }
 export type EnhancementMutation = "enhancements.create" | "enhancements.generate" | "enhancements.accept" | "enhancements.dismiss" | "enhancements.undo" | "enhancements.recover" | "enhancements.revise";
-export interface Task extends TaskCard { description: string; acceptance_criteria: string[]; locked_fields?: EnhancementField[]; logs?: string }
+export interface Task extends TaskCard { description: string; acceptance_criteria: string[]; checklist: ChecklistEntry[]; links: TaskLink[]; locked_fields?: EnhancementField[]; logs?: string }
 export interface BriefReference extends RecordVersion { name: string }
 export interface TaskBrief extends RecordVersion { format_version: 1; task: Task; repositories: BriefReference[]; workspace: BriefReference | null; markdown: string }
 export const RUN_STATES = ["prepared", "starting", "running", "exited", "failed", "cancelled", "unresolved"] as const;
@@ -47,7 +59,14 @@ export interface TaskRun extends RecordVersion {
   provider: AgentProvider; permission_mode: PermissionMode; state: typeof RUN_STATES[number];
   cwd: string; created_at: number; expires_at: number; session_id: string | null;
   exit_code: number | null; reason: string; outcome_uncertain: boolean;
+  /** The model fields this attempt was launched with; null when it used the launcher's own default. */
+  model_choice?: RecordedModelChoice | null;
 }
+/**
+ * A run's model fields as the store records them, e.g. `{ model: "opus", effort: "high" }`:
+ * one string per field, `fallback` joined by commas. Fields are the launcher's.
+ */
+export type RecordedModelChoice = Record<string, string>;
 export interface RunPreparation {
   kind?: RunKind;
   id: string; request_id: string; task_id: string; source_revision: number;
@@ -55,12 +74,15 @@ export interface RunPreparation {
   provider: AgentProvider; permission_mode: PermissionMode; acknowledge_bypass: boolean;
   /** Run in a fresh worktree the host creates from `repo_path` (and removes if refused). */
   worktree?: boolean;
+  /** This launch's model fields, each overriding the saved default's; the result is recorded on the attempt. */
+  model_choice?: LaunchModelChoice;
 }
-export type TaskDraft = Omit<Task, keyof RecordVersion>;
+/** What a write sends: everything but the store's own stamps. */
+export type TaskDraft = Omit<Task, keyof RecordVersion | "completed_at">;
 export type WorkspaceDraft = Omit<Workspace, keyof RecordVersion>;
 export interface Page<T> { items: T[]; total: number; shown: number; has_more: boolean; next_cursor: string | null }
 export type Scope = { kind: "global" } | { kind: "workspace" | "repository"; id: string };
-export type WorkbenchMethod = "decisions.get" | "decisions.list" | "decisions.decide" | "notifications.settings.get" | "notifications.settings.put" | "notifications.delivery.get" | "notifications.ack" | "notifications.native.pending" | "notifications.native.status" | "notifications.native.authorize" | "attention.list" | "attention.get" | "attention.update" | EnhancementMutation | "runs.prepare_managed" | "runs.launch_managed" | "runs.stop_managed" | "runs.prepare_terminal" | "runs.get" | "runs.list" | "runs.cancel" | "runs.release" | "runs.conversation" | "workspaces.list" | "workspaces.get" | "workspaces.put" | "workspaces.delete" | "repositories.list" | "repositories.get" | "repositories.put" | "items.list" | "items.get" | "items.brief.get" | "items.put" | "items.delete" | "items.history" | "events.list" | "enhancements.complete" | "enhancements.get" | "enhancements.list" | "enhancements.configuration" | "enhancements.wake" | "enhancements.worker" | "automation.get" | "automation.put" | "automation.list";
+export type WorkbenchMethod = "decisions.get" | "decisions.list" | "decisions.decide" | "notifications.settings.get" | "notifications.settings.put" | "notifications.delivery.get" | "notifications.ack" | "notifications.native.pending" | "notifications.native.status" | "notifications.native.authorize" | "attention.list" | "attention.get" | "attention.update" | EnhancementMutation | "runs.prepare_managed" | "runs.launch_managed" | "runs.stop_managed" | "runs.prepare_terminal" | "runs.get" | "runs.list" | "runs.cancel" | "runs.release" | "runs.conversation" | "workspaces.list" | "workspaces.get" | "workspaces.put" | "workspaces.delete" | "repositories.list" | "repositories.get" | "repositories.put" | "items.list" | "items.get" | "items.brief.get" | "items.put" | "items.delete" | "items.restore" | "items.merge" | "items.history" | "events.list" | "enhancements.complete" | "enhancements.get" | "enhancements.list" | "enhancements.configuration" | "enhancements.wake" | "enhancements.worker" | "automation.get" | "automation.put" | "automation.list";
 
 export interface WorkbenchError {
   readonly code: string;
@@ -303,7 +325,29 @@ export function taskCard(value: unknown): TaskCard {
   return { ...version(raw), title: text(raw.title), kind: text(raw.kind), status, priority,
     severity: nullableText(raw.severity), owner: nullableText(raw.owner), due_at: raw.due_at === null ? null : integer(raw.due_at),
     labels: strings(raw.labels), repository_ids: repositories, primary_repository_id: primary,
-    home_workspace_id: nullableText(raw.home_workspace_id), position: integer(raw.position) };
+    home_workspace_id: nullableText(raw.home_workspace_id), position: integer(raw.position),
+    // Absent on a task no schema 11 write has touched: not archived, not completed.
+    archived: raw.archived === undefined ? false : boolean(raw.archived),
+    completed_at: raw.completed_at === undefined || raw.completed_at === null ? null : integer(raw.completed_at) };
+}
+function checklist(value: unknown): ChecklistEntry[] {
+  if (value === undefined) return [];
+  if (!Array.isArray(value) || value.length > MAX_CHECKLIST) return invalid();
+  return value.map((entry) => {
+    const raw = object(entry), text_ = text(raw.text);
+    if (!text_.trim() || new TextEncoder().encode(text_).length > MAX_CHECKLIST_TEXT) return invalid();
+    return { text: text_, done: boolean(raw.done) };
+  });
+}
+function links(value: unknown): TaskLink[] {
+  if (value === undefined) return [];
+  if (!Array.isArray(value) || value.length > MAX_TASK_LINKS) return invalid();
+  return value.map((entry) => {
+    const raw = object(entry), id = text(raw.item_id);
+    const kind = LINK_KINDS.find((kind) => kind === raw.kind);
+    if (!kind || !/^[A-Za-z0-9_-]{1,128}$/.test(id)) return invalid();
+    return { kind, item_id: id };
+  });
 }
 function lockFields(value: unknown): EnhancementField[] {
   const fields = strings(value);
@@ -314,7 +358,7 @@ export function task(value: unknown): Task {
   const raw = object(value);
   const logs = raw.logs === undefined ? undefined : text(raw.logs);
   if (logs !== undefined && (logs.includes("\0") || new TextEncoder().encode(logs).length > 1024 * 1024)) return invalid();
-  return { ...taskCard(raw), description: text(raw.description), acceptance_criteria: strings(raw.acceptance_criteria), ...(logs === undefined ? {} : { logs }), ...(raw.locked_fields === undefined ? {} : { locked_fields: lockFields(raw.locked_fields) }) };
+  return { ...taskCard(raw), description: text(raw.description), acceptance_criteria: strings(raw.acceptance_criteria), checklist: checklist(raw.checklist), links: links(raw.links), ...(logs === undefined ? {} : { logs }), ...(raw.locked_fields === undefined ? {} : { locked_fields: lockFields(raw.locked_fields) }) };
 }
 export function enhancementSummary(value: unknown): EnhancementSummary {
   const raw = object(value);
@@ -413,7 +457,15 @@ export function taskRun(value: unknown): TaskRun {
     ...(raw.output_truncated === undefined ? {} : {output_truncated: boolean(raw.output_truncated)}),
     task_id: text(raw.task_id), source_revision: source, task_title: text(raw.task_title), repository_id: text(raw.repository_id), provider: named, permission_mode: permission, state,
     cwd: text(raw.cwd), created_at: integer(raw.created_at), expires_at: integer(raw.expires_at), session_id: nullableText(raw.session_id),
-    exit_code: raw.exit_code === null ? null : integer(raw.exit_code), reason: text(raw.reason), outcome_uncertain: boolean(raw.outcome_uncertain) };
+    exit_code: raw.exit_code === null ? null : integer(raw.exit_code), reason: text(raw.reason), outcome_uncertain: boolean(raw.outcome_uncertain),
+    ...(raw.model_choice === undefined ? {} : { model_choice: modelChoice(raw.model_choice) }) };
+}
+/** A run's recorded model fields. Absent on attempts stored before schema 11. */
+function modelChoice(value: unknown): RecordedModelChoice | null {
+  if (value === undefined || value === null) return null;
+  const raw = object(value), entries = Object.entries(raw);
+  if (entries.length > 8) return invalid();
+  return Object.fromEntries(entries.map(([key, entry]) => /^[a-z_]{1,32}$/.test(key) ? [key, text(entry)] : invalid()));
 }
 export async function getRepository(id: string): Promise<Repository> {
   const repo = record(await request("repositories.get", { id }), repository);
@@ -591,27 +643,89 @@ export async function enhancementConfiguration(selection?: ModelSelection | null
   return { provider, model, model_source, providers };
 }
 export function scopeParams(scope: Scope): Record<string, string> { return scope.kind === "global" ? {} : scope.kind === "workspace" ? { workspace_id: scope.id } : { repository_id: scope.id }; }
+/**
+ * Which side of the board a list reads, and in what order.
+ *
+ * `archived` omitted reads both sides; the board names `false` and the archive
+ * `true`. `deleted` reads soft-deleted tasks instead of live ones. Each order
+ * has its own cursor, so a cursor is only ever passed back with the filter it
+ * was issued under.
+ */
+export interface TaskListFilter {
+  archived?: boolean;
+  deleted?: boolean;
+  order?: "board" | "completed" | "updated";
+}
 export async function listTasks(
   scope: Scope,
   status?: TaskStatus | null,
   query = "",
   cursor?: string,
   limit = 30,
+  filter: TaskListFilter = {},
 ): Promise<Page<TaskCard>> {
-  return page(
+  const result = page(
     await request("items.list", {
       ...scopeParams(scope),
       ...(status ? { status } : {}),
+      ...(filter.archived === undefined ? {} : { archived: filter.archived }),
+      ...(filter.deleted ? { deleted: true } : {}),
+      ...(filter.order && filter.order !== "board" ? { order: filter.order } : {}),
       query,
       limit,
       ...(cursor ? { cursor } : {}),
     }),
     taskCard,
   );
+  // A store that ignored the filter would hand the board archived cards as
+  // live ones; refuse the page rather than draw them in the wrong place.
+  if (filter.archived !== undefined && result.items.some((card) => card.archived !== filter.archived)) return invalid();
+  return result;
+}
+/** What a task that has never been saved starts with in the schema 11 fields. */
+export function freshTaskFields(): Pick<TaskDraft, "archived" | "checklist" | "links"> {
+  return { archived: false, checklist: [], links: [] };
 }
 export function taskDraft(full: Task): TaskDraft {
-  const { id: _id, revision: _revision, updated_at: _updated, ...draft } = full;
+  const { id: _id, revision: _revision, updated_at: _updated, completed_at: _completed, ...draft } = full;
   return draft;
+}
+/** One merged source, as the merge reports it. */
+export interface MergeSource { item_id: string; title: string; outcome: "merged" | "already_merged" | "not_merged"; detail: string | null }
+/** What a board merge did: the target as it is now, and each source's outcome. */
+export interface MergeResult { ok: boolean; outcome: "merged" | "partial" | "unchanged"; item_id: string; sources: MergeSource[]; next_step: string | null }
+/**
+ * Fold `sources` into `into` and delete them: the merge `gitpulse_merge_tasks`
+ * runs, through the host's `items.merge`. Every card carries the revision the
+ * board drew it at, so one changed since is refused rather than merged as it
+ * no longer looks. A partial merge is a result, not an error: it says which
+ * sources are still on the board and why.
+ */
+export async function mergeTasks(repositoryId: string, into: TaskCard, sources: readonly TaskCard[], reason: string): Promise<MergeResult> {
+  const raw = object(await request("items.merge", {
+    repository_id: repositoryId,
+    into: { id: into.id, expected_revision: into.revision },
+    sources: sources.map((card) => ({ id: card.id, expected_revision: card.revision })),
+    reason,
+  }));
+  const outcome = raw.outcome === "merged" || raw.outcome === "partial" || raw.outcome === "unchanged" ? raw.outcome : invalid();
+  if (!Array.isArray(raw.sources) || raw.sources.length !== sources.length) return invalid();
+  const rows = raw.sources.map((value): MergeSource => {
+    const row = object(value);
+    const state = row.outcome === "merged" || row.outcome === "already_merged" || row.outcome === "not_merged" ? row.outcome : invalid();
+    return { item_id: text(row.item_id), title: typeof row.title === "string" ? row.title : "", outcome: state, detail: row.detail === null || row.detail === undefined ? null : text(row.detail) };
+  });
+  return { ok: boolean(raw.ok), outcome, item_id: text(raw.item_id), sources: rows, next_step: nullableText(raw.next_step ?? null) };
+}
+/**
+ * Bring a deleted task back, at the revision its deletion produced.
+ *
+ * The same id, its history and its fields return; the board does not create
+ * a copy. One `request_id` per attempt, kept for a retry of an uncertain reply.
+ */
+export async function restoreDeletedTask(id: string, expectedRevision: number, requestId: string): Promise<Task> {
+  const saved = record(await request("items.restore", { id, expected_revision: expectedRevision, request_id: requestId }), task);
+  return saved.id === id && saved.revision === expectedRevision + 1 ? saved : invalid();
 }
 export function workspaceDraft(full: Workspace): WorkspaceDraft { const { id: _id, revision: _revision, updated_at: _updated, ...draft } = full; return draft; }
 // Keep the same mutation object for an uncertain retry; never regenerate its ID.

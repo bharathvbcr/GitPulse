@@ -13,7 +13,7 @@ vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
 const native = vi.mocked(invoke);
 const repo = { id: "repo_1", revision: 1, updated_at: 100, name: "Manvi", identity_key: "local:/code/Manvi/.git", remote_url: null };
 const group: Workspace = { id: "workspace_1", revision: 3, updated_at: 120, name: "Agentic tools", description: "Shared tooling", icon: "layers", color: "blue", position: 1, pinned: true, archived: false, repository_ids: ["repo_1", "repo_2"] };
-const item: Task = { id: "task_1", revision: 7, updated_at: 130, title: "Preserve repository scope", description: "Keep the original error E42 and both repository links.", acceptance_criteria: ["Both repository checks pass"], kind: "bug", status: "review", priority: 1, severity: "high", owner: "Bharath", due_at: 2_000, labels: ["regression"], repository_ids: ["repo_1", "repo_2"], primary_repository_id: "repo_1", home_workspace_id: "workspace_1", position: 2 };
+const item: Task = { id: "task_1", revision: 7, updated_at: 130, title: "Preserve repository scope", description: "Keep the original error E42 and both repository links.", acceptance_criteria: ["Both repository checks pass"], kind: "bug", status: "review", priority: 1, severity: "high", owner: "Bharath", due_at: 2_000, labels: ["regression"], repository_ids: ["repo_1", "repo_2"], primary_repository_id: "repo_1", home_workspace_id: "workspace_1", position: 2 , archived: false, completed_at: null, checklist: [], links: []};
 
 function reply(items: unknown[], total = items.length, cursor: string | null = null): string {
   return JSON.stringify({ ok: true, items, shown: items.length, total, has_more: cursor !== null, next_cursor: cursor });

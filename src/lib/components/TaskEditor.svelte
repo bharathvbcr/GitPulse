@@ -9,9 +9,10 @@
   import TaskRepositoryPicker from "./TaskRepositoryPicker.svelte";
   import TaskDuePicker from "./TaskDuePicker.svelte";
   import LabelInput from "./LabelInput.svelte";
+  import TaskRelations from "./TaskRelations.svelte";
   import { isCaseInsensitiveFs } from "../repos/paths";
   import { askConfirm } from "../stores/modalStore";
-  import { deleteTask, explainError, getTask, getTaskBrief, getWorkspace, newID, putTask, registerRepository, STATUSES, STATUS_LABELS, taskDraft, taskWrite, WorkbenchError, type EnhancementField, type Repository, type Task, type TaskDraft, type TaskStatus, type WorkspaceCard } from "../workbench/client";
+  import { deleteTask, explainError, freshTaskFields, getTask, getTaskBrief, getWorkspace, newID, putTask, registerRepository, STATUSES, STATUS_LABELS, taskDraft, taskWrite, WorkbenchError, type EnhancementField, type Repository, type Task, type TaskDraft, type TaskStatus, type WorkspaceCard } from "../workbench/client";
   import { deleteAttempt, deleteConfirmCopy, isRetryableDelete } from "../workbench/taskDelete";
   import { addableOpenTabs, attachRepositories, openMembershipCandidates, type OpenTabRef } from "../workbench/openMembership";
   import { linkSummary, repositoryRows, shouldOfferFilter, triggerChips } from "../workbench/taskRepositories";
@@ -51,7 +52,7 @@
       title: "", description: "", kind: "feature", status: initial.initialStatus, priority: 2, severity: null,
       owner: null, due_at: null, labels: [], acceptance_criteria: [], repository_ids: initial.primary ? [initial.primary] : [],
       primary_repository_id: initial.primary, home_workspace_id: initial.home, position: Date.now(), locked_fields: [] as EnhancementField[],
-      logs: "",
+      logs: "", ...freshTaskFields(),
       ...initial.seed,
     };
     return { ...base, locked_fields: base.locked_fields ?? [], logs: base.logs ?? "" };
@@ -769,6 +770,7 @@
                   <label>Labels
                     <LabelInput bind:value={labelChips} disabled={enhancementBusy} />
                   </label>
+                  <TaskRelations bind:checklist={draft.checklist} bind:links={draft.links} taskId={current?.id ?? null} disabled={enhancementBusy} onchange={() => { dirty = true; }} />
                   {#if current}
                     <div class="notifications-row">
                       <p class="notifications-label">Notifications (profile-wide; mute this task)</p>

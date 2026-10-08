@@ -43,13 +43,18 @@
     defaultHandoff,
     attemptHolding,
     handoffGate,
+    launchModelOverride,
+    modelOverrideFields,
+    NO_MODEL_OVERRIDE,
     normalizeCheckout,
     preferredCheckout,
     reconcileHandoff,
     supportsManaged,
     type HandoffGate,
     type HandoffSettings,
+    type ModelOverride,
   } from "../workbench/taskHandoff";
+  import { EFFORT_LEVELS, MAX_MODEL_ID_LEN } from "../terminal/agentDefaults";
   import type { OpenTabRef } from "../workbench/openMembership";
   import type { AgentProvider, RunKind } from "../workbench/vocabulary";
 
@@ -110,6 +115,8 @@
   let error = $state("");
   let note = $state("");
   let pending = $state<RunPreparation | null>(null);
+  /** This launch's model, over the saved default. Not remembered: the next launch starts from the default again. */
+  let modelOverride = $state<ModelOverride>({ ...NO_MODEL_OVERRIDE });
   let disposed = false;
 
   const pathOpts = { caseInsensitive: isCaseInsensitiveFs() };
@@ -124,7 +131,8 @@
    * changing the request would risk a second run for the same attempt.
    */
   const locked = $derived(busy || disabled || pending !== null);
-  const gate = $derived(handoffGate({ checkout, settings, acknowledgedBypass: acknowledged, dirty, busy: busy || disabled }));
+  const gate = $derived(handoffGate({ checkout, settings, acknowledgedBypass: acknowledged, dirty, busy: busy || disabled, model: modelOverride }));
+  const overrideFields = $derived(settings.kind === "managed" ? [] : modelOverrideFields(settings.provider));
   const repositoryName = $derived(repositories.find((repo) => repo.id === selected)?.name ?? selected);
   /**
    * Attempts already holding a checkout in this repository, from any task.
@@ -165,8 +173,12 @@
   });
 
   function choose(next: Partial<HandoffSettings>) {
+    const before = settings;
     settings = reconcileHandoff({ ...settings, ...next });
     if (settings.permission !== "bypass") acknowledged = false;
+    // A model typed for one agent names nothing for another, and a managed
+    // attempt takes none; the fields that held it are no longer shown.
+    if (settings.provider !== before.provider || settings.kind !== before.kind) modelOverride = { ...NO_MODEL_OVERRIDE };
     // The message described a launch with the *previous* settings, so once
     // they change it describes nothing the reader can act on. Leaving it up is
     // how a managed refusal came to sit under a Terminal handoff, naming Codex
@@ -222,6 +234,8 @@
         }
         const repo = await bounded(getRepository(repository));
         if (disposed) return;
+        const model = launchModelOverride(settings, modelOverride);
+        if (!model.ok) throw new Error(model.reason);
         // The host makes the worktree, inside the same step that prepares the
         // attempt, and removes it again if the attempt is refused.
         if (useWorktree) note = "Creating a worktree and running this repository's setup. A dependency install can take several minutes; the attempt appears here when it is ready.";
@@ -238,6 +252,7 @@
           provider: settings.provider,
           permission_mode: settings.permission,
           acknowledge_bypass: acknowledged,
+          ...(model.choice ? { model_choice: model.choice } : {}),
         };
       }
       const preparation = pending;
@@ -371,6 +386,26 @@
     </select>
   </label>
   <p class="meta" data-testid="permission-detail">{PERMISSION_LABELS[settings.permission]?.detail ?? ""}</p>
+  {#if overrideFields.length}
+    <fieldset class="model" data-testid="handoff-model-override">
+      <legend>Model for this launch</legend>
+      <div class="pair">
+        {#if overrideFields.includes("model")}
+          <input class="gp-field" aria-label="Model" placeholder="Saved default" maxlength={MAX_MODEL_ID_LEN} value={modelOverride.model} disabled={locked} oninput={(e) => { modelOverride = { ...modelOverride, model: e.currentTarget.value }; }} />
+        {/if}
+        {#if overrideFields.includes("effort")}
+          <select class="gp-select" aria-label="Effort" value={modelOverride.effort} disabled={locked} onchange={(e) => { modelOverride = { ...modelOverride, effort: e.currentTarget.value }; }}>
+            <option value="">Saved effort</option>
+            {#each EFFORT_LEVELS as level (level)}<option value={level}>{level}</option>{/each}
+          </select>
+        {/if}
+        {#if overrideFields.includes("advisor")}
+          <input class="gp-field" aria-label="Advisor model" placeholder="Saved advisor" maxlength={MAX_MODEL_ID_LEN} value={modelOverride.advisor} disabled={locked} oninput={(e) => { modelOverride = { ...modelOverride, advisor: e.currentTarget.value }; }} />
+        {/if}
+      </div>
+      <p class="meta">Blank fields keep the default from Settings. What this attempt runs with is recorded on it.</p>
+    </fieldset>
+  {/if}
   <p class="meta">These are requested settings. {settings.kind === "managed" ? `Manvi verifies the effective ${PROVIDER_LABELS[settings.provider]} settings before sending the task.` : "The provider handles requests in its own terminal."}</p>
   {#if settings.permission === "bypass"}
     <label class="ack">
@@ -387,6 +422,8 @@
 <style>
   .handoff-form{display:flex;flex-direction:column;gap:12px;font-size:12px;min-width:0}
   .pair{display:flex;gap:8px;flex-wrap:wrap}
+  .model{border:0;padding:0;margin:0;display:flex;flex-direction:column;gap:6px;min-width:0}
+  .model .pair > *{flex:1 1 8rem;width:auto}
   .meta{margin:0;font-size:11px;color:rgb(var(--c-text-muted));line-height:1.5}
   label{display:flex;flex-direction:column;gap:6px;margin:0}
   .checkout{display:flex;gap:6px;flex-wrap:wrap;align-items:center}

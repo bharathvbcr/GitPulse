@@ -25,6 +25,9 @@ const preparedRuns = [], appleDrafts = [];
 // managed attempt, which is the only way a handoff's success path — the host
 // closing the sheet from inside the form's own launch — is exercised.
 let acceptPreparation = false;
+// The code a refused preparation carries. `store_error` leaves the form's
+// request pending for an exact retry; a definite refusal clears it.
+let prepareRefusal = "store_error";
 const fixtureRuns = new Map();
 const issueCalls = [];
 // `issueFailOnCall` aims a failure at one call of a run (1-based over every
@@ -40,7 +43,12 @@ const workspace = { id: "workspace", name: "Developer tools", revision: 1, updat
 const emptyWorkspace = { id: "workspace-empty", name: "Fresh space", revision: 1, updated_at: 1, icon: "", color: "", pinned: false, archived: false, position: 2, description: "", repository_ids: [], repository_count: 0 };
 const workspaces = [workspace, emptyWorkspace];
 const workspaceWrites = [];
-const makeTask = (id, title, repository, status = "ready") => ({ id, title, kind: "feature", status, priority: 2, severity: null, owner: null, due_at: null, labels: [], repository_ids: [repository], primary_repository_id: repository, home_workspace_id: null, position: Number(id.replace(/\D/g, "")) || 1, revision: 1, updated_at: 1, description: "Keep changes focused and verify the result.", acceptance_criteria: [], locked_fields: [] });
+const makeTask = (id, title, repository, status = "ready") => ({ id, title, kind: "feature", status, priority: 2, severity: null, owner: null, due_at: null, labels: [], repository_ids: [repository], primary_repository_id: repository, home_workspace_id: null, position: Number(id.replace(/\D/g, "")) || 1, revision: 1, updated_at: 1, description: "Keep changes focused and verify the result.", acceptance_criteria: [], locked_fields: [], checklist: [], links: [],
+  // As dc-store schema 11's upgrade leaves a profile: work that was Done is
+  // archived, with the time it was completed.
+  archived: status === "done", completed_at: status === "done" ? 1_000 + (Number(id.replace(/\D/g, "")) || 0) : null });
+/** Store-maintained, as dc-store keeps it: set entering Done, kept while there, cleared leaving it. */
+const completedAt = (previous, status) => status !== "done" ? null : previous?.status === "done" ? previous.completed_at ?? null : Math.floor(Date.now() / 1000);
 let tasks = [
   makeTask("task-1", "Keep repository tasks in sync", "repo-0", "in_progress"),
   { ...makeTask("task-2", "Make task sheets easier to scan", "repo-0", "review"), priority: 1, kind: "improvement", owner: "Bharath", labels: ["usability", "tasks", "desktop"], repository_ids: ["repo-0", "repo-1"] },
@@ -52,7 +60,8 @@ let tasks = [
   ...Array.from({length: 34}, (_, i) => makeTask(`task-${i + 100}`, `Completed task ${String(i + 1).padStart(2, "0")}`, "repo-0", "done")),
 ];
 let corruptDelete = false, loseDelete = false;
-const deleted = new Set(), deleteWrites = [];
+const deleted = new Set(), deleteWrites = [], restoreWrites = [], mergeWrites = [];
+let mergeFailSource = "";
 let failList = false, corruptSave = false, loseSave = false, holdSave = false, releaseSave, holdSearch = false, heldSearch = [], holdGet = false, releaseGet;
 const receipts = new Map(), proposals = new Map(), enhancementWrites = [];
 let failConfiguration = false, blankConfiguration = false, loseEnhancement = false, holdDelete = false, releaseDelete;
@@ -157,7 +166,7 @@ mockIPCWithEvents(async (cmd, args) => {
     }
     case "runs.prepare_terminal": case "runs.prepare_managed": {
       preparedRuns.push(structuredClone(input));
-      if (!acceptPreparation) throw {code:"store_error", message:"The tasks fixture does not start agents."};
+      if (!acceptPreparation) throw {code:prepareRefusal, message:"The tasks fixture does not start agents."};
       const now = Math.floor(Date.now() / 1000);
       const run = { kind: args.method === "runs.prepare_managed" ? "managed" : "external_terminal", id: input.id, revision: 1, updated_at: 1, task_id: input.task_id, source_revision: input.source_revision, task_title: tasks.find(task => task.id === input.task_id)?.title ?? "", repository_id: input.repository_id, provider: input.provider, permission_mode: input.permission_mode, state: "prepared", cwd: input.repo_path, created_at: now, expires_at: now + 300, session_id: null, exit_code: null, reason: "", outcome_uncertain: false };
       fixtureRuns.set(run.id, run);
@@ -242,13 +251,21 @@ mockIPCWithEvents(async (cmd, args) => {
     }
     case "items.list": {
       if (failList) throw {code: "store_error", message: "Fixture task storage offline"};
-      const matching = tasks.filter(task => !deleted.has(task.id) && task.status === input.status && (!input.repository_id || task.repository_ids.includes(input.repository_id)) && (!input.workspace_id || task.repository_ids.some(id => workspace.repository_ids.includes(id))) && (!input.query || task.title.toLowerCase().includes(input.query.toLowerCase())))
+      // dc-store schema 11: `deleted` reads deleted tasks instead of live
+      // ones, `archived` filters on the flag (omitted: both), `status` is
+      // optional, and `order` picks the key the store pages on.
+      const matching = tasks.filter(task => deleted.has(task.id) === (input.deleted === true) && (input.status === undefined || task.status === input.status) && (input.archived === undefined || task.archived === input.archived) && (!input.repository_id || task.repository_ids.includes(input.repository_id)) && (!input.workspace_id || task.repository_ids.some(id => workspace.repository_ids.includes(id))) && (!input.query || task.title.toLowerCase().includes(input.query.toLowerCase())))
         // `ORDER BY t.position,t.id`, the same key the store pages on. The
         // fixture used to page in array order, so `items.put` — which appends
         // — moved an edited task to the end of its new column and off the
         // first page. Paging is what this fixture is for, so the order it
         // pages in has to be the real one.
-        .sort((a, b) => a.position - b.position || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
+        .sort((a, b) => {
+          const byId = a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
+          if (input.order === "completed") return (b.completed_at ?? 0) - (a.completed_at ?? 0) || byId;
+          if (input.order === "updated") return b.updated_at - a.updated_at || byId;
+          return a.position - b.position || byId;
+        });
       const result = JSON.stringify(page(matching, Number(input.cursor ?? 0), input.limit));
       if (holdSearch && input.query === "older") return new Promise(resolve => heldSearch.push(() => resolve(result)));
       return result;
@@ -276,10 +293,42 @@ mockIPCWithEvents(async (cmd, args) => {
       const previous = tasks.find(task => task.id === input.id);
       if (!previous || deleted.has(input.id) || previous.revision !== input.expected_revision) throw {code:"revision_conflict", message:"Task changed before deletion."};
       deleted.add(input.id);
-      const result = JSON.stringify({ok:true, item:{...previous, deleted:true, revision:previous.revision + 1}});
+      previous.revision += 1; previous.updated_at = Math.floor(Date.now() / 1000);
+      const result = JSON.stringify({ok:true, item:{...previous, deleted:true}});
       receipts.set(input.request_id, result);
       if (corruptDelete) { corruptDelete = false; return JSON.stringify({ok:false}); }
       if (loseDelete) { loseDelete = false; throw {code:"transport_error", message:"Lost delete reply"}; }
+      return result;
+    }
+    // The host's merge (intake_merge.rs). The fixture keeps its reply shape
+    // and its two effects the board reads: sources deleted, target rewritten.
+    // `mergeFailSource` makes that source's delete fail after its reason is
+    // recorded, which the host reports as a partial merge.
+    case "items.merge": {
+      mergeWrites.push(structuredClone(input));
+      const target = tasks.find(task => task.id === input.into.id);
+      if (!target || target.revision !== input.into.expected_revision) throw {code:"revision_conflict", message:"This task changed since the board drew it."};
+      const rows = input.sources.map(source => {
+        const task = tasks.find(item => item.id === source.id);
+        if (source.id === mergeFailSource) return { task_id: source.id, item_id: source.id, title: task.title, outcome: "not_merged", copied_revision: task.revision, detail: "Its merge reason is recorded on it, but deleting it failed (fixture), so it is still on the board." };
+        deleted.add(source.id); task.revision += 1;
+        return { task_id: source.id, item_id: source.id, title: task.title, outcome: "merged", copied_revision: task.revision - 1, detail: null };
+      });
+      target.revision += 1; target.description += rows.filter(row => row.outcome === "merged").map(row => `\n\n## Merged from ${row.item_id}`).join("");
+      const ok = rows.every(row => row.outcome !== "not_merged");
+      return JSON.stringify({ ok, outcome: ok ? "merged" : "partial", item_id: target.id, revision: target.revision, sources: rows, next_step: ok ? null : "Run the same merge again to finish it." });
+    }
+    case "items.restore": {
+      restoreWrites.push(structuredClone(input));
+      if (receipts.has(input.request_id)) return receipts.get(input.request_id);
+      const previous = tasks.find(task => task.id === input.id);
+      if (!previous) throw {code:"not_found", message:"Fixture has no such task"};
+      if (!deleted.has(input.id)) throw {code:"invalid_state", message:"This task is not deleted."};
+      if (previous.revision !== input.expected_revision) throw {code:"conflict", message:"Task changed since it was deleted."};
+      deleted.delete(input.id);
+      previous.revision += 1; previous.updated_at = Math.floor(Date.now() / 1000);
+      const result = JSON.stringify({ok:true, item:{...previous}});
+      receipts.set(input.request_id, result);
       return result;
     }
     case "items.put": {
@@ -293,7 +342,10 @@ mockIPCWithEvents(async (cmd, args) => {
       const previous = tasks.find(task => task.id === input.id);
       if ((previous?.revision ?? 0) !== input.expected_revision) throw {code:"conflict", message:"Task changed. Reload the saved task."};
       const { expected_revision, request_id, ...draft } = input;
-      const item = {...draft, due_at: draft.due_at ?? null, revision: expected_revision + 1, updated_at: 2};
+      if ("completed_at" in draft) throw {code:"invalid_input", message:"unknown field completed_at"};
+      // A field the request omits keeps its stored value, as dc-store's `put_item` does.
+      const kept = { archived: previous?.archived ?? false, checklist: previous?.checklist ?? [], links: previous?.links ?? [] };
+      const item = {...kept, ...draft, due_at: draft.due_at ?? null, completed_at: completedAt(previous, draft.status), revision: expected_revision + 1, updated_at: 2};
       tasks = [...tasks.filter(task => task.id !== item.id), item];
       const result = JSON.stringify({ok:true, item}); receipts.set(request_id, result);
       if (corruptSave) { corruptSave = false; return JSON.stringify({ok:true, item:{}}); }
@@ -1308,33 +1360,40 @@ if (params.has("check")) {
     const archiveSummaryText = () => root.querySelector('[data-testid="task-archive-summary"]')?.textContent.replace(/\s+/g, " ").trim();
     const archiveToggle = () => [...root.querySelectorAll("header button")].find(el => el.getAttribute("aria-label") === "Archive");
     // Counted from the fixture rather than written as a literal: earlier
-    // checks move tasks into and out of Done, so a hard-coded total would
-    // measure this block's position in the script, not the archive.
-    const completed = () => tasks.filter(task => !deleted.has(task.id) && task.status === "done").length;
-    const expected = completed();
-    check("the board badges the server's completed total, not a page of it",
+    // checks move tasks between columns and delete some, so a hard-coded
+    // total would measure this block's position in the script, not the archive.
+    const archivedCount = () => tasks.filter(task => !deleted.has(task.id) && task.archived).length;
+    const expected = archivedCount();
+    check("the board badges the server's archived total, not a page of it",
       expected > 30 && archiveToggle()?.textContent.trim() === String(expected));
+    // dc-store schema 11: Done and archived are separate. Archived Done work
+    // is off the board, and the Done column holds only what is not archived.
+    check("archived work is not drawn in the Done column",
+      tasks.filter(task => task.archived && !deleted.has(task.id)).every(task => !card(task.id)));
     archiveToggle().click(); await settle(200);
     await wait(() => archiveRows().length > 0);
-    check("the archive opens on the completed tasks for this scope",
+    check("the archive opens on the archived tasks for this scope",
       Boolean(archive()) && archiveRows().length === 30);
+    check("the archive lists the most recently completed first, stamped with it",
+      archiveRows()[0].getAttribute("data-card-id") === [...tasks].filter(task => task.archived && !deleted.has(task.id)).sort((a, b) => (b.completed_at ?? 0) - (a.completed_at ?? 0))[0].id
+      && archiveRows()[0].querySelector('[data-testid="task-archive-stamp"]')?.textContent.startsWith("Completed"));
     // The panel is named Archive and offers Restore. Until this line it never
     // said anywhere what puts a task in it, and the one place that came close
     // was the empty state — the single case a reader has no archived work to
     // ask about.
     check("the archive says how a task gets into it, with rows on screen",
       archive().querySelector('[data-testid="task-archive-rule"]')?.textContent.trim()
-        === "A task is archived when it reaches Done.");
+        === "Archive files a task away from the board in any column; Restore puts it back where it was.");
     // The one number this panel must not get wrong. 30 rows on screen out of
-    // 35 completed tasks has to read as both numbers, or a reader clears an
+    // 34 archived tasks has to read as both numbers, or a reader clears an
     // archive they have only partly seen.
     check("a partly loaded archive says so, with both numbers",
-      archiveSummaryText() === `Showing 30 of ${expected} completed tasks. Load more to see the rest.`);
+      archiveSummaryText() === `Showing 30 of ${expected} archived tasks. Load more to see the rest.`);
     button("Load more", archive()).click(); await settle(200);
     check("Load more grows the page instead of replacing it",
-      archiveRows().length === expected && archiveSummaryText() === `${expected} completed tasks.`);
-    // A restore is the board's own status update, so it must land in the
-    // board's confirm dialog rather than writing straight through.
+      archiveRows().length === expected && archiveSummaryText() === `${expected} archived tasks.`);
+    // A restore is the board's own update, so it must land in the board's
+    // confirm dialog rather than writing straight through.
     archiveRows()[0].querySelector('input[type="checkbox"]').click(); await settle();
     archiveRows()[1].querySelector('input[type="checkbox"]').click(); await settle();
     // The defect this panel was reported for, measured rather than asserted
@@ -1373,45 +1432,54 @@ if (params.has("check")) {
       && archive().scrollHeight <= archive().clientHeight + 1);
     entries().scrollTop = 0; await settle(60);
     const restored = archiveRows().slice(0, 2).map(row => row.getAttribute("data-card-id"));
-    await change(archive().querySelector('[aria-label="Restore to"]'), "ready", "change");
+    const restoredRevisions = restored.map(id => tasks.find(task => task.id === id)?.revision);
     button("Restore", archive()).click(); await settle(150);
     const restoreDialog = document.querySelector('[role="dialog"][aria-label="Update tasks"]');
     check("restoring goes through the board's confirm-and-retry dialog", Boolean(restoreDialog));
     button("Update 2 tasks", restoreDialog).click(); await settle(250);
     button("Done", restoreDialog).click(); await settle(250);
-    check("a restored task leaves the archive and returns to the chosen column",
-      restored.every(id => tasks.find(task => task.id === id)?.status === "ready")
+    // Restore clears the flag and nothing else: a Done task comes back to
+    // Done, which is the column it was archived from.
+    check("a restored task leaves the archive and returns to its own column, status unchanged",
+      restored.every(id => { const task = tasks.find(item => item.id === id); return task?.status === "done" && task.archived === false; })
+      && restored.every((id, at) => tasks.find(task => task.id === id)?.revision === restoredRevisions[at] + 1)
       && archiveRows().every(row => !restored.includes(row.getAttribute("data-card-id")))
-      && restored.every(id => Boolean(card(id)?.closest('[data-task-column="ready"]'))));
-    // A write drops the accumulated pages and reloads from the first one.
-    // Merging a fresh page into rows fetched before the write is how a
-    // restored or deleted task keeps its seat in the list; the cursor only
-    // runs forward, so there is no way to re-fetch the deeper pages. The
-    // summary then has to report the new total against the 30 rows actually
-    // reloaded, which is the case this asserts.
-    check("a restore reloads the archive from its first page, against the new total",
+      && restored.every(id => Boolean(card(id)?.closest('[data-task-column="done"]'))));
+    // The pages already loaded are re-read in place: the reader who scrolled
+    // to the second page keeps both, against the new total.
+    check("a restore refreshes the loaded pages in place, against the new total",
       archiveToggle().textContent.trim() === String(expected - 2)
-      && archiveRows().length === Math.min(30, expected - 2)
-      && archiveSummaryText() === `Showing 30 of ${expected - 2} completed tasks. Load more to see the rest.`);
-    await change(archive().querySelector('[aria-label="Search completed tasks"]'), "Completed task 30");
+      && archiveRows().length === expected - 2
+      && archiveSummaryText() === `${expected - 2} archived tasks.`);
+    await change(archive().querySelector('[aria-label="Search archived tasks"]'), "Completed task 30");
     await settle(350);
-    check("the archive searches completed work without touching the board's search",
+    check("the archive searches archived work without touching the board's search",
       archiveRows().length === 1 && root.querySelector('[aria-label="Search tasks"]').value === "");
-    await change(archive().querySelector('[aria-label="Search completed tasks"]'), "");
+    await change(archive().querySelector('[aria-label="Search archived tasks"]'), "");
     await settle(350);
-    // The dock is a second way to read completed work, not a move, and it
-    // says which of the two is true right now.
-    check("the archive admits that Done is still on the board",
-      archive().textContent.includes("in the Done column on the board") && Boolean(columnEl("done")));
-    button("Hide Done on the board", archive()).click(); await settle(200);
-    check("hiding Done from the archive uses the board's own column preference",
-      !columnEl("done") && archive().textContent.includes("Done column is hidden"));
-    check("the board's hidden-column note then offers the archive by name",
-      Boolean(hiddenNote()) && Boolean(button("Open archive", hiddenNote())));
-    button("Show Done on the board", archive()).click(); await settle(200);
-    check("and the same control puts it back", Boolean(columnEl("done")) && !hiddenNote());
+    // ---- The Deleted view: restore a deleted task with its id ------------
+    // One that was not archived, so restoring it leaves the archive's count alone.
+    const gone = tasks.find(task => deleted.has(task.id) && !task.archived);
+    if (!gone) throw Error("The Deleted view checks need a task an earlier block deleted");
+    archive().querySelector('[data-testid="task-archive-view-deleted"]').click(); await settle(250);
+    await wait(() => archiveRows().length > 0);
+    check("the Deleted view lists deleted tasks, and only those",
+      archiveRows().some(row => row.getAttribute("data-card-id") === gone.id)
+      && archiveRows().every(row => deleted.has(row.getAttribute("data-card-id")))
+      && archiveSummaryText().includes("deleted task"));
+    const goneRow = archiveRows().find(row => row.getAttribute("data-card-id") === gone.id);
+    goneRow.querySelector('input[type="checkbox"]').click(); await settle();
+    check("the Deleted view offers Restore and no second Delete",
+      Boolean(archive().querySelector('[data-testid="task-archive-restore"]')) && !button("Delete", archive().querySelector(".actions")));
+    archive().querySelector('[data-testid="task-archive-restore"]').click(); await settle(400);
+    check("restoring a deleted task brings the same id back, checked against its deletion's revision",
+      !deleted.has(gone.id)
+      && restoreWrites.some(write => write.id === gone.id && write.expected_revision === gone.revision - 1)
+      && archiveRows().every(row => row.getAttribute("data-card-id") !== gone.id));
+    archive().querySelector('[data-testid="task-archive-view-archived"]').click(); await settle(250);
+    await wait(() => archiveRows().length > 0);
     // A backgrounded window defers the query, the way the Inbox does. What it
-    // must not do is answer it: an unread archive saying "No completed tasks
+    // must not do is answer it: an unread archive saying "No archived tasks
     // in this scope" underneath a header badge reading 34 is a check that
     // could not run reporting the same result as one that ran and passed.
     archiveToggle().click(); await settle();
@@ -1422,7 +1490,7 @@ if (params.has("check")) {
     check("a backgrounded window never reports an unread archive as an empty one",
       Boolean(archive())
       && archiveRows().length === 0
-      && !archiveSummaryText().includes("No completed tasks")
+      && !archiveSummaryText().includes("No archived tasks")
       && archiveSummaryText().includes("have not loaded yet")
       && archiveSummaryText().includes("Paused while this window is in the background")
       && archiveToggle().textContent.trim() === String(expected - 2));
@@ -1438,54 +1506,45 @@ if (params.has("check")) {
 
     // ---- Archiving a task -------------------------------------------------
     // The report this block exists for: a panel called Archive, a Restore
-    // inside it, and no Archive verb anywhere in the product. The only route
-    // was `Move to… › Done`, and nothing named the two as the same thing.
+    // inside it, and no Archive verb anywhere in the product. Since dc-store
+    // schema 11 the verb sets the task's own flag; it no longer moves it.
     const archiveRow = () => [...menu().querySelectorAll("button")].find(el => el.dataset.menuId === "archive");
-    const statusOf = id => tasks.find(task => task.id === id)?.status;
-    const revisionOf = id => tasks.find(task => task.id === id)?.revision;
+    const of = id => tasks.find(task => task.id === id);
     // Taken from the board as it stands, not written as literals: earlier
     // blocks in this script delete tasks and move others between columns, so
     // a hard-coded id would be measuring this block's position in the script.
     const onBoardIn = status => [...root.querySelectorAll(`[data-task-column="${status}"] [data-task-card]`)]
       .map(el => el.getAttribute("data-card-id"));
-    const [first, second] = onBoardIn("ready");
-    if (!first || !second) throw Error("Archive checks need two Ready cards on the board");
+    // Archived cards leave the board, so never one a later block opens by id.
+    const [first, second, third] = onBoardIn("ready").filter(id => !["task-11", "task-31", "task-32"].includes(id));
+    if (!first || !second || !third) throw Error("Archive checks need three Ready cards on the board");
     await openMenu(first);
-    check("a card's own menu offers Archive, and names the column it files into",
+    check("a card's own menu offers Archive, and says it keeps the status",
       Boolean(archiveRow()) && !archiveRow().disabled
-      && archiveRow().textContent.includes("Archive") && archiveRow().textContent.includes("Done"));
-    const beforeArchive = completed();
+      && archiveRow().textContent.includes("Archive") && archiveRow().textContent.includes("Keeps status"));
+    const beforeArchive = archivedCount(), firstRevision = of(first).revision;
     archiveRow().click(); await settle(350);
-    check("Archive moves the task without opening a dialog or asking for a status",
-      statusOf(first) === "done" && !document.querySelector('[role="dialog"]')
+    check("Archive files a Ready task away without moving it to Done or opening a dialog",
+      of(first).status === "ready" && of(first).archived === true && of(first).revision === firstRevision + 1
+      && !document.querySelector('[role="dialog"]')
       && Number(archiveToggle().textContent.trim()) === beforeArchive + 1
-      && Boolean(card(first)?.closest('[data-task-column="done"]')));
-    // Disabled rather than hidden, the way a Move row showing the current
-    // status is: the menu keeps its shape, and says what the task already is.
-    await openMenu(first);
-    check("an already-archived task is told so instead of being written again",
-      Boolean(archiveRow()) && archiveRow().disabled && archiveRow().textContent.includes("Already in Done"));
-    menu().dispatchEvent(new KeyboardEvent("keydown",{key:"Escape",bubbles:true,cancelable:true})); await settle();
+      && !card(first));
 
-    // The bulk half, over a deliberately mixed selection: one task already in
-    // Done and one that is not. Archiving both would spend a revision on the
-    // archived one to store the status it already had, and hand the batch one
-    // more write to fail on.
+    // The bulk half. An archived task is off the board, so the selection
+    // cannot mix the two here; `taskMenu.test.ts` holds that case.
     if (root.querySelector(".selection")) await click("Clear task selection");
-    await selectCard(first); await selectCard(second);
+    await selectCard(second); await selectCard(third);
     const bulkButton = () => root.querySelector('[data-testid="task-archive-selected"]');
-    const before = { archived: revisionOf(first), open: revisionOf(second) };
-    check("the selection bar offers Archive beside Delete for a mixed selection",
+    const before = { second: of(second).revision, third: of(third).revision };
+    check("the selection bar offers Archive beside Delete",
       Boolean(bulkButton()) && !bulkButton().disabled
       && root.querySelector('[aria-label="Selected task actions"]').textContent.includes("2 selected"));
     bulkButton().click(); await settle(450);
-    check("bulk Archive files the rest and leaves the already-archived task untouched",
-      statusOf(first) === "done" && statusOf(second) === "done"
-      && revisionOf(first) === before.archived
-      && revisionOf(second) === before.open + 1);
-    check("and it refuses once there is nothing left to archive",
-      Boolean(bulkButton()) && bulkButton().disabled && bulkButton().title.includes("Already in Done"));
-    await click("Clear task selection");
+    check("bulk Archive files each task away once, keeping its status",
+      [second, third].every(id => of(id).archived === true && of(id).status === "ready" && !card(id))
+      && of(second).revision === before.second + 1 && of(third).revision === before.third + 1
+      && Number(archiveToggle().textContent.trim()) === beforeArchive + 3);
+    if (root.querySelector(".selection")) await click("Clear task selection");
 
     // ---- The fuller right-click menu ------------------------------------
     await openMenu("task-11");
@@ -1540,21 +1599,22 @@ if (params.has("check")) {
       card("task-31").dispatchEvent(new KeyboardEvent("keydown",{key:"z",metaKey:true,ctrlKey:true,bubbles:true,cancelable:true}));
       await wait(() => ["task-31","task-32"].every(id => of(id).status === "ready"));
       check("Command- or Control-Z undoes the last board change from the keyboard", Boolean(card("task-31")?.closest('[data-task-column="ready"]')) && !undoStrip());
-      // Archive is a move to Done, so its undo is the same restore.
+      // Archive sets the flag; its undo clears it, and the status never moved.
       root.querySelector('[data-testid="task-archive-selected"]').click(); await settle();
-      await wait(() => ["task-31","task-32"].every(id => of(id).status === "done"));
-      check("bulk Archive offers its own undo", undoStrip()?.textContent.includes("Moved 2 tasks to Done"));
+      await wait(() => ["task-31","task-32"].every(id => of(id).archived === true));
+      check("bulk Archive offers its own undo", undoStrip()?.textContent.includes("Archived 2 tasks"));
       button("Undo", undoStrip()).click();
-      await wait(() => ["task-31","task-32"].every(id => of(id).status === "ready"));
-      check("undoing an archive returns each task to the column it left", Boolean(card("task-32")?.closest('[data-task-column="ready"]')));
+      await wait(() => ["task-31","task-32"].every(id => of(id).archived === false));
+      await wait(() => card("task-32"));
+      check("undoing an archive returns each task to the column it left", Boolean(card("task-32")?.closest('[data-task-column="ready"]')) && of("task-32").status === "ready");
       // An undo never reverts work someone did after the change.
       if (root.querySelector(".selection")) await click("Clear task selection");
       await pick("task-31"); await pick("task-32");
-      root.querySelector('[data-testid="task-archive-selected"]').click(); await wait(() => of("task-32").status === "done");
+      root.querySelector('[data-testid="task-archive-selected"]').click(); await wait(() => of("task-32").archived === true && of("task-31").archived === true);
       const edited = of("task-32"); tasks = [...tasks.filter(task => task.id !== "task-32"), {...edited, title: "Edited elsewhere", revision: edited.revision + 1}];
-      button("Undo", undoStrip()).click(); await wait(() => of("task-31").status === "ready"); await settle(100);
+      button("Undo", undoStrip()).click(); await wait(() => of("task-31").archived === false); await settle(100);
       check("Undo is refused for a task edited since, says so, and still undoes the rest",
-        of("task-32").status === "done" && of("task-32").title === "Edited elsewhere" && of("task-31").status === "ready" && root.textContent.includes("changed while you were moving it"));
+        of("task-32").archived === true && of("task-32").title === "Edited elsewhere" && of("task-31").archived === false && root.textContent.includes("changed while you were moving it"));
       if (root.querySelector(".selection")) await click("Clear task selection");
     } catch (error) { check(`the bulk edits and undo checks ran to the end (${error.message})`, false); }
 
@@ -1759,6 +1819,106 @@ if (params.has("check")) {
       !sheet() && crashes.length === crashesBeforeLaunch && preparedRuns.length === 2 && fixtureRuns.size === 2
       && preparedRuns[1].task_id === "task-11" && preparedRuns[1].id !== preparedRuns[0].id);
     acceptPreparation = false;
+
+    // ---- A model for one launch -------------------------------------------
+    // The override rides on the preparation as `model_choice`; the host
+    // overlays it on the saved default and records the result on the run.
+    prepareRefusal = "invalid_input";
+    await openMenu("task-11"); button("Send to agent…", menu()).click(); await settle();
+    [...menu().querySelectorAll("button")].find(el => el.textContent.trim().startsWith("Claude")).click(); await settle(250);
+    [...sheet().querySelectorAll('[role="group"][aria-label="Connection"] button')].find(el => el.textContent.trim() === "Terminal")?.click(); await settle();
+    const override = () => sheet()?.querySelector('[data-testid="handoff-model-override"]');
+    const overrideField = name => override()?.querySelector(`[aria-label="${name}"]`);
+    check("a terminal handoff offers this launch's model, effort and advisor for Claude Code",
+      Boolean(overrideField("Model")) && Boolean(overrideField("Effort")) && Boolean(overrideField("Advisor model")));
+    await change(overrideField("Model"), "opus 4");
+    check("a model that is not a model name closes the gate, by name, instead of being dropped",
+      sheet().querySelector(".gate").textContent.includes("“opus 4” is not a model name"));
+    await change(overrideField("Model"), "opus");
+    await change(overrideField("Effort"), "high", "change");
+    const preparedBefore = preparedRuns.length;
+    const launchClaude = [...sheet().querySelectorAll("button")].find(el => el.textContent.trim().startsWith("Launch in"));
+    launchClaude?.click(); await wait(() => preparedRuns.length > preparedBefore); await settle(100);
+    check("the launch sends only the fields typed, as this attempt's model_choice",
+      JSON.stringify(preparedRuns.at(-1).model_choice) === JSON.stringify({ model: "opus", effort: "high" }) && preparedRuns.at(-1).provider === "claude");
+    [...sheet().querySelectorAll('[role="group"][aria-label="Connection"] button')].find(el => el.textContent.trim() === "Managed")?.click(); await settle();
+    check("a managed attempt offers no model override, and the typed one is not carried into it",
+      !override() && !sheet().querySelector(".gate").textContent.includes("model"));
+    sheet().dispatchEvent(new KeyboardEvent("keydown",{key:"Escape",bubbles:true,cancelable:true})); await settle();
+    prepareRefusal = "store_error";
+
+    // ---- Checklist and linked tasks in the sheet --------------------------
+    try {
+      card("task-11").click(); await wait(editor);
+      const relations = () => editor().querySelector('[data-testid="task-relations"]');
+      check("the task sheet shows a checklist and linked tasks", Boolean(relations()));
+      const entry = relations().querySelector('[data-testid="task-checklist-add"]');
+      await change(entry, "Write the regression test");
+      entry.dispatchEvent(new KeyboardEvent("keydown", {key: "Enter", bubbles: true, cancelable: true})); await settle();
+      relations().querySelector('[data-testid="task-checklist"] input[type="checkbox"]').click(); await settle();
+      check("a checklist item is added and ticked in place, and the sheet is unsaved",
+        relations().querySelector('[data-testid="task-checklist-count"]')?.textContent.trim() === "1 of 1 done"
+        && editor().querySelector("header small")?.textContent === "Unsaved");
+      await change(relations().querySelector('[aria-label="Link kind"]'), "blocks", "change");
+      await change(relations().querySelector('[data-testid="task-link-search"]'), "Ready task 05");
+      button("Find", relations()).click();
+      await wait(() => relations().querySelector('[data-testid="task-link-results"] button'));
+      const picked = relations().querySelector('[data-testid="task-link-results"] button');
+      const pickedTitle = picked.textContent.trim();
+      picked.click(); await settle();
+      check("a found task is linked by kind, and named by its title",
+        relations().querySelector('[data-testid="task-links"]')?.textContent.includes("Blocks")
+        && relations().querySelector('[data-testid="task-links"]')?.textContent.includes(pickedTitle));
+      const linkedId = tasks.find(task => task.title === pickedTitle)?.id;
+      await click("Save task"); await wait(() => of("task-11").checklist?.length === 1);
+      check("saving writes the checklist and links as stored fields",
+        JSON.stringify(of("task-11").checklist) === JSON.stringify([{ text: "Write the regression test", done: true }])
+        && JSON.stringify(of("task-11").links) === JSON.stringify([{ kind: "blocks", item_id: linkedId }]));
+      confirmAnswer = true; await click("Close task details"); await settle(100);
+    } catch (error) { check(`the checklist and link checks ran to the end (${error.message})`, false); if (editor()) { confirmAnswer = true; await click("Close task details"); } }
+
+    // ---- Merge from the board ---------------------------------------------
+    try {
+      const mergeButton = () => root.querySelector('[data-testid="task-merge-selected"]');
+      const mergeDialog = () => document.querySelector('[data-testid="task-merge-dialog"]');
+      const pickCard = async id => { card(id).dispatchEvent(new MouseEvent("click",{bubbles:true,ctrlKey:true})); await settle(); };
+      const readyIds = [...root.querySelectorAll('[data-task-column="ready"] [data-task-card]')].map(el => el.getAttribute("data-card-id"))
+        .filter(id => !["task-11", "task-31", "task-32"].includes(id));
+      const [keep, fold, partial, shared] = readyIds;
+      if (!keep || !fold || !partial || !shared) throw Error("Merge checks need four Ready cards");
+      if (root.querySelector(".selection")) await click("Clear task selection");
+      // A task shared with another repository is never offered: deleting it
+      // would delete it everywhere, and the merge refuses it.
+      const sharedTask = tasks.find(task => task.id === shared);
+      sharedTask.repository_ids = ["repo-0", "repo-1"]; sharedTask.revision += 1;
+      await click("Refresh tasks"); await wait(() => card(shared));
+      await pickCard(shared); await pickCard(keep);
+      check("Merge is not offered for a selection holding a shared task, and says why",
+        Boolean(mergeButton()) && mergeButton().disabled && mergeButton().title.includes("several repositories"));
+      await click("Clear task selection");
+      await pickCard(keep); await pickCard(fold); await pickCard(partial);
+      check("Merge is offered for cards of one repository", Boolean(mergeButton()) && !mergeButton().disabled);
+      mergeButton().click(); await wait(mergeDialog);
+      const run = () => mergeDialog().querySelector('[data-testid="task-merge-run"]');
+      check("the merge waits for a reason before it writes anything", run().disabled && mergeWrites.length === 0);
+      await change(mergeDialog().querySelector('[data-testid="task-merge-reason"]'), "Same notification bug");
+      mergeFailSource = partial;
+      const revisions = Object.fromEntries([keep, fold, partial].map(id => [id, tasks.find(task => task.id === id).revision]));
+      run().click(); await wait(() => mergeDialog()?.querySelector('[data-testid="task-merge-outcome"]'));
+      const sent = mergeWrites.at(-1);
+      check("the board merge sends the card it keeps and each source at the revision the board drew",
+        sent?.repository_id === "repo-0" && sent.into.id === keep && sent.into.expected_revision === revisions[keep]
+        && JSON.stringify(sent.sources) === JSON.stringify([fold, partial].map(id => ({ id, expected_revision: revisions[id] }))) && sent.reason === "Same notification bug");
+      check("a delete that fails after its reason is recorded reads as a partial merge, naming that card",
+        mergeDialog().querySelector('[data-testid="task-merge-outcome"]').textContent.includes("Merged part of the selection")
+        && mergeDialog().textContent.includes("Still on the board") && mergeDialog().textContent.includes("deleting it failed")
+        && Boolean(button("Review and run again", mergeDialog())));
+      button("Done", mergeDialog()).click(); await settle(300);
+      check("the merged source leaves the board and the one that failed stays",
+        !mergeDialog() && !card(fold) && Boolean(card(partial)) && Boolean(card(keep)));
+      mergeFailSource = "";
+      if (root.querySelector(".selection")) await click("Clear task selection");
+    } catch (error) { check(`the merge checks ran to the end (${error.message})`, false); if (document.querySelector('[data-testid="task-merge-dialog"]')) button("Cancel", document.querySelector('[data-testid="task-merge-dialog"]'))?.click(); }
 
 
     // ---- Which model writes the text ------------------------------------

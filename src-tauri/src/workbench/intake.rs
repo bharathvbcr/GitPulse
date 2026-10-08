@@ -1790,6 +1790,11 @@ enum Removal {
     /// The task changed under one of the two writes, so it was not deleted.
     /// `recorded`: the block was written (and stays on the live task).
     Changed { recorded: bool },
+    /// The block is on the task, but the delete failed for a reason other
+    /// than a conflict. The task is still live and carries the block; running
+    /// the same call again finishes it without recording the block twice.
+    /// `wrote`: this call is the one that recorded the block.
+    Interrupted { wrote: bool, error: WorkbenchError },
 }
 
 /// Record `block` as the task's last log block (unless `recorded` says it
@@ -1852,7 +1857,12 @@ fn record_and_delete(
             Ok(Removal::Deleted(receipt))
         }
         Err(error) if error.code == "revision_conflict" => Ok(Removal::Changed { recorded: true }),
-        Err(error) => Err(error),
+        // Not a bare error: by now the block is on the task, and a caller
+        // that reported only the error would hide that it changed the board.
+        Err(error) => Ok(Removal::Interrupted {
+            wrote: !recorded,
+            error,
+        }),
     }
 }
 
@@ -1956,6 +1966,12 @@ pub(crate) fn delete_task(
                     "The reason was recorded, but the task changed before it could be deleted, so nothing was deleted. Re-read it with gitpulse_get_task and try again.",
                 ));
             }
+            Removal::Interrupted { error, .. } => {
+                return Err(WorkbenchError::new(
+                    error.code.as_str(),
+                    format!("The reason was recorded on the task, but deleting it failed ({}: {}), so it is still on the board. Run the same call again to finish; the reason is not recorded twice.", error.code, error.message),
+                ));
+            }
         }
     }
     Err(WorkbenchError::new(
@@ -1973,7 +1989,7 @@ fn now_millis() -> i64 {
 
 #[path = "intake_merge.rs"]
 mod merge;
-pub(crate) use merge::{merge_tasks, MergeTask, MAX_MERGE_SOURCES};
+pub(crate) use merge::{merge_request, merge_tasks, MergeTask, MAX_MERGE_SOURCES};
 
 #[cfg(test)]
 #[path = "intake_tests.rs"]

@@ -2,30 +2,23 @@ import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 
 /**
- * `docs/ARCHIVE_SEPARATION.md` explains why a task cannot carry an `archived`
- * flag: the vendored `dc-store` has no column to store it, no `items.put`
- * field to write it and no `items.list` filter to read it. Every one of those
- * is a claim about a file in this repository, and a plan whose premise has
- * quietly stopped being true is worse than no plan — it is a standing
- * instruction to do work that is already done, or to avoid work that is now
- * possible.
+ * `docs/ARCHIVE_SEPARATION.md` records how a task's archived flag became
+ * independent of its status (dc-store schema 11). Every claim it makes about
+ * the vendored store is a claim about a file in this repository, and a record
+ * whose premise has quietly stopped being true misdirects the next reader as
+ * badly as a stale plan did. So this pins them.
  *
- * So this pins the three of them. **A failure here is good news**: it means
- * upstream landed the field, and the fix is to execute the plan and delete the
- * document, not to relax the test.
- *
- * It also pins the seam from the other side. The plan promises that switching
- * costs four functions in one module; that promise only holds while nothing
- * else in the app decides for itself what "archived" means.
+ * It also pins the seam from the other side: one module decides what
+ * "archived" means, and no surface compares a status or the raw flag itself.
  */
 const url = (path: string) => new URL(`../${path}`, import.meta.url);
 const read = (path: string) => readFileSync(url(path), "utf8");
 
 const STORE = "src-tauri/vendored/dc-store/src/workbench/mod.rs";
-const SCHEMA = "src-tauri/vendored/dc-store/src/workbench/schema.sql";
-const plan = read("docs/ARCHIVE_SEPARATION.md");
+const MIGRATION = "src-tauri/vendored/dc-store/src/workbench/items.sql";
+const record = read("docs/ARCHIVE_SEPARATION.md");
 const store = read(STORE);
-const schema = read(SCHEMA);
+const migration = read(MIGRATION);
 
 /** The `input.fields(&[...])` list at the top of one function body. */
 function acceptedFields(source: string, fn: string): string[] {
@@ -38,76 +31,69 @@ function acceptedFields(source: string, fn: string): string[] {
   return [...body.slice(open, close).matchAll(/"([a-z_]+)"/g)].map((match) => match[1]);
 }
 
-/** The column names of one `CREATE TABLE`. */
-function columns(sql: string, table: string): string[] {
-  const start = sql.indexOf(`CREATE TABLE ${table} (`);
-  expect(start, `${SCHEMA} must define ${table}`).toBeGreaterThan(-1);
-  const body = sql.slice(start, sql.indexOf(");", start));
-  return [...body.matchAll(/(?:^|,)\s*([a-z_]+)\s+(?:TEXT|INTEGER)/g)].map((match) => match[1]);
-}
-
-describe("the premise of the archive-separation plan", () => {
-  it("reads the store it is asserting about", () => {
-    // Guards against the checks below passing because a rename made every
-    // lookup return nothing.
-    expect(acceptedFields(store, "put_item")).toContain("status");
-    expect(acceptedFields(store, "list_items")).toContain("status");
-    expect(columns(schema, "work_items")).toContain("status");
-    expect(columns(schema, "work_workspaces")).toContain("archived");
+describe("the store the record describes", () => {
+  it("stores the flag and the completion time as generated columns over the body", () => {
+    expect(migration).toMatch(/ALTER TABLE work_items ADD COLUMN archived INTEGER\s+GENERATED ALWAYS AS \(coalesce\(json_extract\(body,'\$\.archived'\),0\)\) VIRTUAL;/);
+    expect(migration).toMatch(/ALTER TABLE work_items ADD COLUMN completed_at INTEGER\s+GENERATED ALWAYS AS \(coalesce\(json_extract\(body,'\$\.completed_at'\),0\)\) VIRTUAL;/);
+    expect(record).toContain("VIRTUAL");
   });
 
-  it("still cannot store an archived flag on a task", () => {
-    expect(
-      columns(schema, "work_items"),
-      "work_items grew `archived` — execute docs/ARCHIVE_SEPARATION.md and delete it",
-    ).not.toContain("archived");
+  it("migrates every Done task into the archive, without spending a revision", () => {
+    expect(migration).toContain("'$.archived',json('true')");
+    expect(migration).toMatch(/WHERE status='done';/);
+    expect(migration).not.toMatch(/SET\s+revision/);
+    expect(record).toContain("migrates every Done task to archived");
   });
 
-  it("still cannot write one", () => {
+  it("writes the new fields and never accepts the store-owned completion time", () => {
     const fields = acceptedFields(store, "put_item");
-    expect(fields, "items.put now accepts `archived` — execute the plan").not.toContain("archived");
-    // The plan's exact count, so "nineteen named fields" cannot go stale.
-    expect(fields.length).toBe(19);
-    expect(plan).toContain("nineteen accepted names");
+    for (const field of ["archived", "checklist", "links"]) expect(fields).toContain(field);
+    expect(fields).not.toContain("completed_at");
+    for (const field of ["archived", "checklist", "links"]) expect(record).toContain(`\`${field}\``);
   });
 
-  it("still cannot filter a list by one", () => {
+  it("filters and orders a list the way the record says", () => {
     const fields = acceptedFields(store, "list_items");
-    expect(fields, "items.list now filters on `archived` — execute the plan").not.toContain("archived");
-    // The plan quotes this list; an added filter would make the quote false
-    // even if it were not `archived`.
-    expect(fields).toEqual(["limit", "cursor", "workspace_id", "repository_id", "status", "query"]);
-    for (const field of fields) expect(plan).toContain(`\`${field}\``);
+    expect(fields).toEqual(["limit", "cursor", "workspace_id", "repository_id", "status", "query", "archived", "order", "deleted"]);
+    for (const order of ["board", "completed", "updated"]) {
+      expect(store).toContain(`Some("${order}")`);
+      expect(record).toContain(`\`${order}\``);
+    }
   });
 
-  it("names the schema version the migration would follow", () => {
+  it("names the schema version the store ends its ladder on", () => {
     const terminal = /if version != (\d+) \{/.exec(store)?.[1];
-    expect(terminal, "the migration ladder must end in a supported-version check").toBeDefined();
-    expect(plan).toContain(`Schema version is **${terminal}**; this is the migration to ${Number(terminal) + 1}.`);
+    expect(terminal, "the migration ladder must end in a supported-version check").toBe("11");
+    expect(record).toContain(`Schema version is **${terminal}**.`);
   });
 
-  it("names the vendored commit the plan was written against", () => {
+  it("names the vendored commit it was written against", () => {
     const vendor = JSON.parse(read("src-tauri/vendored/VENDOR.json"));
     const dcStore = vendor.crates.find((crate: { name: string }) => crate.name === "dc-store");
     expect(dcStore, "VENDOR.json must describe dc-store").toBeDefined();
-    expect(plan).toContain(dcStore.origin.commit.slice(0, 7));
+    expect(record).toContain(dcStore.origin.commit.slice(0, 7));
   });
 });
 
-describe("the seam the plan promises to switch", () => {
+describe("the seam", () => {
   const archive = read("src/lib/workbench/taskArchive.ts");
 
-  it("keeps every function the plan says it will change", () => {
-    for (const owner of ["isArchived", "archiveAction", "restoreAction", "ARCHIVE_RULE", "boardPresence"]) {
-      expect(archive, `taskArchive.ts must export ${owner}`).toContain(`export ${owner.startsWith("ARCHIVE") ? "const" : "function"} ${owner}`);
-      expect(plan, `the plan must account for ${owner}`).toContain(owner);
+  it("keeps every function the record names", () => {
+    for (const owner of ["isArchived", "archiveAction", "restoreAction", "ARCHIVE_RULE", "refreshPages"]) {
+      expect(archive, `taskArchive.ts must export ${owner}`).toMatch(new RegExp(`export (?:async )?(?:const|function) ${owner}\\b`));
+      expect(record, `the record must account for ${owner}`).toContain(owner);
+    }
+    // Retired with the coupling to the Done column; the record says so.
+    for (const gone of ["boardPresence", "offersArchive", "ARCHIVE_STATUS"]) {
+      expect(archive).not.toContain(`export const ${gone}`);
+      expect(archive).not.toContain(`export function ${gone}`);
     }
   });
 
   /**
-   * The whole value of the seam. One module decides what archived means; if a
-   * second surface starts comparing a status to the archive itself, switching
-   * stops being a four-function change and the plan above becomes fiction.
+   * The whole value of the seam. One module decides what archived means; a
+   * surface that compares a status to Done, or reads the raw flag, is a second
+   * decision the next change to the rule would not reach.
    */
   it("is the only place in the app that decides what archived means", () => {
     const surfaces = [
@@ -118,26 +104,23 @@ describe("the seam the plan promises to switch", () => {
       "src/lib/ui/taskView.ts",
     ];
     /**
-     * A *task status* spelled `"done"`, not the word.
-     *
-     * `"done"` is also an `ActionState` — `row.state === "done"` means a batch
-     * entry finished — and a rule keyed on the literal alone fails the board
-     * for a line about something else entirely. The token beside the literal
-     * is what separates the two vocabularies.
+     * The decision `isArchived` owns, made from a task's raw field. Workspaces
+     * have an `archived` flag of their own (`group.archived`), which is a
+     * different thing and not this module's.
      */
-    const spelledStatus =
-      /(?:\bstatus\b\s*[!=]==?\s*|\bstatus\s*:\s*|STATUS_LABELS\s*\[\s*)["']done["']|["']done["']\s*[!=]==?\s*[\w.]*\bstatus\b/;
-    /** The decision `isArchived` owns, made where it cannot be switched from. */
-    const handRolled = /\bstatus\b\s*[!=]==?\s*ARCHIVE_STATUS|ARCHIVE_STATUS\s*[!=]==?\s*[\w.]*\bstatus\b/;
+    const rawFlag = /\b(?:card|task|item|row|entry|full|saved)s?\w*\.archived\b/i;
+    /** Archived spelled as a status. */
+    const statusArchive = /status\s*[!=]==?\s*["']done["'][^\n]*archiv|archiv[^\n]*status\s*[!=]==?\s*["']done["']/i;
     for (const path of surfaces) {
       const source = read(path);
-      expect(source, `${path} must not spell the archived status`).not.toMatch(spelledStatus);
-      expect(source, `${path} must ask isArchived, not compare to ARCHIVE_STATUS`).not.toMatch(handRolled);
+      expect(source, `${path} must ask isArchived, not read .archived`).not.toMatch(rawFlag);
+      expect(source, `${path} must not equate archived with Done`).not.toMatch(statusArchive);
     }
-    // The narrowing must not have narrowed the rule into never matching.
-    expect('card.status === "done"').toMatch(spelledStatus);
-    expect('changes: { status: "done" }').toMatch(spelledStatus);
-    expect("if (card.status === ARCHIVE_STATUS) return;").toMatch(handRolled);
-    expect('row.state === "done"', "an ActionState is not a task status").not.toMatch(spelledStatus);
+    // The rule must still be able to match what it forbids.
+    expect("if (card.archived === true) return;").toMatch(rawFlag);
+    expect("const hidden = !card.archived;").toMatch(rawFlag);
+    expect("archived = card.status === 'done'").toMatch(statusArchive);
+    expect("archived: false").not.toMatch(rawFlag);
+    expect("workspaces.filter((group) => !group.archived)").not.toMatch(rawFlag);
   });
 });

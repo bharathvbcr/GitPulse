@@ -30,6 +30,7 @@
 import { asAgentProvider, PERMISSION_MODES, PROVIDER_LABELS, supportsManaged, type AgentProvider, type PermissionMode, type RunKind } from "./vocabulary";
 import { identityCommonDir, tabMatchesRegistered, type OpenTabRef, type RegisteredRef } from "./openMembership";
 import { identityKey, normalizeRepoPath, type PathIdentityOptions } from "../repos/paths";
+import { MODEL_FIELDS, MODEL_FIELDS_BY_LAUNCHER, isEffortLevel, isModelId, type ModelChoice } from "../terminal/agentDefaults";
 
 export type { AgentProvider };
 
@@ -234,6 +235,8 @@ export function handoffGate(input: {
   acknowledgedBypass: boolean;
   dirty: boolean;
   busy: boolean;
+  /** What the reader typed for this launch's model; absent or blank keeps the saved default. */
+  model?: ModelOverride;
 }): HandoffGate {
   if (input.busy) return { ok: false, reason: "A launch is already in progress." };
   if (input.dirty) return { ok: false, reason: "Save your task edits before launching an agent." };
@@ -246,7 +249,76 @@ export function handoffGate(input: {
   if (input.settings.permission === "bypass" && !input.acknowledgedBypass) {
     return { ok: false, reason: "Bypass needs an explicit authorization for this attempt." };
   }
+  if (input.model) {
+    const override = launchModelOverride(input.settings, input.model);
+    if (!override.ok) return { ok: false, reason: override.reason };
+  }
   return { ok: true, reason: "" };
+}
+
+/**
+ * A run's recorded model, as one line: `opus · high effort · advisor fable`.
+ * Fields this does not name are shown as `field value`, so a field added
+ * later is still visible rather than dropped.
+ */
+export function modelChoiceLabel(choice: Readonly<Record<string, string>>): string {
+  // The record's key order is the JSON object's (alphabetical from the host),
+  // so it is put in the order a settings row shows them.
+  const rank = (field: string) => { const at = (MODEL_FIELDS as readonly string[]).indexOf(field); return at < 0 ? MODEL_FIELDS.length : at; };
+  return Object.entries(choice)
+    .sort(([a], [b]) => rank(a) - rank(b))
+    .map(([field, value]) => field === "model" ? value : field === "effort" ? `${value} effort` : `${field} ${value}`)
+    .join(" · ");
+}
+
+/** The model fields a reader may set for one launch; "" keeps the saved default's. */
+export interface ModelOverride { model: string; effort: string; advisor: string }
+export const NO_MODEL_OVERRIDE: ModelOverride = { model: "", effort: "", advisor: "" };
+
+/** Which of {@link ModelOverride}'s fields this provider's launcher takes. */
+export function modelOverrideFields(provider: AgentProvider): (keyof ModelOverride)[] {
+  const fields = MODEL_FIELDS_BY_LAUNCHER[provider] ?? [];
+  return (["model", "effort", "advisor"] as const).filter((field) => fields.includes(field));
+}
+
+/**
+ * This launch's model fields, to send as `model_choice` — `undefined` when
+ * none is set, so the saved default applies untouched.
+ *
+ * The host overlays these on the saved default field by field and records the
+ * result on the attempt. A field this provider's launcher does not take is
+ * not sent. One that is not a valid value is refused here, by name, rather
+ * than dropped: a launch that quietly ignored what the reader typed would run
+ * a model they did not choose. A managed attempt takes none, because Manvi
+ * sets its model and the host refuses an override it would not apply.
+ */
+export function launchModelOverride(
+  settings: Pick<HandoffSettings, "provider" | "kind">,
+  input: ModelOverride,
+): { ok: true; choice: ModelChoice | undefined } | { ok: false; reason: string } {
+  const typed: Partial<ModelOverride> = {};
+  for (const field of modelOverrideFields(settings.provider)) {
+    const value = input[field].trim();
+    if (value) typed[field] = value;
+  }
+  if (!Object.keys(typed).length) return { ok: true, choice: undefined };
+  if (settings.kind === "managed") {
+    return { ok: false, reason: "A managed agent uses Manvi's model. Clear this launch's model, or start it in a terminal." };
+  }
+  const choice: ModelChoice = {};
+  if (typed.model !== undefined) {
+    if (!isModelId(typed.model)) return { ok: false, reason: `“${typed.model}” is not a model name.` };
+    choice.model = typed.model;
+  }
+  if (typed.effort !== undefined) {
+    if (!isEffortLevel(typed.effort)) return { ok: false, reason: `“${typed.effort}” is not an effort level.` };
+    choice.effort = typed.effort;
+  }
+  if (typed.advisor !== undefined) {
+    if (!isModelId(typed.advisor)) return { ok: false, reason: `“${typed.advisor}” is not an advisor model name.` };
+    choice.advisor = typed.advisor;
+  }
+  return { ok: true, choice };
 }
 
 /** Short, non-repeating state word for a run row. */
