@@ -160,6 +160,15 @@
 
   onDestroy(() => { disposed = true; });
 
+  // A model typed for one agent names nothing for another, and a managed
+  // attempt takes none, so a change of either clears it — however `settings`
+  // changed: through this form or rewritten by the host that binds it.
+  let overrideFor = untrack(() => `${settings.provider}:${settings.kind}`);
+  $effect(() => {
+    const key = `${settings.provider}:${settings.kind}`;
+    if (key !== overrideFor) { overrideFor = key; untrack(() => { modelOverride = { ...NO_MODEL_OVERRIDE }; }); }
+  });
+
   $effect(() => { onGate?.(gate); });
   $effect(() => { onBusy?.(busy); });
   $effect(() => { onPending?.(pending !== null); });
@@ -173,12 +182,8 @@
   });
 
   function choose(next: Partial<HandoffSettings>) {
-    const before = settings;
     settings = reconcileHandoff({ ...settings, ...next });
     if (settings.permission !== "bypass") acknowledged = false;
-    // A model typed for one agent names nothing for another, and a managed
-    // attempt takes none; the fields that held it are no longer shown.
-    if (settings.provider !== before.provider || settings.kind !== before.kind) modelOverride = { ...NO_MODEL_OVERRIDE };
     // The message described a launch with the *previous* settings, so once
     // they change it describes nothing the reader can act on. Leaving it up is
     // how a managed refusal came to sit under a Terminal handoff, naming Codex
@@ -269,6 +274,9 @@
         // Mirrors what the owner remembers: `bypass` is never carried over.
         if (settings.permission === "bypass") settings = { ...settings, permission: defaultHandoff().permission };
         acknowledged = false;
+        // A model for one launch is for that launch: the next one, from a
+        // form that stays mounted (the Agent pane), starts from the default.
+        modelOverride = { ...NO_MODEL_OVERRIDE };
         // The attempt is real the moment the store accepts it, so the host
         // learns of it before its start can fail.
         onPrepared?.(run);
