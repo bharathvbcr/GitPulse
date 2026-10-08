@@ -937,6 +937,11 @@ html.macos.light {
 html.macos,
 html.macos body {
   background-color: transparent;
+  /* Nothing in the document scrolls; the panes do. An elastic root would
+     drag its top edge down on a vertical swipe over the chrome and show the
+     webview's under-page backdrop -- see `backgroundColor` in
+     tauri.macos.conf.json, which clears that backdrop. */
+  overscroll-behavior: none;
 }
 
 html.macos .gp-shell {

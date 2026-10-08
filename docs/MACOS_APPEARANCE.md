@@ -184,13 +184,28 @@ nothing per frame — unlike a CSS `backdrop-filter`, which the app pays for.
 
 The separate macOS status popover applies this material when its lazy window is built in `desktop/popover.rs`; the main-window JSON does not configure it. Its material bounds fit the 360px panel and 18px corners. `StatusPopover.svelte` uses an 80% base tint with stronger secondary-text contrast, translucent cards and a slight highlight. The native mode uses no CSS backdrop filter. The browser fixture labels its simulated backdrop and uses a 34px CSS blur instead. Simulating that blur is the only thing the fixture does differently: both materials are tuned by one shared ladder and one shared pair of light/dark arms, so the fixture cannot be retuned away from what ships. Where no CSS filter exists there is no blur to stand in for, and the fixture falls back to the opaque surface rather than paint a translucent panel over an unblurred page. Reduced transparency, increased contrast and forced colors restore opaque styling in both modes. The native effect resizes with the window, including Details and short recovery states.
 
-Three settings have to be present together, and any one alone is inert:
+Three settings have to be present together, and any one alone is inert. A
+fourth keeps the result from breaking intermittently:
 
 | Setting | Where | Without it |
 | --- | --- | --- |
 | `macos-private-api` feature | `Cargo.toml` **and** `macOSPrivateApi` in the **base** `tauri.conf.json` | The WKWebView stays opaque and covers the material |
 | `"transparent": true` | `tauri.macos.conf.json` | Nothing to see through |
 | `windowEffects` | `tauri.macos.conf.json` | The desktop shows through unblurred |
+| `"backgroundColor": "#00000000"` | `tauri.macos.conf.json` (and `.background_color(Color(0, 0, 0, 0))` on the status window in `desktop/popover.rs`) | Black patches wherever the page has not been painted |
+
+The fourth is the WKWebView's own backdrop, `underPageBackgroundColor`, which
+sits between the page and the material. wry clears it only when a background
+colour is configured; `transparent` alone never reaches it, and WebKit's
+default is an opaque appearance colour, near-black in dark mode (measured on
+the real objects: alpha 1.0 for both windows before the fix). The page covers
+it while every tile is painted, so it shows only where one is not: tiles
+discarded while the window was inactive, occluded or on another Space and not
+yet repainted, and the edge an elastic root drags into view. That surfaced as
+black rectangles over the title bar and tab strip that stayed until the
+pointer next repainted them. The root's `overscroll-behavior: none` removes the
+second exposure. `native_status_material` reads the alpha off both live
+webviews, and `mac-material-contract` keeps the config and the CSS in place.
 
 The feature gate is deeper than it looks: `tauri/macos-private-api` forwards
 `wry/transparent`, and wry compiles its `setOpaque(false)` call only behind
