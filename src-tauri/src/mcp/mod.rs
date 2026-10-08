@@ -361,6 +361,38 @@ fn ok_error_output(extra: Value, required: &[&str]) -> Value {
     json!({ "type": "object", "properties": properties, "required": names })
 }
 
+/// The collision facet ([`insights::CollisionRisk`]): the answer of
+/// `gitpulse_collision_risk`, and the `collisions` field of
+/// `gitpulse_change_context`, which carries the whole facet so its rows keep
+/// the `ok` and coverage counts that say whether anything was looked at.
+fn collision_risk_output() -> Value {
+    ok_error_output(
+        json!({
+            "overlapping_files": { "type": "integer" },
+            "worktrees_involved": { "type": "integer" },
+            "scanned_worktrees": { "type": "integer" },
+            "unscanned_worktrees": { "type": "integer" },
+            "failed_worktrees": { "type": "integer" },
+            "truncated": { "type": "boolean" },
+            "items": { "type": "array" },
+            "shared_worktree_files": { "type": "integer" },
+            "shared_worktrees": { "type": "array" },
+            "sessions_ok": { "type": "boolean" },
+            "sessions_error": { "type": "string" }
+        }),
+        &[
+            "overlapping_files",
+            "scanned_worktrees",
+            "unscanned_worktrees",
+            "failed_worktrees",
+            "items",
+            "shared_worktree_files",
+            "shared_worktrees",
+            "sessions_ok",
+        ],
+    )
+}
+
 /// Advertised tools, in a stable order so clients can cache the catalog.
 ///
 /// Built once. The catalog is ~11 KB of `json!` and every `tools/call` used to
@@ -393,7 +425,7 @@ fn build_tools() -> Vec<Value> {
                     "worktrees": { "type": "object" },
                     "agents": { "type": "object" },
                     "changes": { "type": "object" },
-                    "collisions": { "type": "object" },
+                    "collisions": collision_risk_output(),
                     "ledger": { "type": "object" },
                     "codeintel": { "type": "object" }
                 },
@@ -450,21 +482,7 @@ fn build_tools() -> Vec<Value> {
             "Files with uncommitted changes in more than one worktree — parallel agent checkouts editing the same path — and, in shared_worktrees, the dirty files of any worktree two or more live agent sessions share, which overlapping_files cannot see. Unscanned worktrees are counted, never implied clean; sessions_ok is false when an agent kind could not be observed.",
             json!({ "repo_path": repo_prop() }),
             &["repo_path"],
-            ok_error_output(
-                json!({
-                    "overlapping_files": { "type": "integer" },
-                    "worktrees_involved": { "type": "integer" },
-                    "scanned_worktrees": { "type": "integer" },
-                    "unscanned_worktrees": { "type": "integer" },
-                    "truncated": { "type": "boolean" },
-                    "items": { "type": "array" },
-                    "shared_worktree_files": { "type": "integer" },
-                    "shared_worktrees": { "type": "array" },
-                    "sessions_ok": { "type": "boolean" },
-                    "sessions_error": { "type": "string" }
-                }),
-                &["overlapping_files", "scanned_worktrees", "unscanned_worktrees", "items", "shared_worktree_files", "shared_worktrees", "sessions_ok"],
-            ),
+            collision_risk_output(),
         ),
         tool(
             "gitpulse_change_context",
@@ -480,11 +498,18 @@ fn build_tools() -> Vec<Value> {
                 "properties": {
                     "repo_path": { "type": "string" },
                     "worktree": { "type": "object" },
+                    "worktree_ok": { "type": "boolean" },
+                    "worktree_error": { "type": "string" },
                     "task_id": { "type": "string" },
+                    "task_ok": { "type": "boolean" },
+                    "task_error": { "type": "string" },
                     "changes": { "type": "object" },
-                    "collisions": { "type": "array" }
+                    "collisions": collision_risk_output(),
+                    "operation": { "type": ["object", "null"] },
+                    "operation_ok": { "type": "boolean" },
+                    "operation_error": { "type": "string" }
                 },
-                "required": ["repo_path", "worktree", "task_id", "changes", "collisions"]
+                "required": ["repo_path", "worktree", "worktree_ok", "task_id", "task_ok", "changes", "collisions", "operation", "operation_ok"]
             }),
         ),
         tool(
@@ -515,7 +540,10 @@ fn build_tools() -> Vec<Value> {
                     "events": { "type": "array" },
                     "returned": { "type": "integer" },
                     "truncated": { "type": "boolean" },
-                    "next_cursor": { "type": "integer" }
+                    "next_cursor": {
+                        "type": ["integer", "null"],
+                        "description": "Id of the last event returned; null when this page is empty, so there is nothing further to continue from yet."
+                    }
                 },
                 "required": ["ok", "events", "returned", "truncated"]
             }),
@@ -884,7 +912,28 @@ fn build_tools() -> Vec<Value> {
                 }
             }),
             &["repo_path", "symptom", "since"],
-            codeintel_output(),
+            // [`crate::codeintel::CodeintelSuspectsPayload`]: the ranked list
+            // and what was examined, kept together because `scope` is what
+            // tells an empty list that is a finding from one that was cut short.
+            json!({
+                "type": "object",
+                "properties": {
+                    "response": codeintel_output(),
+                    "scope": {
+                        "type": ["object", "null"],
+                        "description": "Null only when the run was refused before a window could be established.",
+                        "properties": {
+                            "indexed_head": { "type": "string" },
+                            "since": { "type": "string" },
+                            "cone_size": { "type": "integer" },
+                            "blamed_symbols": { "type": "integer" },
+                            "refusals": { "type": "array" }
+                        },
+                        "required": ["indexed_head", "since", "cone_size", "blamed_symbols", "refusals"]
+                    }
+                },
+                "required": ["response", "scope"]
+            }),
         ),
         tool(
             "gitpulse_provenance",
@@ -2378,6 +2427,195 @@ mod tests {
         // `total` used to be the returned count wearing the name of the
         // history size. It must not come back.
         assert!(tool["outputSchema"]["properties"]["total"].is_null());
+    }
+
+    /// Every declared property the payload carries as `null` must declare
+    /// `null` among its types. `validate` reads an optional `null` as an absent
+    /// argument, which is right for input; a client checking `structuredContent`
+    /// type-checks every present property, so for output it is a violation.
+    fn nulls_the_schema_does_not_allow(value: &Value, schema: &Value, path: &str) -> Vec<String> {
+        let mut found = Vec::new();
+        let (Some(fields), Some(properties)) = (
+            value.as_object(),
+            schema.get("properties").and_then(Value::as_object),
+        ) else {
+            return found;
+        };
+        for (name, sub) in properties {
+            let here = format!("{path}/{name}");
+            match fields.get(name) {
+                Some(Value::Null) if !validate_allows_null(sub) => found.push(here),
+                Some(present) => found.extend(nulls_the_schema_does_not_allow(present, sub, &here)),
+                None => {}
+            }
+        }
+        found
+    }
+
+    fn validate_allows_null(schema: &Value) -> bool {
+        match schema.get("type") {
+            Some(Value::String(name)) => name == "null",
+            Some(Value::Array(names)) => names.iter().any(|n| n == "null"),
+            // No `type` constrains nothing.
+            None => true,
+            _ => false,
+        }
+    }
+
+    /// A tool's result is checked by the client against its `outputSchema`,
+    /// and a mismatch fails the whole call. `gitpulse_change_context` declared
+    /// `collisions` an array while it has always returned the collision facet
+    /// object, so every call was refused as "data/collisions must be array".
+    /// Checked on a healthy repository, on one whose registered worktree has
+    /// been deleted (the collision scan fails), and on a path that is not a
+    /// repository at all, because the failure paths are where a payload
+    /// drifts from its happy-path shape.
+    #[test]
+    fn every_read_only_tool_result_matches_its_declared_output_schema() {
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .output_locked()
+                .expect("git");
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        // `task_fixture` leaves this one untrusted: the trust refusal is a
+        // failure path of its own.
+        let (_untrusted_dir, _profile, untrusted) = task_fixture();
+
+        let healthy_dir = tempfile::tempdir().expect("tempdir");
+        let healthy = healthy_dir.path().to_string_lossy().into_owned();
+        git(&["init", "-q", &healthy]);
+        crate::test_support::trust_repo(healthy_dir.path());
+
+        let broken_dir = tempfile::tempdir().expect("tempdir");
+        let broken = broken_dir.path().to_string_lossy().into_owned();
+        git(&["init", "-q", &broken]);
+        git(&[
+            "-C",
+            &broken,
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "-q",
+            "--allow-empty",
+            "-m",
+            "init",
+        ]);
+        crate::test_support::trust_repo(broken_dir.path());
+        let doomed_parent = tempfile::tempdir().expect("tempdir");
+        let doomed = doomed_parent.path().join("doomed");
+        git(&[
+            "-C",
+            &broken,
+            "worktree",
+            "add",
+            "-q",
+            doomed.to_str().unwrap(),
+        ]);
+        crate::test_support::trust_repo(&doomed);
+        std::fs::remove_dir_all(&doomed).expect("remove worktree");
+
+        // A ledger that exists and holds no events: `gitpulse_ledger_events`
+        // answers an empty page, whose `next_cursor` has nothing to point at.
+        let ledgered_dir = tempfile::tempdir().expect("tempdir");
+        let ledgered = ledgered_dir.path().to_string_lossy().into_owned();
+        git(&["init", "-q", &ledgered]);
+        crate::test_support::trust_repo(ledgered_dir.path());
+        let address = crate::ledger::bindings::repository_address(&ledgered).expect("address");
+        let _ = crate::ledger::status(&address.anchor);
+        assert!(
+            crate::ledger::is_initialised(&address.anchor),
+            "fixture ledger"
+        );
+
+        let missing = "/no/such/gitpulse-output-schema-repo".to_string();
+
+        let mut validated = std::collections::BTreeSet::new();
+        for repo in [&healthy, &broken, &untrusted, &ledgered, &missing] {
+            for tool in tools() {
+                let name = tool["name"].as_str().expect("name");
+                if tool["annotations"]["readOnlyHint"] != true {
+                    continue;
+                }
+                let mut arguments = json!({ "repo_path": repo });
+                for extra in [
+                    "query",
+                    "target",
+                    "file_path",
+                    "from",
+                    "to",
+                    "commit_sha",
+                    "task_id",
+                    "symptom",
+                    "since",
+                ] {
+                    if tool["inputSchema"]["properties"][extra].is_object() {
+                        arguments[extra] = json!("probe");
+                    }
+                }
+                // An execution error is reported as `isError` text and carries
+                // no structured content, so there is no schema to meet.
+                let Ok(payload) = handle_tool_call(name, &arguments) else {
+                    continue;
+                };
+                let schema = &tool["outputSchema"];
+                let violations: Vec<String> = validate::validate(&payload, schema)
+                    .iter()
+                    .map(validate::Violation::render)
+                    .collect();
+                assert!(
+                    violations.is_empty(),
+                    "{name} on {repo} violates its outputSchema: {violations:?}\npayload: {payload}"
+                );
+                let nulls = nulls_the_schema_does_not_allow(&payload, schema, "");
+                assert!(
+                    nulls.is_empty(),
+                    "{name} on {repo} returns null where its outputSchema forbids it: {nulls:?}"
+                );
+                validated.insert(name.to_string());
+            }
+        }
+        // A tool that only ever errored here was never checked; these are the
+        // ones whose declared shapes this test was written against.
+        for name in [
+            "gitpulse_insights",
+            "gitpulse_change_context",
+            "gitpulse_collision_risk",
+            "gitpulse_ledger_events",
+            "gitpulse_codeintel_suspects",
+        ] {
+            assert!(
+                validated.contains(name),
+                "{name} was never validated: {validated:?}"
+            );
+        }
+
+        // Type-correct is not enough: the scan that could not read the deleted
+        // worktree must say so, not render as a clean empty list.
+        for name in ["gitpulse_change_context", "gitpulse_insights"] {
+            let payload = handle_tool_call(name, &json!({ "repo_path": broken })).expect(name);
+            assert_eq!(payload["collisions"]["ok"], false, "{name}: {payload}");
+            // The scan ran and failed on the deleted worktree, rather than
+            // being refused before it started.
+            assert_eq!(
+                payload["collisions"]["failed_worktrees"], 1,
+                "{name}: {payload}"
+            );
+            assert!(
+                !payload["collisions"]["error"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .is_empty(),
+                "{name}: {payload}"
+            );
+        }
     }
 
     #[test]
