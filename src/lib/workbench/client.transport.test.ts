@@ -4,7 +4,7 @@ import {
   WorkbenchError, explainError, getTask, getWorkspace, listRepositories,
   listTasks, listWorkspaces, putTask, putWorkspace, registerRepository,
   request, taskDraft, taskWrite, workspaceDraft,
-  getEnhancement, listEnhancements, changeEnhancement, enhancementConfiguration,
+  getEnhancement, listEnhancements, latestEnhancement, LIVE_ENHANCEMENT_STATES, ACTIVE_ENHANCEMENT_STATES, changeEnhancement, enhancementConfiguration,
   generateEnhancement, deleteTask, deleteWorkspace, mergeTasks, restoreDeletedTask,
 } from "./client";
 import type { Task, Workspace } from "./client";
@@ -165,6 +165,12 @@ describe("native workbench boundary", () => {
     native.mockResolvedValueOnce(JSON.stringify({ ok: true, item: { ...proposal, state: "accepted", revision: 4, accepted_fields: ["title"] } }));
     expect(await changeEnhancement("enhancements.accept", input)).toMatchObject({ state: "accepted", accepted_fields: ["title"] });
     expect(native.mock.calls[3]).toEqual(native.mock.calls[4]);
+    // The newest attempt in given states is one filtered read, whatever page it is on.
+    native.mockResolvedValueOnce(reply([{ ...proposal, state: "running", worker_id: "w" }], 1));
+    expect(await latestEnhancement(item.id, LIVE_ENHANCEMENT_STATES)).toMatchObject({ state: "running" });
+    expect(native).toHaveBeenLastCalledWith("cmd_workbench_request", { method: "enhancements.list", input: JSON.stringify({ task_id: item.id, newest: true, limit: 1, states: ["pending", "running", "cancel_requested"] }) });
+    native.mockResolvedValueOnce(reply([], 0));
+    expect(await latestEnhancement(item.id, ACTIVE_ENHANCEMENT_STATES)).toBeNull();
   });
 
   it("reads explicit configuration without inferring provider health or initiating generation", async () => {
