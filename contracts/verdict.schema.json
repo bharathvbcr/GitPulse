@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://devcouncil.local/contracts/verdict.schema.json",
   "title": "Policy verdict v1",
-  "description": "One policy decision, as produced by Manvi's gate and carried on the `manvi serve` wire. Transcribed from manvi/policy/decision.go (type Decision). Manvi is the canonical owner; DevCouncil emits this shape and GitPulse consumes it. Additive-only within v1.",
+  "description": "One policy decision, as produced by Manvi's gate and carried on the `manvi serve` wire. Transcribed from backend/go_orchestrator/policy/decision.go (type Decision). Manvi is the canonical owner; DevCouncil emits this shape and GitPulse consumes it. Additive-only within v1.",
   "type": "object",
   "required": ["action", "rule", "severity", "reason", "target"],
   "additionalProperties": false,
@@ -65,7 +65,7 @@
     },
     "ruleId": {
       "type": "string",
-      "description": "The authoritative rule set. Kept in sync with manvi/policy/decision.go by contracts/verdict-rules-contract; a rule added in Go and not here fails CI in all three repos.",
+      "description": "The authoritative rule set. Kept in sync with backend/go_orchestrator/policy/decision.go by contracts/verdict-rules-contract; a rule added in Go and not here fails CI in all three repos.",
       "enum": [
         "",
         "path.malformed",
@@ -127,7 +127,7 @@
       }
     },
     "classification": {
-      "description": "The state a consumer must render a decision as. This is a TOTAL function over the decision, evaluated in this exact order — the order matters, because a decision can satisfy several conditions at once and the earlier one is the more honest reading. Transcribed from the tally switch in manvi/gate/gate.go and Decision.Clean(). `unchecked` has no Manvi decision behind it at all: it is the ABSENCE of a verdict, and is the consumer's own state.",
+      "description": "The state a consumer must render a decision as. This is a TOTAL function over the decision, evaluated in this exact order — the order matters, because a decision can satisfy several conditions at once and the earlier one is the more honest reading. Transcribed from the tally switch in backend/go_orchestrator/gate/gate.go and Decision.Clean(). `unchecked` has no Manvi decision behind it at all: it is the ABSENCE of a verdict, and is the consumer's own state.",
       "type": "string",
       "enum": ["unchecked", "denied", "granted", "demoted", "widened", "degraded", "warned", "clean"],
       "$comment": "Order of evaluation: (0) no decision at all -> unchecked; (1) action==deny -> denied; (2) grant_id!='' -> granted; (3) demoted!='' -> demoted; (4) widened!='' -> widened; (5) degraded non-empty -> degraded; (6) action==warn -> warned; (7) otherwise -> clean. Clean() in decision.go requires action==allow AND grant_id=='' AND demoted=='' AND widened=='' AND degraded empty."

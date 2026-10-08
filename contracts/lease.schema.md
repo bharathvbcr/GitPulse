@@ -1,6 +1,6 @@
 # Task + lease store v1
 
-**Canonical owner:** Manvi — `crates/dc-store/src/schema.rs` owns the DDL.
+**Canonical owner:** DevCouncil — `rust/dc-store/src/schema.rs` owns the DDL. Manvi builds the same crate through a symlink (`Manvi/crates/dc-store`); it does not own it.
 **Store location:** `.devcouncil/state.sqlite`, per repository.
 **Consumers:** DevCouncil and Manvi (`dc-store`), GitPulse (links `dc-store` directly).
 

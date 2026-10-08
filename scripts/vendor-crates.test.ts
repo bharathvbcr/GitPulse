@@ -231,3 +231,111 @@ it("says so when a crate was vendored from an uncommitted tree", () => {
     f.cleanup();
   }
 });
+
+/**
+ * The shared contracts used to be checked only against their own vendored
+ * CHECKSUMS. A copy that is internally consistent but behind DevCouncil passes
+ * that check, and on 2026-10-08 GitPulse's did: DevCouncil had changed README.md
+ * and CHECKSUMS hours earlier and every consumer still reported "ok". These
+ * hold the copy to upstream through the same check the crates use.
+ */
+function withContracts() {
+  const f = fixture();
+  const upstreamContracts = path.join(f.upstream, "backend/contracts");
+  mkdirSync(path.join(upstreamContracts, "tools"), { recursive: true });
+  writeFileSync(path.join(upstreamContracts, "verdict.schema.json"), "{\"v\":1}\n");
+  writeFileSync(path.join(upstreamContracts, "CHECKSUMS"), "recorded\n");
+  writeFileSync(path.join(upstreamContracts, "tools/generate.py"), "machinery\n");
+  writeFileSync(path.join(upstreamContracts, ".DS_Store"), "noise\n");
+  const contracts = path.join(f.root, "contracts");
+  const contractsOf = (stdout: string) =>
+    JSON.parse(stdout).crates.find((c: { name: string }) => c.name === "contracts");
+  return { ...f, upstreamContracts, contracts, contractsOf };
+}
+
+it("vendors the shared contracts, but not their machinery, and checks them clean", () => {
+  const f = withContracts();
+  try {
+    const vendored = f.run("--contracts");
+    expect(vendored.status, vendored.stderr).toBe(0);
+    expect(readFileSync(path.join(f.contracts, "verdict.schema.json"), "utf8")).toBe("{\"v\":1}\n");
+    expect(readFileSync(path.join(f.contracts, "CHECKSUMS"), "utf8")).toBe("recorded\n");
+    const recorded = JSON.parse(readFileSync(f.manifest, "utf8"));
+    expect(Object.keys(recorded.contracts.files).sort()).toEqual(["CHECKSUMS", "verdict.schema.json"]);
+    expect(recorded.contracts.origin).toMatchObject({ repo: "devcouncil", path: "backend/contracts" });
+    expect(recorded.crates.map((c: { name: string }) => c.name)).toEqual(["dc-redact"]);
+    const check = f.run("--check");
+    expect(check.status, check.stderr).toBe(0);
+    expect(f.contractsOf(check.stdout)).toMatchObject({ edited: [], upstream: "matches", drifted: [] });
+  } finally { f.cleanup(); }
+});
+
+it("reports a vendored contract copy that is consistent with itself but behind upstream", () => {
+  const f = withContracts();
+  try {
+    expect(f.run("--contracts").status).toBe(0);
+    writeFileSync(path.join(f.upstreamContracts, "verdict.schema.json"), "{\"v\":2}\n");
+    writeFileSync(path.join(f.upstreamContracts, "event.schema.json"), "{}\n");
+    const check = f.run("--check");
+    expect(check.status, check.stderr).toBe(1);
+    expect(f.contractsOf(check.stdout)).toMatchObject({
+      edited: [],
+      upstream: "drifted",
+      drifted: ["event.schema.json", "verdict.schema.json"],
+    });
+    expect(f.run("--contracts").status).toBe(0);
+    expect(f.run("--check").status).toBe(0);
+    expect(readFileSync(path.join(f.contracts, "event.schema.json"), "utf8")).toBe("{}\n");
+  } finally { f.cleanup(); }
+});
+
+it.each(["edited", "missing", "extra"])("reports a contract %s here rather than upstream", (mode) => {
+  const f = withContracts();
+  try {
+    expect(f.run("--contracts").status).toBe(0);
+    if (mode === "edited") writeFileSync(path.join(f.contracts, "verdict.schema.json"), "patched here\n");
+    if (mode === "missing") rmSync(path.join(f.contracts, "CHECKSUMS"));
+    if (mode === "extra") writeFileSync(path.join(f.contracts, "lease.schema.md"), "unrecorded\n");
+    const check = f.run("--check");
+    expect(check.status, check.stderr).toBe(1);
+    const entry = f.contractsOf(check.stdout);
+    expect(entry.edited.length).toBe(1);
+    expect(entry.upstream).toBe("matches");
+  } finally { f.cleanup(); }
+});
+
+it("never reports contracts as matching when DevCouncil is not there to compare", () => {
+  const f = withContracts();
+  try {
+    expect(f.run("--contracts").status).toBe(0);
+    const check = spawnSync(process.execPath, [path.join(f.root, "scripts/vendor-crates.mjs"), "--check", "--json"], {
+      encoding: "utf8", timeout: 15_000,
+      env: { ...process.env, GITPULSE_ALLOW_DRIFT: "0", GITPULSE_DEVCOUNCIL_ROOT: "/missing", GITPULSE_MARKDEV_ROOT: "/missing" },
+    });
+    const report = JSON.parse(check.stdout);
+    expect(f.contractsOf(check.stdout)).toMatchObject({ upstream: "unavailable", edited: [] });
+    expect(report.comparable).toBe(false);
+  } finally { f.cleanup(); }
+});
+
+it("treats a contracts directory the manifest never recorded as a local edit", () => {
+  const f = withContracts();
+  try {
+    mkdirSync(f.contracts, { recursive: true });
+    writeFileSync(path.join(f.contracts, "verdict.schema.json"), "{\"v\":1}\n");
+    const check = f.run("--check");
+    expect(check.status, check.stderr).toBe(1);
+    expect(f.contractsOf(check.stdout).edited[0]).toMatch(/not recorded/);
+  } finally { f.cleanup(); }
+});
+
+it("keeps the recorded contracts through a scoped crate refresh", () => {
+  const f = withContracts();
+  try {
+    expect(f.run("--contracts").status).toBe(0);
+    const before = JSON.parse(readFileSync(f.manifest, "utf8")).contracts;
+    writeFileSync(path.join(f.upstream, "rust/dc-redact/src/lib.rs"), "pub const VALUE: u8 = 8;\n");
+    expect(f.run("--crate=dc-redact").status).toBe(0);
+    expect(JSON.parse(readFileSync(f.manifest, "utf8")).contracts).toEqual(before);
+  } finally { f.cleanup(); }
+});

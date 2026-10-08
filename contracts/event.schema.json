@@ -73,7 +73,9 @@
     },
     "verdict_json": {
       "type": ["string", "null"],
-      "description": "The policy verdict as a JSON string conforming to verdict.schema.json, plus the consumer-side `checked` flag. Null ONLY when no gate decision applies to this event kind — never null to mean 'allowed'. An event whose gate did not run carries a verdict with checked=false."
+      "contentMediaType": "application/json",
+      "contentSchema": { "$ref": "#/$defs/ledgerVerdict" },
+      "description": "The gate's decision as recorded by the consumer that acted on it: a JSON string conforming to $defs/ledgerVerdict — the consumer's classified projection of a verdict.schema.json decision, plus `checked` and the reason a gate did not run. Not a raw verdict.schema.json decision: until 2026-10-08 this field was described as one, while every writer and reader used the projection, so no recorded row ever matched that description. Null ONLY when no gate decision applies to this event kind — never null to mean 'allowed'. An event whose gate did not run carries a verdict with checked=false and status `unchecked`."
     },
     "before_ref": {
       "type": ["string", "null"],
@@ -91,6 +93,40 @@
     "detail_json": {
       "type": ["string", "null"],
       "description": "Per-action payload as a JSON string. MUST be redacted before insert. Shape varies by `action` and is deliberately not constrained here: a consumer reads what it recognises and ignores the rest."
+    }
+  },
+  "$defs": {
+    "ledgerVerdict": {
+      "description": "One gate decision as GitPulse records it (GitPulse/src-tauri/src/harness/policy.rs, PolicyVerdict). Every field is always present; an empty string means 'does not apply', never 'unknown'. `status` is the classification verdict.schema.json $defs/classification defines, spelled as the consumer spells it: `allowed` is the contract's `clean` and `blocked` is its `denied`; the other six are identical.",
+      "type": "object",
+      "required": ["status", "checked", "target", "rule", "severity", "reason", "demoted", "grant_id", "granted_by", "widened", "degraded", "task_id", "detail", "detail_code"],
+      "additionalProperties": false,
+      "properties": {
+        "status": {
+          "type": "string",
+          "enum": ["allowed", "demoted", "granted", "widened", "degraded", "warned", "blocked", "unchecked"]
+        },
+        "checked": {
+          "type": "boolean",
+          "description": "True only when the gate actually ran. Never inferred from `status`."
+        },
+        "target": { "type": "string", "description": "What was judged: the command line, or the path." },
+        "rule": { "type": "string", "description": "The rung that fired; empty on a clean allow and when the gate did not run." },
+        "severity": {
+          "type": "string",
+          "enum": ["hard", "soft", "warn", "none", ""],
+          "description": "verdict.schema.json $defs/severity, or empty when the gate did not run (checked=false)."
+        },
+        "reason": { "type": "string" },
+        "demoted": { "type": "string", "description": "Non-empty when a soft denial was demoted by the host posture." },
+        "grant_id": { "type": "string", "description": "Non-empty when an override grant cleared a soft block." },
+        "granted_by": { "type": "string" },
+        "widened": { "type": "string", "description": "Non-empty when executor-appended scope, not the plan, authorised this." },
+        "degraded": { "type": "array", "items": { "type": "string" }, "description": "Checks that could not run. Empty means every rung ran." },
+        "task_id": { "type": "string" },
+        "detail": { "type": "string", "description": "Why the gate did not run, when it did not." },
+        "detail_code": { "type": "string", "description": "Machine-readable reason for `detail` (\"not_installed\", \"timeout\", ...). Empty when the gate ran." }
+      }
     }
   }
 }
