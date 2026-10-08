@@ -1,6 +1,7 @@
 # Framework consumer ports and native lifecycle fixes
 
-Twelve of these thirteen crates carry the GitPulse port of Tauri's Linux GTK consumers.
+Ten of these eleven crates carry the GitPulse port of Tauri's Linux GTK consumers;
+the eleventh is the patched `notify`.
 The application continues to use GTK3 and WebKitGTK 4.1. GTK, GLib, GDK and
 Soup come from published maintained releases; this directory contains their
 consumers whose upstream manifests still require GTK 0.18.
@@ -28,8 +29,10 @@ not published upstream releases.
   retained but are not automatically run as part of GitPulse's suite. Remove
   this patch when a released notify includes the fixes and passes those probes.
 
-- Tauri, its runtime crates, TAO, Muda, WRY, WebKitGTK, JavaScriptCore, and
-  AppIndicator agree on GTK 0.19 / GLib 0.22. WebKitGTK and WRY use Soup 0.9.
+- Tauri, its runtime crates, TAO, Muda, WRY, WebKitGTK, and AppIndicator agree
+  on GTK 0.19 / GLib 0.22. WebKitGTK and WRY use Soup 0.9. JavaScriptCore comes
+  from crates.io: `javascriptcore-rs` 2.0.0 published the GLib 0.22 line, so its
+  two ports were retired and WebKitGTK and WRY require `2` instead of `=1.1`.
 - Removed GLib trait re-exports are imported from the prelude. WRY uses the
   current `glib::clone!` syntax while retaining weak-reference semantics.
 - TAO's removed GLib channels use `async-channel` 2.5, already present in the
@@ -95,7 +98,9 @@ refresh them with the sibling repository vendor command. For an update:
 Remove each local patch only when the published upstream consumer accepts the
 maintained GTK line and the complete Cargo graph resolves without old GLib or
 either abandoned `proc-macro-error` implementation. Preserve the Tauri
-`urlpattern` 0.6 migration when changing revisions.
+`urlpattern` 0.6 migration when changing revisions. The latest re-check of
+every criterion, with the crates.io versions it found, is in
+`../../docs/DEPENDENCY_HEALTH.md` ("Framework port removal criteria").
 
 The Linux tests `gtk_dispatch` and `gtk_runtime` exercise the actual channel
 adapter and native WebKit/menu/window lifecycle. The runtime test requires a
