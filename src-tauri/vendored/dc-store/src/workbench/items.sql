@@ -36,15 +36,21 @@ CREATE INDEX work_item_links_target ON work_item_links(target_id,kind,item_id);
 -- whose status was not Done. A task with no such history falls back to its
 -- own `updated_at`. The revision is not bumped: this restates what the row
 -- already meant, and bumping it would fail every host's pending write.
+--
+-- Every other row gets the same four keys a schema 11 write gives it —
+-- not archived, no completion time, an empty checklist, no links — so a
+-- reader sees one shape whether a row was written before the upgrade or
+-- after, and never has to guess what a missing `archived` means.
 UPDATE work_items SET body=json_set(body,
-    '$.archived',json('true'),
-    '$.completed_at',coalesce(
+    '$.archived',json(CASE WHEN status='done' THEN 'true' ELSE 'false' END),
+    '$.completed_at',CASE WHEN status='done' THEN coalesce(
         (SELECT min(json_extract(r.body,'$.updated_at')) FROM work_revisions r
           WHERE r.entity_type='item' AND r.entity_id=work_items.id
             AND json_extract(r.body,'$.status')='done'
             AND r.revision>coalesce((SELECT max(x.revision) FROM work_revisions x
                 WHERE x.entity_type='item' AND x.entity_id=work_items.id
                   AND json_extract(x.body,'$.status')<>'done'),0)),
-        json_extract(body,'$.updated_at')))
-WHERE status='done';
+        json_extract(body,'$.updated_at')) END,
+    '$.checklist',json(coalesce(json_extract(body,'$.checklist'),'[]')),
+    '$.links',json(coalesce(json_extract(body,'$.links'),'[]')));
 UPDATE work_meta SET version=11 WHERE id=1;
