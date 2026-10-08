@@ -245,8 +245,9 @@ describe("the archive is separate from the Done column", () => {
   // that is not archived stays on it. Every column read says so.
   it("reads every board column without archived tasks", () => {
     expect(board).toContain("const BOARD: TaskListFilter = { archived: false };");
-    expect(board).toContain("listTasks(target, status, query, undefined, 30, BOARD)");
-    expect(board).toContain("listTasks(scope, status, search, cursor, 30, BOARD)");
+    // The filter is the contract; the page size is the board's to choose.
+    expect(board).toMatch(/listTasks\(target, status, query, undefined, \w+, BOARD\)/);
+    expect(board).toMatch(/listTasks\(scope, status, search, cursor, \w+, BOARD\)/);
     expect(board.match(/listTasks\(/g)?.length, "a column read without the filter would draw archived cards").toBe(3);
   });
 
