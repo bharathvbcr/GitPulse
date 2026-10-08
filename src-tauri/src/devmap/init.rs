@@ -672,6 +672,9 @@ mod tests {
 
     #[test]
     fn initialize_writes_no_state_when_the_directory_cannot_be_ignored() {
+        // With no devmap binary the registry is withheld for that reason
+        // first, and the refused ignore rule this test is about never speaks.
+        let _stub = super::super::cli::bind_test_binary("devmap");
         let repo = init_repo();
         let exclude = repo.path().join(".git/info/exclude");
         std::fs::create_dir_all(exclude.parent().expect("parent")).expect("info");

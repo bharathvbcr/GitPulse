@@ -139,7 +139,7 @@ fn the_installed_hook_reaches_the_socket_and_the_app_accepts_what_it_sends() {
     assert_eq!(notice.key, "term-7-1a");
     assert_eq!(notice.label, "Claude Code");
     assert_eq!(notice.place.as_deref(), Some("GitPulse"));
-    assert_eq!(notice.reason.as_deref(), Some("needs your permission"));
+    assert_eq!(notice.reason(), Some("needs your permission"));
     assert_eq!(
         notice.detail.as_deref(),
         Some("Claude needs your permission to use Bash")

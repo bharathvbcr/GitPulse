@@ -497,28 +497,88 @@ pub struct Event {
 /// `SessionEnd`, an agent approved from anywhere but its own GitPulse tab kept
 /// "needs your permission" until someone typed into that tab.
 pub const EVENTS: &[Event] = &[
-    Event { name: "permission_prompt", phrase: "needs your permission", need: Need::Ask, role: Role::Banner },
-    Event { name: "idle_prompt", phrase: "is waiting for you", need: Need::Ask, role: Role::Banner },
-    Event { name: "agent_needs_input", phrase: "needs your input", need: Need::Ask, role: Role::Banner },
-    Event { name: "agent_completed", phrase: "finished its work", need: Need::Finished, role: Role::Banner },
-    Event { name: "elicitation_dialog", phrase: "is asking a question", need: Need::Ask, role: Role::Banner },
-    Event { name: "elicitation_url_dialog", phrase: "is asking you to open a link", need: Need::Ask, role: Role::Banner },
-    Event { name: "error", phrase: "stopped on an error", need: Need::Error, role: Role::Banner },
+    Event {
+        name: "permission_prompt",
+        phrase: "needs your permission",
+        need: Need::Ask,
+        role: Role::Banner,
+    },
+    Event {
+        name: "idle_prompt",
+        phrase: "is waiting for you",
+        need: Need::Ask,
+        role: Role::Banner,
+    },
+    Event {
+        name: "agent_needs_input",
+        phrase: "needs your input",
+        need: Need::Ask,
+        role: Role::Banner,
+    },
+    Event {
+        name: "agent_completed",
+        phrase: "finished its work",
+        need: Need::Finished,
+        role: Role::Banner,
+    },
+    Event {
+        name: "elicitation_dialog",
+        phrase: "is asking a question",
+        need: Need::Ask,
+        role: Role::Banner,
+    },
+    Event {
+        name: "elicitation_url_dialog",
+        phrase: "is asking you to open a link",
+        need: Need::Ask,
+        role: Role::Banner,
+    },
+    Event {
+        name: "error",
+        phrase: "stopped on an error",
+        need: Need::Error,
+        role: Role::Banner,
+    },
     // `PermissionRequest`. Also fires when another hook is about to approve
     // the call itself, which is why it is never a banner: the `Notification`
     // that follows six seconds later, only if the dialog is still up, is.
-    Event { name: "permission_request", phrase: "needs your permission", need: Need::Ask, role: Role::State },
+    Event {
+        name: "permission_request",
+        phrase: "needs your permission",
+        need: Need::Ask,
+        role: Role::State,
+    },
     // `Stop`: the turn ended. `idle_prompt` follows a minute later if nobody
     // answers, and that one may interrupt.
-    Event { name: "turn_finished", phrase: "finished its turn", need: Need::Finished, role: Role::State },
+    Event {
+        name: "turn_finished",
+        phrase: "finished its turn",
+        need: Need::Finished,
+        role: Role::State,
+    },
     // `UserPromptSubmit`: the user answered, from wherever they answered.
-    Event { name: "prompt_submitted", phrase: "is working again", need: Need::Clear, role: Role::Resolve },
+    Event {
+        name: "prompt_submitted",
+        phrase: "is working again",
+        need: Need::Clear,
+        role: Role::Resolve,
+    },
     // `PostToolUse` / `PostToolUseFailure`: a tool ran, so the call it names
     // is no longer waiting for approval.
-    Event { name: "tool_finished", phrase: "is working again", need: Need::Clear, role: Role::Resolve },
+    Event {
+        name: "tool_finished",
+        phrase: "is working again",
+        need: Need::Clear,
+        role: Role::Resolve,
+    },
     // `SessionEnd`, or the PTY's process exiting: nobody can answer a
     // question from a session that is gone.
-    Event { name: "session_ended", phrase: "ended its session", need: Need::Clear, role: Role::Resolve },
+    Event {
+        name: "session_ended",
+        phrase: "ended its session",
+        need: Need::Clear,
+        role: Role::Resolve,
+    },
 ];
 
 /// The event named `name`, if it is one.

@@ -975,7 +975,9 @@ fn resolve(entry: &mut Tracked, notice: &Notice, known: bool, counters: &Counter
         // on. So a permission ends only on its own call, and anything else
         // only on the main agent's own work.
         Some("tool_finished") => match (&standing.subject, &notice.subject) {
-            (Some(asked), Some(ran)) => asked == ran || (!standing.is_permission() && !notice.subagent),
+            (Some(asked), Some(ran)) => {
+                asked == ran || (!standing.is_permission() && !notice.subagent)
+            }
             _ => !standing.is_permission() && !notice.subagent,
         },
         _ => false,
@@ -1126,7 +1128,10 @@ fn prune(now: Instant, tracked: &mut HashMap<String, Tracked>) {
     // evidence and is released with the rest of the session's state.
     tracked.retain(|_, entry| {
         entry.holds_work()
-            || entry.standing.as_ref().is_some_and(|standing| standing.from_hook)
+            || entry
+                .standing
+                .as_ref()
+                .is_some_and(|standing| standing.from_hook)
             || entry.hooked_within(now, HOOKED_TTL)
             || now.saturating_duration_since(entry.touched) < TRACK_TTL
     });

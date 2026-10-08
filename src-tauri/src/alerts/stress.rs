@@ -315,7 +315,10 @@ impl Host for Observer {
         Some(12 * 60)
     }
     fn announce(&self, attention: &Attention) {
-        self.announced.lock().unwrap().insert(attention.session.clone());
+        self.announced
+            .lock()
+            .unwrap()
+            .insert(attention.session.clone());
         let mut view = self.view.lock().unwrap();
         let clears = attention
             .event
@@ -324,12 +327,18 @@ impl Host for Observer {
         if clears {
             view.remove(&attention.session);
         } else {
-            view.insert(attention.session.clone(), attention.event.unwrap_or("signal"));
+            view.insert(
+                attention.session.clone(),
+                attention.event.unwrap_or("signal"),
+            );
         }
     }
     fn withdraw(&self, native: &str) {
         if !self.shown.lock().unwrap().remove(native) {
-            self.spurious_withdrawals.lock().unwrap().push(native.to_owned());
+            self.spurious_withdrawals
+                .lock()
+                .unwrap()
+                .push(native.to_owned());
         }
     }
 }
@@ -376,7 +385,13 @@ fn a_fleet_doing_everything_at_once_keeps_every_promise() {
     // Two fleet sizes: one the tracker holds whole, and one past its bound,
     // so eviction — and what it costs — is exercised as well.
     let past_the_bound = MAX_TRACKED as u64 * 2;
-    for (seed, sessions) in [(1u64, 24), (7, 24), (42, 24), (1_000_003, past_the_bound), (0xdead_beef, past_the_bound)] {
+    for (seed, sessions) in [
+        (1u64, 24),
+        (7, 24),
+        (42, 24),
+        (1_000_003, past_the_bound),
+        (0xdead_beef, past_the_bound),
+    ] {
         let mut rng = Rng(seed);
         let observer = Arc::new(Observer::default());
         let host: Arc<dyn Host> = observer.clone();
@@ -417,7 +432,15 @@ fn a_fleet_doing_everything_at_once_keeps_every_promise() {
             if let Some(last) = admit(notice, now, &mut tracked, &counters) {
                 host.announce(&last);
             }
-            flush(now, false, &mut tracked, &mut bucket, &host, &counters, &last_error);
+            flush(
+                now,
+                false,
+                &mut tracked,
+                &mut bucket,
+                &host,
+                &counters,
+                &last_error,
+            );
             prune(now, &mut tracked);
             // A session evicted while it stood asking leaves the pane holding
             // what the worker forgot. Until the worker next speaks about it,
@@ -434,23 +457,38 @@ fn a_fleet_doing_everything_at_once_keeps_every_promise() {
             }
 
             let at = |what: &str| format!("seed {seed} step {step}: {what}");
-            assert!(tracked.len() <= MAX_TRACKED, "{}", at("the map outgrew its bound"));
+            assert!(
+                tracked.len() <= MAX_TRACKED,
+                "{}",
+                at("the map outgrew its bound")
+            );
             // Liveness: anything held has a time it will go out, so the
             // worker can never sleep on work.
             for (key, entry) in &tracked {
                 if entry.pending.is_some() {
-                    assert!(entry.due_at().is_some(), "{}", at(&format!("{key} held with no due time")));
+                    assert!(
+                        entry.due_at().is_some(),
+                        "{}",
+                        at(&format!("{key} held with no due time"))
+                    );
                 }
                 if let Some(standing) = &entry.standing {
                     assert!(
                         !key.starts_with("hook-") && key != "term-shell",
                         "{}",
-                        at(&format!("{key} stands asking, but no pane can show it: {:?}", standing.attention))
+                        at(&format!(
+                            "{key} stands asking, but no pane can show it: {:?}",
+                            standing.attention
+                        ))
                     );
                 }
             }
             if tracked.values().any(Tracked::holds_work) {
-                assert!(next_wake(&tracked).is_some(), "{}", at("work held and nothing to wake for"));
+                assert!(
+                    next_wake(&tracked).is_some(),
+                    "{}",
+                    at("work held and nothing to wake for")
+                );
             }
             // Every banner offered is in exactly one outcome or still held.
             let held = tracked.values().filter(|e| e.pending.is_some()).count() as u64;
@@ -465,7 +503,12 @@ fn a_fleet_doing_everything_at_once_keeps_every_promise() {
                 + c.displaced.load(Ordering::Relaxed)
                 + c.rate_limited.load(Ordering::Relaxed)
                 + c.failed.load(Ordering::Relaxed);
-            assert_eq!(outcomes + held, banner_offers, "{}", at("a banner went unaccounted for"));
+            assert_eq!(
+                outcomes + held,
+                banner_offers,
+                "{}",
+                at("a banner went unaccounted for")
+            );
             // What a renderer would show agrees with what the worker holds,
             // for every session with nothing still waiting to be said. (An
             // evicted session leaves the map, and with it this comparison.)
@@ -474,8 +517,16 @@ fn a_fleet_doing_everything_at_once_keeps_every_promise() {
                 if entry.unannounced.is_some() || amnesic.contains(key) {
                     continue;
                 }
-                let worker = entry.standing.as_ref().map(|s| s.attention.event.unwrap_or("signal"));
-                assert_eq!(view.get(key).copied(), worker, "{}", at(&format!("{key}: pane and worker disagree")));
+                let worker = entry
+                    .standing
+                    .as_ref()
+                    .map(|s| s.attention.event.unwrap_or("signal"));
+                assert_eq!(
+                    view.get(key).copied(),
+                    worker,
+                    "{}",
+                    at(&format!("{key}: pane and worker disagree"))
+                );
             }
             drop(view);
             assert!(
@@ -485,8 +536,19 @@ fn a_fleet_doing_everything_at_once_keeps_every_promise() {
             );
         }
         // Drain: everything held goes out or is counted, nothing is lost.
-        flush(now + Duration::from_secs(3_600), true, &mut tracked, &mut bucket, &host, &counters, &last_error);
-        assert!(tracked.values().all(|e| e.pending.is_none()), "seed {seed}: held after the final pass");
+        flush(
+            now + Duration::from_secs(3_600),
+            true,
+            &mut tracked,
+            &mut bucket,
+            &host,
+            &counters,
+            &last_error,
+        );
+        assert!(
+            tracked.values().all(|e| e.pending.is_none()),
+            "seed {seed}: held after the final pass"
+        );
         assert!(
             counters.delivered.load(Ordering::Relaxed) > 100,
             "seed {seed}: the run delivered too little to have exercised anything"

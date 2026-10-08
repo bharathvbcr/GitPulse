@@ -430,7 +430,11 @@ fn hook(key: &str, event: &str, detail: Option<&str>) -> Notice {
         origin: Origin::Hook,
         label: "Claude Code".into(),
         place: None,
-        event: Some(bridge::event(event).unwrap_or_else(|| panic!("{event}")).name),
+        event: Some(
+            bridge::event(event)
+                .unwrap_or_else(|| panic!("{event}"))
+                .name,
+        ),
         detail: detail.map(str::to_owned),
         is_agent: true,
         channel: "hook",
@@ -527,7 +531,10 @@ fn every_hook_event_is_announced_by_its_name() {
     // reach the pane as an unnamed signal.
     // A resolving event announces only when something stood for it to end,
     // which `answering_*` below covers.
-    for event in bridge::EVENTS.iter().filter(|e| e.role != bridge::Role::Resolve) {
+    for event in bridge::EVENTS
+        .iter()
+        .filter(|e| e.role != bridge::Role::Resolve)
+    {
         let mut driver = Driver::new();
         driver.tick(Some(hook("term-1", event.name, None)), Instant::now());
         assert_eq!(driver.recorder.announcements()[0].event, Some(event.name));
@@ -649,7 +656,11 @@ fn a_bell_behind_a_hook_report_does_not_erase_its_reason() {
     let mut driver = Driver::new();
     let start = Instant::now();
     driver.tick(
-        Some(hook("term-1", "permission_prompt", Some("Bash: cargo test"))),
+        Some(hook(
+            "term-1",
+            "permission_prompt",
+            Some("Bash: cargo test"),
+        )),
         start,
     );
     driver.tick(Some(notice("term-1")), start + Duration::from_millis(20));
@@ -673,7 +684,11 @@ fn a_bell_racing_ahead_of_its_hook_report_yields_one_banner_with_the_reason() {
     let later = start + Duration::from_secs(120);
     driver.tick(Some(notice("term-1")), later);
     driver.tick(
-        Some(hook("term-1", "permission_prompt", Some("Bash: rm -rf target"))),
+        Some(hook(
+            "term-1",
+            "permission_prompt",
+            Some("Bash: rm -rf target"),
+        )),
         later + Duration::from_millis(40),
     );
     driver.tick(None, later + COALESCE * 3);
@@ -743,7 +758,10 @@ impl Driver {
 fn a_permission_request_is_shown_at_once_and_never_bannered_by_itself() {
     let mut driver = Driver::new();
     let start = Instant::now();
-    driver.tick(Some(tool("term-1", "permission_request", "aa", false)), start);
+    driver.tick(
+        Some(tool("term-1", "permission_request", "aa", false)),
+        start,
+    );
     driver.tick(None, start + COALESCE * 4);
     assert_eq!(driver.recorder.count(), 0, "a state became a banner");
     assert_eq!(driver.last_announced(), Some("permission_request"));
@@ -754,7 +772,10 @@ fn a_permission_request_is_shown_at_once_and_never_bannered_by_itself() {
 fn the_notification_that_follows_a_permission_request_banners_it_with_the_tool() {
     let mut driver = Driver::new();
     let start = Instant::now();
-    driver.tick(Some(tool("term-1", "permission_request", "aa", false)), start);
+    driver.tick(
+        Some(tool("term-1", "permission_request", "aa", false)),
+        start,
+    );
     let mut late = hook(
         "term-1",
         "permission_prompt",
@@ -781,7 +802,10 @@ fn the_notification_that_follows_a_permission_request_banners_it_with_the_tool()
 fn a_permission_ends_only_on_its_own_tool_call() {
     let mut driver = Driver::new();
     let start = Instant::now();
-    driver.tick(Some(tool("term-1", "permission_request", "aa", false)), start);
+    driver.tick(
+        Some(tool("term-1", "permission_request", "aa", false)),
+        start,
+    );
     // Another call in the same batch, and a subagent's, finish meanwhile.
     for (subject, subagent) in [("bb", false), ("cc", true)] {
         driver.tick(
@@ -874,7 +898,11 @@ fn a_session_that_ends_drops_its_question_but_keeps_its_last_word() {
         let mut driver = Driver::new();
         driver.tick(Some(hook("term-1", last, None)), start);
         driver.tick(Some(ended("term-1")), start + Duration::from_secs(2));
-        assert_eq!(driver.standing(), Some(last), "{last} was erased by the exit");
+        assert_eq!(
+            driver.standing(),
+            Some(last),
+            "{last} was erased by the exit"
+        );
     }
 }
 
@@ -949,7 +977,10 @@ fn under_the_rate_limit_a_stalled_agent_goes_before_a_finished_one() {
 fn what_stands_is_what_a_page_that_was_not_listening_reads() {
     let mut driver = Driver::new();
     let start = Instant::now();
-    driver.tick(Some(tool("term-1", "permission_request", "aa", false)), start);
+    driver.tick(
+        Some(tool("term-1", "permission_request", "aa", false)),
+        start,
+    );
     driver.tick(Some(hook("term-2", "turn_finished", None)), start);
     driver.tick(Some(hook("term-3", "idle_prompt", None)), start);
     driver.tick(Some(reader("term-3")), start + Duration::from_secs(1));
@@ -981,7 +1012,10 @@ const WIRE_STANDING: &str = r#"[{"session":"term-1","channel":"hook","event":"pe
 fn what_stands_crosses_to_the_renderer_in_the_shape_it_replays() {
     let mut driver = Driver::new();
     let start = Instant::now();
-    driver.tick(Some(tool("term-1", "permission_request", "aa", false)), start);
+    driver.tick(
+        Some(tool("term-1", "permission_request", "aa", false)),
+        start,
+    );
     let standing = standing_of(&driver.tracked, start + Duration::from_secs(5));
     assert_eq!(serde_json::to_string(&standing).unwrap(), WIRE_STANDING);
 }
@@ -1015,7 +1049,10 @@ fn an_answer_to_a_session_the_worker_forgot_still_clears_its_pane() {
     driver.tick(Some(reader("term-1")), Instant::now());
     assert_eq!(driver.last_announced(), Some("prompt_submitted"));
     // Once known to be asking nothing, a second answer says nothing.
-    driver.tick(Some(reader("term-1")), Instant::now() + Duration::from_secs(2));
+    driver.tick(
+        Some(reader("term-1")),
+        Instant::now() + Duration::from_secs(2),
+    );
     assert_eq!(driver.recorder.announcements().len(), 1);
     // A plain shell, or a session outside GitPulse, has no pane to clear.
     let mut shell = reader("term-shell");
