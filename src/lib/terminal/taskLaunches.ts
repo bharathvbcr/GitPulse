@@ -70,12 +70,14 @@ export interface HostCandidate {
  * where the panel lives, never where the agent runs.
  *
  * This used to be "the checkout's own tab, always", and every agent launched
- * into a new worktree opened a repository tab for it. Those tabs share one
- * bound with the reader's own (`MAX_OPEN_TABS`, and the native watcher cap of
- * the same size), so a reader with fourteen repositories open could start
- * about ten worktree agents, and every later launch was refused with "Too
- * many open repositories" while the live-run and session limits stood
- * mostly unused. Each such tab also paid a full hydrate and an index build.
+ * into a new worktree opened a repository tab for it. Those tabs counted
+ * against the reader's own bound, which was then 24 open repositories (and
+ * a native watcher cap of the same size), so a reader with fourteen
+ * repositories open could start about ten worktree agents, and every later
+ * launch was refused with "Too many open repositories" while the live-run
+ * and session limits stood mostly unused. Each such tab also paid a full
+ * hydrate and an index build. However large the tab bound is, an agent is
+ * not a repository the reader opened and should not spend one.
  *
  * Pure and deterministic over the same tab list, so the dock (which panels to
  * host) and the panel (which request to take) always agree.
