@@ -1,12 +1,32 @@
 name: Dependency audit
 
 # GitHub's dependency graph does not read bun.lock, so Dependabot raises no
-# alerts or security PRs for transitive JS dependencies. This gate does.
+# alerts or security PRs for transitive JS dependencies. The bun job covers
+# that. cargo-deny covers src-tauri: RustSec advisories (including unsound,
+# unmaintained and yanked crates), licences and sources, under
+# src-tauri/deny.toml. The weekly run catches advisories published against an
+# unchanged lockfile.
 on:
   push:
-    paths: ["package.json", "bun.lock", ".github/workflows/bun-audit.yml"]
+    paths:
+      - "package.json"
+      - "bun.lock"
+      - "src-tauri/Cargo.toml"
+      - "src-tauri/Cargo.lock"
+      - "src-tauri/deny.toml"
+      - "src-tauri/framework/**/Cargo.toml"
+      - "src-tauri/vendored/**/Cargo.toml"
+      - ".github/workflows/bun-audit.yml"
   pull_request:
-    paths: ["package.json", "bun.lock", ".github/workflows/bun-audit.yml"]
+    paths:
+      - "package.json"
+      - "bun.lock"
+      - "src-tauri/Cargo.toml"
+      - "src-tauri/Cargo.lock"
+      - "src-tauri/deny.toml"
+      - "src-tauri/framework/**/Cargo.toml"
+      - "src-tauri/vendored/**/Cargo.toml"
+      - ".github/workflows/bun-audit.yml"
   schedule:
     - cron: "0 6 * * 1"
   workflow_dispatch:
@@ -24,3 +44,18 @@ jobs:
       - uses: oven-sh/setup-bun@v2
       - name: bun audit
         run: bun audit
+
+  cargo-deny:
+    name: cargo deny (src-tauri)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      # Fetches the RustSec database on every run, so the scheduled run is
+      # never judged against a stale copy.
+      - name: cargo deny check
+        uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          manifest-path: src-tauri/Cargo.toml
+          command: check
+          arguments: --all-features
