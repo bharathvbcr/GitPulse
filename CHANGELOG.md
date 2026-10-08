@@ -11,6 +11,22 @@ before that tag is pushed.
 
 ## [Unreleased]
 
+### Changed
+
+- **More than 24 repositories can be open at once.** Opening a twenty-fifth
+  used to be refused with "Too many open repositories (max 24)", because every
+  tab held one of 24 native file watches. Tabs and watches are now separate:
+  a workspace holds up to 1000 repositories, and the 24 used most recently are
+  watched live. The rest are *parked* — dimmed on the strip, "Paused" in the
+  status bar and fleet, counts hidden in the menu — and are read in full and
+  watched again when you open them. Restoring a large workspace reads only the
+  watched repositories, so it no longer slows with every tab you keep open.
+- The Open Repositories menu keeps the current repository listed past its 64
+  rows and says how many more are open in the tab bar.
+- The fleet view says when its 64-repository sweep limit, not the clock, left
+  rows unscanned, instead of suggesting a refresh that would reach the same
+  ones.
+
 ## [1.4.0] - 2026-10-07
 
 Agents that start in the background with a pane showing every one at work,

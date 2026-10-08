@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   WATCH_ACTIVE,
+  WATCH_PARKED,
   WATCH_UNKNOWN,
   describeWatch,
   isLiveUpdating,
@@ -14,6 +15,7 @@ import {
 
 const ALL: WatchState[] = [
   WATCH_ACTIVE,
+  WATCH_PARKED,
   WATCH_UNKNOWN,
   watchFailed("Too many watched repositories (max 24)"),
 ];
@@ -116,6 +118,30 @@ describe("describeWatch", () => {
     const text = describeWatch({ status: "degraded", reason: null });
     expect(text).toContain("not receiving live filesystem updates");
     expect(text).not.toContain("()");
+  });
+});
+
+describe("a parked watch", () => {
+  // Withheld on purpose (repos/watchPool.ts), not failed: it must never read
+  // as live, and never borrow the language of a fault.
+  it("is not live, and is caught up by a full read if it is ever polled", () => {
+    expect(isLiveUpdating(WATCH_PARKED)).toBe(false);
+    expect(needsFullPoll(WATCH_PARKED)).toBe(true);
+  });
+
+  it("is surfaced with its own marker and explanation", () => {
+    expect(shouldSurface(WATCH_PARKED)).toBe(true);
+    expect(watchMarker(WATCH_PARKED)).toBe("Paused");
+    const text = describeWatch(WATCH_PARKED);
+    expect(text).toContain("paused");
+    expect(text).toContain("Opening it");
+    expect(text).not.toBe(describeWatch({ status: "degraded", reason: null }));
+    expect(text).not.toContain("not receiving");
+  });
+
+  it("carries no reason, so a decision cannot pass for a backend error", () => {
+    expect(WATCH_PARKED.reason).toBeNull();
+    expect(watchStatesEqual(WATCH_PARKED, watchFailed("full"))).toBe(false);
   });
 });
 
