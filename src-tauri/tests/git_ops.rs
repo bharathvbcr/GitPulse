@@ -1282,6 +1282,50 @@ fn test_get_status_copy_record_keeps_cursor_aligned() {
     assert_eq!(modified.status_code, "M ");
 }
 
+/// The reset preview names the commits a rewind takes off the branch, says
+/// how many no other ref still reaches, and refuses to call a failed read
+/// "detached".
+#[test]
+fn reset_preview_names_what_a_rewind_leaves_behind() {
+    let repo = TestRepo::init();
+    repo.write("f.txt", "1\n");
+    repo.commit_all("base");
+    let base = gitpulse_lib::engine::git_cli::git_text(repo.dir.path(), &["rev-parse", "HEAD"])
+        .unwrap()
+        .trim()
+        .to_string();
+    repo.write("f.txt", "2\n");
+    repo.commit_all("shared with keep");
+    run_git(repo.dir.path(), &["branch", "keep"]);
+    repo.write("f.txt", "3\n");
+    repo.commit_all("only on main");
+
+    let preview = GitReader::reset_preview(&repo.path_str(), &base).expect("preview");
+    assert_eq!(preview.branch.as_deref(), Some("main"));
+    assert_eq!(preview.target, base);
+    assert_eq!(preview.leaving_total, 2);
+    assert_eq!(
+        preview.leaving.iter().map(|c| c.summary.as_str()).collect::<Vec<_>>(),
+        ["only on main", "shared with keep"]
+    );
+    assert_eq!(preview.unreachable_total, 1, "`keep` still holds one of them");
+    assert_eq!(preview.gaining_total, 0);
+
+    // Moving forward again loses nothing and gains what the rewind dropped.
+    run_git(repo.dir.path(), &["reset", "--hard", &base]);
+    let forward = GitReader::reset_preview(&repo.path_str(), "keep").expect("forward");
+    assert_eq!((forward.leaving_total, forward.gaining_total), (0, 1));
+
+    run_git(repo.dir.path(), &["checkout", "--detach", "keep"]);
+    let detached = GitReader::reset_preview(&repo.path_str(), &base).expect("detached");
+    assert_eq!(detached.branch, None);
+    assert_eq!(detached.unreachable_total, 0, "`keep` still reaches it");
+
+    for bad in ["-x", "a..b", "HEAD:f.txt", "nosuch"] {
+        assert!(GitReader::reset_preview(&repo.path_str(), bad).is_err(), "{bad}");
+    }
+}
+
 /// Blame at a revision reads the file as that commit recorded it, and each
 /// line carries the parent to step to — including across a rename, where the
 /// parent's path is the old name.

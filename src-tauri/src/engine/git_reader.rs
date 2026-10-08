@@ -258,6 +258,42 @@ pub struct ReflogEntry {
     pub timestamp: i64,
 }
 
+/// One commit named in a [`ResetPreview`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PreviewCommit {
+    pub commit_id: String,
+    pub summary: String,
+    pub author_name: String,
+    pub timestamp: i64,
+}
+
+/// What moving the current branch (or a detached HEAD) to `target` would
+/// take off it, read before the reset so the confirmation can name it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResetPreview {
+    /// The branch that would move; `None` when HEAD is detached, in which
+    /// case only HEAD moves.
+    pub branch: Option<String>,
+    pub head: String,
+    /// `target` peeled to a commit oid: the reset should run against this,
+    /// not the name, so a ref moving after the preview cannot change it.
+    pub target: String,
+    /// Newest first: the commits in `target..HEAD`, at most
+    /// [`RESET_PREVIEW_LIMIT`] of them.
+    pub leaving: Vec<PreviewCommit>,
+    /// Every commit in `target..HEAD`, so a capped list is never read as all.
+    pub leaving_total: usize,
+    /// Of those, the ones no other branch, tag or remote-tracking ref
+    /// reaches: after the reset only the reflog still holds them.
+    pub unreachable_total: usize,
+    /// Commits in `HEAD..target` the branch would gain (a forward or
+    /// sideways move rather than a rewind).
+    pub gaining_total: usize,
+}
+
+/// How many leaving commits a [`ResetPreview`] lists by name.
+pub const RESET_PREVIEW_LIMIT: usize = 20;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RepoLanguageStat {
     pub language: String,
@@ -1563,6 +1599,98 @@ impl GitReader {
             });
         }
         Ok(entries)
+    }
+
+    /// Reads what a reset of HEAD's branch to `target` would take off it.
+    ///
+    /// Read-only and ungated: it answers the question the confirmation must
+    /// ask before the guarded `cmd_reset` runs.
+    pub fn reset_preview(repo_path: &str, target: &str) -> Result<ResetPreview, String> {
+        let repo = validate_repo(repo_path)?;
+        crate::engine::git_writer::validate_oid_or_revision(target)?;
+        let peel = |rev: &str| -> Result<String, String> {
+            let spec = format!("{rev}^{{commit}}");
+            let oid = git_text(&repo, &["rev-parse", "--verify", "--quiet", spec.as_str()])
+                .map_err(|_| format!("'{rev}' does not name a commit"))?;
+            let oid = oid.trim().to_string();
+            validate_oid(&oid).map_err(|_| format!("'{rev}' does not name a commit"))?;
+            Ok(oid)
+        };
+        let target_oid = peel(target)?;
+        let head = peel("HEAD")?;
+        // Exit 1 is git's answer "HEAD is detached"; any other failure is a
+        // read that did not happen and must not be reported as detached.
+        let symbolic = git_cli::git_captured(&repo, &["symbolic-ref", "--quiet", "--short", "HEAD"])?;
+        let branch = match symbolic.status_code {
+            0 => Some(String::from_utf8_lossy(&symbolic.stdout).trim().to_string()),
+            1 => None,
+            code => {
+                return Err(format!(
+                    "Could not read the current branch (git exited {code}): {}",
+                    String::from_utf8_lossy(&symbolic.stderr).trim()
+                ))
+            }
+        };
+        if let Some(name) = &branch {
+            validate_ref_name(name)?;
+        }
+
+        let count = |args: &[&str]| -> Result<usize, String> {
+            let text = git_text(&repo, args)?;
+            git_cli::parse_count_saturating(text.trim())
+                .ok_or_else(|| format!("git rev-list returned an unreadable count: {text}"))
+        };
+        let not_target = format!("^{target_oid}");
+        let leaving_total = count(&["rev-list", "--count", &head, &not_target])?;
+        let gaining_total = count(&["rev-list", "--count", &target_oid, &format!("^{head}")])?;
+        // Every other ref keeps its commits alive; the moving branch itself
+        // must not, or nothing would ever count as left behind.
+        let exclude = branch.as_ref().map(|name| format!("--exclude={name}"));
+        let mut unreachable_args = vec!["rev-list", "--count", head.as_str(), not_target.as_str(), "--not"];
+        if let Some(exclude) = &exclude {
+            unreachable_args.push(exclude);
+        }
+        unreachable_args.extend_from_slice(&["--branches", "--tags", "--remotes"]);
+        let unreachable_total = count(&unreachable_args)?;
+
+        let limit = format!("--max-count={RESET_PREVIEW_LIMIT}");
+        let listed = git_text(
+            &repo,
+            &[
+                "log",
+                limit.as_str(),
+                "--no-show-signature",
+                "--format=%H%x00%ct%x00%an%x00%s",
+                &head,
+                &not_target,
+            ],
+        )?;
+        let leaving = listed
+            .lines()
+            .filter_map(|line| {
+                let mut parts = line.splitn(4, '\0');
+                let commit_id = parts.next()?.to_string();
+                let timestamp = parts.next()?.parse().unwrap_or(0);
+                let author_name = parts.next()?.to_string();
+                let summary = parts.next().unwrap_or("").to_string();
+                validate_oid(&commit_id).ok()?;
+                Some(PreviewCommit {
+                    commit_id,
+                    summary,
+                    author_name,
+                    timestamp,
+                })
+            })
+            .collect();
+        Ok(ResetPreview {
+            branch,
+            head,
+            target: target_oid,
+            leaving,
+            leaving_total,
+            unreachable_total,
+            gaining_total,
+        })
     }
 
     pub fn get_repo_language_stats(repo_path: &str) -> Result<LanguageStatsReport, String> {

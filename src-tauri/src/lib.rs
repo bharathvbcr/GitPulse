@@ -277,6 +277,7 @@ pub fn run() {
             cmd_get_bezier_connector,
             cmd_list_tags,
             cmd_get_reflog,
+            cmd_reset_preview,
             cmd_get_language_stats,
             cmd_get_pulse_report,
             cmd_get_knowledge_report,

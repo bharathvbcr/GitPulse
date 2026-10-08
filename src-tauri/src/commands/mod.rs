@@ -14,7 +14,7 @@ use crate::engine::git_cli::{
 };
 use crate::engine::git_reader::{
     BlameLine, CommitDetails, CommitFileChange, DiffPayload, DoraReport, FileBlob, KnowledgeReport,
-    LanguageStatsReport, PulseReport, ReflogEntry,
+    LanguageStatsReport, PulseReport, ReflogEntry, ResetPreview,
 };
 use crate::engine::git_writer::{
     reworded_message, validate_oid_or_revision, validate_ref_name, IndexAction, RebaseStep,
@@ -1248,6 +1248,13 @@ pub async fn cmd_get_reflog(
     max_entries: Option<usize>,
 ) -> Result<Vec<ReflogEntry>, String> {
     off_thread(move || GitReader::get_reflog(&repo_path, max_entries.unwrap_or(200))).await
+}
+
+/// What resetting HEAD's branch to `target` would take off it. Read-only and
+/// ungated; the reset itself goes through the guarded [`cmd_reset`].
+#[tauri::command(async)]
+pub async fn cmd_reset_preview(repo_path: String, target: String) -> Result<ResetPreview, String> {
+    off_thread(move || GitReader::reset_preview(&repo_path, &target)).await
 }
 
 #[tauri::command(async)]
