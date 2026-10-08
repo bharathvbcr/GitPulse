@@ -836,8 +836,8 @@ fn title_words(title: &str) -> std::collections::BTreeSet<String> {
         .collect()
 }
 
-/// Open tasks of a repository that look like the same work as a task about
-/// to be filed: two shared title words, or one shared title word and a shared
+/// Open tasks of a repository — on the board, not archived, not done — that
+/// look like the same work as a task about to be filed: two shared title words, or one shared title word and a shared
 /// label that is not just that word again ("DevMap: …" labelled `devmap` on
 /// both sides is one coincidence, not two). Deliberately generous — a false
 /// match costs the agent one look and one `reviewed_related` entry; a missed
@@ -879,8 +879,9 @@ fn related_open_tasks(
     let mut scored = Vec::new();
     let mut compared = 0;
     let mut complete = true;
-    // Column by column, so the bound is spent on open work and never on an
-    // archive of done cards.
+    // Column by column, so the bound is spent on open work and never on done
+    // cards. Archived is its own flag in any column (workbench schema 11): an
+    // archived card is off the board, so it is not open work either.
     'columns: for status in open_statuses() {
         if compared >= MAX_SCANNED_TASKS {
             complete = false;
@@ -888,7 +889,7 @@ fn related_open_tasks(
         }
         let mut cursor: Option<String> = None;
         loop {
-            let mut input = json!({"repository_id": repository_id, "status": status, "limit": 200});
+            let mut input = json!({"repository_id": repository_id, "status": status, "archived": false, "limit": 200});
             if let Some(cursor) = &cursor {
                 input["cursor"] = json!(cursor);
             }
@@ -1225,10 +1226,16 @@ pub(crate) fn import_briefs(
 }
 
 /// Board tasks for a repository, for an agent. Never registers anything.
+///
+/// `items.list` without `archived` reads both sides (workbench schema 11), so
+/// this always names one: the board (`archived` false, in board order) or the
+/// archive (`archived` true, most recently completed first, as the board's
+/// Archive dock shows it).
 pub(crate) fn list_tasks(
     store: &Store,
     repo_path: &str,
     status: Option<&str>,
+    archived: bool,
     limit: u64,
     cursor: Option<&str>,
 ) -> Result<Value, WorkbenchError> {
@@ -1240,7 +1247,12 @@ pub(crate) fn list_tasks(
             "note": "This repository is not on the GitPulse board yet: no task has been filed under it. That is not the same as a repository whose tasks are all done.",
         }));
     };
-    let mut input = json!({"repository_id": repository["id"], "limit": limit.clamp(1, 200)});
+    let mut input = json!({
+        "repository_id": repository["id"], "archived": archived, "limit": limit.clamp(1, 200),
+    });
+    if archived {
+        input["order"] = json!("completed");
+    }
     if let Some(status) = status {
         input["status"] = json!(file_tasks::normalize_status(status)
             .map_err(|m| WorkbenchError::new("invalid_input", m))?);
@@ -1260,6 +1272,7 @@ pub(crate) fn list_tasks(
                 "priority": item["priority"], "severity": item["severity"], "kind": item["kind"],
                 "owner": item["owner"], "labels": item["labels"], "due_at": item["due_at"],
                 "revision": item["revision"], "updated_at": item["updated_at"],
+                "archived": item["archived"], "completed_at": item["completed_at"],
             })
         })
         .collect();
@@ -1408,8 +1421,8 @@ fn ends_with_block(logs: &str, marker: &str, body: &str) -> bool {
 }
 
 /// Statuses an agent may move its own task to. `done` is where a finished
-/// task goes (and is the board's archive); `review` hands it to a person;
-/// `in_progress` says work has started.
+/// task goes (it stays on the board; archiving is a separate flag a person
+/// sets); `review` hands it to a person; `in_progress` says work has started.
 pub(crate) const AGENT_STATUSES: [&str; 3] = ["in_progress", "review", "done"];
 /// Bound on the completion summary appended to the task's logs.
 pub(crate) const MAX_SUMMARY_CHARS: usize = 4000;

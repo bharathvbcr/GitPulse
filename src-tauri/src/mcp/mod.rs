@@ -621,10 +621,11 @@ fn build_tools() -> Vec<Value> {
         tool(
             "gitpulse_list_tasks",
             "List tasks",
-            "List the tasks on the GitPulse task board for this repository, in board order. repository null means no task has ever been filed under it — not that its tasks are done.",
+            "List the tasks on the GitPulse task board for this repository, in board order. Done tasks stay on the board until a person archives them; archived tasks are off the board and are listed only with archived: true (the archive, most recently completed first). Each task carries archived and completed_at. repository null means no task has ever been filed under it — not that its tasks are done.",
             json!({
                 "repo_path": repo_prop(),
                 "status": { "type": "string", "enum": crate::tasks::file_tasks::STATUSES, "maxLength": 32, "description": "Only this column" },
+                "archived": { "type": "boolean", "description": "true lists the archive instead of the board (default false)" },
                 "limit": {
                     "type": "integer",
                     "description": "Maximum tasks to return (default 50, max 200)",
@@ -1201,6 +1202,7 @@ fn handle_tool_call(name: &str, arguments: &Value) -> Result<Value, String> {
                 &store,
                 repo,
                 arguments["status"].as_str(),
+                arguments["archived"].as_bool().unwrap_or(false),
                 limit,
                 arguments["cursor"].as_str(),
             )
@@ -2819,6 +2821,50 @@ mod tests {
             )
             .unwrap();
         (board, repository_id)
+    }
+
+    /// The board an agent lists is the board the person sees: a task archived
+    /// on it is not listed as live work unless the archive is asked for.
+    #[test]
+    fn list_tasks_reads_the_board_or_the_archive_never_both() {
+        let (dir, profile, repo) = task_fixture();
+        crate::test_support::trust_repo(dir.path());
+        let (board, repository_id) = board_task(profile.path(), &repo, "on-the-board");
+        board
+            .board_request(
+                "items.put",
+                &json!({
+                    "id": "in-the-archive", "request_id": "put-in-the-archive",
+                    "expected_revision": 0, "title": "Shelved idea", "status": "backlog",
+                    "archived": true,
+                    "repository_ids": [repository_id], "primary_repository_id": repository_id,
+                })
+                .to_string(),
+            )
+            .unwrap();
+
+        let (error, listed) = tool_json("gitpulse_list_tasks", json!({ "repo_path": repo }));
+        assert!(!error, "{listed}");
+        assert_eq!(listed["total"], 1, "{listed}");
+        assert_eq!(listed["tasks"][0]["item_id"], "on-the-board");
+        assert_eq!(listed["tasks"][0]["archived"], false);
+        assert_eq!(listed["tasks"][0]["completed_at"], Value::Null);
+
+        let (error, archive) = tool_json(
+            "gitpulse_list_tasks",
+            json!({ "repo_path": repo, "archived": true }),
+        );
+        assert!(!error, "{archive}");
+        assert_eq!(archive["total"], 1, "{archive}");
+        assert_eq!(archive["tasks"][0]["item_id"], "in-the-archive");
+        assert_eq!(archive["tasks"][0]["archived"], true);
+
+        // Not a boolean: refused by the schema, never read as "the board".
+        let (error, refused) = tool_json(
+            "gitpulse_list_tasks",
+            json!({ "repo_path": repo, "archived": "yes" }),
+        );
+        assert!(error, "{refused}");
     }
 
     #[test]

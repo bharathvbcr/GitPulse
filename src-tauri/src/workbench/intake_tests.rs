@@ -775,3 +775,77 @@ fn an_agent_whose_task_was_deleted_is_told_so_and_why() {
         );
     }
 }
+
+// --- Archived is its own flag (workbench schema 11) -------------------------
+
+/// `items.list` without `archived` reads both sides of the board. An agent's
+/// list is the board: an archived task never shows up on it as live work,
+/// and a Done task still on the board does.
+#[test]
+fn an_agent_lists_the_board_without_the_archive() {
+    let (_dir, path) = profile();
+    let store = Store::open(&path).unwrap();
+    let repo = git_repo();
+    let repo_path = repo.path().to_str().unwrap();
+    let open = filed(&store, &repo, "gp-open", "Still to do");
+    let done = filed(&store, &repo, "gp-done", "Finished, still on the board");
+    let archived = filed(&store, &repo, "gp-archived", "Put away, never finished");
+    person_edits(&store, &done, |input| {
+        input.insert("status".into(), json!("done"));
+    });
+    person_edits(&store, &archived, |input| {
+        input.insert("archived".into(), json!(true));
+    });
+
+    let board = list_tasks(&store, repo_path, None, false, 200, None).unwrap();
+    let ids: Vec<&str> = board["tasks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["item_id"].as_str().unwrap())
+        .collect();
+    assert!(ids.contains(&open.as_str()), "{board}");
+    assert!(
+        ids.contains(&done.as_str()),
+        "Done is on the board: {board}"
+    );
+    assert!(!ids.contains(&archived.as_str()), "{board}");
+    assert_eq!(board["total"], 2, "{board}");
+    // Each task says which side it is on, and when it was finished.
+    for task in board["tasks"].as_array().unwrap() {
+        assert_eq!(task["archived"], false, "{task}");
+        let finished = task["item_id"] == done.as_str();
+        assert_eq!(task["completed_at"].is_i64(), finished, "{task}");
+    }
+
+    // The archive is asked for by name, and holds only the archived task.
+    let archive = list_tasks(&store, repo_path, None, true, 200, None).unwrap();
+    assert_eq!(archive["total"], 1, "{archive}");
+    assert_eq!(archive["tasks"][0]["item_id"], archived.as_str());
+    assert_eq!(archive["tasks"][0]["archived"], true);
+    assert_eq!(archive["tasks"][0]["completed_at"], Value::Null);
+}
+
+/// An archived task is off the board in any column, so it is not open work
+/// an agent must read before filing: it never trips `related_tasks_exist`.
+#[test]
+fn an_archived_task_is_not_open_work_for_the_related_task_gate() {
+    let (_dir, path) = profile();
+    let store = Store::open(&path).unwrap();
+    let repo = git_repo();
+    let repo_path = repo.path().to_str().unwrap();
+    let title = "DevMap: cross-crate calls get no caller edge";
+    let shelved = filed(&store, &repo, "dm-shelved", title);
+    person_edits(&store, &shelved, |input| {
+        input.insert("archived".into(), json!(true));
+    });
+
+    let added = add_task(&store, repo_path, task("dm-again", title), false, &[])
+        .unwrap_or_else(|e| panic!("{}: {}", e.code, e.message));
+    assert_eq!(added["related_check"]["related_open_tasks"], 0, "{added}");
+
+    // The same title on the board is still open work, and is refused.
+    let error = add_task(&store, repo_path, task("dm-third", title), false, &[]).unwrap_err();
+    assert_eq!(error.code, "related_tasks_exist", "{}", error.message);
+    assert!(!error.message.contains(&shelved), "{}", error.message);
+}

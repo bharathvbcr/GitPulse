@@ -312,7 +312,7 @@ fn every_refusal_writes_nothing() {
         ),
         (
             "target_done",
-            Box::new(|| merge(&store, &repo, &done, &[&source], "Into the archive.")),
+            Box::new(|| merge(&store, &repo, &done, &[&source], "Into finished work.")),
         ),
         (
             "task_in_use",
@@ -461,7 +461,7 @@ fn folding_into_a_merged_card_points_at_its_target_instead_of_filing_a_twin() {
 }
 
 /// The bounds hold at their edge: the most sources one call takes merge in
-/// one write, and a done target takes done sources (housekeeping the archive),
+/// one write, and a done target takes done sources (housekeeping finished work),
 /// just not open ones.
 #[test]
 fn the_largest_merge_one_call_takes_goes_through() {
