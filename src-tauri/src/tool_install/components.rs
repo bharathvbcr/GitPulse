@@ -14,6 +14,13 @@
 //! the bare name). So a missing `dcstore` breaks managed agent runs and
 //! enhancements, and until now it did so with no way to see why.
 //!
+//! A present one is not enough either. `dcstore --version` names the workbench
+//! schema the build opens (`workbench_schema`), and only one that opens the
+//! schema GitPulse's vendored store opens is reported installed: a stale
+//! `dcstore` first on `PATH` is the one Manvi picks, and it refuses the
+//! profile. [`verified_store_binary`] is that checked binary, which the
+//! sidecar hands Manvi as `MANVI_STORE_BINARY`.
+//!
 //! ## Presence, and only the version that exists
 //!
 //! DevCouncil components (`devmap`, `manvi`, `dcstore`, `dcverify`, `dcgrep`,
@@ -133,6 +140,13 @@ struct Spec<'a> {
     /// Managed tools resolve through env → saved config → PATH; the rest are
     /// looked up on `PATH` and GitPulse's own bin directory only.
     managed: Option<ExternalTool>,
+    /// The variable the Manvi host reads this component's path from before
+    /// it searches `PATH`. When it is set, that binary is the one the host
+    /// runs, so it is the one probed.
+    host_env: Option<&'static str>,
+    /// The workbench schema this component must report opening
+    /// (`workbench_schema` in its `--version` answer) to count as installed.
+    workbench_schema: Option<i64>,
 }
 
 /// The catalogue. Kept beside the presets in `devcouncilInstall.ts`, which is
@@ -147,6 +161,8 @@ fn catalogue() -> Vec<Spec<'static>> {
             probe: Probe::VersionFlag,
             presets: &["devmap", "analysis", "all"],
             managed: Some(ExternalTool::Devmap),
+            host_env: None,
+            workbench_schema: None,
         },
         Spec {
             id: "manvi",
@@ -156,6 +172,8 @@ fn catalogue() -> Vec<Spec<'static>> {
             probe: Probe::VersionFlag,
             presets: &["all"],
             managed: Some(ExternalTool::Manvi),
+            host_env: None,
+            workbench_schema: None,
         },
         Spec {
             id: "dcstore",
@@ -165,6 +183,8 @@ fn catalogue() -> Vec<Spec<'static>> {
             probe: Probe::VersionWithFallback(&[]),
             presets: &["analysis", "all"],
             managed: None,
+            host_env: Some("MANVI_STORE_BINARY"),
+            workbench_schema: Some(crate::workbench::WORKBENCH_SCHEMA),
         },
         Spec {
             id: "dcverify",
@@ -174,6 +194,8 @@ fn catalogue() -> Vec<Spec<'static>> {
             probe: Probe::VersionWithFallback(&[]),
             presets: &["analysis", "all"],
             managed: None,
+            host_env: Some("MANVI_VERIFY_BINARY"),
+            workbench_schema: None,
         },
         Spec {
             id: "dcgrep",
@@ -183,6 +205,8 @@ fn catalogue() -> Vec<Spec<'static>> {
             probe: Probe::VersionWithFallback(&["health"]),
             presets: &["analysis", "all"],
             managed: None,
+            host_env: None,
+            workbench_schema: None,
         },
         Spec {
             id: "devcouncil",
@@ -192,6 +216,8 @@ fn catalogue() -> Vec<Spec<'static>> {
             probe: Probe::VersionFlag,
             presets: &["all"],
             managed: None,
+            host_env: None,
+            workbench_schema: None,
         },
     ]
 }
@@ -226,7 +252,38 @@ fn locate(spec: &Spec<'_>) -> Option<String> {
         // would be a lie about which binary answers.
         return super::resolve_status(tool).path;
     }
-    git_cli::find_external_tool(spec.id)
+    let host_choice = spec
+        .host_env
+        .and_then(std::env::var_os)
+        .filter(|choice| !choice.is_empty());
+    host_located(spec.id, host_choice.as_deref())
+}
+
+/// Where the Manvi host finds `id`: the path its override variable names, as
+/// given, or a bare name there or `id` itself looked up — the same rule
+/// Manvi's own resolution follows, so the binary probed is the one it runs.
+fn host_located(id: &str, host_choice: Option<&std::ffi::OsStr>) -> Option<String> {
+    match host_choice {
+        Some(choice) if std::path::Path::new(choice).components().count() > 1 => {
+            Some(choice.to_string_lossy().into_owned())
+        }
+        Some(choice) => git_cli::find_external_tool(&choice.to_string_lossy()),
+        None => git_cli::find_external_tool(id),
+    }
+}
+
+/// The `dcstore` the Manvi host should open the profile workbench through:
+/// located as the host would find it, and probed as the inventory probes it —
+/// its identity, and that it opens the workbench schema GitPulse's vendored
+/// store opens. `None` when no such binary is installed.
+pub(crate) fn verified_store_binary() -> Option<String> {
+    let spec = catalogue().into_iter().find(|spec| spec.id == "dcstore")?;
+    let status = probe(&spec);
+    if status.installed {
+        status.path
+    } else {
+        None
+    }
 }
 
 fn probe(spec: &Spec<'_>) -> ComponentStatus {
@@ -358,46 +415,97 @@ fn probe_located_with(
         );
     };
 
+    // Every JSON answer is judged the same way, whichever call produced it.
+    let impostor = |reported: String| {
+        base(
+            false,
+            Some(path.clone()),
+            VersionReading::Unavailable {
+                detail: format!("reported unexpected component identity {reported:?}"),
+            },
+            Some(format!(
+                "`{}` did not answer like a DevCouncil component: reported identity {reported:?}",
+                spec.id
+            )),
+        )
+    };
+    let unlike = |detail: String| {
+        base(
+            false,
+            Some(path.clone()),
+            VersionReading::Unavailable {
+                detail: detail.clone(),
+            },
+            Some(format!(
+                "`{}` did not answer like a DevCouncil component: {detail}",
+                spec.id
+            )),
+        )
+    };
+    // The component answered as itself. One held to a workbench schema is
+    // installed only if it said it opens that schema; `answer` is `None`
+    // when it said nothing a schema could be read from.
+    let accept = |version: VersionReading, answer: Option<&serde_json::Value>| {
+        let Some(required) = spec.workbench_schema else {
+            return base(true, Some(path.clone()), version, None);
+        };
+        let reported = answer
+            .and_then(|answer| answer.get("workbench_schema"))
+            .and_then(serde_json::Value::as_i64);
+        let reason = match reported {
+            Some(reported) if reported == required => {
+                return base(true, Some(path.clone()), version, None);
+            }
+            Some(reported) if reported < required => format!(
+                "`{path}` opens workbench schema {reported}, and GitPulse's task board is schema {required}. Manvi runs this `{}` against the board and it refuses the profile: update it to one that opens schema {required}.",
+                spec.id
+            ),
+            Some(reported) => format!(
+                "`{path}` opens workbench schema {reported}, newer than GitPulse's task board (schema {required}); Manvi running it would migrate the profile past what GitPulse reads. Install a `{}` that opens schema {required}, or update GitPulse.",
+                spec.id
+            ),
+            None => format!(
+                "`{path}` does not report the workbench schema it opens (`workbench_schema` in `{} --version`), so it predates the check for schema {required}, the one GitPulse's task board needs. Manvi runs it against the board: update it.",
+                spec.id
+            ),
+        };
+        base(false, Some(path.clone()), version, Some(reason))
+    };
+    let judge = |value: &serde_json::Value| match evaluate_json_response(value, spec.id) {
+        JsonProbeOutcome::Reported { version } => {
+            accept(VersionReading::Reported { version }, Some(value))
+        }
+        JsonProbeOutcome::NotExposed { detail } => {
+            accept(VersionReading::NotExposed { detail }, Some(value))
+        }
+        JsonProbeOutcome::IdentityMismatch { reported } => impostor(reported),
+        JsonProbeOutcome::Malformed { detail } => unlike(detail),
+    };
+    let json_object = |text: &str| {
+        serde_json::from_str::<serde_json::Value>(text.trim())
+            .ok()
+            .filter(serde_json::Value::is_object)
+    };
+
     match spec.probe {
         Probe::VersionFlag | Probe::VersionWithFallback(_) => {
             let fallback_args = match spec.probe {
                 Probe::VersionWithFallback(args) => Some(args),
                 _ => None,
             };
+            let asked = run(&path, spec.id, &["--version"]);
+            // A refused or failed `--version` on an older release: its
+            // read-only handshake, when it has one, is the evidence instead.
+            let mut fallback = || {
+                fallback_args
+                    .and_then(|args| run(&path, spec.id, args).ok())
+                    .and_then(|(_, text)| json_object(&text))
+            };
 
-            match run(&path, spec.id, &["--version"]) {
+            match asked {
                 Ok((true, text)) => {
                     if let Ok(value) = serde_json::from_str::<serde_json::Value>(text.trim()) {
-                        match evaluate_json_response(&value, spec.id) {
-                            JsonProbeOutcome::Reported { version } => {
-                                base(true, Some(path), VersionReading::Reported { version }, None)
-                            }
-                            JsonProbeOutcome::NotExposed { detail } => {
-                                base(true, Some(path), VersionReading::NotExposed { detail }, None)
-                            }
-                            JsonProbeOutcome::IdentityMismatch { reported } => base(
-                                false,
-                                Some(path),
-                                VersionReading::Unavailable {
-                                    detail: format!("reported unexpected component identity {reported:?}"),
-                                },
-                                Some(format!(
-                                    "`{}` did not answer like a DevCouncil component: reported identity {reported:?}",
-                                    spec.id
-                                )),
-                            ),
-                            JsonProbeOutcome::Malformed { detail } => base(
-                                false,
-                                Some(path),
-                                VersionReading::Unavailable {
-                                    detail: detail.clone(),
-                                },
-                                Some(format!(
-                                    "`{}` did not answer like a DevCouncil component: {detail}",
-                                    spec.id
-                                )),
-                            ),
-                        }
+                        judge(&value)
                     } else {
                         let reading = match super::version_line(&text, spec.id) {
                             Some(version) => VersionReading::Reported { version },
@@ -405,92 +513,20 @@ fn probe_located_with(
                                 detail: "`--version` printed nothing this reader recognized".into(),
                             },
                         };
-                        base(true, Some(path), reading, None)
+                        accept(reading, None)
                     }
                 }
                 Ok((false, text)) => {
-                    if let Ok(value) = serde_json::from_str::<serde_json::Value>(text.trim()) {
-                        if value.is_object() {
-                            match evaluate_json_response(&value, spec.id) {
-                                JsonProbeOutcome::Reported { version } => {
-                                    return base(
-                                        true,
-                                        Some(path),
-                                        VersionReading::Reported { version },
-                                        None,
-                                    );
-                                }
-                                JsonProbeOutcome::NotExposed { detail } => {
-                                    return base(
-                                        true,
-                                        Some(path),
-                                        VersionReading::NotExposed { detail },
-                                        None,
-                                    );
-                                }
-                                JsonProbeOutcome::IdentityMismatch { reported } => {
-                                    return base(
-                                        false,
-                                        Some(path),
-                                        VersionReading::Unavailable {
-                                            detail: format!("reported unexpected component identity {reported:?}"),
-                                        },
-                                        Some(format!(
-                                            "`{}` did not answer like a DevCouncil component: reported identity {reported:?}",
-                                            spec.id
-                                        )),
-                                    );
-                                }
-                                _ => {}
-                            }
-                        }
+                    if let Some(value) = json_object(&text) {
+                        return judge(&value);
                     }
-
-                    if let Some(args) = fallback_args {
-                        if let Ok((_, fallback_text)) = run(&path, spec.id, args) {
-                            if let Ok(value) =
-                                serde_json::from_str::<serde_json::Value>(fallback_text.trim())
-                            {
-                                if value.is_object() {
-                                    return match evaluate_json_response(&value, spec.id) {
-                                        JsonProbeOutcome::Reported { version } => {
-                                            base(true, Some(path), VersionReading::Reported { version }, None)
-                                        }
-                                        JsonProbeOutcome::NotExposed { detail } => {
-                                            base(true, Some(path), VersionReading::NotExposed { detail }, None)
-                                        }
-                                        JsonProbeOutcome::IdentityMismatch { reported } => base(
-                                            false,
-                                            Some(path),
-                                            VersionReading::Unavailable {
-                                                detail: format!("reported unexpected component identity {reported:?}"),
-                                            },
-                                            Some(format!(
-                                                "`{}` did not answer like a DevCouncil component: reported identity {reported:?}",
-                                                spec.id
-                                            )),
-                                        ),
-                                        JsonProbeOutcome::Malformed { detail } => base(
-                                            false,
-                                            Some(path),
-                                            VersionReading::Unavailable {
-                                                detail: detail.clone(),
-                                            },
-                                            Some(format!(
-                                                "`{}` did not answer like a DevCouncil component: {detail}",
-                                                spec.id
-                                            )),
-                                        ),
-                                    };
-                                }
-                            }
-                        }
+                    if let Some(value) = fallback() {
+                        return judge(&value);
                     }
-
                     let detail = text.trim().chars().take(200).collect::<String>();
                     base(
                         false,
-                        Some(path),
+                        Some(path.clone()),
                         VersionReading::Unavailable {
                             detail: detail.clone(),
                         },
@@ -498,50 +534,12 @@ fn probe_located_with(
                     )
                 }
                 Err(detail) => {
-                    if let Some(args) = fallback_args {
-                        if let Ok((_, fallback_text)) = run(&path, spec.id, args) {
-                            if let Ok(value) =
-                                serde_json::from_str::<serde_json::Value>(fallback_text.trim())
-                            {
-                                if value.is_object() {
-                                    return match evaluate_json_response(&value, spec.id) {
-                                        JsonProbeOutcome::Reported { version } => {
-                                            base(true, Some(path), VersionReading::Reported { version }, None)
-                                        }
-                                        JsonProbeOutcome::NotExposed { detail } => {
-                                            base(true, Some(path), VersionReading::NotExposed { detail }, None)
-                                        }
-                                        JsonProbeOutcome::IdentityMismatch { reported } => base(
-                                            false,
-                                            Some(path),
-                                            VersionReading::Unavailable {
-                                                detail: format!("reported unexpected component identity {reported:?}"),
-                                            },
-                                            Some(format!(
-                                                "`{}` did not answer like a DevCouncil component: reported identity {reported:?}",
-                                                spec.id
-                                            )),
-                                        ),
-                                        JsonProbeOutcome::Malformed { detail } => base(
-                                            false,
-                                            Some(path),
-                                            VersionReading::Unavailable {
-                                                detail: detail.clone(),
-                                            },
-                                            Some(format!(
-                                                "`{}` did not answer like a DevCouncil component: {detail}",
-                                                spec.id
-                                            )),
-                                        ),
-                                    };
-                                }
-                            }
-                        }
+                    if let Some(value) = fallback() {
+                        return judge(&value);
                     }
-
                     base(
                         false,
-                        Some(path),
+                        Some(path.clone()),
                         VersionReading::Unavailable {
                             detail: detail.clone(),
                         },
@@ -554,71 +552,13 @@ fn probe_located_with(
         // succeeded, so the object — not the exit status — is the evidence
         // that the binary is the component it is named after.
         Probe::JsonHandshake(args) => match run(&path, spec.id, args) {
-            Ok((_, text)) => {
-                if let Ok(value) = serde_json::from_str::<serde_json::Value>(text.trim()) {
-                    if value.is_object() {
-                        match evaluate_json_response(&value, spec.id) {
-                            JsonProbeOutcome::Reported { version } => {
-                                base(true, Some(path), VersionReading::Reported { version }, None)
-                            }
-                            JsonProbeOutcome::NotExposed { detail } => {
-                                base(true, Some(path), VersionReading::NotExposed { detail }, None)
-                            }
-                            JsonProbeOutcome::IdentityMismatch { reported } => base(
-                                false,
-                                Some(path),
-                                VersionReading::Unavailable {
-                                    detail: format!("reported unexpected component identity {reported:?}"),
-                                },
-                                Some(format!(
-                                    "`{}` did not answer like a DevCouncil component: reported identity {reported:?}",
-                                    spec.id
-                                )),
-                            ),
-                            JsonProbeOutcome::Malformed { detail } => base(
-                                false,
-                                Some(path),
-                                VersionReading::Unavailable {
-                                    detail: detail.clone(),
-                                },
-                                Some(format!(
-                                    "`{}` did not answer like a DevCouncil component: {detail}",
-                                    spec.id
-                                )),
-                            ),
-                        }
-                    } else {
-                        let detail = text.trim().chars().take(200).collect::<String>();
-                        base(
-                            false,
-                            Some(path),
-                            VersionReading::Unavailable {
-                                detail: detail.clone(),
-                            },
-                            Some(format!(
-                                "`{}` did not answer like a DevCouncil component: {detail}",
-                                spec.id
-                            )),
-                        )
-                    }
-                } else {
-                    let detail = text.trim().chars().take(200).collect::<String>();
-                    base(
-                        false,
-                        Some(path),
-                        VersionReading::Unavailable {
-                            detail: detail.clone(),
-                        },
-                        Some(format!(
-                            "`{}` did not answer like a DevCouncil component: {detail}",
-                            spec.id
-                        )),
-                    )
-                }
-            }
+            Ok((_, text)) => match json_object(&text) {
+                Some(value) => judge(&value),
+                None => unlike(text.trim().chars().take(200).collect::<String>()),
+            },
             Err(detail) => base(
                 false,
-                Some(path),
+                Some(path.clone()),
                 VersionReading::Unavailable {
                     detail: detail.clone(),
                 },
@@ -803,6 +743,8 @@ mod tests {
             probe: Probe::VersionFlag,
             presets: &["all"],
             managed: None,
+            host_env: None,
+            workbench_schema: None,
         };
         let status = probe(&spec);
         assert!(!status.installed);
@@ -834,6 +776,8 @@ mod tests {
                 probe,
                 presets: &["analysis"],
                 managed: None,
+                host_env: None,
+                workbench_schema: None,
             },
             Some(format!("/nowhere/{id}")),
             run,
@@ -919,6 +863,8 @@ mod tests {
                 probe: Probe::JsonHandshake(&["health"]),
                 presets: &["analysis"],
                 managed: None,
+                host_env: None,
+                workbench_schema: None,
             },
             Some(bin.to_string_lossy().into_owned()),
         );
@@ -1027,6 +973,152 @@ mod tests {
             status.version
         );
         assert!(status.reason.is_none());
+    }
+
+    /// The host's override names the binary it runs, so it is the one
+    /// probed: a path as given, a bare name looked up.
+    #[test]
+    fn a_host_override_is_the_binary_located() {
+        assert_eq!(
+            host_located("dcstore", Some(std::ffi::OsStr::new("/opt/dc/bin/dcstore"))).as_deref(),
+            Some("/opt/dc/bin/dcstore")
+        );
+        assert_eq!(
+            host_located(
+                "dcstore",
+                Some(std::ffi::OsStr::new("gitpulse-no-such-store-binary"))
+            ),
+            None,
+            "a bare name the host cannot find either is not installed"
+        );
+        let store = catalogue()
+            .into_iter()
+            .find(|spec| spec.id == "dcstore")
+            .unwrap();
+        assert_eq!(store.host_env, Some("MANVI_STORE_BINARY"));
+    }
+
+    /// The catalogue's own spec for `id`, probed at a known path with canned
+    /// answers: what the inventory says about the real component.
+    fn probed_as_catalogued(
+        id: &str,
+        run: &mut dyn FnMut(&str, &str, &[&str]) -> ProbeAnswer,
+    ) -> ComponentStatus {
+        let spec = catalogue()
+            .into_iter()
+            .find(|spec| spec.id == id)
+            .expect("catalogued");
+        probe_located_with(&spec, Some(format!("/stale/bin/{id}")), run)
+    }
+
+    fn dcstore_answering(payload: &str) -> ComponentStatus {
+        probed_as_catalogued("dcstore", &mut |_, _, args| {
+            assert_eq!(args, ["--version"]);
+            Ok((true, payload.to_string()))
+        })
+    }
+
+    /// A `dcstore` that opens the workbench schema GitPulse's vendored store
+    /// opens is installed, with its version.
+    #[test]
+    fn a_dcstore_reporting_the_vendored_workbench_schema_is_installed() {
+        let status = dcstore_answering(&format!(
+            "{{\"ok\":true,\"id\":\"dcstore\",\"component\":\"dc-store\",\"version\":\"0.2.4\",\"workbench_schema\":{}}}\n",
+            crate::workbench::WORKBENCH_SCHEMA
+        ));
+        assert!(status.installed, "{status:?}");
+        assert_eq!(
+            status.version,
+            VersionReading::Reported {
+                version: "0.2.4".into()
+            }
+        );
+        assert!(status.reason.is_none(), "{status:?}");
+    }
+
+    /// Manvi runs whichever `dcstore` it resolves against the profile. One
+    /// that does not open GitPulse's workbench schema refuses the profile (or,
+    /// newer, would migrate it past what GitPulse reads), so it is not an
+    /// installed dcstore: it is one that needs updating, and says which.
+    #[test]
+    fn a_dcstore_on_another_workbench_schema_needs_updating() {
+        let required = crate::workbench::WORKBENCH_SCHEMA;
+        for (payload, says) in [
+            (
+                "{\"ok\":true,\"id\":\"dcstore\",\"component\":\"dc-store\",\"version\":\"0.2.4\"}\n".to_string(),
+                "does not report".to_string(),
+            ),
+            (
+                format!("{{\"ok\":true,\"id\":\"dcstore\",\"component\":\"dc-store\",\"version\":\"0.2.3\",\"workbench_schema\":{}}}\n", required - 1),
+                format!("workbench schema {}", required - 1),
+            ),
+            (
+                format!("{{\"ok\":true,\"id\":\"dcstore\",\"component\":\"dc-store\",\"version\":\"0.3.0\",\"workbench_schema\":{}}}\n", required + 1),
+                format!("workbench schema {}", required + 1),
+            ),
+            (
+                format!("{{\"ok\":true,\"id\":\"dcstore\",\"component\":\"dc-store\",\"version\":\"0.2.4\",\"workbench_schema\":\"{required}\"}}\n"),
+                "does not report".to_string(),
+            ),
+        ] {
+            let status = dcstore_answering(&payload);
+            assert!(!status.installed, "{payload}: {status:?}");
+            let reason = status.reason.as_deref().unwrap_or_default();
+            assert!(reason.contains(&says), "{payload}: {reason}");
+            assert!(
+                reason.contains(&format!("schema {required}")) && reason.contains("update"),
+                "the reason names what GitPulse needs and what to do: {reason}"
+            );
+            assert!(
+                reason.contains("/stale/bin/dcstore"),
+                "the reason names the binary Manvi would run: {reason}"
+            );
+            assert_eq!(status.path.as_deref(), Some("/stale/bin/dcstore"));
+        }
+    }
+
+    /// A `dcstore` too old to answer `--version` is older still: it cannot
+    /// say which workbench schema it opens, so it is not accepted either.
+    #[test]
+    fn a_dcstore_that_cannot_report_its_workbench_schema_needs_updating() {
+        let status = probed_as_catalogued("dcstore", &mut |_, _, args| {
+            if args == ["--version"] {
+                return Ok((false, "unknown flag --version\n".into()));
+            }
+            Ok((
+                false,
+                "{\"ok\":false,\"error\":\"--db is required\"}\n".into(),
+            ))
+        });
+        assert!(!status.installed, "{status:?}");
+        assert!(
+            status
+                .reason
+                .as_deref()
+                .unwrap_or_default()
+                .contains("does not report"),
+            "{status:?}"
+        );
+        // A plain-text version line names no schema either.
+        let status = probed_as_catalogued("dcstore", &mut |_, _, _| {
+            Ok((true, "dcstore 0.2.1\n".into()))
+        });
+        assert!(!status.installed, "{status:?}");
+    }
+
+    /// Only the store is held to a workbench schema: the verifier and the
+    /// searcher answering without one are as installed as before.
+    #[test]
+    fn only_dcstore_is_held_to_the_workbench_schema() {
+        for id in ["dcverify", "dcgrep"] {
+            let status = probed_as_catalogued(id, &mut |_, _, _| {
+                Ok((
+                    true,
+                    format!("{{\"ok\":true,\"id\":\"{id}\",\"version\":\"0.2.4\"}}\n"),
+                ))
+            });
+            assert!(status.installed, "{id}: {status:?}");
+        }
     }
 
     /// A probe that did not run must never look like a probe that found

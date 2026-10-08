@@ -189,26 +189,23 @@ and 4 that no other card owns.
 
 The store work for each part is done in DevCouncil
 (`rust/dc-store/src/workbench/`), re-vendored, and then wired into GitPulse.
-The vendored dc-store and DevCouncil `main` are both `c3907784` at schema 10,
-and neither has a link, queue or outbox table. However, the unmerged DevCouncil
-branch `feat/workbench-schema-11` (`8d09fa2b`, 2026-10-07) already adds
-`work_item_links` (see part 3). The schema version is a resource two branches
-can both claim. The queue and outbox therefore take the rung after schema 11.
+Schema 11 is merged into DevCouncil `main` (`8d09fa2b`, with follow-up fixes)
+and vendored into GitPulse: the vendored dc-store is `9de7d7cd` at schema 11
+(`src-tauri/vendored/VENDOR.json`). Schema 11 adds `work_item_links` (see
+part 3) but no queue or outbox table. The schema version is a resource two
+branches can both claim, so the queue and outbox take the rung after schema 11.
 
 **Sequencing agreed with the user, 2026-10-07:**
 1. Merge schema 11 into DevCouncil `main` and re-vendor it into GitPulse.
+   *Done.*
 2. Build schema 12 (queue and outbox) on top of it.
 3. Build the GitPulse readiness gate and GitHub sync.
 
-Step 1 has been checked but not merged. On `8d09fa2b`, the dc-store suites pass
-(21 result lines, 0 failed) and so does `go test ./dc/store/...`. The branch
-fast-forwards from `main` (`c3907784`). The merge has to run from a
-DevCouncil-rooted session, because the GitPulse session's gate refuses git
-against another repository.
-
-The re-vendor changes what Done means in GitPulse: schema 11 turns `archived`
-into a flag that is independent of status. That collides with the board lanes,
-so check `gitpulse_insights` for a sibling lane doing the same before starting.
+The re-vendor changed what Done means in GitPulse: schema 11 turns `archived`
+into a flag that is independent of status, so Done stays on the board until a
+person archives it ([ARCHIVE_SEPARATION.md](ARCHIVE_SEPARATION.md)). Every
+`items.list` caller has to name the side it reads, because `archived` omitted
+reads both.
 
 **1. Cross-repository execution and integration queue** (section 4)
 
@@ -274,10 +271,10 @@ so check `gitpulse_insights` for a sibling lane doing the same before starting.
 (section 3)
 
 - *What exists:*
-  - On `main`, nothing: [QUALIFICATION.md](QUALIFICATION.md#task-fields-against-the-plan)
-    declines parent/blocking/related/duplicate links for want of a link table.
-  - On the unmerged DevCouncil branch `feat/workbench-schema-11` (`8d09fa2b`),
-    schema 11 adds `work_item_links(item_id, kind, target_id, position)` with
+  - Before schema 11, nothing: there was no link table. Links are now carried
+    ([QUALIFICATION.md](QUALIFICATION.md#task-fields-against-the-plan)).
+  - Schema 11 (DevCouncil `8d09fa2b`, merged into `main` and vendored)
+    adds `work_item_links(item_id, kind, target_id, position)` with
     `kind` in `parent`, `blocks`, `related` or `duplicate_of`, plus a reverse
     index. It also adds a check that refuses a parent being its own
     descendant, checklists, `archived` and `completed_at`. The brief renders

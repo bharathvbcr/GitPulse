@@ -14,8 +14,9 @@ pins each claim below to the vendored source.
 
 `dc-store` is vendored from DevCouncil
 ([`src-tauri/vendored/VENDOR.json`](../src-tauri/vendored/VENDOR.json), crate
-`dc-store` at commit `9de7d7c`). The change was made upstream on DevCouncil's
-`feat/workbench-schema-11` branch and re-vendored with
+`dc-store` at commit `e57f3d2`). The change was made upstream on DevCouncil's
+`feat/workbench-schema-11` branch, corrected on `fix/workbench-schema-11-audit`
+(below), and re-vendored with
 `node scripts/vendor-crates.mjs --crate=dc-store`, never edited here.
 
 Schema version is **11**. The 10 → 11 rung (`workbench/items.sql`):
@@ -33,10 +34,12 @@ Schema version is **11**. The 10 → 11 rung (`workbench/items.sql`):
   empty itself on upgrade while the Done column doubled — the same work,
   reported two different ways. A reader who wants a Done task back on the
   board restores it, which is a normal action rather than a repair;
-- recovers each migrated task's `completed_at` from its history: the earliest
-  revision of its *current* Done streak (the first revision after the last one
-  whose status was not Done), falling back to `updated_at` when there is no
-  such history. No revision is spent, so a host holding a pre-upgrade revision
+- recovers each migrated task's `completed_at` from its history: the time of
+  the earliest revision of its *current* Done streak (the first revision after
+  the last one whose status was not Done) — that revision's own time, not the
+  earliest time in the streak, which a host with a slower clock can put before
+  the task was Done — falling back to `updated_at` when there is no such
+  history. No revision is spent, so a host holding a pre-upgrade revision
   can still save;
 - gives **every other row** the same keys a schema 11 write gives it —
   `archived: false`, `completed_at: null`, an empty `checklist` and no
@@ -71,9 +74,20 @@ order has its own cursor prefix, so a cursor is refused under another order
 rather than resuming at a position that means something else.
 
 `items.restore` brings a soft-deleted task back at the next revision, checked
-against the revision its deletion produced. A link the task held survives its
-target's deletion (shown as deleted in the brief); a new link must name a live
-task.
+against the revision its deletion produced. Deleting a workspace leaves
+already-deleted tasks as their deletion left them, so that revision and the
+deleted list's order both hold; a home workspace deleted meanwhile is dropped
+on restore. A link the task held survives its target's deletion (shown as
+deleted in the brief); a new link must name a live task. A new parent link is
+refused when the chain it would make — the parent's ancestors, the parent, the
+task and its deepest subtask — holds more than 256 tasks; a parent the task
+already has is not checked again, so another task's edit never makes it
+unsaveable.
+
+`dcstore --version` reports the `workbench_schema` it opens. GitPulse hands
+Manvi only a `dcstore` that reports this build's schema (`MANVI_STORE_BINARY`)
+and shows any other as needing an update: both 0.2.4 builds answered the same
+version, and a schema 10 one on `PATH` refused every workbench request.
 
 ## GitPulse
 

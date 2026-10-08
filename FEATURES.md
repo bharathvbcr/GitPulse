@@ -110,7 +110,7 @@ flowchart LR
 - **Faceted Filters & Search**: Full-text search with priority, type, owner, label, and due-date filters.
 - **Manvi AI Drafting Suggestions**: Proposes title and description enhancements against saved task revisions with field locks and explicit acceptance.
 - **Agent Handoff**: One-click copying of structured task briefs or drafts tailored for coding agents (Claude Code, Cursor, Codex).
-- **Archive Dock & Deletion**: Dedicated dock for archived tasks (auto-archived when Done); allows full search, load-more, and restoring to active boards.
+- **Archive Dock & Deletion**: Dedicated dock for archived tasks, most recently completed first. Archive is its own action, separate from Done: a finished task stays in the Done column until it is archived. Allows full search, load-more, and restoring to active boards.
 
 ---
 

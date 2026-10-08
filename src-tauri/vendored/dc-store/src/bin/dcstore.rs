@@ -199,12 +199,18 @@ fn is_version_arg(arg: &str) -> bool {
 /// JSON rather than a bare string because this boundary's contract is that
 /// every outcome is a JSON object on stdout — a caller that parses each line
 /// must not have to special-case this one.
+///
+/// `workbench_schema` is the profile version this build opens, and the only
+/// field that tells a schema 10 build from a schema 11 one: both are 0.2.4.
+/// A host that hands its profile to whatever `dcstore` is on PATH checks it
+/// first, rather than learning from `schema_unsupported` on every request.
 fn version_object() -> String {
     format!(
-        "{{\"ok\":true,\"id\":{},\"component\":{},\"version\":{}}}",
+        "{{\"ok\":true,\"id\":{},\"component\":{},\"version\":{},\"workbench_schema\":{}}}",
         quote(COMPONENT_ID),
         quote(STORE_IDENTITY),
-        quote(env!("CARGO_PKG_VERSION"))
+        quote(env!("CARGO_PKG_VERSION")),
+        dc_store::workbench::WORKBENCH_SCHEMA
     )
 }
 

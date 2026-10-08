@@ -30,6 +30,11 @@ const MAX_INPUT: usize = 1024 * 1024;
 const MAX_MODEL_BASE_URL: usize = 512;
 const MAX_MODEL_ID: usize = 128;
 
+/// The workbench schema the vendored dc-store opens, and so the only one a
+/// `dcstore` Manvi runs against this profile may open: an older one refuses
+/// the profile, a newer one would migrate it past what GitPulse can read.
+pub(crate) use dc_store::workbench::WORKBENCH_SCHEMA;
+
 /// Identity of the Manvi child environment. Changing it retires the worker.
 type WorkerFingerprint = Option<(String, String)>;
 /// An open-file scan of a directory: `Ok` only when nothing is open in it.

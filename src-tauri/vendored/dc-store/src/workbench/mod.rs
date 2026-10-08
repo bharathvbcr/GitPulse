@@ -21,6 +21,11 @@ use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, 
 use std::collections::HashSet;
 
 const SCHEMA: &str = include_str!("schema.sql");
+/// The workbench schema this build reads and writes. A profile at any other
+/// version is refused, so every host sharing a profile must be built at the
+/// same one; `dcstore --version` reports it so a host can check that before
+/// handing a profile to a store it did not build.
+pub const WORKBENCH_SCHEMA: i64 = 11;
 const MAX_INTEGER: i64 = 9_007_199_254_740_990;
 // Reserve envelope/cursor space within a 2 MiB response. The collector stops
 // fetching rows at this bound, including for full revision and event documents.
@@ -368,7 +373,7 @@ fn ensure_schema(conn: &Connection) -> Result<()> {
         }
         tx.commit()?;
     }
-    if version != 11 {
+    if version != WORKBENCH_SCHEMA {
         return Err(Error {
             code: "schema_unsupported",
             message: format!("workbench schema {version} is not supported"),
@@ -971,14 +976,18 @@ fn delete(
 ) -> Result<Affected> {
     let mut affected = Affected::none();
     if matches!(entity, Entity::Workspace) {
+        // Live tasks only. A deleted task keeps the revision and time its
+        // deletion gave it — what a restore is checked against and what the
+        // deleted list is ordered by — and drops a home that no longer
+        // exists when it is restored.
         affected.total = input.conn.query_row(
-            "SELECT count(*) FROM work_items WHERE home_workspace_id=?1",
+            "SELECT count(*) FROM work_items WHERE home_workspace_id=?1 AND deleted=0",
             [id],
             |r| r.get(0),
         )?;
-        affected.ids=input.conn.query_row("SELECT json_group_array(id) FROM (SELECT id FROM work_items WHERE home_workspace_id=?1 ORDER BY id LIMIT 200)",[id],|r|r.get(0))?;
-        input.conn.execute("INSERT INTO work_revisions(entity_type,entity_id,revision,body) SELECT 'item',id,revision+1,json_set(body,'$.home_workspace_id',NULL,'$.revision',revision+1,'$.updated_at',?2) FROM work_items WHERE home_workspace_id=?1",params![id,now])?;
-        input.conn.execute("UPDATE work_items SET home_workspace_id=NULL,revision=revision+1,body=json_set(body,'$.home_workspace_id',NULL,'$.revision',revision+1,'$.updated_at',?2) WHERE home_workspace_id=?1",params![id,now])?;
+        affected.ids=input.conn.query_row("SELECT json_group_array(id) FROM (SELECT id FROM work_items WHERE home_workspace_id=?1 AND deleted=0 ORDER BY id LIMIT 200)",[id],|r|r.get(0))?;
+        input.conn.execute("INSERT INTO work_revisions(entity_type,entity_id,revision,body) SELECT 'item',id,revision+1,json_set(body,'$.home_workspace_id',NULL,'$.revision',revision+1,'$.updated_at',?2) FROM work_items WHERE home_workspace_id=?1 AND deleted=0",params![id,now])?;
+        input.conn.execute("UPDATE work_items SET home_workspace_id=NULL,revision=revision+1,body=json_set(body,'$.home_workspace_id',NULL,'$.revision',revision+1,'$.updated_at',?2) WHERE home_workspace_id=?1 AND deleted=0",params![id,now])?;
         input.conn.execute(
             "DELETE FROM work_workspace_repositories WHERE workspace_id=?1",
             [id],

@@ -70,8 +70,11 @@ describe("the store the record describes", () => {
   });
 
   it("names the schema version the store ends its ladder on", () => {
-    const terminal = /if version != (\d+) \{/.exec(store)?.[1];
-    expect(terminal, "the migration ladder must end in a supported-version check").toBe("11");
+    const terminal = /pub const WORKBENCH_SCHEMA: i64 = (\d+);/.exec(store)?.[1];
+    expect(store, "the migration ladder must end in a supported-version check").toContain(
+      "if version != WORKBENCH_SCHEMA {",
+    );
+    expect(terminal, "the store must name the schema it opens").toBe("11");
     expect(record).toContain(`Schema version is **${terminal}**.`);
   });
 

@@ -15,8 +15,9 @@ use std::collections::HashSet;
 const MAX_CHECKLIST: usize = 128;
 const MAX_CHECKLIST_TEXT: usize = 4096;
 const MAX_LINKS: usize = 64;
-/// How far a parent chain is followed looking for a cycle. Deeper than any
-/// board a person maintains; a chain this long is refused rather than walked.
+/// The most tasks one parent chain may hold, root to deepest subtask, and so
+/// how far it is followed looking for a cycle. Deeper than any board a person
+/// maintains; a new parent link that would pass it is refused.
 const MAX_PARENT_DEPTH: i64 = 256;
 /// A task's outbound links as `(kind, target id)`, in request order.
 pub(super) type Links = Vec<(String, String)>;
@@ -167,11 +168,25 @@ fn links(input: &Input<'_>, id: &str) -> Result<Option<Links>> {
     if parents.len() > 1 {
         return Err(Error::invalid("a task has at most one parent"));
     }
-    if let Some(parent) = parents.first() {
-        // Walk up from the proposed parent. Reaching this task means the
-        // parent is already beneath it; running past the bound is refused
-        // rather than treated as "no cycle".
-        let (cycle, depth): (bool, i64) = input.conn.query_row(
+    // A parent the task already has was checked when it was set, and nothing
+    // since can have made it a cycle: every new parent link is checked. It is
+    // not checked again, so a chain another task's edit has since lengthened
+    // never makes this task unsaveable.
+    let new_parent = match parents.first() {
+        Some(parent) => !input.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM work_item_links WHERE item_id=?1 AND kind='parent' AND target_id=?2)",
+            params![id, parent],
+            |r| r.get::<_, bool>(0),
+        )?,
+        None => false,
+    };
+    if let Some(parent) = parents.first().filter(|_| new_parent) {
+        // Walk up from the proposed parent and down from this task. Reaching
+        // this task going up means the parent is already beneath it. The
+        // bound is on the whole chain the link would make — the parent's
+        // ancestors, the parent, this task and its deepest subtask — so
+        // hanging one chain under another cannot build one past it.
+        let (cycle, above): (bool, i64) = input.conn.query_row(
             "WITH RECURSIVE up(id,depth) AS (
                 SELECT ?1,0
                 UNION SELECT l.target_id,up.depth+1 FROM work_item_links l JOIN up ON l.item_id=up.id
@@ -185,7 +200,18 @@ fn links(input: &Input<'_>, id: &str) -> Result<Option<Links>> {
                 "that parent is already a subtask of this task",
             ));
         }
-        if depth >= MAX_PARENT_DEPTH {
+        let below: i64 = input.conn.query_row(
+            "WITH RECURSIVE down(id,depth) AS (
+                SELECT ?1,0
+                UNION SELECT l.item_id,down.depth+1 FROM work_item_links l JOIN down ON l.target_id=down.id
+                 WHERE l.kind='parent' AND down.depth<?2
+             ) SELECT max(depth) FROM down",
+            params![id, MAX_PARENT_DEPTH],
+            |r| r.get(0),
+        )?;
+        // Tasks in the chain: `above` ancestors of the parent, the parent,
+        // this task, and `below` levels under it.
+        if above + below + 2 > MAX_PARENT_DEPTH {
             return Err(Error::invalid(format!(
                 "the parent chain is deeper than {MAX_PARENT_DEPTH} tasks"
             )));
@@ -217,12 +243,17 @@ pub(super) fn replace_links(
 /// The row, its repository links, its own task links and its history never
 /// left the profile, so restoring is clearing the flag. What the delete
 /// discarded stays discarded: queued enhancement suggestions are not
-/// re-queued. A home workspace deleted meanwhile was already cleared from the
-/// task by that workspace's delete, so the restored task never points at one.
+/// re-queued. A workspace's delete leaves deleted tasks untouched, so a home
+/// workspace deleted meanwhile is cleared here: the restored task never points
+/// at one.
 pub(super) fn restore(input: &Input<'_>, id: &str, revision: i64, now: i64) -> Result<()> {
     input.fields(&["request_id", "id", "expected_revision"])?;
     let changed = input.conn.execute(
-        "UPDATE work_items SET deleted=0,revision=?2,body=json_set(json_remove(body,'$.deleted'),'$.revision',?2,'$.updated_at',?3) WHERE id=?1 AND deleted=1",
+        "UPDATE work_items SET deleted=0,revision=?2,
+            home_workspace_id=(SELECT w.id FROM work_workspaces w WHERE w.id=work_items.home_workspace_id AND w.deleted=0),
+            body=json_set(json_remove(body,'$.deleted'),'$.revision',?2,'$.updated_at',?3,
+                '$.home_workspace_id',(SELECT w.id FROM work_workspaces w WHERE w.id=work_items.home_workspace_id AND w.deleted=0))
+          WHERE id=?1 AND deleted=1",
         params![id, revision, now],
     )?;
     if changed != 1 {

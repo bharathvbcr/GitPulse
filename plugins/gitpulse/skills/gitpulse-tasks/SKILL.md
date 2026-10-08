@@ -20,7 +20,7 @@ window is shown otherwise.
 | --- | --- | --- |
 | `gitpulse_add_task` | write | File one task on the board for a repository. |
 | `gitpulse_import_tasks` | write | Put every Markdown brief in the repository's `tasks/` folder onto the board. |
-| `gitpulse_list_tasks` | read | List the board's tasks for a repository, in board order. |
+| `gitpulse_list_tasks` | read | List the board's tasks for a repository, in board order; `archived: true` lists the archive instead. |
 | `gitpulse_get_task` | read | Read one task with its canonical agent brief. |
 | `gitpulse_complete_task` | write | Move your task to `done` when the work is finished (or `review`, or `in_progress`), with a summary. |
 | `gitpulse_delete_task` | write, destructive | Delete a task card that should not exist, with a reason. |
@@ -39,7 +39,10 @@ fewest tasks that cover the work.
 
 1. Call `gitpulse_list_tasks` with the absolute `repo_path` and read what is
    already open. `repository: null` means no task has ever been filed under
-   this repository — not that its tasks are all done.
+   this repository — not that its tasks are all done. It lists the board:
+   Done tasks stay on it until a person archives them, and archived tasks are
+   listed only with `archived: true`. Each task carries `archived` and
+   `completed_at`.
 2. **Group before you file.** When you have several findings, sort them by the
    concern they share — the same subsystem, the same root cause, the same fix —
    and file one task per concern, each finding an acceptance criterion. One
@@ -63,7 +66,8 @@ filed. The refusal lists the related open tasks (`item_id`, status, title, and
 what they share). Read them, then either fold your work into one (step 3), or,
 when it is genuinely separate work, call again with `reviewed_related` naming
 **every** listed `item_id`. Naming some of them is refused again. A finished
-(`done`) task never counts, and an overwrite is never checked. The success
+(`done`) task never counts, nor does an archived one in any column — archiving
+is its own flag, separate from Done — and an overwrite is never checked. The success
 answer carries `related_check`: how many related open tasks there were, how many
 open tasks were compared, and whether that was all of them (`scan_complete`).
 
