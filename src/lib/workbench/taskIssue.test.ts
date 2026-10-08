@@ -92,7 +92,10 @@ describe("taskIssueDraft", () => {
     expect(draft.body.match(/^- \[/gm)).toHaveLength(1);
   });
 
-  it("never builds a payload the backend validator refuses", () => {
+  // Deterministic but CPU-bound: 150 of its 300 rounds build and validate a
+  // 70,000-character body. Alone it takes ~2.6 s, so the 5 s default failed it
+  // under a loaded or coverage-instrumented run without anything being wrong.
+  it("never builds a payload the backend validator refuses", { timeout: 20_000 }, () => {
     // Every control character, every bidi override, astral text and sizes
     // straddling both limits.
     const nasty = [
