@@ -218,12 +218,17 @@ fn tool_subject(value: &Value) -> String {
     if let Some(input) = value.get("tool_input") {
         canonical(input, &mut text);
     }
+    format!("{:016x}", fnv1a(&text))
+}
+
+/// FNV-1a, 64-bit: the cheapest stable hash that needs no dependency.
+fn fnv1a(text: &str) -> u64 {
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
     for byte in text.bytes() {
         hash ^= u64::from(byte);
         hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
     }
-    format!("{hash:016x}")
+    hash
 }
 
 /// The longest tool summary a report carries.
@@ -666,7 +671,27 @@ pub fn collision_facts(
 }
 
 /// Gathers, then decides. The impure half of collision-guard.
+///
+/// Two checks, in order. The write is first measured against the task scope
+/// this checkout is bound to, through the same owner the command gate uses
+/// (`harness::check_file_in_scope`), and a write outside the plan is refused
+/// before any collision is looked for. Then the collision scan runs. Both share
+/// one [`BUDGET`]: the host discards the output of a hook that outlives its own
+/// timeout, so two checks each given the full budget could add up to a silent
+/// skip.
 pub fn run_collision_guard(input: &HookInput) -> HookOutput {
+    collision_guard_with(input, |job| within_budget(BUDGET, job))
+}
+
+/// One scope judgement for a file write, built on the caller's thread and run
+/// on whichever thread `run` chooses (see [`command_gate_with`] for why).
+type WriteJob = Box<dyn FnOnce() -> harness::FileScopeCheck + Send>;
+
+fn collision_guard_with(
+    input: &HookInput,
+    run: impl FnOnce(WriteJob) -> Option<harness::FileScopeCheck>,
+) -> HookOutput {
+    let started = std::time::Instant::now();
     if input.file_path.is_empty() {
         return HookOutput::notice(
             "GitPulse collision check did NOT run: the tool call carried no file path.",
@@ -692,11 +717,43 @@ pub fn run_collision_guard(input: &HookInput) -> HookOutput {
     };
 
     let root_arg = root.to_string_lossy().into_owned();
-    let scanned = within_budget(BUDGET, move || insights::collision_risk(&root_arg));
+    let op = write_op(&input.tool_name, &file);
+    let (scope_root, scope_target) = (root_arg.clone(), target.clone());
+    let Some(scope) = run(Box::new(move || {
+        harness::check_file_in_scope(&scope_root, &scope_target, op)
+    })) else {
+        // The scope could not be read in time, so neither check ran: refusing
+        // would be a guess, and silence would read as a clean pass.
+        return HookOutput::notice(format!(
+            "GitPulse could not check this write against the task scope within {}s, and \
+             did not run the collision check either. It ran UNGATED.",
+            BUDGET.as_secs()
+        ));
+    };
+    let (scoped, unscoped) = match &scope {
+        harness::FileScopeCheck::Judged(judged) => {
+            let output = write_scope_decision(judged);
+            if output
+                .hook_specific_output
+                .as_ref()
+                .is_some_and(|specific| specific.permission_decision.is_some())
+            {
+                return output;
+            }
+            (output, judged.unscoped)
+        }
+        harness::FileScopeCheck::Unbound { unscoped } => (HookOutput::silent(), *unscoped),
+    };
+
+    let remaining = BUDGET.saturating_sub(started.elapsed());
+    let scanned = within_budget(remaining, move || insights::collision_risk(&root_arg));
     let Some(risk) = scanned else {
-        return unchecked(
-            &target,
-            &format!("the scan did not finish within {}s", BUDGET.as_secs()),
+        return merge_outputs(
+            scoped,
+            unchecked(
+                &target,
+                &format!("the scan did not finish within {}s", BUDGET.as_secs()),
+            ),
         );
     };
 
@@ -712,7 +769,44 @@ pub fn run_collision_guard(input: &HookInput) -> HookOutput {
         facts.partial,
         risk.scanned_worktrees,
     );
-    collision_decision(&facts)
+    let output = merge_outputs(scoped, collision_decision(&facts));
+    announce_unscoped(output, unscoped, Judged::Write, input)
+}
+
+/// The write-gate operation a file tool performs, in the harness's words.
+///
+/// Specialised rather than sent as `write`: a harness that predates Manvi
+/// `fix/hostscope-unspecialised-write` refuses an unspecialised write to a
+/// planned file as `scope.operation`, and the tool already says which it is.
+fn write_op(tool_name: &str, file: &Path) -> &'static str {
+    match tool_name {
+        "Write" if !file.exists() => "create",
+        "Write" | "Edit" | "MultiEdit" | "NotebookEdit" => "modify",
+        _ => "write",
+    }
+}
+
+/// The scope half of collision-guard, over a verdict the harness returned.
+///
+/// The same contract as the command gate's: a write outside the plan is
+/// refused, and every way of not being judged is said rather than rendered as
+/// an approval.
+fn write_scope_decision(judged: &ScopedVerdict) -> HookOutput {
+    gate_decision(judged, Judged::Write)
+}
+
+/// One answer from two checks: a decision is kept (the scope half returns
+/// early when it refuses, so at most one side carries one), and both notices
+/// are kept, the scope's first.
+fn merge_outputs(first: HookOutput, second: HookOutput) -> HookOutput {
+    let system_message = match (first.system_message, second.system_message) {
+        (Some(a), Some(b)) => Some(format!("{a}\n{b}")),
+        (a, b) => a.or(b),
+    };
+    HookOutput {
+        hook_specific_output: second.hook_specific_output.or(first.hook_specific_output),
+        system_message,
+    }
 }
 
 /// The "this was not checked" notice, in one place so every caller words it the
@@ -740,7 +834,37 @@ fn unchecked(target: &str, why: &str) -> HookOutput {
 /// transient and self-inflicted — because they read very differently to
 /// somebody deciding whether to trust the next command.
 pub(crate) fn command_gate_decision(judged: &ScopedVerdict) -> HookOutput {
+    gate_decision(judged, Judged::Command)
+}
+
+/// What a gate verdict was about, for the words the hook answers in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Judged {
+    /// A Bash command line (`command-gate`).
+    Command,
+    /// One file write by an editing tool (`collision-guard`).
+    Write,
+}
+
+impl Judged {
+    fn noun(self) -> &'static str {
+        match self {
+            Judged::Command => "command",
+            Judged::Write => "write",
+        }
+    }
+}
+
+/// The gate contract both PreToolUse hooks share, over a verdict the harness
+/// already returned. [`command_gate_decision`] is its Bash reading; the
+/// file-tool reading is [`write_scope_decision`].
+///
+/// A verdict reached without a scope that might exist (see
+/// [`ScopedVerdict::unscoped`]) says so in a refusal. On an allow it is left
+/// to the caller, which knows whether this session has been told already.
+fn gate_decision(judged: &ScopedVerdict, what: Judged) -> HookOutput {
     let verdict = &judged.verdict;
+    let noun = what.noun();
     // Ahead of the refusal: a block that only says "I could not read this line"
     // is not judgement, and in an unbound checkout it is not this hook's to
     // enforce. It is not rendered as an approval either — no decision is taken,
@@ -773,19 +897,19 @@ pub(crate) fn command_gate_decision(judged: &ScopedVerdict) -> HookOutput {
         };
     }
     if verdict.blocks() {
+        let mut refusal = verdict.refusal();
+        if let Some(why) = judged.unscoped {
+            refusal.push_str(&format!("\n  scope: {why}"));
+        }
         return HookOutput {
-            hook_specific_output: Some(decision(
-                PRE_TOOL_USE,
-                PermissionDecision::Deny,
-                verdict.refusal(),
-            )),
+            hook_specific_output: Some(decision(PRE_TOOL_USE, PermissionDecision::Deny, refusal)),
             system_message: None,
         };
     }
 
     if verdict.gate_failed() {
         return HookOutput::notice(format!(
-            "{}\nThis command ran UNGATED.",
+            "{}\nThis {noun} ran UNGATED.",
             verdict.gate_failure()
         ));
     }
@@ -793,11 +917,10 @@ pub(crate) fn command_gate_decision(judged: &ScopedVerdict) -> HookOutput {
     match verdict.status {
         // Reached only when `gate_failed` said "not_installed": no harness on
         // this machine, which is documented, permanent, and still not a pass.
-        PolicyStatus::Unchecked => HookOutput::notice(
-            "No MANVI harness is installed, so GitPulse could not judge this command. \
+        PolicyStatus::Unchecked => HookOutput::notice(format!(
+            "No MANVI harness is installed, so GitPulse could not judge this {noun}. \
              It ran UNGATED."
-                .to_string(),
-        ),
+        )),
         // A rung fired and allowed with a note. The note is the whole value of
         // the rung; swallowing it would make a warned command look clean.
         PolicyStatus::Warned => HookOutput::notice(format!(
@@ -809,7 +932,7 @@ pub(crate) fn command_gate_decision(judged: &ScopedVerdict) -> HookOutput {
         // repository's invariant is about, so it is surfaced even though the
         // command proceeds.
         PolicyStatus::Degraded => HookOutput::notice(format!(
-            "The MANVI harness allowed this command with checks it could not run: {}.",
+            "The MANVI harness allowed this {noun} with checks it could not run: {}.",
             verdict.degraded.join(", ")
         )),
         // Demoted, Granted and Widened are allows that something deliberately
@@ -828,9 +951,10 @@ pub(crate) fn command_gate_decision(judged: &ScopedVerdict) -> HookOutput {
         //
         // A checkout bound to a task sends its scope (`run_command_gate`), and
         // a scope violation is not demoted, so it refuses above. What a scope
-        // reaches is the command line's *redirection targets*: Manvi does not
-        // read a write out of a command's arguments, so `sed -i` on a file
-        // outside the plan still comes back here as a demoted allow.
+        // reaches in a command line is every file the harness reads it as
+        // writing: its redirection targets and, from DevCouncil's
+        // `fix/argument-write-targets`, the files `sed -i`, `tee`, `cp` and
+        // `mv` write through their arguments.
         PolicyStatus::Allowed
         | PolicyStatus::Demoted
         | PolicyStatus::Granted
@@ -888,11 +1012,12 @@ fn command_gate_with(
             Box::new(move || ScopedVerdict {
                 verdict: harness::check_command(&root, &command, None),
                 bound: false,
+                unscoped: None,
             })
         }
     };
     let judged = run(job);
-    if let Some(ScopedVerdict { verdict, bound }) = judged.as_ref() {
+    if let Some(ScopedVerdict { verdict, bound, .. }) = judged.as_ref() {
         // The verdict is the only record of why this hook stayed silent, and
         // silence is its most common answer. Without this line an operator
         // cannot tell a clean allow from a demoted one, which is the same
@@ -916,7 +1041,79 @@ fn command_gate_with(
             BUDGET.as_secs()
         ));
     };
-    command_gate_decision(&judged)
+    let output = command_gate_decision(&judged);
+    announce_unscoped(output, judged.unscoped, Judged::Command, input)
+}
+
+/// Adds the unscoped notice to an answer that did not refuse.
+///
+/// A refusal already carries it (see [`gate_decision`]). An allow carries it
+/// the first time this session works in this checkout: the hook answers every
+/// tool call, and a standing condition the person chose — not trusting the
+/// repository — repeated on each one would train them to skip the channel the
+/// real non-checks use. Once per session is enough to make the answer say it
+/// was unscoped rather than let it pass for a checkout with no task bound.
+fn announce_unscoped(
+    output: HookOutput,
+    unscoped: Option<&'static str>,
+    what: Judged,
+    input: &HookInput,
+) -> HookOutput {
+    let Some(why) = unscoped else {
+        return output;
+    };
+    let refused = output
+        .hook_specific_output
+        .as_ref()
+        .is_some_and(|specific| specific.permission_decision == Some(PermissionDecision::Deny));
+    if refused || !first_notice_in_session(&input.session_id, &input.cwd, why) {
+        return output;
+    }
+    with_unscoped_note(output, why, what)
+}
+
+/// The pure half of [`announce_unscoped`].
+fn with_unscoped_note(mut output: HookOutput, why: &str, what: Judged) -> HookOutput {
+    let note = format!(
+        "GitPulse judged this {} {why}: no task scope it could read applies here, so \
+         nothing outside a task's plan is fenced in this checkout. Trust the repository \
+         in GitPulse to have a bound task's scope enforced.",
+        what.noun()
+    );
+    output.system_message = Some(match output.system_message.take() {
+        Some(existing) => format!("{existing}\n{note}"),
+        None => note,
+    });
+    output
+}
+
+/// True the first time `session` is told `why` about the checkout at `cwd`.
+///
+/// Remembered as an empty marker file per (session, checkout, notice) under
+/// the system temporary directory, which the OS clears. Every way of not
+/// knowing — no session id, a directory that cannot be made, a marker that
+/// cannot be written — answers true: telling twice is the safe direction to
+/// be wrong in, and saying nothing is the failure this exists to fix.
+fn first_notice_in_session(session: &str, cwd: &str, why: &str) -> bool {
+    if session.is_empty() {
+        return true;
+    }
+    let root = find_git_root(Path::new(cwd))
+        .map(|root| root.to_string_lossy().into_owned())
+        .unwrap_or_else(|| cwd.to_string());
+    let dir = std::env::temp_dir().join("gitpulse-hook-notices");
+    if std::fs::create_dir_all(&dir).is_err() {
+        return true;
+    }
+    let marker = dir.join(format!("{:016x}", fnv1a(&[session, &root, why].join("\0"))));
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(marker)
+    {
+        Ok(_) => true,
+        Err(error) => error.kind() != std::io::ErrorKind::AlreadyExists,
+    }
 }
 
 /* ── 3. session-brief: SessionStart ───────────────────────────────────────── */
@@ -1631,6 +1828,7 @@ mod tests {
         command_gate_decision(&ScopedVerdict {
             verdict: verdict.clone(),
             bound: false,
+            unscoped: None,
         })
     }
 
@@ -2458,6 +2656,7 @@ mod tests {
         command_gate_decision(&ScopedVerdict {
             verdict: verdict.clone(),
             bound,
+            unscoped: None,
         })
     }
 
@@ -2770,20 +2969,189 @@ done
     /// resolving one runs Git, which the trust gate refuses. Failing closed
     /// there denied every Bash call in every repository the person never
     /// opened in GitPulse (`hook_protocol_stress` caught it as a deny with no
-    /// harness installed). It is judged as it was before scopes: unscoped.
+    /// harness installed). It is judged as it was before scopes: unscoped —
+    /// and it says so, where it used to stay silent and read exactly like a
+    /// checkout with no task bound.
     #[cfg(unix)]
     #[test]
-    fn an_untrusted_repository_is_judged_without_scope_not_refused() {
+    fn an_untrusted_repository_is_judged_without_scope_and_says_so() {
         let (dir, repo, requests) = scoped_hook_fixture(false);
         crate::repository_trust::revoke(&repo).expect("revoke trust");
         let serial = crate::harness::sidecar::test_serial();
         let _binary = install_scoped_manvi(dir.path(), &requests, &serial);
 
-        let output = gate_here(&bash_call(&repo, "echo x > docs/elsewhere.md"));
-        assert!(output.is_silent(), "{:?}", output.render());
+        let mut call = bash_call(&repo, "echo x > docs/elsewhere.md");
+        call.session_id = unique_session(dir.path());
+        let output = gate_here(&call);
+        assert!(
+            output.hook_specific_output.is_none(),
+            "unscoped is not a refusal: {:?}",
+            output.render()
+        );
+        let note = output.system_message.unwrap_or_default();
+        assert!(note.contains(harness::UNSCOPED_UNTRUSTED), "{note}");
         let sent = std::fs::read_to_string(&requests).unwrap_or_default();
         assert!(!sent.is_empty(), "the command was not judged at all");
         assert!(!sent.contains("\"scope\""), "{sent}");
+
+        // Said once per session and checkout, not on every call.
+        assert!(gate_here(&call).is_silent(), "repeated within a session");
+        // A payload with no session cannot be deduplicated, so it is told.
+        call.session_id.clear();
+        assert!(gate_here(&call)
+            .system_message
+            .unwrap_or_default()
+            .contains(harness::UNSCOPED_UNTRUSTED));
+    }
+
+    /// A session id no other test run has used, so the once-per-session
+    /// marker of a previous run cannot answer for this one.
+    #[cfg(unix)]
+    fn unique_session(dir: &Path) -> String {
+        format!(
+            "test-{}-{}",
+            std::process::id(),
+            dir.file_name().unwrap_or_default().to_string_lossy()
+        )
+    }
+
+    fn edit_call(cwd: &str, file_path: &str) -> HookInput {
+        HookInput {
+            hook_event_name: PRE_TOOL_USE.to_string(),
+            tool_name: "Edit".to_string(),
+            cwd: cwd.to_string(),
+            file_path: file_path.to_string(),
+            ..Default::default()
+        }
+    }
+
+    /// The production collision guard, its scope judged on this thread.
+    #[cfg(unix)]
+    fn guard_here(input: &HookInput) -> HookOutput {
+        collision_guard_with(input, |job| Some(job()))
+    }
+
+    /// The Edit/Write hook used to check collisions only, so a task-bound
+    /// agent's most common write — the file tool — was fenced by nothing. It
+    /// is now measured against the bound task's scope, resolved by the same
+    /// owner as the command gate's, and refused outside the plan.
+    #[cfg(unix)]
+    #[test]
+    fn a_task_bound_session_is_refused_an_edit_outside_its_scope() {
+        let (dir, repo, requests) = scoped_hook_fixture(true);
+        let serial = crate::harness::sidecar::test_serial();
+        let _binary = install_scoped_manvi(dir.path(), &requests, &serial);
+        std::fs::create_dir_all(Path::new(&repo).join("docs")).expect("docs");
+        std::fs::write(Path::new(&repo).join("docs/elsewhere.md"), "x").expect("file");
+
+        let output = guard_here(&edit_call(&repo, &format!("{repo}/docs/elsewhere.md")));
+
+        let sent = std::fs::read_to_string(&requests).unwrap_or_default();
+        let request: Value = serde_json::from_str(sent.lines().next().expect("a policy request"))
+            .expect("the request is JSON");
+        assert_eq!(request["op"], "policy.check.file", "{request}");
+        assert_eq!(request["params"]["path"], "docs/elsewhere.md");
+        assert_eq!(request["params"]["op"], "modify");
+        assert_eq!(request["params"]["scope"]["task_id"], "TASK-HOOK");
+        assert_eq!(
+            request["params"]["scope"]["planned_files"][0],
+            "src/planned.rs"
+        );
+
+        let rendered = output.render().unwrap_or_default();
+        let decision = output
+            .hook_specific_output
+            .unwrap_or_else(|| panic!("an out-of-scope edit must be decided: {rendered}"));
+        assert_eq!(
+            decision.permission_decision,
+            Some(PermissionDecision::Deny),
+            "{rendered}"
+        );
+        assert!(rendered.contains("scope.unplanned"), "{rendered}");
+    }
+
+    /// A file the tool is about to create is judged as a creation, not as an
+    /// unspecialised write an older harness refuses on a planned path.
+    #[test]
+    fn a_file_tool_names_the_operation_it_performs() {
+        let dir = tempfile::tempdir().expect("dir");
+        let existing = dir.path().join("there.txt");
+        std::fs::write(&existing, "x").expect("file");
+        let absent = dir.path().join("absent.txt");
+        assert_eq!(write_op("Write", &absent), "create");
+        assert_eq!(write_op("Write", &existing), "modify");
+        assert_eq!(write_op("Edit", &existing), "modify");
+        assert_eq!(write_op("NotebookEdit", &existing), "modify");
+        assert_eq!(write_op("SomethingNew", &existing), "write");
+    }
+
+    /// An unbound checkout has no scope to fence, so an edit costs no harness
+    /// round trip and keeps the answer it always had.
+    #[cfg(unix)]
+    #[test]
+    fn an_unbound_session_does_not_ask_the_harness_about_an_edit() {
+        let (dir, repo, requests) = scoped_hook_fixture(false);
+        let serial = crate::harness::sidecar::test_serial();
+        let _binary = install_scoped_manvi(dir.path(), &requests, &serial);
+
+        let output = guard_here(&edit_call(&repo, &format!("{repo}/docs/elsewhere.md")));
+        assert!(output.is_silent(), "{:?}", output.render());
+        assert!(
+            std::fs::read_to_string(&requests)
+                .unwrap_or_default()
+                .is_empty(),
+            "an unbound edit was sent to the harness"
+        );
+    }
+
+    /// The file-tool hook in an untrusted repository says it judged unscoped.
+    #[cfg(unix)]
+    #[test]
+    fn an_untrusted_repository_edit_says_it_was_unscoped() {
+        let (dir, repo, requests) = scoped_hook_fixture(false);
+        crate::repository_trust::revoke(&repo).expect("revoke trust");
+        let serial = crate::harness::sidecar::test_serial();
+        let _binary = install_scoped_manvi(dir.path(), &requests, &serial);
+
+        let mut call = edit_call(&repo, &format!("{repo}/docs/elsewhere.md"));
+        call.session_id = unique_session(dir.path());
+        let output = guard_here(&call);
+        assert!(
+            output.hook_specific_output.is_none(),
+            "{:?}",
+            output.render()
+        );
+        assert!(
+            output
+                .system_message
+                .unwrap_or_default()
+                .contains(harness::UNSCOPED_UNTRUSTED),
+            "an untrusted edit must not read as an unbound one"
+        );
+    }
+
+    /// Every refusal reached without a scope that might exist names that, so
+    /// the model and the person can tell why no task fenced it.
+    #[test]
+    fn an_unscoped_refusal_says_it_was_unscoped() {
+        let mut verdict = allowed_verdict();
+        verdict.status = PolicyStatus::Blocked;
+        verdict.rule = "command.force_push".to_string();
+        verdict.severity = "hard".to_string();
+        let output = command_gate_decision(&ScopedVerdict {
+            verdict,
+            bound: false,
+            unscoped: Some(harness::UNSCOPED_UNTRUSTED),
+        });
+        let reason = output
+            .hook_specific_output
+            .and_then(|specific| specific.permission_decision_reason)
+            .unwrap_or_default();
+        assert!(reason.contains("command.force_push"), "{reason}");
+        assert!(
+            reason.contains("scope: unscoped: repository not trusted"),
+            "{reason}"
+        );
     }
 
     /// Outside any repository there is no binding to look up. Asking the ledger
@@ -3302,9 +3670,10 @@ done
             let (result, seen) = captured(event.name, &notify_input());
             assert!(result.is_ok(), "{}: {result:?}", event.name);
             let payload = seen.lock().unwrap().clone().expect("a report was sent");
-            let notice = crate::alerts::bridge::parse_report(payload.as_bytes()).unwrap_or_else(
-                |e| panic!("{} produced a report the socket refused: {e}", event.name),
-            );
+            let notice =
+                crate::alerts::bridge::parse_report(payload.as_bytes()).unwrap_or_else(|e| {
+                    panic!("{} produced a report the socket refused: {e}", event.name)
+                });
             assert_eq!(notice.reason(), Some(event.phrase));
             assert_eq!(notice.label, "Codex");
         }
@@ -3491,7 +3860,9 @@ done
         assert_eq!(long.tool_summary, "Bash: echo start");
         let wide = tool_event("PermissionRequest", json!({"command": "y".repeat(4000)}));
         assert_eq!(wide.tool_summary.chars().count(), TOOL_SUMMARY_CHARS);
-        let mcp = HookInput::from_value(&json!({"tool_name":"mcp__github__create_issue","tool_input":{"title":7}}));
+        let mcp = HookInput::from_value(
+            &json!({"tool_name":"mcp__github__create_issue","tool_input":{"title":7}}),
+        );
         assert_eq!(mcp.tool_summary, "mcp__github__create_issue");
     }
 
@@ -3509,7 +3880,10 @@ done
             crate::alerts::bridge::parse_report(payload.as_bytes()).expect("accepted")
         };
         let call = json!({"command":"cargo test"});
-        let asked = report("permission_request", &tool_event("PermissionRequest", call.clone()));
+        let asked = report(
+            "permission_request",
+            &tool_event("PermissionRequest", call.clone()),
+        );
         let ran = report("tool_finished", &tool_event("PostToolUse", call));
         assert_eq!(asked.detail.as_deref(), Some("Bash: cargo test"));
         assert!(asked.subject.is_some());
@@ -3585,7 +3959,10 @@ done
     fn notify_send_reports_what_the_socket_answered() {
         use std::io::{Read, Write};
         let base = std::fs::canonicalize("/tmp").unwrap();
-        for (answer, ok) in [(&b"{\"ok\":true}\n"[..], true), (b"{\"ok\":false}\n", false)] {
+        for (answer, ok) in [
+            (&b"{\"ok\":true}\n"[..], true),
+            (b"{\"ok\":false}\n", false),
+        ] {
             let path = base.join(format!("gph-ack-{}-{ok}.sock", std::process::id()));
             let _ = std::fs::remove_file(&path);
             let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();

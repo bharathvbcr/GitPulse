@@ -500,6 +500,67 @@ where
     }))
 }
 
+/// Whether merging an agent attempt's commits needs a recorded review
+/// (`docs/AGENT_OUTPUT_REVIEW.md`): a host-wide default, and a per-repository
+/// override keyed by the repository's canonical common Git directory, so every
+/// linked worktree of one repository answers alike.
+///
+/// Off unless turned on. Read leniently like its neighbours, but a block this
+/// cannot read is *not* read as "off": `unreadable` makes
+/// [`review_gate_enabled`] an error, and the gate refuses an attempt merge it
+/// cannot place rather than waving it through on a setting it could not read.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ReviewGateSettings {
+    #[serde(default)]
+    pub default_on: bool,
+    #[serde(default)]
+    pub repositories: std::collections::BTreeMap<String, bool>,
+    /// Set when the stored block could not be read. The block is kept as it
+    /// was (`raw`) and written back unchanged, so saving an unrelated setting
+    /// cannot replace a setting nobody could read with "off".
+    #[serde(skip)]
+    pub unreadable: bool,
+    #[serde(skip)]
+    pub raw: Option<serde_json::Value>,
+}
+
+fn write_review_gate<S>(settings: &ReviewGateSettings, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    match (&settings.raw, settings.unreadable) {
+        (Some(raw), true) => raw.serialize(serializer),
+        _ => settings.serialize(serializer),
+    }
+}
+
+impl ReviewGateSettings {
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+fn lenient_review_gate<'de, D>(deserializer: D) -> Result<ReviewGateSettings, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = serde_json::Value::deserialize(deserializer)?;
+    Ok(
+        serde_json::from_value(raw.clone()).unwrap_or_else(|error| {
+            log::warn!(
+                target: "tool_config",
+                "unreadable review_gate block; agent attempt merges are refused until it is fixed: {error}"
+            );
+            ReviewGateSettings {
+                unreadable: true,
+                raw: Some(raw),
+                ..ReviewGateSettings::default()
+            }
+        }),
+    )
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ToolConfig {
     pub version: u32,
@@ -538,6 +599,14 @@ pub struct ToolConfig {
         skip_serializing_if = "LappiSettings::is_default"
     )]
     pub lappi: LappiSettings,
+    /// Whether an agent attempt's merge needs a recorded review.
+    #[serde(
+        default,
+        deserialize_with = "lenient_review_gate",
+        serialize_with = "write_review_gate",
+        skip_serializing_if = "ReviewGateSettings::is_default"
+    )]
+    pub review_gate: ReviewGateSettings,
     /// Top-level keys this build does not know, written back as they were
     /// read. Without this, saving any setting here would delete what a newer
     /// build stored, so moving between versions would quietly cost settings.
@@ -556,6 +625,7 @@ impl Default for ToolConfig {
             agent_defaults: StoredAgentPermissions::default(),
             agent_launch: StoredAgentLaunch::default(),
             lappi: LappiSettings::default(),
+            review_gate: ReviewGateSettings::default(),
             unknown: serde_json::Map::new(),
         }
     }
@@ -1022,6 +1092,55 @@ pub fn lappi_settings() -> LappiSettings {
     load().map(|cfg| cfg.lappi).unwrap_or_default()
 }
 
+/// Whether the agent-output review gate applies to the repository whose
+/// canonical common Git directory is `common_dir`.
+///
+/// An error, never `false`, when the setting cannot be read: the gate is a
+/// refusal a person opted into, and an unreadable file must not be what turns
+/// it off.
+pub fn review_gate_enabled(common_dir: &str) -> Result<bool, String> {
+    let settings = load()?.review_gate;
+    if settings.unreadable {
+        return Err("the review_gate block in tools.json could not be read".into());
+    }
+    Ok(settings
+        .repositories
+        .get(common_dir)
+        .copied()
+        .unwrap_or(settings.default_on))
+}
+
+pub fn review_gate_settings() -> Result<ReviewGateSettings, String> {
+    let settings = load()?.review_gate;
+    if settings.unreadable {
+        return Err("the review_gate block in tools.json could not be read".into());
+    }
+    Ok(settings)
+}
+
+/// Sets the host-wide default (`common_dir: None`), or one repository's
+/// override; `enabled: None` clears that override so the default applies.
+pub fn set_review_gate(common_dir: Option<&str>, enabled: Option<bool>) -> Result<(), String> {
+    let mut cfg = load()?;
+    if cfg.review_gate.unreadable {
+        return Err(
+            "the review_gate block in tools.json could not be read; fix or remove it first".into(),
+        );
+    }
+    match (common_dir, enabled) {
+        (None, Some(on)) => cfg.review_gate.default_on = on,
+        (None, None) => cfg.review_gate.default_on = false,
+        (Some(dir), Some(on)) => {
+            cfg.review_gate.repositories.insert(dir.to_string(), on);
+        }
+        (Some(dir), None) => {
+            cfg.review_gate.repositories.remove(dir);
+        }
+    }
+    save(&cfg)?;
+    Ok(())
+}
+
 pub fn set_lappi_settings(next: LappiSettings) -> Result<(), String> {
     let mut cfg = load()?;
     cfg.lappi = next;
@@ -1087,6 +1206,50 @@ mod tests {
     fn write_raw(path: &Path, json: &str) {
         fs::write(path, json).unwrap();
         invalidate_cache();
+    }
+
+    #[test]
+    fn the_review_gate_is_off_until_turned_on_and_a_repository_overrides_the_default() {
+        with_temp_config(|_| {
+            assert!(
+                !review_gate_enabled("/repo/.git").unwrap(),
+                "off by default"
+            );
+            set_review_gate(None, Some(true)).unwrap();
+            assert!(review_gate_enabled("/repo/.git").unwrap());
+            set_review_gate(Some("/repo/.git"), Some(false)).unwrap();
+            assert!(!review_gate_enabled("/repo/.git").unwrap());
+            assert!(review_gate_enabled("/other/.git").unwrap());
+            set_review_gate(Some("/repo/.git"), None).unwrap();
+            assert!(
+                review_gate_enabled("/repo/.git").unwrap(),
+                "cleared to the default"
+            );
+        });
+    }
+
+    /// An unreadable gate setting is an error, never "off", and saving any
+    /// other setting writes it back as it was rather than as the default.
+    #[test]
+    fn an_unreadable_review_gate_fails_closed_and_survives_an_unrelated_save() {
+        with_temp_config(|path| {
+            write_raw(
+                path,
+                r#"{"version":1,"review_gate":{"default_on":"yes please"}}"#,
+            );
+            assert!(review_gate_enabled("/repo/.git").is_err());
+            assert!(set_review_gate(None, Some(false)).is_err());
+            set_lappi_settings(LappiSettings {
+                ask_on_ambiguous_commit_type: true,
+                record_caller_data: false,
+            })
+            .unwrap();
+            invalidate_cache();
+            let stored: serde_json::Value =
+                serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap();
+            assert_eq!(stored["review_gate"]["default_on"], "yes please");
+            assert!(review_gate_enabled("/repo/.git").is_err());
+        });
     }
 
     #[test]

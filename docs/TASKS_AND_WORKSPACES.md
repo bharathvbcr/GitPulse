@@ -382,6 +382,16 @@ claim — or sooner, once the Manvi that claimed it is provably gone (its owner
 names that process, since Manvi 18fc2c6). This needs no particular Manvi
 version, so attempts claimed by an older Manvi no longer stay held.
 
+None of those releases is final while anything still works in the attempt's own
+worktree. The recorded agent process being gone — or the GitPulse or Manvi that
+launched it — says nothing about a descendant that left its session (`setsid`,
+a double fork, `nohup`), and a launch that crashed between starting the agent
+and recording it recorded no process at all. Such a process keeps the directory
+it was started in, so an attempt in `.gitpulse/worktrees/` is released only
+when no process is working inside it, and the answer names the ones that are.
+A run in your own checkout is not scanned that way — your shells and editors
+live there — which is one more reason agents get their own worktree.
+
 Managed runs use a separate Manvi host protocol for configuration checks,
 structured questions/approvals and completion receipts. A saved decision and its
 delivery to the provider are separate states. Terminal handoffs do not produce
@@ -389,13 +399,51 @@ those structured callbacks. Full crash recovery remains a qualification gap; see
 the [implementation contract](AGENTIC_WORKSPACES_PLAN.md) and
 [architecture](ARCHITECTURE.md#agentic-workbench-implemented-core-broader-qualification-in-progress).
 
+### Reviewing an attempt before it is merged
+
+A repository can require that a person review an agent attempt's commits
+before they land: **Merge review** on an attempt's worktree turns it on for
+that repository, and shows the attempt's commit range and its review. With it
+on, merging or cherry-picking an attempt's branch — from the panels, the
+attempt's **Merge** button or the GitPulse terminal — is refused until someone
+approves exactly that range, or records a merge without review and says why.
+A commit after the approval needs a new one. See
+[AGENT_OUTPUT_REVIEW.md](AGENT_OUTPUT_REVIEW.md).
+
 ### Providers with a managed lane
 
 Codex and Claude Code. Grok and Antigravity are terminal-only, and the limit is
 mechanical rather than editorial: a managed run needs an adapter in the harness
 that speaks that provider's own session protocol. The three places that decide
 this — the renderer's choice, the Rust workbench's gate, and the harness's
-adapter set — are held in agreement by `managed-provider-parity-contract`.
+adapter set (`ManagedProviders` in Manvi's `codingagent`) — are held in
+agreement by `managed-provider-parity-contract`.
+
+Decided per provider on 2026-10-08, against each CLI's own help and documentation:
+
+- **Grok — terminal-only, for now.** Grok's CLI has a route an adapter could
+  speak: `grok agent stdio` runs it as an ACP agent over JSON-RPC on stdio, and
+  `-p --output-format streaming-json` streams NDJSON events. Neither is the
+  protocol Manvi's adapters speak (Claude's stream-json control channel,
+  Codex's app-server JSON-RPC), and xAI does not publish the event schema, so
+  an adapter would be a new protocol implementation qualified against a live
+  account, not a configuration of an existing one. It stays terminal-only
+  until that adapter is built; ACP is the route it would take.
+- **Antigravity — terminal-only.** Its CLI (`agy`, 1.3.1) accepts
+  `--input-format stream-json`, but documents no way to route a tool approval
+  over stdio: the only permission control it offers is skipping permissions
+  altogether. A managed lane exists to put each approval in front of a person,
+  so a provider that can only run unattended or in its own terminal has no
+  managed lane to offer.
+
+A provider callback the managed lane does not answer — Claude's
+`request_user_dialog` or `elicitation`, or any Codex method its adapter does
+not handle — is refused, nothing reaches the decision queue, and the refusal
+is the run's recorded reason. Manvi's `serve_managed_refusal_test.go` drives
+one of each per provider through `manvi serve --workbench-db` and reads the
+reason back from the run record. Writing it found that seven Codex request
+kinds were recorded as "Codex callback has no matching active turn" instead of
+naming the method; Manvi `6df0909` fixes the order of those checks.
 
 Two things differ between the two managed providers, and both are visible in a
 run's recorded effective configuration:

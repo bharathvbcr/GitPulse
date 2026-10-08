@@ -11,6 +11,7 @@
 
 pub mod policy;
 pub mod protocol;
+pub(crate) mod review;
 pub mod sidecar;
 
 use serde::{Deserialize, Serialize};
@@ -94,6 +95,17 @@ pub(crate) fn guard_command_allowing(
     allowed: &[String],
 ) -> Result<PolicyVerdict, String> {
     let command = render_command(argv);
+    if let Err(refused) = review::gate(repo_path, argv) {
+        let action = crate::ledger::action_for_argv(argv);
+        record_gate(
+            repo_path,
+            &action,
+            &command,
+            serde_json::to_string(argv).ok(),
+            &refused,
+        );
+        return gated(*refused);
+    }
     let verdict = match scope_for(repo_path) {
         Ok(scope) => check_command_allowing(repo_path, &command, scope.as_ref(), allowed),
         Err(failure) if failure.kind == ScopeFailureKind::Missing => {
@@ -124,51 +136,125 @@ pub(crate) fn guard_command_allowing(
 /// a trusted path — so an untrusted checkout has no scope GitPulse may read,
 /// and failing closed would refuse every command an agent runs in every
 /// repository the person never opened in GitPulse. It is judged without a
-/// scope, exactly as before scopes reached the hook. That is silent per call
-/// on purpose: the hook answers every Bash call, and a standing condition the
-/// person chose (not trusting the repository) announced on each one would
-/// train them to ignore the channel the real non-checks use. `guard_command`
-/// keeps failing closed because the app never acts in an untrusted repository.
+/// scope, exactly as before scopes reached the hook — but not silently: the
+/// answer carries [`UNSCOPED_UNTRUSTED`], so a reader can tell "no task is
+/// bound here" from "GitPulse could not look". `guard_command` keeps failing
+/// closed because the app never acts in an untrusted repository.
 ///
 /// A checkout that vanished between finding its root and resolving its binding
-/// is judged the same way, for the same reason: there is no binding to read,
-/// and the command will meet a missing directory on its own.
+/// is judged without a scope too: there is no binding to read, and the command
+/// will meet a missing directory on its own.
 ///
 /// Whether a scope was declared comes back beside the verdict, because the
 /// verdict cannot say: the harness stamps every command decision with its
 /// `host-scope` placeholder task, scope or no scope.
 pub(crate) fn check_command_in_scope(repo_path: &str, command: &str) -> ScopedVerdict {
-    match scope_for(repo_path) {
-        Ok(scope) => ScopedVerdict {
-            bound: scope.is_some(),
-            verdict: check_command(repo_path, command, scope.as_ref()),
-        },
-        Err(failure)
-            if matches!(
-                failure.kind,
-                ScopeFailureKind::Untrusted | ScopeFailureKind::Missing
-            ) =>
-        {
-            ScopedVerdict {
-                bound: false,
-                verdict: check_command(repo_path, command, None),
-            }
-        }
-        // A binding exists, or could not be ruled out.
-        Err(failure) => ScopedVerdict {
+    match hook_scope(repo_path) {
+        HookScope::Declared(scope) => ScopedVerdict {
             bound: true,
+            unscoped: None,
+            verdict: check_command(repo_path, command, Some(&scope)),
+        },
+        HookScope::Unbound => ScopedVerdict {
+            bound: false,
+            unscoped: None,
+            verdict: check_command(repo_path, command, None),
+        },
+        HookScope::Untrusted => ScopedVerdict {
+            bound: false,
+            unscoped: Some(UNSCOPED_UNTRUSTED),
+            verdict: check_command(repo_path, command, None),
+        },
+        HookScope::Unresolved(failure) => ScopedVerdict {
+            bound: true,
+            unscoped: None,
             verdict: failure.verdict(command),
         },
     }
 }
 
-/// A command verdict and whether it was measured against a declared task scope.
+/// Judges one write by an agent's file tool against this checkout's bound task
+/// scope, recording nothing.
+///
+/// The file-tool hook's entry to the gate, resolved through the same
+/// [`hook_scope`] as [`check_command_in_scope`] — so `echo x > f`, `sed -i … f`
+/// and an Edit of `f` are measured against one declaration. Before this, the
+/// Edit/Write hook checked collisions only, and the most common way an agent
+/// writes a file was fenced by nothing.
+///
+/// An unbound checkout is not sent to the harness at all. There is no scope to
+/// fence, and the file tools run far more often than anything else an agent
+/// does; asking would add a sidecar round trip to every edit for an answer
+/// (`task.absent`, demoted) that cannot change what the hook says.
+pub(crate) fn check_file_in_scope(repo_path: &str, file_path: &str, op: &str) -> FileScopeCheck {
+    match hook_scope(repo_path) {
+        HookScope::Declared(scope) => FileScopeCheck::Judged(Box::new(ScopedVerdict {
+            bound: true,
+            unscoped: None,
+            verdict: check_file(repo_path, file_path, op, Some(&scope)),
+        })),
+        HookScope::Unbound => FileScopeCheck::Unbound { unscoped: None },
+        HookScope::Untrusted => FileScopeCheck::Unbound {
+            unscoped: Some(UNSCOPED_UNTRUSTED),
+        },
+        HookScope::Unresolved(failure) => FileScopeCheck::Judged(Box::new(ScopedVerdict {
+            bound: true,
+            unscoped: None,
+            verdict: failure.verdict(file_path),
+        })),
+    }
+}
+
+/// What [`check_file_in_scope`] established.
+#[derive(Debug, Clone)]
+pub(crate) enum FileScopeCheck {
+    /// No task scope applies, so the harness was not asked. `unscoped` says
+    /// why when that is not simply "no task is bound here".
+    Unbound { unscoped: Option<&'static str> },
+    /// The write was measured against a declared scope, or refused because the
+    /// declared scope could not be read.
+    Judged(Box<ScopedVerdict>),
+}
+
+/// Why the hook judged a checkout without a scope it could not rule out.
+pub(crate) const UNSCOPED_UNTRUSTED: &str = "unscoped: repository not trusted";
+
+/// The scope the agent hook measures against, resolved by [`scope_for`] and
+/// sorted by how each outcome degrades on the hook's side of the gate.
+enum HookScope {
+    Declared(HostScope),
+    /// No binding, or no checkout left on disk to hold one.
+    Unbound,
+    /// GitPulse is not trusted here, so no binding could be looked up.
+    Untrusted,
+    /// A binding exists, or could not be ruled out, and its scope could not be
+    /// produced.
+    Unresolved(ScopeFailure),
+}
+
+fn hook_scope(repo_path: &str) -> HookScope {
+    match scope_for(repo_path) {
+        Ok(Some(scope)) => HookScope::Declared(scope),
+        Ok(None) => HookScope::Unbound,
+        Err(failure) => match failure.kind {
+            ScopeFailureKind::Untrusted => HookScope::Untrusted,
+            ScopeFailureKind::Missing => HookScope::Unbound,
+            ScopeFailureKind::Broken => HookScope::Unresolved(failure),
+        },
+    }
+}
+
+/// A verdict and whether it was measured against a declared task scope.
 #[derive(Debug, Clone)]
 pub(crate) struct ScopedVerdict {
     pub verdict: PolicyVerdict,
     /// True when the checkout is bound to a task, or a binding could not be
     /// ruled out. Never inferred from `verdict.task_id`.
     pub bound: bool,
+    /// Set when the verdict was reached without a scope that might exist —
+    /// [`UNSCOPED_UNTRUSTED`] — so the answer can say so rather than read as
+    /// an unbound checkout's.
+    pub unscoped: Option<&'static str>,
 }
 
 /// Evaluates one file write, on the same terms as [`guard_command`].
@@ -928,7 +1014,7 @@ done
 
         // The agent hook path: no binding to read, so judged unscoped rather
         // than refused for want of one.
-        let ScopedVerdict { verdict, bound } = check_command_in_scope(&worktree, "ls");
+        let ScopedVerdict { verdict, bound, .. } = check_command_in_scope(&worktree, "ls");
         assert!(!bound, "a missing checkout declares no scope");
         assert_ne!(verdict.rule, TASK_SCOPE_UNAVAILABLE, "{verdict:?}");
     }

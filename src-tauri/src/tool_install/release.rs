@@ -245,14 +245,26 @@ pub fn parse_checksum_file(text: &str) -> Result<String, String> {
 
 /// Compute SHA-256 of a file via `shasum` / `sha256sum` (no new crate).
 pub fn file_sha256_hex(path: &Path) -> Result<String, String> {
+    sha256_with(Some(path), None)
+}
+
+/// Compute SHA-256 of `bytes`, fed on stdin to the same tools as
+/// [`file_sha256_hex`].
+pub fn bytes_sha256_hex(bytes: &[u8]) -> Result<String, String> {
+    sha256_with(None, Some(bytes))
+}
+
+fn sha256_with(path: Option<&Path>, stdin: Option<&[u8]>) -> Result<String, String> {
     let try_cmd = |program: &str, args: &[&str]| -> Result<String, String> {
         let bin =
             git_cli::find_external_tool(program).ok_or_else(|| format!("{program} not found"))?;
         let mut cmd = Command::new(&bin);
         cmd.args(args);
-        cmd.arg(path);
+        if let Some(path) = path {
+            cmd.arg(path);
+        }
         let run =
-            git_cli::run_bounded_capped(cmd, program, Duration::from_secs(60), None, 64 * 1024)?;
+            git_cli::run_bounded_capped(cmd, program, Duration::from_secs(60), stdin, 64 * 1024)?;
         digest_from_run(run, program)
     };
     try_cmd("shasum", &["-a", "256"]).or_else(|_| try_cmd("sha256sum", &[]))

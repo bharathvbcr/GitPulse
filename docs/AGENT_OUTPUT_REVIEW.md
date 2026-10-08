@@ -1,14 +1,17 @@
-# Reviewing agent output before it is merged (design spike)
+# Reviewing agent output before it is merged
 
-Status: **design only — nothing here is built.** Written 2026-10-07 to close
-the "code review" item of the Agent supervision row in
-[QUALIFICATION.md](QUALIFICATION.md). Every "today" statement below was read
-from source on that date; re-read it before building on one.
+Status: **built behind a per-repository opt-in, 2026-10-08.** Written
+2026-10-07 as a design spike for the "code review" item of the Agent
+supervision row in [QUALIFICATION.md](QUALIFICATION.md); the open questions it
+ended on are answered in [Decisions](#decisions), and [What was built](#what-was-built)
+says where each part lives. "What happens today" below is the state the spike
+started from, kept because the design argues from it.
 
 ## What happens today
 
-- A task attempt runs in its own linked worktree on an `agent/<attempt-id>`
-  branch (`src-tauri/src/workbench/agent_worktree.rs`), or in the checkout the
+- A task attempt runs in its own linked worktree on a `gitpulse/<task>-<id>`
+  branch (`src-tauri/src/workbench/agent_worktree.rs`; the spike said
+  `agent/<attempt-id>`, the renderer's older naming), or in the checkout the
   person chose.
 - When the run ends, the store records *how the process ended* —
   `exited`/`failed`/`unresolved`, an exit code, a reason — and nothing about
@@ -44,8 +47,8 @@ table, not a new subsystem.
 
 ## The gate
 
-GitPulse's guarded merge/rebase/cherry-pick of a branch named `agent/<id>`
-(and of any branch whose tip an attempt recorded) asks the store for a decided
+GitPulse's guarded merge or cherry-pick of a `gitpulse/<task>-<id>` attempt
+branch (and of any commit such a branch contains that `HEAD` does not) asks the store for a decided
 `approve` whose `head_oid` equals the tip being merged:
 
 - **No review** — the merge is refused with a reason naming the attempt and a
@@ -78,7 +81,7 @@ the existing managed lane, with three constraints the plan already states:
 - Its run is an attempt like any other, so its own crash, receipts and
   reconciliation are the machinery above.
 
-## What it would take
+## What it would take (the spike's plan)
 
 1. dc-store: `change_review` (and `merge_unreviewed`) in `decisions.create`'s
    kind list and `decisions.decide`'s decision table, with the payload schema
@@ -92,15 +95,88 @@ the existing managed lane, with three constraints the plan already states:
 4. UI: "Review changes" on a finished attempt — the existing diff view over
    `base_oid..head_oid`, plus approve / request changes / deny.
 
-## Open questions
+## Decisions
 
-- **Which merges count.** Merge, rebase, cherry-pick and fast-forward all move
-  agent commits; squash merges change the oids. The gate needs the range, not
-  the commit identities, to survive a squash.
-- **Agent-authored commits outside an attempt branch.** An agent in the
-  person's own checkout commits straight to their branch. Reviewing that needs
-  the run's start oid, which the run record does not store today.
-- **Repository-level opt-in.** Some repositories will want the gate always on,
-  others only for managed runs; that is a per-repository setting with a
-  host-wide default, the scope model [REPOSITORY_HYGIENE.md](REPOSITORY_HYGIENE.md)
-  already uses.
+The spike ended on three open questions. Each is settled here, with the
+reason, before anything was built on it.
+
+- **Which merges count, and squash merges.** The gate judges the *input* of a
+  landing, never its output, so a squash is covered exactly like a merge: it
+  reads the revisions a `git merge` (every form — fast-forward, `--no-ff`,
+  `--squash`) or `git cherry-pick` names, and asks whether any of them is an
+  attempt branch or a commit an attempt branch contains that `HEAD` does not.
+  The commits a squash creates have new oids, but the range it consumed is
+  the attempt's, and that range is what the review binds
+  (`base_oid..head_oid` plus a SHA-256 over its binary diff). `--continue`,
+  `--abort`, `--skip` and `--quit` land nothing new and are not judged.
+  Not counted: `git rebase` (it moves the attempt branch, not the base),
+  `git pull` (it lands a remote's commits), and `gh pr merge` (GitHub merges,
+  and the branch protection there is the gate) — named here so their absence
+  is a decision, not an oversight.
+- **Agent-authored commits outside an attempt branch.** The spike said the run
+  record does not store the run's start oid. It does: `runs.prepare` records
+  `head_oid` and `head_ref` of the checkout (dc-store `runs.rs`), which is the
+  review's `base_oid`. What the gate cannot do for a run in the person's own
+  checkout is *key a merge to it*: the agent committed straight onto the
+  person's branch, so no later merge moves those commits, and there is nothing
+  to stop. Those runs are therefore not gated; their range
+  (`head_oid..` the branch tip) is reviewable from the run's record. Running
+  an agent in its own worktree is how its output becomes gateable, and the
+  launch form already defaults to that whenever the checkout is busy.
+- **Repository-level opt-in.** Off unless turned on, per repository, with a
+  host-wide default (`review_gate` in `tools.json`: `default_on` and a
+  `repositories` map keyed by the canonical common Git directory, so every
+  linked worktree of one repository answers alike). It is stored where the
+  Rust gate can read it — the hygiene settings live in the renderer's
+  `localStorage`, which a Git action cannot consult. An unreadable setting is
+  never read as "off": attempt merges are refused until it is fixed, and the
+  block is written back unchanged by unrelated saves. The per-repository
+  switch is on the attempt's **Merge review** panel; the host-wide default is
+  set in `tools.json` only.
+- **The override is not consumed.** `merge_unreviewed` is decided `allow_once`
+  with a required note and binds exactly one head, as an approval does. It is
+  not claimed by the gate: the store allows one decision per kind per head per
+  run, so an override consumed by a merge that then failed could never be
+  recorded again for that range. Re-merging the same head is idempotent, so a
+  head-bound override lands that range once in effect.
+
+## What was built
+
+- **Store** (DevCouncil `feat/change-review-decisions`, re-vendored):
+  `change_review` (`approve` / `request_changes` / `deny`, optional note) and
+  `merge_unreviewed` (`allow_once` with a required note, or `deny`) are
+  host-raised kinds on `work_decisions`. They are created only for a run that
+  has ended (`exited`, `failed`, `cancelled`), with the run's own owner and
+  session; their payload is validated at the store boundary; they last up to
+  30 days rather than a live callback's 300 seconds; and their freshness does
+  not depend on the run still running. Permission and question decisions are
+  unchanged. The renderer cannot create either kind (`decisions.create` is
+  host-only), and the provider-request list leaves both out.
+- **Gate** (`src-tauri/src/harness/review.rs`): runs first in
+  `harness::guard_command`, before the harness is asked, so the panels, the
+  attempt's **Merge** button (`cmd_worktree_merge_teardown`) and the GitPulse
+  terminal meet it alike. A refusal is GitPulse's own (`checked: false`), is
+  recorded in the ledger like every gate decision, and names its rule:
+  `review.unreviewed`, `review.stale` (approved, then the branch moved),
+  `review.refused` (changes requested or denied, with the note) or
+  `review.unavailable` (the gate could not tell, which refuses).
+- **Recording** (`src-tauri/src/workbench/review.rs`, `cmd_attempt_review`,
+  `cmd_attempt_review_record`, `cmd_review_gate_save`): the host creates and
+  decides a review in one step on the person's action, so no undecided review
+  sits waiting. A decided range cannot be decided again; a new commit is a new
+  range.
+- **UI** (`AttemptReview.svelte`): **Merge review** on an attempt's own
+  worktree shows the range and its status, the per-repository switch, and
+  approve / request changes / deny / merge without review.
+- **Not built:** the automated pre-review below, and native notifications for
+  a review waiting (the run's own exit notice already points at the attempt).
+
+## Security impact
+
+Tightening only. With the gate off — the default — nothing changes. With it
+on, a guarded merge or cherry-pick that would land an agent attempt's commits
+is refused unless a person approved exactly that range or recorded an
+explained override for it. No path is added that permits an action that was
+refused before: the gate runs ahead of the harness and can only refuse, and a
+gate that cannot decide refuses. It does not reach a `git merge` typed into a
+terminal GitPulse does not host.

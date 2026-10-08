@@ -20,6 +20,7 @@
    */
   import { onDestroy, untrack } from "svelte";
   import { ChevronDown, ChevronRight, RotateCw, SquareTerminal } from "@lucide/svelte";
+  import AttemptReview from "./AttemptReview.svelte";
   import AgentDecisions from "./AgentDecisions.svelte";
   import TaskHandoffForm from "./TaskHandoffForm.svelte";
   import { interfaceStore } from "../stores/interfaceStore";
@@ -596,6 +597,7 @@
         <div class="actions"><button class="gp-btn" type="button" onclick={() => inspect(run)} disabled={busy}>Refresh output</button><button class="gp-btn" type="button" onclick={() => { detail = null; }}>Close details</button></div>
       </section>
     {/if}
+    {#if offer.ownWorktree}<AttemptReview {run} />{/if}
     {#if reviewingRunID === run.id}<AgentDecisions {run} {active} refreshToken={decisionRefresh} />{/if}
   </article>
 {/snippet}
