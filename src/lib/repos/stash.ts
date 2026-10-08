@@ -31,6 +31,8 @@ export interface StashList {
 export interface StashSaveOptions {
   include_untracked: boolean;
   keep_index: boolean;
+  /** Stash only these repository-relative paths; omitted or empty stashes everything. */
+  paths?: string[];
 }
 
 /** A stack can legally contain the same object more than once. */

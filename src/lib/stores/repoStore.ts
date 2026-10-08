@@ -76,6 +76,20 @@ import {
 import { expandedStacks, lastUsedCheckouts, noteActiveCheckout } from "../repos/stackState";
 import { isSectionOnScreen, resolveSection } from "../views/viewRegistry";
 import { parseStashList, type StashAction, type StashEntry, type StashSaveOptions } from "../repos/stash";
+import type { MergeMode } from "../branches/mergeSelection";
+import { parseGitPreflight, type GitIdentity, type GitPreflight, type IdentityScope } from "../repos/gitPreflight";
+import {
+  AUTO_FETCH_TICK_MS,
+  createAutoFetchScheduler,
+  loadAutoFetchPrefs,
+  parseAutoFetchOutcome,
+  saveAutoFetchPrefs,
+  withAutoFetchSetting,
+  type AutoFetchOutcome,
+  type AutoFetchPrefs,
+  type AutoFetchSetting,
+} from "../repos/autoFetch";
+import { createVisibleInterval } from "../dom/visibleInterval";
 import { hasUnstagedChanges } from "../files/fileStatus";
 import { indexSelectionPaths } from "../repos/bulkOps";
 import {
@@ -3563,20 +3577,93 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
       runMutating("rebase", ontoCommit, (path) =>
         invokeFn("cmd_rebase_interactive", { repoPath: path, ontoCommit, steps })),
 
-    mergeBranch: async (branchName: string, ffOnly: boolean = false) =>
-      runMutating("merge", branchName, (path) =>
-        invokeFn("cmd_merge_branch", { repoPath: path, branchName, ffOnly }),
+    mergeBranch: async (branchName: string, mode: MergeMode = "default") =>
+      runMutating(mode === "squash" ? "merge-squash" : "merge", branchName, (path) =>
+        invokeFn("cmd_merge_branch", { repoPath: path, branchName, mode }),
       ),
     fetch: async (remote?: string) =>
       runMutating("fetch", remote ?? "origin", (path) =>
         invokeFn("cmd_fetch", { repoPath: path, remote }),
       ),
-    pull: async (remote?: string, branch?: string) =>
+    /**
+     * `rebase`: true rebases local commits onto the upstream (`--rebase`),
+     * false merges (`--no-rebase`), undefined follows `pull.rebase`.
+     */
+    pull: async (remote?: string, branch?: string, rebase?: boolean) =>
       runMutating(
-        "pull",
+        rebase ? "pull-rebase" : "pull",
         [remote, branch].filter(Boolean).join(" ") || "upstream",
-        (path) => invokeFn("cmd_pull", { repoPath: path, remote, branch }),
+        (path) => invokeFn("cmd_pull", { repoPath: path, remote, branch, rebase }),
       ),
+    /** `pull.rebase` for the active repository, or null when unset (git merges). */
+    pullRebaseConfig: async (): Promise<string | null> => {
+      const session = activeSession();
+      if (!session) return null;
+      const value = await invokeFn<unknown>("cmd_pull_rebase_config", { repoPath: session.path });
+      return typeof value === "string" ? value : null;
+    },
+    /**
+     * Stops the hook-running git command (commit, merge, rebase, …) running
+     * in the active repository, hook and all. Resolves to how many were
+     * stopped: zero means nothing was running.
+     */
+    cancelHooks: async (): Promise<number> => {
+      const session = activeSession();
+      if (!session) return 0;
+      const stopped = await invokeFn<unknown>("cmd_cancel_git_hooks", { repoPath: session.path });
+      return typeof stopped === "number" ? stopped : 0;
+    },
+    /** The identity a commit in the active repository would be recorded under. */
+    gitIdentity: async (): Promise<GitIdentity | null> => {
+      const session = activeSession();
+      if (!session) return null;
+      return invokeFn<GitIdentity>("cmd_git_identity", { repoPath: session.path });
+    },
+    setGitIdentity: async (name: string, email: string, scope: IdentityScope) =>
+      runMutating<GitIdentity>(
+        "identity",
+        scope === "global" ? "global identity" : "repository identity",
+        (path) => invokeFn("cmd_set_git_identity", { repoPath: path, name, email, scope }),
+        { skipRefresh: true },
+      ),
+    /** Whether a usable git is installed; asked once at startup. */
+    gitPreflight: async (): Promise<GitPreflight> =>
+      parseGitPreflight(await invokeFn<unknown>("cmd_git_preflight", {})),
+    autoFetchSetting: (path: string): AutoFetchSetting | null => autoFetchPrefs[path] ?? null,
+    setAutoFetch: (path: string, setting: AutoFetchSetting) => {
+      autoFetchPrefs = withAutoFetchSetting(autoFetchPrefs, path, setting);
+      try {
+        saveAutoFetchPrefs(autoFetchPrefs);
+      } catch (error) {
+        diagnostics.warn("autoFetch", `could not save auto-fetch settings: ${formatError(error)}`);
+      }
+    },
+    /**
+     * Starts the opt-in auto-fetch timer. Returns its disposer. One
+     * repository per tick at most; see `repos/autoFetch.ts` for the budget.
+     */
+    startAutoFetch: (): (() => void) => {
+      const scheduler = createAutoFetchScheduler({
+        prefs: () => autoFetchPrefs,
+        now: () => Date.now(),
+        candidates: () => {
+          const byPath = new Map(wipInputs().map((input) => [input.path, input]));
+          const activeId = internal.workspace.activeId;
+          return internal.workspace.tabs.map((tab) => {
+            const input = byPath.get(tab.path);
+            return {
+              path: tab.path,
+              active: tab.id === activeId,
+              skip: input ? bulkSkipReason(input) : "not loaded",
+            };
+          });
+        },
+        fetch: (path) => autoFetchRepo(path),
+        onError: (path, error) =>
+          diagnostics.warn("autoFetch", `auto-fetch of ${path} failed: ${formatError(error)}`),
+      });
+      return createVisibleInterval(() => void scheduler.tick(), AUTO_FETCH_TICK_MS);
+    },
     push: async (remote?: string, branch?: string, force: boolean = false) =>
       runMutating(
         force ? "push-force" : "push",
@@ -3804,6 +3891,25 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
         hydrated: Boolean(session?.hasHydrated),
       };
     });
+  }
+
+  let autoFetchPrefs: AutoFetchPrefs = loadAutoFetchPrefs();
+
+  /**
+   * One automatic fetch. Not a `runMutating`: nobody clicked, so a failure is
+   * logged rather than filed on the session as the user's error, and only
+   * the tab in front is refreshed — a background tab catches up when shown.
+   */
+  async function autoFetchRepo(path: string): Promise<AutoFetchOutcome> {
+    const result = await invokeFn<unknown>("cmd_auto_fetch", { repoPath: path });
+    recordPolicyVerdict(result, path);
+    const outcome = parseAutoFetchOutcome(mutationOutput(result));
+    if (outcome.status === "fetched") {
+      mutationEchoUntil.set(path, Date.now() + WATCHER_ECHO_SUPPRESS_MS);
+      const session = activeSession();
+      if (session?.path === path) await store.refresh(path);
+    }
+    return outcome;
   }
 
   /** The work-in-progress model's narrower view of the same facts. */

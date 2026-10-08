@@ -9,7 +9,7 @@
   import { debounce } from "../async/debounce";
   import { formatError } from "../ui/formatError";
   import { copyText as copyToClipboard } from "../desktop/clipboard";
-  import { mergeRef, type MergeRequest } from "../branches/mergeSelection";
+  import { mergeRef, type MergeMode, type MergeRequest } from "../branches/mergeSelection";
   import MergeBranchDialog from "./MergeBranchDialog.svelte";
   import { enumerateFocusables } from "../ui/focusTrap";
   import {
@@ -570,7 +570,7 @@
     }
   }
 
-  function runMerge(branch?: BranchInfo, ffOnly = false) {
+  function runMerge(branch?: BranchInfo, mode: MergeMode = "default") {
     closeMenu({ restoreFocus: true });
     const repoPath = $repoStore.currentPath;
     if (!repoPath) return;
@@ -578,7 +578,7 @@
       repoPath,
       targetBranch: $repoStore.currentBranch,
       sourceRef: branch ? mergeRef(branch) : "",
-      ffOnly,
+      mode,
     };
   }
 
@@ -1349,11 +1349,14 @@
         <button role="menuitem" class="gp-menu-item" onclick={() => { const name = localNameFor(b); closeMenu(); checkoutName(name); }}>
           <GitBranch size={12} /> Checkout
         </button>
-        <button role="menuitem" class="gp-menu-item" onclick={() => void runMerge(b, false)}>
+        <button role="menuitem" class="gp-menu-item" onclick={() => void runMerge(b, "default")}>
           <GitMerge size={12} /> Merge into current…
         </button>
-        <button role="menuitem" class="gp-menu-item" onclick={() => void runMerge(b, true)}>
+        <button role="menuitem" class="gp-menu-item" onclick={() => void runMerge(b, "ff-only")}>
           <GitMerge size={12} /> Fast-forward merge…
+        </button>
+        <button role="menuitem" class="gp-menu-item" onclick={() => void runMerge(b, "squash")}>
+          <GitMerge size={12} /> Squash merge…
         </button>
       {/if}
       <button role="menuitem" class="gp-menu-item" onclick={() => void runCompare(b)}>

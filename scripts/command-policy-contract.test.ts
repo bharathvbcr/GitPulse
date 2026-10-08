@@ -47,7 +47,10 @@ describe("native mutation policy contract", () => {
       // command that reports a verdict it never actually obtained.
       // `guard_move` is the move delegate: it judges a MovePlan with exactly
       // those two, which the next test pins so it cannot become a bypass.
-      const judged = body.includes("guard(") || body.includes("guard_file(") || body.includes("guard_move(");
+      // `guard_background` is the same gate for a command nobody clicked (the
+      // auto-fetch timer); the next-but-one test pins that it is a real call.
+      const judged = body.includes("guard(") || body.includes("guard_file(") || body.includes("guard_move(")
+        || body.includes("guard_background(");
       expect(judged, `${name} returns Guarded<..> but never calls the write gate`).toBe(true);
     }
   });
@@ -59,6 +62,13 @@ describe("native mutation policy contract", () => {
     expect(body).toContain("guard(repo_path, &refs)");
     expect(body).toContain('guard_file(repo_path, from, "delete")');
     expect(body).toContain('guard_file(repo_path, to, "modify")');
+  });
+
+  it("keeps the background delegate a real gate call", () => {
+    const start = source.indexOf("fn guard_background(");
+    expect(start).toBeGreaterThanOrEqual(0);
+    const body = source.slice(start, source.indexOf("\n}\n", start));
+    expect(body).toContain("crate::harness::guard_command(repo_path, argv)");
   });
 
   it("keeps the historically hand-listed commands covered", () => {

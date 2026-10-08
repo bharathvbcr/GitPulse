@@ -10,6 +10,9 @@
   } from "../stores/harnessStore";
   import { Send, Sparkles, AlertTriangle, ShieldCheck, ShieldAlert, Loader } from "@lucide/svelte";
   import AgentCommitMenu from "./AgentCommitMenu.svelte";
+  import HookRunNotice from "./HookRunNotice.svelte";
+  import IdentityPrompt from "./IdentityPrompt.svelte";
+  import { isIdentityMissing } from "../repos/gitPreflight";
   import MarkdownBody from "./MarkdownBody.svelte";
   import { formatError } from "../ui/formatError";
   import { isImeComposition } from "../keyboard/imeGuard";
@@ -56,6 +59,7 @@
   let generation = $state<AiGeneration | null>(null);
   let aiError = $state<string | null>(null);
   let commitError = $state<string | null>(null);
+  let isCommitting = $state(false);
   let lastVerdict = $state<PolicyVerdict | null>(null);
 
   let quickCommit = $derived(includeUnstaged && !isAmending);
@@ -164,11 +168,12 @@
     if (conflictedCount > 0) return;
     if (useQuick ? dirtyCount === 0 : stagedFiles.length === 0 && !isAmending) return;
     commitError = null;
-    if (useQuick) {
-      await finishCommit(await repoStore.quickCommit(message));
-      return;
+    isCommitting = true;
+    try {
+      await finishCommit(useQuick ? await repoStore.quickCommit(message) : await repoStore.commit(message, isAmending));
+    } finally {
+      isCommitting = false;
     }
-    await finishCommit(await repoStore.commit(message, isAmending));
   }
 
   function onMessageKeydown(event: KeyboardEvent) {
@@ -375,7 +380,16 @@
     </div>
   {/if}
 
-  {#if commitError}
+  {#if isCommitting}
+    <HookRunNotice />
+  {/if}
+
+  {#if commitError && isIdentityMissing(commitError)}
+    <IdentityPrompt
+      onSaved={() => { commitError = null; void handleCommit(); }}
+      onDismiss={() => (commitError = null)}
+    />
+  {:else if commitError}
     <div class="text-[10px] text-rose-400 whitespace-pre-wrap font-mono leading-relaxed">{commitError}</div>
   {:else if lastVerdict}
     <div

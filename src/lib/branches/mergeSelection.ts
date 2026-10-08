@@ -2,11 +2,24 @@ import type { BranchInfo } from "./types";
 import type { OperationState } from "../repos/operation";
 import { fuzzyMatch } from "./groupBranches";
 
+/**
+ * How a merge joins the source into the checked-out branch. Mirrors the Rust
+ * `MergeMode` (kebab-case on the wire).
+ */
+export type MergeMode = "default" | "ff-only" | "no-ff" | "squash";
+
+export const MERGE_MODES: readonly { mode: MergeMode; label: string; detail: string }[] = [
+  { mode: "default", label: "Merge", detail: "Fast-forward when possible, otherwise record a merge commit." },
+  { mode: "ff-only", label: "Fast-forward only", detail: "Only move the branch forward; stop if a merge commit is needed." },
+  { mode: "no-ff", label: "Always create a merge commit", detail: "Record a merge commit even when a fast-forward was possible (--no-ff)." },
+  { mode: "squash", label: "Squash into one commit", detail: "Combine the source's changes into a single new commit with no merge parent (--squash)." },
+];
+
 export interface MergeRequest {
   repoPath: string;
   targetBranch: string | null;
   sourceRef: string;
-  ffOnly: boolean;
+  mode: MergeMode;
 }
 
 /** Fully qualified refs preserve remote identity and avoid tag/name ambiguity. */

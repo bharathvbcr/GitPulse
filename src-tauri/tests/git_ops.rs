@@ -2,6 +2,7 @@ use gitpulse_lib::analyzer::CoverageScanner;
 use gitpulse_lib::diff::PatchBuilder;
 use gitpulse_lib::diff::{DiffLineType, FilePatch, UnifiedDiffHunk, UnifiedDiffLine};
 use gitpulse_lib::engine::git_cli::{resolve_git_dir, sandbox_join, sandbox_write, validate_repo};
+use gitpulse_lib::engine::git_writer::MergeMode;
 use gitpulse_lib::engine::{GitReader, GitWriter, RebaseActionKind, RebaseStep};
 use gitpulse_lib::github::parse_github_remote_url;
 use gitpulse_lib::graph::{LaneSolver, RefScope};
@@ -351,6 +352,7 @@ fn release_stash_options_keep_staged_work_and_leave_untracked_files() {
     let options = StashSaveOptions {
         include_untracked: false,
         keep_index: true,
+        paths: Vec::new(),
     };
     assert_eq!(
         options.argv(Some("--literal-message")),
@@ -1009,7 +1011,7 @@ fn test_merge_conflict_parse_and_resolve() {
     repo.write("app.txt", "ours change\n");
     repo.commit_all("feat: ours");
 
-    let merge = GitWriter::merge_branch(&path, "theirs", false);
+    let merge = GitWriter::merge_branch(&path, "theirs", MergeMode::Default, &mut |_| Ok(()));
     assert!(
         merge.is_err()
             || GitReader::get_status(&path)
@@ -1048,7 +1050,7 @@ fn quick_commit_refuses_unmerged_paths_and_leaves_the_tree() {
     repo.write("app.txt", "ours change\n");
     repo.commit_all("feat: ours");
 
-    let _ = GitWriter::merge_branch(&path, "theirs", false);
+    let _ = GitWriter::merge_branch(&path, "theirs", MergeMode::Default, &mut |_| Ok(()));
     let conflicted = GitReader::get_status(&path)
         .unwrap()
         .iter()

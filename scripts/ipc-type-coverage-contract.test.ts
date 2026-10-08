@@ -45,6 +45,10 @@ const NOT_PAYLOADS = new Set(["Result", "Vec", "Option", "String", "HashMap", "B
  */
 const UNCHECKED = new Map<string, { reason: string; orphanCommand?: string }>([
   [
+    "AutoFetchOutcome",
+    { reason: "internally tagged enum, not a struct; parseAutoFetchOutcome in src/lib/repos/autoFetch.ts refuses any shape but the two variants, pinned by autoFetch.test.ts and the Rust auto_fetch test" },
+  ],
+  [
     "ConventionalCommit",
     { reason: "returned only by an orphaned command", orphanCommand: "cmd_parse_conventional_commit" },
   ],

@@ -17,6 +17,7 @@
   import { filterStore } from "./lib/stores/filterStore";
   import { interfaceStore } from "./lib/stores/interfaceStore";
   import { toastStore } from "./lib/stores/toastStore";
+  import { preflightProblem } from "./lib/repos/gitPreflight";
   import { harnessStore } from "./lib/stores/harnessStore";
   import { applyPlatformClass, isMacOS, isTauri } from "./lib/platform";
   import { displayName } from "./lib/repos/paths";
@@ -464,6 +465,20 @@
     };
     window.addEventListener("gitpulse:diagnostics", openDiagnostics);
     track(() => window.removeEventListener("gitpulse:diagnostics", openDiagnostics));
+
+    // Every feature assumes a git it can drive. Say so once, plainly, rather
+    // than letting the first command fail with "no such program" or an
+    // unknown `git switch`. A probe shed under load says nothing either way
+    // and is not reported as a problem.
+    void repoStore.gitPreflight().then(
+      (preflight) => {
+        const problem = preflightProblem(preflight);
+        if (problem && !listeners.disposed) toastStore.error(problem, undefined, 0);
+      },
+      (error) => diagnostics.warn("boot:git-preflight", error),
+    );
+    // Opt-in per repository; with nothing enabled each tick does no work.
+    track(repoStore.startAutoFetch());
 
     const openShortcuts = () => {
       isShortcutsOpen = true;
