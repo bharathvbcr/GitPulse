@@ -5,7 +5,19 @@ import type { LauncherKind } from "./tabs";
 
 export interface TerminalSessionRecord {
   key: string;
+  /** The repository tab whose panel holds this session: Go to, close and counts. */
   repoPath: string;
+  /**
+   * The checkout the process runs in, when that is not `repoPath`: an agent
+   * hosted in another checkout of the same repository. What a list names.
+   */
+  checkout?: string;
+  /**
+   * The repository family of `repoPath`, when a session a reloaded page left
+   * running was adopted with one: lets Go to show it in an open checkout of
+   * the same repository rather than open a tab for its own.
+   */
+  family?: string;
   label: string;
   /**
    * What the process is: a shell or an agent CLI. `label` is that kind as

@@ -10,7 +10,7 @@ import { focusTerminalSession, type RepoFocusActions } from "./sessionFocus";
  * Asserting the final state alone would pass for all six orderings.
  */
 function stub(
-  openTabs: { id: string; path: string }[],
+  openTabs: { id: string; path: string; family?: string | null; familyRoot?: string | null; trustRequired?: boolean; missing?: boolean }[],
   activeTabId: string | null,
   overrides: Partial<RepoFocusActions> = {},
 ) {
@@ -156,5 +156,30 @@ describe("focusTerminalSession", () => {
     const { actions, calls } = stub(TABS, "beta");
     await focusTerminalSession({ repoPath: "/r/alpha", reveal }, actions);
     expect(calls).toContain("activate:alpha");
+  });
+});
+
+describe("a session left running in a worktree with no tab of its own", () => {
+  const FAMILY = "/repo/.git";
+  const tabs = [
+    { id: "other", path: "/elsewhere", family: "/elsewhere/.git", familyRoot: "/elsewhere" },
+    { id: "main", path: "/repo", family: FAMILY, familyRoot: "/repo" },
+  ];
+
+  it("is shown in its repository's open checkout, where its reveal is hosted, without opening a tab", async () => {
+    const { actions, calls } = stub(tabs, "other");
+    const reveal = vi.fn();
+    const outcome = await focusTerminalSession({ repoPath: "/repo/.gitpulse/worktrees/a", family: FAMILY, reveal }, actions);
+    expect(outcome).toEqual({ ok: true, switchedRepo: true, openedDock: true });
+    expect(calls).toEqual(["surface", "activate:main", "dock:true", "render"]);
+    expect(reveal).toHaveBeenCalledTimes(1);
+  });
+
+  it("still opens its own checkout when it has no family, or none of its repository is open", async () => {
+    for (const record of [{ repoPath: "/repo/.gitpulse/worktrees/a" }, { repoPath: "/x/.gitpulse/worktrees/a", family: "/x/.git" }]) {
+      const { actions, calls } = stub(tabs, "other");
+      await focusTerminalSession({ ...record, reveal: () => {} }, actions);
+      expect(calls).toContain(`open:${record.repoPath}`);
+    }
   });
 });

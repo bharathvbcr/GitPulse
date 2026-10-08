@@ -24,10 +24,11 @@ import { interfaceStore } from "../stores/interfaceStore";
 import { repoStore } from "../stores/repoStore";
 import type { TerminalSessionRecord } from "./sessionRegistry";
 import { isCaseInsensitiveFs, sameRepo, type PathIdentityOptions } from "../repos/paths";
+import { hostTabFor, type HostCandidate } from "./taskLaunches";
 
 /** What `focusTerminalSession` needs from the repository store. */
 export interface RepoFocusTarget {
-  openTabs: readonly { id: string; path: string }[];
+  openTabs: readonly HostCandidate[];
   activeTabId: string | null;
 }
 
@@ -64,7 +65,7 @@ export type FocusOutcome =
  * failure has to be distinguishable from a no-op.
  */
 export async function focusTerminalSession(
-  record: Pick<TerminalSessionRecord, "repoPath" | "reveal"> | null | undefined,
+  record: Pick<TerminalSessionRecord, "repoPath" | "reveal" | "family"> | null | undefined,
   repo: RepoFocusActions = repoStoreFocus,
 ): Promise<FocusOutcome> {
   if (!record) return { ok: false, reason: "no-session" };
@@ -81,11 +82,21 @@ export async function focusTerminalSession(
   // open a second one.
   const identity = repo.identity ?? { caseInsensitive: isCaseInsensitiveFs() };
   const target = before.openTabs.find((tab) => sameRepo(tab.path, record.repoPath, identity));
+  const host = target || !record.family ? undefined : hostTabFor({ repoPath: record.repoPath, family: record.family }, before.openTabs, identity);
   let switchedRepo = false;
 
   if (target) {
     if (target.id !== before.activeTabId) {
       await repo.activateTab(target.id);
+      switchedRepo = true;
+    }
+  } else if (host) {
+    // A session a reloaded page left running in a worktree with no tab of its
+    // own: its reveal is hosted by an open checkout of the same repository,
+    // so that is where to go. Opening the worktree spent a repository tab on
+    // it, the very thing hosting exists to avoid.
+    if (host.id !== before.activeTabId) {
+      await repo.activateTab(host.id);
       switchedRepo = true;
     }
   } else {

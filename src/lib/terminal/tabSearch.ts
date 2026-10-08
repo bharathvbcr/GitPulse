@@ -89,6 +89,7 @@ export function filterSessionRecords(
     matchesTerminalSearch(
       query,
       session.repoPath,
+      session.checkout ?? "",
       session.label,
       session.title ?? "",
       session.status,

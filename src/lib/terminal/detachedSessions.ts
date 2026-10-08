@@ -102,6 +102,12 @@ export async function adoptDetachedSessions(deps: {
   confirm?: Confirm;
   bus?: PtyBus;
   registry?: ReturnType<typeof createSessionRegistry>;
+  /**
+   * A checkout's repository family (`repoStore.familyOf`), so an attempt's
+   * session in a worktree with no tab is shown in an open checkout of the
+   * same repository (`taskLaunches.hostTabFor`). Absent: none is looked up.
+   */
+  familyOf?: (path: string) => Promise<string | null>;
 } = {}): Promise<number> {
   const invoke = deps.invoke ?? (tauriInvoke as Invoke);
   const bus = deps.bus ?? tauriBus;
@@ -117,6 +123,10 @@ export async function adoptDetachedSessions(deps: {
     const launcher = launcherOf(listing);
     const key = `${KEY_PREFIX}${listing.id}`;
     const label = launcherLabel(launcher);
+    // An attempt's terminal is re-opened as a task tab, which any checkout of
+    // its repository can host; a plain session is taken over in its own.
+    const family = listing.run_id && deps.familyOf ? await deps.familyOf(listing.repo).catch(() => null) : null;
+    if (get(registry).some((record) => record.sessionId === listing.id)) continue;
     let unsubscribe: (() => void) | null = null;
     // A refused reserve (the shared limit) throws out of here: sessions the
     // host holds but this page cannot list are reported, not skipped.
@@ -126,6 +136,7 @@ export async function adoptDetachedSessions(deps: {
       label,
       launcher,
       ...(listing.run_id ? { title: "Task attempt", taskRunId: listing.run_id } : {}),
+      ...(family ? { family } : {}),
       status: DETACHED_STATUS,
       sessionId: listing.id,
       async close() {
@@ -144,6 +155,7 @@ export async function adoptDetachedSessions(deps: {
           provider: launcher,
           title: listing.run_id ? "Task attempt" : label,
           ...(listing.run_id ? {} : { attach: { sessionId: listing.id } }),
+          ...(family ? { family } : {}),
         });
         drop();
       },

@@ -9,7 +9,7 @@
   import { loadAgentDefaults } from "../stores/agentDefaultsStore";
   import type { FocusOutcome } from "../terminal/sessionFocus";
   import { isPromptLauncher, terminalLaunchRequests } from "../terminal/launchRequests";
-  import { taskTerminalRequests, consumeTaskTerminalRequest, launchFor, requestFor, type HostCandidate } from "../terminal/taskLaunches";
+  import { taskTerminalRequests, taskTerminalHolds, consumeTaskTerminalRequest, heldElsewhere, holdTaskTerminal, launchFor, releaseTaskTerminal, requestFor, type HostCandidate, type TaskTerminalRequest } from "../terminal/taskLaunches";
   import { isCaseInsensitiveFs, sameRepo } from "../repos/paths";
   import { consoleLaunchRequests, consumeConsoleLaunch } from "../terminal/consoleLaunches";
   import { boundedCommand, retainCommand, retainExecutions, followsConsoleOutput } from "../terminal/consoleHistory";
@@ -381,9 +381,15 @@
   /** Bumped on a refusal, so the opener runs again once a slot frees. */
   let refusals = $state(0);
 
+  /** This panel, as `taskLaunches` holds requests by (`holdTaskTerminal`). */
+  const holder = Symbol("terminal-panel");
+
   $effect(() => {
     const here = repoPath;
-    const hosted = here ? $taskTerminalRequests.filter((request) => requestFor([request], here, pathOpts, checkouts)) : [];
+    const held = $taskTerminalHolds;
+    const hosted = here
+      ? $taskTerminalRequests.filter((request) => !heldElsewhere(request, holder, held) && requestFor([request], here, pathOpts, checkouts))
+      : [];
     const limit = $terminalSessionLimit;
     const used = $terminalSessions.length;
     void refusals;
@@ -404,6 +410,7 @@
         const next = openTab(tabState, request.provider, launchFor(request, here, pathOpts));
         const opened = next.tabs.find((candidate) => !tabState.tabs.includes(candidate));
         if (!opened) break;
+        if (!holdTaskTerminal(request, holder)) continue;
         tabState = next;
         mode = "shell";
         admitting.add(opened.id);
@@ -412,12 +419,18 @@
     });
   });
 
-  function admitTab(id: string) {
-    if (!admitting.delete(id)) return;
+  /** The queued request a tab of this panel was opened for, if it still stands. */
+  function requestOfTab(id: string): TaskTerminalRequest | undefined {
     const tab = tabState.tabs.find((candidate) => candidate.id === id);
-    if (!tab) return;
+    if (!tab) return undefined;
     const one = { tabs: [tab], activeId: null };
-    const request = get(taskTerminalRequests).find((candidate) => tabFor(one, candidate));
+    return get(taskTerminalRequests).find((candidate) => tabFor(one, candidate));
+  }
+
+  function admitTab(id: string) {
+    if (!admitting.has(id)) return;
+    const request = requestOfTab(id);
+    admitting.delete(id);
     if (request) consumeTaskTerminalRequest(request);
   }
 
@@ -425,8 +438,9 @@
     if (!admitting.has(id)) return false;
     // After the session's own start returns: it is still inside that call.
     // Still marked until it is gone, or an opener run in between would take
-    // the refused tab for a running one and consume its request.
-    queueMicrotask(() => { dropTab(id); admitting.delete(id); refusals += 1; });
+    // the refused tab for a running one and consume its request. The request
+    // stays queued for the next free slot.
+    queueMicrotask(() => { dropTab(id, true); refusals += 1; });
     return true;
   }
 
@@ -579,7 +593,10 @@
     });
   });
 
-  onDestroy(() => { for (const tab of tabState.tabs) terminalLaunchRequests.forget(tab.id); });
+  onDestroy(() => {
+    for (const tab of tabState.tabs) terminalLaunchRequests.forget(tab.id);
+    releaseTaskTerminal(holder);
+  });
 
   function selectTab(id: string, keepStripFocus = false) {
     focusTabStrip = keepStripFocus;
@@ -594,11 +611,20 @@
    * terminal that silently respawns what you just closed is worse than one
    * that waits to be asked.
    */
-  function dropTab(id: string) {
+  function dropTab(id: string, keepRequest = false) {
     terminalLaunchRequests.forget(id);
     // A tab closed before it took a slot no longer counts against the room
-    // this panel leaves for queued starts.
-    admitting.delete(id);
+    // this panel leaves for queued starts, and gives up its hold. Closed by
+    // the reader, its request goes too — it was still queued, and would
+    // otherwise reopen the tab they just closed. Refused a slot, it waits.
+    if (admitting.has(id)) {
+      const request = requestOfTab(id);
+      if (request) {
+        if (keepRequest) releaseTaskTerminal(holder, request);
+        else consumeTaskTerminalRequest(request);
+      }
+      admitting.delete(id);
+    }
     focusTabStrip = false;
     const partner = splitIds?.includes(id) ? splitIds.find((other) => other !== id) ?? null : null;
     if (splitIds?.includes(id)) splitIds = null;
@@ -962,7 +988,7 @@
              tab strip's stacks use (`terminal/checkoutLabel.ts`). -->
         {@const row = sessionRow(session, repoPath, checkouts, pathOpts)}
         <div class="flex gap-2 items-center py-0.5" data-testid="session-row">
-          <span class="flex-1 min-w-0 flex items-center gap-1.5" title={session.repoPath}>
+          <span class="flex-1 min-w-0 flex items-center gap-1.5" title={session.checkout ?? session.repoPath}>
             <span class="min-w-0 truncate">
               <span class="font-medium" data-testid="session-repository">{row.repository}</span>{#if row.checkout}<span class="text-textMuted" aria-hidden="true"> / </span><span class="sr-only">, checkout </span><span data-testid="session-checkout">{row.checkout}</span>{/if}
               <span class="text-textMuted"> · {session.title ? `${session.title} · ` : ""}{row.agent ? "" : `${session.label} · `}{session.status}{session.taskRunId ? " · task attempt" : session.continuesRunId ? " · resumed conversation" : ""}{row.here ? "" : " · other checkout"}</span>

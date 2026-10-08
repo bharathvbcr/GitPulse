@@ -883,6 +883,24 @@ describe("repoStore tabs", () => {
       expect(get(store).activeTabId).toBe(id);
     });
 
+    it("says when some of what it ends are agents hosted from other checkouts of the repository", async () => {
+      // An agent in a worktree with no tab of its own runs in its repository's
+      // tab (taskLaunches.hostTabFor). Closing that tab ends it, and "the
+      // shells running in it" did not say that some were not in it at all.
+      const graph = makeGraph();
+      const store = createRepoStore({
+        invoke: makeInvoke(), storage: memoryStorage(), caseInsensitive: true, graph: graph.api, filter: makeFilter(),
+        terminals: { countFor: () => 3, hostedFor: () => 2 },
+      });
+      await store.openRepo("/r/alpha");
+      const closing = store.closeTab(get(store).activeTabId!);
+      await vi.waitFor(() => expect(get(promptState)?.options.title).toBe("End 3 terminal sessions?"));
+      expect(get(promptState)?.options.message).toContain("2 of them are agents working in another checkout of this repository, hosted here; closing ends them too.");
+      cancelPrompt();
+      await closing;
+      expect(get(store).openTabs).toHaveLength(1);
+    });
+
     it("closes once the user confirms", async () => {
       const { store } = withTerminals({ "/r/alpha": 2 });
       await store.openRepo("/r/alpha");

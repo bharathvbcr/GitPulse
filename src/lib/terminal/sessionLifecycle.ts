@@ -31,6 +31,8 @@ export interface SessionHooks {
 export function createSessionLifecycle(options: {
   key: string;
   repoPath: string;
+  /** See `TerminalSessionRecord.checkout`. */
+  checkout?: string;
   label: string;
   /** See `TerminalSessionRecord.launcher`. */
   launcher?: LauncherKind;
@@ -141,6 +143,7 @@ export function createSessionLifecycle(options: {
         try {
           slot = registry.reserve({
             key: options.key, repoPath: options.repoPath, label: options.label, status: "starting", close,
+            ...(options.checkout ? { checkout: options.checkout } : {}),
             ...(options.launcher ? { launcher: options.launcher } : {}),
             reveal: options.reveal, confirmClose: options.confirmClose,
             ...(options.title ? { title: options.title } : {}),

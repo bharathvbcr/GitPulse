@@ -171,6 +171,126 @@ they are historical provenance, not required locations for a fresh checkout.
 
 Implementation has begun; the full goal remains incomplete.
 
+### Design spikes: queue, issue sync, task graph (2026-10-07)
+
+Board card `ft-75540dc2044907153db6fcc74c16f550`. These spikes cover sections 3
+and 4 that no other card owns.
+
+**Scope confirmed by the user, 2026-10-07:**
+- Build all three parts: links, queue and outbox, each as a DevCouncil dc-store
+  migration, then a re-vendor. Use fresh branches.
+- The shipped run limits win: a user setting of 1–64 with a default of 8, and
+  one writer per working tree. The queue adds its own cross-repository job cap
+  of 2, configurable to 4, plus the 45-active-minute and 2-hour elapsed caps.
+  This amends section 4's defaults.
+- Inbound GitHub sync surfaces changes to open/closed state, title and body,
+  and labels. Each one arrives as an accept/dismiss proposal on the task, never
+  as a silent overwrite.
+
+The store work for each part is done in DevCouncil
+(`rust/dc-store/src/workbench/`), re-vendored, and then wired into GitPulse.
+The vendored dc-store and DevCouncil `main` are both `c3907784` at schema 10,
+and neither has a link, queue or outbox table. However, the unmerged DevCouncil
+branch `feat/workbench-schema-11` (`8d09fa2b`, 2026-10-07) already adds
+`work_item_links` (see part 3). The schema version is a resource two branches
+can both claim. The queue and outbox therefore take the rung after schema 11.
+
+**Sequencing agreed with the user, 2026-10-07:**
+1. Merge schema 11 into DevCouncil `main` and re-vendor it into GitPulse.
+2. Build schema 12 (queue and outbox) on top of it.
+3. Build the GitPulse readiness gate and GitHub sync.
+
+Step 1 has been checked but not merged. On `8d09fa2b`, the dc-store suites pass
+(21 result lines, 0 failed) and so does `go test ./dc/store/...`. The branch
+fast-forwards from `main` (`c3907784`). The merge has to run from a
+DevCouncil-rooted session, because the GitPulse session's gate refuses git
+against another repository.
+
+The re-vendor changes what Done means in GitPulse: schema 11 turns `archived`
+into a flag that is independent of status. That collides with the board lanes,
+so check `gitpulse_insights` for a sibling lane doing the same before starting.
+
+**1. Cross-repository execution and integration queue** (section 4)
+
+- *What exists (verified in source):* the per-attempt durable run is
+  `work_runs` in `runs.sql`. The live-run bound is a user setting with a range of
+  1–64 and a default of 8 (`DEFAULT_ACTIVE_RUNS` / `MAX_ACTIVE_RUNS_CEILING`,
+  `runs.rs:20`). Run exclusivity is **per working tree, not per repository**
+  (`runs.rs:511`). This was a deliberate change, because keying on the
+  repository serialized every linked worktree. The older `task_leases`
+  (`schema.rs:44`) are the separate per-repository execution model that
+  section 6 says to retain.
+- *Missing:* a multi-repository snapshot, a lease set taken in one order,
+  dependent execution, combined verification and an integration queue in
+  front of publication.
+- *Conflicts to resolve:* section 4 sets defaults of 2 global jobs
+  (configurable to 4) and one writer workflow per repository. The shipped
+  system has 8 jobs (up to 64) and one writer per working tree. Section 4's
+  45-active-minute and 2-hour elapsed caps have no counterpart today.
+- *Proposed shape:* a `work_queue` row per cross-repository job holds an
+  ordered list of `(repository_id, git_dir, base_oid)`. The snapshot is taken
+  at enqueue. Its leases are acquired in canonical `repository_id` order inside
+  one store transaction, all or none, so two jobs cannot deadlock. Per-member
+  outcomes are kept, and a failed member blocks its dependents. Combined
+  verification runs once every member is done. Its result is recorded per
+  member and never reported as atomic publication. Time caps are enforced by
+  GitPulse's existing reconcile sweep (`src-tauri/src/workbench/reconcile.rs`
+  `sweep`) against `claimed_at` seconds. Tests cover lease ordering under contention, all-or-none
+  acquisition, and expiry at the active and elapsed caps.
+
+**2. Two-way GitHub issue sync with a durable outbox** (section 4)
+
+- *What exists (verified in source):*
+  - Inbound is a one-shot import (`issueTask.ts` `createTaskFromIssue` /
+    `batchCreateTasksFromIssues`). It dedupes on the `issue-N` label
+    (`issueLinkLabel`, `issueTask.ts:293`). Later changes to an issue never
+    reach its task.
+  - Outbound is issue *creation* only, through the one confirmed owner
+    `repoStore.reportIssue` → `cmd_github_create_issue`
+    (`github/mod.rs` `issue_create_argv` / `create_issue`). A `gh` call that
+    hit its deadline is `outcomeUnknown` (`src/lib/async/deferral.ts`) and is
+    never called "not created".
+- *Standing decision:* GitPulse does not publish to GitHub by itself. Every
+  outbound write is an explicit, previewed, user-confirmed action.
+- *Missing:* a stored link (today it is a label), inbound reflection of later
+  changes, any outbound write other than create, an outbox, and three-way
+  conflict handling.
+- *Proposed shape:*
+  - **Inbound** is a read only. On the existing GitHub poll, for each linked
+    task, compare the issue's state, title and labels against a stored
+    `last_seen` copy. A change surfaces as a proposal on the task, on the same
+    accept/dismiss path as enhancement proposals. It is never a silent
+    overwrite.
+  - **Outbound:** a `work_outbox` row (operation, task revision, target issue,
+    payload digest and an idempotency key) is written only after the user
+    confirms a preview. Delivery reads the issue first, which reconciles an
+    uncertain prior attempt, and it survives a restart. A three-way conflict
+    (base = `last_seen`, local, remote) is shown to the user and never merged
+    automatically.
+  - Tests: outbox replay after restart, no duplicate delivery after an
+    `outcomeUnknown`, and no outbound write without a confirmed row.
+
+**3. Grounding with citations, task graphs, prioritization and knowledge**
+(section 3)
+
+- *What exists:*
+  - On `main`, nothing: [QUALIFICATION.md](QUALIFICATION.md#task-fields-against-the-plan)
+    declines parent/blocking/related/duplicate links for want of a link table.
+  - On the unmerged DevCouncil branch `feat/workbench-schema-11` (`8d09fa2b`),
+    schema 11 adds `work_item_links(item_id, kind, target_id, position)` with
+    `kind` in `parent`, `blocks`, `related` or `duplicate_of`, plus a reverse
+    index. It also adds a check that refuses a parent being its own
+    descendant, checklists, `archived` and `completed_at`. The brief renders
+    links in both directions.
+  - *Verified from that commit's diff:* `runs.prepare` does **not** consult
+    `blocks`. Its only run change is `model_choice`. So storage exists but
+    launch ordering does not.
+- *Remaining for this card:* readiness, meaning every `blocks` predecessor is
+  Done, enforced ahead of `runs.prepare` and shown on the card, plus a
+  `blocks` cycle check if schema 11 lacks one. Prioritization and grounding
+  with citations depend on the links and on evidence capture (section 3), so
+  they come after the links.
+
 ### Managed startup recovery checkpoint
 
 - **Verified:** schema ten and preparation protocol version two record native

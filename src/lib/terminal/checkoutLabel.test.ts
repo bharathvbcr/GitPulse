@@ -61,4 +61,17 @@ describe("sessionRow", () => {
     expect(row).toMatchObject({ agent: null, here: false, taskRunId: "run-9" });
     expect(sessionRow({ repoPath: "/work/app" }, null, TABS, opts)).toMatchObject({ agent: null, here: false, taskRunId: null });
   });
+
+  it("names a hosted agent by the worktree it runs in, while its panel stays the host's", () => {
+    // Hosted in the repository's own tab (taskLaunches.hostTabFor), the
+    // record's repoPath is that tab. Named by it, every worktree agent of a
+    // repository read as the repository itself and the worktree was lost.
+    const row = sessionRow(
+      { repoPath: "/work/app", checkout: "/work/app/.gitpulse/worktrees/fix-2-b2c3d4e5", launcher: "claude", taskRunId: "run-2" },
+      "/work/app",
+      TABS,
+      opts,
+    );
+    expect(row).toMatchObject({ repository: "app", checkout: "fix-2-b2c3d4e5", worktreeAgent: "gitpulse", agent: "Claude", here: true, taskRunId: "run-2" });
+  });
 });

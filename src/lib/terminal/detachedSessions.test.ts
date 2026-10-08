@@ -137,3 +137,31 @@ describe("sessions a reloaded page left running", () => {
     }
   });
 });
+
+describe("an attempt's session in a worktree, after a reload", () => {
+  it("learns its repository family, so Go to and its reveal use an open checkout of that repository", async () => {
+    const registry = createSessionRegistry();
+    const { bus } = fakeBus();
+    const asked: string[] = [];
+    const familyOf = async (path: string) => { asked.push(path); return "/repos/app/.git"; };
+    const listing = row({ id: "term-2", repo: "/repos/app/.gitpulse/worktrees/a", cwd: "/repos/app/.gitpulse/worktrees/a", run_id: "run-7" });
+    const invoke = async <T,>(command: string): Promise<T> => (command === "cmd_terminal_sessions" ? [listing, row({ id: "term-3" })] : null) as T;
+    expect(await adoptDetachedSessions({ invoke, bus, registry, confirm: async () => true, familyOf })).toBe(2);
+    // Only the attempt: a plain session is taken over in its own checkout.
+    expect(asked).toEqual(["/repos/app/.gitpulse/worktrees/a"]);
+    const record = get(registry).find((each) => each.sessionId === "term-2");
+    expect(record).toMatchObject({ repoPath: "/repos/app/.gitpulse/worktrees/a", family: "/repos/app/.git", taskRunId: "run-7" });
+    record?.reveal?.();
+    expect(get(taskTerminalRequests)).toContainEqual(expect.objectContaining({ runId: "run-7", family: "/repos/app/.git" }));
+    expect(get(registry).find((each) => each.sessionId === "term-3")).not.toHaveProperty("family");
+  });
+
+  it("is adopted without a family when the lookup fails, rather than not at all", async () => {
+    const registry = createSessionRegistry();
+    const { bus } = fakeBus();
+    const listing = row({ id: "term-4", run_id: "run-8" });
+    const invoke = async <T,>(command: string): Promise<T> => (command === "cmd_terminal_sessions" ? [listing] : null) as T;
+    expect(await adoptDetachedSessions({ invoke, bus, registry, confirm: async () => true, familyOf: async () => { throw new Error("deferred under load"); } })).toBe(1);
+    expect(get(registry)[0]).not.toHaveProperty("family");
+  });
+});

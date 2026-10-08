@@ -524,6 +524,12 @@ export interface RepoStoreDeps {
    */
   terminals?: {
     countFor(repoPath: string): number;
+    /**
+     * Of `countFor`, those running in another checkout of the repository —
+     * agents this tab hosts (`taskLaunches.hostTabFor`). Closing the tab ends
+     * them too, which the question has to say: they are not in it.
+     */
+    hostedFor?(repoPath: string): number;
   };
 }
 
@@ -873,6 +879,8 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
   const filters = deps.filter ?? filterStore;
   const terminals = deps.terminals ?? {
     countFor: (repoPath: string) => sessionsByRepo(get(terminalSessions), options).get(repoPath) ?? 0,
+    hostedFor: (repoPath: string) =>
+      sessionsByRepo(get(terminalSessions).filter((record) => !!record.checkout), options).get(repoPath) ?? 0,
   };
 
   /**
@@ -891,12 +899,15 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
   async function confirmTerminalLoss(paths: readonly string[]): Promise<boolean> {
     let running = 0;
     let repos = 0;
+    let hosted = 0;
     try {
       for (const path of paths) {
         const count = terminals.countFor(path);
         if (!Number.isFinite(count) || count <= 0) continue;
         running += count;
         repos += 1;
+        const elsewhere = terminals.hostedFor?.(path) ?? 0;
+        if (Number.isFinite(elsewhere) && elsewhere > 0) hosted += Math.min(elsewhere, count);
       }
     } catch {
       return true;
@@ -904,11 +915,16 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
     if (running <= 0) return true;
     const shells = running === 1 ? "the shell" : `all ${running} shells`;
     const subject = repos === 1 ? "this repository tab" : `these ${repos} repository tabs`;
+    const elsewhere = hosted === 0 ? ""
+      : hosted === running
+        ? `${hosted === 1 ? "It is an agent" : "They are agents"} working in another checkout of this repository, hosted here; closing ends ${hosted === 1 ? "it" : "them"} too. `
+        : `${hosted} of them ${hosted === 1 ? "is an agent" : "are agents"} working in another checkout of this repository, hosted here; closing ends ${hosted === 1 ? "it" : "them"} too. `;
     return askConfirm({
       title: running === 1 ? "End the terminal session?" : `End ${running} terminal sessions?`,
       message:
         `${paths.length === 1 ? `${paths[0]}\n\n` : ""}` +
         `Closing ${subject} ends ${shells} running in ${repos === 1 ? "it" : "them"}. ` +
+        elsewhere +
         "A command still running — a build, a test run, an agent — is stopped.\n\n" +
         "Hiding the terminal instead (⌃`) leaves it running.",
       confirmLabel: running === 1 ? "Close and End Session" : "Close and End Sessions",

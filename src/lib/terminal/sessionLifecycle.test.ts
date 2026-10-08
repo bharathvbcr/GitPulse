@@ -338,6 +338,20 @@ it("waits for the old renderer to drain before starting a replacement", async ()
   f.owner.dispose(); await flush();
 });
 
+describe("a hosted session's record", () => {
+  it("keeps the host as repoPath and carries the checkout it runs in", async () => {
+    const registry = createSessionRegistry();
+    const transport = { spawn: vi.fn(async () => ({ id: "native-h", shell: "claude", cwd: "/repo/.gitpulse/worktrees/a" })), write: vi.fn(async () => {}), resize: vi.fn(async () => {}), kill: vi.fn(async () => {}) };
+    const owner = createSessionLifecycle({ key: "tab-h", repoPath: "/repo", checkout: "/repo/.gitpulse/worktrees/a", label: "Claude", registry, transport,
+      hooks: { state: vi.fn(), started: vi.fn(), output: vi.fn(), exit: vi.fn(), reset: vi.fn(), warning: vi.fn() },
+      bus: { prepare: async () => () => {}, pendingCount: () => 0, subscribe: () => () => {} },
+    });
+    await owner.start();
+    expect(get(registry)[0]).toMatchObject({ repoPath: "/repo", checkout: "/repo/.gitpulse/worktrees/a" });
+    owner.dispose(); await flush();
+  });
+});
+
 describe("admission to a session slot", () => {
   function owner(registry: ReturnType<typeof createSessionRegistry>, key: string, hooks: { admitted?: () => void; refused?: (m: string) => boolean }) {
     const transport = { spawn: vi.fn(async () => ({ id: `native-${key}`, shell: "/bin/sh", cwd: "/repo" })), write: vi.fn(async () => {}), resize: vi.fn(async () => {}), kill: vi.fn(async () => {}) };

@@ -78,14 +78,15 @@ export interface SessionRow extends CheckoutLabel {
 }
 
 export function sessionRow(
-  session: { repoPath: string; launcher?: LauncherKind; taskRunId?: string; continuesRunId?: string },
+  session: { repoPath: string; checkout?: string; launcher?: LauncherKind; taskRunId?: string; continuesRunId?: string },
   panelPath: string | null,
   tabs: readonly CheckoutTab[],
   options: PathIdentityOptions,
 ): SessionRow {
   const here = !!panelPath && sameRepo(panelPath, session.repoPath, options);
   return {
-    ...describeCheckout(session.repoPath, tabs, options),
+    // Named by where it runs; `here` stays the panel that holds it.
+    ...describeCheckout(session.checkout ?? session.repoPath, tabs, options),
     agent: session.launcher && session.launcher !== "shell" ? launcherLabel(session.launcher) : null,
     here,
     taskRunId: session.taskRunId ?? session.continuesRunId ?? null,

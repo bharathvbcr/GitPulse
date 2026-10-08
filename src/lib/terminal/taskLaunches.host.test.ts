@@ -1,5 +1,9 @@
-import { describe, expect, it } from "vitest";
-import { awaitedTabIds, hostTabFor, launchFor, requestFor, type HostCandidate, type TaskTerminalRequest } from "./taskLaunches";
+import { afterEach, describe, expect, it } from "vitest";
+import { get } from "svelte/store";
+import {
+  awaitedTabIds, consumeTaskTerminal, consumeTaskTerminalRequest, enqueueTaskTerminal, heldElsewhere, holdTaskTerminal, hostTabFor, launchFor,
+  pruneTaskTerminals, releaseTaskTerminal, requestFor, taskTerminalHolds, taskTerminalRequests, type HostCandidate, type TaskTerminalRequest,
+} from "./taskLaunches";
 
 const opts = { caseInsensitive: false };
 const FAMILY = "/repo/.git";
@@ -76,6 +80,55 @@ describe("the dock and the panel agree on the host", () => {
     const ci = { caseInsensitive: true };
     const tabs = [tab("main", "/Repo")];
     expect(requestFor([request("r", "/repo")], "/REPO", ci, tabs)?.runId).toBe("r");
+  });
+});
+
+describe("a request held by the panel that opened a tab for it", () => {
+  const a = Symbol("panel-a"), b = Symbol("panel-b");
+  afterEach(() => {
+    for (const each of get(taskTerminalRequests)) consumeTaskTerminalRequest(each);
+    releaseTaskTerminal(a); releaseTaskTerminal(b);
+  });
+
+  it("is not taken by another panel while it waits for its slot, even when the host moves", () => {
+    // The host is recomputed from the open tabs, so it can move mid-start;
+    // without the hold the new host opened a second tab and launched twice.
+    const req = request("r", worktree("a"), FAMILY);
+    enqueueTaskTerminal(req);
+    expect(holdTaskTerminal(req, a)).toBe(true);
+    expect(holdTaskTerminal(req, a)).toBe(true);
+    expect(holdTaskTerminal(req, b)).toBe(false);
+    expect(heldElsewhere(req, b)).toBe(true);
+    expect(heldElsewhere(req, a)).toBe(false);
+  });
+
+  it("is free again once released, consumed, withdrawn or pruned", () => {
+    const req = request("r", worktree("a"), FAMILY);
+    enqueueTaskTerminal(req);
+    holdTaskTerminal(req, a);
+    releaseTaskTerminal(a, req);
+    expect(heldElsewhere(req, b)).toBe(false);
+
+    holdTaskTerminal(req, a);
+    consumeTaskTerminalRequest(req);
+    expect(get(taskTerminalHolds).size).toBe(0);
+
+    enqueueTaskTerminal(req); holdTaskTerminal(req, a);
+    consumeTaskTerminal("r");
+    expect(get(taskTerminalHolds).size).toBe(0);
+
+    enqueueTaskTerminal(req); holdTaskTerminal(req, a);
+    expect(pruneTaskTerminals([{ id: "r", state: "cancelled", expires_at: 0 }], Date.now())).toEqual(["r"]);
+    expect(get(taskTerminalHolds).size).toBe(0);
+  });
+
+  it("is released wholesale when its panel goes, leaving other panels' holds alone", () => {
+    const one = request("r1", worktree("a"), FAMILY), two = request("r2", worktree("b"), FAMILY);
+    enqueueTaskTerminal(one); enqueueTaskTerminal(two);
+    holdTaskTerminal(one, a); holdTaskTerminal(two, b);
+    releaseTaskTerminal(a);
+    expect(heldElsewhere(one, b)).toBe(false);
+    expect(heldElsewhere(two, a)).toBe(true);
   });
 });
 

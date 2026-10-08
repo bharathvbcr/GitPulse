@@ -118,8 +118,58 @@ export function enqueueTaskTerminal(request: TaskTerminalRequest): void {
   }
   pending.set([...current, request]);
 }
+/**
+ * Which panel holds a queued request: one that opened a tab for it that does
+ * not hold a session slot yet. Keyed like the queue.
+ *
+ * The host is recomputed from the open tabs (`hostTabFor`), so it can move
+ * while a start waits for its slot — the reader reorders tabs, trusts the
+ * repository's own checkout, or opens the worktree from a file link. Without
+ * a hold the new host opened a second tab for the same request and launched
+ * the same attempt twice, and the second launch failed as already claimed.
+ */
+const holds = writable<ReadonlyMap<string, symbol>>(new Map());
+export const taskTerminalHolds = { subscribe: holds.subscribe };
+
+/** Whether another panel than `holder` holds `request`. */
+export function heldElsewhere(request: TaskTerminalRequest, holder: symbol, held: ReadonlyMap<string, symbol> = get(holds)): boolean {
+  const by = held.get(requestKey(request));
+  return by !== undefined && by !== holder;
+}
+
+/** Records that `holder` opened a tab for `request`. False when another holds it. */
+export function holdTaskTerminal(request: TaskTerminalRequest, holder: symbol): boolean {
+  if (heldElsewhere(request, holder)) return false;
+  const key = requestKey(request);
+  holds.update((map) => (map.get(key) === holder ? map : new Map(map).set(key, holder)));
+  return true;
+}
+
+/** Gives up `holder`'s hold on `request` (or every one it has, with none named). */
+export function releaseTaskTerminal(holder: symbol, request?: TaskTerminalRequest): void {
+  const key = request ? requestKey(request) : null;
+  holds.update((map) => {
+    let next: Map<string, symbol> | null = null;
+    for (const [held, by] of map) {
+      if (by === holder && (key === null || held === key)) (next ??= new Map(map)).delete(held);
+    }
+    return next ?? map;
+  });
+}
+
+function forgetHolds(keep: (key: string) => boolean): void {
+  holds.update((map) => {
+    let next: Map<string, symbol> | null = null;
+    for (const key of map.keys()) if (!keep(key)) (next ??= new Map(map)).delete(key);
+    return next ?? map;
+  });
+}
+
 /** Withdraws an attempt's own terminal request (not a resumed conversation). */
-export function consumeTaskTerminal(runId: string): void { pending.update((items) => items.filter((item) => item.resume || item.attach || item.runId !== runId)); }
+export function consumeTaskTerminal(runId: string): void {
+  pending.update((items) => items.filter((item) => item.resume || item.attach || item.runId !== runId));
+  forgetHolds((key) => key !== `run:${runId}`);
+}
 /** Whether an attempt's own terminal request is still waiting for a tab. */
 export function hasTaskTerminalRequest(runId: string): boolean {
   return get(pending).some((item) => !item.resume && !item.attach && item.runId === runId);
@@ -128,6 +178,7 @@ export function hasTaskTerminalRequest(runId: string): boolean {
 export function consumeTaskTerminalRequest(request: TaskTerminalRequest): void {
   const key = requestKey(request);
   pending.update((items) => items.filter((item) => requestKey(item) !== key));
+  forgetHolds((held) => held !== key);
 }
 
 /**
@@ -159,6 +210,7 @@ export function pruneTaskTerminals(runs: readonly { id: string; state: string; e
     dropped.push(item.runId);
     return false;
   }));
+  if (dropped.length) forgetHolds((key) => !dropped.some((runId) => key === `run:${runId}`));
   // A notice that described a start in progress describes nothing now. A
   // failure stays: it is the only record of why the attempt never ran.
   notices.update((map) => {

@@ -85,10 +85,17 @@ pub(super) fn spawn<R: tauri::Runtime>(
     // window read "already claimed" with nothing to attach to — a reloaded
     // page or a second window asking for the same terminal got an error
     // instead of the terminal.
+    //
+    // Each stage is logged with its time. A launch whose run was prepared and
+    // never claimed left nothing in the log to say whether it waited here, in
+    // the CLI check, or in the spawn, so a stall could not be placed.
+    let began = std::time::Instant::now();
     let _launch = state
         .0
         .terminal_launches
-        .enter_within(&launch.id, LAUNCH_WAIT)?;
+        .enter_within(&launch.id, LAUNCH_WAIT)
+        .inspect_err(|e| log::warn!(target: "workbench", "launch {}: not entered after {}ms: {}", launch.id, began.elapsed().as_millis(), e.code))?;
+    log::info!(target: "workbench", "launch {}: entered after {}ms", launch.id, began.elapsed().as_millis());
     let response =
         state.with_store(|store| query(store, "runs.get", &json!({"id":launch.id}).to_string()))?;
     let source: Source = serde_json::from_value(response["item"].clone())
@@ -125,8 +132,20 @@ pub(super) fn spawn<R: tauri::Runtime>(
         &source.provider,
         &source.permission_mode,
         &options,
-    )?;
-    start(app, terminals, state, launch, source, program, options)
+    )
+    .inspect_err(|e| log::warn!(target: "workbench", "launch {}: refused by the CLI check after {}ms: {}", source.id, began.elapsed().as_millis(), e.code))?;
+    log::info!(target: "workbench", "launch {}: checked after {}ms", source.id, began.elapsed().as_millis());
+    let id = source.id.clone();
+    let outcome = start(app, terminals, state, launch, source, program, options);
+    match &outcome {
+        Ok(_) => {
+            log::info!(target: "workbench", "launch {id}: started after {}ms", began.elapsed().as_millis())
+        }
+        Err(e) => {
+            log::warn!(target: "workbench", "launch {id}: failed after {}ms: {}", began.elapsed().as_millis(), e.code)
+        }
+    }
+    outcome
 }
 
 fn start<R: tauri::Runtime>(

@@ -566,7 +566,7 @@
 
   function createLifecycle() {
     return createSessionLifecycle({
-      key: tabId, repoPath, label: launcherLabel(launcher), launcher, bus: ptyBus, registry: terminalSessions,
+      key: tabId, repoPath, ...(checkout ? { checkout } : {}), label: launcherLabel(launcher), launcher, bus: ptyBus, registry: terminalSessions,
       singleAttempt: !!taskRunId,
       reveal: revealSelf,
       confirmClose: confirmCloseSelf,

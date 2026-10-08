@@ -1443,4 +1443,62 @@ done
         );
         assert_eq!(host.request("repositories.list", "{}").unwrap()["total"], 2);
     }
+
+    #[test]
+    fn a_re_cloned_checkout_that_was_never_opened_is_relinked_with_its_tasks() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        let reclone = dir.path().join("reclone");
+        let git = |cwd: &std::path::Path, args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .current_dir(cwd)
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .args(args)
+                .output_locked()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        git(dir.path(), &["init", repo.to_str().unwrap()]);
+        crate::test_support::trust_repo(&repo);
+        let host = state(&dir.path().join("profile.sqlite"));
+        host.register(repo.to_str().unwrap(), "repo-1", "register-1")
+            .unwrap();
+        let task = json!({"request_id":"t1","id":"t1","expected_revision":0,"title":"Survive the re-clone","repository_ids":["repo-1"],"primary_repository_id":"repo-1"});
+        host.request("items.put", &task.to_string()).unwrap();
+
+        // A fresh clone elsewhere, and the original checkout gone. The clone
+        // was never opened, so no record holds its identity yet.
+        git(
+            dir.path(),
+            &[
+                "clone",
+                "--local",
+                repo.to_str().unwrap(),
+                reclone.to_str().unwrap(),
+            ],
+        );
+        std::fs::remove_dir_all(&repo).unwrap();
+        crate::test_support::trust_repo(&reclone);
+
+        let relinked = host
+            .relink("repo-1", 1, reclone.to_str().unwrap(), "relink-1")
+            .unwrap();
+        assert_eq!(relinked["repository"]["id"], "repo-1");
+        assert_eq!(host.request("repositories.list", "{}").unwrap()["total"], 1);
+        let tasks = host
+            .request("items.list", r#"{"repository_id":"repo-1"}"#)
+            .unwrap();
+        assert_eq!(tasks["total"], 1);
+        assert_eq!(tasks["items"][0]["id"], "t1");
+        assert_eq!(tasks["items"][0]["revision"], 1);
+        // Opening the re-clone now finds the original record, not a new one.
+        let again = host
+            .register(reclone.to_str().unwrap(), "unused", "register-2")
+            .unwrap();
+        assert_eq!(again["repository"]["id"], "repo-1");
+    }
 }
