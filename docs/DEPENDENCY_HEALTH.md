@@ -245,6 +245,19 @@ uploaded, so `ci.yml` has a dispatch-only `arm-bundle` job that bundles both
 legs on their real runners through the same tauri-action and checks the
 installer names against the manifest.
 
+Verified on 2026-10-08 by dispatching `ci.yml` on `chore/ci-release-hardening`
+([run 37825161381](https://github.com/bharathvbcr/GitPulse/actions/runs/37825161381)).
+`ARM Bundle (ubuntu-22.04-arm)` built and bundled `GitPulse-1.4.0-1.aarch64.rpm`,
+`GitPulse_1.4.0_aarch64.AppImage` and `GitPulse_1.4.0_arm64.deb`, and
+`ARM Bundle (windows-11-arm)` built `GitPulse_1.4.0_arm64-setup.exe` and
+`GitPulse_1.4.0_arm64_en-US.msi`. Both name checks printed `OK`. The same
+run's Build & Test legs failed on fmt, clippy (`desktop/`), the
+`agent_notify_socket` compile error and frontend checks. The Rust failures and
+both Vitest failures reproduce on a clean checkout of `0d3e9f77`, before any
+of this work; the Svelte and browser failures are in frontend files this work
+does not touch. No upload path was exercised: the real `release.yml`
+ARM upload and the `attest` stage run first on the next tag.
+
 ### Property tests
 
 `proptest` 1.11 (dev-only, default features off) drives
