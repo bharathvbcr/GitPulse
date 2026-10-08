@@ -13,6 +13,7 @@ import {
   facetActive,
   hiddenTaskDetails,
   parseDueInput,
+  partitionLanes,
   reorderPlan,
   visibleHiddenDetails,
 } from "./taskOrganize";
@@ -21,13 +22,14 @@ function card(over: Partial<TaskCard> = {}): TaskCard {
   return {
     id: "t1", revision: 1, updated_at: 1, title: "A", kind: "bug", status: "inbox",
     priority: 1, severity: "high", owner: "Pat", due_at: 100, labels: ["ui", "drag", "extra"],
-    repository_ids: ["r1", "r2"], primary_repository_id: "r1", home_workspace_id: null, position: 1,
+    repository_ids: ["r1", "r2"], primary_repository_id: "r1", home_workspace_id: null, position: 1, archived: false, completed_at: null,
     ...over,
   };
 }
 
 const task: Task = {
   ...card(),
+  checklist: [], links: [],
   description: "Keep the original error E42",
   acceptance_criteria: ["Reproduce", " "],
   locked_fields: ["title"],
@@ -161,5 +163,25 @@ describe("reorderPlan", () => {
     expect(new Set(values).size).toBe(2_000);
     expect(values.every(Number.isSafeInteger)).toBe(true);
     expect(Math.max(...values)).toBeLessThan(Number.MAX_SAFE_INTEGER);
+  });
+});
+
+describe("partitionLanes", () => {
+  const label = (status: string) => status.toUpperCase();
+  const order = ["inbox", "backlog", "ready", "in_progress", "review", "done"] as const;
+  it("puts every card in exactly one lane, unassigned last, keeping card order", () => {
+    const cards = [card({ id: "a", owner: "Zoe" }), card({ id: "b", owner: null }), card({ id: "c", owner: " Ada " }), card({ id: "d", owner: "Zoe" })];
+    const lanes = partitionLanes(cards, "owner", label, order);
+    expect(lanes.map((lane) => [lane.label, lane.cards.map((item) => item.id)])).toEqual([["Ada", ["c"]], ["Zoe", ["a", "d"]], ["Unassigned", ["b"]]]);
+    expect(lanes.flatMap((lane) => lane.cards).length).toBe(cards.length);
+  });
+  it("lanes by first label, so a card with several labels is drawn once", () => {
+    const lanes = partitionLanes([card({ id: "a", labels: ["ui", "ci"] }), card({ id: "b", labels: [] }), card({ id: "c", labels: [" ", "ci"] })], "label", label, order);
+    expect(lanes.map((lane) => [lane.key, lane.cards.map((item) => item.id)])).toEqual([["label:ci", ["c"]], ["label:ui", ["a"]], ["label:", ["b"]]]);
+    expect(lanes.at(-1)?.label).toBe("No label");
+  });
+  it("orders status lanes by the board's status order, not by name", () => {
+    const lanes = partitionLanes([card({ id: "a", status: "review" }), card({ id: "b", status: "inbox" }), card({ id: "c", status: "ready" })], "status", label, order);
+    expect(lanes.map((lane) => lane.label)).toEqual(["INBOX", "READY", "REVIEW"]);
   });
 });

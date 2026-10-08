@@ -48,7 +48,8 @@ describe("TaskEditor", () => {
     expect(source).toContain("if (disposed) return");
     expect(source).toMatch(/confirming = true[\s\S]*askConfirm\(\{title: "Reload saved task\?/);
     expect(source).toContain("shortcutBlocked = `Wait for ${assistName} to finish before saving.`");
-    expect(source).toContain("shortcutBlocked = `Wait for ${assistName} to finish before closing.`");
+    // Every way out goes through canLeave, which names the wait; edits to a suggestion ask instead.
+    expect(source).toContain("shortcutBlocked = `Wait for ${assistName} to finish before leaving this task.`");
     // The sheet never spells an engine name itself: the assist section owns the
     // picker, so a task drafted on-device cannot be refused by a message that
     // names Manvi. `assistName` is the only spelling, and it is seeded once.

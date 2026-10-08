@@ -141,3 +141,24 @@ describe("resuming a conversation", () => {
     }
   });
 });
+
+describe("the model a run was launched with", () => {
+  it("reads the recorded fields, keeps a run from before schema 11 as having none, and refuses a malformed record", () => {
+    expect(taskRun({...run, model_choice: {model:"opus", effort:"high"}}).model_choice).toEqual({model:"opus", effort:"high"});
+    // Recorded as null: the launcher's own default, not "unknown".
+    expect(taskRun({...run, model_choice: null}).model_choice).toBeNull();
+    // Stored before runs recorded one: the key stays absent rather than null.
+    expect("model_choice" in taskRun(run)).toBe(false);
+    for (const bad of [{Model:"opus"}, {model:7}, ["opus"], "opus", Object.fromEntries(Array.from({length:9}, (_, i) => [`f${"a".repeat(i)}`, "x"]))]) {
+      expect(() => taskRun({...run, model_choice: bad}), JSON.stringify(bad)).toThrow();
+    }
+  });
+
+  it("sends a launch's model with the preparation it belongs to", async () => {
+    native.mockResolvedValueOnce(JSON.stringify({ok:true, item:{...run, model_choice:{model:"opus"}}}));
+    const prepared = await prepareTaskRun({...preparation, model_choice: {model: "opus"}});
+    expect(prepared.model_choice).toEqual({model:"opus"});
+    const sent = JSON.parse(String((native.mock.calls[0]?.[1] as {input: string}).input));
+    expect(sent.model_choice).toEqual({model:"opus"});
+  });
+});

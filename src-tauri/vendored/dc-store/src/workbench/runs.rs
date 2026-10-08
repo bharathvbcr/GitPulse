@@ -412,6 +412,7 @@ fn prepare(input: &Input<'_>, id: &str, revision: i64, now: i64) -> Result<()> {
         "head_ref",
         "kind",
         "max_active_runs",
+        "model_choice",
     ])?;
     if revision != 1 {
         return Err(refuse(
@@ -458,6 +459,7 @@ fn prepare(input: &Input<'_>, id: &str, revision: i64, now: i64) -> Result<()> {
             "unsupported terminal provider or permission mode",
         ));
     }
+    let model_choice = model_choice(input)?;
     let bypass = input.boolean("acknowledge_bypass", false)?;
     if (mode == "bypass") != bypass {
         return Err(Error::invalid(
@@ -541,8 +543,8 @@ fn prepare(input: &Input<'_>, id: &str, revision: i64, now: i64) -> Result<()> {
     }
     let body: String = input.conn.query_row("SELECT json_object('id',?1,'revision',?2,'updated_at',?3,'created_at',?3,'expires_at',?4,'kind','external_terminal','task_id',?5,'source_revision',?6,'task_title',json_extract(?7,'$.task.title'),'repository_id',?8,'provider',?9,'permission_mode',?10,'bypass_acknowledged',json(CASE WHEN ?11 THEN 'true' ELSE 'false' END),'cwd',?12,'git_dir',?13,'git_common_dir',?14,'head_oid',?15,'head_ref',?16,'state','prepared','owner_id',NULL,'session_id',NULL,'process_id',NULL,'process_start',NULL,'claimed_at',NULL,'started_at',NULL,'finished_at',NULL,'exit_code',NULL,'reason','','outcome_uncertain',json('false'))",params![id,revision,now,now.saturating_add(300),task_id,source_revision,brief,repository_id,provider,mode,bypass,cwd,git_dir,common,head,head_ref],|r|r.get(0))?;
     let body: String = input.conn.query_row(
-        "SELECT json_set(?1,'$.kind',?2)",
-        params![body, kind],
+        "SELECT json_set(?1,'$.kind',?2,'$.model_choice',json(?3))",
+        params![body, kind, model_choice],
         |r| r.get(0),
     )?;
     put_body(input.conn, Entity::Run, id, revision, &body)?;
@@ -551,6 +553,50 @@ fn prepare(input: &Input<'_>, id: &str, revision: i64, now: i64) -> Result<()> {
         params![id, brief],
     )?;
     Ok(())
+}
+
+/// The model this one attempt was launched with, as the launching host chose
+/// it: `{field: value}`, such as `{"model":"opus","effort":"high"}`. Which
+/// fields a provider takes is the host's to decide; the store bounds the
+/// shape and keeps it with the attempt, so a run says what it ran on even
+/// after the host's defaults change. JSON `null` when the host chose nothing.
+fn model_choice(input: &Input<'_>) -> Result<String> {
+    match input.kind("model_choice")?.as_deref() {
+        None | Some("null") => return Ok("null".into()),
+        Some("object") => {}
+        _ => return Err(Error::invalid("model_choice must be an object")),
+    }
+    let mut stmt = input
+        .conn
+        .prepare("SELECT key,type,value FROM json_each(?1,'$.model_choice')")?;
+    let mut rows = stmt.query([input.raw])?;
+    let mut count = 0;
+    while let Some(row) = rows.next()? {
+        count += 1;
+        let key: String = row.get(0)?;
+        let kind: String = row.get(1)?;
+        if count > 8
+            || key.is_empty()
+            || key.len() > 32
+            || !key.bytes().all(|b| b.is_ascii_lowercase() || b == b'_')
+            || kind != "text"
+        {
+            return Err(Error::invalid(
+                "model_choice holds at most 8 lowercase field names with string values",
+            ));
+        }
+        let value: String = row.get(2)?;
+        if value.trim().is_empty() || value.len() > 128 || value.chars().any(char::is_control) {
+            return Err(Error::invalid(format!(
+                "model_choice.{key} must be a non-blank name of at most 128 bytes"
+            )));
+        }
+    }
+    Ok(input.conn.query_row(
+        "SELECT json_extract(?1,'$.model_choice')",
+        [input.raw],
+        |r| r.get(0),
+    )?)
 }
 
 pub(super) fn get(input: &Input<'_>) -> Result<String> {

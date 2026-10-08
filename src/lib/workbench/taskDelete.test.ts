@@ -14,6 +14,8 @@ import {
   MAX_CONFIRM_TITLES,
   MAX_DELETE_BATCH,
   removeFromColumns,
+  restoreSummary,
+  restoreTasks,
   runBoundedSerial,
   uniqueDeletable,
   withTimeout,
@@ -29,7 +31,7 @@ function card(over: Partial<TaskCard> = {}): TaskCard {
   return {
     id: "t1", revision: 2, updated_at: 1, title: "Keep E42", kind: "bug", status: "ready",
     priority: 1, severity: null, owner: null, due_at: null, labels: [],
-    repository_ids: ["r"], primary_repository_id: "r", home_workspace_id: null, position: 1,
+    repository_ids: ["r"], primary_repository_id: "r", home_workspace_id: null, position: 1, archived: false, completed_at: null,
     ...over,
   };
 }
@@ -206,5 +208,50 @@ describe("identity guards", () => {
     expect(isRevision(0)).toBe(false);
     expect(isRevision(Number.POSITIVE_INFINITY)).toBe(false);
     expect(MAX_DELETE_BATCH).toBe(50);
+  });
+});
+
+describe("restoreTasks and restoreSummary", () => {
+  let n = 0;
+  const newID = () => `rid-${++n}`;
+
+  it("sends each restore at the revision its deletion produced, under the same cap as delete", async () => {
+    const sent: { id: string; expected_revision: number; request_id: string }[] = [];
+    const many = Array.from({ length: MAX_DELETE_BATCH + 3 }, (_, i) => task({ id: `t${i}`, revision: 5 }));
+    const result = await restoreTasks(many, async (attempt) => { sent.push(attempt); }, { newID });
+    expect(sent).toHaveLength(MAX_DELETE_BATCH);
+    expect(sent[0]).toMatchObject({ id: "t0", expected_revision: 5 });
+    expect(new Set(sent.map((attempt) => attempt.request_id)).size).toBe(MAX_DELETE_BATCH);
+    expect(result).toMatchObject({ skipped: 3 });
+    expect(restoreSummary(result)).toBe(`Restored ${MAX_DELETE_BATCH} tasks. Held 3 more — restore again to continue (cap ${MAX_DELETE_BATCH} per pass).`);
+  });
+
+  it("counts a task the store says is already live as restored, and a conflict as a failure", async () => {
+    const live = await restoreTasks([task()], async () => {
+      throw new WorkbenchError("invalid_state", "This task is not deleted.");
+    }, { newID });
+    expect(live.deleted).toEqual(["t1"]);
+    expect(live.failed).toEqual([]);
+    expect(restoreSummary(live)).toBe("Restored 1 task.");
+
+    const changed = await restoreTasks([task()], async () => {
+      throw new WorkbenchError("conflict", "Task changed since it was deleted.");
+    }, { newID });
+    expect(changed.deleted).toEqual([]);
+    expect(restoreSummary(changed)).toBe("Could not restore “Keep E42” (conflict: Task changed since it was deleted.).");
+
+    const two = await restoreTasks([task({ id: "a" }), task({ id: "b" })], async () => {
+      throw new WorkbenchError("conflict", "changed");
+    }, { newID });
+    expect(restoreSummary(two)).toBe("2 failed (conflict: changed).");
+  });
+
+  it("names a hung restore as a restore, not a delete", async () => {
+    const result = await restoreTasks([task()], () => new Promise<void>(() => {}), { newID, timeout: 10 });
+    expect(result.failed[0]?.message).toBe("Restore timed out. Retry to confirm its result.");
+  });
+
+  it("says when nothing was restored", () => {
+    expect(restoreSummary({ deleted: [], failed: [], skipped: 0, attempted: 0, total: 0 })).toBe("Nothing was restored.");
   });
 });

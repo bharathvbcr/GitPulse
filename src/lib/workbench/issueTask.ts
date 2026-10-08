@@ -21,6 +21,7 @@ import {
   registerRepository,
   listTasks,
   taskWrite,
+  freshTaskFields,
   explainError,
   type Task,
   type TaskCard,
@@ -365,6 +366,7 @@ export function issueToTaskDraft(
     position: 0,
     description,
     acceptance_criteria,
+    ...freshTaskFields(),
   };
 }
 

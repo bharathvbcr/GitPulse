@@ -42,14 +42,16 @@ describe("TaskBoard", () => {
   });
 
   it("drops onto the column under the pointer, not only the column title", () => {
-    expect(source).toContain("statusAtPoint");
+    expect(source).toContain("function dropAtPoint");
     expect(source).toContain("elementFromPoint");
     expect(source).toContain("drop-target");
     expect(source).toContain("task-drag-ghost");
   });
 
   it("measures insert slots from the same attribute the card buttons carry", () => {
-    const query = source.match(/querySelectorAll\("(\[[^\]]+\])"\)/);
+    // Measured in the cell under the pointer (`dropAtPoint`), with lanes one of several per status.
+    const drop = source.slice(source.indexOf("function dropAtPoint"), source.indexOf("function releasePointer"));
+    const query = drop.match(/querySelectorAll(?:<HTMLElement>)?\("(\[[^\]]+\])"\)/);
     expect(query?.[1]).toBe("[data-task-card]");
     const card = source.slice(source.indexOf('data-testid="task-card"'), source.indexOf("onpointerdown"));
     expect(card).toContain("data-task-card");
@@ -367,7 +369,7 @@ describe("TaskBoard", () => {
     expect(source).toMatch(
       /scope\.kind === "workspace" && scope\.id === group\.id\)\}<span>\{group\.icon\} \{group\.name\}/,
     );
-    expect(source).toContain("{@render scopeSelection(scope.kind === \"repository\" && scope.id === repo.id)}<span>{repo.name}</span>");
+    expect(source).toContain("{@render scopeSelection(scope.kind === \"repository\" && scope.id === repo.id)}<span>{repo.name}");
   });
 
   it("keeps open tasks in a tab strip with a close control beside each tab", () => {
@@ -440,7 +442,10 @@ describe("the board can archive a task", () => {
     expect(bar).toContain('selectionArchived === "all"');
     expect(bar).toContain("disabled={busy ||");
     // The disabled control still says why, rather than sitting there dead.
-    expect(bar).toContain("Already in ${STATUS_LABELS[ARCHIVE_STATUS]}");
+    expect(bar).toContain('"Already archived"');
+    // And the enabled one says archiving keeps the status, since it once
+    // meant moving to Done.
+    expect(bar).toContain("keeping their status");
   });
 
   /**
@@ -456,12 +461,13 @@ describe("the board can archive a task", () => {
       .not.toMatch(/>Show archived<\/label>/);
   });
 
-  it("names the column the header's Archive toggle actually holds", () => {
+  it("names what the header's Archive toggle actually holds", () => {
     // "Archive — completed tasks in this scope" named a category; a reader
-    // hunting for the verb needed the mechanism instead.
+    // hunting for the verb needed the mechanism instead. Reaching Done no
+    // longer archives anything, so the title must not say it does.
     expect(source).toContain("aria-controls=\"task-archive-dock\"");
-    expect(source).toContain("Archive — tasks in this scope that reached ${STATUS_LABELS[ARCHIVE_STATUS]}");
-    expect(source).not.toContain("Archive — completed tasks in this scope");
+    expect(source).toContain('title="Archive — tasks filed away from this board, and deleted tasks to restore"');
+    expect(source).not.toContain("that reached ${STATUS_LABELS");
   });
 
   it("dims and disables the board's quick-add row while the task editor sheet is open", () => {

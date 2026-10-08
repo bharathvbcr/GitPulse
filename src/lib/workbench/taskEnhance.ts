@@ -2,6 +2,7 @@ import {
   changeEnhancement,
   completeEnhancement,
   getTask,
+  LIVE_ENHANCEMENT_STATES,
   newID,
   WorkbenchError,
   type Enhancement,
@@ -11,6 +12,7 @@ import {
   type EnhancementState,
   type EnhancementSummary,
   type ModelSelection,
+  type Page,
   type Task,
 } from "./client";
 import { canQuickEnhance, enhanceableFields } from "./taskOrganize";
@@ -97,7 +99,41 @@ export function draftingVerb(kind: DraftingKind, quick: boolean): string {
 }
 
 export const liveEnhancement = (proposal: Pick<Enhancement, "state"> | null): boolean =>
-  proposal !== null && ["pending", "running", "cancel_requested"].includes(proposal.state);
+  proposal !== null && (LIVE_ENHANCEMENT_STATES as readonly string[]).includes(proposal.state);
+
+export interface LoadedHistory {
+  entries: EnhancementSummary[];
+  cursor: string | null;
+  /** Whether the reader loaded past the first page. */
+  extended: boolean;
+}
+
+/**
+ * The history after re-reading its first page.
+ *
+ * A refresh runs every second while a suggestion is live, so replacing the
+ * list with the first page threw away every page the reader had loaded — the
+ * picker shrank back to thirty and an older selection vanished from it. The
+ * first page is replaced (states change), and older entries already loaded
+ * are kept behind it with the cursor that continues past them. The cursor is
+ * keyset-based (`created_at`, `id`), so a newer attempt arriving at the head
+ * does not move where the older pages begin.
+ */
+export function refreshedHistory(previous: LoadedHistory, head: Pick<Page<EnhancementSummary>, "items" | "next_cursor">): LoadedHistory {
+  if (!previous.extended) return { entries: [...head.items], cursor: head.next_cursor, extended: false };
+  const fresh = new Set(head.items.map((entry) => entry.id));
+  return {
+    entries: [...head.items, ...previous.entries.filter((entry) => !fresh.has(entry.id))],
+    cursor: previous.cursor,
+    extended: true,
+  };
+}
+
+/** The history with one more page appended, keeping the first copy of any entry seen twice. */
+export function appendedHistory(previous: LoadedHistory, next: Pick<Page<EnhancementSummary>, "items" | "next_cursor">): LoadedHistory {
+  const seen = new Set(previous.entries.map((entry) => entry.id));
+  return { entries: [...previous.entries, ...next.items.filter((entry) => !seen.has(entry.id))], cursor: next.next_cursor, extended: true };
+}
 
 /**
  * How each proposal state reads.

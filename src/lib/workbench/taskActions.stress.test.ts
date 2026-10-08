@@ -18,7 +18,7 @@ function card(i: number): TaskCard {
     id: `t${i}`, revision: i + 1, updated_at: 1, title: `T${i}`, kind: i % 2 ? "bug" : "feature",
     status: "inbox", priority: i % 4, severity: null, owner: i % 5 === 0 ? "Pat" : null,
     due_at: i % 7 === 0 ? 1 : null, labels: i % 3 === 0 ? ["ui"] : [],
-    repository_ids: ["r"], primary_repository_id: "r", home_workspace_id: null, position: i,
+    repository_ids: ["r"], primary_repository_id: "r", home_workspace_id: null, position: i, archived: false, completed_at: null,
   };
 }
 
@@ -158,6 +158,7 @@ describe("adversarial stress", () => {
   it("hidden details survive empty, huge and binary-looking fields", () => {
     const task: Task = {
       ...card(0),
+      checklist: [], links: [],
       description: `${"x".repeat(20_000)}\u0007`,
       acceptance_criteria: ["", "ok", "x".repeat(4096)],
       locked_fields: ["title", "description"],
