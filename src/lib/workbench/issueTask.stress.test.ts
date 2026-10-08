@@ -150,7 +150,7 @@ describe("issueTask adversarial stress testing", () => {
       repository_ids: ["repo-1"],
       primary_repository_id: "repo-1",
       home_workspace_id: null,
-      position: idx,
+      position: idx, archived: false, completed_at: null,
     }));
 
     for (const num of issues) {
@@ -191,7 +191,7 @@ describe("issueTask adversarial stress testing", () => {
         repository_ids: ["repo-1"],
         primary_repository_id: "repo-1",
         home_workspace_id: null,
-        position: 0,
+        position: 0, archived: false, completed_at: null,
       },
       {
         id: "task-142",
@@ -208,7 +208,7 @@ describe("issueTask adversarial stress testing", () => {
         repository_ids: ["repo-1"],
         primary_repository_id: "repo-1",
         home_workspace_id: null,
-        position: 1,
+        position: 1, archived: false, completed_at: null,
       },
     ];
 
@@ -268,7 +268,7 @@ describe("issueTask adversarial stress testing", () => {
         repository_ids: ["repo-1"],
         primary_repository_id: "repo-1",
         home_workspace_id: null,
-        position: i,
+        position: i, archived: false, completed_at: null,
       });
     }
 

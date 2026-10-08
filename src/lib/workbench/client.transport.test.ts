@@ -4,8 +4,8 @@ import {
   WorkbenchError, explainError, getTask, getWorkspace, listRepositories,
   listTasks, listWorkspaces, putTask, putWorkspace, registerRepository,
   request, taskDraft, taskWrite, workspaceDraft,
-  getEnhancement, listEnhancements, changeEnhancement, enhancementConfiguration,
-  generateEnhancement, deleteTask, deleteWorkspace,
+  getEnhancement, listEnhancements, latestEnhancement, LIVE_ENHANCEMENT_STATES, ACTIVE_ENHANCEMENT_STATES, changeEnhancement, enhancementConfiguration,
+  generateEnhancement, deleteTask, deleteWorkspace, mergeTasks, restoreDeletedTask,
 } from "./client";
 import type { Task, Workspace } from "./client";
 
@@ -13,7 +13,7 @@ vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
 const native = vi.mocked(invoke);
 const repo = { id: "repo_1", revision: 1, updated_at: 100, name: "Manvi", identity_key: "local:/code/Manvi/.git", remote_url: null };
 const group: Workspace = { id: "workspace_1", revision: 3, updated_at: 120, name: "Agentic tools", description: "Shared tooling", icon: "layers", color: "blue", position: 1, pinned: true, archived: false, repository_ids: ["repo_1", "repo_2"] };
-const item: Task = { id: "task_1", revision: 7, updated_at: 130, title: "Preserve repository scope", description: "Keep the original error E42 and both repository links.", acceptance_criteria: ["Both repository checks pass"], kind: "bug", status: "review", priority: 1, severity: "high", owner: "Bharath", due_at: 2_000, labels: ["regression"], repository_ids: ["repo_1", "repo_2"], primary_repository_id: "repo_1", home_workspace_id: "workspace_1", position: 2 };
+const item: Task = { id: "task_1", revision: 7, updated_at: 130, title: "Preserve repository scope", description: "Keep the original error E42 and both repository links.", acceptance_criteria: ["Both repository checks pass"], kind: "bug", status: "review", priority: 1, severity: "high", owner: "Bharath", due_at: 2_000, labels: ["regression"], repository_ids: ["repo_1", "repo_2"], primary_repository_id: "repo_1", home_workspace_id: "workspace_1", position: 2 , archived: false, completed_at: null, checklist: [], links: []};
 
 function reply(items: unknown[], total = items.length, cursor: string | null = null): string {
   return JSON.stringify({ ok: true, items, shown: items.length, total, has_more: cursor !== null, next_cursor: cursor });
@@ -165,6 +165,12 @@ describe("native workbench boundary", () => {
     native.mockResolvedValueOnce(JSON.stringify({ ok: true, item: { ...proposal, state: "accepted", revision: 4, accepted_fields: ["title"] } }));
     expect(await changeEnhancement("enhancements.accept", input)).toMatchObject({ state: "accepted", accepted_fields: ["title"] });
     expect(native.mock.calls[3]).toEqual(native.mock.calls[4]);
+    // The newest attempt in given states is one filtered read, whatever page it is on.
+    native.mockResolvedValueOnce(reply([{ ...proposal, state: "running", worker_id: "w" }], 1));
+    expect(await latestEnhancement(item.id, LIVE_ENHANCEMENT_STATES)).toMatchObject({ state: "running" });
+    expect(native).toHaveBeenLastCalledWith("cmd_workbench_request", { method: "enhancements.list", input: JSON.stringify({ task_id: item.id, newest: true, limit: 1, states: ["pending", "running", "cancel_requested"] }) });
+    native.mockResolvedValueOnce(reply([], 0));
+    expect(await latestEnhancement(item.id, ACTIVE_ENHANCEMENT_STATES)).toBeNull();
   });
 
   it("reads explicit configuration without inferring provider health or initiating generation", async () => {
@@ -197,5 +203,66 @@ describe("native workbench boundary", () => {
     expect(JSON.parse(String((native.mock.calls[1]?.[1] as { input: string }).input))).toMatchObject({
       id: "e", request_id: "r", expected_revision: 1, model: selection,
     });
+  });
+});
+
+describe("schema 11 board calls", () => {
+  const sent = (call = 0) => JSON.parse(String((native.mock.calls[call]?.[1] as { input: string }).input));
+  const source = (id: string, outcome: string, detail: string | null = null) => ({ task_id: id, item_id: id, title: `Task ${id}`, outcome, copied_revision: 1, detail });
+
+  it("sends the board read's filter and refuses a page that ignored it", async () => {
+    native.mockResolvedValueOnce(reply([item]));
+    await listTasks({ kind: "repository", id: "repo_1" }, "review", "", undefined, 30, { archived: false, order: "board" });
+    // `board` is the store's default order, so it is not spelled out.
+    expect(sent()).toMatchObject({ repository_id: "repo_1", status: "review", archived: false });
+    expect(sent()).not.toHaveProperty("order");
+    native.mockResolvedValueOnce(reply([item]));
+    await listTasks({ kind: "global" }, null, "", undefined, 30, { deleted: true, order: "updated" });
+    expect(sent(1)).toMatchObject({ deleted: true, order: "updated" });
+    expect(sent(1)).not.toHaveProperty("archived");
+    // A store that ignored `archived:true` would hand the archive live cards.
+    native.mockResolvedValueOnce(reply([item]));
+    await expect(listTasks({ kind: "global" }, null, "", undefined, 30, { archived: true })).rejects.toMatchObject({ code: "protocol_error" });
+  });
+
+  it("restores a deleted task at the next revision and refuses any other reply", async () => {
+    native.mockResolvedValueOnce(JSON.stringify({ ok: true, item: { ...item, revision: 8 } }));
+    expect((await restoreDeletedTask("task_1", 7, "restore-1")).revision).toBe(8);
+    expect(sent()).toEqual({ id: "task_1", expected_revision: 7, request_id: "restore-1" });
+    native.mockResolvedValueOnce(JSON.stringify({ ok: true, item: { ...item, revision: 7 } }));
+    await expect(restoreDeletedTask("task_1", 7, "restore-2")).rejects.toMatchObject({ code: "protocol_error" });
+    native.mockResolvedValueOnce(JSON.stringify({ ok: true, item: { ...item, id: "other", revision: 8 } }));
+    await expect(restoreDeletedTask("task_1", 7, "restore-3")).rejects.toMatchObject({ code: "protocol_error" });
+  });
+
+  it("merges through the host with every card's drawn revision, and reads a partial merge as a result", async () => {
+    const card = (id: string, revision: number) => ({ ...item, id, revision });
+    native.mockResolvedValueOnce(JSON.stringify({
+      ok: false, outcome: "partial", item_id: "keep", revision: 3,
+      sources: [source("a", "merged"), source("b", "not_merged", "deleting it failed")],
+      next_step: "Run the same merge again to finish it.",
+    }));
+    const result = await mergeTasks("repo_1", card("keep", 2), [card("a", 4), card("b", 5)], "Same bug");
+    expect(native.mock.calls[0]?.[0]).toBe("cmd_workbench_request");
+    expect(sent()).toEqual({ repository_id: "repo_1", into: { id: "keep", expected_revision: 2 }, sources: [{ id: "a", expected_revision: 4 }, { id: "b", expected_revision: 5 }], reason: "Same bug" });
+    expect(result).toEqual({
+      ok: false, outcome: "partial", item_id: "keep", next_step: "Run the same merge again to finish it.",
+      sources: [
+        { item_id: "a", title: "Task a", outcome: "merged", detail: null },
+        { item_id: "b", title: "Task b", outcome: "not_merged", detail: "deleting it failed" },
+      ],
+    });
+  });
+
+  it("refuses a merge reply that does not account for every source, or names an outcome it does not know", async () => {
+    const card = (id: string) => ({ ...item, id });
+    for (const reply of [
+      { ok: true, outcome: "merged", item_id: "keep", sources: [source("a", "merged")], next_step: null },
+      { ok: true, outcome: "done", item_id: "keep", sources: [source("a", "merged"), source("b", "merged")], next_step: null },
+      { ok: true, outcome: "merged", item_id: "keep", sources: [source("a", "merged"), source("b", "gone")], next_step: null },
+    ]) {
+      native.mockResolvedValueOnce(JSON.stringify(reply));
+      await expect(mergeTasks("repo_1", card("keep"), [card("a"), card("b")], "why"), JSON.stringify(reply)).rejects.toMatchObject({ code: "protocol_error" });
+    }
   });
 });

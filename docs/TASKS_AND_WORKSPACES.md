@@ -138,29 +138,33 @@ per profile and **Reset board view** restores all of them. Hiding a column does
 not hide its work silently: a banner names how many tasks are in the columns
 currently off screen, and the board refuses to hide its last column.
 
-**Archive** files a task away. It is on a card's right-click menu beside Delete
-and on the selection bar for a batch, and it does exactly one thing: moves the
-task to Done, which is what "archived" means here. The row names that column,
-and is disabled for a task already archived rather than spending a revision to
-store the status it already has — a mixed selection archives only the part that
-is not. There is no separate archived flag to set: the vendored store has no
-field for one, and [ARCHIVE_SEPARATION.md](ARCHIVE_SEPARATION.md) is the plan
-for making the two independent, with the upstream change that needs.
+**Archive** files a task away from the board, in whatever column it is in. It
+is on a card's right-click menu beside Delete and on the selection bar for a
+batch. It sets the task's own archived flag and leaves its status alone:
+finishing a task keeps it in Done, and a Done task is archived only when you
+archive it. The row is disabled for a task already archived rather than
+spending a revision on nothing — a mixed selection archives only the part that
+is not. [ARCHIVE_SEPARATION.md](ARCHIVE_SEPARATION.md) records the store
+change (dc-store schema 11) behind this, including the upgrade that archives
+every task that was Done before it.
 
 **Archive**, the panel beside the Inbox, holds the scope's archived tasks. It
 states that rule above the list whether or not the list is empty. It has its
 own search and **Load more**, and its header badge is the store's total for the
-scope rather than the page on screen. Select rows to restore them to any other
-status or delete them; both go through the same confirm-and-retry dialog as a
-bulk change from the board, so a lost reply is reconciled the same way. A write
-reloads the dock from its first page — the store's cursor only runs forward, so
-pages already scrolled past cannot be refreshed in place. The archive is a
-second way to read completed work, not a move: it says whether the Done column
-is still on the board and offers the same hide the View menu owns, and once
-Done is hidden the board's banner offers the archive by name. Tasks are listed
-in the board's own order and stamped with their last update, because the store
-keeps no completion time to sort by. While the window is in the background the
-query is deferred, and the panel says that rather than showing an empty archive.
+scope rather than the page on screen. Tasks are listed most recently completed
+first, stamped with when they were completed (or last changed, for one archived
+before it was done). Select rows to **Restore** them — back to the column they
+left, with their status unchanged — or delete them; both go through the same
+confirm-and-retry dialog as a bulk change from the board, so a lost reply is
+reconciled the same way. A write refreshes every page already loaded in place,
+so the list keeps your scroll position. While the window is in the background
+the query is deferred, and the panel says that rather than showing an empty
+archive.
+
+The panel's **Deleted** view lists the scope's deleted tasks, most recently
+deleted first. Restoring one brings the same task id back to the board at the
+column it was deleted from, checked against the revision its deletion wrote, so
+a task changed since is refused rather than restored over.
 
 The rows are the only part of that panel that scrolls, and the actions a
 selection enables are pinned below them: ticking a row shows Restore and Delete
@@ -278,6 +282,20 @@ exact request, and remembers the agent, connection and permission mode for the
 next launch. `Bypass permissions` is the one setting never remembered: it has to
 be chosen again, with its acknowledgement, for every attempt.
 
+**Model for this launch**, under a terminal handoff, sets the model — and for
+Claude Code the effort and advisor, for Antigravity the effort — for this one
+attempt. A blank field keeps the default from Settings; a filled one replaces
+just that field. The result is recorded on the attempt and shown on its row,
+and the terminal starts with what was recorded, not with whatever the default
+is by then. It is not remembered for the next launch. A managed attempt takes
+none: Manvi sets its model, so the fields are not offered there.
+
+The task sheet's **Checklist** keeps items with their own done state, and
+**Linked tasks** names other tasks as its parent, ones it blocks, related
+work or the task it duplicates. Both are part of the agent's brief, and a link
+reads from both ends: the other task's brief lists this one as a subtask or as
+blocking it.
+
 Task run controls prepare a saved revision and the selected checkout before
 launch. A terminal handoff opens a dedicated task-bound session in the existing
 [terminal dock](TERMINAL.md). It runs under that CLI's configured permissions;
@@ -309,6 +327,18 @@ target in their history. An agent never deletes or merges away a card another
 agent is running, unless that agent is itself or you asked, and never changes
 a title or description you locked. An agent launched on a card that was
 merged or deleted is told where its work went.
+
+You can run the same merge from the board: select two or more cards of one
+repository and press **Merge…** on the selection bar, choose the card to keep
+and say why. It is the code `gitpulse_merge_tasks` runs — same order of
+writes, same refusals (a card changed since the board drew it, one shared with
+another repository, a target that is archived or Done) — and checklists and
+links are folded into the kept card too. When a merged card's reason is
+recorded but its delete then fails, the result is a partial merge that names
+that card and says running the merge again finishes it; it is never reported
+as a merge that did not happen. A card deleted elsewhere in the instant
+between the merge's last check and its first write is the one window the
+merge cannot close; that card is recoverable from the archive's Deleted view.
 
 An agent can also delete a card, with `gitpulse_delete_task`, when the task
 should not exist — a duplicate, or one it merged into another. It must give a
@@ -415,10 +445,13 @@ fields and dialogs. Card-specific shortcuts require a focused card.
 ## Deletion and verification limits
 
 Deletion asks for confirmation and removes the task from every board. History
-stays in the store and queued suggestions are dropped, but this screen cannot
-restore the same task ID. Each board delete pass attempts at most 50 tasks;
-failed and skipped tasks remain selected. An uncertain editor deletion offers
-**Retry delete** to reconcile the same request before further editing.
+stays in the store and queued suggestions are dropped; the archive's
+**Deleted** view restores the same task id. Each board delete pass attempts at
+most 50 tasks, and the Deleted view restores at most 50 selected tasks per
+press: every task is its own store write with its own timeout, and the bound
+keeps one press from queueing an unbounded run of them behind the board's other
+reads. Failed and skipped tasks remain selected. An uncertain editor deletion
+offers **Retry delete** to reconcile the same request before further editing.
 
 This guide describes the current source paths in `src/lib/workbench/`,
 `src/lib/ai/appleIntelligence.ts`, `src-tauri/src/ai/apple.rs`, `TaskBoard.svelte`,

@@ -33,6 +33,10 @@ struct Preparation {
     /// instead of running in `repo_path` itself.
     #[serde(default)]
     worktree: bool,
+    /// This launch's model, laid over the saved default for the provider;
+    /// the result is recorded on the attempt and is what its launch applies.
+    #[serde(default)]
+    model_choice: Option<crate::tool_config::ModelChoice>,
 }
 
 fn parse(input: &str) -> Result<Preparation, WorkbenchError> {
@@ -349,7 +353,31 @@ fn prepare_in(
     repo_path: &str,
 ) -> Result<Value, WorkbenchError> {
     let checkout = checkout(repo_path)?;
+    // A managed agent's model is Manvi's to set, not these flags: an override
+    // there would be recorded on the attempt and never applied.
+    let model_choice = if kind == "managed" {
+        if input.model_choice.is_some() {
+            return Err(WorkbenchError::new(
+                "unsupported_operation",
+                "A model for one launch applies to agents started in a terminal; a managed agent uses Manvi's model.",
+            ));
+        }
+        Value::Null
+    } else {
+        let defaults = crate::tool_config::agent_defaults();
+        match super::terminal_command::launch_model_choice(
+            &input.provider,
+            defaults.model_for(&input.provider),
+            input.model_choice.as_ref(),
+        )
+        .map_err(|message| WorkbenchError::new("invalid_input", message))?
+        {
+            Some(choice) => super::terminal_command::model_choice_record(&choice),
+            None => Value::Null,
+        }
+    };
     let body = json!({
+        "model_choice": model_choice,
         "id":input.id, "request_id":input.request_id, "expected_revision":0,
         "kind":kind,
         "task_id":input.task_id, "source_revision":input.source_revision,
@@ -1539,5 +1567,67 @@ mod tests {
             std::fs::read_to_string(squatter.join("keep.txt")).unwrap(),
             "mine"
         );
+    }
+
+    /// The handoff form's model for one launch is laid over the saved default
+    /// and recorded on the attempt — the record is what its launch applies
+    /// (`terminal_run::spawn`), not whatever the default is by then.
+    #[test]
+    fn a_launch_records_the_saved_default_with_its_own_override() {
+        let serial = crate::tool_config::lock_config_env();
+        let dir = tempfile::tempdir().unwrap();
+        let _env = crate::test_support::env::bind_env(&serial)
+            .set(
+                crate::tool_config::TOOL_CONFIG_ENV,
+                dir.path().join("tools.json"),
+            )
+            .invalidating(crate::tool_config::invalidate_cache);
+        let mut defaults = crate::tool_config::AgentDefaults::default();
+        defaults.models.insert(
+            "claude".into(),
+            crate::tool_config::ModelChoice {
+                model: Some("sonnet".into()),
+                effort: Some("medium".into()),
+                ..Default::default()
+            },
+        );
+        crate::tool_config::set_agent_defaults(defaults).unwrap();
+
+        let root = dir.path().join("repo");
+        init(&root);
+        commit(&root);
+        let state = host(&dir.path().join("profile.sqlite"));
+        seed(&state, &root);
+        let mut input = prepare(&root);
+        input["provider"] = json!("claude");
+        input["model_choice"] = json!({"model": "opus"});
+        let run = state
+            .request("runs.prepare_terminal", &input.to_string())
+            .unwrap();
+        assert_eq!(
+            run["item"]["model_choice"],
+            json!({"model": "opus", "effort": "medium"})
+        );
+
+        // An override the launcher cannot take is refused before an attempt exists.
+        let mut bad = prepare(&root);
+        bad["id"] = json!("run-bad");
+        bad["request_id"] = json!("prepare-bad");
+        bad["provider"] = json!("codex");
+        bad["model_choice"] = json!({"effort": "high"});
+        let refused = state
+            .request("runs.prepare_terminal", &bad.to_string())
+            .unwrap_err();
+        assert_eq!(refused.code, "invalid_input", "{}", refused.message);
+        // A field the form does not know is refused by the parser, not dropped.
+        bad["model_choice"] = json!({"temperature": "1"});
+        assert_eq!(
+            state
+                .request("runs.prepare_terminal", &bad.to_string())
+                .unwrap_err()
+                .code,
+            "invalid_input"
+        );
+        assert_eq!(state.request("runs.list", "{}").unwrap()["total"], 1);
     }
 }
