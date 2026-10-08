@@ -93,6 +93,13 @@ before that tag is pushed.
   pages in place after a change.
 - A merge whose source's delete fails after its reason is recorded now reports
   a partial merge naming that source, not a bare error.
+- **The shared contracts are vendored, not hand-copied.** `contracts/` is
+  refreshed from DevCouncil's `backend/contracts` by `vendor-crates.mjs`
+  (`--contracts` for just those files), and `vendor:check` reports drift
+  against DevCouncil. The old CHECKSUMS test hashed the copy against itself
+  and passed while it was stale. `verdict_json` is now described as the
+  `PolicyVerdict` projection the ledger actually stores, and a test holds
+  `LedgerEvent` and every `PolicyStatus` to that schema.
 
 ### Fixed
 
@@ -107,12 +114,28 @@ before that tag is pushed.
   also collapsed back to one page every second while a suggestion ran.
 - **Every task in a column can be reached in the list layout**, which had no
   paging; a repository's board links to the Tasks board for everything.
+- **Code intelligence reads schema 26 stores again.** The vendored
+  `devmap-store` was schema 25, so every repository indexed by a current
+  `devmap` reported code intelligence unavailable. It is re-vendored at
+  schema 26 with DevCouncil's reader floor, so a later additive schema bump
+  no longer blinds GitPulse until the next re-vendor.
+- **MCP tool results match their declared output schemas.**
+  `gitpulse_change_context` declared `collisions` as an array (it is an
+  object), `gitpulse_codeintel_suspects` declared fields it never returns, and
+  `gitpulse_ledger_events` can return a null `next_cursor`. A test now
+  validates every read-only tool's result against its schema.
+- The hook-to-socket notification test no longer hangs: state and resolve
+  events are sent from a GitPulse session, as the hook requires, and a hook
+  that exits without connecting ends the wait instead of blocking it forever.
 
 ### Upgrade
 
 - dc-store schema 11 is a one-way migration, and a host built against schema
   10 refuses a migrated profile. Rebuild GitPulse, Manvi and DevCouncil from a
   schema 11 dc-store before any of them opens the profile.
+- Reinstall `gitpulse-mcp` and `gitpulse-hook` (`bun run mcp:install`): an
+  installed 1.4.0 binary carries the schema 25 `devmap-store` and cannot read
+  a store a current `devmap` has built.
 
 ## [1.4.0] - 2026-10-07
 
