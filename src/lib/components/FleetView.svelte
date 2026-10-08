@@ -1403,9 +1403,17 @@
       </table>
 
       {#if $fleetStore.snapshot?.truncated}
+        {@const snapshot = $fleetStore.snapshot}
         <p class="px-4 py-2 text-[10px] text-amber-600 dark:text-amber-400" role="status">
-          The sweep did not reach every repository, so some rows show worktrees, commits and
-          activity as not scanned. Refresh to try the rest.
+          {#if snapshot.requested > snapshot.repos.length}
+            <!-- The repository cap, not the clock: refreshing sends the same
+                 list and reaches the same ones, so it must not promise more. -->
+            One sweep reads at most {snapshot.repos.length} of the {snapshot.requested} repositories
+            open or recent here, so the rest show worktrees, commits and activity as not scanned.
+          {:else}
+            The sweep did not reach every repository, so some rows show worktrees, commits and
+            activity as not scanned. Refresh to try the rest.
+          {/if}
         </p>
       {/if}
     {/if}

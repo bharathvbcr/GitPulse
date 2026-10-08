@@ -48,6 +48,8 @@
         last_author: "Alex", last_summary: "Work",
       });
       const dirty = new Set([WT_A]);
+      const watched = new Set();
+      let peakWatched = 0;
       const fixtures = {
         cmd_resolve_repo: (a) => ({
           path: a.repoPath, name: a.repoPath.split("/").pop(), is_bare: false, common_dir: COMMON[a.repoPath] ?? null,
@@ -60,8 +62,10 @@
         cmd_repo_operation: () => null,
         cmd_stash_list: () => ({ entries: [], truncated: false }),
         cmd_branch_stats: () => ({ updates: [], capped: false, compute_failures: 0, compared_to: "main" }),
-        cmd_watch_repo: () => null,
-        cmd_unwatch_repo: () => null,
+        // The native watch table, kept as the watcher keeps it, so the
+        // many-repositories checks can see what the pool asked for.
+        cmd_watch_repo: (a) => { watched.add(a.repoPath); peakWatched = Math.max(peakWatched, watched.size); return a.repoPath; },
+        cmd_unwatch_repo: (a) => { watched.delete(a.repoPath); return null; },
         cmd_set_recent_menu: () => null,
         // Never fetched: the honest answer for a fixture with no FETCH_HEAD.
         cmd_last_fetch_at: () => null, cmd_note_tab_activated: () => null,
@@ -314,6 +318,45 @@
             !!stackShell("site") && !pills().some((el) => el.textContent.includes("site-preview")));
           check("…seated right after its repository on the strip", () =>
             order().indexOf(SITE_WT) === order().indexOf(SITE) + 1);
+
+          // ---- many more repositories than the watch pool ----------------
+          // The strip used to refuse a twenty-fifth repository. Now watches
+          // are pooled by recency and the rest are parked, visibly.
+          const { WATCH_POOL_SIZE } = await import("../src/lib/repos/watchPool.ts");
+          const MANY = 200;
+          const manyPath = (i) => `/code/many/repo-${String(i).padStart(3, "0")}`;
+          const before = get(repoStore).openTabs.length;
+          const startedAt = performance.now();
+          for (let i = 0; i < MANY; i += 1) {
+            // Every tenth is opened the way a person does; the rest arrive in
+            // the background, the way agent launches and restores do.
+            await repoStore.openRepo(manyPath(i), { activate: i % 10 === 0 });
+          }
+          await settle();
+          const openMs = Math.round(performance.now() - startedAt);
+          const tabFor = (path) => get(repoStore).openTabs.find((t) => t.path === path);
+          const domTab = (path) => $(`[role="tab"][data-tab-id="${CSS.escape(tabFor(path).id)}"]`, strip());
+          console.log(`[repo-tabs] opened ${MANY} repositories in ${openMs} ms`);
+          check(`opens ${MANY} more repositories with no refusal`, () =>
+            get(repoStore).openTabs.length === before + MANY && !get(repoStore).error);
+          check("every one of them has a tab on the strip", () =>
+            Array.from({ length: MANY }, (_, i) => domTab(manyPath(i))).every(Boolean));
+          check("the native watch table stays within the pool", () =>
+            watched.size <= WATCH_POOL_SIZE && peakWatched <= WATCH_POOL_SIZE + 1);
+          const parkedPaths = get(repoStore).openTabs.filter((t) => t.watch === "parked").map((t) => t.path);
+          check("repositories past the pool are parked, not dropped", () =>
+            parkedPaths.length >= before + MANY - WATCH_POOL_SIZE);
+          const parked = parkedPaths.find((path) => path.startsWith("/code/many/"));
+          check("a parked tab says so on the strip", () =>
+            domTab(parked)?.dataset.parked === "true" && /paused/i.test(domTab(parked).title) &&
+            /live updates paused/.test(domTab(parked).textContent));
+          check("the active repository is watched", () => tabFor(activePath()).watch === "watching");
+          domTab(parked).click();
+          await settle();
+          check("clicking a parked tab brings it live", () =>
+            activePath() === parked && tabFor(parked).watch === "watching" && watched.has(parked) &&
+            domTab(parked).dataset.parked === undefined);
+          check("…without growing the native watch table", () => watched.size <= WATCH_POOL_SIZE);
 
           check("every IPC call had a fixture", () => unexpected.length === 0);
           check("no unhandled runtime errors", () => errors.length === 0);

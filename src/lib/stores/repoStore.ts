@@ -31,6 +31,7 @@ import {
   emptyWorkspace,
   MAX_OPEN_TABS,
   openTab,
+  type TabRecord,
   pinTab as pinWorkspaceTab,
   removeRecent as removeWorkspaceRecent,
   moveTabTo as moveWorkspaceTabTo,
@@ -79,12 +80,15 @@ import { hasUnstagedChanges } from "../files/fileStatus";
 import { indexSelectionPaths } from "../repos/bulkOps";
 import {
   WATCH_ACTIVE,
+  WATCH_PARKED,
   WATCH_UNKNOWN,
   needsFullPoll,
   watchFailed,
   watchStatesEqual,
   type WatchState,
+  type WatchStatus,
 } from "../repos/watchState";
+import { createWatchPool } from "../repos/watchPool";
 import { parseRemoteList, type RemoteChange, type RemoteInfo } from "../repos/remotes";
 import { parseSubmoduleList, type SubmoduleChange, type SubmoduleInfo } from "../repos/submodules";
 import {
@@ -240,6 +244,17 @@ export interface OpenRepoTab {
   currentBranch: string | null;
   conflictedCount: number;
   changedCount: number;
+  /**
+   * Whether the repository is watched (see repos/watchPool.ts): `parked`
+   * means more repositories are open than are watched at once, and this one
+   * catches up when it is opened. Absent in fixtures that predate the pool.
+   */
+  watch?: WatchStatus;
+  /**
+   * False until the repository has been read once, so the counts above are
+   * not a clean bill of health for a parked tab restore never read.
+   */
+  countsKnown?: boolean;
 }
 
 /**
@@ -667,25 +682,79 @@ function createSession(
   };
 }
 
-function project(internal: InternalState, options: PathIdentityOptions): RepoState {
-  const labels = disambiguateLabels(
-    internal.workspace.tabs.map((tab) => tab.path),
-  );
+/**
+ * What `project` kept from its last run, so publishing costs a reference
+ * check per unchanged tab rather than a rebuild of every one. Every publish
+ * used to re-derive each tab's labels and family from its paths: harmless at
+ * 24 tabs, but restore publishes a few times per tab, which made opening a
+ * workspace quadratic in its size (500 tabs took 4.5 s, nearly all of it
+ * here). A row is reused only when its tab record, its session, its active
+ * flag and its label are the same objects and values as last time — the
+ * store replaces a session on every change, so that is exactly "nothing
+ * this row reads has changed".
+ */
+interface ProjectionCache {
+  tabs: readonly TabRecord[] | null;
+  labels: Map<string, string>;
+  rows: Map<string, { tab: TabRecord; session: RepoSession | undefined; active: boolean; label: string; row: OpenRepoTab }>;
+}
+
+function createProjectionCache(): ProjectionCache {
+  return { tabs: null, labels: new Map(), rows: new Map() };
+}
+
+function project(
+  internal: InternalState,
+  options: PathIdentityOptions,
+  cache: ProjectionCache = createProjectionCache(),
+): RepoState {
+  if (cache.tabs !== internal.workspace.tabs) {
+    cache.labels = disambiguateLabels(internal.workspace.tabs.map((tab) => tab.path));
+    cache.tabs = internal.workspace.tabs;
+    // Drop rows for tabs that are gone, so the cache is bounded by the strip.
+    const live = new Set(internal.workspace.tabs.map((tab) => tab.id));
+    for (const id of cache.rows.keys()) if (!live.has(id)) cache.rows.delete(id);
+  }
+  const labels = cache.labels;
   const openTabs: OpenRepoTab[] = internal.workspace.tabs.map((tab) => {
     const session = internal.sessions[tab.id];
+    const active = tab.id === internal.workspace.activeId;
+    const label = labels.get(tab.path) ?? displayName(tab.path);
+    const kept = cache.rows.get(tab.id);
+    if (kept && kept.tab === tab && kept.session === session && kept.active === active && kept.label === label) {
+      return kept.row;
+    }
+    const row = projectTab(tab, session, active, label, options);
+    cache.rows.set(tab.id, { tab, session, active, label, row });
+    return row;
+  });
+
+  const active = internal.workspace.activeId
+    ? internal.sessions[internal.workspace.activeId]
+    : undefined;
+  return projectRest(internal, openTabs, active);
+}
+
+function projectTab(
+  tab: TabRecord,
+  session: RepoSession | undefined,
+  isActive: boolean,
+  label: string,
+  options: PathIdentityOptions,
+): OpenRepoTab {
     const statuses = session?.statuses ?? [];
     const family = familyFromCommonDir(session?.commonDir, options);
     return {
       id: tab.id,
       path: tab.path,
       name: session?.name ?? displayName(tab.path),
-      label: labels.get(tab.path) ?? displayName(tab.path),
+      label,
       pinned: tab.pinned,
       group: tab.group ?? null,
       color: normalizeTabColor(tab.color),
       family: family?.key ?? null,
       familyRoot: family?.root ?? null,
-      isActive: tab.id === internal.workspace.activeId,
+      isActive,
       isBare: session?.isBare ?? false,
       isDirty: statuses.some((file) => hasUnstagedChanges(file) || file.is_conflicted),
       isLoading: session?.isLoading ?? false,
@@ -695,11 +764,16 @@ function project(internal: InternalState, options: PathIdentityOptions): RepoSta
       currentBranch: session?.currentBranch ?? null,
       conflictedCount: statuses.filter((file) => file.is_conflicted).length,
       changedCount: new Set(statuses.map((file) => file.path)).size,
+      watch: session?.watch.status ?? "unknown",
+      countsKnown: session?.hasHydrated === true,
     };
-  });
-  const active = internal.workspace.activeId
-    ? internal.sessions[internal.workspace.activeId]
-    : undefined;
+}
+
+function projectRest(
+  internal: InternalState,
+  openTabs: OpenRepoTab[],
+  active: RepoSession | undefined,
+): RepoState {
   const base = emptyProjected();
   return {
     ...base,
@@ -766,10 +840,11 @@ export function repositoryTrustRefused(message: string): boolean {
  * workspace sync re-tried it and re-reported it, once per activation.
  */
 export function pathsTrustedForBackground(
-  tabs: readonly { path: string; trustRequired?: boolean; missing?: boolean }[],
+  tabs: readonly { path: string; trustRequired?: boolean; missing?: boolean; parked?: boolean }[],
   activePath: string | null,
-): { activeKey: string | null; retainedKeys: string[] } {
+): { activeKey: string | null; retainedKeys: string[]; liveKeys: string[] } {
   const retainedKeys: string[] = [];
+  const liveKeys: string[] = [];
   let activeBlocked = false;
   for (const tab of tabs) {
     if (tab.trustRequired || tab.missing) {
@@ -777,10 +852,14 @@ export function pathsTrustedForBackground(
       continue;
     }
     retainedKeys.push(tab.path);
+    // Parked: open but not watched (repos/watchPool.ts). The active tab is
+    // never parked, so this cannot drop the repository being looked at.
+    if (!tab.parked || tab.path === activePath) liveKeys.push(tab.path);
   }
   return {
     activeKey: activePath && !activeBlocked ? activePath : null,
     retainedKeys,
+    liveKeys,
   };
 }
 
@@ -837,6 +916,8 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
     });
   }
 
+  /** Rows `publish` can reuse; see `ProjectionCache`. */
+  const projection = createProjectionCache();
   let internal: InternalState = {
     workspace: emptyWorkspace(),
     sessions: {},
@@ -1003,9 +1084,7 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
     // generation-guarded before it lands.
     pollTickCount += 1;
     if (pollTickCount % WATCH_REASSERT_EVERY_TICKS === 0) {
-      void watch(path).then((state) => {
-        applyToSession(sessionId, generation, { watch: state });
-      });
+      void acquireWatch(sessionId, path, true);
     }
 
     // A repository with no live watcher gets a FULL refresh on this tick
@@ -1066,6 +1145,7 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
   let lastSentRecentsJson: string | null = null;
   /** Last open-tab set synced into workspace.json — skip no-op publishes. */
   let lastWorkspaceSyncKey: string | null = null;
+  let lastLiveScopeKey: string | null = null;
   let persistTimer: ReturnType<typeof setTimeout> | null = null;
   /**
    * User edits that may shrink the tab list or clear groups advance this.
@@ -1150,7 +1230,7 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
 
   /** The strip as drawn, for shortcuts that step through what the reader sees. */
   function drawnLayout() {
-    const projected = project(internal, options);
+    const projected = project(internal, options, projection);
     return computeTabLayout(
       projected.openTabs,
       projected.collapsedGroups,
@@ -1160,10 +1240,38 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
     );
   }
 
+  /**
+   * Restore opens every saved tab before any is read, and each open used to
+   * publish two or three times: a full projection, a persist check and a
+   * background-scope comparison per publish, over every tab, which made
+   * opening a large workspace quadratic in its size. While held, publishing
+   * is owed instead and paid once on release.
+   */
+  let publishHeld = 0;
+  let publishOwed = false;
+
+  function holdPublish(): () => void {
+    publishHeld += 1;
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      publishHeld -= 1;
+      if (publishHeld === 0 && publishOwed) {
+        publishOwed = false;
+        publish();
+      }
+    };
+  }
+
   function publish() {
+    if (publishHeld > 0) {
+      publishOwed = true;
+      return;
+    }
     const activeId = internal.workspace.activeId;
     if (activeId) noteActiveCheckout(familyOfTab(activeId)?.key, activeId);
-    set(project(internal, options));
+    set(project(internal, options, projection));
     persist();
     const active = internal.workspace.activeId
       ? internal.sessions[internal.workspace.activeId]
@@ -1173,21 +1281,27 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
         path: tab.path,
         trustRequired: internal.sessions[tab.id]?.trustRequired === true,
         missing: internal.sessions[tab.id]?.missing === true,
+        parked: internal.sessions[tab.id]?.watch.status === "parked",
       })),
       active?.path ?? null,
     );
-    const syncKey = JSON.stringify(trusted);
+    // Two scopes, each re-applied only when it changes: parking a tab moves
+    // the live set but not membership, and every apply walks every key.
+    const visible = !readBackgroundDocument();
+    const syncKey = JSON.stringify([trusted.activeKey, trusted.retainedKeys]);
     if (syncKey !== lastWorkspaceSyncKey) {
       lastWorkspaceSyncKey = syncKey;
+      // Membership — the registry and the init that writes it — is every
+      // open repository: searching the open tabs means all of them.
       workspaceSync.scheduleWorkspaceSync(trusted.activeKey, trusted.retainedKeys);
-      const visible = !readBackgroundDocument();
-      const scope = {
-        activeKey: trusted.activeKey,
-        retainedKeys: trusted.retainedKeys,
-        visible,
-      };
-      autoInit.setScope(scope);
-      liveIndex.setScope(scope);
+      autoInit.setScope({ activeKey: trusted.activeKey, retainedKeys: trusted.retainedKeys, visible });
+    }
+    const liveKey = JSON.stringify([trusted.activeKey, trusted.liveKeys]);
+    if (liveKey !== lastLiveScopeKey) {
+      lastLiveScopeKey = liveKey;
+      // Background index work is not: a parked repository gets nothing in
+      // the background, the index included, and catches up when opened.
+      liveIndex.setScope({ activeKey: trusted.activeKey, retainedKeys: trusted.liveKeys, visible });
     }
   }
 
@@ -1504,15 +1618,108 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
     }
   }
 
-  async function unwatch(path: string) {
-    // A refresh still owed to a repo nobody watches would run against a
-    // session that is gone, or worse, one reopened since.
+  /**
+   * The open repositories holding a native watch, by tab id. Tabs are not
+   * bounded by watches any more; this is (see repos/watchPool.ts).
+   */
+  const watchPool = createWatchPool();
+  /**
+   * One queue of native watch calls per tab, so the backend ends up holding
+   * the last decision made rather than whichever call landed last: a tab
+   * parked and brought back while its unwatch is in flight must not be left
+   * unwatched behind a pool that thinks it is live.
+   */
+  const watchOps = new Map<string, Promise<void>>();
+
+  function serialWatch(id: string, op: () => Promise<void>): Promise<void> {
+    const run = (watchOps.get(id) ?? Promise.resolve()).then(op);
+    const tail = run.catch(() => {});
+    watchOps.set(id, tail);
+    void tail.then(() => {
+      if (watchOps.get(id) === tail) watchOps.delete(id);
+    });
+    return run;
+  }
+
+  /**
+   * Watch status is a fact about the backend, not about one load of the
+   * view, so it lands on the live session whatever its generation.
+   */
+  function setWatch(id: string, state: WatchState): void {
+    const session = internal.sessions[id];
+    if (session) applyToSession(id, session.generation, { watch: state });
+  }
+
+  /**
+   * The one way into the pool. A slot whose tab is gone (re-keyed, closed by
+   * a path that skipped `unwatch`, or dropped by a restore that replaced
+   * every session) would otherwise shrink the pool for good.
+   */
+  function admitWatch(id: string, foreground: boolean) {
+    for (const key of watchPool.keys()) {
+      if (!internal.sessions[key] && key !== id) watchPool.release(key);
+    }
+    return watchPool.admit(id, foreground);
+  }
+
+  /**
+   * Gives a tab a live watch when the pool admits it, and records the
+   * outcome — watching, degraded or parked — on its session. `foreground` is
+   * a repository a person is looking at: it always gets a slot, taking the
+   * least recently used one; anything else takes only a free slot, so a
+   * background open never steals a watch from a repository someone used.
+   *
+   * A watch that fails keeps its slot. Releasing it would let the active
+   * tab's periodic re-assert evict another repository every minute for as
+   * long as its own watch keeps failing.
+   */
+  async function acquireWatch(id: string, path: string, foreground: boolean): Promise<void> {
+    const { admitted, evicted } = admitWatch(id, foreground);
+    if (!admitted) {
+      setWatch(id, WATCH_PARKED);
+      return;
+    }
+    // The newcomer's watch is asked for first, and never waits on the
+    // evicted one's teardown (an unwatch waits for its callback to release):
+    // the backend's table is larger than the pool. The eviction is recorded
+    // now, not after that watch lands, or a tab re-admitted in between would
+    // be marked parked while it holds a live watch.
+    const admission = serialWatch(id, async () => {
+      if (!watchPool.has(id)) return;
+      const state = await watch(path);
+      if (watchPool.has(id)) setWatch(id, state);
+    });
+    if (evicted) void parkWatch(evicted);
+    await admission;
+  }
+
+  /** Releases an evicted tab's native watch and says it is parked. */
+  async function parkWatch(id: string): Promise<void> {
+    const path = internal.sessions[id]?.path;
+    if (!path || watchPool.has(id)) return;
+    setWatch(id, WATCH_PARKED);
+    // Nothing will refresh it until it is shown again.
     watcherRefreshPolicy.forget(path);
+    await serialWatch(id, async () => {
+      if (!watchPool.has(id)) await unwatchNative(path);
+    });
+  }
+
+  async function unwatchNative(path: string): Promise<void> {
     try {
       await invokeFn("cmd_unwatch_repo", { repoPath: path });
     } catch {
       /* unwatch is best-effort */
     }
+  }
+
+  async function unwatch(path: string) {
+    // A refresh still owed to a repo nobody watches would run against a
+    // session that is gone, or worse, one reopened since.
+    watcherRefreshPolicy.forget(path);
+    const id = identityKey(path, options);
+    watchPool.release(id);
+    await serialWatch(id, () => unwatchNative(path));
   }
 
   async function resolvePath(path: string): Promise<ResolvedRepo> {
@@ -1655,8 +1862,7 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
       revealGraph(activation);
     }
     publish();
-    const watchState = await watch(path);
-    applyToSession(id, activation.generation, { watch: watchState });
+    await acquireWatch(id, path, onScreen);
     if (onScreen) {
       watcherRefreshPolicy.onActivated(path);
       await noteTabActivated(path);
@@ -2170,13 +2376,15 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
       }
       publish();
       if (!resolved) return true;
-      // Recorded before the hydrate so the first snapshot already carries an
-      // honest live/degraded answer, rather than briefly claiming live updates
-      // for a repository that never got a watcher.
-      const watchState = await watch(path);
-      applyToSession(opened.id, session.generation, { watch: watchState });
-      // An open that takes the screen always renders; only a background one may wait.
+      // An open that takes the screen always renders; only a background one
+      // may wait — and restore's background opens wait for the watch too,
+      // which restore hands out once the active tab is presented, within
+      // the pool, rather than one native registration per tab up front.
       if (extras.skipHydrate && !shouldPresent) return true;
+      // Recorded before the hydrate so the first snapshot already carries an
+      // honest live/degraded/parked answer, rather than briefly claiming live
+      // updates for a repository that never got a watcher.
+      await acquireWatch(opened.id, path, shouldPresent);
       if (shouldPresent && !extras.keepEpoch) await noteTabActivated(path);
       await hydrate(opened.id, path, session.generation);
       const latest = internal.sessions[opened.id];
@@ -2268,6 +2476,11 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
       watcherRefreshPolicy.onActivated(session.path);
       // `force` is restore presenting a saved tab, not a person clicking it.
       if (!extras.force) await noteTabActivated(session.path);
+      // A parked tab comes back live here; a watched one moves to the front
+      // of the pool, so the repository someone is looking at is never the
+      // one evicted. After the note, which must precede every native call
+      // this activation makes.
+      await acquireWatch(id, session.path, true);
       await hydrate(id, session.path, activation.generation);
       ensureStatusPoll();
       flushPersist();
@@ -2667,27 +2880,33 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
           await store.activateTab(id, { force: true });
         };
 
-        for (const tab of ordered) {
-          // Always append (activate: false) so restore cannot shuffle tab
-          // order. keepEpoch + a suspended save: quitting halfway cannot
-          // replace the durable list with the tabs opened so far.
-          await store.openRepo(tab.path, {
-            allowBroken: true,
-            deferTrust: true,
-            keepEpoch: true,
-            activate: false,
-            skipHydrate: true,
-            pinned: tab.pinned,
-            group: tab.group ?? null,
-            ...(tab.color ? { color: tab.color } : {}),
-            restore: {
-              viewTab: tab.viewTab,
-              viewSections: tab.viewSections,
-              searchQuery: tab.searchQuery,
-              selectedBranch: tab.selectedBranch,
-              terminalOpen: tab.terminalOpen,
-            },
-          });
+        // One publish for the whole strip, not a few per tab.
+        const releasePublish = holdPublish();
+        try {
+          for (const tab of ordered) {
+            // Always append (activate: false) so restore cannot shuffle tab
+            // order. keepEpoch + a suspended save: quitting halfway cannot
+            // replace the durable list with the tabs opened so far.
+            await store.openRepo(tab.path, {
+              allowBroken: true,
+              deferTrust: true,
+              keepEpoch: true,
+              activate: false,
+              skipHydrate: true,
+              pinned: tab.pinned,
+              group: tab.group ?? null,
+              ...(tab.color ? { color: tab.color } : {}),
+              restore: {
+                viewTab: tab.viewTab,
+                viewSections: tab.viewSections,
+                searchQuery: tab.searchQuery,
+                selectedBranch: tab.selectedBranch,
+                terminalOpen: tab.terminalOpen,
+              },
+            });
+          }
+        } finally {
+          releasePublish();
         }
         const activeTab = persisted.activePath
           ? ordered.find((tab) => isActive(tab.path))
@@ -2730,13 +2949,40 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
             publish();
           }
         }
-        // Phase two: every other resolved tab hydrates in strip order. A tab
-        // that never resolved stays unread, as above; one the reader opened
-        // or closed meanwhile is skipped by the generation check.
-        for (const tab of [...internal.workspace.tabs]) {
-          const session = internal.sessions[tab.id];
+        // Phase two: the other resolved tabs, in strip order, take the watch
+        // pool's free slots and hydrate. The rest are parked, unread, until
+        // someone opens them: reading every restored tab was one full
+        // hydrate per tab against a shared spawn budget, which is why the
+        // number of open repositories used to be capped. A tab that never
+        // resolved stays unread, as above; one the reader opened or closed
+        // meanwhile is skipped by the generation check. Slots are reserved,
+        // and the rest parked, in one held pass: parking a tab at a time
+        // published once per tab.
+        const toRead: string[] = [];
+        const releaseParking = holdPublish();
+        try {
+          for (const tab of internal.workspace.tabs) {
+            const session = internal.sessions[tab.id];
+            if (!session || session.hasHydrated || session.error || session.trustRequired) continue;
+            if (admitWatch(tab.id, false).admitted) {
+              toRead.push(tab.id);
+            } else {
+              applyToSession(tab.id, session.generation, { watch: WATCH_PARKED, isLoading: false });
+            }
+          }
+        } finally {
+          releaseParking();
+        }
+        for (const id of toRead) {
+          const session = internal.sessions[id];
           if (!session || session.hasHydrated || session.error || session.trustRequired) continue;
-          await hydrate(tab.id, session.path, session.generation);
+          await acquireWatch(id, session.path, false);
+          if (watchPool.has(id)) {
+            await hydrate(id, session.path, session.generation);
+          } else {
+            // Its reserved slot went to a repository someone opened meanwhile.
+            applyToSession(id, session.generation, { isLoading: false });
+          }
         }
         ensureStatusPoll();
       } finally {

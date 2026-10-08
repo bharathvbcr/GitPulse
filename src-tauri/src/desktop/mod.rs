@@ -456,7 +456,8 @@ pub fn set_menu_state<R: Runtime>(app: &AppHandle<R>, next: MenuState) -> Result
         .repositories
         .iter()
         .map(state::repository_switcher_key)
-        .ne(next.repositories.iter().map(state::repository_switcher_key));
+        .ne(next.repositories.iter().map(state::repository_switcher_key))
+        || previous.repositories_hidden != next.repositories_hidden;
     let menu = if rebuild_menu {
         let menu = build_native_menu(app, &recent_menu_entries(app), &next)
             .map_err(|error| error.to_string())?;

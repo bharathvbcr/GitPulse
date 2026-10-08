@@ -16,7 +16,12 @@ use std::thread;
 use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter};
 
-pub const MAX_WATCHES: usize = 24;
+/// Native watch sessions held at once. The frontend pools watches by recency
+/// (src/lib/repos/watchPool.ts, `WATCH_POOL_SIZE`) and stays strictly below
+/// this, so an eviction can admit the newcomer before the evicted session has
+/// finished retiring, and one leaked slot cannot refuse the repository a person
+/// just opened. Open tabs are no longer bounded by it.
+pub const MAX_WATCHES: usize = 32;
 
 pub struct WatchSession {
     stop: Arc<AtomicBool>,

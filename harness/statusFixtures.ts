@@ -15,6 +15,7 @@ export function statusFixture(kind: string): MenuState {
       { path: "/Projects/GitPulse", label: "GitPulse", active: true, changed: 12, conflicts: 0, busy: false },
       { path: "/Projects/ScholarLM", label: "ScholarLM", active: false, changed: 3, conflicts: 1, busy: true },
     ],
+    repositoriesHidden: 0,
     trayDetail: "GitPulse · feature/status-popover", traySummary: { id: "section:work:overview", text: "12 changed · 4 staged" },
     trayDetails: ["Repository: /Projects/GitPulse", "Branch: feature/status-popover", "12 changed · 4 staged · 0 conflicts", "2 listed stashes", "3 ahead · 1 behind origin/main (fetched 4 min ago)", "Live updates"],
     status: { repository: "GitPulse", branch: "feature/status-popover", changed: 12, staged: 4, conflicts: 0, ahead: 3, behind: 1,
