@@ -365,6 +365,19 @@
       button("Retry preparation").click();await wait(()=>report.taskSpawns===4);
       check("Preparation retry preserves the exact saved request",preparations.at(-1)===uncertain);
       await finish();button("Refresh").click();await pause(100);
+      // A model for one launch is for that launch. This pane keeps its form
+      // mounted after an accepted attempt, so what was typed would otherwise
+      // still be there for the next press.
+      await openLaunchForm();
+      const launchModel=()=>document.querySelector('[data-testid="handoff-model-override"] [aria-label="Model"]');
+      check("The Agent pane offers a model for this launch",!!launchModel());
+      launchModel().value="opus";launchModel().dispatchEvent(new Event("input",{bubbles:true}));await pause(30);
+      const spawnsBeforeModel=report.taskSpawns;
+      button("Launch in Claude Code").click();await wait(()=>report.taskSpawns===spawnsBeforeModel+1);
+      check("The launch carries the typed model as this attempt's model_choice",JSON.parse(preparations.at(-1)).model_choice?.model==="opus");
+      await openLaunchForm();
+      check("The typed model is cleared once that launch is accepted",launchModel()?.value==="");
+      await finish();button("Refresh").click();await pause(100);
       await openLaunchForm();seg("Connection","Managed").click();await pause(30);
       button("Start managed Claude Code").click();await wait(()=>document.body.textContent.includes("Managed launch reply lost"));
       check("A lost managed launch response retains one provider session",report.managedSpawns===1);
