@@ -1299,18 +1299,32 @@ fn content_search_is_bounded_and_says_why() {
     let opts = ContentSearchOptions::default();
 
     let found = search(&repo.path_str(), "needle", &opts, &never).expect("search");
-    assert!(!found.truncated && found.truncated_reason.is_none(), "{found:?}");
+    assert!(
+        !found.truncated && found.truncated_reason.is_none(),
+        "{found:?}"
+    );
     let mut paths: Vec<_> = found.matches.iter().map(|m| m.path.as_str()).collect();
     paths.sort();
-    assert_eq!(paths, ["notes with space.txt", "src/a.rs"], "untracked yes, ignored no");
+    assert_eq!(
+        paths,
+        ["notes with space.txt", "src/a.rs"],
+        "untracked yes, ignored no"
+    );
     let a = found.matches.iter().find(|m| m.path == "src/a.rs").unwrap();
-    assert_eq!((a.line, a.column, a.text.as_str()), (1, 5, "let needle = 2;"));
+    assert_eq!(
+        (a.line, a.column, a.text.as_str()),
+        (1, 5, "let needle = 2;")
+    );
     assert_eq!(found.files, 2);
 
     let at_head = search(
         &repo.path_str(),
         "needle = 1",
-        &ContentSearchOptions { revision: Some("HEAD".into()), fixed_strings: true, ..Default::default() },
+        &ContentSearchOptions {
+            revision: Some("HEAD".into()),
+            fixed_strings: true,
+            ..Default::default()
+        },
         &never,
     )
     .expect("revision search");
@@ -1318,36 +1332,84 @@ fn content_search_is_bounded_and_says_why() {
     assert_eq!(at_head.matches[0].path, "src/a.rs");
     assert_eq!(at_head.revision.as_deref().map(str::len), Some(40));
 
-    let dash = search(&repo.path_str(), "-dash", &ContentSearchOptions { fixed_strings: true, ..Default::default() }, &never)
-        .expect("a leading dash is a pattern");
+    let dash = search(
+        &repo.path_str(),
+        "-dash",
+        &ContentSearchOptions {
+            fixed_strings: true,
+            ..Default::default()
+        },
+        &never,
+    )
+    .expect("a leading dash is a pattern");
     assert_eq!(dash.matches.len(), 1);
 
-    let none = search(&repo.path_str(), "zzz-not-here", &opts, &never).expect("no match is an answer");
+    let none =
+        search(&repo.path_str(), "zzz-not-here", &opts, &never).expect("no match is an answer");
     assert!(none.matches.is_empty() && !none.truncated);
 
     repo.write("many.txt", &"hit\n".repeat(200));
-    let capped = search(&repo.path_str(), "hit", &ContentSearchOptions { max_matches: Some(10), ..Default::default() }, &never)
-        .expect("capped");
+    let capped = search(
+        &repo.path_str(),
+        "hit",
+        &ContentSearchOptions {
+            max_matches: Some(10),
+            ..Default::default()
+        },
+        &never,
+    )
+    .expect("capped");
     assert_eq!(capped.matches.len(), 10);
-    assert_eq!((capped.truncated, capped.truncated_reason.as_deref()), (true, Some("match_limit")));
+    assert_eq!(
+        (capped.truncated, capped.truncated_reason.as_deref()),
+        (true, Some("match_limit"))
+    );
 
-    let exact = search(&repo.path_str(), "hit", &ContentSearchOptions { max_matches: Some(200), ..Default::default() }, &never)
-        .expect("exactly at the limit");
+    let exact = search(
+        &repo.path_str(),
+        "hit",
+        &ContentSearchOptions {
+            max_matches: Some(200),
+            ..Default::default()
+        },
+        &never,
+    )
+    .expect("exactly at the limit");
     assert_eq!(exact.matches.len(), 200);
-    assert!(!exact.truncated, "200 matches under a 200 limit is complete");
+    assert!(
+        !exact.truncated,
+        "200 matches under a 200 limit is complete"
+    );
 
     let always = || true;
     let stopped = search(&repo.path_str(), "hit", &opts, &always).expect("a cancel is an answer");
-    assert_eq!((stopped.truncated, stopped.truncated_reason.as_deref()), (true, Some("cancelled")));
+    assert_eq!(
+        (stopped.truncated, stopped.truncated_reason.as_deref()),
+        (true, Some("cancelled"))
+    );
 
-    assert!(search(&repo.path_str(), "(", &opts, &never).unwrap_err().contains("Search failed"));
-    assert!(search(&repo.path_str(), "x", &ContentSearchOptions { revision: Some("nosuch".into()), ..Default::default() }, &never).is_err());
+    assert!(search(&repo.path_str(), "(", &opts, &never)
+        .unwrap_err()
+        .contains("Search failed"));
+    assert!(search(
+        &repo.path_str(),
+        "x",
+        &ContentSearchOptions {
+            revision: Some("nosuch".into()),
+            ..Default::default()
+        },
+        &never
+    )
+    .is_err());
     assert!(search(&repo.path_str(), "", &opts, &never).is_err());
 }
 
 fn staged_names(repo: &TestRepo) -> String {
-    gitpulse_lib::engine::git_cli::git_text(repo.dir.path(), &["diff", "--cached", "--name-status", "-M"])
-        .unwrap()
+    gitpulse_lib::engine::git_cli::git_text(
+        repo.dir.path(),
+        &["diff", "--cached", "--name-status", "-M"],
+    )
+    .unwrap()
 }
 
 /// The file tree's rename: tracked content moves with a staged `git mv`,
@@ -1366,7 +1428,10 @@ fn move_path_picks_git_mv_or_a_rename_and_gates_it_first() {
         Err("blocked by policy".into())
     });
     assert_eq!(refused.unwrap_err(), "blocked by policy");
-    assert!(repo.dir.path().join("src/a.txt").exists(), "a refusal moves nothing");
+    assert!(
+        repo.dir.path().join("src/a.txt").exists(),
+        "a refusal moves nothing"
+    );
 
     let mut seen = None;
     let plan = GitWriter::move_path(&repo.path_str(), "src/a.txt", "lib/b.txt", |plan| {
@@ -1377,14 +1442,25 @@ fn move_path_picks_git_mv_or_a_rename_and_gates_it_first() {
     assert_eq!(Some(&plan), seen.as_ref());
     assert_eq!(
         plan,
-        MovePlan::Git { argv: ["git", "mv", "--", "src/a.txt", "lib/b.txt"].map(String::from).to_vec() }
+        MovePlan::Git {
+            argv: ["git", "mv", "--", "src/a.txt", "lib/b.txt"]
+                .map(String::from)
+                .to_vec()
+        }
     );
-    assert!(staged_names(&repo).contains("R100\tsrc/a.txt\tlib/b.txt"), "{}", staged_names(&repo));
+    assert!(
+        staged_names(&repo).contains("R100\tsrc/a.txt\tlib/b.txt"),
+        "{}",
+        staged_names(&repo)
+    );
 
     let plan = GitWriter::move_path(&repo.path_str(), "loose.txt", "dir/loose.txt", |_| Ok(()))
         .expect("untracked move");
     assert!(matches!(plan, MovePlan::Untracked { .. }));
-    assert_eq!(fs::read_to_string(repo.dir.path().join("dir/loose.txt")).unwrap(), "l\n");
+    assert_eq!(
+        fs::read_to_string(repo.dir.path().join("dir/loose.txt")).unwrap(),
+        "l\n"
+    );
 
     for (from, to) in [
         ("lib/b.txt", "dir/loose.txt"),
@@ -1422,31 +1498,61 @@ fn delete_path_removes_tracked_and_untracked_but_never_ignored() {
     assert_eq!(
         plans,
         [
-            ["git", "rm", "-r", "-q", "--", ":(literal)dir"].map(String::from).to_vec(),
-            ["git", "clean", "-f", "-d", "-q", "--", ":(literal)dir"].map(String::from).to_vec(),
+            ["git", "rm", "-r", "-q", "--", ":(literal)dir"]
+                .map(String::from)
+                .to_vec(),
+            ["git", "clean", "-f", "-d", "-q", "--", ":(literal)dir"]
+                .map(String::from)
+                .to_vec(),
         ]
     );
-    assert!(repo.dir.path().join("dir/new.txt").exists(), "a refusal deletes nothing");
+    assert!(
+        repo.dir.path().join("dir/new.txt").exists(),
+        "a refusal deletes nothing"
+    );
 
     let outcome = GitWriter::delete_path(&repo.path_str(), "dir", |_| Ok(())).expect("delete dir");
     assert_eq!((outcome.tracked_removed, outcome.untracked_removed), (1, 1));
-    assert!(outcome.left_behind, "the ignored log stays, and is reported");
+    assert!(
+        outcome.left_behind,
+        "the ignored log stays, and is reported"
+    );
     assert!(repo.dir.path().join("dir/build.log").exists());
     assert!(!repo.dir.path().join("dir/new.txt").exists());
     assert!(staged_names(&repo).contains("D\tdir/tracked.txt"));
 
     repo.write("keep.txt", "edited\n");
     let modified = GitWriter::delete_path(&repo.path_str(), "keep.txt", |_| Ok(()));
-    assert!(modified.is_err(), "git rm refuses a file with local changes");
-    assert_eq!(fs::read_to_string(repo.dir.path().join("keep.txt")).unwrap(), "edited\n");
+    assert!(
+        modified.is_err(),
+        "git rm refuses a file with local changes"
+    );
+    assert_eq!(
+        fs::read_to_string(repo.dir.path().join("keep.txt")).unwrap(),
+        "edited\n"
+    );
 
     repo.write("scratch.txt", "s\n");
-    let untracked = GitWriter::delete_path(&repo.path_str(), "scratch.txt", |_| Ok(())).expect("untracked");
-    assert_eq!((untracked.tracked_removed, untracked.untracked_removed, untracked.left_behind), (0, 1, false));
+    let untracked =
+        GitWriter::delete_path(&repo.path_str(), "scratch.txt", |_| Ok(())).expect("untracked");
+    assert_eq!(
+        (
+            untracked.tracked_removed,
+            untracked.untracked_removed,
+            untracked.left_behind
+        ),
+        (0, 1, false)
+    );
 
-    assert!(GitWriter::delete_path(&repo.path_str(), "dir", |_| Ok(())).is_err(), "only ignored files left");
+    assert!(
+        GitWriter::delete_path(&repo.path_str(), "dir", |_| Ok(())).is_err(),
+        "only ignored files left"
+    );
     for bad in ["", ".", "../x", "nope.txt"] {
-        assert!(GitWriter::delete_path(&repo.path_str(), bad, |_| Ok(())).is_err(), "{bad:?}");
+        assert!(
+            GitWriter::delete_path(&repo.path_str(), bad, |_| Ok(())).is_err(),
+            "{bad:?}"
+        );
     }
 }
 
@@ -1473,10 +1579,17 @@ fn reset_preview_names_what_a_rewind_leaves_behind() {
     assert_eq!(preview.target, base);
     assert_eq!(preview.leaving_total, 2);
     assert_eq!(
-        preview.leaving.iter().map(|c| c.summary.as_str()).collect::<Vec<_>>(),
+        preview
+            .leaving
+            .iter()
+            .map(|c| c.summary.as_str())
+            .collect::<Vec<_>>(),
         ["only on main", "shared with keep"]
     );
-    assert_eq!(preview.unreachable_total, 1, "`keep` still holds one of them");
+    assert_eq!(
+        preview.unreachable_total, 1,
+        "`keep` still holds one of them"
+    );
     assert_eq!(preview.gaining_total, 0);
 
     // Moving forward again loses nothing and gains what the rewind dropped.
@@ -1490,7 +1603,10 @@ fn reset_preview_names_what_a_rewind_leaves_behind() {
     assert_eq!(detached.unreachable_total, 0, "`keep` still reaches it");
 
     for bad in ["-x", "a..b", "HEAD:f.txt", "nosuch"] {
-        assert!(GitReader::reset_preview(&repo.path_str(), bad).is_err(), "{bad}");
+        assert!(
+            GitReader::reset_preview(&repo.path_str(), bad).is_err(),
+            "{bad}"
+        );
     }
 }
 
@@ -1521,7 +1637,10 @@ fn blame_at_revision_steps_to_the_parent_across_a_rename() {
     let at_parent =
         GitReader::get_file_blame(&repo.path_str(), "old name.txt", Some(&parent)).expect("parent");
     assert_eq!(
-        at_parent.iter().map(|l| l.content.as_str()).collect::<Vec<_>>(),
+        at_parent
+            .iter()
+            .map(|l| l.content.as_str())
+            .collect::<Vec<_>>(),
         ["one", "two"]
     );
 
@@ -1583,7 +1702,8 @@ fn blame_new_files_are_uncommitted_without_mutating_the_index() {
                 run_git(repo.dir.path(), &["add", "--", path]);
             }
             let before = git_out(repo.dir.path(), &["status", "--porcelain=v1"]);
-            let lines = GitReader::get_file_blame(&repo.path_str(), path, None).expect("new file blame");
+            let lines =
+                GitReader::get_file_blame(&repo.path_str(), path, None).expect("new file blame");
             assert_eq!(
                 lines.iter().map(|l| l.content.as_str()).collect::<Vec<_>>(),
                 ["first", "", "last"]
@@ -1607,9 +1727,11 @@ fn blame_new_files_are_uncommitted_without_mutating_the_index() {
 fn blame_new_empty_files_succeed_but_missing_and_binary_files_do_not() {
     let repo = TestRepo::init();
     repo.write("empty.txt", "");
-    assert!(GitReader::get_file_blame(&repo.path_str(), "empty.txt", None)
-        .expect("empty file")
-        .is_empty());
+    assert!(
+        GitReader::get_file_blame(&repo.path_str(), "empty.txt", None)
+            .expect("empty file")
+            .is_empty()
+    );
     assert!(GitReader::get_file_blame(&repo.path_str(), "absent.txt", None).is_err());
     repo.write("binary.dat", "a\0b");
     assert!(GitReader::get_file_blame(&repo.path_str(), "binary.dat", None).is_err());
@@ -1668,16 +1790,20 @@ fn blame_new_file_budgets_and_invalid_inputs_fail_explicitly() {
     let repo = TestRepo::init();
     let large = std::fs::File::create(repo.dir.path().join("large.txt")).unwrap();
     large.set_len(9 * 1024 * 1024).unwrap();
-    assert!(GitReader::get_file_blame(&repo.path_str(), "large.txt", None)
-        .unwrap_err()
-        .contains("limit"));
+    assert!(
+        GitReader::get_file_blame(&repo.path_str(), "large.txt", None)
+            .unwrap_err()
+            .contains("limit")
+    );
     repo.write("many.txt", &"\n".repeat(200_000));
     let result = GitReader::get_file_blame(&repo.path_str(), "many.txt", None);
     assert!(matches!(result, Err(error) if error.contains("budget")));
     fs::write(repo.dir.path().join("invalid.txt"), [0xff, 0xfe]).unwrap();
-    assert!(GitReader::get_file_blame(&repo.path_str(), "invalid.txt", None)
-        .unwrap_err()
-        .contains("UTF-8"));
+    assert!(
+        GitReader::get_file_blame(&repo.path_str(), "invalid.txt", None)
+            .unwrap_err()
+            .contains("UTF-8")
+    );
     assert!(GitReader::get_file_blame(&repo.path_str(), ".", None).is_err());
     assert!(GitReader::get_file_blame(&repo.path_str(), "../escape.txt", None).is_err());
 }

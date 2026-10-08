@@ -1085,8 +1085,7 @@ pub async fn cmd_get_file_blame(
     file_path: String,
     revision: Option<String>,
 ) -> Result<Vec<BlameLine>, String> {
-    off_thread(move || GitReader::get_file_blame(&repo_path, &file_path, revision.as_deref()))
-        .await
+    off_thread(move || GitReader::get_file_blame(&repo_path, &file_path, revision.as_deref())).await
 }
 
 #[tauri::command(async)]

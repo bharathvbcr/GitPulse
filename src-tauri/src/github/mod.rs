@@ -1580,7 +1580,9 @@ fn validate_gh_title(subject: &str, title: &str) -> Result<(), String> {
         return Err(format!("{subject} title exceeds the 256 character limit"));
     }
     if title.chars().any(|c| c.is_control()) {
-        return Err(format!("{subject} title must not contain control characters"));
+        return Err(format!(
+            "{subject} title must not contain control characters"
+        ));
     }
     if let Some(bidi) = title.chars().find(|c| BIDI_OVERRIDE_CHARS.contains(c)) {
         return Err(format!(
@@ -1820,7 +1822,12 @@ pub fn view_pull_request(repo_path: &str, number: u64) -> Result<PullRequestDeta
     let remote = discover_github_remote(repo_path)?
         .ok_or_else(|| "No GitHub remote configured".to_string())?;
     let number = number.to_string();
-    let stdout = run_gh(&remote, &pr_view_leading_args(&number), Duration::from_secs(45), Some(&repo))?;
+    let stdout = run_gh(
+        &remote,
+        &pr_view_leading_args(&number),
+        Duration::from_secs(45),
+        Some(&repo),
+    )?;
     parse_pr_view(&stdout)
 }
 
@@ -1889,16 +1896,26 @@ pub fn pr_action_argv(
             validate_gh_body("Pull request", body)?;
             crate::engine::git_writer::validate_ref_name(base)
                 .map_err(|e| format!("Base branch: {e}"))?;
-            let head = head_branch
-                .ok_or("A pull request is opened from a branch; HEAD is detached")?;
+            let head =
+                head_branch.ok_or("A pull request is opened from a branch; HEAD is detached")?;
             crate::engine::git_writer::validate_ref_name(head)
                 .map_err(|e| format!("Head branch: {e}"))?;
             if head == base {
                 return Err(format!("The head and base branch are both {head}"));
             }
             args.extend(
-                ["create", "--title", title.trim(), "--body", body, "--base", base, "--head", head]
-                    .map(String::from),
+                [
+                    "create",
+                    "--title",
+                    title.trim(),
+                    "--body",
+                    body,
+                    "--base",
+                    base,
+                    "--head",
+                    head,
+                ]
+                .map(String::from),
             );
             if *draft {
                 args.push("--draft".into());
@@ -1936,7 +1953,9 @@ pub fn pr_action_argv(
             if *number == 0 {
                 return Err("Invalid pull request number".into());
             }
-            if !matches!(head_oid.len(), 40 | 64) || !head_oid.chars().all(|c| c.is_ascii_hexdigit()) {
+            if !matches!(head_oid.len(), 40 | 64)
+                || !head_oid.chars().all(|c| c.is_ascii_hexdigit())
+            {
                 return Err("Merge needs the head commit the pull request was reviewed at".into());
             }
             let flag = match method {
@@ -1945,8 +1964,14 @@ pub fn pr_action_argv(
                 PrMergeMethod::Rebase => "--rebase",
             };
             args.extend(
-                ["merge", &number.to_string(), flag, "--match-head-commit", head_oid]
-                    .map(|s| s.to_string()),
+                [
+                    "merge",
+                    &number.to_string(),
+                    flag,
+                    "--match-head-commit",
+                    head_oid,
+                ]
+                .map(|s| s.to_string()),
             );
             if *delete_branch {
                 args.push("--delete-branch".into());
@@ -1961,15 +1986,17 @@ pub fn pr_action_argv(
 /// never a rebuild of it.
 pub fn run_pr_action(repo_path: &str, argv: &[String]) -> Result<String, String> {
     let repo = validate_repo(repo_path)?;
-    if argv.first().map(String::as_str) != Some("gh") || argv.get(1).map(String::as_str) != Some("pr") {
+    if argv.first().map(String::as_str) != Some("gh")
+        || argv.get(1).map(String::as_str) != Some("pr")
+    {
         return Err("Not a pull-request command".into());
     }
     if let Some(reason) = gh_unavailable_reason(&probe_gh_cli()) {
         return Err(reason);
     }
     let refs: Vec<&str> = argv.iter().skip(1).map(String::as_str).collect();
-    let stdout =
-        run_command_in("gh", &refs, Duration::from_secs(120), Some(&repo)).map_err(bounded_error)?;
+    let stdout = run_command_in("gh", &refs, Duration::from_secs(120), Some(&repo))
+        .map_err(bounded_error)?;
     Ok(String::from_utf8_lossy(&stdout).trim().to_string())
 }
 
@@ -2815,8 +2842,20 @@ mod tests {
         assert_eq!(
             pr_action_argv(&acme(), &create, Some("feat/search")).unwrap(),
             [
-                "gh", "pr", "create", "--title", "Add search", "--body", "Body\nline", "--base",
-                "main", "--head", "feat/search", "--draft", "--repo", "acme/gitpulse"
+                "gh",
+                "pr",
+                "create",
+                "--title",
+                "Add search",
+                "--body",
+                "Body\nline",
+                "--base",
+                "main",
+                "--head",
+                "feat/search",
+                "--draft",
+                "--repo",
+                "acme/gitpulse"
             ]
         );
         let review = PrAction::Review {
@@ -2826,7 +2865,15 @@ mod tests {
         };
         assert_eq!(
             pr_action_argv(&acme(), &review, None).unwrap(),
-            ["gh", "pr", "review", "12", "--approve", "--repo", "acme/gitpulse"]
+            [
+                "gh",
+                "pr",
+                "review",
+                "12",
+                "--approve",
+                "--repo",
+                "acme/gitpulse"
+            ]
         );
         let changes = PrAction::Review {
             number: 12,
@@ -2835,7 +2882,17 @@ mod tests {
         };
         assert_eq!(
             pr_action_argv(&acme(), &changes, None).unwrap(),
-            ["gh", "pr", "review", "12", "--request-changes", "--body", "-- not a flag", "--repo", "acme/gitpulse"]
+            [
+                "gh",
+                "pr",
+                "review",
+                "12",
+                "--request-changes",
+                "--body",
+                "-- not a flag",
+                "--repo",
+                "acme/gitpulse"
+            ]
         );
         let oid = "a".repeat(40);
         let merge = PrAction::Merge {
@@ -2847,8 +2904,16 @@ mod tests {
         assert_eq!(
             pr_action_argv(&acme(), &merge, None).unwrap(),
             [
-                "gh", "pr", "merge", "9", "--squash", "--match-head-commit", oid.as_str(),
-                "--delete-branch", "--repo", "acme/gitpulse"
+                "gh",
+                "pr",
+                "merge",
+                "9",
+                "--squash",
+                "--match-head-commit",
+                oid.as_str(),
+                "--delete-branch",
+                "--repo",
+                "acme/gitpulse"
             ]
         );
     }
@@ -2861,14 +2926,28 @@ mod tests {
             base: base.into(),
             draft: false,
         };
-        assert!(pr_action_argv(&acme(), &create("t", "main"), None).unwrap_err().contains("detached"));
-        assert!(pr_action_argv(&acme(), &create("", "main"), Some("f")).unwrap_err().contains("Pull request title"));
+        assert!(pr_action_argv(&acme(), &create("t", "main"), None)
+            .unwrap_err()
+            .contains("detached"));
+        assert!(pr_action_argv(&acme(), &create("", "main"), Some("f"))
+            .unwrap_err()
+            .contains("Pull request title"));
         assert!(pr_action_argv(&acme(), &create("t\u{202E}", "main"), Some("f")).is_err());
         assert!(pr_action_argv(&acme(), &create("t", "-evil"), Some("f")).is_err());
         assert!(pr_action_argv(&acme(), &create("t", "main"), Some("main")).is_err());
-        let comment = PrAction::Review { number: 3, verdict: PrReviewVerdict::Comment, body: " ".into() };
-        assert!(pr_action_argv(&acme(), &comment, None).unwrap_err().contains("needs a body"));
-        let zero = PrAction::Review { number: 0, verdict: PrReviewVerdict::Approve, body: String::new() };
+        let comment = PrAction::Review {
+            number: 3,
+            verdict: PrReviewVerdict::Comment,
+            body: " ".into(),
+        };
+        assert!(pr_action_argv(&acme(), &comment, None)
+            .unwrap_err()
+            .contains("needs a body"));
+        let zero = PrAction::Review {
+            number: 0,
+            verdict: PrReviewVerdict::Approve,
+            body: String::new(),
+        };
         assert!(pr_action_argv(&acme(), &zero, None).is_err());
         for head_oid in ["", "HEAD", &"g".repeat(40), &"a".repeat(39)] {
             let merge = PrAction::Merge {
@@ -2877,10 +2956,16 @@ mod tests {
                 delete_branch: false,
                 head_oid: head_oid.to_string(),
             };
-            assert!(pr_action_argv(&acme(), &merge, None).is_err(), "{head_oid:?}");
+            assert!(
+                pr_action_argv(&acme(), &merge, None).is_err(),
+                "{head_oid:?}"
+            );
         }
         // The issue messages kept their wording through the generalization.
-        assert_eq!(validate_issue_payload("", "", &[]).unwrap_err(), "Issue title must not be empty");
+        assert_eq!(
+            validate_issue_payload("", "", &[]).unwrap_err(),
+            "Issue title must not be empty"
+        );
         assert!(run_pr_action("/nonexistent", &["gh".into(), "issue".into()]).is_err());
     }
 
@@ -2891,10 +2976,24 @@ mod tests {
             r#"{"kind":"merge","number":4,"method":"rebase","delete_branch":false,"head_oid":"abc"}"#,
         )
         .unwrap();
-        assert!(matches!(merge, PrAction::Merge { method: PrMergeMethod::Rebase, .. }));
-        let review: PrAction =
-            serde_json::from_str(r#"{"kind":"review","number":4,"verdict":"request_changes","body":"x"}"#).unwrap();
-        assert!(matches!(review, PrAction::Review { verdict: PrReviewVerdict::RequestChanges, .. }));
+        assert!(matches!(
+            merge,
+            PrAction::Merge {
+                method: PrMergeMethod::Rebase,
+                ..
+            }
+        ));
+        let review: PrAction = serde_json::from_str(
+            r#"{"kind":"review","number":4,"verdict":"request_changes","body":"x"}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            review,
+            PrAction::Review {
+                verdict: PrReviewVerdict::RequestChanges,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -2910,11 +3009,18 @@ mod tests {
         let detail = parse_pr_view(json.to_string().as_bytes()).unwrap();
         assert_eq!(detail.author, "ada");
         assert_eq!(detail.head_oid, "b".repeat(40));
-        assert_eq!((detail.additions, detail.deletions, detail.changed_files), (3, 1, 2));
+        assert_eq!(
+            (detail.additions, detail.deletions, detail.changed_files),
+            (3, 1, 2)
+        );
         assert_eq!(detail.merge_state, "CLEAN");
         assert_eq!(detail.review_decision, "");
         assert!(detail.body_truncated);
-        assert_eq!(detail.body.len(), PR_BODY_DISPLAY_BYTES - 1, "cut before the 2-byte é");
+        assert_eq!(
+            detail.body.len(),
+            PR_BODY_DISPLAY_BYTES - 1,
+            "cut before the 2-byte é"
+        );
         assert!(parse_pr_view(b"not json").is_err());
     }
 

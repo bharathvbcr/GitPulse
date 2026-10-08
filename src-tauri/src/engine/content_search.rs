@@ -8,7 +8,9 @@
 //! the caller stops the child the same way and is reported as `cancelled`,
 //! never as "no more matches".
 
-use crate::engine::git_cli::{self, validate_repo, BoundedRun, Incomplete, OutputStream, ProcessObserver};
+use crate::engine::git_cli::{
+    self, validate_repo, BoundedRun, Incomplete, OutputStream, ProcessObserver,
+};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::time::Duration;
@@ -106,7 +108,9 @@ fn validate_pattern(pattern: &str) -> Result<(), String> {
         return Err("Enter something to search for".into());
     }
     if pattern.len() > MAX_PATTERN_BYTES {
-        return Err(format!("The search pattern exceeds {MAX_PATTERN_BYTES} bytes"));
+        return Err(format!(
+            "The search pattern exceeds {MAX_PATTERN_BYTES} bytes"
+        ));
     }
     if pattern.chars().any(|c| c == '\0' || c == '\n' || c == '\r') {
         return Err("The search pattern must be a single line".into());
@@ -117,7 +121,11 @@ fn validate_pattern(pattern: &str) -> Result<(), String> {
 /// The `git grep` argv after `git`. `-e` always introduces the pattern, so a
 /// pattern beginning with `-` is a pattern, never an option; `--` closes the
 /// options before the (absent) pathspec.
-fn grep_args<'a>(pattern: &'a str, options: &ContentSearchOptions, revision: Option<&'a str>) -> Vec<&'a str> {
+fn grep_args<'a>(
+    pattern: &'a str,
+    options: &ContentSearchOptions,
+    revision: Option<&'a str>,
+) -> Vec<&'a str> {
     let mut args = vec![
         "-c",
         "core.quotepath=off",
@@ -153,10 +161,18 @@ fn parse_grep_z(stdout: &[u8], revision: Option<&str>, limit: usize) -> Vec<Cont
     let mut matches = Vec::new();
     let mut rest = stdout;
     while matches.len() < limit {
-        let Some((path, after_path)) = split_at_byte(rest, 0) else { break };
-        let Some((line, after_line)) = split_at_byte(after_path, 0) else { break };
-        let Some((column, after_column)) = split_at_byte(after_line, 0) else { break };
-        let Some((text, after_text)) = split_at_byte(after_column, b'\n') else { break };
+        let Some((path, after_path)) = split_at_byte(rest, 0) else {
+            break;
+        };
+        let Some((line, after_line)) = split_at_byte(after_path, 0) else {
+            break;
+        };
+        let Some((column, after_column)) = split_at_byte(after_line, 0) else {
+            break;
+        };
+        let Some((text, after_text)) = split_at_byte(after_column, b'\n') else {
+            break;
+        };
         rest = after_text;
         let mut path = String::from_utf8_lossy(path).into_owned();
         if let Some(prefix) = &prefix {
@@ -165,7 +181,9 @@ fn parse_grep_z(stdout: &[u8], revision: Option<&str>, limit: usize) -> Vec<Cont
                 None => continue,
             }
         }
-        let (Some(line), Some(column)) = (parse_u64(line), parse_u64(column)) else { continue };
+        let (Some(line), Some(column)) = (parse_u64(line), parse_u64(column)) else {
+            continue;
+        };
         let text = String::from_utf8_lossy(text);
         let text_clipped = text.chars().count() > MAX_LINE_CHARS;
         let text = if text_clipped {
@@ -221,7 +239,12 @@ pub fn search(
         .max_matches
         .unwrap_or(DEFAULT_MAX_MATCHES)
         .clamp(1, MAX_MATCHES_CEILING);
-    let revision = match options.revision.as_deref().map(str::trim).filter(|r| !r.is_empty()) {
+    let revision = match options
+        .revision
+        .as_deref()
+        .map(str::trim)
+        .filter(|r| !r.is_empty())
+    {
         Some(revision) => Some(peel_commit(&repo, revision)?),
         None => None,
     };
@@ -233,7 +256,13 @@ pub fn search(
         user_cancel: cancelled,
         user_cancelled: false,
     };
-    let run = match git_cli::git_observed(&repo, &args, SEARCH_TIMEOUT, MAX_SEARCH_OUTPUT_BYTES, &mut observer) {
+    let run = match git_cli::git_observed(
+        &repo,
+        &args,
+        SEARCH_TIMEOUT,
+        MAX_SEARCH_OUTPUT_BYTES,
+        &mut observer,
+    ) {
         Ok(run) => run,
         // Cancelled while still queued at the spawn gate: nothing was
         // searched, which is a cancelled answer, not a failed one.
@@ -248,7 +277,8 @@ pub fn search(
         }
         Err(error) => return Err(error),
     };
-    let user_cancelled = observer.user_cancelled || (run.cancelled && !observer.over_limit && cancelled());
+    let user_cancelled =
+        observer.user_cancelled || (run.cancelled && !observer.over_limit && cancelled());
     report_from_run(run, revision, limit, observer.over_limit, user_cancelled)
 }
 
@@ -308,9 +338,15 @@ mod tests {
         let out = b"a b.txt\x001\x003\x00let needle = 1;\nweird\nname\x0012\x001\x00needle\n";
         let matches = parse_grep_z(out, None, 10);
         assert_eq!(matches.len(), 2);
-        assert_eq!((matches[0].path.as_str(), matches[0].line, matches[0].column), ("a b.txt", 1, 3));
+        assert_eq!(
+            (matches[0].path.as_str(), matches[0].line, matches[0].column),
+            ("a b.txt", 1, 3)
+        );
         assert_eq!(matches[0].text, "let needle = 1;");
-        assert_eq!(matches[1].path, "weird\nname", "a NUL-framed path may hold a newline");
+        assert_eq!(
+            matches[1].path, "weird\nname",
+            "a NUL-framed path may hold a newline"
+        );
 
         let oid = "f".repeat(40);
         let rev = format!("{oid}:src/x.rs\x007\x002\x00 needle\n");
@@ -323,7 +359,11 @@ mod tests {
         let long = "x".repeat(MAX_LINE_CHARS + 10);
         let out = format!("f\x001\x001\x00{long}\nf\x002\x001\x00half a rec");
         let matches = parse_grep_z(out.as_bytes(), None, 10);
-        assert_eq!(matches.len(), 1, "the record without its newline is a prefix");
+        assert_eq!(
+            matches.len(),
+            1,
+            "the record without its newline is a prefix"
+        );
         assert!(matches[0].text_clipped);
         assert_eq!(matches[0].text.chars().count(), MAX_LINE_CHARS);
         assert_eq!(parse_grep_z(out.as_bytes(), None, 0).len(), 0);
@@ -336,7 +376,11 @@ mod tests {
         assert_eq!(args[at + 1], "-rf /");
         assert!(args.contains(&"--untracked") && args.contains(&"-E"));
         assert_eq!(args.last(), Some(&"--"));
-        let fixed = ContentSearchOptions { fixed_strings: true, ignore_case: true, ..Default::default() };
+        let fixed = ContentSearchOptions {
+            fixed_strings: true,
+            ignore_case: true,
+            ..Default::default()
+        };
         let args = grep_args("x", &fixed, Some("abc"));
         assert!(args.contains(&"-F") && args.contains(&"-i") && !args.contains(&"--untracked"));
         assert_eq!(&args[args.len() - 2..], ["abc", "--"]);

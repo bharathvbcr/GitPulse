@@ -359,10 +359,18 @@ impl GitWriter {
         let untracked = Self::untracked_count(&repo, &spec)?;
         let mut plan: Vec<Vec<String>> = Vec::new();
         if tracked > 0 {
-            plan.push(["git", "rm", "-r", "-q", "--", spec.as_str()].map(String::from).to_vec());
+            plan.push(
+                ["git", "rm", "-r", "-q", "--", spec.as_str()]
+                    .map(String::from)
+                    .to_vec(),
+            );
         }
         if untracked > 0 {
-            plan.push(["git", "clean", "-f", "-d", "-q", "--", spec.as_str()].map(String::from).to_vec());
+            plan.push(
+                ["git", "clean", "-f", "-d", "-q", "--", spec.as_str()]
+                    .map(String::from)
+                    .to_vec(),
+            );
         }
         if plan.is_empty() {
             return Err(format!(
@@ -400,7 +408,14 @@ impl GitWriter {
     fn untracked_count(repo: &Path, spec: &str) -> Result<usize, String> {
         let listed = git_text(
             repo,
-            &["ls-files", "-z", "--others", "--exclude-standard", "--", spec],
+            &[
+                "ls-files",
+                "-z",
+                "--others",
+                "--exclude-standard",
+                "--",
+                spec,
+            ],
         )?;
         Ok(listed.split('\0').filter(|entry| !entry.is_empty()).count())
     }

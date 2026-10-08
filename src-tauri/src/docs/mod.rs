@@ -791,7 +791,8 @@ mod tests {
     fn rename_rewrites_links_and_protects_fenced_samples() {
         let dir = fixture_repo();
         let path = dir.path().to_str().unwrap();
-        let outcome = rename_doc(path, "docs/Roadmap.md", "docs/Plan.md", |_| Ok(())).expect("rename");
+        let outcome =
+            rename_doc(path, "docs/Roadmap.md", "docs/Plan.md", |_| Ok(())).expect("rename");
         assert_eq!(outcome.from, "docs/Roadmap.md");
         assert_eq!(outcome.to, "docs/Plan.md");
         assert!(outcome.links_rewritten >= 1, "{outcome:?}");

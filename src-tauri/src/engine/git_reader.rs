@@ -1652,7 +1652,13 @@ impl GitReader {
         // Every other ref keeps its commits alive; the moving branch itself
         // must not, or nothing would ever count as left behind.
         let exclude = branch.as_ref().map(|name| format!("--exclude={name}"));
-        let mut unreachable_args = vec!["rev-list", "--count", head.as_str(), not_target.as_str(), "--not"];
+        let mut unreachable_args = vec![
+            "rev-list",
+            "--count",
+            head.as_str(),
+            not_target.as_str(),
+            "--not",
+        ];
         if let Some(exclude) = &exclude {
             unreachable_args.push(exclude);
         }
@@ -3926,7 +3932,8 @@ fn blame_at_revision(
     let oid = git_text(repo, &["rev-parse", "--verify", "--quiet", spec.as_str()])
         .map_err(|_| format!("Blame unavailable: '{revision}' does not name a commit"))?;
     let oid = oid.trim();
-    validate_oid(oid).map_err(|_| format!("Blame unavailable: '{revision}' does not name a commit"))?;
+    validate_oid(oid)
+        .map_err(|_| format!("Blame unavailable: '{revision}' does not name a commit"))?;
     // Same literal-path note as the working-tree form: `git blame` takes a
     // path, not a pathspec, and rejects `:(literal)` magic.
     let (stdout, incomplete) = git_text_capped(
@@ -6470,7 +6477,10 @@ mod tests {
         );
         let lines = parse_blame_porcelain(&format!("{with_previous}{}", blame_block(&a, "root")));
         assert_eq!(lines[0].previous_commit.as_deref(), Some(p.as_str()));
-        assert_eq!(lines[0].previous_path.as_deref(), Some("dir/spéc \"x\".txt"));
+        assert_eq!(
+            lines[0].previous_path.as_deref(),
+            Some("dir/spéc \"x\".txt")
+        );
         assert_eq!(lines[1].previous_commit, None);
         assert_eq!(lines[1].previous_path, None);
 
@@ -6482,7 +6492,10 @@ mod tests {
         assert_eq!(parse_blame_porcelain(&bad)[0].previous_commit, None);
         assert_eq!(unquote_c_style("\"bad\\q\""), None);
         assert_eq!(unquote_c_style("\"trailing\\\""), None);
-        assert_eq!(unquote_c_style("\"tab\\there\"").as_deref(), Some("tab\there"));
+        assert_eq!(
+            unquote_c_style("\"tab\\there\"").as_deref(),
+            Some("tab\there")
+        );
     }
 
     #[test]
