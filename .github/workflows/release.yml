@@ -187,9 +187,17 @@ jobs:
           # Pinned to 22.04 deliberately, NOT ubuntu-latest: the glibc and
           # webkit2gtk of the build host become the floor for the .deb and
           # AppImage. Building on 24.04 would silently drop older distros.
+          # The aarch64 leg keeps the same floor on GitHub's native ARM image.
           - platform: 'ubuntu-22.04'
             args: ''
+          - platform: 'ubuntu-22.04-arm'
+            args: ''
           - platform: 'windows-latest'
+            args: ''
+          # Native arm64 runner, not a cross build: libsqlite3-sys's bundled
+          # C build does not cross-compile to MSVC from another host. The
+          # ci.yml arm-bundle job proves both ARM legs on demand.
+          - platform: 'windows-11-arm'
             args: ''
 
     runs-on: ${{ matrix.platform }}
@@ -205,7 +213,7 @@ jobs:
           fetch-tags: true
 
       - name: Install System Dependencies (Linux)
-        if: matrix.platform == 'ubuntu-22.04'
+        if: startsWith(matrix.platform, 'ubuntu-')
         run: |
           sudo apt-get update
           sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev build-essential curl wget file libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev pkg-config
@@ -273,9 +281,80 @@ jobs:
           retryAttempts: 3
           args: ${{ matrix.args }}
 
+  # Every installer is on the draft. Add the SHA-256 manifest and the two
+  # SBOMs, checked against GitHub's own asset digests, before finalize demands
+  # the complete set. release-state.mjs attest replaces its own earlier
+  # uploads on a rerun and never touches an installer.
+  attest:
+    name: Checksums & SBOMs
+    needs: [preflight, prepare, release]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write
+    env:
+      GH_REPO: ${{ github.repository }}
+      RELEASE_COMMIT: ${{ needs.preflight.outputs.commit }}
+      RELEASE_ID: ${{ needs.prepare.outputs.release_id }}
+    steps:
+      - name: Checkout Release Tag
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.preflight.outputs.commit }}
+          fetch-tags: true
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+
+      - name: Setup Rust Toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install cargo-cyclonedx
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-cyclonedx
+
+      # Syft reads installed node_modules only with the installed-package
+      # cataloger; bun.lock alone yields the direct dependencies and misses
+      # the bundled runtime. Scripts are not needed to describe packages.
+      - name: Install Frontend Dependencies
+        run: bun install --frozen-lockfile --ignore-scripts
+
+      - name: SPDX SBOM Of The Build Tree
+        uses: anchore/sbom-action@v0
+        env:
+          SYFT_SELECT_CATALOGERS: +javascript-package-cataloger
+        with:
+          path: .
+          format: spdx-json
+          output-file: ${{ runner.temp }}/sbom.spdx.json
+          upload-artifact: false
+          upload-release-assets: false
+
+      # --target all: one SBOM for every platform the matrix ships. The diff
+      # check refuses an SBOM of a lockfile cargo rewrote.
+      - name: CycloneDX SBOM Of The Rust Graph
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo cyclonedx --manifest-path src-tauri/Cargo.toml --format json --spec-version 1.5 --target all --override-filename gitpulse.cargo.cdx
+          git diff --exit-code -- src-tauri/Cargo.lock
+          mv src-tauri/gitpulse.cargo.cdx.json "$RUNNER_TEMP/sbom.cargo.cdx.json"
+
+      - name: Upload Checksums And SBOMs To The Draft
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_SBOM_SPDX: ${{ runner.temp }}/sbom.spdx.json
+          RELEASE_SBOM_CARGO: ${{ runner.temp }}/sbom.cargo.cdx.json
+        run: node scripts/release-state.mjs attest
+
   verify:
     name: Verify Release Completeness
-    needs: [preflight, prepare, release]
+    needs: [preflight, prepare, release, attest]
     # Runs even when a platform leg failed — that is precisely the case this
     # job exists to report. Without it, `fail-fast: false` produces a draft
     # release that looks finished while silently missing a platform.
@@ -295,8 +374,13 @@ jobs:
         run: |
           set -euo pipefail
           echo "release job aggregate result: ${{ needs.release.result }}"
+          echo "attest job result: ${{ needs.attest.result }}"
           if [ "${{ needs.release.result }}" != "success" ]; then
             echo "::error::At least one platform failed to build or upload. The draft release for $RELEASE_TAG is INCOMPLETE — do not publish it."
+            exit 1
+          fi
+          if [ "${{ needs.attest.result }}" != "success" ]; then
+            echo "::error::Checksums or SBOMs were not attached. The draft release for $RELEASE_TAG is INCOMPLETE — do not publish it."
             exit 1
           fi
 
@@ -322,6 +406,6 @@ jobs:
           {
             echo "### Release $RELEASE_TAG — draft verified"
             echo
-            echo "All seven installers have uploaded SHA-256 metadata; the tag, commit, draft ID, and changelog notes agree."
+            echo "All twelve installers, both SBOMs and the SHA-256 manifest have uploaded with matching SHA-256 metadata; the tag, commit, draft ID, and changelog notes agree."
             echo "The release remains a **draft** for manual publication."
           } >> "$GITHUB_STEP_SUMMARY"

@@ -1,11 +1,12 @@
 #!/usr/bin/env node
 /** One owner for remote release identity, CI provenance, and draft finalization. */
 import { spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { appendFileSync, readFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { parseTag } from "./check-release-version.mjs";
-import { inspectReleaseAssets } from "./check-release-assets.mjs";
+import { expectedInstallerNames, inspectReleaseAssets, supplementNames } from "./check-release-assets.mjs";
 import { extractNotes } from "./release-notes.mjs";
 import { formatUsage, wantsHelp } from "./usage.mjs";
 
@@ -26,23 +27,48 @@ function record(value) {
 }
 
 /**
- * @param {{stage: string, repo: string, tag: string, commit: string, releaseId?: string, notes?: string}} options
+ * `sboms` carries the two SBOM documents the attest stage uploads, as text.
+ *
+ * @param {{stage: string, repo: string, tag: string, commit: string, releaseId?: string, notes?: string, sboms?: {spdx: string, cargo: string}}} options
  * @param {Runner} [run]
  */
 export function runReleaseStage(options, run = runCommand) {
-  const { stage, repo, tag, commit, releaseId, notes } = options;
-  if (!["prepare", "check", "finalize", "ready"].includes(stage)) throw new Error("Expected prepare, check, finalize, or ready");
+  const { stage, repo, tag, commit, releaseId, notes, sboms } = options;
+  if (!["prepare", "check", "attest", "finalize", "ready"].includes(stage)) throw new Error("Expected prepare, check, attest, finalize, or ready");
   if (!/^[A-Za-z0-9][A-Za-z0-9-]*\/[A-Za-z0-9_][A-Za-z0-9_.-]*$/.test(repo)) throw new Error("Invalid repository");
   const parsed = parseTag(tag);
   if (!parsed.ok) throw new Error(parsed.reason);
   if (!/^[a-f0-9]{40}$/.test(commit)) throw new Error("Expected the full preflight commit SHA");
   if (stage !== "prepare" && stage !== "ready" && !/^[1-9]\d*$/.test(releaseId ?? "")) throw new Error("Expected the prepared release ID");
   if (stage === "finalize" && (!notes || Buffer.byteLength(notes) > 125_000)) throw new Error("Missing or oversized release notes");
+  if (stage === "attest" && ![sboms?.spdx, sboms?.cargo].every(text => typeof text === "string" && text.length > 0 && Buffer.byteLength(text) <= 32 * 1024 * 1024)) {
+    throw new Error("Missing, empty or oversized SBOM");
+  }
   const base = `repos/${repo}`;
   /** @param {string} endpoint @param {string} [method] @param {Record<string, unknown>} [body] @param {boolean} [allowMissing] */
   function api(endpoint, method = "GET", body, allowMissing = false) {
     const result = run("gh", ["api", "--include", "--method", method, `${base}/${endpoint}`,
       ...(body ? ["--input", "-"] : [])], body ? JSON.stringify(body) : undefined);
+    return response(result, method, endpoint, allowMissing);
+  }
+  /**
+   * Uploads one asset through the draft's own `upload_url`, which must name
+   * this repository's prepared release on GitHub's upload host.
+   * @param {Record<string, unknown>} release @param {string} name @param {string} content @param {string} contentType
+   */
+  function upload(release, name, content, contentType) {
+    const template = typeof release.upload_url === "string" ? release.upload_url : "";
+    const prefix = `https://uploads.github.com/${base}/releases/${releaseId}/assets`;
+    if (template !== `${prefix}{?name,label}`) throw new Error("Draft upload URL is missing or names another release");
+    const result = run("gh", ["api", "--include", "--method", "POST", `${prefix}?name=${encodeURIComponent(name)}`,
+      "-H", `Content-Type: ${contentType}`, "--input", "-"], content);
+    return record(response(result, "POST", `upload ${name}`, false));
+  }
+  /**
+   * @param {{status: number | null, stdout: string, failed: boolean}} result
+   * @param {string} method @param {string} endpoint @param {boolean} allowMissing
+   */
+  function response(result, method, endpoint, allowMissing) {
     const statusLine = /^HTTP\/[\d.]+ (\d{3})\b/.exec(result.stdout ?? "");
     if (result.failed || !statusLine) throw new Error(`GitHub ${method} ${endpoint}: incomplete response`);
     const status = Number(statusLine[1]);
@@ -145,6 +171,13 @@ export function runReleaseStage(options, run = runCommand) {
   function assetSnapshot(release) {
     const inventory = inspectReleaseAssets({ tag, json: release });
     if (!inventory.ok) throw new Error(`Incomplete release assets: ${inventory.violations.join("; ")}`);
+    return JSON.stringify(assetDigests(release));
+  }
+  /**
+   * Every asset's id, name and GitHub-computed SHA-256, sorted by name.
+   * @param {Record<string, unknown>} release
+   */
+  function assetDigests(release) {
     if (!Array.isArray(release.assets)) throw new Error("Missing asset metadata");
     const assets = release.assets.map(asset => {
       const metadata = record(asset);
@@ -153,7 +186,7 @@ export function runReleaseStage(options, run = runCommand) {
       return {id: metadata.id, name: String(metadata.name), size: metadata.size, state: metadata.state, digest: metadata.digest.toLowerCase()};
     }).sort((a, b) => a.name.localeCompare(b.name));
     if (new Set(assets.map(asset => asset.id)).size !== assets.length) throw new Error("Duplicate release asset IDs");
-    return JSON.stringify(assets);
+    return assets;
   }
   /**
    * `/releases/tags/{tag}` only returns published releases. A draft created for
@@ -232,6 +265,48 @@ export function runReleaseStage(options, run = runCommand) {
     release = record(api(`releases/${releaseId}`));
   }
   release = checkDraft(release);
+  if (stage === "attest") {
+    const version = parsed.version;
+    const names = supplementNames(version);
+    const supplements = new Set(Object.values(names));
+    // A rerun of this stage finds its own earlier uploads. Replace those, and
+    // only those: an installer is never deleted here.
+    const leftovers = assetDigests(release).filter(asset => supplements.has(asset.name));
+    for (const asset of leftovers) api(`releases/assets/${asset.id}`, "DELETE");
+    if (leftovers.length > 0) release = checkDraft(record(api(`releases/${releaseId}`)));
+    const installers = assetDigests(release);
+    const wanted = expectedInstallerNames(version);
+    const present = installers.map(asset => asset.name);
+    const missing = wanted.filter(name => !present.includes(name));
+    const unexpected = present.filter(name => !wanted.includes(name));
+    if (missing.length > 0 || unexpected.length > 0) {
+      throw new Error(`Installer set is not exact (missing: ${missing.join(", ") || "none"}; unexpected: ${unexpected.join(", ") || "none"})`);
+    }
+    /** @param {string} text */
+    const sha256 = text => createHash("sha256").update(text, "utf8").digest("hex");
+    const local = new Map([[names.spdx, sha256(sboms?.spdx ?? "")], [names.cargo, sha256(sboms?.cargo ?? "")]]);
+    // GitHub's digest is computed over the stored bytes, which are exactly
+    // what a user downloads; the SBOM digests are checked against it below.
+    const sums = [...installers.map(asset => [asset.digest.slice("sha256:".length), asset.name]), ...[...local].map(([name, hash]) => [hash, name])]
+      .sort((a, b) => a[1].localeCompare(b[1]))
+      .map(([hash, name]) => `${hash}  ${name}\n`)
+      .join("");
+    local.set(names.checksums, sha256(sums));
+    upload(release, names.spdx, sboms?.spdx ?? "", "application/spdx+json");
+    upload(release, names.cargo, sboms?.cargo ?? "", "application/vnd.cyclonedx+json");
+    upload(release, names.checksums, sums, "text/plain");
+    const confirmed = checkDraft(record(api(`releases/${releaseId}`)));
+    // The full set, installers and supplements, must now be exact.
+    assetSnapshot(confirmed);
+    const uploaded = new Map(assetDigests(confirmed).map(asset => [asset.name, asset.digest]));
+    for (const asset of installers) {
+      if (uploaded.get(asset.name) !== asset.digest) throw new Error(`Installer ${asset.name} changed during attestation`);
+    }
+    for (const [name, hash] of local) {
+      if (uploaded.get(name) !== `sha256:${hash}`) throw new Error(`Uploaded ${name} does not match its local SHA-256`);
+    }
+    checkTag();
+  }
   if (stage === "finalize") {
     const assets = assetSnapshot(release);
     checkTag();
@@ -298,12 +373,12 @@ export function resolveReleaseContext(env = process.env, run = runCommand) {
 export function main(argv = process.argv.slice(2)) {
   if (wantsHelp(argv)) {
     console.log(formatUsage({name: "release-state", summary: "Verify remote release provenance and manage its draft lifecycle.",
-      flags: [{flag: "prepare|check|finalize|ready", description: "stage to run; uses GH_REPO, RELEASE_TAG, RELEASE_COMMIT and RELEASE_ID. ready checks CI without mutating the draft or requiring the tag to already point here"}],
+      flags: [{flag: "prepare|check|attest|finalize|ready", description: "stage to run; uses GH_REPO, RELEASE_TAG, RELEASE_COMMIT and RELEASE_ID. attest also reads the SBOM files named by RELEASE_SBOM_SPDX and RELEASE_SBOM_CARGO. ready checks CI without mutating the draft or requiring the tag to already point here"}],
       exits: "0 stage verified; 1 release refused or verification unavailable"}));
     return 0;
   }
   try {
-    if (argv.length !== 1) throw new Error("Usage: release-state.mjs prepare|check|finalize|ready (RELEASE_TAG, RELEASE_COMMIT, GH_REPO, RELEASE_ID)");
+    if (argv.length !== 1) throw new Error("Usage: release-state.mjs prepare|check|attest|finalize|ready (RELEASE_TAG, RELEASE_COMMIT, GH_REPO, RELEASE_ID)");
     const {repo, commit, tag} = resolveReleaseContext();
     let notes;
     if (argv[0] === "finalize") {
@@ -311,8 +386,15 @@ export function main(argv = process.argv.slice(2)) {
       if (!section.found) throw new Error("Changelog has no notes for release tag");
       notes = section.body;
     }
+    let sboms;
+    if (argv[0] === "attest") {
+      const spdx = process.env.RELEASE_SBOM_SPDX;
+      const cargo = process.env.RELEASE_SBOM_CARGO;
+      if (!spdx || !cargo) throw new Error("attest needs RELEASE_SBOM_SPDX and RELEASE_SBOM_CARGO");
+      sboms = {spdx: readFileSync(spdx, "utf8"), cargo: readFileSync(cargo, "utf8")};
+    }
     const result = runReleaseStage({stage: argv[0], repo, tag,
-      commit, releaseId: process.env.RELEASE_ID, notes});
+      commit, releaseId: process.env.RELEASE_ID, notes, sboms});
     if (process.env.GITHUB_OUTPUT && result.release_id) appendFileSync(process.env.GITHUB_OUTPUT, `release_id=${result.release_id}\n`);
     console.log(JSON.stringify(result));
     return 0;

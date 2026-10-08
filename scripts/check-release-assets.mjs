@@ -15,9 +15,14 @@ import { fileURLToPath } from "node:url";
 import { parseTag } from "./check-release-version.mjs";
 import { formatUsage, wantsHelp } from "./usage.mjs";
 
+const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+
 /**
- * These are the seven artifacts emitted by the current three-runner matrix:
- * macOS DMG and app archive, Linux RPM/AppImage/deb, and Windows MSI/NSIS.
+ * These are the twelve installers emitted by the current five-runner matrix:
+ * macOS universal DMG and app archive; Linux RPM/AppImage/deb on x86_64 and
+ * aarch64; and Windows MSI/NSIS on x64 and arm64. The ARM names are the Tauri
+ * bundler's own arch spellings (deb/NSIS/MSI `arm64`, RPM/AppImage
+ * `aarch64`), not a convention chosen here.
  *
  * The macOS updater archive carries the version like every other asset.
  * `tauri-action@v0` emitted it unversioned; v1 does not, and this manifest
@@ -25,19 +30,80 @@ import { formatUsage, wantsHelp } from "./usage.mjs";
  * for: the three build jobs were green and had uploaded a complete set, so
  * nothing else would have noticed the name change.
  *
+ * Keyed by the release.yml runner label that uploads each group.
+ *
+ * @type {Readonly<Record<string, (version: string) => string[]>>}
+ */
+export const PLATFORM_INSTALLERS = Object.freeze({
+  "macos-latest": (version) => [`GitPulse_${version}_universal.dmg`, `GitPulse_${version}_universal.app.tar.gz`],
+  "ubuntu-22.04": (version) => [
+    `GitPulse-${version}-1.x86_64.rpm`, `GitPulse_${version}_amd64.AppImage`, `GitPulse_${version}_amd64.deb`,
+  ],
+  "ubuntu-22.04-arm": (version) => [
+    `GitPulse-${version}-1.aarch64.rpm`, `GitPulse_${version}_aarch64.AppImage`, `GitPulse_${version}_arm64.deb`,
+  ],
+  "windows-latest": (version) => [`GitPulse_${version}_x64-setup.exe`, `GitPulse_${version}_x64_en-US.msi`],
+  "windows-11-arm": (version) => [`GitPulse_${version}_arm64-setup.exe`, `GitPulse_${version}_arm64_en-US.msi`],
+});
+
+/**
+ * @param {string} version
+ * @returns {string[]}
+ */
+export function expectedInstallerNames(version) {
+  return Object.values(PLATFORM_INSTALLERS).flatMap((names) => names(version)).sort();
+}
+
+/**
+ * Checks the installers one runner bundled locally (tauri-action's
+ * `artifactPaths`) against the names that runner must upload. tauri-action
+ * renames the macOS updater archive at upload time, so a local macOS bundle
+ * cannot be judged by its file name and is refused rather than passed.
+ *
+ * @param {{ platform: string, version: string, paths: unknown }} input
+ * @returns {{ ok: boolean, expected: string[], actual: string[], violations: string[] }}
+ */
+export function inspectBundles({ platform, version, paths }) {
+  const names = PLATFORM_INSTALLERS[platform];
+  if (!names) throw new Error(`unknown release platform ${JSON.stringify(platform)}`);
+  if (platform.startsWith("macos-")) throw new Error("macOS bundle names are rewritten at upload; only the release draft can check them");
+  if (!Array.isArray(paths) || paths.length === 0 || !paths.every((entry) => typeof entry === "string" && entry !== "")) {
+    throw new Error("artifact paths must be a non-empty array of strings");
+  }
+  const installer = /\.(?:rpm|deb|AppImage|msi|exe)$/;
+  const actual = paths.map((entry) => path.basename(entry.replace(/\\/g, "/"))).filter((name) => installer.test(name)).sort();
+  const expected = names(version).sort();
+  const violations = [
+    ...expected.filter((name) => !actual.includes(name)).map((name) => `missing: ${name}`),
+    ...actual.filter((name) => !expected.includes(name)).map((name) => `unexpected: ${name}`),
+  ];
+  if (new Set(actual).size !== actual.length) violations.push("duplicate installer name");
+  return { ok: violations.length === 0, expected, actual, violations };
+}
+
+/**
+ * Files the attest stage of release.yml adds once every installer is on the
+ * draft: the SHA-256 manifest of every other asset, an SPDX SBOM of the whole
+ * build tree (Cargo, npm, Go, Actions) and a CycloneDX SBOM of the Rust graph.
+ *
+ * @param {string} version
+ */
+export function supplementNames(version) {
+  return {
+    checksums: `GitPulse_${version}_SHA256SUMS.txt`,
+    spdx: `GitPulse_${version}_sbom.spdx.json`,
+    cargo: `GitPulse_${version}_sbom.cargo.cdx.json`,
+  };
+}
+
+/**
+ * The complete published set: every installer plus every supplement.
+ *
  * @param {string} version
  * @returns {string[]}
  */
 export function expectedAssetNames(version) {
-  return [
-    `GitPulse-${version}-1.x86_64.rpm`,
-    `GitPulse_${version}_amd64.AppImage`,
-    `GitPulse_${version}_amd64.deb`,
-    `GitPulse_${version}_universal.dmg`,
-    `GitPulse_${version}_x64-setup.exe`,
-    `GitPulse_${version}_x64_en-US.msi`,
-    `GitPulse_${version}_universal.app.tar.gz`,
-  ].sort();
+  return [...expectedInstallerNames(version), ...Object.values(supplementNames(version))].sort();
 }
 
 /** @param {unknown} error */
@@ -167,16 +233,23 @@ export function inspectReleaseAssets({ tag, json }) {
 
 /** @param {string[]} argv */
 function parseArgs(argv) {
-  /** @type {{ tag: string | null, jsonPath: string | null }} */
-  const options = { tag: null, jsonPath: null };
+  /** @type {{ tag: string | null, jsonPath: string | null, bundles: string | null, platform: string | null }} */
+  const options = { tag: null, jsonPath: null, bundles: null, platform: null };
   for (let index = 0; index < argv.length; index += 1) {
     const flag = argv[index];
     const value = argv[index + 1];
     if (value === undefined || value.startsWith("--")) throw new Error(`${flag} requires a value`);
     if (flag === "--tag") options.tag = value;
     else if (flag === "--json") options.jsonPath = path.resolve(value);
+    else if (flag === "--bundles") options.bundles = value;
+    else if (flag === "--platform") options.platform = value;
     else throw new Error(`unknown option ${flag}`);
     index += 1;
+  }
+  if (options.bundles !== null || options.platform !== null) {
+    if (!options.bundles || !options.platform) throw new Error("--bundles and --platform are required together");
+    if (options.tag || options.jsonPath) throw new Error("--bundles cannot be combined with --tag or --json");
+    return options;
   }
   if (!options.tag) throw new Error("--tag is required");
   if (!options.jsonPath) throw new Error("--json is required");
@@ -193,6 +266,7 @@ export function usage() {
     flags: [
       { flag: "--tag <tag>".replace(/^"|"$/g, ""), description: "release tag being verified" },
       { flag: "--json <path>".replace(/^"|"$/g, ""), description: "path to the release JSON from the GitHub API" },
+      { flag: "--bundles <json> --platform <label>", description: "instead: check one runner's tauri-action artifactPaths against the installers it must upload, at the src-tauri/tauri.conf.json version" },
       { flag: "--help, -h".replace(/^"|"$/g, ""), description: "print this message and exit 0" }
     ],
     exits: "0 every expected asset is present · 1 one is missing · 2 the check could not run",
@@ -206,6 +280,18 @@ export function main(argv = process.argv.slice(2)) {
   }
   try {
     const options = parseArgs(argv);
+    if (options.bundles && options.platform) {
+      const config = JSON.parse(readFileSync(path.join(REPO_ROOT, "src-tauri", "tauri.conf.json"), "utf8"));
+      if (typeof config.version !== "string" || !config.version) throw new Error("tauri.conf.json has no version");
+      const result = inspectBundles({ platform: options.platform, version: config.version, paths: JSON.parse(options.bundles) });
+      for (const name of result.actual) console.log(`  ${name}`);
+      if (!result.ok) {
+        for (const violation of result.violations) console.error(`FAIL: ${options.platform} bundle ${violation}`);
+        return 1;
+      }
+      console.log(`OK: ${options.platform} bundled exactly the installers release.yml uploads`);
+      return 0;
+    }
     const tag = options.tag;
     const jsonPath = options.jsonPath;
     if (!tag || !jsonPath) throw new Error("--tag and --json are required");

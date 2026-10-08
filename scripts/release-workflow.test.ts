@@ -96,3 +96,24 @@ it("fails the release when any platform leg fails rather than publishing a parti
   expect(verify).toContain("needs.release.result");
   expect(verify).toContain("do not publish it");
 });
+
+it("builds Linux aarch64 and Windows arm64 on native runners with the Linux dependencies installed", () => {
+  const release = workflow.slice(workflow.indexOf("\n  release:"), workflow.indexOf("\n  attest:"));
+  for (const platform of ["macos-latest", "ubuntu-22.04", "ubuntu-22.04-arm", "windows-latest", "windows-11-arm"]) {
+    expect(release).toContain(`- platform: '${platform}'`);
+  }
+  expect(release).toContain("if: startsWith(matrix.platform, 'ubuntu-')");
+});
+
+it("attaches checksums and SBOMs after every installer and before finalize", () => {
+  const attest = workflow.slice(workflow.indexOf("\n  attest:"), workflow.indexOf("\n  verify:"));
+  expect(attest).toContain("needs: [preflight, prepare, release]");
+  expect(attest).toContain("ref: ${{ needs.preflight.outputs.commit }}");
+  expect(attest).toContain("uses: anchore/sbom-action@v0");
+  expect(attest).toContain("upload-release-assets: false");
+  expect(attest).toContain("cargo cyclonedx --manifest-path src-tauri/Cargo.toml");
+  expect(attest).toContain("run: node scripts/release-state.mjs attest");
+  const verify = workflow.slice(workflow.indexOf("\n  verify:"));
+  expect(verify).toContain("needs: [preflight, prepare, release, attest]");
+  expect(verify).toContain('if [ "${{ needs.attest.result }}" != "success" ]; then');
+});
