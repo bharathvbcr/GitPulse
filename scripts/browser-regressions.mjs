@@ -11,6 +11,23 @@ import { createServer } from "vite";
 const run = promisify(execFile);
 export const BROWSER_HARNESSES = Object.freeze(["diagnostics", "conflicts", "uncommitted", "coverage", "health", "blame", "branches", "hygiene", "palette", "status", "tasks", "task-materials", "task-runs", "onboarding", "firebase", "delivery", "terminal", "impact", "secrets", "markdown", "repo-tabs", "agents"]);
 
+/**
+ * How long one page may take, from server start to verdict.
+ *
+ * The cap is a hang detector, not a speed target. Every page fits a minute
+ * except `tasks`, which drives the whole board — each editor, sheet, view and
+ * route guard — through real waits, and already used ~56 of its 60 seconds on
+ * an idle host. A page that is long by design gets its own number here; the
+ * rest keep the minute, so a hang anywhere else is still caught as fast.
+ */
+export const DEFAULT_DEADLINE_SECONDS = 60;
+export const HARNESS_DEADLINE_SECONDS = Object.freeze(/** @type {Record<string, number>} */ ({ tasks: 150 }));
+
+/** @param {string} harness */
+export function harnessDeadlineSeconds(harness) {
+  return HARNESS_DEADLINE_SECONDS[harness] ?? DEFAULT_DEADLINE_SECONDS;
+}
+
 /** A missing/partial verdict is a failure, even when Chrome exits normally.
  * @param {string} html
  */
@@ -83,6 +100,7 @@ function undoLive() {
 
 /** @param {string} harness @param {boolean} webkit */
 async function runHarness(harness, webkit) {
+  const seconds = harnessDeadlineSeconds(harness);
   const profile = await mkdtemp(path.join(tmpdir(), "gitpulse-browser-"));
   const undo = () => {
     if (browser && browser.exitCode === null && browser.signalCode === null) browser.kill("SIGKILL");
@@ -101,7 +119,7 @@ async function runHarness(harness, webkit) {
   /** @type {import('vite').Plugin} */
   const receiver = { name: "gitpulse-browser-verdict" };
   const completed = new Promise((resolve, reject) => {
-    deadline = setTimeout(() => reject(new Error(`Browser did not finish within 60 seconds (${requests} HTTP requests; last: ${lastRequest})`)), 60_000);
+    deadline = setTimeout(() => reject(new Error(`Browser did not finish within ${seconds} seconds (${requests} HTTP requests; last: ${lastRequest})`)), seconds * 1000);
     receiver.configureServer = (server) => {
       server.middlewares.use((request, _response, next) => { requests++; lastRequest = request.url ?? "unknown"; next(); });
       server.middlewares.use(reportPath, (request, response) => {
@@ -141,9 +159,9 @@ async function runHarness(harness, webkit) {
     console.log(version.stdout.trim());
     const url = `http://127.0.0.1:${address.port}/harness/${harness}.html?check=1&report=${reportPath}`;
     if (webkit) {
-      // The Swift runner ends itself at its own 65-second deadline.
-      browser = execFile("xcrun", ["swift", fileURLToPath(new URL("./webkit-regressions.swift", import.meta.url)), url],
-        { timeout: 65_000, maxBuffer: 1024 * 1024, killSignal: "SIGKILL" });
+      // The Swift runner ends itself five seconds after this page's deadline.
+      browser = execFile("xcrun", ["swift", fileURLToPath(new URL("./webkit-regressions.swift", import.meta.url)), url, String(seconds + 5)],
+        { timeout: (seconds + 5) * 1000, maxBuffer: 1024 * 1024, killSignal: "SIGKILL" });
     } else {
       const launch = chromeLaunch(chrome, profile, url);
       browser = spawn(launch.file, launch.args, { stdio: launch.stdio });
