@@ -8,7 +8,14 @@
    * An inline arrow is a new function on every render, which misses the cache
    * below and remounts the view on every parent update.
    */
-  export type ViewLoader = () => Promise<{ default: Component }>;
+  /*
+   * Props are erased at this seam, as in LazyMount: a concrete prop type would
+   * have to fit every deferred view, and the strict version rejected the first
+   * views with required props (Code and History). App.test.ts checks that each
+   * loader is handed its props in the template.
+   */
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  export type ViewLoader = () => Promise<{ default: Component<any> }>;
 
   /**
    * Views already fetched, keyed by loader.

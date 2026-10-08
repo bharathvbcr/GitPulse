@@ -9,6 +9,7 @@ import {
   jitteredRetryDelayMs,
 } from "../async/deferral";
 import { whenDocumentShown } from "../runtime/foreground";
+import { activity, observeSettled } from "../diagnostics/activity";
 
 /**
  * The one IPC entry point the frontend uses.
@@ -123,8 +124,9 @@ export function withDeferralRetry(raw: Raw, options: DeferralRetryOptions = {}) 
   //
   // Not an `async` function: each extra `await` layer delays every answer by
   // microtasks, and callers that publish an answer to a store and are read in
-  // the same turn saw the delay. A call that cannot be retried is the raw
-  // promise itself; one that can adds a single `.catch`.
+  // the same turn saw the delay. A call that cannot be retried adds nothing
+  // here; one that can adds a single `.catch`. The exported `invoke` sits one
+  // microtask above `tauriInvoke`, for the stall-attribution note below.
   return function invoke<T>(cmd: string, ...rest: Rest): Promise<T> {
     // A call carrying options (request headers, for raw-body commands) is
     // treated like one with non-plain arguments: neither retried nor joined.
@@ -145,4 +147,7 @@ export function withDeferralRetry(raw: Raw, options: DeferralRetryOptions = {}) 
   };
 }
 
-export const invoke = withDeferralRetry(tauriInvoke);
+// Each answer is noted for UI stall attribution (diagnostics/activity.ts).
+export const invoke = withDeferralRetry(
+  observeSettled(tauriInvoke, (cmd) => activity.noteCommandSettled(cmd)),
+);

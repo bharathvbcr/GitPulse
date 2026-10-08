@@ -6,10 +6,20 @@ view, and action with the report; they help correlate UI observations with
 native commands.
 
 - `performance:ui`: the visible, focused UI timer ran at least 250 ms late.
-  The report records delayed samples and maximum lateness. It does not
-  identify the cause or measure FPS. Hidden and unfocused windows are not
-  sampled; unreported samples are dropped when leaving the foreground. Very
-  long gaps are labelled as potentially including system sleep or suspension.
+  The report records delayed samples, maximum lateness, the attribution of the
+  worst sample (`worst: cause=… view=… commands=[…] watcher_events=…`) and a
+  tally of causes (`causes: …`). A cause is `command:<name>` when IPC answers
+  were handled during the late interval, `watcher-burst` when `repo-changed`
+  events were at least as many, and otherwise `view:<surface/tab>`. It is
+  what the UI thread handled inside the late interval
+  (`src/lib/diagnostics/activity.ts`), a correlation and not a profile; it
+  carries command and view names only, never arguments, paths or results. A
+  `(activity log wrapped …)` note means the 256-event log overflowed inside
+  the interval and the counts are lower bounds. It does not measure FPS, and
+  it does not see the native AppKit main thread, which is a separate process
+  from the web view. Hidden and unfocused windows are not sampled; unreported
+  samples are dropped when leaving the foreground. Very long gaps are labelled
+  as potentially including system sleep or suspension.
 - Backend `[performance]`: a command through the shared blocking wrapper took
   at least one second. `queue_ms` measures waiting for a blocking worker;
   `work_ms` includes everything inside that command, including subprocess and
@@ -17,9 +27,21 @@ native commands.
 - `slow_calls_since_report`, `max_queue_ms`, and `max_work_ms` summarize slow
   calls accumulated since the previous report for that operation. Each
   operation reports at most once per 30 seconds, when another slow call
-  finishes. Maxima can come from different calls. Pending aggregate counts
-  are not flushed at shutdown, so these are bounded observations, not an
-  exhaustive trace. A stuck command has no completion record.
+  finishes. Maxima can come from different calls. At application exit,
+  aggregates still held by that pacing are written as `slow command summary
+  at exit`, so a session's last slow calls are not lost.
+- `operation still running`: a command through the same wrapper has been
+  waiting or working for 5 s, written while it is still running, and again
+  each time its age doubles. One line per operation: `calls` past the budget,
+  `waiting_for_worker` (queued behind a saturated blocking pool, never
+  started) and `oldest_ms`. Calls are registered when queued, so pool
+  starvation shows here too. At most eight operations per one-second pass;
+  the rest are one counted line. `operation no longer running` follows when
+  reported calls end; `operation unfinished at exit` lists every call still
+  registered when the app quits. Over 1,024 concurrent calls, the excess is
+  counted (`in-flight table full`), not tracked. A call that hangs the whole
+  process before the watchdog's next pass can still leave no record; take a
+  `sample` as below.
 - `docs-refresh`: a background document rebuild failed, or the bounded queue
   could not accept additional repositories. An empty log is not proof that
   all documents refreshed.
@@ -179,9 +201,9 @@ Local evidence: `/tmp/gitpulse-docs-timing-before.log`,
 `/tmp/gitpulse-followup-coverage-final.log` and
 `/tmp/gitpulse-exit-observation-baseline.log`.
 
-Still open in the overall audit: finer-grained stutter recording and unfinished
-operation diagnostics, and measured native macOS rendering/idle-power behavior
-with the updated build. Physical Windows/Linux execution and native Mac
+Still open in the overall audit: measured native macOS rendering/idle-power
+behavior with the updated build (stutter attribution and still-running
+operation records closed on 2026-10-08, below). Physical Windows/Linux execution and native Mac
 sleep/wake/display testing remain separate from these deterministic queue and
 filesystem tests.
 
@@ -292,6 +314,114 @@ warm navigation need a stopwatch or an instrumented build. A two-second smoke
 run against the running 1.4.0 app read 167 MiB resident for the app process —
 a wiring check, not an idle measurement: agents were working in its tabs.
 
+## 2026-10-08: stall attribution, still-running records, canary, limits
+
+**Verified (tests):** `performance:ui` samples are attributed to the command,
+watcher burst or view handled during the late interval
+(`src/lib/diagnostics/{activity,responsiveness}.test.ts`; the four new probe
+tests fail against the previous probe). Native commands are visible while
+running and at exit: `commands::assemble_tests::running_command_is_visible_in_diagnostics_before_it_finishes`
+drives a real blocked `off_thread` call and waits for its `operation still
+running` and `operation no longer running` lines; `exit_flush_writes_paced_slow_calls_and_unfinished_calls`
+proves a paced second slow call and a running call are written by `flush`,
+which `RunEvent::Exit` calls before terminal shutdown. Unit tests in
+`logging/performance.rs` cover the doubling schedule, grouping, the 1,024-call
+and eight-line caps, and that drained aggregates are not repeated.
+The IPC observer forwards each answer through a new promise rather than a
+side `.then`, because any reaction marks a promise handled and would hide
+unhandled rejections from callers without a `catch`. That costs callers
+exactly one microtask, pinned by `activity.test.ts`. It cannot sit lower:
+Tauri's `invoke` is an `async` wrapper over a non-writable
+`__TAURI_INTERNALS__.invoke`.
+
+**Stress canary at full length (Chromium, headless).** Commit `0d3e9f77`
+(after 737183a7), Chrome 154.0.8037.98, `tabs=5`, `cycles=44`, each scenario
+twice in a fresh browser and profile with background-timer throttling
+disabled, verdicts read from the posted `data-gp-result` and checked against
+the requested component/scenario. All 18 runs completed 44 cycles with
+`armed: true`, `mountError: null`, and identical results across both runs:
+
+| Scenario | depthExceeded | otherCrashes | Notes |
+| --- | ---: | --- | --- |
+| LoopCanary/chaos | 7 | `["updated at"]` | tripped as designed; the entry is Svelte's own debug trace logged with the loop error |
+| PulseView/chaos | 0 | none | `stripMatchesTabs: true` |
+| StoragePanel/switch | 0 | none | |
+| HealthPanel/chaos | 0 | none | |
+| CoverageViewer/chaos | 0 | none | |
+| FleetView/chaos | 0 | none | |
+| StatusBar/chaos | 0 | none | |
+| ManviOpsPanel/chaos | 0 | none | the earlier `unregisterListener` crash is gone |
+| TerminalPanel/termtabs | 0 | none | opened 44 tabs, peak 31 xterm screens |
+
+`stripMatchesTabs` is a real check only for PulseView; the others render no
+repository strip and read `n/a`. LoopCanary has no documented scenario, so
+`chaos` was chosen. This is Chromium, not WKWebView or the installed app.
+
+**Startup fan-out, ten repositories (verified on this Mac, debug build).**
+`watcher::registration_timing::watcher_registration_timing` (ignored; run with
+`cargo test --manifest-path src-tauri/Cargo.toml --lib watcher_registration_timing -- --ignored --nocapture --test-threads=1`)
+times the production `RepoFileWatcher::watch_repo` and the whole
+`start_watch_inner` body against ten fresh repositories, nine interleaved
+rounds with rotated order:
+
+| Native `watch_repo`, ms | min | median | max |
+| --- | ---: | ---: | ---: |
+| one registration alone | 14.05 | 15.53 | 18.27 |
+| ten serial, total | 122.05 | 152.42 | 177.46 |
+| ten concurrent (ten threads), total | 128.65 | 149.64 | 203.27 |
+| one concurrent call | 12.86 | 82.18 | 203.10 |
+
+Registrations serialize: ten concurrent take as long as ten serial
+(median ratio 0.98), and a concurrent call waits about 5.3× a lone one. A
+second, busier run gave the same ratios. Startup already registers one
+repository at a time (`repoStore.ts` restore loop awaits each watch before the
+next tab's hydrate), so serialization costs nothing extra today: about 15 ms
+per repository, roughly 150 ms for ten, interleaved with hydrates. Running
+registrations in parallel would gain essentially nothing; no change was made.
+Not established: whether the lock is in `fseventsd` or in the in-process
+CoreServices client, and the split of the 15 ms between stream creation and
+`FSEventStreamStart`.
+
+**Bundle: Code and History split out; the 500 kB advisory accepted.** The
+2026-10-08 production build measured the entry chunk `main` at 777,830
+bytes, 2,170 under the enforced `MAX_PRODUCTION_CHUNK_BYTES` (then 780,000)
+and up from 543 KB after the first lazy-view split. By source map,
+`src/lib/components` was 415 KB of it. Following the config's own rule (defer
+views not on screen at startup rather than raise the ceiling), CodeView and
+HistoryView now load through `LazyView` (pinned in `src/App.test.ts`). The
+rebuilt `main` is **563,540 bytes** (−214 KB); the new chunks are HistoryView
+130.5 KB and CodeView 43.0 KB, carrying DiffViewer, CommitTable, CommitRow,
+FileViewer and the file tree. Components shared with the eager Work tab and
+sidebar (BranchList, WorktreesPanel, CodeViewer, GraphRenderer) stay in `main`.
+A session restored into Code or History pays one local chunk fetch and the
+skeleton once, as every other lazy view does. The ceiling is now 640,000
+bytes, so a tens-of-KB leak still trips it. `main` stays above Vite's generic
+500 kB warning because the default Work tab is deliberately eager; that
+advisory is accepted, and the enforced budget is the ceiling. `LazyView`'s
+loader type now erases props, as `LazyMount` already did, because Code and
+History are the first lazy views with required props. The CI build-cache
+revisit (`docs/GOOD_FIRST_ISSUES.md`) is unchanged: the build takes 5–10 s.
+
+**Structural limits, kept with reasons:**
+
+- *Blocked non-Unix stdin writer.* Unix writers are cancelled by stdin
+  readiness polling. Windows anonymous pipes do not support overlapped
+  I/O, so cancelling a blocked synchronous write needs `CancelSynchronousIo`
+  against the writer thread, through new Windows FFI. That cannot be
+  validated here (no Windows hardware; physical Windows runs are an open
+  gate), and an untested cancellation path is worse than a documented bound.
+  The runner still returns at its deadline; only the writer thread can
+  outlive the settle window until the pipe closes.
+- *Stalled network filesystem.* A `read`/`stat` blocked in the kernel on a
+  hung mount cannot be interrupted from user space, so input budgets cannot
+  give a response deadline. Such a call now appears in Diagnostics as
+  `operation still running` while it is stuck, instead of leaving no record.
+- *Parsed index memory.* Byte caps bound the source admitted (32 MiB of
+  documents, per-note caps), not the parsed structures or snapshots held by
+  active readers. A hard memory bound would need allocation accounting inside
+  the vendored MarkDev/DevMap parsers, which this repository does not own.
+- *Slow-call aggregates at shutdown:* fixed (above).
+
 The semaphore saturation test initially used the global gate and interfered
 with unrelated concurrent tests. It now drives the same production runner
 with a private gate; the deadline assertion remains unchanged.
@@ -301,7 +431,8 @@ validation remains a CI/physical gate. Unix stdin cancellation is implemented;
 a blocked non-Unix writer can outlive the caller's bounded settle window until
 the pipe closes. Filesystem input budgets cannot guarantee a response deadline
 from a stalled network filesystem. Source byte caps do not bound all parsed
-index memory or the lifetime of snapshots retained by active readers.
+index memory or the lifetime of snapshots retained by active readers. The
+reasons each is kept are in the 2026-10-08 section above.
 
 
 Evidence from this workstation is retained in `/tmp/gitpulse-spawn-benchmark.log`,

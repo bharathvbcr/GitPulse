@@ -25,6 +25,7 @@
   import { diagnostics } from "./lib/diagnostics/diagnostics";
   import { formatDiagnosticFailure } from "./lib/diagnostics/diagnostics";
   import { createPaneCrashReporter } from "./lib/diagnostics/paneCrash";
+  import { activity } from "./lib/diagnostics/activity";
   import { get } from "svelte/store";
   import { showsDiagnosticsButton } from "./lib/ui/diagnosticsButton";
   import {
@@ -42,9 +43,6 @@
   import ScrollCue from "./lib/components/ScrollCue.svelte";
   import HarnessBadge from "./lib/components/HarnessBadge.svelte";
   import Sidebar from "./lib/components/Sidebar.svelte";
-  // Graph, Diff and Reflog live inside History now; App no longer mounts any
-  // of them directly, nor the filter bar that used to strip across the top.
-  import HistoryView from "./lib/components/HistoryView.svelte";
   import InsightsView from "./lib/components/InsightsView.svelte";
   import {
     FOCUS_COMMIT_SEARCH_EVENT,
@@ -74,7 +72,6 @@
   const showFirstRunCard = onboardingStore.showFirstRunCard;
   const setupWizard = onboardingStore.wizard;
   import WorkspaceView from "./lib/components/WorkspaceView.svelte";
-  import CodeView from "./lib/components/CodeView.svelte";
   import LazyView from "./lib/components/LazyView.svelte";
   import LazyMount from "./lib/components/LazyMount.svelte";
   import TerminalDock from "./lib/components/TerminalDock.svelte";
@@ -84,6 +81,10 @@
   // GitHub, terminal and Manvi panes — nor, through TerminalPanel, the
   // 334 KB xterm runtime. WorkView is deliberately NOT here: it is the
   // default tab, so deferring it would only add a round trip to startup.
+  // Code and History followed when the entry chunk reached 778 KB against
+  // its 780 KB ceiling: together they took 214 KB out of it (Graph, Diff,
+  // Reflog and the file tree live inside them). A session restored into
+  // either tab pays one local chunk fetch, as every view here does.
   //
   // Declared at module scope on purpose. LazyView keys its cache on the
   // loader's identity, so an inline `load={() => import(...)}` would be a
@@ -107,6 +108,8 @@
   const loadFleetView = () => import("./lib/components/FleetView.svelte");
   const loadAgentsView = () => import("./lib/components/AgentsView.svelte");
   const loadTaskBoard = () => import("./lib/components/TaskBoard.svelte");
+  const loadCodeView = () => import("./lib/components/CodeView.svelte");
+  const loadHistoryView = () => import("./lib/components/HistoryView.svelte");
 
   // Overlays. None of these is on screen at startup and most sessions open
   // none of them, yet all six were parsed at boot because App mounted them
@@ -656,6 +659,7 @@
         openRepo: openFromExternal,
         syncRecentMenu: () => syncRecentMenu([...get(repoStore).recentRepos]),
         handleRepoChanged: (path, change) => {
+          activity.noteWatcherEvent();
           const blocked = path
             ? get(repoStore).openTabs.some((tab) => tab.trustRequired === true && tab.path === path)
             : false;
@@ -1089,11 +1093,16 @@
                   loadManvi={loadManviOpsPanel}
                 />
               {:else if $repoStore.activeTab === "code"}
-                <CodeView loadBlame={loadBlameViewer} loadMap={loadRepoMapPanel} loadSearch={loadContentSearch} />
+                <LazyView
+                  load={loadCodeView}
+                  name="Code"
+                  props={{ loadBlame: loadBlameViewer, loadMap: loadRepoMapPanel, loadSearch: loadContentSearch }}
+                />
               {:else if $repoStore.activeTab === "history"}
-                <HistoryView
-                  loadReflog={loadReflogViewer}
-                  loadSuspects={loadRegressionSuspectsPanel}
+                <LazyView
+                  load={loadHistoryView}
+                  name="History"
+                  props={{ loadReflog: loadReflogViewer, loadSuspects: loadRegressionSuspectsPanel }}
                 />
               {:else if $repoStore.activeTab === "insights"}
                 <InsightsView

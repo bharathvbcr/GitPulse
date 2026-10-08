@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { installResponsivenessDiagnostics } from "./responsiveness";
 import { readEventLoopDelay, resetEventLoopDelay } from "../runtime/loadCadence";
+import { createActivityLog } from "./activity";
 
 describe("UI responsiveness diagnostics", () => {
   let stop = () => {};
@@ -12,11 +13,15 @@ describe("UI responsiveness diagnostics", () => {
     const frame = new EventTarget();
     const warn = vi.fn();
     let time = 0;
+    const activity = createActivityLog(() => time);
+    let view = "repository/history";
     stop = installResponsivenessDiagnostics({ warn }, {
-      document: target, window: frame, now: () => time,
+      document: target, window: frame, now: () => time, activity,
+      view: () => view,
     });
     return {
-      target, frame, warn,
+      target, frame, warn, activity,
+      setView(next: string) { view = next; },
       async tick(elapsed = 500) { time += elapsed; await vi.advanceTimersByTimeAsync(500); },
       advance(elapsed: number) { time += elapsed; },
     };
@@ -29,13 +34,66 @@ describe("UI responsiveness diagnostics", () => {
     expect(vi.getTimerCount()).toBe(1);
   });
 
-  it("records the first delay at the threshold without claiming a cause", async () => {
+  it("records the first delay at the threshold, attributed to the view when nothing else ran", async () => {
     const p = probe();
     await p.tick(749);
     expect(p.warn).not.toHaveBeenCalled();
     await p.tick(750);
     expect(p.warn).toHaveBeenCalledExactlyOnceWith("performance:ui", expect.stringContaining("max_delay_ms=250"));
-    expect(p.warn.mock.calls[0][1]).toContain("not a specific cause");
+    const line = p.warn.mock.calls[0][1] as string;
+    expect(line).toContain("cause=view:repository/history");
+    expect(line).toContain("correlation rather than a profile");
+  });
+
+  it("attributes a late sample to the IPC answer handled inside the late interval", async () => {
+    const p = probe();
+    // Delivered before the probe re-armed: not part of the next interval.
+    p.activity.noteCommandSettled("cmd_before_interval");
+    await p.tick();
+    p.advance(100);
+    p.activity.noteCommandSettled("cmd_get_commit_graph");
+    p.activity.noteCommandSettled("cmd_get_commit_graph");
+    p.activity.noteWatcherEvent();
+    p.setView("repository/code");
+    await p.tick(800);
+    const line = p.warn.mock.calls[0][1] as string;
+    expect(line).toContain("worst: cause=command:cmd_get_commit_graph view=repository/code");
+    expect(line).toContain("commands=[cmd_get_commit_graphx2]");
+    expect(line).toContain("watcher_events=1");
+    expect(line).toContain("causes: command:cmd_get_commit_graphx1");
+    expect(line).not.toContain("cmd_before_interval");
+  });
+
+  it("names a watcher burst and tallies causes across one report", async () => {
+    const p = probe();
+    await p.tick(800);
+    p.advance(10);
+    for (let i = 0; i < 5; i++) p.activity.noteWatcherEvent();
+    await p.tick(1_500);
+    p.advance(10);
+    p.activity.noteCommandSettled("cmd_get_status");
+    await p.tick(900);
+    for (let i = 0; i < 60; i++) await p.tick();
+    const line = p.warn.mock.calls[1][1] as string;
+    expect(line).toContain("2 delayed UI timer sample(s)");
+    expect(line).toContain("worst: cause=watcher-burst");
+    expect(line).toContain("watcher_events=5");
+    expect(line).toContain("causes: command:cmd_get_statusx1, watcher-burstx1");
+  });
+
+  it("keeps sampling when the view getter throws", async () => {
+    const target = Object.assign(new EventTarget(), { visibilityState: "visible" as DocumentVisibilityState });
+    const warn = vi.fn();
+    let time = 0;
+    stop = installResponsivenessDiagnostics({ warn }, {
+      document: target, window: new EventTarget(), now: () => time,
+      activity: createActivityLog(() => time),
+      view: () => { throw new Error("store gone"); },
+    });
+    time += 800;
+    await vi.advanceTimersByTimeAsync(500);
+    expect(warn.mock.calls[0][1]).toContain("cause=view:unknown");
+    expect(vi.getTimerCount()).toBe(1);
   });
 
   it("aggregates repeated delays and flushes them on a later healthy tick", async () => {

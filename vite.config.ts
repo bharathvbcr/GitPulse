@@ -32,8 +32,12 @@ import { gitpulseIgnoreNestedWorktrees } from "./scripts/vite-watch.mjs";
  * xterm runtime out of startup entirely: 204 KB transferred on launch against
  * roughly 590 KB before. Prefer that move to raising this again; the ceiling
  * is only useful while it is lower than what the app would otherwise grow to.
+ *
+ * It grew back to 778 KB (2 KB under the old 780 KB ceiling) by 2026-10-08.
+ * Code and History then went lazy too, taking `main` to 564 KB, and the
+ * ceiling came down to 640 KB so a tens-of-KB leak still trips it.
  */
-const MAX_PRODUCTION_CHUNK_BYTES = 780_000;
+const MAX_PRODUCTION_CHUNK_BYTES = 640_000;
 
 /**
  * Keep independently cacheable runtimes out of the application entry chunk.

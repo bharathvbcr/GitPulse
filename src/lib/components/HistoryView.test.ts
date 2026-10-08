@@ -37,10 +37,12 @@ describe("HistoryView", () => {
     expect(history).toContain('{:else if section === "suspects"}');
     expect(history).not.toContain("import RegressionSuspectsPanel");
     expect(app).toContain("const loadRegressionSuspectsPanel = () =>");
-    expect(app).toContain("loadSuspects={loadRegressionSuspectsPanel}");
+    // History is itself lazy, so App hands its loaders through LazyView's
+    // `props={{ … }}` rather than as attributes.
+    expect(app).toContain("loadSuspects: loadRegressionSuspectsPanel");
     // Inline arrows are the failure this contract exists for: a new function
     // each render misses LazyView's cache and remounts the pane.
-    expect(app).not.toContain("loadSuspects={() =>");
+    expect(app).not.toMatch(/loadSuspects(=\{|:\s*)\(\)\s*=>/);
   });
 
   it("swaps sections with {#if}, never {#key}", () => {

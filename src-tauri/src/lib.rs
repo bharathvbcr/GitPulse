@@ -488,6 +488,8 @@ pub fn run() {
         .run(|app, event| {
             if matches!(event, tauri::RunEvent::Exit) {
                 use tauri::Manager;
+                // First, so a terminal shutdown that stalls cannot lose it.
+                logging::performance::flush();
                 if let Err(error) =
                     terminal::shutdown_sessions(&app.state::<terminal::TerminalSessions>())
                 {

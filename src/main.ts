@@ -5,6 +5,9 @@ import { applyPlatformClass } from "./lib/platform";
 import { loadHostPlatform } from "./lib/stores/platformStore";
 import { installGlobalDiagnostics, diagnostics } from "./lib/diagnostics/diagnostics";
 import { installResponsivenessDiagnostics } from "./lib/diagnostics/responsiveness";
+import { get } from "svelte/store";
+import { interfaceStore } from "./lib/stores/interfaceStore";
+import { repoStore } from "./lib/stores/repoStore";
 
 applyPlatformClass();
 
@@ -21,7 +24,13 @@ void loadHostPlatform();
 // reach devtools with the same prefixes as before. Retrieve via the
 // Diagnostics panel (header bug icon or the command palette).
 installGlobalDiagnostics(diagnostics);
-const stopResponsivenessDiagnostics = installResponsivenessDiagnostics(diagnostics);
+// Late samples name the visible surface; a repository view also names its tab.
+const stopResponsivenessDiagnostics = installResponsivenessDiagnostics(diagnostics, {
+  view: () => {
+    const surface = get(interfaceStore).globalSurface;
+    return surface === "repository" ? `repository/${get(repoStore).activeTab}` : surface;
+  },
+});
 import.meta.hot?.dispose(stopResponsivenessDiagnostics);
 
 const app = mount(App, {

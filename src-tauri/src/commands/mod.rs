@@ -258,10 +258,9 @@ where
     F: FnOnce() -> Result<T, String> + Send + 'static,
     T: Send + 'static,
 {
-    let queued = std::time::Instant::now();
+    let mut timing = crate::logging::performance::CommandTiming::queue(std::any::type_name::<F>());
     tauri::async_runtime::spawn_blocking(move || {
-        let mut timing =
-            crate::logging::performance::CommandTiming::start(std::any::type_name::<F>(), queued);
+        timing.start();
         // Every command starts as a deferrable read. `guard` promotes the
         // rest of a mutation's body to a user action, and this scope is what
         // ends that promotion before the pool thread runs anything else — and
@@ -5327,6 +5326,87 @@ mod assemble_tests {
         assert!(line.contains("queue_ms="), "{line}");
         assert!(line.contains("work_ms="), "{line}");
         assert!(!line.contains("private command payload"), "{line}");
+    }
+
+    /// A call that never returns used to leave no record at all. It must be
+    /// visible while it is still running, and its end must be recorded too.
+    #[test]
+    fn running_command_is_visible_in_diagnostics_before_it_finishes() {
+        crate::logging::init();
+        crate::logging::performance::enable_test_facade();
+        let (release, blocked) = std::sync::mpsc::channel::<()>();
+        let call = tauri::async_runtime::spawn(off_thread(move || {
+            blocked
+                .recv_timeout(std::time::Duration::from_secs(30))
+                .map_err(|e| e.to_string())
+        }));
+        let marker = "running_command_is_visible_in_diagnostics";
+        let find = |needle: &str| {
+            crate::logging::diagnostic_tail(500)
+                .into_iter()
+                .find(|line| line.contains(needle) && line.contains(marker))
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        let running = loop {
+            if let Some(line) = find("operation still running") {
+                break line;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "no still-running record within 15 s"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        };
+        assert!(running.contains("calls=1"), "{running}");
+        assert!(running.contains("waiting_for_worker=0"), "{running}");
+        assert!(running.contains("oldest_ms="), "{running}");
+        release.send(()).unwrap();
+        tauri::async_runtime::block_on(call).unwrap().unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while find("operation no longer running").is_none() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "no end record after release"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+    }
+
+    /// Pacing holds a second slow call inside its 30-second window; exit must
+    /// write it rather than drop it, along with any call still running.
+    #[test]
+    fn exit_flush_writes_paced_slow_calls_and_unfinished_calls() {
+        crate::logging::init();
+        crate::logging::performance::enable_test_facade();
+        let slow = || {
+            tauri::async_runtime::block_on(off_thread(|| {
+                std::thread::sleep(std::time::Duration::from_millis(1100));
+                Ok::<_, String>(())
+            }))
+            .unwrap()
+        };
+        let marker = "exit_flush_writes_paced_slow_calls";
+        slow();
+        slow();
+        let (release, blocked) = std::sync::mpsc::channel::<()>();
+        let call = tauri::async_runtime::spawn(off_thread(move || {
+            blocked
+                .recv_timeout(std::time::Duration::from_secs(30))
+                .map_err(|e| e.to_string())
+        }));
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        crate::logging::performance::flush();
+        release.send(()).unwrap();
+        tauri::async_runtime::block_on(call).unwrap().unwrap();
+        let lines = crate::logging::diagnostic_tail(500);
+        let summary = lines
+            .iter()
+            .find(|line| line.contains("slow command summary at exit") && line.contains(marker))
+            .expect("the paced second slow call must be flushed at exit");
+        assert!(summary.contains("slow_calls_since_report=1"), "{summary}");
+        assert!(lines
+            .iter()
+            .any(|line| line.contains("operation unfinished at exit") && line.contains(marker)));
     }
 
     fn commit(id: &str, parents: &[&str], author: &str, summary: &str) -> RawCommitNode {

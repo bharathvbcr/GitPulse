@@ -48,6 +48,8 @@ function usedComponents(template: string): string[] {
  * change, so it is pinned here.
  */
 const DEFERRED_VIEWS = [
+  "CodeView",
+  "HistoryView",
   "CoverageViewer",
   "HealthPanel",
   "StoragePanel",
@@ -76,8 +78,9 @@ describe("App view code splitting", () => {
     // a loader may be handed to a view that owns the section it belongs to
     // (History takes the reflog's). What must never happen is a loader that
     // is declared and then reaches nothing, which is a chunk nobody loads.
+    // A lazy view's own loaders travel in its LazyView `props={{ … }}`.
     expect(template, `load${view} is declared but never rendered`).toMatch(
-      new RegExp(`=\\{load${view}\\}`),
+      new RegExp(`(=\\{|:\\s*)load${view}\\b`),
     );
   });
 

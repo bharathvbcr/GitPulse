@@ -1,4 +1,6 @@
 pub mod debouncer;
+#[cfg(test)]
+mod registration_timing;
 
 pub use debouncer::RepoFileWatcher;
 
