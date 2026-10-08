@@ -80,6 +80,10 @@ name = "neighbors_composition"
 required-features = ["parse"]
 
 [[test]]
+name = "persisted_engine_answers"
+required-features = ["parse"]
+
+[[test]]
 name = "preview_containment"
 required-features = ["parse"]
 
@@ -267,5 +271,21 @@ name = "a_wrapped_callback_is_a_function"
 required-features = ["parse"]
 
 [[test]]
+name = "a_kernel_is_reached_from_its_host_by_name"
+required-features = ["parse"]
+
+[[test]]
 name = "a_walk_names_only_the_gaps_it_touches"
+required-features = ["parse"]
+
+[[test]]
+name = "retired_python_claims_have_kernel_tests"
+required-features = ["parse"]
+
+[[test]]
+name = "name_query_filters"
+required-features = ["parse"]
+
+[[test]]
+name = "literal_sites"
 required-features = ["parse"]

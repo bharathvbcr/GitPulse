@@ -184,14 +184,21 @@ fn is_explained(row: &UnresolvedReference) -> bool {
     row.class.is_explained()
 }
 
+/// The key `ext` is reported under. See [`devmap_extract::languages::report_language`].
+fn reported(ext: &Extraction) -> &str {
+    devmap_extract::languages::report_language(&ext.file_path, &ext.language)
+}
+
 /// Compute the rate over one generation's resolution.
 pub fn resolution_rate(
     extractions: &[Extraction],
     resolution: &ResolutionResult,
 ) -> ResolutionRate {
+    // Keyed by the language a file is written in, not the grammar that read
+    // it: Metal is parsed by the C++ grammar and reported as Metal.
     let language_of: HashMap<&str, &str> = extractions
         .iter()
-        .map(|ext| (ext.file_path.as_str(), ext.language.as_str()))
+        .map(|ext| (ext.file_path.as_str(), reported(ext)))
         .collect();
 
     let (resolved_sites, resolved_by_language) =
@@ -240,7 +247,7 @@ pub fn resolution_rate(
     > = std::collections::BTreeMap::new();
     for ext in extractions {
         let entry = capabilities_by_language
-            .entry(ext.language.clone())
+            .entry(reported(ext).to_string())
             .or_insert(devmap_extract::languages::Capabilities::NONE);
         *entry = entry.union(ext.capabilities());
     }
@@ -254,7 +261,7 @@ pub fn resolution_rate(
                     | devmap_extract::model::ExtractionEngine::Notebook { .. }
             )
         })
-        .map(|ext| ext.language.clone())
+        .map(|ext| reported(ext).to_string())
         .collect();
     present.extend(resolved_by_language.keys().cloned());
     present.extend(unresolved_by_language.keys().cloned());

@@ -219,3 +219,15 @@ required-features = ["parse"]
 [[test]]
 name = "real_corpus_resolution"
 required-features = ["parse"]
+
+[[test]]
+name = "commonjs_require_bindings"
+required-features = ["parse"]
+
+[[test]]
+name = "a_receiver_member_nothing_declares"
+required-features = ["parse"]
+
+[[test]]
+name = "function_values_and_platform_targets"
+required-features = ["parse"]

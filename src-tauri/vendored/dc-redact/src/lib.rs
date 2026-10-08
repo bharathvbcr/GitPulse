@@ -516,7 +516,18 @@ fn url_password_spans(line: &str) -> Vec<std::ops::Range<usize>> {
 fn assignment_spans(line: &str) -> Vec<std::ops::Range<usize>> {
     let bytes = line.as_bytes();
     let mut spans = Vec::new();
+    // Where the last `}` and the last `${` or `{{` before `i` are, carried
+    // forward rather than searched back for at every separator: a minified
+    // line is all separators, and the backward search made it quadratic.
+    let (mut last_close, mut last_open) = (None::<usize>, None::<usize>);
+    let mut ends = ValueEnds::default();
     for (i, &b) in bytes.iter().enumerate() {
+        if i >= 1 && bytes[i - 1] == b'}' {
+            last_close = Some(i - 1);
+        }
+        if i >= 2 && matches!(&bytes[i - 2..i], b"${" | b"{{") {
+            last_open = Some(i - 2);
+        }
         let prev = i.checked_sub(1).map(|j| bytes[j]);
         let next = bytes.get(i + 1).copied();
         let value_from = match b {
@@ -531,7 +542,9 @@ fn assignment_spans(line: &str) -> Vec<std::ops::Range<usize>> {
             b':' => i + 1,
             _ => continue,
         };
-        if inside_template(&line[..i]) {
+        // Inside an unclosed `${…}` or `{{…}}` a separator is template
+        // syntax (`${API_KEY:?missing}`), not an assignment.
+        if last_open.is_some_and(|open| last_close.is_none_or(|close| close < open)) {
             continue;
         }
         let Some(key) = declared_name(line, i) else {
@@ -540,21 +553,11 @@ fn assignment_spans(line: &str) -> Vec<std::ops::Range<usize>> {
         if !names_a_credential(key) {
             continue;
         }
-        if let Some(span) = literal_after(line, value_from) {
+        if let Some(span) = literal_after(line, value_from, &mut ends) {
             spans.push(span);
         }
     }
     spans
-}
-
-/// Whether `head` ends inside an unclosed `${…}` or `{{…}}`: a separator
-/// there is template syntax (`${API_KEY:?missing}`), not an assignment.
-fn inside_template(head: &str) -> bool {
-    let close = head.rfind('}');
-    ["${", "{{"].iter().any(|open| {
-        head.rfind(open)
-            .is_some_and(|at| close.is_none_or(|c| c < at))
-    })
 }
 
 /// The name a separator at `sep` assigns to. Usually [`key_before`]; for a
@@ -702,36 +705,98 @@ fn names_a_credential(key: &str) -> bool {
         "handler",
         "class",
     ];
-    // Distinctive enough to match inside a fused word: `PGPASSWORD`,
-    // `dbpasswd`. `token` is not — `tokenizer` contains it.
+    // Distinctive enough to match at the end of a fused word: `PGPASSWORD`,
+    // `dbpasswd`, `password2`. Only at the end: `passwordless` names a way of
+    // not having one. `token` is not fused at all — `tokenizer` contains it.
     const FUSED: &[&str] = &["password", "passwd", "passphrase"];
     let w = words(key);
     if w.last().is_some_and(|last| ABOUT.contains(&last.as_str())) {
         return false;
     }
-    w.iter()
-        .any(|x| SINGLE.contains(&x.as_str()) || FUSED.iter().any(|f| x.contains(f)))
-        || w.windows(2)
-            .any(|p| PAIRS.contains(&(p[0].as_str(), p[1].as_str())))
+    w.iter().any(|x| {
+        let x = x.trim_end_matches(|c: char| c.is_ascii_digit());
+        SINGLE.contains(&x) || FUSED.iter().any(|f| x.ends_with(f))
+    }) || w
+        .windows(2)
+        .any(|p| PAIRS.contains(&(p[0].as_str(), p[1].as_str())))
+}
+
+/// The first position at or after a query where a scan stops, remembered.
+///
+/// [`assignment_spans`] asks where a value ends at every separator of a line,
+/// and its queries only move forward. Without the memory each one rescans to
+/// the same stop, which on a line of separators is quadratic; with it, a stop
+/// found once answers every later query that starts at or before it.
+#[derive(Default)]
+struct NextStop {
+    /// (where the scan that found it started, the stop), the stop being the
+    /// line's length when there is none.
+    found: Option<(usize, usize)>,
+}
+
+impl NextStop {
+    fn at_or_after(&mut self, line: &str, from: usize, stop: impl Fn(char) -> bool) -> usize {
+        if let Some((started, at)) = self.found
+            && started <= from
+            && from <= at
+        {
+            return at;
+        }
+        let at = from + line[from..].find(stop).unwrap_or(line.len() - from);
+        self.found = Some((from, at));
+        at
+    }
+}
+
+/// The scans [`literal_after`] makes, one memory per kind of stop.
+#[derive(Default)]
+struct ValueEnds {
+    /// The end of an unquoted value: whitespace or a delimiter.
+    unquoted: NextStop,
+    /// How far an unquoted secret's redaction reaches past a comma.
+    continued: NextStop,
+    /// The closing quote, per quote character.
+    quotes: [NextStop; 3],
 }
 
 /// The span of the literal value starting at or after `from`, when it is one
 /// a credential could be.
-fn literal_after(line: &str, from: usize) -> Option<std::ops::Range<usize>> {
+///
+/// An unquoted value is *judged* up to its first delimiter, so `token:someVar,`
+/// in minified code reads `someVar`. A value that is a secret is *redacted* up
+/// to whitespace, a closing bracket or a `, ` — a comma inside it is part of
+/// it (`api_key: Ab12…Xy,zzzz` is one YAML value), and stopping at that comma
+/// left the rest of the secret on display.
+fn literal_after(line: &str, from: usize, ends: &mut ValueEnds) -> Option<std::ops::Range<usize>> {
     let rest = &line[from..];
     let start = from + (rest.len() - rest.trim_start().len());
     let rest = &line[start..];
     let first = rest.chars().next()?;
-    let (span, quoted) = if matches!(first, '"' | '\'' | '`') {
-        let close = rest[1..].find(first)?;
-        (start + 1..start + 1 + close, true)
-    } else {
-        let len = rest
-            .find(|c: char| c.is_whitespace() || ",;)}]\"'".contains(c))
-            .unwrap_or(rest.len());
-        (start..start + len, false)
-    };
-    is_literal_secret(&line[span.clone()], quoted).then_some(span)
+    if let Some(q) = ['"', '\'', '`'].iter().position(|c| *c == first) {
+        let close = ends.quotes[q].at_or_after(line, start + 1, |c| c == first);
+        if close == line.len() {
+            return None;
+        }
+        let span = start + 1..close;
+        return is_literal_secret(&line[span.clone()], true).then_some(span);
+    }
+    let end = ends
+        .unquoted
+        .at_or_after(line, start, |c| c.is_whitespace() || ",;)}]\"'".contains(c));
+    if !is_literal_secret(&line[start..end], false) {
+        return None;
+    }
+    let mut whole = end;
+    while line[whole..].starts_with(',') {
+        let next = whole + 1;
+        if next == line.len() || line[next..].starts_with(char::is_whitespace) {
+            break;
+        }
+        whole = ends
+            .continued
+            .at_or_after(line, next, |c| c.is_whitespace() || ",;)}]\"'".contains(c));
+    }
+    Some(start..whole)
 }
 
 /// Whether `value` reads as a literal password or secret rather than a
@@ -739,24 +804,58 @@ fn literal_after(line: &str, from: usize) -> Option<std::ops::Range<usize>> {
 /// `.` or `(` is a character, not member access or a call.
 fn is_literal_secret(value: &str, quoted: bool) -> bool {
     let has_digit = value.bytes().any(|b| b.is_ascii_digit());
-    // A name, not a value: `session_token`, `settings.api_token`, `apiToken`.
+    // A name, not a value: `session_token`, `settings.api_token`, `apiToken`,
+    // and the kebab-case settings a credential-ish key often holds —
+    // `same-origin`, `oidc-provider`, `refresh-token`.
     let reads_as_identifier = !has_digit
-        && (value.contains(['_', '.'])
+        && (value.contains(['_', '.', '-'])
             || value
                 .as_bytes()
                 .windows(2)
                 .any(|p| p[0].is_ascii_lowercase() && p[1].is_ascii_uppercase()));
+    // A name with a number on the end: `hashedPassword1`,
+    // `hashed_password_2024`. The rest must be words, not a random run with a
+    // digit at the end — `Summer2024` is one word, and stays a password.
+    let stem = value
+        .trim_end_matches(|c: char| c.is_ascii_digit())
+        .trim_end_matches(['_', '-']);
+    let numbered_name = stem.len() < value.len()
+        && !stem.bytes().any(|b| b.is_ascii_digit())
+        && reads_as_words(stem, 2);
+    // A qualified name: `v1.Token`, `config.Secrets`. Its last part is a
+    // word, which a dotted token's random tail is not.
+    let qualified_name = !quoted
+        && value.contains('.')
+        && value.split('.').all(|part| {
+            part.starts_with(|c: char| c.is_ascii_alphabetic())
+                && part.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+        })
+        && value
+            .rsplit('.')
+            .next()
+            .is_some_and(|last| reads_as_words(last, 1));
     // An expression rather than a literal: a call, an index, a member access.
-    let expression = !quoted && (value.contains(['(', '[']) || value.contains('.') && !has_digit);
+    let expression = !quoted
+        && (value.contains(['(', '[']) || value.contains('.') && !has_digit || qualified_name);
     let plain_word = value.bytes().all(|b| b.is_ascii_lowercase()) && value.len() < 12;
     value.chars().count() >= MIN_LITERAL_LEN
         && !value.contains(char::is_whitespace)
         && !value.contains("://")
         && !value.bytes().all(|b| b.is_ascii_digit())
         && !reads_as_identifier
+        && !numbered_name
         && !expression
         && !plain_word
         && !is_placeholder(value)
+}
+
+/// Whether `text` is at least `min` and at most four words of three or more
+/// letters each — how an identifier reads, and how a random token does not.
+fn reads_as_words(text: &str, min: usize) -> bool {
+    let w = words(text);
+    (min..=4).contains(&w.len())
+        && w.iter()
+            .all(|x| x.len() >= 3 && x.bytes().all(|b| b.is_ascii_alphabetic()))
 }
 
 /// A password given to a command-line client: the MySQL family's attached
@@ -788,9 +887,9 @@ fn cli_password_spans(line: &str) -> Vec<std::ops::Range<usize>> {
             client = None;
             continue;
         }
-        let (start, value) = match client {
+        let start = match client {
             Some("sshpass") if word == "-p" => match words.get(i + 1) {
-                Some(&(next_at, next)) => (next_at, next),
+                Some(&(next_at, _)) => next_at,
                 None => continue,
             },
             Some(c)
@@ -799,23 +898,44 @@ fn cli_password_spans(line: &str) -> Vec<std::ops::Range<usize>> {
                     && word.starts_with("-p")
                     && !word.starts_with("--") =>
             {
-                (at + 2, &word[2..])
+                at + 2
             }
             _ => continue,
         };
-        let quoted = value.len() >= 2
-            && matches!(value.as_bytes()[0], b'"' | b'\'')
-            && value.ends_with(value.as_bytes()[0] as char);
-        let (start, value) = if quoted {
-            (start + 1, &value[1..value.len() - 1])
-        } else {
-            (start, value)
-        };
-        if is_literal_secret(value, quoted) {
-            spans.push(start..start + value.len());
+        // The whole shell word, which a quoted space does not end:
+        // `-pS3cr3t"x y"` is one argument, and redacting only the part before
+        // the space left the rest of the password visible.
+        let end = shell_word_end(line, start);
+        let raw = &line[start..end];
+        let quoted = raw.contains(['"', '\'']);
+        // Judged without its quotes and its quoted spaces: after `-p` the
+        // context already says this is a password, so a space in it is a
+        // character of the password, not a sign of prose.
+        let value: String = raw
+            .chars()
+            .filter(|c| !matches!(c, '"' | '\'') && !c.is_whitespace())
+            .collect();
+        if is_literal_secret(&value, quoted) {
+            spans.push(start..end);
         }
     }
     spans
+}
+
+/// Where the shell word starting at `start` ends: the first whitespace outside
+/// quotes, or the end of the line when a quote is never closed.
+fn shell_word_end(line: &str, start: usize) -> usize {
+    let mut quote: Option<char> = None;
+    for (i, c) in line[start..].char_indices() {
+        match quote {
+            Some(q) if c == q => quote = None,
+            Some(_) => {}
+            None if c == '"' || c == '\'' => quote = Some(c),
+            None if c.is_whitespace() => return start + i,
+            None => {}
+        }
+    }
+    line.len()
 }
 
 /// A value standing in for a credential rather than being one: a template, a
@@ -880,6 +1000,22 @@ pub fn find_secret(line: &str) -> Option<SecretMatch> {
 /// gate reports. A token is replaced wherever it appears, not only at its
 /// first occurrence.
 pub fn redact_secrets(text: &str) -> String {
+    // One line at a time, exactly as `contains_secret` reads. Every detector
+    // is a one-line rule; run over a whole text, one line's `${` made the next
+    // line's password look like template syntax, so the password was found by
+    // `contains_secret` and left in place here.
+    let mut out = String::with_capacity(text.len());
+    for segment in text.split_inclusive('\n') {
+        let line = segment.strip_suffix('\n').unwrap_or(segment);
+        let line = line.strip_suffix('\r').unwrap_or(line);
+        out.push_str(&redact_line(line));
+        out.push_str(&segment[line.len()..]);
+    }
+    out
+}
+
+/// [`redact_secrets`] for one line.
+fn redact_line(text: &str) -> String {
     // Preserve byte offsets until every family has been checked. Sorting and
     // merging overlaps keeps the most specific prefix at a shared start and
     // prevents replacement text from being interpreted as another credential.
@@ -1169,6 +1305,110 @@ mod redaction_tests {
                     let _ = redact_secrets(&probe);
                 }
             }
+        }
+    }
+
+    /// Every detector reads one line, and so does redaction. When
+    /// `redact_secrets` read a whole multi-line text as one line, a `${` on an
+    /// earlier line made a later `password = "…"` look like template syntax:
+    /// `contains_secret` saw the password and the redacted text still held it.
+    #[test]
+    fn redaction_judges_each_line_on_its_own() {
+        for text in [
+            "echo \"${\"\npassword = \"Tr0ub4dor3xample\"\n",
+            "{{ header }}\r\napi_key: Xk29LmQp3ZxW8vRt5N\r\n",
+            "run:\n  - echo ${\n  - PGPASSWORD=xv9Lq2Rt7pW3 psql",
+        ] {
+            assert!(contains_secret(text), "{text:?}");
+            let out = redact_secrets(text);
+            assert!(!contains_secret(&out), "{text:?} -> {out:?}");
+            assert_eq!(
+                out.matches('\n').count(),
+                text.matches('\n').count(),
+                "line structure changed: {out:?}"
+            );
+        }
+        let clean = "a: ${\nb: }\r\nc = 1\n";
+        assert_eq!(redact_secrets(clean), clean);
+    }
+
+    /// One added line can be a minified bundle. The named-key detector once
+    /// scanned back over the whole line at every `:` and `=`, so a 400 KB line
+    /// took tens of seconds and stalled the gate. Linear work finishes this in
+    /// milliseconds; the bound is generous so a slow machine cannot flake it.
+    #[test]
+    fn a_long_line_is_scanned_in_linear_time() {
+        let line = "a:1,".repeat(100_000);
+        let started = std::time::Instant::now();
+        assert!(!contains_secret(&line));
+        assert_eq!(redact_secrets(&line), line);
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "400 KB of separators took {elapsed:?}"
+        );
+    }
+
+    /// A value is redacted whole. An unquoted value used to end at any comma,
+    /// and `-p` took its value up to whitespace inside shell quotes, so the
+    /// redaction left the tail of the secret visible.
+    #[test]
+    fn a_secret_value_is_redacted_whole() {
+        for (line, hidden, kept) in [
+            ("api_key: Ab1234567890Xy,zzzz", vec!["Ab12", "zzzz"], ""),
+            (
+                "{api_key: Ab1234567890Xy, next: 1}",
+                vec!["Ab1234567890Xy"],
+                ", next: 1}",
+            ),
+            (
+                "mysql -u root -pS3cr3t\"x y\" appdb",
+                vec!["S3cr3t", "x y"],
+                " appdb",
+            ),
+        ] {
+            assert!(contains_secret(line), "{line}");
+            let out = redact_secrets(line);
+            for h in hidden {
+                assert!(!out.contains(h), "{line} -> {out}");
+            }
+            assert!(out.ends_with(kept), "{line} -> {out}");
+        }
+    }
+
+    /// Settings and names that sit under a credential-ish key and are not
+    /// credentials. Each of these blocked a commit: a kebab-case setting, an
+    /// identifier with a number on the end, a qualified type name, and a key
+    /// that only begins with `password`.
+    ///
+    /// The textbook `Bearer abc123def456ghi789` in a comment is *not* here: the
+    /// corpus labels credentials by shape, published examples included, and
+    /// its held-out set labels `AbC123dEf456GhI789jKl0` a secret.
+    #[test]
+    fn names_settings_and_examples_under_credential_keys_are_not_secrets() {
+        for line in [
+            "fetch(url, { credentials: 'same-origin' })",
+            r#"  "auth": "github-actions","#,
+            "auth: oidc-provider",
+            r#"token: "refresh-token""#,
+            "secret: my-app-secret",
+            "passwordless: webauthn-v2",
+            "token: v1.Token",
+            "password: hashedPassword1",
+            "user.password = hashed_password_2024",
+        ] {
+            assert_eq!(find_secret(line), None, "{line}");
+        }
+        // The same keys with literal values still are.
+        for line in [
+            "secret: Tr0ub4dor-x9q",
+            "token: v1.Xk29LmQp3ZxW8vRt5N",
+            "password: Summer2024!x",
+            "auth: dXNlcjpwYXNzd29yZDEyMw==",
+            "DB_PASSWORD=correcthorsebatterystaple",
+            "// Bearer token format: Bearer abc123def456ghi789",
+        ] {
+            assert!(find_secret(line).is_some(), "{line}");
         }
     }
 

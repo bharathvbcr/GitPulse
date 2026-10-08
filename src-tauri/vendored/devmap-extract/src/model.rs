@@ -938,6 +938,22 @@ pub enum ReferenceKind {
     /// unresolved *code* reference: the declaration may legitimately live in a
     /// global stylesheet, a framework, or a CDN this index never saw.
     Selector,
+    /// A string literal whose whole text is an identifier, as a host program
+    /// writes the name of something a runtime looks up by name: `rt.pipeline("
+    /// flash_attn_rows_h256_r16_g32")`, a `("encoder_attn_rows_h256_r16_g32",
+    /// 16, 32)` row in a dispatch table, Swift `makeFunction(name: "…")`.
+    /// Outside any function, `assigned_to` names the top-level constant the
+    /// literal initializes, so the resolver can find what reads it. Produced
+    /// by `entry_names` for the languages a Metal host is written in.
+    ///
+    /// Outside the code ladder for the reason [`Self::Selector`] is: a string
+    /// is not an identifier, and letting the unique-global rung answer
+    /// `"reduce"` with some `fn reduce` would fabricate an edge. `devmap-resolve`
+    /// answers it only from declarations a runtime dispatches by name — Metal
+    /// shader entry points — and a literal naming none of them is not a failed
+    /// attribution: almost every identifier-shaped string is a key, a label or a
+    /// message, never a name anything declares.
+    EntryName,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1499,6 +1515,27 @@ pub struct Extraction {
     pub local_bindings: Vec<LocalBinding>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_code: Option<String>,
+    /// String literals in this file, each with the symbol that encloses it.
+    ///
+    /// Empty on an extraction cached before literals were indexed. A const
+    /// whose value is a string also contributes a site at each use of that
+    /// const, so the reader is a site even when the literal is written once.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub literals: Vec<ExtractedLiteral>,
+}
+
+/// One string literal and the symbol whose span contains it.
+///
+/// `enclosing_qualified_name` is empty when the literal sits outside every
+/// symbol (a module-level private const has no graph symbol of its own).
+/// `line` is 1-based. `value` is the decoded text, never the quoted source.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExtractedLiteral {
+    pub value: String,
+    pub start_byte: usize,
+    pub line: u32,
+    pub enclosing_qualified_name: String,
+    pub enclosing_name: String,
 }
 
 /// A lexical binding at a specific use site. `scope` is absent for an
@@ -1579,6 +1616,28 @@ impl Extraction {
     /// there and did not run, which is a failure and is charged as one.
     pub fn grammar_read_this_file(&self) -> bool {
         grammar_read(&self.engine, &self.parse_outcome)
+    }
+
+    /// The Metal shader entry points this file declares — `kernel`, `vertex`
+    /// and `fragment` functions, plain or stamped by a macro — which a host
+    /// looks up by name.
+    ///
+    /// Read from the file's own `RuntimeEntryPoint` annotations, which the
+    /// extractor attaches only to a declaration whose leading qualifier names a
+    /// shader stage, so a shader's private helper is never one. Empty for any
+    /// file that is not Metal. The one answer both the resolver's entry-name
+    /// index and the workspace's cross-repository links read.
+    pub fn metal_entry_points(&self) -> impl Iterator<Item = &ExtractedSymbol> {
+        let is_metal = crate::languages::detect_extractor_id(std::path::Path::new(&self.file_path))
+            == Some(crate::languages::ExtractorId::Metal);
+        self.wiring
+            .iter()
+            .filter(move |annotation| is_metal && annotation.kind == WiringKind::RuntimeEntryPoint)
+            .filter_map(|annotation| {
+                self.symbols
+                    .iter()
+                    .find(|symbol| symbol.qualified_name == annotation.target_symbol)
+            })
     }
 
     /// Whether this file can be the subject of a liveness verdict, and if not,

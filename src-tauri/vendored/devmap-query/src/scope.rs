@@ -16,6 +16,7 @@
 
 use std::collections::{BTreeSet, HashSet};
 
+use devmap_extract::SymbolKind;
 use serde::{Deserialize, Serialize};
 
 /// Most path prefixes one scope accepts. Each is compared against every
@@ -23,6 +24,8 @@ use serde::{Deserialize, Serialize};
 pub const MAX_SCOPE_PATHS: usize = 32;
 /// Most languages one scope accepts. More than the extractor knows.
 pub const MAX_SCOPE_LANGUAGES: usize = 16;
+/// Most symbol kinds one name query accepts.
+pub const MAX_SCOPE_KINDS: usize = 16;
 /// Most entries a refusal lists as alternatives, so a repository with a
 /// thousand top-level directories cannot turn an error into a page.
 const MAX_LISTED_ALTERNATIVES: usize = 20;
@@ -89,6 +92,16 @@ impl SymbolScope {
             paths: normalised,
             languages: langs,
         }))
+    }
+
+    /// Path prefixes after normalisation, in the caller's order.
+    pub fn paths(&self) -> &[String] {
+        &self.paths
+    }
+
+    /// Languages after normalisation, in the caller's order.
+    pub fn languages(&self) -> &[String] {
+        &self.languages
     }
 
     /// Check this scope against the files one generation indexed, and return
@@ -165,6 +178,7 @@ impl SymbolScope {
             report: ScopeReport {
                 paths,
                 languages: self.languages.clone(),
+                kinds: Vec::new(),
                 files: u32::try_from(admitted.len()).unwrap_or(u32::MAX),
                 symbols: 0,
                 corpus_files: u32::try_from(files.len()).unwrap_or(u32::MAX),
@@ -204,6 +218,10 @@ pub struct ScopeReport {
     pub paths: Vec<String>,
     /// The languages applied, lowercased. Empty when only paths were given.
     pub languages: Vec<String>,
+    /// Symbol kinds applied, in canonical [`SymbolKind::as_str`] spelling.
+    /// Empty when every kind was admitted. Absent from an older answer.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub kinds: Vec<String>,
     /// Indexed files in scope, including files that declare no symbol.
     pub files: u32,
     /// Symbols in scope — the corpus the ranking ran over.
@@ -220,6 +238,117 @@ pub struct ScopeReport {
 
 fn is_zero(value: &u32) -> bool {
     *value == 0
+}
+
+/// Path, language and symbol-kind narrowing for a name query.
+///
+/// `None` from [`Self::new`] means no narrowing: the whole repository, every
+/// kind. A kind with no path and no language is still a filter — keyword
+/// search has to apply it in SQL, or the full-text page would be cut before
+/// the kind was known and the counts would describe a different set.
+///
+/// Kind names are matched ignoring case and echoed as [`SymbolKind::as_str`].
+/// One unknown entry refuses the call and lists the kinds that exist; it is
+/// not dropped. [`SymbolKind::from_persisted`] stays case-sensitive, because
+/// that reads rows already stored, and this accepts what a caller types.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NameQueryFilter {
+    paths: Vec<String>,
+    languages: Vec<String>,
+    kinds: Vec<String>,
+}
+
+impl NameQueryFilter {
+    /// Build a filter, or `None` when every list is empty.
+    pub fn new(
+        paths: &[String],
+        languages: &[String],
+        kinds: &[String],
+    ) -> anyhow::Result<Option<Self>> {
+        if paths.is_empty() && languages.is_empty() && kinds.is_empty() {
+            return Ok(None);
+        }
+        if kinds.len() > MAX_SCOPE_KINDS {
+            anyhow::bail!(
+                "kinds accepts at most {MAX_SCOPE_KINDS} entries, got {}",
+                kinds.len()
+            );
+        }
+        let mut canonical = Vec::with_capacity(kinds.len());
+        for raw in kinds {
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                anyhow::bail!(
+                    "kinds entry {raw:?} is empty; omit `kinds` to admit every kind"
+                );
+            }
+            let Some(kind) = SymbolKind::ALL
+                .iter()
+                .copied()
+                .find(|kind| kind.as_str().eq_ignore_ascii_case(trimmed))
+            else {
+                anyhow::bail!(
+                    "kinds entry {raw:?} is not a symbol kind. Known kinds: {}",
+                    known_kinds()
+                );
+            };
+            let name = kind.as_str().to_string();
+            if !canonical.iter().any(|have| have == &name) {
+                canonical.push(name);
+            }
+        }
+        // Path and language shape stay with `SymbolScope`. Kind-only has no
+        // scope of that kind: `new` returns `None` when both lists are empty,
+        // and that is still a filter here.
+        let (paths, languages) = match SymbolScope::new(paths, languages)? {
+            Some(scope) => (scope.paths().to_vec(), scope.languages().to_vec()),
+            None => (Vec::new(), Vec::new()),
+        };
+        Ok(Some(Self {
+            paths,
+            languages,
+            kinds: canonical,
+        }))
+    }
+
+    pub fn paths(&self) -> &[String] {
+        &self.paths
+    }
+
+    pub fn languages(&self) -> &[String] {
+        &self.languages
+    }
+
+    pub fn kinds(&self) -> &[String] {
+        &self.kinds
+    }
+
+    /// The path/language half, for a ranking that already scopes that way.
+    /// `Ok(None)` when this filter is kind-only.
+    pub fn symbol_scope(&self) -> anyhow::Result<Option<SymbolScope>> {
+        SymbolScope::new(&self.paths, &self.languages)
+    }
+}
+
+/// A requested kind labels nothing in the corpus the caller narrowed to.
+pub fn missing_kind_message(missing: &[String], present: &BTreeSet<String>, scoped: bool) -> String {
+    let place = if scoped {
+        "under the path/language"
+    } else {
+        "in the indexed repository"
+    };
+    format!(
+        "kinds entry {missing:?} labels no symbol {place}; kinds present: {}",
+        listed(present.clone())
+    )
+}
+
+fn known_kinds() -> String {
+    SymbolKind::ALL
+        .iter()
+        .map(|kind| kind.as_str())
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn admits(paths: &[String], languages: &[String], path: &str, language: &str) -> bool {

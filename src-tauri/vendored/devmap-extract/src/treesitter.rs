@@ -534,6 +534,39 @@ fn extract_treesitter_before_deadline(
                         over_budget("walking the syntax tree"),
                     );
                 }
+                // After the walk, because a stamped function is a declaration
+                // the walk could not see: it exists only in a macro's
+                // expansion. Its overrun is caught by the check below, the one
+                // every phase between here and assembly shares.
+                if is_c_family_grammar(lang) {
+                    crate::cmacro::stamp_macro_instantiations(
+                        root,
+                        source,
+                        lang,
+                        &file_symbol_name,
+                        is_metal_path(path),
+                        &mut symbols,
+                        &mut calls,
+                        &mut references,
+                        &mut wiring,
+                        deadline,
+                    );
+                }
+                if !crate::entry_names::collect(
+                    root,
+                    source,
+                    lang,
+                    &file_symbol_name,
+                    &mut references,
+                    deadline,
+                ) {
+                    return refused_extraction(
+                        path,
+                        lang,
+                        source,
+                        over_budget("reading name strings"),
+                    );
+                }
 
                 let (go_interface_methods, go_method_params, go_member_names) = if lang == "go" {
                     let (interface_methods, method_params, mut member_names) =
@@ -759,6 +792,7 @@ fn extract_treesitter_before_deadline(
                     scope_locals: collect_scope_locals(root, source, &file_symbol_name),
                     local_bindings,
                     source_code: Some(source.to_string()),
+                    literals: Vec::new(),
                 };
 
                 // The code inside a template language's `<script>` blocks, in
@@ -795,6 +829,10 @@ fn extract_treesitter_before_deadline(
                 // after one registry lookup for every language whose entry
                 // permits neither `css` nor `html` inside it.
                 crate::markup::merge_markup(&mut extraction, root, source, lang);
+                let (literals, mut notes) =
+                    crate::literals::index_literals(root, source, lang, &extraction.symbols, deadline);
+                extraction.literals = literals;
+                extraction.diagnostics.append(&mut notes);
                 #[cfg(test)]
                 EXTRACTION_FINISH_HOOK.with(|hook| {
                     if let Some(finish) = hook.take() {
@@ -853,7 +891,7 @@ fn push_children_reversed<'tree>(node: Node<'tree>, worklist: &mut Vec<Node<'tre
 }
 
 /// [`push_children`] over named children only.
-fn push_named_children<'tree>(node: Node<'tree>, worklist: &mut Vec<Node<'tree>>) {
+pub(crate) fn push_named_children<'tree>(node: Node<'tree>, worklist: &mut Vec<Node<'tree>>) {
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
         worklist.push(child);
@@ -1506,6 +1544,84 @@ fn python_import_bindings(node: Node, source: &str) -> (Vec<String>, Vec<String>
 /// (`{ a, // why\n b }` bound `//` and lost `b`) and an inline `type` modifier
 /// (`{ type Foo, bar }` bound `type` and lost `Foo`). A specifier's `name` and
 /// `alias` fields hold only an identifier or a string, so nothing else is read.
+/// The names a CommonJS `require(...)` binds, in the shape an ES import of the
+/// same meaning records.
+///
+/// `const path = require("node:path")` is `import * as path`: the alias plus a
+/// `*` name. `const { a, b: c } = require("./x")` is `import { a, b as c }`.
+/// Only a `require` that *is* a declarator's value binds anything; a bare
+/// side-effect `require` and `require("./x").member` name no handle for the
+/// module, and inventing one would bind a name the author never wrote.
+fn js_require_bindings(call: Node, source: &str) -> (Option<String>, Vec<String>, Vec<String>) {
+    let unbound = (None, Vec::new(), Vec::new());
+    let Some(declarator) = call
+        .parent()
+        .filter(|parent| parent.kind() == "variable_declarator")
+        .filter(|parent| {
+            parent
+                .child_by_field_name("value")
+                .is_some_and(|value| value.id() == call.id())
+        })
+    else {
+        return unbound;
+    };
+    let Some(pattern) = declarator.child_by_field_name("name") else {
+        return unbound;
+    };
+    match pattern.kind() {
+        "identifier" => {
+            let local = get_node_text(pattern, source);
+            (Some(local.clone()), vec!["*".to_string()], vec![local])
+        }
+        "object_pattern" => {
+            let mut names = Vec::new();
+            let mut locals = Vec::new();
+            let mut cursor = pattern.walk();
+            for property in pattern.named_children(&mut cursor) {
+                let (name, local) = match property.kind() {
+                    "shorthand_property_identifier_pattern" => {
+                        let name = get_node_text(property, source);
+                        (name.clone(), name)
+                    }
+                    // `{ a = fallback }` binds `a`.
+                    "object_assignment_pattern" => {
+                        let Some(left) = property
+                            .child_by_field_name("left")
+                            .filter(|left| left.kind() == "shorthand_property_identifier_pattern")
+                        else {
+                            continue;
+                        };
+                        let name = get_node_text(left, source);
+                        (name.clone(), name)
+                    }
+                    // `{ a: b }` binds `b` to the module's `a`. A nested
+                    // pattern (`{ a: { b } }`) binds a member of a member,
+                    // which no import shape can say.
+                    "pair_pattern" => {
+                        let (Some(key), Some(value)) = (
+                            property.child_by_field_name("key"),
+                            property.child_by_field_name("value"),
+                        ) else {
+                            continue;
+                        };
+                        if key.kind() != "property_identifier" || value.kind() != "identifier" {
+                            continue;
+                        }
+                        (get_node_text(key, source), get_node_text(value, source))
+                    }
+                    _ => continue,
+                };
+                if !name.is_empty() && !local.is_empty() {
+                    names.push(name);
+                    locals.push(local);
+                }
+            }
+            (None, names, locals)
+        }
+        _ => unbound,
+    }
+}
+
 fn js_clause_bindings(clause: Node, source: &str) -> (Vec<String>, Vec<String>) {
     let mut names = Vec::new();
     let mut locals = Vec::new();
@@ -1756,6 +1872,7 @@ fn unparsed_extraction(
         scope_locals: Vec::new(),
         local_bindings: Vec::new(),
         source_code: Some(source.to_string()),
+        literals: Vec::new(),
     }
 }
 
@@ -1963,6 +2080,7 @@ fn unavailable_extraction(path: &str, lang: &str, source: &str) -> Extraction {
         scope_locals: Vec::new(),
         local_bindings: Vec::new(),
         source_code: Some(source.to_string()),
+        literals: Vec::new(),
     }
 }
 
@@ -3246,7 +3364,7 @@ fn generic_declaration_name(node: Node, source: &str) -> Option<String> {
 /// declaration's *leading* tokens are read, within a bounded window, so a
 /// `kernel`-typed parameter or an address space further along the signature can
 /// never promote an ordinary helper to an entry point.
-fn metal_shader_entry_reason_of(node: Node, source: &str) -> Option<&'static str> {
+pub(crate) fn metal_shader_entry_reason_of(node: Node, source: &str) -> Option<&'static str> {
     const HEAD_WINDOW: usize = 256;
     let start = node.start_byte();
     let end = node.end_byte().min(start + HEAD_WINDOW);
@@ -3961,12 +4079,18 @@ fn extract_node(
                                         .trim_matches('`')
                                         .to_string();
                                     if !mod_spec.is_empty() {
+                                        let (alias, imported_names, local_names) =
+                                            if callee == "require" {
+                                                js_require_bindings(node, source)
+                                            } else {
+                                                (None, vec![], vec![])
+                                            };
                                         imports.push(ExtractedImport {
                                             raw_import: get_node_text(node, source),
                                             module_specifier: mod_spec,
-                                            imported_names: vec![],
-                                            local_names: vec![],
-                                            alias: None,
+                                            imported_names,
+                                            local_names,
+                                            alias,
                                             span: span.clone(),
                                             path_load: None,
                                         });
@@ -5449,7 +5573,7 @@ pub(crate) fn c_family_declaration(
 /// delegates, target/action and protocol conformance all invoke methods that no
 /// call expression in the corpus mentions. Metal's shader qualifiers are handled
 /// by `metal_shader_entry_reason_of`, which already owns that rule.
-fn c_family_entry_point_reason(
+pub(crate) fn c_family_entry_point_reason(
     node: Node,
     source: &str,
     path: &str,
@@ -5636,7 +5760,26 @@ thread_local! {
 /// this rule: a missing edge is one more finding a reader sees, never a hidden
 /// one. No function-like macro in any corpus measured here comes within two
 /// orders of magnitude of it.
-const C_MACRO_BODY_MAX_BYTES: usize = 64 * 1024;
+pub(crate) const C_MACRO_BODY_MAX_BYTES: usize = 64 * 1024;
+
+/// Parse a C-family fragment that exists only in memory — a macro body, or a
+/// macro invocation's expansion — with `lang`'s grammar, on this thread's
+/// reused probe parser.
+pub(crate) fn parse_c_probe(lang: &str, text: &str) -> Option<tree_sitter::Tree> {
+    let (grammar, language) = grammar_for(lang)?;
+    C_MACRO_PROBE_PARSER.with(|cell| {
+        let mut slot = cell.borrow_mut();
+        if slot.as_ref().is_none_or(|(held, _)| *held != grammar) {
+            let mut parser = Parser::new();
+            if parser.set_language(&language).is_err() {
+                return None;
+            }
+            *slot = Some((grammar, parser));
+        }
+        slot.as_mut()
+            .and_then(|(_, parser)| parser.parse(text, None))
+    })
+}
 
 /// Most probe-tree nodes one macro body is walked for.
 const C_MACRO_PROBE_MAX_NODES: usize = 50_000;
@@ -5694,9 +5837,6 @@ fn extract_c_macro_body_calls(
             }
         }
     }
-    let Some((grammar, language)) = grammar_for(lang) else {
-        return;
-    };
     let body = raw
         .replace("\\\r\n", "\n")
         .replace("\\\n", "\n")
@@ -5706,19 +5846,7 @@ fn extract_c_macro_body_calls(
         body.clone(),
         format!("void {C_MACRO_PROBE}() {{\n{body}\n}}\n"),
     ] {
-        let parsed = C_MACRO_PROBE_PARSER.with(|cell| {
-            let mut slot = cell.borrow_mut();
-            if slot.as_ref().is_none_or(|(held, _)| *held != grammar) {
-                let mut parser = Parser::new();
-                if parser.set_language(&language).is_err() {
-                    return None;
-                }
-                *slot = Some((grammar, parser));
-            }
-            slot.as_mut()
-                .and_then(|(_, parser)| parser.parse(&probe, None))
-        });
-        let Some(tree) = parsed else {
+        let Some(tree) = parse_c_probe(lang, &probe) else {
             continue;
         };
         collect_c_probe_calls(tree.root_node(), &probe, &parameters, &mut found);
@@ -7723,7 +7851,7 @@ fn is_r_binding_target(node: Node) -> bool {
     }
 }
 
-fn is_user_ident(name: &str) -> bool {
+pub(crate) fn is_user_ident(name: &str) -> bool {
     let Some(first) = name.chars().next() else {
         return false;
     };
@@ -7995,6 +8123,18 @@ fn is_defining_name(node: Node) -> bool {
         if parent.kind() == "generic_type" {
             return false;
         }
+        // Rust's struct literal writes the type it constructs on the `name`
+        // field of `struct_expression`. That is a use: a serde record built
+        // only as `to_string(&FileRecord { .. })` has no other mention, and
+        // reading it as a binding suppressed the Type reference, so the type
+        // was reported dead at 0.9. `Self { .. }` is the same position, and
+        // the resolver reads a Rust `Self` type reference as the enclosing
+        // impl's type. The arm's `Constructor` reference cannot stand in: it
+        // carries the `let` binding only, and the resolver skips that kind as
+        // the duplicate of a call no struct literal has.
+        if parent.kind() == "struct_expression" && field_contains(parent, "name", current) {
+            return false;
+        }
         // The C++ spelling of the same shape, but transparent rather than a
         // verdict: `f<T>(x)` is a use and `template <> struct Tiles<8> {…}` is
         // a declaration, and only the node above the wrapper can tell which.
@@ -8212,7 +8352,7 @@ fn walk_overran() -> bool {
 /// checking nothing. Either one means the result is not a complete read of the
 /// file, and a check that could not run must never report what a check that ran
 /// and passed reports.
-fn extraction_overran(deadline: std::time::Instant) -> bool {
+pub(crate) fn extraction_overran(deadline: std::time::Instant) -> bool {
     walk_overran() || std::time::Instant::now() >= deadline
 }
 

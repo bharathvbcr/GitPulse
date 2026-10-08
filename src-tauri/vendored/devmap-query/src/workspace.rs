@@ -13,8 +13,9 @@
 //! the graph worse rather than larger — the same failure the resolver already
 //! records at 0.2 confidence within a single repository. Cross-repository links
 //! are asserted only where a repository *declares* the module another one
-//! imports (see [`link_candidates`]), and they are reported as candidates with
-//! their evidence attached.
+//! imports, or the Metal entry point another one names in a string (see
+//! [`link_candidates`]), and they are reported as candidates with their
+//! evidence attached.
 
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -340,20 +341,50 @@ pub struct FederatedSearch {
     pub truncated: bool,
 }
 
-/// A module one repository imports and another declares.
+/// A module one repository imports and another declares, or a Metal entry point
+/// one repository declares and another names in a string.
 ///
-/// This is the only cross-repository relation asserted here, because it is the
-/// only one with evidence that does not reduce to "two files used the same
-/// word". `evidence` records what matched — a Go module path from `go.mod`, or
-/// a top-level package directory — so a reader can judge the claim instead of
-/// taking it.
+/// These are the only cross-repository relations asserted here, because they
+/// are the only ones with evidence that does not reduce to "two files used the
+/// same word": a module path is how the toolchain resolves an import, and an
+/// entry-point name is how the Metal runtime resolves a lookup — and only a
+/// declaration that runtime dispatches by name counts, never a same-named
+/// helper. `evidence` records what matched — a Go module path from `go.mod`, a
+/// top-level package directory, or the shader file that declares the entry
+/// point — so a reader can judge the claim instead of taking it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LinkCandidate {
+    /// Which relation this is. Absent in a candidate written before kinds
+    /// existed, which was always an import.
+    #[serde(default)]
+    pub kind: LinkKind,
     pub from_repo: String,
     pub from_file: String,
+    /// The imported module, or — for [`LinkKind::EntryName`] — the name the
+    /// string spells.
     pub module_specifier: String,
     pub to_repo: String,
     pub evidence: String,
+    /// The function (or top-level constant) that writes the name, for an
+    /// entry-name link.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from_symbol: Option<String>,
+    /// The entry point the name matches, for an entry-name link.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub to_symbol: Option<String>,
+}
+
+/// The two cross-repository relations with evidence of their own.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LinkKind {
+    /// An import of a module another repository declares.
+    #[default]
+    Import,
+    /// A string naming a Metal entry point another repository declares — a
+    /// host that dispatches a sibling crate's kernel by name, as ojas and
+    /// qd-metal do with tessl's.
+    EntryName,
 }
 
 #[cfg(test)]

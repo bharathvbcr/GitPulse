@@ -94,7 +94,22 @@ fn parse_replace_spec(spec: &str) -> Option<(String, String)> {
 
 /// Collect every non-gitignored `go.mod` under `root`.
 pub fn collect_go_modules(root: &Path) -> anyhow::Result<Vec<GoModule>> {
+    collect_project_manifests(root).map(|manifests| manifests.go_modules)
+}
+
+/// The project manifests the resolver reads beside source: Go modules and
+/// TypeScript / JavaScript project configs.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ProjectManifests {
+    pub go_modules: Vec<GoModule>,
+    pub ts_projects: Vec<crate::tsconfig::TsProject>,
+}
+
+/// One walk for every manifest kind, so a build pays for the tree once: this
+/// is already the second walk of it on the build path.
+pub fn collect_project_manifests(root: &Path) -> anyhow::Result<ProjectManifests> {
     let mut modules = Vec::new();
+    let mut ts_configs: Vec<String> = Vec::new();
     let walk_root = root.to_path_buf();
     let marker_error = std::sync::Arc::new(std::sync::Mutex::new(None));
     let marker_error_writer = std::sync::Arc::clone(&marker_error);
@@ -159,7 +174,11 @@ pub fn collect_go_modules(root: &Path) -> anyhow::Result<Vec<GoModule>> {
         if !path.is_file() {
             continue;
         }
-        if path.file_name().and_then(|name| name.to_str()) != Some("go.mod") {
+        let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        let is_go_mod = file_name == "go.mod";
+        if !is_go_mod && !crate::tsconfig::is_ts_config_name(file_name) {
             continue;
         }
         let Ok(rel) = path.strip_prefix(root) else {
@@ -169,6 +188,10 @@ pub fn collect_go_modules(root: &Path) -> anyhow::Result<Vec<GoModule>> {
             continue;
         };
         let rel_str = rel_str.replace('\\', "/");
+        if !is_go_mod {
+            ts_configs.push(rel_str);
+            continue;
+        }
         let Ok(source) = fs::read_to_string(path) else {
             continue;
         };
@@ -187,7 +210,12 @@ pub fn collect_go_modules(root: &Path) -> anyhow::Result<Vec<GoModule>> {
             .then_with(|| left.prefix.cmp(&right.prefix))
             .then_with(|| left.dir.cmp(&right.dir))
     });
-    Ok(modules)
+    ts_configs.sort();
+    let ts_projects = crate::tsconfig::build_ts_projects(root, &ts_configs);
+    Ok(ProjectManifests {
+        go_modules: modules,
+        ts_projects,
+    })
 }
 
 /// Directories (repo-relative, `/`-separated) that hold an indexed `.go` file

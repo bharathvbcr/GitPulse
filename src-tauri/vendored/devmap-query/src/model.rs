@@ -218,9 +218,10 @@ pub struct Response<T> {
     /// ledger could not be read; `Some` with no sites is a checked absence.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub unresolved_namesakes: Option<UnresolvedNamesakes>,
-    /// The path prefixes and languages the ranking was restricted to, with the
-    /// scoped and whole corpus sizes. Set by a scoped `ask` or semantic
-    /// `search` alone.
+    /// The path prefixes, languages and kinds the ranking was restricted to,
+    /// with the scoped and whole corpus sizes. Set by a scoped `ask`, a
+    /// semantic `search`, or a keyword `search` / `explore` that passed a
+    /// path, language or kind filter.
     ///
     /// A client that asked for a scope over the socket protocol should
     /// require this on the answer: an older daemon ignores fields it does not
@@ -605,6 +606,44 @@ pub struct ExploreReport {
     pub limit: u32,
     pub blast_radius: BlastRadius,
     pub budget: ExploreBudget,
+    /// Path, language and kind narrowing applied to the definition search.
+    /// Absent when the caller narrowed nothing, so an older reader still parses
+    /// an unscoped answer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<crate::scope::ScopeReport>,
+}
+
+/// One place a string literal is written, and the symbol that encloses it.
+///
+/// `qualified_name` is the graph's spelling (`file::Type.method`), empty when
+/// the literal sits outside every symbol. `line` is 1-based.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LiteralSite {
+    pub file_path: String,
+    pub line: u32,
+    pub value: String,
+    pub qualified_name: String,
+    pub symbol_name: String,
+}
+
+/// Where a string value is written.
+///
+/// `exact` false is a prefix: `session.` matches `session.spawn`. Counts obey
+/// `shown + hidden == total`. `walk_incomplete` is set when a page cap cut the
+/// rows before the token budget did, so `hidden` includes sites this page
+/// never loaded.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LiteralReport {
+    pub query: String,
+    pub exact: bool,
+    pub items: Vec<LiteralSite>,
+    pub shown: u32,
+    pub hidden: u32,
+    pub total: u32,
+    pub truncated: bool,
+    pub tokens_used: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub walk_incomplete: Option<String>,
 }
 
 /// A test file the inbound walk reached, and how far away it was.

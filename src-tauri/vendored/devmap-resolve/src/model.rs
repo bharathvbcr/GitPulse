@@ -360,21 +360,25 @@ pub enum Resolution {
         target_symbol: String,
         target_file: String,
     },
-    /// Exactly one file in the repository declares this markup or stylesheet
-    /// identity, and it is not the file that names it: a global stylesheet's
-    /// `.btn`, reached from a component that writes `class="btn"`.
+    /// Exactly one declaration in a namespace kept apart from the code ladder
+    /// answers this name, and it is not in the file that names it. Two such
+    /// namespaces exist: markup and stylesheet identities (a global
+    /// stylesheet's `.btn`, reached from a component that writes
+    /// `class="btn"`), and entry points a runtime dispatches by name (a Metal
+    /// kernel, reached from a Rust `pipeline("…")` string).
     ///
     /// The same rung as [`Self::UniqueGlobal`] and rated identically — one
     /// declaration of that name, so there is nothing to choose between — but a
     /// separate variant because `UniqueGlobal` carries a [`LangFamily`] and this
     /// rung has none to carry. A `.btn` in `app.css` is named by a Svelte
-    /// component, a Vue one and a plain `.html` page alike; the namespace
-    /// searched is the markup one, which spans every language. Filling that
+    /// component, a Vue one and a plain `.html` page alike, and a kernel is
+    /// named from Rust, Swift or Objective-C; the namespace searched spans every
+    /// language. Filling that
     /// field in would have meant either naming a family the rung never consulted
     /// or writing `Generic`, which
     /// [`LangFamily::admits`](crate::model::LangFamily::admits) defines as inert
     /// — an edge whose own evidence says cross-file resolution was refused.
-    UniqueSelector {
+    UniqueNamespaced {
         target_symbol: String,
         target_file: String,
     },
@@ -400,7 +404,7 @@ impl Resolution {
             // The same rung as UniqueGlobal: one declaration of the name in the
             // repository. Persisted under the same label, so no stored
             // generation and no schema check changes meaning.
-            Resolution::UniqueSelector { .. } => ResolutionKind::UniqueGlobal,
+            Resolution::UniqueNamespaced { .. } => ResolutionKind::UniqueGlobal,
         }
     }
 
@@ -454,7 +458,7 @@ impl Resolution {
                 target_symbol,
                 target_file,
             }
-            | Resolution::UniqueSelector {
+            | Resolution::UniqueNamespaced {
                 target_symbol,
                 target_file,
             } => Some((target_file.as_str(), target_symbol.as_str())),
@@ -609,7 +613,8 @@ pub enum UnresolvedClass {
     /// module handle (`strings.TrimSpace()`) or a value whose *declared type*
     /// comes from an import (`t.Fatalf()` where `t` is a `*testing.T`).
     External { module: String },
-    /// A method call whose receiver exists but could not be typed.
+    /// A method call whose receiver exists but could not be typed, on a member
+    /// that some symbol of the caller's language family does declare.
     ///
     /// `expect(...).toBe(...)`, `value.unwrap()`, `items.append(x)` — the
     /// receiver is an expression or an untyped local, so naming its owner needs
@@ -617,16 +622,20 @@ pub enum UnresolvedClass {
     ///
     /// Split out because it is a *known structural limitation*, not a defect.
     /// Leaving it merged with `Unresolved` is what made that tier unreadable:
-    /// this is by far the largest group, and it drowned the bare-name failures
-    /// that actually indicate an extraction or resolution bug.
+    /// it drowned the bare-name failures that actually indicate an extraction
+    /// or resolution bug. A member no symbol of the family declares is
+    /// [`NoNamesake`] instead: there is no owner for inference to find.
     UninferredReceiver,
-    /// A bare-name call or reference that failed every ladder rung, and **no
-    /// indexed symbol carries that bare name**.
+    /// A call or reference that failed every ladder rung, and **no indexed
+    /// symbol that could be its target carries that name**: for a bare name,
+    /// no symbol anywhere; for a member on a receiver, no symbol of the
+    /// caller's language family.
     ///
-    /// Distinct from [`Unresolved`]: when the corpus has no namesake, the miss
-    /// cannot be an extraction gap pointing at a declaration we failed to bind
-    /// — there is nothing to bind. Kept in the ledger for completeness; excluded
-    /// from gap numerators that treat [`Unresolved`] as a defect count.
+    /// Distinct from [`Unresolved`] and [`UninferredReceiver`]: when the corpus
+    /// has no namesake, the miss cannot be an extraction gap or an untyped
+    /// receiver pointing at a declaration we failed to bind — there is nothing
+    /// to bind. Kept in the ledger for completeness; excluded from gap
+    /// numerators that treat [`Unresolved`] as a defect count.
     NoNamesake,
     /// A receiver that is a **module path** into this crate (`crate::`,
     /// `super::`, `self::`, or a path rooted at a module this file's own `mod`

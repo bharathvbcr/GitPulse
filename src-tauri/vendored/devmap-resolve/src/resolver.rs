@@ -8,7 +8,8 @@ use rayon::prelude::*;
 use devmap_extract::model::*;
 
 use crate::model::*;
-use devmap_extract::GoModule;
+use devmap_extract::tsconfig::TsProject;
+use devmap_extract::{GoModule, ProjectManifests};
 
 /// One package-level declaration, as [`Resolver::go_package_symbols`] holds it:
 /// the file that declares it, its qualified name, and its kind.
@@ -238,6 +239,16 @@ pub struct Resolver {
     /// coarser answer. Kept apart, the only thing that can answer a selector is
     /// a markup or stylesheet declaration.
     selector_symbols: BTreeMap<String, Vec<SelectorDeclaration>>,
+    /// Entry points a runtime dispatches by name — Metal `kernel`, `vertex` and
+    /// `fragment` functions, plain or stamped by a macro — by bare name, to the
+    /// files that declare them, deduplicated and sorted.
+    ///
+    /// The only thing that can answer a [`ReferenceKind::EntryName`], and kept
+    /// out of `symbol_index` for the reason `selector_symbols` is: a string
+    /// naming `"reduce"` is not a reference to every `fn reduce`, and only a
+    /// declaration the runtime itself looks up by name is a target a string can
+    /// mean.
+    entry_names: BTreeMap<String, Vec<String>>,
     /// Every indexed file, grouped by its parent directory, each group sorted.
     ///
     /// Three call sites answered "which files sit directly in this directory"
@@ -465,6 +476,11 @@ pub struct Resolver {
     /// resolves without module prefixes, which under-resolves Go imports rather
     /// than resolving them confidently against a stale map.
     go_modules_fresh: bool,
+    /// TypeScript / JavaScript project configs, deepest directory first: the
+    /// `paths` / `baseUrl` mapping a non-relative specifier resolves through.
+    ts_projects: Vec<TsProject>,
+    /// The `go_modules_fresh` contract, for `ts_projects`.
+    ts_projects_fresh: bool,
     /// file_path → Go package identifier (`pkg` in `package pkg`).
     go_package_by_file: BTreeMap<String, String>,
     /// X45. `(directory, package clause, bare name)` → the **package-level**
@@ -564,6 +580,7 @@ impl Resolver {
             symbol_index: BTreeMap::new(),
             file_symbols: BTreeMap::new(),
             selector_symbols: BTreeMap::new(),
+            entry_names: BTreeMap::new(),
             files_by_dir: BTreeMap::new(),
             py_files_by_name: BTreeMap::new(),
             path_module_bindings: BTreeMap::new(),
@@ -592,6 +609,8 @@ impl Resolver {
             symbol_parents: BTreeMap::new(),
             go_modules: Vec::new(),
             go_modules_fresh: false,
+            ts_projects: Vec::new(),
+            ts_projects_fresh: false,
             go_package_by_file: BTreeMap::new(),
             go_package_symbols: BTreeMap::new(),
             go_package_methods: BTreeMap::new(),
@@ -1089,6 +1108,145 @@ impl Resolver {
     pub fn index_go_modules(&mut self, modules: &[GoModule]) {
         self.go_modules = modules.to_vec();
         self.go_modules_fresh = true;
+    }
+
+    /// Supply every project manifest collected for the snapshot: Go modules
+    /// and TypeScript / JavaScript project configs, under the one-pass
+    /// freshness contract `index_go_modules` states.
+    pub fn index_project_manifests(&mut self, manifests: &ProjectManifests) {
+        self.index_go_modules(&manifests.go_modules);
+        let mut projects = manifests.ts_projects.clone();
+        // Deepest first, whatever order arrived: the nearest config governs.
+        projects.sort_by(|left, right| {
+            Self::dir_depth(&right.dir)
+                .cmp(&Self::dir_depth(&left.dir))
+                .then_with(|| right.dir.len().cmp(&left.dir.len()))
+                .then_with(|| left.dir.cmp(&right.dir))
+        });
+        self.ts_projects = projects;
+        self.ts_projects_fresh = true;
+    }
+
+    fn dir_depth(dir: &str) -> usize {
+        if dir.is_empty() {
+            0
+        } else {
+            dir.split('/').count()
+        }
+    }
+
+    /// The config governing `file`: the deepest whose directory contains it.
+    fn governing_ts_project(&self, file: &str) -> Option<&TsProject> {
+        self.ts_projects.iter().find(|project| {
+            project.dir.is_empty() || file.starts_with(&format!("{}/", project.dir))
+        })
+    }
+
+    /// Where a non-relative specifier points under the governing config's
+    /// `paths`, as the substituted base paths in TypeScript's order: for each
+    /// mapping (own config, then references), the best-matching pattern —
+    /// exact, else the longest prefix before its `*` — and its targets.
+    ///
+    /// A lone `*` pattern is skipped here: it matches every specifier, so it
+    /// is no evidence that a given one names a file in this tree.
+    fn ts_paths_bases(&self, file: &str, specifier: &str) -> Vec<String> {
+        let Some(project) = self.governing_ts_project(file) else {
+            return Vec::new();
+        };
+        let mut bases = Vec::new();
+        for mapping in &project.mappings {
+            let mut best: Option<(usize, bool, &str, &Vec<String>)> = None;
+            for (pattern, targets) in &mapping.paths {
+                let matched = match pattern.split_once('*') {
+                    None if pattern == specifier => Some((pattern.len(), true, "")),
+                    None => None,
+                    Some(("", "")) => None,
+                    Some((prefix, suffix)) => specifier
+                        .strip_prefix(prefix)
+                        .and_then(|rest| rest.strip_suffix(suffix))
+                        .map(|star| (prefix.len(), false, star)),
+                };
+                let Some((rank, exact, star)) = matched else {
+                    continue;
+                };
+                let better = match best {
+                    None => true,
+                    Some((best_rank, best_exact, _, _)) => {
+                        (exact && !best_exact) || (exact == best_exact && rank > best_rank)
+                    }
+                };
+                if better {
+                    best = Some((rank, exact, star, targets));
+                }
+            }
+            if let Some((_, _, star, targets)) = best {
+                bases.extend(targets.iter().map(|target| target.replacen('*', star, 1)));
+            }
+        }
+        bases
+    }
+
+    /// The JS/TS module candidates for a base path: the file itself, each
+    /// extension, then a directory's `index`.
+    fn js_module_candidates(base: &str) -> [String; 19] {
+        [
+            base.to_string(),
+            format!("{}.ts", base),
+            format!("{}.tsx", base),
+            format!("{}.mts", base),
+            format!("{}.cts", base),
+            format!("{}.js", base),
+            format!("{}.jsx", base),
+            format!("{}.mjs", base),
+            format!("{}.cjs", base),
+            format!("{}.svelte", base),
+            format!("{}.vue", base),
+            format!("{}.astro", base),
+            format!("{}/index.ts", base),
+            format!("{}/index.tsx", base),
+            format!("{}/index.js", base),
+            format!("{}/index.jsx", base),
+            format!("{}/index.svelte", base),
+            format!("{}/index.vue", base),
+            format!("{}/index.astro", base),
+        ]
+    }
+
+    /// A non-relative JS/TS specifier resolved through the governing config:
+    /// its `paths` first, then each mapping's `baseUrl`.
+    fn resolve_ts_mapped(&self, file: &str, specifier: &str) -> Option<String> {
+        let indexed = |base: &str| {
+            Self::js_module_candidates(base)
+                .into_iter()
+                .find(|candidate| self.file_symbols.contains_key(candidate))
+        };
+        if let Some(hit) = self
+            .ts_paths_bases(file, specifier)
+            .iter()
+            .find_map(|base| indexed(base))
+        {
+            return Some(hit);
+        }
+        let project = self.governing_ts_project(file)?;
+        project.mappings.iter().find_map(|mapping| {
+            let base_url = mapping.base_url.as_deref()?;
+            let base = if base_url.is_empty() {
+                specifier.to_string()
+            } else {
+                format!("{base_url}/{specifier}")
+            };
+            indexed(&base)
+        })
+    }
+
+    /// Whether a JS/TS specifier is a `paths` pattern into this tree: a miss
+    /// through one is an index gap, not an outside module.
+    fn specifier_is_ts_mapped(&self, file: &str, lang: &str, specifier: &str) -> bool {
+        LangFamily::from_lang(lang) == LangFamily::JsTs
+            && !specifier.starts_with('.')
+            && !self
+                .ts_paths_bases(file, specifier.trim_matches(|c| c == '\'' || c == '"'))
+                .is_empty()
     }
 
     /// Resolve a (file, bare name) pair to its graph identity, falling back to
@@ -2006,6 +2164,18 @@ impl Resolver {
             }
         }
 
+        // No symbol of this family carries the member's name, so there is no
+        // owner for type inference to find: every edge ends at an indexed
+        // symbol, and none could end here. The evidence `bare_name_miss`
+        // stands on, asked of a receiver. Measured at generation 4144: 827 of
+        // the 837 JavaScript `uninferred_receiver` rows (`push`, `includes`,
+        // `length`) named a member no JavaScript or TypeScript file declares.
+        // A namesake in another family is no candidate — `family.admits` is
+        // the same scoping the binding rungs use.
+        if !self.family_declares(family, callee_name) {
+            return UnresolvedClass::NoNamesake;
+        }
+
         // A receiver we could not type. Not a defect — naming its owner needs
         // real type inference — but distinct from a bare-name failure, and by
         // far the larger group.
@@ -2087,6 +2257,7 @@ impl Resolver {
         self.symbol_index.clear();
         self.file_symbols.clear();
         self.selector_symbols.clear();
+        self.entry_names.clear();
         self.files_by_dir.clear();
         self.py_files_by_name.clear();
         self.path_module_bindings.clear();
@@ -2157,6 +2328,9 @@ impl Resolver {
         // them against the previous snapshot's module map.
         if !std::mem::take(&mut self.go_modules_fresh) {
             self.go_modules.clear();
+        }
+        if !std::mem::take(&mut self.ts_projects_fresh) {
+            self.ts_projects.clear();
         }
 
         // Pass one establishes the complete file/symbol universe. Import
@@ -2242,6 +2416,7 @@ impl Resolver {
                 file_syms.push(sym.name.clone());
             }
             self.file_symbols.insert(ext.file_path.clone(), file_syms);
+            self.index_entry_names(ext);
             for (scope, local) in &ext.scope_locals {
                 self.scope_locals
                     .insert((ext.file_path.clone(), scope.clone(), local.clone()));
@@ -2425,9 +2600,23 @@ impl Resolver {
             // handle-keyed map holds.
             let mut file_external_roots: BTreeSet<String> = BTreeSet::new();
             let mut file_local_roots: BTreeSet<String> = BTreeSet::new();
+            // Specifiers a governing tsconfig `paths` pattern maps into this
+            // tree. Owned, so the closure below holds no borrow of `self`.
+            let ts_mapped: BTreeSet<String> = ext
+                .imports
+                .iter()
+                .filter(|imp| {
+                    self.specifier_is_ts_mapped(
+                        &ext.file_path,
+                        &ext.language,
+                        &imp.module_specifier,
+                    )
+                })
+                .map(|imp| imp.module_specifier.clone())
+                .collect();
             let mut unresolved_import = |local: String, specifier: &str| {
                 let root = Self::path_root(specifier);
-                if Self::specifier_is_repo_relative(specifier) {
+                if Self::specifier_is_repo_relative(specifier) || ts_mapped.contains(specifier) {
                     if !root.is_empty() {
                         file_local_roots.insert(root.to_string());
                     }
@@ -3339,7 +3528,13 @@ impl Resolver {
                     // Absolute specifiers are not recorded — `import "strings"`
                     // resolving to nothing is the expected case and carries no
                     // information.
-                    if targets.is_empty() && Self::specifier_is_repo_relative(&imp.module_specifier)
+                    if targets.is_empty()
+                        && (Self::specifier_is_repo_relative(&imp.module_specifier)
+                            || self.specifier_is_ts_mapped(
+                                &ext.file_path,
+                                &ext.language,
+                                &imp.module_specifier,
+                            ))
                     {
                         unresolved.push(UnresolvedReference {
                             source_file: ext.file_path.clone(),
@@ -4060,6 +4255,16 @@ impl Resolver {
                         if let Some(edge) = self.resolve_selector_reference(ext, reference) {
                             edges.push(edge);
                         }
+                        continue;
+                    }
+                    // A string naming a runtime entry point, answered from
+                    // `entry_names` and by nothing else — and silent when that
+                    // finds nothing, because an identifier-shaped string is
+                    // almost always a key, a label or a message. Recording each
+                    // as a failed code attribution would bury the defect tier
+                    // under literals no declaration was ever meant to answer.
+                    if reference.kind == ReferenceKind::EntryName {
+                        edges.extend(self.resolve_entry_name_reference(ext, reference));
                         continue;
                     }
                     if let Some(edge) = self.resolve_name_reference(ext, family, reference) {
@@ -6941,7 +7146,7 @@ impl Resolver {
             let target = declaring[0].file.clone();
             (
                 target.clone(),
-                Resolution::UniqueSelector {
+                Resolution::UniqueNamespaced {
                     target_symbol: reference.name.clone(),
                     target_file: target,
                 },
@@ -6950,6 +7155,93 @@ impl Resolver {
             return None;
         };
         Some(self.reference_edge(ext, &target_file, &reference.name, reference, resolution))
+    }
+
+    /// Every Metal shader entry point `ext` declares, into `entry_names`. See
+    /// [`Extraction::metal_entry_points`] — a shader's private helper, which the
+    /// host can never look up, is never a target.
+    fn index_entry_names(&mut self, ext: &Extraction) {
+        for symbol in ext.metal_entry_points() {
+            let declaring = self.entry_names.entry(symbol.name.clone()).or_default();
+            if let Err(at) = declaring.binary_search(&ext.file_path) {
+                declaring.insert(at, ext.file_path.clone());
+            }
+        }
+    }
+
+    /// Resolve one [`ReferenceKind::EntryName`] against runtime entry points
+    /// only.
+    ///
+    /// One rung: **exactly one file declares an entry point of that name.** A
+    /// runtime library is built from every shader source together, and two
+    /// files declaring one name would not link, so two candidates mean the
+    /// index holds two libraries — a tuning copy beside the real kernels, say —
+    /// and which one this string loads is not in the source. That is no edge,
+    /// as it is for a selector two components scope.
+    ///
+    /// **Who names it.** A string inside a function is that function's. One in
+    /// a `const` or `static` initializer (`assigned_to` names the item) is
+    /// dispatched by whatever reads the item: when the item is itself a symbol
+    /// — a `pub const` — it is the source, and the reads already edge to it;
+    /// when it is not — a private const, which the extractor does not emit —
+    /// each function in this file that reads it is a source, since a private
+    /// item has no reader anywhere else. A string nothing narrower owns stays
+    /// with the file.
+    fn resolve_entry_name_reference(
+        &self,
+        ext: &Extraction,
+        reference: &ExtractedReference,
+    ) -> Vec<ResolvedEdge> {
+        let Some([target_file]) = self.entry_names.get(&reference.name).map(Vec::as_slice) else {
+            return Vec::new();
+        };
+        let edge = |source: &ExtractedReference| {
+            let resolution = Resolution::UniqueNamespaced {
+                target_symbol: reference.name.clone(),
+                target_file: target_file.clone(),
+            };
+            self.reference_edge(ext, target_file, &reference.name, source, resolution)
+        };
+        let item = reference
+            .assigned_to
+            .as_deref()
+            .filter(|_| reference.enclosing_symbol.is_none());
+        let Some(item) = item else {
+            return vec![edge(reference)];
+        };
+        let item_symbol = format!("{}::{item}", ext.file_path);
+        if ext
+            .symbols
+            .iter()
+            .any(|symbol| symbol.qualified_name == item_symbol)
+        {
+            let mut owned = reference.clone();
+            owned.enclosing_symbol = Some(item_symbol);
+            return vec![edge(&owned)];
+        }
+        let mut readers: Vec<&str> = ext
+            .references
+            .iter()
+            .filter(|read| {
+                read.kind == ReferenceKind::Name
+                    && read.name == item
+                    && matches!(read.receiver_expr.as_deref(), None | Some("Self"))
+            })
+            .filter_map(|read| read.enclosing_symbol.as_deref())
+            .collect();
+        readers.sort_unstable();
+        readers.dedup();
+        if readers.is_empty() {
+            return vec![edge(reference)];
+        }
+        readers
+            .into_iter()
+            .map(|reader| {
+                let mut owned = reference.clone();
+                owned.enclosing_symbol = Some(reader.to_string());
+                edge(&owned)
+            })
+            .collect()
     }
 
     /// Whether a selector may reach a declaration in *another* file at all.
@@ -7079,31 +7371,17 @@ impl Resolver {
         // import — the corpus was told a local file came from outside it.
         if LangFamily::from_lang(lang) == LangFamily::JsTs && clean_spec.starts_with('.') {
             let base = Self::normalize_rel(&dir, clean_spec)?;
-            let candidates = [
-                base.clone(),
-                format!("{}.ts", base),
-                format!("{}.tsx", base),
-                format!("{}.mts", base),
-                format!("{}.cts", base),
-                format!("{}.js", base),
-                format!("{}.jsx", base),
-                format!("{}.mjs", base),
-                format!("{}.cjs", base),
-                format!("{}.svelte", base),
-                format!("{}.vue", base),
-                format!("{}.astro", base),
-                format!("{}/index.ts", base),
-                format!("{}/index.tsx", base),
-                format!("{}/index.js", base),
-                format!("{}/index.jsx", base),
-                format!("{}/index.svelte", base),
-                format!("{}/index.vue", base),
-                format!("{}/index.astro", base),
-            ];
-            for cand in candidates {
+            for cand in Self::js_module_candidates(&base) {
                 if self.file_symbols.contains_key(&cand) {
                     return Some(cand);
                 }
+            }
+        }
+        // A non-relative specifier names a file in this tree only through the
+        // config that governs the importer: `paths`, then `baseUrl`.
+        if LangFamily::from_lang(lang) == LangFamily::JsTs && !clean_spec.starts_with('.') {
+            if let Some(mapped) = self.resolve_ts_mapped(current_file, clean_spec) {
+                return Some(mapped);
             }
         }
 

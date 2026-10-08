@@ -532,13 +532,6 @@ fn consumer_manifest_json(
         "package_managers": inventory.package_managers,
         "test_commands": inventory.test_commands,
         "important_files": lean.important_files,
-        // A goal-ranked list, and this producer is given no goal. `dev map
-        // --goal` fills it in `map_artifacts.py:379` with the ripgrep scorer;
-        // absent that flag it is empty because nobody asked, which is what
-        // `candidate_files_computed: false` says. The marker is this kernel's
-        // account of its own run and stays false even after that enrichment
-        // overwrites the list.
-        "candidate_files": [],
         "files": files,
         "subsystems": subsystems,
         "dependents": dependents,
@@ -563,19 +556,6 @@ fn consumer_manifest_json(
         // `verify`.
         "graph_degraded": graph_degraded,
         "graph_degraded_reason": graph_degraded_reason,
-        // No language server is consulted by this kernel and no `src/` consumer
-        // reads this key off the manifest — `semantic_index.py:61` builds an
-        // `lsp` block for a different artifact entirely. Kept rather than
-        // removed because removing a key needs the readers gone first, and
-        // marked so the empty object is not read as "the servers found
-        // nothing".
-        "lsp": {},
-        // An opt-in software-composition audit. `dev map --scan-deps` fills it
-        // in `map_artifacts.py:383`; without that flag nothing ran, and
-        // `prompt_builder.py:830` renders the list into the agent's prompt. An
-        // empty list there has meant "no risks" and "no audit" identically,
-        // which is the one thing a security finding must never do.
-        "dependency_risks": [],
         "entry_roots": lean.entry_roots,
         // Computed, not asserted empty. `code_graph.json` has always derived
         // this from the same `extractions` and `edges` this function already
@@ -769,11 +749,6 @@ fn consumer_manifest_json(
             },
             "unavailable": unreachable_unavailable,
         },
-        // Process/dataflow chains. Nothing in this kernel derives them and no
-        // `src/` consumer reads this key off the manifest; `viz.py` reads a
-        // `processes` key off the *code graph's* meta, which is a different
-        // artifact. Marked rather than removed, for the same reason as `lsp`.
-        "processes": [],
         "map_engine": CONSUMER_MAP_ENGINE,
         "freshness": freshness,
         // This producer's account of its own run, under the key
@@ -850,18 +825,9 @@ fn consumer_manifest_json(
             "inventory_unreadable_count": inventory.unreadable_count,
                 "inventory_directories_visited": inventory.directories_visited,
                 "inventory_unavailable_reason": inventory.unavailable_reason,
-                // Goal-dependent; `dev map --goal` fills it downstream.
-                "candidate_files_computed": false,
                 // Paths of files this build cannot see imports for. `true`
                 // means the list above is the answer, empty or not.
                 "import_blind_files_computed": true,
-                // No language server is consulted by this kernel.
-                "lsp_computed": false,
-                // Opt-in SCA; `dev map --scan-deps` fills it downstream. The
-                // one field here where a wrong reading is a security claim.
-                "dependency_risks_computed": false,
-                // No producer in this kernel.
-                "processes_computed": false,
             },
         },
     });

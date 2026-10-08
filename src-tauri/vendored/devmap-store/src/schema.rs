@@ -1306,8 +1306,19 @@ pub const MIGRATION_V22_TO_V23: &str = "";
 /// interleaved rounds of five `impact` calls: min 36.50 ms → 11.74 ms, p50
 /// 37.77 ms → 12.69 ms, so 7.55 ms → 2.54 ms per call at p50; a second run gave
 /// 8.55 ms → 3.00 ms. The index adds 2.4 MB (1.6%) to the file and took 42 to
-/// 88 ms to build over the existing rows. What it costs a cold build — one more
-/// b-tree insertion per ledger row — was not re-measured.
+/// 88 ms to build over the existing rows.
+///
+/// What it costs a cold build, measured 2026-10-07 with
+/// `benchmarks/cold_build_ab.py`: two release binaries differing only in this
+/// statement (the patch is under
+/// `benchmarks/results/competition/20261007-build-cost/patches/`), real
+/// `devmap build --full` of a frozen DevCouncil tree (1,310 files, 163,126
+/// unresolved calls) into a new store, 12 ABBA rounds, identical counts on
+/// both arms. With the index → without: `persist:write`'s unresolved part min
+/// 378 → 263 ms, median 505 → 445 ms; `persist:write` min 906 → 814 ms; the
+/// whole build min 2.89 → 2.93 s, inside the noise (1-minute load 30–45 on 18
+/// cores). So the index costs about 60–115 ms of a cold persist and 2.83 MB of
+/// store, against 5.0 ms saved on every `impact` call at p50.
 pub const MIGRATION_V23_TO_V24: &str = r#"
 CREATE INDEX IF NOT EXISTS idx_unresolved_rows_callee
     ON unresolved_rows(callee_name);
@@ -1322,7 +1333,76 @@ CREATE INDEX IF NOT EXISTS idx_unresolved_rows_callee
 /// claimed v24 for the `callee_name` index.)
 pub const MIGRATION_V24_TO_V25: &str = "";
 
-pub const CURRENT_SCHEMA_VERSION: i32 = 25;
+/// String literals and the symbol that encloses each one.
+///
+/// A name query cannot see a string-keyed protocol: event actions, IPC
+/// command names, config keys. The coupling is the value, not a call edge.
+/// `value` is compared with `=` and a byte-range prefix, never `LIKE`, so the
+/// match stays case-sensitive. The index is `(generation_id, value)` because
+/// that is the predicate both the count and the page lead with.
+pub const MIGRATION_V25_TO_V26: &str = r#"
+CREATE TABLE IF NOT EXISTS generation_literals (
+    generation_id INTEGER NOT NULL,
+    file_id INTEGER NOT NULL,
+    line INTEGER NOT NULL,
+    span_start INTEGER NOT NULL,
+    value TEXT NOT NULL,
+    qualified_name TEXT NOT NULL,
+    symbol_name TEXT NOT NULL,
+    PRIMARY KEY (generation_id, file_id, span_start, value, qualified_name)
+);
+CREATE INDEX IF NOT EXISTS idx_generation_literals_value
+    ON generation_literals (generation_id, value);
+"#;
+
+pub const CURRENT_SCHEMA_VERSION: i32 = 26;
+
+/// The oldest reader schema that can read a store this binary writes.
+///
+/// `user_version` alone forced an exact match on every reader, so each bump —
+/// including v26, which only *added* a table no older reader selects — blinded
+/// every embedding reader (GitPulse links `devmap-store` read-only) until it was
+/// re-vendored. The writer is the only party that knows whether a bump is safe
+/// for an older reader, so the writer says so, in the store, through
+/// [`READER_COMPAT_TABLE`]; [`Store::open_read_only`](crate::Store::open_read_only)
+/// admits a store newer than itself only when this floor reaches down to it.
+///
+/// When raising [`CURRENT_SCHEMA_VERSION`], add a row to
+/// [`SCHEMA_READER_FLOORS`] and set this to its floor:
+///
+/// * **keep the previous floor** when the bump only adds tables, indexes or
+///   nullable columns that older readers never select (v26:
+///   `generation_literals`);
+/// * **raise it to the new version** when the bump changes what an existing
+///   column means, writes a value an older binary would misdecode, or removes
+///   or renames anything an older reader selects. v23 and v25 were exactly
+///   this — version-only bumps that exist so an older binary *refuses* rather
+///   than reconstructing `LanguageServer` rows or `Registers` edges as
+///   something else.
+///
+/// Writers stay exact-match: a binary never migrates or writes a store newer
+/// than itself, whatever this floor says.
+pub const MIN_READER_SCHEMA_VERSION: i32 = 25;
+
+/// `(schema, floor)` for every schema since the floor was introduced, oldest
+/// first. The last row must be `(CURRENT_SCHEMA_VERSION,
+/// MIN_READER_SCHEMA_VERSION)`; a unit test holds that, so bumping the schema
+/// without deciding the new floor fails rather than silently inheriting one.
+pub const SCHEMA_READER_FLOORS: &[(i32, i32)] = &[(26, 25)];
+
+/// Where a writer records [`MIN_READER_SCHEMA_VERSION`].
+///
+/// Added without a `user_version` bump, on purpose: the table is invisible to
+/// every reader that does not look for it, so a schema-26 binary that predates
+/// it reads such a store exactly as before. A store without the row — written
+/// before this table existed — is read with the exact-match rule it always had.
+pub const READER_COMPAT_TABLE: &str = r#"
+CREATE TABLE IF NOT EXISTS reader_compat (
+    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+    min_reader_schema INTEGER NOT NULL
+        CHECK (typeof(min_reader_schema) = 'integer' AND min_reader_schema >= 3)
+);
+"#;
 
 /// The `user_version` the Python engine's `index.sqlite` carries — a database
 /// this kernel never wrote and cannot read. Named once, here, so the store's
@@ -1365,6 +1445,10 @@ pub const FRESH_SCHEMA_BATCHES: &[&str] = &[
     MIGRATION_V23_TO_V24,
     // Empty: v25 only stamps `user_version`.
     MIGRATION_V24_TO_V25,
+    MIGRATION_V25_TO_V26,
+    // Not a rung: no `user_version` bump. Every writer open creates it — the
+    // fresh path and the ladder alike — so both still land on one schema.
+    READER_COMPAT_TABLE,
 ];
 
 /// Strip SQL line comments so a scan of DDL text cannot read prose as code.

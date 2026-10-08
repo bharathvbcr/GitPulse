@@ -317,3 +317,11 @@ required-features = ["parse"]
 [[test]]
 name = "module_bindings_and_import_names"
 required-features = ["parse"]
+
+[[test]]
+name = "sql_check_constraint_parse"
+required-features = ["parse"]
+
+[[test]]
+name = "powershell_stays_pattern_recovered"
+required-features = ["parse"]

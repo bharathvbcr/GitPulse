@@ -709,6 +709,40 @@ pub fn detect_extractor_id(path: &Path) -> Option<ExtractorId> {
     find_spec_by_extension(ext).map(|spec| spec.extractor_id)
 }
 
+/// The language a file is *reported* under: its own name when its grammar key
+/// is shared with another language, else the grammar key it was extracted with.
+///
+/// `Extraction::language` is the grammar key, and must stay so — every
+/// dispatch site, the cache identity and the capability table are keyed on it.
+/// A per-language report keyed the same way files Metal under `cpp` and ArkTS
+/// under `typescript`, so a reader asking how Metal resolves is told nothing
+/// and the C++ figure silently absorbs it.
+///
+/// Only a **shared** key is split. A grammar one language owns alone — `hcl`
+/// for Terraform — already names exactly one language, and renaming its row
+/// would only move a published key. And only a file whose registry entry names
+/// `grammar` is relabelled, so a notebook, a config file or a fallback
+/// language keeps the key it was stored with.
+pub fn report_language<'a>(path: &str, grammar: &'a str) -> &'a str {
+    let Some(spec) = Path::new(path)
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .and_then(find_spec_by_extension)
+    else {
+        return grammar;
+    };
+    let shared = LANGUAGE_SPECS
+        .iter()
+        .filter(|other| other.grammar == grammar)
+        .nth(1)
+        .is_some();
+    if spec.grammar == grammar && shared {
+        spec.extractor_id.name()
+    } else {
+        grammar
+    }
+}
+
 /// Language id for a path, or `"generic"` when unknown.
 pub fn detect_language(path: &Path) -> &'static str {
     let filename = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
@@ -1332,6 +1366,19 @@ mod tests {
     /// both read. The config filenames are checked before the extension, so
     /// dropping one silently reclassifies `tsconfig.json` as plain `json` and
     /// `Cargo.toml` as plain `toml`.
+    /// A shared grammar key is split into the languages that share it; a key
+    /// one language owns, and a file no registry entry claims, keep their key.
+    #[test]
+    fn a_report_splits_only_a_shared_grammar_key() {
+        assert_eq!(report_language("kernels/a.metal", "cpp"), "metal");
+        assert_eq!(report_language("src/a.cpp", "cpp"), "cpp");
+        assert_eq!(report_language("entry/a.ets", "typescript"), "arkts");
+        assert_eq!(report_language("src/a.ts", "typescript"), "typescript");
+        assert_eq!(report_language("main.tf", "hcl"), "hcl");
+        assert_eq!(report_language("a.ipynb", "notebook"), "notebook");
+        assert_eq!(report_language("Cargo.toml", "config"), "config");
+    }
+
     #[test]
     fn detect_language_pins_config_names_and_fallback_extensions() {
         for filename in [
