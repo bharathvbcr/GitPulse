@@ -34,7 +34,17 @@ const gitAvailable = (() => {
   }
 })();
 
+const FIXTURE_NAME = "GitPulse Contract";
+const FIXTURE_EMAIL = "contract@gitpulse.test";
+
 function git(cwd: string, ...args: string[]): string {
+  // `git config user.*` persists. That is how this fixture became the author
+  // of real commits. Identity is passed with `-c` on the commit instead.
+  if (args[0] === "config" && (args[1] ?? "").startsWith("user.")) {
+    throw new Error(
+      `refusing to persist ${args[1]} — pass it with git -c on the one command that needs it`,
+    );
+  }
   return execFileSync("git", args, { cwd, encoding: "utf8" });
 }
 
@@ -60,8 +70,6 @@ function initRepo(): string {
   const dir = mkdtempSync(join(tmpdir(), "gitpulse-apply-contract-"));
   dirs.push(dir);
   git(dir, "init", "-q", "-b", "main");
-  git(dir, "config", "user.email", "contract@gitpulse.test");
-  git(dir, "config", "user.name", "GitPulse Contract");
   git(dir, "config", "core.autocrlf", "false");
   return dir;
 }
@@ -69,7 +77,17 @@ function initRepo(): string {
 function commitFile(dir: string, path: string, content: string): void {
   writeFileSync(join(dir, path), content);
   git(dir, "add", "--", path);
-  git(dir, "commit", "-q", "-m", `add ${path}`);
+  git(
+    dir,
+    "-c",
+    `user.name=${FIXTURE_NAME}`,
+    "-c",
+    `user.email=${FIXTURE_EMAIL}`,
+    "commit",
+    "-q",
+    "-m",
+    `add ${path}`,
+  );
 }
 
 function indexOfHunkHeader(lines: AnnotatedDiffLine[]): number {
@@ -85,6 +103,13 @@ afterEach(() => {
 });
 
 describe.skipIf(!gitAvailable)("git apply --cached contract (real git)", () => {
+  it("does not write the fixture identity into git config", () => {
+    const dir = initRepo();
+    expect(gitQuiet(dir, "config", "--local", "--get", "user.email")).toBe(false);
+    expect(gitQuiet(dir, "config", "--local", "--get", "user.name")).toBe(false);
+    expect(() => git(dir, "config", "user.email", FIXTURE_EMAIL)).toThrow(/refusing to persist/);
+  });
+
   it("stages a plain modification via both hunk and line-selection variants", () => {
     const dir = initRepo();
     commitFile(dir, "plain.txt", "alpha\nbeta\ngamma\n");

@@ -420,6 +420,99 @@ impl GitWriter {
         Ok(listed.split('\0').filter(|entry| !entry.is_empty()).count())
     }
 
+    /// True when `email` is an address that exists so a fixture can commit in a
+    /// throwaway repository. Reserved DNS names (`.test`, `.invalid`,
+    /// `example.com`) and the local fixture addresses this repo actually uses.
+    ///
+    /// Keep the rule in lockstep with `.githooks/pre-commit`. A checkout of
+    /// this project refuses these on commit; a fixture repository does not,
+    /// because it has no `.githooks/pre-commit`.
+    pub(crate) fn is_fixture_author_email(email: &str) -> bool {
+        let email = email.trim().to_ascii_lowercase();
+        if email.is_empty() || email.len() > 320 {
+            return false;
+        }
+        let Some((local, domain)) = email.rsplit_once('@') else {
+            return false;
+        };
+        if local.is_empty() || domain.is_empty() {
+            return false;
+        }
+        domain == "test"
+            || domain.ends_with(".test")
+            || domain == "invalid"
+            || domain.ends_with(".invalid")
+            || domain == "example"
+            || domain.ends_with(".example")
+            || domain == "example.com"
+            || domain == "example.org"
+            || domain == "example.net"
+            || matches!(
+                email.as_str(),
+                "gitpulse@test.local" | "test@gitpulse.local" | "t@t" | "t@e.com" | "test@test.com"
+            )
+    }
+
+    fn email_from_ident(ident: &str) -> Result<String, String> {
+        let start = ident
+            .rfind('<')
+            .ok_or_else(|| format!("could not read an email from git identity: {ident}"))?;
+        let rest = &ident[start + 1..];
+        let end = rest
+            .find('>')
+            .ok_or_else(|| format!("could not read an email from git identity: {ident}"))?;
+        let email = rest[..end].trim();
+        if email.is_empty() || !email.contains('@') {
+            return Err(format!(
+                "could not read an email from git identity: {ident}"
+            ));
+        }
+        Ok(email.to_string())
+    }
+
+    fn fixture_identity_refusal(role: &str, email: &str) -> String {
+        format!(
+            "refusing to record the {role} as <{email}>. \
+That address is a test fixture. This checkout's git identity was overwritten with it, \
+so the commit would be attributed to the fixture. \
+Unset the local override with `git config --local --unset-all user.name` and \
+`git config --local --unset-all user.email`, and unset GIT_AUTHOR_* / GIT_COMMITTER_* if they are set."
+        )
+    }
+
+    fn refuse_email(role: &str, email: &str) -> Result<(), String> {
+        if Self::is_fixture_author_email(email) {
+            Err(Self::fixture_identity_refusal(role, email.trim()))
+        } else {
+            Ok(())
+        }
+    }
+
+    /// This checkout ships `.githooks/pre-commit` specifically so a fixture
+    /// identity cannot be recorded. Other repositories, including the temp
+    /// repos the suite commits in, do not carry that file and are left alone.
+    fn guards_fixture_identity(repo: &Path) -> bool {
+        repo.join(".githooks/pre-commit").is_file()
+    }
+
+    fn refuse_fixture_identity(repo: &Path, amend: bool) -> Result<(), String> {
+        if !Self::guards_fixture_identity(repo) {
+            return Ok(());
+        }
+        // An amend keeps the existing author unless --reset-author is passed,
+        // and this writer never passes it. `git var` outside the hook reports
+        // the configured identity, not the author the amend will preserve.
+        if amend {
+            let existing = git_text(repo, &["log", "-1", "--format=%ae"])?;
+            Self::refuse_email("author", existing.trim())?;
+        }
+        let author = git_text(repo, &["var", "GIT_AUTHOR_IDENT"])?;
+        let committer = git_text(repo, &["var", "GIT_COMMITTER_IDENT"])?;
+        Self::refuse_email("author", &Self::email_from_ident(author.trim())?)?;
+        Self::refuse_email("committer", &Self::email_from_ident(committer.trim())?)?;
+        Ok(())
+    }
+
     pub fn commit(repo_path: &str, message: &str, amend: bool) -> Result<String, String> {
         let repo = validate_repo(repo_path)?;
         if message.trim().is_empty() && !(amend && message.is_empty()) {
@@ -433,6 +526,7 @@ impl GitWriter {
     }
 
     fn commit_inner(repo: &Path, message: &str, amend: bool) -> Result<String, String> {
+        Self::refuse_fixture_identity(repo, amend)?;
         let mut args = vec!["commit"];
         if amend && message.is_empty() {
             args.push("--amend");
@@ -472,6 +566,7 @@ impl GitWriter {
     }
 
     fn quick_commit_inner(repo: &Path, message: &str) -> Result<String, String> {
+        Self::refuse_fixture_identity(repo, false)?;
         let unmerged = git_text(repo, &["ls-files", "--unmerged"])?;
         if !unmerged.trim().is_empty() {
             return Err("Resolve merge conflicts before committing.".into());
@@ -499,6 +594,7 @@ impl GitWriter {
             return Err("Commit message must not be empty".into());
         }
         let paths = literal_paths(&repo, files)?;
+        Self::refuse_fixture_identity(&repo, false)?;
         let _repo_lock = repo_mutation_lock(&repo);
         let _guard = _repo_lock
             .lock()
@@ -1948,6 +2044,148 @@ mod tests {
     fn is_empty_commit_refusal(error: &str) -> bool {
         let lower = error.to_lowercase();
         lower.contains("nothing to commit") || lower.contains("nothing added to commit")
+    }
+
+    #[test]
+    fn fixture_email_matches_the_hook_denylist() {
+        for email in [
+            "contract@gitpulse.test",
+            "GitPulse@test.local",
+            "person@example.invalid",
+            "person@example.com",
+            "t@t",
+            "t@e.com",
+            "a@test",
+            "a@invalid",
+            "test@test.com",
+            "test@gitpulse.local",
+        ] {
+            assert!(
+                GitWriter::is_fixture_author_email(email),
+                "{email} must be a fixture address"
+            );
+        }
+        for email in [
+            "ada@gitpulse.dev",
+            "bharath.vbcr@gmail.com",
+            "dev@github.com",
+        ] {
+            assert!(
+                !GitWriter::is_fixture_author_email(email),
+                "{email} must be committable"
+            );
+        }
+    }
+
+    fn git_ok(dir: &std::path::Path, args: &[&str]) {
+        let output = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .output_locked()
+            .unwrap_or_else(|err| panic!("spawn git {}: {err}", args.join(" ")));
+        assert!(
+            output.status.success(),
+            "git {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn mark_guarded(dir: &std::path::Path) {
+        std::fs::create_dir_all(dir.join(".githooks")).unwrap();
+        std::fs::write(dir.join(".githooks/pre-commit"), "#!/bin/sh\nexit 0\n").unwrap();
+    }
+
+    #[test]
+    fn a_guarded_checkout_refuses_the_contract_identity_and_keeps_the_index() {
+        let dir = tempfile::TempDir::new().unwrap();
+        git_ok(dir.path(), &["init", "-q", "-b", "main"]);
+        git_ok(dir.path(), &["config", "user.name", "GitPulse Contract"]);
+        git_ok(
+            dir.path(),
+            &["config", "user.email", "contract@gitpulse.test"],
+        );
+        git_ok(dir.path(), &["config", "commit.gpgsign", "false"]);
+        mark_guarded(dir.path());
+        std::fs::write(dir.path().join("f.txt"), "one\n").unwrap();
+        git_ok(dir.path(), &["add", "--", "f.txt"]);
+        crate::test_support::trust_repo(dir.path());
+
+        let err = GitWriter::commit(dir.path().to_str().unwrap(), "should not land", false)
+            .expect_err("fixture identity must be refused");
+        assert!(
+            err.contains("contract@gitpulse.test"),
+            "refusal must name the address, got {err}"
+        );
+        let head = std::process::Command::new("git")
+            .args(["rev-parse", "--verify", "HEAD"])
+            .current_dir(dir.path())
+            .output_locked()
+            .unwrap();
+        assert!(!head.status.success(), "the refused commit must not exist");
+        let staged = std::process::Command::new("git")
+            .args(["diff", "--cached", "--name-only"])
+            .current_dir(dir.path())
+            .output_locked()
+            .unwrap();
+        assert_eq!(String::from_utf8_lossy(&staged.stdout).trim(), "f.txt");
+    }
+
+    #[test]
+    fn a_guarded_checkout_commits_as_a_real_identity() {
+        let dir = tempfile::TempDir::new().unwrap();
+        git_ok(dir.path(), &["init", "-q", "-b", "main"]);
+        git_ok(dir.path(), &["config", "user.name", "Ada"]);
+        git_ok(dir.path(), &["config", "user.email", "ada@gitpulse.dev"]);
+        git_ok(dir.path(), &["config", "commit.gpgsign", "false"]);
+        mark_guarded(dir.path());
+        std::fs::write(dir.path().join("f.txt"), "one\n").unwrap();
+        git_ok(dir.path(), &["add", "--", "f.txt"]);
+        crate::test_support::trust_repo(dir.path());
+
+        GitWriter::commit(dir.path().to_str().unwrap(), "real author", false)
+            .expect("a real identity must still commit");
+        let email = std::process::Command::new("git")
+            .args(["log", "-1", "--format=%ae"])
+            .current_dir(dir.path())
+            .output_locked()
+            .unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&email.stdout).trim(),
+            "ada@gitpulse.dev"
+        );
+    }
+
+    #[test]
+    fn amend_refuses_to_keep_a_fixture_author_after_the_config_is_fixed() {
+        let dir = tempfile::TempDir::new().unwrap();
+        git_ok(dir.path(), &["init", "-q", "-b", "main"]);
+        git_ok(dir.path(), &["config", "user.name", "GitPulse Contract"]);
+        git_ok(
+            dir.path(),
+            &["config", "user.email", "contract@gitpulse.test"],
+        );
+        git_ok(dir.path(), &["config", "commit.gpgsign", "false"]);
+        std::fs::write(dir.path().join("f.txt"), "one\n").unwrap();
+        git_ok(dir.path(), &["add", "--", "f.txt"]);
+        git_ok(dir.path(), &["commit", "-q", "-m", "fixture"]);
+        mark_guarded(dir.path());
+        git_ok(dir.path(), &["config", "user.name", "Ada"]);
+        git_ok(dir.path(), &["config", "user.email", "ada@gitpulse.dev"]);
+        crate::test_support::trust_repo(dir.path());
+
+        let err = GitWriter::commit(dir.path().to_str().unwrap(), "rewritten", true)
+            .expect_err("amend must not preserve the fixture author");
+        assert!(err.contains("contract@gitpulse.test"), "{err}");
+        let email = std::process::Command::new("git")
+            .args(["log", "-1", "--format=%ae"])
+            .current_dir(dir.path())
+            .output_locked()
+            .unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&email.stdout).trim(),
+            "contract@gitpulse.test"
+        );
     }
 
     #[test]

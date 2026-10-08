@@ -109,6 +109,19 @@ pub(crate) fn coverage_relaxed(duration: Duration) -> Duration {
 /// production code spawning outside the gated seam.
 #[cfg(test)]
 pub(crate) fn git_in(dir: &Path, args: &[&str]) {
+    // Persisting a fixture identity is how contract@gitpulse.test became the
+    // author of real commits. `-c` on one command is hermetic; `git config
+    // user.*` is not, and this checkout refuses to store it.
+    if args.first() == Some(&"config")
+        && args.get(1).is_some_and(|key| key.starts_with("user."))
+        && dir.join(".githooks/pre-commit").is_file()
+    {
+        panic!(
+            "refusing to persist {} in {}; this checkout rejects fixture identities",
+            args[1],
+            dir.display()
+        );
+    }
     let mut command = Command::new("git");
     command
         .args([
