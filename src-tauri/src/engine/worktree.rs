@@ -10,6 +10,7 @@
 use crate::engine::git_cli::{git_text, resolve_git_common_dir, validate_repo};
 use crate::engine::git_writer::validate_oid_or_revision;
 use crate::engine::git_writer::validate_ref_name;
+use crate::engine::git_writer::{GitWriter, MergeMode, SquashFailure};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex, OnceLock, PoisonError};
@@ -1362,36 +1363,31 @@ pub fn merge_and_teardown_worktree(
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
 
-        let merge = merge_teardown_argv(&branch, squash);
-        let merge: Vec<&str> = merge.iter().map(String::as_str).collect();
-        gate(&merge)?;
         if squash {
-            git_text(&repo, &merge)?;
-            // `git merge` refuses to start over staged changes, so whatever is
-            // staged now is the squash. Nothing staged means the branch's
-            // changes are already on the target and there is nothing to
-            // commit — not a failure.
-            let staged = git_text(&repo, &["diff", "--cached", "--name-only"])?;
-            if !staged.trim().is_empty() {
-                let commit_msg = format!("Merge branch '{branch}' (squashed)");
-                let commit = ["commit", "-m", commit_msg.as_str()];
-                gate(&commit)?;
-                // Fail closed before anything is torn down. This was
-                // discarded, and the next steps removed the worktree and
-                // force-deleted the branch whose work was never committed.
-                git_text(&repo, &commit).map_err(|e| {
-                    format!(
-                        "The squashed changes of {branch} are staged on {target} but could not be committed: {e}. \
-                         The worktree and the branch were kept. Commit the staged changes, or undo them with `git reset --merge`."
-                    )
-                })?;
+            // Nothing staged means the branch's changes are already on the
+            // target and there is nothing to commit — not a failure. A failed
+            // commit fails closed before anything is torn down: it used to be
+            // discarded, and the next steps removed the worktree and
+            // force-deleted the branch whose work was never committed.
+            GitWriter::squash_merge_locked(&repo, &branch, gate).map_err(
+                |failure| match failure {
+                    SquashFailure::Merge(e) => e,
+                    SquashFailure::Commit(e) => {
+                        format!("{e} The worktree and the branch {branch} were kept on {target}.")
+                    }
+                },
+            )?;
+        } else {
+            let fast_forward = merge_teardown_argv(&branch, false);
+            let fast_forward: Vec<&str> = fast_forward.iter().map(String::as_str).collect();
+            gate(&fast_forward)?;
+            if let Err(ff_err) = git_text(&repo, &fast_forward) {
+                let commit_msg = format!("Merge branch '{branch}' into {target}");
+                let merge = ["merge", branch.as_str(), "-m", commit_msg.as_str()];
+                gate(&merge)?;
+                git_text(&repo, &merge)
+                    .map_err(|e| format!("Merge failed (ff error: {ff_err}): {e}"))?;
             }
-        } else if let Err(ff_err) = git_text(&repo, &merge) {
-            let commit_msg = format!("Merge branch '{branch}' into {target}");
-            let merge = ["merge", branch.as_str(), "-m", commit_msg.as_str()];
-            gate(&merge)?;
-            git_text(&repo, &merge)
-                .map_err(|e| format!("Merge failed (ff error: {ff_err}): {e}"))?;
         }
     }
 
@@ -1431,9 +1427,13 @@ pub fn merge_and_teardown_worktree(
 }
 
 /// Git's arguments for the merge step of [`merge_and_teardown_worktree`].
+/// A squash is the one [`GitWriter::merge_argv`] runs for every squash merge.
 pub fn merge_teardown_argv(branch: &str, squash: bool) -> Vec<String> {
     if squash {
-        vec!["merge".into(), "--squash".into(), branch.into()]
+        GitWriter::merge_argv(branch, MergeMode::Squash)
+            .into_iter()
+            .map(String::from)
+            .collect()
     } else {
         vec!["merge".into(), "--ff-only".into(), branch.into()]
     }

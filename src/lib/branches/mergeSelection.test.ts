@@ -9,7 +9,7 @@ const branch = (name: string, remote = false): BranchInfo => ({
   last_author: "", last_summary: "", commits_ahead_of_base: 0, commits_behind_base: 0,
   additions: 0, deletions: 0, files_changed: 0,
 });
-const request: MergeRequest = { repoPath: "/repo", targetBranch: "main", sourceRef: "refs/heads/topic", ffOnly: false };
+const request: MergeRequest = { repoPath: "/repo", targetBranch: "main", sourceRef: "refs/heads/topic", mode: "default" };
 const ready = { currentPath: "/repo", currentBranch: "main", isBare: false, isLoading: false, operation: IDLE_OPERATION };
 
 describe("merge selection", () => {

@@ -83,7 +83,11 @@ flowchart LR
 - **Worktree Named Localhost Routing**: Detects running `portless` instances to assign named localhost URLs (`http://<worktree>.localhost/`), or falls back to stable deterministic ports derived from the worktree name.
 - **Worktree Lifecycle Hooks**: Trusted repositories can configure `post_create`, `pre_merge`, and `post_merge` shell hooks in `.gitpulse/hooks.toml`. Untrusted repositories refuse lifecycle hook execution.
 - **Embedded Branch Stack Hierarchy**: Renders stacked branches as a tree (parents above, children indented). Displays upstream tracking and commit distance. Restacking recomputes fork points from recorded tips (immune to reflog expiration) and rebases parent-before-child with rollback safety.
-- **Remotes, Submodules & Stash Management**: Collapsible drawer to add, rename, re-point, or prune remotes; initialize and sync submodules; preview and apply stashes.
+- **Remotes, Submodules & Stash Management**: Collapsible drawer to add, rename, re-point, or prune remotes; initialize and sync submodules; preview and apply stashes; stash only selected files.
+- **Pull, Merge & Clone Options**: Pull by merging or by rebasing local commits (or follow `pull.rebase`); merge with fast-forward-only, always-a-merge-commit (`--no-ff`), or squash; clone a single branch, a shallow history, or with submodules, with live progress.
+- **Opt-In Auto-Fetch**: Per repository and off by default. Background tabs are fetched four times less often than the active one, nothing runs while the window is hidden, and the spawn gate sheds an auto-fetch under load rather than queueing it ahead of your own commands.
+- **Slow Hooks Are Not Hangs**: Commit, merge, rebase, cherry-pick, revert and `am` run repository hooks under their own 20-minute budget instead of the 90-second plumbing timeout, can be stopped from the UI while they run, and a timeout names the installed hook that was running.
+- **Git Preflight**: Startup reports a missing Git, a Git older than 2.23, or a broken install in one sentence; a commit with no `user.name`/`user.email` is refused before Git runs and offers to set them for the repository or globally.
 
 ### 1.2 Resolve
 - **3-Way Visual Conflict Editor**: Clear three-pane visual comparison between *ours* (current branch), *theirs* (incoming branch), and *base* (common ancestor).

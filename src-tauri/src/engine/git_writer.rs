@@ -1,6 +1,8 @@
 use crate::engine::git_cli::{
-    git_captured, git_global_with_timeout, git_text, git_text_network, git_with_stdin,
-    resolve_git_common_dir, sandbox_join, validate_repo, NETWORK_TIMEOUT,
+    git_captured, git_global_observed, git_text, git_text_network, git_with_stdin,
+    git_with_timeout, is_deferred_under_load, is_slot_wait_timeout, resolve_git_common_dir,
+    sandbox_join, validate_repo, with_background_processes, BoundedRun, OutputStream,
+    ProcessObserver, NETWORK_TIMEOUT,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -43,11 +45,14 @@ pub enum IndexAction {
     Unstage,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct StashSaveOptions {
     pub include_untracked: bool,
     pub keep_index: bool,
+    /// Stash only these repository-relative paths. Empty stashes everything.
+    /// Each is passed as a `:(literal)` pathspec, so `*` is a file name.
+    pub paths: Vec<String>,
 }
 
 impl Default for StashSaveOptions {
@@ -55,23 +60,262 @@ impl Default for StashSaveOptions {
         Self {
             include_untracked: true,
             keep_index: false,
+            paths: Vec::new(),
         }
     }
 }
 
 impl StashSaveOptions {
-    pub fn argv<'a>(&self, message: Option<&'a str>) -> Vec<&'a str> {
-        let mut argv = vec!["git", "stash", "push"];
+    /// The argv, program included, that the gate judges and the writer runs.
+    pub fn argv(&self, message: Option<&str>) -> Vec<String> {
+        let mut argv: Vec<String> = vec!["git".into(), "stash".into(), "push".into()];
         if self.include_untracked {
-            argv.push("-u");
+            argv.push("-u".into());
         }
         if self.keep_index {
-            argv.push("--keep-index");
+            argv.push("--keep-index".into());
         }
         if let Some(message) = message {
-            argv.extend(["-m", message]);
+            argv.extend(["-m".into(), message.into()]);
+        }
+        if !self.paths.is_empty() {
+            argv.push("--".into());
+            let mut seen = HashSet::new();
+            argv.extend(
+                self.paths
+                    .iter()
+                    .filter(|path| seen.insert(path.as_str()))
+                    .map(|path| format!(":(literal){path}")),
+            );
         }
         argv
+    }
+
+    /// Checks the selected paths stay inside `repo` and fit one command line.
+    /// Stashing a selection runs as one `stash push`, so it cannot be split
+    /// into chunks the way staging is.
+    fn validate_paths(&self, repo: &Path) -> Result<(), String> {
+        if self.paths.is_empty() {
+            return Ok(());
+        }
+        let literal = literal_paths(repo, &self.paths)?;
+        let bytes: usize = literal.iter().map(|path| path.len() + 1).sum();
+        if bytes > MAX_INDEX_ARGV_BYTES {
+            return Err(format!(
+                "The {} selected paths are too long to stash in one command; \
+                 stash fewer files or the whole working tree",
+                literal.len()
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// How [`GitWriter::merge_branch`] joins a branch into the checked-out one.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum MergeMode {
+    /// Fast-forward when possible, otherwise a merge commit: git's default.
+    #[default]
+    Default,
+    /// Only move the branch forward; refuse when a merge commit is needed.
+    FfOnly,
+    /// Always record a merge commit, even when a fast-forward was possible.
+    NoFf,
+    /// Stage the branch's combined changes and commit them as one commit
+    /// with no merge parent.
+    Squash,
+}
+
+/// Options for [`GitWriter::clone_repo_with`]. The default is a plain clone.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct CloneOptions {
+    /// Check out this branch (or tag) instead of the remote's default.
+    pub branch: Option<String>,
+    /// Shallow clone: only the most recent `depth` commits.
+    pub depth: Option<u32>,
+    /// Also clone and check out every submodule.
+    pub recurse_submodules: bool,
+}
+
+/// Deepest history a shallow clone may ask for; deeper is a full clone.
+pub const MAX_CLONE_DEPTH: u32 = 1_000_000;
+
+impl CloneOptions {
+    fn validate(&self) -> Result<(), String> {
+        if let Some(branch) = &self.branch {
+            validate_ref_name(branch)?;
+        }
+        if let Some(depth) = self.depth {
+            if depth == 0 || depth > MAX_CLONE_DEPTH {
+                return Err(format!(
+                    "Clone depth must be between 1 and {MAX_CLONE_DEPTH}"
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// `clone` and its options, up to and including the `--` before the URL.
+    fn argv(&self) -> Vec<String> {
+        let mut argv = vec!["clone".to_string(), "--progress".to_string()];
+        if let Some(branch) = &self.branch {
+            argv.extend(["--branch".to_string(), branch.clone()]);
+        }
+        if let Some(depth) = self.depth {
+            argv.extend(["--depth".to_string(), depth.to_string()]);
+        }
+        if self.recurse_submodules {
+            argv.push("--recurse-submodules".to_string());
+        }
+        argv.push("--".to_string());
+        argv
+    }
+}
+
+/// One step of a clone as git reports it: `Receiving objects` at 45%.
+/// `percent` is `None` for a step git does not count (`Cloning into …`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CloneProgress {
+    pub phase: String,
+    pub percent: Option<u8>,
+}
+
+impl CloneProgress {
+    /// Reads one line of git's progress (`LC_ALL=C`, so the phrases are
+    /// stable). `None` for anything that is not a progress report.
+    fn parse(line: &str) -> Option<Self> {
+        let line = line.trim();
+        let line = line.strip_prefix("remote:").map_or(line, str::trim);
+        if line.is_empty()
+            || ["fatal:", "error:", "warning:", "hint:"]
+                .iter()
+                .any(|prefix| line.starts_with(prefix))
+        {
+            return None;
+        }
+        let Some((phase, rest)) = line.split_once(':') else {
+            return line.starts_with("Cloning into").then(|| Self {
+                phase: "Cloning".into(),
+                percent: None,
+            });
+        };
+        let phase = phase.trim();
+        if phase.is_empty()
+            || phase.len() > 64
+            || !phase.chars().all(|c| c.is_ascii_alphabetic() || c == ' ')
+        {
+            return None;
+        }
+        let percent = rest
+            .split_once('%')
+            .and_then(|(number, _)| number.trim().parse::<u8>().ok().filter(|n| *n <= 100));
+        Some(Self {
+            phase: phase.to_string(),
+            percent,
+        })
+    }
+}
+
+/// Splits git's stderr into progress lines (git rewrites one line with `\r`)
+/// and hands each change of phase or percentage to `sink`.
+struct CloneProgressObserver<'a> {
+    pending: Vec<u8>,
+    last: Option<CloneProgress>,
+    sink: &'a mut dyn FnMut(&CloneProgress),
+}
+
+impl CloneProgressObserver<'_> {
+    /// A partial line longer than this is not progress; drop it.
+    const MAX_PENDING: usize = 4096;
+}
+
+impl ProcessObserver for CloneProgressObserver<'_> {
+    fn output(&mut self, stream: OutputStream, bytes: &[u8]) {
+        if !matches!(stream, OutputStream::Stderr) {
+            return;
+        }
+        for &byte in bytes {
+            if byte == b'\r' || byte == b'\n' {
+                let line = String::from_utf8_lossy(&self.pending).into_owned();
+                self.pending.clear();
+                if let Some(progress) = CloneProgress::parse(&line) {
+                    if self.last.as_ref() != Some(&progress) {
+                        (self.sink)(&progress);
+                        self.last = Some(progress);
+                    }
+                }
+            } else if self.pending.len() < Self::MAX_PENDING {
+                self.pending.push(byte);
+            }
+        }
+    }
+}
+
+/// Git's diagnosis of a failed clone, without the progress lines that fill
+/// its stderr: what is left is the `fatal:` and its context.
+fn clone_failure(run: &BoundedRun) -> String {
+    let stderr = String::from_utf8_lossy(&run.stderr);
+    let lines: Vec<&str> = stderr
+        .split(['\r', '\n'])
+        .map(str::trim)
+        .filter(|line| {
+            !line.is_empty()
+                && !CloneProgress::parse(line)
+                    .is_some_and(|p| p.percent.is_some() || line.ends_with(", done."))
+        })
+        .collect();
+    let tail = lines[lines.len().saturating_sub(20)..].join("\n");
+    if tail.is_empty() {
+        format!("git clone failed with status {}", run.status_code)
+    } else if tail.len() > 2000 {
+        let mut cut = tail.len() - 2000;
+        while !tail.is_char_boundary(cut) {
+            cut += 1;
+        }
+        format!("…{}", &tail[cut..])
+    } else {
+        tail
+    }
+}
+
+/// What [`GitWriter::auto_fetch`] did.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "lowercase")]
+pub enum AutoFetchOutcome {
+    Fetched,
+    /// Nothing ran. Not a failure: the next tick tries again.
+    Skipped {
+        reason: String,
+    },
+}
+
+/// The argv, program included, of an automatic fetch. No `--prune`: an
+/// unattended run only adds remote-tracking refs, never removes one.
+pub const AUTO_FETCH_ARGV: [&str; 4] = ["git", "fetch", "--all", "--quiet"];
+
+/// An automatic fetch holds the repository's mutation lock while it runs,
+/// so it gets a short deadline: a slow network must not keep a user's
+/// commit waiting behind a fetch nobody asked for just now.
+pub const AUTO_FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// A squash merge that did not complete. The distinction matters to the
+/// caller: before the commit nothing is staged; after it, the squash is.
+#[derive(Debug)]
+pub(crate) enum SquashFailure {
+    /// The merge or the gate refused; the index is as it was.
+    Merge(String),
+    /// The changes are staged but the commit failed (a refusing hook, an
+    /// identity problem). The message says how to finish or undo it.
+    Commit(String),
+}
+
+impl SquashFailure {
+    pub(crate) fn into_message(self) -> String {
+        match self {
+            SquashFailure::Merge(message) | SquashFailure::Commit(message) => message,
+        }
     }
 }
 
@@ -169,6 +413,43 @@ impl ResetMode {
         matches!(self, ResetMode::Hard)
     }
 }
+
+/// Where [`GitWriter::set_identity`] writes `user.name` / `user.email`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum IdentityScope {
+    /// This repository's `.git/config` only.
+    Repo,
+    /// The user's global config, for every repository on this machine.
+    Global,
+}
+
+impl IdentityScope {
+    fn flag(self) -> &'static str {
+        match self {
+            IdentityScope::Repo => "--local",
+            IdentityScope::Global => "--global",
+        }
+    }
+}
+
+/// The identity git would record a commit under, as far as configuration
+/// and the environment say. `None` is "not set anywhere git reads".
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GitIdentity {
+    pub name: Option<String>,
+    pub email: Option<String>,
+}
+
+impl GitIdentity {
+    pub fn is_complete(&self) -> bool {
+        self.name.is_some() && self.email.is_some()
+    }
+}
+
+/// Opening phrase of the error a commit returns when no identity is set.
+/// The UI matches it to offer setting one; nothing else produces it.
+pub const IDENTITY_MISSING: &str = "Git does not know who you are";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum RebaseActionKind {
@@ -513,11 +794,145 @@ Unset the local override with `git config --local --unset-all user.name` and \
         Ok(())
     }
 
+    /// Reads `name` from git's effective configuration: `Some` when set,
+    /// `None` when git says it is unset (exit 1), an error when the read
+    /// itself failed, so an unreadable config never passes as "unset".
+    fn config_value(repo: &Path, name: &str) -> Result<Option<String>, String> {
+        let run = git_captured(repo, &["config", "--get", name])?;
+        match run.status_code {
+            0 => {
+                let value = String::from_utf8_lossy(&run.stdout).trim().to_string();
+                Ok((!value.is_empty()).then_some(value))
+            }
+            1 => Ok(None),
+            code => Err(format!(
+                "Could not read {name} from git config (exit {code}): {}",
+                String::from_utf8_lossy(&run.stderr).trim()
+            )),
+        }
+    }
+
+    /// The identity a commit in `repo` would be recorded under. The
+    /// environment counts only when it covers author and committer both,
+    /// which is what git needs to record a commit without configuration.
+    pub fn identity(repo_path: &str) -> Result<GitIdentity, String> {
+        let repo = validate_repo(repo_path)?;
+        Self::identity_in(&repo)
+    }
+
+    fn identity_in(repo: &Path) -> Result<GitIdentity, String> {
+        Self::identity_with(repo, &|name| std::env::var(name).ok())
+    }
+
+    /// [`Self::identity_in`] with the environment passed in: git's child
+    /// inherits this process's `GIT_AUTHOR_*` / `GIT_COMMITTER_*` / `EMAIL`.
+    fn identity_with(
+        repo: &Path,
+        lookup: &dyn Fn(&str) -> Option<String>,
+    ) -> Result<GitIdentity, String> {
+        let env = |name: &str| lookup(name).filter(|v| !v.trim().is_empty());
+        let env_pair =
+            |author: &str, committer: &str| env(author).filter(|_| env(committer).is_some());
+        let name = match Self::config_value(repo, "user.name")? {
+            Some(name) => Some(name),
+            None => env_pair("GIT_AUTHOR_NAME", "GIT_COMMITTER_NAME"),
+        };
+        let email = match Self::config_value(repo, "user.email")? {
+            Some(email) => Some(email),
+            None => env_pair("GIT_AUTHOR_EMAIL", "GIT_COMMITTER_EMAIL").or_else(|| env("EMAIL")),
+        };
+        Ok(GitIdentity { name, email })
+    }
+
+    /// Refuses before git runs when no identity is configured. Git would
+    /// otherwise either fail with its own multi-line advice or, on a machine
+    /// with a resolvable hostname, quietly record `user@host.local`.
+    fn require_identity(repo: &Path) -> Result<(), String> {
+        let identity = Self::identity_in(repo)?;
+        let missing: Vec<&str> = [
+            ("user.name", identity.name.is_none()),
+            ("user.email", identity.email.is_none()),
+        ]
+        .into_iter()
+        .filter_map(|(key, absent)| absent.then_some(key))
+        .collect();
+        if missing.is_empty() {
+            return Ok(());
+        }
+        Err(format!(
+            "{IDENTITY_MISSING}: {} {} not set. Set your name and email for this repository \
+             or for every repository, then commit again.",
+            missing.join(" and "),
+            if missing.len() == 1 { "is" } else { "are" }
+        ))
+    }
+
+    /// The argv pair [`Self::set_identity`] runs, program included. Shared
+    /// with the command gate so the judged lines are the lines that run.
+    pub fn identity_argv(scope: IdentityScope, name: &str, email: &str) -> [Vec<String>; 2] {
+        let line = |key: &str, value: &str| {
+            vec![
+                "git".to_string(),
+                "config".to_string(),
+                scope.flag().to_string(),
+                key.to_string(),
+                value.to_string(),
+            ]
+        };
+        [line("user.name", name), line("user.email", email)]
+    }
+
+    /// Validates an identity before it is written to any config file.
+    pub fn validate_identity(name: &str, email: &str) -> Result<(), String> {
+        let name = name.trim();
+        let email = email.trim();
+        if name.is_empty() || name.len() > 256 || name.chars().any(char::is_control) {
+            return Err("Enter a name of 1 to 256 printable characters".into());
+        }
+        if name.contains(['<', '>']) {
+            return Err("A name cannot contain < or >".into());
+        }
+        let valid_email = email.len() <= 320
+            && !email
+                .chars()
+                .any(|c| c.is_control() || c.is_whitespace() || c == '<' || c == '>')
+            && email
+                .rsplit_once('@')
+                .is_some_and(|(local, domain)| !local.is_empty() && !domain.is_empty());
+        if !valid_email {
+            return Err("Enter an email address such as you@example.org".into());
+        }
+        Ok(())
+    }
+
+    /// Writes `user.name` and `user.email` to the repository's or the user's
+    /// global config. Values are trimmed; nothing is written unless both are
+    /// valid.
+    pub fn set_identity(
+        repo_path: &str,
+        name: &str,
+        email: &str,
+        scope: IdentityScope,
+    ) -> Result<GitIdentity, String> {
+        let repo = validate_repo(repo_path)?;
+        Self::validate_identity(name, email)?;
+        let _repo_lock = repo_mutation_lock(&repo);
+        let _guard = _repo_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for argv in Self::identity_argv(scope, name.trim(), email.trim()) {
+            let args: Vec<&str> = argv.iter().skip(1).map(String::as_str).collect();
+            git_text(&repo, &args)?;
+        }
+        Self::identity_in(&repo)
+    }
+
     pub fn commit(repo_path: &str, message: &str, amend: bool) -> Result<String, String> {
         let repo = validate_repo(repo_path)?;
         if message.trim().is_empty() && !(amend && message.is_empty()) {
             return Err("Commit message must not be empty".into());
         }
+        Self::require_identity(&repo)?;
         let _repo_lock = repo_mutation_lock(&repo);
         let _guard = _repo_lock
             .lock()
@@ -566,6 +981,7 @@ Unset the local override with `git config --local --unset-all user.name` and \
     }
 
     fn quick_commit_inner(repo: &Path, message: &str) -> Result<String, String> {
+        Self::require_identity(repo)?;
         Self::refuse_fixture_identity(repo, false)?;
         let unmerged = git_text(repo, &["ls-files", "--unmerged"])?;
         if !unmerged.trim().is_empty() {
@@ -594,6 +1010,7 @@ Unset the local override with `git config --local --unset-all user.name` and \
             return Err("Commit message must not be empty".into());
         }
         let paths = literal_paths(&repo, files)?;
+        Self::require_identity(&repo)?;
         Self::refuse_fixture_identity(&repo, false)?;
         let _repo_lock = repo_mutation_lock(&repo);
         let _guard = _repo_lock
@@ -928,6 +1345,36 @@ Unset the local override with `git config --local --unset-all user.name` and \
         Ok(())
     }
 
+    /// A fetch nobody clicked: from the opt-in timer. Runs as background
+    /// work, so the spawn gate sheds it under load instead of queueing it
+    /// ahead of the user's own commands, and skips rather than waits when
+    /// another git operation holds the repository.
+    pub fn auto_fetch(repo_path: &str) -> Result<AutoFetchOutcome, String> {
+        let repo = validate_repo(repo_path)?;
+        let skipped = |reason: &str| {
+            Ok(AutoFetchOutcome::Skipped {
+                reason: reason.to_string(),
+            })
+        };
+        let repo_lock = repo_mutation_lock(&repo);
+        let _guard = match repo_lock.try_lock() {
+            Ok(guard) => guard,
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                return skipped("another git operation is running in this repository")
+            }
+        };
+        match with_background_processes(|| {
+            git_with_timeout(&repo, &AUTO_FETCH_ARGV[1..], AUTO_FETCH_TIMEOUT)
+        }) {
+            Ok(_) => Ok(AutoFetchOutcome::Fetched),
+            Err(error) if is_deferred_under_load(&error) || is_slot_wait_timeout(&error) => {
+                skipped("the app is busy; deferred to the next interval")
+            }
+            Err(error) => Err(error),
+        }
+    }
+
     pub fn fetch(repo_path: &str, remote: Option<&str>) -> Result<String, String> {
         let repo = validate_repo(repo_path)?;
         let _repo_lock = repo_mutation_lock(&repo);
@@ -942,28 +1389,51 @@ Unset the local override with `git config --local --unset-all user.name` and \
         }
     }
 
+    /// Git's arguments (no program) for a pull. Shared by the gate and
+    /// [`Self::pull`]. `rebase`: `Some(true)` rebases local commits onto the
+    /// upstream, `Some(false)` merges, `None` leaves it to `pull.rebase`.
+    /// A branch is only named after a remote; git reads a lone word as the
+    /// remote, so a branch without one is dropped rather than misread.
+    pub fn pull_argv<'a>(
+        remote: Option<&'a str>,
+        branch: Option<&'a str>,
+        rebase: Option<bool>,
+    ) -> Vec<&'a str> {
+        let mut argv = vec!["pull"];
+        match rebase {
+            Some(true) => argv.push("--rebase"),
+            Some(false) => argv.push("--no-rebase"),
+            None => {}
+        }
+        if let Some(remote) = remote {
+            argv.push(remote);
+            argv.extend(branch);
+        }
+        argv
+    }
+
     pub fn pull(
         repo_path: &str,
         remote: Option<&str>,
         branch: Option<&str>,
+        rebase: Option<bool>,
     ) -> Result<String, String> {
         let repo = validate_repo(repo_path)?;
+        for name in remote.into_iter().chain(branch) {
+            validate_ref_name(name)?;
+        }
         let _repo_lock = repo_mutation_lock(&repo);
         let _guard = _repo_lock
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        match (remote, branch) {
-            (Some(r), Some(b)) => {
-                validate_ref_name(r)?;
-                validate_ref_name(b)?;
-                git_text_network(&repo, &["pull", r, b])
-            }
-            (Some(r), None) => {
-                validate_ref_name(r)?;
-                git_text_network(&repo, &["pull", r])
-            }
-            _ => git_text_network(&repo, &["pull"]),
-        }
+        git_text_network(&repo, &Self::pull_argv(remote, branch, rebase))
+    }
+
+    /// `pull.rebase` as configured for `repo` (`true`, `false`, `merges`,
+    /// `interactive`), or `None` when unset — git then merges.
+    pub fn pull_rebase_config(repo_path: &str) -> Result<Option<String>, String> {
+        let repo = validate_repo(repo_path)?;
+        Self::config_value(&repo, "pull.rebase")
     }
 
     /// Arguments after `git` for a push. The command gate judges this exact
@@ -1025,22 +1495,92 @@ Unset the local override with `git config --local --unset-all user.name` and \
         git_text_network(&repo, &["push", remote, &refspec])
     }
 
+    /// Git's arguments (no program) for the merge step of `mode`. Shared by
+    /// the command gate and [`Self::merge_branch`], so the judged line is the
+    /// line that runs. A squash is `merge --squash`, followed by the commit
+    /// [`Self::squash_commit_argv`] describes when anything was staged.
+    pub fn merge_argv(branch: &str, mode: MergeMode) -> Vec<&str> {
+        match mode {
+            MergeMode::Default => vec!["merge", "--no-edit", branch],
+            MergeMode::FfOnly => vec!["merge", "--ff-only", "--no-edit", branch],
+            MergeMode::NoFf => vec!["merge", "--no-ff", "--no-edit", branch],
+            MergeMode::Squash => vec!["merge", "--squash", branch],
+        }
+    }
+
+    /// The commit that records a squash of `branch`, message included.
+    pub fn squash_commit_argv(branch: &str) -> [String; 3] {
+        [
+            "commit".into(),
+            "-m".into(),
+            format!("Merge branch '{branch}' (squashed)"),
+        ]
+    }
+
+    /// Merges `branch_name` into the checked-out branch. `gate` is asked
+    /// about each git command, as git's arguments, before it runs; a squash
+    /// asks twice, for the merge and then for its commit.
     pub fn merge_branch(
         repo_path: &str,
         branch_name: &str,
-        ff_only: bool,
+        mode: MergeMode,
+        gate: &mut dyn FnMut(&[&str]) -> Result<(), String>,
     ) -> Result<String, String> {
         let repo = validate_repo(repo_path)?;
+        validate_ref_name(branch_name)?;
         let _repo_lock = repo_mutation_lock(&repo);
         let _guard = _repo_lock
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        validate_ref_name(branch_name)?;
-        if ff_only {
-            git_text(&repo, &["merge", "--ff-only", "--no-edit", branch_name])
-        } else {
-            git_text(&repo, &["merge", "--no-edit", branch_name])
+        if mode == MergeMode::Squash {
+            return Self::squash_merge_locked(&repo, branch_name, gate)
+                .map(|committed| {
+                    if committed {
+                        format!("Squashed {branch_name} into one commit")
+                    } else {
+                        format!("Nothing to squash: {branch_name} is already merged")
+                    }
+                })
+                .map_err(SquashFailure::into_message);
         }
+        let argv = Self::merge_argv(branch_name, mode);
+        gate(&argv)?;
+        git_text(&repo, &argv)
+    }
+
+    /// Squash-merges `branch` into the checkout at `repo` and commits it.
+    /// `Ok(false)` when the merge staged nothing: the branch's changes are
+    /// already there, which is not a failure. Caller MUST hold the repository
+    /// mutation lock. The one squash path: worktree teardown uses it too.
+    pub(crate) fn squash_merge_locked(
+        repo: &Path,
+        branch: &str,
+        gate: &mut dyn FnMut(&[&str]) -> Result<(), String>,
+    ) -> Result<bool, SquashFailure> {
+        // Checked first: once the merge has staged the squash, a missing
+        // identity would leave it stranded in the index.
+        Self::require_identity(repo).map_err(SquashFailure::Merge)?;
+        let merge = Self::merge_argv(branch, MergeMode::Squash);
+        gate(&merge).map_err(SquashFailure::Merge)?;
+        git_text(repo, &merge).map_err(SquashFailure::Merge)?;
+        // `git merge` refuses to start over staged changes, so whatever is
+        // staged now is the squash.
+        let staged =
+            git_text(repo, &["diff", "--cached", "--name-only"]).map_err(SquashFailure::Merge)?;
+        if staged.trim().is_empty() {
+            return Ok(false);
+        }
+        let commit = Self::squash_commit_argv(branch);
+        let commit: Vec<&str> = commit.iter().map(String::as_str).collect();
+        let staged_note = |e: String| {
+            SquashFailure::Commit(format!(
+                "The squashed changes of {branch} are staged but could not be committed: {e}. \
+                 Commit the staged changes, or undo them with `git reset --merge`."
+            ))
+        };
+        gate(&commit).map_err(staged_note)?;
+        git_text(repo, &commit).map_err(staged_note)?;
+        Ok(true)
     }
 
     /// Resolves the upstream for a restack of `branch` onto `onto`: where
@@ -1319,9 +1859,11 @@ Unset the local override with `git config --local --unset-all user.name` and \
         let _guard = _repo_lock
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        options.validate_paths(&repo)?;
         Self::refuse_if_parked(&repo, "stash")?;
         let argv = options.argv(message);
-        git_text(&repo, &argv[1..])
+        let args: Vec<&str> = argv.iter().skip(1).map(String::as_str).collect();
+        git_text(&repo, &args)
     }
 
     pub fn stash_pop(repo_path: &str) -> Result<String, String> {
@@ -1460,7 +2002,19 @@ Unset the local override with `git config --local --unset-all user.name` and \
     }
 
     pub fn clone_repo(url: &str, target_dir: &str) -> Result<String, String> {
+        Self::clone_repo_with(url, target_dir, &CloneOptions::default(), &mut |_| {})
+    }
+
+    /// Clones with `options`, reporting each step of git's progress to
+    /// `on_progress` as it happens.
+    pub fn clone_repo_with(
+        url: &str,
+        target_dir: &str,
+        options: &CloneOptions,
+        on_progress: &mut dyn FnMut(&CloneProgress),
+    ) -> Result<String, String> {
         validate_clone_url(url)?;
+        options.validate()?;
         // Global Git runs from a neutral directory. Resolve local relative
         // sources first so that isolation does not reinterpret the user's URL.
         // Keep URL schemes and scp-like host:path syntax intact.
@@ -1506,18 +2060,31 @@ Unset the local override with `git config --local --unset-all user.name` and \
                 .parent()
                 .ok_or("Clone destination has no parent")?,
         )?;
-        let result = git_global_with_timeout(
-            &["clone", "--", url, &staging.to_string_lossy()],
-            NETWORK_TIMEOUT,
-        )
-        .and_then(|_| {
-            crate::fs_entry::rename_noreplace(&staging, &clone_path).map_err(|error| {
-                format!(
-                    "Cannot publish clone at {} without replacing an existing entry: {error}",
-                    clone_path.display()
-                )
+        let staging_text = staging.to_string_lossy().into_owned();
+        let mut argv = options.argv();
+        argv.extend([url.to_string(), staging_text]);
+        let args: Vec<&str> = argv.iter().map(String::as_str).collect();
+        let mut observer = CloneProgressObserver {
+            pending: Vec::new(),
+            last: None,
+            sink: on_progress,
+        };
+        let result = git_global_observed(&args, NETWORK_TIMEOUT, &mut observer)
+            .and_then(|run| {
+                if run.success {
+                    Ok(())
+                } else {
+                    Err(clone_failure(&run))
+                }
             })
-        });
+            .and_then(|_| {
+                crate::fs_entry::rename_noreplace(&staging, &clone_path).map_err(|error| {
+                    format!(
+                        "Cannot publish clone at {} without replacing an existing entry: {error}",
+                        clone_path.display()
+                    )
+                })
+            });
         if let Err(clone_err) = result {
             // This attempt exclusively created staging. Never remove `.git`
             // at the requested destination: another client may own it now.
@@ -3306,5 +3873,567 @@ mod tests {
         }
         let reacquired = repo_mutation_lock(Path::new("/mock/repo_held"));
         assert!(Arc::ptr_eq(&held_lock, &reacquired));
+    }
+
+    /// Installs an executable `name` hook in `dir`'s default hooks directory.
+    #[cfg(unix)]
+    fn install_hook(dir: &std::path::Path, name: &str, body: &str) {
+        use std::os::unix::fs::PermissionsExt;
+        let hooks = dir.join(".git/hooks");
+        std::fs::create_dir_all(&hooks).unwrap();
+        let path = hooks.join(name);
+        std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    fn head_oid(dir: &tempfile::TempDir) -> String {
+        git_text(dir.path(), &["rev-parse", "HEAD"])
+            .unwrap()
+            .trim()
+            .to_string()
+    }
+
+    /// A hook that outlives the hook budget is stopped, and the error names
+    /// the hook rather than calling it a git hang.
+    #[cfg(unix)]
+    #[test]
+    fn a_hook_past_its_budget_is_named_in_the_timeout() {
+        let dir = init_repo_with_commit();
+        install_hook(dir.path(), "pre-commit", "sleep 30");
+        std::fs::write(dir.path().join("tracked.txt"), "changed\n").unwrap();
+        git_in(dir.path(), &["add", "tracked.txt"]);
+        let before = head_oid(&dir);
+        let started = std::time::Instant::now();
+        let err = crate::engine::git_cli::hooks::with_hook_timeout(
+            std::time::Duration::from_secs(2),
+            || GitWriter::commit(&repo_path(&dir), "never lands", false),
+        )
+        .unwrap_err();
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(20),
+            "{err}"
+        );
+        assert!(err.contains("git commit timed out after "), "{err}");
+        assert!(err.contains("pre-commit"), "the hook must be named: {err}");
+        assert!(
+            !err.contains("commit-msg"),
+            "only installed hooks are named: {err}"
+        );
+        assert_eq!(head_oid(&dir), before);
+    }
+
+    /// The user can stop a slow hook from the UI; the commit does not land
+    /// and the hook's process goes with git's.
+    #[cfg(unix)]
+    #[test]
+    fn a_running_hook_is_cancelled_on_request() {
+        let dir = init_repo_with_commit();
+        let marker = dir.path().join(".git/hook-started");
+        install_hook(
+            dir.path(),
+            "pre-commit",
+            &format!("touch '{}'\nsleep 30", marker.display()),
+        );
+        std::fs::write(dir.path().join("tracked.txt"), "changed\n").unwrap();
+        git_in(dir.path(), &["add", "tracked.txt"]);
+        let before = head_oid(&dir);
+        let canonical = dir.path().canonicalize().unwrap();
+        let canceller = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+            while !marker.exists() {
+                assert!(std::time::Instant::now() < deadline, "hook never started");
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            crate::engine::git_cli::cancel_hooked_git(&canonical)
+        });
+        let started = std::time::Instant::now();
+        let err = GitWriter::commit(&repo_path(&dir), "never lands", false).unwrap_err();
+        assert_eq!(canceller.join().unwrap(), 1, "one run was in flight");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(20),
+            "{err}"
+        );
+        assert!(
+            crate::engine::git_cli::is_hooked_git_cancelled(&err),
+            "{err}"
+        );
+        assert!(err.contains("pre-commit"), "{err}");
+        assert_eq!(head_oid(&dir), before);
+    }
+
+    /// Overrides any global identity with an empty one, which git refuses
+    /// to commit under, so the repository has no usable identity at all.
+    fn blank_identity(dir: &std::path::Path) {
+        git_ok(dir, &["config", "user.name", ""]);
+        git_ok(dir, &["config", "user.email", ""]);
+    }
+
+    #[test]
+    fn identity_reads_config_then_an_environment_covering_author_and_committer() {
+        let dir = init_repo_with_commit();
+        blank_identity(dir.path());
+        let none = |_: &str| None;
+        assert_eq!(
+            GitWriter::identity_with(dir.path(), &none).unwrap(),
+            GitIdentity {
+                name: None,
+                email: None
+            }
+        );
+        let author_only = |key: &str| (key == "GIT_AUTHOR_NAME").then(|| "Ada".to_string());
+        assert_eq!(
+            GitWriter::identity_with(dir.path(), &author_only)
+                .unwrap()
+                .name,
+            None,
+            "an author without a committer is not enough to record a commit"
+        );
+        let full = |key: &str| match key {
+            "GIT_AUTHOR_NAME" | "GIT_COMMITTER_NAME" => Some("Ada".to_string()),
+            "EMAIL" => Some("ada@gitpulse.dev".to_string()),
+            _ => None,
+        };
+        let identity = GitWriter::identity_with(dir.path(), &full).unwrap();
+        assert!(identity.is_complete(), "{identity:?}");
+        git_ok(dir.path(), &["config", "user.name", "Grace"]);
+        assert_eq!(
+            GitWriter::identity_with(dir.path(), &full)
+                .unwrap()
+                .name
+                .as_deref(),
+            Some("Grace"),
+            "configuration wins over the environment"
+        );
+    }
+
+    #[test]
+    fn a_commit_without_an_identity_is_refused_before_git_runs_and_setting_one_fixes_it() {
+        for key in ["GIT_AUTHOR_NAME", "GIT_COMMITTER_NAME"] {
+            assert!(
+                std::env::var_os(key).is_none(),
+                "this test needs an environment without {key}"
+            );
+        }
+        let dir = init_repo_with_commit();
+        blank_identity(dir.path());
+        std::fs::write(dir.path().join("tracked.txt"), "changed\n").unwrap();
+        std::fs::write(dir.path().join("new.txt"), "new\n").unwrap();
+        git_in(dir.path(), &["add", "tracked.txt"]);
+        let before = head_oid(&dir);
+        for err in [
+            GitWriter::commit(&repo_path(&dir), "no identity", false).unwrap_err(),
+            GitWriter::quick_commit(&repo_path(&dir), "no identity").unwrap_err(),
+            GitWriter::commit_files(&repo_path(&dir), "no identity", &["new.txt".into()])
+                .unwrap_err(),
+        ] {
+            assert!(err.starts_with(IDENTITY_MISSING), "{err}");
+            assert!(err.contains("user.name"), "{err}");
+        }
+        assert_eq!(head_oid(&dir), before);
+        let staged = git_text(dir.path(), &["diff", "--cached", "--name-only"]).unwrap();
+        assert_eq!(
+            staged.trim(),
+            "tracked.txt",
+            "quick commit must not have run `add`"
+        );
+
+        assert!(
+            GitWriter::set_identity(&repo_path(&dir), "  ", "a@b", IdentityScope::Repo).is_err()
+        );
+        assert!(GitWriter::set_identity(
+            &repo_path(&dir),
+            "Ada",
+            "not-an-email",
+            IdentityScope::Repo
+        )
+        .is_err());
+        let identity = GitWriter::set_identity(
+            &repo_path(&dir),
+            " Ada Lovelace ",
+            "ada@gitpulse.dev",
+            IdentityScope::Repo,
+        )
+        .unwrap();
+        assert_eq!(identity.name.as_deref(), Some("Ada Lovelace"));
+        GitWriter::commit(&repo_path(&dir), "with identity", false).unwrap();
+        let author = git_text(dir.path(), &["log", "-1", "--format=%an <%ae>"]).unwrap();
+        assert_eq!(author.trim(), "Ada Lovelace <ada@gitpulse.dev>");
+    }
+
+    #[test]
+    fn identity_argv_writes_the_chosen_scope_only() {
+        let [name, email] = GitWriter::identity_argv(IdentityScope::Global, "Ada", "a@b.dev");
+        assert_eq!(name, ["git", "config", "--global", "user.name", "Ada"]);
+        assert_eq!(
+            email,
+            ["git", "config", "--global", "user.email", "a@b.dev"]
+        );
+        let [name, _] = GitWriter::identity_argv(IdentityScope::Repo, "Ada", "a@b.dev");
+        assert_eq!(name[2], "--local");
+    }
+
+    /// A repository with `feature` two commits ahead of `main`, on `main`.
+    fn feature_ahead() -> tempfile::TempDir {
+        let dir = init_repo_with_commit();
+        git_in(dir.path(), &["checkout", "-q", "-b", "feature"]);
+        write_commit(&dir, "a.txt", "a\n", "feature one");
+        write_commit(&dir, "b.txt", "b\n", "feature two");
+        git_in(dir.path(), &["checkout", "-q", "main"]);
+        dir
+    }
+
+    fn parents_of_head(dir: &tempfile::TempDir) -> usize {
+        git_text(dir.path(), &["rev-list", "--parents", "-n", "1", "HEAD"])
+            .unwrap()
+            .split_whitespace()
+            .count()
+            - 1
+    }
+
+    #[test]
+    fn merge_modes_run_the_argv_the_gate_was_shown() {
+        assert_eq!(
+            GitWriter::merge_argv("f", MergeMode::Default),
+            ["merge", "--no-edit", "f"]
+        );
+        assert_eq!(
+            GitWriter::merge_argv("f", MergeMode::FfOnly),
+            ["merge", "--ff-only", "--no-edit", "f"]
+        );
+        assert_eq!(
+            GitWriter::merge_argv("f", MergeMode::NoFf),
+            ["merge", "--no-ff", "--no-edit", "f"]
+        );
+        assert_eq!(
+            GitWriter::merge_argv("f", MergeMode::Squash),
+            ["merge", "--squash", "f"]
+        );
+        assert_eq!(
+            crate::engine::worktree::merge_teardown_argv("f", true),
+            GitWriter::merge_argv("f", MergeMode::Squash),
+            "worktree teardown squashes through the same path"
+        );
+    }
+
+    #[test]
+    fn no_ff_records_a_merge_commit_where_a_fast_forward_was_possible() {
+        let dir = feature_ahead();
+        let mut asked = Vec::new();
+        GitWriter::merge_branch(&repo_path(&dir), "feature", MergeMode::NoFf, &mut |args| {
+            asked.push(args.join(" "));
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(asked, ["merge --no-ff --no-edit feature"]);
+        assert_eq!(parents_of_head(&dir), 2);
+    }
+
+    #[test]
+    fn squash_merges_into_one_commit_and_asks_the_gate_about_each_step() {
+        let dir = feature_ahead();
+        let before = head_oid(&dir);
+        let mut asked = Vec::new();
+        let output = GitWriter::merge_branch(
+            &repo_path(&dir),
+            "feature",
+            MergeMode::Squash,
+            &mut |args| {
+                asked.push(args.join(" "));
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            asked,
+            [
+                "merge --squash feature",
+                "commit -m Merge branch 'feature' (squashed)"
+            ]
+        );
+        assert!(output.contains("Squashed feature"), "{output}");
+        assert_eq!(parents_of_head(&dir), 1, "a squash has no merge parent");
+        assert_eq!(
+            git_text(dir.path(), &["rev-parse", "HEAD~1"])
+                .unwrap()
+                .trim(),
+            before
+        );
+        assert!(dir.path().join("a.txt").exists() && dir.path().join("b.txt").exists());
+
+        let refused =
+            GitWriter::merge_branch(&repo_path(&dir), "feature", MergeMode::Squash, &mut |_| {
+                Err("policy: no".into())
+            })
+            .unwrap_err();
+        assert_eq!(refused, "policy: no");
+    }
+
+    #[test]
+    fn pull_argv_names_the_rebase_choice_and_never_a_branch_without_a_remote() {
+        assert_eq!(GitWriter::pull_argv(None, None, None), ["pull"]);
+        assert_eq!(
+            GitWriter::pull_argv(None, None, Some(true)),
+            ["pull", "--rebase"]
+        );
+        assert_eq!(
+            GitWriter::pull_argv(Some("origin"), Some("main"), Some(false)),
+            ["pull", "--no-rebase", "origin", "main"]
+        );
+        assert_eq!(
+            GitWriter::pull_argv(None, Some("main"), None),
+            ["pull"],
+            "git would read a lone branch as a remote"
+        );
+    }
+
+    /// `local` is a clone of a bare `origin`; `other` pushed one commit there.
+    fn diverged_clone() -> (tempfile::TempDir, tempfile::TempDir) {
+        let seed = init_repo_with_commit();
+        let origin = tempfile::TempDir::new().unwrap();
+        git_ok(
+            origin.path(),
+            &["clone", "-q", "--bare", &repo_path(&seed), "."],
+        );
+        let local = tempfile::TempDir::new().unwrap();
+        git_ok(
+            local.path(),
+            &["clone", "-q", &origin.path().to_string_lossy(), "."],
+        );
+        configure_identity(local.path());
+        crate::test_support::trust_repo(local.path());
+        let other = tempfile::TempDir::new().unwrap();
+        git_ok(
+            other.path(),
+            &["clone", "-q", &origin.path().to_string_lossy(), "."],
+        );
+        configure_identity(other.path());
+        std::fs::write(other.path().join("theirs.txt"), "theirs\n").unwrap();
+        git_ok(other.path(), &["add", "theirs.txt"]);
+        git_ok(other.path(), &["commit", "-q", "-m", "theirs"]);
+        git_ok(other.path(), &["push", "-q", "origin", "HEAD"]);
+        std::fs::write(local.path().join("mine.txt"), "mine\n").unwrap();
+        git_ok(local.path(), &["add", "mine.txt"]);
+        git_ok(local.path(), &["commit", "-q", "-m", "mine"]);
+        (local, origin)
+    }
+
+    #[test]
+    fn pull_with_rebase_replays_local_commits_without_a_merge() {
+        let (local, _origin) = diverged_clone();
+        assert_eq!(
+            GitWriter::pull_rebase_config(&repo_path(&local)).unwrap(),
+            None
+        );
+        GitWriter::pull(&repo_path(&local), None, None, Some(true)).unwrap();
+        assert_eq!(parents_of_head(&local), 1, "rebased, not merged");
+        let log = git_text(local.path(), &["log", "--format=%s", "-3"]).unwrap();
+        assert_eq!(log.lines().collect::<Vec<_>>(), ["mine", "theirs", "init"]);
+        git_ok(local.path(), &["config", "pull.rebase", "merges"]);
+        assert_eq!(
+            GitWriter::pull_rebase_config(&repo_path(&local))
+                .unwrap()
+                .as_deref(),
+            Some("merges")
+        );
+    }
+
+    #[test]
+    fn stash_with_paths_sets_aside_only_the_selection() {
+        let dir = init_repo_with_commit();
+        write_commit(&dir, "other.txt", "base\n", "other");
+        std::fs::write(dir.path().join("tracked.txt"), "stash me\n").unwrap();
+        std::fs::write(dir.path().join("other.txt"), "keep me\n").unwrap();
+        std::fs::write(dir.path().join("*"), "literal star\n").unwrap();
+        let options = StashSaveOptions {
+            paths: vec!["tracked.txt".into(), "*".into(), "tracked.txt".into()],
+            ..StashSaveOptions::default()
+        };
+        assert_eq!(
+            options.argv(Some("part")),
+            [
+                "git",
+                "stash",
+                "push",
+                "-u",
+                "-m",
+                "part",
+                "--",
+                ":(literal)tracked.txt",
+                ":(literal)*"
+            ]
+        );
+        GitWriter::stash_save_with(&repo_path(&dir), Some("part"), options).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("tracked.txt")).unwrap(),
+            "base\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("other.txt")).unwrap(),
+            "keep me\n"
+        );
+        assert!(
+            !dir.path().join("*").exists(),
+            "the literal `*` file was stashed"
+        );
+
+        let escape = StashSaveOptions {
+            paths: vec!["../outside".into()],
+            ..StashSaveOptions::default()
+        };
+        assert!(GitWriter::stash_save_with(&repo_path(&dir), None, escape).is_err());
+        let huge = StashSaveOptions {
+            paths: (0..2000).map(|i| format!("file-number-{i}.txt")).collect(),
+            ..StashSaveOptions::default()
+        };
+        let err = GitWriter::stash_save_with(&repo_path(&dir), None, huge).unwrap_err();
+        assert!(err.contains("too long to stash in one command"), "{err}");
+    }
+
+    #[test]
+    fn clone_progress_reads_git_phases_and_ignores_diagnostics() {
+        let parse = CloneProgress::parse;
+        assert_eq!(
+            parse("Receiving objects:  45% (450/1000), 1.20 MiB | 2.00 MiB/s"),
+            Some(CloneProgress {
+                phase: "Receiving objects".into(),
+                percent: Some(45)
+            })
+        );
+        assert_eq!(
+            parse("remote: Counting objects: 100% (12/12), done."),
+            Some(CloneProgress {
+                phase: "Counting objects".into(),
+                percent: Some(100)
+            })
+        );
+        assert_eq!(
+            parse("Cloning into '/tmp/x'..."),
+            Some(CloneProgress {
+                phase: "Cloning".into(),
+                percent: None
+            })
+        );
+        assert_eq!(parse("fatal: repository 'x' does not exist"), None);
+        assert_eq!(parse("warning: --depth is ignored in local clones"), None);
+        assert_eq!(parse(""), None);
+    }
+
+    #[test]
+    fn clone_options_shallow_branch_and_progress() {
+        let src = init_repo_with_commit();
+        write_commit(&src, "two.txt", "2\n", "two");
+        git_in(src.path(), &["branch", "side"]);
+        write_commit(&src, "three.txt", "3\n", "three");
+        let parent = tempfile::TempDir::new().unwrap();
+        let url = format!("file://{}", src.path().display());
+        let options = CloneOptions {
+            branch: Some("side".into()),
+            depth: Some(1),
+            recurse_submodules: false,
+        };
+        let mut seen = Vec::new();
+        let cloned = GitWriter::clone_repo_with(
+            &url,
+            parent.path().join("shallow").to_str().unwrap(),
+            &options,
+            &mut |progress| seen.push(progress.clone()),
+        )
+        .unwrap();
+        let cloned = Path::new(&cloned);
+        assert_eq!(
+            git_text(cloned, &["rev-list", "--count", "HEAD"])
+                .unwrap()
+                .trim(),
+            "1",
+            "depth 1"
+        );
+        assert_eq!(
+            git_text(cloned, &["rev-parse", "--abbrev-ref", "HEAD"])
+                .unwrap()
+                .trim(),
+            "side"
+        );
+        assert!(!cloned.join("three.txt").exists());
+        assert!(
+            seen.iter().any(|p| p.percent.is_some()),
+            "progress was streamed: {seen:?}"
+        );
+        for window in seen.windows(2) {
+            assert_ne!(window[0], window[1], "unchanged progress is not resent");
+        }
+        assert!(CloneOptions {
+            depth: Some(0),
+            ..CloneOptions::default()
+        }
+        .validate()
+        .is_err());
+        assert!(CloneOptions {
+            branch: Some("-x".into()),
+            ..CloneOptions::default()
+        }
+        .validate()
+        .is_err());
+        assert_eq!(
+            CloneOptions {
+                recurse_submodules: true,
+                ..CloneOptions::default()
+            }
+            .argv(),
+            ["clone", "--progress", "--recurse-submodules", "--"]
+        );
+        let missing = GitWriter::clone_repo_with(
+            &format!("file://{}/nope", parent.path().display()),
+            parent.path().join("missing").to_str().unwrap(),
+            &CloneOptions::default(),
+            &mut |_| {},
+        )
+        .unwrap_err();
+        assert!(
+            missing.contains("fatal:"),
+            "the diagnosis survives: {missing}"
+        );
+    }
+
+    #[test]
+    fn auto_fetch_fetches_skips_a_busy_repository_and_never_prunes() {
+        assert!(!AUTO_FETCH_ARGV.contains(&"--prune"));
+        let (local, _origin) = diverged_clone();
+        let before = git_text(local.path(), &["rev-parse", "origin/main"]).unwrap();
+        let canon = local.path().canonicalize().unwrap();
+        {
+            let lock = repo_mutation_lock(&canon);
+            let _held = lock.lock().unwrap();
+            let busy = GitWriter::auto_fetch(&repo_path(&local)).unwrap();
+            assert!(matches!(busy, AutoFetchOutcome::Skipped { .. }), "{busy:?}");
+            assert_eq!(
+                git_text(local.path(), &["rev-parse", "origin/main"]).unwrap(),
+                before,
+                "a skipped fetch ran nothing"
+            );
+        }
+        assert_eq!(
+            GitWriter::auto_fetch(&repo_path(&local)).unwrap(),
+            AutoFetchOutcome::Fetched
+        );
+        assert_ne!(
+            git_text(local.path(), &["rev-parse", "origin/main"]).unwrap(),
+            before
+        );
+    }
+
+    /// The bug as reported: a pre-commit hook slower than the 90 s read
+    /// timeout. Real time, so ignored by default; run it with
+    /// `cargo test --lib slow_pre_commit_hook_past_ninety_seconds -- --ignored`.
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "sleeps 95 s in a real pre-commit hook"]
+    fn slow_pre_commit_hook_past_ninety_seconds_still_commits() {
+        let dir = init_repo_with_commit();
+        install_hook(dir.path(), "pre-commit", "sleep 95");
+        std::fs::write(dir.path().join("tracked.txt"), "changed\n").unwrap();
+        git_in(dir.path(), &["add", "tracked.txt"]);
+        GitWriter::commit(&repo_path(&dir), "slow hook", false)
+            .expect("a slow hook is not a hung git");
+        assert_eq!(head_message(&dir).trim(), "slow hook");
     }
 }

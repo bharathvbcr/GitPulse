@@ -57,6 +57,8 @@ const NO_TS_MIRROR = new Map<string, string>([
 function serializedName(variant: string, rule: string | undefined): string {
   if (rule === "lowercase") return variant.toLowerCase();
   if (rule === "snake_case") return variant.replace(/(?<!^)(?=[A-Z])/g, "_").toLowerCase();
+  // MergeMode spells its variants as git spells the flags (`ff-only`, `no-ff`).
+  if (rule === "kebab-case") return variant.replace(/(?<!^)(?=[A-Z])/g, "-").toLowerCase();
   // Used by the hook wire types, whose field and variant names are fixed by the
   // host's hook protocol rather than by this repo.
   if (rule === "camelCase") return variant.charAt(0).toLowerCase() + variant.slice(1);

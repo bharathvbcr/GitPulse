@@ -3,7 +3,8 @@
   import { AlertTriangle, ArrowRight, Check, Cloud, GitBranch, GitMerge, Search, X } from "@lucide/svelte";
   import { repoStore } from "../stores/repoStore";
   import { toastStore } from "../stores/toastStore";
-  import { mergeBlockedReason, mergeCandidates, mergeRef, type MergeRequest } from "../branches/mergeSelection";
+  import { MERGE_MODES, mergeBlockedReason, mergeCandidates, mergeRef, type MergeRequest } from "../branches/mergeSelection";
+  import HookRunNotice from "./HookRunNotice.svelte";
   import { trapFocus } from "../ui/focusTrap";
   import { portal } from "../dom/portal";
   import { LAYERS } from "../ui/layers";
@@ -11,7 +12,7 @@
 
   let { request, onClose }: { request: MergeRequest; onClose: () => void } = $props();
   let selectedRef = $state(untrack(() => request.sourceRef));
-  let ffOnly = $state(untrack(() => request.ffOnly));
+  let mode = $state(untrack(() => request.mode));
   let query = $state("");
   let scope = $state<"all" | "local" | "remote">("all");
   let busy = $state(false);
@@ -81,10 +82,12 @@
     busy = true;
     error = null;
     try {
-      const outcome = await repoStore.mergeBranch(mergeRef(chosen), ffOnly);
+      const outcome = await repoStore.mergeBranch(mergeRef(chosen), mode);
       if ($repoStore.currentPath !== request.repoPath) return;
       if (outcome.ok) {
-        toastStore.success(`Merged ${chosen.name} into ${request.targetBranch}`);
+        toastStore.success(mode === "squash"
+          ? `Squashed ${chosen.name} into ${request.targetBranch}`
+          : `Merged ${chosen.name} into ${request.targetBranch}`);
         onClose();
       } else {
         error = outcome.error ?? "Merge failed. Review the repository and try again.";
@@ -183,7 +186,13 @@
       {#if blocked}<p role="status" class="flex items-start gap-2 text-amber-600 dark:text-amber-400"><AlertTriangle size={14} class="shrink-0 mt-0.5" />{blocked}</p>{/if}
       {#if error}<p role="alert" class="text-rose-500 break-words whitespace-pre-wrap">{error}</p>{/if}
       {#if $repoStore.statuses.length > 0 && !blocked && !error}<p class="text-textMuted">You have uncommitted changes. Git may require you to commit or stash them first.</p>{/if}
-      <label class="flex items-start gap-2.5 cursor-pointer"><input type="checkbox" bind:checked={ffOnly} disabled={busy} class="accent-accent mt-0.5" /><span>Fast-forward only<span class="block text-[10px] text-textMuted mt-1">Only move the branch forward; stop if a merge commit is needed.</span></span></label>
+      <fieldset class="space-y-1.5" disabled={busy}>
+        <legend class="text-[10px] uppercase tracking-wider text-textMuted mb-1">Merge strategy</legend>
+        {#each MERGE_MODES as option (option.mode)}
+          <label class="flex items-start gap-2.5 cursor-pointer"><input type="radio" name="merge-mode" value={option.mode} bind:group={mode} class="accent-accent mt-0.5" /><span>{option.label}<span class="block text-[10px] text-textMuted mt-0.5">{option.detail}</span></span></label>
+        {/each}
+      </fieldset>
+      {#if busy}<HookRunNotice />{/if}
       <div class="flex items-center justify-end gap-2 pt-1">
         {#if conflicted && $repoStore.currentPath === request.repoPath}<button type="button" class="gp-btn" disabled={busy} onclick={() => { repoStore.setActiveTab("work", "resolve"); close(); }}>Resolve conflicts</button>{/if}
         <button type="button" class="gp-btn" disabled={busy} onclick={close}>Cancel</button>

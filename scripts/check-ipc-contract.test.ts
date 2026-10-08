@@ -293,10 +293,12 @@ describe("annotated but unregistered commands", () => {
     ]);
     // Cross-checked three ways against the real crate: the generate_handler!
     // list, a raw attribute count, and this scanner all report the same total.
-    // 256 since cmd_session_attention_standing and cmd_session_attention_answered
-    // arrived; `bun run check:ipc` prints all three numbers, so a bump made
-    // without re-running it will not agree.
-    expect(found.size).toBe(256);
+    // 262 since the git write-path commands (cmd_auto_fetch,
+    // cmd_pull_rebase_config, cmd_git_preflight, cmd_cancel_git_hooks,
+    // cmd_git_identity, cmd_set_git_identity) arrived; `bun run check:ipc`
+    // prints all three numbers, so a bump made without re-running it will not
+    // agree.
+    expect(found.size).toBe(262);
     expect(found.has("cmd_repository_trust")).toBe(true);
     expect(found.has("cmd_grant_repository_trust")).toBe(true);
     expect(found.has("cmd_revoke_repository_trust")).toBe(true);

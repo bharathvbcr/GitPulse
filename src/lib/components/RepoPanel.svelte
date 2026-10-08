@@ -27,7 +27,9 @@
     Loader2,
     Plus,
     Trash2,
+    Download,
   } from "@lucide/svelte";
+  import { DEFAULT_AUTO_FETCH_MINUTES, MAX_AUTO_FETCH_MINUTES, MIN_AUTO_FETCH_MINUTES } from "../repos/autoFetch";
   import {
     describeRemotes,
     carriesEmbeddedCredential,
@@ -85,6 +87,17 @@
   let stashMessage = $state("");
   let includeUntracked = $state(true);
   let keepIndex = $state(false);
+  /** Stash only the ticked paths instead of the whole working tree. */
+  let stashSelectedOnly = $state(false);
+  let stashPaths = $state<string[]>([]);
+  /** Selection lists past this are not rendered; stash the whole tree instead. */
+  const STASH_PICKER_LIMIT = 500;
+  type PullStrategy = "config" | "merge" | "rebase";
+  let pullStrategy = $state<PullStrategy>("config");
+  let pullRebaseConfig = $state<string | null>(null);
+  let autoFetchOn = $state(false);
+  let autoFetchMinutes = $state(DEFAULT_AUTO_FETCH_MINUTES);
+  const changedPaths = $derived([...new Set($repoStore.statuses.map((status) => status.path))]);
   let previewKey = $state<string | null>(null);
   let preview = $state<DiffPayload | null>(null);
   let previewError = $state<string | null>(null);
@@ -133,6 +146,13 @@
     stashMessage = "";
     includeUntracked = true;
     keepIndex = false;
+    stashSelectedOnly = false;
+    stashPaths = [];
+    pullStrategy = "config";
+    pullRebaseConfig = null;
+    const setting = path ? repoStore.autoFetchSetting(path) : null;
+    autoFetchOn = setting?.enabled ?? false;
+    autoFetchMinutes = setting?.minutes ?? DEFAULT_AUTO_FETCH_MINUTES;
     if (!path) {
       guard?.cancel();
       remotes = [];
@@ -173,18 +193,47 @@
     const path = repoPath;
     const message = stashMessage;
     await run("stash-save", async () => {
+      const paths = stashSelectedOnly ? stashPaths.filter((p) => changedPaths.includes(p)) : [];
+      if (stashSelectedOnly && paths.length === 0) {
+        return { ok: false, error: "Tick at least one file to stash, or stash the whole working tree." };
+      }
       const outcome = await repoStore.stashSave(message.trim() || undefined, {
-        include_untracked: includeUntracked, keep_index: keepIndex,
+        include_untracked: includeUntracked, keep_index: keepIndex, paths,
       });
       if (outcome.ok && repoPath === path && stashMessage === message) stashMessage = "";
+      if (outcome.ok && repoPath === path) stashPaths = [];
       return outcome;
     });
+  }
+
+  async function pull() {
+    const rebase = pullStrategy === "config" ? undefined : pullStrategy === "rebase";
+    await run("pull", () => repoStore.pull(undefined, undefined, rebase));
+  }
+
+  function setAutoFetch(enabled: boolean, minutes: number) {
+    const path = repoPath;
+    if (!path) return;
+    try {
+      repoStore.setAutoFetch(path, { enabled, minutes });
+      const saved = repoStore.autoFetchSetting(path);
+      autoFetchOn = saved?.enabled ?? false;
+      autoFetchMinutes = saved?.minutes ?? minutes;
+    } catch (error) {
+      autoFetchOn = false;
+      toastStore.error(formatError(error));
+    }
   }
 
   async function load() {
     guard?.cancel();
     const active = createAsyncGuard();
     guard = active;
+    void repoStore.pullRebaseConfig().then((value) => {
+      if (active.isLive()) pullRebaseConfig = value;
+    }).catch(() => {
+      if (active.isLive()) pullRebaseConfig = null;
+    });
     // Loaded independently: a broken .gitmodules must not hide the remotes.
     await Promise.all([
       (async () => {
@@ -352,6 +401,31 @@
           <RefreshCw size={11} />
         </button>
       </header>
+
+      <div class="mb-3 flex flex-wrap items-center gap-x-3 gap-y-2 rounded-xl border border-border/60 p-2.5 text-[11px] text-textSecondary">
+        <label class="inline-flex items-center gap-1.5">
+          Pull by
+          <select class="gp-input py-0.5!" bind:value={pullStrategy} disabled={busy !== null}>
+            <option value="config">{pullRebaseConfig ? `pull.rebase (${pullRebaseConfig})` : "git's default (merge)"}</option>
+            <option value="merge">Merging (--no-rebase)</option>
+            <option value="rebase">Rebasing local commits (--rebase)</option>
+          </select>
+        </label>
+        <button type="button" class="gp-btn py-1! px-2.5! text-[11px]!" disabled={busy !== null || !$repoStore.currentBranch} onclick={() => void pull()}>
+          {#if busy === "pull"}<Loader2 size={11} class="animate-spin" />{:else}<Download size={11} />{/if} Pull
+        </button>
+        <span class="flex-1"></span>
+        <label class="inline-flex items-center gap-1.5" title="Off by default. Fetches this repository in the background; background tabs are fetched less often, and nothing runs while the window is hidden or the app is busy.">
+          <input type="checkbox" checked={autoFetchOn} onchange={(event) => setAutoFetch(event.currentTarget.checked, autoFetchMinutes)} />
+          Auto-fetch every
+        </label>
+        <select class="gp-input py-0.5!" value={autoFetchMinutes} disabled={!autoFetchOn} aria-label="Auto-fetch interval"
+          onchange={(event) => setAutoFetch(true, Number(event.currentTarget.value))}>
+          {#each [5, 10, 15, 30, 60, 120, 240].filter((m) => m >= MIN_AUTO_FETCH_MINUTES && m <= MAX_AUTO_FETCH_MINUTES) as minutes (minutes)}
+            <option value={minutes}>{minutes} min</option>
+          {/each}
+        </select>
+      </div>
 
       {#if remotesTruncated}
         <p class="mb-2 flex items-start gap-1.5 text-[11px] text-amber-600 dark:text-amber-400">
@@ -700,7 +774,20 @@
         <div class="flex flex-wrap gap-3 text-[11px] text-textSecondary">
           <label class="inline-flex items-center gap-1.5"><input type="checkbox" bind:checked={includeUntracked} disabled={busy !== null} />Include untracked files</label>
           <label class="inline-flex items-center gap-1.5"><input type="checkbox" bind:checked={keepIndex} disabled={busy !== null} />Keep staged changes</label>
+          <label class="inline-flex items-center gap-1.5"><input type="checkbox" bind:checked={stashSelectedOnly} disabled={busy !== null || changedPaths.length === 0} />Only selected files</label>
         </div>
+        {#if stashSelectedOnly}
+          {#if changedPaths.length > STASH_PICKER_LIMIT}
+            <p class="text-[11px] text-amber-600 dark:text-amber-400">{changedPaths.length} changed files is too many to pick from here. Stash the whole working tree instead.</p>
+          {:else}
+            <fieldset class="max-h-40 overflow-y-auto rounded-lg border border-border/60 p-2 space-y-0.5" disabled={busy !== null} aria-label="Files to stash">
+              {#each changedPaths as path (path)}
+                <label class="flex items-center gap-1.5 text-[11px] font-mono"><input type="checkbox" value={path} bind:group={stashPaths} /><span class="truncate">{path}</span></label>
+              {/each}
+            </fieldset>
+            <p class="text-[11px] text-textMuted">{stashPaths.length} of {changedPaths.length} selected</p>
+          {/if}
+        {/if}
         <p class="text-[11px] text-textMuted">{keepIndex ? "Staged changes remain ready to commit. " : ""}Ignored files stay in the working tree.</p>
         <button type="submit" class="gp-btn" disabled={busy !== null || !$repoStore.statuses.length || $repoStore.isBare}>Save stash</button>
       </form>

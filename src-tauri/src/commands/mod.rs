@@ -17,7 +17,8 @@ use crate::engine::git_reader::{
     LanguageStatsReport, PulseReport, ReflogEntry, ResetPreview,
 };
 use crate::engine::git_writer::{
-    reworded_message, validate_oid_or_revision, validate_ref_name, IndexAction, RebaseStep,
+    reworded_message, validate_oid_or_revision, validate_ref_name, AutoFetchOutcome, CloneOptions,
+    CloneProgress, GitIdentity, IdentityScope, IndexAction, MergeMode, RebaseStep,
     StashSaveOptions,
 };
 use crate::engine::{
@@ -1022,9 +1023,95 @@ pub async fn cmd_deadbranch_restore(
     .await
 }
 
+/// One step of a clone, sent as the `clone-progress` event while
+/// [`cmd_clone_repo`] runs. `id` is the caller's, so a window can tell its
+/// clone's progress from another's.
+#[derive(Clone, Serialize)]
+struct CloneProgressEvent {
+    id: String,
+    #[serde(flatten)]
+    progress: CloneProgress,
+}
+
 #[tauri::command(async)]
-pub async fn cmd_clone_repo(url: String, target_dir: String) -> Result<String, String> {
-    off_thread(move || GitWriter::clone_repo(&url, &target_dir)).await
+pub async fn cmd_clone_repo(
+    app: AppHandle,
+    url: String,
+    target_dir: String,
+    options: Option<CloneOptions>,
+    progress_id: Option<String>,
+) -> Result<String, String> {
+    off_thread(move || {
+        use tauri::Emitter;
+        let options = options.unwrap_or_default();
+        let mut on_progress = |progress: &CloneProgress| {
+            if let Some(id) = &progress_id {
+                let event = CloneProgressEvent {
+                    id: id.clone(),
+                    progress: progress.clone(),
+                };
+                if let Err(error) = app.emit("clone-progress", event) {
+                    log::debug!("clone progress event not delivered: {error}");
+                }
+            }
+        };
+        GitWriter::clone_repo_with(&url, &target_dir, &options, &mut on_progress)
+    })
+    .await
+}
+
+/// Whether a usable git is installed: missing, older than 2.23, or broken,
+/// each with a message the user can act on. Asked once at startup.
+#[tauri::command(async)]
+pub async fn cmd_git_preflight() -> Result<crate::engine::git_cli::GitPreflight, String> {
+    off_thread(|| Ok(crate::engine::git_cli::git_preflight())).await
+}
+
+/// Stops the hook-running git command (commit, merge, rebase, …) in flight
+/// in this repository, its hook included. Returns how many were stopped;
+/// zero when nothing was running, which the UI says rather than pretends.
+#[tauri::command(async)]
+pub async fn cmd_cancel_git_hooks(repo_path: String) -> Result<usize, String> {
+    off_thread(move || {
+        let repo = validate_repo(&repo_path)?;
+        Ok(crate::engine::git_cli::cancel_hooked_git(&repo))
+    })
+    .await
+}
+
+/// The name and email a commit here would be recorded under.
+#[tauri::command(async)]
+pub async fn cmd_git_identity(repo_path: String) -> Result<GitIdentity, String> {
+    off_thread(move || GitWriter::identity(&repo_path)).await
+}
+
+/// Sets `user.name` and `user.email` for this repository or globally, after
+/// the gate has judged both `git config` lines.
+#[tauri::command(async)]
+pub async fn cmd_set_git_identity(
+    repo_path: String,
+    name: String,
+    email: String,
+    scope: IdentityScope,
+) -> Result<Guarded<GitIdentity>, String> {
+    off_thread(move || {
+        GitWriter::validate_identity(&name, &email)?;
+        let mut policy: Option<crate::harness::PolicyVerdict> = None;
+        for argv in GitWriter::identity_argv(scope, name.trim(), email.trim()) {
+            let refs: Vec<&str> = argv.iter().map(String::as_str).collect();
+            let verdict = guard(&repo_path, &refs)?;
+            policy = Some(match policy.take() {
+                Some(previous) => strictest_verdict(previous, verdict),
+                None => verdict,
+            });
+        }
+        let output = GitWriter::set_identity(&repo_path, &name, &email, scope)?;
+        Ok(Guarded {
+            policy: policy.unwrap_or_else(no_git_verdict),
+            output,
+        })
+    })
+    .await
 }
 
 #[tauri::command(async)]
@@ -1461,26 +1548,45 @@ pub async fn cmd_fetch(
     .await
 }
 
+/// Fetches on the opt-in auto-fetch timer. Judged by the gate like any
+/// fetch, but not as a user action: it runs as background work the spawn
+/// gate sheds under load, and it skips a repository another command holds.
+#[tauri::command(async)]
+pub async fn cmd_auto_fetch(repo_path: String) -> Result<Guarded<AutoFetchOutcome>, String> {
+    off_thread(move || {
+        let policy = guard_background(&repo_path, &crate::engine::git_writer::AUTO_FETCH_ARGV)?;
+        let output = GitWriter::auto_fetch(&repo_path)?;
+        Ok(Guarded { policy, output })
+    })
+    .await
+}
+
+/// `pull.rebase` as configured for this repository, or `None` when unset.
+#[tauri::command(async)]
+pub async fn cmd_pull_rebase_config(repo_path: String) -> Result<Option<String>, String> {
+    off_thread(move || GitWriter::pull_rebase_config(&repo_path)).await
+}
+
 #[tauri::command(async)]
 pub async fn cmd_pull(
     repo_path: String,
     remote: Option<String>,
     branch: Option<String>,
+    rebase: Option<bool>,
 ) -> Result<Guarded<String>, String> {
     off_thread(move || {
-        // Pull is gated and fetch is not: a pull merges into the working tree, and
-        // the working tree is what the write gate exists to protect. A fetch only
-        // moves remote-tracking refs, and gating every one would put a sidecar
-        // round trip in front of a background refresh for no decision.
-        let mut argv = vec!["git", "pull"];
-        if let Some(ref r) = remote {
-            argv.push(r.as_str());
-        }
-        if let Some(ref b) = branch {
-            argv.push(b.as_str());
-        }
+        // A pull merges or rebases into the working tree, which is what the
+        // write gate exists to protect. The judged argv is the one
+        // GitWriter::pull runs: both come from pull_argv.
+        let argv: Vec<&str> = std::iter::once("git")
+            .chain(GitWriter::pull_argv(
+                remote.as_deref(),
+                branch.as_deref(),
+                rebase,
+            ))
+            .collect();
         let policy = guard(&repo_path, &argv)?;
-        let output = GitWriter::pull(&repo_path, remote.as_deref(), branch.as_deref())?;
+        let output = GitWriter::pull(&repo_path, remote.as_deref(), branch.as_deref(), rebase)?;
         Ok(Guarded { policy, output })
     })
     .await
@@ -1515,25 +1621,36 @@ pub async fn cmd_push(
     .await
 }
 
+/// Merges `branch_name` into the checked-out branch as `mode` says
+/// (default, fast-forward only, always a merge commit, or squash). The
+/// writer asks the gate about each command as it is about to run it, so a
+/// squash's commit is judged with the message it will carry.
 #[tauri::command(async)]
 pub async fn cmd_merge_branch(
     repo_path: String,
     branch_name: String,
-    ff_only: Option<bool>,
+    mode: Option<MergeMode>,
 ) -> Result<Guarded<String>, String> {
     off_thread(move || {
-        let ff_only = ff_only.unwrap_or(false);
-        // Same flag order as GitWriter::merge_branch, which always passes
-        // --no-edit (it never opens an interactive editor).
-        let mut argv = vec!["git", "merge"];
-        if ff_only {
-            argv.push("--ff-only");
-        }
-        argv.push("--no-edit");
-        argv.push(branch_name.as_str());
-        let policy = guard(&repo_path, &argv)?;
-        let output = GitWriter::merge_branch(&repo_path, &branch_name, ff_only)?;
-        Ok(Guarded { policy, output })
+        let mut policy: Option<crate::harness::PolicyVerdict> = None;
+        let output = GitWriter::merge_branch(
+            &repo_path,
+            &branch_name,
+            mode.unwrap_or_default(),
+            &mut |args| {
+                let argv: Vec<&str> = std::iter::once("git").chain(args.iter().copied()).collect();
+                let verdict = guard(&repo_path, &argv)?;
+                policy = Some(match policy.take() {
+                    Some(previous) => strictest_verdict(previous, verdict),
+                    None => verdict,
+                });
+                Ok(())
+            },
+        )?;
+        Ok(Guarded {
+            policy: policy.unwrap_or_else(no_git_verdict),
+            output,
+        })
     })
     .await
 }
@@ -1584,7 +1701,8 @@ pub async fn cmd_stash_save(
     off_thread(move || {
         let options = options.unwrap_or_default();
         let argv = options.argv(message.as_deref());
-        let policy = guard(&repo_path, &argv)?;
+        let refs: Vec<&str> = argv.iter().map(String::as_str).collect();
+        let policy = guard(&repo_path, &refs)?;
         let output = GitWriter::stash_save_with(&repo_path, message.as_deref(), options)?;
         Ok(Guarded { policy, output })
     })
@@ -2727,6 +2845,16 @@ fn guard(repo_path: &str, argv: &[&str]) -> Result<crate::harness::PolicyVerdict
     // Every mutation passes here, and only mutations: the user clicked
     // something, so the spawn gate must not defer it behind refresh traffic.
     crate::engine::git_cli::mark_user_action(repo_path);
+    crate::harness::guard_command(repo_path, argv)
+}
+
+/// [`guard`] for a mutation nobody clicked (the auto-fetch timer): the same
+/// write gate, without promoting the command to a user action, so the spawn
+/// gate can still defer or shed it behind the user's own work.
+fn guard_background(
+    repo_path: &str,
+    argv: &[&str],
+) -> Result<crate::harness::PolicyVerdict, String> {
     crate::harness::guard_command(repo_path, argv)
 }
 

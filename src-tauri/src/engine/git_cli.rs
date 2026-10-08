@@ -27,6 +27,14 @@ mod thread_io;
 
 mod shared_budget;
 
+pub(crate) mod hooks;
+pub use hooks::{
+    cancel as cancel_hooked_git, is_cancelled as is_hooked_git_cancelled, HOOK_TIMEOUT,
+};
+
+mod preflight;
+pub use preflight::{git_preflight, GitPreflight, GitPreflightStatus, MIN_GIT_VERSION};
+
 /// Shared grace window for pipe EOF after child exit. Unix closes unfinished
 /// descriptors; Windows cancels workers and retains their resource slots until
 /// they exit. This cleanup grace is separate from the command deadline.
@@ -440,8 +448,18 @@ fn git_command_with_env(
 }
 
 /// Runs `git` in `repo` with a hard timeout and bounded stdout/stderr.
+///
+/// The timeout is [`DEFAULT_TIMEOUT`], or [`HOOK_TIMEOUT`] for a subcommand
+/// that runs repository hooks (`commit`, `merge`, `rebase`, `am`, …): a
+/// slow `pre-commit` is the repository owner's program working, not git
+/// hanging.
 pub fn git(repo: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
-    git_timeout(Some(repo), args, DEFAULT_TIMEOUT, None)
+    git_timeout(
+        Some(repo),
+        args,
+        hooks::default_timeout_for(subcommand(args)),
+        None,
+    )
 }
 
 pub fn git_text(repo: &Path, args: &[&str]) -> Result<String, String> {
@@ -535,12 +553,31 @@ pub(crate) fn git_observed(
     run_observed(&mut cmd, &label, timeout, None, stdout_cap, observer)
 }
 
+/// A repository-less git (`clone`) whose output streams to `observer` as it
+/// is written: how a clone reports progress instead of being a silent wait.
+/// The finished run comes back whatever its exit status; a deadline is an
+/// error, as for [`git_global_with_timeout`].
+pub(crate) fn git_global_observed(
+    args: &[&str],
+    timeout: Duration,
+    observer: &mut dyn ProcessObserver,
+) -> Result<BoundedRun, String> {
+    let label = format!("git {}", subcommand(args));
+    let mut cmd = git_command(None, args);
+    run_observed(&mut cmd, &label, timeout, None, MAX_OUTPUT_BYTES, observer)
+}
+
 pub fn git_global(args: &[&str]) -> Result<Vec<u8>, String> {
     git_timeout(None, args, DEFAULT_TIMEOUT, None)
 }
 
 pub fn git_with_stdin(repo: &Path, args: &[&str], stdin_bytes: &[u8]) -> Result<Vec<u8>, String> {
-    git_timeout(Some(repo), args, DEFAULT_TIMEOUT, Some(stdin_bytes))
+    git_timeout(
+        Some(repo),
+        args,
+        hooks::default_timeout_for(subcommand(args)),
+        Some(stdin_bytes),
+    )
 }
 
 /// A caller-owned index transaction. The override is applied only after the
@@ -3622,6 +3659,11 @@ fn git_run_inner(
     let started = Instant::now();
     let mut attempts = 0;
     const MAX_LOCK_RETRIES: usize = 3;
+    // A command that runs hooks can be cancelled from the UI while it lives,
+    // and its timeout or cancel names the hooks instead of blaming git.
+    let hooked = repo
+        .filter(|_| hooks::hooks_run_by(sub).is_some())
+        .map(|repo| (repo, hooks::HookedRun::enter(repo)));
 
     // A deadline keeps the bytes git already printed. Callers that need the
     // whole stream (`git_timeout`, `git_text_shared`) still turn that prefix
@@ -3633,11 +3675,30 @@ fn git_run_inner(
         if remaining.is_zero() {
             return Err(format!("{label}{TIMEOUT_MARKER}{}s", timeout.as_secs_f64()));
         }
-        let out = if shared && stdin_bytes.is_none() {
+        let mut out = if shared && stdin_bytes.is_none() {
             run_read_shared(cmd, &label, remaining, stdout_cap, spawn_gate())?
+        } else if let Some((_, run)) = &hooked {
+            let mut cmd = cmd;
+            let mut observer = HookObserver(run);
+            run_observed(
+                &mut cmd,
+                &label,
+                remaining,
+                stdin_bytes,
+                stdout_cap,
+                &mut observer,
+            )?
         } else {
             run_bounded_capped(cmd, &label, remaining, stdin_bytes, stdout_cap)?
         };
+        if let Some((repo, _)) = &hooked {
+            if out.cancelled {
+                return Err(hooks::cancelled_message(repo, sub));
+            }
+            if let Some(Incomplete::Deadline { message, .. }) = &mut out.incomplete {
+                *message = hooks::timeout_message(repo, sub, message);
+            }
+        }
         if out.success || matches!(out.incomplete, Some(Incomplete::Deadline { .. })) {
             return Ok((out.stdout, out.incomplete));
         }
@@ -3670,6 +3731,16 @@ fn git_run_inner(
             "git {} failed with status {}",
             sub, out.status_code
         ));
+    }
+}
+
+/// [`hooks::HookedRun`] borrowed as the observer of one attempt; the run
+/// itself outlives the lock-retry loop so a cancel between attempts holds.
+struct HookObserver<'a>(&'a hooks::HookedRun);
+
+impl ProcessObserver for HookObserver<'_> {
+    fn cancelled(&self) -> bool {
+        self.0.cancelled()
     }
 }
 

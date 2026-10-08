@@ -3,6 +3,7 @@
 //! the whole document's line endings.
 
 use gitpulse_lib::diff::{ConflictResolutionChoice, ConflictResolver, FileSegment};
+use gitpulse_lib::engine::git_writer::MergeMode;
 use gitpulse_lib::engine::GitWriter;
 use gitpulse_lib::procguard::LockedSpawn;
 use std::fs;
@@ -115,7 +116,7 @@ fn resolving_mixed_eol_conflict_rewrites_only_the_hunk_region() {
     repo.write("mixed.txt", &with_line(&base_file(), 8, "ours-08"));
     repo.commit_all("feat: ours edit");
 
-    let merge = GitWriter::merge_branch(&path, "theirs", false);
+    let merge = GitWriter::merge_branch(&path, "theirs", MergeMode::Default, &mut |_| Ok(()));
     let conflicted = merge.is_err() || {
         gitpulse_lib::engine::GitReader::get_status(&path)
             .unwrap()
