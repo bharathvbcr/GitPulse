@@ -2505,6 +2505,9 @@ fn read_fleet_languages(
     Ok(out)
 }
 
+#[cfg(test)]
+mod contract_tests;
+
 /// Test-only helpers that need the private registry.
 #[cfg(test)]
 pub(crate) mod tests_support {
