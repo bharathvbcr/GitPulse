@@ -104,7 +104,7 @@ fn placement_is_idempotent_and_replace_keeps_board_placement() {
     // Someone drags it to another column position on the board.
     let mut moved = again.item.unwrap();
     let mut write = moved.as_object().unwrap().clone();
-    for key in ["revision", "updated_at", "locked_fields"] {
+    for key in ["revision", "updated_at", "completed_at", "locked_fields"] {
         write.remove(key);
     }
     write.insert("position".into(), json!(999));

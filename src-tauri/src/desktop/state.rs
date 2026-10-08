@@ -76,10 +76,6 @@ pub struct MenuState {
     pub checked: Vec<String>,
     pub labels: Vec<MenuLabel>,
     pub repositories: Vec<MenuRepository>,
-    /// Open repositories past the switcher's 64 rows. The menu says how many
-    /// it left out rather than ending as if that were all of them.
-    #[serde(default)]
-    pub repositories_hidden: u32,
     pub active_path: Option<String>,
     pub show_status_icon: bool,
     /// Hide the Dock icon while the main window is closed and the status icon is on.
@@ -122,7 +118,6 @@ impl Default for MenuState {
             checked: vec![actions::THEME_SYSTEM.into()],
             labels: vec![],
             repositories: vec![],
-            repositories_hidden: 0,
             active_path: None,
             show_status_icon: false,
             hide_dock_when_closed: true,
@@ -213,8 +208,6 @@ impl MenuState {
             || self.checked.len() > 64
             || self.labels.len() > 64
             || self.repositories.len() > 64
-            || self.repositories_hidden > 1_000_000
-            || (self.repositories_hidden > 0 && self.repositories.len() < 64)
         {
             return Err("Native menu state exceeds its entry limit".into());
         }
@@ -295,36 +288,6 @@ mod tests {
         assert!(!state.enabled(actions::FETCH));
         assert!(!state.enabled(actions::STASH_POP));
         assert!(!state.enabled(actions::OPERATION_ABORT));
-    }
-
-    #[test]
-    fn a_hidden_count_is_only_honest_under_a_full_switcher() {
-        let full = |n: usize| -> Vec<MenuRepository> {
-            (0..n)
-                .map(|i| MenuRepository {
-                    path: format!("/r/{i}"),
-                    ..Default::default()
-                })
-                .collect()
-        };
-        let mut state = MenuState {
-            repositories: full(64),
-            repositories_hidden: 936,
-            ..Default::default()
-        };
-        assert!(state.validate().is_ok());
-        // Rows left out while there was room for them is a dropped list
-        // calling itself a summary.
-        state.repositories = full(63);
-        assert!(state.validate().is_err());
-        state.repositories = full(64);
-        state.repositories_hidden = 1_000_001;
-        assert!(state.validate().is_err());
-        // An older frontend that never sends the field still parses.
-        let mut legacy = serde_json::to_value(MenuState::default()).unwrap();
-        legacy.as_object_mut().unwrap().remove("repositoriesHidden");
-        let parsed: MenuState = serde_json::from_value(legacy).unwrap();
-        assert_eq!(parsed.repositories_hidden, 0);
     }
 
     #[test]

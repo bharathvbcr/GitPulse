@@ -1,7 +1,7 @@
 /**
  * Running one operation across many open repositories.
  *
- * A workspace can hold hundreds of repository tabs. "Fetch everything before I start
+ * A workspace holds up to 24 repository tabs. "Fetch everything before I start
  * work" and "is anything unsaved anywhere?" are the two questions that make a
  * multi-repo client worth using, and both are unanswerable one tab at a time.
  *
@@ -74,7 +74,7 @@ export interface RunOptions {
    * How many repositories are worked on at once.
    *
    * Defaults to 4. The operations that matter here are network-bound (`fetch`,
-   * `pull`), and each one spawns a git subprocess; letting every tab run at
+   * `pull`), and each one spawns a git subprocess; letting all 24 tabs run at
    * once saturates the connection, and every repository finishes late instead
    * of most finishing early.
    */

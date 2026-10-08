@@ -1,24 +1,26 @@
 <script lang="ts">
   /**
-   * The archive dock: completed tasks for the current scope, and the way back.
+   * The archive dock: archived tasks for the current scope, deleted tasks a
+   * restore can bring back, and the way back for both.
    *
    * A dock rather than a destination, for the same reason the Inbox is one.
    * The board already owns the scope navigator, the search, the selection and
    * the confirm-and-retry dialog; a separate page would have to grow its own
    * copy of each, and a reader restoring a task would land somewhere other
    * than the board it belongs on. This panel opens over the board, reads the
-   * board's scope, and hands every write back to the board's existing
-   * `TaskActionDialog`.
+   * board's scope, and hands every write back to the board.
    *
-   * It owns no write path of its own. Restore is `restoreAction`, which is
-   * the same `TaskBatch` status update the board's Move menu builds, and
-   * delete is the board's delete. That is what keeps revision checks,
-   * interrupted-write recovery and receipt identity in one place.
+   * It owns no write path of its own. Restoring from the archive is
+   * `restoreAction`, the same `TaskBatch` update every board change uses;
+   * delete is the board's delete; and bringing a deleted task back is the
+   * board's `onrestoredeleted`, which runs the bounded pass in `taskDelete.ts`.
    *
    * The one number this panel must never get wrong is how much it is showing.
    * `items.list` pages, so the rows on screen are a prefix of the scope's
-   * completed work; `archiveSummary` prints the loaded count beside the
-   * server's total for as long as they differ.
+   * archive; `archiveSummary` prints the loaded count beside the server's
+   * total for as long as they differ. After a write the pages already loaded
+   * are re-read in place (`refreshPages`), so a reader who paged deep keeps
+   * their place instead of being thrown back to the first page.
    *
    * Two layout rules the panel is built around, both of them defects it had:
    *
@@ -52,40 +54,42 @@
   import { bindForegroundChanges, readBackgroundDocument } from "../runtime/foreground";
   import { formatRelativeTime } from "../format";
   import { MAX_TASK_SELECTION, type TaskAction } from "../workbench/taskActions";
-  import { ARCHIVE_RULE, ARCHIVE_STATUS, RESTORE_STATUSES, archiveSummary, boardPresence, restoreAction } from "../workbench/taskArchive";
+  import { MAX_DELETE_BATCH } from "../workbench/taskDelete";
+  import { ARCHIVE_RULE, archiveStamp, archiveSummary, refreshPages, restoreAction, type ArchiveView } from "../workbench/taskArchive";
   import {
     STATUS_LABELS, explainError, listTasks,
-    type Page, type Scope, type TaskCard, type TaskStatus,
+    type Page, type Scope, type TaskCard,
   } from "../workbench/client";
 
   let {
     scope,
     active = true,
     busy = false,
-    hiddenColumns = [],
     refreshToken = 0,
     hiddenIds = new Set<string>(),
     onopen,
     onaction,
-    ontogglecolumn,
+    onrestoredeleted,
   }: {
     scope: Scope;
     active?: boolean;
     /** The board is mid-write; the dock must not queue a second one. */
     busy?: boolean;
-    hiddenColumns?: readonly TaskStatus[];
     /** Bumped by the board after a write, so a lost live event still reloads. */
     refreshToken?: number;
     /** Tasks the board is about to delete (its undo window); already gone here too. */
     hiddenIds?: ReadonlySet<string>;
     onopen: (taskID: string) => Promise<void>;
     onaction: (cards: TaskCard[], action: TaskAction) => void;
-    ontogglecolumn: () => void;
+    /** Bring deleted tasks back; resolves with the line to show. */
+    onrestoredeleted: (cards: TaskCard[]) => Promise<string>;
   } = $props();
 
+  let view = $state<ArchiveView>("archived");
   let result = $state<Page<TaskCard> | null>(null);
+  /** How many pages are on screen, so a refresh re-reads exactly those. */
+  let pages = 0;
   let query = $state("");
-  let restoreTo = $state<TaskStatus>(RESTORE_STATUSES[RESTORE_STATUSES.length - 1]);
   let selected = $state<Set<string>>(new Set());
   let error = $state(""), notice = $state(""), visible = $state(!readBackgroundDocument()), working = $state(false);
   let now = $state(Math.floor(Date.now() / 1000));
@@ -97,28 +101,43 @@
   // `null` until a read succeeds, so an unread dock never renders as an empty
   // archive. The dock defers while the window is in the background, which is
   // exactly when that distinction stops being theoretical.
-  const summary = $derived(archiveSummary(result ? rows.length : null, Math.max(0, (result?.total ?? 0) - hiddenHere)));
-  const presence = $derived(boardPresence(hiddenColumns));
+  const summary = $derived(archiveSummary(result ? rows.length : null, Math.max(0, (result?.total ?? 0) - hiddenHere), view));
   const chosen = $derived(rows.filter((card) => selected.has(card.id)));
-  // The cap is the board's, not a second policy: a batch larger than this is
-  // refused by `TaskBatch` itself, so the dock stops offering it first.
-  const overCap = $derived(chosen.length > MAX_TASK_SELECTION);
+  // The caps are the board's, not a second policy: a batch larger than this is
+  // refused by `TaskBatch` (or the delete/restore pass) itself.
+  const cap = $derived(view === "deleted" ? MAX_DELETE_BATCH : MAX_TASK_SELECTION);
+  const overCap = $derived(chosen.length > cap);
   const canAct = $derived(chosen.length > 0 && !overCap && !busy && !working);
 
-  async function load(cursor?: string) {
+  function read(cursor: string | undefined) {
+    return listTasks(scope, null, query, cursor, 30, view === "archived"
+      ? { archived: true, order: "completed" }
+      : { deleted: true, order: "updated" });
+  }
+
+  /**
+   * `"first"` starts over (scope, search or view changed); `"more"` appends
+   * the next page; `"refresh"` re-reads the pages already on screen.
+   */
+  async function load(mode: "first" | "more" | "refresh" = "refresh") {
     if (!active || !visible || disposed) return;
     if (loading) { again = true; return; }
     const epoch = generation;
     loading = true;
     try {
-      const next = await listTasks(scope, ARCHIVE_STATUS, query, cursor);
-      if (epoch !== generation || disposed) return;
-      // "Load more" grows the page the way the board's columns do, so a
-      // reader who paged deep does not lose those rows on the next refresh.
-      const items = cursor
-        ? [...new Map([...(result?.items ?? []), ...next.items].map((item) => [item.id, item])).values()]
-        : next.items;
-      result = { ...next, items, shown: items.length };
+      if (mode === "more" && result?.next_cursor) {
+        const next = await read(result.next_cursor);
+        if (epoch !== generation || disposed) return;
+        const items = [...new Map([...(result?.items ?? []), ...next.items].map((item) => [item.id, item])).values()];
+        result = { ...next, items, shown: items.length };
+        pages++;
+      } else {
+        const fresh = await refreshPages(mode === "first" || !result ? 1 : pages, read);
+        if (epoch !== generation || disposed) return;
+        result = { items: fresh.items, total: fresh.total, shown: fresh.items.length, has_more: fresh.next_cursor !== null, next_cursor: fresh.next_cursor };
+        pages = fresh.pages;
+      }
+      const items = result.items;
       selected = new Set([...selected].filter((id) => items.some((item) => item.id === id)));
       error = "";
     } catch (cause) {
@@ -152,12 +171,18 @@
     return () => { disposed = true; generation++; clearTimeout(refreshTimer); listeners.dispose(); };
   });
 
-  // Scope, search and a completed write each invalidate the whole page, so
-  // the accumulated rows are dropped rather than merged into a stale list.
+  // Scope, search and view each change what the list is, so the page starts
+  // over. A completed write only changes rows within it: refreshed in place.
   $effect(() => {
-    scope; query; active; visible; refreshToken;
-    generation++; result = null; selected = new Set(); clearTimeout(refreshTimer);
-    untrack(() => { void load(); });
+    scope; query; view; active; visible;
+    generation++; result = null; pages = 0; selected = new Set(); clearTimeout(refreshTimer);
+    untrack(() => { void load("first"); });
+  });
+  let seenToken = untrack(() => refreshToken);
+  $effect(() => {
+    if (refreshToken === seenToken) return;
+    seenToken = refreshToken;
+    untrack(() => { void load("refresh"); });
   });
 
   function toggle(id: string, on: boolean) {
@@ -178,27 +203,39 @@
     finally { if (!disposed) working = false; }
   }
 
-  function restore() {
+  async function restore() {
     if (!canAct) return;
-    try { onaction([...chosen], restoreAction(restoreTo)); error = ""; }
+    if (view === "archived") { onaction([...chosen], restoreAction()); error = ""; return; }
+    working = true;
+    try { notice = await onrestoredeleted([...chosen]); error = ""; }
     catch (cause) { error = explainError(cause); }
+    finally { if (!disposed) { working = false; void load("refresh"); } }
   }
 
   function remove() {
-    if (!canAct) return;
+    if (!canAct || view !== "archived") return;
     onaction([...chosen], { kind: "delete" });
+  }
+
+  function stamp(card: TaskCard): string {
+    const relative = (at: number) => formatRelativeTime(at, now);
+    return view === "deleted" ? `Deleted ${relative(card.updated_at)} · was ${STATUS_LABELS[card.status]}` : archiveStamp(card, relative);
   }
 </script>
 
 <section id="task-archive-dock" class="archive gp-glass bg-surface" aria-label="Archive" data-testid="task-archive">
   <header>
     <strong><Archive size={13} aria-hidden="true" /> Archive</strong>
+    <div class="gp-seg" role="group" aria-label="Show">
+      <button type="button" class="gp-seg-btn" data-active={view === "archived"} aria-pressed={view === "archived"} data-testid="task-archive-view-archived" onclick={() => { view = "archived"; }}>Archived</button>
+      <button type="button" class="gp-seg-btn" data-active={view === "deleted"} aria-pressed={view === "deleted"} data-testid="task-archive-view-deleted" onclick={() => { view = "deleted"; }}>Deleted</button>
+    </div>
     <div class="controls">
       <input
         class="gp-field"
         type="search"
-        aria-label="Search completed tasks"
-        placeholder="Search completed tasks"
+        aria-label={view === "archived" ? "Search archived tasks" : "Search deleted tasks"}
+        placeholder={view === "archived" ? "Search archived tasks" : "Search deleted tasks"}
         maxlength="512"
         bind:value={query}
       />
@@ -215,24 +252,10 @@
     {#if summary.pending && !visible && !error}<span class="more-note">Paused while this window is in the background.</span>{/if}
   </p>
 
-  <!-- One row on a normal window, two when the panel is narrow. Both
-       sentences are fixed chrome above the scrolling list, so every line
-       they do not spend is a line the list keeps. -->
-  <div class="about">
-    <!-- How a task gets here, said whether or not the panel is empty. A dock
-         named Archive that offers Restore and never names the one thing that
-         archives a task is the reason this line is not in the empty state. -->
-    <p class="rule" data-testid="task-archive-rule">{ARCHIVE_RULE}</p>
-
-    <!-- The dock is a second way to read completed work, not a move. Whether
-         the Done column is still on the board is said plainly, with the
-         toggle that changes it; the board's `taskHiddenColumns` stays the
-         only owner of that choice. -->
-    <p class="presence">
-      {presence.sentence}
-      <button type="button" class="link" onclick={ontogglecolumn}>{presence.actionLabel}</button>
-    </p>
-  </div>
+  <!-- How a task gets here, said whether or not the panel is empty. -->
+  <p class="rule" data-testid="task-archive-rule">
+    {view === "archived" ? ARCHIVE_RULE : "Deleted tasks keep their history; Restore brings one back with its id, fields and archive state."}
+  </p>
 
   {#if error}<div role="alert">{error}</div>{/if}
   {#if notice}<p class="notice" role="status">{notice}</p>{/if}
@@ -240,11 +263,9 @@
   <!-- Gated on a successful read, not on an empty list: "nothing here" is a
        finding, and a dock that has not run its query has not found it. -->
   {#if summary.pending}
-    <p class="empty">{error ? "The archive could not be read. Retry with Refresh." : "Reading completed tasks…"}</p>
+    <p class="empty">{error ? "The archive could not be read. Retry with Refresh." : "Reading tasks…"}</p>
   {:else if rows.length === 0}
-    <!-- The same sentence the header carries, from the same constant: an
-         empty archive and a full one must not teach two different rules. -->
-    <p class="empty">{query.trim() ? "No completed tasks match this search." : `Nothing here yet. ${ARCHIVE_RULE}`}</p>
+    <p class="empty">{query.trim() ? `No ${view} tasks match this search.` : view === "archived" ? `Nothing here yet. ${ARCHIVE_RULE}` : "No deleted tasks in this scope."}</p>
   {:else}
     <!-- A row above the scroller, never a bar floating inside it. Why, and
          what was tried first, is in the component note at the top. -->
@@ -268,38 +289,29 @@
           </label>
           <div class="summary-cell">
             <strong>{card.title}</strong>
-            <!-- `updated_at` is the last write, not a completion stamp; the
-                 store keeps no completion time, so the label says which it
-                 is rather than implying the archive is ordered by recency. -->
-            <span>Updated {formatRelativeTime(card.updated_at, now)}{card.owner ? ` · ${card.owner}` : ""}</span>
+            <span data-testid="task-archive-stamp">{stamp(card)}{card.owner ? ` · ${card.owner}` : ""}</span>
           </div>
-          <button type="button" class="gp-btn" onclick={() => void open(card)} disabled={busy || working}>
-            <ExternalLink size={12} aria-hidden="true" /> Open
-          </button>
+          {#if view === "archived"}
+            <button type="button" class="gp-btn" onclick={() => void open(card)} disabled={busy || working}>
+              <ExternalLink size={12} aria-hidden="true" /> Open
+            </button>
+          {/if}
         </article>
       {/each}
-      <!-- Inside the scroller, at the end of the rows it extends. Outside it
-           this was a fixed row competing with the list for the panel's
-           height, and it belongs after the last row anyway. -->
+      <!-- Inside the scroller, at the end of the rows it extends. -->
       {#if result?.next_cursor}
-        <button type="button" class="gp-btn more" onclick={() => load(result?.next_cursor ?? undefined)} disabled={busy || working}>Load more</button>
+        <button type="button" class="gp-btn more" onclick={() => load("more")} disabled={busy || working}>Load more</button>
       {/if}
     </div>
   {/if}
 
   {#if chosen.length > 0}
-    <div class="actions bg-surface" role="group" aria-label="Archived task actions">
+    <div class="actions bg-surface" role="group" aria-label={view === "archived" ? "Archived task actions" : "Deleted task actions"}>
       <span>{chosen.length} selected</span>
-      <label>
-        Restore to
-        <select class="gp-select" aria-label="Restore to" bind:value={restoreTo}>
-          {#each RESTORE_STATUSES as status (status)}<option value={status}>{STATUS_LABELS[status]}</option>{/each}
-        </select>
-      </label>
-      <button type="button" class="gp-btn" onclick={restore} disabled={!canAct}>Restore</button>
-      <button type="button" class="gp-btn-danger" onclick={remove} disabled={!canAct}>Delete</button>
+      <button type="button" class="gp-btn" data-testid="task-archive-restore" onclick={() => void restore()} disabled={!canAct}>Restore</button>
+      {#if view === "archived"}<button type="button" class="gp-btn-danger" onclick={remove} disabled={!canAct}>Delete</button>{/if}
       <button type="button" class="gp-btn" onclick={() => selectLoaded(false)}>Clear</button>
-      {#if overCap}<p class="over" role="alert">Select at most {MAX_TASK_SELECTION} tasks per action.</p>{/if}
+      {#if overCap}<p class="over" role="alert">Select at most {cap} tasks per action.</p>{/if}
     </div>
   {/if}
 </section>
@@ -320,11 +332,7 @@
   p{margin:6px 0;color:rgb(var(--c-text-muted))}
   .summary{font-weight:550;color:rgb(var(--c-text))}
   .more-note{font-weight:400;color:rgb(var(--c-text-muted))}
-  .about{display:flex;align-items:baseline;flex-wrap:wrap;column-gap:12px}
-  .about p{margin:4px 0}
-  .presence{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
-  .link{border:0;padding:0;background:transparent;color:rgb(var(--c-accent));cursor:pointer;text-decoration:underline;font:inherit}
-  .rule{color:rgb(var(--c-text-muted))}
+  .rule{margin:4px 0;color:rgb(var(--c-text-muted))}
   /* No ground and no pin: it is a row of the panel's column, above the
      scroller rather than floating over it. See the note at the markup. */
   .list-head{padding:6px 4px;border-top:1px solid rgb(var(--c-border))}
@@ -344,9 +352,8 @@
      itself starts to scroll. A selection whose only verbs have scrolled out
      of sight is the defect this panel was reported for. */
   .actions{position:sticky;bottom:0;display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-top:10px;padding:10px 0 0;border-top:1px solid rgb(var(--c-border))}
-  .actions label{display:flex;align-items:center;gap:6px;color:rgb(var(--c-text-muted))}
   .over{flex-basis:100%;margin:0;color:#ef9a9a}
-  button,select,input[type=search]{font:inherit;color:inherit;background:transparent;border:1px solid rgb(var(--c-border));border-radius:6px;padding:6px 9px}
+  button,input[type=search]{font:inherit;color:inherit;background:transparent;border:1px solid rgb(var(--c-border));border-radius:6px;padding:6px 9px}
   button{cursor:pointer}button:disabled{opacity:.45;cursor:default}
   [role=alert]{color:#ef9a9a}
   .empty{padding:8px 0}

@@ -139,13 +139,6 @@
     return info.tabIds.map((id) => byId.get(id)).filter((tab): tab is OpenRepoTab => tab !== undefined);
   }
 
-  /**
-   * A parked tab is open but not watched (repos/watchPool.ts): what it shows
-   * is as old as its last read, or nothing if it was never read.
-   */
-  const PARKED_TITLE =
-    "Live updates paused: more repositories are open than GitPulse watches at once. Opening this tab reads it and resumes them.";
-
   function memberOf(info: StackHeaderItem, tab: OpenRepoTab) {
     return checkoutName(tab.path, tab.label, info.root, identity);
   }
@@ -1054,8 +1047,6 @@
       data-active-repo={tab.isActive ? "true" : "false"}
       data-tab-index={index}
       data-tab-id={tab.id}
-      data-parked={tab.watch === "parked" ? "true" : undefined}
-      title={tab.watch === "parked" ? PARKED_TITLE : undefined}
       onclick={() => selectRepoTab(tab.id)}
       onkeydown={(e) => {
         if (e.key === "p" || e.key === "P") {
@@ -1074,10 +1065,7 @@
       {:else}
         <FolderGit2 size={11} class="shrink-0 {tab.error ? 'text-rose-400' : 'text-accent'}" />
       {/if}
-      <span class="whitespace-nowrap font-medium {tab.watch === 'parked' ? 'opacity-60' : ''}">{tab.label}</span>
-      {#if tab.watch === "parked"}
-        <span class="sr-only">, live updates paused</span>
-      {/if}
+      <span class="whitespace-nowrap font-medium">{tab.label}</span>
       {#if colorInfo.color}
         <span class="sr-only">{colorInfo.source === "own" ? TAB_COLOR_LABEL[colorInfo.color] : `${TAB_COLOR_LABEL[colorInfo.color]} group color`}</span>
       {/if}

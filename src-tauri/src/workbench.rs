@@ -349,6 +349,12 @@ impl WorkbenchState {
         if method == "runs.conversation" {
             return conversation::find(self, input);
         }
+        // The board's Merge: the merge `gitpulse_merge_tasks` runs, not a
+        // second implementation of it. It is a sequence of store writes, so
+        // it is a host method rather than a raw store one.
+        if method == "items.merge" {
+            return self.with_store(|store| intake::merge_request(store, input));
+        }
         if matches!(
             method,
             "enhancements.generate"

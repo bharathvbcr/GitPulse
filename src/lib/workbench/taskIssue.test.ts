@@ -24,7 +24,7 @@ function task(over: Partial<Task> = {}): Task {
   return {
     id: "t1", revision: 3, updated_at: 1, title: "Fix the flaky watcher", kind: "bug", status: "ready",
     priority: 2, severity: null, owner: "sam", due_at: null, labels: ["p1", "inbox"],
-    repository_ids: ["r"], primary_repository_id: "r", home_workspace_id: null, position: 1,
+    repository_ids: ["r"], primary_repository_id: "r", home_workspace_id: null, position: 1, archived: false, completed_at: null, checklist: [], links: [],
     description: "The watcher drops events.", acceptance_criteria: ["No dropped events", "A regression test"],
     ...over,
   };
@@ -92,7 +92,10 @@ describe("taskIssueDraft", () => {
     expect(draft.body.match(/^- \[/gm)).toHaveLength(1);
   });
 
-  it("never builds a payload the backend validator refuses", () => {
+  // Deterministic but CPU-bound: 150 of its 300 rounds build and validate a
+  // 70,000-character body. Alone it takes ~2.6 s, so the 5 s default failed it
+  // under a loaded or coverage-instrumented run without anything being wrong.
+  it("never builds a payload the backend validator refuses", { timeout: 20_000 }, () => {
     // Every control character, every bidi override, astral text and sizes
     // straddling both limits.
     const nasty = [

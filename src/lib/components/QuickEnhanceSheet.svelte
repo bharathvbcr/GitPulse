@@ -9,6 +9,7 @@
   import { getTask, explainError, type EnhancementField, type Task } from "../workbench/client";
   import { hiddenTaskDetails, visibleHiddenDetails } from "../workbench/taskOrganize";
   import { bounded } from "../workbench/taskActions";
+  import { askConfirm } from "../stores/modalStore";
   import TaskManviAssist from "./TaskManviAssist.svelte";
   import SettingToggle from "./SettingToggle.svelte";
 
@@ -39,6 +40,9 @@
   let task = $state<Task | null>(null);
   let loading = $state(true);
   let busy = $state(false);
+  /** Unsaved edits to the suggestion; `busy` covers them too (see `onEditing`). */
+  let editing = $state(false);
+  let confirming = false;
   let error = $state("");
   let showEmpty = $state(false);
   let title = $state("");
@@ -62,10 +66,32 @@
     finally { if (!disposed) loading = false; }
   }
 
+  /**
+   * Whether the sheet may close, asking first when that would lose edits to
+   * the suggestion. The board asks this before any route that replaces the
+   * sheet, and the sheet's own close controls go through it too, so an edit
+   * is never dropped by one door and guarded by another.
+   */
+  export async function canLeave(): Promise<boolean> {
+    if (confirming) return false;
+    if (busy && !editing) { error = "Wait for the suggestion to finish before leaving."; return false; }
+    if (!editing) return true;
+    confirming = true;
+    try {
+      return await askConfirm({ title: "Discard suggestion edits?", message: "Your edits to the suggestion have not been saved and will be lost.", confirmLabel: "Discard edits", cancelLabel: "Keep editing", destructive: true });
+    } finally { confirming = false; }
+  }
+  async function requestClose() {
+    if (await canLeave()) onClose();
+  }
+  async function openEditor() {
+    const current = task;
+    if (current && await canLeave()) onOpenEditor(current);
+  }
   function onKey(event: KeyboardEvent) {
-    if (event.key === "Escape" && !busy) {
+    if (event.key === "Escape" && (!busy || editing)) {
       event.preventDefault();
-      onClose();
+      void requestClose();
     }
   }
 </script>
@@ -80,7 +106,7 @@
   class="gp-scrim bg-black/40 flex justify-end gp-gpu"
   style="z-index: {LAYERS.MODAL}"
   role="presentation"
-  onclick={(e) => { if (e.target === e.currentTarget && !busy) onClose(); }}
+  onclick={(e) => { if (e.target === e.currentTarget && (!busy || editing)) void requestClose(); }}
   onkeydown={onKey}
   in:fade={backdropFade()}
   out:fade={backdropFadeOut()}
@@ -110,7 +136,7 @@
             : "Review hidden fields, then let Manvi rewrite title and description."}
         </p>
       </div>
-      <button type="button" class="gp-icon-btn" aria-label="Close Quick Enhance" onclick={onClose} disabled={busy}><X size={14} /></button>
+      <button type="button" class="gp-icon-btn" aria-label="Close Quick Enhance" onclick={() => void requestClose()} disabled={busy && !editing}><X size={14} /></button>
     </header>
 
     <div class="flex-1 overflow-auto px-[18px] py-4 space-y-4">
@@ -152,11 +178,12 @@
           quick
           onApplied={(saved) => { task = saved; title = saved.title; description = saved.description; lockedFields = [...(saved.locked_fields ?? [])]; onApplied(saved); }}
           onBusy={(value) => { busy = value; }}
+          onEditing={(value) => { editing = value; }}
         />
       {/if}
     </div>
     <footer class="px-[18px] pt-2.5 pb-4 border-t border-border/45 flex justify-between gap-2">
-      <button type="button" class="gp-btn" disabled={!task || busy} onclick={() => { if (task) onOpenEditor(task); }}>Open full editor</button>
+      <button type="button" class="gp-btn" disabled={!task || (busy && !editing)} onclick={() => void openEditor()}>Open full editor</button>
     </footer>
   </div>
 </div>

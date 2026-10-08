@@ -6,11 +6,11 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { get, writable } from "svelte/store";
 import { createRepoStore, type InvokeFn } from "../repoStore";
-import { memoryStorage, savePersistedWorkspace, WORKSPACE_VERSION, type StorageLike } from "../../repos/persist";
+import { memoryStorage } from "../../repos/persist";
 import { MAX_OPEN_TABS } from "../../repos/tabModel";
 import { cancelPrompt, completePrompt, promptState } from "../modalStore";
 
-function makeStore(trusted: Set<string>, storage: StorageLike = memoryStorage()) {
+function makeStore(trusted: Set<string>) {
   const invoke: InvokeFn = async (cmd, args) => {
     const path = String(args?.repoPath ?? "");
     switch (cmd) {
@@ -41,7 +41,7 @@ function makeStore(trusted: Set<string>, storage: StorageLike = memoryStorage())
   };
   return createRepoStore({
     invoke,
-    storage,
+    storage: memoryStorage(),
     caseInsensitive: true,
     graph: { showRepo: () => {}, loadGraph: async () => {}, evict: () => {} },
     filter: { subscribe: writable({ searchQuery: "", selectedBranch: null }).subscribe, setSearch: () => {}, selectBranch: () => {}, clear: () => {} },
@@ -94,21 +94,8 @@ describe("openRefusal", () => {
   it("names the capacity refusal openRepo would give, and nothing for a checkout already open", async () => {
     const trusted = new Set<string>();
     for (let i = 0; i < MAX_OPEN_TABS; i += 1) trusted.add(`/code/r${i}`);
-    // A full workspace arrives the way a real one does, by restore, which
-    // reads only the repositories the watch pool holds.
-    const storage = memoryStorage();
-    savePersistedWorkspace(storage, {
-      version: WORKSPACE_VERSION,
-      tabs: Array.from({ length: MAX_OPEN_TABS }, (_, i) => ({
-        path: `/code/r${i}`, pinned: false, viewTab: "work" as const, terminalOpen: false, searchQuery: "", selectedBranch: null,
-      })),
-      activePath: "/code/r0",
-      recents: [],
-      lastClosed: [],
-    });
-    const store = makeStore(trusted, storage);
-    await store.restoreWorkspace();
-    expect(get(store).openTabs).toHaveLength(MAX_OPEN_TABS);
+    const store = makeStore(trusted);
+    for (let i = 0; i < MAX_OPEN_TABS; i += 1) await store.openRepo(`/code/r${i}`, { activate: false });
     expect(store.openRefusal("/code/new")).toMatch(/Too many open repositories/);
     expect(store.openRefusal("/CODE/R3")).toBeNull();
     expect(store.openRefusal("")).toBe("Invalid repository path");

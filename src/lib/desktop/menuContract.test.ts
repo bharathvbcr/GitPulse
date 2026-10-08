@@ -283,58 +283,13 @@ describe("the payload budget", () => {
     expect(state.enabled.length).toBeLessThan(MENU_LIMITS.enabled);
     expect(state.checked.length).toBeLessThan(MENU_LIMITS.checked);
     expect(state.labels.length).toBeLessThan(MENU_LIMITS.labels);
-    // More repositories can be open than the switcher lists: it fills, and
-    // counts the rest rather than ending as if that were all of them.
-    expect(state.repositories).toHaveLength(MENU_LIMITS.repositories);
-    expect(state.repositoriesHidden).toBe(MAX_OPEN_TABS - MENU_LIMITS.repositories);
+    expect(state.repositories).toHaveLength(MAX_OPEN_TABS);
+    expect(MAX_OPEN_TABS).toBeLessThanOrEqual(MENU_LIMITS.repositories);
     // Every id is spelled once: state.rs rejects a duplicate label outright,
     // and `apply_presentation` would honour only the first of two anyway.
     expect(new Set(state.enabled).size).toBe(state.enabled.length);
     expect(new Set(state.checked).size).toBe(state.checked.length);
     expect(new Set(state.labels.map((entry) => entry.id)).size).toBe(state.labels.length);
-  });
-});
-
-describe("more open repositories than the switcher lists", () => {
-  function workspace(count: number, active: number) {
-    const repo: RepoState = {
-      ...base(),
-      currentPath: `/r/${active}`,
-      currentBranch: "main",
-      openTabs: Array.from({ length: count }, (_, index) =>
-        tab({ id: `/r/${index}`, path: `/r/${index}`, isActive: index === active }),
-      ),
-    };
-    return buildMenuState(repo, prefs(), "system", {}, false, {});
-  }
-
-  it("keeps the active repository's row when it sits past the limit", () => {
-    const state = workspace(300, 250);
-    expect(menuStateProblem(state)).toBeNull();
-    expect(state.activePath).toBe("/r/250");
-    expect(state.repositories).toHaveLength(MENU_LIMITS.repositories);
-    expect(state.repositories.at(-1)).toMatchObject({ path: "/r/250", active: true });
-    expect(state.repositoriesHidden).toBe(300 - MENU_LIMITS.repositories);
-  });
-
-  it("hides nothing while every repository fits", () => {
-    const state = workspace(MENU_LIMITS.repositories, 3);
-    expect(state.repositoriesHidden).toBe(0);
-    expect(state.repositories).toHaveLength(MENU_LIMITS.repositories);
-  });
-
-  it("shows no counts for a parked tab, or one never read", () => {
-    const repo: RepoState = {
-      ...base(),
-      currentPath: "/r/0",
-      openTabs: [
-        tab({ id: "/r/0", path: "/r/0", isActive: true, changedCount: 2 }),
-        tab({ id: "/r/1", path: "/r/1", changedCount: 4, watch: "parked" }),
-        tab({ id: "/r/2", path: "/r/2", changedCount: 0, countsKnown: false }),
-      ],
-    };
-    const state = buildMenuState(repo, prefs(), "system", {}, false, {});
-    expect(state.repositories.map((row) => row.changed)).toEqual([2, null, null]);
   });
 });
 
@@ -437,9 +392,7 @@ describe("generated hostile workspaces", () => {
     for (let seed = 1; seed <= 4000; seed += 1) {
       const next = random(seed);
       const pick = <T,>(list: readonly T[]): T => list[Math.floor(next() * list.length)] as T;
-      // Past the switcher's limit, so the overflow branch is exercised; the
-      // full tab bound would only make each seed slower, not different.
-      const count = Math.floor(next() * (MENU_LIMITS.repositories + 40));
+      const count = Math.floor(next() * (MAX_OPEN_TABS + 4));
       const tabs = Array.from({ length: count }, (_, index) =>
         tab({
           id: `t${index}`,

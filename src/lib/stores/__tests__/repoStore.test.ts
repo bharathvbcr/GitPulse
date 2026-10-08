@@ -268,23 +268,6 @@ describe("explicit repository trust", () => {
   });
 });
 
-describe("pathsTrustedForBackground", () => {
-  it("keeps parked repositories in membership and out of background work", () => {
-    const tabs = [
-      { path: "/r/live" },
-      { path: "/r/parked", parked: true },
-      { path: "/r/active", parked: true },
-      { path: "/r/untrusted", trustRequired: true },
-    ];
-    expect(pathsTrustedForBackground(tabs, "/r/active")).toEqual({
-      activeKey: "/r/active",
-      retainedKeys: ["/r/live", "/r/parked", "/r/active"],
-      // The active tab is never left out, even if it is marked parked.
-      liveKeys: ["/r/live", "/r/active"],
-    });
-  });
-});
-
 describe("restored untrusted tabs", () => {
   afterEach(() => {
     cancelPrompt();
@@ -442,7 +425,6 @@ describe("restored untrusted tabs", () => {
     expect(pathsTrustedForBackground(get(store).openTabs, get(store).currentPath)).toEqual({
       activeKey: null,
       retainedKeys: [TRUSTED],
-      liveKeys: [TRUSTED],
     });
 
     sync.mockClear();
@@ -1047,7 +1029,6 @@ describe("repoStore tabs", () => {
     expect(pathsTrustedForBackground(tabs, "/r/removed")).toEqual({
       activeKey: null,
       retainedKeys: ["/r/kept"],
-      liveKeys: ["/r/kept"],
     });
     init.mockRestore();
   });
@@ -1088,13 +1069,14 @@ describe("repoStore tabs", () => {
     expect(graph.evicted).toContain("/r/c");
   });
 
-  it("opens past the 24 repositories the native watch table once capped it", async () => {
+  it("refuses to open past the tab cap", async () => {
     const { store } = makeStore();
-    for (let i = 0; i < 40; i += 1) {
-      expect(await store.openRepo(`/r/repo-${i}`)).toBe(true);
+    for (let i = 0; i < 24; i += 1) {
+      await store.openRepo(`/r/repo-${i}`);
     }
-    expect(get(store).openTabs).toHaveLength(40);
-    expect(get(store).error).toBeNull();
+    await store.openRepo("/r/overflow");
+    expect(get(store).openTabs).toHaveLength(24);
+    expect(get(store).error ?? "").toMatch(/Too many open repositories/);
   });
 
   it("keeps a broken restored tab instead of pretending it opened", async () => {

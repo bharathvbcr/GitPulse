@@ -12,18 +12,32 @@ before treating a row as still open.
 
 | Area | Remaining |
 |------|-----------|
-| Workspaces and boards | The task fields the store cannot hold yet (see [Task fields](#task-fields-against-the-plan)); detecting an unavailable checkout before a relink, and remote-only repositories; swimlanes, saved views and WIP limits; installed-app qualification. Board/list multi-select with bulk status/label/archive, undo (a deferred window for deletion), keyboard operation, group import from tab groups, group reorder and relinking a moved or re-cloned checkout shipped 2026-10-07 — `harness/tasks.html` checks each in Chrome and WKWebView |
+| Workspaces and boards | The task fields the store cannot hold yet (see [Task fields](#task-fields-against-the-plan)); registering a remote-only repository from the board (they are shown and can be linked to a checkout, but only another host creates one); the [early board gaps](#early-board-gaps-plan889-894) still open; installed-app qualification. Board/list multi-select with bulk status/label/archive, undo (a deferred window for deletion), keyboard operation, group import from tab groups, group reorder and relinking a moved or re-cloned checkout shipped 2026-10-07; swimlanes (status, owner, first label), saved named views and optional WIP limits per board, unsaved-suggestion-edit guards on every board route, the latest active suggestion read across paginated history, missing-checkout and remote-only marks before any launch or relink, list-layout paging and a repository board's link to the global board shipped 2026-10-08 — `harness/tasks.html` checks each in Chrome and WKWebView |
 | Manvi intelligence | Semantic quality evaluation, context/planning/orchestration, installed native qualification |
 | Agent supervision | Approve/deny round-trip through the managed lane on real Claude Code and Codex accounts (only controlled providers so far). Codex mid-turn driver kill with a tool running or an approval pending (its configured model is refused on the measuring machine; the other mid-turn cases are measured, see ARCHITECTURE.md). End-to-end test that a refused provider callback (Claude `request_user_dialog`/`elicitation`/any other subtype, Codex any unhandled method) lands as the run's visible reason — traced in code, adapter-tested, not driven through `serve`. The agent hook's scope fence covers redirection targets only: Manvi does not read writes out of a command's arguments, so `sed -i` outside the plan is still a demoted allow — and the file-tool hook (`collision-guard`, on Edit/Write) checks collisions only, so a task-bound agent's direct write outside its scope is not fenced by any hook. It applies only in repositories GitPulse is trusted in; elsewhere commands are judged unscoped, silently. A redirect into a *planned* file is refused (`scope.operation`) until Manvi's `fix/hostscope-unspecialised-write` ships in the installed harness. Code review is designed, not built ([AGENT_OUTPUT_REVIEW.md](AGENT_OUTPUT_REVIEW.md)). Installed-app qualification |
 | Native notifications | Installed OS delivery/activation (now including the banner Snooze action and withdrawal, built and store-tested 2026-10-07 but never observed in an installed bundle), callback crash-window, burst/grouping behaviour, native resource measurements, producers blocked on other workflows (CI, reminders, GitHub, workspace results, agent output review), Windows and Linux bindings (candidates already in Cargo.lock; approval needed) — see [NATIVE_NOTIFICATIONS_ADAPTER.md](NATIVE_NOTIFICATIONS_ADAPTER.md) |
 | Performance | Stress broad global/workspace search meets the 100 ms target on the committed benchmark (44.6/70.5 ms p95, interleaved A/B, 2026-10-07 in [the archived benchmark](archive/AGENTIC_WORKSPACES_BENCHMARK.md)). GitPulse has vendored it since `0af6bff7`. The vendored source (DevCouncil `c17fd379`) measured 55.5/90.2 ms p95, minimum of five interleaved runs on a heavily loaded host, with 10–30% on scoped search over the measured commit unexplained. Installed-build native rendering/frame pacing, cold/warm navigation, idle CPU/memory and the eight-hour soak are **not measured** — the release build was not installed; `scripts/native-sample.mjs` is the soak sampler. Browser canary 2026-10-07 in [PERFORMANCE.md](PERFORMANCE.md): six components clean at 12 cycles; ManviOpsPanel not clean (harness crash) and TerminalPanel/termtabs never armed |
 
+### Early board gaps (plan:889-894)
+
+Re-checked 2026-10-08 against the code, item by item.
+
+| Gap | State | Evidence |
+| --- | --- | --- |
+| Efficient repository lookup beyond the bounded registration scan | **Open** | `intake::find` (`src-tauri/src/workbench/intake.rs`) still pages `repositories.list` 200 at a time, up to 50 pages, and refuses past 10,000 with `registry_limit`. An indexed identity lookup needs a dc-store query, so it is a DevCouncil change and re-vendor, not a board change |
+| Global navigation from repository tabs | Closed 2026-10-08 | A repository's board (no navigator) has an **All tasks** link to the global Tasks surface; the repository pane is hidden, not unmounted, so its open task survives |
+| Consistent unsaved-change handling | Closed inside the board 2026-10-08; **open** outside it | Unsaved suggestion edits made every board route refuse silently (they held the assist busy); they now ask, through the same `canLeave` as task edits, in the task sheet and in Quick Enhance. Still open: leaving a repository's Tasks section or switching repository tabs unmounts that board (`{#key currentPath}` and the `{#if}` view chain in `App.svelte`, `{#if section === "tasks"}` in `WorkspaceView.svelte`), dropping its unsaved edits without a prompt |
+| Recovery from an uncertain delete | Closed | A confirmed delete waits out an undo window, then runs as a `TaskBatch` whose uncertain rows reopen the action dialog with an exact retry under the same request id. Across a restart nothing local claims a result: the board re-reads the store, which holds whatever committed |
+| Full pagination navigation | Closed 2026-10-08 | The list layout had no paging, so a task past a column's first page was unreachable from it; both layouts now show "N of M", Load more and First page per column |
+| Syncing when the Go host changes data while the app has focus | Closed | `src-tauri/src/workbench/external_changes.rs` (642c5d5b) polls SQLite `data_version` while the window is visible and emits `workbench-changed`, which the board debounces into a refresh |
+
 ### Task fields against the plan
 
-Checked 2026-10-07 against the plan's section 2 and against what the store
+Checked 2026-10-08 against the plan's section 2 and against what the store
 accepts: `put_item` in `src-tauri/vendored/dc-store/src/workbench/mod.rs`
-takes exactly 19 named fields and refuses any other, so a field the store does
-not name cannot ride along in a task — not even as extra JSON.
+takes exactly 22 named fields (schema 11 added `archived`, `checklist` and
+`links`) and refuses any other, so a field the store does not name cannot ride
+along in a task — not even as extra JSON.
 
 | Plan field | Store | Task sheet | State |
 | --- | --- | --- | --- |
@@ -34,18 +48,19 @@ not name cannot ride along in a task — not even as extra JSON.
 | Linked repositories and a primary one | `repository_ids`, `primary_repository_id` | Repository picker | Closed |
 | Optional home group | `home_workspace_id` | Home workspace select (it was set once, at creation, and could not be changed) | Closed 2026-10-07 |
 | Dates | `due_at` only; `updated_at` is the store's | Due | Due is closed. A start date is **declined**: no field holds it, and when a task changed is already in its revision history |
-| Checklists | None: subtasks are plain lines in `acceptance_criteria`, with no done state | Subtasks list without checkboxes | **Declined here** — needs a store field |
-| Attachments | None | None | **Declined here** — needs a store field and a file store |
-| Source links | None; a GitHub issue is linked by an `issue-N` label | Through labels | **Declined here** — needs a store field |
-| Parent, blocking, related and duplicate links | None; a merge records its sources as `## Merged from <id>` text in the description, not as a link | None | **Declined here** — needs a link table |
-| Per-repository objectives | None: `work_item_repositories` holds only the link and its order | None; intake folds per-repository detail into the description | **Declined here** — needs a column on the link |
+| Checklists | `checklist`: up to 128 `{text, done}` entries, kept when a write omits it (schema 11) | Checklist with checkboxes (`TaskRelations.svelte`); the brief's `## Checklist` | Closed 2026-10-08 |
+| Parent, blocking, related and duplicate links | `links` → `work_item_links` (`parent`, `blocks`, `related`, `duplicate_of`), up to 64; one parent, no parent cycle, a new link must name a live task (schema 11) | Linked tasks with a task search (`TaskRelations.svelte`); the brief's `## Linked tasks`, read from both ends | Closed 2026-10-08 |
+| Completion time | `completed_at`, the store's own: set entering Done, cleared leaving it (schema 11) | Archive sorts by it and stamps each row | Closed 2026-10-08 |
+| Attachments | None | None | **Declined** — needs a file store, not a field: a path would point outside the profile and break on another machine, and copying files into SQLite is a storage decision this board should not make on its own |
+| Source links | None; a GitHub issue is linked by an `issue-N` label | Through labels | **Declined** — the `issue-N` label already round-trips with the GitHub panel; a second field would be a second answer to "which issue is this", and the two would drift |
+| Per-repository objectives | None: `work_item_repositories` holds only the link and its order | None; intake folds per-repository detail into the description | **Declined** — no consumer: neither the brief nor any launch reads per-repository text separately, so a column would be written and never read; revisit when a multi-repository launch needs one |
 
-Each declined row is a dc-store change in DevCouncil first — the field
-whitelist, the body built in `put_item`, and the brief format agents read —
-then a re-vendor, then the sheet. That is a schema migration of its own, not
-a board change, so it is listed here instead of being emulated: a reserved
-label or description heading would look like a field and silently drop on
-the next edit by a host that does not know the convention.
+Checklists, links and completion time shipped as dc-store schema 11, made in
+DevCouncil first (field whitelist, `put_item` body, brief format), re-vendored,
+then surfaced in the sheet — see [ARCHIVE_SEPARATION.md](ARCHIVE_SEPARATION.md).
+A declined row stays out rather than being emulated: a reserved label or
+description heading would look like a field and silently drop on the next
+edit by a host that does not know the convention.
 
 ## Platform coverage
 

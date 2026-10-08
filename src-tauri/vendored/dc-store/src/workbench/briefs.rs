@@ -136,6 +136,8 @@ pub(super) fn get(input: &Input<'_>) -> Result<String> {
     for criterion in criteria {
         markdown.push_str(&format!("- [ ] {criterion}\n"));
     }
+    checklist_section(input, &body, &mut markdown)?;
+    links_section(input, &id, &mut markdown)?;
     if let Some(logs) = task.text("logs", MAX_LOGS_BYTES)?
         && !logs.trim().is_empty()
     {
@@ -151,6 +153,68 @@ pub(super) fn get(input: &Input<'_>) -> Result<String> {
         return Err(too_large());
     }
     Ok(response)
+}
+
+/// The task's checklist with each entry's done state, when it has one.
+fn checklist_section(input: &Input<'_>, body: &str, markdown: &mut String) -> Result<()> {
+    let mut stmt = input.conn.prepare(
+        "SELECT json_extract(value,'$.text'),json_extract(value,'$.done') FROM json_each(?1,'$.checklist')",
+    )?;
+    let entries = stmt
+        .query_map([body], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, bool>(1)?))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    if entries.is_empty() {
+        return Ok(());
+    }
+    let done = entries.iter().filter(|(_, done)| *done).count();
+    markdown.push_str(&format!(
+        "\n## Checklist\n{done} of {} done.\n",
+        entries.len()
+    ));
+    for (text, done) in entries {
+        markdown.push_str(&format!("- [{}] {text}\n", if done { "x" } else { " " }));
+    }
+    Ok(())
+}
+
+/// Links in both directions: the ones this task names, and the live tasks
+/// that name it, each read the way it applies to this task.
+fn links_section(input: &Input<'_>, id: &str, markdown: &mut String) -> Result<()> {
+    let mut stmt = input.conn.prepare(
+        "SELECT CASE l.kind WHEN 'parent' THEN 'Parent' WHEN 'blocks' THEN 'Blocks' WHEN 'related' THEN 'Related to' ELSE 'Duplicate of' END,
+                t.id,t.title,t.status,t.deleted,0,l.position
+           FROM work_item_links l JOIN work_items t ON t.id=l.target_id WHERE l.item_id=?1
+         UNION ALL
+         SELECT CASE l.kind WHEN 'parent' THEN 'Subtask' WHEN 'blocks' THEN 'Blocked by' WHEN 'related' THEN 'Related to' ELSE 'Duplicated by' END,
+                t.id,t.title,t.status,t.deleted,1,l.position
+           FROM work_item_links l JOIN work_items t ON t.id=l.item_id WHERE l.target_id=?1 AND t.deleted=0
+         ORDER BY 6,7,2 LIMIT 129",
+    )?;
+    let rows = stmt
+        .query_map([id], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, bool>(4)?,
+            ))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    if rows.is_empty() {
+        return Ok(());
+    }
+    markdown.push_str("\n## Linked tasks\n");
+    for (relation, other, title, status, deleted) in rows.iter().take(128) {
+        let state = if *deleted { "deleted" } else { status.as_str() };
+        markdown.push_str(&format!("- {relation}: {title} [{other}] ({state})\n"));
+    }
+    if rows.len() > 128 {
+        markdown.push_str("- More linked tasks are not listed.\n");
+    }
+    Ok(())
 }
 
 fn reference(input: &Input<'_>, entity: Entity, id: &str) -> Result<(String, String)> {

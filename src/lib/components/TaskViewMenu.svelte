@@ -13,8 +13,17 @@
   import { LAYERS } from "../ui/layers";
   import { STATUSES, STATUS_LABELS } from "../workbench/vocabulary";
   import { TASK_CARD_FIELDS, TASK_CARD_FIELD_LABELS, canHideStatus } from "../ui/taskView";
+  import { MAX_WIP_LIMIT, SWIMLANES, SWIMLANE_LABELS, boardPrefs, effectiveSwimlane, sanitizeWipLimit } from "../ui/taskBoardViews";
 
-  let { disabled = false }: { disabled?: boolean } = $props();
+  let { disabled = false, board, boardName }: {
+    disabled?: boolean;
+    /** `boardKey` of the board on screen: limits belong to one board, not to every board. */
+    board: string;
+    boardName: string;
+  } = $props();
+  const limits = $derived(boardPrefs($interfaceStore.taskBoards, board).wip);
+  const lane = $derived($interfaceStore.taskSwimlane);
+  const laneIgnored = $derived(lane !== "none" && effectiveSwimlane($interfaceStore.taskLayout, lane) === "none");
 
   let open = $state(false);
   let root: HTMLDivElement | undefined = $state();
@@ -28,7 +37,8 @@
     hidden.size > 0 ||
       compact ||
       fields.size !== TASK_CARD_FIELDS.length ||
-      $interfaceStore.taskLayout !== "board",
+      $interfaceStore.taskLayout !== "board" ||
+      lane !== "none",
   );
 
   /**
@@ -69,7 +79,7 @@
   {#if open}
     <div
       use:popover={dismissal}
-      class="absolute right-0 top-full mt-1 gp-menu gp-pop p-2 w-56 flex flex-col gap-0.5"
+      class="view-panel absolute right-0 top-full mt-1 gp-menu gp-pop p-2 w-56 flex flex-col gap-0.5"
       style="z-index: {LAYERS.MENU}"
       role="group"
       aria-label="Board view"
@@ -84,6 +94,24 @@
       >
         {@render mark(compact)}<span class="flex-1 text-textPrimary">Compact cards</span>
       </button>
+
+      <p class="px-1.5 pt-2 pb-1 text-[10px] uppercase tracking-wide text-textMuted" id="task-lanes-label">Lanes</p>
+      <div role="radiogroup" aria-labelledby="task-lanes-label" class="flex flex-col gap-0.5">
+        {#each SWIMLANES as option (option)}
+          <button
+            type="button"
+            class="row"
+            role="radio"
+            aria-checked={lane === option}
+            data-task-lane-option={option}
+            onclick={() => interfaceStore.setTaskSwimlane(option)}
+          >
+            {@render mark(lane === option)}<span class="flex-1 text-textPrimary">{SWIMLANE_LABELS[option]}{option === "label" ? " (first label)" : ""}</span>
+          </button>
+        {/each}
+      </div>
+      {#if laneIgnored}<p class="note" data-testid="task-lanes-note">The board's columns are already statuses, so status lanes group the List layout only.</p>{/if}
+      {#if lane !== "none" && !laneIgnored}<p class="note">Dragging a card into another lane changes its status only.</p>{/if}
 
       <p class="px-1.5 pt-2 pb-1 text-[10px] uppercase tracking-wide text-textMuted">Columns</p>
       {#each STATUSES as status (status)}
@@ -100,6 +128,33 @@
         >
           {@render mark(!hidden.has(status))}<span class="flex-1 text-textPrimary">{STATUS_LABELS[status]}</span>
         </button>
+      {/each}
+
+      <p class="px-1.5 pt-2 pb-1 text-[10px] uppercase tracking-wide text-textMuted">Work-in-progress limits</p>
+      <p class="note">For {boardName} only. A column over its limit is marked; nothing is refused.</p>
+      {#each STATUSES as status (status)}
+        <label class="limit">
+          <span class="flex-1 text-textPrimary">{STATUS_LABELS[status]}</span>
+          <input
+            class="gp-field"
+            type="number"
+            inputmode="numeric"
+            min="1"
+            max={MAX_WIP_LIMIT}
+            placeholder="None"
+            data-task-wip-input={status}
+            aria-label={`Work-in-progress limit for ${STATUS_LABELS[status]}`}
+            value={limits[status] ?? ""}
+            onchange={(e) => {
+              const raw = e.currentTarget.value;
+              const limit = sanitizeWipLimit(raw);
+              interfaceStore.setTaskWipLimit(board, status, limit);
+              // A value the limit cannot hold is put back to what is stored,
+              // so the box never shows a limit the board is not applying.
+              e.currentTarget.value = limit === null ? "" : String(limit);
+            }}
+          />
+        </label>
       {/each}
 
       <p class="px-1.5 pt-2 pb-1 text-[10px] uppercase tracking-wide text-textMuted">Card shows</p>
@@ -140,5 +195,10 @@
   .reset:hover:not(:disabled){color:rgb(var(--c-text));background:rgb(var(--c-surface-hover) / 0.7)}
   .reset:disabled{opacity:.5}
   .row:disabled{opacity:.55;cursor:default}
+  /* Lanes and limits made the panel taller than a short window; it scrolls rather than run off it. */
+  .view-panel{max-height:min(70vh,36rem);overflow:hidden auto}
+  .note{margin:0;padding:0 6px 4px;font-size:10px;line-height:1.35;color:rgb(var(--c-text-muted))}
+  .limit{display:flex;align-items:center;gap:8px;padding:2px 6px;font-size:11px}
+  .limit input{width:4.5rem;padding:2px 6px;font-size:11px}
   .row:disabled:hover{background:transparent}
 </style>
