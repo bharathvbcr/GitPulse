@@ -50,8 +50,8 @@ pub mod workspace_registry;
 use commands::*;
 use desktop::shell::{cmd_open_worktree_path, cmd_reveal_worktree_path};
 use desktop::{
-    cmd_exit_app, cmd_resolve_git_root, cmd_set_exit_guard_ready, cmd_set_recent_menu,
-    cmd_take_pending_open,
+    cmd_exit_app, cmd_exit_request_answer, cmd_resolve_git_root, cmd_set_exit_guard_ready,
+    cmd_set_recent_menu, cmd_take_pending_open,
 };
 use logging::{cmd_diagnostic_log_tail, cmd_diagnostic_persisted_log};
 
@@ -101,6 +101,9 @@ pub fn run() {
     let builder = builder.plugin(tauri_plugin_single_instance::init(|app, argv, _cwd| {
         desktop::handle_second_instance(app, &argv);
     }));
+    // Replaces Tauri's silent, unbounded reload of a crashed page.
+    #[cfg(target_os = "macos")]
+    let builder = builder.on_web_content_process_terminate(desktop::webcrash::on_terminated);
     builder
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_autostart::init(
@@ -177,6 +180,12 @@ pub fn run() {
                 log::error!(target: "setup", "menu installation failed: {e}");
                 return Err(e.into());
             }
+            // Cmd-Q, Dock → Quit and a Quit Apple event reach the exit guard
+            // only through this; without it AppKit terminates unasked.
+            #[cfg(target_os = "macos")]
+            if let Err(error) = desktop::terminate::install(app.handle()) {
+                log::error!(target: "setup", "quit guard not installed; AppKit quits bypass it: {error}");
+            }
             // Login-item / LaunchAgent starts with --background: stay in the
             // menu bar until the frontend projects showStatusIcon. If the icon
             // is off, menu sync reveals the main window as usual.
@@ -213,18 +222,7 @@ pub fn run() {
         // A reload replaces the page that acknowledged terminal output while
         // the processes it started keep running here. Detached before the new
         // page's script runs, so nothing it spawns is caught up in it.
-        .on_page_load(|webview, payload| {
-            if webview.label() == "main"
-                && matches!(payload.event(), tauri::webview::PageLoadEvent::Started)
-            {
-                use tauri::Manager as _;
-                let sessions = webview.state::<terminal::TerminalSessions>();
-                let detached = terminal::detach_all(&sessions);
-                if detached > 0 {
-                    log::info!(target: "terminal", "page reloaded; {detached} terminal session(s) detached and still running");
-                }
-            }
-        })
+        .on_page_load(desktop::handle_page_load)
         .invoke_handler(tauri::generate_handler![
             workbench::cmd_workbench_request,
             workbench::cmd_workbench_register_repository,
@@ -400,6 +398,7 @@ pub fn run() {
             desktop::shell::cmd_reveal_repository,
             cmd_set_exit_guard_ready,
             cmd_exit_app,
+            cmd_exit_request_answer,
             cmd_diagnostic_log_tail,
             cmd_diagnostic_persisted_log,
             cmd_ledger_tail,

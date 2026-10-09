@@ -1340,9 +1340,14 @@ pub fn call_policy<T: serde::de::DeserializeOwned>(
     let _serial = test_serial();
     let params = serde_json::to_value(params)
         .map_err(|e| HarnessError::Protocol(format!("could not encode {} params: {}", op, e)))?;
+    // A sidecar already inside its respawn backoff did not fault on this call:
+    // its stored error is replayed without a spawn. Retrying then would clear
+    // the backoff, so a `manvi serve` that dies at every start was respawned
+    // twice per gated action instead of once per 30 s.
+    let backing_off = in_respawn_backoff();
     match call_typed::<T>(op, Some(params.clone()), timeout) {
         Ok(v) => Ok(v),
-        Err(e) if retriable_transport_fault(&e) => {
+        Err(e) if !backing_off && retriable_transport_fault(&e) => {
             // The first fault already dropped the child and armed the respawn
             // backoff inside [`call`]; clear it so the retry is allowed to
             // spawn at all, then let the second attempt decide the outcome.
@@ -1368,6 +1373,18 @@ pub fn handshake() -> Result<(String, HelloResult), HarnessError> {
     })?;
     let sidecar = guard.ensure()?;
     Ok((sidecar.binary.clone(), sidecar.hello.clone()))
+}
+
+/// Whether the next call would be refused by the respawn backoff rather than
+/// reach a sidecar. A slot that is busy is talking to a live sidecar, so it is
+/// not backing off.
+fn in_respawn_backoff() -> bool {
+    acquire_slot(Instant::now() + Duration::from_millis(50)).is_some_and(|slot| {
+        slot.sidecar.is_none()
+            && slot
+                .backoff_until
+                .is_some_and(|until| Instant::now() < until)
+    })
 }
 
 /// Forgets the backoff so the next call retries immediately. The UI's
@@ -2385,6 +2402,62 @@ done
             guard.backoff_until.is_none(),
             "a successful retry must not leave respawn backoff armed"
         );
+    }
+
+    /// A `manvi serve` that dies at every start is spawned once per 30 s
+    /// backoff, not twice per gated action: a call made while the backoff holds
+    /// replays its error instead of clearing it and spawning again.
+    #[cfg(unix)]
+    #[test]
+    fn a_policy_call_inside_the_respawn_backoff_does_not_respawn() {
+        let _serial = test_serial();
+        let dir = tempfile::tempdir().expect("tempdir for the crashing manvi");
+        let spawns = dir.path().join("spawns");
+        let script = dir.path().join("crashing-manvi");
+        std::fs::write(
+            &script,
+            format!("#!/bin/sh\necho x >> '{}'\nexit 1\n", spawns.display()),
+        )
+        .expect("write crashing manvi");
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
+            .expect("make it executable");
+        let _binary = bind_test_binary(&_serial, script.to_string_lossy());
+        super::reset();
+        let count = || {
+            std::fs::read_to_string(&spawns)
+                .map(|text| text.lines().count())
+                .unwrap_or(0)
+        };
+        let ask = || {
+            super::call_policy::<RawDecision>(
+                OP_POLICY_CHECK_COMMAND,
+                serde_json::json!({ "command": "true", "root": dir.path() }),
+                Duration::from_secs(5),
+            )
+        };
+
+        assert!(
+            ask().is_err(),
+            "a sidecar that cannot start gives no verdict"
+        );
+        let after_first = count();
+        assert!(
+            (1..=2).contains(&after_first),
+            "the first call spawns, and may retry once: {after_first}"
+        );
+        assert!(in_respawn_backoff(), "the failure arms the backoff");
+
+        for _ in 0..3 {
+            assert!(ask().is_err());
+        }
+        assert_eq!(
+            count(),
+            after_first,
+            "calls inside the backoff must not spawn again"
+        );
+        assert!(in_respawn_backoff(), "and must not clear it");
+        super::reset();
     }
 
     /// Only transport faults are worth a fresh connection; refusals are real

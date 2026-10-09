@@ -1,15 +1,19 @@
 pub mod actions;
+pub mod exit;
 mod menu;
 pub mod popover;
 pub mod shell;
 pub mod state;
+#[cfg(target_os = "macos")]
+pub mod terminate;
 mod tray;
+#[cfg(target_os = "macos")]
+pub mod webcrash;
 
 pub use state::MenuState;
 pub use tray::build_tray_menu;
 
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
 use serde::Serialize;
@@ -30,7 +34,7 @@ pub struct DesktopState {
     recents: Mutex<Vec<String>>,
     menu_state: Mutex<MenuState>,
     pending_open: Mutex<Option<String>>,
-    exit_guard_ready: AtomicBool,
+    exit: exit::ExitGate,
     tray_glyph: Mutex<Option<GlyphVariant>>,
 }
 
@@ -39,19 +43,6 @@ pub struct NativeEvent {
     pub id: String,
     pub path: Option<String>,
     pub repo_path: Option<String>,
-}
-
-fn should_guard_exit(frontend_ready: bool, programmatic_exit: bool) -> bool {
-    frontend_ready && !programmatic_exit
-}
-
-fn request_exit_confirmation<R: Runtime>(app: &AppHandle<R>) {
-    if let Err(error) = reveal_main(app) {
-        log::warn!(target: "desktop", "Could not reveal quit confirmation: {error}");
-    }
-    if let Err(error) = app.emit(EXIT_REQUESTED_EVENT, ()) {
-        log::warn!(target: "desktop", "exit-request emit failed: {error}");
-    }
 }
 
 pub fn install_menu<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
@@ -80,13 +71,7 @@ pub fn handle_menu_event<R: Runtime>(app: &AppHandle<R>, id: &str) {
                 return;
             }
             "quit" => {
-                if app
-                    .state::<DesktopState>()
-                    .exit_guard_ready
-                    .load(Ordering::Acquire)
-                {
-                    request_exit_confirmation(app);
-                } else {
+                if exit::begin(app, exit::Origin::Internal) == exit::Begin::Proceed {
                     app.exit(0);
                 }
                 return;
@@ -185,12 +170,7 @@ fn request_window_close<R: Runtime>(window: &Window<R>) -> bool {
             Err(error) => log::warn!(target: "desktop", "Could not hide main window: {error}"),
         }
     }
-    let ready = app
-        .state::<DesktopState>()
-        .exit_guard_ready
-        .load(Ordering::Acquire);
-    if ready {
-        request_exit_confirmation(app);
+    if exit::begin(app, exit::Origin::Internal) != exit::Begin::Proceed {
         true
     } else {
         // Before the listener is installed, nobody can answer a quit request.
@@ -198,6 +178,44 @@ fn request_window_close<R: Runtime>(window: &Window<R>) -> bool {
         #[cfg(target_os = "macos")]
         app.exit(0);
         false
+    }
+}
+
+/// A reload replaces the page that acknowledged terminal output and the one
+/// that confirms quits, while the processes it started keep running here.
+/// Both are let go before the new page's script runs.
+pub fn handle_page_load<R: Runtime>(
+    webview: &tauri::Webview<R>,
+    payload: &tauri::webview::PageLoadPayload<'_>,
+) {
+    if webview.label() != "main"
+        || !matches!(payload.event(), tauri::webview::PageLoadEvent::Started)
+    {
+        return;
+    }
+    exit::disarm(webview.app_handle(), "the main window's page is reloading");
+    let sessions = webview.state::<crate::terminal::TerminalSessions>();
+    let detached = crate::terminal::detach_all(&sessions);
+    if detached > 0 {
+        log::info!(target: "terminal", "page reloaded; {detached} terminal session(s) detached and still running");
+    }
+}
+
+impl DesktopState {
+    /// The quit gate, for checks that must see whether quits are confirmed.
+    pub fn exit_gate(&self) -> &exit::ExitGate {
+        &self.exit
+    }
+}
+
+/// `AppHandle::exit` supplies a code: that exit was already approved and is
+/// never asked about again. Only a code-less request (the last window closing)
+/// goes to the frontend.
+fn route_exit_requested<R: Runtime>(app: &AppHandle<R>, code: Option<i32>) -> exit::Begin {
+    if code.is_some() {
+        exit::Begin::Proceed
+    } else {
+        exit::begin(app, exit::Origin::Internal)
     }
 }
 
@@ -235,13 +253,8 @@ pub fn handle_run_event<R: Runtime>(app: &AppHandle<R>, event: &RunEvent) {
         // `sidecar::shutdown` gives up after ~1.2s rather than stalling
         // exit behind an in-flight request.
         RunEvent::ExitRequested { code, api, .. } => {
-            let ready = app
-                .state::<DesktopState>()
-                .exit_guard_ready
-                .load(Ordering::Acquire);
-            if should_guard_exit(ready, code.is_some()) {
+            if route_exit_requested(app, *code) != exit::Begin::Proceed {
                 api.prevent_exit();
-                request_exit_confirmation(app);
             } else {
                 if let Some(workbench) = app.try_state::<crate::workbench::WorkbenchState>() {
                     workbench.shutdown();
@@ -572,14 +585,19 @@ pub fn cmd_resolve_git_root(path: String) -> Result<String, String> {
 /// Arms close protection only after the frontend listener is installed.
 #[tauri::command(async)]
 pub fn cmd_set_exit_guard_ready(state: State<DesktopState>) {
-    state.exit_guard_ready.store(true, Ordering::Release);
+    state.exit.arm();
 }
 
-/// Completes a frontend-approved exit. `AppHandle::exit` supplies a code, so
-/// the run-event guard can distinguish this from an OS/user quit request.
+/// Completes a frontend-approved exit (see `exit::approve`).
 #[tauri::command(async)]
 pub fn cmd_exit_app(app: AppHandle) {
-    app.exit(0);
+    exit::approve(&app);
+}
+
+/// The frontend acknowledges a quit request, or cancels it.
+#[tauri::command(async)]
+pub fn cmd_exit_request_answer(app: AppHandle, answer: exit::ExitAnswer) {
+    exit::answer(&app, answer);
 }
 
 #[cfg(test)]
@@ -622,6 +640,54 @@ mod tests {
             1,
             "main-window quit protection must remain active"
         );
+        // Settled before its deadline: the mock runtime cannot exit.
+        exit::answer(app.handle(), exit::ExitAnswer::Cancel);
+    }
+
+    #[test]
+    fn a_quit_is_handed_to_the_frontend_once_and_only_while_it_listens() {
+        use std::sync::{Arc, Mutex};
+        use tauri::Listener;
+        let app = tauri::test::mock_builder()
+            .manage(DesktopState::default())
+            .build(crate::context())
+            .unwrap();
+        let confirmations = Arc::new(Mutex::new(0));
+        let received = Arc::clone(&confirmations);
+        app.listen(EXIT_REQUESTED_EVENT, move |_| {
+            *received.lock().unwrap() += 1;
+        });
+        let handle = app.handle();
+        let state = app.state::<DesktopState>();
+        assert_eq!(
+            exit::begin(handle, exit::Origin::Internal),
+            exit::Begin::Proceed,
+            "before the frontend listens, nobody could answer a held quit"
+        );
+        assert_eq!(*confirmations.lock().unwrap(), 0);
+
+        cmd_set_exit_guard_ready(app.state::<DesktopState>());
+        assert_eq!(
+            exit::begin(handle, exit::Origin::Internal),
+            exit::Begin::Deferred
+        );
+        assert_eq!(
+            exit::begin(handle, exit::Origin::Internal),
+            exit::Begin::AlreadyPending,
+            "a repeated quit must not stack a second confirmation"
+        );
+        assert_eq!(*confirmations.lock().unwrap(), 1);
+        exit::answer(handle, exit::ExitAnswer::Seen);
+        exit::answer(handle, exit::ExitAnswer::Cancel);
+        assert!(state.exit.take().is_none(), "a cancelled quit is settled");
+
+        // A reload or crash takes the listener away: quits go straight through.
+        exit::disarm(handle, "test reload");
+        assert_eq!(
+            exit::begin(handle, exit::Origin::Internal),
+            exit::Begin::Proceed
+        );
+        assert_eq!(*confirmations.lock().unwrap(), 1);
     }
 
     #[test]
@@ -704,10 +770,21 @@ mod tests {
 
     #[test]
     fn exit_guard_only_intercepts_user_requests_after_frontend_is_ready() {
-        assert!(!should_guard_exit(false, false));
-        assert!(!should_guard_exit(false, true));
-        assert!(should_guard_exit(true, false));
-        assert!(!should_guard_exit(true, true));
+        let app = tauri::test::mock_builder()
+            .manage(DesktopState::default())
+            .build(crate::context())
+            .unwrap();
+        let handle = app.handle();
+        assert_eq!(route_exit_requested(handle, None), exit::Begin::Proceed);
+        assert_eq!(route_exit_requested(handle, Some(0)), exit::Begin::Proceed);
+        cmd_set_exit_guard_ready(app.state::<DesktopState>());
+        assert_eq!(
+            route_exit_requested(handle, Some(0)),
+            exit::Begin::Proceed,
+            "an approved exit must never be asked about again"
+        );
+        assert_eq!(route_exit_requested(handle, None), exit::Begin::Deferred);
+        exit::answer(handle, exit::ExitAnswer::Cancel);
     }
 
     #[test]

@@ -258,6 +258,25 @@ describe("App overlay wiring", () => {
     expect(source.indexOf("conflictSessions.flush()")).toBeLessThan(source.indexOf('await invoke("cmd_exit_app")'));
   });
 
+  it("answers every native quit request it saw, so a held quit or logout is never stranded", () => {
+    const start = source.indexOf("async function answerNativeExitRequest()");
+    const end = source.indexOf("\n  }\n", start);
+    expect(start).toBeGreaterThan(-1);
+    const body = source.slice(start, end);
+    const returns = body.match(/return;/g) ?? [];
+    const cancelled = body.match(/cancelNativeExitRequest\(\);\s*return;/g) ?? [];
+    // The one return that answers nothing is the repeat of an open request.
+    expect(body).toContain("if (exitRequestPending) return;");
+    expect(cancelled.length).toBe(returns.length - 1);
+    expect(cancelled.length).toBeGreaterThanOrEqual(5);
+    expect(body).toContain("cancelNativeExitRequest();\n      diagnostics.error(\"desktop:exit\"");
+
+    // The acknowledgement goes out before the confirmation can await anything.
+    const listener = source.slice(source.indexOf('listen<void>("gitpulse-exit-requested"'));
+    expect(listener.indexOf('answer: "seen"')).toBeGreaterThan(-1);
+    expect(listener.indexOf('answer: "seen"')).toBeLessThan(listener.indexOf("answerNativeExitRequest()"));
+  });
+
   it("owns boot unlistens through createListenerTracker, not an inline array", () => {
     // The tracker is the one owner of the late-registration race. An inline
     // `unsubs` + `disposed` copy next to it is how the helper goes unwired

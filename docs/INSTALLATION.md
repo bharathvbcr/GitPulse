@@ -44,6 +44,61 @@ xattr -dr com.apple.quarantine /Applications/GitPulse.app
 This removes a local quarantine attribute; it does not verify or notarize the app.
 Open GitPulse from Applications, Finder, or Spotlight.
 
+#### Quitting
+
+Cmd-Q, Dock → Quit, the status menu's Quit item, and a Quit Apple event
+(`osascript -e 'quit app id "com.gitpulse.desktop"'`) all go through the same
+confirmation. GitPulse asks first when Git actions are still running, editor saves
+are in flight, or editor drafts are unsaved, and quits immediately otherwise.
+A logout or restart waits while GitPulse asks, then continues if you quit, or
+stops if you choose to keep working.
+
+- **Quit again to force it.** A second Quit while the confirmation is open
+  quits at once without asking.
+- **A window that cannot answer does not block quitting.** If the window does
+  not respond to a quit within 3 seconds, for example because its page crashed,
+  is reloading, or has hung, GitPulse quits.
+- **A crashed window reloads itself.** If the window's web content crashes,
+  GitPulse reloads it and records the crash in the log. When crashes repeat,
+  GitPulse waits longer before each reload, up to 30 seconds.
+
+A script or agent that quits GitPulse with an Apple event needs macOS Automation
+permission for the program that sends it, such as Terminal or an agent's own
+binary. The first time, macOS shows a consent dialog. Until someone answers it, the
+event never reaches GitPulse and `osascript` fails with `AppleEvent timed out
+(-1712)`. GitPulse cannot see or answer that dialog. Allow or deny it, or change
+it later in System Settings → Privacy & Security → Automation.
+
+#### Local builds and duplicate registrations
+
+`bun run tauri build` leaves a complete `GitPulse.app` in
+`src-tauri/target/release/bundle/macos/`, and Spotlight registers every app bundle
+it indexes. That copy then competes with the installed one for "Open with",
+`open -a GitPulse`, and `.git` file associations. Building the DMG also mounts it
+under `/Volumes/dmg.*`, which can leave a registration for each mount that no
+longer exists.
+
+After you copy a build into Applications, unregister the build copy and refresh
+the installed one:
+
+```sh
+LSREGISTER=/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister
+"$LSREGISTER" -u src-tauri/target/release/bundle/macos/GitPulse.app
+"$LSREGISTER" -f /Applications/GitPulse.app
+"$LSREGISTER" -dump | grep -E '^path: .*GitPulse\.app'
+```
+
+Spotlight re-registers the build copy the next time it indexes `target/`. To stop
+that, use one of these:
+
+- Add `src-tauri/target` to System Settings → Spotlight → Search Privacy. This
+  also keeps the large build tree out of the index.
+- Delete `src-tauri/target/release/bundle/macos/GitPulse.app` after installing it.
+  The DMG beside it is the artifact to keep.
+
+`lsregister -gc` compacts the database. It is not established here whether it also
+drops the stale `/Volumes/dmg.*` records.
+
 ### Linux and Windows
 
 On Linux, install the `.deb` with your distribution's package tools, or mark the

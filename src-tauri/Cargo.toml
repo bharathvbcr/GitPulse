@@ -260,6 +260,12 @@ harness = false
 name = "native_event_unwind"
 harness = false
 
+# Each scenario re-executes this binary on its own main thread: an approved
+# AppKit `terminate:` ends the process, so one process cannot run two.
+[[test]]
+name = "native_quit_guard"
+harness = false
+
 # Wall-clock measurement, not a pass/fail gate. `test = false` keeps it out of
 # `cargo test`: a timing assertion fails on a loaded machine for reasons that
 # have nothing to do with the code, and a check that fails spuriously is worse

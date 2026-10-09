@@ -204,7 +204,7 @@ flowchart TD
 | --- | --- |
 | `bun run check` | Runs `svelte-check` (TypeScript 6 compatibility API for Svelte) and stable TypeScript 7 `tsc` type validation on `tsconfig.node.json` |
 | `bun run test` | Runs the Vitest frontend unit and integration test suite (2,000+ tests) |
-| `bun run check:ipc` | Verifies the Rust `cmd_*` registry (265 handlers) and frontend `invoke()` calls match with zero untracked orphans, and that every `#[tauri::command]` in the crate is actually registered |
+| `bun run check:ipc` | Verifies the Rust `cmd_*` registry (266 handlers) and frontend `invoke()` calls match with zero untracked orphans, and that every `#[tauri::command]` in the crate is actually registered |
 | `bun run vendor:check` | Verifies no vendored crate has been edited here, and compares the complete transformed snapshot against upstream when that repository is present — including deleted files and resolved `Cargo.toml` changes. `bun run vendor -- --crate=NAME` stages an isolated crate refresh while preserving the other recorded crates; every refresh replaces the live tree only after the full requested snapshot is ready. |
 | `bun run check:vendor-schema` | Pins vendored `CURRENT_SCHEMA_VERSION` against the installed `devmap` CLI (when present) so an incompatible store is reported explicitly |
 | `bun run check:types` | Verifies that Rust serde structs match their TypeScript interfaces field-for-field and wire-type-for-wire-type, across 83 contracts (211 structs, 1466 fields) |
@@ -316,7 +316,7 @@ GitPulse/
 │   ├── lib/views/        View registry + navigation (routerless, 4 views)
 │   └── lib/<domain>/     Pure logic: files, diff, filter, graph, coverage, health…
 └── src-tauri/src/        Rust core
-    ├── commands/         #[tauri::command] handlers — the ONLY IPC entry points (265 handlers)
+    ├── commands/         #[tauri::command] handlers — the ONLY IPC entry points (266 handlers)
     ├── engine/           git CLI wrapper: reader, writer, worktrees, sandboxing
     ├── graph/            Lane solver, mainline pinning, filter simplification, bezier geometry, ref decorations
     ├── analyzer/         Language detection, LOC, coverage, dependency health

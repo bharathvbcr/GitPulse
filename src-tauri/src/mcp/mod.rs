@@ -1485,6 +1485,20 @@ impl Ready {
             Some(json!({ "method": self.method })),
         )
     }
+
+    /// The answer to send when no thread could be started to run this request.
+    /// The request never ran, so the client may retry it.
+    pub fn unstarted(&self) -> JsonRpcResponse {
+        err(
+            self.id.clone(),
+            -32603,
+            format!(
+                "{} did not run: the server could not start a thread for it; retry",
+                self.method
+            ),
+            Some(json!({ "method": self.method, "ran": false })),
+        )
+    }
 }
 
 /// What [`accept`] decided about a message.

@@ -636,6 +636,20 @@ fn task_environment_replaces_root_overrides_but_preserves_auth_and_parent_settin
     );
 }
 
+/// Whether a read error from the PTY master means the session's side closed.
+/// On Unix that is `EIO` once every holder of the slave has gone; ConPTY's pipe
+/// reports a broken pipe. Anything else is a fault, not an ending.
+fn is_end_of_terminal(error: &std::io::Error) -> bool {
+    #[cfg(unix)]
+    if error.raw_os_error() == Some(libc::EIO) {
+        return true;
+    }
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::UnexpectedEof
+    )
+}
+
 /// Snapshot of the parts of [`portable_pty::ExitStatus`] the exit event
 /// reports, extracted so the finalize logic is unit-testable without
 /// spawning a real PTY-backed process.
@@ -647,9 +661,9 @@ struct ExitStatusLike {
 
 impl From<&portable_pty::ExitStatus> for ExitStatusLike {
     fn from(status: &portable_pty::ExitStatus) -> Self {
-        // On Unix a signal death surfaces as a fallback code (see vendored
-        // lib.rs From<std::process::ExitStatus>) plus Some(signal name), so
-        // both fields carry honest data.
+        // On Unix a signal death surfaces as portable-pty's fallback code 1
+        // (its `From<std::process::ExitStatus>`) plus Some(signal name). The
+        // code is invented there; `finalize_pty_session` drops it.
         ExitStatusLike {
             code: status.exit_code(),
             signal: status.signal().map(str::to_string),
@@ -662,10 +676,10 @@ impl From<&portable_pty::ExitStatus> for ExitStatusLike {
 /// `wait` blocks until the child terminates; the reader thread calls this only
 /// after the master side hit EOF/error. EOF can precede child exit, so the
 /// caller keeps its killable registry entry until reaping. A successful wait
-/// reports the real exit code — on Unix a killed
-/// shell yields the fallback code with the signal name attached — while a
-/// failed wait degrades honestly to `exit_code: None` instead of inventing a
-/// status.
+/// reports the real exit code. A shell killed by a signal has no exit code, so
+/// it reports the signal name and `exit_code: None` — portable-pty's fallback 1
+/// would read as an ordinary failure in a run record. A failed wait also
+/// degrades to `exit_code: None` instead of inventing a status.
 fn finalize_pty_session<E, W>(session_id: &str, wait: W, mut emit: E)
 where
     W: FnOnce() -> std::io::Result<ExitStatusLike>,
@@ -673,7 +687,10 @@ where
 {
     let (exit_code, signal, error, reaped) = match wait() {
         Ok(status) => (
-            Some(i32::try_from(status.code).unwrap_or(-1)),
+            status
+                .signal
+                .is_none()
+                .then(|| i32::try_from(status.code).unwrap_or(-1)),
             status.signal.unwrap_or_default(),
             None,
             true,
@@ -1364,7 +1381,20 @@ fn spawn_session_inner<R: tauri::Runtime>(
                             break;
                         }
                     }
-                    Err(_) => break,
+                    Err(e) if is_end_of_terminal(&e) => break,
+                    Err(e) => {
+                        // The shell may still be running, with nothing left
+                        // reading what it prints or delivering what is typed:
+                        // stop it and say why, rather than leave a frozen tab.
+                        if !dead_flag.swap(true, Ordering::SeqCst) {
+                            failure = Some(format!("Terminal output could not be read: {e}"));
+                            output_flow.stop();
+                            if let Err(error) = terminate_pty_child(&thread_child, &thread_master) {
+                                log::warn!(target: "terminal", "could not signal failed terminal: {error}");
+                            }
+                        }
+                        break;
+                    }
                 }
             }
 
@@ -4618,8 +4648,31 @@ mod tests {
             },
             |p| emitted.push(p),
         );
-        assert_eq!(emitted[0].exit_code, Some(1));
+        // The 1 is portable-pty's stand-in, not a status the shell returned:
+        // a run record must not show "exit 1" for a killed shell.
+        assert_eq!(emitted[0].exit_code, None);
         assert_eq!(emitted[0].signal, "Hangup");
+        assert!(
+            emitted[0].reaped,
+            "a signal death is still a confirmed exit"
+        );
+    }
+
+    #[test]
+    fn only_a_closed_terminal_ends_a_session_quietly() {
+        use std::io::{Error, ErrorKind};
+        #[cfg(unix)]
+        assert!(is_end_of_terminal(&Error::from_raw_os_error(libc::EIO)));
+        assert!(is_end_of_terminal(&Error::from(ErrorKind::BrokenPipe)));
+        assert!(is_end_of_terminal(&Error::from(ErrorKind::UnexpectedEof)));
+        #[cfg(unix)]
+        for fault in [libc::EBADF, libc::EFAULT, libc::ENOMEM, libc::EINVAL] {
+            assert!(
+                !is_end_of_terminal(&Error::from_raw_os_error(fault)),
+                "errno {fault} is a fault and must be reported, not treated as an ending"
+            );
+        }
+        assert!(!is_end_of_terminal(&Error::other("reader fault")));
     }
 
     #[test]

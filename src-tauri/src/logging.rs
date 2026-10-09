@@ -4,8 +4,43 @@ use std::collections::VecDeque;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
+
+thread_local! {
+    /// Whether this thread is inside the logger, holding its locks.
+    static INSIDE_LOGGER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Marks this thread as inside the logger until dropped.
+///
+/// A panic raised while the logger holds its ring or file lock runs the panic
+/// hook on the same thread, and the hook logs through those same locks. A std
+/// `Mutex` is not re-entrant, so that thread would wait on itself forever — a
+/// crash turned into a hang with nothing recorded. The nested entry is dropped
+/// and counted instead, and [`PersistedLog`] says so.
+struct InsideLogger {
+    outermost: bool,
+}
+
+impl InsideLogger {
+    fn enter() -> Self {
+        let outermost = !INSIDE_LOGGER.with(|inside| inside.replace(true));
+        Self { outermost }
+    }
+
+    fn nested(&self) -> bool {
+        !self.outermost
+    }
+}
+
+impl Drop for InsideLogger {
+    fn drop(&mut self) {
+        if self.outermost {
+            INSIDE_LOGGER.with(|inside| inside.set(false));
+        }
+    }
+}
 
 pub(crate) mod performance;
 
@@ -281,6 +316,7 @@ impl FileSink {
     /// The durable tail, oldest line first, spanning both generations.
     fn tail(&self, max_lines: usize) -> PersistedLog {
         let max_lines = max_lines.clamp(1, TAIL_MAX_LINES);
+        let _inside = InsideLogger::enter();
         // Keep the sink lock across both reads. Otherwise a writer can rotate
         // `current` into `previous` between them and make a whole generation
         // disappear from an apparently complete response.
@@ -641,6 +677,9 @@ pub(crate) struct RingLogger {
     /// loggers must not: `--nocapture` shares a pipe with the harness, and a
     /// timeout there injects "stderr mirror disabled" into the ring.
     mirror_stderr: bool,
+    /// Entries dropped because this logger was entered again from inside
+    /// itself (see [`InsideLogger`]). Shared with panic-hook clones.
+    reentrant_drops: Arc<AtomicU64>,
 }
 
 static LOGGER: OnceLock<RingLogger> = OnceLock::new();
@@ -654,6 +693,7 @@ impl RingLogger {
             stderr_failed: Arc::new(AtomicBool::new(false)),
             stderr: Arc::new(OnceLock::new()),
             mirror_stderr: false,
+            reentrant_drops: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -666,6 +706,11 @@ impl RingLogger {
     }
 
     fn write_entry(&self, level: Level, target: &str, message: &str) {
+        let inside = InsideLogger::enter();
+        if inside.nested() {
+            self.reentrant_drops.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
         let line = format_entry(now_epoch_secs(), level, target, message);
         self.push(level, line.clone());
         // Disk before stderr: stderr is discarded for a bundled app launched
@@ -713,6 +758,7 @@ impl RingLogger {
 
     fn snapshot_tail(&self, max_lines: usize) -> Vec<String> {
         let max_lines = max_lines.clamp(1, TAIL_MAX_LINES);
+        let _inside = InsideLogger::enter();
         let queue = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
         let mut out: Vec<String> = queue
             .iter()
@@ -814,12 +860,29 @@ pub fn persisted_log(max_lines: usize) -> PersistedLog {
     let Some(logger) = LOGGER.get() else {
         return PersistedLog::unavailable("logging not initialised");
     };
-    match logger.sink.as_ref() {
+    let mut log = match logger.sink.as_ref() {
         Some(sink) => sink.tail(max_lines),
         None => PersistedLog::unavailable(&format!(
             "no durable log for this binary; set {LOG_DIR_ENV} to enable one"
         )),
+    };
+    note_reentrant_drops(&mut log, logger.reentrant_drops.load(Ordering::Relaxed));
+    log
+}
+
+/// A record that silently lost entries must not read as complete.
+fn note_reentrant_drops(log: &mut PersistedLog, dropped: u64) {
+    if dropped == 0 {
+        return;
     }
+    let note = format!(
+        "{dropped} entr{} raised inside the logger itself (a panic while it held its locks) could not be recorded",
+        if dropped == 1 { "y" } else { "ies" }
+    );
+    log.degraded = Some(match log.degraded.take() {
+        Some(existing) => format!("{existing}; {note}"),
+        None => note,
+    });
 }
 
 #[tauri::command]
@@ -1337,6 +1400,62 @@ mod tests {
             lines.iter().any(|l| l.contains("panic at ")),
             "hook must record a location: {lines:?}"
         );
+    }
+
+    /// A panic raised while the logger holds its own lock reaches the panic
+    /// hook on that same thread. It must cost that one entry, not hang the
+    /// thread on a lock it already holds.
+    #[test]
+    fn a_panic_inside_the_logger_does_not_deadlock_its_own_hook() {
+        let _guard = HOOK_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+        let original = std::panic::take_hook();
+        let logger = Arc::new(RingLogger::new(LevelFilter::Trace));
+        install_panic_hook_for(logger.clone());
+
+        let (done, finished) = std::sync::mpsc::channel();
+        let inside = logger.clone();
+        std::thread::spawn(move || {
+            let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                // Exactly the state `write_entry` is in while it pushes.
+                let _inside = InsideLogger::enter();
+                let _held = inside.entries.lock().unwrap();
+                panic!("panic inside the logger");
+            }));
+            let _ = done.send(caught.is_err());
+        });
+        let outcome = finished.recv_timeout(std::time::Duration::from_secs(5));
+        if outcome.is_err() {
+            // The stuck thread is inside the panic hook, holding std's hook
+            // lock, so `set_hook` (and any assertion's panic) would hang too.
+            eprintln!(
+                "FAIL a_panic_inside_the_logger_does_not_deadlock_its_own_hook: \
+                 the panic hook deadlocked on the logger's own lock"
+            );
+            std::process::exit(1);
+        }
+        std::panic::set_hook(original);
+
+        assert_eq!(
+            outcome,
+            Ok(true),
+            "the thread must unwind, not wait on itself"
+        );
+        assert!(
+            logger.reentrant_drops.load(Ordering::Relaxed) >= 1,
+            "the dropped entry is counted"
+        );
+        let mut persisted = PersistedLog::unavailable("no sink");
+        note_reentrant_drops(&mut persisted, 1);
+        assert!(persisted
+            .degraded
+            .as_deref()
+            .is_some_and(|why| why.contains("no sink") && why.contains("1 entry")));
+        // The logger works again once the faulting call has unwound.
+        logger.write_entry(Level::Info, "after", "still recording");
+        assert!(logger
+            .snapshot_tail(10)
+            .iter()
+            .any(|line| line.contains("still recording")));
     }
 
     // ---- durable sink -------------------------------------------------

@@ -32,11 +32,22 @@ fn main() {
     // spawn budget the app and the agent servers spend. First, before any
     // spawn builds the gate.
     gitpulse_lib::engine::git_cli::run_process_with_shared_spawn_budget();
-    decide();
+    let code = run_guarded(decide);
     // Not a bare return: a hook that finished while a caught signal was still
     // being swept would exit out from under it, leaving the git or harness
     // subprocess the sweep was killing.
-    gitpulse_lib::procguard::exit(0);
+    gitpulse_lib::procguard::exit(code);
+}
+
+/// Runs the hook and returns its exit code, which is 0 even when it panicked.
+/// A panic otherwise exits 101: not the blocking 2, but not the promised 0
+/// either, and a host is free to treat any non-zero hook as a failure the user
+/// has to look at. The installed panic hook has already logged the fault.
+fn run_guarded(decide: impl FnOnce() + std::panic::UnwindSafe) -> i32 {
+    if std::panic::catch_unwind(decide).is_err() {
+        log::error!(target: "hook", "gitpulse-hook panicked; no decision");
+    }
+    0
 }
 
 fn decide() {
@@ -117,5 +128,16 @@ fn emit(payload: String) {
     .and_then(|output| output.write(payload.as_bytes()));
     if let Err(error) = result {
         log::warn!(target: "hook", "could not deliver hook stdout: {error}; no retry");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_panicking_hook_still_exits_zero_with_no_decision() {
+        assert_eq!(run_guarded(|| panic!("hook fault")), 0);
+        assert_eq!(run_guarded(|| {}), 0);
     }
 }

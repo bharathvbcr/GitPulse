@@ -95,6 +95,54 @@ fn immediate_output_and_exit_status_survive_spawn() {
     assert!(exit["error"].is_null());
 }
 
+/// A shell that crashes or is killed has no exit code. Reporting portable-pty's
+/// stand-in 1 made a killed agent's run read "exit 1", like a command that
+/// failed on its own.
+#[test]
+fn a_shell_killed_by_a_signal_reports_the_signal_and_no_exit_code() {
+    let app = tauri::test::mock_builder()
+        .build(gitpulse_lib::context())
+        .unwrap();
+    let state = TerminalSessions::default();
+    let _cleanup = TerminalCleanup(state.clone());
+    let ack = state.clone();
+    app.listen("terminal-output", move |event| {
+        let (id, bytes) = take_output(event.payload());
+        acknowledge_output(&ack, &id, bytes.len()).unwrap();
+    });
+    let (send, receive) = mpsc::channel();
+    app.listen("terminal-exit", move |event| {
+        send.send(event.payload().to_string()).unwrap();
+    });
+    let dir = repo();
+    for signal in ["KILL", "SEGV", "ABRT"] {
+        spawn_session(
+            app.handle(),
+            &state,
+            dir.path().to_str().unwrap(),
+            24,
+            80,
+            Some("/bin/sh".into()),
+            // Core dumps off, so a crashing shell leaves nothing behind.
+            Some(vec!["-c".into(), format!("ulimit -c 0; kill -{signal} $$")]),
+            None,
+        )
+        .unwrap();
+        let exit: serde_json::Value =
+            serde_json::from_str(&receive.recv_timeout(Duration::from_secs(10)).unwrap()).unwrap();
+        assert!(
+            exit["exit_code"].is_null(),
+            "SIG{signal}: a signal death has no exit code, got {exit}"
+        );
+        assert!(
+            exit["signal"].as_str().is_some_and(|name| !name.is_empty()),
+            "SIG{signal}: the signal must be named, got {exit}"
+        );
+        assert_eq!(exit["reaped"], true, "SIG{signal}: the death was confirmed");
+        assert!(exit["error"].is_null(), "SIG{signal}: {exit}");
+    }
+}
+
 #[test]
 fn output_flood_is_backpressured_then_drains_without_loss() {
     let app = tauri::test::mock_builder()

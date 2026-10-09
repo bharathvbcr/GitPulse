@@ -217,6 +217,41 @@ struct CycleReport {
     elapsed_ms: u64,
 }
 
+/// Runs one repository's cycle so that a panic in it costs that repository's
+/// cycle, not the daemon. Without this a fault in one of up to 32 repositories
+/// exited the process with 101 and stopped catch-up for all of them, and a
+/// restarted daemon met the same unmoved watermark and the same panic.
+fn guarded_cycle(
+    repo: &str,
+    cycle: u64,
+    run: impl FnOnce(&str, u64) -> CycleReport,
+) -> CycleReport {
+    let started = Instant::now();
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run(repo, cycle))) {
+        Ok(report) => report,
+        Err(payload) => {
+            let what = payload
+                .downcast_ref::<&str>()
+                .map(|text| (*text).to_string())
+                .or_else(|| payload.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "a non-text panic".to_string());
+            log::error!(target: "gitpulsed", "catch-up for {repo} panicked: {what}");
+            CycleReport {
+                repo: repo.to_string(),
+                cycle,
+                recorded: 0,
+                transcripts: 0,
+                skipped_lines: 0,
+                reflog_entries: 0,
+                // Unknown, so not claimed: the panic may have hit the ledger.
+                recording: false,
+                error: format!("catch-up panicked: {what}"),
+                elapsed_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+            }
+        }
+    }
+}
+
 fn run_cycle(repo: &str, cycle: u64) -> CycleReport {
     let started = Instant::now();
 
@@ -304,7 +339,7 @@ fn main() {
             loop {
                 cycle += 1;
                 for repo in &config.repos {
-                    let report = run_cycle(repo, cycle);
+                    let report = guarded_cycle(repo, cycle, run_cycle);
                     match serde_json::to_string(&report) {
                         Ok(line) => write_output(format!("{line}\n").as_bytes()),
                         // Serialising our own struct cannot fail, but a panic
@@ -357,6 +392,46 @@ mod tests {
 
     fn args(list: &[&str]) -> Vec<String> {
         list.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    #[test]
+    fn a_panicking_repository_fails_its_own_cycle_and_the_rest_still_run() {
+        let repos = ["/r/first", "/r/broken", "/r/last"];
+        let reports: Vec<CycleReport> = repos
+            .iter()
+            .map(|repo| {
+                guarded_cycle(repo, 3, |repo, cycle| {
+                    if repo.ends_with("broken") {
+                        panic!("index out of bounds in {repo}");
+                    }
+                    CycleReport {
+                        repo: repo.to_string(),
+                        cycle,
+                        recorded: 1,
+                        transcripts: 0,
+                        skipped_lines: 0,
+                        reflog_entries: 0,
+                        recording: true,
+                        error: String::new(),
+                        elapsed_ms: 0,
+                    }
+                })
+            })
+            .collect();
+        assert_eq!(reports.len(), 3, "every repository is reported");
+        assert!(reports[0].error.is_empty() && reports[2].error.is_empty());
+        let broken = &reports[1];
+        assert_eq!((broken.repo.as_str(), broken.cycle), ("/r/broken", 3));
+        assert!(
+            broken.error.contains("panicked") && broken.error.contains("index out of bounds"),
+            "{}",
+            broken.error
+        );
+        assert!(
+            !broken.recording,
+            "a panicked cycle claims nothing about the ledger"
+        );
+        assert_eq!(broken.recorded, 0);
     }
 
     /// An absolute repository path for the host platform.

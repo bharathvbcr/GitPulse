@@ -337,7 +337,20 @@
   let exitRequestPending = false;
   let exitApproved = false;
 
+  // The native side holds a quit until this page answers it: "seen" at once,
+  // so a page that is alive is never mistaken for a dead one, then either
+  // `cmd_exit_app` or "cancel". A request that is never cancelled holds a
+  // macOS logout open, so every way out of the confirmation below says so.
+  function cancelNativeExitRequest() {
+    exitRequestPending = false;
+    void invoke("cmd_exit_request_answer", { answer: "cancel" }).catch((error) =>
+      diagnostics.warn("desktop:exit-cancel", error),
+    );
+  }
+
   async function answerNativeExitRequest() {
+    // A repeat while one is open: the native side holds it without a second
+    // request, so this answers nothing and must not cancel the first.
     if (exitRequestPending) return;
     exitRequestPending = true;
     const gitActions = gitActionCount(get(repoStore.mutationActivity));
@@ -345,9 +358,9 @@
       const wait = await askConfirm({ title: "Finish Git Actions Before Quit?",
         message: `${gitActions} Git action${gitActions === 1 ? " is" : "s are"} still running. Wait for them before quitting.`,
         confirmLabel: "Wait and Quit", cancelLabel: "Keep Working" });
-      if (!wait) { exitRequestPending = false; return; }
+      if (!wait) { cancelNativeExitRequest(); return; }
       try { await waitForGitIdle(repoStore.mutationActivity); }
-      catch (error) { toastStore.error(formatError(error)); exitRequestPending = false; return; }
+      catch (error) { toastStore.error(formatError(error)); cancelNativeExitRequest(); return; }
     }
 
     if (editorFileSaveQueue.pending > 0) {
@@ -359,7 +372,7 @@
         cancelLabel: "Keep Editing",
       });
       if (!waitForSaves) {
-        exitRequestPending = false;
+        cancelNativeExitRequest();
         return;
       }
       toastStore.info("Finishing editor saves before quitting…");
@@ -382,14 +395,14 @@
         cancelLabel: "Keep Editing",
       });
       if (!confirmed) {
-        exitRequestPending = false;
+        cancelNativeExitRequest();
         return;
       }
     }
 
     if (gitActionCount(get(repoStore.mutationActivity)) > 0) {
       toastStore.info("A Git action started while confirming quit. Try again when it finishes.");
-      exitRequestPending = false;
+      cancelNativeExitRequest();
       return;
     }
     conflictSessions.flush();
@@ -399,7 +412,7 @@
       await invoke("cmd_exit_app");
     } catch (error) {
       exitApproved = false;
-      exitRequestPending = false;
+      cancelNativeExitRequest();
       diagnostics.error("desktop:exit", error);
       toastStore.error(`Could not quit GitPulse: ${formatError(error)}`);
     }
@@ -447,6 +460,10 @@
     // Arm the native side only after its listener exists. This prevents a
     // startup failure from trapping an exit request with nobody to answer it.
     void listen<void>("gitpulse-exit-requested", () => {
+      // Before any await: this is what tells the native side the page lives.
+      void invoke("cmd_exit_request_answer", { answer: "seen" }).catch((error) =>
+        diagnostics.warn("desktop:exit-seen", error),
+      );
       void answerNativeExitRequest();
     }).then(
       (unlisten) => {
