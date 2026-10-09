@@ -25,7 +25,7 @@ function mulberry32(seed: number): () => number {
 }
 
 const RUNS = ["a", "b", "c", ""];
-const STATUSES = ["starting", "running", "exited", "", "Close failed; use Sessions to retry.", "x".repeat(400), "Still running — not shown since the window reloaded"];
+const STATUSES = ["starting", "running", "exited", "", "Close failed; use Sessions to retry.", "x".repeat(400), "Still running — not shown in any tab"];
 const close = async () => {};
 
 describe("attemptTerminalView under arbitrary mixtures", () => {

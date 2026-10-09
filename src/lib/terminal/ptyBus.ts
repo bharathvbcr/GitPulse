@@ -23,6 +23,18 @@ export interface PtySessionHandlers {
   onOutput: (dataB64: string, reservedBytes?: number) => void;
   onExit: (event: TerminalExitEvent) => void;
   onError?: (message: string) => void;
+  /**
+   * Output this view was not shown while the process kept running — it fell
+   * behind and the host skipped output for it (`terminal-loss`). Not an
+   * error: the session is fine, and status must keep saying it runs.
+   */
+  onNotice?: (message: string) => void;
+}
+
+/** `terminal-loss`: the host skipped output for a live session's view. */
+export interface TerminalLossEvent {
+  id: string;
+  message: string;
 }
 
 /** The subset of Tauri's `listen` this needs, injectable for tests. */
@@ -255,12 +267,23 @@ export function createPtyBus(listen: EventListen): PtyBus {
     held.exit = held.exit ? withNotice(held.exit, payload.error) : payload;
   }
 
+  function handleLoss(payload: TerminalLossEvent) {
+    if (!payload || typeof payload.id !== "string" || typeof payload.message !== "string" || !payload.message.trim()) {
+      report("Invalid terminal loss event");
+      return;
+    }
+    // Unclaimed: no view of this session exists to have fallen behind, and
+    // whichever view takes it over repaints from the program's next frame.
+    handlers.get(payload.id)?.onNotice?.(payload.message.slice(0, 1024));
+  }
+
   function attach(): Promise<void> {
     if (unlisteners.length > 0) return Promise.resolve();
     if (attaching) return attaching;
     const attempt = Promise.allSettled([
       boundedListen<TerminalOutputEvent>("terminal-output", (e) => handleOutput(e.payload)),
       boundedListen<TerminalExitEvent>("terminal-exit", (e) => handleExit(e.payload)),
+      boundedListen<TerminalLossEvent>("terminal-loss", (e) => handleLoss(e.payload)),
     ]).then((results) => {
       const releases = results.flatMap((r) => r.status === "fulfilled" ? [r.value] : []);
       const failure = results.find((r) => r.status === "rejected");

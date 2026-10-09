@@ -2,8 +2,8 @@
  * Frontend half of the PTY output window.
  *
  * Rust `OutputFlow.reserve` counts every emitted chunk until
- * `cmd_terminal_ack` subtracts it. The reader blocks, then kills the child,
- * when that debt sits for 30 seconds. Credit therefore has to be released
+ * `cmd_terminal_ack` subtracts it. The reader blocks when that debt sits
+ * for 30 seconds, then skips output (never the process) until it is repaid. Credit therefore has to be released
  * once for every chunk the view accepted, including a chunk the emulator
  * never paints: the view was already gone, or it was not open yet and the
  * hold reached the window. Releasing early, before an emulator exists, would
@@ -156,7 +156,7 @@ export type OutputPlan =
   | { action: "ack"; bytes: number; failure: string | null }
   | { action: "held" }
   | { action: "overflow"; owed: OutputAck[]; failure: string }
-  | { action: "stop"; failure: string };
+  | { action: "lost"; failure: string };
 
 /**
  * Decide what one output event does to the credit window.
@@ -164,8 +164,10 @@ export type OutputPlan =
  * A chunk the emulator cannot decode still occupied `reserved` bytes in
  * `OutputFlow`. Acknowledging that count is what keeps one bad frame from
  * stalling the reader. When the event does not name a usable length, the
- * caller has to stop the session: `flow.stop` is what wakes `reserve`.
- * Guessing the count from the base64 text would acknowledge the wrong number.
+ * chunk is reported lost and its credit stays outstanding: the host sheds
+ * output rather than wait on it forever, so the process is never ended for
+ * it. Guessing the count from the base64 text would acknowledge the wrong
+ * number.
  */
 export function planTerminalOutput(
   credit: ReturnType<typeof createOutputCredit>,
@@ -181,7 +183,7 @@ export function planTerminalOutput(
   } catch (err) {
     const failure = `Invalid terminal output: ${err instanceof Error ? err.message : String(err)}`;
     if (reservedBytes !== null) return { action: "ack", bytes: reservedBytes, failure };
-    return { action: "stop", failure };
+    return { action: "lost", failure };
   }
   if (reservedBytes !== null && reservedBytes !== decoded.length) {
     return {

@@ -135,6 +135,7 @@
         if (args.args?.[0]==="--resume") { report.resumes.push({program:args.program,args:args.args,permissionMode:args.permissionMode??null}); show(); return {id:`resume-${report.resumes.length}`,cwd:args.repoPath,shell:"claude"}; }
         report.shellSpawns++;show();return {id:`shell-${report.shellSpawns}`,cwd:args.repoPath,shell:"/bin/sh"};
       case "cmd_terminal_kill":report.kills++;show();return null;
+      case "cmd_terminal_detach":report.detaches=(report.detaches??0)+1;show();return true;
       case "cmd_terminal_resize":report.resizes.push({id:args.sessionId,rows:args.rows,cols:args.cols});return null;
       case "cmd_terminal_write":report.writes.push({id:args.sessionId,data:typeof args.data==="string"?args.data:""});return null;
       case "cmd_terminal_ack":case "cmd_workspace_sync":return null;
