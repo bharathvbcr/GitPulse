@@ -80,11 +80,7 @@
     filterTerminalTabs,
     stepSearchIndex,
   } from "../terminal/tabSearch";
-  import {
-    applyHorizontalScrollDelta,
-    scrollChildIntoHorizontalView,
-    verticalWheelToHorizontalDelta,
-  } from "../dom/overflowHint";
+  import { bindHorizontalWheel, scrollChildIntoHorizontalView } from "../dom/overflowHint";
   import { portal } from "../dom/portal";
   import { LAYERS } from "../ui/layers";
   import { popover, restoreFocusTo } from "../ui/popover";
@@ -344,15 +340,7 @@
   $effect(() => {
     const scroller = tabScroller;
     if (!scroller) return;
-    const onWheel = (event: WheelEvent) => {
-      const delta = verticalWheelToHorizontalDelta(event);
-      if (delta === null) return;
-      if (scroller.scrollWidth <= scroller.clientWidth + 0.5) return;
-      event.preventDefault();
-      scroller.scrollLeft = applyHorizontalScrollDelta(scroller, delta);
-    };
-    scroller.addEventListener("wheel", onWheel, { passive: false });
-    return () => scroller.removeEventListener("wheel", onWheel);
+    return bindHorizontalWheel(scroller);
   });
 
   /**

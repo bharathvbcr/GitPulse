@@ -4,15 +4,19 @@
    *
    * Overlay, not a wrapper: the existing scroller keeps its event handlers,
    * roles and overflow classes, and the cue sits on a `relative` parent so
-   * it does not scroll away with the content. A supplied `hint` (the graph
-   * gutter's layout math) wins over DOM measurement; everyone else is
-   * observed.
+   * it does not scroll away with the content. The overlay paints nothing but
+   * the chevron; the fade is the scroller masking its own edge (the
+   * `data-gp-fade` token), so it works over glass, surface and base alike.
+   * A supplied `hint` (the graph gutter's layout math) wins over DOM
+   * measurement; everyone else is observed.
    */
   import { ChevronDown, ChevronLeft, ChevronRight, ChevronUp } from "@lucide/svelte";
   import {
     EMPTY_OVERFLOW_HINT,
     observeOverflow,
+    overflowFadeToken,
     scrollOverflowBy,
+    setOverflowFade,
     type OverflowAxis,
     type OverflowHint,
   } from "../dom/overflowHint";
@@ -44,6 +48,20 @@
     });
   });
 
+  // The token follows the hint; clearing is tied to the element alone, so a
+  // retarget or unmount never leaves a mask behind and a hint change is one
+  // attribute write, not a delete-then-set.
+  $effect(() => {
+    const el = target;
+    if (!el) return;
+    return () => setOverflowFade(el, null);
+  });
+
+  $effect(() => {
+    const el = target;
+    if (el) setOverflowFade(el, overflowFadeToken(axis, resolved));
+  });
+
   function nudge(toward: "start" | "end") {
     if (!target) return;
     scrollOverflowBy(target, axis, toward, {
@@ -71,8 +89,8 @@
     : (horizontal ? "Scroll right" : "Scroll down")}
   <div
     class={horizontal
-      ? `gp-edge-fade ${toward === "start" ? "gp-edge-fade-start" : "gp-edge-fade-end"}`
-      : `gp-edge-fade-y ${toward === "start" ? "gp-edge-fade-top" : "gp-edge-fade-bottom"}`}
+      ? `gp-scroll-cue ${toward === "start" ? "gp-scroll-cue-start" : "gp-scroll-cue-end"}`
+      : `gp-scroll-cue-y ${toward === "start" ? "gp-scroll-cue-top" : "gp-scroll-cue-bottom"}`}
   >
     <button
       type="button"

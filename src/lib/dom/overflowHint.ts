@@ -9,7 +9,7 @@
  * chevron on the overflowing edge is the other.
  */
 
-import { createResizeObservation } from "./observeResize";
+import { createResizeObservation, type ObserveResizeOptions } from "./observeResize";
 
 export type OverflowAxis = "x" | "y";
 
@@ -45,10 +45,23 @@ function finiteNonNegative(value: number, fallback = 0): number {
   return Number.isFinite(value) && value >= 0 ? value : fallback;
 }
 
+/**
+ * Scroll extent at each end that is not content: padding, and the rounding
+ * slack of integer `scrollWidth`/`clientWidth` against fractional layout.
+ * Hiding only this much is not hiding anything, so it never earns a cue.
+ */
+export interface OverflowInsets {
+  start: number;
+  end: number;
+}
+
+export const NO_OVERFLOW_INSETS: OverflowInsets = { start: 0, end: 0 };
+
 export function resolveOverflowHint(
   scrollPos: number,
   viewport: number,
   content: number,
+  insets: OverflowInsets = NO_OVERFLOW_INSETS,
 ): OverflowHint {
   const view = finiteNonNegative(viewport);
   const size = finiteNonNegative(content);
@@ -56,14 +69,16 @@ export function resolveOverflowHint(
   const pos = Number.isFinite(scrollPos)
     ? Math.min(max, Math.max(0, scrollPos))
     : 0;
-  const canScroll = max > SCROLL_EPS;
-  if (!canScroll) return EMPTY_OVERFLOW_HINT;
+  if (!(max > SCROLL_EPS)) return EMPTY_OVERFLOW_HINT;
+  // What is past each edge, less the padding that sits there: an edge that
+  // hides only padding hides nothing. Padding at the other edge is in view
+  // and does not count -- a toolbar scrolled to 0 still hides its last
+  // control even when the controls alone would fit.
   const edge = edgeThreshold(max);
-  return {
-    canScroll: true,
-    showStart: pos > edge,
-    showEnd: pos < max - edge,
-  };
+  const showStart = pos - finiteNonNegative(insets.start) > edge;
+  const showEnd = max - pos - finiteNonNegative(insets.end) > edge;
+  if (!showStart && !showEnd) return EMPTY_OVERFLOW_HINT;
+  return { canScroll: true, showStart, showEnd };
 }
 
 export interface OverflowBox {
@@ -75,11 +90,92 @@ export interface OverflowBox {
   scrollHeight: number;
 }
 
-export function readOverflowHint(el: OverflowBox, axis: OverflowAxis): OverflowHint {
+export function readOverflowHint(
+  el: OverflowBox,
+  axis: OverflowAxis,
+  insets: OverflowInsets = NO_OVERFLOW_INSETS,
+): OverflowHint {
   if (axis === "x") {
-    return resolveOverflowHint(el.scrollLeft, el.clientWidth, el.scrollWidth);
+    return resolveOverflowHint(el.scrollLeft, el.clientWidth, el.scrollWidth, insets);
   }
-  return resolveOverflowHint(el.scrollTop, el.clientHeight, el.scrollHeight);
+  return resolveOverflowHint(el.scrollTop, el.clientHeight, el.scrollHeight, insets);
+}
+
+/**
+ * `scrollWidth` and `clientWidth` are rounded to whole pixels while layout is
+ * fractional, so at a fractional zoom or device scale the two can disagree by
+ * up to a pixel with nothing hidden at all.
+ */
+export const OVERFLOW_ROUNDING_SLACK = 0.5;
+
+type InsetStyle = Pick<
+  CSSStyleDeclaration,
+  "paddingLeft" | "paddingRight" | "paddingTop" | "paddingBottom" | "borderLeftWidth" | "borderRightWidth" | "borderTopWidth" | "borderBottomWidth"
+>;
+
+function px(value: string): number {
+  const n = Number.parseFloat(value);
+  return Number.isFinite(n) && n > 0 ? n : 0;
+}
+
+/**
+ * The non-content scroll extent of a DOM scroller: its own padding, plus the
+ * padding and border of a single wrapping row (the `min-w-max px-3` toolbar
+ * and title-bar shape), plus rounding slack. Only a lone child is unwrapped:
+ * with several children the padding of one is not the edge of the content.
+ */
+export function readOverflowInsets(
+  el: Element,
+  axis: OverflowAxis,
+  styleOf: (node: Element) => InsetStyle = (node) => getComputedStyle(node),
+): OverflowInsets {
+  const startPad = (style: InsetStyle) => (axis === "x" ? px(style.paddingLeft) : px(style.paddingTop));
+  const endPad = (style: InsetStyle) => (axis === "x" ? px(style.paddingRight) : px(style.paddingBottom));
+  const startBorder = (style: InsetStyle) => (axis === "x" ? px(style.borderLeftWidth) : px(style.borderTopWidth));
+  const endBorder = (style: InsetStyle) => (axis === "x" ? px(style.borderRightWidth) : px(style.borderBottomWidth));
+  const own = styleOf(el);
+  let start = startPad(own) + OVERFLOW_ROUNDING_SLACK;
+  let end = endPad(own) + OVERFLOW_ROUNDING_SLACK;
+  const only = el.childElementCount === 1 ? el.firstElementChild : null;
+  if (only) {
+    const row = styleOf(only);
+    start += startPad(row) + startBorder(row);
+    end += endPad(row) + endBorder(row);
+  }
+  return { start, end };
+}
+
+/**
+ * Which edges of a scroller fade, as the `data-gp-fade` token app.css masks.
+ *
+ * The fade is a mask on the scroller itself rather than a band painted over
+ * it: a painted band needs a colour, and no one colour matches a glass title
+ * bar, a surface toolbar and a base pane, so on most hosts it read as a
+ * blank patch. A mask fades the content to whatever is behind it.
+ */
+export type OverflowFadeToken = `${OverflowAxis}-${"start" | "end" | "both"}`;
+
+export function overflowFadeToken(
+  axis: OverflowAxis,
+  hint: OverflowHint,
+): OverflowFadeToken | null {
+  if (!hint.canScroll) return null;
+  if (hint.showStart && hint.showEnd) return `${axis}-both`;
+  if (hint.showStart) return `${axis}-start`;
+  if (hint.showEnd) return `${axis}-end`;
+  return null;
+}
+
+/** Write (or clear) the fade token; a repeated token leaves the DOM alone. */
+export function setOverflowFade(
+  el: { dataset: DOMStringMap },
+  token: OverflowFadeToken | null,
+): void {
+  if (token === null) {
+    if ("gpFade" in el.dataset) delete el.dataset.gpFade;
+  } else if (el.dataset.gpFade !== token) {
+    el.dataset.gpFade = token;
+  }
 }
 
 /** Distance a cue click pans, in the scroller's own pixels. */
@@ -137,6 +233,59 @@ export function applyHorizontalScrollDelta(
   return Math.min(max, Math.max(0, pos + delta));
 }
 
+export interface HorizontalWheelTarget {
+  scrollLeft: number;
+  scrollWidth: number;
+  clientWidth: number;
+  addEventListener(type: "wheel", listener: (event: WheelEvent) => void, options: AddEventListenerOptions): void;
+  removeEventListener(type: "wheel", listener: (event: WheelEvent) => void): void;
+}
+
+/** Pixels per line for a line-mode wheel (Firefox, some Linux mice). */
+export const WHEEL_LINE_PX = 40;
+
+/**
+ * A wheel delta in pixels. Line- and page-mode wheels report counts, not
+ * pixels: three lines read as three pixels would barely move the strip.
+ */
+export function wheelDeltaPixels(delta: number, deltaMode: number, pagePx: number): number {
+  if (!Number.isFinite(delta)) return 0;
+  if (deltaMode === 1) return delta * WHEEL_LINE_PX;
+  if (deltaMode === 2) return delta * Math.max(WHEEL_LINE_PX, finiteNonNegative(pagePx) * 0.9);
+  return delta;
+}
+
+export type HorizontalWheelEvent = Pick<
+  WheelEvent,
+  "deltaX" | "deltaY" | "deltaMode" | "ctrlKey" | "metaKey" | "defaultPrevented" | "preventDefault"
+>;
+
+/**
+ * Let a mouse wheel pan a strip that only scrolls on X. A strip that hides
+ * its track is otherwise reachable only by trackpad, chevron or keyboard.
+ *
+ * The wheel is left to the page when the strip fits, when the strip is
+ * already at the end the wheel points past (so scrolling chains on), when
+ * it is a pinch or ctrl/cmd+wheel zoom, and when a nested handler already
+ * claimed it.
+ */
+export function bindHorizontalWheel(el: HorizontalWheelTarget): () => void {
+  const onWheel = (event: HorizontalWheelEvent) => {
+    if (event.defaultPrevented || event.ctrlKey || event.metaKey) return;
+    const raw = verticalWheelToHorizontalDelta(event);
+    if (raw === null) return;
+    if (el.scrollWidth <= el.clientWidth + SCROLL_EPS) return;
+    const delta = wheelDeltaPixels(raw, event.deltaMode, el.clientWidth);
+    const from = Number.isFinite(el.scrollLeft) ? el.scrollLeft : 0;
+    const to = applyHorizontalScrollDelta(el, delta);
+    if (Math.abs(to - from) < SCROLL_EPS) return;
+    event.preventDefault();
+    el.scrollLeft = to;
+  };
+  el.addEventListener("wheel", onWheel, { passive: false });
+  return () => el.removeEventListener("wheel", onWheel);
+}
+
 /**
  * The smallest scrollLeft that keeps `child` fully inside the scroller.
  * `scrollIntoView` can pan a parent instead of this strip; this cannot.
@@ -169,36 +318,66 @@ export function observeOverflow(
   el: HTMLElement,
   axis: OverflowAxis,
   onChange: (hint: OverflowHint) => void,
+  options: ObserveResizeOptions = {},
 ): () => void {
   let frame = 0;
+  let disposed = false;
+  // Insets are read with every answer rather than cached: a cached padding
+  // went stale when a class swap changed it without resizing anything.
+  const deliver = () => {
+    if (!disposed) onChange(readOverflowHint(el, axis, readOverflowInsets(el, axis)));
+  };
   const notify = () => {
     if (frame) cancelAnimationFrame(frame);
     frame = requestAnimationFrame(() => {
       frame = 0;
-      onChange(readOverflowHint(el, axis));
+      deliver();
     });
   };
-  notify();
   el.addEventListener("scroll", notify, { passive: true });
-  const resize = createResizeObservation(() => {
-    onChange(readOverflowHint(el, axis));
-  });
+  const resize = createResizeObservation(deliver, options);
   resize.observe(el);
+  // Children are observed so a tab growing inside a fixed strip is seen, and
+  // unobserved when they leave: a ResizeObserver holds its targets, so a strip
+  // that lives all session would otherwise keep every closed tab alive.
+  const watched = new Set<Element>();
   const watchChildren = () => {
-    for (const child of el.children) {
-      resize.observe(child);
+    const current = new Set(el.children);
+    for (const child of watched) {
+      if (!current.has(child)) {
+        resize.unobserve(child);
+        watched.delete(child);
+      }
+    }
+    for (const child of current) {
+      if (!watched.has(child)) {
+        // Border box: a row whose padding changes keeps its content box, and
+        // the default content-box observation would never hear about it.
+        resize.observe(child, { box: "border-box" });
+        watched.add(child);
+      }
     }
   };
   watchChildren();
   const mo = new MutationObserver(() => {
+    // A late callback must not re-observe: observe() revives a disconnected
+    // ResizeObserver, which would then hold these children for good.
+    if (disposed) return;
+    // The watched set changes now (it costs no layout); the measurement waits
+    // for the frame, so a burst of tab opens is one read, not one per batch.
     watchChildren();
     notify();
   });
   mo.observe(el, { childList: true });
+  // Synchronous first answer: a cue that moves to a new scroller must not
+  // paint the previous scroller's edges for a frame while this one is read.
+  deliver();
   return () => {
+    disposed = true;
     if (frame) cancelAnimationFrame(frame);
     el.removeEventListener("scroll", notify);
     resize.disconnect();
+    watched.clear();
     mo.disconnect();
   };
 }

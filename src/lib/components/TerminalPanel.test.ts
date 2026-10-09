@@ -153,7 +153,7 @@ describe("TerminalPanel tab strip", () => {
     expect(source).toContain("filterTerminalTabs");
     expect(source).toContain("data-terminal-tab-scroller");
     expect(source).toContain("overflow-x-auto overflow-y-hidden");
-    expect(source).toContain("verticalWheelToHorizontalDelta");
+    expect(source).toContain("bindHorizontalWheel(scroller)");
     expect(source).toContain("scrollChildIntoHorizontalView");
     expect(source).toContain("crowdedTabStrip");
   });

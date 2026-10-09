@@ -1004,7 +1004,12 @@
 
     <div class="relative min-w-0 flex-1 h-full">
     <div bind:this={headerScroller} class="gp-header-scroll min-w-0 h-full">
-      <div class="flex items-center gap-2 min-w-full w-max px-2 h-full">
+      <!-- Everything in this row is measured as overflow, so nothing may sit
+           after the last control: a drag spacer (and the gap before it) or
+           trailing padding put the overflow cue over empty space. The row is
+           the drag region instead -- a bare attribute drags only on direct
+           hits, so the controls inside it still take their own clicks. -->
+      <div class="flex items-center gap-2 min-w-full w-max pl-2 h-full" data-tauri-drag-region>
         <HeaderRepoMenu
           onOpen={() => void repoStore.pickAndOpenRepo()}
           onClone={openCloneDialog}
@@ -1014,7 +1019,6 @@
           <div class="h-3.5 w-1 rounded-full bg-border/50 mx-1 shrink-0" aria-hidden="true"></div>
           <ViewTabBar {conflictedCount} />
         {/if}
-        <div class="flex-1 min-w-4 h-full" data-tauri-drag-region></div>
       </div>
     </div>
     <ScrollCue target={headerScroller} axis="x" />

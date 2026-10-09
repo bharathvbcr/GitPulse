@@ -29,6 +29,8 @@ const fixtures={
  cmd_repo_operation:()=>null,cmd_stash_list: () => ({ entries: stashEntries, truncated: stashTruncated }),cmd_watch_repo:()=>null,cmd_unwatch_repo:()=>null,
  cmd_list_remotes:()=>({remotes:[],truncated:false}),cmd_list_submodules:()=>({submodules:[],truncated:false}),
  cmd_stash_show:()=>stashPreviewPending??({text:patch("stash-file.txt","stashed modification"),truncated:true,truncation_reason:"Fixture byte limit"}),
+ // `pull.rebase` unset: the backend's Option<String> None, so pull merges.
+ cmd_pull_rebase_config:()=>null,
  cmd_stash_save:a=>{stashWrites.push(a);return {policy:null,output:"Saved stash"};},
  cmd_stash_action:a=>{stashWrites.push(a);return {policy:null,output:"Applied stash"};},
  cmd_change_index:a=>{indexWrites.push(a);return {policy:null,output:a.filePaths.length};},
@@ -258,8 +260,11 @@ async function run(){
   check("closing a stash preview releases its content",!surface.querySelector('[aria-label="Stash preview"]'));
   const message=surface.querySelector('input[placeholder="What are you setting aside?"]');
   message.value="focused work";message.dispatchEvent(new Event("input",{bubbles:true}));
-  const toggles=[...surface.querySelectorAll('input[type="checkbox"]')];
-  toggles[0].click();toggles[1].click();await tick();
+  // By label, not position: the panel gained an auto-fetch checkbox above
+  // these, and the first two checkboxes stopped being the stash scope.
+  const toggle=(text)=>[...surface.querySelectorAll("label")].find(l=>l.textContent.trim()===text)?.querySelector('input[type="checkbox"]');
+  check("stash scope toggles are found by their labels",!!toggle("Include untracked files")&&!!toggle("Keep staged changes"));
+  toggle("Include untracked files").click();toggle("Keep staged changes").click();await tick();
   button("Save stash").click();
   await until(()=>stashWrites.length===1&&!button("Save stash").disabled,"stash save");
   check("stash save sends both scope choices",stashWrites[0].options.include_untracked===false&&stashWrites[0].options.keep_index===true);
