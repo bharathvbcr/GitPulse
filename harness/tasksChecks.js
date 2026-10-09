@@ -171,6 +171,10 @@ mockIPCWithEvents(async (cmd, args) => {
       const items = boardRuns.filter(run => (!input.state || run.state === input.state) && (!input.task_id || run.task_id === input.task_id) && (!input.repository_id || run.repository_id === input.repository_id));
       return JSON.stringify({ok:true, items, shown:items.length, total:items.length, has_more:false, next_cursor:null});
     }
+    // A fixture checkout is its own repository: its Git directory sits inside
+    // it, and nothing shares its common directory.
+    case "runs.checkout_identity":
+      return JSON.stringify({ok:true, cwd: input.repo_path, git_dir: `${input.repo_path}/.git`, git_common_dir: `${input.repo_path}/.git`});
     case "decisions.list": {
       const items = boardDecisions.filter(item => item.run_id === input.run_id && (!input.state || item.state === input.state));
       return JSON.stringify({ok:true, items, shown:items.length, total:items.length, has_more:false, next_cursor:null});
@@ -1988,10 +1992,14 @@ if (params.has("check")) {
     const overrideField = name => override()?.querySelector(`[aria-label="${name}"]`);
     check("a terminal handoff offers this launch's model, effort and advisor for Claude Code",
       Boolean(overrideField("Model")) && Boolean(overrideField("Effort")) && Boolean(overrideField("Advisor model")));
-    await change(overrideField("Model"), "opus 4");
-    check("a model that is not a model name closes the gate, by name, instead of being dropped",
-      sheet().querySelector(".gate").textContent.includes("“opus 4” is not a model name"));
-    await change(overrideField("Model"), "opus");
+    // Claude Code's model is chosen from its aliases, so an id that is not a
+    // model name cannot be entered at all: the select has no option to hold it.
+    await change(overrideField("Model"), "opus 4", "change");
+    const modelOptions = [...(overrideField("Model")?.options ?? [])].map(option => option.value);
+    check("Claude Code's model is chosen from its aliases, so a model that is not a model name cannot be entered",
+      overrideField("Model")?.tagName === "SELECT" && modelOptions.includes("opus") && !modelOptions.includes("opus 4")
+      && overrideField("Model").value === "" && !sheet().querySelector(".gate").textContent.includes("opus 4"));
+    await change(overrideField("Model"), "opus", "change");
     await change(overrideField("Effort"), "high", "change");
     const preparedBefore = preparedRuns.length;
     const launchClaude = [...sheet().querySelectorAll("button")].find(el => el.textContent.trim().startsWith("Launch in"));

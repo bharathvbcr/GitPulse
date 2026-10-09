@@ -52,6 +52,9 @@
         if(loseDecision){loseDecision=false;throw {code:"transport_error",message:"Decision committed; fixture reply lost"};}
         return receipt;
       }
+      // A fixture checkout is its own repository: its Git directory sits
+      // inside it, and nothing shares its common directory.
+      if (args.method === "runs.checkout_identity") return JSON.stringify({ok:true,cwd:input.repo_path,git_dir:`${input.repo_path}/.git`,git_common_dir:`${input.repo_path}/.git`});
       if (args.method === "items.get") return record(task);
       if (args.method === "repositories.get") return record(repository);
       if (args.method === "runs.list") {
@@ -372,12 +375,12 @@
       await openLaunchForm();
       const launchModel=()=>document.querySelector('[data-testid="handoff-model-override"] [aria-label="Model"]');
       check("The Agent pane offers a model for this launch",!!launchModel());
-      launchModel().value="opus";launchModel().dispatchEvent(new Event("input",{bubbles:true}));await pause(30);
+      launchModel().value="opus";launchModel().dispatchEvent(new Event("change",{bubbles:true}));await pause(30);
       const spawnsBeforeModel=report.taskSpawns;
       button("Launch in Claude Code").click();await wait(()=>report.taskSpawns===spawnsBeforeModel+1);
-      check("The launch carries the typed model as this attempt's model_choice",JSON.parse(preparations.at(-1)).model_choice?.model==="opus");
+      check("The launch carries the chosen model as this attempt's model_choice",JSON.parse(preparations.at(-1)).model_choice?.model==="opus");
       await openLaunchForm();
-      check("The typed model is cleared once that launch is accepted",launchModel()?.value==="");
+      check("The chosen model is cleared once that launch is accepted",launchModel()?.value==="");
       await finish();button("Refresh").click();await pause(100);
       await openLaunchForm();seg("Connection","Managed").click();await pause(30);
       button("Start managed Claude Code").click();await wait(()=>document.body.textContent.includes("Managed launch reply lost"));

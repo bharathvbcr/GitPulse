@@ -111,8 +111,13 @@ describe("the agent handoff has one implementation", () => {
     // press minted a new identity for what may already be a committed run.
     expect(form).toContain("let pending = $state<RunPreparation | null>(untrack(() => pendingPreparationFor(taskId)));");
     const launch = form.slice(form.indexOf("export async function launch()"));
-    expect(launch.indexOf("holdPendingPreparation(pending)")).toBeGreaterThan(-1);
-    expect(launch.indexOf("holdPendingPreparation(pending)")).toBeLessThan(launch.indexOf("prepareTaskRun(preparation)"));
+    // Held as the plain object, before it becomes state: `$state` deep-proxies
+    // it, and structuredClone throws on a proxy, which failed every launch.
+    expect(launch.indexOf("holdPendingPreparation(prepared);\n        pending = prepared;")).toBeGreaterThan(-1);
+    expect(launch.indexOf("holdPendingPreparation(prepared)")).toBeLessThan(launch.indexOf("prepareTaskRun(preparation)"));
+    expect(launch).not.toContain("holdPendingPreparation(pending)");
+    // A restored copy lets go once another form settles the hold.
+    expect(form).toMatch(/\$pendingPreparationsChanged;\s*untrack\(\(\) => \{\s*if \(!pending \|\| busy \|\| pendingPreparationFor\(pending\.task_id\)\?\.id === pending\.id\) return;\s*pending = null;/);
     expect(launch).toContain("releasePendingPreparation(preparation.task_id, preparation.id);\n      pending = null;");
     // A settled refusal is released even when it lands after the form is gone.
     const handler = launch.slice(launch.indexOf("} catch (cause) {"));

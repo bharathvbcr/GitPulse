@@ -51,6 +51,7 @@
     NO_MODEL_OVERRIDE,
     normalizeCheckout,
     pendingPreparationFor,
+    pendingPreparationsChanged,
     preferredCheckout,
     reconcileHandoff,
     releasePendingPreparation,
@@ -123,6 +124,18 @@
   let note = $state("");
   /** Restored for this task when an earlier form's preparation is still unanswered: closing a sheet must not forget it. */
   let pending = $state<RunPreparation | null>(untrack(() => pendingPreparationFor(taskId)));
+  // A restored preparation can be settled by the form that sent it — the one
+  // a remount destroyed while the store was answering. Once the hold no longer
+  // names it, it is not this form's to retry: the attempt is listed (or was
+  // refused) and the checkout's occupancy has changed.
+  $effect(() => {
+    $pendingPreparationsChanged;
+    untrack(() => {
+      if (!pending || busy || pendingPreparationFor(pending.task_id)?.id === pending.id) return;
+      pending = null;
+      void loadHolding(selected);
+    });
+  });
   /** This launch's model, over the saved default. Not remembered: the next launch starts from the default again. */
   let modelOverride = $state<ModelOverride>({ ...NO_MODEL_OVERRIDE });
   let disposed = false;
@@ -304,7 +317,7 @@
         // The host makes the worktree, inside the same step that prepares the
         // attempt, and removes it again if the attempt is refused.
         if (useWorktree) note = "Creating a worktree and running this repository's setup. A dependency install can take several minutes; the attempt appears here when it is ready.";
-        pending = {
+        const prepared: RunPreparation = {
           kind: settings.kind,
           id: newID(),
           request_id: newID(),
@@ -319,7 +332,10 @@
           acknowledge_bypass: acknowledged,
           ...(model.choice ? { model_choice: model.choice } : {}),
         };
-        holdPendingPreparation(pending);
+        // Held before it becomes state: `$state` deep-proxies the object, and
+        // a proxy cannot be structuredClone'd into the hold.
+        holdPendingPreparation(prepared);
+        pending = prepared;
       }
       const preparation = pending;
       preparing?.({ id: preparation.id, provider: preparation.provider, kind: preparation.kind ?? "external_terminal", worktree: preparation.worktree === true });

@@ -30,6 +30,7 @@
 import { asAgentProvider, PERMISSION_MODES, PROVIDER_LABELS, supportsManaged, type AgentProvider, type PermissionMode, type RunKind } from "./vocabulary";
 import { identityCommonDir, tabMatchesRegistered, type OpenTabRef, type RegisteredRef } from "./openMembership";
 import { identityKey, normalizeRepoPath, type PathIdentityOptions } from "../repos/paths";
+import { writable, type Readable } from "svelte/store";
 import type { RunPreparation } from "./client";
 import { HANDOFF_MODEL_CHOICES, MODEL_FIELDS, MODEL_FIELDS_BY_LAUNCHER, isEffortLevel, isModelId, type ModelChoice } from "../terminal/agentDefaults";
 
@@ -352,6 +353,14 @@ export function launchModelOverride(
 const pendingPreparations = new Map<string, RunPreparation>();
 /** Far above the tasks one person launches at once; the oldest goes first. */
 export const MAX_PENDING_PREPARATIONS = 64;
+const pendingRevision = writable(0);
+/**
+ * Changes whenever a preparation is held or released. A form that restored a
+ * held copy is not the form the store answers: when the pane remounts mid-call
+ * the answer reaches the form that sent it, which is gone, and releases the
+ * hold there. Watching this is how the restored copy learns it was settled.
+ */
+export const pendingPreparationsChanged: Readable<number> = { subscribe: pendingRevision.subscribe };
 
 /** The unknown-outcome preparation held for `taskId`, as a copy, or null. */
 export function pendingPreparationFor(taskId: string): RunPreparation | null {
@@ -368,6 +377,7 @@ export function holdPendingPreparation(preparation: RunPreparation): void {
     if (oldest.done) break;
     pendingPreparations.delete(oldest.value);
   }
+  pendingRevision.update((n) => n + 1);
 }
 
 /**
@@ -375,7 +385,8 @@ export function holdPendingPreparation(preparation: RunPreparation): void {
  * so a form settling an older attempt cannot drop a newer one.
  */
 export function releasePendingPreparation(taskId: string, id?: string): void {
-  if (id === undefined || pendingPreparations.get(taskId)?.id === id) pendingPreparations.delete(taskId);
+  if (id !== undefined && pendingPreparations.get(taskId)?.id !== id) return;
+  if (pendingPreparations.delete(taskId)) pendingRevision.update((n) => n + 1);
 }
 
 /** Short, non-repeating state word for a run row. */

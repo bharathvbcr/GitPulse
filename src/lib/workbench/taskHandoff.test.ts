@@ -10,6 +10,7 @@ import {
   holdPendingPreparation,
   MAX_PENDING_PREPARATIONS,
   pendingPreparationFor,
+  pendingPreparationsChanged,
   releasePendingPreparation,
   isAgentProvider,
   launchModelOverride,
@@ -519,6 +520,27 @@ describe("a preparation whose outcome is unknown", () => {
     if (!read) throw new Error("expected a held preparation");
     read.repo_path = "/elsewhere";
     expect(pendingPreparationFor("t1")?.repo_path).toBe("/work/a");
+  });
+
+  it("signals every hold and release, so a form showing a restored copy sees another form settle it", () => {
+    // The pane remounts while the store is answering: the new form restores
+    // the hold, and the form that sent it — gone — is the one the answer
+    // reaches. Without a signal the new form keeps offering a retry of an
+    // attempt that is already running.
+    const seen: number[] = [];
+    const stop = pendingPreparationsChanged.subscribe((revision) => seen.push(revision));
+    try {
+      hold(preparation("t1"));
+      const restored = pendingPreparationFor("t1");
+      releasePendingPreparation("t1", "someone-else");
+      expect(seen).toHaveLength(2); // the subscription's first value, then the hold; a no-op release is silent
+      releasePendingPreparation("t1", restored?.id);
+      expect(seen).toHaveLength(3);
+      expect(new Set(seen).size).toBe(3);
+      expect(pendingPreparationFor("t1")).toBeNull();
+    } finally {
+      stop();
+    }
   });
 
   it("is released only for the attempt it names", () => {
