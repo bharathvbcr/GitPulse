@@ -22,8 +22,8 @@ use crate::analyzer::cargo_supply::{
 };
 use crate::analyzer::language::LanguageDetector;
 use crate::engine::git_cli::{
-    capture_command_with_env, classify_tool_probe, git_text, resolve_spawn_program_with,
-    sandbox_join, sandbox_join_canonical, validate_repo, CapturedOutput, ToolProbe,
+    capture_command_with_env, classify_tool_probe, git_text, resolve_spawn_program_in,
+    sandbox_join, sandbox_join_canonical, validate_repo, CapturedOutput, PathSource, ToolProbe,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -268,11 +268,15 @@ pub struct ScanOptions {
     /// still runs. Tests use this so a missing lockfile does not hit the registry.
     pub run_cli: bool,
     /// Test seam: when set, replaces the process `PATH` for every probe and
-    /// spawn this scan performs, so a GUI-minimal launch environment can be
-    /// simulated without mutating process state. `None` inherits the real
-    /// environment (app behavior).
+    /// spawn this scan performs, and is the whole search path — the GUI-launch
+    /// fallback dirs are not added to it, so a tool absent from it is absent.
+    /// `None` inherits the real environment, fallback dirs included (app
+    /// behavior).
     pub path_var: Option<std::ffi::OsString>,
-    /// Test seam: same contract as [`ScanOptions::path_var`] for `HOME`.
+    /// Test seam: when set, replaces the process `HOME` for every probe and
+    /// spawn this scan performs. Under an inherited PATH it also roots the
+    /// home-relative fallback dirs (`~/.cargo/bin`, `~/go/bin`, …); under an
+    /// explicit [`ScanOptions::path_var`] no fallback dir is searched.
     pub home: Option<std::ffi::OsString>,
 }
 
@@ -295,6 +299,9 @@ impl Default for ScanOptions {
 #[derive(Debug, Clone)]
 struct ScanEnv {
     path_var: Option<std::ffi::OsString>,
+    /// Whether `path_var` is the override or the process value; only the
+    /// latter is widened by the GUI-launch fallback dirs.
+    path_source: PathSource,
     home: Option<std::ffi::OsString>,
 }
 
@@ -302,11 +309,13 @@ impl ScanEnv {
     /// Environment view implied by the options: an override wins wholesale,
     /// otherwise the process value is used as-is (`None` stays `None`).
     fn from_options(options: &ScanOptions) -> Self {
+        let (path_var, path_source) = match &options.path_var {
+            Some(path_var) => (Some(path_var.clone()), PathSource::Explicit),
+            None => (std::env::var_os("PATH"), PathSource::Inherited),
+        };
         Self {
-            path_var: options
-                .path_var
-                .clone()
-                .or_else(|| std::env::var_os("PATH")),
+            path_var,
+            path_source,
             home: options
                 .home
                 .clone()
@@ -2176,8 +2185,12 @@ fn npm_missing_message(npm_probe: &ToolProbe, node_probe: &ToolProbe, env: &Scan
             // Resolution re-runs the same PATH/fallback lookup the successful
             // spawn would have used; a bare-name passthrough means no absolute
             // location is known, and the message simply omits it.
-            let resolved =
-                resolve_spawn_program_with(npm_program(), env.path(), env.home());
+            let resolved = resolve_spawn_program_in(
+                npm_program(),
+                env.path(),
+                env.home(),
+                env.path_source,
+            );
             let location = if resolved.contains('/') || resolved.contains('\\') {
                 format!(" at {resolved}")
             } else {
@@ -2219,6 +2232,7 @@ fn capture_scanner_command(
         extra_env,
         env.path(),
         env.home(),
+        env.path_source,
     )
 }
 
@@ -5662,6 +5676,65 @@ not-json-at-all
         assert!(!report.audit_complete);
     }
 
+    /// An explicit `path_var` is the whole search path. The GUI-launch
+    /// fallback dirs exist for an *inherited* minimal PATH; searched under a
+    /// caller's PATH they made the seam leak, so a test that hid cargo-deny
+    /// still saw `/opt/homebrew/bin/cargo-deny` on any host that had one.
+    /// The tool sits in `~/.cargo/bin` of a scratch HOME — a fallback dir the
+    /// seam itself controls — so this holds on every host.
+    #[cfg(unix)]
+    #[test]
+    fn an_explicit_path_var_is_not_widened_by_gui_fallback_dirs() {
+        let repo = git_repo();
+        write(repo.path(), "Cargo.lock", "# generated\nversion = 3\n");
+        write(
+            repo.path(),
+            "Cargo.toml",
+            "[package]\nname = \"demo\"\nversion = \"1.0.0\"\n",
+        );
+        write(repo.path(), "deny.toml", "[advisories]\n");
+        git_add(repo.path(), "Cargo.lock");
+        git_add(repo.path(), "Cargo.toml");
+        git_add(repo.path(), "deny.toml");
+        let home = TempDir::new().unwrap();
+        let cargo_bin = home.path().join(".cargo/bin");
+        fs::create_dir_all(&cargo_bin).unwrap();
+        let deny_log = home.path().join("cargo-deny-argv");
+        write_exec(
+            &cargo_bin,
+            "cargo-deny",
+            &format!(
+                "#!/bin/sh\necho \"$*\" >> {}\necho 'cargo-deny 0.20.2'\nexit 0\n",
+                deny_log.display()
+            ),
+        );
+        let stubs = TempDir::new().unwrap();
+        write_exec(
+            stubs.path(),
+            "cargo-audit",
+            "#!/bin/sh\nif [ \"$2\" = --version ]; then echo 'cargo-audit 0.22.0'; exit 0; fi\necho '{\"vulnerabilities\":{\"list\":[]},\"warnings\":{}}'\nexit 0\n",
+        );
+        let path_var =
+            std::env::join_paths([stubs.path(), Path::new("/usr/bin"), Path::new("/bin")]).unwrap();
+        let report = DepsScanner::scan_with(
+            repo.path().to_str().unwrap(),
+            ScanOptions {
+                run_cli: true,
+                path_var: Some(path_var),
+                home: Some(home.path().as_os_str().to_owned()),
+            },
+        )
+        .expect("scan");
+        assert!(report.cargo_audit_present);
+        assert!(
+            !deny_log.exists(),
+            "cargo-deny outside the explicit PATH was spawned: {}",
+            fs::read_to_string(&deny_log).unwrap_or_default()
+        );
+        assert!(!report.cargo_deny_present);
+        assert!(!report.audit_complete);
+    }
+
     /// `cargo crev verify` creates an identity when none exists. A Health scan
     /// must not be that write.
     #[cfg(unix)]
@@ -6108,6 +6181,7 @@ not-json-at-all
     fn npm_missing_message_matches_resolution_truth() {
         let env = ScanEnv {
             path_var: None,
+            path_source: PathSource::Inherited,
             home: None,
         };
         let broken = ToolProbe::FoundButFailed("env: node: No such file or directory".to_string());
@@ -6146,6 +6220,7 @@ not-json-at-all
         write_exec(dir.path(), "gitpulse-silent-probe", "#!/bin/sh\nexit 0\n");
         let silent_env = ScanEnv {
             path_var: Some(dir.path().as_os_str().to_os_string()),
+            path_source: PathSource::Explicit,
             home: None,
         };
         match probe_tool_version(
@@ -6169,6 +6244,7 @@ not-json-at-all
         );
         let slow_env = ScanEnv {
             path_var: Some(dir.path().as_os_str().to_os_string()),
+            path_source: PathSource::Explicit,
             home: None,
         };
         match probe_tool_version(
@@ -6191,6 +6267,7 @@ not-json-at-all
     fn probe_reports_not_found_with_spawn_error_text() {
         let env = ScanEnv {
             path_var: Some(std::ffi::OsString::new()),
+            path_source: PathSource::Explicit,
             home: None,
         };
         match probe_tool_version(
