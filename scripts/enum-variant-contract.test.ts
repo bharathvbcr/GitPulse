@@ -51,6 +51,10 @@ const NO_TS_MIRROR = new Map<string, string>([
     "ConfigPathStaleReason",
     "ToolConfigView.stale.reason is typed as string in TS; the UI does not branch on the variant",
   ],
+  [
+    "Request",
+    "desktop::instance wire type: a second GitPulse launch sends it to the running owner over the profile's unix socket; both ends are Rust, and it never reaches the frontend",
+  ],
 ]);
 
 /** serde's rename_all, for the rules this repo uses. */
