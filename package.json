@@ -47,6 +47,7 @@
     "gusset:check": "node scripts/gusset-check.mjs",
     "vendor": "node scripts/vendor-crates.mjs",
     "vendor:check": "node scripts/vendor-crates.mjs --check",
+    "check:vendor-edits": "node scripts/vendor-crates.mjs --check --allow-drift",
     "release:notes": "node scripts/release-notes.mjs",
     "release:ready": "node scripts/release-state.mjs ready",
     "ci:local": "node scripts/ci-local.mjs",

@@ -39,6 +39,14 @@
  *     never `matches`. A comparison that could not run must not read like one
  *     that ran and found nothing.
  *
+ * Bare `--check` fails on upstream drift alone, and that is deliberate: it
+ * answers "is this tree exactly what upstream would vendor now?", which is the
+ * question after `bun run vendor` (`bun run vendor:check`). It is not a gate.
+ * Upstream commits land independently of GitPulse, so a gate that failed on
+ * drift would turn red with no change here and teach everyone to ignore it.
+ * The gate is `--check --allow-drift` (`bun run check:vendor-edits`), run by
+ * CI and `ci:local` alike: a local edit fails it, drift is still printed.
+ *
  * Exit codes: 0 vendored / no drift · 1 drift or a local edit · 2 the run
  * could not complete.
  */

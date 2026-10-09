@@ -11,6 +11,20 @@ before that tag is pushed.
 
 ## [Unreleased]
 
+### Changed
+
+- CI now fails when a vendored crate is edited in this repository, through the
+  new `bun run check:vendor-edits` (`vendor-crates.mjs --check --allow-drift`),
+  which `ci:local` runs too. Upstream drift is still printed but never fails a
+  gate: DevCouncil commits land independently, so bare `vendor:check` stays the
+  check to run right after `bun run vendor`.
+
+### Fixed
+
+- The agentic workspaces plan no longer describes the flat graph export as
+  "generation 1". It records the real path, `.devcouncil/graph/code_graph.json`,
+  and how fresh each repository's export was on 2026-10-09.
+
 ## [1.4.0] - 2026-10-09
 
 Agents that start in the background with a pane showing every one at work,

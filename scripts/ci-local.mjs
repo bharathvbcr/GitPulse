@@ -53,12 +53,11 @@ const CARGO_MANIFEST = "src-tauri/Cargo.toml";
  */
 export const GATES = [
   {
-    id: "vendor-drift",
-    name: "Vendored crate drift",
-    program: "node",
-    args: ["scripts/vendor-crates.mjs", "--check", "--allow-drift"],
-    local: true,
-    why: "vendored sources are compared against upstream checkouts only a developer has",
+    id: "vendor-edits",
+    name: "Vendored crates unedited",
+    program: "bun",
+    args: ["run", "check:vendor-edits"],
+    why: "upstream drift is reported, not failed: it is a refresh signal, and failing on it would make every upstream commit break this gate",
   },
   {
     id: "vendor-schema",
