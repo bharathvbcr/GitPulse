@@ -1,0 +1,3 @@
+# Commits recorded under a test-fixture identity before the hooks refused one.
+# The real author of each is the repository owner; see .githooks/pre-push.
+BHARATH CHANDRA VADDARAM <bharath.vbcr@gmail.com> GitPulse Contract <contract@gitpulse.test>

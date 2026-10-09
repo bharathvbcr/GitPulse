@@ -114,9 +114,12 @@ describe("pre-push release hook", () => {
   it.skipIf(!hasBash)("lets a branch push through untouched", () => {
     // A hook that blocks ordinary pushes gets uninstalled, and then guards
     // nothing at all.
-    const result = execFileSync("bash", [".githooks/pre-push"], {
+    // The hook lists the commits a push would add, so the input names a commit
+    // this checkout has; pushing a branch to its own tip adds none.
+    const head = execFileSync("git", ["rev-parse", "HEAD"], { cwd: REPO_ROOT, encoding: "utf8" }).trim();
+    const result = execFileSync("bash", [".githooks/pre-push", "origin", "unused-url"], {
       cwd: REPO_ROOT,
-      input: `refs/heads/main ${"a".repeat(40)} refs/heads/main ${"b".repeat(40)}\n`,
+      input: `refs/heads/main ${head} refs/heads/main ${head}\n`,
       encoding: "utf8",
     });
     expect(result).toBe("");

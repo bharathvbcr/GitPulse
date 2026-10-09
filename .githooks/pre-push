@@ -1,6 +1,14 @@
 #!/usr/bin/env bash
 #
-# Refuse a release tag that would publish a tree nobody meant to ship.
+# Refuse a push that would publish a commit authored by a test fixture, and a
+# release tag that would publish a tree nobody meant to ship.
+#
+# The pre-commit hook refuses a fixture identity, but only `git commit` runs
+# it. A merge, cherry-pick, rebase or `commit-tree`, or a commit made before
+# the hook existed, reaches the branch without it — which is how eleven commits
+# authored as contract@gitpulse.test were pushed to main. This hook is the one
+# place every such commit passes, so it checks each commit the push would add
+# to the remote: author and committer, merges included.
 #
 # `.github/workflows/release.yml` triggers on `push: tags: v*`, checks the tag
 # out, and builds THAT tree. Every gate it runs — the version manifests, the
@@ -25,6 +33,10 @@
 
 set -euo pipefail
 
+# shellcheck source-path=SCRIPTDIR source=lib/fixture-identity.sh
+. "$(dirname "$0")/lib/fixture-identity.sh"
+
+remote=${1:-}
 repo_root=$(git rev-parse --show-toplevel)
 zero=$(git hash-object --stdin </dev/null | tr '0-9a-f' '0')
 head_sha=$(git rev-parse HEAD)
@@ -35,9 +47,56 @@ fail() {
   status=1
 }
 
-while read -r local_ref local_sha _remote_ref _remote_sha; do
+# Lists the commits this push would add to the remote, as `sha author committer`.
+# Anything any remote-tracking ref of this remote already holds is excluded, and
+# so is the ref's own remote tip, which covers a push to a bare URL. A commit
+# the remote already has is not this push's to refuse.
+outgoing_identities() {
+  local local_sha=$1 remote_sha=$2
+  local -a exclude=()
+  [ -n "$remote" ] && exclude+=("--remotes=$remote")
+  if [ "$remote_sha" != "$zero" ] && git cat-file -e "$remote_sha^{commit}" 2>/dev/null; then
+    exclude+=("$remote_sha")
+  fi
+  git log --format='%H %ae %ce' "$local_sha" --not ${exclude[@]+"${exclude[@]}"} --
+}
+
+# Fails closed: a range that could not be listed is reported, never treated as
+# a range with no fixture commits in it.
+check_identities() {
+  local local_ref=$1 local_sha=$2 remote_sha=$3
+  local listing sha author committer email
+  local -a found=()
+  if ! listing=$(outgoing_identities "$local_sha" "$remote_sha" 2>&1); then
+    fail "could not list the commits $local_ref would push, so their authors were not checked:
+        $listing"
+    return
+  fi
+  while read -r sha author committer; do
+    [ -n "$sha" ] || continue
+    for email in "$author" "$committer"; do
+      email=$(printf '%s' "$email" | tr '[:upper:]' '[:lower:]')
+      if is_fixture_email "$email"; then
+        found+=("$(git rev-parse --short "$sha") <$email>")
+        break
+      fi
+    done
+  done <<<"$listing"
+  [ "${#found[@]}" -eq 0 ] && return
+  local shown=("${found[@]:0:20}")
+  fail "$local_ref would push ${#found[@]} commit(s) authored or committed as a test fixture:
+$(printf '        %s\n' "${shown[@]}")$([ "${#found[@]}" -gt 20 ] && printf '        … and %d more\n' $((${#found[@]} - 20)))
+        Those addresses are not people; the commits would be attributed to the fixture.
+        Re-author them before pushing, for example:
+          git rebase -r --exec 'git commit --amend --no-edit --no-verify --reset-author' <base>
+        and unset any local override:  git config --local --unset-all user.email
+        Push them deliberately anyway with:  git push --no-verify"
+}
+
+while read -r local_ref local_sha _remote_ref remote_sha; do
   # A deletion pushes the zero oid; there is nothing to build.
   [ "$local_sha" = "$zero" ] && continue
+  check_identities "$local_ref" "$local_sha" "$remote_sha"
   case "$local_ref" in
     refs/tags/v*) ;;
     *) continue ;;

@@ -705,7 +705,8 @@ impl GitWriter {
     /// throwaway repository. Reserved DNS names (`.test`, `.invalid`,
     /// `example.com`) and the local fixture addresses this repo actually uses.
     ///
-    /// Keep the rule in lockstep with `.githooks/pre-commit`. A checkout of
+    /// Keep the rule in lockstep with `.githooks/lib/fixture-identity.sh`,
+    /// which the commit, merge and push hooks share. A checkout of
     /// this project refuses these on commit; a fixture repository does not,
     /// because it has no `.githooks/pre-commit`.
     pub(crate) fn is_fixture_author_email(email: &str) -> bool {
