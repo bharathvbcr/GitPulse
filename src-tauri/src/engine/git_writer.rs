@@ -702,23 +702,32 @@ impl GitWriter {
     }
 
     /// True when `email` is an address that exists so a fixture can commit in a
-    /// throwaway repository. Reserved DNS names (`.test`, `.invalid`,
-    /// `example.com`) and the local fixture addresses this repo actually uses.
+    /// throwaway repository — reserved DNS names (`.test`, `.invalid`,
+    /// `example.com`) and the local fixture addresses this repo actually uses —
+    /// or is not an address at all: empty, without an `@`, with nothing on
+    /// either side of its last `@`, or longer than the 254 characters an SMTP
+    /// path allows (in bytes). Neither kind is a person, so both are refused rather than
+    /// recorded. Case and surrounding space are ignored.
     ///
-    /// Keep the rule in lockstep with `.githooks/lib/fixture-identity.sh`,
-    /// which the commit, merge and push hooks share. A checkout of
-    /// this project refuses these on commit; a fixture repository does not,
-    /// because it has no `.githooks/pre-commit`.
+    /// `is_fixture_email` in `.githooks/lib/fixture-identity.sh` is the same
+    /// rule for the commit, merge and push hooks; both are tested against
+    /// `.githooks/lib/fixture-identity.cases`. A checkout of this project
+    /// refuses these on commit; a fixture repository does not, because it has
+    /// no `.githooks/pre-commit`.
     pub(crate) fn is_fixture_author_email(email: &str) -> bool {
-        let email = email.trim().to_ascii_lowercase();
-        if email.is_empty() || email.len() > 320 {
-            return false;
+        // Bytes and ASCII case, as the shell rule counts and folds them: the
+        // reserved names are ASCII, and an SMTP path's limit is in octets.
+        let email = email
+            .trim_matches(|c: char| c.is_ascii_whitespace())
+            .to_ascii_lowercase();
+        if email.len() > 254 {
+            return true;
         }
         let Some((local, domain)) = email.rsplit_once('@') else {
-            return false;
+            return true;
         };
         if local.is_empty() || domain.is_empty() {
-            return false;
+            return true;
         }
         domain == "test"
             || domain.ends_with(".test")
@@ -1180,6 +1189,7 @@ Unset the local override with `git config --local --unset-all user.name` and \
         if steps.is_empty() {
             return Err("Rebase sequence is empty".into());
         }
+        Self::refuse_fixture_identity(&repo, false)?;
         if let Some(first) = steps.first() {
             if matches!(
                 first.action,
@@ -1427,6 +1437,9 @@ Unset the local override with `git config --local --unset-all user.name` and \
         let _guard = _repo_lock
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // A pull that does not fast-forward records a merge or replays local
+        // commits, and either one writes the configured identity.
+        Self::refuse_fixture_identity(&repo, false)?;
         git_text_network(&repo, &Self::pull_argv(remote, branch, rebase))
     }
 
@@ -1544,6 +1557,10 @@ Unset the local override with `git config --local --unset-all user.name` and \
                 })
                 .map_err(SquashFailure::into_message);
         }
+        // Only a fast-forward-only merge is guaranteed to write no commit.
+        if mode != MergeMode::FfOnly {
+            Self::refuse_fixture_identity(&repo, false)?;
+        }
         let argv = Self::merge_argv(branch_name, mode);
         gate(&argv)?;
         git_text(&repo, &argv)
@@ -1561,6 +1578,7 @@ Unset the local override with `git config --local --unset-all user.name` and \
         // Checked first: once the merge has staged the squash, a missing
         // identity would leave it stranded in the index.
         Self::require_identity(repo).map_err(SquashFailure::Merge)?;
+        Self::refuse_fixture_identity(repo, false).map_err(SquashFailure::Merge)?;
         let merge = Self::merge_argv(branch, MergeMode::Squash);
         gate(&merge).map_err(SquashFailure::Merge)?;
         git_text(repo, &merge).map_err(SquashFailure::Merge)?;
@@ -1690,6 +1708,8 @@ Unset the local override with `git config --local --unset-all user.name` and \
                 "Working tree has uncommitted changes; commit or stash before restacking".into(),
             );
         }
+        // A rebase re-commits every replayed commit as the configured committer.
+        Self::refuse_fixture_identity(repo_canon, false)?;
 
         // symbolic-ref fails on detached HEAD; then there is no branch to restore.
         let original_head = git_text(repo_canon, &["symbolic-ref", "--quiet", "HEAD"])
@@ -1779,6 +1799,10 @@ Unset the local override with `git config --local --unset-all user.name` and \
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         validate_ref_name(tag_name)?;
+        // An annotated tag records the configured identity as its tagger.
+        if message.is_some() {
+            Self::refuse_fixture_identity(&repo, false)?;
+        }
         let mut args = vec!["tag"];
         if let Some(msg) = message {
             args.push("-a");
@@ -1973,6 +1997,11 @@ Unset the local override with `git config --local --unset-all user.name` and \
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         Self::refuse_if_parked(&repo, subcommand)?;
+        // A replayed commit keeps its author but records the configured
+        // committer; `--no-commit` records nothing.
+        if !no_commit {
+            Self::refuse_fixture_identity(&repo, false)?;
+        }
         let argv = Self::replay_argv(subcommand, commits, no_commit);
         git_text(&repo, &argv[1..])
     }
@@ -2616,33 +2645,42 @@ mod tests {
 
     #[test]
     fn fixture_email_matches_the_hook_denylist() {
-        for email in [
-            "contract@gitpulse.test",
-            "GitPulse@test.local",
-            "person@example.invalid",
-            "person@example.com",
-            "t@t",
-            "t@e.com",
-            "a@test",
-            "a@invalid",
-            "test@test.com",
-            "test@gitpulse.local",
-        ] {
-            assert!(
+        // The table the shell hooks are tested against too, so the two
+        // implementations cannot drift apart.
+        let table = include_str!("../../../.githooks/lib/fixture-identity.cases");
+        let mut checked = (0, 0);
+        for (number, line) in table.lines().enumerate() {
+            if line.starts_with('#') || line.is_empty() {
+                continue;
+            }
+            let (label, email) = line
+                .split_once('\t')
+                .unwrap_or_else(|| panic!("fixture-identity.cases:{}: no tab", number + 1));
+            let email = email
+                .strip_prefix('"')
+                .and_then(|quoted| quoted.strip_suffix('"'))
+                .unwrap_or(email);
+            let expected = match label {
+                "fixture" => true,
+                "person" => false,
+                other => panic!("fixture-identity.cases:{}: label {other:?}", number + 1),
+            };
+            assert_eq!(
                 GitWriter::is_fixture_author_email(email),
-                "{email} must be a fixture address"
+                expected,
+                "fixture-identity.cases:{}: {email:?} must be a {label}",
+                number + 1
             );
+            if expected {
+                checked.0 += 1;
+            } else {
+                checked.1 += 1;
+            }
         }
-        for email in [
-            "ada@gitpulse.dev",
-            "bharath.vbcr@gmail.com",
-            "dev@github.com",
-        ] {
-            assert!(
-                !GitWriter::is_fixture_author_email(email),
-                "{email} must be committable"
-            );
-        }
+        assert!(
+            checked.0 >= 20 && checked.1 >= 10,
+            "the table must exercise both classes, read {checked:?}"
+        );
     }
 
     fn git_ok(dir: &std::path::Path, args: &[&str]) {
@@ -2754,6 +2792,187 @@ mod tests {
             String::from_utf8_lossy(&email.stdout).trim(),
             "contract@gitpulse.test"
         );
+    }
+
+    /// A guarded checkout whose history was written by a real identity, with a
+    /// `side` branch diverged from `main` by one commit each, and whose local
+    /// config now names the contract fixture. Returns the checkout and the
+    /// `side` tip.
+    fn guarded_checkout_with_a_fixture_identity() -> (tempfile::TempDir, String) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let real = |args: &[&str]| {
+            let mut full = vec!["-c", "user.name=Ada", "-c", "user.email=ada@gitpulse.dev"];
+            full.extend_from_slice(args);
+            git_ok(dir.path(), &full);
+        };
+        git_ok(dir.path(), &["init", "-q", "-b", "main"]);
+        git_ok(dir.path(), &["config", "commit.gpgsign", "false"]);
+        git_ok(dir.path(), &["config", "tag.gpgsign", "false"]);
+        std::fs::write(dir.path().join("base.txt"), "base\n").unwrap();
+        real(&["add", "--", "base.txt"]);
+        real(&["commit", "-q", "-m", "base"]);
+        real(&["switch", "-q", "-c", "side"]);
+        std::fs::write(dir.path().join("side.txt"), "side\n").unwrap();
+        real(&["add", "--", "side.txt"]);
+        real(&["commit", "-q", "-m", "side"]);
+        real(&["switch", "-q", "main"]);
+        std::fs::write(dir.path().join("main.txt"), "main\n").unwrap();
+        real(&["add", "--", "main.txt"]);
+        real(&["commit", "-q", "-m", "main"]);
+        // Ignored, so the guard marker leaves the tree clean for a rebase.
+        std::fs::write(dir.path().join(".git/info/exclude"), ".githooks/\n").unwrap();
+        mark_guarded(dir.path());
+        git_ok(dir.path(), &["config", "user.name", "GitPulse Contract"]);
+        git_ok(
+            dir.path(),
+            &["config", "user.email", "contract@gitpulse.test"],
+        );
+        crate::test_support::trust_repo(dir.path());
+        let side = git_stdout(dir.path(), &["rev-parse", "side"]);
+        (dir, side)
+    }
+
+    fn git_stdout(dir: &std::path::Path, args: &[&str]) -> String {
+        let output = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .output_locked()
+            .unwrap_or_else(|err| panic!("spawn git {}: {err}", args.join(" ")));
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    }
+
+    /// Every ref and HEAD, so a refused operation can be shown to have written
+    /// nothing.
+    fn refs_snapshot(dir: &std::path::Path) -> String {
+        format!(
+            "{}\n{}",
+            git_stdout(dir, &["rev-parse", "HEAD"]),
+            git_stdout(dir, &["for-each-ref", "--format=%(refname) %(objectname)"])
+        )
+    }
+
+    fn assert_refused(dir: &std::path::Path, what: &str, result: Result<String, String>) {
+        let err = result.expect_err(&format!("{what} must refuse the fixture identity"));
+        assert!(
+            err.contains("contract@gitpulse.test"),
+            "{what}: refusal must name the address, got {err}"
+        );
+        assert!(
+            git_stdout(dir, &["status", "--porcelain"]).is_empty(),
+            "{what}: a refused operation must leave the tree clean"
+        );
+    }
+
+    /// `git commit` is not the only command that records an identity. Each of
+    /// these writes the configured committer (or tagger) into a new object,
+    /// and before the guard reached them a fixture identity in this checkout's
+    /// config passed every one.
+    #[test]
+    fn every_writer_that_records_an_identity_refuses_a_fixture() {
+        let pass = &mut |_: &[&str]| Ok(());
+        for mode in [MergeMode::Default, MergeMode::NoFf, MergeMode::Squash] {
+            let (dir, _) = guarded_checkout_with_a_fixture_identity();
+            let before = refs_snapshot(dir.path());
+            let result = GitWriter::merge_branch(dir.path().to_str().unwrap(), "side", mode, pass);
+            assert_refused(dir.path(), &format!("merge {mode:?}"), result);
+            assert_eq!(
+                refs_snapshot(dir.path()),
+                before,
+                "merge {mode:?} wrote a ref"
+            );
+        }
+
+        let (dir, side) = guarded_checkout_with_a_fixture_identity();
+        let repo = dir.path().to_str().unwrap();
+        let before = refs_snapshot(dir.path());
+        assert_refused(
+            dir.path(),
+            "cherry-pick",
+            GitWriter::cherry_pick(repo, std::slice::from_ref(&side), false),
+        );
+        assert_refused(
+            dir.path(),
+            "revert",
+            GitWriter::revert(
+                repo,
+                &[git_stdout(dir.path(), &["rev-parse", "HEAD"])],
+                false,
+            ),
+        );
+        assert_refused(
+            dir.path(),
+            "annotated tag",
+            GitWriter::create_tag(repo, "v9.9.9", None, Some("release")).map(|()| String::new()),
+        );
+        assert_refused(
+            dir.path(),
+            "restack",
+            GitWriter::restack(repo, "side", "main"),
+        );
+        let base = git_stdout(dir.path(), &["rev-parse", "main~1"]);
+        let head = git_stdout(dir.path(), &["rev-parse", "main"]);
+        assert_refused(
+            dir.path(),
+            "interactive rebase",
+            GitWriter::execute_rebase_sequence(
+                repo,
+                &base,
+                // A plain pick: a reword would be caught by the commit it runs,
+                // and the pick alone is what re-commits as the configured
+                // committer.
+                &[RebaseStep {
+                    commit_id: head,
+                    action: RebaseActionKind::Pick,
+                }],
+            )
+            .map(|()| String::new()),
+        );
+        assert_eq!(
+            refs_snapshot(dir.path()),
+            before,
+            "a refused writer wrote a ref"
+        );
+    }
+
+    /// The guard refuses what records an identity, not every command near one:
+    /// a fast-forward, a lightweight tag and a `--no-commit` replay write no
+    /// identity and still work under the same config.
+    #[test]
+    fn writers_that_record_no_identity_still_run_under_a_fixture_config() {
+        let (dir, side) = guarded_checkout_with_a_fixture_identity();
+        let repo = dir.path().to_str().unwrap();
+        GitWriter::create_tag(repo, "light", None, None).expect("a lightweight tag has no tagger");
+        GitWriter::cherry_pick(repo, std::slice::from_ref(&side), true)
+            .expect("--no-commit records nothing");
+        git_ok(dir.path(), &["reset", "-q", "--hard"]);
+        git_ok(dir.path(), &["switch", "-q", "-c", "behind", "main~1"]);
+        let pass = &mut |_: &[&str]| Ok(());
+        GitWriter::merge_branch(repo, "main", MergeMode::FfOnly, pass)
+            .expect("a fast-forward records nothing");
+        assert_eq!(
+            git_stdout(dir.path(), &["rev-parse", "HEAD"]),
+            git_stdout(dir.path(), &["rev-parse", "main"])
+        );
+    }
+
+    #[test]
+    fn pull_refuses_a_fixture_identity_before_reaching_the_remote() {
+        let (dir, _) = guarded_checkout_with_a_fixture_identity();
+        // A remote that does not exist: a refusal must come before any fetch.
+        git_ok(
+            dir.path(),
+            &["remote", "add", "origin", "/nonexistent/gitpulse-remote"],
+        );
+        let before = refs_snapshot(dir.path());
+        let err = GitWriter::pull(
+            dir.path().to_str().unwrap(),
+            Some("origin"),
+            Some("main"),
+            None,
+        )
+        .expect_err("pull must refuse the fixture identity");
+        assert!(err.contains("contract@gitpulse.test"), "{err}");
+        assert_eq!(refs_snapshot(dir.path()), before);
     }
 
     #[test]

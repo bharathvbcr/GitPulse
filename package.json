@@ -22,6 +22,7 @@
     "check:coverage": "node scripts/check-coverage-floor.mjs",
     "check:workflows": "node scripts/check-workflows.mjs",
     "check:vendor-schema": "node scripts/check-vendor-schema.mjs",
+    "check:fixture-authors": "bash .githooks/lib/fixture-commits.sh",
     "mcp:install": "cargo install --path src-tauri --bin gitpulse-mcp --bin gitpulse-hook --locked --force && node scripts/record-install.mjs",
     "mcp:doctor": "node scripts/check-mcp-install.mjs",
     "gusset:check": "node scripts/gusset-check.mjs",

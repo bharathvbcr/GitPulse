@@ -7,7 +7,7 @@
  * The denylist matches `GitWriter::is_fixture_author_email`.
  */
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -270,5 +270,219 @@ describe.skipIf(!gitAvailable || !hasBash)("fixture author merge and push hooks"
     commitAs(dir, "r.txt", "ada@gitpulse.dev");
     const result = tryGit(dir, ["push", "origin", "main"]);
     expect(result.ok, result.stderr).toBe(true);
+  });
+});
+
+const LIB = join(HOOKS, "lib");
+
+/** Runs a command, returning its exit status and output instead of throwing. */
+function run(
+  cwd: string,
+  program: string,
+  args: string[],
+  input?: string,
+): { status: number; stdout: string; stderr: string } {
+  try {
+    const stdout = execFileSync(program, args, {
+      cwd,
+      encoding: "utf8",
+      env: envWithoutIdentity(),
+      input,
+      maxBuffer: 64 * 1024 * 1024,
+    });
+    return { status: 0, stdout, stderr: "" };
+  } catch (error) {
+    const e = error as { status?: number; stdout?: unknown; stderr?: unknown };
+    return { status: e.status ?? -1, stdout: String(e.stdout ?? ""), stderr: String(e.stderr ?? "") };
+  }
+}
+
+describe.skipIf(!hasBash)("the fixture address rule", () => {
+  it("agrees with every row of the table GitWriter is tested against", () => {
+    // fixture-identity.cases is read by GitWriter's Rust test too; this runs
+    // the shell rule over the same rows, so the two cannot drift apart.
+    const table = readFileSync(join(LIB, "fixture-identity.cases"), "utf8");
+    const rows = table
+      .split("\n")
+      .filter((line) => line !== "" && !line.startsWith("#"))
+      .map((line) => {
+        const tab = line.indexOf("\t");
+        expect(tab, `no tab in ${JSON.stringify(line)}`).toBeGreaterThan(0);
+        const raw = line.slice(tab + 1);
+        const quoted = raw.length >= 2 && raw.startsWith('"') && raw.endsWith('"');
+        return { label: line.slice(0, tab), email: quoted ? raw.slice(1, -1) : raw };
+      });
+    expect(rows.filter((row) => row.label === "fixture").length).toBeGreaterThanOrEqual(20);
+    expect(rows.filter((row) => row.label === "person").length).toBeGreaterThanOrEqual(10);
+    // The quoting is what keeps these rows alive through an editor.
+    expect(rows.some((row) => row.email === "")).toBe(true);
+    expect(rows.some((row) => row.email !== row.email.trim() && row.email.trim() !== "")).toBe(true);
+    // One shell for every row: each answer is printed on its own line.
+    const script = `. "${LIB}/fixture-identity.sh"
+while IFS= read -r email; do
+  if is_fixture_email "$email"; then echo fixture; else echo person; fi
+done`;
+    const result = run(REPO_ROOT, "bash", ["-c", script], rows.map((row) => row.email).join("\n") + "\n");
+    expect(result.status, result.stderr).toBe(0);
+    const answers = result.stdout.trimEnd().split("\n");
+    expect(answers.length).toBe(rows.length);
+    const wrong = rows
+      .map((row, i) => ({ ...row, got: answers[i] }))
+      .filter((row) => row.got !== row.label)
+      .map((row) => `${JSON.stringify(row.email)}: expected ${row.label}, got ${row.got}`);
+    expect(wrong).toEqual([]);
+  });
+});
+
+describe.skipIf(!gitAvailable || !hasBash)("fixture-commits.sh", () => {
+  const script = join(LIB, "fixture-commits.sh");
+
+  it("exits 0 for a clean range, 1 naming each fixture commit, 2 for a range it could not read", () => {
+    const dir = initPushed();
+    expect(run(dir, "bash", [script]).status).toBe(0);
+    const bad = commitAs(dir, "a.txt", "contract@gitpulse.test");
+    const found = run(dir, "bash", [script]);
+    expect(found.status).toBe(1);
+    expect(found.stdout).toBe(`${bad} <contract@gitpulse.test> <contract@gitpulse.test>\n`);
+    for (const args of [["no-such-rev"], ["HEAD", "no-such-rev"], ["--output=/tmp/gitpulse-x"], ["HEAD", "--all"]]) {
+      const result = run(dir, "bash", [script, ...args]);
+      expect(result.status, `${args.join(" ")} was read as a range`).toBe(2);
+      expect(result.stderr).toContain("is not a commit");
+    }
+  });
+
+  it("reads an address holding a space or a separator-like character as one field", () => {
+    const dir = initPushed();
+    commitAs(dir, "a.txt", "two words@ci.test");
+    commitAs(dir, "b.txt", "pipe|semi;colon@gitpulse.dev");
+    const result = run(dir, "bash", [script]);
+    expect(result.status).toBe(1);
+    expect(result.stdout).toContain("<two words@ci.test> <two words@ci.test>");
+    expect(result.stdout).not.toContain("gitpulse.dev");
+  });
+
+  it("checks merge commits, not only the commits they join", () => {
+    const dir = initPushed();
+    git(dir, ["switch", "-q", "-c", "side"]);
+    commitAs(dir, "s.txt", "ada@gitpulse.dev");
+    git(dir, ["switch", "-q", "main"]);
+    commitAs(dir, "m.txt", "ada@gitpulse.dev");
+    git(
+      dir,
+      ["merge", "--no-verify", "--no-ff", "-q", "-m", "merge", "side"],
+      envWithoutIdentity({
+        GIT_AUTHOR_NAME: "Contract",
+        GIT_AUTHOR_EMAIL: "contract@gitpulse.test",
+        GIT_COMMITTER_NAME: "Contract",
+        GIT_COMMITTER_EMAIL: "contract@gitpulse.test",
+      }),
+    );
+    const merge = git(dir, ["rev-parse", "--short", "HEAD"]).trim();
+    const result = run(dir, "bash", [script]);
+    expect(result.status).toBe(1);
+    expect(result.stdout.trim().split("\n")).toEqual([
+      `${merge} <contract@gitpulse.test> <contract@gitpulse.test>`,
+    ]);
+  });
+
+  it("finds the one fixture commit in a five-thousand-commit history, quickly", () => {
+    // fast-import writes the history in one process; the check walks all of it.
+    const dir = mkdtempSync(join(tmpdir(), "gitpulse-fixture-large-"));
+    dirs.push(dir);
+    git(dir, ["init", "-q", "-b", "main"]);
+    const total = 5000;
+    const planted = 3217;
+    let stream = "";
+    for (let i = 1; i <= total; i++) {
+      const who = i === planted ? "Contract <contract@gitpulse.test>" : `Dev ${i} <dev${i}@gitpulse.dev>`;
+      const message = `c${i}`;
+      stream += `commit refs/heads/main\nmark :${i}\nauthor ${who} ${1_700_000_000 + i} +0000\ncommitter Dev <dev@gitpulse.dev> ${1_700_000_000 + i} +0000\ndata ${message.length}\n${message}\n`;
+      if (i > 1) stream += `from :${i - 1}\n`;
+      stream += `M 644 inline f.txt\ndata ${String(i).length + 1}\n${i}\n\n`;
+    }
+    execFileSync("git", ["fast-import", "--quiet"], { cwd: dir, input: stream });
+    git(dir, ["reset", "-q", "--hard", "main"]);
+    const started = performance.now();
+    const result = run(dir, "bash", [script, "HEAD", "--remotes"]);
+    const elapsed = performance.now() - started;
+    expect(result.status).toBe(1);
+    const lines = result.stdout.trim().split("\n");
+    expect(lines).toHaveLength(1);
+    expect(git(dir, ["log", "-1", "--format=%s", lines[0].split(" ")[0]]).trim()).toBe(`c${planted}`);
+    expect(elapsed, `took ${Math.round(elapsed)} ms`).toBeLessThan(15_000);
+  });
+});
+
+describe.skipIf(!gitAvailable || !hasBash)("pre-push across remotes, tags and many refs", () => {
+  it("lets a published fixture commit reach a second remote", () => {
+    // Excluding only the pushed-to remote's refs would refuse every push to a
+    // new remote forever: the fixture commits published before the check
+    // existed are history now.
+    const dir = initPushed();
+    commitAs(dir, "old.txt", "contract@gitpulse.test");
+    git(dir, ["push", "-q", "--no-verify", "origin", "main"], envWithoutIdentity());
+    const mirror = mkdtempSync(join(tmpdir(), "gitpulse-fixture-mirror-"));
+    dirs.push(mirror);
+    git(mirror, ["init", "-q", "--bare"]);
+    git(dir, ["remote", "add", "mirror", mirror]);
+    const result = tryGit(dir, ["push", "mirror", "main"]);
+    expect(result.ok, result.stderr).toBe(true);
+  });
+
+  it("refuses an annotated tag whose tagger is a fixture, and allows one by a person", () => {
+    const dir = initPushed();
+    git(
+      dir,
+      ["tag", "-a", "fixture-tag", "-m", "t"],
+      envWithoutIdentity({ GIT_COMMITTER_NAME: "Contract", GIT_COMMITTER_EMAIL: "contract@gitpulse.test" }),
+    );
+    const refused = tryGit(dir, ["push", "origin", "refs/tags/fixture-tag"]);
+    expect(refused.ok, refused.stderr).toBe(false);
+    expect(refused.stderr).toContain("tagger is the test fixture <contract@gitpulse.test>");
+    git(dir, ["tag", "-a", "real-tag", "-m", "t"], envWithoutIdentity());
+    const allowed = tryGit(dir, ["push", "origin", "refs/tags/real-tag"]);
+    expect(allowed.ok, allowed.stderr).toBe(true);
+  });
+
+  it("names only the refs that carry a fixture commit when many are pushed at once", () => {
+    const dir = initPushed();
+    for (let i = 0; i < 40; i++) {
+      git(dir, ["branch", `b${i}`, "main"]);
+    }
+    git(dir, ["switch", "-q", "b17"]);
+    commitAs(dir, "x.txt", "contract@gitpulse.test");
+    git(dir, ["switch", "-q", "b31"]);
+    commitAs(dir, "y.txt", "ada@gitpulse.dev");
+    git(dir, ["switch", "-q", "main"]);
+    const result = tryGit(dir, ["push", "origin", "--all"]);
+    expect(result.ok).toBe(false);
+    expect(result.stderr).toContain("refs/heads/b17 would push 1 commit(s)");
+    expect(result.stderr.match(/would push/g)).toHaveLength(1);
+  });
+
+  it("lists twenty fixture commits and counts the rest", () => {
+    const dir = initPushed();
+    for (let i = 0; i < 25; i++) {
+      commitAs(dir, `f${i}.txt`, "contract@gitpulse.test");
+    }
+    const result = tryGit(dir, ["push", "origin", "main"]);
+    expect(result.ok).toBe(false);
+    expect(result.stderr).toContain("would push 25 commit(s)");
+    expect(result.stderr).toContain("… and 5 more");
+    expect(result.stderr.match(/<contract@gitpulse\.test> <contract@gitpulse\.test>/g)).toHaveLength(20);
+  });
+
+  it("refuses rather than passes when the pushed commit cannot be read", () => {
+    // A ref pointing at an object this repository does not have is not a
+    // range with no fixture commits in it.
+    const dir = initPushed();
+    const result = run(
+      dir,
+      "bash",
+      [join(HOOKS, "pre-push"), "origin", "unused"],
+      `refs/heads/main ${"1".repeat(40)} refs/heads/main ${"0".repeat(40)}\n`,
+    );
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain("could not list the commits refs/heads/main would push");
   });
 });

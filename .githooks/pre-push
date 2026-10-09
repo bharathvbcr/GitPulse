@@ -8,7 +8,8 @@
 # the hook existed, reaches the branch without it — which is how eleven commits
 # authored as contract@gitpulse.test were pushed to main. This hook is the one
 # place every such commit passes, so it checks each commit the push would add
-# to the remote: author and committer, merges included.
+# to the remote (author and committer, merges included) and the tagger of an
+# annotated tag, through lib/fixture-commits.sh, which CI runs as well.
 #
 # `.github/workflows/release.yml` triggers on `push: tags: v*`, checks the tag
 # out, and builds THAT tree. Every gate it runs — the version manifests, the
@@ -36,7 +37,7 @@ set -euo pipefail
 # shellcheck source-path=SCRIPTDIR source=lib/fixture-identity.sh
 . "$(dirname "$0")/lib/fixture-identity.sh"
 
-remote=${1:-}
+hooks_dir=$(dirname "$0")
 repo_root=$(git rev-parse --show-toplevel)
 zero=$(git hash-object --stdin </dev/null | tr '0-9a-f' '0')
 head_sha=$(git rev-parse HEAD)
@@ -47,50 +48,57 @@ fail() {
   status=1
 }
 
-# Lists the commits this push would add to the remote, as `sha author committer`.
-# Anything any remote-tracking ref of this remote already holds is excluded, and
-# so is the ref's own remote tip, which covers a push to a bare URL. A commit
-# the remote already has is not this push's to refuse.
-outgoing_identities() {
-  local local_sha=$1 remote_sha=$2
-  local -a exclude=()
-  [ -n "$remote" ] && exclude+=("--remotes=$remote")
+# Refuses a ref whose push would add a commit authored or committed as a test
+# fixture, or publish an annotated tag whose tagger is one.
+#
+# What the push adds is everything reachable from the new tip that no
+# remote-tracking ref of ANY remote holds, nor the ref's current remote tip. A
+# commit already published somewhere is not this push's to refuse: excluding
+# only this remote's refs would refuse every push to a new remote forever,
+# because the commits published before this check existed are still history.
+check_identities() {
+  local local_ref=$1 local_sha=$2 remote_sha=$3
+  local listing code=0
+  local -a exclude=(--remotes)
   if [ "$remote_sha" != "$zero" ] && git cat-file -e "$remote_sha^{commit}" 2>/dev/null; then
     exclude+=("$remote_sha")
   fi
-  git log --format='%H %ae %ce' "$local_sha" --not ${exclude[@]+"${exclude[@]}"} --
-}
-
-# Fails closed: a range that could not be listed is reported, never treated as
-# a range with no fixture commits in it.
-check_identities() {
-  local local_ref=$1 local_sha=$2 remote_sha=$3
-  local listing sha author committer email
-  local -a found=()
-  if ! listing=$(outgoing_identities "$local_sha" "$remote_sha" 2>&1); then
-    fail "could not list the commits $local_ref would push, so their authors were not checked:
-        $listing"
-    return
-  fi
-  while read -r sha author committer; do
-    [ -n "$sha" ] || continue
-    for email in "$author" "$committer"; do
-      email=$(printf '%s' "$email" | tr '[:upper:]' '[:lower:]')
-      if is_fixture_email "$email"; then
-        found+=("$(git rev-parse --short "$sha") <$email>")
-        break
-      fi
-    done
-  done <<<"$listing"
-  [ "${#found[@]}" -eq 0 ] && return
-  local shown=("${found[@]:0:20}")
-  fail "$local_ref would push ${#found[@]} commit(s) authored or committed as a test fixture:
-$(printf '        %s\n' "${shown[@]}")$([ "${#found[@]}" -gt 20 ] && printf '        … and %d more\n' $((${#found[@]} - 20)))
+  # Offending commits arrive on stdout and the reason for a failure on
+  # stderr; they are kept apart so a message line is never counted as a commit.
+  local errors
+  errors=$(mktemp "${TMPDIR:-/tmp}/gitpulse-pre-push.XXXXXX")
+  listing=$(bash "$hooks_dir/lib/fixture-commits.sh" "$local_sha" "${exclude[@]}" 2>"$errors") || code=$?
+  local reason
+  reason=$(cat "$errors")
+  rm -f "$errors"
+  case $code in
+    0) ;;
+    1)
+      local count
+      count=$(printf '%s\n' "$listing" | grep -c . || true)
+      fail "$local_ref would push $count commit(s) authored or committed as a test fixture:
+$(printf '%s\n' "$listing" | head -20 | sed 's/^/        /')$([ "$count" -gt 20 ] && printf '\n        … and %d more' $((count - 20)))
         Those addresses are not people; the commits would be attributed to the fixture.
         Re-author them before pushing, for example:
           git rebase -r --exec 'git commit --amend --no-edit --no-verify --reset-author' <base>
         and unset any local override:  git config --local --unset-all user.email
         Push them deliberately anyway with:  git push --no-verify"
+      ;;
+    *)
+      fail "could not list the commits $local_ref would push, so their authors were not checked:
+        ${reason:-fixture-commits.sh exited $code}"
+      ;;
+  esac
+
+  if [ "$(git cat-file -t "$local_sha" 2>/dev/null)" = "tag" ]; then
+    local tagger
+    tagger=$(git cat-file tag "$local_sha" | sed -n 's/^tagger .*<\([^<>]*\)>.*/\1/p' | head -1)
+    if is_fixture_email "$tagger"; then
+      fail "$local_ref is an annotated tag whose tagger is the test fixture <$tagger>.
+        Recreate it as yourself:  git tag -f -a ${local_ref#refs/tags/} <commit>
+        Push it deliberately anyway with:  git push --no-verify"
+    fi
+  fi
 }
 
 while read -r local_ref local_sha _remote_ref remote_sha; do
