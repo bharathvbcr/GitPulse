@@ -10,7 +10,12 @@
   <button onclick={() => { repositoryPath = "/fixture/GitPulse"; }}>GitPulse fixture</button>
   <button onclick={() => { repositoryPath = "/fixture/Manvi"; }}>Manvi fixture</button>
 </div>
-<TaskBoard {repositoryPath} acceptsOpenRequests={repositoryPath === null} />
+<!-- The same pane wrapper App.svelte gives the board. `.gp-pane` contains
+     layout and paint, which makes it the containing block of every
+     `position: fixed` descendant; a board mounted bare here hid that. -->
+<div class="gp-workspace flex-1 flex flex-col min-h-0 bg-background gp-pane">
+  <TaskBoard {repositoryPath} acceptsOpenRequests={repositoryPath === null} />
+</div>
 <PromptModal />
 
 <style>
