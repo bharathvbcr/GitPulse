@@ -1,4 +1,5 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
+import type { RunPreparation } from "./client";
 import {
   MAX_CHECKOUT_LENGTH,
   checkoutBesideCommonDir,
@@ -6,9 +7,14 @@ import {
   defaultHandoff,
   describeHandoff,
   handoffGate,
+  holdPendingPreparation,
+  MAX_PENDING_PREPARATIONS,
+  pendingPreparationFor,
+  releasePendingPreparation,
   isAgentProvider,
   launchModelOverride,
   modelChoiceLabel,
+  modelOverrideChoices,
   modelOverrideFields,
   NO_MODEL_OVERRIDE,
   normalizeCheckout,
@@ -135,6 +141,23 @@ describe("normalizeCheckout", () => {
     expect(normalizeCheckout("x".repeat(MAX_CHECKOUT_LENGTH + 1))).toBe("");
     expect(normalizeCheckout(42)).toBe("");
     expect(normalizeCheckout(null)).toBe("");
+  });
+
+  it("refuses what the host refuses: a relative path, and a path over its byte budget", () => {
+    // The host requires an absolute path of at most 4096 bytes
+    // (`terminal_launch::valid_path`); the gate passing anything else only
+    // moved the refusal to a generic error after the reader pressed Launch.
+    for (const relative of ["repo", "./repo", "../repo", "~/code/repo", "C:repo", "work/GitPulse"]) {
+      expect(normalizeCheckout(relative), relative).toBe("");
+      expect(handoffGate({ checkout: relative, settings: defaultHandoff(), acknowledgedBypass: false, dirty: false, busy: false }).ok, relative).toBe(false);
+    }
+    for (const absolute of ["/work/GitPulse", "C:\\work\\GitPulse", "C:/work/GitPulse", "\\\\server\\share\\repo"]) {
+      expect(normalizeCheckout(absolute), absolute).toBe(absolute);
+    }
+    // 2048 two-byte characters plus "/" is 2049 UTF-16 units but 4097 bytes.
+    expect(normalizeCheckout("/" + "é".repeat(2048))).toBe("");
+    expect(normalizeCheckout("/" + "é".repeat(2047) + "x")).toBe("/" + "é".repeat(2047) + "x");
+    expect(normalizeCheckout("/" + "x".repeat(MAX_CHECKOUT_LENGTH - 1))).toBe("/" + "x".repeat(MAX_CHECKOUT_LENGTH - 1));
   });
 });
 
@@ -341,20 +364,70 @@ describe("attemptHolding", () => {
 
   it("names the attempt in this checkout, by identity, and ignores other checkouts", () => {
     const runs = [held("/work/Repo/.gitpulse/worktrees/a-1"), held("/work/Repo")];
-    expect(attemptHolding(runs, "/work/repo/", insensitive)?.cwd).toBe("/work/Repo");
-    expect(attemptHolding(runs, "/work/repo/.gitpulse/worktrees/a-1", insensitive)?.id).toBe("/work/Repo/.gitpulse/worktrees/a-1");
-    expect(attemptHolding(runs, "/work/repo/.gitpulse/worktrees/b-2", insensitive)).toBeNull();
-    expect(attemptHolding(runs, "", insensitive)).toBeNull();
+    expect(attemptHolding(runs, { path: "/work/repo/" }, insensitive)?.cwd).toBe("/work/Repo");
+    expect(attemptHolding(runs, { path: "/work/repo/.gitpulse/worktrees/a-1" }, insensitive)?.id).toBe("/work/Repo/.gitpulse/worktrees/a-1");
+    expect(attemptHolding(runs, { path: "/work/repo/.gitpulse/worktrees/b-2" }, insensitive)).toBeNull();
+    expect(attemptHolding(runs, { path: "" }, insensitive)).toBeNull();
   });
 
   it("does not count history or an expired preparation as occupying the checkout", () => {
     for (const state of ["exited", "failed", "cancelled"]) {
-      expect(attemptHolding([held("/r", state)], "/r", insensitive), state).toBeNull();
+      expect(attemptHolding([held("/r", state)], { path: "/r" }, insensitive), state).toBeNull();
     }
-    expect(attemptHolding([held("/r", "prepared", 1)], "/r", insensitive, 5_000)).toBeNull();
-    expect(attemptHolding([held("/r", "prepared", 10)], "/r", insensitive, 5_000)?.state).toBe("prepared");
+    expect(attemptHolding([held("/r", "prepared", 1)], { path: "/r" }, insensitive, 5_000)).toBeNull();
+    expect(attemptHolding([held("/r", "prepared", 10)], { path: "/r" }, insensitive, 5_000)?.state).toBe("prepared");
     // Unresolved holds it: that is the row that refused launches before.
-    expect(attemptHolding([held("/r", "unresolved")], "/r", insensitive)?.state).toBe("unresolved");
+    expect(attemptHolding([held("/r", "unresolved")], { path: "/r" }, insensitive)?.state).toBe("unresolved");
+  });
+
+  describe("by the store's own key, the checkout's Git directory", () => {
+    const sensitive = { caseInsensitive: false };
+    const inRepo = (cwd: string, git_dir?: string) => ({ ...held(cwd), ...(git_dir === undefined ? {} : { git_dir }) });
+
+    it("sees an agent working in a subfolder of the chosen checkout", () => {
+      // The store refuses by `git_dir`; comparing `cwd` missed this agent,
+      // the store refused the launch, and only a second press ran it.
+      const runs = [inRepo("/r/pkg/web", "/r/.git")];
+      expect(attemptHolding(runs, { path: "/r", git_dir: "/r/.git" }, sensitive)?.cwd).toBe("/r/pkg/web");
+    });
+
+    it("keeps a worktree nested inside the checkout apart from the checkout", () => {
+      // A path-prefix rule would mark /r busy for every attempt in one of
+      // its own `.gitpulse/worktrees` — each has a Git directory of its own.
+      const nested = [inRepo("/r/.gitpulse/worktrees/a", "/r/.git/worktrees/a")];
+      expect(attemptHolding(nested, { path: "/r", git_dir: "/r/.git" }, sensitive)).toBeNull();
+      expect(attemptHolding([inRepo("/r", "/r/.git")], { path: "/r/.gitpulse/worktrees/a", git_dir: "/r/.git/worktrees/a" }, sensitive)).toBeNull();
+    });
+
+    it("compares Git directories by the platform's path identity", () => {
+      expect(attemptHolding([inRepo("/R", "/R/.git")], { path: "/r", git_dir: "/r/.git" }, insensitive)).not.toBeNull();
+      expect(attemptHolding([inRepo("/R", "/R/.git")], { path: "/r", git_dir: "/r/.git" }, sensitive)).toBeNull();
+      expect(attemptHolding([inRepo("C:\\r", "C:\\r\\.git")], { path: "C:/r", git_dir: "C:/r/.git" }, insensitive)).not.toBeNull();
+    });
+
+    it("falls back to the directory where either side has no Git directory", () => {
+      expect(attemptHolding([inRepo("/r")], { path: "/r", git_dir: "/r/.git" }, sensitive)).not.toBeNull();
+      expect(attemptHolding([inRepo("/r/pkg", "/r/.git")], { path: "/r" }, sensitive)).toBeNull();
+      expect(attemptHolding([inRepo("/r", "/r/.git")], { path: "/r", git_dir: null }, sensitive)).not.toBeNull();
+    });
+
+    it("fuzz: any spelling of one Git directory matches, and no two worktrees do", () => {
+      let seed = 7;
+      const rand = (n: number) => { seed = (seed * 1_103_515_245 + 12_345) % 2_147_483_648; return seed % n; };
+      const spell = (path: string) => {
+        let out = rand(2) ? path.toUpperCase() : path;
+        if (rand(2)) out = out.replaceAll("/", "\\");
+        if (rand(2)) out += rand(2) ? "/" : "\\";
+        return out;
+      };
+      for (let n = 0; n < 2_000; n += 1) {
+        const name = `w${rand(50)}`, other = `w${50 + rand(50)}`;
+        const gitDir = `/work/repo/.git/worktrees/${name}`;
+        const runs = [inRepo(`/work/repo/.gitpulse/worktrees/${name}/sub`, spell(gitDir))];
+        expect(attemptHolding(runs, { path: `/work/repo/.gitpulse/worktrees/${name}`, git_dir: spell(gitDir) }, insensitive), gitDir).not.toBeNull();
+        expect(attemptHolding(runs, { path: `/work/repo/.gitpulse/worktrees/${other}`, git_dir: `/work/repo/.git/worktrees/${other}` }, insensitive)).toBeNull();
+      }
+    });
   });
 });
 
@@ -399,6 +472,19 @@ describe("a model for one launch", () => {
     expect(gate).toMatchObject({ ok: false, reason: expect.stringContaining("opus 4") });
   });
 
+  it("offers Claude Code's family aliases as choices, and leaves other launchers' fields typed", () => {
+    expect(modelOverrideChoices("claude", "model")).toEqual(["fable", "opus", "sonnet", "haiku"]);
+    expect(modelOverrideChoices("claude", "advisor")).toEqual(["fable", "opus", "sonnet"]);
+    for (const provider of ["codex", "grok", "agy"] as const) expect(modelOverrideChoices(provider, "model"), provider).toBeNull();
+    // Every choice is one a launch sends as chosen, never one the gate refuses.
+    for (const model of modelOverrideChoices("claude", "model") ?? []) {
+      expect(launchModelOverride(terminal("claude"), typed(model))).toEqual({ ok: true, choice: { model } });
+    }
+    for (const advisor of modelOverrideChoices("claude", "advisor") ?? []) {
+      expect(launchModelOverride(terminal("claude"), typed("", "", advisor))).toEqual({ ok: true, choice: { advisor } });
+    }
+  });
+
   it("refuses any model for a managed attempt, whose model is Manvi's", () => {
     expect(launchModelOverride({ provider: "claude", kind: "managed" }, typed("opus"))).toMatchObject({ ok: false, reason: expect.stringContaining("Manvi") });
     expect(launchModelOverride({ provider: "claude", kind: "managed" }, NO_MODEL_OVERRIDE)).toEqual({ ok: true, choice: undefined });
@@ -408,5 +494,48 @@ describe("a model for one launch", () => {
     expect(modelChoiceLabel({ advisor: "fable", effort: "high", model: "opus" })).toBe("opus · high effort · advisor fable");
     expect(modelChoiceLabel({ fallback: "sonnet,haiku", model: "opus" })).toBe("opus · fallback sonnet,haiku");
     expect(modelChoiceLabel({ zeta: "1", model: "m" })).toBe("m · zeta 1");
+  });
+});
+
+describe("a preparation whose outcome is unknown", () => {
+  const preparation = (task: string, id = `run-${task}`): RunPreparation => ({
+    id, request_id: `req-${id}`, task_id: task, source_revision: 1, repository_id: "repo", repository_revision: 1,
+    repo_path: "/work/a", provider: "claude", permission_mode: "ask", acknowledge_bypass: false,
+  });
+  const held: string[] = [];
+  const hold = (prep: RunPreparation) => { held.push(prep.task_id); holdPendingPreparation(prep); };
+  afterEach(() => { for (const task of held.splice(0)) releasePendingPreparation(task); });
+
+  it("outlives the form that sent it, so a reopened sheet retries the same request", () => {
+    expect(pendingPreparationFor("t1")).toBeNull();
+    hold(preparation("t1"));
+    expect(pendingPreparationFor("t1")).toMatchObject({ id: "run-t1", request_id: "req-run-t1" });
+    expect(pendingPreparationFor("t2")).toBeNull();
+  });
+
+  it("hands back a copy, so a form cannot edit the request it will replay", () => {
+    hold(preparation("t1"));
+    const read = pendingPreparationFor("t1");
+    if (!read) throw new Error("expected a held preparation");
+    read.repo_path = "/elsewhere";
+    expect(pendingPreparationFor("t1")?.repo_path).toBe("/work/a");
+  });
+
+  it("is released only for the attempt it names", () => {
+    hold(preparation("t1", "first"));
+    releasePendingPreparation("t1", "other");
+    expect(pendingPreparationFor("t1")?.id).toBe("first");
+    releasePendingPreparation("t1", "first");
+    expect(pendingPreparationFor("t1")).toBeNull();
+  });
+
+  it("stays bounded, dropping the oldest, and refreshes a task that is held again", () => {
+    for (let n = 0; n < MAX_PENDING_PREPARATIONS; n += 1) hold(preparation(`t${n}`));
+    hold(preparation("t0", "again"));
+    hold(preparation("overflow"));
+    expect(pendingPreparationFor("t0")?.id).toBe("again");
+    expect(pendingPreparationFor("t1")).toBeNull();
+    expect(pendingPreparationFor("overflow")).not.toBeNull();
+    expect(pendingPreparationFor(`t${MAX_PENDING_PREPARATIONS - 1}`)).not.toBeNull();
   });
 });

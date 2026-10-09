@@ -167,6 +167,17 @@ export const MODEL_SUGGESTIONS: Readonly<Partial<Record<LauncherKind, Partial<Re
 };
 
 /**
+ * The models a task handoff offers as a choice rather than a typed name,
+ * per launcher and field. Claude Code's four family aliases, which always
+ * name its current model in each family, so the list does not go stale as
+ * model ids change; the advisor offers the three names above. A launcher or
+ * field absent here keeps a free-text field.
+ */
+export const HANDOFF_MODEL_CHOICES: Readonly<Partial<Record<LauncherKind, Partial<Record<"model" | "advisor", readonly string[]>>>>> = {
+  claude: { model: ["fable", "opus", "sonnet", "haiku"], advisor: MODEL_SUGGESTIONS.claude?.advisor },
+};
+
+/**
  * Whether `id` has the shape of a model name — the same rule as
  * `terminal_command::validate_model_id`. Shape only: whether the model
  * exists is the CLI's to decide when it starts.

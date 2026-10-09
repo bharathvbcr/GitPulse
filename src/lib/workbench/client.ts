@@ -59,6 +59,8 @@ export interface TaskRun extends RecordVersion {
   provider: AgentProvider; permission_mode: PermissionMode; state: typeof RUN_STATES[number];
   cwd: string; created_at: number; expires_at: number; session_id: string | null;
   exit_code: number | null; reason: string; outcome_uncertain: boolean;
+  /** The checkout's Git directories as preparation observed them; the store's key for "this checkout is taken". */
+  git_dir?: string; git_common_dir?: string;
   /** The model fields this attempt was launched with; null when it used the launcher's own default. */
   model_choice?: RecordedModelChoice | null;
 }
@@ -82,7 +84,7 @@ export type TaskDraft = Omit<Task, keyof RecordVersion | "completed_at">;
 export type WorkspaceDraft = Omit<Workspace, keyof RecordVersion>;
 export interface Page<T> { items: T[]; total: number; shown: number; has_more: boolean; next_cursor: string | null }
 export type Scope = { kind: "global" } | { kind: "workspace" | "repository"; id: string };
-export type WorkbenchMethod = "decisions.get" | "decisions.list" | "decisions.decide" | "notifications.settings.get" | "notifications.settings.put" | "notifications.delivery.get" | "notifications.ack" | "notifications.native.pending" | "notifications.native.status" | "notifications.native.authorize" | "attention.list" | "attention.get" | "attention.update" | EnhancementMutation | "runs.prepare_managed" | "runs.launch_managed" | "runs.stop_managed" | "runs.prepare_terminal" | "runs.get" | "runs.list" | "runs.cancel" | "runs.release" | "runs.conversation" | "workspaces.list" | "workspaces.get" | "workspaces.put" | "workspaces.delete" | "repositories.list" | "repositories.get" | "repositories.put" | "items.list" | "items.get" | "items.brief.get" | "items.put" | "items.delete" | "items.restore" | "items.merge" | "items.history" | "events.list" | "enhancements.complete" | "enhancements.get" | "enhancements.list" | "enhancements.configuration" | "enhancements.wake" | "enhancements.worker" | "automation.get" | "automation.put" | "automation.list";
+export type WorkbenchMethod = "decisions.get" | "decisions.list" | "decisions.decide" | "notifications.settings.get" | "notifications.settings.put" | "notifications.delivery.get" | "notifications.ack" | "notifications.native.pending" | "notifications.native.status" | "notifications.native.authorize" | "attention.list" | "attention.get" | "attention.update" | EnhancementMutation | "runs.prepare_managed" | "runs.launch_managed" | "runs.stop_managed" | "runs.prepare_terminal" | "runs.get" | "runs.list" | "runs.cancel" | "runs.release" | "runs.conversation" | "runs.checkout_identity" | "workspaces.list" | "workspaces.get" | "workspaces.put" | "workspaces.delete" | "repositories.list" | "repositories.get" | "repositories.put" | "items.list" | "items.get" | "items.brief.get" | "items.put" | "items.delete" | "items.restore" | "items.merge" | "items.history" | "events.list" | "enhancements.complete" | "enhancements.get" | "enhancements.list" | "enhancements.configuration" | "enhancements.wake" | "enhancements.worker" | "automation.get" | "automation.put" | "automation.list";
 
 export interface WorkbenchError {
   readonly code: string;
@@ -470,7 +472,9 @@ export function taskRun(value: unknown): TaskRun {
     task_id: text(raw.task_id), source_revision: source, task_title: text(raw.task_title), repository_id: text(raw.repository_id), provider: named, permission_mode: permission, state,
     cwd: text(raw.cwd), created_at: integer(raw.created_at), expires_at: integer(raw.expires_at), session_id: nullableText(raw.session_id),
     exit_code: raw.exit_code === null ? null : integer(raw.exit_code), reason: text(raw.reason), outcome_uncertain: boolean(raw.outcome_uncertain),
-    ...(raw.model_choice === undefined ? {} : { model_choice: modelChoice(raw.model_choice) }) };
+    ...(raw.model_choice === undefined ? {} : { model_choice: modelChoice(raw.model_choice) }),
+    ...(raw.git_dir === undefined ? {} : { git_dir: text(raw.git_dir) }),
+    ...(raw.git_common_dir === undefined ? {} : { git_common_dir: text(raw.git_common_dir) }) };
 }
 /** A run's recorded model fields. Absent on attempts stored before schema 11. */
 function modelChoice(value: unknown): RecordedModelChoice | null {
@@ -496,6 +500,20 @@ export async function launchManagedRun(id: string): Promise<TaskRun> {
 export async function stopManagedRun(id: string): Promise<void> {
   const result = object(await request("runs.stop_managed", {id}));
   if (result.ok !== true) invalid();
+}
+/** The Git identity of the checkout holding a directory, by the probe a preparation records. */
+export interface CheckoutIdentity { cwd: string; git_dir: string; git_common_dir: string }
+/**
+ * Asks the host which checkout holds `path`, so "is it taken" can be asked by
+ * the key the store refuses on (`git_dir`) — not by the directory, which may
+ * be a subfolder of the checkout another attempt is working in.
+ */
+export async function checkoutIdentity(path: string): Promise<CheckoutIdentity> {
+  const raw = object(await request("runs.checkout_identity", { repo_path: path }));
+  if (raw.ok !== true) return invalid();
+  const cwd = text(raw.cwd), gitDir = text(raw.git_dir), commonDir = text(raw.git_common_dir);
+  if (!cwd || !gitDir || !commonDir) return invalid();
+  return { cwd, git_dir: gitDir, git_common_dir: commonDir };
 }
 export async function getTaskRun(id: string): Promise<TaskRun> {
   const run = record(await request("runs.get", { id }), taskRun);

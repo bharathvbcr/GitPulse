@@ -27,6 +27,7 @@
     explainError,
     getRepository,
     getTask,
+    checkoutIdentity,
     listHoldingRuns,
     newID,
     prepareTaskRun,
@@ -43,12 +44,16 @@
     defaultHandoff,
     attemptHolding,
     handoffGate,
+    holdPendingPreparation,
     launchModelOverride,
+    modelOverrideChoices,
     modelOverrideFields,
     NO_MODEL_OVERRIDE,
     normalizeCheckout,
+    pendingPreparationFor,
     preferredCheckout,
     reconcileHandoff,
+    releasePendingPreparation,
     supportsManaged,
     type HandoffGate,
     type HandoffSettings,
@@ -107,6 +112,8 @@
     onPreparing?: (draft: { id: string; provider: AgentProvider; kind: RunKind; worktree: boolean } | null) => void;
   } = $props();
 
+  /** How long the checkout field must stay unchanged before its Git identity is read. */
+  const CHECKOUT_IDENTITY_SETTLE_MS = 250;
   let repositoryId = $state(untrack(() => primaryRepositoryId));
   let checkout = $state("");
   let acknowledged = $state(false);
@@ -114,7 +121,8 @@
   let busy = $state(false);
   let error = $state("");
   let note = $state("");
-  let pending = $state<RunPreparation | null>(null);
+  /** Restored for this task when an earlier form's preparation is still unanswered: closing a sheet must not forget it. */
+  let pending = $state<RunPreparation | null>(untrack(() => pendingPreparationFor(taskId)));
   /** This launch's model, over the saved default. Not remembered: the next launch starts from the default again. */
   let modelOverride = $state<ModelOverride>({ ...NO_MODEL_OVERRIDE });
   let disposed = false;
@@ -141,7 +149,29 @@
    */
   let holding = $state<TaskRun[] | null>(null);
   let holdingTicket = 0;
-  const occupant = $derived(holding ? attemptHolding(holding, checkout, pathOpts) : null);
+  /**
+   * The chosen checkout's Git directory — the key the store refuses a busy
+   * checkout by — once the host has said. Null while unknown or after a
+   * failed read, when "is it taken" falls back to comparing directories and
+   * the store's own refusal remains the backstop. Launch never waits on it.
+   */
+  let targetGitDir = $state<string | null>(null);
+  let identityTicket = 0;
+  $effect(() => {
+    const path = normalizeCheckout(checkout);
+    const ticket = ++identityTicket;
+    targetGitDir = null;
+    if (!path) return;
+    // Settled typing only: each read runs Git in the checkout.
+    const timer = setTimeout(() => {
+      bounded(checkoutIdentity(path)).then(
+        (identity) => { if (!disposed && ticket === identityTicket) targetGitDir = identity.git_dir; },
+        () => { if (!disposed && ticket === identityTicket) targetGitDir = null; },
+      );
+    }, CHECKOUT_IDENTITY_SETTLE_MS);
+    return () => clearTimeout(timer);
+  });
+  const occupant = $derived(holding ? attemptHolding(holding, { path: checkout, git_dir: targetGitDir }, pathOpts) : null);
   /** A checkout that already has an agent can only take this one in a worktree. */
   const useWorktree = $derived(provisionWorktree || occupant !== null);
 
@@ -176,6 +206,18 @@
   // The checkout follows the repository. A reader who typed one keeps it; an
   // untouched field takes the best candidate for whatever is now selected.
   let touchedCheckout = false;
+  // A restored preparation is shown as what it will replay — its checkout,
+  // agent, connection and mode — since every control is locked while it is.
+  untrack(() => {
+    if (!pending) return;
+    repositoryId = pending.repository_id;
+    checkout = pending.repo_path;
+    touchedCheckout = true;
+    provisionWorktree = pending.worktree === true;
+    acknowledged = pending.acknowledge_bypass;
+    settings = reconcileHandoff({ provider: pending.provider, kind: pending.kind ?? "external_terminal", permission: pending.permission_mode });
+    note = "This attempt's earlier preparation was never answered. Retry it, or discard it to start over.";
+  });
   $effect(() => {
     const best = preferredCheckout(candidates);
     if (!touchedCheckout) checkout = best;
@@ -192,6 +234,22 @@
     // this cannot discard the warning for an in-flight retry.
     error = "";
     note = "";
+  }
+
+  /**
+   * Gives up replaying an unanswered preparation, deliberately.
+   *
+   * The only way out of the retry, so it says what it cannot know: if the
+   * store did commit it, that attempt is real. A prepared attempt expires on
+   * its own, and while it lives it is shown as holding its checkout.
+   */
+  function discard() {
+    if (!pending || busy) return;
+    releasePendingPreparation(pending.task_id, pending.id);
+    pending = null;
+    error = "";
+    note = "Discarded. If the store did create that attempt it is listed under this task's Agents, holds its checkout until it expires, and can be cancelled there.";
+    void loadHolding(selected);
   }
 
   async function browse() {
@@ -227,6 +285,8 @@
     // acceptance — never a read of the bound prop after an await.
     const chosen: HandoffSettings = { ...settings };
     const preparing = onPreparing;
+    /** The request actually sent, once it is: what a settled answer releases. */
+    let sent: RunPreparation | null = null;
     busy = true; error = ""; note = "";
     try {
       if (!pending) {
@@ -259,12 +319,15 @@
           acknowledge_bypass: acknowledged,
           ...(model.choice ? { model_choice: model.choice } : {}),
         };
+        holdPendingPreparation(pending);
       }
       const preparation = pending;
       preparing?.({ id: preparation.id, provider: preparation.provider, kind: preparation.kind ?? "external_terminal", worktree: preparation.worktree === true });
       // A worktree attempt runs the repository's setup inside this call: give
       // it the setup's own bound, not the 30 s a store read gets.
+      sent = preparation;
       const run = await bounded(prepareTaskRun(preparation), preparation.worktree ? WORKTREE_PREPARE_TIMEOUT_MS : undefined);
+      releasePendingPreparation(preparation.task_id, preparation.id);
       pending = null;
       // Accepted: from here on the attempt exists, and its start belongs to
       // the module owner — begun before any check of whether this form still
@@ -286,9 +349,19 @@
       // the form has nothing left to say about an accepted attempt.
       if (!disposed && result.ok) onLaunched(result.run);
     } catch (cause) {
+      // Settled before the disposal check: a refusal that lands after the
+      // sheet closed must not be replayed by the next one as if unanswered.
+      const settled = cause instanceof WorkbenchError && !["transport_error", "worker_error", "store_error"].includes(cause.code);
+      if (settled && sent) releasePendingPreparation(sent.task_id, sent.id);
       if (disposed) return;
       error = explainError(cause);
-      if (cause instanceof WorkbenchError && !["transport_error", "worker_error", "store_error"].includes(cause.code)) pending = null;
+      if (settled) pending = null;
+      // The store answered and the reply could not be read: it committed or
+      // refused, and replaying gets the same unreadable answer, so the retry
+      // is dropped — but the attempt may well exist.
+      if (sent && cause instanceof WorkbenchError && cause.code === "protocol_error") {
+        error = `${error} The store did answer, so this attempt may exist: check this task's Agents before launching again.`;
+      }
       // The store saw an agent this form did not (a read that failed, or one
       // that started since). Select the worktree so the next press runs.
       if (cause instanceof WorkbenchError && cause.code === "checkout_busy" && pending === null) {
@@ -399,7 +472,15 @@
       <legend>Model for this launch</legend>
       <div class="pair">
         {#if overrideFields.includes("model")}
-          <input class="gp-field" aria-label="Model" placeholder="Saved default" maxlength={MAX_MODEL_ID_LEN} value={modelOverride.model} disabled={locked} oninput={(e) => { modelOverride = { ...modelOverride, model: e.currentTarget.value }; }} />
+          {@const choices = modelOverrideChoices(settings.provider, "model")}
+          {#if choices}
+            <select class="gp-select" aria-label="Model" value={modelOverride.model} disabled={locked} onchange={(e) => { modelOverride = { ...modelOverride, model: e.currentTarget.value }; }}>
+              <option value="">Saved model</option>
+              {#each choices as id (id)}<option value={id}>{id}</option>{/each}
+            </select>
+          {:else}
+            <input class="gp-field" aria-label="Model" placeholder="Saved default" maxlength={MAX_MODEL_ID_LEN} value={modelOverride.model} disabled={locked} oninput={(e) => { modelOverride = { ...modelOverride, model: e.currentTarget.value }; }} />
+          {/if}
         {/if}
         {#if overrideFields.includes("effort")}
           <select class="gp-select" aria-label="Effort" value={modelOverride.effort} disabled={locked} onchange={(e) => { modelOverride = { ...modelOverride, effort: e.currentTarget.value }; }}>
@@ -408,7 +489,15 @@
           </select>
         {/if}
         {#if overrideFields.includes("advisor")}
-          <input class="gp-field" aria-label="Advisor model" placeholder="Saved advisor" maxlength={MAX_MODEL_ID_LEN} value={modelOverride.advisor} disabled={locked} oninput={(e) => { modelOverride = { ...modelOverride, advisor: e.currentTarget.value }; }} />
+          {@const choices = modelOverrideChoices(settings.provider, "advisor")}
+          {#if choices}
+            <select class="gp-select" aria-label="Advisor model" value={modelOverride.advisor} disabled={locked} onchange={(e) => { modelOverride = { ...modelOverride, advisor: e.currentTarget.value }; }}>
+              <option value="">Saved advisor</option>
+              {#each choices as id (id)}<option value={id}>{id}</option>{/each}
+            </select>
+          {:else}
+            <input class="gp-field" aria-label="Advisor model" placeholder="Saved advisor" maxlength={MAX_MODEL_ID_LEN} value={modelOverride.advisor} disabled={locked} oninput={(e) => { modelOverride = { ...modelOverride, advisor: e.currentTarget.value }; }} />
+          {/if}
         {/if}
       </div>
       <p class="meta">Blank fields keep the default from Settings. What this attempt runs with is recorded on it.</p>
@@ -422,7 +511,12 @@
     </label>
   {/if}
 
-  {#if pending}<p role="status" class="warn">The preparation result is uncertain. Retry this exact attempt before creating another.</p>{/if}
+  {#if pending}
+    <p role="status" class="warn">
+      The preparation result is uncertain. Retry this exact attempt before creating another.
+      <button type="button" class="gp-btn discard" disabled={busy} onclick={discard}>Discard it</button>
+    </p>
+  {/if}
   {#if note}<p role="status" class="meta">{note}</p>{/if}
   {#if error}<p role="alert" class="error">{error}</p>{/if}
 </div>
@@ -442,5 +536,6 @@
   .ack input{width:auto}
   .error{margin:0;font-size:11px;color:#dc6565}
   .warn{margin:0;font-size:11px;color:rgb(180 83 9)}
+  .discard{margin-left:6px;font-size:11px;padding:2px 8px}
   button:disabled{opacity:.5}
 </style>

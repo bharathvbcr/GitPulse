@@ -14,6 +14,7 @@ import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import {
   EFFORT_LEVELS,
+  HANDOFF_MODEL_CHOICES,
   MAX_FALLBACK_MODELS,
   MAX_MODEL_ID_LEN,
   MODEL_FIELDS,
@@ -86,6 +87,22 @@ describe("the model vocabulary is the Rust table's", () => {
       for (const [field, names] of Object.entries(byField ?? {})) {
         expect(MODEL_FIELDS_BY_LAUNCHER[launcher as LauncherKind]).toContain(field);
         for (const name of names ?? []) expect(isModelId(name), `${launcher}.${field}: ${name}`).toBe(true);
+      }
+    }
+  });
+
+  it("offers in a handoff only fields the launcher takes and aliases Claude Code has", () => {
+    const aliases = readFileSync(join(repoRoot, "src-tauri", "src", "workbench", "agent_models.rs"), "utf8");
+    const table = aliases.slice(aliases.indexOf("const CLAUDE_ALIASES"), aliases.indexOf("];", aliases.indexOf("const CLAUDE_ALIASES")));
+    expect(table.length).toBeGreaterThan(0);
+    for (const [launcher, byField] of Object.entries(HANDOFF_MODEL_CHOICES)) {
+      for (const [field, names] of Object.entries(byField ?? {})) {
+        expect(MODEL_FIELDS_BY_LAUNCHER[launcher as LauncherKind]).toContain(field);
+        expect(names?.length, `${launcher}.${field}`).toBeGreaterThan(0);
+        for (const name of names ?? []) {
+          expect(isModelId(name), `${launcher}.${field}: ${name}`).toBe(true);
+          if (launcher === "claude") expect(table, name).toContain(`("${name}",`);
+        }
       }
     }
   });

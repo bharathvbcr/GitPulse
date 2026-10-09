@@ -456,10 +456,17 @@ pub(crate) fn launch_model_choice(
     Ok(Some(choice))
 }
 
+/// The longest value the store records for one model field on a run — the
+/// vendored store's `runs.rs` refuses more — with `fallback` counted joined,
+/// as it is stored. Above any real id; a plain terminal tab records nothing
+/// and is held only to [`MAX_MODEL_ID_LEN`] per name.
+pub(crate) const MAX_RECORDED_MODEL_FIELD: usize = 128;
+
 /// A [`ModelChoice`] as the store records it on a run (`model_choice`): one
 /// string per field, `fallback` joined by commas — a model name never holds
-/// one ([`validate_model_id`]).
-pub(crate) fn model_choice_record(choice: &ModelChoice) -> serde_json::Value {
+/// one ([`validate_model_id`]). A field longer than the store records is
+/// refused here, by name, before a launch prepares anything for it.
+pub(crate) fn model_choice_record(choice: &ModelChoice) -> Result<serde_json::Value, String> {
     let mut record = serde_json::Map::new();
     for (field, value) in [
         ("model", choice.model.clone()),
@@ -471,10 +478,16 @@ pub(crate) fn model_choice_record(choice: &ModelChoice) -> serde_json::Value {
         ("advisor", choice.advisor.clone()),
     ] {
         if let Some(value) = value {
+            if value.len() > MAX_RECORDED_MODEL_FIELD {
+                return Err(format!(
+                    "The {field} setting is {} bytes as a task attempt records it; an attempt records at most {MAX_RECORDED_MODEL_FIELD}.",
+                    value.len()
+                ));
+            }
             record.insert(field.into(), serde_json::Value::String(value));
         }
     }
-    serde_json::Value::Object(record)
+    Ok(serde_json::Value::Object(record))
 }
 
 /// The run's recorded choice back as a [`ModelChoice`]; `None` for a run that
@@ -2947,7 +2960,10 @@ mod model_tests {
 
 #[cfg(test)]
 mod launch_choice_tests {
-    use super::{launch_model_choice, model_choice_from_record, model_choice_record};
+    use super::{
+        launch_model_choice, model_choice_from_record, model_choice_record,
+        MAX_RECORDED_MODEL_FIELD,
+    };
     use crate::tool_config::ModelChoice;
     use serde_json::json;
 
@@ -3006,7 +3022,7 @@ mod launch_choice_tests {
             advisor: Some("opus".into()),
             ..choice(Some("opus[1m]"), Some("high"))
         };
-        let record = model_choice_record(&original);
+        let record = model_choice_record(&original).unwrap();
         assert_eq!(
             record,
             json!({"model":"opus[1m]","effort":"high","fallback":"sonnet,haiku","advisor":"opus"})
@@ -3015,5 +3031,26 @@ mod launch_choice_tests {
         assert_eq!(model_choice_from_record(&json!(null)).unwrap(), None);
         assert!(model_choice_from_record(&json!({"temperature":"1"})).is_err());
         assert!(model_choice_from_record(&json!({"model":7})).is_err());
+    }
+
+    /// The store refuses a recorded field over 128 bytes; the record says so
+    /// first, naming the field, and counts `fallback` the way it is stored.
+    #[test]
+    fn the_record_refuses_a_field_the_store_would() {
+        let at_cap = "m".repeat(MAX_RECORDED_MODEL_FIELD);
+        assert!(model_choice_record(&choice(Some(&at_cap), None)).is_ok());
+        let over = "m".repeat(MAX_RECORDED_MODEL_FIELD + 1);
+        let refused = model_choice_record(&choice(Some(&over), None)).unwrap_err();
+        assert!(
+            refused.contains("model") && refused.contains("128"),
+            "{refused}"
+        );
+        let half = "f".repeat(MAX_RECORDED_MODEL_FIELD / 2);
+        let joined = ModelChoice {
+            fallback: Some(vec![half.clone(), half]),
+            ..ModelChoice::default()
+        };
+        let refused = model_choice_record(&joined).unwrap_err();
+        assert!(refused.contains("fallback"), "{refused}");
     }
 }
