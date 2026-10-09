@@ -11,6 +11,28 @@ before that tag is pushed.
 
 ## [Unreleased]
 
+## [1.4.0] - 2026-10-09
+
+Agents that start in the background with a pane showing every one at work,
+stacked worktree tabs, a model choice per agent, one agent guidance in every
+handoff, and board tools that delete and merge tasks and make agents group work
+before filing — plus stale-branch cleanup with backups, a secret scan that never
+reads a partial scan as clean, worktree cache sync and named local routes,
+symbol-level collision notes, Markdown rendered by MarkDev, terminals that
+report what they are running, coloured tabs, timers that stop in the
+background, Bun for installs and scripts, and git spawns admitted by class so
+a refresh storm can no longer starve the actions you asked for, with branch
+churn kept across restarts. Two live agents sharing one worktree now show up
+in collision risk; the task board gains Undo, bulk changes and full keyboard
+operation; workspaces can be reordered, imported from tab groups and relinked
+to a moved checkout; and the code graph opens the maps devmap 0.2.4 writes.
+Tasks gain checklists, links, search filters, swimlanes, saved views and
+work-in-progress limits; the code view searches file contents and renames,
+moves and deletes files; pull requests can be reviewed and merged. A terminal
+agent now ends only by its own exit, a Close or Quit — never because its view
+stalled or went away — every way to quit on macOS reaches the confirmation,
+and a second launch on macOS hands its request to the running GitPulse.
+
 ### Added
 
 - **Task search filters and repository search.** The Tasks search box takes
@@ -28,7 +50,9 @@ before that tag is pushed.
 - **Merge…** on the board's selection bar, running the same merge as
   `gitpulse_merge_tasks`.
 - **Model for this launch** in a terminal handoff: model, effort and advisor
-  for one attempt, recorded on the attempt and shown on its row.
+  for one attempt, recorded on the attempt and shown on its row. For Claude
+  Code, model and advisor are chosen from its aliases (fable, opus, sonnet,
+  haiku); other agents take a model id.
 - **Board views: swimlanes, saved views and work-in-progress limits.** Lanes
   group cards by owner or first label on the board, and by status in the list.
   A board's current arrangement — layout, lanes, columns, card chips, filters
@@ -75,126 +99,6 @@ before that tag is pushed.
   is counted with the same rule as the task pane, including a permission asked
   through the agent hook, and the menu-bar glyph names that count while the
   window is closed. A session that has finished is shown and is not counted.
-
-### Changed
-- **More than 24 repositories can be open at once.** Opening a twenty-fifth
-  used to be refused with "Too many open repositories (max 24)", because every
-  tab held one of 24 native file watches. Tabs and watches are now separate:
-  a workspace holds up to 1000 repositories, and the 24 used most recently are
-  watched live. The rest are *parked* — dimmed on the strip, "Paused" in the
-  status bar and fleet, counts hidden in the menu — and are read in full and
-  watched again when you open them. Restoring a large workspace reads only the
-  watched repositories, so it no longer slows with every tab you keep open.
-- The Open Repositories menu keeps the current repository listed past its 64
-  rows and says how many more are open in the tab bar.
-- The fleet view says when its 64-repository sweep limit, not the clock, left
-  rows unscanned, instead of suggesting a refresh that would reach the same
-  ones.
-
-
-- Archived is its own flag, independent of status (dc-store schema 11).
-  Finishing a task leaves it in Done; Archive files a task away from any column
-  and Restore brings it back with its status unchanged. Upgrading a profile
-  archives every task that was Done, keeping when it was completed.
-- The archive lists most recently completed first and refreshes its loaded
-  pages in place after a change.
-- A merge whose source's delete fails after its reason is recorded now reports
-  a partial merge naming that source, not a bare error.
-- **The shared contracts are vendored, not hand-copied.** `contracts/` is
-  refreshed from DevCouncil's `backend/contracts` by `vendor-crates.mjs`
-  (`--contracts` for just those files), and `vendor:check` reports drift
-  against DevCouncil. The old CHECKSUMS test hashed the copy against itself
-  and passed while it was stale. `verdict_json` is now described as the
-  `PolicyVerdict` projection the ledger actually stores, and a test holds
-  `LedgerEvent` and every `PolicyStatus` to that schema.
-
-### Fixed
-
-- **A terminal agent is no longer ended by anything but its own exit, a Close, or Quit.** The PTY reader killed a session whose window did not acknowledge 256 KiB of output within 30 s — a hidden, minimized or busy window, which macOS throttles — and a failed output event killed it too. It now skips output for that view (one notice, the screen redrawn when the view catches up; a view that lagged once is waited 2 s, not 30) and the process keeps running. A terminal tab that unmounted for any reason other than Close — its repository tab closed, its pane crashed, the dock re-hosting — killed its process; it is now detached and its slot handed to **Sessions**, where it can be shown again or stopped. Only a plain shell known to be idle at its prompt ends with its view. Quitting asks first when agents are running. Every session end is logged with its cause.
-- Typing a filter into the Tasks search no longer searches for its words: the
-  store's full-text query split `is:bug` into "is" and "bug" and never matched a
-  task by its type, so searching for bugs found only tasks that said "bug".
-  The archive's search had the same defect and now reads filters the same way.
-- Changing a Tasks filter (type, priority, owner, label, due) now clears the
-  selection. The filters write a field in place, which the board did not
-  notice, so a selection the filter had just hidden stayed live for a bulk
-  Delete or Archive to act on.
-- **Cmd-Q, Dock → Quit and a Quit Apple event no longer skip the quit confirmation on macOS.** TAO's application delegate answers `applicationWillTerminate:` but not `applicationShouldTerminate:`, so AppKit approved these quits without asking, and Tauri never raised `ExitRequested` for them. Only the status menu's Quit item and the main window's close button reached the guard that protects running Git actions, in-flight saves and unsaved editor drafts. GitPulse now adds `applicationShouldTerminate:` to the delegate's class and answers `NSTerminateLater`, replying once the window confirms or cancels. An approved quit therefore leaves through AppKit's own termination path, and a logout waits for the answer instead of being refused. One owner (`desktop/exit.rs`) now serves every way to quit: tray, window close, `ExitRequested` and AppKit. The window must acknowledge a request within 3 s, or the quit proceeds, so a crashed or hung page can no longer leave Force Quit as the only way out. A request that could not be delivered quits instead of waiting. A second Quit while the confirmation is open quits at once, which is AppKit's behaviour. `native_quit_guard` drives nine of these paths against real AppKit and a SIGKILLed WebKit process.
-- **A terminal killed by a signal no longer reports "exit 1".** For any signal death, portable-pty substitutes the exit code 1. That code reached the exit event and the task run record, so an agent killed by SIGKILL or SIGSEGV read "exit 1", the same as a command that failed on its own. A signal death now reports the signal and no exit code. A real SIGKILL, SIGSEGV and SIGABRT are now covered in `terminal_pty_stress`.
-- **A terminal whose output cannot be read stops and says why.** A PTY read error other than the master closing (`EIO`, a broken pipe) ended the reader silently. The shell kept running, input went nowhere, and no exit event reached the tab until it was closed. Now the shell is stopped and the error is reported.
-- **Crash containment in the helper processes.**
-  - gitpulse-mcp now answers a request whose worker thread could not start. Previously the request was marked answered without a reply, so the client waited until its own timeout.
-  - gitpulsed turns a panic in one repository's catch-up into that repository's error. Previously the panic exited the whole daemon and stopped catch-up for every repository.
-  - gitpulse-hook exits 0 after a panic, as its contract promises, instead of 101.
-- **A panic inside the logger no longer deadlocks the panic hook.** A panic raised while the logger held its own lock re-entered the logger from the panic hook on the same thread and waited on itself forever. That also held std's hook lock, so a crash became a hang with nothing recorded. The nested entry is now dropped, and the persisted log reports how many were dropped.
-- **The policy sidecar's 30 s respawn backoff holds.** A policy call made during the backoff cleared it to retry, so a `manvi serve` that died at every start was respawned twice per gated action.
-- **A crashed window is logged, and reloads back off.** When the WKWebView content process died, Tauri reloaded the page immediately, every time, with no trace in the log: its "web content process terminated" debug line was written when the webview was built, not when it died. A page that crashed while loading therefore reload-looped invisibly, and the quit listener went with it. Each crash is now logged as an error with its count. The quit confirmation is disarmed until the reloaded page listens again, both on a crash and on any reload. Two crashes a minute reload at once; after that, reloads back off from 1 s, doubling to a 30 s cap.
-- A commit authored or committed as a test fixture (such as
-  `contract@gitpulse.test`) can no longer be pushed or recorded by another
-  route. Only `git commit` ran the fixture-identity check, so merges, rebases,
-  cherry-picks and commits made before the check existed reached `main`
-  unchecked; eleven did. The pre-push hook now checks every commit a push would
-  add and the tagger of an annotated tag, a pre-merge-commit hook covers
-  merges, and CI's `fixture-authors` job runs the same check over each push and
-  pull request, for clones without the hooks. In the app, merge, squash, pull,
-  cherry-pick, revert, interactive rebase, restack and annotated tags refuse a
-  fixture identity as commit already did. The shell and Rust rules now agree on
-  malformed addresses (empty, no `@`, over 254 bytes: refused) and are tested
-  against one table. `.mailmap` attributes the eleven to their real author.
-- **Black rectangles over the title bar and repository tab strip on macOS, staying until the pointer passed over them.** The WKWebView has a backdrop of its own between the page and the window's material, `underPageBackgroundColor`, and wry clears it only when a background colour is configured — `transparent: true` never reaches it. It stayed WebKit's opaque default (alpha 1.0, read off the live webview), so every region the page had not painted showed near-black instead of glass: tiles discarded while the window was inactive, occluded or on another Space, and the edge an elastic root dragged into view on a vertical swipe over the chrome. Both transparent windows now set a fully clear background colour, and the root no longer rubber-bands. The native material test reads the backdrop's alpha off the main and status webviews and fails against the old config.
-- **A blank band at the edge of the title bar and tab strips with nothing hovered.** The overflow cue painted its fade as a 32px band of one colour (`--c-bg`, or a black shade on macOS); over the glass title bar, the repository strip and every surface toolbar it read as a darker block with a hard edge. The scroller now masks its own edge, which needs no colour, and the cue overlay paints only its chevron. The cue also stopped advertising space that is not content: the title bar's drag spacer, and the end padding of the code viewer's, media viewer's, MarkDev's and explorer's toolbars, no longer bring up an arrow that scrolls into nothing. The repository strip no longer shows a scrollbar track under its tabs when the system shows scroll bars; a mouse wheel pans it instead, and that wheel leaves pinch and ctrl/cmd zoom, line- and page-mode wheels and the strip's ends to the page.
-- **The overflow cue no longer keeps closed tabs alive.** It observed each child of its scroller and never stopped, so the repository strip held every tab ever closed until the window did. It now unobserves children as they leave, answers on the first frame when it moves to another scroller rather than showing the previous one's edges, and hears a padding change that leaves the content box alone.
-- **Unsaved edits to a suggestion are asked about.** Editing a Manvi or Apple
-  Intelligence suggestion made every way off the task — another card, a tab,
-  close, Escape, New task, a terminal's link to another task — do nothing
-  without a word. Each now asks, in the task sheet and in Quick Enhance.
-- **The newest running suggestion is found wherever it sits in the history.**
-  Only the first thirty attempts were looked at, so an older running one was
-  never shown or polled and did not stop a second from starting; the history
-  also collapsed back to one page every second while a suggestion ran.
-- **Every task in a column can be reached in the list layout**, which had no
-  paging; a repository's board links to the Tasks board for everything.
-- **Code intelligence reads schema 26 stores again.** The vendored
-  `devmap-store` was schema 25, so every repository indexed by a current
-  `devmap` reported code intelligence unavailable. It is re-vendored at
-  schema 26 with DevCouncil's reader floor, so a later additive schema bump
-  no longer blinds GitPulse until the next re-vendor.
-- **MCP tool results match their declared output schemas.**
-  `gitpulse_change_context` declared `collisions` as an array (it is an
-  object), `gitpulse_codeintel_suspects` declared fields it never returns, and
-  `gitpulse_ledger_events` can return a null `next_cursor`. A test now
-  validates every read-only tool's result against its schema.
-- The hook-to-socket notification test no longer hangs: state and resolve
-  events are sent from a GitPulse session, as the hook requires, and a hook
-  that exits without connecting ends the wait instead of blocking it forever.
-
-### Upgrade
-
-- dc-store schema 11 is a one-way migration, and a host built against schema
-  10 refuses a migrated profile. Rebuild GitPulse, Manvi and DevCouncil from a
-  schema 11 dc-store before any of them opens the profile.
-- Reinstall `gitpulse-mcp` and `gitpulse-hook` (`bun run mcp:install`): an
-  installed 1.4.0 binary carries the schema 25 `devmap-store` and cannot read
-  a store a current `devmap` has built.
-
-## [1.4.0] - 2026-10-07
-
-Agents that start in the background with a pane showing every one at work,
-stacked worktree tabs, a model choice per agent, one agent guidance in every
-handoff, and board tools that delete and merge tasks and make agents group work
-before filing — plus stale-branch cleanup with backups, a secret scan that never
-reads a partial scan as clean, worktree cache sync and named local routes,
-symbol-level collision notes, Markdown rendered by MarkDev, terminals that
-report what they are running, coloured tabs, timers that stop in the
-background, Bun for installs and scripts, and git spawns admitted by class so
-a refresh storm can no longer starve the actions you asked for, with branch
-churn kept across restarts. Two live agents sharing one worktree now show up
-in collision risk; the task board gains Undo, bulk changes and full keyboard
-operation; workspaces can be reordered, imported from tab groups and relinked
-to a moved checkout; and the code graph opens the maps devmap 0.2.4 writes.
-
-### Added
-
 - **Two agents in one worktree are no longer invisible.** Collision risk used
   to compare worktrees only, so two sessions editing one checkout read as
   `overlapping_files: 0`. `gitpulse_insights` now reports running Claude Code
@@ -342,6 +246,36 @@ to a moved checkout; and the code graph opens the maps devmap 0.2.4 writes.
 
 ### Changed
 
+- **More than 24 repositories can be open at once.** Opening a twenty-fifth
+  used to be refused with "Too many open repositories (max 24)", because every
+  tab held one of 24 native file watches. Tabs and watches are now separate:
+  a workspace holds up to 1000 repositories, and the 24 used most recently are
+  watched live. The rest are *parked* — dimmed on the strip, "Paused" in the
+  status bar and fleet, counts hidden in the menu — and are read in full and
+  watched again when you open them. Restoring a large workspace reads only the
+  watched repositories, so it no longer slows with every tab you keep open.
+- The Open Repositories menu keeps the current repository listed past its 64
+  rows and says how many more are open in the tab bar.
+- The fleet view says when its 64-repository sweep limit, not the clock, left
+  rows unscanned, instead of suggesting a refresh that would reach the same
+  ones.
+
+
+- Archived is its own flag, independent of status (dc-store schema 11).
+  Finishing a task leaves it in Done; Archive files a task away from any column
+  and Restore brings it back with its status unchanged. Upgrading a profile
+  archives every task that was Done, keeping when it was completed.
+- The archive lists most recently completed first and refreshes its loaded
+  pages in place after a change.
+- A merge whose source's delete fails after its reason is recorded now reports
+  a partial merge naming that source, not a bare error.
+- **The shared contracts are vendored, not hand-copied.** `contracts/` is
+  refreshed from DevCouncil's `backend/contracts` by `vendor-crates.mjs`
+  (`--contracts` for just those files), and `vendor:check` reports drift
+  against DevCouncil. The old CHECKSUMS test hashed the copy against itself
+  and passed while it was stale. `verdict_json` is now described as the
+  `PolicyVerdict` projection the ledger actually stores, and a test holds
+  `LedgerEvent` and every `PolicyStatus` to that schema.
 - **Agents leave running and locked work alone.** `gitpulse_delete_task` and
   `gitpulse_merge_tasks` refuse a task another agent may still be working on
   (`task_in_use`) unless told the running agent is the caller, and
@@ -457,6 +391,82 @@ to a moved checkout; and the code graph opens the maps devmap 0.2.4 writes.
 
 ### Fixed
 
+- **A terminal agent is no longer ended by anything but its own exit, a Close, or Quit.** The PTY reader killed a session whose window did not acknowledge 256 KiB of output within 30 s — a hidden, minimized or busy window, which macOS throttles — and a failed output event killed it too. It now skips output for that view (one notice, the screen redrawn when the view catches up; a view that lagged once is waited 2 s, not 30) and the process keeps running. A terminal tab that unmounted for any reason other than Close — its repository tab closed, its pane crashed, the dock re-hosting — killed its process; it is now detached and its slot handed to **Sessions**, where it can be shown again or stopped. Only a plain shell known to be idle at its prompt ends with its view. Quitting asks first when agents are running. Every session end is logged with its cause.
+- **One GitPulse per profile on macOS.** LaunchServices keeps one instance per
+  app bundle, not per identifier, so a notification banner routed to another
+  copy of GitPulse.app, Finder's "Open with" or a folder dropped on the Dock
+  icon could start a second app on the same profile. A lock on the profile now
+  picks the owner; a later launch hands its folder, reveal or banner response
+  to the running GitPulse over a private socket and exits. On Windows and
+  Linux, `gitpulse .` from a terminal opens the folder relative to where it was
+  typed, not where GitPulse was started.
+- **A handoff retry is answered with the attempt the store already made.** A
+  preparation whose reply was lost is kept for its task after the form closes
+  and is replayed exactly; the host answers a replay with the attempt it
+  committed instead of a second one, and **Discard it** is the deliberate way
+  out. A checkout is recognised as busy by its Git directory, so a subfolder
+  of a busy checkout is busy and a worktree nested inside it is not.
+- **The task drag preview stays under the pointer.** It was drawn inside the
+  board's pane, whose containment offset it by the pane's origin; it is now
+  drawn at the card's own size where the card was grabbed. A drag always ends:
+  on Escape, a release anywhere, lost capture, the window losing focus, or the
+  board going away, and a second pointer cannot take it over.
+- Typing a filter into the Tasks search no longer searches for its words: the
+  store's full-text query split `is:bug` into "is" and "bug" and never matched a
+  task by its type, so searching for bugs found only tasks that said "bug".
+  The archive's search had the same defect and now reads filters the same way.
+- Changing a Tasks filter (type, priority, owner, label, due) now clears the
+  selection. The filters write a field in place, which the board did not
+  notice, so a selection the filter had just hidden stayed live for a bulk
+  Delete or Archive to act on.
+- **Cmd-Q, Dock → Quit and a Quit Apple event no longer skip the quit confirmation on macOS.** TAO's application delegate answers `applicationWillTerminate:` but not `applicationShouldTerminate:`, so AppKit approved these quits without asking, and Tauri never raised `ExitRequested` for them. Only the status menu's Quit item and the main window's close button reached the guard that protects running Git actions, in-flight saves and unsaved editor drafts. GitPulse now adds `applicationShouldTerminate:` to the delegate's class and answers `NSTerminateLater`, replying once the window confirms or cancels. An approved quit therefore leaves through AppKit's own termination path, and a logout waits for the answer instead of being refused. One owner (`desktop/exit.rs`) now serves every way to quit: tray, window close, `ExitRequested` and AppKit. The window must acknowledge a request within 3 s, or the quit proceeds, so a crashed or hung page can no longer leave Force Quit as the only way out. A request that could not be delivered quits instead of waiting. A second Quit while the confirmation is open quits at once, which is AppKit's behaviour. `native_quit_guard` drives nine of these paths against real AppKit and a SIGKILLed WebKit process.
+- **A terminal killed by a signal no longer reports "exit 1".** For any signal death, portable-pty substitutes the exit code 1. That code reached the exit event and the task run record, so an agent killed by SIGKILL or SIGSEGV read "exit 1", the same as a command that failed on its own. A signal death now reports the signal and no exit code. A real SIGKILL, SIGSEGV and SIGABRT are now covered in `terminal_pty_stress`.
+- **A terminal whose output cannot be read stops and says why.** A PTY read error other than the master closing (`EIO`, a broken pipe) ended the reader silently. The shell kept running, input went nowhere, and no exit event reached the tab until it was closed. Now the shell is stopped and the error is reported.
+- **Crash containment in the helper processes.**
+  - gitpulse-mcp now answers a request whose worker thread could not start. Previously the request was marked answered without a reply, so the client waited until its own timeout.
+  - gitpulsed turns a panic in one repository's catch-up into that repository's error. Previously the panic exited the whole daemon and stopped catch-up for every repository.
+  - gitpulse-hook exits 0 after a panic, as its contract promises, instead of 101.
+- **A panic inside the logger no longer deadlocks the panic hook.** A panic raised while the logger held its own lock re-entered the logger from the panic hook on the same thread and waited on itself forever. That also held std's hook lock, so a crash became a hang with nothing recorded. The nested entry is now dropped, and the persisted log reports how many were dropped.
+- **The policy sidecar's 30 s respawn backoff holds.** A policy call made during the backoff cleared it to retry, so a `manvi serve` that died at every start was respawned twice per gated action.
+- **A crashed window is logged, and reloads back off.** When the WKWebView content process died, Tauri reloaded the page immediately, every time, with no trace in the log: its "web content process terminated" debug line was written when the webview was built, not when it died. A page that crashed while loading therefore reload-looped invisibly, and the quit listener went with it. Each crash is now logged as an error with its count. The quit confirmation is disarmed until the reloaded page listens again, both on a crash and on any reload. Two crashes a minute reload at once; after that, reloads back off from 1 s, doubling to a 30 s cap.
+- A commit authored or committed as a test fixture (such as
+  `contract@gitpulse.test`) can no longer be pushed or recorded by another
+  route. Only `git commit` ran the fixture-identity check, so merges, rebases,
+  cherry-picks and commits made before the check existed reached `main`
+  unchecked; eleven did. The pre-push hook now checks every commit a push would
+  add and the tagger of an annotated tag, a pre-merge-commit hook covers
+  merges, and CI's `fixture-authors` job runs the same check over each push and
+  pull request, for clones without the hooks. In the app, merge, squash, pull,
+  cherry-pick, revert, interactive rebase, restack and annotated tags refuse a
+  fixture identity as commit already did. The shell and Rust rules now agree on
+  malformed addresses (empty, no `@`, over 254 bytes: refused) and are tested
+  against one table. `.mailmap` attributes the eleven to their real author.
+- **Black rectangles over the title bar and repository tab strip on macOS, staying until the pointer passed over them.** The WKWebView has a backdrop of its own between the page and the window's material, `underPageBackgroundColor`, and wry clears it only when a background colour is configured — `transparent: true` never reaches it. It stayed WebKit's opaque default (alpha 1.0, read off the live webview), so every region the page had not painted showed near-black instead of glass: tiles discarded while the window was inactive, occluded or on another Space, and the edge an elastic root dragged into view on a vertical swipe over the chrome. Both transparent windows now set a fully clear background colour, and the root no longer rubber-bands. The native material test reads the backdrop's alpha off the main and status webviews and fails against the old config.
+- **A blank band at the edge of the title bar and tab strips with nothing hovered.** The overflow cue painted its fade as a 32px band of one colour (`--c-bg`, or a black shade on macOS); over the glass title bar, the repository strip and every surface toolbar it read as a darker block with a hard edge. The scroller now masks its own edge, which needs no colour, and the cue overlay paints only its chevron. The cue also stopped advertising space that is not content: the title bar's drag spacer, and the end padding of the code viewer's, media viewer's, MarkDev's and explorer's toolbars, no longer bring up an arrow that scrolls into nothing. The repository strip no longer shows a scrollbar track under its tabs when the system shows scroll bars; a mouse wheel pans it instead, and that wheel leaves pinch and ctrl/cmd zoom, line- and page-mode wheels and the strip's ends to the page.
+- **The overflow cue no longer keeps closed tabs alive.** It observed each child of its scroller and never stopped, so the repository strip held every tab ever closed until the window did. It now unobserves children as they leave, answers on the first frame when it moves to another scroller rather than showing the previous one's edges, and hears a padding change that leaves the content box alone.
+- **Unsaved edits to a suggestion are asked about.** Editing a Manvi or Apple
+  Intelligence suggestion made every way off the task — another card, a tab,
+  close, Escape, New task, a terminal's link to another task — do nothing
+  without a word. Each now asks, in the task sheet and in Quick Enhance.
+- **The newest running suggestion is found wherever it sits in the history.**
+  Only the first thirty attempts were looked at, so an older running one was
+  never shown or polled and did not stop a second from starting; the history
+  also collapsed back to one page every second while a suggestion ran.
+- **Every task in a column can be reached in the list layout**, which had no
+  paging; a repository's board links to the Tasks board for everything.
+- **Code intelligence reads schema 26 stores again.** The vendored
+  `devmap-store` was schema 25, so every repository indexed by a current
+  `devmap` reported code intelligence unavailable. It is re-vendored at
+  schema 26 with DevCouncil's reader floor, so a later additive schema bump
+  no longer blinds GitPulse until the next re-vendor.
+- **MCP tool results match their declared output schemas.**
+  `gitpulse_change_context` declared `collisions` as an array (it is an
+  object), `gitpulse_codeintel_suspects` declared fields it never returns, and
+  `gitpulse_ledger_events` can return a null `next_cursor`. A test now
+  validates every read-only tool's result against its schema.
+- The hook-to-socket notification test no longer hangs: state and resolve
+  events are sent from a GitPulse session, as the hook requires, and a hook
+  that exits without connecting ends the wait instead of blocking it forever.
 - **Startup loads less again.** The Worktrees panel pulled the task board's
   attempt and session code into the startup bundle for one lookup, and the
   setup wizard was parsed at boot though it opens only on request. The lookup
@@ -803,6 +813,15 @@ to a moved checkout; and the code graph opens the maps devmap 0.2.4 writes.
   reboot-stable identity check (no device number), the stable record names
   and startup migration, how refused tabs are treated, and the revocation
   fallback for a deleted checkout.
+
+### Upgrade
+
+- dc-store schema 11 is a one-way migration, and a host built against schema
+  10 refuses a migrated profile. Rebuild GitPulse, Manvi and DevCouncil from a
+  schema 11 dc-store before any of them opens the profile.
+- Reinstall `gitpulse-mcp` and `gitpulse-hook` (`bun run mcp:install`): a
+  1.4.0 binary built before 2026-10-08 carries the schema 25 `devmap-store` and
+  cannot read a store a current `devmap` has built.
 
 ## [1.3.1] - 2026-09-22
 
