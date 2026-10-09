@@ -67,6 +67,7 @@ describe("createDiagnostics", () => {
       `git push https://user:${key}@github.com/o/r\nAuthorization: Bearer ${key}`,
     );
 
+    store.flush();
     const [entry] = get(store);
     const persisted = storage.getItem(DIAGNOSTIC_STORAGE_KEY) ?? "";
     const report = formatDiagnosticReport([entry], new Date("2026-01-01T00:00:00Z"));
@@ -329,6 +330,7 @@ describe("createDiagnostics", () => {
     const storage = memoryStorage();
     const first = createDiagnostics({ storage, now: () => 5 });
     first.error("pane-crash", "graph blew up");
+    first.flush();
     expect(JSON.parse(storage.getItem(DIAGNOSTIC_STORAGE_KEY) ?? "[]")).toHaveLength(1);
 
     const second = createDiagnostics({ storage, now: () => 6 });
@@ -367,9 +369,14 @@ describe("createDiagnostics", () => {
   it("clear() empties memory and removes the persisted blob", () => {
     const { store, storage } = makeStore();
     store.error("test", "gone soon");
+    store.flush();
     expect(storage.getItem(DIAGNOSTIC_STORAGE_KEY)).not.toBeNull();
+    store.error("test", "recorded after the last save");
     store.clear();
     expect(get(store)).toEqual([]);
+    expect(storage.getItem(DIAGNOSTIC_STORAGE_KEY)).toBeNull();
+    // The save that was pending when the log was cleared does not put it back.
+    store.flush();
     expect(storage.getItem(DIAGNOSTIC_STORAGE_KEY)).toBeNull();
   });
 
@@ -956,6 +963,7 @@ describe("installGlobalDiagnostics", () => {
     target.emit("error", { message: "real failure after storm" });
     expect(get(store)[0].message).toBe("real failure after storm");
     expect(get(store)[0].severity).toBe("error");
+    store.flush();
     expect(storage.setItem).toHaveBeenCalledTimes(1);
     uninstall();
     target.emit("error", { message: limit, error: new Error(limit) });
@@ -990,6 +998,7 @@ describe("installGlobalDiagnostics", () => {
     expect(get(store).every((entry) => entry.source === "uncaught-error" && entry.severity === "error")).toBe(true);
     expect(get(store).some((entry) => entry.message.includes("app.js"))).toBe(true);
     expect(get(store).some((entry) => entry.message.includes(":12:"))).toBe(true);
+    store.flush();
     expect(storage.setItem).toHaveBeenCalled();
     uninstall();
   });
@@ -1496,6 +1505,7 @@ describe("diagnostics ring under fuzz", () => {
     expect(counted).toBeLessThanOrEqual(recorded);
 
     // The persisted blob restores an identical ring.
+    store.flush();
     expect(get(createDiagnostics({ storage }))).toEqual(entries);
   }, STRESS_TIMEOUT_MS);
 

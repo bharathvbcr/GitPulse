@@ -16,7 +16,9 @@ describe("diagnostics retention and durability", () => {
   });
   it("keeps identical errors from two builds distinct after restart", () => {
     const storage = memoryStorage();
-    createDiagnostics({ storage, buildId: "build-one" }).error("runtime", "same failure");
+    const first = createDiagnostics({ storage, buildId: "build-one" });
+    first.error("runtime", "same failure");
+    first.flush();
     const next = createDiagnostics({ storage, buildId: "build-two" });
     next.error("runtime", "same failure");
     const entries = get(next);
@@ -63,14 +65,21 @@ describe("diagnostics retention and durability", () => {
       setItem: (key, value) => { attempts++; if (failing) throw new Error("quota token=private-value"); backing.setItem(key, value); },
     } });
     for (let i = 0; i < 100; i++) store.error("test", `failure ${i}`);
+    // Saves are deferred: the storm shares one, which runs on flush.
+    expect(attempts).toBe(0);
+    store.flush();
     expect(get(store)).toHaveLength(100);
     expect(get(store.health).persistence).toBe("memory-only");
     expect(get(store.health).persistenceError).not.toContain("private-value");
     expect(attempts).toBe(1);
+    // A blocked store does not retry on its own as the storm continues.
+    for (let i = 0; i < 10; i++) store.error("test", `later failure ${i}`);
+    store.flush();
+    expect(attempts).toBe(1);
     failing = false;
     store.retryPersistence();
     expect(get(store.health).persistence).toBe("saved");
-    expect(get(createDiagnostics({ storage: backing }))).toHaveLength(100);
+    expect(get(createDiagnostics({ storage: backing }))).toHaveLength(110);
   });
 
   it("distinguishes missing storage, an unreadable history, and corrupt JSON from an empty log", () => {
