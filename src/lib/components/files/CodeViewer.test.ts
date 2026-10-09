@@ -126,6 +126,12 @@ describe("CodeViewer", () => {
     expect(source).toContain("linesTruncated");
   });
 
+  it("does not request a whole-document highlight for a file past the render cap", () => {
+    // ft-0ff882a6: the byte limit lives in highlightDocument (diff/highlight
+    // tests); the render cap is this viewer's, so the skip is here.
+    expect(source).toContain("if (!usesTreeSitter(lang) || isEditing || linesTruncated) return;");
+  });
+
   it("scrolls long lines and chrome instead of letting them overlap", () => {
     expect(source).toContain("contentWidth");
     expect(source).toContain("scaledRowHeight");

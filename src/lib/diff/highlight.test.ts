@@ -3,6 +3,8 @@ import {
   composeLineSpans,
   composeSpans,
   highlightDocument,
+  exceedsUtf8Bytes,
+  MAX_HIGHLIGHT_DOCUMENT_BYTES,
   lineTokensFromSpans,
   MAX_HIGHLIGHT_CHARS,
   normalizeRanges,
@@ -287,6 +289,35 @@ describe("tree-sitter owner", () => {
     expect(lines).not.toBeNull();
     expect(lines![0].map((t) => t.text).join("")).toBe("fn main");
     expect(lines![0].some((t) => t.type === "keyword")).toBe(true);
+  });
+
+  it("highlightDocument does not send a document over the backend's 1 MiB limit", async () => {
+    // ft-0ff882a6: the viewer shipped multi-megabyte files across IPC only for
+    // the backend to refuse them. The limit is in UTF-8 bytes, as Rust counts.
+    vi.mocked(syntaxHighlight).mockClear();
+    await expect(highlightDocument("rust", "a".repeat(MAX_HIGHLIGHT_DOCUMENT_BYTES + 1))).resolves.toBeNull();
+    // 400k three-byte characters: under the limit in UTF-16 units, over it in bytes.
+    await expect(highlightDocument("rust", "€".repeat(400_000))).resolves.toBeNull();
+    expect(syntaxHighlight).not.toHaveBeenCalled();
+    vi.mocked(syntaxHighlight).mockResolvedValueOnce([]);
+    await highlightDocument("rust", "a".repeat(MAX_HIGHLIGHT_DOCUMENT_BYTES));
+    expect(syntaxHighlight).toHaveBeenCalledTimes(1);
+  });
+
+  it("exceedsUtf8Bytes counts bytes the way the backend does", () => {
+    expect(exceedsUtf8Bytes("abc", 3)).toBe(false);
+    expect(exceedsUtf8Bytes("abcd", 3)).toBe(true);
+    expect(exceedsUtf8Bytes("é", 1)).toBe(true);
+    expect(exceedsUtf8Bytes("é", 2)).toBe(false);
+    expect(exceedsUtf8Bytes("€€", 5)).toBe(true);
+    expect(exceedsUtf8Bytes("€€", 6)).toBe(false);
+    // A surrogate pair is four bytes, not six.
+    expect(exceedsUtf8Bytes("😀", 4)).toBe(false);
+    expect(exceedsUtf8Bytes("😀", 3)).toBe(true);
+    const sample = "a€é😀\uD800z".repeat(1000);
+    const bytes = new TextEncoder().encode(sample).length;
+    expect(exceedsUtf8Bytes(sample, bytes)).toBe(false);
+    expect(exceedsUtf8Bytes(sample, bytes - 1)).toBe(true);
   });
 
   it("highlightDocument returns null when IPC fails rather than inventing tokens", async () => {
