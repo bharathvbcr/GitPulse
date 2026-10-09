@@ -61,7 +61,8 @@ struct Agent {
 fn agent(behave: impl FnOnce(UnixStream) + Send + 'static) -> Agent {
     let dir = socket_dir();
     let path = dir.path().join("qd.sock");
-    let listener = UnixListener::bind(&path).expect("the fake agent binds");
+    let listener = crate::procguard::with_inheritance_lock(|| UnixListener::bind(&path))
+        .expect("the fake agent binds");
     let (tx, requests) = std::sync::mpsc::channel();
     thread::spawn(move || {
         let Ok((stream, _)) = listener.accept() else {
@@ -128,7 +129,8 @@ fn a_reply_written_at_accept_is_read_even_when_the_request_write_fails() {
     for round in 0..30 {
         let dir = socket_dir();
         let path = dir.path().join("qd.sock");
-        let listener = UnixListener::bind(&path).expect("binds");
+        let listener =
+            crate::procguard::with_inheritance_lock(|| UnixListener::bind(&path)).expect("binds");
         let refuser = thread::spawn(move || {
             let (mut stream, _) = listener.accept().expect("accepts");
             stream.write_all(ERROR.as_bytes()).expect("writes");
@@ -200,7 +202,7 @@ fn no_socket_is_socket_not_found() {
 fn a_socket_nobody_listens_on_is_connect_refused() {
     let dir = socket_dir();
     let path = dir.path().join("stale.sock");
-    drop(UnixListener::bind(&path).expect("bind"));
+    drop(crate::procguard::with_inheritance_lock(|| UnixListener::bind(&path)).expect("bind"));
     assert!(path.exists(), "the stale socket file stays behind");
     assert_eq!(
         client::ask(&path, &request_line(), DEADLINE),

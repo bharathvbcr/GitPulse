@@ -20,7 +20,8 @@
 //! stronger than being the same user:
 //!
 //! * The directory is created `0700` and refused if any ancestor is a symlink;
-//!   the socket itself is bound under a `0177`-clearing umask so it is `0600`.
+//!   the socket itself is made `0600` inside it, without touching the
+//!   process-wide umask (`crate::local_socket`).
 //! * Every connection's peer credentials are read and refused unless the uid
 //!   matches this process's. On a Unix where neither `getpeereid` nor
 //!   `SO_PEERCRED` is available the socket is **not bound at all** — a check
@@ -187,172 +188,14 @@ fn start(path: Option<std::path::PathBuf>) {
     }
 }
 
-/// The longest socket path this platform can bind.
-///
-/// `sun_path` is a fixed array — 104 bytes on macOS, 108 on Linux — and
-/// `bind` reports a path one byte too long as `ENAMETOOLONG`, which reads as a
-/// filesystem problem rather than as "your home directory's name is long".
-/// Checking it here is what lets the settings panel say the real reason.
-#[cfg(unix)]
-fn max_socket_path_bytes() -> usize {
-    // SAFETY: reading the length of a field of a zeroed `sockaddr_un` is a
-    // compile-time constant expressed through the libc type; nothing is
-    // dereferenced.
-    let probe = unsafe { std::mem::zeroed::<libc::sockaddr_un>() };
-    probe.sun_path.len().saturating_sub(1)
-}
-
+/// The one hardened bind every GitPulse socket shares; see `local_socket`.
 #[cfg(unix)]
 fn bind(
     path: Option<std::path::PathBuf>,
 ) -> Result<(std::os::unix::net::UnixListener, std::path::PathBuf), String> {
-    use std::os::unix::fs::PermissionsExt;
-    use std::os::unix::net::UnixListener;
-
-    if !peer_identity_is_checkable() {
-        return Err(
-            "This platform cannot report a socket peer's user, so the hook bridge stays closed."
-                .into(),
-        );
-    }
     let path = path.ok_or("Application config directory unavailable")?;
-    let limit = max_socket_path_bytes();
-    if path.as_os_str().len() > limit {
-        return Err(format!(
-            "The notification socket path is {} bytes and this system allows {limit}: {}",
-            path.as_os_str().len(),
-            path.display()
-        ));
-    }
-    let dir = path
-        .parent()
-        .ok_or("Application config directory unavailable")?
-        .to_path_buf();
-    for ancestor in dir.ancestors() {
-        if ancestor.try_exists().map_err(|e| e.to_string())? {
-            crate::storage::hygiene::tree::no_symlinks(ancestor)?;
-            break;
-        }
-    }
-    std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
-    crate::storage::hygiene::tree::no_symlinks(&dir)?;
-    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
-        .map_err(|e| format!("{}: {e}", dir.display()))?;
-
-    // A stale socket from a killed process would make `bind` fail with
-    // EADDRINUSE forever. Remove only a socket, never a regular file someone
-    // else put at this path.
-    match std::fs::symlink_metadata(&path) {
-        Ok(meta) => {
-            use std::os::unix::fs::FileTypeExt;
-            if !meta.file_type().is_socket() {
-                return Err(format!(
-                    "{} exists and is not a socket; the hook bridge stays closed.",
-                    path.display()
-                ));
-            }
-            std::fs::remove_file(&path).map_err(|e| format!("{}: {e}", path.display()))?;
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => return Err(format!("{}: {e}", path.display())),
-    }
-
-    // Bind under a umask that clears group and other bits. The socket's mode
-    // is applied at creation; chmod after the fact leaves a window in which it
-    // is world-writable.
-    // SAFETY: `umask` only reads and replaces this process's file-mode mask.
-    // It is restored before returning, and binding is serialised by `start`.
-    let previous = unsafe { libc::umask(0o177) };
-    let listener = UnixListener::bind(&path);
-    // SAFETY: as above; restores the value read a moment ago.
-    unsafe { libc::umask(previous) };
-    let listener = listener.map_err(|e| format!("{}: {e}", path.display()))?;
-    listener
-        .set_nonblocking(true)
-        .map_err(|e| format!("{}: {e}", path.display()))?;
+    let listener = crate::local_socket::bind_private(&path, "notification socket")?;
     Ok((listener, path))
-}
-
-#[cfg(unix)]
-fn peer_identity_is_checkable() -> bool {
-    cfg!(any(
-        target_os = "macos",
-        target_os = "ios",
-        target_os = "freebsd",
-        target_os = "openbsd",
-        target_os = "netbsd",
-        target_os = "dragonfly",
-        target_os = "linux",
-        target_os = "android"
-    ))
-}
-
-/// The uid on the other end of a connected socket, or `None` when it cannot be
-/// established. `None` is always a refusal.
-#[cfg(unix)]
-fn peer_uid(stream: &std::os::unix::net::UnixStream) -> Option<u32> {
-    use std::os::unix::io::AsRawFd;
-    let fd = stream.as_raw_fd();
-    #[cfg(any(
-        target_os = "macos",
-        target_os = "ios",
-        target_os = "freebsd",
-        target_os = "openbsd",
-        target_os = "netbsd",
-        target_os = "dragonfly"
-    ))]
-    {
-        let mut uid: libc::uid_t = 0;
-        let mut gid: libc::gid_t = 0;
-        // SAFETY: `fd` is a live connected socket owned by `stream`, and both
-        // out-pointers address initialised locals for the call's duration.
-        let ok = unsafe { libc::getpeereid(fd, &mut uid, &mut gid) } == 0;
-        return ok.then_some(uid);
-    }
-    #[cfg(any(target_os = "linux", target_os = "android"))]
-    {
-        let mut cred = libc::ucred {
-            pid: 0,
-            uid: 0,
-            gid: 0,
-        };
-        let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
-        // SAFETY: `fd` is a live connected socket; the buffer and its length
-        // describe one `ucred` and are valid for the call.
-        let ok = unsafe {
-            libc::getsockopt(
-                fd,
-                libc::SOL_SOCKET,
-                libc::SO_PEERCRED,
-                std::ptr::addr_of_mut!(cred).cast(),
-                &mut len,
-            )
-        } == 0;
-        return (ok && len as usize == std::mem::size_of::<libc::ucred>()).then_some(cred.uid);
-    }
-    #[allow(unreachable_code)]
-    {
-        let _ = fd;
-        None
-    }
-}
-
-/// Waits for a listener to have a connection ready, or for the timeout.
-///
-/// `poll` rather than a sleep between non-blocking `accept` calls: the
-/// difference is the latency of every notification, which is the whole point
-/// of the socket.
-#[cfg(unix)]
-fn wait_readable(fd: std::os::unix::io::RawFd, timeout: std::time::Duration) -> bool {
-    let mut descriptor = libc::pollfd {
-        fd,
-        events: libc::POLLIN,
-        revents: 0,
-    };
-    let millis = i32::try_from(timeout.as_millis()).unwrap_or(i32::MAX);
-    // SAFETY: one initialised `pollfd` describing a descriptor this thread
-    // owns for the duration of the call.
-    unsafe { libc::poll(&mut descriptor, 1, millis) > 0 }
 }
 
 #[cfg(unix)]
@@ -365,12 +208,15 @@ fn accept_loop(listener: std::os::unix::net::UnixListener, generation: u64) {
         if state.generation.load(Ordering::SeqCst) != generation {
             break;
         }
-        if !wait_readable(listener.as_raw_fd(), ACCEPT_WAIT) {
+        if !crate::local_socket::wait_readable(listener.as_raw_fd(), ACCEPT_WAIT) {
             continue;
         }
-        match listener.accept() {
+        // The accepted descriptor is made close-on-exec only after `accept`
+        // returns; the inheritance lock keeps a concurrent spawn from copying
+        // it in between. Non-blocking, so the lock covers one syscall.
+        match crate::procguard::with_inheritance_lock(|| listener.accept()) {
             Ok((stream, _)) => {
-                if peer_uid(&stream) != Some(own) {
+                if crate::local_socket::peer_uid(&stream) != Some(own) {
                     super::count_bridge_rejection();
                     continue;
                 }
@@ -946,7 +792,10 @@ mod tests {
         let dir = ShortDir::new("stale");
 
         // A socket left by a killed process: replaced, so the bridge comes back.
-        let orphan = std::os::unix::net::UnixListener::bind(dir.socket()).unwrap();
+        let orphan = crate::procguard::with_inheritance_lock(|| {
+            std::os::unix::net::UnixListener::bind(dir.socket())
+        })
+        .unwrap();
         drop(orphan);
         assert!(dir.socket().exists());
         apply_at(true, Some(dir.socket()));
