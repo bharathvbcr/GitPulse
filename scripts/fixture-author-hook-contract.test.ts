@@ -410,9 +410,12 @@ describe.skipIf(!gitAvailable || !hasBash)("fixture-commits.sh", () => {
     expect(lines).toHaveLength(1);
     expect(git(dir, ["log", "-1", "--format=%s", lines[0].split(" ")[0]]).trim()).toBe(`c${planted}`);
     expect(elapsed, `took ${Math.round(elapsed)} ms`).toBeLessThan(15_000);
-  });
+  }, 60_000);
 });
 
+// The multi-ref and long-history cases spawn hundreds of git processes. Their
+// limits are set per test, well above what they take, because vitest's 5 s
+// default is shorter than a loaded machine needs (measured: 5.4 s at load 28).
 describe.skipIf(!gitAvailable || !hasBash)("pre-push across remotes, tags and many refs", () => {
   it("lets a published fixture commit reach a second remote", () => {
     // Excluding only the pushed-to remote's refs would refuse every push to a
@@ -458,7 +461,7 @@ describe.skipIf(!gitAvailable || !hasBash)("pre-push across remotes, tags and ma
     expect(result.ok).toBe(false);
     expect(result.stderr).toContain("refs/heads/b17 would push 1 commit(s)");
     expect(result.stderr.match(/would push/g)).toHaveLength(1);
-  });
+  }, 30_000);
 
   it("lists twenty fixture commits and counts the rest", () => {
     const dir = initPushed();
@@ -470,7 +473,7 @@ describe.skipIf(!gitAvailable || !hasBash)("pre-push across remotes, tags and ma
     expect(result.stderr).toContain("would push 25 commit(s)");
     expect(result.stderr).toContain("… and 5 more");
     expect(result.stderr.match(/<contract@gitpulse\.test> <contract@gitpulse\.test>/g)).toHaveLength(20);
-  });
+  }, 30_000);
 
   it("refuses rather than passes when the pushed commit cannot be read", () => {
     // A ref pointing at an object this repository does not have is not a
