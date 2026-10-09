@@ -170,11 +170,48 @@ The rows are the only part of that panel that scrolls, and the actions a
 selection enables are pinned below them: ticking a row shows Restore and Delete
 without scrolling for them.
 
-Search uses the store's full-text query. **Filters** narrows loaded cards by
-priority, type, owner, label and due date. **Due soon** means from now through the
-next seven days; overdue tasks have their own filter. Facet choices and **Select
-all** use loaded cards. Column totals and **Load more** expose additional results;
-an empty filtered page does not establish that the whole profile has no matches.
+Words in the search box use the store's full-text query over titles and
+descriptions. The box also takes filters, which the board applies to loaded
+cards and never sends to the store — the store would search for their words:
+
+| Filter | Matches |
+| --- | --- |
+| `is:bug` (also `type:`, `kind:`; `is:bugs` works) | Type |
+| `priority:high` (`urgent`, `high`, `normal`, `low`, `p0`–`p3`) | Priority |
+| `status:review`, `status:in-progress`, `status:open` | Column; `open` is anything not Done |
+| `is:open`, `is:closed`, `is:unassigned`, `is:overdue` | The status, owner and due filters above, as GitHub spells them |
+| `repo:gitpulse`, `repo:acme`, `repo:code/gitpulse` | A linked repository: part of its name, a whole folder, owner or host in its path or remote, or — with a `/` — any part of it |
+| `owner:pat`, `owner:none` | Owner, or unassigned |
+| `label:ci`, `label:"needs review"`, `label:none` | Label, or unlabelled |
+| `severity:high`, `severity:none` | Severity |
+| `due:overdue` (`soon`, `later`, `none`, `any`) | Due date |
+
+Several filters on one key match either (`is:bug is:feature`); filters on
+different keys must all match. A leading `-` excludes (`-label:ci`), and `-word`
+hides cards whose title contains the word. Quote a filter (`"is:bug"`) to search
+for it as words. A filter the board cannot read — `priority:huge` — is reported
+under the search box and not applied. Each applied filter shows as a chip that
+removes it, and the quick filters (**Bugs**, **Urgent**, **Overdue**,
+**Unassigned**, **Open** …) add or remove theirs. **?** beside the box lists the
+syntax. A saved view keeps the search, filters included. The archive's search
+reads filters the same way, against its loaded rows. Changing any filter clears
+the selection, so a bulk action never reaches a card the filter has hidden.
+
+**Filters** also narrows loaded cards by priority, type, owner, label, due date
+and, on the global and workspace boards, repository. **Due soon** means from now
+through the next seven days; overdue tasks have their own filter. Facet choices,
+search filters and **Select all** use loaded cards: the filter bar says how many
+of the loaded tasks match and how many the board has not loaded. Column totals and
+**Load more** expose additional results; an empty filtered page does not establish
+that the whole profile has no matches.
+
+The navigator's **Find workspace or repo** box narrows its rows by name, and a
+repository's by its path or remote as well, by the same rule as `repo:` — so
+`git` finds repositories named for it, not every repository whose path ends
+in `.git`. The open board's row stays listed
+while it is filtered, workspace reordering waits until the box is cleared, and
+Escape clears it. It searches the rows the navigator has loaded; **More** loads
+the rest.
 
 Click a card to edit it. Command/Ctrl-click toggles selection; Shift-click selects
 a visible range. Right-click a card, or press Shift+F10 on a focused card, for

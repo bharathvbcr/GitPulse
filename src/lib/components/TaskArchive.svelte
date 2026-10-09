@@ -55,6 +55,7 @@
   import { formatRelativeTime } from "../format";
   import { MAX_TASK_SELECTION, type TaskAction } from "../workbench/taskActions";
   import { MAX_DELETE_BATCH } from "../workbench/taskDelete";
+  import { cardMatchesQuery, parseTaskQuery, type QueryContext } from "../workbench/taskQuery";
   import { ARCHIVE_RULE, archiveStamp, archiveSummary, refreshPages, restoreAction, type ArchiveView } from "../workbench/taskArchive";
   import {
     STATUS_LABELS, explainError, listTasks,
@@ -70,6 +71,7 @@
     onopen,
     onaction,
     onrestoredeleted,
+    repository = () => undefined,
   }: {
     scope: Scope;
     active?: boolean;
@@ -83,6 +85,8 @@
     onaction: (cards: TaskCard[], action: TaskAction) => void;
     /** Bring deleted tasks back; resolves with the line to show. */
     onrestoredeleted: (cards: TaskCard[]) => Promise<string>;
+    /** The board's repositories by id, so `repo:` finds one by name here too. */
+    repository?: QueryContext["repository"];
   } = $props();
 
   let view = $state<ArchiveView>("archived");
@@ -96,8 +100,18 @@
   let generation = 0, disposed = false, loading = false, again = false;
   let refreshTimer: ReturnType<typeof setTimeout> | undefined;
 
-  const rows = $derived((result?.items ?? []).filter((card) => !hiddenIds.has(card.id)));
-  const hiddenHere = $derived((result?.items.length ?? 0) - rows.length);
+  /**
+   * The search read as the board reads its own (`taskQuery.ts`): the words go
+   * to the store, the filters narrow the rows loaded here. Sending the whole
+   * box searched for `is:bug` as the words "is" and "bug".
+   */
+  const parsed = $derived(parseTaskQuery(query));
+  const storeQuery = $derived(parsed.text);
+  const queryContext = $derived<QueryContext>({ repository, nowSec: now });
+  /** Loaded rows not waiting out the board's undo window. */
+  const live = $derived((result?.items ?? []).filter((card) => !hiddenIds.has(card.id)));
+  const rows = $derived(live.filter((card) => cardMatchesQuery(card, parsed, queryContext)));
+  const hiddenHere = $derived((result?.items.length ?? 0) - live.length);
   // `null` until a read succeeds, so an unread dock never renders as an empty
   // archive. The dock defers while the window is in the background, which is
   // exactly when that distinction stops being theoretical.
@@ -110,7 +124,7 @@
   const canAct = $derived(chosen.length > 0 && !overCap && !busy && !working);
 
   function read(cursor: string | undefined) {
-    return listTasks(scope, null, query, cursor, 30, view === "archived"
+    return listTasks(scope, null, storeQuery, cursor, 30, view === "archived"
       ? { archived: true, order: "completed" }
       : { deleted: true, order: "updated" });
   }
@@ -174,10 +188,13 @@
   // Scope, search and view each change what the list is, so the page starts
   // over. A completed write only changes rows within it: refreshed in place.
   $effect(() => {
-    scope; query; view; active; visible;
+    scope; storeQuery; view; active; visible;
     generation++; result = null; pages = 0; selected = new Set(); clearTimeout(refreshTimer);
     untrack(() => { void load("first"); });
   });
+  // Filters change which loaded rows show, not the list: no re-read, but a
+  // selection they may have hidden is dropped rather than acted on.
+  $effect(() => { query; untrack(() => { selected = new Set(); }); });
   let seenToken = untrack(() => refreshToken);
   $effect(() => {
     if (refreshToken === seenToken) return;
@@ -246,6 +263,7 @@
   <p class="summary" role="status" data-testid="task-archive-summary">
     {summary.text}
     {#if summary.partial}<span class="more-note">Load more to see the rest.</span>{/if}
+    {#if parsed.terms.length && !summary.pending}<span class="more-note" data-testid="task-archive-filter-note">Filters apply to the {live.length} loaded.</span>{/if}
     <!-- Deferring the query while the window is in the background is the
          Inbox's behaviour too, and worth the saved round trips. Leaving the
          reader to guess why the panel is blank is not. -->
@@ -257,6 +275,11 @@
     {view === "archived" ? ARCHIVE_RULE : "Deleted tasks keep their history; Restore brings one back with its id, fields and archive state."}
   </p>
 
+  {#if parsed.problems.length}
+    <ul class="problems" role="status" aria-live="polite" data-testid="task-archive-query-problems">
+      {#each parsed.problems as problem}<li>{problem} Not applied.</li>{/each}
+    </ul>
+  {/if}
   {#if error}<div role="alert">{error}</div>{/if}
   {#if notice}<p class="notice" role="status">{notice}</p>{/if}
 
@@ -327,6 +350,7 @@
      the whole of an over-tall panel is taken out of the row list and the
      action bar cannot be the part that goes off screen. */
   .archive > *{flex:0 0 auto}
+  .problems{margin:4px 0 0;padding:0;list-style:none;font-size:11px;color:rgb(var(--c-status-amber))}
   header,.controls{display:flex;align-items:center;gap:8px;flex-wrap:wrap}header{justify-content:space-between}
   header strong{display:flex;align-items:center;gap:6px;font-weight:600}
   p{margin:6px 0;color:rgb(var(--c-text-muted))}

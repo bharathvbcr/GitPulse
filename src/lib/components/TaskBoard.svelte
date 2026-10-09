@@ -34,6 +34,7 @@
   import { linkTaskToIssue, MAX_TASK_ISSUE_BATCH, prepareTaskIssues, runTaskIssues, summarizeTaskIssues, taskIssuesConfirmation, type TaskIssueResult, type TaskIssueTarget } from "../workbench/taskIssue";
   import { askConfirm } from "../stores/modalStore";
   import { openExternal } from "../desktop/openExternal";
+  import { cardMatchesQuery, parseTaskQuery, queryHas, removeQueryTerm, repositoryMatches, toggleQueryTerm, QUERY_HELP, type QueryContext } from "../workbench/taskQuery";
   import { cardChrome, cardMatchesFacet, collectFacetOptions, emptyFacet, facetActive, allLoadedCards, reorderPlan, partitionLanes, type TaskFacet, type TaskLane } from "../workbench/taskOrganize";
   import { plural } from "../format";
   import { archiveAction, archivable, archiveState } from "../workbench/taskArchive";
@@ -124,11 +125,21 @@
   let loadedKey = $state("");
   let unreadError = $state("");
   let unreadRevision = 0, initializationRevision = 0, openingRevision = 0;
-  const boardKey = $derived(JSON.stringify([scope, search]));
+  /**
+   * The search box read as store text plus board filters (`taskQuery.ts`).
+   * Only the text reaches the store, so typing `is:bug` filters the loaded
+   * cards instead of reloading the board for the words "is" and "bug".
+   */
+  const parsedQuery = $derived(parseTaskQuery(search));
+  const serverQuery = $derived(parsedQuery.text);
+  const boardKey = $derived(JSON.stringify([scope, serverQuery]));
   // A deletion waiting out its undo window is already gone from the board:
   // its cards, its counts and anything a selection could act on.
   const displayColumns = $derived(loadedKey === boardKey ? (pendingDelete ? removeFromColumns(columns, pendingDelete.ids) : columns) : {});
-  $effect(() => { boardKey; facet; selected = new Set(); selectionAnchor = null; menu = null; });
+  // `JSON.stringify(facet)`, not `facet`: the Filters selects write a field in
+  // place, which reading the object alone does not track, so a filter change
+  // used to leave a selection it had hidden — for a bulk Delete to act on.
+  $effect(() => { boardKey; JSON.stringify(facet); search; selected = new Set(); selectionAnchor = null; menu = null; });
   // An undo offer belongs to the board it was made on. A pending deletion is
   // not withdrawn by a scope change: it is still the reader's to undo.
   $effect(() => { JSON.stringify(scope); untrack(() => offerUndo(null)); });
@@ -164,6 +175,17 @@
   let enhanceStart = $state(0);
   let facet = $state<TaskFacet>(emptyFacet());
   let showFilters = $state(false);
+  let showSearchHelp = $state(false);
+  /** One-click filters; each is a search filter, so a saved view keeps it and a chip removes it. */
+  const QUICK_FILTERS = [
+    { label: "Bugs", filter: "is:bug" },
+    { label: "Features", filter: "is:feature" },
+    { label: "Urgent", filter: "priority:urgent" },
+    { label: "High", filter: "priority:high" },
+    { label: "Overdue", filter: "due:overdue" },
+    { label: "Unassigned", filter: "owner:none" },
+    { label: "Open", filter: "status:open" },
+  ] as const;
   let quickAdding = $state(false);
   let quickAddEl = $state<{ focus: () => void }>();
   let handoff = $state<{ card: TaskCard; settings: HandoffSettings } | null>(null);
@@ -227,6 +249,14 @@
   const total = $derived(STATUSES.reduce((sum, status) => sum + (displayColumns[status]?.total ?? 0), 0));
   const loadedCards = $derived(allLoadedCards(displayColumns));
   const facetOptions = $derived(collectFacetOptions(loadedCards));
+  /**
+   * The repository filter's choices, by name; an id the catalog has not
+   * loaded shows as itself. The chosen one stays listed even when no loaded
+   * card links it, so the select never shows a blank for an active filter.
+   */
+  const facetRepositories = $derived([...new Set([...facetOptions.repositories, ...(facet.repository === "all" ? [] : [facet.repository])])]
+    .map((id) => ({ id, name: repositoryById.get(id)?.name ?? id }))
+    .sort((a, b) => a.name.localeCompare(b.name)));
   const filtering = $derived(facetActive(facet) || search.trim().length > 0);
   // Layout, density, hidden columns and card chips are reader preferences the
   // profile remembers; the header and the View menu write them back.
@@ -238,6 +268,22 @@
   const visibleWorkspaces = $derived(showArchived ? workspaces : workspaces.filter((group) => !group.archived));
   /** The navigator's order; moves are computed against this same list. */
   const orderedWorkspaces = $derived(navigatorOrder(visibleWorkspaces));
+  // ---- Navigator search -------------------------------------------------
+  // Narrows the workspace and repository rows by name (and a repository's
+  // identity, its path or remote). The selected scope stays listed, so the
+  // reader never loses sight of which board is open. Only loaded rows are
+  // searched; while more pages exist the navigator says so beside "More".
+  let navFilter = $state("");
+  const navNeedle = $derived(navFilter.trim().toLowerCase());
+  const navFiltering = $derived(navNeedle.length > 0);
+  function navShowsWorkspace(group: WorkspaceCard): boolean {
+    return !navFiltering || (scope.kind === "workspace" && scope.id === group.id) || group.name.toLowerCase().includes(navNeedle);
+  }
+  function navShowsRepository(repo: Repository): boolean {
+    return !navFiltering || (scope.kind === "repository" && scope.id === repo.id) || repositoryMatches(repo, navNeedle);
+  }
+  const navWorkspaceMatches = $derived(orderedWorkspaces.filter(navShowsWorkspace).length);
+  const navRepositoryMatches = $derived(repositories.filter(navShowsRepository).length);
   /** Named groups on the repository tab strip that could become workspaces. */
   const importableGroups = $derived(tabGroups($repoStore.openTabs, $repoStore.groupColors));
   let movingGroup = $state(false);
@@ -336,8 +382,16 @@
     announce = `Showing the saved view ${view.name}`;
   }
   function repoName(id: string) { return repositories.find((repo) => repo.id === id)?.name; }
+  const repositoryById = $derived(new Map(repositories.map((repo) => [repo.id, repo])));
+  const queryContext = $derived<QueryContext>({ repository: (id) => repositoryById.get(id), nowSec: now });
+  /** The one test for "on screen": the Filters bar and the search box's filters. */
+  function cardVisible(card: TaskCard): boolean {
+    return cardMatchesFacet(card, facet, now) && cardMatchesQuery(card, parsedQuery, queryContext);
+  }
+  /** Cards on screen across every column, hidden ones included; the filter bar's count. */
+  const visibleCount = $derived(loadedCards.filter(cardVisible).length);
   function visibleIn(status: TaskStatus): TaskCard[] {
-    return (displayColumns[status]?.items ?? []).filter((card) => cardMatchesFacet(card, facet, now));
+    return (displayColumns[status]?.items ?? []).filter(cardVisible);
   }
 
   async function catalog() {
@@ -347,7 +401,7 @@
     workspaces = groups.items; workspaceTotal = groups.total; workspaceCursor = groups.next_cursor;
     catalogError = "";
   }
-  async function loadBoard(target: Scope = scope, query: string = search) {
+  async function loadBoard(target: Scope = scope, query: string = serverQuery) {
     const generation = ++revision, key = JSON.stringify([target, query]); loading = true; error = "";
     try {
       // Columns hold what is on the board: an archived task leaves them
@@ -496,7 +550,7 @@
   });
   $effect(() => {
     if (!initialized || !active) return;
-    const target = scope, query = search;
+    const target = scope, query = serverQuery;
     loading = true;
     const timer = setTimeout(() => { void loadBoard(target, query); void loadUnread(target); }, 250);
     return () => { clearTimeout(timer); revision++; };
@@ -758,7 +812,9 @@
    * only partly took is reported with both numbers, never as done.
    */
   async function moveGroup(id: string, delta: -1 | 1) {
-    if (movingGroup || busy) return;
+    // A move swaps with the neighbour in the full order, which a filtered
+    // navigator may be hiding; the row would not visibly move.
+    if (movingGroup || busy || navFiltering) return;
     const writes = moveWrites(orderedWorkspaces, id, delta);
     if (!writes) return;
     const name = workspaces.find((group) => group.id === id)?.name ?? "Workspace";
@@ -838,7 +894,7 @@
     const generation = revision, key = boardKey;
     loading = true; error = "";
     try {
-      const result = await listTasks(scope, status, search, cursor, TASK_PAGE_SIZE, BOARD);
+      const result = await listTasks(scope, status, serverQuery, cursor, TASK_PAGE_SIZE, BOARD);
       if (generation !== revision || disposed || key !== boardKey) return;
       const items = cursor ? [...new Map([...(columns[status]?.items ?? []), ...result.items].map((item) => [item.id, item])).values()] : result.items;
       columns = { ...columns, [status]: { ...result, items, shown: items.length } };
@@ -926,7 +982,7 @@
       return;
     }
     if (e.shiftKey) {
-      const ids = flattenVisibleIds(displayColumns, shown, (item) => cardMatchesFacet(item, facet, now));
+      const ids = flattenVisibleIds(displayColumns, shown, cardVisible);
       selected = rangeSelect(ids, selectionAnchor, card.id);
       return;
     }
@@ -1013,7 +1069,7 @@
       next.focus();
       const id = next.dataset.cardId;
       if (id && e.shiftKey && (e.key === "ArrowUp" || e.key === "ArrowDown")) {
-        const ids = flattenVisibleIds(displayColumns, shown, (item) => cardMatchesFacet(item, facet, now));
+        const ids = flattenVisibleIds(displayColumns, shown, cardVisible);
         if (!selectionAnchor) selectionAnchor = card.id;
         selected = rangeSelect(ids, selectionAnchor, id);
       }
@@ -1073,7 +1129,7 @@
     }
     if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "a") {
       e.preventDefault();
-      selected = new Set(flattenVisibleIds(displayColumns, shown, (item) => cardMatchesFacet(item, facet, now)));
+      selected = new Set(flattenVisibleIds(displayColumns, shown, cardVisible));
       selectionAnchor = [...selected][0] ?? null;
       return;
     }
@@ -1753,13 +1809,17 @@
 <div bind:this={boardEl} class="workbench bg-background" class:is-dragging={drag !== null} class:is-compact={compact} data-testid="task-board">
   {#if !repositoryPath}
     <nav class="navigator gp-glass" class:gp-liquid-tabs={macos} aria-label="Task scopes">
+      <label class="nav-search"><Search size={11} aria-hidden="true" /><input class="gp-field" type="search" data-testid="task-nav-search" aria-label="Find a workspace or repository" placeholder="Find workspace or repo" maxlength="200" bind:value={navFilter} onkeydown={(e) => { if (e.key === "Escape" && navFilter) { e.preventDefault(); e.stopPropagation(); navFilter = ""; } }} /></label>
       <div class="nav-heading">Workspaces<span class="heading-actions">{#if importableGroups.length}<button type="button" class="icon gp-icon-btn" data-testid="import-tab-groups" title={`Import ${plural(importableGroups.length, "tab group")} as workspaces`} aria-label={`Import ${plural(importableGroups.length, "tab group")} as workspaces`} disabled={importingGroups || busy} onclick={() => void importGroups()}><Import size={12} /></button>{/if}<button type="button" class="icon gp-icon-btn" title="New workspace" aria-label="New workspace" onclick={newWorkspace}><Plus size={12} /></button></span></div>
       <button type="button" class="gp-seg-btn" aria-pressed={scope.kind === "global"} data-active={scope.kind === "global"} class:selected={scope.kind === "global"} onclick={() => { scope = { kind: "global" }; }}>{@render scopeSelection(scope.kind === "global")}<span>All</span></button>
       {#each orderedWorkspaces as group, index (group.id)}
         {@const siblings = orderedWorkspaces.filter((other) => other.pinned === group.pinned)}
-        <div class="nav-row" data-workspace-row={group.id}><button type="button" class="gp-seg-btn" aria-pressed={scope.kind === "workspace" && scope.id === group.id} data-active={scope.kind === "workspace" && scope.id === group.id} class:selected={scope.kind === "workspace" && scope.id === group.id} aria-keyshortcuts="Alt+ArrowUp Alt+ArrowDown" onkeydown={(e) => { if (e.altKey && (e.key === "ArrowUp" || e.key === "ArrowDown")) { e.preventDefault(); void moveGroup(group.id, e.key === "ArrowUp" ? -1 : 1); } }} onclick={() => { scope = { kind: "workspace", id: group.id }; }} title="{group.name} — {workspaceMembershipLabel(group.repository_count)}">{@render scopeSelection(scope.kind === "workspace" && scope.id === group.id)}<span>{group.icon} {group.name}{group.repository_count === 0 ? " · Empty" : ""}{group.archived ? " · Archived" : ""}</span></button><span class="reorder"><button type="button" class="gp-icon-btn" aria-label={`Move ${group.name} up`} disabled={movingGroup || busy || siblings[0]?.id === group.id} onclick={() => void moveGroup(group.id, -1)}><ChevronUp size={11} /></button><button type="button" class="gp-icon-btn" aria-label={`Move ${group.name} down`} disabled={movingGroup || busy || siblings.at(-1)?.id === group.id || (index === orderedWorkspaces.length - 1)} onclick={() => void moveGroup(group.id, 1)}><ChevronDown size={11} /></button></span><button type="button" class="icon gp-icon-btn" aria-label={`Edit ${group.name}`} onclick={() => editWorkspace(group.id)} disabled={opening}>⋯</button></div>
+        {#if navShowsWorkspace(group)}
+        <div class="nav-row" data-workspace-row={group.id}><button type="button" class="gp-seg-btn" aria-pressed={scope.kind === "workspace" && scope.id === group.id} data-active={scope.kind === "workspace" && scope.id === group.id} class:selected={scope.kind === "workspace" && scope.id === group.id} aria-keyshortcuts="Alt+ArrowUp Alt+ArrowDown" onkeydown={(e) => { if (e.altKey && (e.key === "ArrowUp" || e.key === "ArrowDown")) { e.preventDefault(); void moveGroup(group.id, e.key === "ArrowUp" ? -1 : 1); } }} onclick={() => { scope = { kind: "workspace", id: group.id }; }} title="{group.name} — {workspaceMembershipLabel(group.repository_count)}">{@render scopeSelection(scope.kind === "workspace" && scope.id === group.id)}<span>{group.icon} {group.name}{group.repository_count === 0 ? " · Empty" : ""}{group.archived ? " · Archived" : ""}</span></button><span class="reorder"><button type="button" class="gp-icon-btn" aria-label={`Move ${group.name} up`} disabled={movingGroup || busy || navFiltering || siblings[0]?.id === group.id} onclick={() => void moveGroup(group.id, -1)}><ChevronUp size={11} /></button><button type="button" class="gp-icon-btn" aria-label={`Move ${group.name} down`} disabled={movingGroup || busy || navFiltering || siblings.at(-1)?.id === group.id || (index === orderedWorkspaces.length - 1)} onclick={() => void moveGroup(group.id, 1)}><ChevronDown size={11} /></button></span><button type="button" class="icon gp-icon-btn" aria-label={`Edit ${group.name}`} onclick={() => editWorkspace(group.id)} disabled={opening}>⋯</button></div>
+        {/if}
       {/each}
-      {#if workspaceCursor}<button type="button" onclick={moreWorkspaces}>More ({workspaces.length}/{workspaceTotal})</button>{/if}
+      {#if navFiltering && navWorkspaceMatches === 0}<p class="nav-empty" data-testid="task-nav-no-workspaces">No workspace matches “{navFilter.trim()}”{workspaceCursor ? " in the loaded rows" : ""}.</p>{/if}
+      {#if workspaceCursor}<button type="button" onclick={moreWorkspaces}>More ({workspaces.length}/{workspaceTotal}){navFiltering ? " — search covers loaded rows" : ""}</button>{/if}
       {#if workspaces.some((group) => group.archived)}
         <!-- "workspaces", not just "archived": this page also has an Archive
              that holds completed tasks, and two unqualified uses of the word
@@ -1807,11 +1867,14 @@
       {/if}
       {#each repositories as repo (repo.id)}
         {@const health = checkouts.get(repo.id)}
+        {#if navShowsRepository(repo)}
         <div class="nav-row" data-repository-row={repo.id} data-checkout={health?.state ?? "unread"}><button type="button" class="gp-seg-btn" class:selected={scope.kind === "repository" && scope.id === repo.id} aria-pressed={scope.kind === "repository" && scope.id === repo.id} data-active={scope.kind === "repository" && scope.id === repo.id} onclick={() => { scope = { kind: "repository", id: repo.id }; }} title={health && health.state !== "available" ? health.detail : repo.identity_key}>
         {@render scopeSelection(scope.kind === "repository" && scope.id === repo.id)}<span>{repo.name}{#if health?.state === "missing"}<span class="checkout-mark" data-testid="repository-checkout-missing"> · <AlertTriangle size={10} aria-hidden="true" /> Missing</span>{:else if health?.state === "remote"}<span class="checkout-mark" data-testid="repository-remote-only"> · Remote only</span>{:else if health?.state === "unknown"}<span class="checkout-mark" data-testid="repository-checkout-unknown"> · Not checked</span>{/if}</span>
       </button>{#if health?.state === "remote"}<button type="button" class="icon gp-icon-btn" aria-label={`Link ${repo.name} to a local checkout`} title={`Link ${repo.name} to a checkout on this machine — its tasks, workspaces and history keep their place`} disabled={relinking || busy} onclick={() => void relinkRepo(repo)}><FolderSync size={12} /></button>{:else}<button type="button" class="icon gp-icon-btn" class:urgent={health?.state === "missing"} aria-label={`Relink ${repo.name} to a moved checkout`} title={health?.state === "missing" ? health.detail : `Relink ${repo.name} — its checkout moved or was cloned again`} disabled={relinking || busy} onclick={() => void relinkRepo(repo)}><FolderSync size={12} /></button>{/if}</div>
+        {/if}
       {/each}
-      {#if repositoryCursor}<button type="button" onclick={moreRepositories}>More ({repositories.length}/{repositoryTotal})</button>{/if}
+      {#if navFiltering && navRepositoryMatches === 0}<p class="nav-empty" data-testid="task-nav-no-repositories">No repository matches “{navFilter.trim()}”{repositoryCursor ? " in the loaded rows" : ""}.</p>{/if}
+      {#if repositoryCursor}<button type="button" onclick={moreRepositories}>More ({repositories.length}/{repositoryTotal}){navFiltering ? " — search covers loaded rows" : ""}</button>{/if}
     </nav>
   {/if}
   <main class="board-main">
@@ -1824,7 +1887,9 @@
         {#if repositoryPath}<button type="button" class="link" data-testid="task-board-all" title="Open the Tasks board for every repository and workspace" onclick={() => interfaceStore.setGlobalSurface("tasks")}>All tasks</button>{/if}
       </div>
       <div class="actions">
-        <label class="search"><Search size={12} /><input id="task-search" class="gp-field" aria-label="Search tasks" type="search" bind:value={search} placeholder="Search tasks" maxlength="512" /></label>
+        <label class="search"><Search size={12} /><input id="task-search" class="gp-field" aria-label="Search tasks" aria-describedby="task-search-hint" type="search" bind:value={search} placeholder="Search — is:bug repo:name" title="Words search titles and descriptions; is:bug, priority:high, repo:name, owner:, label:, status:, due:, severity: filter the board. A leading - excludes." maxlength="512" /></label>
+        <span id="task-search-hint" class="sr-only">Words search titles and descriptions. Filters such as is:bug, priority:high or repo:name narrow the loaded cards; a leading minus excludes.</span>
+        <button type="button" class="gp-icon-btn" aria-pressed={showSearchHelp} aria-controls="task-search-help" aria-label="Search syntax" title="Search syntax" onclick={() => { showSearchHelp = !showSearchHelp; }}>?</button>
         <div class="gp-segmented" class:gp-liquid-tabs={macos} role="group" aria-label="Task layout">
           <button type="button" class="gp-seg-btn" data-active={layout === "board"} aria-pressed={layout === "board"} onclick={() => interfaceStore.setTaskLayout("board")}><LayoutGrid size={12} /> Board</button>
           <button type="button" class="gp-seg-btn" data-active={layout === "list"} aria-pressed={layout === "list"} onclick={() => interfaceStore.setTaskLayout("list")}><List size={12} /> List</button>
@@ -1886,7 +1951,47 @@
           <option value="soon">Due soon</option>
           <option value="none">No due date</option>
         </select>
+        <!-- A repository's own board already shows only its tasks, so the
+             select is offered there only while a filter carried over from
+             another board is still on — never as an invisible constraint. -->
+        {#if (scope.kind !== "repository" && facetRepositories.length) || facet.repository !== "all"}
+          <select class="gp-select" aria-label="Filter by repository" data-testid="task-filter-repository" bind:value={facet.repository}>
+            <option value="all">All repositories</option>
+            {#each facetRepositories as repo (repo.id)}<option value={repo.id}>{repo.name}</option>{/each}
+          </select>
+        {/if}
         {#if filtering}<button type="button" class="gp-btn" onclick={() => { facet = emptyFacet(); search = ""; }}>Clear filters</button>{/if}
+      </div>
+    {/if}
+    {#if initialized && (showFilters || filtering || showSearchHelp)}
+      <div class="query-bar" data-testid="task-query-bar">
+        <div class="quick-filters" role="group" aria-label="Quick filters">
+          {#each QUICK_FILTERS as quick (quick.filter)}
+            {@const on = queryHas(parsedQuery, quick.filter)}
+            <button type="button" class="gp-btn quick" aria-pressed={on} data-active={on} title={on ? `Remove ${quick.filter}` : `Add ${quick.filter} to the search`} onclick={() => { search = toggleQueryTerm(search, quick.filter); }}>{quick.label}</button>
+          {/each}
+        </div>
+        {#if parsedQuery.terms.length}
+          <ul class="query-chips" aria-label="Search filters">
+            {#each parsedQuery.terms as term (`${term.start}:${term.raw}`)}
+              <li class="gp-pill query-chip" class:negated={term.negated}><span>{term.raw}</span><button type="button" class="chip-remove" aria-label={`Remove filter ${term.raw}`} onclick={() => { search = removeQueryTerm(search, term); }}><X size={10} /></button></li>
+            {/each}
+          </ul>
+        {/if}
+        {#if parsedQuery.terms.length && loadedKey === boardKey}
+          <span class="query-coverage" data-testid="task-query-coverage">{plural(visibleCount, "match", "matches")} in {plural(loadedCards.length, "loaded task")}{loadedCards.length < total ? ` of ${total} — Load more in a column to filter the rest` : ""}</span>
+        {/if}
+        {#if parsedQuery.problems.length}
+          <ul class="query-problems" role="status" aria-live="polite" data-testid="task-query-problems">
+            {#each parsedQuery.problems as problem}<li><AlertTriangle size={11} aria-hidden="true" /> {problem} Not applied.</li>{/each}
+          </ul>
+        {/if}
+        {#if showSearchHelp}
+          <dl id="task-search-help" class="query-help" data-testid="task-search-help">
+            <div><dt>words</dt><dd>Search titles and descriptions (the store’s full-text search)</dd></div>
+            {#each QUERY_HELP as row (row.example)}<div><dt><button type="button" class="link" title="Add to the search" onclick={() => { search = toggleQueryTerm(search, row.example); }}>{row.example}</button></dt><dd>{row.meaning}</dd></div>{/each}
+          </dl>
+        {/if}
       </div>
     {/if}
     {#if creation.allowed}
@@ -1994,6 +2099,7 @@
         onopen={openTask}
         onaction={(cards, action) => void archiveDockAction(cards, action)}
         onrestoredeleted={restoreDeleted}
+        repository={(id) => repositoryById.get(id)}
       />
     {/if}
     {#if relinkPending}<div class="banner error" role="alert" data-testid="repository-relink-uncertain"><span>{relinkPending.message}</span><button type="button" class="gp-btn" disabled={relinking} onclick={() => void retryRelink()}>Retry relink</button></div>{/if}
@@ -2275,7 +2381,24 @@
   button:disabled{opacity:.5}
   .hint{font-size:11px;color:rgb(var(--c-text-muted))}
   .search{display:flex;align-items:center;gap:6px;color:rgb(var(--c-text-muted))}
-  .search input{width:160px}
+  .search input{width:200px}
+  .nav-search{display:flex;align-items:center;gap:5px;margin:0 0 6px;color:rgb(var(--c-text-muted))}
+  .nav-search input{flex:1;min-width:0;font-size:11px}
+  .nav-empty{margin:2px 6px 6px;font-size:11px;color:rgb(var(--c-text-muted))}
+  .query-bar{display:flex;flex-wrap:wrap;gap:6px 10px;align-items:center;padding:0 14px 8px}
+  .quick-filters{display:flex;flex-wrap:wrap;gap:4px}
+  .quick{font-size:11px;padding:2px 8px}
+  .quick[data-active="true"]{background:rgb(var(--c-accent) / .18);border-color:rgb(var(--c-accent) / .55)}
+  .query-chips{display:flex;flex-wrap:wrap;gap:4px;margin:0;padding:0;list-style:none}
+  .query-chip{display:inline-flex;align-items:center;gap:4px;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:11px}
+  .query-chip.negated span{text-decoration:line-through}
+  .chip-remove{display:inline-flex;border:0;background:none;padding:0;color:inherit;cursor:pointer}
+  .query-coverage{font-size:11px;color:rgb(var(--c-text-muted))}
+  .query-problems{flex-basis:100%;margin:0;padding:0;list-style:none;font-size:11px;color:rgb(var(--c-status-amber))}
+  .query-help{flex-basis:100%;display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:2px 14px;margin:0;font-size:11px}
+  .query-help div{display:flex;gap:8px}
+  .query-help dt{min-width:130px;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+  .query-help dd{margin:0;color:rgb(var(--c-text-muted))}
   .columns{display:flex;gap:8px;padding:12px;overflow:auto;flex:1;min-height:0;align-items:stretch}
   .column{width:220px;min-width:196px;flex:1;display:flex;flex-direction:column;border-radius:12px;border:1px solid rgb(var(--c-border) / 0.65);overflow:hidden;min-height:0}
   .column.drop-target{border-color:rgb(var(--c-accent))}

@@ -52,6 +52,13 @@ describe("facets", () => {
     expect(cardMatchesFacet(card(), { ...emptyFacet(), label: "missing" }, now)).toBe(false);
     expect(cardMatchesFacet(card(), { ...emptyFacet(), due: "overdue" }, 200)).toBe(true);
     expect(cardMatchesFacet(card({ due_at: null }), { ...emptyFacet(), due: "none" }, now)).toBe(true);
+    // Any linked repository counts, not only the primary one.
+    expect(cardMatchesFacet(card(), { ...emptyFacet(), repository: "r2" }, now)).toBe(true);
+    expect(cardMatchesFacet(card(), { ...emptyFacet(), repository: "r9" }, now)).toBe(false);
+  });
+
+  it("is active while a repository is chosen", () => {
+    expect(facetActive({ ...emptyFacet(), repository: "r1" })).toBe(true);
   });
 
   it("collects sorted unique kinds, owners and labels from loaded cards", () => {
@@ -63,6 +70,7 @@ describe("facets", () => {
     expect(options.kinds).toEqual(["bug", "feature"]);
     expect(options.owners).toEqual(["Ann", "Zed"]);
     expect(options.labels).toEqual(["a", "b"]);
+    expect(options.repositories).toEqual(["r1", "r2"]);
   });
 });
 
