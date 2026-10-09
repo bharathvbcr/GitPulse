@@ -1,3 +1,6 @@
+import { readFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { describe, expect, it, vi } from "vitest";
 import {
   composeLineSpans,
@@ -302,6 +305,20 @@ describe("tree-sitter owner", () => {
     vi.mocked(syntaxHighlight).mockResolvedValueOnce([]);
     await highlightDocument("rust", "a".repeat(MAX_HIGHLIGHT_DOCUMENT_BYTES));
     expect(syntaxHighlight).toHaveBeenCalledTimes(1);
+  });
+
+  it("mirrors the backend's MAX_HIGHLIGHT_CODE_BYTES", () => {
+    const repoRoot = join(dirname(fileURLToPath(import.meta.url)), "..", "..", "..");
+    const rust = readFileSync(join(repoRoot, "src-tauri", "vendored", "markdev-highlight", "src", "lib.rs"), "utf8");
+    const match = rust.match(/pub const MAX_HIGHLIGHT_CODE_BYTES: usize = ([\d_ *]+);/);
+    expect(match, "MAX_HIGHLIGHT_CODE_BYTES not found in markdev-highlight/src/lib.rs").not.toBeNull();
+    // The declaration is a product of integer literals, e.g. `1024 * 1024`.
+    const bytes = match![1]
+      .split("*")
+      .map((factor) => Number(factor.trim().replaceAll("_", "")))
+      .reduce((product, factor) => product * factor, 1);
+    expect(Number.isSafeInteger(bytes)).toBe(true);
+    expect(MAX_HIGHLIGHT_DOCUMENT_BYTES).toBe(bytes);
   });
 
   it("exceedsUtf8Bytes counts bytes the way the backend does", () => {
