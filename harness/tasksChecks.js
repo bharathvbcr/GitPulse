@@ -458,6 +458,70 @@ const moveThroughMenu = async (id, status) => {
 await wait(() => card("task-1"));
 if (params.has("check")) {
   try {
+    // ---- The drag preview sits under the pointer ----------------------------
+    // The board lives in a `.gp-pane`, whose `contain: layout paint` is the
+    // containing block of any `position: fixed` inside it. A ghost rendered
+    // there was offset by the pane's own origin, so it trailed the pointer by
+    // the header's height. Every drag here is cancelled, never dropped, so the
+    // board the later blocks read is the one they expect.
+    {
+      const ghost = () => document.querySelector('[data-testid="task-drag-ghost"]');
+      const pointer = (target, type, x, y, extra = {}) => target.dispatchEvent(new PointerEvent(type, {
+        bubbles: true, cancelable: true, composed: true, pointerId: 1, pointerType: "mouse", isPrimary: true,
+        button: 0, buttons: type === "pointerup" ? 0 : 1, clientX: x, clientY: y, ...extra,
+      }));
+      const grabbed = card("task-1");
+      const box = grabbed.getBoundingClientRect();
+      const grab = { x: Math.round(box.width * 0.8), y: Math.round(box.height * 0.6) };
+      const start = { x: box.left + grab.x, y: box.top + grab.y };
+      const at = { x: start.x + 37, y: start.y + 23 };
+      const beginDrag = async () => {
+        pointer(card("task-1"), "pointerdown", start.x, start.y);
+        pointer(card("task-1"), "pointermove", at.x, at.y); await settle();
+      };
+      const writesBefore = writes.length;
+
+      await beginDrag();
+      const shown = ghost()?.getBoundingClientRect();
+      check("dragging a card shows its preview", Boolean(shown));
+      check("the drag preview is portaled out of the contained pane", ghost()?.parentElement === document.body);
+      check("the drag preview sits under the pointer",
+        Boolean(shown) && at.x >= shown.left && at.x <= shown.right && at.y >= shown.top && at.y <= shown.bottom);
+      check("the drag preview keeps the point the card was grabbed by",
+        Boolean(shown) && Math.abs(at.x - shown.left - grab.x) <= 1 && Math.abs(at.y - shown.top - grab.y) <= 1);
+      check("the drag preview is the card's own width", Boolean(shown) && Math.abs(shown.width - box.width) <= 1);
+      // A second finger or pen must not take over a drag the first one owns.
+      pointer(card("task-1"), "pointerdown", start.x + 200, start.y, { pointerId: 7, pointerType: "touch", isPrimary: false });
+      pointer(card("task-1"), "pointermove", 5, 5, { pointerId: 7, pointerType: "touch", isPrimary: false });
+      pointer(card("task-1"), "pointerup", 5, 5, { pointerId: 7, pointerType: "touch", isPrimary: false }); await settle();
+      const still = ghost()?.getBoundingClientRect();
+      check("another pointer cannot steal, move or end a drag in progress",
+        Boolean(still) && Math.abs(still.left - shown.left) <= 1 && Math.abs(still.top - shown.top) <= 1);
+
+      document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true })); await settle();
+      check("Escape cancels a drag", !ghost());
+      pointer(document.body, "pointerup", at.x, at.y); await settle();
+      check("a cancelled drag writes nothing when the pointer is released", writes.length === writesBefore);
+
+      // The captured card can leave the DOM mid-drag (a refresh, another agent
+      // moving it), and then the release lands elsewhere. It must still end.
+      await beginDrag();
+      pointer(document.body, "pointerup", at.x, at.y); await settle();
+      check("a release away from the card still ends the drag", !ghost());
+
+      await beginDrag();
+      card("task-1").dispatchEvent(new PointerEvent("lostpointercapture", { bubbles: true, pointerId: 1 })); await settle();
+      check("losing pointer capture ends the drag", !ghost());
+
+      await beginDrag();
+      window.dispatchEvent(new Event("blur")); await settle();
+      check("leaving the window ends the drag", !ghost());
+      pointer(document.body, "pointerup", at.x, at.y); await settle();
+      check("drags that never dropped wrote nothing", writes.length === writesBefore);
+      // A press left over from any of the above would turn the next click into a drag.
+      await settle(50);
+    }
+
     // These assertions exercise the pre-fix defects through production components.
     await click("GitPulse fixture"); await settle(400);
     check("repository prop changes reload the board scope", !card("task-3") && Boolean(card("task-1")));

@@ -16,7 +16,7 @@
   import { portal } from "../dom/portal";
   import { LAYERS } from "../ui/layers";
   import { popover, restoreFocusTo } from "../ui/popover";
-  import { cardFace, dragExceeded, insertIndexFromY, insertionNeighbors, insertionPosition, neighborStatus, parseColumnStatus, shouldCommitMove } from "../workbench/boardDrag";
+  import { cardFace, dragExceeded, grabPoint, type GrabPoint, insertIndexFromY, insertionNeighbors, insertionPosition, neighborStatus, parseColumnStatus, shouldCommitMove } from "../workbench/boardDrag";
   import {
     explainError, getTask, getTaskBrief, getWorkspace, listAttention, listRepositories, listTasks, listWorkspaces, newID, putTask, registerRepository, restoreDeletedTask,
     STATUSES, STATUS_LABELS, TASK_PAGE_SIZE, taskDraft, taskWrite,
@@ -144,7 +144,12 @@
   // not withdrawn by a scope change: it is still the reader's to undo.
   $effect(() => { JSON.stringify(scope); untrack(() => offerUndo(null)); });
   let opening = $state(false); let moving = $state(false); let deleting = $state(false);
-  let press = $state<{ card: TaskCard; x: number; y: number } | null>(null);
+  /**
+   * A held card, before and during its drag. Owned by one pointer: every
+   * later event for the press is matched on `pointerId`, so a second finger
+   * or pen can neither move nor end it. `target` holds the capture.
+   */
+  let press = $state<{ card: TaskCard; pointerId: number; x: number; y: number; grab: GrabPoint; target: HTMLElement } | null>(null);
   let drag = $state<{ card: TaskCard; over: TaskStatus | null; insertIndex: number; lane: string; local: number; x: number; y: number } | null>(null);
   let skipClick = false;
   let showInbox = $state(false);
@@ -928,14 +933,36 @@
   function releasePointer(target: EventTarget | null, pointerId: number) {
     if (target instanceof HTMLElement && target.hasPointerCapture(pointerId)) target.releasePointerCapture(pointerId);
   }
+  /**
+   * The press and drag end on the window, not the card: a card a refresh or
+   * another writer removes mid-drag takes its capture with it, and the
+   * release then lands on whatever is under the pointer instead.
+   */
+  function ownsPointer(e: PointerEvent): boolean {
+    return press !== null && e.pointerId === press.pointerId;
+  }
+  /** Ends a press or drag without dropping it. */
+  function cancelDrag() {
+    const held = press;
+    drag = null;
+    press = null;
+    if (held) releasePointer(held.target, held.pointerId);
+  }
+  // A board hidden mid-drag (a surface switch from the keyboard) would leave
+  // the preview on <body>, over whatever is shown instead.
+  $effect(() => { if (!active) untrack(cancelDrag); });
   function onCardPointerDown(e: PointerEvent, card: TaskCard) {
     if (opening) return;
-    if (e.button !== 0 || busy || menu) return;
-    press = { card, x: e.clientX, y: e.clientY };
-    (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
+    if (e.button !== 0 || busy || menu || press) return;
+    const target = e.currentTarget as HTMLElement;
+    press = { card, pointerId: e.pointerId, x: e.clientX, y: e.clientY, grab: grabPoint({ x: e.clientX, y: e.clientY }, target.getBoundingClientRect()), target };
+    // Capture keeps the moves coming once the pointer leaves the window. A
+    // pointer the browser has already stopped tracking cannot be captured;
+    // the window listeners still see that press through to its end.
+    try { target.setPointerCapture(e.pointerId); } catch { /* uncaptured press, ended by the window listeners */ }
   }
   function onCardPointerMove(e: PointerEvent) {
-    if (!press) return;
+    if (!press || !ownsPointer(e)) return;
     if (!drag) {
       if (!dragExceeded(e.clientX - press.x, e.clientY - press.y)) return;
       menu = null;
@@ -945,10 +972,9 @@
     drag = { card: drag.card, over: at.over, insertIndex: at.index, lane: at.lane, local: at.local, x: e.clientX, y: e.clientY };
   }
   function onCardPointerUp(e: PointerEvent) {
+    if (!ownsPointer(e)) return;
     const current = drag;
-    drag = null;
-    press = null;
-    releasePointer(e.currentTarget, e.pointerId);
+    cancelDrag();
     if (!current) return;
     skipClick = true;
     requestAnimationFrame(() => { skipClick = false; });
@@ -993,9 +1019,7 @@
     void openTask(card.id);
   }
   function onCardPointerCancel(e: PointerEvent) {
-    drag = null;
-    press = null;
-    releasePointer(e.currentTarget, e.pointerId);
+    if (ownsPointer(e)) cancelDrag();
   }
   function openCardMenu(card: TaskCard, status: TaskStatus, x: number, y: number) {
     if (!selected.has(card.id)) {
@@ -1113,6 +1137,13 @@
     boardEl?.querySelector<HTMLElement>(`[data-task-card][data-card-id="${CSS.escape(card.id)}"]`)?.focus();
   }
   function onBoardKeydown(e: KeyboardEvent) {
+    // Before the focus checks: Safari does not focus a pressed button, so
+    // during a drag the focus can be anywhere, or nowhere.
+    if (press && e.key === "Escape") {
+      e.preventDefault();
+      cancelDrag();
+      return;
+    }
     if (!active || !boardEl) return;
     const target = e.target;
     if (!(target instanceof Node) || !boardEl.contains(target)) return;
@@ -1732,9 +1763,6 @@
     aria-keyshortcuts="ArrowUp ArrowDown Home End Shift+ArrowUp Shift+ArrowDown Alt+ArrowUp Alt+ArrowDown ArrowLeft ArrowRight X Delete ContextMenu"
     aria-disabled={opening || undefined}
     onpointerdown={(e) => onCardPointerDown(e, card)}
-    onpointermove={onCardPointerMove}
-    onpointerup={onCardPointerUp}
-    onpointercancel={onCardPointerCancel}
     onclick={(e) => onCardClick(e, card)}
     oncontextmenu={(e) => onCardContextMenu(e, card, status)}
     onkeydown={(e) => onCardKeydown(e, card, status)}
@@ -1805,7 +1833,7 @@
 {#snippet scopeSelection(selected: boolean)}
   {#if macos && selected}<span class="gp-liquid-selection gp-gpu" aria-hidden="true" in:receiveScope={{ key: "task-scope" }} out:sendScope={{ key: "task-scope" }}></span>{/if}
 {/snippet}
-<svelte:window onkeydown={onBoardKeydown} />
+<svelte:window onkeydown={onBoardKeydown} onpointermove={onCardPointerMove} onpointerup={onCardPointerUp} onpointercancel={onCardPointerCancel} onlostpointercapture={onCardPointerCancel} onblur={cancelDrag} />
 <div bind:this={boardEl} class="workbench bg-background" class:is-dragging={drag !== null} class:is-compact={compact} data-testid="task-board">
   {#if !repositoryPath}
     <nav class="navigator gp-glass" class:gp-liquid-tabs={macos} aria-label="Task scopes">
@@ -2213,7 +2241,12 @@
     {/if}
   </main>
   {#if drag}
-    <div class="ghost gp-glass bg-surface shadow-float" style="transform: translate({drag.x + 10}px, {drag.y + 10}px)" data-testid="task-drag-ghost">{drag.card.title}</div>
+    <!-- Portaled to body: the board's `.gp-pane` contains layout and paint,
+         which makes it the containing block of `position: fixed`, and a
+         preview drawn in it trailed the pointer by the pane's own origin.
+         Drawn at the card's size and held where it was grabbed. -->
+    {@const grab = press?.grab ?? { dx: 0, dy: 0, width: 0, height: 0 }}
+    <div use:portal={"body"} class="ghost gp-glass bg-surface shadow-float" style="width: {grab.width}px; height: {grab.height}px; transform: translate3d({drag.x - grab.dx}px, {drag.y - grab.dy}px, 0)" data-testid="task-drag-ghost">{drag.card.title}</div>
   {/if}
   {#if menu}
     <TaskContextMenu
@@ -2471,7 +2504,7 @@
   .list{padding:12px;overflow:auto;flex:1}
   .banner{padding:7px 14px;font-size:12px;border-bottom:1px solid rgb(var(--c-border) / 0.65);display:flex;align-items:center;justify-content:space-between;gap:10px}
   .error{color:#d15a64}
-  .ghost{position:fixed;top:0;left:0;z-index:20;pointer-events:none;max-width:220px;padding:6px 10px;font-size:12px;font-weight:550;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .ghost{position:fixed;top:0;left:0;z-index:20;pointer-events:none;box-sizing:border-box;padding:8px 9px;font-size:12px;font-weight:550;overflow:hidden;overflow-wrap:anywhere}
   .pad{padding:16px}
   .quick-add-row{padding:8px 14px 0}
   .quick-add-row.dimmed{opacity:.45;pointer-events:none;transition:opacity .15s ease}

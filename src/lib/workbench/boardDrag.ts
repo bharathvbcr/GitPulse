@@ -9,6 +9,32 @@ export function dragExceeded(dx: number, dy: number, threshold = TASK_DRAG_THRES
   return dx * dx + dy * dy >= threshold * threshold;
 }
 
+/** Where a card was held, and the size its drag preview is drawn at. */
+export interface GrabPoint {
+  dx: number;
+  dy: number;
+  width: number;
+  height: number;
+}
+
+const extent = (value: number) => (Number.isFinite(value) && value > 0 ? value : 0);
+const within = (value: number, max: number) => (Number.isFinite(value) ? Math.min(Math.max(value, 0), max) : 0);
+
+/**
+ * The press point inside the card's box. The preview is drawn at
+ * `pointer - (dx, dy)` with the card's own size, so the spot the card was
+ * picked up by stays under the pointer for the whole drag. Clamped into the
+ * box, so a degenerate or stale measurement can never place the preview
+ * away from the pointer.
+ */
+export function grabPoint(
+  press: { x: number; y: number },
+  box: { left: number; top: number; width: number; height: number },
+): GrabPoint {
+  const width = extent(box.width), height = extent(box.height);
+  return { dx: within(press.x - box.left, width), dy: within(press.y - box.top, height), width, height };
+}
+
 export function parseColumnStatus(value: string | null | undefined): TaskStatus | null {
   return STATUSES.find((status) => status === value) ?? null;
 }
