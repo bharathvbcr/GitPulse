@@ -162,7 +162,9 @@ fn launch_with(
         // Retrying a lost result reads the same attempt; it never starts another.
         return Ok(row);
     }
-    terminal_launch::revalidate(&row)?;
+    // A refusal here, before Manvi is asked, hands the repository back like
+    // any other: left at `prepared`, the row would hold it until expiry.
+    terminal_launch::revalidate(&row).map_err(|error| release_unclaimed(state, &id, error))?;
     // Stable for this attempt across UI reloads. The store forbids repeating a
     // consumed claim; only the owning live Manvi session can recover this call.
     let prepared = match call(
@@ -575,6 +577,40 @@ mod tests {
         // The point of all of it: the next attempt is not refused as busy.
         state.request("runs.prepare_managed", &json!({"id":"run2","request_id":"prepare2","task_id":"task","source_revision":1,"repository_id":"repo","repository_revision":1,"provider":"claude","permission_mode":"inspect","repo_path":root}).to_string())
             .expect("the repository was still held by a refused preparation");
+    }
+
+    /// A checkout that moved before launch hands the repository back too.
+    ///
+    /// The re-check ahead of Manvi returned its refusal with a bare `?`, so
+    /// the row stayed `prepared` and held the slot until it expired; the
+    /// retry sweep never touches `prepared`, and every re-preparation in that
+    /// checkout was refused as busy — the lock-out the refusal path above
+    /// was written to end, reached by another door.
+    #[test]
+    fn a_checkout_that_moved_before_launch_hands_the_repository_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, root) = prepared_attempt(dir.path(), "claude");
+        git_global(&[
+            "-C",
+            root.to_str().unwrap(),
+            "symbolic-ref",
+            "HEAD",
+            "refs/heads/elsewhere",
+        ])
+        .unwrap();
+        let refusal = launch_with(
+            &state,
+            r#"{"id":"run"}"#,
+            |_, _| panic!("a moved checkout reached Manvi"),
+            |_| panic!("a moved checkout observed a process"),
+        )
+        .expect_err("a moved checkout launched");
+        assert_eq!(refusal.code, "checkout_changed");
+        let row = state.request("runs.get", r#"{"id":"run"}"#).unwrap();
+        assert_eq!(
+            row["item"]["state"], "cancelled",
+            "a refused launch kept holding the checkout: {row}"
+        );
     }
 
     /// Only an *unclaimed* attempt is released.

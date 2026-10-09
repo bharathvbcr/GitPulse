@@ -76,6 +76,73 @@ describe("the agent handoff has one implementation", () => {
     expect(form).toContain('data-testid="permission-detail"');
   });
 
+  it("offers a launch's model as a choice where the launcher has one, and as text otherwise", () => {
+    for (const field of ["model", "advisor"]) {
+      expect(form).toContain(`modelOverrideChoices(settings.provider, "${field}")`);
+    }
+    expect(form).toMatch(/<select class="gp-select" aria-label="Model"[\s\S]*?\{#each choices as id \(id\)\}/);
+    expect(form).toMatch(/<select class="gp-select" aria-label="Advisor model"[\s\S]*?\{#each choices as id \(id\)\}/);
+    expect(form).toMatch(/\{:else\}\s*<input class="gp-field" aria-label="Model"/);
+  });
+
+  it("sends the sheet's key and button through one guard that refuses after a preparation", () => {
+    // Once the store accepted an attempt whose start then failed, the footer
+    // swapped Launch for Done — but Cmd+Enter still called the form, which
+    // passed its gate again and prepared a second run in a forced worktree.
+    expect(sheet).toMatch(/function launch\(\)\s*\{\s*if \(prepared \|\| busy \|\| !gate\.ok\) return;/);
+    expect(sheet.match(/form\?\.launch\(\)/g)).toHaveLength(1);
+    expect(sheet).toContain('event.key === "Enter") { event.preventDefault(); launch(); }');
+    expect(sheet).toContain("onclick={launch}");
+  });
+
+  it("lets the sheet close once the attempt is accepted, while its start is still running", () => {
+    // The start belongs to `startPreparedAttempt` and outlives the sheet, but
+    // `busy` stays set through it, and the terminal's start awaits repository
+    // reads with no bound. Close, Escape and Done must not wait on that.
+    expect(sheet).toContain("const closable = $derived(!busy || prepared);");
+    expect(sheet).toContain('event.key === "Escape" && closable)');
+    expect(sheet).toContain('aria-label="Close agent handoff" disabled={!closable}');
+    expect(sheet).toMatch(/\{#if prepared\}\s*<span class="meta gate">/);
+    expect(sheet).not.toContain("{#if prepared && !busy}");
+  });
+
+  it("keeps an unanswered preparation for its task, past the form that sent it", () => {
+    // Held in the form, it died with the sheet or the task tab, and the next
+    // press minted a new identity for what may already be a committed run.
+    expect(form).toContain("let pending = $state<RunPreparation | null>(untrack(() => pendingPreparationFor(taskId)));");
+    const launch = form.slice(form.indexOf("export async function launch()"));
+    expect(launch.indexOf("holdPendingPreparation(pending)")).toBeGreaterThan(-1);
+    expect(launch.indexOf("holdPendingPreparation(pending)")).toBeLessThan(launch.indexOf("prepareTaskRun(preparation)"));
+    expect(launch).toContain("releasePendingPreparation(preparation.task_id, preparation.id);\n      pending = null;");
+    // A settled refusal is released even when it lands after the form is gone.
+    const handler = launch.slice(launch.indexOf("} catch (cause) {"));
+    expect(handler.indexOf("releasePendingPreparation(sent.task_id, sent.id)")).toBeGreaterThan(-1);
+    expect(handler.indexOf("releasePendingPreparation(sent.task_id, sent.id)")).toBeLessThan(handler.indexOf("if (disposed) return;"));
+    // The way out is deliberate and says what it cannot know.
+    expect(form).toContain('onclick={discard}>Discard it</button>');
+    expect(form).toMatch(/function discard\(\) \{\s*if \(!pending \|\| busy\) return;\s*releasePendingPreparation\(pending\.task_id, pending\.id\);/);
+  });
+
+  it("says the store answered when its reply to a preparation could not be read", () => {
+    expect(form).toContain('cause.code === "protocol_error"');
+    expect(form).toContain("this attempt may exist: check this task's Agents before launching again.");
+  });
+
+  it("asks whether a checkout is taken by its Git directory, without ever waiting on the answer", () => {
+    // The store refuses by `git_dir`; an agent in a subfolder of the chosen
+    // checkout was invisible to a comparison of directories.
+    expect(form).toContain("attemptHolding(holding, { path: checkout, git_dir: targetGitDir }, pathOpts)");
+    const ask = form.slice(form.indexOf("let identityTicket"), form.indexOf("let identityTicket") + 900);
+    // Debounced, bounded, ticketed, and a failure is only "unknown".
+    expect(ask).toContain("setTimeout(");
+    expect(ask).toContain("return () => clearTimeout(timer);");
+    expect(ask).toContain("bounded(checkoutIdentity(path))");
+    expect(ask).toContain("ticket === identityTicket");
+    expect(ask).toMatch(/\(\) => \{\s*if \(!disposed && ticket === identityTicket\) targetGitDir = null;/);
+    // Launch never waits on it: the gate does not read it.
+    expect(form.slice(form.indexOf("const gate = $derived("), form.indexOf("const gate = $derived(") + 200)).not.toContain("targetGitDir");
+  });
+
   it("re-reads the saved task and refuses a revision that moved", () => {
     expect(form).toContain("await bounded(getTask(taskId))");
     expect(form).toContain("if (latest.revision !== revision)");
@@ -88,7 +155,11 @@ describe("the agent handoff has one implementation", () => {
     // Every control obeys the lock — derived from the markup rather than
     // counted by hand, because a control added later is exactly the one that
     // would be missed, and one editable control makes "Retry preparation" a lie.
-    const markup = form.slice(form.indexOf("</script>"));
+    // One named exception: Discard is the way out of the lock, so it is
+    // usable exactly while the lock holds, and refused only mid-request.
+    const discard = '<button type="button" class="gp-btn discard" disabled={busy} onclick={discard}>Discard it</button>';
+    expect(form).toContain(discard);
+    const markup = form.slice(form.indexOf("</script>")).replace(discard, "");
     const gates = markup.match(/\sdisabled=\{[^}]*\}/g) ?? [];
     expect(gates.length).toBeGreaterThanOrEqual(9);
     expect(gates.filter((gate) => !gate.includes("locked"))).toEqual([]);
@@ -110,7 +181,8 @@ describe("the agent handoff has one implementation", () => {
     expect(panel).toContain("runs.filter((item) => item.id !== run.id)");
     // The sheet stops offering a launch once one exists, so a failure after
     // preparation cannot be answered by making a second attempt.
-    expect(sheet).toContain("{#if prepared && !busy}");
+    // From the moment it exists — not only after its start has finished.
+    expect(sheet).toMatch(/\{#if prepared\}\s*<span class="meta gate">/);
     expect(sheet).toContain("Resume or cancel it from this task's Agents tab.");
   });
 
@@ -142,8 +214,12 @@ describe("the agent handoff has one implementation", () => {
   });
 
   it("keeps polling scoped to runs that can still change", () => {
-    expect(panel).toContain('["starting", "running"].includes(run.state)');
-    expect(panel).toContain("run.expires_at * 1000 > clock");
+    // Exactly the runs that hold a checkout, by the one helper the board and
+    // the row use. A hand copy here left out `unresolved` — which the store
+    // still holds and its owner can still finish — so the pane stopped
+    // polling and showed "Unresolved" after the attempt had ended.
+    expect(panel).toContain("live: allRuns.some((run) => runHoldsCheckout(run, clock)),");
+    expect(panel).not.toMatch(/live: allRuns\.some\(\(run\) => \[/);
     // The working agents are read apart from the history page, so an old one
     // can be on the live list alone. Polling read only the history page, and
     // stopped while that agent was still running.

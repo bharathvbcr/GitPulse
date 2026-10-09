@@ -352,6 +352,9 @@ impl WorkbenchState {
         if method == "runs.release" {
             return reconcile::release(self, input);
         }
+        if method == "runs.checkout_identity" {
+            return terminal_launch::checkout_identity(input);
+        }
         if method == "runs.conversation" {
             return conversation::find(self, input);
         }

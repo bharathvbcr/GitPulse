@@ -423,6 +423,68 @@ fn build_pty_command(
     PtyCommand { cmd, resolved }
 }
 
+/// Why cmd.exe would read this launch as more than one command, or `None`.
+///
+/// Windows starts a `.cmd`/`.bat` program — how npm installs `codex`,
+/// `claude` and `grok` — through cmd.exe, which re-reads the command line
+/// portable-pty built for a C runtime. There, `& | < > ^` outside a quoted
+/// region are syntax, `%NAME%` expands quoted or not, and a line break ends
+/// the command; so a prompt `fix&calc`, or a checkout under `C:\R&D`, ran a
+/// second program. Escaping for cmd is a different grammar per character,
+/// so this refuses instead, naming the argument.
+///
+/// The command line is rebuilt exactly as portable-pty's `append_quoted`
+/// writes it — quoted only when an argument holds a space, tab, `\n`, `\v`
+/// or `"`, inner quotes written `\"` — and read the way cmd reads it: every
+/// `"` toggles its quoting, backslash or not. A task prompt's JSON-quoted
+/// brief path therefore passes unless that path itself holds syntax.
+fn batch_reparse_refusal(program: &str, args: &[String]) -> Option<String> {
+    let lower = program.to_ascii_lowercase();
+    if !(lower.ends_with(".cmd") || lower.ends_with(".bat")) {
+        return None;
+    }
+    // cmd's quoting is one state across the whole line, not per argument: an
+    // argument with an odd count of inner quotes leaves it inside a region,
+    // and the next argument's opening quote then takes it out.
+    let mut inside = false;
+    std::iter::once(program)
+        .chain(args.iter().map(String::as_str))
+        .find(|arg| cmd_would_reinterpret(arg, &mut inside))
+        .map(|arg| {
+            let shown: String = arg.chars().take(80).collect();
+            format!(
+                "{program} is a batch file, which Windows starts through cmd.exe, and cmd.exe would read \
+                 {shown:?} as part of a command rather than as text. Remove & | < > ^ % or line breaks from \
+                 it, or install the program as an .exe."
+            )
+        })
+}
+
+/// Whether cmd.exe would act on `arg` as portable-pty quotes it, given
+/// whether cmd is `inside` a quoted region where the argument starts; leaves
+/// `inside` where the argument ends.
+fn cmd_would_reinterpret(arg: &str, inside: &mut bool) -> bool {
+    if arg.contains(['%', '\r', '\n']) {
+        return true;
+    }
+    let quoted = arg.is_empty() || arg.contains([' ', '\t', '\n', '\x0b', '"']);
+    // The opening quote, each inner one and the closing one all toggle.
+    if quoted {
+        *inside = !*inside;
+    }
+    for c in arg.chars() {
+        match c {
+            '"' => *inside = !*inside,
+            '&' | '|' | '<' | '>' | '^' if !*inside => return true,
+            _ => {}
+        }
+    }
+    if quoted {
+        *inside = !*inside;
+    }
+    false
+}
+
 /// The agent CLIs a terminal tab can start, by the name they are invoked as.
 ///
 /// The same set the tab strip offers, minus the user's own shell.
@@ -715,6 +777,25 @@ where
         error,
         reaped,
     });
+}
+
+/// The exit of a child stopped because its reader thread could not start:
+/// the same normalisation as every other exit, with the reason attached.
+fn reader_failure_payload(
+    session_id: &str,
+    exit: std::io::Result<ExitStatusLike>,
+    reason: &dyn std::fmt::Display,
+) -> TerminalExitPayload {
+    let mut payload = TerminalExitPayload {
+        id: session_id.to_owned(),
+        exit_code: None,
+        signal: String::new(),
+        error: None,
+        reaped: false,
+    };
+    finalize_pty_session(session_id, || exit, |p| payload = p);
+    payload.error = Some(format!("PTY reader failed: {reason}"));
+    payload
 }
 
 // PTY commands are user-authored and may contain newlines (e.g. sh -c).
@@ -1183,6 +1264,12 @@ fn spawn_session_inner<R: tauri::Runtime>(
         &start,
         &PtyEnv::from_process(),
     );
+    if cfg!(windows) {
+        if let Some(refusal) = batch_reparse_refusal(&resolved, args.as_deref().unwrap_or_default())
+        {
+            return Err(refusal);
+        }
+    }
     if observer.is_some() {
         normalize_task_environment(&mut cmd, &repo);
     }
@@ -1445,24 +1532,10 @@ fn spawn_session_inner<R: tauri::Runtime>(
         let exit = child
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .wait();
+            .wait()
+            .map(|status| ExitStatusLike::from(&status));
         if let Some(observer) = &observer {
-            let payload = TerminalExitPayload {
-                reaped: exit.is_ok(),
-                id: session_id.clone(),
-                exit_code: exit
-                    .as_ref()
-                    .ok()
-                    .and_then(|s| i32::try_from(s.exit_code()).ok()),
-                signal: exit
-                    .as_ref()
-                    .ok()
-                    .and_then(|s| s.signal())
-                    .unwrap_or_default()
-                    .to_owned(),
-                error: Some(format!("PTY reader failed: {e}")),
-            };
-            observer.finished(&payload);
+            observer.finished(&reader_failure_payload(&session_id, exit, &e));
         }
         return Err(format!("Failed to spawn PTY reader thread: {e}"));
     }
@@ -2876,6 +2949,140 @@ mod tests {
     use super::*;
     use crate::procguard::LockedSpawn;
     use tempfile::TempDir;
+
+    /// A Windows batch shim re-reads the command line through cmd.exe, so an
+    /// argument that is safe for the program can still be a second command.
+    #[test]
+    fn a_batch_shim_refuses_what_cmd_would_read_as_syntax() {
+        let shim = r"C:\Users\a\AppData\Roaming\npm\codex.cmd";
+        let ok = |args: &[&str]| {
+            batch_reparse_refusal(
+                shim,
+                &args.iter().map(|a| a.to_string()).collect::<Vec<_>>(),
+            )
+        };
+        // What a task launch passes: flags, an absolute path, and a prompt
+        // whose JSON-quoted brief path sits inside cmd's quoted region.
+        assert_eq!(
+            ok(&[
+                "--cd",
+                r"C:\code\app",
+                "--",
+                "Read the brief at \"C:\\tmp\\brief.md\" and do it."
+            ]),
+            None
+        );
+        assert_eq!(ok(&["--model", "opus[1m]", "--effort", "high"]), None);
+        // Quoted as a whole and holding no quote, a metacharacter is text.
+        assert_eq!(ok(&["fix the R&D build"]), None);
+        // Unquoted: cmd runs `calc` after the agent.
+        assert!(ok(&["fix&calc"]).is_some());
+        assert!(ok(&["--cd", r"C:\code\R&D\app"]).is_some());
+        assert!(ok(&["a|b"]).is_some() && ok(&["a>out"]).is_some() && ok(&["a^b"]).is_some());
+        // An inner quote ends cmd's quoted region early: the JSON-quoted path
+        // is exactly the part cmd reads unquoted.
+        assert!(ok(&["Read the brief at \"C:\\R&D\\brief.md\" now"]).is_some());
+        // Expanded wherever it stands, quoted or not.
+        assert!(ok(&["see %PATH% here"]).is_some());
+        // A line break ends the command cmd runs.
+        assert!(ok(&["one\r\ntwo"]).is_some());
+        // The shim's own path is read the same way.
+        assert!(batch_reparse_refusal(r"C:\R&D\npm\codex.cmd", &[]).is_some());
+        // Only batch files are re-read; an .exe gets its arguments as written.
+        assert_eq!(
+            batch_reparse_refusal(r"C:\bin\codex.exe", &["fix&calc".into()]),
+            None
+        );
+        assert!(batch_reparse_refusal(r"C:\bin\CODEX.BAT", &["fix&calc".into()]).is_some());
+        // cmd's quoting carries across arguments: an odd inner quote leaves it
+        // inside, so the next argument's opening quote takes it out again.
+        assert!(ok(&["a \"b", "x & calc"]).is_some());
+    }
+
+    /// Fuzzes the batch check against the whole command line, built by a port
+    /// of portable-pty's `append_quoted` and read as cmd reads it.
+    #[test]
+    fn the_batch_check_agrees_with_cmd_over_the_whole_line() {
+        fn append_quoted(arg: &str, line: &mut String) {
+            if !arg.is_empty() && !arg.contains([' ', '\t', '\n', '\x0b', '"']) {
+                line.push_str(arg);
+                return;
+            }
+            line.push('"');
+            let chars: Vec<char> = arg.chars().collect();
+            let mut i = 0;
+            while i < chars.len() {
+                let mut slashes = 0;
+                while i < chars.len() && chars[i] == '\\' {
+                    i += 1;
+                    slashes += 1;
+                }
+                if i == chars.len() {
+                    line.push_str(&"\\".repeat(slashes * 2));
+                    break;
+                } else if chars[i] == '"' {
+                    line.push_str(&"\\".repeat(slashes * 2 + 1));
+                } else {
+                    line.push_str(&"\\".repeat(slashes));
+                }
+                line.push(chars[i]);
+                i += 1;
+            }
+            line.push('"');
+        }
+        fn cmd_acts_on(line: &str) -> bool {
+            let mut inside = false;
+            for c in line.chars() {
+                match c {
+                    '%' | '\r' | '\n' => return true,
+                    '"' => inside = !inside,
+                    '&' | '|' | '<' | '>' | '^' if !inside => return true,
+                    _ => {}
+                }
+            }
+            false
+        }
+        let pool = [
+            'a', ' ', '"', '\\', '&', '|', '^', '<', '>', '%', '\t', 'z', '-',
+        ];
+        let mut seed = 0x9e37_79b9_7f4a_7c15_u64;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let (mut refused, mut cases) = (0, 0);
+        for _ in 0..20_000 {
+            let args: Vec<String> = (0..(next() % 4))
+                .map(|_| {
+                    (0..(next() % 7))
+                        .map(|_| pool[(next() % pool.len() as u64) as usize])
+                        .collect()
+                })
+                .collect();
+            let program = r"C:\npm\codex.cmd";
+            let mut line = String::new();
+            append_quoted(program, &mut line);
+            for arg in &args {
+                line.push(' ');
+                append_quoted(arg, &mut line);
+            }
+            let verdict = batch_reparse_refusal(program, &args);
+            assert_eq!(
+                verdict.is_some(),
+                cmd_acts_on(&line),
+                "args {args:?} → line {line}"
+            );
+            cases += 1;
+            refused += usize::from(verdict.is_some());
+        }
+        // Both answers were exercised, not one of them 20 000 times.
+        assert!(
+            refused > 1_000 && cases - refused > 1_000,
+            "{refused} of {cases} refused"
+        );
+    }
 
     #[test]
     fn late_trust_revocation_records_a_failed_spawn_without_starting_a_child() {
@@ -4600,6 +4807,32 @@ mod tests {
     /// PTY-free tests for the post-EOF finalize logic: the exit payload must
     /// carry the real status when wait succeeds and degrade honestly to
     /// `exit_code: None` when reaping fails.
+    /// The child stopped because its reader thread could not start is
+    /// reported by the one normaliser, so a signal death is not recorded as
+    /// portable-pty's invented exit code 1 — an agent failure — beside the
+    /// signal that says GitPulse stopped it.
+    #[test]
+    fn a_reader_failure_reports_a_signal_death_without_an_exit_code() {
+        let signalled = reader_failure_payload(
+            "term-r1",
+            Ok(ExitStatusLike {
+                code: 1,
+                signal: Some("Terminated".into()),
+            }),
+            &"no threads left",
+        );
+        assert_eq!(signalled.exit_code, None);
+        assert_eq!(signalled.signal, "Terminated");
+        assert_eq!(
+            signalled.error.as_deref(),
+            Some("PTY reader failed: no threads left")
+        );
+        assert!(signalled.reaped);
+        let lost = reader_failure_payload("term-r1", Err(std::io::Error::other("gone")), &"x");
+        assert_eq!((lost.exit_code, lost.reaped), (None, false));
+        assert_eq!(lost.error.as_deref(), Some("PTY reader failed: x"));
+    }
+
     #[test]
     fn finalize_propagates_clean_exit_code() {
         let mut emitted = Vec::new();

@@ -232,7 +232,7 @@
       baseMs: TASK_RUN_POLL_MS,
       lagMs: readEventLoopDelay(),
       background: readBackgroundDocument(),
-      live: allRuns.some((run) => ["starting", "running"].includes(run.state) || (run.state === "prepared" && run.expires_at * 1000 > clock)),
+      live: allRuns.some((run) => runHoldsCheckout(run, clock)),
       active: true,
     });
     if (delay === null) return;
