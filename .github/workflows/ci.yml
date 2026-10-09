@@ -309,3 +309,39 @@ jobs:
 
       - name: gusset-check
         run: bun run gusset:check
+
+  # The pre-push hook refuses a commit authored or committed as a test fixture,
+  # but only in a checkout whose core.hooksPath is .githooks, and only when not
+  # bypassed. This runs the same check over what the push or pull request adds,
+  # so a clone without the hooks cannot publish one unnoticed.
+  fixture-authors:
+    name: No commit authored as a test fixture
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v7
+        with:
+          # The base of the range must be present to exclude it.
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+
+      - name: Refuse commits authored as a test fixture
+        shell: bash
+        env:
+          TIP: ${{ github.event.pull_request.head.sha || github.sha }}
+          BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+          # A new branch pushes the zero oid as `before`, and a force push can
+          # name a commit no ref holds any more; both fall back to the default
+          # branch, so the range is never empty for want of a base.
+          if [[ -z "$BASE" ]] || ! git cat-file -e "$BASE^{commit}" 2>/dev/null; then
+            BASE="$(git rev-parse --verify "origin/$DEFAULT_BRANCH")"
+          fi
+          echo "Checking $(git rev-list --count "$TIP" --not "$BASE") commit(s) in $BASE..$TIP"
+          bun run check:fixture-authors "$TIP" "$BASE"

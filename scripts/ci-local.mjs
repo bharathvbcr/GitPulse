@@ -76,6 +76,15 @@ export const GATES = [
     covers: ["./actionlint -color"],
   },
   {
+    // ci.yml's fixture-authors job checks the pushed range; here it checks what
+    // this checkout has not pushed, which is what the next push would add.
+    id: "fixture-authors",
+    name: "No commit authored as a test fixture",
+    program: "bun",
+    args: ["run", "check:fixture-authors"],
+    covers: ['bun run check:fixture-authors "$TIP" "$BASE"'],
+  },
+  {
     id: "ipc-contract",
     name: "IPC command contract",
     program: "bun",

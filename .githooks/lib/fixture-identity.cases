@@ -1,0 +1,55 @@
+# Which addresses are test fixtures: the one table both implementations are
+# tested against, so they cannot drift. Read by
+#   - src-tauri/src/engine/git_writer.rs (GitWriter::is_fixture_author_email)
+#   - scripts/fixture-author-hook-contract.test.ts (is_fixture_email in
+#     .githooks/lib/fixture-identity.sh)
+#
+# FORMAT: <fixture|person><TAB><address>. An address that is empty or begins or
+# ends with a space is written in double quotes, which are removed, so no
+# editor can strip what the row tests. Lines starting # are comments.
+#
+# Reserved names (RFC 2606, RFC 6761) and the addresses this repository's
+# suites commit as.
+fixture	contract@gitpulse.test
+fixture	GitPulse@test.local
+fixture	gitpulse@test.local
+fixture	test@gitpulse.local
+fixture	person@example.invalid
+fixture	person@example.com
+fixture	person@example.org
+fixture	person@example.net
+fixture	person@example
+fixture	person@sub.example
+fixture	t@t
+fixture	t@e.com
+fixture	test@test.com
+fixture	a@test
+fixture	a@invalid
+fixture	a@sub.domain.test
+# Case and surrounding space do not make a fixture a person.
+fixture	CONTRACT@GITPULSE.TEST
+fixture	"  contract@gitpulse.test  "
+fixture	Person@Example.COM
+# The domain is what follows the last @.
+fixture	a@b@test
+# Not an address at all is not a person either: refuse rather than record it.
+fixture	""
+fixture	"   "
+fixture	no-at-sign
+fixture	@test
+fixture	@gitpulse.dev
+fixture	ada@
+fixture	aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa@x.dev
+# People. A reserved word inside a real domain is still a real domain.
+person	ada@gitpulse.dev
+person	bharath.vbcr@gmail.com
+person	dev@github.com
+person	a@test.com
+person	a@testing
+person	a@contest
+person	a@example.co
+person	a@notexample.com
+person	a@example.com.au
+person	test@gitpulse.dev
+person	49699333+dependabot[bot]@users.noreply.github.com
+person	ünïcode@exämple.de
