@@ -183,8 +183,11 @@ libc = "0.2"
 # another devmap build, all on the same repositories. Repeat it and the copies
 # stack until the machine gives out.
 #
-# Deliberately absent on macOS, where LaunchServices already guarantees one
-# instance of a bundled app and the plugin's own guidance is not to add it.
+# Absent on macOS, which has its own guard (`desktop::instance`). LaunchServices
+# keeps one instance per bundle *path*, not per identifier: with two copies of
+# GitPulse.app on disk a banner click could start a second app. The plugin's
+# macOS mode (a socket in /tmp, claimed by unlink-and-bind) races between two
+# launches and cannot carry a banner response or an Apple-event open.
 [target.'cfg(not(target_os = "macos"))'.dependencies]
 tauri-plugin-single-instance = "2"
 

@@ -3965,7 +3965,10 @@ done
         ] {
             let path = base.join(format!("gph-ack-{}-{ok}.sock", std::process::id()));
             let _ = std::fs::remove_file(&path);
-            let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+            let listener = crate::procguard::with_inheritance_lock(|| {
+                std::os::unix::net::UnixListener::bind(&path)
+            })
+            .unwrap();
             let server = thread::spawn(move || {
                 let (mut stream, _) = listener.accept().unwrap();
                 let mut seen = Vec::new();

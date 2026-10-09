@@ -1,5 +1,9 @@
 pub mod actions;
 pub mod exit;
+#[cfg(target_os = "macos")]
+pub mod instance;
+#[cfg(target_os = "macos")]
+pub mod launch;
 mod menu;
 pub mod popover;
 pub mod shell;
@@ -263,6 +267,10 @@ pub fn handle_run_event<R: Runtime>(app: &AppHandle<R>, event: &RunEvent) {
             }
         }
         RunEvent::Exit => {
+            // First: a launch from here on must wait for this process to be
+            // gone and take over, not hand its request to one that is leaving.
+            #[cfg(target_os = "macos")]
+            launch::shutdown();
             if let Some(workbench) = app.try_state::<crate::workbench::WorkbenchState>() {
                 workbench.shutdown();
             }
@@ -314,16 +322,66 @@ pub fn repository_arg(argv: &[String]) -> Option<&str> {
 /// window is not optional — without it a user who opened a repository from the
 /// file manager sees nothing happen at all, because the window that answered is
 /// behind whatever they were looking at.
-pub fn handle_second_instance<R: Runtime>(app: &AppHandle<R>, argv: &[String]) {
+///
+/// `cwd` is the second launch's directory, not ours: `gitpulse .` typed in a
+/// terminal names the repository the terminal is in.
+#[cfg(not(target_os = "macos"))]
+pub fn handle_second_instance<R: Runtime>(app: &AppHandle<R>, argv: &[String], cwd: &str) {
     match second_launch(argv) {
         // Reveals the window itself, after queuing the repository.
-        SecondLaunch::Open(path) => queue_and_emit_open(app, Path::new(path)),
+        SecondLaunch::Open(path) => queue_and_emit_open(app, &launch_path(path, Path::new(cwd))),
         SecondLaunch::Reveal => {
             if let Err(error) = reveal_main(app) {
                 log::warn!(target: "desktop", "Could not reveal GitPulse for a second launch: {error}");
             }
         }
         SecondLaunch::Ignore => {}
+    }
+}
+
+/// A path from another process's command line, made absolute against that
+/// process's working directory. One that is already absolute is untouched; an
+/// empty `cwd` (the launch could not read its own) leaves it as given.
+pub fn launch_path(path: &str, cwd: &Path) -> std::path::PathBuf {
+    let path = Path::new(path);
+    if path.is_absolute() || cwd.as_os_str().is_empty() {
+        path.to_path_buf()
+    } else {
+        cwd.join(path)
+    }
+}
+
+/// What a launch handed over through [`instance`] asks of this one. Runs on
+/// the main thread: revealing changes the Dock policy, which AppKit only
+/// accepts there.
+#[cfg(target_os = "macos")]
+pub fn answer_forwarded(app: &AppHandle, request: instance::Request) {
+    let handle = app.clone();
+    let scheduled = app.run_on_main_thread(move || match request {
+        instance::Request::Open { paths } => {
+            for path in paths {
+                queue_and_emit_open(&handle, Path::new(&path));
+            }
+        }
+        instance::Request::Reveal => {
+            if let Err(error) = reveal_main(&handle) {
+                log::warn!(target: "desktop", "Could not reveal GitPulse for another launch: {error}");
+            }
+        }
+        instance::Request::Notification { id, snooze } => {
+            if let Err(error) = crate::workbench::notifications::forward(&handle, id, snooze) {
+                log::warn!(target: "desktop", "A banner response from another launch was not delivered: {error}");
+                // The click still asked for GitPulse. Snooze asked for nothing.
+                if !snooze {
+                    if let Err(error) = reveal_main(&handle) {
+                        log::warn!(target: "desktop", "Could not reveal GitPulse for a banner: {error}");
+                    }
+                }
+            }
+        }
+    });
+    if let Err(error) = scheduled {
+        log::error!(target: "desktop", "A request from another launch was dropped: {error}");
     }
 }
 
@@ -725,6 +783,25 @@ mod tests {
         assert_eq!(repository_arg(&argv(&["--"])), None);
         // argv[0] is never the request, however much it looks like a path.
         assert_eq!(repository_arg(&["/opt/gitpulse".into()]), None);
+    }
+
+    /// `gitpulse .` from a terminal names the terminal's repository. The
+    /// running instance has its own working directory, which is not the one
+    /// the request was made in.
+    #[test]
+    fn a_launch_path_is_resolved_where_the_launch_was_made() {
+        let cwd = std::env::temp_dir();
+        assert_eq!(launch_path(".", &cwd), cwd.join("."));
+        assert_eq!(launch_path("sub/repo", &cwd), cwd.join("sub/repo"));
+        let absolute = cwd.join("elsewhere");
+        let absolute = absolute.to_str().unwrap();
+        assert_eq!(
+            launch_path(absolute, Path::new("/ignored")),
+            Path::new(absolute)
+        );
+        // A launch that could not read its own directory sends none; the path
+        // is left as given rather than anchored somewhere arbitrary.
+        assert_eq!(launch_path("rel", Path::new("")), Path::new("rel"));
     }
 
     #[test]

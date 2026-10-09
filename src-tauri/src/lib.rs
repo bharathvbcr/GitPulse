@@ -23,6 +23,8 @@ pub mod insights;
 pub mod lappi;
 pub mod ledger;
 pub mod limits;
+#[cfg(unix)]
+pub mod local_socket;
 pub mod logging;
 pub mod markdown;
 pub mod mcp;
@@ -74,6 +76,15 @@ pub fn run() {
     logging::init();
     #[cfg(not(test))]
     logging::install_panic_hook();
+    // Before anything else is built. LaunchServices starts a second copy of
+    // GitPulse whenever it prefers another bundle of the same identifier —
+    // which is what a banner click does once the running copy's bundle was
+    // rebuilt or deleted. That launch hands its request to the running one and
+    // leaves here, without a window, watchers or a code-intelligence build.
+    #[cfg(target_os = "macos")]
+    if let desktop::launch::Launch::Exit = desktop::launch::establish() {
+        return;
+    }
     // Before anything opens a descriptor. A GUI launch inherits launchd's soft
     // limit of 256, which this app exhausts on a busy workspace -- and past it
     // every git spawn fails with EMFILE until restart. Reported either way, so
@@ -96,10 +107,12 @@ pub fn run() {
     let builder = tauri::Builder::default();
     // Registered before every other plugin, as this one requires: it decides
     // whether this process is the app or a message to the app, and nothing
-    // should have started initialising by the time it answers that.
+    // should have started initialising by the time it answers that. macOS
+    // answers the same question with `desktop::launch` above, which also
+    // carries banner responses and Apple-event opens the plugin cannot see.
     #[cfg(not(target_os = "macos"))]
-    let builder = builder.plugin(tauri_plugin_single_instance::init(|app, argv, _cwd| {
-        desktop::handle_second_instance(app, &argv);
+    let builder = builder.plugin(tauri_plugin_single_instance::init(|app, argv, cwd| {
+        desktop::handle_second_instance(app, &argv, &cwd);
     }));
     // Replaces Tauri's silent, unbounded reload of a crashed page.
     #[cfg(target_os = "macos")]
@@ -211,6 +224,11 @@ pub fn run() {
                     desktop::queue_and_emit_open(app.handle(), std::path::Path::new(path));
                 }
             }
+            // Last, so a request another launch sent while this one started is
+            // answered after the `--background` hide above rather than undone
+            // by it, and after the notification worker it may need exists.
+            #[cfg(target_os = "macos")]
+            desktop::launch::attach(app.handle());
             Ok(())
         })
         .on_menu_event(|app, event| {
