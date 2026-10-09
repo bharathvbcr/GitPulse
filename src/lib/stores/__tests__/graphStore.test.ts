@@ -257,6 +257,49 @@ describe("graphStore payload signature", () => {
     has_more: true,
   });
 
+  it("hashes each reload's rows once and never re-walks the cached page", async () => {
+    // ft-0ff882a6: a reload used to hash the new payload AND re-derive the
+    // cached page's signature from its rows — two walks over up to 100k rows
+    // on every watcher refresh. Each row here counts reads of `summary`, which
+    // the signature reads once per row.
+    const ROWS = 50;
+    const counted = (reads: { n: number }) =>
+      Array.from({ length: ROWS }, (_, i) => {
+        const row = grow(`c${i}`);
+        const summary = row.summary;
+        Object.defineProperty(row, "summary", {
+          enumerable: true,
+          get: () => {
+            reads.n += 1;
+            return summary;
+          },
+        });
+        return row;
+      });
+    const first = { n: 0 };
+    const second = { n: 0 };
+    const pages = [counted(first), counted(second)];
+    let call = 0;
+    const invoke: InvokeFn = async (cmd) => {
+      if (cmd === "cmd_get_commit_graph") return { rows: pages[call++], head_id: "c0" } as never;
+      if (cmd === "cmd_get_commit_details") return { id: "c0", summary: "d", changed_files: [] } as never;
+      throw new Error(cmd);
+    };
+    const store = createGraphStore({ invoke });
+    store.showRepo("/r/a");
+    await store.loadGraph("/r/a");
+    const rowsAfterFirst = get(store).rows;
+
+    first.n = 0;
+    await store.loadGraph("/r/a");
+    // The cached page is compared by its stored signature, not re-hashed.
+    expect(first.n).toBe(0);
+    // The new payload is hashed exactly once.
+    expect(second.n).toBe(ROWS);
+    // And the identical reload still short-circuits, keeping array identity.
+    expect(get(store).rows).toBe(rowsAfterFirst);
+  });
+
   it("is equal for structurally identical payloads with fresh identities", () => {
     expect(graphPayloadSignature(full())).toBe(graphPayloadSignature(full()));
   });
