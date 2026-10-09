@@ -108,6 +108,18 @@ describe("saved views", () => {
     expect(view.facet).toEqual({ ...emptyFacet(), priority: 1 });
     expect(boards.global.wip).toEqual({ ready: 2 });
   });
+  it("reads a repository filter back, and a view saved before it existed as every repository", () => {
+    expect(sanitizeSnapshot({ facet: { kind: "bug" } }).facet).toEqual({ ...emptyFacet(), kind: "bug" });
+    expect(sanitizeSnapshot({ facet: { repository: "repo_1-a" } }).facet.repository).toBe("repo_1-a");
+    for (const hostile of ["../etc", "", "a b", 7, null, "x".repeat(129)]) {
+      expect(sanitizeSnapshot({ facet: { repository: hostile } }).facet.repository).toBe("all");
+    }
+  });
+  it("keeps search filters in a saved view as the reader typed them", () => {
+    const saved = saveView({}, "global", "Bugs", snapshot({ search: "is:bug -label:ci repo:gitpulse" }), nextId);
+    if (!saved.ok) throw new Error("not saved");
+    expect(sanitizeBoards(JSON.parse(JSON.stringify(saved.boards))).global.views[0].search).toBe("is:bug -label:ci repo:gitpulse");
+  });
   it("bounds the number of boards kept", () => {
     const many = Object.fromEntries(Array.from({ length: MAX_BOARDS + 20 }, (_, i) => [`workspace:w${i}`, { wip: { ready: 1 } }]));
     expect(Object.keys(sanitizeBoards(many))).toHaveLength(MAX_BOARDS);

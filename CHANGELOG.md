@@ -13,6 +13,13 @@ before that tag is pushed.
 
 ### Added
 
+- **Task search filters and repository search.** The Tasks search box takes
+  `is:bug`, `priority:high`, `status:open`, `repo:name`, `owner:`, `label:`,
+  `severity:` and `due:` filters, with `-` to exclude; they filter the loaded
+  cards and only the remaining words go to the store. Quick filters (Bugs,
+  Urgent, Overdue, Unassigned, Open …), removable chips, a syntax panel, a
+  Repository filter, and a navigator box that finds workspaces and
+  repositories by name or path.
 - Task checklists with a done state per item, and links between tasks
   (parent, blocks, related, duplicate of), edited in the task sheet and read
   from both ends in the agent brief.
@@ -104,6 +111,14 @@ before that tag is pushed.
 ### Fixed
 
 - **A terminal agent is no longer ended by anything but its own exit, a Close, or Quit.** The PTY reader killed a session whose window did not acknowledge 256 KiB of output within 30 s — a hidden, minimized or busy window, which macOS throttles — and a failed output event killed it too. It now skips output for that view (one notice, the screen redrawn when the view catches up; a view that lagged once is waited 2 s, not 30) and the process keeps running. A terminal tab that unmounted for any reason other than Close — its repository tab closed, its pane crashed, the dock re-hosting — killed its process; it is now detached and its slot handed to **Sessions**, where it can be shown again or stopped. Only a plain shell known to be idle at its prompt ends with its view. Quitting asks first when agents are running. Every session end is logged with its cause.
+- Typing a filter into the Tasks search no longer searches for its words: the
+  store's full-text query split `is:bug` into "is" and "bug" and never matched a
+  task by its type, so searching for bugs found only tasks that said "bug".
+  The archive's search had the same defect and now reads filters the same way.
+- Changing a Tasks filter (type, priority, owner, label, due) now clears the
+  selection. The filters write a field in place, which the board did not
+  notice, so a selection the filter had just hidden stayed live for a bulk
+  Delete or Archive to act on.
 - **Cmd-Q, Dock → Quit and a Quit Apple event no longer skip the quit confirmation on macOS.** TAO's application delegate answers `applicationWillTerminate:` but not `applicationShouldTerminate:`, so AppKit approved these quits without asking, and Tauri never raised `ExitRequested` for them. Only the status menu's Quit item and the main window's close button reached the guard that protects running Git actions, in-flight saves and unsaved editor drafts. GitPulse now adds `applicationShouldTerminate:` to the delegate's class and answers `NSTerminateLater`, replying once the window confirms or cancels. An approved quit therefore leaves through AppKit's own termination path, and a logout waits for the answer instead of being refused. One owner (`desktop/exit.rs`) now serves every way to quit: tray, window close, `ExitRequested` and AppKit. The window must acknowledge a request within 3 s, or the quit proceeds, so a crashed or hung page can no longer leave Force Quit as the only way out. A request that could not be delivered quits instead of waiting. A second Quit while the confirmation is open quits at once, which is AppKit's behaviour. `native_quit_guard` drives nine of these paths against real AppKit and a SIGKILLed WebKit process.
 - **A terminal killed by a signal no longer reports "exit 1".** For any signal death, portable-pty substitutes the exit code 1. That code reached the exit event and the task run record, so an agent killed by SIGKILL or SIGSEGV read "exit 1", the same as a command that failed on its own. A signal death now reports the signal and no exit code. A real SIGKILL, SIGSEGV and SIGABRT are now covered in `terminal_pty_stress`.
 - **A terminal whose output cannot be read stops and says why.** A PTY read error other than the master closing (`EIO`, a broken pipe) ended the reader silently. The shell kept running, input went nowhere, and no exit event reached the tab until it was closed. Now the shell is stopped and the error is reported.

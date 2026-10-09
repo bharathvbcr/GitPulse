@@ -189,9 +189,22 @@ describe("the dock reads only what the store actually has", () => {
   it("asks the store for each list by its own filter and order", () => {
     expect(source).toContain('{ archived: true, order: "completed" }');
     expect(source).toContain('{ deleted: true, order: "updated" }');
-    expect(source).toContain("listTasks(scope, null, query, cursor, 30,");
+    expect(source).toContain("listTasks(scope, null, storeQuery, cursor, 30,");
     expect(source).not.toMatch(/["']done["']/);
     expect(source).not.toMatch(/\.sort\(/);
+  });
+
+  // The dock had its own copy of the board's defect: the whole search box
+  // went to the store's full-text query, so `is:bug` searched for two words.
+  it("sends the store only the search's words and applies its filters to loaded rows", () => {
+    expect(source).toContain("const parsed = $derived(parseTaskQuery(query));");
+    expect(source).toContain("rows = $derived(live.filter((card) => cardMatchesQuery(card, parsed, queryContext)))");
+    expect(source, "the raw search box still reaches the store").not.toMatch(/listTasks\([^)]*\bquery\b/);
+    // Reloaded on the words, not on every filter keystroke; the pending-delete
+    // count is not confused with rows a filter hid.
+    expect(source).toContain("scope; storeQuery; view; active; visible;");
+    expect(source).toContain("hiddenHere = $derived((result?.items.length ?? 0) - live.length)");
+    expect(source).toContain('data-testid="task-archive-query-problems"');
   });
 
   // The stamp states the completion the list is ordered by, and for a task
@@ -247,7 +260,7 @@ describe("the archive is separate from the Done column", () => {
     expect(board).toContain("const BOARD: TaskListFilter = { archived: false };");
     // The filter is the contract; the page size is the board's to choose.
     expect(board).toMatch(/listTasks\(target, status, query, undefined, \w+, BOARD\)/);
-    expect(board).toMatch(/listTasks\(scope, status, search, cursor, \w+, BOARD\)/);
+    expect(board).toMatch(/listTasks\(scope, status, serverQuery, cursor, \w+, BOARD\)/);
     expect(board.match(/listTasks\(/g)?.length, "a column read without the filter would draw archived cards").toBe(3);
   });
 

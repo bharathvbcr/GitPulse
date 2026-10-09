@@ -10,12 +10,16 @@ export interface TaskFacet {
   owner: string | "all";
   label: string | "all";
   due: DueFilter;
+  /** A repository id the card links to, primary or not. */
+  repository: string | "all";
 }
 
 export interface FacetOptions {
   kinds: string[];
   owners: string[];
   labels: string[];
+  /** Ids of every repository a loaded card links to; the board names them. */
+  repositories: string[];
 }
 
 export interface CardChrome {
@@ -29,11 +33,11 @@ export interface CardChrome {
 const SOON_SECONDS = 7 * 24 * 60 * 60;
 
 export function emptyFacet(): TaskFacet {
-  return { priority: "all", kind: "all", owner: "all", label: "all", due: "all" };
+  return { priority: "all", kind: "all", owner: "all", label: "all", due: "all", repository: "all" };
 }
 
 export function facetActive(facet: TaskFacet): boolean {
-  return normalizePriority(facet.priority) !== "all" || facet.kind !== "all" || facet.owner !== "all" || facet.label !== "all" || facet.due !== "all";
+  return normalizePriority(facet.priority) !== "all" || facet.kind !== "all" || facet.owner !== "all" || facet.label !== "all" || facet.due !== "all" || facet.repository !== "all";
 }
 
 export function dueState(dueAt: number | null | undefined, nowSec: number): DueState {
@@ -59,6 +63,7 @@ export function cardMatchesFacet(card: TaskCard, facet: TaskFacet, nowSec: numbe
     if (facet.owner === "" ? owner !== "" : owner !== facet.owner) return false;
   }
   if (facet.label !== "all" && !card.labels.includes(facet.label)) return false;
+  if (facet.repository !== "all" && !card.repository_ids.includes(facet.repository)) return false;
   if (facet.due !== "all") {
     const due = dueState(card.due_at, nowSec);
     if (facet.due === "none" && due !== "none") return false;
@@ -72,13 +77,15 @@ export function collectFacetOptions(cards: readonly TaskCard[]): FacetOptions {
   const kinds = new Set<string>();
   const owners = new Set<string>();
   const labels = new Set<string>();
+  const repositories = new Set<string>();
   for (const card of cards) {
     if (card.kind.trim()) kinds.add(card.kind);
     if (card.owner?.trim()) owners.add(card.owner.trim());
     for (const label of card.labels) if (label.trim()) labels.add(label);
+    for (const id of card.repository_ids) if (id.trim()) repositories.add(id);
   }
   const sort = (values: Iterable<string>) => [...values].sort((a, b) => a.localeCompare(b));
-  return { kinds: sort(kinds), owners: sort(owners), labels: sort(labels) };
+  return { kinds: sort(kinds), owners: sort(owners), labels: sort(labels), repositories: sort(repositories) };
 }
 
 export function allLoadedCards(

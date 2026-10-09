@@ -132,6 +132,8 @@ export function sanitizeFacet(value: unknown): TaskFacet {
     owner: facetText(raw.owner),
     label: facetText(raw.label),
     due: DUE_FILTERS.find((due) => due === raw.due) ?? "all",
+    // A view saved before this facet existed has none, and shows every repository.
+    repository: typeof raw.repository === "string" && /^[A-Za-z0-9_-]{1,128}$/.test(raw.repository) ? raw.repository : "all",
   };
 }
 

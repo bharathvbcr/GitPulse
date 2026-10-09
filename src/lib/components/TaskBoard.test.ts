@@ -478,3 +478,54 @@ describe("the board can archive a task", () => {
   });
 });
 
+describe("TaskBoard search and filters", () => {
+  /**
+   * The search box went to the store whole. The store's search is full-text
+   * over title and description, so `is:bug` searched for the words "is" and
+   * "bug" and never matched a task by its type; filters now stay on the board.
+   */
+  it("sends the store only the search's free text, never its filters", () => {
+    expect(source).toContain("const parsedQuery = $derived(parseTaskQuery(search));");
+    expect(source).toContain("const boardKey = $derived(JSON.stringify([scope, serverQuery]));");
+    expect(source).toContain("async function loadBoard(target: Scope = scope, query: string = serverQuery)");
+    expect(source).toContain("const target = scope, query = serverQuery;");
+    expect(source).toContain("await listTasks(scope, status, serverQuery, cursor, TASK_PAGE_SIZE, BOARD)");
+    expect(source, "a listTasks call still sends the raw search box").not.toMatch(/listTasks\([^)]*\bsearch\b/);
+  });
+
+  it("decides what is on screen in one place, for the columns, selection and select-all", () => {
+    expect(source).toContain("cardMatchesFacet(card, facet, now) && cardMatchesQuery(card, parsedQuery, queryContext)");
+    expect(source.match(/cardMatchesFacet\(/g)).toHaveLength(1);
+    expect(source.match(/flattenVisibleIds\(displayColumns, shown, cardVisible\)/g)).toHaveLength(3);
+    // A filter change still clears a selection that may now be off screen.
+    expect(source).toContain("$effect(() => { boardKey; JSON.stringify(facet); search; selected = new Set();");
+  });
+
+  it("shows filters as removable chips, reports unreadable ones and says what the filter covered", () => {
+    expect(source).toContain('data-testid="task-query-problems"');
+    expect(source).toContain("search = removeQueryTerm(search, term)");
+    expect(source).toContain("search = toggleQueryTerm(search, quick.filter)");
+    expect(source).toContain('{ label: "Bugs", filter: "is:bug" }');
+    expect(source).toContain('data-testid="task-query-coverage"');
+    expect(source).toContain("Load more in a column to filter the rest");
+    expect(source).toContain('data-testid="task-filter-repository"');
+    // A repository filter carried onto a repository's board stays visible, or
+    // it would empty that board with no control saying why.
+    expect(source).toContain('{#if (scope.kind !== "repository" && facetRepositories.length) || facet.repository !== "all"}');
+    // Typed one key at a time, `priority:h` is a problem until it is `high`; a
+    // polite status, not an alert, so a screen reader is not interrupted per key.
+    expect(source).not.toMatch(/query-problems" role="alert"/);
+  });
+
+  it("finds workspaces and repositories in the navigator without hiding the open board", () => {
+    expect(source).toContain('data-testid="task-nav-search"');
+    expect(source).toMatch(/function navShowsWorkspace[\s\S]*?scope\.kind === "workspace" && scope\.id === group\.id/);
+    expect(source).toMatch(/function navShowsRepository[\s\S]*?scope\.kind === "repository" && scope\.id === repo\.id/);
+    // One rule for the navigator and the `repo:` filter (`repositoryMatches`).
+    expect(source).toContain("|| repositoryMatches(repo, navNeedle);");
+    expect(source).not.toContain("identity_key.toLowerCase().includes(");
+    // Reordering against a filtered list would swap with a row the reader cannot see.
+    expect(source).toContain("if (movingGroup || busy || navFiltering) return;");
+    expect(source).toContain("search covers loaded rows");
+  });
+});

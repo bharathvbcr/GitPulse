@@ -44,6 +44,8 @@ const workspace = { id: "workspace", name: "Developer tools", revision: 1, updat
 const emptyWorkspace = { id: "workspace-empty", name: "Fresh space", revision: 1, updated_at: 1, icon: "", color: "", pinned: false, archived: false, position: 2, description: "", repository_ids: [], repository_count: 0 };
 const workspaces = [workspace, emptyWorkspace];
 const workspaceWrites = [];
+/** Every `query` the board sent `items.list`, to prove filters never reach the store. */
+const listQueries = [];
 const makeTask = (id, title, repository, status = "ready") => ({ id, title, kind: "feature", status, priority: 2, severity: null, owner: null, due_at: null, labels: [], repository_ids: [repository], primary_repository_id: repository, home_workspace_id: null, position: Number(id.replace(/\D/g, "")) || 1, revision: 1, updated_at: 1, description: "Keep changes focused and verify the result.", acceptance_criteria: [], locked_fields: [], checklist: [], links: [],
   // As dc-store schema 11's upgrade leaves a profile: work that was Done is
   // archived, with the time it was completed.
@@ -266,6 +268,7 @@ mockIPCWithEvents(async (cmd, args) => {
       return result;
     }
     case "items.list": {
+      listQueries.push(input.query ?? "");
       if (failList) throw {code: "store_error", message: "Fixture task storage offline"};
       // dc-store schema 11: `deleted` reads deleted tasks instead of live
       // ones, `archived` filters on the flag (omitted: both), `status` is
@@ -774,6 +777,64 @@ if (params.has("check")) {
     failList = false; await click("Retry loading tasks"); await settle(300);
     check("a failed search can be retried", root.textContent.includes("No tasks match") && !root.textContent.includes("Fixture task storage offline"));
     await click("Clear task search"); await wait(() => card("task-1"));
+
+    // Filters typed into the search box. The store's search is full-text, so
+    // the board used to send `is:improvement` as words and find nothing; the
+    // fixture's title match reproduces that exactly.
+    listQueries.length = 0;
+    await change(search, "is:improvement"); await settle(400);
+    check("is: filters the board by type instead of searching for the words",
+      Boolean(card("task-2")) && !card("task-1") && !card("task-3") && !root.textContent.includes("No tasks match"));
+    check("a search of only filters does not reload the board from the store", listQueries.every(query => query === ""));
+    await change(search, "is:improvement Make"); await settle(400);
+    check("words beside a filter still reach the store, without the filter",
+      Boolean(card("task-2")) && listQueries.includes("Make") && !listQueries.some(query => query.includes("is:")));
+    await change(search, "-is:improvement"); await settle(400);
+    check("a leading minus excludes the type", !card("task-2") && Boolean(card("task-1")) && Boolean(card("task-3")));
+    await change(search, "repo:manvi"); await settle(400);
+    check("repo: keeps tasks linked to that repository, primary or not", Boolean(card("task-2")) && Boolean(card("task-3")) && !card("task-1"));
+    const chip = root.querySelector('[aria-label="Remove filter repo:manvi"]');
+    chip?.click(); await settle(400);
+    check("a filter chip removes its filter from the search", Boolean(chip) && search.value === "" && Boolean(card("task-1")));
+    await change(search, "priority:huge"); await settle(400);
+    check("an unreadable filter is reported and not applied",
+      root.querySelector('[data-testid="task-query-problems"]')?.textContent.includes("priority:huge is not a priority") && Boolean(card("task-1")));
+    await change(search, ""); await settle(300);
+    await click("Filters"); await settle(100);
+    await click("Bugs"); await settle(400);
+    check("the Bugs quick filter writes is:bug into the search", search.value === "is:bug" && button("Bugs").getAttribute("aria-pressed") === "true" && root.textContent.includes("No tasks match"));
+    await click("Bugs"); await settle(400);
+    check("pressing a quick filter again takes it out", search.value === "" && Boolean(card("task-1")));
+    const repoFilter = root.querySelector('[data-testid="task-filter-repository"]');
+    await change(repoFilter, "repo-1", "change"); await settle(300);
+    check("the repository filter narrows the global board", Boolean(card("task-3")) && Boolean(card("task-2")) && !card("task-1"));
+    root.querySelector('[data-repository-row="repo-0"] button')?.click(); await settle(400);
+    check("a repository filter carried onto a repository board stays on screen",
+      root.querySelector('[data-testid="task-filter-repository"]')?.value === "repo-1" && Boolean(button("Clear filters")));
+    await change(root.querySelector('[data-testid="task-filter-repository"]'), "all", "change"); await settle(300);
+    check("clearing the carried filter brings that board's tasks back", Boolean(card("task-1")));
+    button("All", root.querySelector('nav[aria-label="Task scopes"]'))?.click(); await settle(400);
+    // A facet is changed in place (`facet.kind = …`), not reassigned. The
+    // selection must still be dropped, or a bulk Delete acts on cards the
+    // filter has just taken off screen.
+    card("task-1").dispatchEvent(new MouseEvent("click", { bubbles: true, ctrlKey: true })); await settle();
+    const selectedBefore = root.querySelector(".selection")?.textContent.includes("1 selected");
+    await change(root.querySelector('[aria-label="Filter by type"]'), "improvement", "change"); await settle(300);
+    check("changing a filter drops a selection it may have hidden",
+      selectedBefore && !card("task-1") && !root.querySelector(".selection"));
+    await change(root.querySelector('[aria-label="Filter by type"]'), "all", "change"); await settle(300);
+    await click("Filters"); await settle(100);
+    const navSearch = root.querySelector('[data-testid="task-nav-search"]');
+    await change(navSearch, "manv"); await settle(100);
+    check("the navigator finds a repository by name",
+      Boolean(root.querySelector('[data-repository-row="repo-1"]')) && !root.querySelector('[data-repository-row="repo-0"]'));
+    await change(navSearch, "fixture/gitpulse"); await settle(100);
+    check("the navigator finds a repository by its path",
+      Boolean(root.querySelector('[data-repository-row="repo-0"]')) && !root.querySelector('[data-repository-row="repo-1"]'));
+    await change(navSearch, "zzz-nothing"); await settle(100);
+    check("the navigator says when nothing matches", Boolean(root.querySelector('[data-testid="task-nav-no-repositories"]')) && Boolean(root.querySelector('[data-testid="task-nav-no-workspaces"]')));
+    navSearch.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true })); await settle(100);
+    check("Escape clears the navigator search", navSearch.value === "" && Boolean(root.querySelector('[data-repository-row="repo-0"]')) && Boolean(workspaceTab("Developer tools")));
 
     await click("Developer tools"); await wait(() => Boolean(card("task-3")) && !card("task-1"));
     await click("New task");
@@ -1471,6 +1532,22 @@ if (params.has("check")) {
     await settle(350);
     check("the archive searches archived work without touching the board's search",
       archiveRows().length === 1 && root.querySelector('[aria-label="Search tasks"]').value === "");
+    // The archive had its own copy of the defect: it too sent `is:bug` to the
+    // store as the words "is" and "bug".
+    const archiveSearch = archive().querySelector('[aria-label="Search archived tasks"]');
+    await change(archiveSearch, ""); await settle(350);
+    listQueries.length = 0;
+    await change(archiveSearch, "is:feature Completed task 30"); await settle(350);
+    check("the archive applies filters itself and sends the store only the words",
+      archiveRows().length === 1 && listQueries.includes("Completed task 30") && !listQueries.some(query => query.includes("is:")));
+    await change(archiveSearch, "is:bug"); await settle(350);
+    check("an archive filter nothing matches says so instead of listing everything",
+      archiveRows().length === 0 && archive().textContent.includes("No archived tasks match"));
+    listQueries.length = 0;
+    await change(archiveSearch, "is:feature"); await settle(350);
+    check("adding a filter to the archive's words does not re-read the store", listQueries.length === 0 || listQueries.every(query => query === ""));
+    await change(archiveSearch, "priority:huge"); await settle(350);
+    check("the archive reports an unreadable filter", archive().querySelector('[data-testid="task-archive-query-problems"]')?.textContent.includes("priority:huge"));
     await change(archive().querySelector('[aria-label="Search archived tasks"]'), "");
     await settle(350);
     // ---- The Deleted view: restore a deleted task with its id ------------
