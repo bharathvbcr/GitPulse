@@ -101,6 +101,26 @@ export function draftingVerb(kind: DraftingKind, quick: boolean): string {
 export const liveEnhancement = (proposal: Pick<Enhancement, "state"> | null): boolean =>
   proposal !== null && (LIVE_ENHANCEMENT_STATES as readonly string[]).includes(proposal.state);
 
+/**
+ * Whether a re-read of a proposal says anything the last read did not.
+ *
+ * A live suggestion is polled every second, and each poll used to re-read the
+ * history as well (two more requests) whether or not anything had moved —
+ * about three requests a second for the length of a run. Every write to a
+ * proposal advances its revision and `updated_at`; the state is compared too,
+ * so a store that ever changed state without a write still counts as moved.
+ */
+export function enhancementMoved(
+  previous: Pick<EnhancementSummary, "id" | "revision" | "updated_at" | "state"> | null,
+  next: Pick<EnhancementSummary, "id" | "revision" | "updated_at" | "state">,
+): boolean {
+  return previous === null ||
+    previous.id !== next.id ||
+    previous.revision !== next.revision ||
+    previous.updated_at !== next.updated_at ||
+    previous.state !== next.state;
+}
+
 export interface LoadedHistory {
   entries: EnhancementSummary[];
   cursor: string | null;

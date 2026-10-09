@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { ENHANCEMENT_STATES, type Enhancement, type EnhancementSummary, type Task } from "./client";
-import { acceptEnhancementInput, appendedHistory, createEnhancementInput, refreshedHistory, runAppleEnhancement,
+import { acceptEnhancementInput, appendedHistory, enhancementMoved, createEnhancementInput, refreshedHistory, runAppleEnhancement,
   assistEngineName,
   draftingKind,
   draftingVerb,
@@ -334,5 +334,37 @@ describe("enhancementApplyBlock", () => {
       const input = acceptEnhancementInput(proposal, full, ["title", "description"], "req");
       expect(Boolean(enhancementApplyBlock(entry.proposal, full)), JSON.stringify(entry)).toBe(input === null);
     }
+  });
+});
+
+describe("enhancementMoved", () => {
+  const read = { id: "e1", revision: 3, updated_at: 100, state: "running" as const };
+
+  it("is false for a re-read that changed nothing", () => {
+    expect(enhancementMoved(read, { ...read })).toBe(false);
+  });
+
+  it("is true when the revision, the write time, the state or the record changed, or nothing was read yet", () => {
+    expect(enhancementMoved(read, { ...read, revision: 4 })).toBe(true);
+    expect(enhancementMoved(read, { ...read, updated_at: 101 })).toBe(true);
+    expect(enhancementMoved(read, { ...read, state: "ready" })).toBe(true);
+    expect(enhancementMoved(read, { ...read, id: "e2" })).toBe(true);
+    expect(enhancementMoved(null, read)).toBe(true);
+  });
+
+  it("cuts a quiet live run's history reads to the ticks where it moved", () => {
+    // The poll loop's request count over a ten-tick run that moves twice:
+    // one read of the proposal per tick, plus the history (two reads) only
+    // when it moved. The loop used to read the history on every tick.
+    const reads = [3, 3, 3, 4, 4, 4, 4, 5, 5, 5].map((revision) => ({ ...read, revision, updated_at: revision }));
+    let shown: typeof read = { ...read, revision: 3, updated_at: 3 };
+    let requests = 0;
+    for (const next of reads) {
+      requests += 1;
+      if (!enhancementMoved(shown, next)) continue;
+      shown = next;
+      requests += 2;
+    }
+    expect(requests).toBe(10 + 2 * 2);
   });
 });

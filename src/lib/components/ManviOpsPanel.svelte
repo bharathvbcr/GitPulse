@@ -196,7 +196,10 @@
       if ($repoStore.currentPath === repo) {
         github = next;
         if (opts.background) pollError = null;
-        void loadRepoTasks(repo);
+        // The issue poll does not re-read tasks while `workbench-changed`
+        // delivers them: that listener already reloads on every change, so a
+        // timed re-read only repeated it once a minute for nothing.
+        if (!opts.background || !tasksFollowChanges) void loadRepoTasks(repo);
       }
     } catch (error) {
       if ($repoStore.currentPath !== repo) return;
@@ -443,6 +446,8 @@
   }
 
   let repoTasksGeneration = 0;
+  /** True once the `workbench-changed` listener is attached; tasks then reload on change, not on a timer. */
+  let tasksFollowChanges = false;
   let refreshTasksTimer: number | null = null;
 
   function scheduleRefreshRepoTasks() {
@@ -643,7 +648,10 @@
     const listeners = createListenerTracker();
     if (isTauri()) {
       void listen("workbench-changed", scheduleRefreshRepoTasks)
-        .then((stop) => listeners.track(stop))
+        .then((stop) => {
+          listeners.track(stop);
+          tasksFollowChanges = true;
+        })
         .catch(() => {
           // Live updates unavailable in non-Tauri preview mode
         });
@@ -662,6 +670,7 @@
 
     return () => {
       stopInterval();
+      tasksFollowChanges = false;
       listeners.dispose();
       if (refreshTasksTimer !== null) {
         window.clearTimeout(refreshTasksTimer);
