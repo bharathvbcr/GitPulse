@@ -1560,25 +1560,73 @@ mod tests {
         let state = host(&dir.path().join("profile.sqlite"));
         seed(&state, &root);
         let sub = root.join("pkg/web");
-        let prepared = state.request("runs.prepare_terminal", &prepare(&sub).to_string()).unwrap();
+        let prepared = state
+            .request("runs.prepare_terminal", &prepare(&sub).to_string())
+            .unwrap();
         for path in [&root, &sub] {
-            let identity = state.request("runs.checkout_identity", &json!({"repo_path": path}).to_string()).unwrap();
-            assert_eq!(identity["git_dir"], prepared["item"]["git_dir"], "{}", path.display());
-            assert_eq!(identity["git_common_dir"], prepared["item"]["git_common_dir"]);
+            let identity = state
+                .request(
+                    "runs.checkout_identity",
+                    &json!({"repo_path": path}).to_string(),
+                )
+                .unwrap();
+            assert_eq!(
+                identity["git_dir"],
+                prepared["item"]["git_dir"],
+                "{}",
+                path.display()
+            );
+            assert_eq!(
+                identity["git_common_dir"],
+                prepared["item"]["git_common_dir"]
+            );
         }
         // A worktree nested inside the checkout is a checkout of its own.
-        let nested = state.request("runs.prepare_terminal", &with_worktree(&root, "cafe0123-n").to_string()).unwrap();
-        let identity = state.request("runs.checkout_identity", &json!({"repo_path": nested["item"]["cwd"]}).to_string()).unwrap();
+        let nested = state
+            .request(
+                "runs.prepare_terminal",
+                &with_worktree(&root, "cafe0123-n").to_string(),
+            )
+            .unwrap();
+        let identity = state
+            .request(
+                "runs.checkout_identity",
+                &json!({"repo_path": nested["item"]["cwd"]}).to_string(),
+            )
+            .unwrap();
         assert_eq!(identity["git_dir"], nested["item"]["git_dir"]);
         assert_ne!(identity["git_dir"], prepared["item"]["git_dir"]);
         // Refused as input: relative, oversized, unknown fields, not an object.
-        for input in [json!({"repo_path":"repo"}).to_string(), json!({"repo_path": format!("/{}", "x".repeat(4_200))}).to_string(), json!({"repo_path":"/r","extra":1}).to_string(), "[]".into(), "x".repeat(9_000)] {
-            assert_eq!(state.request("runs.checkout_identity", &input).unwrap_err().code, "invalid_input", "{}", &input[..input.len().min(60)]);
+        for input in [
+            json!({"repo_path":"repo"}).to_string(),
+            json!({"repo_path": format!("/{}", "x".repeat(4_200))}).to_string(),
+            json!({"repo_path":"/r","extra":1}).to_string(),
+            "[]".into(),
+            "x".repeat(9_000),
+        ] {
+            assert_eq!(
+                state
+                    .request("runs.checkout_identity", &input)
+                    .unwrap_err()
+                    .code,
+                "invalid_input",
+                "{}",
+                &input[..input.len().min(60)]
+            );
         }
         // Git is not run in a checkout nobody trusted.
         let stranger = dir.path().join("stranger");
         git_global(&["init", stranger.to_str().unwrap()]).unwrap();
-        assert_eq!(state.request("runs.checkout_identity", &json!({"repo_path": stranger}).to_string()).unwrap_err().code, "repository_unavailable");
+        assert_eq!(
+            state
+                .request(
+                    "runs.checkout_identity",
+                    &json!({"repo_path": stranger}).to_string()
+                )
+                .unwrap_err()
+                .code,
+            "repository_unavailable"
+        );
         assert_eq!(state.request("runs.list", "{}").unwrap()["total"], 2);
     }
 

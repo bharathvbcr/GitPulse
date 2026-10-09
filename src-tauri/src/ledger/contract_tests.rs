@@ -61,7 +61,10 @@ fn validate(value: &Value, schema: &Value, root: &Value, at: &str) -> Vec<String
             .strip_prefix("#/$defs/")
             .unwrap_or_else(|| panic!("unsupported $ref {reference}"));
         let target = &root["$defs"][name];
-        assert!(!target.is_null(), "{at}: $ref {reference} resolves to nothing");
+        assert!(
+            !target.is_null(),
+            "{at}: $ref {reference} resolves to nothing"
+        );
         return validate(value, target, root, at);
     }
     for (keyword, rule) in object {
@@ -181,17 +184,53 @@ fn verdict(status: PolicyStatus) -> PolicyVerdict {
         status,
         checked,
         target: "git push --force origin main".into(),
-        rule: if checked { "command.force_push".into() } else { String::new() },
-        severity: if checked { "soft".into() } else { String::new() },
+        rule: if checked {
+            "command.force_push".into()
+        } else {
+            String::new()
+        },
+        severity: if checked {
+            "soft".into()
+        } else {
+            String::new()
+        },
         reason: "fixture".into(),
-        demoted: if status == PolicyStatus::Demoted { "posture".into() } else { String::new() },
-        grant_id: if status == PolicyStatus::Granted { "g-1".into() } else { String::new() },
-        granted_by: if status == PolicyStatus::Granted { "ada".into() } else { String::new() },
-        widened: if status == PolicyStatus::Widened { "src/**".into() } else { String::new() },
-        degraded: if status == PolicyStatus::Degraded { vec!["repo_map".into()] } else { vec![] },
+        demoted: if status == PolicyStatus::Demoted {
+            "posture".into()
+        } else {
+            String::new()
+        },
+        grant_id: if status == PolicyStatus::Granted {
+            "g-1".into()
+        } else {
+            String::new()
+        },
+        granted_by: if status == PolicyStatus::Granted {
+            "ada".into()
+        } else {
+            String::new()
+        },
+        widened: if status == PolicyStatus::Widened {
+            "src/**".into()
+        } else {
+            String::new()
+        },
+        degraded: if status == PolicyStatus::Degraded {
+            vec!["repo_map".into()]
+        } else {
+            vec![]
+        },
         task_id: "TASK-7".into(),
-        detail: if checked { String::new() } else { "no manvi binary".into() },
-        detail_code: if checked { String::new() } else { "not_installed".into() },
+        detail: if checked {
+            String::new()
+        } else {
+            "no manvi binary".into()
+        },
+        detail_code: if checked {
+            String::new()
+        } else {
+            "not_installed".into()
+        },
     }
 }
 
@@ -260,7 +299,10 @@ fn every_field_the_contract_names_is_one_this_struct_serializes() {
         root["properties"].as_object().unwrap().keys().collect();
     let value = serde_json::to_value(minimal_event()).unwrap();
     let ours: std::collections::BTreeSet<&String> = value.as_object().unwrap().keys().collect();
-    assert_eq!(contract, ours, "LedgerEvent and event.schema.json name different fields");
+    assert_eq!(
+        contract, ours,
+        "LedgerEvent and event.schema.json name different fields"
+    );
 }
 
 #[test]
@@ -347,12 +389,16 @@ fn the_validator_rejects_what_the_contract_forbids() {
         );
     }
     // The pre-2026-10-08 description: a raw verdict.schema.json decision.
-    let raw_decision = json!({"action": "allow", "rule": "", "severity": "none", "reason": "", "target": "x"});
+    let raw_decision =
+        json!({"action": "allow", "rule": "", "severity": "none", "reason": "", "target": "x"});
     let errors = validate(
         &raw_decision,
         &root["properties"]["verdict_json"]["contentSchema"],
         &root,
         "verdict_json",
     );
-    assert!(!errors.is_empty(), "a raw decision is not what the ledger records");
+    assert!(
+        !errors.is_empty(),
+        "a raw decision is not what the ledger records"
+    );
 }
