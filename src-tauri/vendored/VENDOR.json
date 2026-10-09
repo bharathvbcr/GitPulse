@@ -7,7 +7,7 @@
         "repo": "devcouncil",
         "root_env": "GITPULSE_DEVCOUNCIL_ROOT",
         "path": "rust/dc-proc",
-        "commit": "ad5c941c599c6d8d0fcfaf6044bed52f6293a66e"
+        "commit": "06d704b92682a0be0530ca8a7d59b8d20de70a8c"
       },
       "omitted": [
         "tests/",
@@ -29,7 +29,7 @@
         "repo": "devcouncil",
         "root_env": "GITPULSE_DEVCOUNCIL_ROOT",
         "path": "rust/dc-redact",
-        "commit": "ad5c941c599c6d8d0fcfaf6044bed52f6293a66e"
+        "commit": "06d704b92682a0be0530ca8a7d59b8d20de70a8c"
       },
       "omitted": [
         "tests/",
@@ -51,7 +51,7 @@
         "repo": "devcouncil",
         "root_env": "GITPULSE_DEVCOUNCIL_ROOT",
         "path": "rust/dc-regress",
-        "commit": "ad5c941c599c6d8d0fcfaf6044bed52f6293a66e"
+        "commit": "06d704b92682a0be0530ca8a7d59b8d20de70a8c"
       },
       "omitted": [
         "tests/",
@@ -84,7 +84,7 @@
         "repo": "devcouncil",
         "root_env": "GITPULSE_DEVCOUNCIL_ROOT",
         "path": "rust/dc-regress-store",
-        "commit": "ad5c941c599c6d8d0fcfaf6044bed52f6293a66e"
+        "commit": "06d704b92682a0be0530ca8a7d59b8d20de70a8c"
       },
       "omitted": [
         "tests/",
@@ -109,7 +109,7 @@
         "repo": "devcouncil",
         "root_env": "GITPULSE_DEVCOUNCIL_ROOT",
         "path": "rust/dc-store",
-        "commit": "ad5c941c599c6d8d0fcfaf6044bed52f6293a66e"
+        "commit": "06d704b92682a0be0530ca8a7d59b8d20de70a8c"
       },
       "omitted": [
         "tests/",
@@ -158,7 +158,7 @@
         "repo": "devcouncil",
         "root_env": "GITPULSE_DEVCOUNCIL_ROOT",
         "path": "rust/devmap-analyze",
-        "commit": "ad5c941c599c6d8d0fcfaf6044bed52f6293a66e"
+        "commit": "06d704b92682a0be0530ca8a7d59b8d20de70a8c"
       },
       "omitted": [
         "tests/",
@@ -196,7 +196,7 @@
         "repo": "devcouncil",
         "root_env": "GITPULSE_DEVCOUNCIL_ROOT",
         "path": "rust/devmap-extract",
-        "commit": "ad5c941c599c6d8d0fcfaf6044bed52f6293a66e"
+        "commit": "06d704b92682a0be0530ca8a7d59b8d20de70a8c"
       },
       "omitted": [
         "tests/",
@@ -335,7 +335,7 @@
         "repo": "devcouncil",
         "root_env": "GITPULSE_DEVCOUNCIL_ROOT",
         "path": "rust/devmap-query",
-        "commit": "ad5c941c599c6d8d0fcfaf6044bed52f6293a66e"
+        "commit": "06d704b92682a0be0530ca8a7d59b8d20de70a8c"
       },
       "omitted": [
         "tests/",
@@ -410,7 +410,7 @@
         "repo": "devcouncil",
         "root_env": "GITPULSE_DEVCOUNCIL_ROOT",
         "path": "rust/devmap-resolve",
-        "commit": "ad5c941c599c6d8d0fcfaf6044bed52f6293a66e"
+        "commit": "06d704b92682a0be0530ca8a7d59b8d20de70a8c"
       },
       "omitted": [
         "tests/",
@@ -441,7 +441,7 @@
         "repo": "devcouncil",
         "root_env": "GITPULSE_DEVCOUNCIL_ROOT",
         "path": "rust/devmap-store",
-        "commit": "ad5c941c599c6d8d0fcfaf6044bed52f6293a66e"
+        "commit": "06d704b92682a0be0530ca8a7d59b8d20de70a8c"
       },
       "omitted": [
         "tests/",
@@ -476,7 +476,7 @@
         "src/db/tests/git_head_tests.rs": "4822a097b4a57ed5b19bc7b569505c1b1e5245f0167988028960e1741aa0d744",
         "src/db/tests/sidecar_link_tests.rs": "fd0014892605e15b4baafe36c1991861dbbfc8c3237a0c3c7fa584788be800a5",
         "src/db/write.rs": "946ffbc374da5e24dd93ecfcb5a76ea3053cec906e21dc80c2bc59a30caafd65",
-        "src/db.rs": "6c3469516a44b4f42d5bfa4e78dac2e73fd1f1b25697d9cd72047e8cf953f5fe",
+        "src/db.rs": "66b47f033a74044c41c77acbf18b416d97031a3ac1dbd2910121b3b88e059be1",
         "src/edge_index.rs": "5ffafc8167d8e39b7506673cdab4dc29b0056bb6b60037ec489fdece90461369",
         "src/extract_cache.rs": "900483f7e1f5687063cb57dd0b355ddb829e65314a76be8bcc529c51f979a340",
         "src/lib.rs": "c8262ee8d8ab260aa7ba59d266387bb8361eead911a01687058a7a8aa5939b1e",
@@ -595,7 +595,7 @@
       "repo": "devcouncil",
       "root_env": "GITPULSE_DEVCOUNCIL_ROOT",
       "path": "backend/contracts",
-      "commit": "ad5c941c599c6d8d0fcfaf6044bed52f6293a66e"
+      "commit": "06d704b92682a0be0530ca8a7d59b8d20de70a8c"
     },
     "files": {
       "CHECKSUMS": "bd2c7b3746812270eebf47f11131244e5c272dfcb2c41e54c3dbe9422152c568",

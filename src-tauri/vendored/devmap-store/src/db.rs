@@ -2074,6 +2074,10 @@ struct StoredPayload<'a> {
 /// defined meaning instead (exact-match admission), and its *contents* are
 /// validated where they are read (`Store::recorded_reader_floor`), which
 /// refuses a damaged row rather than reading it as absent.
+///
+/// Only the relation gate's test reads this list, so it exists only in test
+/// builds; a release build would otherwise warn that it is never used.
+#[cfg(test)]
 pub(crate) const OPTIONAL_RELATIONS: &[&str] = &["reader_compat"];
 
 const REQUIRED_SCHEMA: &[(&str, &[&str])] = &[
