@@ -4,7 +4,7 @@ import { get } from "svelte/store";
 vi.mock("./ptyBus.tauri", () => ({ ptyBus: { subscribe: () => () => {} } }));
 vi.mock("../ipc/invoke", () => ({ invoke: vi.fn() }));
 
-const { adoptDetachedSessions, handOverDetachedRun, parseListing, stopQuestion, DETACHED_STATUS } = await import("./detachedSessions");
+const { adoptDetachedSessions, handOverDetachedRun, keepDetached, parseListing, stopQuestion, DETACHED_STATUS } = await import("./detachedSessions");
 const { createSessionRegistry } = await import("./sessionRegistry");
 const { taskTerminalRequests, consumeTaskTerminalRequest } = await import("./taskLaunches");
 import type { PtyBus, PtySessionHandlers } from "./ptyBus";
@@ -106,7 +106,7 @@ describe("sessions a reloaded page left running", () => {
     expect(asked[0]).toMatchObject({ ...stopQuestion({ run_id: "run-1" }, "Claude"), confirmLabel: "Stop", destructive: true });
     expect(asked[0].message).toContain("ends that attempt");
     expect(calls.some((call) => call.command === "cmd_terminal_kill")).toBe(false);
-    expect(stopQuestion({ run_id: null }, "Shell").message).toContain("still running from before the window reloaded");
+    expect(stopQuestion({ run_id: null }, "Shell").message).toContain("still running, not shown in any tab");
   });
 
   // The advisor's case: "Open terminal" takes a reloaded task session over
@@ -163,5 +163,47 @@ describe("an attempt's session in a worktree, after a reload", () => {
     const invoke = async <T,>(command: string): Promise<T> => (command === "cmd_terminal_sessions" ? [listing] : null) as T;
     expect(await adoptDetachedSessions({ invoke, bus, registry, confirm: async () => true, familyOf: async () => { throw new Error("deferred under load"); } })).toBe(1);
     expect(get(registry)[0]).not.toHaveProperty("family");
+  });
+});
+
+describe("a tab's process kept after its view went away", () => {
+  it("takes the tab's own slot, so the limit never sees it free, and watches its exit", async () => {
+    const registry = createSessionRegistry();
+    const { bus, handlers } = fakeBus();
+    const tabSlot = registry.reserve({ key: "tab-a", repoPath: "/repos/app", label: "Claude", status: "running", sessionId: "term-1-a", close: async () => {} });
+    const calls: string[] = [];
+    const invoke = async <T,>(command: string): Promise<T> => { calls.push(command); return null as T; };
+    keepDetached(row(), tabSlot, { invoke, bus, confirm: async () => true });
+    expect(get(registry).map((r) => r.key)).toEqual(["detached:term-1-a"]);
+    expect(get(registry)[0]).toMatchObject({ status: DETACHED_STATUS, sessionId: "term-1-a", label: "Claude" });
+    // The old slot handle is spent: it cannot release the record it gave away.
+    tabSlot.release();
+    expect(get(registry)).toHaveLength(1);
+    expect(() => tabSlot.handOver({ key: "x", repoPath: "/r", label: "l", status: "s", close: async () => {} })).toThrow();
+    // Exit removes it; Stop really stops it.
+    handlers.get("term-1-a")?.onExit({ id: "term-1-a", exit_code: 0, signal: "", error: null, reaped: true });
+    expect(get(registry)).toHaveLength(0);
+    expect(calls).toEqual([]);
+  });
+
+  it("is stopped for real from Sessions", async () => {
+    const registry = createSessionRegistry();
+    const { bus } = fakeBus();
+    const tabSlot = registry.reserve({ key: "tab-a", repoPath: "/repos/app", label: "Claude", status: "running", close: async () => {} });
+    const calls: { command: string; args?: Record<string, unknown> }[] = [];
+    const invoke = async <T,>(command: string, args?: Record<string, unknown>): Promise<T> => { calls.push({ command, args }); return null as T; };
+    keepDetached(row(), tabSlot, { invoke, bus, confirm: async () => true });
+    await get(registry)[0].close();
+    expect(calls).toEqual([{ command: "cmd_terminal_kill", args: { sessionId: "term-1-a" } }]);
+    expect(get(registry)).toHaveLength(0);
+  });
+
+  it("is not adopted a second time by a later page-wide adoption", async () => {
+    const { registry, adopt } = setup([row()]);
+    const { bus } = fakeBus();
+    const tabSlot = registry.reserve({ key: "tab-a", repoPath: "/repos/app", label: "Claude", status: "running", close: async () => {} });
+    keepDetached(row(), tabSlot, { bus, invoke: async <T,>() => null as T, confirm: async () => true });
+    expect(await adopt()).toBe(0);
+    expect(get(registry)).toHaveLength(1);
   });
 });

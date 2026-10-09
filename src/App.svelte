@@ -165,6 +165,7 @@
   import { applyReduceMotion } from "./lib/motion/motionPreference";
   import { installWindowStatePersistence } from "./lib/desktop/windowState";
   import { askConfirm } from "./lib/stores/modalStore";
+  import { runningAgents, terminalSessions } from "./lib/terminal/sessionRegistry";
   import {
     hasUnsavedEditorDrafts,
     unsavedEditorDrafts,
@@ -353,6 +354,22 @@
     // request, so this answers nothing and must not cancel the first.
     if (exitRequestPending) return;
     exitRequestPending = true;
+    // Quitting ends every PTY, and an agent's work in progress with it. Every
+    // other way an agent's tab goes away now leaves it running; this one
+    // cannot, so it asks.
+    const agents = runningAgents(get(terminalSessions));
+    if (agents.length > 0) {
+      const listed = agents.slice(0, 5).map((record) => `• ${record.label} — ${displayName(record.repoPath)}`).join("\n");
+      const omitted = agents.length > 5 ? `\n…and ${agents.length - 5} more` : "";
+      const quit = await askConfirm({
+        title: agents.length === 1 ? "Quit While an Agent Is Running?" : `Quit While ${agents.length} Agents Are Running?`,
+        message: `${listed}${omitted}\nQuitting GitPulse ends ${agents.length === 1 ? "this agent" : "these agents"} and whatever ${agents.length === 1 ? "it is" : "they are"} in the middle of.`,
+        confirmLabel: agents.length === 1 ? "Quit and End Agent" : "Quit and End Agents",
+        cancelLabel: "Keep Working",
+        destructive: true,
+      });
+      if (!quit) { cancelNativeExitRequest(); return; }
+    }
     const gitActions = gitActionCount(get(repoStore.mutationActivity));
     if (gitActions > 0) {
       const wait = await askConfirm({ title: "Finish Git Actions Before Quit?",

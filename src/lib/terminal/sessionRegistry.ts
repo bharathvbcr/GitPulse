@@ -162,6 +162,16 @@ export function sessionByNativeId(
 }
 
 /**
+ * The agent sessions a quit would end: every record that holds a native
+ * process (it has an id; an exited session has already released its record)
+ * and runs an agent CLI, whether a tab shows it or it was left in Sessions.
+ * A plain shell is not counted — its job, if any, is the shell's own.
+ */
+export function runningAgents<T extends Pick<TerminalSessionRecord, "launcher" | "sessionId">>(records: readonly T[]): T[] {
+  return records.filter((record) => Boolean(record.sessionId) && record.launcher !== undefined && record.launcher !== "shell");
+}
+
+/**
  * Stops a session from outside its tab — the Sessions list, a task's Agents
  * pane — asking the tab's own question first. Resolves to whether it was
  * stopped, so a declined question is not reported as a stop.
@@ -197,45 +207,61 @@ export function createSessionRegistry() {
       if (records.has(record.key)) throw new Error("This terminal already owns a session slot");
       const limit = currentSessionLimit();
       if (records.size >= limit) throw new SessionCapacityError(limit);
-      records.set(record.key, record);
-      publish();
-      let released = false;
-      return {
-        update(status: string) {
-          if (released) return;
-          const current = records.get(record.key) ?? record;
-          records.set(record.key, { ...current, status });
-          publish();
-        },
-        /**
-         * Records the backend id once the PTY has one.
-         *
-         * One record per native session: any other record holding this id
-         * gives way. A session a reloaded page left running is adopted as a
-         * record of its own, and a task tab can take that same process over
-         * through its own launch path ("Open terminal"), never through the
-         * adopted record. Without this the session was listed twice, held
-         * two slots against the shared limit, and the stale row's Close
-         * stopped the live tab's process.
-         */
-        identify(sessionId: string) {
-          if (released || !sessionId) return;
-          const current = records.get(record.key) ?? record;
-          if (current.sessionId === sessionId) return;
-          for (const [key, other] of records) {
-            if (key !== record.key && other.sessionId === sessionId) records.delete(key);
-          }
-          records.set(record.key, { ...current, sessionId });
-          publish();
-        },
-        release() {
-          if (released) return;
-          released = true;
-          records.delete(record.key);
-          publish();
-        },
-      };
+      return admit(record);
     },
   };
+  function admit(record: TerminalSessionRecord) {
+    records.set(record.key, record);
+    publish();
+    let released = false;
+    return {
+      update(status: string) {
+        if (released) return;
+        const current = records.get(record.key) ?? record;
+        records.set(record.key, { ...current, status });
+        publish();
+      },
+      /**
+       * Records the backend id once the PTY has one.
+       *
+       * One record per native session: any other record holding this id
+       * gives way. A session a reloaded page left running is adopted as a
+       * record of its own, and a task tab can take that same process over
+       * through its own launch path ("Open terminal"), never through the
+       * adopted record. Without this the session was listed twice, held
+       * two slots against the shared limit, and the stale row's Close
+       * stopped the live tab's process.
+       */
+      identify(sessionId: string) {
+        if (released || !sessionId) return;
+        const current = records.get(record.key) ?? record;
+        if (current.sessionId === sessionId) return;
+        for (const [key, other] of records) {
+          if (key !== record.key && other.sessionId === sessionId) records.delete(key);
+        }
+        records.set(record.key, { ...current, sessionId });
+        publish();
+      },
+      release() {
+        if (released) return;
+        released = true;
+        records.delete(record.key);
+        publish();
+      },
+      /**
+       * Gives this slot to another record, in one step: no capacity check,
+       * because no slot is added, and no moment where the slot is free for
+       * another tab to take. How a tab whose view went away hands its
+       * still-running process to Sessions.
+       */
+      handOver(next: TerminalSessionRecord) {
+        if (released) throw new Error("This terminal no longer owns a session slot");
+        if (next.key !== record.key && records.has(next.key)) throw new Error("This terminal already owns a session slot");
+        released = true;
+        records.delete(record.key);
+        return admit(next);
+      },
+    };
+  }
 }
 export const terminalSessions = createSessionRegistry();

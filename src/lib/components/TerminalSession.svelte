@@ -108,6 +108,7 @@
   import { openTaskForRun } from "../workbench/taskOpen";
   import { noteAttempt } from "../terminal/taskLaunches";
   import { toastStore } from "../stores/toastStore";
+  import { keepDetached, parseListing } from "../terminal/detachedSessions";
   import {
     clampTerminalFontSize, hasRenderedBox, macLineEditing, spawnGridSize, terminalViewChord, terminalSearchSummary,
     TERMINAL_FONT_DEFAULT, TERMINAL_FONT_MIN, TERMINAL_FONT_MAX,
@@ -604,6 +605,23 @@
         write: (sessionId, data, binary) => invoke("cmd_terminal_write", { sessionId, data, binary }),
         resize: (sessionId, rows, cols) => invoke("cmd_terminal_resize", { sessionId, rows, cols }),
         kill: (sessionId) => invoke("cmd_terminal_kill", { sessionId }),
+        detach: (sessionId) => invoke<boolean>("cmd_terminal_detach", { sessionId }),
+      },
+      // Only a plain shell positively at its prompt may end with its view.
+      // An agent, a running job, or a context that cannot be read is kept.
+      idle: async (sessionId) => {
+        if (launcher !== "shell") return false;
+        const context = parseTerminalContext(await invoke<unknown>("cmd_terminal_context", { sessionId }));
+        return context?.busy === false;
+      },
+      // Listed in Sessions, where it can be shown again or stopped. Looked up
+      // while this tab still holds the slot, which it then hands over.
+      keep: async (sessionId) => {
+        const raw = await invoke<unknown>("cmd_terminal_sessions");
+        const listing = Array.isArray(raw) ? raw.map(parseListing).find((row) => row?.id === sessionId) ?? null : null;
+        if (!listing) return null;
+        const family = listing.run_id ? await repoStore.familyOf(listing.repo).catch(() => null) : null;
+        return (slot) => keepDetached({ ...listing, detached: true }, slot, { family });
       },
       hooks: {
         state(status, message) {
@@ -648,10 +666,13 @@
           } else if (decision.action === "overflow") {
             for (const owed of decision.owed) acknowledgeOutput(owed.sessionId, owed.bytes);
             lifecycle?.fail(decision.failure, true);
-          } else if (decision.action === "stop") {
-            void lifecycle?.stop(decision.failure);
+          } else if (decision.action === "lost") {
+            // An unreadable frame is lost output, not a dead process. The
+            // host sheds rather than waits forever on the credit this frame
+            // could not name, so nothing here needs to end the session.
+            lifecycle?.fail(decision.failure, true);
           }
-          if (decision.action !== "stop" && !disposed) {
+          if (decision.action !== "lost" && !disposed) {
             sessionActivity.output(sessionId);
             if (!active) onActivity();
           }
@@ -670,6 +691,10 @@
           });
         },
         warning(message) { warning = message; },
+        // CAN aborts any escape, OSC or DCS sequence the gap cut short, and
+        // does nothing at all on the ground state. Queued behind what was
+        // painted, ahead of what the resumed stream sends.
+        skipped() { if (term && !disposed) term.write("\x18"); },
         admitted() { onAdmitted?.(); },
         refused(message) { return onRefused?.(message) ?? false; },
       },
@@ -729,6 +754,13 @@
   }
 
   export function restart() { void lifecycle?.restart(); }
+
+  /**
+   * The user's Close: ends the process. Called before the tab is dropped, so
+   * the unmount that follows has nothing left to keep. Rejects when the
+   * process could not be stopped; the tab then stays, with its retry.
+   */
+  export async function close(): Promise<void> { await lifecycle?.close(); }
 
   /**
    * The attempt this tab belongs to: its own, or the one a resumed

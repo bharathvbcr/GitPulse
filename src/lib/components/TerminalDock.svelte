@@ -28,11 +28,12 @@
    * *against* something: a Health remediation, a failing test, the diff you
    * are about to commit. A full-screen terminal hid all of it.
    *
-   * Mounted on first open and kept mounted after, because unmounting kills
-   * the shell. Closing hides it. Switching repository tabs also hides rather
+   * Mounted on first open and kept mounted after, because unmounting loses
+   * the scrollback (and detaches anything running). Closing hides it. Switching repository tabs also hides rather
    * than unmounts: one panel per visited tab, bound to that tab's path, so
    * the scrollback is still there when you come back. Closing the repository
-   * tab is what drops the panel.
+   * tab is what drops the panel; what was still running there is detached,
+   * not killed, and stays under Sessions.
    */
 
   let {

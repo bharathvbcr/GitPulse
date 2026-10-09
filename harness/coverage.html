@@ -92,7 +92,7 @@
             return { id, cwd: args.repoPath, shell: args.program ?? "/bin/zsh" };
           }
           case "cmd_terminal_write": writes.push(args); return null;
-          case "cmd_terminal_ack": case "cmd_terminal_resize": case "cmd_terminal_kill": return null;
+          case "cmd_terminal_ack": case "cmd_terminal_resize": case "cmd_terminal_kill": case "cmd_terminal_detach": return null;
           case "cmd_list_branches": case "cmd_get_status": case "cmd_list_remotes": case "cmd_list_submodules": return [];
           case "cmd_stash_list": return { entries: [], truncated: false };
           case "cmd_list_tags": return { tags: [], truncated: false };

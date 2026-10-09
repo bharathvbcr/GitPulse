@@ -2,6 +2,7 @@ import { get } from "svelte/store";
 import { describe, expect, it, vi } from "vitest";
 import {
   createSessionRegistry,
+  runningAgents,
   sessionByNativeId,
   sessionsByRepo,
   type TerminalSessionRecord,
@@ -299,5 +300,54 @@ describe("one record per native session", () => {
     // The displaced holder releasing late frees nothing that is not its own.
     adopted.release();
     expect(get(registry).map((record) => record.key).sort()).toEqual(["tab-1", "tab-2"]);
+  });
+});
+
+describe("handing a slot over", () => {
+  it("swaps one record for another in one publish, with no capacity check and no free moment", async () => {
+    const { createSessionRegistry: create } = await import("./sessionRegistry");
+    const { DEFAULT_TERMINAL_SESSIONS } = await import("./sessionLimit");
+    const registry = create();
+    const slots = Array.from({ length: DEFAULT_TERMINAL_SESSIONS }, (_, i) =>
+      registry.reserve({ key: `k${i}`, repoPath: "/r", label: "Shell", status: "running", close: async () => {} }));
+    const seen: number[] = [];
+    const stop = registry.subscribe((records) => seen.push(records.length));
+    seen.length = 0;
+    const next = slots[0].handOver({ key: "detached:x", repoPath: "/r", label: "Shell", status: "kept", sessionId: "x", close: async () => {} });
+    stop();
+    expect(seen).toEqual([DEFAULT_TERMINAL_SESSIONS]);
+    expect(() => registry.reserve({ key: "late", repoPath: "/r", label: "Shell", status: "s", close: async () => {} })).toThrow();
+    // The new handle owns the record; the old one is spent.
+    slots[0].release();
+    next.update("still running");
+    expect(get(registry).find((r) => r.key === "detached:x")?.status).toBe("still running");
+    next.release();
+    expect(get(registry)).toHaveLength(DEFAULT_TERMINAL_SESSIONS - 1);
+  });
+
+  it("refuses a key another record holds, and leaves the original in place", async () => {
+    const { createSessionRegistry: create } = await import("./sessionRegistry");
+    const registry = create();
+    const a = registry.reserve({ key: "a", repoPath: "/r", label: "Shell", status: "s", close: async () => {} });
+    registry.reserve({ key: "b", repoPath: "/r", label: "Shell", status: "s", close: async () => {} });
+    expect(() => a.handOver({ key: "b", repoPath: "/r", label: "Shell", status: "s", close: async () => {} })).toThrow();
+    expect(get(registry).map((r) => r.key)).toEqual(["a", "b"]);
+    a.release();
+    expect(get(registry).map((r) => r.key)).toEqual(["b"]);
+  });
+});
+
+describe("runningAgents", () => {
+  it("counts agent processes, shown or left in Sessions, and nothing else", () => {
+    const base = { repoPath: "/r", label: "x", status: "running", close: async () => {} };
+    const records: TerminalSessionRecord[] = [
+      { ...base, key: "a", launcher: "claude", sessionId: "s1" },
+      { ...base, key: "detached:s2", launcher: "codex", sessionId: "s2", status: "Still running — not shown in any tab" },
+      { ...base, key: "b", launcher: "shell", sessionId: "s3" },
+      { ...base, key: "c", sessionId: "s4" },
+      { ...base, key: "d", launcher: "claude", status: "starting" },
+    ];
+    expect(runningAgents(records).map((r) => r.key)).toEqual(["a", "detached:s2"]);
+    expect(runningAgents([])).toEqual([]);
   });
 });

@@ -166,12 +166,12 @@ describe("reserved output length", () => {
     expect(credit.pending()).toBe(0);
   });
 
-  it("stops when a corrupt chunk does not name a length that can be acknowledged", () => {
+  it("reports a corrupt chunk lost when it does not name a length that can be acknowledged", () => {
     const credit = createOutputCredit();
     for (const reserved of [null, 0, 1.5, MAX_TERMINAL_OUTPUT_CHUNK + 1]) {
       const plan = planTerminalOutput(credit, "!!!!", "native-a", reserved, open);
-      expect(plan.action).toBe("stop");
-      if (plan.action === "stop") expect(plan.failure).toContain("Invalid terminal output");
+      expect(plan.action).toBe("lost");
+      if (plan.action === "lost") expect(plan.failure).toContain("Invalid terminal output");
     }
     const full = planTerminalOutput(credit, "!!!!", "native-a", MAX_TERMINAL_OUTPUT_CHUNK, open);
     expect(full).toMatchObject({ action: "ack", bytes: MAX_TERMINAL_OUTPUT_CHUNK });

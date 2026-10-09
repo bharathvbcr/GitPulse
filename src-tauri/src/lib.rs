@@ -384,6 +384,7 @@ pub fn run() {
             cmd_terminal_context,
             cmd_terminal_sessions,
             cmd_terminal_attach,
+            cmd_terminal_detach,
             cmd_terminal_run,
             cmd_manvi_run_action,
             cmd_take_pending_open,

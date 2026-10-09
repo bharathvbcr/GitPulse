@@ -4083,6 +4083,17 @@ pub async fn cmd_terminal_resize(
     crate::terminal::resize_session(&state, &session_id, rows, cols)
 }
 
+/// Leaves a session running with no view, for a tab that went away without
+/// being closed. Returns whether there was a live session to detach.
+#[tauri::command(async)]
+pub async fn cmd_terminal_detach(
+    state: State<'_, crate::terminal::TerminalSessions>,
+    session_id: String,
+) -> Result<bool, String> {
+    let state = state.inner().clone();
+    off_thread(move || crate::terminal::detach_session(&state, &session_id)).await
+}
+
 /// Kills a session's shell and frees its slot.
 #[tauri::command(async)]
 pub async fn cmd_terminal_kill(

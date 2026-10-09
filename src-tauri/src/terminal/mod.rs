@@ -21,7 +21,7 @@ use flow::{OutputFlow, Route};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::io::{Read, Write};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -132,6 +132,23 @@ fn output_payload_names_the_reserved_length() {
     assert_eq!(OUTPUT_CHUNK_BYTES, 4096);
 }
 
+/// Output a live session's view will never see. The process keeps running;
+/// the view says what was lost. Emitted as `terminal-loss`.
+#[derive(Clone, Serialize)]
+pub struct TerminalLossPayload {
+    pub id: String,
+    pub message: String,
+}
+
+/// What a view is told when it fell behind and output was dropped for it.
+pub const SHED_NOTICE: &str = "Terminal output was skipped while this window was not keeping up \
+     (hidden, minimized, or busy). The session kept running; the screen was redrawn when it caught up.";
+
+/// How long the reader waits for a view to repay its output window before it
+/// sheds instead. Long enough that a busy page is not shed for a hiccup;
+/// shedding no longer costs the process, only skipped output.
+pub const DEFAULT_OUTPUT_STALL: Duration = Duration::from_secs(30);
+
 #[derive(Clone, Serialize)]
 pub struct TerminalExitPayload {
     pub id: String,
@@ -173,6 +190,9 @@ pub struct TerminalSessions {
     /// Live rather than read per spawn, so a saved setting applies to the
     /// next session and a test registry never depends on the machine's file.
     limit: Arc<AtomicUsize>,
+    /// Milliseconds a reader waits on an unacknowledged window before it
+    /// sheds (`DEFAULT_OUTPUT_STALL`). Live, so a test can shorten it.
+    output_stall_ms: Arc<AtomicU64>,
 }
 
 impl Default for TerminalSessions {
@@ -181,6 +201,7 @@ impl Default for TerminalSessions {
             sessions: Arc::default(),
             active_sessions: Arc::default(),
             limit: Arc::new(AtomicUsize::new(DEFAULT_PTY_SESSIONS)),
+            output_stall_ms: Arc::new(AtomicU64::new(DEFAULT_OUTPUT_STALL.as_millis() as u64)),
         }
     }
 }
@@ -206,6 +227,14 @@ impl TerminalSessions {
     pub fn set_session_limit(&self, limit: usize) {
         self.limit
             .store(limit.clamp(1, MAX_PTY_SESSIONS), Ordering::Release);
+    }
+
+    /// Sets how long a reader waits for a view before shedding, clamped to
+    /// 10 ms..=5 min. For tests that cannot wait the default.
+    #[doc(hidden)]
+    pub fn set_output_stall_timeout(&self, timeout: Duration) {
+        let ms = timeout.as_millis().clamp(10, 300_000) as u64;
+        self.output_stall_ms.store(ms, Ordering::Release);
     }
 }
 
@@ -1037,6 +1066,27 @@ pub fn detach_all(state: &TerminalSessions) -> usize {
     detached
 }
 
+/// The one view holding this session has gone without closing it — a tab
+/// unmounted by anything other than its Close. The process keeps running,
+/// undelivered, until a view takes it over (`attach_session`) or the user
+/// stops it. Returns whether it was live and is now detached; an id that has
+/// already ended is not an error, there is simply nothing left to keep.
+pub fn detach_session(state: &TerminalSessions, session_id: &str) -> Result<bool, String> {
+    let guard = state
+        .sessions
+        .lock()
+        .map_err(|e| format!("Lock error: {e}"))?;
+    let Some(session) = guard
+        .get(session_id)
+        .filter(|s| !s.dead.load(Ordering::Acquire))
+    else {
+        return Ok(false);
+    };
+    session.flow.detach();
+    log::info!(target: "terminal", "terminal view went away; session detached and left running");
+    Ok(true)
+}
+
 /// Hands a detached session to a new view at that view's size.
 ///
 /// Refused for a session a view still holds: two views of one PTY would both
@@ -1097,6 +1147,21 @@ pub(crate) fn attach_tracked_session(
         repaint(&master, rows, cols);
     }
     Some(spawned)
+}
+
+/// Has the program redraw at the size it already has: what a view that
+/// skipped output needs to show the screen as it is.
+fn repaint_current(master: &Arc<Mutex<Box<dyn MasterPty + Send>>>) {
+    let size = master
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get_size();
+    match size {
+        Ok(size) => repaint(master, size.rows, size.cols),
+        Err(error) => {
+            log::warn!(target: "terminal", "could not read a terminal's size to repaint it: {error}")
+        }
+    }
 }
 
 fn repaint(master: &Arc<Mutex<Box<dyn MasterPty + Send>>>, rows: u16, cols: u16) {
@@ -1298,6 +1363,13 @@ fn spawn_session_inner<R: tauri::Runtime>(
     let sid_for_exit = session_id.clone();
     let dead_flag = dead.clone();
     let sessions_map = state.sessions.clone();
+    let output_stall_ms = state.output_stall_ms.clone();
+    // The program's name, not its path or the session's id (see
+    // `log_sites_do_not_interpolate_session_identifiers`).
+    let program_for_log = std::path::Path::new(&resolved).file_name().map_or_else(
+        || "shell".to_string(),
+        |name| name.to_string_lossy().into_owned(),
+    );
     let thread_child = child.clone();
     let thread_master = master.clone();
     let thread_observer = observer.clone();
@@ -1320,6 +1392,8 @@ fn spawn_session_inner<R: tauri::Runtime>(
             let mut failure = None;
             let mut watcher = watcher;
             let mut buf = [0u8; OUTPUT_CHUNK_BYTES];
+            // Logged once per run of failures, not once per chunk.
+            let mut emit_failing = false;
             loop {
                 match reader.read(&mut buf) {
                     Ok(0) => break,
@@ -1332,18 +1406,63 @@ fn spawn_session_inner<R: tauri::Runtime>(
                         // full tty queue undrained can prevent a killed writer
                         // from completing on macOS, stranding its process slot.
                         if dead_flag.load(Ordering::Relaxed) { continue; }
-                        let delivery = output_flow.reserve(n, Duration::from_secs(30)).and_then(|route| {
-                            // Detached: the page that would paint this is gone.
-                            // The process keeps running; the bytes are not sent.
-                            if route == Route::Hold { return Ok(()); }
-                            app_handle.emit("terminal-output", TerminalOutputPayload {
+                        let stall = Duration::from_millis(output_stall_ms.load(Ordering::Acquire));
+                        let delivery = output_flow.reserve(n, stall).map(|route| {
+                            let resumed = match route {
+                                // Detached: the page that would paint this is gone.
+                                // The process keeps running; the bytes are not sent.
+                                Route::Hold => return,
+                                // The view is alive but behind. Never a reason to
+                                // end the process: drop, keep draining, say so once.
+                                Route::Shed { began } => {
+                                    if began {
+                                        log::warn!(
+                                            target: "terminal",
+                                            "{program_for_log} terminal: view did not acknowledge output for {}ms; skipping output until it catches up (process left running)",
+                                            stall.as_millis()
+                                        );
+                                        if let Err(error) = app_handle.emit("terminal-loss", TerminalLossPayload {
+                                            id: sid_for_thread.clone(),
+                                            message: SHED_NOTICE.into(),
+                                        }) {
+                                            log::warn!(target: "terminal", "{program_for_log} terminal: could not report skipped output: {error}");
+                                        }
+                                    }
+                                    return;
+                                }
+                                Route::Resume => true,
+                                Route::Deliver => false,
+                            };
+                            let sent = app_handle.emit("terminal-output", TerminalOutputPayload {
                                 id: sid_for_thread.clone(),
                                 data_b64: BASE64_STANDARD.encode(&buf[..n]),
                                 bytes: n,
-                            }).map_err(|e| {
-                                log::warn!(target: "terminal", "failed to emit terminal-output: {e}");
-                                format!("Terminal output delivery failed: {e}")
-                            })
+                            });
+                            match sent {
+                                Ok(()) => {
+                                    emit_failing = false;
+                                    if resumed {
+                                        log::info!(target: "terminal", "{program_for_log} terminal: view caught up; output resumed");
+                                        repaint_current(&thread_master);
+                                    }
+                                }
+                                // A failed emit is the event loop's trouble,
+                                // not the process's; it keeps running. Shed
+                                // as after a stall (see `OutputFlow::shed`).
+                                Err(error) => {
+                                    if !std::mem::replace(&mut emit_failing, true) {
+                                        log::warn!(target: "terminal", "{program_for_log} terminal: failed to emit terminal-output, skipping output: {error}");
+                                    }
+                                    if output_flow.shed() {
+                                        if let Err(error) = app_handle.emit("terminal-loss", TerminalLossPayload {
+                                            id: sid_for_thread.clone(),
+                                            message: SHED_NOTICE.into(),
+                                        }) {
+                                            log::warn!(target: "terminal", "{program_for_log} terminal: could not report skipped output: {error}");
+                                        }
+                                    }
+                                }
+                            }
                         });
                         if let Err(error) = delivery {
                             if !dead_flag.swap(true, Ordering::SeqCst) {
@@ -1420,6 +1539,13 @@ fn spawn_session_inner<R: tauri::Runtime>(
                 },
                 |mut payload| {
                     if payload.error.is_none() { payload.error = failure.take(); }
+                    // Every end is on record with its cause. A session that
+                    // vanished with nothing in the log was undiagnosable.
+                    log::info!(
+                        target: "terminal",
+                        "{program_for_log} terminal session ended: exit_code={:?} signal={:?} reaped={} error={:?}",
+                        payload.exit_code, payload.signal, payload.reaped, payload.error
+                    );
                     // Shutdown waits for session removal. Persist the owned
                     // process's outcome before telling shutdown it is cleaned up.
                     if let Some(observer) = &thread_observer { observer.finished(&payload); }
@@ -1694,6 +1820,7 @@ pub fn kill_session(state: &TerminalSessions, session_id: &str) -> Result<(), St
         })
     };
     if let Some((child, master, flow, dead)) = handles {
+        log::info!(target: "terminal", "terminal close requested");
         terminate_pty_child(&child, &master)?;
         dead.store(true, Ordering::SeqCst);
         flow.stop();

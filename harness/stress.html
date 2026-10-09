@@ -424,6 +424,7 @@
         cmd_terminal_write: () => null,
         cmd_terminal_resize: () => null,
         cmd_terminal_kill: () => null,
+        cmd_terminal_detach: () => true,
       };
       // The shared mock layer, not a hand-rolled `__TAURI_INTERNALS__`. The
       // hand-rolled one answered `plugin:event|listen` with null and installed

@@ -185,7 +185,11 @@ describe("TerminalSession PTY contracts", () => {
     expect(outputIdx).toBeGreaterThan(-1);
     const body = source.slice(outputIdx, source.indexOf("exit(event)", outputIdx));
     expect(body).toContain("planTerminalOutput(");
-    expect(body).toContain("lifecycle?.stop(");
+    // A frame that cannot be measured is lost output, never a reason to end
+    // the process: the host sheds instead of waiting on its credit.
+    expect(body).toContain('decision.action === "lost"');
+    expect(body).toContain("lifecycle?.fail(decision.failure, true)");
+    expect(body).not.toContain("lifecycle?.stop(");
     expect(body).not.toContain("credit.accept(");
     expect(body).not.toContain("if (disposed) return");
     expect(body).not.toContain("term?.write(");
