@@ -259,3 +259,14 @@ CLAUDE.md
 
 # DevCouncil local state
 !.devcouncil/config.yaml
+
+# Additional generated, cache and test-runner artifacts
+.cache/
+.svelte-kit/
+test-results/
+playwright-report/
+blob-report/
+*.pid
+*.tgz
+*.stackdump
+*.pdb
