@@ -10,10 +10,12 @@
   <img src="https://img.shields.io/badge/built%20with-Tauri%202%20%7C%20Rust%20%7C%20Svelte%205-orange" alt="Tech Stack">
 </p>
 
-**Git, code, and tasks in one local-first desktop workspace.**
+**Fast, local-first Git desktop client, code intelligence suite, and task workspace.**
 
-Review changes, follow branch history, organize tasks, and inspect repository
-health from a native Rust / Tauri 2 app with a Svelte 5 frontend.
+Review changes with GPU acceleration, resolve 3-way conflicts, follow branch and commit
+history, search across repositories, organize tasks with board swimlanes, and inspect repository
+health from a native Rust / Tauri 2 app with a Svelte 5 frontend. 100% on-device, private-by-design,
+zero telemetry.
 
 [Download](https://github.com/bharathvbcr/GitPulse/releases/latest) ·
 [Getting started](docs/GETTING_STARTED.md) ·
@@ -38,43 +40,48 @@ walks through a review, task creation, and optional setup.
 
 ## Four views, one workspace
 
-GitPulse has 4 application views. Each view keeps related sections together.
+GitPulse has 4 application views with 18 specialized sections. Each view keeps related sections together.
 
 | View | What you do here | Sections |
 | --- | --- | --- |
 | **Work** | Track work in flight, resolve conflicts, organize tasks | Overview · Resolve · Remote · Policy · Tasks |
-| **Code** | Browse files, inspect authorship, explore structure | Explorer · Blame · Map |
+| **Code** | Browse files, inspect authorship, search text, explore structure | Explorer · Blame · Search · Map |
 | **History** | Follow commits, review changes, find recovery points | Graph · Diff · Reflog · Suspects |
 | **Insights** | Inspect activity, coverage, dependencies, secrets, and disk usage | Pulse · Coverage · Health · Secrets · Storage |
 
 Graph, Diff and Suspects share the selected commit; Explorer and Blame share the selected
-file; Overview embeds branch stack hierarchy. **Fleet** compares repositories across the workspace,
-**Tasks** opens global and saved-workspace boards, and the **terminal dock** stays available across views.
+file; Overview embeds branch stack hierarchy. **Fleet** compares repositories across the workspace (scaling to 1,000 repositories with 24 active watches),
+**Tasks** opens global and saved-workspace boards with swimlanes and WIP limits, and the **terminal dock** stays available across views.
 
 ## From a change to the next step
 
-- **Review and commit.** Canvas commit graph, unified and side-by-side diffs,
+- **Review and commit.** Canvas commit graph (100K+ commits at 60/120 FPS), unified and side-by-side diffs,
   word highlighting, symbol-grouped diff hunks, image comparisons, selective staging,
   stash previews, a three-way conflict resolver, and structured patch-brief commit
   phrasing with on-device Apple Intelligence fallback.
 - **Manage worktrees and branches.** Dead-branch cleanup with durable tip backups
-  in the ledger and authorized delete commands, copy-on-write build cache sync
+  in the WAL ledger and authorized delete commands, copy-on-write build cache sync
   (`node_modules`, `target`, `.venv`), named localhost routes via portless, and
   trust-gated lifecycle hooks.
 - **Organize the work.** Quick add parses priority, labels, owner, repository,
-  due date, and notes. Customize board/list layouts, use the Archive dock,
-  review drafting suggestions, and hand a task to an agent from its board.
-- **Explore the code.** File navigation and blame are built in. Add DevMap for
-  structural navigation, symbol search, symbol-level collision detection,
-  dependencies, impact, and candidate tests.
-- **Inspect the repository.** Coverage reports, multi-ecosystem dependency audits
-  with `cargo deny` and `cargo crev` parsers, Kingfisher redacted secrets scanning
-  that locates each finding against Git, storage cleanup previews, and Pulse
-  activity summaries distinguish results from scans that did not run. Capped
-  results identify their limits.
-- **Work from the desktop.** Native menus, a command palette, a docked PTY terminal
-  that reports what each session is running, colour-coded repository tabs and groups
-  that survive a restart, and an optional macOS menu-bar status popover keep
+  due date, and notes. Board views with swimlanes (grouped by owner or label),
+  saved views, column WIP limits, task checklists with done states, cross-task links
+  (parent, blocks, related, duplicate), the Archive dock with Deleted recovery,
+  review drafting suggestions, and agent terminal handoff with per-launch model selection.
+- **Explore and search the code.** File navigation and blame are built in. High-speed
+  repository-wide text search (`git grep` over working tree or revisions with honest
+  cancellation and truncation reporting). Add DevMap for structural navigation,
+  symbol search, symbol-level collision detection, dependencies, impact, and candidate tests.
+- **Inspect the repository.** Universal coverage reports across 6 formats (LCOV, Cobertura,
+  Go cover, Istanbul, JaCoCo, Clover), multi-ecosystem dependency audits (`cargo-audit`,
+  `npm audit`, `pip-audit`, `govulncheck`) with `cargo deny` and `cargo crev` parsers,
+  Kingfisher redacted secrets scanning that locates each finding against Git, storage
+  cleanup previews, and Pulse activity summaries distinguish results from scans that did not run.
+  Capped results identify their limits.
+- **Work from the desktop.** Native menus, a command palette (`⌘K`), a docked PTY terminal
+  that reports what each session is running, reflog recovery (`reset --keep`), GitHub pull
+  request actions (review, comment, approve, merge pinned to viewed commit), colour-coded repository
+  tabs and groups that survive a restart, and an optional macOS menu-bar status popover keep
   frequent actions close. Background windows stop their timers instead of polling.
 
 The [feature reference](docs/FEATURES.md) describes each surface and its limits.
@@ -117,7 +124,7 @@ for code intelligence. Modules can be updated independently.
 flowchart TB
     subgraph Frontend["Svelte 5 Frontend (Runes & TS)"]
         direction LR
-        Views["4 Views · 17 Sections<br/>(Work, Code, History, Insights)"]
+        Views["4 Views · 18 Sections<br/>(Work, Code, History, Insights)"]
         Canvas["GPU HTML5 Canvas<br/>Commit Graph"]
         TerminalDock["PTY Terminal Dock<br/>(portable-pty)"]
     end
@@ -247,6 +254,17 @@ To add someone (including yourself), comment on any issue or pull request:
 The bot opens a pull request updating this section and `.all-contributorsrc`.
 See the [emoji key](https://allcontributors.org/docs/en/emoji-key) for contribution
 types.
+
+---
+
+## Topics, Tags & Discoverability
+
+| Category | Metadata / Values |
+| --- | --- |
+| **GitHub Topics** | `git`, `git-client`, `git-gui`, `tauri`, `tauri-v2`, `rust`, `svelte5`, `svelte`, `local-first`, `code-intelligence`, `developer-tools`, `devtools`, `desktop-app`, `mcp`, `commit-graph`, `merge-conflict-resolver`, `reflog`, `test-coverage`, `terminal`, `privacy-first`, `zero-telemetry` |
+| **Tech Stack** | Rust (Tauri 2, Rayon), Svelte 5 (Runes), TypeScript, Tailwind CSS, portable-pty, DevMap, Manvi |
+| **Target Platforms** | macOS (Apple Silicon & Intel Universal dmg), Linux (.AppImage, .deb), Windows (.msi, .exe) |
+| **License & Privacy** | MIT License · 100% on-device · Zero telemetry |
 
 ---
 

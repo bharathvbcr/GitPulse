@@ -3,7 +3,26 @@
   "version": "1.4.0",
   "private": true,
   "license": "MIT",
-  "description": "High-performance native Git desktop client built with Rust (Tauri 2) and Svelte 5",
+  "description": "Fast, local-first Git desktop client, code intelligence suite, and task workspace built with Rust (Tauri 2) and Svelte 5",
+  "keywords": [
+    "git",
+    "git-client",
+    "git-gui",
+    "tauri",
+    "tauri-v2",
+    "rust",
+    "svelte",
+    "svelte-5",
+    "local-first",
+    "code-intelligence",
+    "commit-graph",
+    "merge-conflicts",
+    "developer-tools",
+    "devtools",
+    "desktop-app",
+    "mcp",
+    "terminal"
+  ],
   "repository": {
     "type": "git",
     "url": "git+https://github.com/bharathvbcr/GitPulse.git"

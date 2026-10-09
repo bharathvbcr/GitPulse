@@ -1,11 +1,13 @@
 [package]
 name = "gitpulse"
 version = "1.4.0"
-description = "High-Performance Native Git Desktop Client"
+description = "High-performance native Git desktop client, code intelligence engine, and task workspace"
 authors = ["GitPulse Team"]
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/bharathvbcr/GitPulse"
+keywords = ["git", "git-client", "tauri", "devtools", "local-first"]
+categories = ["development-tools", "gui"]
 default-run = "gitpulse"
 
 [lib]

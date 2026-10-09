@@ -16,7 +16,7 @@ updatable; this app takes only the subset it needs. See
 flowchart TB
     subgraph Frontend["Svelte 5 + TypeScript Frontend"]
         direction TB
-        UI["Views & Components (17 Sections)<br/><code>src/lib/components/</code>"]
+        UI["Views & Components (18 Sections)<br/><code>src/lib/components/</code>"]
         Stores["State & Mutation Stores<br/><code>src/lib/stores/</code>"]
         Registry["View Registry & Routerless Nav<br/><code>src/lib/views/</code>"]
         Canvas["Canvas 2D Rendering<br/><code>src/lib/canvas/</code>"]
