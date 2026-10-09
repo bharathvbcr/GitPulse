@@ -742,6 +742,45 @@ fn gui_launch_fallback_dirs(home: Option<&std::ffi::OsStr>) -> Vec<PathBuf> {
     dirs
 }
 
+/// Whose `PATH` a spawn was handed, which decides whether the
+/// [`gui_launch_fallback_dirs`] may widen it.
+///
+/// The fallback dirs repair an *inherited* PATH that a GUI launch left
+/// minimal. A PATH a caller chose on purpose — a test simulating a host with
+/// a tool absent — is the whole answer, and widening it made the choice
+/// meaningless: a scan told "cargo-deny is not on this PATH" still found
+/// `/opt/homebrew/bin/cargo-deny` on any host that had one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PathSource {
+    /// Read from the process environment: searched first, then the fallback
+    /// dirs, and the child's PATH is extended the same way.
+    Inherited,
+    /// Supplied by the caller: searched alone, and handed to the child as is.
+    Explicit,
+}
+
+/// Directories a bare program name is searched in, in precedence order.
+///
+/// Single owner of that list for resolution ([`resolve_spawn_program_in`],
+/// [`find_external_tool_with`]). Empty entries are dropped: POSIX reads one as
+/// "the current directory".
+fn tool_search_dirs(
+    path_var: Option<&std::ffi::OsStr>,
+    home: Option<&std::ffi::OsStr>,
+    source: PathSource,
+) -> Vec<PathBuf> {
+    let mut dirs: Vec<PathBuf> = path_var
+        .map(std::env::split_paths)
+        .into_iter()
+        .flatten()
+        .filter(|entry| !entry.as_os_str().is_empty())
+        .collect();
+    if source == PathSource::Inherited {
+        dirs.extend(gui_launch_fallback_dirs(home));
+    }
+    dirs
+}
+
 /// First entry of `dirs` holding a spawnpable file named `program`.
 ///
 /// Deliberately stricter than an `is_file()` scan so resolution matches what
@@ -1055,17 +1094,21 @@ pub(crate) fn resolve_spawn_program_with(
     path_var: Option<&std::ffi::OsStr>,
     home: Option<&std::ffi::OsStr>,
 ) -> String {
+    resolve_spawn_program_in(program, path_var, home, PathSource::Inherited)
+}
+
+/// [`resolve_spawn_program_with`] for a `path_var` of known [`PathSource`]:
+/// an explicit one is searched alone.
+pub(crate) fn resolve_spawn_program_in(
+    program: &str,
+    path_var: Option<&std::ffi::OsStr>,
+    home: Option<&std::ffi::OsStr>,
+    source: PathSource,
+) -> String {
     if program.contains('/') || program.contains('\\') {
         return program.to_string();
     }
-    let mut dirs: Vec<PathBuf> = path_var
-        .map(std::env::split_paths)
-        .into_iter()
-        .flatten()
-        .filter(|entry| !entry.as_os_str().is_empty())
-        .collect();
-    dirs.extend(gui_launch_fallback_dirs(home));
-    find_in_dirs(program, &dirs)
+    find_in_dirs(program, &tool_search_dirs(path_var, home, source))
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_else(|| program.to_string())
 }
@@ -1102,14 +1145,11 @@ pub(crate) fn find_external_tool_with(
     if program.is_empty() || program.contains('/') || program.contains('\\') {
         return None;
     }
-    let mut dirs: Vec<PathBuf> = path_var
-        .map(std::env::split_paths)
-        .into_iter()
-        .flatten()
-        .filter(|entry| !entry.as_os_str().is_empty())
-        .collect();
-    dirs.extend(gui_launch_fallback_dirs(home));
-    find_in_dirs(program, &dirs).map(|p| p.to_string_lossy().into_owned())
+    find_in_dirs(
+        program,
+        &tool_search_dirs(path_var, home, PathSource::Inherited),
+    )
+    .map(|p| p.to_string_lossy().into_owned())
 }
 
 /// Windows' legacy path limit. Beyond it a path needs the `\\?\` prefix to be
@@ -1202,7 +1242,31 @@ pub(crate) fn build_capture_command(
     path_var: Option<&std::ffi::OsStr>,
     home: Option<&std::ffi::OsStr>,
 ) -> Command {
-    let resolved = resolve_spawn_program_with(program, path_var, home);
+    build_capture_command_in(
+        program,
+        args,
+        cwd,
+        extra_env,
+        path_var,
+        home,
+        PathSource::Inherited,
+    )
+}
+
+/// [`build_capture_command`] for a `path_var` of known [`PathSource`]. An
+/// explicit PATH is both the resolution search path and, verbatim apart from
+/// dropped empty entries, the child's PATH — so nothing the child re-resolves
+/// (a shebang interpreter, a nested tool) reaches past it either.
+fn build_capture_command_in(
+    program: &str,
+    args: &[&str],
+    cwd: Option<&Path>,
+    extra_env: &[(&str, &str)],
+    path_var: Option<&std::ffi::OsStr>,
+    home: Option<&std::ffi::OsStr>,
+    source: PathSource,
+) -> Command {
+    let resolved = resolve_spawn_program_in(program, path_var, home, source);
     let mut cmd = Command::new(&resolved);
     // The same injected-GIT-* strip [`git_command`] applies: captured tools
     // shell out to git themselves (`gh pr checkout` fetches and merges in the
@@ -1251,8 +1315,22 @@ pub(crate) fn build_capture_command(
     }
     if !cfg!(windows) {
         // Applied before `extra_env` so an explicit caller-provided PATH wins.
-        if let Some(child_path) = extended_child_path(path_var, home) {
-            cmd.env("PATH", child_path);
+        match source {
+            PathSource::Inherited => {
+                if let Some(child_path) = extended_child_path(path_var, home) {
+                    cmd.env("PATH", child_path);
+                }
+            }
+            // Never left to inherit: the process PATH is exactly what an
+            // explicit one replaces.
+            PathSource::Explicit => {
+                match path_var.and_then(|value| {
+                    std::env::join_paths(tool_search_dirs(Some(value), home, source)).ok()
+                }) {
+                    Some(child_path) => cmd.env("PATH", child_path),
+                    None => cmd.env_remove("PATH"),
+                };
+            }
         }
     }
     for (key, value) in extra_env {
@@ -1283,13 +1361,16 @@ pub fn capture_command(
         extra_env,
         path_var.as_deref(),
         home.as_deref(),
+        PathSource::Inherited,
     )
 }
 
 /// [`capture_command`] with injectable `PATH`/home lookups — the seam its
 /// callers fill from the process environment by default. Tests use it to run
 /// the exact production spawn path under a simulated GUI-minimal environment
-/// without mutating process-global state.
+/// without mutating process-global state. `source` says which of those two
+/// `path_var` is; see [`PathSource`].
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn capture_command_with_env(
     program: &str,
     args: &[&str],
@@ -1298,8 +1379,9 @@ pub(crate) fn capture_command_with_env(
     extra_env: &[(&str, &str)],
     path_var: Option<&std::ffi::OsStr>,
     home: Option<&std::ffi::OsStr>,
+    source: PathSource,
 ) -> Result<CapturedOutput, String> {
-    let cmd = build_capture_command(program, args, cwd, extra_env, path_var, home);
+    let cmd = build_capture_command_in(program, args, cwd, extra_env, path_var, home, source);
 
     let out = run_bounded(cmd, program, timeout, None)?.require_complete(program)?;
     Ok(CapturedOutput {
@@ -4916,6 +4998,7 @@ mod tests {
             &[],
             Some(std::ffi::OsStr::new("")),
             None,
+            PathSource::Inherited,
         );
         match classify_tool_probe("gitpulse-no-such-tool-7f3a", missing) {
             ToolProbe::NotFound(error) => {
@@ -5322,6 +5405,74 @@ mod tests {
             Path::new(&resolved),
             &tool,
             "bare name must resolve through the fallback dir on an empty PATH"
+        );
+    }
+
+    /// An explicit PATH is the whole search path: the same tool in the same
+    /// fallback dir stays unresolved, and the child is handed that PATH
+    /// without the fallback dirs, so neither the spawn nor anything the child
+    /// re-resolves can reach past it.
+    #[cfg(unix)]
+    #[test]
+    fn an_explicit_path_is_not_widened_by_fallback_dirs() {
+        let home = tempfile::TempDir::new().unwrap();
+        let bin = home.path().join(".local/bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let tool = bin.join("gitpulse-fake-tool");
+        std::fs::write(&tool, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&tool, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .unwrap();
+
+        assert_eq!(
+            resolve_spawn_program_in(
+                "gitpulse-fake-tool",
+                Some(std::ffi::OsStr::new("/usr/bin:/bin")),
+                Some(home.path().as_os_str()),
+                PathSource::Explicit,
+            ),
+            "gitpulse-fake-tool",
+            "a tool outside the explicit PATH must not resolve"
+        );
+
+        let cmd = build_capture_command_in(
+            "gitpulse-fake-tool",
+            &[],
+            None,
+            &[],
+            Some(std::ffi::OsStr::new("/usr/bin::/bin")),
+            Some(home.path().as_os_str()),
+            PathSource::Explicit,
+        );
+        assert_eq!(
+            cmd.get_program(),
+            std::ffi::OsStr::new("gitpulse-fake-tool")
+        );
+        let child_path: Vec<Option<std::ffi::OsString>> = cmd
+            .get_envs()
+            .filter(|(key, _)| *key == std::ffi::OsStr::new("PATH"))
+            .map(|(_, value)| value.map(std::ffi::OsStr::to_os_string))
+            .collect();
+        assert_eq!(
+            child_path,
+            vec![Some(std::ffi::OsString::from("/usr/bin:/bin"))],
+            "the child gets the explicit PATH, empty entries dropped, nothing appended"
+        );
+
+        // No explicit value at all is not "inherit the process PATH".
+        let unset = build_capture_command_in(
+            "sh",
+            &[],
+            None,
+            &[],
+            None,
+            Some(home.path().as_os_str()),
+            PathSource::Explicit,
+        );
+        assert!(
+            unset
+                .get_envs()
+                .any(|(key, value)| key == std::ffi::OsStr::new("PATH") && value.is_none()),
+            "an explicit unset PATH must be removed from the child"
         );
     }
 
