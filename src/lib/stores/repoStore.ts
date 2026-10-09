@@ -144,6 +144,7 @@ import {
 import { decideCadence, readEventLoopDelay } from "../runtime/loadCadence";
 import { debounce, type Debounced } from "../async/debounce";
 import { beginGeneration } from "../async/guard";
+import { createCommitDraftStore } from "./commitDraftStore";
 import type { FilePatch } from "../diff/patchBuilder";
 import type { ReleasePublishResult } from "../ops/model";
 
@@ -364,7 +365,6 @@ export interface RepoSession {
   terminalOpen: boolean;
   searchQuery: string;
   selectedBranch: string | null;
-  commitDraft: string;
   isAmending: boolean;
   isLoading: boolean;
   error: string | null;
@@ -475,7 +475,6 @@ export interface RepoState {
   error: string | null;
   /** Active session needs trust before Git or background work may run. */
   trustRequired: boolean;
-  commitDraft: string;
   isAmending: boolean;
   isBare: boolean;
   /** Hydration epoch of the active session; bumps on every activation. */
@@ -629,7 +628,6 @@ function emptyProjected(): RepoState {
     isLoading: false,
     error: null,
     trustRequired: false,
-    commitDraft: "",
     isAmending: false,
     isBare: false,
     generation: 0,
@@ -681,7 +679,6 @@ function createSession(
     terminalOpen: extras.terminalOpen ?? false,
     searchQuery: extras.searchQuery ?? "",
     selectedBranch: extras.selectedBranch ?? null,
-    commitDraft: extras.commitDraft ?? "",
     isAmending: extras.isAmending ?? false,
     isLoading: extras.isLoading ?? false,
     error: extras.error ?? null,
@@ -823,7 +820,6 @@ function projectRest(
     isLoading: active?.isLoading ?? false,
     error: active?.error ?? internal.workspaceError,
     trustRequired: active?.trustRequired === true,
-    commitDraft: active?.commitDraft ?? "",
     isAmending: active?.isAmending ?? false,
     isBare: active?.isBare ?? false,
     generation: active?.generation ?? 0,
@@ -1176,6 +1172,9 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
   let lastSentRecentsJson: string | null = null;
   /** Last open-tab set synced into workspace.json — skip no-op publishes. */
   let lastWorkspaceSyncKey: string | null = null;
+  const commitDrafts = createCommitDraftStore();
+  /** The tab list the drafts were last pruned against. */
+  let draftTabs: readonly TabRecord[] | null = null;
   let lastLiveScopeKey: string | null = null;
   let persistTimer: ReturnType<typeof setTimeout> | null = null;
   /**
@@ -1302,6 +1301,11 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
     }
     const activeId = internal.workspace.activeId;
     if (activeId) noteActiveCheckout(familyOfTab(activeId)?.key, activeId);
+    if (draftTabs !== internal.workspace.tabs) {
+      draftTabs = internal.workspace.tabs;
+      commitDrafts.retain(draftTabs.map((tab) => tab.id));
+    }
+    commitDrafts.setActiveTab(activeId);
     set(project(internal, options, projection));
     persist();
     const active = internal.workspace.activeId
@@ -1353,7 +1357,7 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
 
   /**
    * Persists workspace state. The write + menu IPC are debounced on a short
-   * trailing delay so per-keystroke state (commit draft, search query) cannot
+   * trailing delay so per-keystroke state (the search query) cannot
    * storm localStorage and the native menu; `flushPersist` runs the live
    * snapshot immediately whenever a critical mutation lands.
    */
@@ -2160,6 +2164,8 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
 
   const store = {
     subscribe,
+    /** The active tab's commit message; see `commitDraftStore`. */
+    commitDraft: commitDrafts,
     mutationActivity: { subscribe: mutationActivity.subscribe },
     contentRevisions: { subscribe: contentRevisions.subscribe },
     setError: (error: string | null) => {
@@ -2299,6 +2305,7 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
       // string-normalized only.
       let workspace = internal.workspace;
       let carriedSession: RepoSession | undefined;
+      let carriedId: string | undefined;
       const rawKey = identityKey(rawPath, options);
       const canonicalKey = identityKey(path, options);
       if (resolved && rawKey && canonicalKey && rawKey !== canonicalKey) {
@@ -2310,7 +2317,10 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
         if (aliases.length > 0) {
           const aliasIds = new Set(aliases.map((tab) => tab.id));
           for (const alias of aliases) {
-            carriedSession = internal.sessions[alias.id] ?? carriedSession;
+            if (internal.sessions[alias.id]) {
+              carriedSession = internal.sessions[alias.id];
+              carriedId = alias.id;
+            }
             // Broken aliases never loaded a graph, but showRepo may have been
             // pointed at the alias string on activation.
             graph.evict(alias.path);
@@ -2416,7 +2426,6 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
                 carriedSession?.selectedBranch,
               terminalOpen:
                 extras.restore?.terminalOpen ?? carriedSession?.terminalOpen,
-              commitDraft: carriedSession?.commitDraft ?? "",
               isAmending: carriedSession?.isAmending ?? false,
               isLoading: Boolean(resolved),
               error: resolved
@@ -2425,6 +2434,9 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
               trustRequired: deferredTrustMessage !== null,
             },
           );
+      // The draft follows the adopted alias the way the rest of its session
+      // does: only into a tab created for it, never over an existing one.
+      if (!existing && carriedId !== undefined) commitDrafts.move(carriedId, opened.id);
       putSession(session);
       const shouldPresent =
         activate && internal.workspace.activeId === opened.id;
@@ -3813,11 +3825,6 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
         activeTab: "history",
       });
       flushPersist();
-    },
-    setCommitDraft: (message: string) => {
-      const session = activeSession();
-      if (!session) return;
-      applyToSession(session.id, session.generation, { commitDraft: message });
     },
     setAmending: (isAmending: boolean) => {
       const session = activeSession();

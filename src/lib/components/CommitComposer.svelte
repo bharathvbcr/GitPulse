@@ -52,7 +52,9 @@
       live = false;
     };
   });
-  let commitMessage = $derived($repoStore.commitDraft);
+  // Its own store: a keystroke must not republish the repository state.
+  const commitDraft = repoStore.commitDraft;
+  let commitMessage = $derived($commitDraft);
   let isAmending = $derived($repoStore.isAmending);
   let includeUnstaged = $state(false);
   let isGenerating = $state(false);
@@ -140,7 +142,7 @@
       // the draft now would land it in the active session — the wrong repo.
       if ($repoStore.currentPath !== path) return;
       generation = result;
-      repoStore.setCommitDraft(result.text);
+      commitDraft.set(result.text);
     } catch (err: unknown) {
       aiError = formatError(err);
     } finally {
@@ -156,7 +158,7 @@
       commitError = outcome.error ?? "The commit did not run.";
       return;
     }
-    repoStore.setCommitDraft("");
+    commitDraft.set("");
     repoStore.setAmending(false);
     generation = null;
   }
@@ -344,7 +346,7 @@
 
   <textarea
     value={commitMessage}
-    oninput={(e) => repoStore.setCommitDraft((e.currentTarget as HTMLTextAreaElement).value)}
+    oninput={(e) => commitDraft.set((e.currentTarget as HTMLTextAreaElement).value)}
     onkeydown={onMessageKeydown}
     placeholder="Commit message (e.g. feat: add auth)..."
     rows="3"

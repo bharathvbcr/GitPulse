@@ -1312,6 +1312,46 @@ describe("repoStore tabs", () => {
     expect(get(store).generation).toBeGreaterThan(genA2);
   });
 
+  it("types a commit message without republishing the repository state", async () => {
+    // ft-0ff882a6: the draft lived on the session, so each keystroke replaced
+    // the session, rebuilt the active tab's row and notified every subscriber.
+    const { store } = makeStore();
+    await store.openRepo("/r/draft-a");
+    let published = 0;
+    const unsubscribe = store.subscribe(() => (published += 1));
+    const rowBefore = get(store).openTabs[0];
+    published = 0;
+    let drafts = 0;
+    const unsubscribeDraft = store.commitDraft.subscribe(() => (drafts += 1));
+    drafts = 0;
+    const message = "fix: keep the draft out of the repository state";
+    for (let i = 1; i <= message.length; i += 1) store.commitDraft.set(message.slice(0, i));
+    expect(published).toBe(0);
+    expect(drafts).toBe(message.length);
+    expect(get(store.commitDraft)).toBe(message);
+    expect(get(store).openTabs[0]).toBe(rowBefore);
+    unsubscribe();
+    unsubscribeDraft();
+  });
+
+  it("keeps one draft per tab and drops a closed tab's draft", async () => {
+    const { store } = makeStore();
+    await store.openRepo("/r/draft-a");
+    const a = get(store).activeTabId!;
+    store.commitDraft.set("draft for a");
+    await store.openRepo("/r/draft-b");
+    const b = get(store).activeTabId!;
+    expect(get(store.commitDraft)).toBe("");
+    store.commitDraft.set("draft for b");
+    await store.activateTab(a);
+    expect(get(store.commitDraft)).toBe("draft for a");
+    await store.closeTab(b);
+    expect(store.commitDraft.read(b)).toBe("");
+    // Reopening the closed repository starts a fresh message, as before.
+    await store.openRepo("/r/draft-b");
+    expect(get(store.commitDraft)).toBe("");
+  });
+
   it("skips storage writes and recent-menu IPC while only unpersisted state changes", async () => {
     const counts = { setItem: 0, menu: 0 };
     const storage = memoryStorage();
@@ -1339,8 +1379,8 @@ describe("repoStore tabs", () => {
     counts.setItem = 0;
     counts.menu = 0;
 
-    await store.setCommitDraft("fix: handle");
-    await store.setCommitDraft("fix: handle edge");
+    store.commitDraft.set("fix: handle");
+    store.commitDraft.set("fix: handle edge");
     await store.setAmending(true);
 
     expect(counts.setItem).toBe(0);
@@ -1532,7 +1572,7 @@ describe("repoStore canonical identity", () => {
     await store.openRepo("/r/ghost", { allowBroken: true });
     expect(get(store).openTabs.map((tab) => tab.path)).toEqual(["/r/ghost"]);
     expect(get(store).error ?? "").toMatch(/unavailable|Cannot access/i);
-    await store.setCommitDraft("wip notes");
+    store.commitDraft.set("wip notes");
 
     // The volume comes back; retrying the alias adopts the canonical identity.
     ghostResolves = true;
@@ -1542,7 +1582,7 @@ describe("repoStore canonical identity", () => {
     expect(state.currentPath).toBe("/r/real");
     expect(state.error).toBeNull();
     // Draft state travels from the alias tab to its canonical successor.
-    expect(state.commitDraft).toBe("wip notes");
+    expect(get(store.commitDraft)).toBe("wip notes");
     // No stale alias entry lingers to resurrect a duplicate tab later.
     expect(state.lastClosed).not.toContain("/r/ghost");
 
@@ -1567,12 +1607,12 @@ describe("repoStore canonical identity", () => {
     const { store } = makeStore(invoke);
     // Canonical tab first, with its own draft.
     await store.openRepo("/r/real");
-    await store.setCommitDraft("canonical draft");
+    store.commitDraft.set("canonical draft");
     const realId = get(store).activeTabId!;
 
     // Broken alias opened afterwards stays a separate tab until healed.
     await store.openRepo("/r/ghost", { allowBroken: true });
-    await store.setCommitDraft("alias draft");
+    store.commitDraft.set("alias draft");
     expect(get(store).openTabs).toHaveLength(2);
 
     ghostResolves = true;
@@ -1580,7 +1620,7 @@ describe("repoStore canonical identity", () => {
     const state = get(store);
     expect(state.openTabs).toHaveLength(1);
     expect(state.openTabs[0].id).toBe(realId);
-    expect(state.commitDraft).toBe("canonical draft");
+    expect(get(store.commitDraft)).toBe("canonical draft");
   });
 });
 
