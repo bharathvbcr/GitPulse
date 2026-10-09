@@ -5,7 +5,7 @@ afterEach(() => {
   vi.useRealTimers();
 });
 
-function listenerTarget(extra: Record<string, unknown> = {}) {
+function listenerTarget<T extends object>(extra: T) {
   const listeners = new Map<string, Set<() => void>>();
   return {
     ...extra,
@@ -82,13 +82,13 @@ describe("createDeferredWrite", () => {
 
 describe("flushOnPageHide", () => {
   it("flushes on pagehide and when the document becomes hidden, not when it shows", () => {
-    const win = listenerTarget();
-    const doc = listenerTarget({ visibilityState: "visible" });
+    const win = listenerTarget({});
+    const doc = listenerTarget({ visibilityState: "visible" as DocumentVisibilityState });
     const flush = vi.fn();
     const unbind = flushOnPageHide(flush, win, doc);
     doc.emit("visibilitychange");
     expect(flush).not.toHaveBeenCalled();
-    (doc as { visibilityState: string }).visibilityState = "hidden";
+    doc.visibilityState = "hidden";
     doc.emit("visibilitychange");
     win.emit("pagehide");
     expect(flush).toHaveBeenCalledTimes(2);
