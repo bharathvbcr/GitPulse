@@ -145,57 +145,68 @@
   backdrop-filter: blur(4px);
 }
 
-@utility gp-edge-fade {
-  /* Overflow cue at the edges of a scroller. Written inline as
-     `from-background to-transparent`, which has two faults: Tailwind's
-     `to-transparent` is `rgb(0 0 0 / 0)`, so the ramp travels through black
-     and fringes on light themes, and `from-background` is a full-alpha stop --
-     an opaque band at each edge of a pane that is otherwise translucent. Both
-     ends fade one colour to its own zero instead, and macOS swaps the colour
-     for a shade, because the gutter deliberately stopped painting the base.
-     The fade is pointer-events-none so the graph (and any other host) still
-     receives clicks through it; the chevron button re-enables pointer events. */
+@utility gp-scroll-cue {
+  /* The chevron overlay at the edge of a scroller. It paints nothing itself:
+     it used to carry the fade as a gradient band, and a band needs a colour.
+     `--c-bg` was right only over the base; over the glass title bar and the
+     repository strip it was a darker block with a hard inner edge, and the
+     macOS shade that replaced it was a black smear on light glass. The fade
+     is now the scroller masking its own edge -- see `[data-gp-fade]` below --
+     which needs no colour at all. Pointer-events-none so the host still gets
+     clicks through it; the chevron button re-enables them. */
   @apply pointer-events-none absolute inset-y-0 z-20 flex w-8 items-center justify-center;
 }
 
-@utility gp-edge-fade-start {
+@utility gp-scroll-cue-start {
   left: 0;
-  background-image: linear-gradient(
-    to right,
-    rgb(var(--c-bg)),
-    rgb(var(--c-bg) / 0)
-  );
 }
 
-@utility gp-edge-fade-end {
+@utility gp-scroll-cue-end {
   right: 0;
-  background-image: linear-gradient(
-    to left,
-    rgb(var(--c-bg)),
-    rgb(var(--c-bg) / 0)
-  );
 }
 
-@utility gp-edge-fade-y {
+@utility gp-scroll-cue-y {
   @apply pointer-events-none absolute inset-x-0 z-20 flex h-8 items-center justify-center;
 }
 
-@utility gp-edge-fade-top {
+@utility gp-scroll-cue-top {
   top: 0;
-  background-image: linear-gradient(
-    to bottom,
-    rgb(var(--c-bg)),
-    rgb(var(--c-bg) / 0)
-  );
 }
 
-@utility gp-edge-fade-bottom {
+@utility gp-scroll-cue-bottom {
   bottom: 0;
-  background-image: linear-gradient(
-    to top,
-    rgb(var(--c-bg)),
-    rgb(var(--c-bg) / 0)
-  );
+}
+
+/* The fade itself: ScrollCue writes `data-gp-fade` on the scroller for each
+   edge that still hides content, and the scroller's content fades out over
+   the cue's 2rem to whatever is behind it -- glass, surface or base. */
+[data-gp-fade] {
+  -webkit-mask-image: var(--gp-fade-mask);
+  mask-image: var(--gp-fade-mask);
+}
+
+[data-gp-fade="x-start"] {
+  --gp-fade-mask: linear-gradient(to right, transparent, #000 2rem);
+}
+
+[data-gp-fade="x-end"] {
+  --gp-fade-mask: linear-gradient(to left, transparent, #000 2rem);
+}
+
+[data-gp-fade="x-both"] {
+  --gp-fade-mask: linear-gradient(to right, transparent, #000 2rem, #000 calc(100% - 2rem), transparent);
+}
+
+[data-gp-fade="y-start"] {
+  --gp-fade-mask: linear-gradient(to bottom, transparent, #000 2rem);
+}
+
+[data-gp-fade="y-end"] {
+  --gp-fade-mask: linear-gradient(to top, transparent, #000 2rem);
+}
+
+[data-gp-fade="y-both"] {
+  --gp-fade-mask: linear-gradient(to bottom, transparent, #000 2rem, #000 calc(100% - 2rem), transparent);
 }
 
 @utility gp-scroll-cue-btn {
@@ -871,11 +882,6 @@ html.macos {
   --mac-glass-blur-float: 34px;
   --mac-glass-boost: saturate(190%) brightness(1.06);
   --mac-shell-veil: 0.55;
-  /* The horizontal-overflow cue at the edges of the graph gutter. It cannot
-     be the base colour here: the gutter stopped painting the base precisely
-     so the plate shows through it, and fading from the base would repaint the
-     one band the fade covers. A shade reads as a fade over any desktop. */
-  --mac-edge-shade: rgb(0 0 0 / 0.38);
   /* An inset area inside a panel -- a diff preview, a code block, an
      explanation card. Over opaque paint the author asked for `--c-bg` at half
      strength, a small COLOUR difference against `--c-surface`. Over glass the
@@ -914,7 +920,6 @@ html.macos.light {
      the dark field glow turns pastel washes into flat colour here. */
   --mac-glass-boost: saturate(150%) brightness(1.02);
   --mac-shell-veil: 0.62;
-  --mac-edge-shade: rgb(38 46 76 / 0.14);
   --mac-recess: rgb(38 46 76 / 0.05);
 }
 
@@ -1083,22 +1088,6 @@ html.macos :where([class~="bg-surface"], .gp-card, .gp-btn, .gp-keycap) {
 
 html.macos :where([class~="bg-surfaceHover"], .gp-pill) {
   background-color: var(--mac-fill-surface-hover);
-}
-
-html.macos .gp-edge-fade-start {
-  background-image: linear-gradient(to right, var(--mac-edge-shade), rgb(0 0 0 / 0));
-}
-
-html.macos .gp-edge-fade-end {
-  background-image: linear-gradient(to left, var(--mac-edge-shade), rgb(0 0 0 / 0));
-}
-
-html.macos .gp-edge-fade-top {
-  background-image: linear-gradient(to bottom, var(--mac-edge-shade), rgb(0 0 0 / 0));
-}
-
-html.macos .gp-edge-fade-bottom {
-  background-image: linear-gradient(to top, var(--mac-edge-shade), rgb(0 0 0 / 0));
 }
 
 /*
@@ -1277,7 +1266,6 @@ html.macos .gp-liquid-tabs .gp-seg-btn:focus-visible {
     --mac-fill-bg: rgb(var(--c-bg));
     --mac-fill-surface: rgb(var(--c-surface));
     --mac-fill-surface-hover: rgb(var(--c-surface-hover));
-    --mac-edge-shade: rgb(var(--c-bg));
     --mac-recess: rgb(var(--c-bg));
     --bg-main: rgb(var(--c-bg));
     --bg-terminal: rgb(var(--c-surface));

@@ -416,7 +416,9 @@ describe("macOS material", () => {
     // `from-background` is alpha 1, so an overflow cue becomes an opaque band
     // at the edge of a translucent pane; Tailwind's `to-transparent` is
     // `rgb(0 0 0 / 0)`, so the ramp also travels through black on light
-    // themes. `.gp-edge-fade` owns both ends instead.
+    // themes. The shared cue owns the fade, and it is a mask on the scroller,
+    // not a band painted in any colour: a painted band could match only one
+    // of glass, surface and base, and read as a blank patch on the others.
     const strays: string[] = [];
     for (const file of svelteFiles(componentsDir)) {
       const source = readFileSync(file, "utf8");
@@ -425,12 +427,14 @@ describe("macOS material", () => {
       }
     }
     expect(strays).toEqual([]);
-    expect(css).toMatch(/\.gp-edge-fade-start \{/);
-    expect(css).toMatch(/\.gp-edge-fade-end \{/);
-    expect(css).toMatch(/\.gp-edge-fade-top \{/);
-    expect(css).toMatch(/\.gp-edge-fade-bottom \{/);
-    expect(css).toMatch(/html\.macos \.gp-edge-fade-start \{[^}]*var\(--mac-edge-shade\)/);
-    expect(css).toMatch(/html\.macos \.gp-edge-fade-top \{[^}]*var\(--mac-edge-shade\)/);
+    expect(css).toMatch(/\[data-gp-fade\] \{[^}]*-webkit-mask-image: var\(--gp-fade-mask\)[^}]*\bmask-image: var\(--gp-fade-mask\)/);
+    for (const token of ["x-start", "x-end", "x-both", "y-start", "y-end", "y-both"]) {
+      expect(css).toMatch(new RegExp(`\\[data-gp-fade="${token}"\\] \\{[^}]*--gp-fade-mask: linear-gradient\\([^;]*transparent`));
+    }
+    // No overflow cue paints a colour, on any platform.
+    expect(css).not.toMatch(/gp-edge-fade|--mac-edge-shade/);
+    expect(css).toMatch(/@utility gp-scroll-cue \{/);
+    expect(css).not.toMatch(/(?:@utility |\.)gp-scroll-cue(?:-y|-start|-end|-top|-bottom)?\s*\{[^}]*background/);
   });
 
   it("keeps a veil under the content so an unknown desktop cannot set the contrast", () => {

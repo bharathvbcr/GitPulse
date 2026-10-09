@@ -4,6 +4,7 @@
   import { interfaceStore } from "../stores/interfaceStore";
   import { isCaseInsensitiveFs, displayName, identityKey, isPathAmong } from "../repos/paths";
   import { portal } from "../dom/portal";
+  import { bindHorizontalWheel } from "../dom/overflowHint";
   import { isTauri } from "../platform";
   import { isImeComposition } from "../keyboard/imeGuard";
   import { nextRovingIndex, type RovingKey } from "../dom/rovingFocus";
@@ -625,6 +626,14 @@
     // window listener for the component's whole life, not a popover's.
     window.addEventListener("keydown", handleKey);
     return () => window.removeEventListener("keydown", handleKey);
+  });
+
+  // The strip hides its track (a classic scrollbar was a blank band under the
+  // tabs whenever the system shows scroll bars), so a mouse wheel pans it.
+  $effect(() => {
+    const el = scroller;
+    if (!el) return;
+    return bindHorizontalWheel(el);
   });
 
   function endDrag() {
@@ -1332,7 +1341,7 @@
       <div class="relative min-w-0 max-w-full shrink self-stretch">
       <div
         bind:this={scroller}
-        class="h-full flex items-center gap-1 overflow-x-auto min-w-0 py-1"
+        class="gp-header-scroll h-full flex items-center gap-1 min-w-0 py-1"
         role="tablist"
         tabindex="-1"
         aria-label="Open repositories"

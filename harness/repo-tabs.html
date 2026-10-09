@@ -319,6 +319,15 @@
           check("…seated right after its repository on the strip", () =>
             order().indexOf(SITE_WT) === order().indexOf(SITE) + 1);
 
+          // ---- overflow cue: the fade is a mask, never a painted patch ---
+          // A painted fade was one colour on every host, so on the glass strip
+          // it read as a blank block at the edge with nothing hovered.
+          const cueOverlays = () => $$(".gp-scroll-cue, .gp-scroll-cue-y", strip().parentElement);
+          const maskOf = (el) => { const cs = getComputedStyle(el); return cs.maskImage || cs.webkitMaskImage || "none"; };
+          check("a strip that fits carries no fade and no cue", () =>
+            strip().scrollWidth <= strip().clientWidth + 0.5 && strip().dataset.gpFade === undefined &&
+            maskOf(strip()) === "none" && cueOverlays().length === 0);
+
           // ---- many more repositories than the watch pool ----------------
           // The strip used to refuse a twenty-fifth repository. Now watches
           // are pooled by recency and the rest are parked, visibly.
@@ -357,6 +366,37 @@
             activePath() === parked && tabFor(parked).watch === "watching" && watched.has(parked) &&
             domTab(parked).dataset.parked === undefined);
           check("…without growing the native watch table", () => watched.size <= WATCH_POOL_SIZE);
+
+          // Two hundred tabs overflow the strip; walk it from end to end.
+          const frames = async () => { await settle(); await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r))); await tick(); };
+          strip().scrollLeft = 0;
+          await frames();
+          check("an overflowing strip fades its own trailing edge", () =>
+            strip().scrollWidth > strip().clientWidth && strip().dataset.gpFade === "x-end" &&
+            maskOf(strip()) !== "none");
+          check("the cue overlay paints nothing behind its chevron", () => {
+            const overlays = cueOverlays();
+            return overlays.length === 1 && overlays.every((el) => {
+              const cs = getComputedStyle(el);
+              return cs.backgroundImage === "none" && cs.backgroundColor === "rgba(0, 0, 0, 0)" && cs.pointerEvents === "none";
+            });
+          });
+          strip().scrollLeft = Math.floor((strip().scrollWidth - strip().clientWidth) / 2);
+          await frames();
+          check("in the middle both edges fade", () => strip().dataset.gpFade === "x-both" && cueOverlays().length === 2);
+          strip().scrollLeft = strip().scrollWidth;
+          await frames();
+          check("at the end only the leading edge fades", () => strip().dataset.gpFade === "x-start" && cueOverlays().length === 1);
+          check("the strip draws no scrollbar track under the tabs", () => {
+            const cs = getComputedStyle(strip());
+            return cs.overflowY === "hidden" && cs.scrollbarWidth === "none" &&
+              strip().offsetHeight - strip().clientHeight === 0;
+          });
+          strip().scrollLeft = 0;
+          await frames();
+          const wheelEvent = new WheelEvent("wheel", { deltaY: 120, bubbles: true, cancelable: true });
+          strip().dispatchEvent(wheelEvent);
+          check("a mouse wheel pans the hidden-track strip", () => strip().scrollLeft > 0 && wheelEvent.defaultPrevented);
 
           check("every IPC call had a fixture", () => unexpected.length === 0);
           check("no unhandled runtime errors", () => errors.length === 0);

@@ -237,7 +237,7 @@ if(params.has("check")) {
     sourceRow.dispatchEvent(new MouseEvent("contextmenu",{bubbles:true,cancelable:true,clientX:150,clientY:260}));await settle();
     await click("Fast-forward merge…");
     check("context menu opens review without merging",merges.length===0&&dialog());
-    check("context menu preserves source and merge mode",button("Select local branch feature/branch-selection").getAttribute("aria-checked")==="true"&&dialog().querySelector('input[type="checkbox"]').checked);
+    check("context menu preserves source and merge mode",button("Select local branch feature/branch-selection").getAttribute("aria-checked")==="true"&&dialog().querySelector('input[name="merge-mode"]:checked')?.value==="ff-only");
     await click("Cancel");
     // A menu action closes the menu first, and the branch it acts on is a
     // `{@const}` derived from that menu. Read after the close, it re-derives
@@ -269,7 +269,7 @@ if(params.has("check")) {
     document.activeElement.dispatchEvent(new KeyboardEvent("keydown",{key:"ArrowDown",bubbles:true,cancelable:true}));await settle();
     check("arrow navigation selects exactly one source",button("Select local branch feature/keyboard-navigation").getAttribute("aria-checked")==="true"&&document.querySelectorAll('[role="radio"][aria-checked="true"]').length===1);
     document.activeElement.dispatchEvent(new KeyboardEvent("keydown",{key:"Tab",bubbles:true,cancelable:true}));await settle();
-    check("Tab leaves the entire branch list for merge options",document.activeElement===dialog().querySelector('input[type="checkbox"]'));
+    check("Tab leaves the entire branch list for merge options",document.activeElement?.getAttribute("name")==="merge-mode");
     document.querySelector("#merge-branch-search").focus();document.activeElement.dispatchEvent(new KeyboardEvent("keydown",{key:"ArrowDown",bubbles:true,cancelable:true}));await settle();
     check("search reenters the selected radio",document.activeElement===button("Select local branch feature/keyboard-navigation"));
     await click("Remote branches");
@@ -286,10 +286,10 @@ if(params.has("check")) {
     check("arrow key enters branch choices",document.activeElement?.hasAttribute("data-merge-choice"));
     await click("Select remote branch origin/feature/branch-selection");
     check("selection is explicit and enables merge",button("Select remote branch origin/feature/branch-selection").getAttribute("aria-checked")==="true"&&!button("Merge branch").disabled);
-    const checkbox=dialog().querySelector('input[type="checkbox"]');checkbox.click();await settle();
+    dialog().querySelector('input[name="merge-mode"][value="ff-only"]').click();await settle();
     await click("Merge branch");await waitFor(()=>!dialog());
     check("remote identity survives the merge IPC",merges.at(-1).branchName==="refs/remotes/origin/feature/branch-selection");
-    check("fast-forward setting is preserved",merges.at(-1).ffOnly===true);
+    check("fast-forward setting is preserved",merges.at(-1).mode==="ff-only");
     check("success identifies source and destination",get(toastStore).some(t=>t.message==="Merged origin/feature/branch-selection into main"));
     await click("Merge branches");await search("no-match");
     check("empty search has recovery copy",dialog().textContent.includes("No branches match"));

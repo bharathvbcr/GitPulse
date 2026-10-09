@@ -410,3 +410,29 @@ describe("App display preferences", () => {
     expect(script.slice(call)).toContain("$themeStore");
   });
 });
+
+/**
+ * The title-bar row is `min-w-full w-max`, so everything in it counts toward
+ * the scroller's width. A drag spacer with a minimum width, or padding after
+ * the last control, made the row wider than the header by that much while
+ * every control was in view: the overflow cue then sat on the right edge over
+ * empty space (at ~912-940px wide), and its chevron scrolled into nothing.
+ */
+describe("title-bar overflow", () => {
+  const start = source.indexOf("bind:this={headerScroller}");
+  const end = source.indexOf("<ScrollCue target={headerScroller}", start);
+  const region = source.slice(start, end);
+
+  it("is measured from the controls, not from empty space", () => {
+    expect(start).toBeGreaterThanOrEqual(0);
+    expect(end).toBeGreaterThan(start);
+    const row = /<div class="([^"]*min-w-full w-max[^"]*)"([^>]*)>/.exec(region);
+    expect(row).not.toBeNull();
+    // No padding after the last control...
+    expect(row![1]).not.toMatch(/(^|\s)(px|pr|pe)-/);
+    // ...and no spacer element after it either; the row itself is the drag
+    // region, which a bare attribute limits to direct hits on the row.
+    expect(row![2]).toMatch(/\sdata-tauri-drag-region(\s|$)/);
+    expect(region.match(/data-tauri-drag-region/g)).toHaveLength(1);
+  });
+});

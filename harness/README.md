@@ -519,3 +519,15 @@ inventory and an incomplete DevMap walk. Verify the warning in the rendered
 panel and copied report; the empty variant must not display a dead-code
 all-clear. The fixture exposes copied text on the `data-gp-copied` HTML attribute
 without writing the system clipboard.
+
+## Scroll cue
+
+`bun run test:browser -- --harness scroll-cue` drives `ScrollCue` and the
+`overflowHint` helpers through a strip, a padded `min-w-max` toolbar and a
+vertical list: padding-only overflow, retargeting, hiding, unmounting, a
+supplied hint, 400 rounds of child churn, a seeded storm of resizes, scrolls,
+refills, retargets and zooms, a fractional-width sweep at eight zoom levels,
+and every wheel case. The storm's oracle reads item boxes, not `scrollWidth`,
+so padding cannot pass for content; under 2.5px hidden it skips as undecidable.
+A failing storm prints its seed. Replay it on the dev server with
+`/harness/scroll-cue.html?seed=<n>&ops=<n>`.

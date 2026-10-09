@@ -84,6 +84,7 @@
   } from "../terminal/runResult";
   import VirtualList from "./VirtualList.svelte";
   import EmptyState from "./EmptyState.svelte";
+  import ScrollCue from "./ScrollCue.svelte";
   import CoverageAgentPrompt from "./CoverageAgentPrompt.svelte";
   import { filterCoverageFiles, missedLineBlocks, moveMissedBlock, coverageScanReasons, coverageScanStatus, type CoverageFilter, type CoverageSort } from "../coverage/explorer";
   import { isImeComposition } from "../keyboard/imeGuard";
@@ -115,6 +116,7 @@
   let activeMissed = $state<number | null>(null);
   let selectedScope = $state(false);
   let coverageRoot = $state<HTMLDivElement>();
+  let languageStrip = $state<HTMLDivElement>();
   const visibleFiles = $derived.by(() => filterCoverageFiles(report?.files ?? [], fileQuery, languageFilter, coverageFilter, fileSort));
   const filterLanguages = $derived.by(() => [...new Set(report?.files.map(file => file.language) ?? [])].sort());
   const selectedFile = $derived.by(() => report?.files.find(file => file.path.toLowerCase() === selectedPath?.toLowerCase()));
@@ -1809,7 +1811,10 @@
   {/if}
 
   {#if report && report.languages.length > 0}
-    <div class="px-4 py-2 border-b border-border/40 gp-section-edge bg-surface/20 flex items-center gap-3 overflow-x-auto gp-edge-fade-end font-sans">
+    <!-- The shared cue, not a fade class on the strip itself: a fade utility
+         on the scroller painted its gradient across the whole bar. -->
+    <div class="relative border-b border-border/40 gp-section-edge bg-surface/20">
+    <div bind:this={languageStrip} class="px-4 py-2 flex items-center gap-3 overflow-x-auto font-sans">
       <span class="text-[10px] uppercase tracking-wider text-textMuted/60 shrink-0">by language</span>
       <!-- Fixed track width, not `min-w-36`. The bar length encodes the
            percentage, so a track that grows with the label made 98.2% Rust and
@@ -1833,6 +1838,8 @@
           </div>
         </div>
       {/each}
+    </div>
+    <ScrollCue target={languageStrip} axis="x" />
     </div>
   {/if}
 
