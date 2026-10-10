@@ -11,6 +11,24 @@ before that tag is pushed.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Freshness badges no longer spend a third of launch's git budget.** The
+  branch list and the Remote pane asked for provenance freshness from effects
+  that re-ran on every repository-store emission — a status poll, a diff
+  selection, a loading flag — and the branch list also reset the shared store
+  each time, dropping whatever was in flight: one launch ran 108 `git notes`
+  listings, two per freshness request, in its first 32 s. The effects now ask
+  only when the
+  repository, its branches or its pull requests change; an identical request
+  still out is joined; the two lists' answers no longer discard each other.
+  Each notes ref is listed once until it moves, rather than twice per batch,
+  and every branch or remote-tracking tip in a batch is measured by one
+  `for-each-ref` instead of one `rev-list` per row.
+- **Code-index retries no longer return in lockstep.** A deferred index check
+  or initialization, and a busy index writer's retry, now wait the shared
+  jittered backoff, so tabs refused by one spawn storm come back spread out.
+
 ## [1.4.0] - 2026-10-09
 
 Agents that start in the background with a pane showing every one at work,

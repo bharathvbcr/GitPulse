@@ -110,7 +110,7 @@ describe("freshness store", () => {
     expect(get(store).byRevision["main"].commit_sha).toBe("newer");
   });
 
-  it("drops an in-flight answer after a reset", async () => {
+  it("drops an in-flight answer after a repository switch", async () => {
     // Switching repositories mid-load must not paint the old repository's
     // verifications onto the new one's branches.
     const pending = deferred<ProvenanceFreshness[]>();
@@ -118,11 +118,88 @@ describe("freshness store", () => {
     const store = createFreshnessStore({ invoke: invoke as never });
 
     const inFlight = store.load("/repo-a", ["main"]);
-    store.reset();
+    store.forRepo("/repo-b");
     pending.resolve([row("stale")]);
     await inFlight;
 
     expect(get(store).byRevision).toEqual({});
+  });
+
+  it("keeps answers and loads in flight when told the same repository again", async () => {
+    // The branch list says which repository it shows from an effect. It used
+    // to reset unconditionally, on every store emission, dropping every load
+    // in flight; the next emission asked again, ~54 batches in 30 s.
+    const pending = deferred<ProvenanceFreshness[]>();
+    const invoke = vi
+      .fn()
+      .mockResolvedValueOnce([row("aaa")])
+      .mockReturnValueOnce(pending.promise);
+    const store = createFreshnessStore({ invoke: invoke as never });
+
+    await store.load("/repo", ["main"]);
+    const inFlight = store.load("/repo", ["topic"]);
+    for (let i = 0; i < 5; i += 1) store.forRepo("/repo");
+    pending.resolve([row("bbb")]);
+    await inFlight;
+
+    const state = get(store);
+    expect(state.byRevision["main"].commit_sha).toBe("aaa");
+    expect(state.byRevision["topic"].commit_sha).toBe("bbb");
+    expect(invoke).toHaveBeenCalledTimes(2);
+  });
+
+  it("asks once for a request identical to one still in flight", async () => {
+    const pending = deferred<ProvenanceFreshness[]>();
+    const invoke = vi.fn().mockReturnValue(pending.promise);
+    const store = createFreshnessStore({ invoke: invoke as never });
+
+    // Order and duplicates do not make a different request.
+    const loads = [
+      store.load("/repo", ["main", "topic"], "main"),
+      store.load("/repo", ["topic", "main", "main"], "main"),
+      store.load("/repo", ["main", "topic"], "main"),
+    ];
+    pending.resolve([row("aaa"), row("bbb")]);
+    await Promise.all(loads);
+
+    expect(invoke).toHaveBeenCalledTimes(1);
+    expect(get(store).byRevision["topic"].commit_sha).toBe("bbb");
+    expect(get(store).loading).toBe(false);
+
+    // Settled, the same request is a new one: a refresh may have moved notes.
+    invoke.mockResolvedValueOnce([row("aaa"), row("ccc")]);
+    await store.load("/repo", ["main", "topic"], "main");
+    expect(invoke).toHaveBeenCalledTimes(2);
+    expect(get(store).byRevision["topic"].commit_sha).toBe("ccc");
+  });
+
+  it("keeps both lists' answers when their loads overlap in one repository", async () => {
+    // The branch list asks for tips, the pull-request list for head refs. The
+    // older answer used to be thrown away whole, so whichever list asked
+    // first drew no badges until something asked again.
+    const branches = deferred<ProvenanceFreshness[]>();
+    const pulls = deferred<ProvenanceFreshness[]>();
+    const invoke = vi
+      .fn()
+      .mockReturnValueOnce(branches.promise)
+      .mockReturnValueOnce(pulls.promise);
+    const store = createFreshnessStore({ invoke: invoke as never });
+
+    const first = store.load("/repo", ["tip-a", "shared"], "main");
+    const second = store.load("/repo", ["origin/pr", "shared"], "main");
+    expect(get(store).loading).toBe(true);
+    pulls.resolve([row("pr"), row("shared-newer")]);
+    await second;
+    expect(get(store).loading).toBe(true);
+    branches.resolve([row("tip-a"), row("shared-older")]);
+    await first;
+
+    const state = get(store);
+    expect(state.byRevision["tip-a"].commit_sha).toBe("tip-a");
+    expect(state.byRevision["origin/pr"].commit_sha).toBe("pr");
+    // Asked by both: the newer request's answer stands.
+    expect(state.byRevision["shared"].commit_sha).toBe("shared-newer");
+    expect(state.loading).toBe(false);
   });
 
   it("says when it trimmed the request rather than silently dropping rows", async () => {

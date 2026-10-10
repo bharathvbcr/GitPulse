@@ -3168,7 +3168,10 @@ fn compute_eligible_churn(
 /// Ahead/behind of every branch and remote-tracking tip against `base_oid`,
 /// keyed by tip oid, from one `for-each-ref`. `None` when git cannot answer
 /// (the atom needs 2.42), which leaves each tip to its own walk.
-fn tip_counts_against(repo: &Path, base_oid: &str) -> Option<HashMap<String, (usize, usize)>> {
+pub(crate) fn tip_counts_against(
+    repo: &Path,
+    base_oid: &str,
+) -> Option<HashMap<String, (usize, usize)>> {
     validate_oid(base_oid).ok()?;
     let format = format!("--format=%(objectname)%00%(ahead-behind:{base_oid})");
     let text = ref_cache::git_text(

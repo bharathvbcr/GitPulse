@@ -471,13 +471,18 @@
    *
    * Each head is asked about under both `origin/<ref>` and `<ref>`; a head
    * that resolves under neither reads as *unknown*, never as unverified.
+   *
+   * The effect reads derived values, never `$repoStore` itself, so a store
+   * emission that changed neither the repository nor its default branch — a
+   * status poll, a diff selection — is not another batch.
    */
+  const freshnessRepo = $derived($repoStore.currentPath);
   const defaultBranchName = $derived(
     $repoStore.branches.find((b) => b.is_default && !b.is_remote)?.name ?? null,
   );
 
   $effect(() => {
-    const repo = $repoStore.currentPath;
+    const repo = freshnessRepo;
     const prs = ctx?.pull_requests ?? [];
     const base = defaultBranchName;
     if (!repo || prs.length === 0) return;

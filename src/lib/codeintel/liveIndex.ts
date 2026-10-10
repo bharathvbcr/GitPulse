@@ -15,7 +15,7 @@
  */
 
 import { get, writable } from "svelte/store";
-import { deferredRetryDelayMs, MAX_DEFERRED_RETRIES } from "../async/deferral";
+import { jitteredDelayMs, jitteredRetryDelayMs, MAX_DEFERRED_RETRIES } from "../async/deferral";
 import { createPacedQueue, type BackgroundScope } from "../async/pacedQueue";
 import { diagnostics } from "../diagnostics/diagnostics";
 import { maybeRefreshDevmap } from "./client";
@@ -116,9 +116,12 @@ export function createLiveIndex(opts?: {
   debounceMs?: number;
   maybeRefresh?: (repoPath: string, repoChanged: boolean) => Promise<LiveRefreshOutcome>;
   scope?: BackgroundScope;
+  /** Source in [0, 1) that spreads retry waits; see `jitteredDelayMs`. */
+  random?: () => number;
 }): LiveIndexController {
   const debounceMs = opts?.debounceMs ?? LIVE_INDEX_DEBOUNCE_MS;
   const maybeRefresh = opts?.maybeRefresh ?? maybeRefreshDevmap;
+  const random = opts?.random ?? Math.random;
   const snapshots = writable<Record<string, LiveIndexSnapshot>>({});
   const retained = new Set<string>();
   const busyRetries = new Map<string, number>();
@@ -176,9 +179,11 @@ export function createLiveIndex(opts?: {
       // The backend's spawn gate declined to start the probe under load —
       // nothing was examined. Settling it as "skipped" is what left every tab
       // restored at launch unhealed for the session, so ask again, later.
-      // `dirty` is kept: the retry still owes the watcher its rebuild.
+      // `dirty` is kept: the retry still owes the watcher its rebuild. Every
+      // tab restored at launch is deferred by the same storm, so the waits
+      // are spread rather than returning to the gate on one millisecond.
       const attempt = (deferrals.get(repoPath) ?? 0) + 1;
-      const delayMs = deferredRetryDelayMs(attempt);
+      const delayMs = jitteredRetryDelayMs(attempt, random);
       const retrying = attempt <= MAX_DEFERRED_RETRIES && queue.enqueue(repoPath, { delayMs });
       if (retrying) deferrals.set(repoPath, attempt);
       else {
@@ -203,7 +208,7 @@ export function createLiveIndex(opts?: {
     if (outcome.decision === "skip_building") {
       const retries = busyRetries.get(repoPath) ?? 0;
       const retrying = retries < LIVE_INDEX_BUSY_RETRIES &&
-        queue.enqueue(repoPath, { delayMs: busyRetryDelayMs(retries + 1) });
+        queue.enqueue(repoPath, { delayMs: jitteredDelayMs(busyRetryDelayMs(retries + 1), random) });
       if (retrying) busyRetries.set(repoPath, retries + 1);
       else {
         forgetRetries(repoPath);

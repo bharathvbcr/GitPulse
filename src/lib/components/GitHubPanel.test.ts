@@ -446,3 +446,16 @@ describe("GitHubPanel deploy-section reachability", () => {
     expect(effect).toContain("latestReleaseOnly = true;");
   });
 });
+
+describe("GitHubPanel freshness badges", () => {
+  it("asks for a batch only when the repository, the pull requests or the base change", () => {
+    // Reading `$repoStore` inside the effect re-ran it on every store
+    // emission, and each re-run was a freshness batch.
+    const at = source.indexOf("freshnessStore.load(");
+    expect(at).toBeGreaterThan(-1);
+    const effect = source.slice(source.lastIndexOf("$effect(() => {", at), source.indexOf("\n  });", at));
+    expect(effect).not.toContain("$repoStore");
+    expect(effect).toContain("const repo = freshnessRepo;");
+    expect(source).toContain("const freshnessRepo = $derived($repoStore.currentPath);");
+  });
+});

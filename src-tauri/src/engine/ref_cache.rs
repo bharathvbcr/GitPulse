@@ -323,7 +323,12 @@ pub(crate) fn git_text_capped(
 }
 
 /// `run` answers with the text and whether it may be kept.
-fn through(
+///
+/// Called directly by a listing whose non-zero exit can be an answer rather
+/// than a failure (`git notes list` on a ref this git cannot load), which the
+/// single `Err` of [`git_text`] cannot tell apart. `run` still owns the spawn,
+/// so it still goes through [`git_cli`] and its gate.
+pub(crate) fn through(
     repo: &Path,
     namespaces: &[&str],
     args: &[&str],
@@ -399,6 +404,32 @@ fn note_hit() {
     HITS.with(|cell| cell.set(cell.get() + 1));
 }
 
+/// Held by every test that counts on an answer staying kept, and by the one
+/// that fills the budget: that one evicts whatever else is in the
+/// process-wide table. Shared with the callers' own tests (provenance), whose
+/// kept answers live in the same table.
+#[cfg(test)]
+pub(crate) fn retention() -> std::sync::MutexGuard<'static, ()> {
+    static SERIAL: Mutex<()> = Mutex::new(());
+    SERIAL.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Runs `f` with no racy window, so every stamp is stored: what the oracle
+/// then proves is that the stamp itself sees every change, with no help from
+/// the window.
+#[cfg(test)]
+pub(crate) fn eager<T>(f: impl FnOnce() -> T) -> T {
+    RACY_OVERRIDE.with(|cell| cell.set(Some(Duration::ZERO)));
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            RACY_OVERRIDE.with(|cell| cell.set(None));
+        }
+    }
+    let _reset = Reset;
+    f()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -432,29 +463,6 @@ mod tests {
     const REV_LIST_ALL_ARGS: &[&str] = &["rev-list", "--all"];
     const HEAD_ONLY: &[&str] = &["refs/heads"];
     const HEAD_ARGS: &[&str] = &["rev-parse", "HEAD"];
-
-    /// Runs `f` with no racy window, so every stamp is stored: what the oracle
-    /// then proves is that the stamp itself sees every change, with no help
-    /// Held by every test that counts on an answer staying kept, and by the
-    /// one that fills the budget: that one evicts whatever else is in the
-    /// process-wide table.
-    fn retention() -> std::sync::MutexGuard<'static, ()> {
-        static SERIAL: Mutex<()> = Mutex::new(());
-        SERIAL.lock().unwrap_or_else(PoisonError::into_inner)
-    }
-
-    /// from the window.
-    fn eager<T>(f: impl FnOnce() -> T) -> T {
-        RACY_OVERRIDE.with(|cell| cell.set(Some(Duration::ZERO)));
-        struct Reset;
-        impl Drop for Reset {
-            fn drop(&mut self) {
-                RACY_OVERRIDE.with(|cell| cell.set(None));
-            }
-        }
-        let _reset = Reset;
-        f()
-    }
 
     fn hits() -> u64 {
         HITS.with(std::cell::Cell::get)
