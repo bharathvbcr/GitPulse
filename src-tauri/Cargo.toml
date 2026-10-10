@@ -284,6 +284,12 @@ lto = "thin"
 # names nothing is not a stack trace. "debuginfo" drops the bulk (the debug
 # info) and keeps the names the panic hook's capture is written to produce.
 strip = "debuginfo"
+# One codegen unit: LLVM sees each crate whole, so it inlines and drops dead
+# code across what were 16 partitions — a smaller, faster binary for the
+# shipped build. It costs release compile time, which the release job's
+# 90-minute budget absorbs (builds ran 13–17 minutes at 16 units). Not
+# `panic = "abort"`: workbench/managed_run.rs and in_flight.rs `catch_unwind`.
+codegen-units = 1
 
 # urlpattern 0.3 (unic-ucd-ident and friends, RUSTSEC-2025-0075/0080/0081/0098/0100)
 # is still what crates.io tauri-utils 2.9.3 declares. urlpattern 0.6 dropped those
