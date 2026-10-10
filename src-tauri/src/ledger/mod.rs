@@ -1962,6 +1962,49 @@ pub(crate) fn recorded_reflog_objects(
     })
 }
 
+/// Events kept by [`prune_events`] whatever their age: the newest ones, so
+/// the cursor never moves backwards or repeats an id.
+pub const RETAIN_NEWEST_EVENTS: i64 = 10_000;
+/// The age past which [`prune_events`] may delete an event.
+pub const RETAIN_EVENT_DAYS: u32 = 365;
+/// Rows one prune deletes, so it holds the write lock for a bounded time.
+const PRUNE_BATCH: i64 = 5_000;
+
+/// Deletes events older than `older_than_days`, never the newest
+/// `keep_newest`, and never a worktree bind or unbind (they are what a
+/// worktree's task scope is enforced from, however old). One bounded batch per
+/// call; returns how many were deleted, so a caller loops until it is 0.
+///
+/// The ledger is an audit record, so nothing runs this on its own: it is the
+/// retention policy a host or operator invokes deliberately. Keeping the
+/// newest rows means the highest cursor survives, so ids are never reused.
+pub fn prune_events(
+    repo_path: &str,
+    older_than_days: u32,
+    keep_newest: i64,
+) -> Result<usize, LedgerError> {
+    let keep_newest = keep_newest.max(1);
+    let age_ms = u64::from(older_than_days).saturating_mul(86_400_000);
+    let cutoff = ids::iso8601_utc(ids::now_millis().saturating_sub(age_ms));
+    with_conn(repo_path, |conn| {
+        let failed = |e: rusqlite::Error| LedgerError::new("prune_failed", e.to_string());
+        let tx = write_tx(conn).map_err(failed)?;
+        let deleted = tx
+            .execute(
+                "DELETE FROM events WHERE id IN (
+                     SELECT id FROM events
+                     WHERE ts_utc < ?1
+                       AND action NOT IN ('worktree.bind', 'worktree.unbind')
+                       AND id <= (SELECT COALESCE(MAX(id), 0) FROM events) - ?2
+                     ORDER BY id LIMIT ?3)",
+                params![cutoff, keep_newest, PRUNE_BATCH],
+            )
+            .map_err(failed)?;
+        tx.commit().map_err(failed)?;
+        Ok(deleted)
+    })
+}
+
 /// The highest cursor in this repo's ledger, or 0 when it is empty.
 ///
 /// Phase 3's reflog catch-up starts here: everything git recorded after this

@@ -299,3 +299,51 @@ fn recorded_reflog_objects_is_scoped_to_the_checkout() {
     let linked = recorded_reflog_objects(&repo, "/elsewhere/linked", false).unwrap();
     assert_eq!(linked, ["b2 linked".to_string()].into());
 }
+
+#[test]
+fn pruning_keeps_the_newest_events_and_every_binding() {
+    let (_dir, repo) = repo_dir();
+    for _ in 0..12 {
+        append(draft(&repo, "git.commit")).unwrap();
+    }
+    append(draft(&repo, "worktree.bind")).unwrap();
+    // Age everything: the policy deletes by age, so push the stored times back.
+    with_conn(&repo, |conn| {
+        conn.execute("UPDATE events SET ts_utc = '2001-01-01T00:00:00.000Z'", [])
+            .map_err(|e| LedgerError::new("t", e.to_string()))
+    })
+    .unwrap();
+    let before = latest_cursor(&repo).unwrap();
+
+    // Nothing is older than a day only if it is new: these are all old.
+    let deleted = prune_events(&repo, 1, 5).unwrap();
+    assert_eq!(
+        deleted, 8,
+        "13 rows less the newest 5 are 8 candidates, none of them the bind"
+    );
+    assert_eq!(
+        prune_events(&repo, 1, 5).unwrap(),
+        0,
+        "a second pass has nothing left"
+    );
+    let rest = tail(&repo, 0, 100).unwrap();
+    assert_eq!(rest.len(), 5);
+    assert!(rest.iter().any(|e| e.action == "worktree.bind"));
+    assert_eq!(
+        latest_cursor(&repo).unwrap(),
+        before,
+        "the highest cursor survives"
+    );
+    // A row appended after a prune takes a fresh id, never a reused one.
+    let next = append(draft(&repo, "git.push")).unwrap();
+    assert_eq!(next, before + 1);
+    // Age decides, not just position: the fresh row survives even a keep of
+    // one, and the old non-binding rows go.
+    assert_eq!(prune_events(&repo, 1, 1).unwrap(), 4);
+    let left: Vec<String> = tail(&repo, 0, 100)
+        .unwrap()
+        .into_iter()
+        .map(|e| e.action)
+        .collect();
+    assert_eq!(left, ["worktree.bind", "git.push"]);
+}
