@@ -23,6 +23,7 @@ mod receipts;
 mod reconcile;
 pub(crate) mod retention;
 pub mod review;
+mod suggest;
 pub(crate) mod terminal_command;
 mod terminal_launch;
 mod terminal_run;
@@ -468,6 +469,12 @@ impl WorkbenchState {
             } = generation_input(method, &rest)?;
             params["repo_root"] = json!(root);
             return self.worker_call("work.enhancements.refine", params, selection);
+        }
+        // Which tasks to start next is Manvi's ranking of the open board; this
+        // only names the ask. It reads and never writes the board.
+        if method == "tasks.suggest" {
+            let params = suggest::params(input)?;
+            return self.worker_call("work.tasks.suggest", params, None);
         }
         if matches!(
             method,

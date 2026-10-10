@@ -114,6 +114,16 @@ before that tag is pushed.
   re-parses every earlier commit (one 100k-commit answer exceeded the cache's
   per-entry cap and was never kept). Git still skips past earlier commits for a
   new chunk, and lane solving still covers the whole window.
+- Tasks board: **Suggest next** asks Manvi (`work.tasks.suggest`, through the
+  host method `tasks.suggest`) which open tasks to start, ranked by priority,
+  severity, due date, idle age, what each unblocks and its last verification,
+  with a one-line reason per task, a priority filter, and a plain statement when
+  blocked, duplicate, in-progress or unread tasks were left out or the board read
+  was capped. It is deterministic and makes no model call. The serve contract
+  mirror and the profile worker allowlist gain the op.
+- Tasks board Filters: a severity filter (saved views keep it) and a Priority
+  first order for the columns, a view that never writes a position. A card's
+  priority pip now has an accessible name.
 
 ### Changed
 

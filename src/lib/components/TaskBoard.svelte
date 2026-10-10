@@ -18,9 +18,9 @@
   import { popover, restoreFocusTo } from "../ui/popover";
   import { cardFace, dragExceeded, grabPoint, type GrabPoint, insertIndexFromY, insertionNeighbors, insertionPosition, neighborStatus, parseColumnStatus, shouldCommitMove } from "../workbench/boardDrag";
   import {
-    explainError, getTask, getTaskBrief, getWorkspace, listAttention, listRepositories, listTasks, listWorkspaces, newID, putTask, registerRepository, restoreDeletedTask,
+    explainError, getTask, getTaskBrief, getWorkspace, listAttention, listRepositories, listTasks, listWorkspaces, newID, putTask, registerRepository, restoreDeletedTask, suggestTasks,
     STATUSES, STATUS_LABELS, TASK_PAGE_SIZE, taskDraft, taskWrite,
-    type Page, type Repository, type Scope, type Task, type TaskCard, type TaskDraft, type TaskListFilter, type TaskStatus, type Workspace, type WorkspaceCard,
+    type Page, type Repository, type Scope, type Task, type TaskCard, type TaskDraft, type TaskListFilter, type TaskStatus, type TaskSuggestions, type Workspace, type WorkspaceCard,
   } from "../workbench/client";
   import { addableOpenTabs, attachRepositories, openAddActionLabel, openMembershipCandidates, pickerSelectionIds } from "../workbench/openMembership";
   import { quickAddRefusal, taskCreation } from "../workbench/taskCreation";
@@ -38,13 +38,14 @@
   import { describeMatch, searchCards, type RankContext, type RankedCard, type SearchOrder } from "../workbench/taskRank";
   import { CANDIDATE_PAGE, bucketByStatus, canLoadMore, candidatesComplete, describeSearch, mergeCandidates, planSearch, type CandidateSet, type SearchPlan } from "../workbench/taskSearchPlan";
   import TaskSearchField from "./TaskSearchField.svelte";
-  import { cardChrome, cardMatchesFacet, collectFacetOptions, emptyFacet, facetActive, allLoadedCards, reorderPlan, partitionLanes, type TaskFacet, type TaskLane } from "../workbench/taskOrganize";
+  import { cardChrome, cardMatchesFacet, collectFacetOptions, emptyFacet, facetActive, allLoadedCards, priorityLabel, reorderPlan, partitionLanes, sortByPriority, type TaskFacet, type TaskLane } from "../workbench/taskOrganize";
   import { plural } from "../format";
   import { archiveAction, archivable, archiveState } from "../workbench/taskArchive";
   import { interfaceStore } from "../stores/interfaceStore";
   import { hiddenColumnReport, visibleBoardStatuses } from "../ui/taskView";
   import { boardKey as viewBoardKey, boardPrefs, effectiveSwimlane, wipState, type SavedTaskView, type TaskViewSnapshot } from "../ui/taskBoardViews";
   import TaskSavedViews from "./TaskSavedViews.svelte";
+  import TaskSuggestPanel from "./TaskSuggestPanel.svelte";
   import { consumeTaskOpen, taskOpenRequest } from "../workbench/taskOpen";
   import { parseQuickAddDue, quickAddDraft, type QuickAddMode, type QuickAddResult } from "../workbench/taskQuickAdd";
   import { removeFromColumns, restoreSummary, restoreTasks } from "../workbench/taskDelete";
@@ -153,6 +154,15 @@
   const plan = $derived(planSearch(scope, parsedQuery, facet, repositories, repositoryCursor === null));
   const searching = $derived(plan.mode === "search");
   let sort = $state<SearchOrder>("relevance");
+  /** How a column is drawn when no search ranks it: the board's own order, or the most urgent first. A view; positions are never written. */
+  let boardSort = $state<"board" | "priority">("board");
+  /** Manvi's ranking of what to start next (`work.tasks.suggest`), asked for on demand. */
+  let showSuggest = $state(false);
+  let suggestion = $state<TaskSuggestions | null>(null);
+  let suggestLoading = $state(false);
+  let suggestError = $state("");
+  let suggestPriority = $state<number | "all">("all");
+  let suggestTicket = 0;
   /** The search's candidates; null while the board browses columns. */
   let candidates = $state.raw<CandidateSet | null>(null);
   const boardKey = $derived(JSON.stringify([scope, plan.key]));
@@ -174,6 +184,8 @@
   // An undo offer belongs to the board it was made on. A pending deletion is
   // not withdrawn by a scope change: it is still the reader's to undo.
   $effect(() => { JSON.stringify(scope); untrack(() => offerUndo(null)); });
+  // A suggestion ranks one board's tasks: another scope drops it, and an open panel asks again.
+  $effect(() => { JSON.stringify(scope); untrack(() => { suggestTicket++; suggestion = null; suggestError = ""; suggestLoading = false; if (showSuggest) void askSuggest(); }); });
   let opening = $state(false); let moving = $state(false); let deleting = $state(false);
   /**
    * A held card, before and during its drag. Owned by one pointer: every
@@ -450,7 +462,7 @@
    * or a keyboard nudge there would write a position relative to neighbours
    * that are not the column's.
    */
-  const reorderLocked = $derived(searching && order === "relevance");
+  const reorderLocked = $derived((searching && order === "relevance") || boardSort === "priority");
   // Description hits belong to the word they were read for: never credited
   // to a new word while its own read is in flight.
   const rankContext = $derived.by<RankContext>(() => {
@@ -479,7 +491,8 @@
   const visibleCount = $derived(loadedCards.filter(cardVisible).length);
   function visibleIn(status: TaskStatus): TaskCard[] {
     if (ranking && order === "relevance") return ranked.byStatus[status] ?? [];
-    return (displayColumns[status]?.items ?? []).filter(cardVisible);
+    const items = (displayColumns[status]?.items ?? []).filter(cardVisible);
+    return boardSort === "priority" ? sortByPriority(items) : items;
   }
   /** A column's count: the store's total while browsing, the matches while searching. */
   function columnCount(status: TaskStatus): number {
@@ -1011,6 +1024,27 @@
     } catch (cause) { if (!disposed && ticket === openingRevision) error = explainError(cause); }
     finally { if (!disposed && ticket === openingRevision) opening = false; }
   }
+  /** Ask Manvi which open tasks to start next. The newest ask wins; a stale answer never replaces it. */
+  async function askSuggest() {
+    const ticket = ++suggestTicket;
+    suggestLoading = true; suggestError = "";
+    try {
+      const answer = await suggestTasks({
+        limit: 5,
+        ...(suggestPriority === "all" ? {} : { max_priority: suggestPriority }),
+        ...(scope.kind === "repository" ? { repository_id: scope.id } : {}),
+      });
+      if (disposed || ticket !== suggestTicket) return;
+      suggestion = answer;
+    } catch (cause) {
+      if (disposed || ticket !== suggestTicket) return;
+      suggestion = null; suggestError = explainError(cause);
+    } finally { if (!disposed && ticket === suggestTicket) suggestLoading = false; }
+  }
+  function toggleSuggest() {
+    showSuggest = !showSuggest;
+    if (showSuggest && !suggestion && !suggestLoading) void askSuggest();
+  }
   async function openTask(id: string) {
     if (session?.tabId === id && session.value) return;
     if (busy) return;
@@ -1282,7 +1316,7 @@
    */
   async function nudgeCard(card: TaskCard, delta: -1 | 1) {
     if (busy) return;
-    if (reorderLocked) { announce = "Matches are ordered by relevance. Switch to Board order to move a card within its column."; return; }
+    if (reorderLocked) { announce = boardSort === "priority" ? "Cards are ordered by priority. Switch to Board order to move a card within its column." : "Matches are ordered by relevance. Switch to Board order to move a card within its column."; return; }
     const items = displayColumns[card.status]?.items ?? [];
     const from = items.findIndex((item) => item.id === card.id);
     const to = from + delta;
@@ -1925,7 +1959,7 @@
     onkeydown={(e) => onCardKeydown(e, card, status)}
   >
     <div class="card-meta">
-      {#if face.pip !== null}<span class="pip" data-priority={face.pip}></span>{/if}
+      {#if face.pip !== null}<span class="pip" data-priority={face.pip} role="img" aria-label={`${priorityLabel(face.pip)} priority`} title={`${priorityLabel(face.pip)} priority`}></span>{/if}
       <h3>{face.title}{#if selected.has(card.id)}<span class="sr-only">, selected</span>{/if}</h3>
       {#if openCardIds.has(card.id)}<span class="open-mark">Open</span>{/if}
     </div>
@@ -2103,6 +2137,7 @@
         {/if}
         <button type="button" class="gp-icon-btn" aria-label="Refresh" title="Refresh" onclick={() => { void boardAgents.refresh(); checkoutToken++; if (initialized) void refresh(); else void initialize(); }} disabled={loading}><RefreshCw size={13} /></button>
         <button type="button" class="gp-btn" aria-pressed={showFilters || filtering} onclick={() => { showFilters = !showFilters; }}>Filters</button>
+        <button type="button" class="gp-btn" data-testid="task-suggest-toggle" aria-pressed={showSuggest} aria-controls="task-suggest" disabled={!initialized} title="Ask Manvi which tasks to start next, ranked by priority, severity, due date and blockers" onclick={toggleSuggest}>Suggest next</button>
         <TaskSavedViews disabled={!initialized} board={viewBoard} boardName={title} current={viewSnapshot} onApply={applyView} />
         <TaskViewMenu disabled={!initialized} board={viewBoard} boardName={title} />
         <button type="button" class="gp-btn-primary" onclick={() => void createTask()} disabled={!creation.allowed} title={creation.blocked ?? creation.caveat ?? "New task"} aria-label="New task">New task</button>
@@ -2141,6 +2176,11 @@
           <option value="all">All labels</option>
           {#each facetOptions.labels as label}<option value={label}>{label}</option>{/each}
         </select>
+        <select class="gp-select" aria-label="Filter by severity" bind:value={facet.severity}>
+          <option value="all">Any severity</option>
+          <option value="">No severity</option>
+          {#each facetOptions.severities as severity}<option value={severity}>{severity}</option>{/each}
+        </select>
         <select class="gp-select" aria-label="Filter by due date" bind:value={facet.due}>
           <option value="all">Any due date</option>
           <option value="overdue">Overdue</option>
@@ -2156,8 +2196,19 @@
             {#each facetRepositories as repo (repo.id)}<option value={repo.id}>{repo.name}</option>{/each}
           </select>
         {/if}
+        <div class="gp-segmented" role="group" aria-label="Order cards">
+          <button type="button" class="gp-seg-btn" data-active={boardSort === "board"} aria-pressed={boardSort === "board"} title="Cards in the board's own order, where they can be moved." onclick={() => { boardSort = "board"; }}>Board order</button>
+          <button type="button" class="gp-seg-btn" data-active={boardSort === "priority"} aria-pressed={boardSort === "priority"} title="Most urgent first, then the earlier due date. Cards cannot be moved within a column in this order." onclick={() => { boardSort = "priority"; }}>Priority first</button>
+        </div>
         {#if filtering}<button type="button" class="gp-btn" onclick={() => { facet = emptyFacet(); search = ""; }}>Clear filters</button>{/if}
       </div>
+    {/if}
+    {#if initialized && showSuggest}
+      <TaskSuggestPanel
+        result={suggestion} loading={suggestLoading} error={suggestError} priority={suggestPriority}
+        onPriority={(value) => { suggestPriority = value; void askSuggest(); }}
+        onOpen={(id) => void openTask(id)} onRefresh={() => void askSuggest()} onClose={() => { showSuggest = false; }}
+      />
     {/if}
     {#if initialized && (showFilters || filtering || showSearchHelp)}
       <div class="query-bar" data-testid="task-query-bar">

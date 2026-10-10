@@ -90,7 +90,7 @@ export type TaskDraft = Omit<Task, keyof RecordVersion | "completed_at">;
 export type WorkspaceDraft = Omit<Workspace, keyof RecordVersion>;
 export interface Page<T> { items: T[]; total: number; shown: number; has_more: boolean; next_cursor: string | null }
 export type Scope = { kind: "global" } | { kind: "workspace" | "repository"; id: string };
-export type WorkbenchMethod = "decisions.get" | "decisions.list" | "decisions.decide" | "notifications.settings.get" | "notifications.settings.put" | "notifications.delivery.get" | "notifications.ack" | "notifications.native.pending" | "notifications.native.status" | "notifications.native.authorize" | "attention.list" | "attention.get" | "attention.update" | EnhancementMutation | "runs.prepare_managed" | "runs.launch_managed" | "runs.stop_managed" | "runs.prepare_terminal" | "runs.get" | "runs.list" | "runs.cancel" | "runs.release" | "runs.conversation" | "runs.checkout_identity" | "workspaces.list" | "workspaces.get" | "workspaces.put" | "workspaces.delete" | "repositories.list" | "repositories.get" | "repositories.put" | "items.list" | "items.get" | "items.brief.get" | "items.put" | "items.delete" | "items.restore" | "items.merge" | "items.history" | "events.list" | "enhancements.complete" | "verifications.status" | "verifications.run" | "verifications.board" | "enhancements.get" | "enhancements.list" | "enhancements.configuration" | "enhancements.wake" | "enhancements.worker" | "automation.get" | "automation.put" | "automation.list";
+export type WorkbenchMethod = "decisions.get" | "decisions.list" | "decisions.decide" | "notifications.settings.get" | "notifications.settings.put" | "notifications.delivery.get" | "notifications.ack" | "notifications.native.pending" | "notifications.native.status" | "notifications.native.authorize" | "attention.list" | "attention.get" | "attention.update" | EnhancementMutation | "runs.prepare_managed" | "runs.launch_managed" | "runs.stop_managed" | "runs.prepare_terminal" | "runs.get" | "runs.list" | "runs.cancel" | "runs.release" | "runs.conversation" | "runs.checkout_identity" | "workspaces.list" | "workspaces.get" | "workspaces.put" | "workspaces.delete" | "repositories.list" | "repositories.get" | "repositories.put" | "items.list" | "items.get" | "items.brief.get" | "items.put" | "items.delete" | "items.restore" | "items.merge" | "items.history" | "events.list" | "enhancements.complete" | "verifications.status" | "verifications.run" | "verifications.board" | "enhancements.get" | "enhancements.list" | "enhancements.configuration" | "enhancements.wake" | "enhancements.worker" | "automation.get" | "automation.put" | "automation.list" | "tasks.suggest";
 
 export interface WorkbenchError {
   readonly code: string;
@@ -992,4 +992,49 @@ export function taskBrief(value: unknown): TaskBrief {
   const workspace = raw.workspace === null ? null : briefReference(raw.workspace);
   if ((workspace?.id ?? null) !== full.home_workspace_id) return invalid();
   return { ...saved, format_version: 1, task: full, repositories, workspace, markdown };
+}
+
+/** Manvi's `work.tasks.suggest`: which open tasks to start next, ranked, with the reason for each. */
+export interface TaskSuggestionSignal { name: string; points: number; detail: string }
+export interface TaskSuggestion { rank: number; id: string; title: string; status: TaskStatus; priority: number; score: number; reason: string; signals: TaskSuggestionSignal[] }
+export interface TaskSuggestions {
+  generated_at: number;
+  suggestions: TaskSuggestion[];
+  blocked: { id: string; title: string; blocked_by: string[] }[];
+  excluded: { in_progress: number; review: number; duplicate: number; blocked: number; filtered: number };
+  /** False when a bound cut the read: the list is then a ranking of what was read. */
+  board: { scanned: number; complete: boolean; unhydrated: number };
+  verification: { checked: number; unchecked: number; failed: number };
+  candidates: number;
+}
+export interface SuggestParams { limit?: number; max_priority?: number; repository_id?: string }
+export const MAX_SUGGESTIONS = 20;
+function suggestion(value: unknown): TaskSuggestion {
+  const raw = object(value);
+  const priority = integer(raw.priority), status = text(raw.status);
+  const signals = raw.signals;
+  if (priority > 3 || !(STATUSES as readonly string[]).includes(status) || !Array.isArray(signals) || signals.length > 32) return invalid();
+  return {
+    rank: integer(raw.rank), id: text(raw.id), title: text(raw.title), status: status as TaskStatus, priority, score: Number.isFinite(raw.score) ? (raw.score as number) : invalid(),
+    reason: text(raw.reason),
+    signals: signals.map((entry) => { const signal = object(entry); return { name: text(signal.name), points: Number.isFinite(signal.points) ? (signal.points as number) : invalid(), detail: text(signal.detail) }; }),
+  };
+}
+export async function suggestTasks(params: SuggestParams = {}): Promise<TaskSuggestions> {
+  return taskSuggestions(await request("tasks.suggest", { ...params }));
+}
+/** The decoder `suggestTasks` applies: a reply that is not exactly this shape is a protocol error, never a partial list. */
+export function taskSuggestions(value: unknown): TaskSuggestions {
+  const raw = object(value);
+  if (raw.ok !== true || !Array.isArray(raw.suggestions) || raw.suggestions.length > MAX_SUGGESTIONS || !Array.isArray(raw.blocked) || raw.blocked.length > 100) return invalid();
+  const excluded = object(raw.excluded), board = object(raw.board), verification = object(raw.verification);
+  return {
+    generated_at: integer(raw.generated_at),
+    suggestions: raw.suggestions.map(suggestion),
+    blocked: raw.blocked.map((entry) => { const item = object(entry); return { id: text(item.id), title: text(item.title), blocked_by: strings(item.blocked_by) }; }),
+    excluded: { in_progress: integer(excluded.in_progress), review: integer(excluded.review), duplicate: integer(excluded.duplicate), blocked: integer(excluded.blocked), filtered: integer(excluded.filtered) },
+    board: { scanned: integer(board.scanned), complete: boolean(board.complete), unhydrated: integer(board.unhydrated) },
+    verification: { checked: integer(verification.checked), unchecked: integer(verification.unchecked), failed: integer(verification.failed) },
+    candidates: integer(raw.candidates),
+  };
 }

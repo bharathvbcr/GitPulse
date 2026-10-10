@@ -552,7 +552,8 @@ describe("TaskBoard ranking", () => {
   };
 
   it("never moves a card by a position read from a ranked order", () => {
-    expect(source).toContain('const reorderLocked = $derived(searching && order === "relevance");');
+    // Priority order is a view too, so it locks moves the same way; the ranked lock itself is unchanged.
+    expect(source).toContain('const reorderLocked = $derived((searching && order === "relevance") || boardSort === "priority");');
     expect(fn("onCardPointerDown")).toContain("reorderLocked");
     expect(fn("nudgeCard")).toContain("reorderLocked");
     // Re-spacing a column needs all of it; a partial candidate set is not.
@@ -566,5 +567,31 @@ describe("TaskBoard ranking", () => {
   it("offers Relevance and Board order only for a search with words", () => {
     expect(source).toContain("{#if searching && parsedQuery.words}");
     expect(source).toContain('const order = $derived<SearchOrder>(searching && parsedQuery.words ? sort : "board");');
+  });
+});
+
+describe("TaskBoard priority, severity and Suggest next", () => {
+  it("asks Manvi for suggestions on demand, scoped to a repository board, and keeps only the newest answer", () => {
+    expect(source).toContain('data-testid="task-suggest-toggle"');
+    expect(source).toContain("<TaskSuggestPanel");
+    const ask = source.slice(source.indexOf("async function askSuggest"), source.indexOf("function toggleSuggest"));
+    expect(ask).toContain("suggestTasks({");
+    expect(ask).toContain('scope.kind === "repository" ? { repository_id: scope.id }');
+    expect(ask).toContain("max_priority: suggestPriority");
+    // A stale answer is dropped, and a failure clears the list instead of leaving an old one up.
+    expect(ask).toContain("ticket !== suggestTicket");
+    expect(ask).toContain("suggestion = null; suggestError = explainError(cause)");
+  });
+
+  it("filters by severity and orders by priority without writing a position", () => {
+    expect(source).toContain('aria-label="Filter by severity"');
+    expect(source).toContain("bind:value={facet.severity}");
+    expect(source).toContain("sortByPriority(items)");
+    // A priority-sorted column is a view: moving a card within it is off, as under Relevance.
+    expect(source).toContain('const reorderLocked = $derived((searching && order === "relevance") || boardSort === "priority");');
+  });
+
+  it("names a card's priority for screen readers, not by colour alone", () => {
+    expect(source).toContain("aria-label={`${priorityLabel(face.pip)} priority`}");
   });
 });

@@ -9,6 +9,8 @@ export interface TaskFacet {
   kind: string | "all";
   owner: string | "all";
   label: string | "all";
+  /** A severity as the cards spell it, compared case-insensitively; "" is "no severity". */
+  severity: string | "all";
   due: DueFilter;
   /** A repository id the card links to, primary or not. */
   repository: string | "all";
@@ -18,6 +20,7 @@ export interface FacetOptions {
   kinds: string[];
   owners: string[];
   labels: string[];
+  severities: string[];
   /** Ids of every repository a loaded card links to; the board names them. */
   repositories: string[];
 }
@@ -33,11 +36,11 @@ export interface CardChrome {
 const SOON_SECONDS = 7 * 24 * 60 * 60;
 
 export function emptyFacet(): TaskFacet {
-  return { priority: "all", kind: "all", owner: "all", label: "all", due: "all", repository: "all" };
+  return { priority: "all", kind: "all", owner: "all", label: "all", severity: "all", due: "all", repository: "all" };
 }
 
 export function facetActive(facet: TaskFacet): boolean {
-  return normalizePriority(facet.priority) !== "all" || facet.kind !== "all" || facet.owner !== "all" || facet.label !== "all" || facet.due !== "all" || facet.repository !== "all";
+  return normalizePriority(facet.priority) !== "all" || facet.kind !== "all" || facet.owner !== "all" || facet.label !== "all" || facet.severity !== "all" || facet.due !== "all" || facet.repository !== "all";
 }
 
 export function dueState(dueAt: number | null | undefined, nowSec: number): DueState {
@@ -63,6 +66,7 @@ export function cardMatchesFacet(card: TaskCard, facet: TaskFacet, nowSec: numbe
     if (facet.owner === "" ? owner !== "" : owner !== facet.owner) return false;
   }
   if (facet.label !== "all" && !card.labels.includes(facet.label)) return false;
+  if (facet.severity !== "all" && (card.severity ?? "").trim().toLowerCase() !== facet.severity.trim().toLowerCase()) return false;
   if (facet.repository !== "all" && !card.repository_ids.includes(facet.repository)) return false;
   if (facet.due !== "all") {
     const due = dueState(card.due_at, nowSec);
@@ -77,15 +81,18 @@ export function collectFacetOptions(cards: readonly TaskCard[]): FacetOptions {
   const kinds = new Set<string>();
   const owners = new Set<string>();
   const labels = new Set<string>();
+  const severities = new Map<string, string>();
   const repositories = new Set<string>();
   for (const card of cards) {
     if (card.kind.trim()) kinds.add(card.kind);
     if (card.owner?.trim()) owners.add(card.owner.trim());
+    const severity = card.severity?.trim();
+    if (severity && !severities.has(severity.toLowerCase())) severities.set(severity.toLowerCase(), severity);
     for (const label of card.labels) if (label.trim()) labels.add(label);
     for (const id of card.repository_ids) if (id.trim()) repositories.add(id);
   }
   const sort = (values: Iterable<string>) => [...values].sort((a, b) => a.localeCompare(b));
-  return { kinds: sort(kinds), owners: sort(owners), labels: sort(labels), repositories: sort(repositories) };
+  return { kinds: sort(kinds), owners: sort(owners), labels: sort(labels), severities: sort(severities.values()), repositories: sort(repositories) };
 }
 
 export function allLoadedCards(
@@ -270,4 +277,22 @@ export function reorderPlan(
   const cards = items.filter((card) => card.id !== dragged.id);
   cards.splice(Math.max(0, Math.min(cards.length, index)), 0, dragged);
   return { cards, positions: Object.fromEntries(cards.map((card, i) => [card.id, (i + 1) * 1_048_576])) };
+}
+
+/**
+ * The cards most worth starting first: urgent before low, the earlier due date
+ * first among equals, and the board's own order for the rest (the sort is
+ * stable). A view over the cards; it never writes a position.
+ */
+export function sortByPriority<T extends Pick<TaskCard, "priority" | "due_at">>(cards: readonly T[]): T[] {
+  const rank = (card: T) => (normalizePriority(card.priority) === "all" ? 2 : (normalizePriority(card.priority) as number));
+  const due = (card: T) => (card.due_at != null && Number.isFinite(card.due_at) && card.due_at > 0 ? card.due_at : Number.POSITIVE_INFINITY);
+  return cards.map((card, index) => ({ card, index })).sort((a, b) => rank(a.card) - rank(b.card) || (due(a.card) < due(b.card) ? -1 : due(a.card) > due(b.card) ? 1 : 0) || a.index - b.index).map((entry) => entry.card);
+}
+
+/** What a priority is called on a card, a chip and a screen reader. */
+export const PRIORITY_LABELS = ["Urgent", "High", "Normal", "Low"] as const;
+export function priorityLabel(value: unknown): string {
+  const priority = normalizePriority(value);
+  return priority === "all" ? "Normal" : PRIORITY_LABELS[priority];
 }

@@ -1560,6 +1560,7 @@ impl ProfileConnection {
                 | "work.scan.gaps"
                 | "work.scan.get"
                 | "work.scan.cancel"
+                | "work.tasks.suggest"
         ) {
             return Err(HarnessError::Protocol(
                 "unsupported profile worker operation".into(),

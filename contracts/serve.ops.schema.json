@@ -79,6 +79,7 @@
       "work.scan.gaps",
       "work.scan.get",
       "work.store.compact",
+      "work.tasks.suggest",
       "work.verify.get",
       "work.verify.task",
       "work.workspaces.delete",
@@ -702,6 +703,199 @@
         "state": {
           "type": "string",
           "required": true
+        }
+      }
+    },
+    "SuggestParams": {
+      "type": "object",
+      "required": false,
+      "fields": {
+        "limit": {
+          "type": "integer",
+          "required": false
+        },
+        "max_priority": {
+          "type": "integer",
+          "required": false,
+          "nullable": true
+        },
+        "repository_id": {
+          "type": "string",
+          "required": false
+        },
+        "request_id": {
+          "type": "string",
+          "required": false
+        }
+      }
+    },
+    "SuggestResult": {
+      "type": "object",
+      "required": false,
+      "fields": {
+        "blocked": {
+          "type": "array",
+          "required": true,
+          "items": {
+            "type": "object",
+            "required": false,
+            "fields": {
+              "blocked_by": {
+                "type": "array",
+                "required": true,
+                "items": {
+                  "type": "string",
+                  "required": false
+                }
+              },
+              "id": {
+                "type": "string",
+                "required": true
+              },
+              "title": {
+                "type": "string",
+                "required": true
+              }
+            }
+          }
+        },
+        "board": {
+          "type": "object",
+          "required": true,
+          "fields": {
+            "complete": {
+              "type": "boolean",
+              "required": true
+            },
+            "scanned": {
+              "type": "integer",
+              "required": true
+            },
+            "unhydrated": {
+              "type": "integer",
+              "required": true
+            }
+          }
+        },
+        "candidates": {
+          "type": "integer",
+          "required": true
+        },
+        "excluded": {
+          "type": "object",
+          "required": true,
+          "fields": {
+            "blocked": {
+              "type": "integer",
+              "required": true
+            },
+            "duplicate": {
+              "type": "integer",
+              "required": true
+            },
+            "filtered": {
+              "type": "integer",
+              "required": true
+            },
+            "in_progress": {
+              "type": "integer",
+              "required": true
+            },
+            "review": {
+              "type": "integer",
+              "required": true
+            }
+          }
+        },
+        "generated_at": {
+          "type": "integer",
+          "required": true
+        },
+        "ok": {
+          "type": "boolean",
+          "required": true
+        },
+        "request_id": {
+          "type": "string",
+          "required": false
+        },
+        "suggestions": {
+          "type": "array",
+          "required": true,
+          "items": {
+            "type": "object",
+            "required": false,
+            "fields": {
+              "id": {
+                "type": "string",
+                "required": true
+              },
+              "priority": {
+                "type": "integer",
+                "required": true
+              },
+              "rank": {
+                "type": "integer",
+                "required": true
+              },
+              "reason": {
+                "type": "string",
+                "required": true
+              },
+              "score": {
+                "type": "integer",
+                "required": true
+              },
+              "signals": {
+                "type": "array",
+                "required": true,
+                "items": {
+                  "type": "object",
+                  "required": false,
+                  "fields": {
+                    "detail": {
+                      "type": "string",
+                      "required": true
+                    },
+                    "name": {
+                      "type": "string",
+                      "required": true
+                    },
+                    "points": {
+                      "type": "integer",
+                      "required": true
+                    }
+                  }
+                }
+              },
+              "status": {
+                "type": "string",
+                "required": true
+              },
+              "title": {
+                "type": "string",
+                "required": true
+              }
+            }
+          }
+        },
+        "verification": {
+          "type": "object",
+          "required": true,
+          "fields": {
+            "checked": {
+              "type": "integer",
+              "required": true
+            },
+            "failed": {
+              "type": "integer",
+              "required": true
+            },
+            "unchecked": {
+              "type": "integer",
+              "required": true
+            }
+          }
         }
       }
     },

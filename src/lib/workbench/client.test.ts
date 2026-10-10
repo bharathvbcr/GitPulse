@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { enhancement, enhancementKind, enhancementSummary, page, storedRefinement, taskCard, task, taskDraft, taskWrite, scopeParams } from "./client";
+import { enhancement, enhancementKind, enhancementSummary, page, storedRefinement, taskCard, task, taskDraft, taskWrite, scopeParams, taskSuggestions } from "./client";
 
 const full = { id: "t1", revision: 2, updated_at: 1, title: "Preserve task evidence", description: "exact error: E42", acceptance_criteria: ["Round-trip evidence"], kind: "bug", status: "ready", priority: 1, severity: null, owner: null, due_at: null, labels: ["regression"], repository_ids: ["r1", "r2"], primary_repository_id: "r1", home_workspace_id: null, position: 10 };
 describe("workbench boundary", () => {
@@ -58,5 +58,27 @@ describe("workbench boundary", () => {
     expect(taskWrite(full.id, full.revision, taskDraft(task(full)))).not.toHaveProperty("logs");
     expect(() => task({ ...full, logs: 12 })).toThrow("invalid response");
     expect(() => task({ ...full, logs: "a\0b" })).toThrow("invalid response");
+  });
+});
+
+describe("task suggestions", () => {
+  const reply = {
+    ok: true, generated_at: 5, candidates: 2,
+    suggestions: [{ rank: 1, id: "t1", title: "Fix it", status: "ready", priority: 0, score: 110, reason: "urgent priority", signals: [{ name: "priority", points: 100, detail: "urgent priority" }] }],
+    blocked: [{ id: "t2", title: "Held", blocked_by: ["t1"] }],
+    excluded: { in_progress: 1, review: 0, duplicate: 0, blocked: 1, filtered: 0 },
+    board: { scanned: 4, complete: true, unhydrated: 0 }, verification: { checked: 1, unchecked: 0, failed: 0 },
+  };
+  it("reads a well-formed answer whole", () => {
+    expect(taskSuggestions(reply).suggestions[0]).toMatchObject({ id: "t1", rank: 1, priority: 0, reason: "urgent priority" });
+    expect(taskSuggestions(reply).board.complete).toBe(true);
+  });
+  it("refuses a malformed or failed answer instead of showing part of it", () => {
+    const bad: unknown[] = [
+      { ...reply, ok: false }, { ...reply, suggestions: null }, { ...reply, board: { ...reply.board, complete: "yes" } },
+      { ...reply, suggestions: [{ ...reply.suggestions[0], priority: 9 }] }, { ...reply, suggestions: [{ ...reply.suggestions[0], status: "doing" }] },
+      { ...reply, suggestions: Array(21).fill(reply.suggestions[0]) }, { ...reply, excluded: { ...reply.excluded, blocked: -1 } }, null, [],
+    ];
+    for (const value of bad) expect(() => taskSuggestions(value)).toThrow("invalid response");
   });
 });

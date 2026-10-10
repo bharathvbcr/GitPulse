@@ -142,3 +142,13 @@ describe("swimlanes", () => {
     expect(effectiveSwimlane("board", "owner")).toBe("owner");
   });
 });
+
+describe("a saved view's severity filter", () => {
+  it("is kept, and a view saved before it existed shows every severity", () => {
+    expect(sanitizeSnapshot({ facet: { severity: "high" } }).facet.severity).toBe("high");
+    expect(sanitizeSnapshot({ facet: { severity: "" } }).facet.severity).toBe("");
+    expect(sanitizeSnapshot({ facet: { priority: 1 } }).facet.severity).toBe("all");
+    expect(sanitizeSnapshot({ facet: { severity: 7 } }).facet.severity).toBe("all");
+    expect(sanitizeSnapshot({ facet: { severity: "x".repeat(301) } }).facet.severity).toBe("all");
+  });
+});
