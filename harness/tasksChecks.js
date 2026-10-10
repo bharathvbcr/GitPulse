@@ -522,6 +522,23 @@ if (params.has("check")) {
       check("leaving the window ends the drag", !ghost());
       pointer(document.body, "pointerup", at.x, at.y); await settle();
       check("drags that never dropped wrote nothing", writes.length === writesBefore);
+
+      // A backgrounded window runs no animation frames (WKWebView suspends
+      // them while hidden). The click a drop swallows used to be released by
+      // the next frame, so in a hidden window every later card click was
+      // swallowed too and no task would open. Frames are withheld only while
+      // the release is handled, the moment the board arms its guard.
+      await beginDrag();
+      const frame = window.requestAnimationFrame;
+      window.requestAnimationFrame = () => 0;
+      try { pointer(document.body, "pointerup", at.x, at.y); } finally { window.requestAnimationFrame = frame; }
+      await settle(100);
+      card("task-1").click();
+      let opened = false;
+      for (let i = 0; i < 30 && !opened; i++) { opened = Boolean(editor()); if (!opened) await settle(100); }
+      check("a card click after a drop opens the task even when the window runs no frames", opened);
+      if (editor()) await click("Close task details");
+      await wait(() => !editor());
       // A press left over from any of the above would turn the next click into a drag.
       await settle(50);
     }

@@ -33,6 +33,9 @@ describe("TaskBoard", () => {
     expect(source).toContain("onpointerdown");
     expect(source).toContain("onpointerup");
     expect(source).toContain("skipClick");
+    // The guard is lifted by a timer, never by a frame a hidden window does not run.
+    expect(source).toContain("skipClickTimer = setTimeout(() => { skipClick = false; }, 0);");
+    expect(source).not.toMatch(/requestAnimationFrame\(\(\) => \{ skipClick/);
     expect(source).toContain("onCardClick");
     expect(source).toContain("data-task-column");
     expect(source).toContain('draggable="false"');

@@ -177,7 +177,21 @@
    */
   let press = $state<{ card: TaskCard; pointerId: number; x: number; y: number; grab: GrabPoint; target: HTMLElement } | null>(null);
   let drag = $state<{ card: TaskCard; over: TaskStatus | null; insertIndex: number; lane: string; local: number; x: number; y: number } | null>(null);
+  /**
+   * Set while a drop or a context-menu press is still being dispatched, so
+   * the click that same gesture produces does not also open the card. The
+   * browser dispatches that click in the same task as the release; a timer
+   * clears the guard in the next one. Not the next animation frame: a hidden
+   * window runs no frames, so the guard stayed up and every card click after
+   * a drop was swallowed until the window showed again.
+   */
   let skipClick = false;
+  let skipClickTimer: ReturnType<typeof setTimeout> | undefined;
+  function swallowGestureClick() {
+    skipClick = true;
+    clearTimeout(skipClickTimer);
+    skipClickTimer = setTimeout(() => { skipClick = false; }, 0);
+  }
   let showInbox = $state(false);
   let showArchive = $state(false);
   let archiveToken = $state(0);
@@ -650,7 +664,7 @@
     listeners.track(stopClock);
     listeners.track(bindForegroundChanges(document, typeof window === "undefined" ? null : window, onForeground));
     return () => {
-      disposed = true; revision++; unreadRevision++; initializationRevision++; openingRevision++; pendingUpdate?.stop(); clearTimeout(refreshTimer); clearTimeout(undoTimer); listeners.dispose();
+      disposed = true; revision++; unreadRevision++; initializationRevision++; openingRevision++; pendingUpdate?.stop(); clearTimeout(refreshTimer); clearTimeout(undoTimer); clearTimeout(skipClickTimer); listeners.dispose();
       // Leaving the board ends the undo window rather than dropping it: the
       // reader saw these tasks go, so they go.
       if (pendingDelete && !pendingDelete.running) void commitPendingDelete();
@@ -1100,8 +1114,7 @@
     const current = drag;
     cancelDrag();
     if (!current) return;
-    skipClick = true;
-    requestAnimationFrame(() => { skipClick = false; });
+    swallowGestureClick();
     void dropCard(current.card, current.over, current.insertIndex);
   }
   /**
@@ -1156,8 +1169,7 @@
     if (opening) return;
     e.preventDefault();
     e.stopPropagation();
-    skipClick = true;
-    requestAnimationFrame(() => { skipClick = false; });
+    swallowGestureClick();
     openCardMenu(card, status, e.clientX, e.clientY);
   }
   function onColumnContextMenu(e: MouseEvent, status: TaskStatus) {
