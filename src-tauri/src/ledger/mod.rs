@@ -1307,11 +1307,7 @@ fn latest_binding(
     };
     with_conn(repo_path, |conn| {
         let foreign = conn
-            .query_row(
-                FOREIGN_ROW_SQL,
-                params![lo, hi],
-                |row| row.get::<_, i64>(0),
-            )
+            .query_row(FOREIGN_ROW_SQL, params![lo, hi], |row| row.get::<_, i64>(0))
             .optional()
             .map_err(|e| LedgerError::new("query_failed", e.to_string()))?;
         if foreign.is_some() {
