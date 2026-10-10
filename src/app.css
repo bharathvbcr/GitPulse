@@ -1,4 +1,11 @@
-@import "tailwindcss";
+/* Scan only the trees that render with this sheet. Automatic detection read
+   every non-ignored file — docs/, wiki/, go/, plugins/ — and emitted rules for
+   words in prose and Go source (`[router:Logger(middleware)]`, `!hidden` from
+   `if (!hidden)`) that no component uses. harness/ imports this sheet too. */
+@import "tailwindcss" source(none);
+@source "./";
+@source "../index.html";
+@source "../harness";
 
 /* Dark-mode utilities must match both the themed document element and its
    descendants — a descendant-only selector misses the root. */
