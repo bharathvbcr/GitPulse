@@ -539,7 +539,7 @@ fn repository_config(git: &Path, root: &Path) -> Result<RepositoryConfig, Failur
             return Ok(RepositoryConfig {
                 filters: Vec::new(),
                 partial_clone: false,
-            })
+            });
         }
         _ => {
             return Err(refuse(format!(

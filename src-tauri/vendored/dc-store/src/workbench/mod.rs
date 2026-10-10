@@ -5,6 +5,7 @@
 mod attention;
 mod automation;
 mod briefs;
+mod compaction;
 mod decisions;
 mod enhancements;
 mod input;
@@ -167,6 +168,7 @@ impl Store {
                 | "decisions.decide"
                 | "decisions.claim"
                 | "decisions.resolve"
+                | "store.compact"
         );
         if !writing
             && !matches!(
@@ -210,7 +212,11 @@ impl Store {
         let tx = Transaction::new_unchecked(&self.conn, behavior)?;
         let result = if writing {
             let now_ms = self.workbench_now_millis()?;
-            mutate(&input, method, now_ms / 1000, now_ms)?
+            if method == "store.compact" {
+                compaction::compact(&input, now_ms / 1000)?
+            } else {
+                mutate(&input, method, now_ms / 1000, now_ms)?
+            }
         } else {
             let now = if matches!(
                 method,

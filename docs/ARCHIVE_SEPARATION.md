@@ -14,7 +14,7 @@ pins each claim below to the vendored source.
 
 `dc-store` is vendored from DevCouncil
 ([`src-tauri/vendored/VENDOR.json`](../src-tauri/vendored/VENDOR.json), crate
-`dc-store` at commit `acb5e3b`). The schema 11 change was made upstream on DevCouncil's
+`dc-store` at commit `c0bc26d`). The schema 11 change was made upstream on DevCouncil's
 `feat/workbench-schema-11` branch, corrected on `fix/workbench-schema-11-audit`
 (below), and re-vendored with
 `node scripts/vendor-crates.mjs --crate=dc-store`, never edited here.

@@ -78,6 +78,7 @@
       "work.scan.cancel",
       "work.scan.gaps",
       "work.scan.get",
+      "work.store.compact",
       "work.verify.get",
       "work.verify.task",
       "work.workspaces.delete",
