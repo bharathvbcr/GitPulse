@@ -3,6 +3,7 @@
   import { densityStore } from "../../stores/densityStore";
   import { rowHeight } from "../../ui/density";
   import { repoStore, type FileStatus } from "../../stores/repoStore";
+  import { graphStore } from "../../stores/graphStore";
   import { invoke } from "../../ipc/invoke";
   import {
     ChevronDown,
@@ -200,11 +201,22 @@
   // does, and the reload below runs only then. HEAD stands in for "the
   // tracked tree changed underneath a clean status" (a checkout or pull),
   // which the poll-driven reload used to catch by accident.
+  //
+  // On a branch, HEAD is that branch's tip. A detached HEAD belongs to no
+  // branch, so the tip is empty and a checkout from one commit to another
+  // would change nothing here; the graph store's `headId` (the backend's
+  // `rev-parse HEAD`, re-read by every refresh, no polling of its own) is the
+  // HEAD for the repository it is showing. It is consulted only then, so an
+  // attached HEAD keys exactly as before and a commit reloads once, not twice.
   const currentRepo = $derived($repoStore.currentPath);
   const statusMembership = $derived(statusPathKey($repoStore.statuses));
-  const headTip = $derived(
+  const branchTip = $derived(
     $repoStore.branches.find((b) => b.is_current && !b.is_remote)?.tip_commit_id ?? "",
   );
+  const graphHead = $derived(
+    currentRepo && $graphStore.visiblePath === currentRepo ? ($graphStore.headId ?? "") : "",
+  );
+  const headTip = $derived(branchTip || graphHead);
 
   let lastRepo = "";
   let lastListKey = "";

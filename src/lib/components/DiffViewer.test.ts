@@ -376,6 +376,31 @@ describe("DiffViewer store-emission memo guards", () => {
     expect(source).toContain("$effect(() => () => hunkSymbolsGuard?.cancel());");
   });
 
+  it("refreshes impact and hunk labels when HEAD moves or the index republishes, without polling", () => {
+    // Keyed on primitives, these no longer re-ran every poll, so labels from
+    // a stale index stuck until the selection changed.
+    expect(source).toContain('import { liveIndex } from "../codeintel/liveIndex";');
+    expect(source).toContain("const headTip = $derived(branchHeadTip || graphHeadId);");
+    expect(source).toContain("$graphStore.visiblePath === currentRepoPath ? ($graphStore.headId ?? \"\") : \"\"");
+    expect(source).toContain("($indexSnapshots[currentRepoPath]?.revision ?? 0)");
+    const impact = effectContaining("getImpactAtRung(repoPath, filePath");
+    expect(impact).toContain("void headTip;");
+    expect(impact).toContain("void indexRevision;");
+    const symbols = effectContaining('invoke<string>("cmd_get_head_id"');
+    expect(symbols).toContain('const head = commitId ? "" : headTip;');
+    expect(symbols).toContain("const index = indexRevision;");
+    expect(symbols).toMatch(/\[repo, section\.path, commitId \?\? "", head, String\(index\)/);
+    // The memo still precedes the cancel, so a hit leaves the lookup running.
+    expect(symbols.indexOf("if (key === hunkSymbolsKey) return;")).toBeLessThan(symbols.indexOf("hunkSymbolsGuard?.cancel();"));
+  });
+
+  it("opens the rail for a new working-tree read without re-running on every repoStore publish", () => {
+    const rail = effectContaining("railOpen = true");
+    expect(rail).not.toContain("$repoStore");
+    expect(rail).toContain("if (pending && !currentCommitId) railOpen = true;");
+    expect(source).toContain("const pending = $derived($repoStore.selectedDiffPending);");
+  });
+
   it("loads change-set blast via getImpactLayeredMany and shows omitted counts", () => {
     expect(source).toContain("getImpactLayeredMany");
     expect(source).toContain("composeLayeredImpacts");

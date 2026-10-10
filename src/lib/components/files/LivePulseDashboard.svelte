@@ -4,6 +4,7 @@
   import { onMount } from "svelte";
   import { createVisibleInterval } from "../../dom/visibleInterval";
   import { repoStore } from "../../stores/repoStore";
+  import { graphStore } from "../../stores/graphStore";
   import { invoke } from "../../ipc/invoke";
   import {
     Activity,
@@ -194,11 +195,18 @@
   // per-publish reload used to pick that up by accident. No teardown cancels
   // the load, so a memo hit leaves it in flight: `loadFileDetails` cancels its
   // own predecessor, and unmount is handled in `onMount`.
+  //
+  // A detached HEAD has no current branch, so its tip is empty; the graph
+  // store's `headId` (`rev-parse HEAD`, re-read by every refresh) stands in
+  // for the repository it is showing, so a checkout between commits still
+  // reloads. On a branch the branch tip is used, exactly as before.
   let lastDetailsKey = "";
   $effect(() => {
     const repo = $repoStore.currentPath;
-    const head =
+    const branchTip =
       $repoStore.branches.find((b) => b.is_current && !b.is_remote)?.tip_commit_id ?? "";
+    const graph = $graphStore;
+    const head = branchTip || (repo && graph.visiblePath === repo ? (graph.headId ?? "") : "");
     const key = `${repo ?? ""}\0${selectedFile ?? ""}\0${head}`;
     if (key === lastDetailsKey) return;
     lastDetailsKey = key;

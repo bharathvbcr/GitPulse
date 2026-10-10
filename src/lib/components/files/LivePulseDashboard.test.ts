@@ -94,4 +94,19 @@ describe("LivePulseDashboard", () => {
     // No teardown: it would run before a memo-hit re-run and kill the load.
     expect(selectionEffect).not.toMatch(/return \(\) =>/);
   });
+
+  it("reloads file details on a checkout between commits with a detached HEAD", () => {
+    // No current branch means an empty branch tip; the graph store's HEAD
+    // (for the repository it shows) is the fallback. No new IPC is polled.
+    const selectionEffect = source.slice(
+      source.lastIndexOf("$effect(() =>"),
+      source.indexOf("</script>"),
+    );
+    expect(source).toContain('import { graphStore } from "../../stores/graphStore";');
+    expect(selectionEffect).toContain("const graph = $graphStore;");
+    expect(selectionEffect).toContain(
+      'const head = branchTip || (repo && graph.visiblePath === repo ? (graph.headId ?? "") : "");',
+    );
+    expect(source).not.toContain("cmd_get_head_id");
+  });
 });

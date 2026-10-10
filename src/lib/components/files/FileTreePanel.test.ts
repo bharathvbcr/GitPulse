@@ -332,6 +332,19 @@ describe("FileTreePanel rename and delete", () => {
     expect(source).toContain("return () => inflight?.cancel();");
   });
 
+  it("keys the listing on the real HEAD when it is detached, without new polling", () => {
+    // A detached HEAD has no current branch, so a checkout between commits
+    // left the branch-tip key unchanged and the listing stale.
+    expect(source).toContain('import { graphStore } from "../../stores/graphStore";');
+    expect(source).toContain("$graphStore.visiblePath === currentRepo ? ($graphStore.headId ?? \"\") : \"\"");
+    // The branch tip still wins on a branch, so an attached HEAD keys as before.
+    expect(source).toContain("const headTip = $derived(branchTip || graphHead);");
+    const effect = source.slice(source.indexOf("let lastListKey"), source.indexOf("let listedPaths"));
+    expect(effect).toContain("const head = headTip;");
+    expect(effect).not.toContain("$graphStore");
+    expect(source).not.toContain("cmd_get_head_id");
+  });
+
   it("holds the listing as raw state and builds the tree apart from folding", () => {
     expect(source).toContain("let files = $state.raw<string[]>([]);");
     expect(source).toContain("let tree = $derived(buildFileTree(filteredPaths));");
