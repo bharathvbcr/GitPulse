@@ -50,12 +50,13 @@ export function appBuild() {
  * commit a release was built from before it was retagged, and that build may
  * have shipped. Null is not an empty set — a caller that cannot tell a release
  * commit from any other must keep every clean snapshot.
+ * @param {string} [cwd] repository to read; this checkout by default
  * @returns {Set<string> | null}
  */
-export function releaseRevisions() {
+export function releaseRevisions(cwd = REPO_ROOT) {
   try {
     const out = execFileSync("git", ["for-each-ref", "--format=%(objectname) %(*objectname)", "refs/tags/"], {
-      cwd: REPO_ROOT, encoding: "utf8", timeout: 2_000, stdio: ["ignore", "pipe", "ignore"],
+      cwd, encoding: "utf8", timeout: 2_000, stdio: ["ignore", "pipe", "ignore"],
     });
     return new Set(out.split(/\s+/).filter((oid) => /^[0-9a-f]{40,64}$/.test(oid)));
   } catch {
