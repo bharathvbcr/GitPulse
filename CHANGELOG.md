@@ -183,6 +183,55 @@ before that tag is pushed.
   function floor has a margin of over one point instead of 0.05. The coverage
   workflow now reports Rust branch coverage (nightly `--branch`); it is reported,
   not gated, until a floor has been measured.
+- **The task-scope fence's open edges are decided and documented.** `rm`,
+  `truncate`, `touch`, `dd of=`, `perl -i`, `install`, `ln`, `rsync`, `patch`,
+  `git apply` and `xargs` / `find -exec` writes are not read by the harness
+  and are allowed against a plan that excludes the file; fencing them belongs
+  to the harness, not a second parser here. The hook now has a test that every
+  one reaches the harness verbatim with the bound scope, and the real-harness
+  fence test pins the gap so it fails when it closes. Escaped descendants and
+  second-profile agents are documented as outside what a hook can judge. No
+  behaviour changed.
+- **`gitpulse-hook` correctness.** The hook now takes down any `git` or harness
+  child a check abandoned at its deadline before it exits (a stalled `git
+  status` used to outlive it and could hold `.git/index.lock`); one 8 s
+  deadline starts when the process does and every wait is cut to what is left,
+  so a late stdin no longer adds up to the host's 10 s timeout and drops the
+  decision; the collision verdict is computed for the file being edited rather
+  than the first overlapping file; a file touched in another worktree on
+  different symbols (or with a stale index) informs the agent through
+  additional context instead of asking, which a launched agent turned into a
+  refused edit; a Cursor deny or ask is shown as a warning instead of looking
+  like a clean pass; and the `MultiEdit` tool the guard judges is now in the
+  plugin's matcher, with a test that keeps the two lists equal. Security
+  impact: the guard now also covers `MultiEdit` and no longer leaves orphans;
+  the disjoint-symbol case stops asking, which narrows nothing that was
+  blocking a real conflict (shared-symbol and file-level overlaps still ask).
+- **A released app's safety hooks and MCP server now resolve, and a hook that
+  cannot launch no longer fails open.** The plugin's manifests name bare
+  `gitpulse-hook` / `gitpulse-mcp`, which only a developer's `mcp:install`
+  puts on PATH, and a host runs the tool call anyway when a hook cannot start.
+  Settings now resolves both binaries beside the app, says `not reachable`
+  when `gitpulse-hook` is missing and when either is not on PATH, and copies
+  `.mcp.json` and a new `hooks.json` built from the resolved absolute paths.
+  In the copied hooks the collision guard and command gate refuse the call
+  (exit status 2, reason on stderr) when the binary is missing, and session
+  start tells the agent the hooks are off. Security impact: this narrows what
+  proceeds without a gate (a missing gate now blocks instead of passing); it
+  grants nothing. The plugin's own static `hooks/hooks.json` keeps its
+  portable bare names.
+- **Repository hooks need your approval.** `.gitpulse/hooks.json` and
+  `hooks.toml` come from the working tree, so a pulled branch or a compromised
+  agent could write shell commands that GitPulse then ran on every agent
+  launch, worktree add and merge. They now run only after you approve the
+  exact file text (the Worktrees panel shows it); any edit asks again. Each
+  command goes through the command gate and the ledger before it runs, "Run
+  repository hooks" is its own option and off by default (split from "Share
+  build caches"), a file that does not parse is an error instead of falling
+  back to the other format, and TOML commands containing commas are no longer
+  cut apart. Unapproved hooks are skipped with a notice, never run. Security
+  impact: this narrows what repository content can execute; nothing widens.
+
 - CI now fails when a vendored crate is edited in this repository, through the
   new `bun run check:vendor-edits` (`vendor-crates.mjs --check --allow-drift`),
   which `ci:local` runs too. Upstream drift is still printed but never fails a

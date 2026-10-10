@@ -17,6 +17,33 @@
 //! GITPULSE_MANVI_BIN=/path/to/manvi cargo test --test hook_scope_fence -- --ignored
 //! ```
 //!
+//! # What the fence does not cover
+//!
+//! The harness reads a command line's redirections and the files `sed -i`,
+//! `tee`, `cp` and `mv` write through their arguments. It does **not** read the
+//! other argument-writing programs, and the last section of the test pins that
+//! with the real binary: `rm`, `truncate`, `touch`, `dd of=`, `perl -i`,
+//! `install`, `ln`, `rsync`, `patch`, `git apply`, and anything run through
+//! `xargs` or `find -exec` come back allowed against a plan that excludes the
+//! file. Reading them is write-target extraction, which belongs to the harness
+//! (DevCouncil `policy`), so it is not reimplemented here in a second, drifting
+//! parser; the hook forwards every one of them verbatim with the bound scope
+//! (`every_argument_writer_reaches_the_harness_verbatim_with_the_scope` in
+//! `src/hooks/mod.rs`, which CI runs), so fencing one more writer is a harness
+//! change with no change in this repository. When one starts to be refused, the
+//! assertion below fails and moves that program into the refused list above it.
+//!
+//! The same decision applies to the two other open edges: a descendant that
+//! escapes the agent's process group acts outside any hook (the hook judges
+//! calls, not processes; teardown reaping owns processes), and an agent running
+//! under a second Claude profile has no hook registered at all, which no hook
+//! can fence (Settings -> MCP now copies a `hooks.json` for that profile).
+//! `wiki/MCP and Agents.md` states all three.
+//!
+//! CI does not run this file: it needs a Manvi built from DevCouncil
+//! `fix/argument-write-targets`, and no such build exists at a ref CI can fetch.
+//! Run it by hand when the harness changes.
+//!
 //! Its `HOME` is scoped to the test through `bind_env`: trust records live under
 //! it, and a fixture must not write the developer's own.
 
@@ -162,6 +189,29 @@ fn a_task_bound_session_cannot_write_outside_its_plan_through_any_tool() {
         denied(&answer),
         "an Edit outside the plan was not refused: {answer:?}"
     );
+
+    // The argument writers the harness does not read are allowed today. This
+    // pins that gap with the real binary, so it cannot close unnoticed.
+    for command in [
+        "rm docs/other.md",
+        "truncate -s 0 docs/other.md",
+        "touch docs/other.md",
+        "dd if=seed.txt of=docs/other.md",
+        "perl -pi -e 's/a/b/' docs/other.md",
+        "install seed.txt docs/other.md",
+        "ln -sf seed.txt docs/other.md",
+        "rsync seed.txt docs/other.md",
+        "patch docs/other.md < x.diff",
+        "git apply x.diff",
+        "echo docs/other.md | xargs rm",
+        "find docs -name other.md -exec rm {} +",
+    ] {
+        let answer = ask("command-gate", &bash(command), home.path(), logs.path());
+        assert!(
+            !denied(&answer),
+            "{command} is now refused: the harness learned a writer. Move it to the refused list above and update wiki/MCP and Agents.md: {answer:?}"
+        );
+    }
 
     // Inside the plan, nothing is refused.
     for command in [

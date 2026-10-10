@@ -20,7 +20,8 @@ pub mod worktree_hooks;
 pub use cow_clone::{reflink_copy_dir, reflink_ignored_caches, ReflinkResult};
 pub use portless::{detect_worktree_routes, hash_port, read_portless_routes, WorktreeRouteInfo};
 pub use worktree_hooks::{
-    execute_worktree_hooks, load_worktree_hooks, HookExecutionResult, WorktreeHooksConfig,
+    approve_worktree_hooks, preview_worktree_hooks, run_repo_hooks, HookExecutionResult,
+    HookOutcome, WorktreeHooksConfig, WorktreeHooksPreview,
 };
 
 pub use deadbranch::{

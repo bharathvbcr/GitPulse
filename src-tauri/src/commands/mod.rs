@@ -2439,6 +2439,7 @@ pub async fn cmd_add_worktree(
     start_point: Option<String>,
     detach: bool,
     cow_caches: Option<bool>,
+    run_hooks: Option<bool>,
 ) -> Result<Guarded<crate::engine::worktree::WorktreeCreated>, String> {
     off_thread(move || {
         // GitPulse's task-worktree container has one creator, the task
@@ -2460,11 +2461,39 @@ pub async fn cmd_add_worktree(
             start_point.as_deref(),
             detach,
             cow,
+            // Off unless asked for; and even then only hooks a person
+            // approved for this exact file run.
+            run_hooks.unwrap_or(false),
         )?;
         Ok(Guarded {
             policy,
             output: created,
         })
+    })
+    .await
+}
+
+/// The repository's `.gitpulse/hooks` file as the approval dialog shows it:
+/// its exact text, what it would run, and whether that exact text is approved.
+/// `None` when the repository has no such file. Reads only.
+#[tauri::command(async)]
+pub async fn cmd_preview_worktree_hooks(
+    repo_path: String,
+) -> Result<Option<crate::engine::worktree_hooks::WorktreeHooksPreview>, String> {
+    off_thread(move || {
+        let repo = crate::engine::git_cli::validate_repo(&repo_path)?;
+        crate::engine::preview_worktree_hooks(&repo)
+    })
+    .await
+}
+
+/// Records consent to run the hooks file whose text is `content` — the text
+/// the person was shown. Refused if the file on disk is no longer exactly that.
+#[tauri::command(async)]
+pub async fn cmd_approve_worktree_hooks(repo_path: String, content: String) -> Result<(), String> {
+    off_thread(move || {
+        let repo = crate::engine::git_cli::validate_repo(&repo_path)?;
+        crate::engine::approve_worktree_hooks(&repo, &content)
     })
     .await
 }

@@ -294,6 +294,18 @@ describe("SettingsModal MCP / Agent Plugins", () => {
     expect(source).toContain("mcp.json");
     expect(source).toContain("gitpulse_insights");
   });
+
+  it("copies the resolved absolute-path manifests and reports an unreachable hook binary", () => {
+    // The shipped manifests name bare `gitpulse-mcp` / `gitpulse-hook`, which a
+    // released app never puts on PATH; what Settings copies is built from the
+    // path it resolved, and nothing is offered when the hook binary is missing.
+    expect(source).toContain('copyMcp("mcp", mcpInfo?.mcp_config_json ?? "")');
+    expect(source).toContain('copyMcp("hooks", mcpInfo?.hooks_config_json ?? "")');
+    expect(source).toContain("disabled={!mcpInfo.hooks_config_json}");
+    expect(source).not.toContain("plugin_mcp_json");
+    expect(source).toContain("not reachable.");
+    expect(source).toContain("hook_on_path");
+  });
 });
 
 describe("SettingsModal restore defaults", () => {

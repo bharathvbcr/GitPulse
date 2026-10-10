@@ -298,8 +298,9 @@ describe("annotated but unregistered commands", () => {
     // cmd_git_identity, cmd_set_git_identity) arrived, and 265 since the
     // attempt-review commands (cmd_attempt_review, cmd_attempt_review_record,
     // cmd_review_gate_save) joined them, 266 with cmd_exit_request_answer,
-    // 267 with cmd_terminal_detach, and 269 with cmd_degraded_subsystems and
-    // cmd_daemon_status;
+    // 267 with cmd_terminal_detach, 269 with cmd_degraded_subsystems and
+    // cmd_daemon_status, and 271 with the worktree-hook approval commands
+    // (cmd_preview_worktree_hooks, cmd_approve_worktree_hooks);
     // `bun run check:ipc`
     // prints all three numbers, so a bump made without re-running it will not
     // agree.

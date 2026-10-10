@@ -546,6 +546,31 @@ describe("hook budgets sit inside the host's timeouts", () => {
     }
   });
 
+  it("ends the whole process, not just each wait, a stated margin before the host's timeout", () => {
+    // Each wait is cut to what is left of TOTAL_BUDGET from process start, so
+    // stdin + scope check + scan cannot add up to the host's timeout. The margin
+    // is what printing the answer and reaping a child need after the work ends.
+    const seconds = (name: string): number => {
+      const declared = new RegExp(
+        `pub const ${name}: Duration = Duration::from_secs\\((\\d+)\\)`,
+      ).exec(hookSource);
+      expect(declared, `${name} is no longer a whole number of seconds; update this contract`).toBeTruthy();
+      return Number(declared![1]);
+    };
+    const total = seconds("TOTAL_BUDGET");
+    const margin = seconds("HOST_TIMEOUT_MARGIN");
+    expect(total).toBeGreaterThanOrEqual(hookBudgetSeconds());
+    // Reports (`notify`) wait their own short budget; the deciding hooks are
+    // the ones that can reach the whole deadline.
+    for (const { event, command, timeout } of declaredTimeouts()) {
+      if (command.split(/\s+/)[1] === "notify") continue;
+      expect(
+        timeout,
+        `${event} "${command}" times out at ${timeout}s; the hook's own deadline is ${total}s plus a ${margin}s margin`,
+      ).toBeGreaterThanOrEqual(total + margin);
+    }
+  });
+
   it("reads a different budget for a subcommand that declares one", () => {
     // Guards the derivation itself: if the regex stopped matching, every
     // subcommand would silently fall back to BUDGET and this contract would

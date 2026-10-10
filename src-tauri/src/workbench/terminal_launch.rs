@@ -1639,11 +1639,11 @@ mod tests {
     /// Commits a `post_create` hook, so a provisioned worktree runs it.
     fn post_create(root: &Path, command: &str) {
         std::fs::create_dir_all(root.join(".gitpulse")).unwrap();
-        std::fs::write(
-            root.join(".gitpulse/hooks.json"),
-            json!({"worktree":{"post_create":[command]}}).to_string(),
-        )
-        .unwrap();
+        let hooks = json!({"worktree":{"post_create":[command]}}).to_string();
+        std::fs::write(root.join(".gitpulse/hooks.json"), &hooks).unwrap();
+        // Hooks run only once approved; these tests are about what a hook
+        // that runs does, so the file is approved as written.
+        crate::engine::approve_worktree_hooks(root, &hooks).unwrap();
         git_text(root, &["add", ".gitpulse/hooks.json"]).unwrap();
         commit(root);
     }

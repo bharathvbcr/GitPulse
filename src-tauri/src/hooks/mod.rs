@@ -53,6 +53,39 @@ use crate::insights::{self, CollisionRisk, InsightsSnapshot};
 /// instead lets us give up *loudly*.
 pub const BUDGET: Duration = Duration::from_secs(5);
 
+/// Wall-clock ceiling for the whole process, from the moment `main` starts.
+///
+/// [`BUDGET`] bounds one wait, but a hook makes several in a row (stdin, then
+/// the scope check, then the collision scan), so their sum reached the host's
+/// 10 s timeout and the decision was dropped with the notice that explains it.
+/// Every wait is clamped to what is left of this, so the work ends at least
+/// [`HOST_TIMEOUT_MARGIN`] before the host would kill it, leaving room to print
+/// and to take down a child. `scripts/plugin-contract.test.ts` keeps this and
+/// the margin inside every deciding hook's `timeout`.
+pub const TOTAL_BUDGET: Duration = Duration::from_secs(8);
+
+/// What the host's `timeout` must exceed [`TOTAL_BUDGET`] by: printing the
+/// answer (up to a second) and reaping children (up to
+/// [`crate::procguard::CHILD_GRACE`]).
+pub const HOST_TIMEOUT_MARGIN: Duration = Duration::from_secs(2);
+
+static STARTED: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+
+/// Starts the one deadline. Called first thing in `main`; later calls keep the
+/// first instant. A process that never calls it (the unit tests, the library
+/// embedded elsewhere) is bounded by [`BUDGET`] per wait only.
+pub fn start_deadline() {
+    let _ = STARTED.set(std::time::Instant::now());
+}
+
+/// `budget`, cut to what is left of [`TOTAL_BUDGET`] since `started`.
+fn clamp_to_total(budget: Duration, started: Option<std::time::Instant>) -> Duration {
+    match started {
+        Some(started) => budget.min(TOTAL_BUDGET.saturating_sub(started.elapsed())),
+        None => budget,
+    }
+}
+
 pub const MAX_INPUT_BYTES: usize = 4 * 1024 * 1024;
 
 /// Read one complete JSON document, including pretty-printed input. This is
@@ -407,8 +440,24 @@ impl HookOutput {
 
     fn render_cursor(&self) -> Option<String> {
         if let Some(specific) = &self.hook_specific_output {
-            if specific.permission_decision.is_some() {
-                return None;
+            if let Some(decision) = specific.permission_decision {
+                // Claude's nested `permissionDecision` is a schema mismatch that
+                // blocks a Cursor tool, so it is not sent. Printing nothing
+                // instead made a deny look like a clean pass, so the decision
+                // goes out as a visible warning that says what it was.
+                let verb = match decision {
+                    PermissionDecision::Deny => "GitPulse would block this call",
+                    PermissionDecision::Ask => "GitPulse asks you to confirm this call",
+                };
+                let reason = specific
+                    .permission_decision_reason
+                    .as_deref()
+                    .unwrap_or_default();
+                let message = match &self.system_message {
+                    Some(note) => format!("{verb}: {reason}\n{note}"),
+                    None => format!("{verb}: {reason}"),
+                };
+                return Some(json!({ "systemMessage": message }).to_string());
             }
             if let Some(ctx) = &specific.additional_context {
                 return Some(json!({ "additional_context": ctx }).to_string());
@@ -524,6 +573,27 @@ pub fn collision_decision(facts: &CollisionFacts) -> HookOutput {
     reason.push_str(&entity_collision_tail(facts));
     if !facts.partial.is_empty() {
         reason.push_str(&format!("\n(Scan was incomplete: {}.)", facts.partial));
+    }
+
+    // Same file, but the symbols do not overlap (or the index could not say):
+    // an Ask would turn an edit that cannot conflict into a refusal, because a
+    // headless agent's Ask is a deny. The agent is told instead.
+    if facts.entity.as_ref().is_some_and(|e| {
+        e.kind == crate::insights::EntityCollisionKind::DisjointSymbols || e.index_stale()
+    }) {
+        let summary = format!(
+            "GitPulse: {} is also changed in another worktree, but this edit is not known to conflict.",
+            or_unknown(&facts.target)
+        );
+        return HookOutput {
+            hook_specific_output: Some(HookSpecificOutput {
+                hook_event_name: PRE_TOOL_USE.to_string(),
+                permission_decision: None,
+                permission_decision_reason: None,
+                additional_context: Some(reason),
+            }),
+            system_message: Some(summary),
+        };
     }
 
     HookOutput {
@@ -746,7 +816,10 @@ fn collision_guard_with(
     };
 
     let remaining = BUDGET.saturating_sub(started.elapsed());
-    let scanned = within_budget(remaining, move || insights::collision_risk(&root_arg));
+    let scanned = within_budget(remaining, {
+        let target = target.clone();
+        move || insights::collision_risk_for_path(&root_arg, &target)
+    });
     let Some(risk) = scanned else {
         return merge_outputs(
             scoped,
@@ -781,10 +854,16 @@ fn collision_guard_with(
 fn write_op(tool_name: &str, file: &Path) -> &'static str {
     match tool_name {
         "Write" if !file.exists() => "create",
-        "Write" | "Edit" | "MultiEdit" | "NotebookEdit" => "modify",
+        t if FILE_WRITE_TOOLS.contains(&t) => "modify",
         _ => "write",
     }
 }
+
+/// The tools collision-guard judges. `plugins/gitpulse/hooks/hooks.json`
+/// matches exactly these on `PreToolUse`; a tool in one list and not the other
+/// is either a write nobody checks or a check nobody asks for, so a contract
+/// test keeps the two equal.
+pub const FILE_WRITE_TOOLS: [&str; 4] = ["Edit", "MultiEdit", "NotebookEdit", "Write"];
 
 /// The scope half of collision-guard, over a verdict the harness returned.
 ///
@@ -1629,6 +1708,7 @@ fn within_budget<T: Send + 'static>(
     budget: Duration,
     work: impl FnOnce() -> T + Send + 'static,
 ) -> Option<T> {
+    let budget = clamp_to_total(budget, STARTED.get().copied());
     let (tx, rx) = mpsc::channel();
     // A send onto a dropped receiver is an error, not a panic, so the worker
     // outliving our patience cannot take the process down with it.
@@ -2280,20 +2360,22 @@ mod tests {
                 shared_symbols: Vec::new(),
             }),
         });
-        let reason = output
-            .hook_specific_output
-            .as_ref()
-            .and_then(|s| s.permission_decision_reason.as_deref())
-            .unwrap_or_default();
+        let specific = output.hook_specific_output.as_ref().expect("a notice");
+        // An Ask is a deny to a headless agent, which would refuse an edit
+        // that cannot conflict: the agent is told, and nothing is decided.
+        assert_eq!(specific.permission_decision, None);
+        assert!(output.system_message.is_some());
+        let reason = specific.additional_context.as_deref().unwrap_or_default();
         assert!(
             !reason.contains("will conflict when these branches meet"),
             "disjoint must not use collision wording: {reason}"
         );
         assert!(reason.contains("not a merge promise"), "{reason}");
+        assert!(!output.render().unwrap().contains("permissionDecision"));
     }
 
     #[test]
-    fn head_sha_mismatch_entity_keeps_file_level_collision_wording() {
+    fn head_sha_mismatch_entity_keeps_file_level_wording_as_a_notice() {
         let output = collision_decision(&CollisionFacts {
             ok: true,
             error: String::new(),
@@ -2312,11 +2394,12 @@ mod tests {
                 shared_symbols: Vec::new(),
             }),
         });
-        let reason = output
-            .hook_specific_output
-            .as_ref()
-            .and_then(|s| s.permission_decision_reason.as_deref())
-            .unwrap_or_default();
+        let specific = output.hook_specific_output.as_ref().expect("a notice");
+        assert_eq!(
+            specific.permission_decision, None,
+            "a stale index says nothing about the symbols, so it informs and does not Ask"
+        );
+        let reason = specific.additional_context.as_deref().unwrap_or_default();
         assert!(
             reason.contains("will conflict when these branches meet"),
             "{reason}"
@@ -2946,6 +3029,52 @@ done
         assert!(rendered.contains("scope.unplanned"), "{rendered}");
     }
 
+    /// Which commands count as writing a file is the harness's call, not the
+    /// hook's: the hook must not pre-filter by program name and must not alter
+    /// what it sends. Every argument-writing program the fence is asked about
+    /// reaches the harness verbatim, with the bound task's scope, so a
+    /// harness that learns to read one more writer fences it with no change
+    /// here. (The writers the shipped harness does not yet read are listed in
+    /// `tests/hook_scope_fence.rs` and the wiki.)
+    #[cfg(unix)]
+    #[test]
+    fn every_argument_writer_reaches_the_harness_verbatim_with_the_scope() {
+        let writers = [
+            "rm docs/elsewhere.md",
+            "truncate -s 0 docs/elsewhere.md",
+            "touch docs/elsewhere.md",
+            "dd if=seed.txt of=docs/elsewhere.md",
+            "perl -pi -e 's/a/b/' docs/elsewhere.md",
+            "install seed.txt docs/elsewhere.md",
+            "ln -sf seed.txt docs/elsewhere.md",
+            "rsync seed.txt docs/elsewhere.md",
+            "patch docs/elsewhere.md < x.diff",
+            "git apply x.diff",
+            "echo docs/elsewhere.md | xargs rm",
+            "find docs -name elsewhere.md -exec rm {} +",
+        ];
+        let (dir, repo, requests) = scoped_hook_fixture(true);
+        let serial = crate::harness::sidecar::test_serial();
+        let _binary = install_scoped_manvi(dir.path(), &requests, &serial);
+
+        for writer in writers {
+            let _ = std::fs::remove_file(&requests);
+            let _ = gate_here(&bash_call(&repo, writer));
+            let sent = std::fs::read_to_string(&requests).unwrap_or_default();
+            let request: Value = serde_json::from_str(
+                sent.lines()
+                    .next()
+                    .unwrap_or_else(|| panic!("`{writer}` was never put to the harness")),
+            )
+            .expect("the request is JSON");
+            assert_eq!(request["params"]["command"], writer, "altered in flight");
+            assert_eq!(
+                request["params"]["scope"]["task_id"], "TASK-HOOK",
+                "`{writer}` was judged without the bound scope: {request}"
+            );
+        }
+    }
+
     /// An unbound checkout declares nothing, and the same command keeps the
     /// answer it always had.
     #[cfg(unix)]
@@ -3453,26 +3582,43 @@ done
     }
 
     /// Cursor preToolUse is a permission hook. Claude's nested
-    /// `permissionDecision` is a schema mismatch that blocks the tool.
+    /// `permissionDecision` is a schema mismatch that blocks the tool, so it is
+    /// not sent; but printing nothing made a deny or ask look like a clean
+    /// pass, so it goes out as a visible `systemMessage` naming the decision.
     #[test]
-    fn a_cursor_permission_decision_renders_nothing() {
-        let output = HookOutput {
-            hook_specific_output: Some(decision(
-                PRE_TOOL_USE,
-                PermissionDecision::Deny,
-                "other worktree holds this file".to_string(),
-            )),
-            system_message: None,
-        };
-        assert_eq!(
-            output.render_for_host(true),
-            None,
-            "Cursor must fail open rather than block on a Claude permission document"
-        );
-        assert!(
-            output.render_for_host(false).is_some(),
-            "Claude must still receive deny/ask"
-        );
+    fn a_cursor_permission_decision_renders_as_a_visible_system_message() {
+        for (decision_kind, verb) in [
+            (PermissionDecision::Deny, "would block"),
+            (PermissionDecision::Ask, "asks you to confirm"),
+        ] {
+            let output = HookOutput {
+                hook_specific_output: Some(decision(
+                    PRE_TOOL_USE,
+                    decision_kind,
+                    "other worktree holds this file".to_string(),
+                )),
+                system_message: None,
+            };
+            let rendered = output.render_for_host(true).expect("Cursor must be told");
+            let value: Value = serde_json::from_str(&rendered).expect("JSON");
+            let message = value["systemMessage"].as_str().expect("a system message");
+            assert!(message.contains(verb), "{message}");
+            assert!(
+                message.contains("other worktree holds this file"),
+                "{message}"
+            );
+            assert!(
+                !rendered.contains("permissionDecision"),
+                "Cursor must not get Claude's nested permission document: {rendered}"
+            );
+            assert!(
+                output
+                    .render_for_host(false)
+                    .expect("Claude")
+                    .contains("permissionDecision"),
+                "Claude must still receive deny/ask"
+            );
+        }
     }
 
     /// Notices (`systemMessage`) already parse on Cursor sessionStart. Keep
@@ -4029,6 +4175,67 @@ done
         let cut = truncate_marked(text, 40);
         assert!(cut.len() <= 40);
         assert!(cut.ends_with("… truncated"));
+    }
+
+    /// The waits of one hook add up: stdin, then the scope check, then the
+    /// scan. Each is cut to what is left of the one deadline, so a late start
+    /// leaves a short wait and an exhausted deadline leaves none.
+    #[test]
+    fn every_wait_is_cut_to_what_is_left_of_the_one_deadline() {
+        let now = std::time::Instant::now();
+        assert_eq!(clamp_to_total(BUDGET, None), BUDGET, "no deadline started");
+        assert_eq!(clamp_to_total(BUDGET, Some(now)), BUDGET);
+        let late = clamp_to_total(BUDGET, Some(now - Duration::from_secs(6)));
+        assert!(late <= TOTAL_BUDGET - Duration::from_secs(6), "{late:?}");
+        assert_eq!(
+            clamp_to_total(BUDGET, Some(now - TOTAL_BUDGET - Duration::from_secs(1))),
+            Duration::ZERO
+        );
+        // Two full BUDGET waits used to be allowed back to back (10 s) against
+        // a host timeout of 10 s.
+        assert!(
+            BUDGET * 2 > TOTAL_BUDGET,
+            "the clamp is what bounds the sum"
+        );
+        assert!(TOTAL_BUDGET + HOST_TIMEOUT_MARGIN <= Duration::from_secs(10));
+    }
+
+    /// collision-guard is registered for exactly the tools it knows how to
+    /// judge: a tool in the manifest matcher and not in `write_op` is judged
+    /// as a generic write, and one in `write_op` and not the matcher is never
+    /// asked about. MultiEdit was in the second state.
+    #[test]
+    fn the_manifest_matcher_and_the_judged_write_tools_agree() {
+        let manifest: Value = serde_json::from_str(
+            &std::fs::read_to_string(
+                Path::new(env!("CARGO_MANIFEST_DIR")).join("../plugins/gitpulse/hooks/hooks.json"),
+            )
+            .expect("the plugin ships a hooks manifest"),
+        )
+        .expect("JSON");
+        let matcher = manifest["hooks"]["PreToolUse"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|group| group["matcher"].as_str())
+            .find(|m| m.contains("Edit"))
+            .expect("a file-write matcher");
+        let inner = matcher
+            .strip_prefix("^(")
+            .and_then(|m| m.strip_suffix(")$"))
+            .expect("an anchored alternation");
+        let mut matched: Vec<&str> = inner.split('|').collect();
+        matched.sort_unstable();
+        let mut judged = FILE_WRITE_TOOLS.to_vec();
+        judged.sort_unstable();
+        assert_eq!(matched, judged);
+        for tool in FILE_WRITE_TOOLS {
+            assert_ne!(
+                write_op(tool, Path::new("/definitely/not/there")),
+                "write",
+                "{tool} is judged as an unspecialised write"
+            );
+        }
     }
 
     #[test]

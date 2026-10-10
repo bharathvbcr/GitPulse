@@ -1169,6 +1169,26 @@
                               {mcpInfo.binary_error}
                             {/if}
                           </div>
+                          <div class="text-textMuted text-[10px] font-mono break-all" data-testid="hook-binary-status">
+                            gitpulse-hook:
+                            {#if mcpInfo.hook_found}
+                              {mcpInfo.hook_path}
+                            {:else}
+                              not reachable. {mcpInfo.hook_error}
+                            {/if}
+                          </div>
+                          {#if !mcpInfo.binary_on_path || !mcpInfo.hook_on_path}
+                            <div class="text-amber-600 dark:text-amber-400 text-[10px] mt-1" data-testid="path-status">
+                              {#if !mcpInfo.binary_on_path && !mcpInfo.hook_on_path}
+                                `gitpulse-mcp` and `gitpulse-hook` are not on PATH, so the plugin's own manifests cannot start them.
+                              {:else if !mcpInfo.binary_on_path}
+                                `gitpulse-mcp` is not on PATH, so the plugin's own manifest cannot start it.
+                              {:else}
+                                `gitpulse-hook` is not on PATH, so the plugin's own hooks cannot start it and the collision guard and command gate are off.
+                              {/if}
+                              Copy the manifests below instead: they name the binaries by absolute path.
+                            </div>
+                          {/if}
                           <div class="text-textMuted text-[10px] mt-1">
                             {#if mcpInfo.plugin_found}
                               Plugin: {mcpInfo.plugin_path}
@@ -1191,11 +1211,20 @@
                         <button
                           type="button"
                           class="gp-btn py-0.5! px-2! text-[10px] inline-flex items-center gap-1"
-                          disabled={!mcpInfo.plugin_mcp_json}
-                          onclick={() => void copyMcp("mcp", mcpInfo?.plugin_mcp_json ?? "")}
+                          disabled={!mcpInfo.mcp_config_json}
+                          onclick={() => void copyMcp("mcp", mcpInfo?.mcp_config_json ?? "")}
                         >
                           {#if mcpCopied === "mcp"}<Check size={10} />{:else}<Copy size={10} />{/if}
                           .mcp.json
+                        </button>
+                        <button
+                          type="button"
+                          class="gp-btn py-0.5! px-2! text-[10px] inline-flex items-center gap-1"
+                          disabled={!mcpInfo.hooks_config_json}
+                          onclick={() => void copyMcp("hooks", mcpInfo?.hooks_config_json ?? "")}
+                        >
+                          {#if mcpCopied === "hooks"}<Check size={10} />{:else}<Copy size={10} />{/if}
+                          hooks.json
                         </button>
                       </div>
                       {#if mcpInfo.tools.length > 0}

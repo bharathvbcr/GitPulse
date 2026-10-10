@@ -144,6 +144,9 @@ export const CONTRACTS = Object.freeze([
   { label: "language-detect", rustPath: rust("analyzer", "language.rs"), tsPath: ts("files", "types.ts"), structs: ["LanguageInfo"] },
   { label: "reflog", rustPath: rust("engine", "git_reader.rs"), tsPath: ts("branches", "types.ts"), structs: ["ReflogEntry", "ResetPreview", "PreviewCommit"] },
   { label: "worktrees", rustPath: rust("engine", "worktree.rs"), tsPath: ts("branches", "types.ts"), structs: ["WorktreeInfo", "WorktreeCreated", "MergeTeardownResult"] },
+  // The hooks file as the approval dialog shows it: `approved` decides whether
+  // the panel offers to approve, so a renamed field would read as unapproved.
+  { label: "worktree-hooks", rustPath: rust("engine", "worktree_hooks.rs"), tsPath: ts("branches", "types.ts"), structs: ["WorktreeHooksPreview", "WorktreeHooksConfig"] },
   // A commit refused for want of an identity offers to set one from these;
   // a renamed field would prefill nothing and look like "no identity".
   { label: "git-identity", rustPath: rust("engine", "git_writer.rs"), tsPath: ts("repos", "gitPreflight.ts"), structs: ["GitIdentity"] },
