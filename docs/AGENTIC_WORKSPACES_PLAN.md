@@ -332,8 +332,9 @@ reads both.
   checks. RustSec and the configured local-provider wire check passed. Missing
   golangci-lint/debt ratchet, govulncheck, nilaway, the legacy DevCouncil environment,
   and live Anthropic/Gemini/xAI wire checks remain unverified. The flat graph export
-  is still generation 1; refreshed DevMap stores reached Manvi 20 and GitPulse 18,
-  with incomplete walks. Logs: `/tmp/manvi-recovery-verify.log`,
+  Manvi's gate read was the stale legacy `.devcouncil/code_graph.json`, not DevMap's
+  `.devcouncil/graph/code_graph.json` ([current state](#flat-graph-export-path-and-freshness));
+  refreshed DevMap stores reached Manvi 20 and GitPulse 18, with incomplete walks. Logs: `/tmp/manvi-recovery-verify.log`,
   `/tmp/gitpulse-recovery-ci.log`, `/tmp/gitpulse-recovery-vendor.log`.
 - **Open:** unactivated-helper and legacy host-crash reconciliation, escaped
   descendants, writer fencing, managed Claude, real-account approvals, richer
@@ -385,8 +386,10 @@ reads both.
 - Unrun verifier gates remain explicit: golangci-lint/debt ratchet, govulncheck,
   nilaway, legacy DevCouncil environment interop, and live Anthropic/Gemini/xAI
   wire checks. RustSec and the configured local-provider wire check passed.
-  The flat graph export remains generation 1; refreshed DevMap stores are
-  GitPulse generation 17 and Manvi generation 19. Graph walks remain incomplete.
+  The flat graph export read was the stale legacy `.devcouncil/code_graph.json`, not
+  `.devcouncil/graph/code_graph.json` ([current state](#flat-graph-export-path-and-freshness));
+  refreshed DevMap stores are GitPulse generation 17 and Manvi generation 19. Graph
+  walks remain incomplete.
 - **Open:** real-account approval modes and additional protocol callbacks, managed
   Claude, process-tree termination/recovery, launch fencing, richer reviews,
   installed notifications, workspace/board completion and performance targets.
@@ -493,8 +496,9 @@ reads both.
 - The full Manvi gate did not cover golangci-lint/lint-debt ratcheting,
   govulncheck or nilaway because those tools were unavailable; incumbent Python
   lease interop lacked the sibling virtual environment; the flat navigation
-  graph was generation 1 versus DevMap generation 14. Anthropic/Gemini/xAI wire
-  checks used scripted servers. RustSec audit and a local provider wire request
+  graph read was the stale legacy `.devcouncil/code_graph.json` while DevMap was at
+  generation 14 ([current state](#flat-graph-export-path-and-freshness)).
+  Anthropic/Gemini/xAI wire checks used scripted servers. RustSec audit and a local provider wire request
   did pass. These limitations are recorded in `/tmp/manvi-notifications-verify.log`.
   Focused `go test -race ./dc/store ./serve ./cmd/manvi` also passed with CGO enabled
   and the inherited root override removed (`/tmp/manvi-notifications-race.log`).
@@ -654,8 +658,9 @@ reads both.
   203 Rust tests, 82.1% Go coverage, 4,087 Go tests collected with five skipped,
   869 benchmark-instrument checks, and a real local provider wire request.
   Missing golangci-lint/lint-debt checks, govulncheck, nilaway, incumbent
-  `../DevCouncil/.venv`, stale flat navigation export (generation 1 versus index
-  12), and live cloud-provider qualification remain explicit gaps.
+  `../DevCouncil/.venv`, stale flat navigation export (the legacy
+  `.devcouncil/code_graph.json` versus index generation 12), and live cloud-provider
+  qualification remain explicit gaps.
 - Verified: GitPulse `npm run ci:local` passed with 5,230 frontend tests and one
   skip, 24 browser regressions, and 2,074 Rust tests with ten ignored. That run
   measured frontend lines/branches at 96.06%/88.85% and Rust lines at 84.72%.
@@ -803,7 +808,7 @@ reads both.
   4,085 collected Go tests (five skipped), and 869 benchmark-instrument checks.
   Its local-provider wire probe passed. Missing lint/nil/vulnerability tools,
   incumbent Python lease interoperability, the stale flat graph artifact
-  (generation one versus index eight), and live cloud-provider checks remain
+  (the legacy `.devcouncil/code_graph.json` versus index generation eight), and live cloud-provider checks remain
   unverified. These are verification gaps, not successful checks.
 - This proves automatic workflow wiring and controlled provider behavior. It
   does not prove live model semantic quality, installed desktop notification/UI
@@ -868,8 +873,8 @@ reads both.
   behavior. Full Manvi verification passed again with the same qualifications
   after the prompt change: 82.2% Go statement coverage, five skipped cases out
   of 4,073 Go tests, and 176 Rust tests across the workspace. Missing analysis
-  tools, Python lease interop, the stale flat navigation graph (generation one
-  versus index seven), and live cloud-provider checks remain unverified.
+  tools, Python lease interop, the stale flat navigation graph (the legacy
+  `.devcouncil/code_graph.json` versus index generation seven), and live cloud-provider checks remain unverified.
   The existing output-boundary fuzz target passed 9,658 executions in a bounded
   20-second run. These checks do not constitute a semantic quality corpus.
 
@@ -1083,11 +1088,32 @@ reads both.
   incumbent Python lease interoperability and live cloud-provider qualification
   remain uncovered. The live local-provider wire probe passed; this is separate
   from task-enhancement semantic quality.
-- The broad Manvi navigation gate also reported a stale artifact: it reads
-  `.devcouncil/code_graph.json` at generation one, while the rebuilt index was at
-  generation four. The DevMap build emitted its graph under
-  `.devcouncil/graph/code_graph.json`. That path mismatch remains a navigation
-  qualification gap; the successful generation tests do not qualify it.
+- The broad Manvi navigation gate also reported a stale artifact: it read the
+  legacy `.devcouncil/code_graph.json` while the rebuilt index was at generation
+  four, because DevMap writes its export to `.devcouncil/graph/code_graph.json`.
+  That path mismatch remains a navigation qualification gap; the successful
+  generation tests do not qualify it.
+
+#### Flat graph export path and freshness
+
+Corrected 2026-10-09. DevMap writes the flat export to
+`.devcouncil/graph/code_graph.json`. Its schema 2 carries no generation counter, so
+earlier revisions of the checkpoints above, which called it "generation 1", were
+describing the stale legacy file, not a property of the export. Freshness is the export's `generated_head` against the
+checkout's `HEAD`; the index generation is what `gitpulse_insights` reports as
+`codeintel.generation_id`. On 2026-10-09:
+
+| Repository | Index generation (fresh) | `graph/code_graph.json` `generated_head` |
+| --- | --- | --- |
+| GitPulse | 4045 | `0d3e9f77`, 60 commits behind `HEAD` |
+| DevCouncil | 4395 | `673073d3`, 72 commits behind `HEAD` |
+| Manvi | 564 | `c2950614`, at `HEAD` |
+
+Manvi still defaults to the legacy path (`manvi/cmd/manvi/root.go`
+`graphArtifactPath`, and `verify.sh`'s `MANVI_GRAPH` default), and its legacy file
+is at `063632ff`, 35 commits behind. The index and the export advance
+independently — every index above is fresh while two exports trail `HEAD` — so a
+fresh index is not evidence of a fresh export.
 
 ### Storage checkpoint
 

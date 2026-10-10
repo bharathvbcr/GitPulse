@@ -485,6 +485,43 @@ mod tests {
     }
 
     #[test]
+    fn a_store_from_before_the_gap_output_columns_still_reads_its_gaps() {
+        // `stdout_path` / `stderr_path` were added to `gaps` after schema 9
+        // shipped, without a schema bump, so a long-lived store can lack them
+        // while claiming the current version. The view selects both columns;
+        // what makes that safe is `open_existing` (read-write, not read-only)
+        // running dc-store's additive upgrade before anything is read. Without
+        // it this view reads "no such column" and reports the store unavailable.
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().to_str().unwrap();
+        let db = store_path(repo);
+        std::fs::create_dir_all(db.parent().unwrap()).unwrap();
+        let store = dc_store::Store::open(&db).unwrap();
+        store
+            .connection()
+            .execute_batch(
+                "ALTER TABLE gaps DROP COLUMN stdout_path;
+                 ALTER TABLE gaps DROP COLUMN stderr_path;
+                 INSERT INTO gaps (id, severity, gap_type, description, evidence_json,
+                     recommended_fix, blocking, task_id)
+                 VALUES ('g-old', 'high', 'coverage', 'missing test', '{}', 'add test', 1, 'TASK-1');",
+            )
+            .unwrap();
+        drop(store);
+
+        let v = view_filtered(repo, Some("TASK-1"));
+        assert!(
+            v.available,
+            "a pre-column store must still read: {}",
+            v.error
+        );
+        assert_eq!(v.gaps.len(), 1);
+        assert_eq!(v.gaps[0].id, "g-old");
+        assert_eq!(v.gaps[0].stdout_path, None);
+        assert_eq!(v.gaps[0].stderr_path, None);
+    }
+
+    #[test]
     fn every_gap_field_dc_store_keeps_reaches_the_view() {
         // Three rounds of the same bug: dc-store learned to keep a gap field
         // and this view dropped it. Each optional field is written through
