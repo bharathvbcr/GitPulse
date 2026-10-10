@@ -59,6 +59,11 @@ describe("TaskRefine renders", () => {
     expect(body).not.toMatch(/data-testid="task-refine-part-duplicate_of"[^>]*checked/);
     expect(body).toContain("were dropped");
   });
+  it("offers 'apply anyway' only after the host held a split, and never before", () => {
+    const body = shown();
+    expect(body).not.toContain("task-refine-related");
+    expect(readFileSync(join(here, "TaskRefine.svelte"), "utf8")).toMatch(/task-refine-apply-anyway[\s\S]*apply\(\[/);
+  });
   it("a task that moved since the proposal disables Apply and says to ask again", () => {
     const body = shown({}, { ...task, revision: 5 });
     expect(body).toContain("task-refine-stale");

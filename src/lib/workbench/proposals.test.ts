@@ -132,10 +132,22 @@ describe("refinement", () => {
     const result = { ...refineResult(refine()), enhancement_revision: 2 };
     native.mockResolvedValueOnce(JSON.stringify({ ok: true, outcome: "applied", revision: 5, criteria_added: 1, links_added: 0, created_item_ids: ["ft-a"] }));
     const receipt = await applyRefine("/r", result, ["acceptance_criteria", "split_into"]);
-    expect(receipt).toEqual({ revision: 5, criteriaAdded: 1, linksAdded: 0, createdTaskIds: ["ft-a"] });
+    expect(receipt).toEqual({ outcome: "applied", revision: 5, criteriaAdded: 1, linksAdded: 0, createdTaskIds: ["ft-a"] });
     expect(method()).toBe("proposals.apply");
-    expect(wire()).toEqual({ repo_path: "/r", id: "enh-1", expected_revision: 2, expected_task_revision: 4, fields: ["acceptance_criteria", "split_into"] });
+    expect(wire()).toEqual({ repo_path: "/r", id: "enh-1", expected_revision: 2, expected_task_revision: 4, fields: ["acceptance_criteria", "split_into"], reviewed_related: [] });
     expect(wire()).not.toHaveProperty("split_ids");
+  });
+  it("a split that looks like open work holds the accept until the person names those tasks", async () => {
+    const result = { ...refineResult(refine()), enhancement_revision: 2 };
+    native.mockResolvedValueOnce(JSON.stringify({ ok: false, outcome: "related_tasks_exist", scan_complete: true,
+      splits: [{ index: 0, title: "Indexer", related: [{ item_id: "ft-2", title: "Index things", status: "ready" }] }] }));
+    expect(await applyRefine("/r", result, ["split_into"])).toEqual({ outcome: "related_tasks_exist",
+      splits: [{ index: 0, title: "Indexer", related: [{ item_id: "ft-2", title: "Index things", status: "ready" }] }] });
+    native.mockResolvedValueOnce(JSON.stringify({ ok: true, outcome: "applied", revision: 5, criteria_added: 0, links_added: 0, created_item_ids: ["ft-a"] }));
+    expect((await applyRefine("/r", result, ["split_into"], ["ft-2"])).outcome).toBe("applied");
+    expect(wire(1)).toMatchObject({ reviewed_related: ["ft-2"] });
+    native.mockResolvedValueOnce(JSON.stringify({ ok: true, outcome: "related_tasks_exist", splits: [] }));
+    await expect(applyRefine("/r", result, ["split_into"])).rejects.toBeInstanceOf(WorkbenchError);
   });
   it("a stale task is a visible refusal", async () => {
     const result = { ...refineResult(refine()), enhancement_revision: 2 };

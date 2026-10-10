@@ -33,6 +33,16 @@ before that tag is pushed.
 
 ### Changed
 
+- The profile is compacted once a day: the host runs dc-store's `store.compact`
+  (expired receipts, events and revisions, a bounded number per pass) from its
+  existing background loop, off the UI thread, never beside itself, never
+  creating a profile. The last attempt is stamped beside the profile, so a
+  restart does not start another window and a failure is logged and retried next
+  window. The log line carries deleted, eligible and truncated per table.
+- Accepting a refinement's splits runs the board's related-task check on each
+  split title. A split that looks like open work holds the whole accept, and the
+  sheet offers "They are separate: apply anyway". DevCouncil is re-vendored at
+  `c0bc26d5` and the serve contract refreshed from Manvi's `work.store.compact`.
 - DevCouncil is re-vendored at `acb5e3b9`: dc-store workbench schema 12 (refinement
   proposals, an `acceptance_criteria` lock) and `dc-glob`. A profile that
   Manvi's dc-store has taken to 12 is refused by a GitPulse built at 11, so the

@@ -281,21 +281,36 @@ export function refineDiff(task: Task, result: RefineResult): RefineDiff {
   };
 }
 
-export interface ApplyReceipt { revision: number; criteriaAdded: number; linksAdded: number; createdTaskIds: string[] }
+export interface ApplyReceipt { outcome: "applied"; revision: number; criteriaAdded: number; linksAdded: number; createdTaskIds: string[] }
+/** Nothing was applied: a proposed split looks like open work, and the person must say it is separate. */
+export interface ApplyHeld { outcome: "related_tasks_exist"; splits: { index: number; title: string; related: RelatedTask[] }[] }
+const relatedRows = (value: unknown): RelatedTask[] => list(value, "apply receipt", (r) => {
+  const row = obj(r, "related task");
+  return { item_id: str(row.item_id, "related task"), title: str(row.title, "related task"), status: str(row.status, "related task") };
+}, 25);
 /**
  * Accept the selected parts of the stored refinement. Conditional on the
  * proposal's revision and on the task still being at `source_revision`; a task
  * that moved since is refused (`revision_conflict`) and nothing is written. The
- * new tasks' ids are made by the host, not here.
+ * new tasks' ids are made by the host, not here. A split that looks like open
+ * work holds the whole accept (`related_tasks_exist`, nothing written) until
+ * the person names those tasks in `reviewedRelated`.
  */
-export async function applyRefine(repoPath: string, result: RefineResult, parts: readonly RefinePart[]): Promise<ApplyReceipt> {
+export async function applyRefine(repoPath: string, result: RefineResult, parts: readonly RefinePart[], reviewedRelated: readonly string[] = []): Promise<ApplyReceipt | ApplyHeld> {
   const raw = obj(await request("proposals.apply", {
     repo_path: repoPath, id: result.enhancement_id, expected_revision: result.enhancement_revision,
-    expected_task_revision: result.source_revision, fields: parts,
+    expected_task_revision: result.source_revision, fields: parts, reviewed_related: reviewedRelated,
   }), "apply receipt");
+  if (raw.outcome === "related_tasks_exist") {
+    if (raw.ok !== false) return invalid("apply receipt");
+    return { outcome: "related_tasks_exist", splits: list(raw.splits, "apply receipt", (s) => {
+      const row = obj(s, "held split");
+      return { index: int(row.index, "held split"), title: str(row.title, "held split"), related: relatedRows(row.related) };
+    }, 16) };
+  }
   if (raw.ok !== true || raw.outcome !== "applied") return invalid("apply receipt");
   return {
-    revision: int(raw.revision, "apply receipt"), criteriaAdded: int(raw.criteria_added, "apply receipt"), linksAdded: int(raw.links_added, "apply receipt"),
+    outcome: "applied", revision: int(raw.revision, "apply receipt"), criteriaAdded: int(raw.criteria_added, "apply receipt"), linksAdded: int(raw.links_added, "apply receipt"),
     createdTaskIds: list(raw.created_item_ids, "apply receipt", (id) => str(id, "apply receipt"), 16),
   };
 }

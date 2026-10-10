@@ -153,6 +153,16 @@ fn reviewed(store: &Store, repo: &tempfile::TempDir) -> (String, i64) {
 /// Store a refinement the way Manvi's `work.enhancements.refine` does: reserve
 /// it for the task at its revision, then complete it with the proposal.
 fn stored_refinement(store: &Store, task: &str, revision: i64, other: &str) -> String {
+    stored_refinement_with(store, task, revision, other, "Alpha indexer")
+}
+
+fn stored_refinement_with(
+    store: &Store,
+    task: &str,
+    revision: i64,
+    other: &str,
+    first: &str,
+) -> String {
     let id = format!("enh-{task}");
     let create = json!({
         "id": id, "request_id": format!("create-{id}"), "expected_revision": 0,
@@ -165,7 +175,7 @@ fn stored_refinement(store: &Store, task: &str, revision: i64, other: &str) -> S
         "id": id, "request_id": format!("complete-{id}"), "expected_revision": 1,
         "acceptance_criteria": ["Exports CSV with a header row"],
         "split_into": [
-            {"title": "Alpha indexer", "description": "Part of the exporter."},
+            {"title": first, "description": "Part of the exporter."},
             {"title": "Zebra exporter", "description": "Part of the exporter."},
         ],
         "duplicate_of": [{"id": other, "reason": "same exporter"}],
@@ -275,6 +285,56 @@ fn only_the_selected_parts_are_applied() {
     assert_eq!(card["acceptance_criteria"], json!(["Existing criterion"]));
     assert_eq!(card["links"][0]["item_id"], other.as_str());
     assert_eq!(board(&store, &repo).len(), 2, "no split was created");
+}
+
+#[test]
+fn a_split_that_looks_like_open_work_is_held_until_the_person_confirms() {
+    let (_d, store, repo) = setup();
+    let (id, revision) = reviewed(&store, &repo);
+    let other = original(&store, &repo);
+    // A split named like a task already open on the board.
+    let proposal = stored_refinement_with(&store, &id, revision, &other, "Original exporter");
+    let held = apply_refinement(
+        &store,
+        &apply_input(&repo, &proposal, revision, json!(["split_into"])),
+    )
+    .unwrap();
+    assert_eq!(held["ok"], false, "{held}");
+    assert_eq!(held["outcome"], "related_tasks_exist");
+    assert_eq!(held["splits"][0]["index"], 0);
+    assert_eq!(held["splits"][0]["related"][0]["item_id"], other.as_str());
+    assert_eq!(board(&store, &repo).len(), 2, "nothing was created");
+    assert_eq!(
+        get_item(&store, &id).unwrap().unwrap()["revision"],
+        revision
+    );
+
+    // Naming a task that is not the one shown does not confirm it.
+    let mut wrong: Value = serde_json::from_str(&apply_input(
+        &repo,
+        &proposal,
+        revision,
+        json!(["split_into"]),
+    ))
+    .unwrap();
+    wrong["reviewed_related"] = json!(["ft-something-else"]);
+    assert_eq!(
+        apply_refinement(&store, &wrong.to_string()).unwrap()["outcome"],
+        "related_tasks_exist"
+    );
+
+    let mut confirmed: Value = serde_json::from_str(&apply_input(
+        &repo,
+        &proposal,
+        revision,
+        json!(["split_into"]),
+    ))
+    .unwrap();
+    confirmed["reviewed_related"] = json!([other]);
+    let applied = apply_refinement(&store, &confirmed.to_string()).unwrap();
+    assert_eq!(applied["outcome"], "applied", "{applied}");
+    assert_eq!(applied["created_item_ids"].as_array().unwrap().len(), 2);
+    assert_eq!(board(&store, &repo).len(), 4);
 }
 
 #[test]

@@ -281,6 +281,10 @@ struct ApplyInput {
     /// The task's revision, as reviewed.
     expected_task_revision: i64,
     fields: Vec<String>,
+    /// Open tasks the person was shown as possibly the same work as a split
+    /// and says it is separate from. Honoured as `file_proposal` honours it.
+    #[serde(default)]
+    reviewed_related: Vec<String>,
 }
 
 /// Accept the parts of a stored refinement proposal a person selected.
@@ -380,6 +384,51 @@ pub(crate) fn apply_refinement(store: &Store, input: &str) -> Result<Value, Work
     } else {
         0
     };
+    // A split becomes an inbox task, so it gets the check `add_task` gives any
+    // task: one that looks like open work is not created until the person has
+    // seen those tasks and named them.
+    if selected("split_into") {
+        let mut held = Vec::new();
+        let mut scan_complete = true;
+        for (index, split) in proposed["split_into"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .enumerate()
+        {
+            let title = split["title"].as_str().unwrap_or_default();
+            let candidate = ExternalTask {
+                key: format!("refine-split-{index}"),
+                title: title.to_owned(),
+                description: split["description"].as_str().unwrap_or_default().to_owned(),
+                ..ExternalTask::default()
+            };
+            let related = related_open_tasks(store, &repository_id, task_id, &candidate)?;
+            scan_complete &= related.complete;
+            let unreviewed: Vec<Value> = related
+                .tasks
+                .into_iter()
+                .filter(|t| {
+                    !parsed
+                        .reviewed_related
+                        .iter()
+                        .any(|r| t["item_id"].as_str() == Some(r.trim()))
+                })
+                .take(MAX_RELATED)
+                .collect();
+            if !unreviewed.is_empty() {
+                held.push(json!({"index": index, "title": title, "related": unreviewed}));
+            }
+        }
+        if !held.is_empty() {
+            return Ok(json!({
+                "ok": false,
+                "outcome": "related_tasks_exist",
+                "splits": held,
+                "scan_complete": scan_complete,
+            }));
+        }
+    }
     let saved = query(store, "enhancements.accept", &accept.to_string())?;
     let accepted = &saved["item"];
     Ok(json!({

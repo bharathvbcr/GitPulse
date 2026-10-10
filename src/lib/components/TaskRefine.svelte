@@ -15,7 +15,7 @@
   import { get } from "svelte/store";
   import { Sparkles } from "@lucide/svelte";
   import { explainError, getTask, newID, WorkbenchError, type RefinePart, type Task } from "../workbench/client";
-  import { applyRefine, dismissRefine, refineDiff, requestRefine, type RefineResult } from "../workbench/proposals";
+  import { applyRefine, dismissRefine, refineDiff, requestRefine, type ApplyHeld, type RefineResult } from "../workbench/proposals";
   import { effectiveSelection } from "../workbench/taskModel";
   import { harnessStore } from "../stores/harnessStore";
 
@@ -42,6 +42,9 @@
   /** Kept across a failed ask so a retry replays the same request instead of calling the model again. */
   let attempt = newID();
 
+  /** Splits the host held because they look like open work; applying again names these tasks as separate. */
+  let held = $state<ApplyHeld | null>(null);
+
   const diff = $derived(task && result ? refineDiff(task, result) : null);
   const nothingPicked = $derived(picked.size === 0);
 
@@ -51,7 +54,7 @@
     try {
       const next = await requestRefine(repositoryPath, task, effectiveSelection(get(harnessStore)), attempt);
       attempt = newID();
-      result = next; picked = defaultParts(next);
+      result = next; picked = defaultParts(next); held = null;
     } catch (cause) {
       result = null;
       error = explainError(cause);
@@ -61,7 +64,7 @@
   function toggle(part: RefinePart) {
     const next = new Set(picked);
     if (!next.delete(part)) next.add(part);
-    picked = next;
+    picked = next; held = null;
   }
 
   async function dismiss() {
@@ -71,19 +74,21 @@
     if (dropped) try { await dismissRefine(dropped); } catch { /* nothing was applied either way */ }
   }
 
-  async function apply() {
+  async function apply(reviewedRelated: readonly string[] = []) {
     if (!result || applying || nothingPicked || diff?.stale) return;
     applying = true; error = ""; message = "";
     const reviewed = result;
     try {
-      const receipt = await applyRefine(repositoryPath, reviewed, [...picked]);
+      const receipt = await applyRefine(repositoryPath, reviewed, [...picked], reviewedRelated);
+      if (receipt.outcome === "related_tasks_exist") { held = receipt; return; }
+      held = null;
       onApplied(await getTask(reviewed.task_id));
       message = `Applied: ${receipt.criteriaAdded} criteria added, ${receipt.linksAdded} links added, ${receipt.createdTaskIds.length} tasks created in the inbox.`;
       result = null;
     } catch (cause) {
       if (cause instanceof WorkbenchError && cause.code === "revision_conflict") {
         // Refused, nothing written. Show the task as it is now and ask again against it.
-        result = null;
+        result = null; held = null;
         error = "The task changed after this suggestion was made, so nothing was applied. It has been re-read; ask again to refine the current version.";
         try { onApplied(await getTask(reviewed.task_id)); } catch (reread) { error += ` (It could not be re-read: ${explainError(reread)}.)`; }
       } else {
@@ -162,9 +167,16 @@
       {/if}
 
       {#if diff.criteria.length + diff.duplicates.length + diff.splits.length > 0}
-        <button type="button" class="gp-btn primary" data-testid="task-refine-apply" disabled={applying || nothingPicked || diff.stale} onclick={apply}>
+        <button type="button" class="gp-btn primary" data-testid="task-refine-apply" disabled={applying || nothingPicked || diff.stale} onclick={() => apply()}>
           {applying ? "Applying…" : "Apply selected"}
         </button>
+        {#if held}
+          <div class="held" role="alert" data-testid="task-refine-related">
+            <p>Nothing was applied. Similar open work exists for {held.splits.length === 1 ? "a proposed split" : "some proposed splits"}:</p>
+            <ul>{#each held.splits as split}<li><strong>{split.title}</strong>: {split.related.map((r) => r.title).join("; ")}</li>{/each}</ul>
+            <button type="button" class="gp-btn" data-testid="task-refine-apply-anyway" disabled={applying} onclick={() => apply([...new Set(held!.splits.flatMap((split) => split.related.map((r) => r.item_id)))])}>They are separate: apply anyway</button>
+          </div>
+        {/if}
       {/if}
 
       {#if diff.criteria.length + diff.duplicates.length + diff.splits.length === 0}
@@ -192,6 +204,8 @@
   .proposal{display:flex;flex-direction:column;gap:6px;padding:10px;border-radius:12px;border:1px solid rgb(var(--c-border) / 0.65)}
   .rows{list-style:none;margin:0;padding:0;display:flex;flex-direction:column;gap:6px}
   .present{opacity:.65}
+  .held{display:flex;flex-direction:column;gap:6px;color:rgb(var(--c-status-red))}
+  .held p,.held ul{margin:0}
   .part{display:flex;align-items:center;gap:6px}
   ins{text-decoration:none;color:rgb(var(--c-accent))}
   .cites{display:block;font-size:10px;color:rgb(var(--c-text-muted))}
