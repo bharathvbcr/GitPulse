@@ -20,6 +20,16 @@ before that tag is pushed.
   `failed`, `degraded` and a verification that could not run keep it in review,
   each recorded distinctly. Task details show the verdict chip with
   per-criterion results and a Verify action.
+- Review Manvi's proposals. A **Proposals** panel beside the task board runs
+  Manvi's repository gap scan and lists what it found with its evidence and its
+  coverage (a capped or partial scan says so, with both numbers). Accept files
+  the task in the inbox through the board's own intake, so the related-task
+  check still applies and a double click files one card; Edit changes it first;
+  Dismiss hides it for you. The task sheet gains **Suggest refinements**, which
+  shows Manvi's acceptance criteria, splits and duplicate links as a diff and
+  applies only what you select, at the revision you reviewed: a task that
+  changed since is refused and re-read. Nothing Manvi proposes is applied
+  automatically, and a sidecar that is down is an error, never an empty scan.
 
 ### Changed
 

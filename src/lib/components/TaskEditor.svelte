@@ -7,6 +7,8 @@
   import NativeNotificationSettings from "./NativeNotificationSettings.svelte";
   import TaskManviAssist from "./TaskManviAssist.svelte";
   import TaskVerification from "./TaskVerification.svelte";
+  import TaskRefine from "./TaskRefine.svelte";
+  import { repoStore } from "../stores/repoStore";
   import TaskRepositoryPicker from "./TaskRepositoryPicker.svelte";
   import TaskDuePicker from "./TaskDuePicker.svelte";
   import LabelInput from "./LabelInput.svelte";
@@ -662,6 +664,9 @@
                     onStatus={({ state, uncertain }) => { assistState = state; assistUncertain = uncertain; }}
                     disabled={saving || reloading || pending !== null || pendingDelete !== null}
                   />
+                  {#if current}
+                    <TaskRefine task={current} repositoryPath={$repoStore.currentPath ?? ""} disabled={dirty || saving || reloading || pending !== null || pendingDelete !== null || enhancementBusy} onApplied={applied} />
+                  {/if}
                 </div>
               {:else if section.id === "title"}
                 <fieldset disabled={enhancementBusy}>
