@@ -13,6 +13,19 @@ before that tag is pushed.
 
 ### Changed
 
+- **A released app's safety hooks and MCP server now resolve, and a hook that
+  cannot launch no longer fails open.** The plugin's manifests name bare
+  `gitpulse-hook` / `gitpulse-mcp`, which only a developer's `mcp:install`
+  puts on PATH, and a host runs the tool call anyway when a hook cannot start.
+  Settings now resolves both binaries beside the app, says `not reachable`
+  when `gitpulse-hook` is missing and when either is not on PATH, and copies
+  `.mcp.json` and a new `hooks.json` built from the resolved absolute paths.
+  In the copied hooks the collision guard and command gate refuse the call
+  (exit status 2, reason on stderr) when the binary is missing, and session
+  start tells the agent the hooks are off. Security impact: this narrows what
+  proceeds without a gate (a missing gate now blocks instead of passing); it
+  grants nothing. The plugin's own static `hooks/hooks.json` keeps its
+  portable bare names.
 - **Repository hooks need your approval.** `.gitpulse/hooks.json` and
   `hooks.toml` come from the working tree, so a pulled branch or a compromised
   agent could write shell commands that GitPulse then ran on every agent
