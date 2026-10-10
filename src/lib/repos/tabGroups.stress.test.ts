@@ -5,6 +5,7 @@ import {
   parentFolderName,
 } from "./tabGroups";
 import type { OpenRepoTab } from "../stores/repoStore";
+import { wallClockBudget } from "../testing/wallClock";
 
 function makeTab(overrides: Partial<OpenRepoTab> & { id: string; path: string }): OpenRepoTab {
   return {
@@ -74,7 +75,7 @@ describe("tabGroups adversarial stress tests", () => {
     const layout = computeTabLayout(tabs, collapsed);
     const duration = performance.now() - start;
 
-    expect(duration).toBeLessThan(100);
+    expect(duration).toBeLessThan(wallClockBudget(100));
     expect(layout.groups).toHaveLength(100);
 
     // 50 collapsed groups show only header (50)

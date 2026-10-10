@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import type { TaskCard } from "./client";
 import { cardMatchesQuery, parseTaskQuery, type QueryContext } from "./taskQuery";
 import { describeMatch, searchCards, type RankContext, type SearchOrder } from "./taskRank";
+import { wallClockBudget } from "../testing/wallClock";
 
 let next = 0;
 function card(over: Partial<TaskCard> = {}): TaskCard {
@@ -112,6 +113,6 @@ describe("performance", () => {
     const start = performance.now();
     const outcome = search(cards, "logn handlng label:l1");
     expect(outcome.cards.length).toBeGreaterThan(0);
-    expect(performance.now() - start).toBeLessThan(250);
+    expect(performance.now() - start).toBeLessThan(wallClockBudget(250));
   });
 });

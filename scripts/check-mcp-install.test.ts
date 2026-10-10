@@ -18,6 +18,7 @@ import {
   probeServer,
   resolveOnPath,
 } from "./check-mcp-install.mjs";
+import { wallClockBudget } from "../src/lib/testing/wallClock";
 
 const tempDirs: string[] = [];
 
@@ -407,7 +408,7 @@ describe("probeHook", () => {
     const started = Date.now();
     const result = await probeHook(file, 400);
     expect(result.error).toContain("within 400ms");
-    expect(Date.now() - started).toBeLessThan(5000);
+    expect(Date.now() - started).toBeLessThan(wallClockBudget(5000));
   });
 });
 

@@ -12,6 +12,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
+import { wallClockBudget } from "../src/lib/testing/wallClock";
 
 const REPO_ROOT = fileURLToPath(new URL("..", import.meta.url));
 const HOOKS = join(REPO_ROOT, ".githooks");
@@ -409,7 +410,7 @@ describe.skipIf(!gitAvailable || !hasBash)("fixture-commits.sh", () => {
     const lines = result.stdout.trim().split("\n");
     expect(lines).toHaveLength(1);
     expect(git(dir, ["log", "-1", "--format=%s", lines[0].split(" ")[0]]).trim()).toBe(`c${planted}`);
-    expect(elapsed, `took ${Math.round(elapsed)} ms`).toBeLessThan(15_000);
+    expect(elapsed, `took ${Math.round(elapsed)} ms`).toBeLessThan(wallClockBudget(15_000));
   }, 60_000);
 });
 

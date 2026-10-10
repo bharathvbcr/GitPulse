@@ -35,9 +35,15 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev build-essential curl wget file libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev pkg-config xvfb xauth dbus-x11
 
+      # Nightly, pinned: `cargo llvm-cov --branch` is unstable, and without it
+      # the Rust report carries line data only, so "Rust coverage" meant lines.
+      # Pinned to a dated toolchain so a nightly regression cannot turn this
+      # workflow red on its own; bump the date deliberately. The gating build
+      # in ci.yml stays on stable.
       - name: Setup Rust Toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: nightly-2026-10-05
           components: llvm-tools-preview
 
       - name: Install cargo-llvm-cov
@@ -88,11 +94,11 @@ jobs:
           # One thread: instrumented pipe/shebang/stub-devmap fixtures time out
           # under 4-way contention even after isolating fan-out and giving the
           # child its full timeout after a process slot.
-          xvfb-run -a dbus-run-session -- cargo llvm-cov --manifest-path src-tauri/Cargo.toml --workspace --lcov --output-path lcov.info -- --test-threads=1
+          xvfb-run -a dbus-run-session -- cargo llvm-cov --branch --manifest-path src-tauri/Cargo.toml --workspace --lcov --output-path lcov.info -- --test-threads=1
           # Reuse the counters from the lcov run. A second test execution hid
           # its failures behind `> rust-coverage-summary.txt` and could fail
           # the job minutes after `lcov.info` had already been written.
-          xvfb-run -a dbus-run-session -- cargo llvm-cov --manifest-path src-tauri/Cargo.toml --workspace --summary-only --no-run > rust-coverage-summary.txt
+          xvfb-run -a dbus-run-session -- cargo llvm-cov --branch --manifest-path src-tauri/Cargo.toml --workspace --summary-only --no-run > rust-coverage-summary.txt
           cat rust-coverage-summary.txt
 
       - name: Verify Rust LCOV Was Produced

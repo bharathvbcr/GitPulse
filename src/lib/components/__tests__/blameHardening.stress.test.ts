@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import type { BlameLine } from "../../files/types";
 import type { FileStatus } from "../../stores/repoStore";
+import { wallClockBudget } from "../../testing/wallClock";
 
 /**
  * Deep equality comparator for BlameLine arrays, matching the canonical
@@ -200,7 +201,7 @@ describe("BlameViewer SWR Hardening & Concurrency Stress Tests", () => {
       const t0 = performance.now();
       expect(areBlameLinesEqual(fileA, fileB)).toBe(true);
       const elapsed = performance.now() - t0;
-      expect(elapsed).toBeLessThan(50);
+      expect(elapsed).toBeLessThan(wallClockBudget(50));
     });
 
     it("detects granular mutations across all BlameLine fields", () => {

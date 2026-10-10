@@ -30,6 +30,7 @@ import {
   sanitizeHandoff,
   supportsManaged,
 } from "./taskHandoff";
+import { wallClockBudget } from "../testing/wallClock";
 
 const options = { caseInsensitive: false };
 const repositories = [
@@ -247,7 +248,7 @@ describe("checkoutCandidates", () => {
     // Catches an accidental O(n^2) over the tab list, which at 5,000 tabs is
     // 25M comparisons and lands in seconds; the bound is sized to separate
     // that from linear work on a machine that is also running a build.
-    expect(performance.now() - started).toBeLessThan(2_000);
+    expect(performance.now() - started).toBeLessThan(wallClockBudget(2_000));
     expect(candidates).toHaveLength(1);
   });
 });
