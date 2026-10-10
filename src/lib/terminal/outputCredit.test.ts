@@ -1,9 +1,13 @@
 import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
+  ACK_FLUSH_BACKSTOP_MS,
+  ACK_FLUSH_THRESHOLD,
+  createAckCoalescer,
   createOutputCredit,
+  frameAckScheduler,
   decodeTerminalOutput,
   MAX_TERMINAL_OUTPUT_CHUNK,
   OUTPUT_CREDIT_WINDOW,
@@ -190,5 +194,124 @@ describe("reserved output length", () => {
     expect(omitted.token.bytes).toEqual(new Uint8Array([66]));
     expect(omitted.token.release()).toBe(1);
     expect(credit.pending()).toBe(0);
+  });
+});
+
+describe("acknowledgement coalescing", () => {
+  function harness() {
+    const sent: Array<[string, number]> = [];
+    const queued: Array<() => void> = [];
+    let cancelled = 0;
+    const acks = createAckCoalescer(
+      (sessionId, bytes) => sent.push([sessionId, bytes]),
+      (flush) => {
+        queued.push(flush);
+        return () => {
+          cancelled += 1;
+        };
+      },
+    );
+    const frame = () => queued.splice(0).forEach((flush) => flush());
+    return { acks, sent, frame, scheduled: () => queued.length, cancelled: () => cancelled };
+  }
+
+  it("sends one acknowledgement per session per frame for many chunks", () => {
+    const h = harness();
+    for (let i = 0; i < 10; i++) h.acks.add("a", MAX_TERMINAL_OUTPUT_CHUNK);
+    h.acks.add("b", 3);
+    expect(h.sent, "nothing goes out before the frame").toEqual([]);
+    expect(h.scheduled(), "one frame is asked for, not one per chunk").toBe(1);
+    h.frame();
+    expect(h.sent).toEqual([
+      ["a", 10 * MAX_TERMINAL_OUTPUT_CHUNK],
+      ["b", 3],
+    ]);
+    expect(h.acks.owed()).toBe(0);
+  });
+
+  it("ignores zero and negative counts and schedules nothing for them", () => {
+    const h = harness();
+    h.acks.add("a", 0);
+    h.acks.add("a", -4);
+    expect(h.scheduled()).toBe(0);
+    h.acks.flush();
+    expect(h.sent).toEqual([]);
+  });
+
+  it("sends at once when a session owes the threshold, well inside the window", () => {
+    expect(ACK_FLUSH_THRESHOLD).toBeLessThanOrEqual(OUTPUT_CREDIT_WINDOW / 4);
+    const h = harness();
+    const chunks = ACK_FLUSH_THRESHOLD / MAX_TERMINAL_OUTPUT_CHUNK;
+    for (let i = 0; i < chunks - 1; i++) h.acks.add("a", MAX_TERMINAL_OUTPUT_CHUNK);
+    expect(h.sent).toEqual([]);
+    h.acks.add("a", MAX_TERMINAL_OUTPUT_CHUNK);
+    expect(h.sent).toEqual([["a", ACK_FLUSH_THRESHOLD]]);
+    expect(h.cancelled(), "the pending frame is cancelled by the early send").toBe(1);
+    expect(h.acks.owed()).toBe(0);
+    // The stale frame firing anyway sends nothing twice.
+    h.frame();
+    expect(h.sent).toHaveLength(1);
+  });
+
+  it("never holds more than the threshold unsent, however long frames take", () => {
+    const h = harness();
+    let maxOwed = 0;
+    let total = 0;
+    for (let i = 0; i < 1000; i++) {
+      h.acks.add(i % 3 === 0 ? "b" : "a", MAX_TERMINAL_OUTPUT_CHUNK);
+      total += MAX_TERMINAL_OUTPUT_CHUNK;
+      maxOwed = Math.max(maxOwed, h.acks.owed());
+    }
+    h.acks.flush();
+    expect(maxOwed).toBeLessThan(2 * ACK_FLUSH_THRESHOLD);
+    for (const [, bytes] of h.sent) expect(bytes).toBeLessThanOrEqual(ACK_FLUSH_THRESHOLD);
+    expect(h.sent.reduce((sum, [, bytes]) => sum + bytes, 0), "no credit lost or doubled").toBe(total);
+  });
+
+  it("flushes synchronously on teardown, so released credit is not left behind", () => {
+    const h = harness();
+    const credit = createOutputCredit();
+    const painted = credit.accept(chunk(100), "a", open);
+    credit.accept(chunk(7), "a", waiting);
+    if (painted.action !== "paint") throw new Error("expected paint");
+    h.acks.add("a", painted.token.release());
+    for (const owed of credit.releaseAll()) h.acks.add(owed.sessionId, owed.bytes);
+    h.acks.flush();
+    expect(h.sent).toEqual([["a", 107]]);
+    expect(h.cancelled()).toBe(1);
+    h.frame();
+    expect(h.sent).toHaveLength(1);
+  });
+
+  it("schedules again after a frame has sent", () => {
+    const h = harness();
+    h.acks.add("a", 1);
+    h.frame();
+    h.acks.add("a", 2);
+    expect(h.scheduled()).toBe(1);
+    h.frame();
+    expect(h.sent).toEqual([
+      ["a", 1],
+      ["a", 2],
+    ]);
+  });
+
+  it("falls back to a timer when no animation frame comes (a hidden window)", () => {
+    vi.useFakeTimers();
+    try {
+      const flush = vi.fn();
+      const cancel = frameAckScheduler(flush);
+      vi.advanceTimersByTime(ACK_FLUSH_BACKSTOP_MS - 1);
+      expect(flush).not.toHaveBeenCalled();
+      vi.advanceTimersByTime(1);
+      expect(flush).toHaveBeenCalledTimes(1);
+      cancel();
+      const never = vi.fn();
+      frameAckScheduler(never)();
+      vi.advanceTimersByTime(ACK_FLUSH_BACKSTOP_MS * 2);
+      expect(never).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

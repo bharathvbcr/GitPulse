@@ -82,7 +82,7 @@
   import { isEditingElsewhere } from "../keyboard/terminalFocus";
   import { planPaste } from "../terminal/pasteGuard";
   import { askConfirm } from "../stores/modalStore";
-  import { createOutputCredit, planTerminalOutput, type PaintToken } from "../terminal/outputCredit";
+  import { createAckCoalescer, createOutputCredit, planTerminalOutput, type PaintToken } from "../terminal/outputCredit";
   import { applyHelperTextareaHardening, createEraseGuard, describeTerminalControl, webkit229ChordEvent, type TerminalInputEvent } from "../terminal/eraseGuard";
   import { terminalSessions } from "../terminal/sessionRegistry";
   import { copyText } from "../desktop/clipboard";
@@ -491,11 +491,20 @@
     return term;
   }
 
-  function acknowledgeOutput(sessionId: string, bytes: number) {
-    if (bytes <= 0) return;
+  /**
+   * Released credit is owed here and sent once per frame (or at once past
+   * `ACK_FLUSH_THRESHOLD`), not as one IPC call per 4 KiB chunk. Teardown
+   * flushes it synchronously.
+   */
+  const acks = createAckCoalescer((sessionId, bytes) => {
     void invoke("cmd_terminal_ack", { sessionId, bytes }).catch((err: unknown) => {
       if (lifecycle?.isCurrent(sessionId)) lifecycle.fail(`Output acknowledgement failed: ${formatError(err)}`, true);
     });
+  });
+
+  function acknowledgeOutput(sessionId: string, bytes: number) {
+    if (bytes <= 0) return;
+    acks.add(sessionId, bytes);
   }
 
   function paintOutput(token: PaintToken) {
@@ -1056,6 +1065,9 @@
       armTimers.clear();
       disposed = true;
       for (const owed of credit.releaseAll()) acknowledgeOutput(owed.sessionId, owed.bytes);
+      // Before `lifecycle` goes: nothing owed waits for a frame this view
+      // will not see, and a failure is still reported against the session.
+      acks.flush();
       if (nativeSessionId) { terminalAttendance.forget(nativeSessionId); sessionActivity.forget(nativeSessionId); }
       lifecycle?.dispose();
       lifecycle = null;

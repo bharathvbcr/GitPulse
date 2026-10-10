@@ -196,3 +196,82 @@ export function planTerminalOutput(
   if (decision.action === "held") return { action: "held" };
   return { action: "overflow", owed: decision.owed, failure: "Terminal output was dropped: the view was not open" };
 }
+
+/**
+ * Owed bytes at which acknowledgements are sent at once rather than at the
+ * next frame. A quarter of the window: whatever is being coalesced is never
+ * more than this, so the reader always has at least three quarters of
+ * `OutputFlow`'s window free and never waits on a frame that has not come.
+ */
+export const ACK_FLUSH_THRESHOLD = 64 * 1024;
+
+/**
+ * Upper bound on how long owed credit waits when no frame comes: a hidden
+ * window does not run animation frames, and a backgrounded terminal still
+ * paints (xterm's write callbacks are not frame-driven).
+ */
+export const ACK_FLUSH_BACKSTOP_MS = 50;
+
+/** Runs `flush` later; returns a cancel. */
+export type AckScheduler = (flush: () => void) => () => void;
+
+/** The next animation frame, or the backstop timer, whichever comes first. */
+export const frameAckScheduler: AckScheduler = (flush) => {
+  const raf = typeof globalThis.requestAnimationFrame === "function" ? globalThis.requestAnimationFrame : null;
+  const frame = raf ? raf(flush) : null;
+  const timer = setTimeout(flush, ACK_FLUSH_BACKSTOP_MS);
+  return () => {
+    if (frame !== null) globalThis.cancelAnimationFrame?.(frame);
+    clearTimeout(timer);
+  };
+};
+
+/**
+ * Coalesces `cmd_terminal_ack` calls.
+ *
+ * Every painted chunk (at most one 4 KiB read) used to be acknowledged with
+ * its own IPC call. `OutputFlow::acknowledge` accepts any total up to what it
+ * has reserved, and the sum of released credit is by construction never more
+ * than that, so one call per session per frame carries the same credit.
+ * Owed credit is sent at once when any session reaches
+ * `ACK_FLUSH_THRESHOLD`, and `flush()` sends everything synchronously — the
+ * view's teardown calls it so no credit is left behind with the view.
+ */
+export function createAckCoalescer(
+  send: (sessionId: string, bytes: number) => void,
+  schedule: AckScheduler = frameAckScheduler,
+) {
+  const owed = new Map<string, number>();
+  let cancel: (() => void) | null = null;
+
+  function flush() {
+    if (cancel) {
+      const stop = cancel;
+      cancel = null;
+      stop();
+    }
+    if (owed.size === 0) return;
+    const rows = [...owed];
+    owed.clear();
+    for (const [sessionId, bytes] of rows) send(sessionId, bytes);
+  }
+
+  return {
+    /** Owe `bytes` to `sessionId`. Zero and negative counts are ignored. */
+    add(sessionId: string, bytes: number) {
+      if (!(bytes > 0)) return;
+      const total = (owed.get(sessionId) ?? 0) + bytes;
+      owed.set(sessionId, total);
+      if (total >= ACK_FLUSH_THRESHOLD) flush();
+      else if (!cancel) cancel = schedule(flush);
+    },
+    /** Send everything owed now. */
+    flush,
+    /** Bytes owed and not yet sent. */
+    owed(): number {
+      let total = 0;
+      for (const bytes of owed.values()) total += bytes;
+      return total;
+    },
+  };
+}

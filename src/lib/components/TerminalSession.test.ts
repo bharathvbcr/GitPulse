@@ -194,6 +194,21 @@ describe("TerminalSession PTY contracts", () => {
     expect(source.indexOf("credit.releaseAll()", cleanupIdx)).toBeLessThan(source.indexOf("term?.dispose()", cleanupIdx));
   });
 
+  it("coalesces output acknowledgements and flushes them synchronously on teardown", () => {
+    // One `cmd_terminal_ack` per 4 KiB chunk was one IPC call per read.
+    const helper = source.slice(source.indexOf("function acknowledgeOutput("), source.indexOf("function paintOutput("));
+    expect(helper).toContain("acks.add(sessionId, bytes)");
+    expect(helper).not.toContain('invoke("cmd_terminal_ack"');
+    expect(source).toContain("createAckCoalescer(");
+    const cleanupIdx = source.indexOf("disposed = true;");
+    const released = source.indexOf("credit.releaseAll()", cleanupIdx);
+    const flushed = source.indexOf("acks.flush();", cleanupIdx);
+    expect(flushed, "teardown sends what is owed").toBeGreaterThan(released);
+    expect(flushed, "while the lifecycle can still report a failure").toBeLessThan(
+      source.indexOf("lifecycle?.dispose()", cleanupIdx),
+    );
+  });
+
   it("owns Backspace on the helper textarea before xterm can reinsert the line", () => {
     const mountIdx = source.indexOf("onMount(() => {");
     const openIdx = source.indexOf("t?.open(host)", mountIdx);
