@@ -22,6 +22,7 @@ pub(crate) mod process_birth;
 mod receipts;
 mod reconcile;
 pub mod review;
+mod suggest;
 pub(crate) mod terminal_command;
 mod terminal_launch;
 mod terminal_run;
@@ -375,6 +376,12 @@ impl WorkbenchState {
         if method == "verifications.get" {
             let params = verification_gate::get_params(input)?;
             return self.worker_call("work.verify.get", params, None);
+        }
+        // Which tasks to start next is Manvi's ranking of the open board; this
+        // only names the ask. It reads and never writes the board.
+        if method == "tasks.suggest" {
+            let params = suggest::params(input)?;
+            return self.worker_call("work.tasks.suggest", params, None);
         }
         if matches!(
             method,
