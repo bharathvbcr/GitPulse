@@ -29,6 +29,10 @@ use std::path::Path;
 
 /// The dc-store evidence type Manvi stores a verification record under.
 pub(crate) const EVIDENCE_TYPE: &str = "work.verify.task";
+/// The state the host's own record carries when verification could not be
+/// started or never answered. Manvi never writes it; it is a different thing
+/// from a `failed` or `degraded` verdict, which Manvi reached by running.
+pub(crate) const STATE_COULD_NOT_RUN: &str = "could_not_run";
 /// Bound on the per-criterion text carried into a task's history.
 const MAX_SUMMARY_CHARS: usize = 1500;
 
@@ -141,6 +145,11 @@ fn judge(
             record.item_id
         ));
     }
+    if record.state == STATE_COULD_NOT_RUN {
+        return Gate::Held(format!(
+            "verification could not run, so no verdict exists. {verdict}"
+        ));
+    }
     if record.state != "settled" {
         return Gate::Held(format!(
             "verification is still {:?}; no verdict yet. {verdict}",
@@ -194,6 +203,13 @@ fn short(oid: &str) -> &str {
 /// One bounded paragraph for the task's history: outcome, head, the criteria
 /// that were not met and what Manvi could not check.
 pub(crate) fn summarize(record: &Record) -> String {
+    if record.state == STATE_COULD_NOT_RUN {
+        return format!(
+            "Verification could not run for {}: {}",
+            short(&record.head),
+            record.degraded.join("; ")
+        );
+    }
     let mut text = format!(
         "Verification {} for {} (request {}).",
         if record.outcome.is_empty() {

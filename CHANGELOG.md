@@ -11,6 +11,16 @@ before that tag is pushed.
 
 ## [Unreleased]
 
+### Added
+
+- An agent's `done` that is held in review for lack of a passing verification
+  now starts that verification itself (one per task and head, at most two at a
+  time, off the MCP response path) and moves the card to done when Manvi's
+  verdict is `passed` for the head and nobody has touched the card since.
+  `failed`, `degraded` and a verification that could not run keep it in review,
+  each recorded distinctly. Task details show the verdict chip with
+  per-criterion results and a Verify action.
+
 ### Changed
 
 - The profile worker's per-call timeout now comes from Manvi's `hello`

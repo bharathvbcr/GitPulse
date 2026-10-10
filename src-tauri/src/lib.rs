@@ -153,6 +153,14 @@ pub fn run() {
             // Tasks other processes file (an agent over MCP) reach the board
             // without waiting for the window to lose and regain focus.
             workbench::external_changes::install(app.handle());
+            // An agent's `done` is held in review until Manvi verifies it;
+            // this starts that verification and settles the card.
+            {
+                use tauri::Manager as _;
+                workbench::verification_driver::install(
+                    app.state::<workbench::WorkbenchState>().inner().clone(),
+                );
+            }
             // A crash or force-quit leaves its task runs holding their
             // checkouts with no owner left to end them. Release the ones whose
             // processes are provably gone, off the startup path.
