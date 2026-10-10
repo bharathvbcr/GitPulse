@@ -832,10 +832,8 @@ impl GitReader {
         scope: RefScope,
     ) -> Result<Vec<RawCommitNode>, String> {
         let repo = validate_repo(repo_path)?;
-        let count = Self::page_count_limit(max_count).to_string();
-        let skipped = skip.min(Self::MAX_HISTORY_COMMITS).to_string();
-        let count_arg = format!("-n{}", count);
-        let skip_arg = format!("--skip={}", skipped);
+        let count = Self::page_count_limit(max_count);
+        let skipped = skip.min(Self::MAX_HISTORY_COMMITS);
         // History reads Git objects, not today's filesystem. A historical
         // file may now be a dangling link or live below a replaced directory.
         // Lexical confinement and a literal pathspec bound the object query.
@@ -846,6 +844,49 @@ impl GitReader {
             }
             None => None,
         };
+        let chunk = history_chunk_size();
+        let mut commits = if count <= chunk {
+            Self::history_chunk(&repo, skipped, count, revision, spec.as_deref(), scope)?
+        } else {
+            // A long window is read as aligned chunks, each kept on its own.
+            // One 100k-commit answer exceeded the cache's per-entry cap and
+            // was never kept, so every "load more" walked and parsed the whole
+            // window again; chunks stay under the cap, and growing the window
+            // reads only the chunks it has not seen. (Git still skips past
+            // the earlier commits for a new chunk: `--skip` has to walk them.)
+            let end = skipped.saturating_add(count);
+            let mut start = skipped - skipped % chunk;
+            let mut commits = Vec::with_capacity(count);
+            while start < end {
+                let rows =
+                    Self::history_chunk(&repo, start, chunk, revision, spec.as_deref(), scope)?;
+                let ended = rows.len() < chunk;
+                let from = skipped.saturating_sub(start).min(rows.len());
+                let to = (end - start).min(rows.len());
+                commits.extend(rows.into_iter().skip(from).take(to - from));
+                if ended {
+                    break;
+                }
+                start += chunk;
+            }
+            commits
+        };
+        mark_shallow_boundary(&repo, &mut commits)?;
+        Ok(commits)
+    }
+
+    /// One `git log` page: `count` commits after `skip`, parsed. Each distinct
+    /// (skip, count) is its own kept answer in [`ref_cache`].
+    fn history_chunk(
+        repo: &Path,
+        skip: usize,
+        count: usize,
+        revision: Option<&str>,
+        spec: Option<&str>,
+        scope: RefScope,
+    ) -> Result<Vec<RawCommitNode>, String> {
+        let count_arg = format!("-n{count}");
+        let skip_arg = format!("--skip={skip}");
         let mut args: Vec<&str> = Vec::new();
         if spec.is_some() {
             // Path bytes reach us raw rather than octal-escaped, matching the
@@ -879,7 +920,7 @@ impl GitReader {
             // decides the set for both sides; see crate::graph::ref_scope.
             args.extend_from_slice(crate::graph::history_rev_args(scope));
         }
-        if let Some(spec) = spec.as_deref() {
+        if let Some(spec) = spec {
             args.push("--");
             args.push(spec);
         }
@@ -894,7 +935,7 @@ impl GitReader {
         } else {
             &crate::graph::ref_scope::NAMED_REF_PATTERNS
         };
-        let stdout = ref_cache::git_text(&repo, namespaces, &args)?;
+        let stdout = ref_cache::git_text(repo, namespaces, &args)?;
 
         // Each record is exactly six NUL-delimited fields plus its terminator.
         // `format:` separates entries with a bare newline AFTER our %x00, so
@@ -908,7 +949,6 @@ impl GitReader {
                 commits.push(node);
             }
         }
-        mark_shallow_boundary(&repo, &mut commits)?;
         Ok(commits)
     }
 
@@ -3661,6 +3701,40 @@ fn read_sized_blob(repo: &Path, oid: &str) -> Result<Vec<u8>, String> {
         return Err("Git object size did not match cat-file".into());
     }
     Ok(bytes)
+}
+
+/// Commits per kept history chunk. See [`GitReader::read_commit_history_paged`].
+const HISTORY_CHUNK: usize = 5_000;
+
+#[cfg(not(test))]
+fn history_chunk_size() -> usize {
+    HISTORY_CHUNK
+}
+
+#[cfg(test)]
+thread_local! {
+    static CHUNK_OVERRIDE: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+fn history_chunk_size() -> usize {
+    CHUNK_OVERRIDE
+        .with(|cell| cell.get())
+        .unwrap_or(HISTORY_CHUNK)
+}
+
+/// Runs `body` with a small history chunk, so a test can cross chunk
+/// boundaries without a 5,000-commit fixture.
+#[cfg(test)]
+pub(crate) fn with_history_chunk<T>(size: usize, body: impl FnOnce() -> T) -> T {
+    struct Restore(Option<usize>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            CHUNK_OVERRIDE.with(|cell| cell.set(self.0));
+        }
+    }
+    let _restore = Restore(CHUNK_OVERRIDE.with(|cell| cell.replace(Some(size))));
+    body()
 }
 
 /// The warning a status row carries when its path cannot be trusted to name
@@ -7813,6 +7887,72 @@ __GP_PULSE__\0def456\0abc123\x001700000100\0N\0second\0Ada\0ada@example.com\0\0\
         );
         let fine = statuses.iter().find(|s| s.path == "fine.txt").expect("row");
         assert!(fine.warnings.is_empty(), "{:?}", fine.warnings);
+    }
+
+    /// Growing the window reads only the chunks it has not seen, and the
+    /// result is the window a single walk would have produced.
+    #[test]
+    fn growing_the_history_window_reads_only_the_new_chunk() {
+        let _held = ref_cache::retention();
+        let dir = init_repo_with_remotes(&[], "main");
+        for n in 0..40 {
+            git_in(
+                dir.path(),
+                &["commit", "--allow-empty", "-m", &format!("c{n}")],
+            );
+        }
+        let repo = dir.path().canonicalize().unwrap();
+        let path = repo.to_str().unwrap();
+        let log_skips = |since: usize| -> Vec<String> {
+            git_cli::spawn_log::spawns_in(&repo)[since..]
+                .iter()
+                .filter(|argv| argv.iter().any(|a| a == "log"))
+                .filter_map(|argv| argv.iter().find(|a| a.starts_with("--skip=")).cloned())
+                .collect()
+        };
+        let ids = |rows: &[RawCommitNode]| rows.iter().map(|r| r.id.clone()).collect::<Vec<_>>();
+
+        let whole = with_history_chunk(usize::MAX, || {
+            GitReader::read_commit_history_paged(path, 0, 30, None, None, RefScope::Named)
+        })
+        .unwrap();
+        assert_eq!(whole.len(), 30);
+
+        let (first, second, before, middle) = with_history_chunk(10, || {
+            ref_cache::eager(|| {
+                let first =
+                    GitReader::read_commit_history_paged(path, 0, 20, None, None, RefScope::Named)
+                        .unwrap();
+                let before = git_cli::spawn_log::spawns_in(&repo).len();
+                let second =
+                    GitReader::read_commit_history_paged(path, 0, 30, None, None, RefScope::Named)
+                        .unwrap();
+                let middle = git_cli::spawn_log::spawns_in(&repo).len();
+                (first, second, before, middle)
+            })
+        });
+        assert_eq!(ids(&first), ids(&whole[..20]));
+        assert_eq!(
+            ids(&second),
+            ids(&whole),
+            "chunked read differs from one walk"
+        );
+        assert_eq!(
+            log_skips(before),
+            vec!["--skip=20".to_string()],
+            "the larger window re-read chunks it already held (spawns {before}..{middle})"
+        );
+        // A page that starts mid-chunk is still exact.
+        let mid = with_history_chunk(10, || {
+            GitReader::read_commit_history_paged(path, 7, 18, None, None, RefScope::Named)
+        })
+        .unwrap();
+        let direct = with_history_chunk(usize::MAX, || {
+            GitReader::read_commit_history_paged(path, 7, 18, None, None, RefScope::Named)
+        })
+        .unwrap();
+        assert_eq!(ids(&mid), ids(&direct));
+        assert_eq!(mid.len(), 18);
     }
 
     #[test]

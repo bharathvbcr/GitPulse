@@ -1093,6 +1093,67 @@ mod tests {
         assert!(!kept().lock().unwrap().contains_key(&huge));
     }
 
+    /// A 100,000-commit window is read as 5,000-commit chunks (about 1.3 MB
+    /// each at a typical 260 bytes a record), because one answer that size
+    /// exceeded [`MAX_ENTRY_BYTES`] and was never kept. Every chunk of such a
+    /// window stays kept together; a longer one evicts oldest-first and never
+    /// passes the byte budget.
+    #[test]
+    fn a_hundred_thousand_commit_window_stays_kept_as_chunks_and_evicts_oldest_first() {
+        let _held = retention();
+        let fx = fixture(None).unwrap();
+        let chunk_bytes = 5_000 * 260;
+        assert!(chunk_bytes < MAX_ENTRY_BYTES, "a chunk must fit one entry");
+        let chunks_in_window = 100_000 / 5_000;
+        assert!(
+            chunks_in_window * chunk_bytes <= MAX_KEPT_BYTES && chunks_in_window < MAX_ENTRIES,
+            "the window must fit the budget it is meant to fit"
+        );
+        let key = |n: usize| Key {
+            repo: fx.main.clone(),
+            argv: vec!["log".into(), format!("chunk-{n}")],
+        };
+        let keep_chunk = |n: usize| {
+            eager(|| {
+                through(&fx.main, TAGS, &["log", &format!("chunk-{n}")], || {
+                    Ok(("c".repeat(chunk_bytes), true))
+                })
+            })
+            .unwrap();
+        };
+        for n in 0..chunks_in_window {
+            keep_chunk(n);
+        }
+        {
+            let table = kept().lock().unwrap();
+            for n in 0..chunks_in_window {
+                assert!(
+                    table.contains_key(&key(n)),
+                    "chunk {n} of the window was not kept"
+                );
+            }
+        }
+        // Growing past the budget evicts the oldest chunks, not the newest.
+        for n in chunks_in_window..chunks_in_window + 12 {
+            keep_chunk(n);
+        }
+        let table = kept().lock().unwrap();
+        let bytes: usize = table
+            .iter()
+            .filter(|(k, _)| k.repo == fx.main)
+            .map(|(_, entry)| entry.value.len())
+            .sum();
+        assert!(bytes <= MAX_KEPT_BYTES, "{bytes} bytes kept");
+        assert!(
+            !table.contains_key(&key(0)),
+            "the oldest chunk outlived the budget"
+        );
+        assert!(
+            table.contains_key(&key(chunks_in_window + 11)),
+            "the newest chunk was evicted"
+        );
+    }
+
     /// A timestamp from the future is never settled.
     #[test]
     fn a_future_timestamp_is_never_settled() {

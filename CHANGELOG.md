@@ -55,6 +55,14 @@ before that tag is pushed.
   commit is drawn as a stub rather than the root of the history; and a path
   git printed as non-UTF-8 carries a warning instead of silently naming a file
   that does not exist.
+- Long histories and wide graphs say what they leave out. A graph wider than
+  the 4,096 px canvas shows how many lanes are not drawn; a filter that joins
+  more than 32 ancestors onto a commit reports how many parent links the cap
+  dropped instead of cutting them silently; and a window longer than 5,000
+  commits is read and kept as chunks, so "load more" no longer re-reads and
+  re-parses every earlier commit (one 100k-commit answer exceeded the cache's
+  per-entry cap and was never kept). Git still skips past earlier commits for a
+  new chunk, and lane solving still covers the whole window.
 
 ### Changed
 

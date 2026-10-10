@@ -16,4 +16,6 @@ pub use ref_scope::{
 pub use refs::{
     list_ref_decorations, probe_hidden_history, RefDecoration, RefKind, RefListing, REFS_OTHER_CAP,
 };
-pub use simplify::{simplify_history, MAX_REWRITTEN_PARENTS};
+pub use simplify::{
+    simplify_history, simplify_history_reporting, Simplified, MAX_REWRITTEN_PARENTS,
+};

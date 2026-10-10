@@ -33,8 +33,8 @@ use crate::github::{
     DependabotReport, GitHubContext,
 };
 use crate::graph::{
-    mainline_chain_ids, simplify_history, BezierGeometryCalculator, CubicBezierCurve, LaneSolver,
-    MainlineHint, RawCommitNode, RefDecoration, RefKind, RefScope, VisualCommitRow,
+    mainline_chain_ids, simplify_history_reporting, BezierGeometryCalculator, CubicBezierCurve,
+    LaneSolver, MainlineHint, RawCommitNode, RefDecoration, RefKind, RefScope, VisualCommitRow,
 };
 use crate::stack::StackTreeEngine;
 use crate::watcher::{start_watch, unwatch, WatcherState};
@@ -305,7 +305,7 @@ pub fn assemble_commit_graph(
     refs: Vec<RefDecoration>,
     default_branch: Option<&str>,
     head_id: Option<String>,
-    notes: GraphNotes,
+    mut notes: GraphNotes,
 ) -> CommitGraphPayload {
     let has_more = raw_commits.len() > max_commits;
     if has_more {
@@ -324,7 +324,10 @@ pub fn assemble_commit_graph(
             .collect();
         if keep.iter().any(|kept| !kept) {
             let chain = mainline_chain_ids(&raw_commits, &hint);
-            raw_commits = simplify_history(&raw_commits, &keep);
+            let simplified = simplify_history_reporting(&raw_commits, &keep);
+            // The parent cap protects the solver's width; say when it cut.
+            notes.notices.extend(simplified.notice());
+            raw_commits = simplified.commits;
             let kept: HashSet<&str> = raw_commits.iter().map(|c| c.id.as_str()).collect();
             let survivor = chain.iter().find(|id| kept.contains(id.as_str())).cloned();
             if survivor.is_some() {
@@ -2795,6 +2798,7 @@ pub async fn cmd_publish_release(
                     plan.tag.as_str(),
                     "-m",
                     plan.message.as_str(),
+                    plan.head.as_str(),
                 ],
             )?)
         } else {
@@ -2807,7 +2811,12 @@ pub async fn cmd_publish_release(
         )?;
 
         if plan.create_tag {
-            crate::ops::create_release_tag(&repo_path, &plan)?;
+            GitWriter::create_tag(
+                &repo_path,
+                &plan.tag,
+                Some(plan.head.as_str()),
+                Some(&plan.message),
+            )?;
         }
         let output =
             GitWriter::push_tag(&repo_path, &plan.remote, &plan.tag).map_err(|error| {
@@ -5648,6 +5657,31 @@ mod assemble_tests {
             Some("m0".to_string()),
             GraphNotes::default(),
         )
+    }
+
+    /// The parent cap's cut reaches the screen as a notice, not just the log.
+    #[test]
+    fn a_filtered_graph_that_hit_the_parent_cap_says_so() {
+        let beyond: Vec<String> = (0..40).map(|n| format!("beyond{n}")).collect();
+        let refs: Vec<&str> = beyond.iter().map(String::as_str).collect();
+        let raw = vec![
+            commit("a0", &refs, "Ada", "feat: wide octopus"),
+            commit("b0", &[], "Bob", "fix: unrelated"),
+        ];
+        let payload = assemble_commit_graph(
+            raw,
+            10,
+            &CommitFilter::parse("author:Ada"),
+            Vec::new(),
+            None,
+            None,
+            GraphNotes::default(),
+        );
+        assert!(
+            payload.notices.iter().any(|n| n.contains("parent link")),
+            "{:?}",
+            payload.notices
+        );
     }
 
     fn ids(payload: &CommitGraphPayload) -> Vec<&str> {

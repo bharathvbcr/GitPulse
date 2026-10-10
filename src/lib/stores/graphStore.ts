@@ -143,6 +143,8 @@ export interface RefDecoration {
   kind: RefKind;
   commit_id: string;
   is_head: boolean;
+  /** Owning remote of a remote-tracking ref (longest configured name). */
+  remote?: string;
 }
 
 export interface CommitGraphPayload {

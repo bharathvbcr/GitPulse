@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::analyzer::ConventionalCommitParser;
 use crate::engine::git_cli::{git_text, validate_repo};
-use crate::engine::git_writer::{validate_ref_name, GitWriter};
+use crate::engine::git_writer::validate_ref_name;
 use crate::engine::{BranchInfo, GitReader};
 
 const COMMIT_REVIEW_LIMIT: usize = 500;
@@ -502,14 +502,10 @@ pub fn prepare_release(repo_path: &str, tag: &str, message: &str) -> Result<Rele
     })
 }
 
-/// Creates the release tag on the commit the plan checked.
-pub fn create_release_tag(repo_path: &str, plan: &ReleasePlan) -> Result<(), String> {
-    GitWriter::create_tag(repo_path, &plan.tag, Some(&plan.head), Some(&plan.message))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine::git_writer::GitWriter;
     use crate::procguard::LockedSpawn;
     use std::path::Path;
     use std::process::Command;
@@ -777,7 +773,7 @@ mod tests {
         let moved = git_text(repo.path(), &["rev-parse", "HEAD"]).expect("head");
         assert_ne!(moved.trim(), plan.head, "the fixture must move HEAD");
 
-        create_release_tag(path, &plan).expect("tag");
+        GitWriter::create_tag(path, &plan.tag, Some(&plan.head), Some(&plan.message)).expect("tag");
         let tagged = git_text(repo.path(), &["rev-list", "-n", "1", "v1.0.0"]).expect("tag target");
         assert_eq!(
             tagged.trim(),
