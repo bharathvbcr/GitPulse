@@ -50,7 +50,7 @@
   import FreshnessBadge from "./FreshnessBadge.svelte";
   import FirebasePanel from "./FirebasePanel.svelte";
   import { freshnessStore } from "../provenance/store";
-  import { prFreshness, prRevisions } from "../provenance/pullRequests";
+  import { prHeadFreshness, prRevisions } from "../provenance/pullRequests";
   import { createAsyncGuard, type AsyncGuard } from "../async/guard";
   import { harnessStore, verdictLabel, type Guarded } from "../stores/harnessStore";
   import type {
@@ -1033,7 +1033,7 @@
                       <div class="flex items-center gap-2 text-textPrimary font-medium flex-wrap">
                         <GitPullRequest size={14} class="text-accent shrink-0" />
                         <span class="truncate">#{pr.number} {pr.title}</span>
-                        <FreshnessBadge freshness={prFreshness($freshnessStore.byRevision, pr.head_ref)} />
+                        <FreshnessBadge freshness={prHeadFreshness($freshnessStore.byRevision, pr)} />
                         {#if pr.is_draft}
                           <span class="gp-pill">draft</span>
                         {/if}

@@ -720,22 +720,29 @@ pub(super) fn check(
     mode: &str,
     options: &LaunchOptions<'_>,
 ) -> Result<(), WorkbenchError> {
-    let version = capture_command(
-        program,
-        &["--version"],
-        Some(Path::new(cwd)),
-        Duration::from_secs(8),
-        &[],
-    )
-    .map_err(|e| error("capability_error", e))?;
-    let help = capture_command(
-        program,
-        &["--help"],
-        Some(Path::new(cwd)),
-        Duration::from_secs(8),
-        &[],
-    )
-    .map_err(|e| error("capability_error", e))?;
+    // `--version` and `--help` describe the binary, not the repository or the
+    // launch, and used to run serially before every agent launch. They are
+    // kept per binary (path, size, mtime), so an upgrade is seen at once.
+    static PROBES: crate::tool_capability::BinaryProbeCache<
+        Result<(CapturedOutput, CapturedOutput), String>,
+    > = crate::tool_capability::BinaryProbeCache::new();
+    let probed = PROBES.get_or_probe(program, || {
+        let probe = |arg: &str| {
+            capture_command(
+                program,
+                &[arg],
+                Some(Path::new(cwd)),
+                Duration::from_secs(8),
+                &[],
+            )
+        };
+        let outcome = probe("--version").and_then(|v| probe("--help").map(|h| (v, h)));
+        // A refusal or a failed run may pass on the next try; only a binary
+        // that answered both is remembered.
+        let cacheable = outcome.as_ref().is_ok_and(|(v, h)| v.success && h.success);
+        (outcome, cacheable)
+    });
+    let (version, help) = probed.map_err(|e| error("capability_error", e))?;
     advertises(provider, mode, options, &version, &help)
 }
 
@@ -1949,6 +1956,39 @@ mod tests {
         );
         assert_eq!(removed, 0);
         assert!(live.path.exists());
+    }
+
+    /// `--version` and `--help` ran serially before every agent launch. They
+    /// describe the binary, so they run once per binary (path, size, mtime).
+    #[cfg(unix)]
+    #[test]
+    fn an_agent_clis_version_and_help_are_probed_once_per_binary() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("claude");
+        let write = |tag: &str| {
+            std::fs::write(
+                &bin,
+                format!("#!/bin/sh\ncase \"$1\" in --version) echo 'Claude Code {tag}';; *) echo 'usage';; esac\n"),
+            )
+            .unwrap();
+            std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        };
+        write("1.0");
+        let program = bin.to_str().unwrap();
+        let cwd = dir.path().to_str().unwrap();
+        let spawns = |program: &str| {
+            let (_, labels) = crate::engine::git_cli::spawn_labels_during(|| {
+                // The verdict is not the point (the fake advertises no flags);
+                // how many children were started to reach it is.
+                let _ = super::check(program, cwd, "claude", "ask", &opts(true, None));
+            });
+            labels.len()
+        };
+        assert_eq!(spawns(program), 2, "first launch: --version and --help");
+        assert_eq!(spawns(program), 0, "second launch reuses the answer");
+        write("2.0.1-longer");
+        assert_eq!(spawns(program), 2, "an upgraded binary is probed again");
     }
 
     #[test]

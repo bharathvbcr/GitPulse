@@ -1,5 +1,5 @@
 <script lang="ts">
-  import type { RepoChangedPayload, RepoGonePayload } from "./lib/repos/events";
+  import type { RepoChange, RepoChangedPayload, RepoGonePayload } from "./lib/repos/events";
   import { readRepoChange, routeRepoChange } from "./lib/repos/changeScope";
   import type { LedgerAppended } from "./lib/ledger/types";
   import { onDestroy, onMount, tick, untrack } from "svelte";
@@ -719,6 +719,25 @@
     // not take down, say, the repo-changed listener registration with it.
     // Boot errors surface between renders, so unlike pane crash reports they
     // need no setTimeout deferral.
+    // Views derived from the checkout's files. Shared by watcher events and by
+    // the status poll, which sees the nested edits the non-recursive worktree
+    // watch cannot.
+    const fileDerivedTargets = {
+      metrics: (repo: string, touched: RepoChange | null) => repoMetrics.invalidate(repo, touched),
+      // Live index: gated incremental `devmap build` when the map is stale
+      // (or the watcher dirty signal forces it) and no build is in flight.
+      codeIndex: (repo: string) => liveIndex.onRepoChanged(repo),
+      docs: (repo: string) => onDocsRepoChanged(repo),
+    };
+    track(
+      repoStore.onPolledChange((repo, polled) => {
+        const blocked = get(repoStore).openTabs.some(
+          (tab) => tab.trustRequired === true && tab.path === repo,
+        );
+        // Repository state is the poll's own result, already applied.
+        routeRepoChange(repo, polled, blocked, { ...fileDerivedTargets, repoState: () => {} });
+      }),
+    );
     void runBootSequence(
       {
         subscribeNativeShell,
@@ -732,12 +751,8 @@
             ? get(repoStore).openTabs.some((tab) => tab.trustRequired === true && tab.path === path)
             : false;
           routeRepoChange(path, change ?? null, blocked, {
+            ...fileDerivedTargets,
             repoState: (repo) => void repoStore.handleRepoChanged(repo),
-            metrics: (repo, touched) => repoMetrics.invalidate(repo, touched),
-            // Live index: gated incremental `devmap build` when the map is stale
-            // (or the watcher dirty signal forces it) and no build is in flight.
-            codeIndex: (repo) => liveIndex.onRepoChanged(repo),
-            docs: (repo) => onDocsRepoChanged(repo),
           });
         },
         listenRepoChanged: (changed) =>

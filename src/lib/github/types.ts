@@ -160,6 +160,11 @@ export interface PullRequestInfo {
   review_decision: string;
   /** Empty when nobody has reviewed yet — not a zero-hour review. */
   first_review_at: string;
+  /** True when the head branch lives in a fork: `head_ref` then names a
+   *  branch of the contributor's repository, not of this one. */
+  is_cross_repository?: boolean;
+  /** Login of the head repository's owner; empty when gh did not report it. */
+  head_owner?: string;
 }
 
 /** Mirrors `PullRequestDetail` in src-tauri/src/github/mod.rs (`gh pr view`). */

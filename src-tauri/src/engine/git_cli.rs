@@ -3254,6 +3254,11 @@ thread_local! {
     #[cfg(test)]
     static FORCED_FAILURE_HOOK: std::cell::RefCell<Option<Box<dyn Fn()>>> =
         const { std::cell::RefCell::new(None) };
+    /// Labels of the children this thread asked the gate to run, newest last,
+    /// for [`spawn_labels_during`].
+    #[cfg(test)]
+    static SPAWN_LABELS: std::cell::RefCell<Vec<String>> =
+        const { std::cell::RefCell::new(Vec::new()) };
     /// Fails only the spawns on this thread whose arguments include this one.
     #[cfg(test)]
     static FORCED_FAILURE_ARG: std::cell::RefCell<Option<String>> =
@@ -3371,6 +3376,18 @@ pub(crate) fn with_forced_spawn_failure_then<T>(
     with_forced_spawn_failure(body)
 }
 
+/// Runs `body` and returns the label of every child it asked this thread's
+/// gate to spawn — the spawn-count assertion for "one process, not N". Only
+/// spawns made on the calling thread are seen, which is where a synchronous
+/// reader makes them.
+#[cfg(test)]
+pub(crate) fn spawn_labels_during<R>(body: impl FnOnce() -> R) -> (R, Vec<String>) {
+    SPAWN_LABELS.with(|labels| labels.borrow_mut().clear());
+    let result = body();
+    let seen = SPAWN_LABELS.with(|labels| std::mem::take(&mut *labels.borrow_mut()));
+    (result, seen)
+}
+
 /// [`run_with_gate`] with `on_admitted` called after the gate admits the
 /// child and before it is spawned — the last moment at which nothing has been
 /// read yet, which is what [`run_read_shared`] needs to stop new joiners.
@@ -3385,6 +3402,8 @@ fn run_admitted(
     gate: &'static SpawnGate,
     on_admitted: &dyn Fn(),
 ) -> Result<BoundedRun, String> {
+    #[cfg(test)]
+    SPAWN_LABELS.with(|labels| labels.borrow_mut().push(label.to_string()));
     #[cfg(test)]
     if FORCE_SPAWN_FAILURE.get() || forced_failure_matches(cmd) {
         FORCED_FAILURE_HOOK.with(|slot| {

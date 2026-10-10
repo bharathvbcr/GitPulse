@@ -484,9 +484,9 @@ impl GitWriter {
     }
 
     /// One native request and lock for a selection. All paths and all policy
-    /// verdicts are checked before the first write. Bounded argv chunks avoid
-    /// platform command-length limits. A later Git failure names the completed
-    /// prefix; it is never presented as an atomic rollback or as success.
+    /// verdicts are checked before the write, then one git process applies the
+    /// whole selection (paths on stdin, so no command-length limit applies).
+    /// A Git failure is reported, never presented as success.
     pub fn change_index_with<J, V>(
         repo_path: &str,
         files: &[String],
@@ -526,14 +526,25 @@ impl GitWriter {
             let args: Vec<&str> = plan.iter().map(String::as_str).collect();
             verdicts.push(judge(&args)?);
         }
-        let mut completed = 0;
-        for plan in &plans {
-            let args: Vec<&str> = plan.iter().skip(1).map(String::as_str).collect();
-            git_text(&repo, &args).map_err(|error| format!(
-                "Index update stopped after {completed} of {} selected paths: {error}. Refresh to review the current index.", paths.len()
-            ))?;
-            completed += plan.len() - prefix.len();
+        // One process for the whole selection, paths on stdin NUL-separated:
+        // git applies the pathspec set to the index under one lock, so a
+        // failure leaves nothing half-applied (the chunked form ran a process
+        // per 128 paths and could stop partway). The judged lines above name
+        // the same pathspecs; only the transport differs.
+        let mut input = Vec::new();
+        for path in &paths {
+            input.extend_from_slice(path.as_bytes());
+            input.push(0);
         }
+        let mut args: Vec<&str> = prefix[1..prefix.len() - 1]
+            .iter()
+            .map(String::as_str)
+            .collect();
+        args.extend(["--pathspec-from-file=-", "--pathspec-file-nul"]);
+        git_with_stdin(&repo, &args, &input).map_err(|error| {
+            format!("Index update failed for the {} selected paths: {error}. Refresh to review the current index.", paths.len())
+        })?;
+        let completed = paths.len();
         Ok((verdicts, completed))
     }
 
@@ -4774,6 +4785,52 @@ mod tests {
         GitWriter::commit(&repo_path(&dir), "slow hook", false)
             .expect("a slow hook is not a hung git");
         assert_eq!(head_message(&dir).trim(), "slow hook");
+    }
+
+    /// A selection of 300 paths used to be three `git add` processes (one per
+    /// 128 paths) that could stop partway. It is one, and stages everything.
+    #[test]
+    fn staging_and_unstaging_a_selection_is_one_process_each() {
+        let dir = init_repo_with_commit();
+        let path = repo_path(&dir);
+        let files: Vec<String> = (0..300).map(|i| format!("dir/f {i}.txt")).collect();
+        std::fs::create_dir_all(dir.path().join("dir")).unwrap();
+        for file in &files {
+            std::fs::write(dir.path().join(file), "x\n").unwrap();
+        }
+        let staged = |dir: &tempfile::TempDir| {
+            let out = std::process::Command::new("git")
+                .args(["diff", "--cached", "--name-only", "-z"])
+                .current_dir(dir.path())
+                .output_locked()
+                .expect("git diff --cached");
+            String::from_utf8_lossy(&out.stdout)
+                .split('\0')
+                .filter(|p| !p.is_empty())
+                .count()
+        };
+
+        let (staged_result, labels) = crate::engine::git_cli::spawn_labels_during(|| {
+            GitWriter::change_index_with(&path, &files, IndexAction::Stage, |_| Ok(()))
+        });
+        assert_eq!(staged_result.expect("stage").1, 300);
+        assert_eq!(
+            labels.iter().filter(|l| l.as_str() == "git add").count(),
+            1,
+            "{labels:?}"
+        );
+        assert_eq!(staged(&dir), 300);
+
+        let (unstaged_result, labels) = crate::engine::git_cli::spawn_labels_during(|| {
+            GitWriter::change_index_with(&path, &files, IndexAction::Unstage, |_| Ok(()))
+        });
+        assert_eq!(unstaged_result.expect("unstage").1, 300);
+        assert_eq!(
+            labels.iter().filter(|l| l.as_str() == "git reset").count(),
+            1,
+            "{labels:?}"
+        );
+        assert_eq!(staged(&dir), 0);
     }
 }
 

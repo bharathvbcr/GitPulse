@@ -2,8 +2,8 @@ use crate::analyzer::{DiffChurn, LanguageDetector, LanguageInfo, LocCounter};
 use crate::engine::budget;
 use crate::engine::churn_store::{self, Churn, ZERO_CHURN};
 use crate::engine::git_cli::{
-    self, git, git_text, git_text_capped, git_text_shared, sandbox_join, sandbox_join_canonical,
-    sandbox_join_entry, validate_repo, Incomplete,
+    self, git, git_text, git_text_capped, git_text_shared, git_text_with_timeout, sandbox_join,
+    sandbox_join_canonical, sandbox_join_entry, validate_repo, Incomplete,
 };
 use crate::engine::git_writer::validate_ref_name;
 use crate::engine::ref_cache::{self, FileIdentity};
@@ -1902,12 +1902,7 @@ impl GitReader {
             match git_text_capped(&repo, &args, budget::MAX_PULSE_BYTES) {
                 Ok(out) => out,
                 Err(e) => {
-                    let msg = e.to_lowercase();
-                    if msg.contains("does not have any commits")
-                        || msg.contains("bad default revision 'head'")
-                        || msg.contains("fatal: your current branch")
-                        || msg.contains("fatal: needed a single revision")
-                    {
+                    if is_unborn_head_error(&e) {
                         return Ok(PulseReport {
                             commits: Vec::new(),
                             top_files_by_churn: Vec::new(),
@@ -1981,12 +1976,7 @@ impl GitReader {
         let stdout = match git_text(&repo, &["ls-files", "-z", "--cached"]) {
             Ok(out) => out,
             Err(e) => {
-                let msg = e.to_lowercase();
-                if msg.contains("does not have any commits")
-                    || msg.contains("bad default revision 'head'")
-                    || msg.contains("fatal: your current branch")
-                    || msg.contains("fatal: needed a single revision")
-                {
+                if is_unborn_head_error(&e) {
                     return Ok(KnowledgeReport {
                         scanned_files: 0,
                         candidate_files: 0,
@@ -2214,6 +2204,7 @@ impl GitReader {
         max_scan_commits: usize,
     ) -> Result<DoraReport, String> {
         let repo = validate_repo(repo_path)?;
+        let started = Instant::now();
         let window = window_days.unwrap_or(90).clamp(7, 365);
         let now_secs = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -2232,12 +2223,7 @@ impl GitReader {
         ) {
             Ok(out) => out,
             Err(e) => {
-                let msg = e.to_lowercase();
-                if msg.contains("does not have any commits")
-                    || msg.contains("bad default revision 'head'")
-                    || msg.contains("fatal: your current branch")
-                    || msg.contains("fatal: needed a single revision")
-                {
+                if is_unborn_head_error(&e) {
                     return Ok(DoraReport {
                         deploy_frequency_per_week: 0.0,
                         deploy_rating: "Low".to_string(),
@@ -2298,33 +2284,49 @@ impl GitReader {
 
         let mut lead_times_hours: Vec<f64> = Vec::new();
         if !release_tags.is_empty() {
-            let commit_stdout =
-                git_text(&repo, &["log", "-n", "30", "--format=%H%x00%ct"]).unwrap_or_default();
-
-            for line in commit_stdout.lines() {
-                let parts: Vec<&str> = line.split('\0').collect();
-                if parts.len() >= 2 {
-                    let commit_sha = parts[0];
-                    let commit_ts: i64 = parts[1].parse().unwrap_or(0);
-
-                    if let Ok(desc) =
-                        git_text(&repo, &["describe", "--tags", "--contains", commit_sha])
+            let commit_stdout = dora_git(
+                &repo,
+                started,
+                &["log", "-n", "30", "--format=%H%x00%ct"],
+                "the recent-commit read",
+            )?;
+            let commits: Vec<(&str, i64)> = commit_stdout
+                .lines()
+                .filter_map(|line| {
+                    let (sha, ts) = line.split_once('\0')?;
+                    Some((sha, ts.parse().unwrap_or(0)))
+                })
+                .collect();
+            if !commits.is_empty() {
+                // One `name-rev` for all of them: this was one `describe
+                // --contains` process per commit, thirty in a row. It prints
+                // one line per argument, in order; `undefined` marks a commit
+                // no tag contains.
+                let mut args = vec!["name-rev", "--tags", "--name-only"];
+                args.extend(commits.iter().map(|(sha, _)| *sha));
+                let names = dora_git(&repo, started, &args, "the tag lookup")?;
+                let names: Vec<&str> = names.lines().collect();
+                if names.len() != commits.len() {
+                    return Err(format!(
+                        "DORA tag lookup answered {} lines for {} commits",
+                        names.len(),
+                        commits.len()
+                    ));
+                }
+                for ((_, commit_ts), name) in commits.iter().zip(names) {
+                    let tag_ref = name
+                        .trim()
+                        .trim_start_matches("tags/")
+                        .split('~')
+                        .next()
+                        .unwrap_or("")
+                        .split('^')
+                        .next()
+                        .unwrap_or("");
+                    if let Some((_, _, tag_ts)) = release_tags.iter().find(|(t, _, _)| t == tag_ref)
                     {
-                        let tag_ref = desc
-                            .trim()
-                            .split('~')
-                            .next()
-                            .unwrap_or("")
-                            .split('^')
-                            .next()
-                            .unwrap_or("");
-                        if let Some((_, _, tag_ts)) =
-                            release_tags.iter().find(|(t, _, _)| t == tag_ref)
-                        {
-                            if *tag_ts >= commit_ts {
-                                let diff_hours = ((*tag_ts - commit_ts) as f64) / 3600.0;
-                                lead_times_hours.push(diff_hours);
-                            }
+                        if *tag_ts >= *commit_ts {
+                            lead_times_hours.push(((*tag_ts - *commit_ts) as f64) / 3600.0);
                         }
                     }
                 }
@@ -2352,11 +2354,12 @@ impl GitReader {
 
         let since_arg = format!("--since={window}.days");
         let scan_limit = max_scan_commits.to_string();
-        let log_stdout = git_text(
+        let log_stdout = dora_git(
             &repo,
+            started,
             &["log", "-n", &scan_limit, &since_arg, "--format=%s%x00%ct"],
-        )
-        .unwrap_or_default();
+            "the commit scan",
+        )?;
 
         let mut total_commits = 0usize;
         let mut revert_or_fix_commits = 0usize;
@@ -2441,6 +2444,41 @@ impl GitReader {
             is_mttr_approximation: true,
             window_days: window,
         })
+    }
+}
+
+/// True when git's error says the repository has no commit to read yet: an
+/// empty history, which is an answer, not a failed read.
+fn is_unborn_head_error(error: &str) -> bool {
+    let msg = error.to_lowercase();
+    msg.contains("does not have any commits")
+        || msg.contains("bad default revision 'head'")
+        || msg.contains("fatal: your current branch")
+        || msg.contains("fatal: needed a single revision")
+}
+
+/// Wall-clock budget for one DORA report across all of its git reads.
+const DORA_DEADLINE: Duration = Duration::from_secs(60);
+
+/// One git read of the DORA report, bounded by what is left of
+/// [`DORA_DEADLINE`]. A failed or out-of-time read is an error naming the
+/// step: the report used to swallow it (`unwrap_or_default`), so an empty
+/// answer from a read that never ran looked like a repository with no
+/// commits and published a 0% failure rate and no lead time.
+fn dora_git(repo: &Path, started: Instant, args: &[&str], step: &str) -> Result<String, String> {
+    let left = DORA_DEADLINE
+        .checked_sub(started.elapsed())
+        .filter(|left| !left.is_zero())
+        .ok_or_else(|| {
+            format!(
+                "DORA report ran out of its {}s budget before {step}",
+                DORA_DEADLINE.as_secs()
+            )
+        })?;
+    match git_text_with_timeout(repo, args, left) {
+        Ok(text) => Ok(text),
+        Err(error) if is_unborn_head_error(&error) => Ok(String::new()),
+        Err(error) => Err(format!("DORA {step} failed: {error}")),
     }
 }
 
@@ -8014,6 +8052,44 @@ __GP_PULSE__\0def456\0abc123\x001700000100\0N\0second\0Ada\0ada@example.com\0\0\
             "an empty history was not cut short; the empty sample is the signal"
         );
         assert_eq!(report.commit_scan_window_commits, None);
+    }
+
+    /// Lead time asked git once per commit (30 `describe --contains` spawns).
+    /// It must be one `name-rev` for the whole batch, and still find the tag.
+    #[test]
+    fn dora_lead_time_is_one_process_not_one_per_commit() {
+        let dir = repo_with_commits(12);
+        git_in(dir.path(), &["tag", "-a", "v1.0.0", "-m", "release"]);
+        let path = dir.path().to_str().unwrap();
+
+        let (report, labels) =
+            git_cli::spawn_labels_during(|| GitReader::dora_report(path, Some(90)));
+        let report = report.expect("report");
+        let count = |label: &str| labels.iter().filter(|l| l.as_str() == label).count();
+        assert_eq!(count("git name-rev"), 1, "{labels:?}");
+        assert_eq!(count("git describe"), 0, "{labels:?}");
+        assert!(
+            labels.len() <= 6,
+            "a DORA report is a handful of spawns, not one per commit: {labels:?}"
+        );
+        assert!(
+            report.median_lead_time_hours >= 0.0 && report.lead_time_rating != "None",
+            "the tag was found: {report:?}"
+        );
+    }
+
+    /// A failed commit read is not an empty history: it used to publish 0%
+    /// change failures and no lead time as if measured.
+    #[test]
+    fn dora_reports_a_failed_git_read_instead_of_an_empty_answer() {
+        let dir = repo_with_commits(3);
+        git_in(dir.path(), &["tag", "-a", "v1.0.0", "-m", "release"]);
+        let path = dir.path().to_str().unwrap();
+        let error = git_cli::with_forced_spawn_failure_of("--format=%s%x00%ct", || {
+            GitReader::dora_report(path, Some(90))
+        })
+        .expect_err("a failed commit scan must fail the report");
+        assert!(error.contains("commit scan"), "{error}");
     }
 
     /// Seeds `count` commits whose subjects alternate so the scan has both

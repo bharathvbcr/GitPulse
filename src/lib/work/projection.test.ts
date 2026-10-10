@@ -205,6 +205,22 @@ describe("projectWork joins", () => {
     expect(withPr.sort()).toEqual(["TASK-1", "TASK-2"]);
   });
 
+  it("never attaches a fork pull request to the local branch of the same name", () => {
+    const fork = { ...pr(11, "main"), is_cross_repository: true };
+    const p = projectWork(
+      inputs({
+        leases: [lease("TASK-1")],
+        worktrees: [worktree("/wt/a", "main")],
+        bindings: { "/wt/a": "TASK-1" },
+        pullRequests: [fork],
+      }),
+    );
+    expect(p.rows.find((r) => r.taskId === "TASK-1")!.pullRequests).toEqual([]);
+    expect(
+      p.rows.find((r) => r.taskId === UNBOUND_ROW_ID)!.pullRequests.map((x) => x.number),
+    ).toEqual([11]);
+  });
+
   it("does not guess a task for a pull request no worktree matches", () => {
     const p = projectWork(
       inputs({

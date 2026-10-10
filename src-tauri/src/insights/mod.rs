@@ -805,17 +805,10 @@ fn snapshot_observed(
     };
 
     let changes = match GitReader::get_status(repo_path) {
-        Ok(files) => {
-            let truncated = files.len() > MAX_ACTIVE_FILES;
-            let kept = if truncated {
-                &files[..MAX_ACTIVE_FILES]
-            } else {
-                &files
-            };
-            let mut facet = changes_from_status(kept, truncated);
-            facet.files = files.len() as u32;
-            facet
-        }
+        // The facet carries counts, not rows, and the whole status is already
+        // in memory: count every file. Counting only the first
+        // `MAX_ACTIVE_FILES` made every total a floor on a busy tree.
+        Ok(files) => changes_from_status(&files, false),
         Err(error) => empty_changes(error),
     };
 
@@ -1098,11 +1091,23 @@ fn fleet_commit_stats(
     // One over the cap, so "we stopped early" is observable rather than
     // indistinguishable from a repository that happens to have exactly the cap.
     let limit = (MAX_FLEET_COMMITS + 1).to_string();
+    // Only commits inside the window count toward the cap. Without a date
+    // bound the cap was spent on history older than the window, so a
+    // repository with more than the cap in total read as truncated even when
+    // every commit of the window had been seen; with it, `truncated` means the
+    // window itself hit the cap. `--since-as-filter` (git 2.37) rather than
+    // `--since`: plain `--since` stops walking at the first old commit, so one
+    // commit with a skewed clock at the tip hid everything behind it.
+    let since = format!(
+        "--since-as-filter={}",
+        anchor_epoch.saturating_sub(i64::from(window_days) * BUCKET_SECONDS)
+    );
     let text = match git_text(
         repo,
         &[
             "log",
             "--no-show-signature",
+            &since,
             "-n",
             &limit,
             "--format=%ct%x1f%ae",
@@ -1642,7 +1647,9 @@ fn changes_in(repo_path: &str, target: &str, limit: Option<u32>) -> ActiveChange
             let total = files.len() as u32;
             let truncated = files.len() > cap;
             let kept: Vec<FileStatus> = files.iter().take(cap).cloned().collect();
-            let counts = count_statuses(&kept);
+            // Totals describe the whole worktree, like `total`; only the row
+            // list is capped. Counting the rows kept understated them.
+            let counts = count_statuses(&files);
             ActiveChanges {
                 repo_path: repo_path.to_string(),
                 worktree_path: target.to_string(),
@@ -2483,6 +2490,31 @@ mod tests {
         assert_eq!(changes.total, 0);
     }
 
+    /// 250 untracked files, a cap of 200 on rows: the totals cover all 250.
+    /// They were rolled from the first 200 and read as exact.
+    #[test]
+    fn change_totals_cover_every_file_not_the_capped_list() {
+        let main = init_repo();
+        let repo = main.path().to_str().unwrap();
+        for i in 0..250 {
+            fs::write(main.path().join(format!("f{i}.txt")), "x\n").unwrap();
+        }
+        let snap = snapshot(repo);
+        assert!(snap.changes.ok, "{:?}", snap.changes);
+        assert_eq!(snap.changes.files, 250);
+        assert_eq!(snap.changes.untracked, 250, "{:?}", snap.changes);
+        assert!(!snap.changes.truncated, "{:?}", snap.changes);
+
+        let listed = active_changes(repo, None, Some(10));
+        assert_eq!(listed.files.len(), 10);
+        assert_eq!(listed.total, 250);
+        assert!(listed.truncated, "the row list is capped");
+        assert_eq!(
+            listed.untracked, 250,
+            "totals are not the capped rows: {listed:?}"
+        );
+    }
+
     /// Commits an empty change stamped at an exact instant.
     ///
     /// `git_in` cannot carry environment, and a commit-rhythm test that lets
@@ -2709,6 +2741,53 @@ mod tests {
             "every in-window commit is counted, whatever order the dates arrive in"
         );
         assert_eq!(stats.active_days, 4);
+    }
+
+    /// More history than the cap, all of it older than the window except three
+    /// commits: the window was fully covered, so nothing is a floor.
+    #[test]
+    fn a_long_history_older_than_the_window_is_not_truncated() {
+        use std::io::Write;
+        let dir = tempfile::TempDir::new().unwrap();
+        git_in(dir.path(), &["init", "-b", "main"]);
+        let anchor = 1_800_000_000i64;
+        let old_total = MAX_FLEET_COMMITS + 50;
+        let mut stream = String::new();
+        for i in 0..old_total + 3 {
+            let stamp = if i < old_total {
+                anchor - 400 * 86_400 + i as i64
+            } else {
+                anchor - 100 * (1 + (i - old_total) as i64)
+            };
+            stream.push_str(&format!(
+                "commit refs/heads/main\nmark :{}\ncommitter A <a@example.com> {stamp} +0000\ndata 2\nc\n",
+                i + 1
+            ));
+            if i > 0 {
+                stream.push_str(&format!("from :{i}\n"));
+            }
+            stream.push('\n');
+        }
+        let file = dir.path().join("stream");
+        fs::File::create(&file)
+            .unwrap()
+            .write_all(stream.as_bytes())
+            .unwrap();
+        let status = std::process::Command::new("git")
+            .args(["fast-import", "--quiet"])
+            .current_dir(dir.path())
+            .stdin(fs::File::open(&file).unwrap())
+            .status_locked()
+            .expect("spawn git fast-import");
+        assert!(status.success());
+
+        let stats =
+            fleet_commit_stats(dir.path(), anchor, FLEET_COMMIT_WINDOW_DAYS).expect("probe runs");
+        assert_eq!(stats.commits, 3);
+        assert!(
+            !stats.truncated,
+            "the window held 3 commits; history past the window must not spend the cap"
+        );
     }
 
     #[test]

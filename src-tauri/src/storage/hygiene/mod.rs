@@ -343,48 +343,14 @@ fn local_checks(repo: &Path, relative: &str) -> Result<PathBuf, String> {
     Ok(path)
 }
 
+/// Refuses cleanup while any process uses `path`: an open file or a working
+/// directory under it ([`open_files_under`]).
+///
+/// This used to also refuse when *any* process on the machine was named
+/// `cargo`, `uv`, `npm`, ...; five long-lived `uvx` MCP proxies then blocked
+/// every cleanup regardless of what they touched. The path-scoped scan is the
+/// check that says whether this directory is in use, so it is the only one.
 fn activity_check(path: &Path) -> Result<(), String> {
-    #[cfg(unix)]
-    {
-        let processes = capture_command(
-            "ps",
-            &["-A", "-o", "comm="],
-            None,
-            Duration::from_secs(5),
-            &[],
-        )?;
-        if !processes.success {
-            return Err("Could not verify active build processes".into());
-        }
-        for line in processes.stdout_text().lines() {
-            let name = Path::new(line.trim())
-                .file_name()
-                .and_then(|s| s.to_str())
-                .unwrap_or("");
-            if matches!(
-                name,
-                "cargo"
-                    | "rustc"
-                    | "rustdoc"
-                    | "go"
-                    | "swift"
-                    | "swift-frontend"
-                    | "javac"
-                    | "gradle"
-                    | "dotnet"
-                    | "cmake"
-                    | "ninja"
-                    | "make"
-                    | "xcodebuild"
-                    | "pytest"
-                    | "uv"
-                    | "pnpm"
-                    | "npm"
-            ) {
-                return Err(format!("An active {name} process may be using build output. Stop builds before cleanup."));
-            }
-        }
-    }
     open_files_under(path)
 }
 

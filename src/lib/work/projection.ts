@@ -20,6 +20,7 @@ import type { LedgerEvent } from "../ledger/types";
 import type { TaskLease } from "../tasks/types";
 import type { WorktreeInfo } from "../branches/types";
 import type { PullRequestInfo, WorkflowRunInfo } from "../github/types";
+import { isForkPr } from "../provenance/pullRequests";
 import type { PolicyStatus } from "../stores/harnessStore";
 import type { RepoOperation } from "../repos/operation";
 import { agentKindsOn, isAgentWorktree } from "./agentWorktree";
@@ -286,9 +287,16 @@ export function projectWork(input: WorkInputs): WorkProjection {
   const MAX_ROW_LINKS = 20_000;
   let possibleLinks = 0;
   let shownLinks = 0;
-  function distribute<T>(items: readonly T[], branch: (item: T) => string, bucket: (row: WorkRow) => T[]): void {
+  function distribute<T>(
+    items: readonly T[],
+    branch: (item: T) => string,
+    bucket: (row: WorkRow) => T[],
+    foreign: (item: T) => boolean = () => false,
+  ): void {
     for (const item of items) {
-      const owners = keysByBranch.get(branch(item));
+      // A fork's head branch shares a name with ours by accident, not by
+      // identity: it never attaches to the local row of that name.
+      const owners = foreign(item) ? undefined : keysByBranch.get(branch(item));
       possibleLinks += owners?.size ?? 1;
       if (shownLinks >= MAX_ROW_LINKS) continue;
       if (!owners) { bucket(unbound()).push(item); shownLinks += 1; continue; }
@@ -299,7 +307,7 @@ export function projectWork(input: WorkInputs): WorkProjection {
       }
     }
   }
-  distribute(uniqueBy(input.pullRequests ?? [], pr => pr.number), pr => pr.head_ref, row => row.pullRequests);
+  distribute(uniqueBy(input.pullRequests ?? [], pr => pr.number), pr => pr.head_ref, row => row.pullRequests, isForkPr);
   distribute(uniqueBy(input.runs ?? [], run => run.id), run => run.head_branch, row => row.runs);
   const sources = { ...input.sources };
   if (shownLinks < possibleLinks) sources.github = {

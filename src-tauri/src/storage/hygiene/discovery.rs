@@ -104,6 +104,13 @@ pub fn discover(roots: &[PathBuf], excludes: &[PathBuf], cancel: &AtomicBool) ->
                 }
             }
         }
+        // A repository is an inventory unit, not a place to look for more:
+        // walking its source tree spent the whole entry budget on files (a
+        // 84k-entry ~/Code went partial and the scheduled run refused). Its
+        // own artifact directories are measured by the repository scan.
+        if report.repos.contains(&path) {
+            continue;
+        }
         if depth >= 24 {
             report.partial = true;
             if report.issues.len() < 128 {
@@ -133,7 +140,6 @@ pub fn discover(roots: &[PathBuf], excludes: &[PathBuf], cancel: &AtomicBool) ->
                 report.partial = true;
                 break;
             }
-            report.visited += 1;
             match child {
                 Ok(child) => {
                     let name = child.file_name().to_string_lossy().to_string();

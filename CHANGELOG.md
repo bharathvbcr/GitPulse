@@ -325,6 +325,37 @@ before that tag is pushed.
   input write no longer ends the tab's input, and a cut-off bracketed paste is
   closed; failed output emits no longer leak flow credit; a session whose
   process outlives its terminal is listed as ending, with Stop.
+- GitHub calls on any host but github.com no longer fail: `gh pr/issue/run/
+  release` have no `--hostname` flag, so the host now travels inside
+  `--repo HOST/OWNER/REPO` from one builder (`gh_repo_flags`). `ssh.github.com`
+  remotes normalise to github.com. A 403 whose message says "API rate limit
+  exceeded" or "secondary rate limit" is classified rate-limited, with the wait
+  when GitHub gave one; a scope-only 403 stays forbidden. A fork pull request
+  whose head branch shares a name with a local branch no longer attaches to
+  that row or shows freshness for `origin/<name>`.
+- Insights finds agent sessions under every Claude config directory
+  (`CLAUDE_CONFIG_DIR`, `GITPULSE_CLAUDE_CONFIG_DIRS`, `~/.claude`, the XDG
+  directory and `~/.claude-*`) and reports not-ok when that list could not be
+  completed. Storage cleanup is no longer blocked machine-wide by an unrelated
+  `uv`/`npm`/`cargo` process (the path-scoped open-file scan remains), discovery
+  no longer walks repository source trees (an ~80k-entry root completes), a
+  symlinked cache root is an error rather than 0 bytes, and a partial removal
+  says entries were already removed. The fleet commit walk is bounded by its
+  window, so only a window that hit the cap reads as truncated; change totals
+  cover every file.
+- The watcher ignores read-only access events (Linux self-refresh loops),
+  treats a backend rescan/overflow and a full event queue as one full refresh,
+  no longer lets continuous noise hold a real change back, ignores a sibling
+  worktree's `git add` and the main checkout's HEAD/index, and keeps a
+  truncated ignore list instead of re-listing every 30 s. The status poll now
+  tells the live index and document vault about nested edits the
+  non-recursive worktree watch cannot see.
+- Performance: DORA lead time is one `git name-rev` instead of up to 30
+  `describe` processes, bounded by a 60 s deadline, and a failed read is
+  reported rather than published as an empty answer. Stage/unstage of a
+  selection is one git process. `gh --version` and an agent CLI's
+  `--version`/`--help` are probed once per binary (path, size, mtime). Alert
+  ranking asks GitHub for the worst severities when the first page is full.
 
 - The agentic workspaces plan no longer describes the flat graph export as
   "generation 1". It records the real path, `.devcouncil/graph/code_graph.json`,
