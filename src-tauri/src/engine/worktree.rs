@@ -43,6 +43,31 @@ pub fn resolve_worktree_family(
     repo_path: &str,
     worktree_path: &str,
 ) -> Result<WorktreeFamily, String> {
+    admit_worktree_pair(repo_path, worktree_path)?.authenticate()
+}
+
+/// A repository/worktree pair admitted from filesystem metadata alone.
+///
+/// Both paths are trusted checkouts sharing one common Git directory. Nothing
+/// has run Git yet, so membership is *not* established: a hand-written gitfile
+/// passes this step. [`AdmittedPair::authenticate`] is what proves it.
+#[derive(Debug, Clone)]
+pub struct AdmittedPair {
+    repo: PathBuf,
+    worktree: PathBuf,
+    common: PathBuf,
+}
+
+/// Linked-worktree registry entries read before the metadata view gives up.
+/// Far above any real family; past it the caller asks Git instead.
+const MAX_REGISTRY_ENTRIES: usize = 1024;
+
+/// A registry `gitdir` pointer is one path; anything longer is not one.
+const MAX_GITDIR_POINTER: u64 = 4096;
+
+/// The trust and common-directory checks of [`resolve_worktree_family`],
+/// which run before it spawns Git and fail with the same messages.
+pub fn admit_worktree_pair(repo_path: &str, worktree_path: &str) -> Result<AdmittedPair, String> {
     let repo = validate_repo(repo_path)?;
     let worktree = if Path::new(worktree_path) == repo {
         repo.clone()
@@ -63,56 +88,202 @@ pub fn resolve_worktree_family(
             repo.display()
         ));
     }
-
-    // `-z` makes paths containing newlines unambiguous. IPC repository paths
-    // are UTF-8 strings, so an unrepresentable list entry cannot equal either
-    // validated input and is safely ignored.
-    let raw = git_text(&repo, &["worktree", "list", "--porcelain", "-z"])?;
-    let mut registered = Vec::new();
-    for field in raw.split('\0') {
-        let Some(path) = field.strip_prefix("worktree ") else {
-            continue;
-        };
-        let Ok(canonical) = std::fs::canonicalize(path) else {
-            // Prunable entries are history, not active authority targets.
-            continue;
-        };
-        registered.push(canonical);
-    }
-
-    let Some(anchor) = registered.first().cloned() else {
-        return Err("Git returned no active worktrees for this repository".to_string());
-    };
-    if !registered.iter().any(|path| path == &repo) {
-        return Err(format!(
-            "Repository '{}' is not a registered worktree",
-            repo.display()
-        ));
-    }
-    if !registered.iter().any(|path| path == &worktree) {
-        return Err(format!(
-            "Worktree '{}' is not registered with repository '{}'",
-            worktree.display(),
-            repo.display()
-        ));
-    }
-
-    let anchor_common = if anchor == repo {
-        repo_common.clone()
-    } else if anchor == worktree {
-        worktree_common.clone()
-    } else {
-        resolve_git_common_dir(&anchor)?
-    };
-    if anchor_common != repo_common {
-        return Err("Git's primary worktree belongs to a different repository".to_string());
-    }
-
-    Ok(WorktreeFamily {
-        anchor,
+    Ok(AdmittedPair {
+        repo,
         worktree,
-        members: registered,
+        common: repo_common,
     })
+}
+
+impl AdmittedPair {
+    /// Every checkout the repository's own metadata names: the primary
+    /// working tree and each registered linked worktree, plus the admitted
+    /// pair itself. Read from the common directory, never from Git.
+    ///
+    /// A necessary-condition view, not an authentication: a caller may use it
+    /// to conclude that *no* checkout holds some state, and must ask Git
+    /// ([`Self::authenticate`]) for anything else. `None` when the metadata
+    /// cannot account for the whole family — a primary working tree that does
+    /// not hold the common directory directly, a configured `core.worktree`
+    /// (also written by `--separate-git-dir`), an unreadable registry entry,
+    /// or an oversized registry — so a caller falls back to Git rather than
+    /// act on a partial list.
+    pub fn metadata_checkouts(&self) -> Option<Vec<PathBuf>> {
+        // Git lists the primary working tree first: the directory holding
+        // `.git`, or the repository itself when it is bare. The candidate is
+        // proved the way `repository_trust` proves a main checkout — its own
+        // metadata must name this common directory as its private one.
+        let primary = if self.common.file_name() == Some(std::ffi::OsStr::new(".git")) {
+            self.common.parent()?.to_path_buf()
+        } else {
+            self.common.clone()
+        };
+        match crate::repository_trust::git_directories(&primary) {
+            Ok((private, common)) if private == self.common && common == self.common => {}
+            _ => return None,
+        }
+        // `core.worktree` (which `--separate-git-dir` also writes) moves the
+        // primary working tree somewhere this layout cannot see. A possible
+        // setting gives up — a false alarm costs one Git call.
+        if config_mentions_worktree(&self.common).unwrap_or(true) {
+            return None;
+        }
+        let mut checkouts = vec![primary, self.repo.clone(), self.worktree.clone()];
+
+        let entries = match std::fs::read_dir(self.common.join("worktrees")) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Some(checkouts),
+            Err(_) => return None,
+        };
+        for (index, entry) in entries.enumerate() {
+            if index >= MAX_REGISTRY_ENTRIES {
+                return None;
+            }
+            let entry_dir = entry.ok()?.path();
+            let pointer = match read_registry_pointer(&entry_dir.join("gitdir")) {
+                Ok(Some(pointer)) => pointer,
+                // Not a registration (Git's own registry count skips these too).
+                Ok(None) => continue,
+                Err(()) => return None,
+            };
+            // Git writes `<checkout>/.git`; relative pointers are relative to
+            // the registry entry.
+            let pointer = entry_dir.join(pointer);
+            let checkout = pointer.parent()?;
+            match std::fs::canonicalize(checkout) {
+                Ok(canonical) => checkouts.push(canonical),
+                // Prunable: `git worktree list` drops it from the family too.
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(_) => return None,
+            }
+        }
+        Some(checkouts)
+    }
+
+    /// Proves membership with `git worktree list` and names the family.
+    pub fn authenticate(self) -> Result<WorktreeFamily, String> {
+        let AdmittedPair {
+            repo,
+            worktree,
+            common: repo_common,
+        } = self;
+
+        // `-z` makes paths containing newlines unambiguous. IPC repository paths
+        // are UTF-8 strings, so an unrepresentable list entry cannot equal either
+        // validated input and is safely ignored.
+        let raw = git_text(&repo, &["worktree", "list", "--porcelain", "-z"])?;
+        let mut registered = Vec::new();
+        for field in raw.split('\0') {
+            let Some(path) = field.strip_prefix("worktree ") else {
+                continue;
+            };
+            let Ok(canonical) = std::fs::canonicalize(path) else {
+                // Prunable entries are history, not active authority targets.
+                continue;
+            };
+            registered.push(canonical);
+        }
+
+        let Some(anchor) = registered.first().cloned() else {
+            return Err("Git returned no active worktrees for this repository".to_string());
+        };
+        if !registered.iter().any(|path| path == &repo) {
+            return Err(format!(
+                "Repository '{}' is not a registered worktree",
+                repo.display()
+            ));
+        }
+        if !registered.iter().any(|path| path == &worktree) {
+            return Err(format!(
+                "Worktree '{}' is not registered with repository '{}'",
+                worktree.display(),
+                repo.display()
+            ));
+        }
+
+        // The pair shares one common directory (admission checked it), so only a
+        // third checkout as the anchor needs its own read.
+        let anchor_common = if anchor == repo || anchor == worktree {
+            repo_common.clone()
+        } else {
+            resolve_git_common_dir(&anchor)?
+        };
+        if anchor_common != repo_common {
+            return Err("Git's primary worktree belongs to a different repository".to_string());
+        }
+
+        Ok(WorktreeFamily {
+            anchor,
+            worktree,
+            members: registered,
+        })
+    }
+}
+
+/// Largest repository `config` [`AdmittedPair::metadata_checkouts`] reads.
+const MAX_CONFIG_SCAN: u64 = 64 * 1024;
+
+/// Whether the common directory's `config` (or its `config.worktree`) may set
+/// `core.worktree`: a line whose key is exactly `worktree`, or any `include`
+/// section, which can pull that key in from a file not read here. `None` when
+/// a file could not be read whole, which the caller treats as "yes".
+///
+/// Keys only, so `extensions.worktreeConfig` — common, and harmless here —
+/// does not count.
+fn config_mentions_worktree(common: &Path) -> Option<bool> {
+    use std::io::Read;
+    for name in ["config", "config.worktree"] {
+        let file = match std::fs::File::open(common.join(name)) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(_) => return None,
+        };
+        let mut raw = Vec::new();
+        file.take(MAX_CONFIG_SCAN + 1).read_to_end(&mut raw).ok()?;
+        if raw.len() as u64 > MAX_CONFIG_SCAN {
+            return None;
+        }
+        for line in String::from_utf8_lossy(&raw).lines() {
+            let line = line.trim_start().to_ascii_lowercase();
+            if line.starts_with('[') {
+                if line.contains("include") {
+                    return Some(true);
+                }
+                continue;
+            }
+            let key = line
+                .split(|c: char| c == '=' || c.is_whitespace())
+                .next()
+                .unwrap_or_default();
+            if key == "worktree" {
+                return Some(true);
+            }
+        }
+    }
+    Some(false)
+}
+
+/// One registry entry's `gitdir` pointer: `Ok(None)` when the entry has none,
+/// `Err(())` when it exists and could not be read whole.
+fn read_registry_pointer(path: &Path) -> Result<Option<PathBuf>, ()> {
+    use std::io::Read;
+    let file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => return Err(()),
+    };
+    let mut raw = String::new();
+    file.take(MAX_GITDIR_POINTER + 1)
+        .read_to_string(&mut raw)
+        .map_err(|_| ())?;
+    if raw.len() as u64 > MAX_GITDIR_POINTER {
+        return Err(());
+    }
+    let pointer = raw.trim_end_matches(['\n', '\r']);
+    if pointer.is_empty() || pointer.contains('\0') {
+        return Err(());
+    }
+    Ok(Some(PathBuf::from(pointer)))
 }
 
 /// How many worktrees get a dirty-file scan when listing. Worktrees number in
@@ -3066,5 +3237,62 @@ some-future-field whatever
         let led = led.expect_err("the broken repository listed");
         assert_eq!(Err(led), joined.map(|listed| as_json(&listed)));
         assert!(!gathering(&root));
+    }
+
+    /// The metadata view names exactly what `git worktree list` names — the
+    /// primary checkout, live linked worktrees, no pruned ones — and gives up
+    /// (`None`) where the layout cannot account for the primary checkout.
+    #[test]
+    fn metadata_checkouts_match_git_and_give_up_on_core_worktree() {
+        let main = tempfile::TempDir::new().unwrap();
+        git_in(main.path(), &["init", "-b", "main"]);
+        std::fs::write(main.path().join("seed.txt"), "seed").unwrap();
+        git_in(main.path(), &["add", "."]);
+        git_in(main.path(), &["commit", "-m", "init"]);
+        let parent = tempfile::TempDir::new().unwrap();
+        let live = parent.path().join("live");
+        let pruned = parent.path().join("pruned");
+        for path in [&live, &pruned] {
+            git_in(
+                main.path(),
+                &["worktree", "add", "--detach", path.to_str().unwrap()],
+            );
+        }
+        crate::test_support::trust_repo(&live);
+        std::fs::remove_dir_all(&pruned).unwrap();
+
+        let repo = main.path().to_str().unwrap();
+        let live_path = live.canonicalize().unwrap();
+        let pair = admit_worktree_pair(repo, live_path.to_str().unwrap()).expect("admitted");
+        let mut from_metadata = pair
+            .metadata_checkouts()
+            .expect("a plain layout is accounted for");
+        from_metadata.sort();
+        from_metadata.dedup();
+        let mut from_git = pair.clone().authenticate().expect("authenticated").members;
+        from_git.sort();
+        assert_eq!(from_metadata, from_git);
+        assert!(!from_metadata.iter().any(|path| path.ends_with("pruned")));
+
+        git_in(
+            main.path(),
+            &["config", "extensions.worktreeConfig", "true"],
+        );
+        assert!(
+            pair.metadata_checkouts().is_some(),
+            "extensions.worktreeConfig does not move the primary checkout"
+        );
+
+        git_in(main.path(), &["config", "include.path", "elsewhere.cfg"]);
+        assert_eq!(pair.metadata_checkouts(), None, "an include may set it");
+        git_in(main.path(), &["config", "--unset", "include.path"]);
+        assert!(pair.metadata_checkouts().is_some());
+
+        git_in(main.path(), &["config", "core.worktree", repo]);
+        assert_eq!(
+            pair.metadata_checkouts(),
+            None,
+            "a configured core.worktree must send the caller to Git"
+        );
     }
 }

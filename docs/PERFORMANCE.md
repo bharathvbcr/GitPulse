@@ -500,3 +500,65 @@ editing, and their broad read/write callers were covered by the native suites.
 Current cumulative scope: selected performance source, tests, harness and this
 report add 2,381 lines and remove 213, excluding shared App/command wiring and
 architecture documentation. This performance work adds no dependencies.
+
+## 2026-10-10: hook binding lookup, read-only; one family resolution per gated action
+
+Every `gitpulse-hook` run (each agent Bash call, each file edit) resolved the
+checkout's task binding through the app's creating path: `git worktree list`
+and a legacy-ledger consolidation pass *before* checking whether any ledger
+existed, then a read-write ledger open — directory and file chmod checks, WAL
+and synchronous pragmas, the full schema DDL — against a ledger the app is
+writing. In the app, a guarded command or write resolved the worktree family
+twice (scope lookup, then the gate row).
+
+**Changed.** `ledger::bindings::resolve_binding_readonly` is the hook's lookup
+(`harness::hook_scope`). When the repository's own metadata
+(`engine::worktree::AdmittedPair::metadata_checkouts`: the primary checkout
+plus the linked-worktree registry, read without Git) shows no ledger in any
+checkout, it answers "unbound" with no Git child at all. Otherwise it
+authenticates with `git worktree list` as before and reads the binding through
+a read-only connection (`ledger::latest_binding_readonly`) that is never
+cached and cannot chmod, set pragmas or run DDL. It never consolidates: if a
+sibling ledger holds rows the anchor has not imported, the binding cannot be
+ruled out and the lookup fails closed (`legacy_ledger_unconsolidated`) until
+GitPulse has consolidated. Missing, untrusted, unrelated and foreign-row
+outcomes are unchanged. The app's `guard_command`/`guard_file` resolve the
+family once (`repository_address`) and hand that answer to both the scope
+lookup (`bindings::binding_at`) and `record_gate`. A commit is still two gated
+actions (add, then commit), so it now resolves the family twice, not four times.
+
+**Verified (tests; each fails against the previous code, checked by
+reverting the change locally):** `ledger::bindings::readonly_tests` — zero Git
+children on an uninitialised ledger from a main or linked checkout; no
+read-write open, no chmod (0644 stays 0644), no WAL switch (a DELETE-journal
+ledger stays DELETE), no DDL (a dropped index stays dropped); unimported legacy
+history refuses, then resolves once consolidated; untrusted, missing, foreign
+row and unregistered gitfile each keep their code.
+`harness::scope_tests::a_gated_action_resolves_its_family_once` (exactly one
+`git worktree list` per `guard_file` and per `guard_command`, was two), and
+`the_hook_scope_*`. `hook_protocol_stress::sixty_four_concurrent_hooks_read_a_live_ledger`
+runs 64 concurrent `command-gate` processes against an initialised ledger
+while the test process keeps appending to it. Every one exits 0 (a SIGBUS would
+fail it), every one answers `task.scope_unavailable` (proving it read the
+binding), and the ledger's 0644 mode survives. Passed 4 of 4 runs.
+
+**Measured (release `gitpulse-hook`, interleaved A/B, alternating order per
+pair, min over rounds; same commit with and without this change).** The
+machine was heavily loaded by other work (load average 40–52 throughout), so
+absolute numbers are well above the quiet-machine 25 ms in the 2026-10-09
+audit:
+
+| `command-gate`, payload `ls` | rounds × N | median before → after | p95 before → after |
+| --- | ---: | ---: | ---: |
+| trusted repo, no ledger anywhere | 7 × 30 | 35.67 → **24.03** ms | 52.95 → **33.42** ms |
+| this repository (38 MB live ledger, 4 MB WAL) | 7 × 30 | 40.58 → 42.68 ms | 63.84 → 61.33 ms |
+| same, second run | 10 × 40 | 52.51 → 47.53 ms | 104.28 → 100.70 ms |
+
+The repository with no ledger loses its `git worktree list` child and is about
+a third faster. On the live ledger the change removes the pragmas, DDL and
+chmod checks but keeps the authenticating `git worktree list`, and the
+difference is inside the noise at this load: not established either way. The
+proposed ≤ 15 ms command-gate target (A19) is not met. What remains per call is
+process start, the `git worktree list` on initialised repositories, and the
+per-call `manvi serve --posture host` sidecar, which is ft-5a4e25c8's
+follow-up and out of scope here.

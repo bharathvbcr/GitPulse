@@ -995,8 +995,9 @@ fn command_gate_with(
     // A checkout bound to a task is judged against that task's scope, resolved
     // by the same owner `harness::guard_command` uses — so a redirection into a
     // file outside the plan reaches `scope.unplanned`, which Manvi does not
-    // demote once a scope is declared. Resolving it opens the ledger and the
-    // task store, so it runs inside the budget the host's timeout allows.
+    // demote once a scope is declared. Resolving it reads the ledger
+    // (read-only, and not at all when no checkout has one) and the task
+    // store, so it runs inside the budget the host's timeout allows.
     //
     // Outside a Git repository there is no checkout to be bound, and asking the
     // ledger about a bare directory would fail closed — refusing every command
