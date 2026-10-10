@@ -199,6 +199,8 @@
     try {
       Storage.prototype.setItem=function(key,value){if(key===DIAGNOSTIC_STORAGE_KEY)throw Error("Harness quota failure");return originalSetItem.call(this,key,value);};
       diagnostics.error("storage-canary","Harness diagnostic save failure");
+      // Saves are deferred; flush while the failing setItem is still installed.
+      diagnostics.flush();
       host.show("diagnostics");await settle();
       check("diagnostics window identifies memory-only errors",target.textContent.includes("memory only")&&target.textContent.includes("Harness quota failure"));
     } finally {Storage.prototype.setItem=originalSetItem;}

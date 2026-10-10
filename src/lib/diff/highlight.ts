@@ -64,6 +64,43 @@ export const TREE_SITTER_LANGUAGES: ReadonlySet<SupportedLanguage> = new Set([
   "shell",
 ]);
 
+/**
+ * The most UTF-8 bytes `cmd_syntax_highlight` accepts.
+ *
+ * Mirrors `MAX_HIGHLIGHT_CODE_BYTES` in the vendored markdev-highlight crate
+ * (`src-tauri/vendored/markdev-highlight/src/lib.rs`) — keep in sync. Above
+ * it the backend refuses the call anyway, so sending the document only
+ * copies megabytes across IPC to be told no.
+ */
+export const MAX_HIGHLIGHT_DOCUMENT_BYTES = 1024 * 1024;
+
+/**
+ * Whether `text` encodes to more than `limit` UTF-8 bytes, without encoding it.
+ *
+ * Every UTF-16 unit is at least one UTF-8 byte and at most three (a surrogate
+ * pair is two units and four bytes), so most inputs are decided by length
+ * alone; only the band in between is counted, and the count stops at the limit.
+ */
+export function exceedsUtf8Bytes(text: string, limit: number): boolean {
+  if (text.length > limit) return true;
+  if (text.length * 3 <= limit) return false;
+  let bytes = 0;
+  for (let i = 0; i < text.length; i++) {
+    const unit = text.charCodeAt(i);
+    if (unit < 0x80) bytes += 1;
+    else if (unit < 0x800) bytes += 2;
+    else if (unit >= 0xd800 && unit <= 0xdbff && i + 1 < text.length) {
+      const next = text.charCodeAt(i + 1);
+      if (next >= 0xdc00 && next <= 0xdfff) {
+        bytes += 4;
+        i++;
+      } else bytes += 3;
+    } else bytes += 3;
+    if (bytes > limit) return true;
+  }
+  return false;
+}
+
 /** Whether `language` should be highlighted in Rust when a whole file is available. */
 export function usesTreeSitter(language: SupportedLanguage): boolean {
   return TREE_SITTER_LANGUAGES.has(language);
@@ -355,14 +392,16 @@ export function composeLineSpans(
  * Highlights a whole document in Rust when a grammar exists.
  *
  * Returns one token list per line, or `null` when the language has no
- * tree-sitter grammar / the IPC call fails — callers then keep the regex
- * tokenizer. Never invents an empty success: failure is `null`.
+ * tree-sitter grammar, the document is over the backend's size limit, or
+ * the IPC call fails — callers then keep the regex tokenizer. Never invents
+ * an empty success: failure is `null`.
  */
 export async function highlightDocument(
   language: SupportedLanguage,
   code: string,
 ): Promise<SyntaxToken[][] | null> {
   if (!usesTreeSitter(language) || code.length === 0) return null;
+  if (exceedsUtf8Bytes(code, MAX_HIGHLIGHT_DOCUMENT_BYTES)) return null;
   try {
     const spans = await syntaxHighlight(language, code);
     return lineTokensFromSpans(code, spans);

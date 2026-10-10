@@ -2634,6 +2634,8 @@ if (params.has("check")) {
       await saveAs("Owners");
       check("saving a view names it on the control and keeps it for this board", viewsToggle().textContent.trim() === "Owners"
         && get(interfaceStore).taskBoards.global?.views.some(view => view.name === "Owners" && view.swimlane === "owner" && view.facet.priority === 1));
+      // Preference saves are deferred; leaving the page flushes them, as this does.
+      interfaceStore.flush();
       check("a saved view survives a reload: it is in the stored preferences", JSON.stringify({ ...localStorage }).includes("Owners"));
       await closeViews();
       await openView(); viewMenu().querySelector('[data-task-lane-option="none"]').click(); await settle(); await closeView();

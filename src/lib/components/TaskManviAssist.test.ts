@@ -222,4 +222,16 @@ describe("TaskManviAssist", () => {
     // not spin the request forever.
     expect(source).toMatch(/for \(let attempt = 0; attempt < \d+; attempt\+\+\)/);
   });
+
+  it("re-reads the history only when a polled suggestion moved", () => {
+    // ft-0ff882a6: each one-second poll of a live suggestion also re-read the
+    // history (two requests) whether or not anything changed.
+    expect(source).toContain("if (!enhancementMoved(proposal, next)) return;");
+    expect(source).toContain("void follow(id); }, 2000)");
+    expect(source).toContain("if (disposed || latestActive?.id !== id || !enhancementMoved(latestActive, next)) return;");
+    // Both loops stay on the visibility-aware timer.
+    expect(source).not.toMatch(/\bsetInterval\(/);
+    expect(source).toContain("return createAdaptiveTimer(() => { void poll(id); }, 1000);");
+    expect(source).toContain("return createAdaptiveTimer(() => { if (!acting && !editing) void follow(id); }, 2000);");
+  });
 });

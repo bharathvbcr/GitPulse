@@ -1,8 +1,13 @@
+import { readFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { describe, expect, it, vi } from "vitest";
 import {
   composeLineSpans,
   composeSpans,
   highlightDocument,
+  exceedsUtf8Bytes,
+  MAX_HIGHLIGHT_DOCUMENT_BYTES,
   lineTokensFromSpans,
   MAX_HIGHLIGHT_CHARS,
   normalizeRanges,
@@ -287,6 +292,49 @@ describe("tree-sitter owner", () => {
     expect(lines).not.toBeNull();
     expect(lines![0].map((t) => t.text).join("")).toBe("fn main");
     expect(lines![0].some((t) => t.type === "keyword")).toBe(true);
+  });
+
+  it("highlightDocument does not send a document over the backend's 1 MiB limit", async () => {
+    // ft-0ff882a6: the viewer shipped multi-megabyte files across IPC only for
+    // the backend to refuse them. The limit is in UTF-8 bytes, as Rust counts.
+    vi.mocked(syntaxHighlight).mockClear();
+    await expect(highlightDocument("rust", "a".repeat(MAX_HIGHLIGHT_DOCUMENT_BYTES + 1))).resolves.toBeNull();
+    // 400k three-byte characters: under the limit in UTF-16 units, over it in bytes.
+    await expect(highlightDocument("rust", "€".repeat(400_000))).resolves.toBeNull();
+    expect(syntaxHighlight).not.toHaveBeenCalled();
+    vi.mocked(syntaxHighlight).mockResolvedValueOnce([]);
+    await highlightDocument("rust", "a".repeat(MAX_HIGHLIGHT_DOCUMENT_BYTES));
+    expect(syntaxHighlight).toHaveBeenCalledTimes(1);
+  });
+
+  it("mirrors the backend's MAX_HIGHLIGHT_CODE_BYTES", () => {
+    const repoRoot = join(dirname(fileURLToPath(import.meta.url)), "..", "..", "..");
+    const rust = readFileSync(join(repoRoot, "src-tauri", "vendored", "markdev-highlight", "src", "lib.rs"), "utf8");
+    const match = rust.match(/pub const MAX_HIGHLIGHT_CODE_BYTES: usize = ([\d_ *]+);/);
+    expect(match, "MAX_HIGHLIGHT_CODE_BYTES not found in markdev-highlight/src/lib.rs").not.toBeNull();
+    // The declaration is a product of integer literals, e.g. `1024 * 1024`.
+    const bytes = match![1]
+      .split("*")
+      .map((factor) => Number(factor.trim().replaceAll("_", "")))
+      .reduce((product, factor) => product * factor, 1);
+    expect(Number.isSafeInteger(bytes)).toBe(true);
+    expect(MAX_HIGHLIGHT_DOCUMENT_BYTES).toBe(bytes);
+  });
+
+  it("exceedsUtf8Bytes counts bytes the way the backend does", () => {
+    expect(exceedsUtf8Bytes("abc", 3)).toBe(false);
+    expect(exceedsUtf8Bytes("abcd", 3)).toBe(true);
+    expect(exceedsUtf8Bytes("é", 1)).toBe(true);
+    expect(exceedsUtf8Bytes("é", 2)).toBe(false);
+    expect(exceedsUtf8Bytes("€€", 5)).toBe(true);
+    expect(exceedsUtf8Bytes("€€", 6)).toBe(false);
+    // A surrogate pair is four bytes, not six.
+    expect(exceedsUtf8Bytes("😀", 4)).toBe(false);
+    expect(exceedsUtf8Bytes("😀", 3)).toBe(true);
+    const sample = "a€é😀\uD800z".repeat(1000);
+    const bytes = new TextEncoder().encode(sample).length;
+    expect(exceedsUtf8Bytes(sample, bytes)).toBe(false);
+    expect(exceedsUtf8Bytes(sample, bytes - 1)).toBe(true);
   });
 
   it("highlightDocument returns null when IPC fails rather than inventing tokens", async () => {

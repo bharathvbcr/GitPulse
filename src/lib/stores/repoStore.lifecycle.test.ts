@@ -13,22 +13,23 @@ const tabBar = readFileSync(
 );
 
 describe("repoStore quit flush", () => {
-  it("flushes on pagehide for the life of the store, not only while the poll runs", () => {
+  it("flushes on page hide for the life of the store, not only while the poll runs", () => {
     const ensureIdx = repoStore.indexOf("function ensureStatusPoll()");
     const stopIdx = repoStore.indexOf("function stopStatusPoll()");
     const stopBody = repoStore.slice(stopIdx, repoStore.indexOf("async function runStatusPoll()"));
     expect(ensureIdx).toBeGreaterThan(-1);
     expect(stopIdx).toBeGreaterThan(ensureIdx);
-    expect(stopBody).not.toContain("pagehide");
-    expect(repoStore).toContain('document.addEventListener("pagehide"');
-    expect(repoStore).toContain("flushPersist(true)");
+    expect(stopBody).not.toContain("flushOnPageHide");
+    // Bound through the shared wiring, which listens on window — `pagehide`
+    // is fired there — and joins the registry the native exit flushes.
+    // repoStore.test.ts drives it ("writes a pending workspace change...").
+    expect(repoStore).toContain("flushOnPageHide(() => flushPersist(true));");
+    expect(repoStore).not.toContain('document.addEventListener("pagehide"');
   });
 
   it("installs the quit flush once", () => {
-    expect(repoStore).toContain("let pagehideWired = false;");
-    const adds = repoStore.match(/pagehideWired/g)?.length ?? 0;
-    expect(adds).toBeGreaterThanOrEqual(2);
-    expect(repoStore).not.toContain('document.removeEventListener("pagehide"');
+    // One registration at store creation; nothing re-binds or removes it.
+    expect(repoStore.match(/flushOnPageHide\(/g)?.length).toBe(1);
   });
 });
 

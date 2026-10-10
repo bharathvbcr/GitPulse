@@ -37,10 +37,10 @@ export interface QuickCommitPromptDeps {
 
 export function defaultQuickCommitDeps(): QuickCommitPromptDeps {
   return {
-    getState: () => get(repoStore),
+    getState: () => ({ ...get(repoStore), commitDraft: get(repoStore.commitDraft) }),
     askMessage: (opts) => askText(opts),
     commitAll: (message) => repoStore.quickCommit(message),
-    setDraft: (message) => repoStore.setCommitDraft(message),
+    setDraft: (message) => repoStore.commitDraft.set(message),
     setAmending: (value) => repoStore.setAmending(value),
     setError: (error) => repoStore.setError(error),
   };

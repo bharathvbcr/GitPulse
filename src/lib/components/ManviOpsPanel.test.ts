@@ -191,4 +191,12 @@ describe("ManviOpsPanel issue monitor task integration", () => {
     expect(source).toContain("currentGen === repoTasksGeneration");
     expect(source).toContain("if ($repoStore.currentPath === repoPath)");
   });
+
+  it("leaves task reloads to workbench-changed once it is listening", () => {
+    // ft-0ff882a6: the 60 s issue poll re-read every task although the
+    // change listener already reloads them on each change.
+    expect(source).toContain("if (!opts.background || !tasksFollowChanges) void loadRepoTasks(repo);");
+    expect(source).toContain("tasksFollowChanges = true;");
+    expect(source).toContain("createVisibleInterval(() => {");
+  });
 });

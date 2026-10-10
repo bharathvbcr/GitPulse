@@ -1312,6 +1312,84 @@ describe("repoStore tabs", () => {
     expect(get(store).generation).toBeGreaterThan(genA2);
   });
 
+  it("writes a pending workspace change when the page is hidden or closed", async () => {
+    // The quit flush listened for `pagehide` on `document`, but the browser
+    // fires it at `window` and window events never reach document listeners,
+    // so a change inside the debounce window was lost on close.
+    const listeners = new Map<string, Set<() => void>>();
+    const win = {
+      addEventListener: (type: string, fn: () => void) => {
+        if (!listeners.has(type)) listeners.set(type, new Set());
+        listeners.get(type)!.add(fn);
+      },
+      removeEventListener: (type: string, fn: () => void) => void listeners.get(type)?.delete(fn),
+    };
+    vi.stubGlobal("window", win);
+    try {
+      const storage = memoryStorage();
+      const filter = makeFilter();
+      const store = createRepoStore({
+        invoke: makeInvoke(),
+        storage,
+        caseInsensitive: true,
+        graph: makeGraph().api,
+        filter,
+      });
+      await store.openRepo("/r/quit-a");
+      store.flushPersistedWorkspace();
+      // The search box is debounced state: it waits for the persist timer.
+      filter.setSearch("needle");
+      const read = () => (JSON.parse(storage.getItem(STORAGE_KEY_WORKSPACE) ?? "{}") as {
+        tabs?: Array<{ searchQuery?: string }>;
+      }).tabs?.[0]?.searchQuery ?? "";
+      expect(read()).toBe("");
+      for (const fn of listeners.get("pagehide") ?? []) fn();
+      expect(read()).toBe("needle");
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it("types a commit message without republishing the repository state", async () => {
+    // ft-0ff882a6: the draft lived on the session, so each keystroke replaced
+    // the session, rebuilt the active tab's row and notified every subscriber.
+    const { store } = makeStore();
+    await store.openRepo("/r/draft-a");
+    let published = 0;
+    const unsubscribe = store.subscribe(() => (published += 1));
+    const rowBefore = get(store).openTabs[0];
+    published = 0;
+    let drafts = 0;
+    const unsubscribeDraft = store.commitDraft.subscribe(() => (drafts += 1));
+    drafts = 0;
+    const message = "fix: keep the draft out of the repository state";
+    for (let i = 1; i <= message.length; i += 1) store.commitDraft.set(message.slice(0, i));
+    expect(published).toBe(0);
+    expect(drafts).toBe(message.length);
+    expect(get(store.commitDraft)).toBe(message);
+    expect(get(store).openTabs[0]).toBe(rowBefore);
+    unsubscribe();
+    unsubscribeDraft();
+  });
+
+  it("keeps one draft per tab and drops a closed tab's draft", async () => {
+    const { store } = makeStore();
+    await store.openRepo("/r/draft-a");
+    const a = get(store).activeTabId!;
+    store.commitDraft.set("draft for a");
+    await store.openRepo("/r/draft-b");
+    const b = get(store).activeTabId!;
+    expect(get(store.commitDraft)).toBe("");
+    store.commitDraft.set("draft for b");
+    await store.activateTab(a);
+    expect(get(store.commitDraft)).toBe("draft for a");
+    await store.closeTab(b);
+    expect(store.commitDraft.read(b)).toBe("");
+    // Reopening the closed repository starts a fresh message, as before.
+    await store.openRepo("/r/draft-b");
+    expect(get(store.commitDraft)).toBe("");
+  });
+
   it("skips storage writes and recent-menu IPC while only unpersisted state changes", async () => {
     const counts = { setItem: 0, menu: 0 };
     const storage = memoryStorage();
@@ -1339,8 +1417,8 @@ describe("repoStore tabs", () => {
     counts.setItem = 0;
     counts.menu = 0;
 
-    await store.setCommitDraft("fix: handle");
-    await store.setCommitDraft("fix: handle edge");
+    store.commitDraft.set("fix: handle");
+    store.commitDraft.set("fix: handle edge");
     await store.setAmending(true);
 
     expect(counts.setItem).toBe(0);
@@ -1532,7 +1610,7 @@ describe("repoStore canonical identity", () => {
     await store.openRepo("/r/ghost", { allowBroken: true });
     expect(get(store).openTabs.map((tab) => tab.path)).toEqual(["/r/ghost"]);
     expect(get(store).error ?? "").toMatch(/unavailable|Cannot access/i);
-    await store.setCommitDraft("wip notes");
+    store.commitDraft.set("wip notes");
 
     // The volume comes back; retrying the alias adopts the canonical identity.
     ghostResolves = true;
@@ -1542,7 +1620,7 @@ describe("repoStore canonical identity", () => {
     expect(state.currentPath).toBe("/r/real");
     expect(state.error).toBeNull();
     // Draft state travels from the alias tab to its canonical successor.
-    expect(state.commitDraft).toBe("wip notes");
+    expect(get(store.commitDraft)).toBe("wip notes");
     // No stale alias entry lingers to resurrect a duplicate tab later.
     expect(state.lastClosed).not.toContain("/r/ghost");
 
@@ -1567,12 +1645,12 @@ describe("repoStore canonical identity", () => {
     const { store } = makeStore(invoke);
     // Canonical tab first, with its own draft.
     await store.openRepo("/r/real");
-    await store.setCommitDraft("canonical draft");
+    store.commitDraft.set("canonical draft");
     const realId = get(store).activeTabId!;
 
     // Broken alias opened afterwards stays a separate tab until healed.
     await store.openRepo("/r/ghost", { allowBroken: true });
-    await store.setCommitDraft("alias draft");
+    store.commitDraft.set("alias draft");
     expect(get(store).openTabs).toHaveLength(2);
 
     ghostResolves = true;
@@ -1580,7 +1658,7 @@ describe("repoStore canonical identity", () => {
     const state = get(store);
     expect(state.openTabs).toHaveLength(1);
     expect(state.openTabs[0].id).toBe(realId);
-    expect(state.commitDraft).toBe("canonical draft");
+    expect(get(store.commitDraft)).toBe("canonical draft");
   });
 });
 
