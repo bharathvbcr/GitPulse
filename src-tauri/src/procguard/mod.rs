@@ -241,7 +241,7 @@ impl Registration {
     ///
     /// A pid already forgotten means another reap path got there first, so
     /// there is nothing left to wait for.
-    fn exited(&self, child: &mut Child) -> bool {
+    pub fn exited(&self, child: &mut Child) -> bool {
         #[cfg(unix)]
         {
             let _ = child;
