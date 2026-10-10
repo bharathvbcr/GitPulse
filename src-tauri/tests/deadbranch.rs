@@ -151,7 +151,8 @@ fn backup_creation_and_restoration_roundtrip() {
 
     // Set custom backup directory for the test
     let temp_backups = TempDir::new().unwrap();
-    std::env::set_var(
+    let serial = common::env::env_serial();
+    let _backups = common::env::bind_env(&serial).set(
         "GITPULSE_BACKUPS_DIR",
         temp_backups.path().to_str().unwrap(),
     );
@@ -210,8 +211,6 @@ fn backup_creation_and_restoration_roundtrip() {
         .trim()
         .to_string();
     assert_eq!(restored_sha, tip_sha);
-
-    std::env::remove_var("GITPULSE_BACKUPS_DIR");
 }
 
 #[test]

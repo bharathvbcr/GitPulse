@@ -176,7 +176,7 @@ mod tests {
         .unwrap();
         output.write(b"ready\n").unwrap();
         assert_eq!(*bytes.lock().unwrap(), b"ready\n");
-        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(started.elapsed() < crate::test_support::coverage_relaxed(Duration::from_secs(2)));
     }
 
     #[cfg(unix)]
@@ -242,7 +242,7 @@ mod tests {
                 io::ErrorKind::BrokenPipe
             );
         }
-        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(started.elapsed() < crate::test_support::coverage_relaxed(Duration::from_secs(1)));
         release.send(()).unwrap();
         drop(output);
         // A detached worker is deliberately not joined by Drop. The release

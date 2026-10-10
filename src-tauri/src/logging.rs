@@ -1762,7 +1762,10 @@ mod tests {
         sink.write_line("cannot acquire generation lock");
         let tail = sink.tail(10);
         // Both append and tail attempt the one-second admission deadline.
-        assert!(started.elapsed() < std::time::Duration::from_secs(3));
+        assert!(
+            started.elapsed()
+                < crate::test_support::coverage_relaxed(std::time::Duration::from_secs(3))
+        );
         assert!(tail.degraded.unwrap().contains("lock unavailable"));
         drop(held);
         sink.write_line("disabled writes are not retried");

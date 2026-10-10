@@ -63,7 +63,7 @@ pub struct CatchUp {
 pub const CATCH_UP_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Where Claude Code keeps its transcripts.
-fn transcript_root() -> Option<std::path::PathBuf> {
+pub(crate) fn transcript_root() -> Option<std::path::PathBuf> {
     std::env::var_os("GITPULSE_TRANSCRIPT_ROOT")
         .map(std::path::PathBuf::from)
         .or_else(|| dirs_home().map(|h| h.join(".claude").join("projects")))
@@ -642,24 +642,13 @@ mod tests {
 
     use crate::test_support::git_in;
 
-    /// Serialises the tests that override the transcript root.
-    ///
-    /// The override is an environment variable, which is process-global: two
-    /// tests setting and clearing it in parallel let one of them run against
-    /// the developer's real `~/.claude/projects`. That is a 1.8 GB scan in the
-    /// corpus this was measured on, and — worse — a test whose result depends
-    /// on what happens to be on the machine.
-    static ROOT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     /// Runs `f` with the transcript root pointed at `root`, restoring it after.
     ///
     /// "After" includes the case where `f` panics: a `f()` that failed used to
     /// skip the restore and hand every later test in this process a transcript
     /// root pointing into a deleted `TempDir`.
     fn with_transcript_root<T>(root: &std::path::Path, f: impl FnOnce() -> T) -> T {
-        let serial = ROOT_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let serial = crate::test_support::env::env_serial();
         let _env =
             crate::test_support::env::bind_env(&serial).set("GITPULSE_TRANSCRIPT_ROOT", root);
         f()

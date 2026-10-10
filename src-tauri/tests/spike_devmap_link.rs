@@ -11,6 +11,11 @@
 //! leaves the repository; this checks that what those paths point at still
 //! links and runs.
 
+// The hermetic test environment: a per-process home, git config and trust
+// store, rewritten before `main`. See `src/test_support/env.rs`.
+#[path = "../src/test_support/env.rs"]
+mod hermetic_env;
+
 use devmap_query::{Request, StoreQueryEngine};
 use devmap_store::Store;
 

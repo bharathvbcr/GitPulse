@@ -9,6 +9,11 @@
 //!   cargo test --manifest-path src-tauri/Cargo.toml \
 //!   --test pulse_real_repo_smoke -- --ignored --nocapture
 
+// The hermetic test environment: a per-process home, git config and trust
+// store, rewritten before `main`. See `src/test_support/env.rs`.
+#[path = "../src/test_support/env.rs"]
+mod hermetic_env;
+
 use gitpulse_lib::engine::GitReader;
 
 fn repo_from_env() -> String {

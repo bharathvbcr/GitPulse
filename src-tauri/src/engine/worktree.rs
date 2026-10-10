@@ -2910,7 +2910,10 @@ some-future-field whatever
     fn wait_until(what: &str, mut ready: impl FnMut() -> bool) {
         let started = std::time::Instant::now();
         while !ready() {
-            assert!(started.elapsed() < Duration::from_secs(10), "never {what}");
+            assert!(
+                started.elapsed() < crate::test_support::coverage_relaxed(Duration::from_secs(10)),
+                "never {what}"
+            );
             std::thread::sleep(Duration::from_millis(2));
         }
     }
@@ -3030,7 +3033,7 @@ some-future-field whatever
         let started = std::time::Instant::now();
         let bare = list_worktrees_scanned(&path, ScanDepth::Listing).expect("listing");
         assert!(
-            started.elapsed() < Duration::from_millis(400),
+            started.elapsed() < crate::test_support::coverage_relaxed(Duration::from_millis(400)),
             "a bare listing waited {:?}",
             started.elapsed()
         );

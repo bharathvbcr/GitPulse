@@ -2081,7 +2081,7 @@ mod tests {
         let started = Instant::now();
         let run = run_cancellable_install(&mut cmd, "fixture", ExternalTool::Devmap, None);
         assert!(
-            started.elapsed() < Duration::from_secs(3),
+            started.elapsed() < crate::test_support::coverage_relaxed(Duration::from_secs(3)),
             "install drain hung: {:?}",
             started.elapsed()
         );
@@ -2475,7 +2475,7 @@ mod tests {
     #[test]
     fn saved_config_binary_precedes_path_and_tags_lookup() {
         let _lock = crate::harness::sidecar::test_serial();
-        let _cfg_env = crate::tool_config::lock_config_env();
+        let _cfg_env = crate::test_support::env::env_serial();
         let dir = TempDir::new().unwrap();
         let bin = dir.path().join("fake-devmap");
         #[cfg(unix)]
@@ -2513,7 +2513,7 @@ mod tests {
     #[test]
     fn disabled_tool_is_not_installed_without_env() {
         let _lock = crate::harness::sidecar::test_serial();
-        let _cfg_env = crate::tool_config::lock_config_env();
+        let _cfg_env = crate::test_support::env::env_serial();
         let dir = TempDir::new().unwrap();
         let cfg_path = dir.path().join("tools.json");
         let _env = crate::test_support::env::bind_env(&_cfg_env)
@@ -2536,7 +2536,7 @@ mod tests {
     #[test]
     fn app_bin_dir_follows_tool_config_env() {
         let _lock = crate::harness::sidecar::test_serial();
-        let _cfg_env = crate::tool_config::lock_config_env();
+        let _cfg_env = crate::test_support::env::env_serial();
         let dir = TempDir::new().unwrap();
         let cfg_path = dir.path().join("tools.json");
         let _env = crate::test_support::env::bind_env(&_cfg_env)
@@ -2550,7 +2550,7 @@ mod tests {
     #[test]
     fn uninstall_removes_broken_symlink_and_skips_directory() {
         let _lock = crate::harness::sidecar::test_serial();
-        let _cfg_env = crate::tool_config::lock_config_env();
+        let _cfg_env = crate::test_support::env::env_serial();
         let dir = TempDir::new().unwrap();
         let cfg_path = dir.path().join("tools.json");
         let _env = crate::test_support::env::bind_env(&_cfg_env)

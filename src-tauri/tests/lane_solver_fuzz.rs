@@ -56,6 +56,11 @@
 //! a dangling stub, or the mainline reservation on column 0. Wider means
 //! columns leak; narrower is impossible (pigeonhole).
 
+// The hermetic test environment: a per-process home, git config and trust
+// store, rewritten before `main`. See `src/test_support/env.rs`.
+#[path = "../src/test_support/env.rs"]
+mod hermetic_env;
+
 use gitpulse_lib::graph::{
     mainline_chain_ids, simplify_history, LaneSolver, MainlineHint, RawCommitNode, VisualCommitRow,
     MAINLINE_COLOR, MAINLINE_COLUMN, MAX_REWRITTEN_PARENTS,

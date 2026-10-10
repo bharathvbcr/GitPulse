@@ -10,6 +10,7 @@ import {
   isQuickAddMode,
   quickAddDraft,
 } from "./taskQuickAdd";
+import { wallClockBudget } from "../testing/wallClock";
 
 const repositories = [
   { id: "r0", name: "GitPulse" },
@@ -383,7 +384,7 @@ describe("quick add under hostile input", () => {
     // Catches catastrophic backtracking, which on this input does not finish
     // at all: seconds, not milliseconds, is the separation that matters, and a
     // tighter bound only buys failures on a loaded machine.
-    expect(performance.now() - started).toBeLessThan(2_000);
+    expect(performance.now() - started).toBeLessThan(wallClockBudget(2_000));
     expect(result.usable).toBe(true);
   });
 
@@ -409,7 +410,7 @@ describe("quick add under hostile input", () => {
     // Catches catastrophic backtracking, which on this input does not finish
     // at all: seconds, not milliseconds, is the separation that matters, and a
     // tighter bound only buys failures on a loaded machine.
-    expect(performance.now() - started).toBeLessThan(2_000);
+    expect(performance.now() - started).toBeLessThan(wallClockBudget(2_000));
     expect(result.labels).toHaveLength(1);
   });
 
@@ -422,7 +423,7 @@ describe("quick add under hostile input", () => {
     // Catches catastrophic backtracking, which on this input does not finish
     // at all: seconds, not milliseconds, is the separation that matters, and a
     // tighter bound only buys failures on a loaded machine.
-    expect(performance.now() - started).toBeLessThan(2_000);
+    expect(performance.now() - started).toBeLessThan(wallClockBudget(2_000));
     // Last one wins; no warning, because every token parsed.
     expect(result.dueAt).toBeGreaterThan(0);
     expect(result.warnings).toEqual([]);

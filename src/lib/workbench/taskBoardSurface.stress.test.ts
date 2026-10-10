@@ -35,6 +35,7 @@ import {
   sanitizeHandoff,
   supportsManaged,
 } from "./taskHandoff";
+import { wallClockBudget } from "../testing/wallClock";
 
 /** Names that exist on every object and have bitten this codebase before. */
 const POLLUTION = ["__proto__", "constructor", "prototype", "toString", "valueOf", "hasOwnProperty", "isPrototypeOf"];
@@ -115,7 +116,7 @@ describe("quick add under hostile input", () => {
     const nasty = `${"!high ".repeat(300)}${"#label ".repeat(300)}${"due:friday ".repeat(60)}title`;
     const started = performance.now();
     for (let i = 0; i < 40; i++) parseQuickAdd(nasty.slice(0, MAX_QUICK_ADD_LENGTH), { repositories: [] });
-    expect(performance.now() - started).toBeLessThan(3_000);
+    expect(performance.now() - started).toBeLessThan(wallClockBudget(3_000));
   });
 
   it("refuses every due value it cannot place on the calendar", () => {
@@ -357,7 +358,7 @@ describe("the archive seam under hostile selections", () => {
     const started = performance.now();
     expect(archiveState(huge)).toBe("some");
     expect(archivable(huge).length).toBe(huge.length - archived);
-    expect(performance.now() - started).toBeLessThan(2000);
+    expect(performance.now() - started).toBeLessThan(wallClockBudget(2000));
   });
 
   it("offers the menu's Archive row exactly when the batch would write something", () => {

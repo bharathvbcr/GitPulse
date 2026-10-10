@@ -1354,7 +1354,7 @@ mod tests {
     /// refused does not refuse a replay of an attempt that already exists.
     #[test]
     fn a_retry_keeps_the_model_its_attempt_recorded() {
-        let serial = crate::tool_config::lock_config_env();
+        let serial = crate::test_support::env::env_serial();
         let dir = tempfile::tempdir().unwrap();
         let _env = crate::test_support::env::bind_env(&serial)
             .set(
@@ -2106,7 +2106,7 @@ mod tests {
     /// (`terminal_run::spawn`), not whatever the default is by then.
     #[test]
     fn a_launch_records_the_saved_default_with_its_own_override() {
-        let serial = crate::tool_config::lock_config_env();
+        let serial = crate::test_support::env::env_serial();
         let dir = tempfile::tempdir().unwrap();
         let _env = crate::test_support::env::bind_env(&serial)
             .set(

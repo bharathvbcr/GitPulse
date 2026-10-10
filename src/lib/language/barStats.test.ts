@@ -5,6 +5,7 @@ import {
   type LanguageMixInput,
   type RepoLanguageStat,
 } from "./barStats";
+import { wallClockBudget } from "../testing/wallClock";
 
 function stat(
   language: string,
@@ -428,7 +429,7 @@ describe("stress testing and maximum hardening", () => {
     const pickedCodeOnly = pickLanguageBarStats(hugeStats, 6, "code-only");
     const elapsed = performance.now() - start;
 
-    expect(elapsed).toBeLessThan(200); // Must be fast even on 10k items
+    expect(elapsed).toBeLessThan(wallClockBudget(200)); // Must be fast even on 10k items
     expect(pickedCodeOnly).toHaveLength(7); // 6 shown + 1 Other
     const other = pickedCodeOnly.find((s) => s.language === "Other");
     expect(other).toBeDefined();

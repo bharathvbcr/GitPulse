@@ -33,6 +33,7 @@ before that tag is pushed.
 
 ### Changed
 
+<<<<<<< HEAD
 - The profile is compacted once a day: the host runs dc-store's `store.compact`
   (expired receipts, events and revisions, a bounded number per pass) from its
   existing background loop, off the UI thread, never beside itself, never
@@ -58,6 +59,49 @@ before that tag is pushed.
   so. The vendored `contracts/serve.ops.schema.json` is refreshed for it and for
   the repository roots Manvi's `devmap.*`, refine and scan ops now require
   (`E_BAD_ROOT` otherwise); GitPulse sends none of those ops today.
+=======
+- **The update check announces releases, not tags.** `git ls-remote --tags`
+  only says a tag exists, and the release workflow runs for many minutes after
+  a tag is pushed and may never publish, so a `vX.Y.Z` pushed early (or a
+  mistaken `v9.0.0`) was announced to every user. A tag newer than the running
+  build is now announced only once its release is published, confirmed by one
+  bounded `HEAD` of the release's checksum asset (a draft's assets are not
+  public); at most five tags are probed, a check that cannot be made fails the
+  check rather than guessing, and a tag with no release is not announced.
+- **`gitpulse-mcp` answers an unknown protocol version with the newest it
+  supports.** A client asking for a revision the binary does not list (such as
+  `2025-06-18`) used to be answered with the oldest, `2024-11-05`, under which
+  `outputSchema` and `structuredContent` may be ignored. The lifecycle
+  specification says the answer SHOULD be the latest the server supports.
+- The MCP output-schema contract test now validates every advertised tool,
+  the task-board writers included, and fails a tool whose calls all errored
+  instead of skipping it. The thirteen tools that declare only
+  `{"type":"object"}` are named in an explicit allow-list with a reason each,
+  and the list cannot go stale.
+- **The Rust tests run in a hermetic environment.** Every test process now
+  starts in a per-process temporary home with its own git configuration, so a
+  developer's `core.hooksPath`, `init.defaultBranch`, `~/.claude` sessions,
+  repository-trust store and `tools.json` can no longer decide whether the suite
+  passes (and fixture repositories are no longer granted trust in the real
+  store). There is one environment lock instead of six, enforced by the type
+  `bind_env` takes; raw `set_var` is refused outside
+  `src/test_support/env.rs`; every wall-clock limit goes through
+  `coverage_relaxed` (Rust) or `wallClockBudget` (TypeScript). The Rust suite now
+  also runs on 8 threads in a separate workflow (`test-parallel.yml`); the serial
+  gate in `ci.yml` is unchanged.
+- **A runaway test process is stopped.** Test processes sample the operating
+  system's own write counter and abort with a message when one averages more
+  than 40 MiB/s over 30 s or writes more than 8 GiB, a guard added after a
+  `gitpulse_lib` test binary was reported writing 549.8 GiB in 90 minutes.
+  `node scripts/test-disk-writes.mjs` attributes bytes to single tests and fails
+  any over a budget.
+- The coverage floors are less generous. `graphStore.ts` and `repoMetrics.ts`
+  count again, each remaining exclusion names an owner and a review date (a
+  passed date fails `scripts/coverage-exclusions-contract.test.ts`), and the
+  function floor has a margin of over one point instead of 0.05. The coverage
+  workflow now reports Rust branch coverage (nightly `--branch`); it is reported,
+  not gated, until a floor has been measured.
+>>>>>>> hx/test-hermetic
 - CI now fails when a vendored crate is edited in this repository, through the
   new `bun run check:vendor-edits` (`vendor-crates.mjs --check --allow-drift`),
   which `ci:local` runs too. Upstream drift is still printed but never fails a

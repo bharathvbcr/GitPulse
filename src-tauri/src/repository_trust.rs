@@ -2093,7 +2093,10 @@ mod tests {
         assert_eq!(unsafe { libc::mkfifo(cpath.as_ptr(), 0o600) }, 0);
         let start = std::time::Instant::now();
         assert!(inspect(repo.path().to_str().unwrap()).is_err());
-        assert!(start.elapsed() < std::time::Duration::from_secs(2));
+        assert!(
+            start.elapsed()
+                < crate::test_support::coverage_relaxed(std::time::Duration::from_secs(2))
+        );
     }
 
     #[cfg(unix)]
@@ -2440,7 +2443,8 @@ mod tests {
         let started = std::time::Instant::now();
         migrate_store(storage.path()).unwrap();
         assert!(
-            started.elapsed() < std::time::Duration::from_secs(2),
+            started.elapsed()
+                < crate::test_support::coverage_relaxed(std::time::Duration::from_secs(2)),
             "migration blocked on a fifo"
         );
         assert!(link.symlink_metadata().unwrap().file_type().is_symlink());

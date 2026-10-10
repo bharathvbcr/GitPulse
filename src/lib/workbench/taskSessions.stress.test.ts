@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import { attemptTerminalView } from "./taskSessions";
 import type { TerminalSessionRecord } from "../terminal/sessionRegistry";
 import type { TaskTerminalRequest } from "../terminal/taskLaunches";
+import { wallClockBudget } from "../testing/wallClock";
 
 /**
  * The pane's join under arbitrary registry and queue contents.
@@ -97,6 +98,6 @@ describe("attemptTerminalView under arbitrary mixtures", () => {
     const started = performance.now();
     const view = attemptTerminalView("a", records, [], false);
     expect(view.sessions).toHaveLength(25_000);
-    expect(performance.now() - started).toBeLessThan(2_000);
+    expect(performance.now() - started).toBeLessThan(wallClockBudget(2_000));
   });
 });

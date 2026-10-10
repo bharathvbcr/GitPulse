@@ -299,7 +299,7 @@ mod tests {
                 Route::Shed { began: false }
             );
         }
-        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(started.elapsed() < crate::test_support::coverage_relaxed(Duration::from_secs(1)));
         assert!(flow.is_shedding());
     }
 

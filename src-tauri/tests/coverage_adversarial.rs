@@ -73,7 +73,7 @@ fn fifo_artifact_is_skipped_not_blocking() {
     let started = std::time::Instant::now();
     let report = CoverageScanner::scan(repo.path().to_str().unwrap()).expect("scan must finish");
     assert!(
-        started.elapsed() < std::time::Duration::from_secs(10),
+        started.elapsed() < common::env::coverage_relaxed(std::time::Duration::from_secs(10)),
         "scan blocked on FIFO for {:?}",
         started.elapsed()
     );

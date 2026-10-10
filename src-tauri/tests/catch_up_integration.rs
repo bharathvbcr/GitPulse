@@ -59,9 +59,12 @@ fn catch_up_attributes_real_history() {
     .to_string();
     std::fs::write(slug.join("S1.jsonl"), line + "\n").expect("write transcript");
 
-    std::env::set_var("GITPULSE_TRANSCRIPT_ROOT", transcript_dir.path());
-    let out = ingest::catch_up(&repo);
-    std::env::remove_var("GITPULSE_TRANSCRIPT_ROOT");
+    let serial = common::env::env_serial();
+    let out = {
+        let _root =
+            common::env::bind_env(&serial).set("GITPULSE_TRANSCRIPT_ROOT", transcript_dir.path());
+        ingest::catch_up(&repo)
+    };
     eprintln!(
         "catch_up: recorded={} transcripts={} skipped_lines={} reflog_entries={} error={:?}",
         out.recorded, out.transcripts, out.skipped_lines, out.reflog_entries, out.error
@@ -102,9 +105,11 @@ fn catch_up_attributes_real_history() {
 
     // Idempotence: catch-up runs on every repo open, so a second pass that
     // added rows would double a history every time the app started.
-    std::env::set_var("GITPULSE_TRANSCRIPT_ROOT", transcript_dir.path());
-    let again = ingest::catch_up(&repo);
-    std::env::remove_var("GITPULSE_TRANSCRIPT_ROOT");
+    let again = {
+        let _root =
+            common::env::bind_env(&serial).set("GITPULSE_TRANSCRIPT_ROOT", transcript_dir.path());
+        ingest::catch_up(&repo)
+    };
     assert_eq!(
         again.recorded, 0,
         "a second catch-up on real data duplicated {} rows",

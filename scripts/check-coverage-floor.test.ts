@@ -218,4 +218,53 @@ describe("coverage floor contract", () => {
     expect(malformed.code).toBe(2);
     expect(malformed.output).toMatch(/Frontend invalid:.*unterminated/);
   });
+
+  it("reports Rust branch coverage when the LCOV has it, and says when it has none", async () => {
+    const root = await scratchRoot();
+    await writeFile(
+      path.join(root, "coverage", "lcov.info"),
+      report({ source: "src/frontend.ts", lineCounts: Array.from({ length: 10 }, () => 1), branchHits: [1, 1] }),
+    );
+    await writeFile(
+      path.join(root, "lcov.info"),
+      report({ source: "src-tauri/src/lib.rs", lineCounts: [1, 1, 1, 1, 0], branchHits: [1, 0, 1, 1] }),
+    );
+    const withBranches = await runScript(["--root", root]);
+    expect(withBranches.code).toBe(0);
+    expect(withBranches.output).toMatch(/Rust branches 75\.00% \(3\/4\) \(not gated\)/);
+
+    await writeFile(
+      path.join(root, "lcov.info"),
+      report({ source: "src-tauri/src/lib.rs", lineCounts: [1, 1, 1, 1, 0], branchHits: [] }),
+    );
+    const without = await runScript(["--root", root]);
+    expect(without.code).toBe(0);
+    expect(without.output).toMatch(/Rust branches unavailable \(the LCOV carries no branch data\) \(not gated\)/);
+  });
+
+  it("enforces a Rust branch floor only when one is asked for, and never passes a report with no branch data against it", async () => {
+    const root = await scratchRoot();
+    await writeFile(
+      path.join(root, "coverage", "lcov.info"),
+      report({ source: "src/frontend.ts", lineCounts: Array.from({ length: 10 }, () => 1), branchHits: [1, 1] }),
+    );
+    await writeFile(
+      path.join(root, "lcov.info"),
+      report({ source: "src-tauri/src/lib.rs", lineCounts: [1, 1, 1, 1, 0], branchHits: [1, 0, 1, 1] }),
+    );
+    const met = await runScript(["--root", root, "--rust-branches", "70"]);
+    expect(met.code).toBe(0);
+    expect(met.output).toMatch(/Rust branches 75\.00% \(3\/4\) \(required >= 70\.00%\)/);
+
+    const missed = await runScript(["--root", root, "--rust-branches", "80"]);
+    expect(missed.code).toBe(1);
+    expect(missed.output).toMatch(/Rust branches 75\.00% is below required 80\.00%/);
+
+    await writeFile(
+      path.join(root, "lcov.info"),
+      report({ source: "src-tauri/src/lib.rs", lineCounts: [1, 1, 1, 1, 0], branchHits: [] }),
+    );
+    const unmeasurable = await runScript(["--root", root, "--rust-branches", "10"]);
+    expect(unmeasurable.code).not.toBe(0);
+  });
 });

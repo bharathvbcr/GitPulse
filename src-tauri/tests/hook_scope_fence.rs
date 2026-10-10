@@ -17,8 +17,13 @@
 //! GITPULSE_MANVI_BIN=/path/to/manvi cargo test --test hook_scope_fence -- --ignored
 //! ```
 //!
-//! One test per file, because it sets `HOME` for the whole process: trust
-//! records live under it, and a fixture must not write the developer's own.
+//! Its `HOME` is scoped to the test through `bind_env`: trust records live under
+//! it, and a fixture must not write the developer's own.
+
+// The hermetic test environment: a per-process home, git config and trust
+// store, rewritten before `main`. See `src/test_support/env.rs`.
+#[path = "../src/test_support/env.rs"]
+mod hermetic_env;
 
 use gitpulse_lib::procguard::LockedSpawn;
 use std::io::Write;
@@ -85,8 +90,8 @@ fn denied(answer: &Option<serde_json::Value>) -> bool {
 fn a_task_bound_session_cannot_write_outside_its_plan_through_any_tool() {
     let home = tempfile::tempdir().expect("home");
     let logs = tempfile::tempdir().expect("logs");
-    // SAFETY: the only test in this binary, set before anything reads it.
-    unsafe { std::env::set_var("HOME", home.path()) };
+    let serial = hermetic_env::env_serial();
+    let _home = hermetic_env::bind_env(&serial).set("HOME", home.path());
 
     let dir = tempfile::tempdir().expect("repository");
     let repo_buf = dir.path().canonicalize().expect("canonical repository");

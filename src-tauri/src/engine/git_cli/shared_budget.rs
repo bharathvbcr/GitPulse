@@ -435,7 +435,10 @@ mod tests {
             matches!(&outcome, Take::Unavailable(reason) if reason.contains("held")),
             "{outcome:?}"
         );
-        assert!(started.elapsed() < Duration::from_secs(1), "bounded wait");
+        assert!(
+            started.elapsed() < crate::test_support::coverage_relaxed(Duration::from_secs(1)),
+            "bounded wait"
+        );
         holder.unlock().unwrap();
         assert_eq!(shared.take_at(0, 4, 1, S), Take::Granted);
     }

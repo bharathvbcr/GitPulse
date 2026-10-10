@@ -578,7 +578,7 @@ fn a_socket_path_too_long_to_bind_still_keeps_one_owner() {
         other => panic!("expected Blocked, got {}", describe(&other)),
     }
     assert!(
-        started.elapsed() < Duration::from_secs(1),
+        started.elapsed() < crate::test_support::coverage_relaxed(Duration::from_secs(1)),
         "waited for a mailbox that cannot exist"
     );
 }

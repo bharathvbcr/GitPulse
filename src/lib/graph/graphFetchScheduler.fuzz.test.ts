@@ -7,6 +7,7 @@ import {
   type GraphFetchRequest,
   type ScheduledLoad,
 } from "./graphFetchScheduler";
+import { wallClockBudget } from "../testing/wallClock";
 
 /**
  * Seeded PRNG (mulberry32) so every failure reproduces exactly from the seed
@@ -309,7 +310,7 @@ describe("createGraphFetchScheduler fuzz", () => {
       }
       // Tripwire against pathological blowups, not an SLA: this suite shares
       // the machine with Rust builds.
-      expect(performance.now() - startedAt).toBeLessThan(5000);
+      expect(performance.now() - startedAt).toBeLessThan(wallClockBudget(5000));
     }
   );
 });

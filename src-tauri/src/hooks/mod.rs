@@ -3592,19 +3592,10 @@ done
 
     /* ── notify ───────────────────────────────────────────────────────────── */
 
-    /// Serialises the notify tests' environment overrides.
-    ///
-    /// These two variables are not hypothetical in this process: running the
-    /// suite from inside a GitPulse agent tab sets both, so a test that read
-    /// the ambient value would pass on a laptop and fail in CI, or the reverse.
-    /// Every notify test pins both.
-    static NOTIFY_ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    fn notify_serial() -> std::sync::MutexGuard<'static, ()> {
-        NOTIFY_ENV
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-    }
+    // The notify tests pin the agent-session variables through `bind_env`.
+    // These variables are not hypothetical in this process: running the suite
+    // from inside a GitPulse agent tab sets them, so a test that read the
+    // ambient value would pass on a laptop and fail in CI, or the reverse.
 
     fn notify_input() -> HookInput {
         HookInput {
@@ -3639,7 +3630,7 @@ done
     /// written twice could never do.
     #[test]
     fn what_the_hook_sends_is_what_the_socket_accepts() {
-        let serial = notify_serial();
+        let serial = crate::test_support::env::env_serial();
         let _env = crate::test_support::env::bind_env(&serial)
             .set(AGENT_KIND_ENV, "claude")
             .set(crate::alerts::bridge::SESSION_ENV, "term-4-1")
@@ -3661,7 +3652,7 @@ done
 
     #[test]
     fn every_event_the_plugin_can_route_produces_an_acceptable_report() {
-        let serial = notify_serial();
+        let serial = crate::test_support::env::env_serial();
         let _env = crate::test_support::env::bind_env(&serial)
             .set(AGENT_KIND_ENV, "codex")
             .set(crate::alerts::bridge::SESSION_ENV, "term-4-1")
@@ -3681,7 +3672,7 @@ done
 
     #[test]
     fn an_event_the_manifest_and_this_binary_disagree_about_is_an_error() {
-        let serial = notify_serial();
+        let serial = crate::test_support::env::env_serial();
         let _env = crate::test_support::env::bind_env(&serial)
             .set(crate::alerts::bridge::SOCKET_ENV, "/tmp/gitpulse-test.sock");
         // The failure this catches is a plugin manifest updated without the
@@ -3698,7 +3689,7 @@ done
 
     #[test]
     fn a_session_outside_gitpulse_still_reports_and_identifies_itself() {
-        let serial = notify_serial();
+        let serial = crate::test_support::env::env_serial();
         let _env = crate::test_support::env::bind_env(&serial)
             .remove(AGENT_KIND_ENV)
             .remove(crate::alerts::bridge::SESSION_ENV)
@@ -3717,7 +3708,7 @@ done
 
     #[test]
     fn an_agent_kind_the_socket_does_not_know_is_not_forwarded_as_one() {
-        let serial = notify_serial();
+        let serial = crate::test_support::env::env_serial();
         let _env = crate::test_support::env::bind_env(&serial)
             .set(AGENT_KIND_ENV, "not-an-agent")
             .remove(crate::alerts::bridge::SESSION_ENV)
@@ -3729,7 +3720,7 @@ done
 
     #[test]
     fn a_socket_that_never_answers_does_not_hold_the_users_turn() {
-        let serial = notify_serial();
+        let serial = crate::test_support::env::env_serial();
         let _env = crate::test_support::env::bind_env(&serial)
             .set(crate::alerts::bridge::SOCKET_ENV, "/tmp/gitpulse-test.sock");
         let started = std::time::Instant::now();
@@ -3868,7 +3859,7 @@ done
 
     #[test]
     fn a_permission_request_and_its_result_reach_the_socket_as_one_subject() {
-        let serial = notify_serial();
+        let serial = crate::test_support::env::env_serial();
         let _env = crate::test_support::env::bind_env(&serial)
             .set(AGENT_KIND_ENV, "claude")
             .set(crate::alerts::bridge::SESSION_ENV, "term-4-1")
@@ -3899,7 +3890,7 @@ done
 
     #[test]
     fn a_state_outside_a_gitpulse_terminal_never_touches_the_socket() {
-        let serial = notify_serial();
+        let serial = crate::test_support::env::env_serial();
         let _env = crate::test_support::env::bind_env(&serial)
             .remove(crate::alerts::bridge::SESSION_ENV)
             .set(crate::alerts::bridge::SOCKET_ENV, "/tmp/gitpulse-test.sock");
@@ -3917,7 +3908,7 @@ done
 
     #[test]
     fn a_long_final_message_is_cut_rather_than_costing_the_report() {
-        let serial = notify_serial();
+        let serial = crate::test_support::env::env_serial();
         let _env = crate::test_support::env::bind_env(&serial)
             .set(crate::alerts::bridge::SESSION_ENV, "term-4-1")
             .set(crate::alerts::bridge::SOCKET_ENV, "/tmp/gitpulse-test.sock");
@@ -3985,7 +3976,7 @@ done
 
     #[test]
     fn a_report_never_produces_a_decision_or_a_transcript_warning() {
-        let serial = notify_serial();
+        let serial = crate::test_support::env::env_serial();
         let _env = crate::test_support::env::bind_env(&serial)
             .set(crate::alerts::bridge::SOCKET_ENV, "/tmp/gitpulse-test.sock");
         let (result, _) = captured("agent_completed", &notify_input());

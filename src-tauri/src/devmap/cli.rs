@@ -195,27 +195,17 @@ static TEST_BINARY: Mutex<Option<String>> = Mutex::new(None);
 #[cfg(test)]
 static TEST_STATUS: Mutex<Option<CliStatus>> = Mutex::new(None);
 
-/// Serializes every test that installs a global `devmap` override.
+/// Every test that installs a global `devmap` override takes
+/// [`crate::test_support::env::env_serial`], the process's one environment lock.
 ///
 /// `TEST_BINARY` is process-wide, so two tests that bind their own stub at the
 /// same time resolve each other's binary. The symptom is not a clean failure:
 /// each stub appends argv to a log inside *its own* fixture, so one test
 /// asserts against a log that is missing a spawn while another test's log
-/// quietly holds it — and which test fails moves from run to run. Latent for as
-/// long as the override has existed; anything that lengthens the window between
-/// binding and unbinding makes it likelier.
-///
-/// Poison-tolerant, following [`crate::harness::sidecar::test_serial`]: a
-/// panicking test must not wedge every later one, and the data behind this lock
-/// is the emptiness of `()`.
-#[cfg(test)]
-pub(crate) fn test_serial() -> std::sync::MutexGuard<'static, ()> {
-    static SERIAL: Mutex<()> = Mutex::new(());
-    SERIAL
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-}
-
+/// quietly holds it — and which test fails moves from run to run. A private
+/// lock here was also a lock that readers of `GITPULSE_TOOL_CONFIG` under a
+/// different one never took, which is how `resolve_binary` could observe a
+/// concurrently bound config.
 #[cfg(test)]
 fn set_test_binary(path: Option<String>) {
     *TEST_BINARY
@@ -240,7 +230,7 @@ fn set_test_status(status: Option<CliStatus>) {
 pub(crate) struct TestBinaryBinding(
     /// Held, never read: the serial's whole job is to be released on drop.
     #[allow(dead_code)]
-    std::sync::MutexGuard<'static, ()>,
+    crate::test_support::env::EnvGuard,
 );
 
 #[cfg(test)]
@@ -273,7 +263,7 @@ impl TestBinaryBinding {
 /// binding is dropped.
 #[cfg(test)]
 pub(crate) fn bind_test_binary(path: impl Into<String>) -> TestBinaryBinding {
-    let serial = test_serial();
+    let serial = crate::test_support::env::env_serial();
     set_test_binary(Some(path.into()));
     TestBinaryBinding(serial)
 }
@@ -1651,7 +1641,7 @@ exit 2
         // under test would never happen. Acquired after the sidecar's, which is
         // the order every binding site uses; reversing it anywhere would be a
         // lock-order inversion.
-        let _no_override = test_serial();
+        let _no_override = crate::test_support::env::env_serial();
         let _env = crate::test_support::env::bind_env(&_lock)
             .set("GITPULSE_DEVMAP_BIN", "/no/such/devmap-binary");
         let err = resolve_binary().expect_err("must refuse");
@@ -2062,7 +2052,7 @@ exit 2
         // here is a concurrently installed `TEST_STATUS`, and that is the serial
         // guarding it. Holding the sidecar's instead would exclude today's
         // setters only because all of them happen to take both.
-        let _lock = test_serial();
+        let _lock = crate::test_support::env::env_serial();
         for path in [
             "",
             "relative/path",

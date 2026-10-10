@@ -4126,7 +4126,8 @@ mod tests {
         let shed = with_background_processes(|| gate.acquire_until(far(), &|| false).err());
         assert_eq!(shed, Some(Refusal::Shed));
         assert!(
-            began.elapsed() < std::time::Duration::from_millis(500),
+            began.elapsed()
+                < crate::test_support::coverage_relaxed(std::time::Duration::from_millis(500)),
             "shedding must not wait out the budget: {:?}",
             began.elapsed()
         );
@@ -4383,7 +4384,8 @@ mod tests {
             slowest = slowest.max(waited);
         }
         assert!(
-            started.elapsed() < std::time::Duration::from_secs(4),
+            started.elapsed()
+                < crate::test_support::coverage_relaxed(std::time::Duration::from_secs(4)),
             "join took {:?}; a refused spawn must not sit until the 90s git deadline",
             started.elapsed()
         );
@@ -4409,7 +4411,9 @@ mod tests {
             let gate = Arc::clone(&gate);
             let admitted = Arc::clone(&admitted);
             threads.push(std::thread::spawn(move || {
-                while started.elapsed() < std::time::Duration::from_millis(500) {
+                while started.elapsed()
+                    < crate::test_support::coverage_relaxed(std::time::Duration::from_millis(500))
+                {
                     if let Some(permit) = gate
                         .acquire(std::time::Instant::now() + std::time::Duration::from_millis(15))
                     {
@@ -4619,7 +4623,7 @@ mod tests {
             "-c", "alias.retry=!echo attempt >> attempts; sleep 0.08; echo 'cannot lock ref' >&2; exit 1", "retry"
         ], Duration::from_millis(150), None, 1024).unwrap_err();
         assert!(
-            started.elapsed() < Duration::from_millis(500),
+            started.elapsed() < crate::test_support::coverage_relaxed(Duration::from_millis(500)),
             "retries renewed the timeout: {:?}",
             started.elapsed()
         );
@@ -4692,7 +4696,7 @@ mod tests {
             Some(&vec![b'x'; 1024 * 1024]),
         );
         assert!(
-            started.elapsed() < Duration::from_secs(2),
+            started.elapsed() < crate::test_support::coverage_relaxed(Duration::from_secs(2)),
             "stdin join outlived the child: {:?}",
             started.elapsed()
         );
@@ -5408,7 +5412,7 @@ mod tests {
             ),
         }
         assert!(
-            started.elapsed() < Duration::from_secs(10),
+            started.elapsed() < crate::test_support::coverage_relaxed(Duration::from_secs(10)),
             "bounded run should finish promptly once pipes drain"
         );
     }
@@ -6725,7 +6729,7 @@ mod tests {
         };
         assert!(err.contains("timed out"), "got: {err}");
         assert!(
-            started.elapsed() < Duration::from_secs(10),
+            started.elapsed() < crate::test_support::coverage_relaxed(Duration::from_secs(10)),
             "kill must be prompt, took {:?}",
             started.elapsed()
         );
@@ -6802,7 +6806,7 @@ mod tests {
         .expect("bytes written before the deadline are the result");
         drop(kept);
         assert!(
-            started.elapsed() < Duration::from_secs(5),
+            started.elapsed() < crate::test_support::coverage_relaxed(Duration::from_secs(5)),
             "kill must be prompt, took {:?}",
             started.elapsed()
         );
@@ -6927,7 +6931,8 @@ mod tests {
                 )
                 .expect("prefix");
                 assert!(
-                    started.elapsed() < Duration::from_secs(5),
+                    started.elapsed()
+                        < crate::test_support::coverage_relaxed(Duration::from_secs(5)),
                     "reader {index} took {:?}",
                     started.elapsed()
                 );
@@ -7181,7 +7186,7 @@ mod tests {
         let err = run_bounded(cmd, "sh", Duration::from_secs(1), None).expect_err("timeout");
         assert!(err.contains("timed out"), "got: {err}");
         assert!(
-            started.elapsed() < Duration::from_secs(15),
+            started.elapsed() < crate::test_support::coverage_relaxed(Duration::from_secs(15)),
             "timeout handling must stay bounded (one shared grace window), took {:?}",
             started.elapsed()
         );
@@ -7785,7 +7790,7 @@ mod tests {
             }
         }
         assert!(
-            started.elapsed() < Duration::from_secs(10),
+            started.elapsed() < crate::test_support::coverage_relaxed(Duration::from_secs(10)),
             "refusals sat until the command deadline: {:?}",
             started.elapsed()
         );
@@ -8365,7 +8370,7 @@ mod tests {
                 .unwrap_err()
                 .contains("timed out")
         );
-        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(started.elapsed() < crate::test_support::coverage_relaxed(Duration::from_secs(2)));
     }
 
     #[test]
@@ -8396,7 +8401,7 @@ mod tests {
         assert!(out.cancelled && !out.success);
         assert_eq!(out.stdout, b"progress");
         assert_eq!(observer.0, b"progress");
-        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(started.elapsed() < crate::test_support::coverage_relaxed(Duration::from_secs(2)));
     }
 }
 

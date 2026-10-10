@@ -41,7 +41,11 @@ use crate::insights::{self, McpToolInfo};
 pub const PROTOCOL_VERSION: &str = "2026-07-28";
 pub const SERVER_NAME: &str = "gitpulse-mcp";
 
-/// Legacy handshake-based revisions this binary still answers.
+/// Legacy handshake-based revisions this binary still answers, newest first.
+/// The first is what an `initialize` for any version not listed here is answered
+/// with: the lifecycle spec says the server "MUST respond with another protocol
+/// version it supports. This SHOULD be the *latest* version supported by the
+/// server", and it is the client's job to disconnect if it cannot use it.
 pub const LEGACY_VERSIONS: &[&str] = &["2025-11-25", "2024-11-05"];
 
 const TOOLS_TTL_MS: u64 = 3_600_000;
@@ -1565,9 +1569,9 @@ pub fn accept(req: JsonRpcRequest, era: &mut Era) -> Accepted {
 
     if req.method == "initialize" {
         *era = Era::Legacy;
-        let requested = req.params["protocolVersion"]
-            .as_str()
-            .unwrap_or("2024-11-05");
+        // An absent version asks for nothing in particular, so it gets the same
+        // answer as an unknown one rather than being assumed to mean the oldest.
+        let requested = req.params["protocolVersion"].as_str().unwrap_or("");
         let protocol_version = if LEGACY_VERSIONS.contains(&requested) {
             requested
         } else if requested == PROTOCOL_VERSION {
@@ -1575,7 +1579,7 @@ pub fn accept(req: JsonRpcRequest, era: &mut Era) -> Accepted {
             // they asked for so they are not stuck, and name the modern version.
             PROTOCOL_VERSION
         } else {
-            LEGACY_VERSIONS[1]
+            LEGACY_VERSIONS[0]
         };
         return Accepted::Answered(ok(
             id,
@@ -2041,6 +2045,54 @@ mod tests {
         }
     }
 
+    /// Regression (oldest-version fallback): a client asking for a revision this
+    /// binary does not list was answered 2024-11-05, the *oldest* it speaks,
+    /// under which `outputSchema` and `structuredContent` (the `ok` and
+    /// `unscanned_worktrees` facets) may be ignored. The spec says the latest.
+    #[test]
+    fn an_unlisted_requested_version_is_answered_with_the_newest_supported() {
+        assert!(
+            LEGACY_VERSIONS.windows(2).all(|pair| pair[0] > pair[1]),
+            "LEGACY_VERSIONS must be newest first: {LEGACY_VERSIONS:?}"
+        );
+        for requested in [
+            json!("2025-06-18"),
+            json!("2025-03-26"),
+            json!("1999-01-01"),
+            json!(null),
+        ] {
+            let mut era = Era::Unknown;
+            let resp = process_request(
+                request(
+                    "initialize",
+                    Some(json!(1)),
+                    json!({ "protocolVersion": requested, "capabilities": {} }),
+                ),
+                &mut era,
+            )
+            .expect("answered");
+            assert_eq!(
+                resp.result.unwrap()["protocolVersion"],
+                LEGACY_VERSIONS[0],
+                "requested {requested}"
+            );
+        }
+        // A listed version is still answered with itself.
+        for version in LEGACY_VERSIONS {
+            let mut era = Era::Unknown;
+            let resp = process_request(
+                request(
+                    "initialize",
+                    Some(json!(1)),
+                    json!({ "protocolVersion": version }),
+                ),
+                &mut era,
+            )
+            .expect("answered");
+            assert_eq!(resp.result.unwrap()["protocolVersion"], *version);
+        }
+    }
+
     #[test]
     fn the_legacy_handshake_advertises_the_same_capabilities_as_discover() {
         let mut era = Era::Unknown;
@@ -2476,6 +2528,75 @@ mod tests {
         }
     }
 
+    /// Tools whose `outputSchema` is only `{"type":"object"}`, each with why.
+    ///
+    /// An object-only schema accepts any object, so validating against it
+    /// proves nothing; leaving that silent is how "every tool validated" came
+    /// to mean "five of them". Each is named here instead, and
+    /// `every_advertised_tool_result_matches_its_declared_output_schema` fails
+    /// both for a tool missing from this list and for one that no longer
+    /// belongs on it.
+    const OBJECT_ONLY_OUTPUT_SCHEMAS: &[(&str, &str)] = &[
+        (
+            "gitpulse_task_view",
+            "relays Manvi's task view; the shape is Manvi's contract",
+        ),
+        (
+            "gitpulse_provenance",
+            "relays git-notes provenance records, which carry per-commit free-form fields",
+        ),
+        (
+            "devmap_status",
+            "relays the DevMap CLI envelope; DevMap owns its schema",
+        ),
+        (
+            "devmap_search",
+            "relays the DevMap CLI envelope; DevMap owns its schema",
+        ),
+        (
+            "devmap_dependencies",
+            "relays the DevMap CLI envelope; DevMap owns its schema",
+        ),
+        (
+            "devmap_impact",
+            "relays the DevMap CLI envelope; DevMap owns its schema",
+        ),
+        (
+            "devmap_trace",
+            "relays the DevMap CLI envelope; DevMap owns its schema",
+        ),
+        (
+            "devmap_neighbors",
+            "relays the DevMap CLI envelope; DevMap owns its schema",
+        ),
+        (
+            "devmap_dead_symbols",
+            "relays the DevMap CLI envelope; DevMap owns its schema",
+        ),
+        (
+            "devmap_clones",
+            "relays the DevMap CLI envelope; DevMap owns its schema",
+        ),
+        (
+            "devmap_preview",
+            "relays the DevMap CLI envelope; DevMap owns its schema",
+        ),
+        (
+            "devmap_explore",
+            "relays the DevMap CLI envelope; DevMap owns its schema",
+        ),
+        (
+            "devmap_affected_tests",
+            "relays the DevMap CLI envelope; DevMap owns its schema",
+        ),
+    ];
+
+    fn is_object_only_exempt(name: &str) -> bool {
+        OBJECT_ONLY_OUTPUT_SCHEMAS
+            .iter()
+            .any(|(exempt, _)| *exempt == name)
+    }
+
     /// A tool's result is checked by the client against its `outputSchema`,
     /// and a mismatch fails the whole call. `gitpulse_change_context` declared
     /// `collisions` an array while it has always returned the collision facet
@@ -2484,8 +2605,16 @@ mod tests {
     /// been deleted (the collision scan fails), and on a path that is not a
     /// repository at all, because the failure paths are where a payload
     /// drifts from its happy-path shape.
+    ///
+    /// Every advertised tool is held to it, the task-board writers included
+    /// (they run as one lifecycle on the healthy repository), and a tool whose
+    /// every call errored is a failure, not a skip: this used to `continue`
+    /// past an error and require five of the 27 tools, so the other 22 could
+    /// drift without a test noticing. The only tools exempt are those named in
+    /// [`OBJECT_ONLY_OUTPUT_SCHEMAS`], each with the reason its schema is not
+    /// typed here.
     #[test]
-    fn every_read_only_tool_result_matches_its_declared_output_schema() {
+    fn every_advertised_tool_result_matches_its_declared_output_schema() {
         let git = |args: &[&str]| {
             let out = std::process::Command::new("git")
                 .args(args)
@@ -2552,10 +2681,46 @@ mod tests {
         let missing = "/no/such/gitpulse-output-schema-repo".to_string();
 
         let mut validated = std::collections::BTreeSet::new();
+        let mut errors: std::collections::BTreeMap<String, Vec<String>> = Default::default();
+        let mut check =
+            |name: &str,
+             label: &str,
+             schema: &Value,
+             outcome: Result<Value, String>,
+             validated: &mut std::collections::BTreeSet<String>| {
+                // An execution error is reported as `isError` text and carries no
+                // structured content, so there is no schema to meet. It is recorded
+                // rather than skipped: a tool with no successful call is reported
+                // below.
+                let payload = match outcome {
+                    Ok(payload) => payload,
+                    Err(error) => {
+                        errors
+                            .entry(name.to_string())
+                            .or_default()
+                            .push(format!("{label}: {error}"));
+                        return;
+                    }
+                };
+                let violations: Vec<String> = validate::validate(&payload, schema)
+                    .iter()
+                    .map(validate::Violation::render)
+                    .collect();
+                assert!(
+                violations.is_empty(),
+                "{name} on {label} violates its outputSchema: {violations:?}\npayload: {payload}"
+            );
+                let nulls = nulls_the_schema_does_not_allow(&payload, schema, "");
+                assert!(
+                    nulls.is_empty(),
+                    "{name} on {label} returns null where its outputSchema forbids it: {nulls:?}"
+                );
+                validated.insert(name.to_string());
+            };
         for repo in [&healthy, &broken, &untrusted, &ledgered, &missing] {
             for tool in tools() {
                 let name = tool["name"].as_str().expect("name");
-                if tool["annotations"]["readOnlyHint"] != true {
+                if tool["annotations"]["readOnlyHint"] != true || is_object_only_exempt(name) {
                     continue;
                 }
                 let mut arguments = json!({ "repo_path": repo });
@@ -2574,28 +2739,124 @@ mod tests {
                         arguments[extra] = json!("probe");
                     }
                 }
-                // An execution error is reported as `isError` text and carries
-                // no structured content, so there is no schema to meet.
-                let Ok(payload) = handle_tool_call(name, &arguments) else {
-                    continue;
-                };
-                let schema = &tool["outputSchema"];
-                let violations: Vec<String> = validate::validate(&payload, schema)
-                    .iter()
-                    .map(validate::Violation::render)
-                    .collect();
-                assert!(
-                    violations.is_empty(),
-                    "{name} on {repo} violates its outputSchema: {violations:?}\npayload: {payload}"
+                check(
+                    name,
+                    repo,
+                    &tool["outputSchema"],
+                    handle_tool_call(name, &arguments),
+                    &mut validated,
                 );
-                let nulls = nulls_the_schema_does_not_allow(&payload, schema, "");
-                assert!(
-                    nulls.is_empty(),
-                    "{name} on {repo} returns null where its outputSchema forbids it: {nulls:?}"
-                );
-                validated.insert(name.to_string());
             }
         }
+
+        // The writers, as the lifecycle an agent runs: file two tasks, import
+        // briefs, finish one, merge the other into it, delete a third. Each
+        // reply is held to the schema the tool advertises. The task profile is
+        // the fixture's own (`PROFILE_OVERRIDE`), so nothing here touches a
+        // real board.
+        let schema_of = |name: &str| -> Value {
+            tools()
+                .into_iter()
+                .find(|tool| tool["name"] == name)
+                .map(|tool| tool["outputSchema"].clone())
+                .unwrap_or_else(|| panic!("{name} is not advertised"))
+        };
+        let mut call_writer =
+            |name: &str, arguments: Value, validated: &mut std::collections::BTreeSet<String>| {
+                let outcome = handle_tool_call(name, &arguments);
+                check(
+                    name,
+                    "the task-board lifecycle",
+                    &schema_of(name),
+                    outcome,
+                    validated,
+                );
+            };
+        for (task, title) in [
+            ("gp-schema-first", "Rotate the signing keys"),
+            ("gp-schema-second", "Paginate the activity feed"),
+            ("gp-schema-third", "Compress the ledger archives"),
+        ] {
+            call_writer(
+                "gitpulse_add_task",
+                json!({ "repo_path": healthy, "task_id": task, "title": title, "status": "ready", "priority": 2 }),
+                &mut validated,
+            );
+        }
+        call_writer(
+            "gitpulse_import_tasks",
+            json!({ "repo_path": healthy }),
+            &mut validated,
+        );
+        call_writer(
+            "gitpulse_complete_task",
+            json!({ "repo_path": healthy, "task_id": "gp-schema-first", "status": "review", "summary": "schema probe" }),
+            &mut validated,
+        );
+        call_writer(
+            "gitpulse_merge_tasks",
+            json!({
+                "repo_path": healthy,
+                "into_task_id": "gp-schema-first",
+                "sources": [{ "task_id": "gp-schema-second" }],
+                "reason": "schema probe: duplicate of the first"
+            }),
+            &mut validated,
+        );
+        call_writer(
+            "gitpulse_delete_task",
+            json!({ "repo_path": healthy, "task_id": "gp-schema-third", "reason": "schema probe cleanup" }),
+            &mut validated,
+        );
+        // And the readers that depend on those tasks existing.
+        for name in ["gitpulse_list_tasks", "gitpulse_get_task"] {
+            let tool = tools()
+                .into_iter()
+                .find(|tool| tool["name"] == name)
+                .unwrap();
+            let arguments = json!({ "repo_path": healthy, "task_id": "gp-schema-first" });
+            check(
+                name,
+                "the task-board lifecycle",
+                &tool["outputSchema"],
+                handle_tool_call(name, &arguments),
+                &mut validated,
+            );
+        }
+
+        // Every advertised tool is validated or explicitly exempt. A tool whose
+        // every call errored was never checked, and says why.
+        for tool in tools() {
+            let name = tool["name"].as_str().expect("name");
+            if is_object_only_exempt(name) {
+                continue;
+            }
+            assert!(
+                validated.contains(name),
+                "{name} was never validated against its outputSchema (every call errored): {:?}",
+                errors.get(name)
+            );
+        }
+        // The allow-list cannot go stale: an exempt tool must still declare
+        // only an object, and a tool that gained a real schema must leave it.
+        for (name, reason) in OBJECT_ONLY_OUTPUT_SCHEMAS {
+            let tool = tools()
+                .into_iter()
+                .find(|tool| tool["name"] == *name)
+                .unwrap_or_else(|| panic!("{name} is exempt but no longer advertised"));
+            assert_eq!(
+                tool["outputSchema"],
+                json!({ "type": "object" }),
+                "{name} now declares a real outputSchema; drop it from OBJECT_ONLY_OUTPUT_SCHEMAS ({reason})"
+            );
+        }
+        assert!(
+            tools().iter().all(|tool| {
+                let name = tool["name"].as_str().unwrap();
+                tool["outputSchema"] != json!({ "type": "object" }) || is_object_only_exempt(name)
+            }),
+            "a tool declares only {{\"type\":\"object\"}} without being listed, with a reason, in OBJECT_ONLY_OUTPUT_SCHEMAS"
+        );
         // A tool that only ever errored here was never checked; these are the
         // ones whose declared shapes this test was written against.
         for name in [

@@ -15,6 +15,11 @@
 //! JSON-RPC message per line**, **every request carrying an id is answered
 //! exactly once**, and **no input kills the server**.
 
+// The hermetic test environment: a per-process home, git config and trust
+// store, rewritten before `main`. See `src/test_support/env.rs`.
+#[path = "../src/test_support/env.rs"]
+mod hermetic_env;
+
 use gitpulse_lib::procguard::LockedSpawn;
 use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Read, Write};

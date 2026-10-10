@@ -2,6 +2,11 @@
 //! Each case runs on a fresh process's main thread; a foreign-unwind abort cannot
 //! be caught by libtest, and AppKit requires the process main thread.
 
+// The hermetic test environment: a per-process home, git config and trust
+// store, rewritten before `main`. See `src/test_support/env.rs`.
+#[path = "../src/test_support/env.rs"]
+mod hermetic_env;
+
 #[cfg(target_os = "macos")]
 mod macos {
     use gitpulse_lib::procguard::LockedSpawn;

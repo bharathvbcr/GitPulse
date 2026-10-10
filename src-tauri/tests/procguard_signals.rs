@@ -12,6 +12,11 @@
 //! asserting nothing.
 #![cfg(unix)]
 
+// The hermetic test environment: a per-process home, git config and trust
+// store, rewritten before `main`. See `src/test_support/env.rs`.
+#[path = "../src/test_support/env.rs"]
+mod hermetic_env;
+
 use gitpulse_lib::procguard::LockedSpawn;
 use std::io::{BufReader, Read, Write};
 use std::path::{Path, PathBuf};

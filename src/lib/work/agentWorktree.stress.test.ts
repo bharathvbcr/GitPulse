@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { agentKind, agentKindsOn, agentLayout, agentSessionSlug, isAgentWorktree } from "./agentWorktree";
+import { wallClockBudget } from "../testing/wallClock";
 
 /**
  * Adversarial and randomised input for the agent-worktree detector.
@@ -204,7 +205,7 @@ describe("agent worktree detector invariants", () => {
         expect(() => agentLayout(path), path).not.toThrow();
       }
     }
-    expect(performance.now() - started).toBeLessThan(5_000);
+    expect(performance.now() - started).toBeLessThan(wallClockBudget(5_000));
   });
 
   it("holds the layout it found however long the session name is", () => {

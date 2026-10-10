@@ -4067,7 +4067,8 @@ mod tests {
             .starts_with("https://github.com/a/r/releases/tag/v1.0.")));
 
         assert!(
-            started.elapsed() < std::time::Duration::from_secs(30),
+            started.elapsed()
+                < crate::test_support::coverage_relaxed(std::time::Duration::from_secs(30)),
             "stress parsing must stay bounded, took {:?}",
             started.elapsed()
         );

@@ -4166,7 +4166,8 @@ mod tests {
         )
         .unwrap_err();
         assert!(
-            started.elapsed() < std::time::Duration::from_secs(20),
+            started.elapsed()
+                < crate::test_support::coverage_relaxed(std::time::Duration::from_secs(20)),
             "{err}"
         );
         assert!(err.contains("git commit timed out after "), "{err}");
@@ -4206,7 +4207,8 @@ mod tests {
         let err = GitWriter::commit(&repo_path(&dir), "never lands", false).unwrap_err();
         assert_eq!(canceller.join().unwrap(), 1, "one run was in flight");
         assert!(
-            started.elapsed() < std::time::Duration::from_secs(20),
+            started.elapsed()
+                < crate::test_support::coverage_relaxed(std::time::Duration::from_secs(20)),
             "{err}"
         );
         assert!(
