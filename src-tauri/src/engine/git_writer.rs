@@ -2297,11 +2297,17 @@ pub(crate) fn record_deleted_branch_tip(
 /// default: the primary remote's HEAD branch first, then conventional
 /// main/master/trunk/develop — the same resolution `list_branches` uses.
 pub(crate) fn is_default_branch(repo: &Path, branch_name: &str) -> bool {
+    default_branch_short_name(repo).is_some_and(|short| short == branch_name)
+}
+
+/// The short name [`is_default_branch`] compares against, for a caller that
+/// checks several branches and should resolve it once rather than per branch.
+pub(crate) fn default_branch_short_name(repo: &Path) -> Option<String> {
     let remote = crate::engine::git_reader::resolve_default_remote(repo);
     let head_ref = crate::engine::git_reader::remote_head_ref(&remote);
     let remote_head = git_text(repo, &["symbolic-ref", "--quiet", head_ref.as_str()]).ok();
     crate::engine::git_reader::resolve_default_base_on(repo, &remote, remote_head.as_deref())
-        .is_some_and(|(short, _)| short == branch_name)
+        .map(|(short, _)| short)
 }
 
 /// True when any worktree of `repo` (including the main one) has
@@ -2310,11 +2316,21 @@ pub(crate) fn is_checked_out_in_any_worktree(
     repo: &Path,
     branch_name: &str,
 ) -> Result<bool, String> {
+    Ok(checked_out_branches(repo)?.contains(branch_name))
+}
+
+/// Short names of every local branch checked out in any worktree of `repo`
+/// (including the main one). One `git worktree list` for a caller that checks
+/// many branches: asking [`is_checked_out_in_any_worktree`] per branch spent
+/// one spawn per branch against the shared spawn budget.
+pub(crate) fn checked_out_branches(repo: &Path) -> Result<HashSet<String>, String> {
     let stdout = git_text(repo, &["worktree", "list", "--porcelain"])?;
-    let target = format!("refs/heads/{branch_name}");
     Ok(stdout
         .lines()
-        .any(|line| line.strip_prefix("branch ").map(str::trim) == Some(target.as_str())))
+        .filter_map(|line| line.strip_prefix("branch "))
+        .filter_map(|r| r.trim().strip_prefix("refs/heads/"))
+        .map(str::to_string)
+        .collect())
 }
 
 /// Rewrites only the subject line of a commit message, keeping the body —

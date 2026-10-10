@@ -18,8 +18,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::engine::git_cli::{git_text, validate_repo};
 use crate::engine::git_reader::GitReader;
 use crate::engine::git_writer::{
-    is_checked_out_in_any_worktree, is_default_branch, record_deleted_branch_tip,
-    repo_mutation_lock, validate_ref_name,
+    checked_out_branches, default_branch_short_name, record_deleted_branch_tip, repo_mutation_lock,
+    validate_ref_name,
 };
 
 /// Default list of branches that are never deleted.
@@ -311,6 +311,10 @@ pub fn scan_stale_branches(
         None
     };
 
+    // One `worktree list` for the whole scan, not one per local branch. A
+    // failure reads as "nothing checked out", as the per-branch probe did.
+    let checked_out = checked_out_branches(&repo).unwrap_or_default();
+
     // First pass: collect metadata and evaluate fast ancestry merge status
     let mut candidates: Vec<StaleBranchInfo> = Vec::new();
     let mut warnings = Vec::new();
@@ -345,9 +349,8 @@ pub fn scan_stale_branches(
             .iter()
             .any(|pat| matches_glob(pat, &short_name) || matches_glob(pat, &branch.name));
 
-        let is_curr_or_wt = branch.is_current
-            || (!branch.is_remote
-                && is_checked_out_in_any_worktree(&repo, &short_name).unwrap_or(false));
+        let is_curr_or_wt =
+            branch.is_current || (!branch.is_remote && checked_out.contains(&short_name));
 
         let age_days = if branch.last_commit_timestamp > 0 {
             std::cmp::max(0, (now_sec - branch.last_commit_timestamp) / 86400)
@@ -599,15 +602,18 @@ where
         });
     }
 
-    // Safety checks: reject deleting default branch or any worktree-checked-out branch
+    // Safety checks: reject deleting default branch or any worktree-checked-out branch.
+    // Both are resolved once for the batch rather than once per target.
+    let default_short = default_branch_short_name(&repo);
+    let checked_out = checked_out_branches(&repo)?;
     for b in &to_clean {
-        if is_default_branch(&repo, &b.short_name) {
+        if default_short.as_deref() == Some(b.short_name.as_str()) {
             return Err(format!(
                 "Refusing to delete '{name}': it is the repository's default branch",
                 name = b.short_name
             ));
         }
-        if !b.is_remote && is_checked_out_in_any_worktree(&repo, &b.short_name)? {
+        if !b.is_remote && checked_out.contains(&b.short_name) {
             return Err(format!(
                 "Refusing to delete '{name}': it is checked out in a linked worktree",
                 name = b.short_name
