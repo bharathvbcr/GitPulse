@@ -70,6 +70,8 @@ CREATE TABLE IF NOT EXISTS events (
   detail_json    TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_events_repo_ts  ON events(repo_path, ts_utc);
+CREATE INDEX IF NOT EXISTS idx_events_reflog   ON events(worktree_path, object)
+    WHERE action LIKE 'reflog.%';
 CREATE INDEX IF NOT EXISTS idx_events_task     ON events(task_id)    WHERE task_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_events_session  ON events(session_id) WHERE session_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_events_binding  ON events(worktree_path, ts_utc)
@@ -372,7 +374,41 @@ pub fn action_for_argv(argv: &[&str]) -> String {
     }
 }
 
-type Registry = Mutex<HashMap<PathBuf, Result<Mutex<Connection>, LedgerError>>>;
+/// One repository's connection, behind its own lock.
+///
+/// The slot stays empty until an open succeeds: a failed open is returned to
+/// its caller and retried by the next one, so one transient `SQLITE_BUSY` or
+/// permission race cannot disable the ledger for the process lifetime.
+#[derive(Default)]
+struct Slot {
+    conn: Mutex<Option<Live>>,
+}
+
+/// An open connection and the identity of the file it was opened on.
+struct Live {
+    conn: Connection,
+    file: Option<FileId>,
+}
+
+/// Device and inode of the database file: enough to notice that
+/// `.devcouncil/` was deleted and recreated underneath an open connection.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct FileId(u64, u64);
+
+#[cfg(unix)]
+fn file_id(path: &Path) -> Option<FileId> {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::symlink_metadata(path)
+        .ok()
+        .map(|meta| FileId(meta.dev(), meta.ino()))
+}
+
+#[cfg(not(unix))]
+fn file_id(_path: &Path) -> Option<FileId> {
+    None
+}
+
+type Registry = Mutex<HashMap<PathBuf, std::sync::Arc<Slot>>>;
 type DroppedRegistry = Mutex<HashMap<PathBuf, u64>>;
 
 /// One connection per repository, opened once.
@@ -868,37 +904,127 @@ fn secure_ledger_files(_db_path: &Path, _repo: &Path) -> Result<(), LedgerError>
 
 /// Runs `f` against this repo's connection.
 ///
-/// The open is attempted once per repository and the result — success *or*
-/// failure — is cached. Retrying a failed open on every append would turn a
-/// read-only checkout into a syscall storm on the mutation path.
+/// The registry lock covers only the map lookup; the open, the schema DDL and
+/// `f` run under the repository's own slot lock, so one busy or slow ledger
+/// stalls that repository alone. Cross-process writers are serialised by
+/// SQLite (WAL plus the busy timeout set in [`open`]), which is also what the
+/// schema's monotonic cursor rests on: it is per database, so no lock shared
+/// between repositories ever protected it.
+///
+/// An open that fails is not remembered. A connection whose database file was
+/// deleted or replaced is dropped and reopened, rather than appending to an
+/// unlinked inode while [`status`] reports `recording`.
 fn with_conn<T>(
     repo_path: &str,
     f: impl FnOnce(&Connection) -> Result<T, LedgerError>,
 ) -> Result<T, LedgerError> {
     let db_path = ledger_path(repo_path);
-    let mut reg = registry()
+    let slot = {
+        let mut reg = registry().lock().map_err(|_| {
+            LedgerError::new("registry_poisoned", "ledger registry mutex was poisoned")
+        })?;
+        std::sync::Arc::clone(reg.entry(db_path.clone()).or_default())
+    };
+    let mut guard = slot
+        .conn
         .lock()
-        .map_err(|_| LedgerError::new("registry_poisoned", "ledger registry mutex was poisoned"))?;
+        .map_err(|_| LedgerError::new("conn_poisoned", "ledger connection mutex was poisoned"))?;
 
-    let entry = reg
-        .entry(db_path.clone())
-        .or_insert_with(|| open(&db_path).map(Mutex::new));
-
-    match entry {
-        Err(e) => Err(e.clone()),
-        // The registry lock is still held, so this reference is already
-        // exclusive: `get_mut` reaches the connection without a second lock,
-        // and cannot deadlock the way a nested `lock()` could.
-        //
-        // Holding the registry across `f` is deliberate rather than incidental.
-        // It is what makes "one writer" true across every repository at once,
-        // which is the property the schema's monotonic cursor rests on. Appends
-        // cost tens of microseconds, so the contention this creates is far
-        // cheaper than the coordination it replaces.
-        Ok(lock) => f(lock.get_mut().map_err(|_| {
-            LedgerError::new("conn_poisoned", "ledger connection mutex was poisoned")
-        })?),
+    if guard
+        .as_ref()
+        .is_some_and(|live| live.file.is_some() && file_id(&db_path) != live.file)
+    {
+        *guard = None;
     }
+    if guard.is_none() {
+        let conn = open(&db_path)?;
+        *guard = Some(Live {
+            conn,
+            file: file_id(&db_path),
+        });
+    }
+    match guard.as_ref() {
+        Some(live) => f(&live.conn),
+        None => Err(LedgerError::new("open_failed", "ledger connection missing")),
+    }
+}
+
+/// Begins a write transaction that takes the write lock up front.
+///
+/// A deferred transaction that reads first and writes later must upgrade its
+/// lock mid-flight, and SQLite fails that upgrade with `SQLITE_BUSY` at once
+/// when another process wrote in between — the busy timeout does not apply.
+/// `IMMEDIATE` waits for the lock at `BEGIN`, where the timeout does. Every
+/// multi-statement writer goes through here.
+fn write_tx(conn: &Connection) -> rusqlite::Result<rusqlite::Transaction<'_>> {
+    rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)
+}
+
+/// How a read reaches the database.
+#[derive(Clone, Copy)]
+enum Access {
+    /// The shared writable connection: creates and migrates on first use.
+    Writable,
+    /// A fresh `SQLITE_OPEN_READ_ONLY` connection: never creates, migrates,
+    /// chmods or checkpoints, so a read-only tool cannot change the ledger.
+    ReadOnly,
+}
+
+fn with_access<T>(
+    repo_path: &str,
+    access: Access,
+    f: impl FnOnce(&Connection) -> Result<T, LedgerError>,
+) -> Result<T, LedgerError> {
+    match access {
+        Access::Writable => with_conn(repo_path, f),
+        Access::ReadOnly => {
+            let conn = open_readonly(&ledger_path(repo_path))?;
+            f(&conn)
+        }
+    }
+}
+
+/// Opens an existing ledger without any ability to write. The directory and
+/// file are validated exactly as [`open`] validates them, and a database with
+/// no schema yet is reported rather than read as empty.
+fn open_readonly(db_path: &Path) -> Result<Connection, LedgerError> {
+    let dir = db_path.parent().ok_or_else(|| {
+        LedgerError::new(
+            "state_path_invalid",
+            format!("ledger path has no parent: {}", db_path.display()),
+        )
+    })?;
+    let repo = dir.parent().ok_or_else(|| {
+        LedgerError::new(
+            "state_path_invalid",
+            format!(
+                "ledger state directory has no repository: {}",
+                dir.display()
+            ),
+        )
+    })?;
+    checked_state_directory(dir, Some(repo), false)?;
+    validate_ledger_files(db_path, repo)?;
+    let conn = Connection::open_with_flags(
+        db_path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(|e| LedgerError::new("open_failed", format!("{}: {e}", db_path.display())))?;
+    validate_ledger_files(db_path, repo)?;
+    let has_events: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'events')",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|e| LedgerError::new("query_failed", e.to_string()))?;
+    if !has_events {
+        return Err(LedgerError::new(
+            "not_initialised",
+            "the ledger file has no schema yet; nothing has been recorded",
+        ));
+    }
+    Ok(conn)
 }
 
 /// Appends one event and returns its cursor id.
@@ -946,6 +1072,23 @@ struct Prepared {
     detail: Option<String>,
 }
 
+/// `contracts/event.schema.json`'s action pattern,
+/// `^[a-z][a-z0-9_]*(\.[a-z][a-z0-9_]*)+$`: two or more dot-separated words,
+/// each starting with a lowercase letter.
+fn valid_action(action: &str) -> bool {
+    let mut words = 0;
+    for word in action.split('.') {
+        let mut chars = word.chars();
+        let ok = chars.next().is_some_and(|c| c.is_ascii_lowercase())
+            && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_');
+        if !ok {
+            return false;
+        }
+        words += 1;
+    }
+    words >= 2
+}
+
 fn prepare(draft: &Draft) -> Result<Prepared, LedgerError> {
     if draft.repo_path.is_empty() {
         return Err(LedgerError::new(
@@ -957,6 +1100,13 @@ fn prepare(draft: &Draft) -> Result<Prepared, LedgerError> {
         return Err(LedgerError::new(
             "no_action",
             "an event must name an action",
+        ));
+    }
+
+    if !valid_action(&draft.action) {
+        return Err(LedgerError::new(
+            "invalid_action",
+            "an action must be a dotted lowercase name such as git.commit",
         ));
     }
 
@@ -1146,9 +1296,7 @@ pub(crate) fn advance_transcripts(
         let failed = |e: rusqlite::Error| LedgerError::new("insert_failed", e.to_string());
         // IMMEDIATE takes the write lock before the offset is read, so a
         // second process cannot move it between the check and the write.
-        let tx =
-            rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)
-                .map_err(failed)?;
+        let tx = write_tx(conn).map_err(failed)?;
         let mut recorded = 0i64;
         let mut newest = None;
         for (advance, events) in advances.iter().zip(&prepared) {
@@ -1214,7 +1362,7 @@ pub(crate) fn forget_transcripts(
     let worktree = transcript_key(Path::new(worktree_path));
     with_conn(repo_path, |conn| {
         let failed = |e: rusqlite::Error| LedgerError::new("forget_failed", e.to_string());
-        let tx = conn.unchecked_transaction().map_err(failed)?;
+        let tx = write_tx(conn).map_err(failed)?;
         for key in file_keys {
             tx.execute(
                 "DELETE FROM transcript_cursors WHERE worktree_key = ?1 AND file_key = ?2",
@@ -1249,7 +1397,7 @@ pub fn record(draft: Draft) -> Option<i64> {
 /// asks for what followed, and the answer is the same whether it has been
 /// listening for an hour or has just opened the app.
 pub fn tail(repo_path: &str, cursor: i64, limit: u32) -> Result<Vec<LedgerEvent>, LedgerError> {
-    read_after(repo_path, cursor, limit, false)
+    read_after(repo_path, cursor, limit, false, Access::Writable)
 }
 
 /// The newest `limit` events after `cursor`, oldest first.
@@ -1265,7 +1413,7 @@ pub fn tail_newest(
     cursor: i64,
     limit: u32,
 ) -> Result<Vec<LedgerEvent>, LedgerError> {
-    read_after(repo_path, cursor, limit, true)
+    read_after(repo_path, cursor, limit, true, Access::Writable)
 }
 
 /// Any row attributed to a repository other than the two spellings `?1 <= ?2`.
@@ -1331,11 +1479,44 @@ fn latest_binding(
     })
 }
 
+/// The newest bind or unbind for a worktree in one *legacy sibling* ledger,
+/// with its `(ts_utc, ulid)` precedence key, read through a read-only
+/// connection. For resolving a binding while the family's own ledger does not
+/// exist yet, so the answer can still be enforced without creating or
+/// migrating that ledger from a read.
+pub(crate) fn newest_binding_readonly(
+    sibling_repo: &str,
+    worktree: &str,
+    stored_worktree: &str,
+) -> Result<Option<((String, String), Option<String>)>, LedgerError> {
+    with_access(sibling_repo, Access::ReadOnly, |conn| {
+        conn.query_row(
+            "SELECT ts_utc, ulid, action, task_id FROM events
+             WHERE action IN ('worktree.bind', 'worktree.unbind')
+               AND worktree_path IN (?1, ?2)
+             ORDER BY ts_utc DESC, ulid DESC
+             LIMIT 1",
+            params![worktree, stored_worktree],
+            |row| {
+                let action: String = row.get(2)?;
+                let task: Option<String> = row.get(3)?;
+                Ok((
+                    (row.get::<_, String>(0)?, row.get::<_, String>(1)?),
+                    task.filter(|_| action == bindings::BIND),
+                ))
+            },
+        )
+        .optional()
+        .map_err(|e| LedgerError::new("query_failed", e.to_string()))
+    })
+}
+
 fn read_after(
     repo_path: &str,
     cursor: i64,
     limit: u32,
     newest: bool,
+    access: Access,
 ) -> Result<Vec<LedgerEvent>, LedgerError> {
     #[cfg(test)]
     tests::LEDGER_READS.with(|reads| reads.set(reads.get() + 1));
@@ -1345,7 +1526,7 @@ fn read_after(
     let canonical_repo_path = canonical_repo(repo_path);
     let stored_repo_path = redact::text(&canonical_repo_path);
     let order = if newest { "DESC" } else { "ASC" };
-    with_conn(repo_path, |conn| {
+    with_access(repo_path, access, |conn| {
         let mut stmt = conn
             .prepare(&format!(
                 "SELECT id, ulid, ts_utc, schema_version, repo_path, worktree_path,
@@ -1546,8 +1727,7 @@ fn import_legacy_page(
 ) -> Result<(usize, Option<i64>), LedgerError> {
     let source_label = redact::text(source_label);
     with_conn(anchor, |conn| {
-        let transaction = conn
-            .unchecked_transaction()
+        let transaction = write_tx(conn)
             .map_err(|error| LedgerError::new("legacy_import_failed", error.to_string()))?;
         let mut imported = 0usize;
         let mut newest_cursor = None;
@@ -1748,6 +1928,40 @@ pub(crate) fn consolidate_worktree_ledgers(
     Ok(imported_total)
 }
 
+/// The `object` of every `reflog.*` event recorded for one checkout, in the
+/// form it is stored (redacted), for the reflog catch-up's "already recorded"
+/// test.
+///
+/// One query on the partial index `idx_events_reflog` in place of paging the whole ledger
+/// through [`tail`]. A read error is an error: the caller must not read "could
+/// not find out" as "nothing is recorded" and write the history a second time.
+/// Callers compare against [`redact::text`] of an identity, never the raw one,
+/// because the raw spelling is not what is stored.
+pub(crate) fn recorded_reflog_objects(
+    repo_path: &str,
+    worktree_path: &str,
+    is_anchor: bool,
+) -> Result<std::collections::HashSet<String>, LedgerError> {
+    let raw = worktree_path.to_string();
+    let stored = redact::text(worktree_path);
+    with_conn(repo_path, |conn| {
+        let mut stmt = conn
+            .prepare(
+                "SELECT object FROM events
+                 WHERE action LIKE 'reflog.%' AND object IS NOT NULL
+                   AND (worktree_path IN (?1, ?2) OR (?3 AND worktree_path IS NULL))",
+            )
+            .map_err(|e| LedgerError::new("prepare_failed", e.to_string()))?;
+        let rows = stmt
+            .query_map(params![raw, stored, is_anchor], |row| {
+                row.get::<_, String>(0)
+            })
+            .map_err(|e| LedgerError::new("query_failed", e.to_string()))?;
+        rows.collect::<Result<_, _>>()
+            .map_err(|e| LedgerError::new("row_failed", e.to_string()))
+    })
+}
+
 /// The highest cursor in this repo's ledger, or 0 when it is empty.
 ///
 /// Phase 3's reflog catch-up starts here: everything git recorded after this
@@ -1781,15 +1995,29 @@ pub fn is_initialised(repo_path: &str) -> bool {
 /// and "there is no ledger yet" is a distinct, reported state rather than one
 /// conjured into existence so the answer can be "recording".
 pub fn status_readonly(repo_path: &str) -> LedgerStatus {
-    if is_initialised(repo_path) {
-        return status(repo_path);
-    }
+    let path = ledger_path(repo_path);
+    let (recording, error, error_code) = if !is_initialised(repo_path) {
+        (
+            false,
+            "no ledger in this repository yet; nothing has been recorded".to_string(),
+            "not_initialised".to_string(),
+        )
+    } else {
+        match open_readonly(&path) {
+            Ok(_) => (true, String::new(), String::new()),
+            Err(e) => (false, e.message, e.code.to_string()),
+        }
+    };
     LedgerStatus {
-        recording: false,
-        path: ledger_path(repo_path).display().to_string(),
-        dropped: 0,
-        error: "no ledger in this repository yet; nothing has been recorded".to_string(),
-        error_code: "not_initialised".to_string(),
+        recording,
+        path: path.display().to_string(),
+        dropped: if recording {
+            dropped_appends(repo_path)
+        } else {
+            0
+        },
+        error,
+        error_code,
     }
 }
 
@@ -1805,7 +2033,7 @@ pub fn tail_readonly(
     if !is_initialised(repo_path) {
         return Ok(None);
     }
-    tail(repo_path, cursor, limit).map(Some)
+    read_after(repo_path, cursor, limit, false, Access::ReadOnly).map(Some)
 }
 
 pub fn status(repo_path: &str) -> LedgerStatus {
@@ -2138,7 +2366,12 @@ pub fn save_fleet_metrics(repo_path: &str, input: &FleetMetricsInput) -> Result<
     let coverage_at = input.coverage_pct.map(|_| now.clone());
     let loc_language = input.loc_language.as_deref().map(redact::text);
     with_conn(repo_path, |conn| {
-        conn.execute(
+        // One transaction for the metrics row, the language rows and the
+        // day's history: a failure part-way leaves none of them, rather than a
+        // fresh scalar row beside last scan's languages.
+        let tx = write_tx(conn)
+            .map_err(|e| LedgerError::new("fleet_metrics_tx_failed", e.to_string()))?;
+        tx.execute(
             r#"
             INSERT INTO fleet_metrics (
                 repo_path, loc, loc_language, loc_truncated, loc_at,
@@ -2203,9 +2436,10 @@ pub fn save_fleet_metrics(repo_path: &str, input: &FleetMetricsInput) -> Result<
             ],
         )
         .map_err(|e| LedgerError::new("insert_fleet_metrics_failed", e.to_string()))?;
-        write_fleet_languages(conn, &repo_identity, input.languages.as_deref())?;
-        write_fleet_history(conn, &repo_identity, &utc_day(&now), input)?;
-        Ok(())
+        write_fleet_languages(&tx, &repo_identity, input.languages.as_deref())?;
+        write_fleet_history(&tx, &repo_identity, &utc_day(&now), input)?;
+        tx.commit()
+            .map_err(|e| LedgerError::new("fleet_metrics_commit_failed", e.to_string()))
     })
 }
 
@@ -2271,18 +2505,15 @@ fn write_fleet_languages(
     let Some(languages) = languages else {
         return Ok(());
     };
-    // Delete-then-insert inside one transaction, so a failure part-way cannot
-    // leave a repository with half of one scan and half of the last.
-    let tx = conn
-        .unchecked_transaction()
-        .map_err(|e| LedgerError::new("fleet_languages_tx_failed", e.to_string()))?;
-    tx.execute(
+    // Delete-then-insert inside the caller's transaction, so a failure part-way
+    // cannot leave a repository with half of one scan and half of the last.
+    conn.execute(
         "DELETE FROM fleet_languages WHERE repo_path = ?1",
         params![repo_identity],
     )
     .map_err(|e| LedgerError::new("delete_fleet_languages_failed", e.to_string()))?;
     for stat in languages.iter().take(MAX_FLEET_LANGUAGES) {
-        tx.execute(
+        conn.execute(
             r#"
             INSERT INTO fleet_languages
                 (repo_path, language, color_hex, category, code_lines, file_count, percentage)
@@ -2306,8 +2537,6 @@ fn write_fleet_languages(
         )
         .map_err(|e| LedgerError::new("insert_fleet_languages_failed", e.to_string()))?;
     }
-    tx.commit()
-        .map_err(|e| LedgerError::new("fleet_languages_commit_failed", e.to_string()))?;
     Ok(())
 }
 
@@ -2519,6 +2748,9 @@ fn read_fleet_languages(
 
 #[cfg(test)]
 mod contract_tests;
+
+#[cfg(test)]
+mod reliability_tests;
 
 /// Test-only helpers that need the private registry.
 #[cfg(test)]

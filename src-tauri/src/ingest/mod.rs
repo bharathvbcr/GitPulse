@@ -503,27 +503,29 @@ pub(crate) fn ingest_reflog_into(
         }
     };
 
-    // Already-recorded selectors, so a second open adds nothing.
-    let mut seen = std::collections::HashSet::new();
-    let mut cursor = 0i64;
-    while let Ok(page) = ledger::tail(ledger_repo, cursor, 1000) {
-        if page.is_empty() {
-            break;
+    // Already-recorded identities, so a second open adds nothing. Stored rows
+    // hold the redacted spelling, so that is what each entry is compared as. A
+    // failed read stops the replay: recording against an unknown "seen" set is
+    // how the same history would be written twice.
+    let seen =
+        ledger::recorded_reflog_objects(ledger_repo, worktree_path, ledger_repo == worktree_path);
+    replay_reflog(ledger_repo, worktree_path, entries, seen, out)
+}
+
+fn replay_reflog(
+    ledger_repo: &str,
+    worktree_path: &str,
+    entries: Vec<crate::engine::git_reader::ReflogEntry>,
+    seen: Result<std::collections::HashSet<String>, ledger::LedgerError>,
+    mut out: CatchUp,
+) -> CatchUp {
+    let seen = match seen {
+        Ok(seen) => seen,
+        Err(e) => {
+            out.error = format!("could not read the recorded reflog history: {e}");
+            return out;
         }
-        for event in &page {
-            if event_belongs_to_worktree(event, ledger_repo, worktree_path)
-                && event.action.starts_with("reflog.")
-            {
-                if let Some(object) = &event.object {
-                    seen.insert(object.clone());
-                }
-            }
-        }
-        cursor = page[page.len() - 1].id;
-        if page.len() < 1000 {
-            break;
-        }
-    }
+    };
 
     // Oldest first, so the ledger's order matches the order things happened.
     let task_id = crate::ledger::bindings::resolve(ledger_repo, worktree_path)
@@ -533,7 +535,7 @@ pub(crate) fn ingest_reflog_into(
         // The selector (`HEAD@{3}`) is positional and shifts as the reflog
         // grows, so identity is the commit plus the message.
         let identity = format!("{} {}", entry.commit_id, entry.message);
-        if seen.contains(&identity) {
+        if seen.contains(&ledger::redact::text(&identity)) {
             continue;
         }
         out.reflog_entries += 1;
@@ -832,6 +834,61 @@ mod tests {
             ledger::tail(&anchor, 0, 1000).expect("family ledger").len(),
             events.len(),
             "the second pass changed the shared ledger"
+        );
+    }
+
+    #[test]
+    fn a_reflog_message_carrying_a_secret_is_not_recorded_again_on_every_catch_up() {
+        let main = tempfile::tempdir().expect("checkout");
+        git_in(main.path(), &["init", "-b", "main"]);
+        std::fs::write(main.path().join("seed.txt"), "seed").expect("seed");
+        git_in(main.path(), &["add", "seed.txt"]);
+        git_in(
+            main.path(),
+            &[
+                "commit",
+                "-m",
+                "rotate ghp_0123456789abcdefghijklmnopqrstuvwxyzA",
+            ],
+        );
+        crate::test_support::trust_repo(main.path());
+        let repo = main.path().canonicalize().expect("canonical");
+        let repo = repo.to_string_lossy();
+
+        let first = ingest_reflog_into(&repo, &repo, 200);
+        assert!(first.recorded > 0, "{first:?}");
+        let second = ingest_reflog_into(&repo, &repo, 200);
+        assert_eq!(
+            second.recorded, 0,
+            "the redacted stored identity was compared with the raw one"
+        );
+    }
+
+    #[test]
+    fn an_unreadable_recorded_history_records_nothing() {
+        let main = tempfile::tempdir().expect("checkout");
+        git_in(main.path(), &["init", "-b", "main"]);
+        std::fs::write(main.path().join("seed.txt"), "seed").expect("seed");
+        git_in(main.path(), &["add", "seed.txt"]);
+        git_in(main.path(), &["commit", "-m", "seed"]);
+        crate::test_support::trust_repo(main.path());
+        let repo = main.path().canonicalize().expect("canonical");
+        let repo = repo.to_string_lossy();
+        let entries = crate::engine::git_reader::GitReader::get_reflog(&repo, 200).expect("reflog");
+        assert!(!entries.is_empty());
+
+        let out = replay_reflog(
+            &repo,
+            &repo,
+            entries,
+            Err(ledger::LedgerError::new("query_failed", "injected")),
+            CatchUp::default(),
+        );
+        assert_eq!(out.recorded, 0);
+        assert!(out.error.contains("injected"), "{out:?}");
+        assert!(
+            ledger::tail_readonly(&repo, 0, 10).expect("tail").is_none(),
+            "a replay against an unknown history created or wrote the ledger"
         );
     }
 

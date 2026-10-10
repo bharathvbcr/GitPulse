@@ -25,6 +25,7 @@ static DOUBLE_QUOTED_COOKIE: OnceLock<Regex> = OnceLock::new();
 static EMBEDDED_COOKIE: OnceLock<Regex> = OnceLock::new();
 static COOKIE: OnceLock<Regex> = OnceLock::new();
 static URL_PASSWORD: OnceLock<Regex> = OnceLock::new();
+static URL_TOKEN_USERINFO: OnceLock<Regex> = OnceLock::new();
 static DOUBLE_QUOTED_NAMED_SECRET: OnceLock<Regex> = OnceLock::new();
 static EMBEDDED_NAMED_SECRET: OnceLock<Regex> = OnceLock::new();
 static NAMED_SECRET: OnceLock<Regex> = OnceLock::new();
@@ -158,9 +159,13 @@ fn redact_contextual(value: &str) -> String {
         &COOKIE,
         r#"(?im)(["']?(?:set-)?cookie["']?\s*[:=]\s*)([^"'\\\r\n]+?)(?:\\.*)?$"#,
     );
+    // The password runs to the LAST `@` of the whitespace-delimited word, so a
+    // password containing `/` or `@` is removed whole. Over-redacting the tail
+    // of a path that also holds an `@` is the safe direction. `<` and `>` end
+    // it so an already-redacted `<redacted>` is not matched twice.
     let url_password = compiled(
         &URL_PASSWORD,
-        r"(?i)([a-z][a-z0-9+.-]*://[^/\s:@]+:)[^@\s/?#]+@",
+        r#"(?i)([a-z][a-z0-9+.-]*://[^/\s:@]*:)([^\s'"<>,]*)@"#,
     );
     let named_secret = compiled_named(
         &NAMED_SECRET,
@@ -208,7 +213,19 @@ fn redact_contextual(value: &str) -> String {
         .replace_all(&out, redacted_embedded_assignment)
         .into_owned();
     let out = cookie.replace_all(&out, redacted_assignment).into_owned();
-    let out = url_password.replace_all(&out, "$1<redacted>@").into_owned();
+    let out = url_password
+        .replace_all(&out, |caps: &Captures<'_>| {
+            // `host:8443/@scope/pkg` is a port and a path, not a password.
+            let looks_like_port = caps[2].split_once('/').is_some_and(|(head, _)| {
+                !head.is_empty() && head.bytes().all(|b| b.is_ascii_digit())
+            });
+            if looks_like_port {
+                caps[0].to_string()
+            } else {
+                format!("{}<redacted>@", &caps[1])
+            }
+        })
+        .into_owned();
     let out = double_quoted_named_secret
         .replace_all(&out, redacted_embedded_assignment)
         .into_owned();
@@ -223,6 +240,26 @@ fn redact_contextual(value: &str) -> String {
         .into_owned();
     shell_userinfo_flag
         .replace_all(&out, redacted_assignment)
+        .into_owned()
+}
+
+/// A token used as the whole URL userinfo (`https://<token>@host`). Runs after
+/// the vendor patterns, which keep a recognisable prefix for the tokens they
+/// know; this catches the rest. Short names such as `git` are usernames, not
+/// secrets, so only a long credential-shaped run containing a digit qualifies.
+fn redact_userinfo_tokens(value: &str) -> String {
+    let url_token_userinfo = compiled(
+        &URL_TOKEN_USERINFO,
+        r"(?i)([a-z][a-z0-9+.-]*://)([a-z0-9_.~%-]{20,})@",
+    );
+    url_token_userinfo
+        .replace_all(value, |caps: &Captures<'_>| {
+            if caps[2].bytes().any(|b| b.is_ascii_digit()) {
+                format!("{}<redacted>@", &caps[1])
+            } else {
+                caps[0].to_string()
+            }
+        })
         .into_owned()
 }
 
@@ -606,7 +643,7 @@ fn redact_value_at_depth(value: &str, depth: usize) -> String {
         return value;
     }
     let value = redact_embedded_cli_arrays_at_depth(&value, depth);
-    redact_vendor_tokens(&redact_contextual(&value))
+    redact_userinfo_tokens(&redact_vendor_tokens(&redact_contextual(&value)))
 }
 
 /// Redacts every credential-shaped token or contextual secret in `text`.
@@ -1126,5 +1163,83 @@ mod tests {
         let once = text(KEY);
         assert_eq!(text(&once), once, "a credential survived the first pass");
         assert!(!carries_secret(&once));
+    }
+}
+
+#[cfg(test)]
+mod url_userinfo_tests {
+    use super::*;
+
+    /// No vendor prefix, so only the URL-userinfo rule can catch it.
+    const PAT: &str = "q7Zp4Lw9Xv2Rk8Tn5Jm3Hs6Bd1Fg0Ca";
+
+    fn leaks(input: &str) -> Option<String> {
+        let out = text(input);
+        out.contains(PAT).then_some(out)
+    }
+
+    #[test]
+    fn empty_username_url_password_is_redacted() {
+        let input = format!("git push https://:{PAT}@dev.azure.com/org/p/_git/r main");
+        assert_eq!(
+            leaks(&input),
+            None,
+            "carries_secret={}",
+            carries_secret(&input)
+        );
+    }
+
+    #[test]
+    fn token_only_userinfo_is_redacted() {
+        let input = format!("git clone https://{PAT}@github.com/o/r.git");
+        assert_eq!(
+            leaks(&input),
+            None,
+            "carries_secret={}",
+            carries_secret(&input)
+        );
+        assert!(carries_secret(&input));
+    }
+
+    #[test]
+    fn password_containing_slash_is_redacted() {
+        let input = format!("git fetch https://user:ab/{PAT}@host.example/r.git");
+        assert_eq!(
+            leaks(&input),
+            None,
+            "carries_secret={}",
+            carries_secret(&input)
+        );
+    }
+
+    #[test]
+    fn password_containing_at_is_redacted() {
+        let input = format!("git fetch https://user:p@{PAT}@host.example/r.git");
+        assert_eq!(
+            leaks(&input),
+            None,
+            "carries_secret={}",
+            carries_secret(&input)
+        );
+    }
+
+    #[test]
+    fn plain_usernames_and_paths_are_kept() {
+        for input in [
+            "git clone ssh://git@github.com/o/r.git",
+            "git clone https://github.com/o/r.git@v1",
+            "npm i git+https://github.com/o/r#semver:^1",
+            "mailto://someone@example.com",
+            "npm i https://registry.example.com:8443/@scope/pkg",
+        ] {
+            assert_eq!(text(input), input, "{input}");
+        }
+    }
+
+    #[test]
+    fn redaction_is_idempotent_for_userinfo() {
+        let input = format!("https://user:p@{PAT}@host.example/r.git https://{PAT}@h.example/x");
+        let once = text(&input);
+        assert_eq!(text(&once), once);
     }
 }
