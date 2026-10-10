@@ -172,13 +172,9 @@ pub fn list_ref_decorations(repo_path: &str, scope: RefScope) -> Result<RefListi
     // branch. A refusal is not, and used to render the graph with no HEAD
     // branch label at all, so it fails the listing with its own cause.
     let failures = crate::engine::git_cli::process_failures();
-    let current_branch = crate::engine::ref_cache::git_text(
-        &repo,
-        &["refs/heads"],
-        &["symbolic-ref", "--quiet", "--short", "HEAD"],
-    )
-    .map(|s| s.trim().to_string())
-    .unwrap_or_default();
+    let current_branch = crate::engine::git_reader::head_branch_cached(&repo)
+        .unwrap_or_default()
+        .unwrap_or_default();
     if crate::engine::git_cli::process_failures() != failures {
         return Err(crate::engine::git_cli::last_process_failure()
             .unwrap_or_else(|| "the current-branch lookup produced no answer".into()));

@@ -1606,20 +1606,7 @@ impl GitReader {
     /// Exit 1 is git's answer "HEAD is detached"; any other failure is a read
     /// that did not happen and is an error, never reported as detached.
     pub fn current_branch(repo_path: &str) -> Result<Option<String>, String> {
-        let repo = validate_repo(repo_path)?;
-        let run = git_cli::git_captured(&repo, &["symbolic-ref", "--quiet", "--short", "HEAD"])?;
-        match run.status_code {
-            0 => {
-                let name = String::from_utf8_lossy(&run.stdout).trim().to_string();
-                validate_ref_name(&name)?;
-                Ok(Some(name))
-            }
-            1 => Ok(None),
-            code => Err(format!(
-                "Could not read the current branch (git exited {code}): {}",
-                String::from_utf8_lossy(&run.stderr).trim()
-            )),
-        }
+        head_branch(&validate_repo(repo_path)?)
     }
 
     /// Reads what a reset of HEAD's branch to `target` would take off it.
@@ -2621,29 +2608,42 @@ pub(crate) fn parse_pulse_stream(
 /// Priority: `checkout.defaultRemote`, the current branch's configured
 /// upstream remote, a lone configured remote, else "origin".
 pub(crate) fn resolve_default_remote(repo: &Path) -> String {
+    default_remote_reads(repo).0
+}
+
+/// [`resolve_default_remote`] plus the reason, when a read it depends on
+/// produced no answer (config, the current branch, the remote list). The name
+/// is then a guess built from "not set"; a caller guarding a destructive
+/// action refuses on the reason instead of trusting the guess.
+fn default_remote_reads(repo: &Path) -> (String, Option<String>) {
+    let mut unread: Option<String> = None;
     // One read of the effective config answers what used to be two
-    // `config --get` processes and, usually, `git remote` too. A failed read
-    // is "not set", as each failed `--get` was; the spawn gate's failure
-    // counter is what marks the answer unclean (see `default_base`).
-    let config = config_snapshot(repo).unwrap_or_default();
+    // `config --get` processes and, usually, `git remote` too.
+    let config = match config_snapshot(repo) {
+        Ok(config) => config,
+        Err(error) => {
+            unread = Some(error);
+            HashMap::new()
+        }
+    };
     if let Some(configured) = config.get("checkout.defaultremote") {
         let trimmed = configured.trim();
         if !trimmed.is_empty() {
-            return trimmed.to_string();
+            return (trimmed.to_string(), unread);
         }
     }
-    if let Ok(branch) = ref_cache::git_text(
-        repo,
-        &["refs/heads"],
-        &["symbolic-ref", "--quiet", "--short", "HEAD"],
-    ) {
-        let branch = branch.trim();
-        if !branch.is_empty() {
-            if let Some(upstream) = config.get(&format!("branch.{branch}.remote")) {
-                let trimmed = upstream.trim();
-                if !trimmed.is_empty() {
-                    return trimmed.to_string();
-                }
+    let branch = match head_branch_cached(repo) {
+        Ok(branch) => branch,
+        Err(error) => {
+            unread.get_or_insert(error);
+            None
+        }
+    };
+    if let Some(branch) = branch.filter(|branch| !branch.is_empty()) {
+        if let Some(upstream) = config.get(&format!("branch.{branch}.remote")) {
+            let trimmed = upstream.trim();
+            if !trimmed.is_empty() {
+                return (trimmed.to_string(), unread);
             }
         }
     }
@@ -2658,15 +2658,18 @@ pub(crate) fn resolve_default_remote(repo: &Path) -> String {
                 .filter(|s| !s.is_empty())
                 .map(str::to_string)
                 .collect(),
-            Err(_) => Vec::new(),
+            Err(error) => {
+                unread.get_or_insert(error);
+                Vec::new()
+            }
         }
     } else {
         configured
     };
     if let [only] = names.as_slice() {
-        return only.clone();
+        return (only.clone(), unread);
     }
-    "origin".to_string()
+    ("origin".to_string(), unread)
 }
 
 /// The effective config as `git config --list -z` prints it, last value of a
@@ -2807,25 +2810,12 @@ pub(crate) fn default_base(repo: &Path) -> DefaultBase {
             }
         }
     }
-    // The lookups below read a failed spawn as "not set". Under load that is
-    // a refusal, not an answer, so a value computed while any of them failed
+    // The lookups read a failed spawn as "not set". Under load that is a
+    // refusal, not an answer, so a value computed while any of them failed
     // is marked unclean: shared with the callers already queued behind it,
     // never served to one that arrives later.
-    let failures_before = git_cli::process_failures();
-    let remote = resolve_default_remote(repo);
-    let head_ref = remote_head_ref(&remote);
-    let remote_head = git_text(repo, &["symbolic-ref", "--quiet", head_ref.as_str()]).ok();
-    let base = resolve_default_base_on(repo, &remote, remote_head.as_deref());
-    let clean = git_cli::process_failures() == failures_before;
-    let value = DefaultBase {
-        remote,
-        remote_head,
-        base,
-        incomplete: (!clean).then(|| {
-            git_cli::last_process_failure()
-                .unwrap_or_else(|| "a default-branch lookup produced no answer".into())
-        }),
-    };
+    let value = compute_default_base(repo);
+    let clean = value.incomplete.is_none();
     if let Some(stamp) = stamp {
         let mut memo = memo.lock().unwrap_or_else(PoisonError::into_inner);
         if memo.len() >= MAX_MEMOIZED_REPOS && !memo.contains_key(repo) {
@@ -2842,6 +2832,39 @@ pub(crate) fn default_base(repo: &Path) -> DefaultBase {
         );
     }
     value
+}
+
+/// The uncached default-base lookup behind [`default_base`]. A read that gave
+/// no answer (a refused spawn, a deadline, an unreadable ref) sets
+/// `incomplete`; it never reads as "no remote HEAD". Callers that guard a
+/// destructive action use this directly, so a memoized answer from before the
+/// read started failing cannot stand in for the state they are acting on.
+pub(crate) fn compute_default_base(repo: &Path) -> DefaultBase {
+    let failures_before = git_cli::process_failures();
+    let (remote, mut unread) = default_remote_reads(repo);
+    let head_ref = remote_head_ref(&remote);
+    let remote_head = match symbolic_ref_target(repo, head_ref.as_str()) {
+        Ok(target) => target,
+        Err(error) => {
+            unread.get_or_insert(error);
+            None
+        }
+    };
+    let base = resolve_default_base_on(repo, &remote, remote_head.as_deref());
+    let incomplete = if git_cli::process_failures() != failures_before {
+        Some(
+            git_cli::last_process_failure()
+                .unwrap_or_else(|| "a default-branch lookup produced no answer".into()),
+        )
+    } else {
+        unread
+    };
+    DefaultBase {
+        remote,
+        remote_head,
+        base,
+        incomplete,
+    }
 }
 
 #[derive(Clone)]
@@ -2936,6 +2959,59 @@ fn pick_default_branch(local_names: &[String], remote_head: Option<&str>, remote
 /// commit.
 const TAG_LIST_FORMAT: &str =
     "%(refname:short)%00%(objectname)%00%(contents:subject)%00%(*objectname)";
+
+/// Where the symbolic ref `refname` points, as the full ref name.
+///
+/// `--quiet` makes exit 1 git's answer "this is not a symbolic ref" (a
+/// detached HEAD, an absent `origin/HEAD`): `Ok(None)`. Any other failure is a
+/// read that did not happen (a refused spawn, a deadline, an unreadable ref
+/// file) and is an `Err`, never "not set": callers that guard a destructive
+/// action on the answer must not take an unreadable ref for an absent one.
+pub(crate) fn symbolic_ref_target(repo: &Path, refname: &str) -> Result<Option<String>, String> {
+    let run = git_cli::git_captured(repo, &["symbolic-ref", "--quiet", refname])?;
+    match run.status_code {
+        0 => {
+            let target = String::from_utf8_lossy(&run.stdout).trim().to_string();
+            Ok((!target.is_empty()).then_some(target))
+        }
+        1 => Ok(None),
+        code => Err(format!(
+            "Could not read {refname} (git exited {code}): {}",
+            String::from_utf8_lossy(&run.stderr).trim()
+        )),
+    }
+}
+
+/// The local branch HEAD is on, as its short name; `None` when detached.
+///
+/// Asks for the full ref and strips `refs/heads/` itself: `--short` shortens
+/// to the shortest *unambiguous* name, which is `heads/main` when a tag is
+/// also called `main`. The canonical owner of the question: a failed read is
+/// an `Err` (see [`symbolic_ref_target`]) and never "detached".
+pub(crate) fn head_branch(repo: &Path) -> Result<Option<String>, String> {
+    symbolic_ref_target(repo, "HEAD")?
+        .map(|target| branch_of_head_target(&target))
+        .transpose()
+}
+
+/// [`head_branch`] answered through the ref cache, for the readers that ask on
+/// every refresh. The cached read cannot tell a detached HEAD (exit 1, an
+/// answer) from a refusal, so a failed cached read is asked again, uncached,
+/// and that one decides.
+pub(crate) fn head_branch_cached(repo: &Path) -> Result<Option<String>, String> {
+    match ref_cache::git_text(repo, &["refs/heads"], &["symbolic-ref", "--quiet", "HEAD"]) {
+        Ok(target) => branch_of_head_target(target.trim()).map(Some),
+        Err(_) => head_branch(repo),
+    }
+}
+
+fn branch_of_head_target(target: &str) -> Result<String, String> {
+    let name = target
+        .strip_prefix("refs/heads/")
+        .ok_or_else(|| format!("HEAD points at {target}, which is not a local branch"))?;
+    validate_ref_name(name)?;
+    Ok(name.to_string())
+}
 
 /// What a branch listing over `refs/heads/` and `refs/remotes/` reads.
 const BRANCH_NAMESPACES: &[&str] = &["refs/heads", "refs/remotes"];
@@ -5347,18 +5423,7 @@ mod tests {
         use std::sync::atomic::{AtomicBool, Ordering};
         let dir = init_repo_with_remotes(&["origin", "upstream"], "main");
         let repo = dir.path().canonicalize().unwrap();
-        let uncached = |repo: &Path| {
-            let remote = resolve_default_remote(repo);
-            let head_ref = remote_head_ref(&remote);
-            let remote_head = git_text(repo, &["symbolic-ref", "--quiet", head_ref.as_str()]).ok();
-            let base = resolve_default_base_on(repo, &remote, remote_head.as_deref());
-            DefaultBase {
-                remote,
-                remote_head,
-                base,
-                incomplete: None,
-            }
-        };
+        let uncached = compute_default_base;
         let stop = std::sync::Arc::new(AtomicBool::new(false));
         let readers: Vec<_> = (0..3)
             .map(|_| {

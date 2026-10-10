@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::analyzer::ConventionalCommitParser;
 use crate::engine::git_cli::{git_text, validate_repo};
-use crate::engine::git_writer::validate_ref_name;
+use crate::engine::git_writer::{validate_ref_name, GitWriter};
 use crate::engine::{BranchInfo, GitReader};
 
 const COMMIT_REVIEW_LIMIT: usize = 500;
@@ -429,6 +429,11 @@ pub fn validate_release_tag(tag: &str) -> Result<(), String> {
 
 #[derive(Debug, Clone)]
 pub struct ReleasePlan {
+    /// The commit every check above was made against. The tag is created on
+    /// exactly this oid, not on whatever HEAD is by then: a commit or branch
+    /// switch between the checks and the tag must not publish an unchecked
+    /// commit.
+    pub head: String,
     pub tag: String,
     pub message: String,
     pub remote: String,
@@ -489,11 +494,17 @@ pub fn prepare_release(repo_path: &str, tag: &str, message: &str) -> Result<Rele
     }
 
     Ok(ReleasePlan {
+        head,
         tag: tag.to_string(),
         message: message.to_string(),
         remote: remote.to_string(),
         create_tag,
     })
+}
+
+/// Creates the release tag on the commit the plan checked.
+pub fn create_release_tag(repo_path: &str, plan: &ReleasePlan) -> Result<(), String> {
+    GitWriter::create_tag(repo_path, &plan.tag, Some(&plan.head), Some(&plan.message))
 }
 
 #[cfg(test)]
@@ -736,5 +747,42 @@ mod tests {
         std::fs::write(repo.path().join("dirty.txt"), "dirty").expect("fixture write");
         let error = prepare_release(path, "v1.0.0", "Release v1.0.0").unwrap_err();
         assert!(error.contains("clean working tree"));
+    }
+
+    /// A commit landing between the checks and the tag must not be published:
+    /// the tag goes on the commit that was checked.
+    #[test]
+    fn the_release_tag_lands_on_the_commit_that_was_checked() {
+        let remote = tempfile::tempdir().expect("bare remote");
+        git(remote.path(), &["init", "--bare", "--initial-branch=main"]);
+        let repo = tempfile::tempdir().expect("local repo");
+        git(repo.path(), &["init", "-b", "main"]);
+        commit_file(repo.path(), "app.txt", "ready", "feat: ready release #1");
+        git(
+            repo.path(),
+            &[
+                "remote",
+                "add",
+                "origin",
+                remote.path().to_str().expect("utf8 remote"),
+            ],
+        );
+        git(repo.path(), &["push", "-u", "origin", "main"]);
+        let path = repo.path().to_str().expect("utf8 repo");
+        let plan = prepare_release(path, "v1.0.0", "Release v1.0.0").expect("ready release");
+        assert!(plan.create_tag);
+
+        // Between prepare and execute, an unchecked commit lands on HEAD.
+        commit_file(repo.path(), "late.txt", "unreviewed", "feat: late change");
+        let moved = git_text(repo.path(), &["rev-parse", "HEAD"]).expect("head");
+        assert_ne!(moved.trim(), plan.head, "the fixture must move HEAD");
+
+        create_release_tag(path, &plan).expect("tag");
+        let tagged = git_text(repo.path(), &["rev-list", "-n", "1", "v1.0.0"]).expect("tag target");
+        assert_eq!(
+            tagged.trim(),
+            plan.head,
+            "the release tag was created on an unchecked commit"
+        );
     }
 }

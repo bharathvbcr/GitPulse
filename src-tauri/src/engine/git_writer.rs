@@ -1124,7 +1124,11 @@ Unset the local override with `git config --local --unset-all user.name` and \
         if force {
             // `-d` leaves these to git's own safety nets; `-D` bypasses them,
             // so the checks must be re-done server side.
-            if is_default_branch(&repo, branch_name) {
+            if is_default_branch(&repo, branch_name).map_err(|error| {
+                format!(
+                    "refusing to force-delete '{branch_name}': could not tell whether it is the default branch: {error}"
+                )
+            })? {
                 return Err(format!(
                     "refusing to force-delete '{branch_name}': it resolves to the repository's default branch"
                 ));
@@ -1238,10 +1242,9 @@ Unset the local override with `git config --local --unset-all user.name` and \
                 ));
             }
         }
-        let original_branch = git_text(&repo, &["symbolic-ref", "--quiet", "--short", "HEAD"])
-            .ok()
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty());
+        // A refused read is an error: taking it for "detached" would skip the
+        // final `branch -f` and report success with HEAD left detached.
+        let original_branch = crate::engine::git_reader::head_branch(&repo)?;
 
         // Recovery must never swallow its own failure: the checkout outcome is
         // captured so a locked index or full disk cannot hide that HEAD was
@@ -1712,15 +1715,9 @@ Unset the local override with `git config --local --unset-all user.name` and \
         Self::refuse_fixture_identity(repo_canon, false)?;
 
         // symbolic-ref fails on detached HEAD; then there is no branch to restore.
-        let original_head = git_text(repo_canon, &["symbolic-ref", "--quiet", "HEAD"])
-            .ok()
-            .map(|s| {
-                s.trim()
-                    .trim_start_matches("refs/heads/")
-                    .trim()
-                    .to_string()
-            })
-            .filter(|s| !s.is_empty());
+        // A refused read is an error, never "detached": the restore below
+        // would then be skipped and the repository left on the wrong branch.
+        let original_head = crate::engine::git_reader::head_branch(repo_canon)?;
 
         let restore_checkout = |repo_canon: &Path, target: &str| -> Result<(), String> {
             if git_text(repo_canon, &["checkout", target]).is_ok() {
@@ -1753,7 +1750,23 @@ Unset the local override with `git config --local --unset-all user.name` and \
                 // their original branch (--abort lands on `branch`, not where
                 // the user was). Neither cleanup failure hides the primary
                 // error; the message names the true end-state instead.
-                let _ = git_text(repo_canon, &["rebase", "--abort"]);
+                let abort = git_text(repo_canon, &["rebase", "--abort"]);
+                // An abort with no rebase to abort (the rebase never started)
+                // fails harmlessly; one that failed with a rebase still parked
+                // is not a rollback, and an undecidable state is treated the
+                // same way.
+                let still_parked = !matches!(crate::engine::repo_op::detect(repo_canon), Ok(None));
+                if let (Err(abort_err), true) = (&abort, still_parked) {
+                    // Nothing was rolled back, and checking out another
+                    // branch now would fail or compound it.
+                    return Err(format!(
+                        "Restack of '{branch}' onto '{onto}' failed and could not be rolled back \
+                         (git rebase --abort failed: {}); the repository is still mid-rebase. \
+                         Original failure: {}",
+                        summarize_git_failure(abort_err),
+                        summarize_git_failure(&rebase_err)
+                    ));
+                }
                 let end_state = match &original_head {
                     Some(orig) if orig != branch => {
                         if restore_checkout(repo_canon, orig).is_err() {
@@ -2354,12 +2367,15 @@ impl BranchDeleteJournal {
 /// True when `branch_name` is the branch the repository's HEAD resolves to by
 /// default: the primary remote's HEAD branch first, then conventional
 /// main/master/trunk/develop — the same resolution `list_branches` uses.
-pub(crate) fn is_default_branch(repo: &Path, branch_name: &str) -> bool {
-    let remote = crate::engine::git_reader::resolve_default_remote(repo);
-    let head_ref = crate::engine::git_reader::remote_head_ref(&remote);
-    let remote_head = git_text(repo, &["symbolic-ref", "--quiet", head_ref.as_str()]).ok();
-    crate::engine::git_reader::resolve_default_base_on(repo, &remote, remote_head.as_deref())
-        .is_some_and(|(short, _)| short == branch_name)
+///
+/// `Err` when a read the answer depends on produced none (a refused spawn, a
+/// deadline, an unreadable `origin/HEAD`): an unknown is never "not the
+/// default", so a destructive caller refuses. Reads the repository afresh
+/// rather than through the memoized default base, which would answer from
+/// before the read started failing.
+pub(crate) fn is_default_branch(repo: &Path, branch_name: &str) -> Result<bool, String> {
+    let base = crate::engine::git_reader::compute_default_base(repo).checked()?;
+    Ok(base.base.is_some_and(|(short, _)| short == branch_name))
 }
 
 /// True when any worktree of `repo` (including the main one) has
@@ -2474,17 +2490,7 @@ fn branch_has_upstream(repo: &Path) -> bool {
 }
 
 fn current_branch_name(repo: &Path) -> Result<String, String> {
-    match git_text(repo, &["symbolic-ref", "--quiet", "--short", "HEAD"]) {
-        Ok(name) => {
-            let name = name.trim();
-            if name.is_empty() {
-                Err(PUSH_DETACHED.into())
-            } else {
-                Ok(name.to_string())
-            }
-        }
-        Err(_) => Err(PUSH_DETACHED.into()),
-    }
+    crate::engine::git_reader::head_branch(repo)?.ok_or_else(|| PUSH_DETACHED.to_string())
 }
 
 fn configured_remotes(repo: &Path) -> Result<Vec<String>, String> {
@@ -4691,5 +4697,143 @@ mod tests {
         GitWriter::commit(&repo_path(&dir), "slow hook", false)
             .expect("a slow hook is not a hung git");
         assert_eq!(head_message(&dir).trim(), "slow hook");
+    }
+}
+
+/// Destructive actions are bound to a read that happened: a git read that
+/// produced no answer is never taken as "not the default branch" or "HEAD is
+/// detached".
+#[cfg(all(test, unix))]
+mod bound_to_checked_state {
+    use super::*;
+    use crate::test_support::git_in;
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::Path;
+
+    fn rev(dir: &Path, rev: &str) -> String {
+        git_text(dir, &["rev-parse", rev])
+            .unwrap()
+            .trim()
+            .to_string()
+    }
+
+    fn commit_file(dir: &Path, name: &str) -> String {
+        std::fs::write(dir.join(name), name).unwrap();
+        git_in(dir, &["add", "--", name]);
+        git_in(dir, &["commit", "-q", "-m", name]);
+        rev(dir, "HEAD")
+    }
+
+    fn repo_on(branch: &str) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        git_in(dir.path(), &["init", "-q", "-b", branch]);
+        git_in(dir.path(), &["commit", "-q", "--allow-empty", "-m", "init"]);
+        dir
+    }
+
+    fn branch_exists(dir: &Path, name: &str) -> bool {
+        git_text(
+            dir,
+            &[
+                "show-ref",
+                "--verify",
+                "--quiet",
+                &format!("refs/heads/{name}"),
+            ],
+        )
+        .is_ok()
+    }
+
+    /// The default branch is `trunk2`, named only by origin/HEAD. When that
+    /// read fails, a force delete must refuse rather than assume "not default".
+    #[test]
+    fn a_force_delete_refuses_when_the_default_branch_read_fails() {
+        let dir = repo_on("trunk2");
+        let p = dir.path();
+        git_in(p, &["remote", "add", "origin", "/nonexistent/origin.git"]);
+        git_in(p, &["update-ref", "refs/remotes/origin/trunk2", "HEAD"]);
+        git_in(
+            p,
+            &[
+                "symbolic-ref",
+                "refs/remotes/origin/HEAD",
+                "refs/remotes/origin/trunk2",
+            ],
+        );
+        git_in(p, &["checkout", "-q", "-b", "feature"]);
+
+        let head = p.join(".git/refs/remotes/origin/HEAD");
+        std::fs::set_permissions(&head, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let read_fails =
+            git_text(p, &["symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"]).is_err();
+        let result = GitWriter::delete_branch(p.to_str().unwrap(), "trunk2", true);
+        std::fs::set_permissions(&head, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        assert!(read_fails, "precondition: the remote-HEAD read must fail");
+        assert!(
+            result.is_err() && branch_exists(p, "trunk2"),
+            "force-deleted the default branch after a failed remote-HEAD read: {result:?}"
+        );
+    }
+
+    /// A refused `symbolic-ref HEAD` read is not "HEAD is detached": the
+    /// rebase would skip `branch -f` and report success with HEAD detached.
+    #[test]
+    fn a_rebase_does_not_treat_a_failed_head_read_as_detached() {
+        let dir = repo_on("main");
+        let p = dir.path();
+        let c1 = commit_file(p, "a.txt");
+        commit_file(p, "b.txt");
+        let c3 = commit_file(p, "c.txt");
+
+        let result = crate::engine::git_cli::with_forced_spawn_failure_of("symbolic-ref", || {
+            GitWriter::execute_rebase_sequence(
+                p.to_str().unwrap(),
+                &c1,
+                &[RebaseStep {
+                    commit_id: c3.clone(),
+                    action: RebaseActionKind::Pick,
+                }],
+            )
+        });
+
+        let on_branch = git_text(p, &["symbolic-ref", "--quiet", "HEAD"]).is_ok();
+        assert!(
+            result.is_err(),
+            "a failed HEAD read let the rebase report {result:?}"
+        );
+        assert!(on_branch, "HEAD was left detached");
+        assert_eq!(rev(p, "refs/heads/main"), c3, "main must not have moved");
+    }
+
+    /// Same class for restack: a refused HEAD read must stop it before the
+    /// rebase starts, not be read as "no branch to restore".
+    #[test]
+    fn a_restack_does_not_treat_a_failed_head_read_as_detached() {
+        let dir = repo_on("main");
+        let p = dir.path();
+        git_in(p, &["checkout", "-q", "-b", "feature"]);
+        let tip = commit_file(p, "f.txt");
+        git_in(p, &["checkout", "-q", "main"]);
+        commit_file(p, "m.txt");
+        let main_tip = rev(p, "main");
+
+        let result = crate::engine::git_cli::with_forced_spawn_failure_of("symbolic-ref", || {
+            GitWriter::execute_restack(p, "feature", "main", &main_tip)
+        });
+
+        assert!(
+            result.is_err(),
+            "a failed HEAD read let the restack report {result:?}"
+        );
+        assert_eq!(
+            rev(p, "refs/heads/feature"),
+            tip,
+            "feature must not have moved"
+        );
+        assert!(
+            git_text(p, &["symbolic-ref", "--quiet", "HEAD"]).is_ok(),
+            "HEAD was left detached"
+        );
     }
 }

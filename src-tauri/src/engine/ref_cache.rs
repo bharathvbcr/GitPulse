@@ -903,7 +903,7 @@ mod tests {
         };
         assert_eq!(exact(&["rev-parse", "HEAD"]), 1, "head id");
         assert_eq!(
-            exact(&["symbolic-ref", "--quiet", "--short", "HEAD"]),
+            exact(&["symbolic-ref", "--quiet", "HEAD"]),
             1,
             "current branch"
         );

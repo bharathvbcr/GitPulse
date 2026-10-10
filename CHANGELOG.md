@@ -11,6 +11,21 @@ before that tag is pushed.
 
 ## [Unreleased]
 
+### Fixed
+
+- Destructive git actions are bound to the state they checked. A release tag is
+  created on the commit the release checks were made against, not on whatever
+  HEAD is by then; a local CI note is written only if HEAD and the tree are the
+  ones the run started on; merge-and-teardown holds one lock from its checks
+  through the removal and re-reads the worktree and the branch tip before
+  `worktree remove --force` and `branch -D`. A git read that produced no answer
+  (the current branch, `origin/HEAD`) is an error, never "detached" or "not the
+  default branch", so a rebase or restack can no longer finish with HEAD
+  detached and a force delete can no longer remove the default branch after an
+  unreadable `origin/HEAD`. A failed `rebase --abort` during a restack is
+  reported instead of "rolled back". With a tag named like the branch, the
+  current branch is still found.
+
 ### Changed
 
 - CI now fails when a vendored crate is edited in this repository, through the

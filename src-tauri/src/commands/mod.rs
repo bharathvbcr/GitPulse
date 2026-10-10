@@ -2798,7 +2798,7 @@ pub async fn cmd_publish_release(
         )?;
 
         if plan.create_tag {
-            GitWriter::create_tag(&repo_path, &plan.tag, None, Some(&plan.message))?;
+            crate::ops::create_release_tag(&repo_path, &plan)?;
         }
         let output =
             GitWriter::push_tag(&repo_path, &plan.remote, &plan.tag).map_err(|error| {
@@ -2990,10 +2990,9 @@ fn rebase_planned_commands(
     }
 
     let original_head = git_text(&repo, &["rev-parse", "HEAD"])?.trim().to_string();
-    let original_branch = git_text(&repo, &["symbolic-ref", "--quiet", "--short", "HEAD"])
-        .ok()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty());
+    // Must agree with the writer this previews: a refused read is an error,
+    // never "detached".
+    let original_branch = crate::engine::git_reader::head_branch(&repo)?;
 
     let mut planned: Vec<Vec<String>> = vec![vec![
         "git".into(),
