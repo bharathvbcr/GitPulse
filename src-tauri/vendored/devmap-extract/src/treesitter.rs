@@ -594,6 +594,9 @@ fn extract_treesitter_before_deadline(
                 } else {
                     (Vec::new(), Vec::new(), None)
                 };
+                if matches!(lang, "typescript" | "tsx") {
+                    ts_ambient_exemptions(path, root, &symbols, &mut wiring);
+                }
                 if extraction_overran(deadline) {
                     // Labelled by what actually ran for *this* language. The
                     // block above is gated on `lang == "go"`, so naming it
@@ -829,8 +832,13 @@ fn extract_treesitter_before_deadline(
                 // after one registry lookup for every language whose entry
                 // permits neither `css` nor `html` inside it.
                 crate::markup::merge_markup(&mut extraction, root, source, lang);
-                let (literals, mut notes) =
-                    crate::literals::index_literals(root, source, lang, &extraction.symbols, deadline);
+                let (literals, mut notes) = crate::literals::index_literals(
+                    root,
+                    source,
+                    lang,
+                    &extraction.symbols,
+                    deadline,
+                );
                 extraction.literals = literals;
                 extraction.diagnostics.append(&mut notes);
                 #[cfg(test)]
@@ -959,8 +967,33 @@ fn parse_outcome_of(root: Node, source: &str, is_metal: bool, is_python: bool) -
     if error_ranges.is_empty() {
         ParseOutcome::Clean
     } else {
-        ParseOutcome::Partial { error_ranges }
+        let nameless_ranges = error_ranges
+            .iter()
+            .filter(|range| range_is_nameless(source, range))
+            .cloned()
+            .collect();
+        ParseOutcome::Partial {
+            error_ranges,
+            nameless_ranges,
+        }
     }
+}
+
+/// Whether an error region of nonzero width holds no identifier character.
+///
+/// ASCII letters, digits, `_` and `$` count, and so does every non-ASCII byte,
+/// since an identifier may be spelled in any script. A range that does not lie
+/// on the source is not nameless: what cannot be read is assumed to hold a name.
+fn range_is_nameless(source: &str, range: &TextRange) -> bool {
+    range.end_byte > range.start_byte
+        && source
+            .as_bytes()
+            .get(range.start_byte..range.end_byte)
+            .is_some_and(|bytes| {
+                !bytes
+                    .iter()
+                    .any(|&b| b.is_ascii_alphanumeric() || b == b'_' || b == b'$' || !b.is_ascii())
+            })
 }
 
 /// Metal declaration qualifiers that the C++ grammar has no production for.
@@ -2546,6 +2579,24 @@ fn drop_duplicate_callee_names(references: &mut Vec<ExtractedReference>) {
 
 fn member_access_receiver(node: Node, source: &str) -> Option<String> {
     let parent = bounded_parent(node)?;
+    // Swift nests the member one level deeper: `Meter.privDouble` is a
+    // `navigation_expression` whose `suffix` is a `navigation_suffix` holding
+    // the name. Without this a function passed by name — `map(Meter.privDouble)`
+    // — arrived as a bare `privDouble`, which the resolver declines by design,
+    // and the method was published dead at 0.9 (the audit's Swift P4).
+    if parent.kind() == "navigation_suffix" {
+        if parent
+            .child_by_field_name("suffix")
+            .is_none_or(|suffix| suffix.id() != node.id())
+        {
+            return None;
+        }
+        let navigation =
+            bounded_parent(parent).filter(|nav| nav.kind() == "navigation_expression")?;
+        let target = navigation.child_by_field_name("target")?;
+        let text = receiver_identity(target, source, 0);
+        return (!text.is_empty()).then_some(text);
+    }
     // The grammars spell the same shape several ways: `attribute` in Python,
     // `member_expression` in JS/TS, `selector_expression` in Go, Rust's
     // `field_expression` (`self.field`) and `scoped_identifier` (`Self::f`).
@@ -3173,6 +3224,61 @@ fn go_interface_method_exemptions(
             target_symbol: symbol.qualified_name.clone(),
             details: go_interface_exemption_reason(interface_name),
         });
+    }
+}
+
+/// Why an ambient TypeScript declaration is never a dead-code candidate.
+pub const TS_AMBIENT_REASON: &str = "ambient TypeScript declaration (`declare module`, `declare \
+     global`, a module augmentation or a `.d.ts` shim) — it describes a type that lives \
+     elsewhere, so no call site is ever expected";
+
+/// Exempt every symbol an ambient declaration introduces.
+///
+/// `declare module '*.svg' { … }`, `declare global { interface Window … }` and
+/// `declare module './logger' { interface Extra … }` add to a type the program
+/// never names at the declaration — the compiler merges them into a module or
+/// the global scope. A `.d.ts` file holds nothing else. The 2026-10-09 audit
+/// found these published at 0.9; nothing calls them because nothing *can*.
+///
+/// Span containment over the tree's `ambient_declaration` nodes, so every
+/// symbol nested in one — the module itself and the interfaces inside it — is
+/// covered without each symbol arm having to know.
+fn ts_ambient_exemptions(
+    path: &str,
+    root: Node,
+    symbols: &[ExtractedSymbol],
+    wiring: &mut Vec<WiringAnnotation>,
+) {
+    let whole_file = crate::wiring::is_ambient_declaration(path);
+    let mut ambient: Vec<(usize, usize)> = Vec::new();
+    if !whole_file {
+        let mut stack = vec![root];
+        while let Some(node) = stack.pop() {
+            if node.kind() == "ambient_declaration" {
+                ambient.push((node.start_byte(), node.end_byte()));
+                continue;
+            }
+            push_children(node, &mut stack);
+        }
+        if ambient.is_empty() {
+            return;
+        }
+    }
+    for symbol in symbols {
+        if symbol.kind == SymbolKind::File {
+            continue;
+        }
+        let inside = whole_file
+            || ambient.iter().any(|&(start, end)| {
+                start <= symbol.span.start_byte && symbol.span.end_byte <= end
+            });
+        if inside {
+            wiring.push(WiringAnnotation {
+                kind: WiringKind::StructuralExempt,
+                target_symbol: symbol.qualified_name.clone(),
+                details: TS_AMBIENT_REASON.to_string(),
+            });
+        }
     }
 }
 
@@ -4519,6 +4625,21 @@ fn extract_node(
                             target_symbol: qualified_name.clone(),
                             details: reason.to_string(),
                         });
+                    }
+                    // The directive comments directly above the declaration:
+                    // cgo's `//export` and `//go:linkname`.
+                    let mut above = node.prev_sibling();
+                    while let Some(comment) = above.filter(|sibling| sibling.kind() == "comment") {
+                        let text = &source[comment.start_byte()..comment.end_byte()];
+                        if let Some(reason) = crate::wiring::go_directive_entry_reason(text, &n) {
+                            wiring.push(WiringAnnotation {
+                                kind: WiringKind::RuntimeEntryPoint,
+                                target_symbol: qualified_name.clone(),
+                                details: reason.to_string(),
+                            });
+                            break;
+                        }
+                        above = comment.prev_sibling();
                     }
                     // Bind each parameter name to its declared type, scoped
                     // to this function so two functions using the same
@@ -8142,6 +8263,22 @@ fn is_defining_name(node: Node) -> bool {
             current = parent;
             continue;
         }
+        // A destructuring default is a use, not a binding. In
+        // `({ sleep = defaultSleep, cwd = repoRoot() }) => …` the left side
+        // binds and the right side is an expression evaluated when the
+        // property is absent — but the whole pattern sits on the parameter's
+        // `pattern` field, so the test below read `defaultSleep` as a
+        // declaration and dropped its only reference. The 2026-10-09 audit
+        // measured the result: `defaultSleep` published dead at 0.9 (TS V17).
+        if matches!(
+            parent.kind(),
+            "assignment_pattern" | "object_assignment_pattern"
+        ) && parent
+            .child_by_field_name("right")
+            .is_some_and(|right| right.id() == current.id())
+        {
+            return false;
+        }
         if field_contains(parent, "name", node)
             || field_contains(parent, "alias", node)
             || field_contains(parent, "parameter", node)
@@ -9252,10 +9389,21 @@ fn collect_parameter_names(callable: Node, source: &str, out: &mut BTreeSet<Stri
         }
         let mut cursor = node.walk();
         for (index, child) in node.children(&mut cursor).enumerate() {
-            if matches!(
-                node.field_name_for_child(index as u32),
-                Some("type") | Some("value")
-            ) {
+            let field = node.field_name_for_child(index as u32);
+            if matches!(field, Some("type") | Some("value")) {
+                continue;
+            }
+            // A destructuring default — `{ sleep = defaultSleep }` — keeps its
+            // value under `right`, not `value`. It is an expression evaluated
+            // when the property is absent, not a name the signature binds;
+            // collecting it made `defaultSleep` a "parameter" of the function
+            // that reads it, and the resolver refused its only reference.
+            if field == Some("right")
+                && matches!(
+                    node.kind(),
+                    "assignment_pattern" | "object_assignment_pattern"
+                )
+            {
                 continue;
             }
             worklist.push(child);
@@ -10093,6 +10241,108 @@ mod tests {
         );
     }
 
+    /// An error region holding no identifier character is recorded as
+    /// nameless; one holding a name, or a zero-width one, is not.
+    ///
+    /// The two nameless shapes are the ones measured: the `>()` tree-sitter-
+    /// typescript strands after a `typeof import(…)` type argument, and the
+    /// lone `}` the CUDA preprocessor scanner leaves behind a macro whose body
+    /// line ends in a comment. `abstract?:` holds a name and stays charged
+    /// wherever it lies outside a declaration.
+    #[test]
+    fn error_regions_without_a_name_are_recorded_as_nameless() {
+        let outcome = |path: &str, lang: &str, source: &str| {
+            let ParseOutcome::Partial {
+                error_ranges,
+                nameless_ranges,
+            } = extract_treesitter(path, lang, source).parse_outcome
+            else {
+                panic!("{path} must parse partially");
+            };
+            let text = |ranges: &[TextRange]| -> Vec<String> {
+                ranges
+                    .iter()
+                    .map(|range| source[range.start_byte..range.end_byte].to_string())
+                    .collect()
+            };
+            (text(&error_ranges), text(&nameless_ranges))
+        };
+
+        let (errors, nameless) = outcome(
+            "a.test.ts",
+            "typescript",
+            "vi.mock('m', async (o) => ({\n  ...(await o<typeof import('m')>()),\n}));\n\
+             function after(): number { return 2; }\n",
+        );
+        assert_eq!(errors, vec![">()"]);
+        assert_eq!(nameless, vec![">()"]);
+
+        let (errors, nameless) = outcome(
+            "k.cu",
+            "cuda",
+            "#define STAMP(NAME) \\\n  __global__ void NAME(float *p) { \\\n    \
+             f(p); /* g(p) */ \\\n    f(p); \\\n  }\n__device__ void f(float *p) {}\n",
+        );
+        assert!(errors.contains(&"}".to_string()), "{errors:?}");
+        assert_eq!(
+            nameless,
+            vec!["}"],
+            "only the brace is nameless: {errors:?}"
+        );
+
+        let (errors, nameless) = outcome(
+            "p.ts",
+            "typescript",
+            "export interface Paper {\n  title: string;\n  abstract?: string;\n}\n",
+        );
+        assert_eq!(errors, vec!["abstract?:"]);
+        assert!(
+            nameless.is_empty(),
+            "a keyword is spelled in letters: {nameless:?}"
+        );
+
+        assert!(
+            range_is_nameless(
+                "a)}",
+                &TextRange {
+                    start_byte: 1,
+                    end_byte: 3
+                }
+            ),
+            "punctuation alone is nameless"
+        );
+        assert!(
+            !range_is_nameless(
+                "a)}",
+                &TextRange {
+                    start_byte: 1,
+                    end_byte: 1
+                }
+            ),
+            "a zero-width region is not listed: it consumed nothing, and is not charged anyway"
+        );
+        assert!(
+            !range_is_nameless(
+                "})",
+                &TextRange {
+                    start_byte: 0,
+                    end_byte: 9
+                }
+            ),
+            "a range off the end of the source cannot be read, so it is not nameless"
+        );
+        assert!(
+            !range_is_nameless(
+                "(é)",
+                &TextRange {
+                    start_byte: 0,
+                    end_byte: 4
+                }
+            ),
+            "a non-ASCII byte may spell an identifier"
+        );
+    }
+
     /// A real syntax error must never be reported as a clean parse.
     ///
     /// `is_benign_jsx_ampersand` suppresses a known upstream grammar
@@ -10119,7 +10369,7 @@ mod tests {
         // Genuinely broken source must stay Partial, with ranges recorded.
         let broken = extract_treesitter("bad.tsx", "tsx", "export function A( {\n");
         match &broken.parse_outcome {
-            ParseOutcome::Partial { error_ranges } => {
+            ParseOutcome::Partial { error_ranges, .. } => {
                 assert!(
                     !error_ranges.is_empty(),
                     "a partial parse must record ranges"

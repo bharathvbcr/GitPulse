@@ -91,6 +91,7 @@
         "command.too_long",
         "command.directory_change",
         "path.secret_read",
+        "command.secret_read",
         "path.engine_unavailable",
         "command.engine_unavailable"
       ]
@@ -122,6 +123,7 @@
         "command.too_long": { "const": "hard" },
         "command.directory_change": { "const": "hard" },
         "path.secret_read": { "const": "hard" },
+        "command.secret_read": { "const": "hard" },
         "path.engine_unavailable": { "const": "hard" },
         "command.engine_unavailable": { "const": "hard" }
       }

@@ -2110,6 +2110,7 @@ mod tests {
             confidence: 0.9,
             is_exempt: false,
             exemption_reason: None,
+            evidence: None,
         }];
         let value = graph(
             &[extract_file("k.py", "def a(): pass\n")],
@@ -2279,6 +2280,7 @@ mod tests {
                 confidence: 0.9,
                 is_exempt: false,
                 exemption_reason: None,
+                evidence: None,
             },
             DeadSymbolReport {
                 symbol_name: "a1".to_string(),
@@ -2286,6 +2288,7 @@ mod tests {
                 confidence: 0.9,
                 is_exempt: false,
                 exemption_reason: None,
+                evidence: None,
             },
         ];
         let edges = vec![
@@ -2500,6 +2503,7 @@ mod tests {
                 confidence: 0.3,
                 is_exempt: true,
                 exemption_reason: Some("Go init function".to_string()),
+                evidence: None,
             },
             DeadSymbolReport {
                 symbol_name: "gone".to_string(),
@@ -2507,6 +2511,7 @@ mod tests {
                 confidence: 0.9,
                 is_exempt: false,
                 exemption_reason: None,
+                evidence: None,
             },
         ];
         let value = graph(
@@ -2548,6 +2553,7 @@ mod tests {
                 confidence: 0.9,
                 is_exempt: false,
                 exemption_reason: None,
+                evidence: None,
             },
             DeadSymbolReport {
                 symbol_name: "ghost".to_string(),
@@ -2555,6 +2561,7 @@ mod tests {
                 confidence: 0.9,
                 is_exempt: false,
                 exemption_reason: None,
+                evidence: None,
             },
         ];
         let source = "def a(): pass\ndef gone(): pass\n";

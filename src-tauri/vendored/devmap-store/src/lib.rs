@@ -8,17 +8,18 @@ pub mod extract_cache;
 pub mod schema;
 
 pub use coverage::{
-    discovery_refusals, CoverageGapRow, CoverageGapSample, CoverageGaps, DiscoveryRefusal,
-    COVERAGE_GAP_SAMPLE, GAP_DISCOVERY_REFUSED,
+    add_manifest_refusals, discovery_refusals, over_limit_inventory, refusal_inventory,
+    CoverageGapRow, CoverageGapSample, CoverageGaps, DiscoveryInventory, DiscoveryRefusal,
+    COVERAGE_GAP_SAMPLE, GAP_DISCOVERY_REFUSED, GAP_OVER_LIMIT,
 };
 pub use db::{
     checked_min_confidence, current_git_head, BuildHistoryRow, CallersPage, DeadPage, FileEdges,
-    FileSymbolsPage, GenerationWriteOpts, PageSizeConversion, PendingClaim, PendingEnqueueReport,
-    KeywordNarrowing, LiteralPage, PendingReconcile, PendingSupersede, PendingWatermark,
-    QuerySourceFreshness, SearchNarrowing, SearchPage, StoredLiteral,
-    SourceTreeDelta, Store, StoreStatus, StoredEdge, StoredFile, StoredSymbol, UnresolvedSiteRow,
-    UnresolvedSitesByName, UnsupportedSchema, VacuumAction, VacuumOutcome, WalCheckpointMode,
-    WalCheckpointResult, WriteBreakdown, WriterLock, MAX_PENDING_ATTEMPTS,
+    FileSymbolsPage, GenerationWriteOpts, KeywordNarrowing, LiteralPage, PageSizeConversion,
+    PendingClaim, PendingEnqueueReport, PendingReconcile, PendingSupersede, PendingWatermark,
+    QuerySourceFreshness, SearchNarrowing, SearchPage, SourceTreeDelta, Store, StoreStatus,
+    StoredEdge, StoredFile, StoredLiteral, StoredSymbol, UnresolvedSiteRow, UnresolvedSitesByName,
+    UnsupportedSchema, VacuumAction, VacuumOutcome, WalCheckpointMode, WalCheckpointResult,
+    WriteBreakdown, WriterLock, MAX_PENDING_ATTEMPTS,
 };
 pub use edge_index::{
     edge_kind_from_stored, edge_resolution, resolution_kind_from_stored, resolution_kind_label,

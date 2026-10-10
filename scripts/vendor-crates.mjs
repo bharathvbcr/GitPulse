@@ -116,6 +116,10 @@ export function sources(env = process.env, from = REPO) {
         // took it as a hard dependency upstream after that, so a re-vendor
         // without it fails to resolve rather than building a stale tree.
         "dc-proc",
+        // Python fnmatch semantics and the secret-path table. `devmap-extract`
+        // took it as a hard dependency upstream (it withholds secret paths from
+        // the code graph), so a re-vendor without it fails to resolve.
+        "dc-glob",
         // The credential table the ledger redacts with — the same one
         // dc-verify's secret gate blocks on, so the two cannot disagree about
         // what a secret is. GitPulse vendored all of dc-verify for this until

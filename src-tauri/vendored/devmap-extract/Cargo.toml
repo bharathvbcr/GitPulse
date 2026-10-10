@@ -8,6 +8,8 @@ description = "Tree-sitter extraction frontend for the DevCouncil code-intellige
 
 [dependencies]
 dc-proc = { path = "../dc-proc" }
+dc-glob = { path = "../dc-glob" }
+dc-redact = { path = "../dc-redact" }
 serde = { version = "1.0", features = ["derive", "rc"] }
 serde_json = { version = "1.0" }
 rayon = { version = "1.10" }

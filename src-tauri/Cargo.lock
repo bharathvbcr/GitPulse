@@ -722,6 +722,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "dc-glob"
+version = "0.2.4"
+
+[[package]]
 name = "dc-proc"
 version = "0.2.4"
 dependencies = [
@@ -837,7 +841,9 @@ version = "0.2.4"
 dependencies = [
  "anyhow",
  "cc",
+ "dc-glob",
  "dc-proc",
+ "dc-redact",
  "ignore",
  "libc",
  "rayon",

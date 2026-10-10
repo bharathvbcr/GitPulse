@@ -61,6 +61,12 @@ pub enum HistoryRefusal {
     NotText {
         path: String,
     },
+    /// A revision was refused before it reached any read: it begins with `-`,
+    /// or `git rev-parse --verify` does not resolve it to a commit.
+    RevisionRefused {
+        rev: String,
+        reason: String,
+    },
 }
 
 impl HistoryRefusal {
@@ -84,6 +90,9 @@ impl HistoryRefusal {
             }
             HistoryRefusal::NotText { path } => {
                 format!("{path} is not UTF-8 text, so it has no lines to attribute")
+            }
+            HistoryRefusal::RevisionRefused { rev, reason } => {
+                format!("the revision {rev:?} was refused: {reason}")
             }
         }
     }
@@ -142,8 +151,14 @@ pub(crate) fn run_git_with_deadline(
     stdout_cap: usize,
     deadline: Duration,
 ) -> Result<dc_proc::Captured, HistoryRefusal> {
-    let mut command = git_with_program(program, repo);
-    command.args(args);
+    let mut command = match git_with_program(program, repo, args) {
+        Ok(command) => command,
+        Err(failure) => {
+            return Err(HistoryRefusal::GitUnavailable {
+                reason: failure.to_string(),
+            })
+        }
+    };
     let captured = match run_bounded(&mut command, bounds_with_deadline(stdout_cap, deadline)) {
         Ok(captured) => captured,
         Err(Failure::Deadline { .. }) => {
@@ -175,6 +190,74 @@ pub(crate) fn run_git_with_deadline(
     Ok(captured)
 }
 
+/// Whether `rev` is a full object id, in either object format: 40 hex digits
+/// for sha1, 64 for sha256.
+fn is_full_oid(rev: &str) -> bool {
+    matches!(rev.len(), 40 | 64) && rev.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// The object id of the commit `rev` names, so that only an object id ever
+/// reaches `diff`, `log`, `show` or `blame`.
+///
+/// A revision is caller input — over MCP, an agent's — and git reads an
+/// argument that begins with `-` as an option wherever it stands. Passed as
+/// `since`, `--ext-diff` switched the repository's `diff.external` back on
+/// and ran its program; `--output=<file>` truncated a file; both answered
+/// with a clean, empty change. So a revision is resolved first, by
+/// `rev-parse --verify --end-of-options <rev>^{commit}`, which reads it as a
+/// name and nothing else, and the commands that follow see the id it
+/// answers. A leading `-` is refused before anything runs: no ref git
+/// creates begins with one, and `--end-of-options` is not understood by
+/// every git a host may have. A full object id is already that answer and
+/// costs no spawn; a full id that names nothing is git's to refuse in the
+/// read that uses it.
+pub fn commit_oid(
+    program: &std::ffi::OsStr,
+    repo: &Path,
+    rev: &str,
+) -> Result<String, HistoryRefusal> {
+    let refuse = |reason: &str| HistoryRefusal::RevisionRefused {
+        rev: rev.to_string(),
+        reason: reason.to_string(),
+    };
+    if rev.is_empty() {
+        return Err(refuse("an empty revision names no commit"));
+    }
+    if rev.starts_with('-') {
+        return Err(refuse(
+            "it begins with '-', so git would read it as an option rather than a revision",
+        ));
+    }
+    if is_full_oid(rev) {
+        return Ok(rev.to_ascii_lowercase());
+    }
+    let spec = format!("{rev}^{{commit}}");
+    let captured = run_git(
+        program,
+        repo,
+        &[
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            "--end-of-options",
+            &spec,
+        ],
+        "git rev-parse --verify",
+        4 * 1024,
+    )
+    .map_err(|refusal| match refusal {
+        HistoryRefusal::GitRefused { .. } => refuse("git does not resolve it to a commit"),
+        other => other,
+    })?;
+    let oid = captured.stdout_lossy().trim().to_string();
+    if !is_full_oid(&oid) {
+        return Err(refuse(&format!(
+            "git rev-parse answered {oid:?}, which is not an object id"
+        )));
+    }
+    Ok(oid)
+}
+
 /// The commits reachable from `until` but not from `since`, newest first.
 pub fn commit_window(
     repo: &Path,
@@ -194,6 +277,8 @@ pub fn commit_window_with_program(
     // One past the cap, so hitting it is distinguishable from exactly filling
     // it. Asking for exactly `COMMIT_CAP` and getting `COMMIT_CAP` back cannot
     // tell "the range is this long" from "the range is longer".
+    let since = commit_oid(program, repo, since)?;
+    let until = commit_oid(program, repo, until)?;
     let max_count = format!("--max-count={}", COMMIT_CAP + 1);
     let range = format!("{since}..{until}");
     let captured = run_git(
@@ -231,6 +316,7 @@ pub fn resolve_blob_with_program(
     rev: &str,
     path: &str,
 ) -> Result<ResolvedBlob, HistoryRefusal> {
+    let rev = commit_oid(program, repo, rev)?;
     let spec = format!("{rev}:{path}");
     let id = run_git(
         program,
@@ -266,6 +352,7 @@ pub fn files_changed_with_program(
     repo: &Path,
     commit: &str,
 ) -> Result<Vec<String>, HistoryRefusal> {
+    let commit = commit_oid(program, repo, commit)?;
     let captured = run_git(
         program,
         repo,
@@ -278,7 +365,7 @@ pub fn files_changed_with_program(
             // own bytes rather than as a C-escaped rendering that would never
             // match a graph's `file_path`.
             "-z",
-            commit,
+            &commit,
         ],
         "git show --name-only",
         LOG_OUTPUT_CAP,

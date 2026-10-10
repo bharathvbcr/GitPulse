@@ -304,6 +304,12 @@ pub struct Resolver {
     /// Ambiguity abstains rather than picking, the same rule
     /// [`Self::unique_basename`] follows.
     rust_crate_roots: BTreeMap<String, Option<String>>,
+    /// The `Cargo.toml` packages the manifest pass read, so a crate is also
+    /// known by the names its manifest gives it — `[package] name` and `[lib]
+    /// name` — and not only by its directory. Set by
+    /// [`Self::index_project_manifests`], which a caller runs before
+    /// [`Self::index_extractions`]; that one builds `rust_crate_roots` from it.
+    rust_manifest_crates: Vec<devmap_extract::RustCrateManifest>,
     /// `(file, qualified name)` → the header a Rust function was declared
     /// with. Read by the rungs that type a binding from a return type or a
     /// closure parameter; see `devmap_extract::rustsig`.
@@ -586,6 +592,7 @@ impl Resolver {
             path_module_bindings: BTreeMap::new(),
             py_search_dirs: BTreeMap::new(),
             rust_crate_roots: BTreeMap::new(),
+            rust_manifest_crates: Vec::new(),
             rust_signatures: BTreeMap::new(),
             reexport_chains: BTreeMap::new(),
             receiver_types: BTreeMap::new(),
@@ -1115,6 +1122,7 @@ impl Resolver {
     /// freshness contract `index_go_modules` states.
     pub fn index_project_manifests(&mut self, manifests: &ProjectManifests) {
         self.index_go_modules(&manifests.go_modules);
+        self.rust_manifest_crates = manifests.rust_crates.clone();
         let mut projects = manifests.ts_projects.clone();
         // Deepest first, whatever order arrived: the nearest config governs.
         projects.sort_by(|left, right| {
@@ -2250,6 +2258,29 @@ impl Resolver {
         }
     }
 
+    /// Record `name` as the crate rooted at `root`, abstaining when another
+    /// root already claims it.
+    ///
+    /// A crate with both a `lib.rs` and a `main.rs` is one crate with one root,
+    /// not two claimants. Two *directories* of the same name are the ambiguity
+    /// this abstains on.
+    fn claim_rust_crate_name(
+        rust_crate_roots: &mut BTreeMap<String, Option<String>>,
+        name: String,
+        root: String,
+    ) {
+        match rust_crate_roots.entry(name) {
+            std::collections::btree_map::Entry::Vacant(slot) => {
+                slot.insert(Some(root));
+            }
+            std::collections::btree_map::Entry::Occupied(mut held) => {
+                if held.get().as_deref() != Some(root.as_str()) {
+                    held.insert(None);
+                }
+            }
+        }
+    }
+
     pub fn index_extractions(&mut self, extractions: &[Extraction]) {
         // The resolver indexes a complete snapshot. Resetting prevents stale
         // candidates and duplicate bindings when a caller reuses the object
@@ -2560,21 +2591,46 @@ impl Resolver {
             };
             let name = name.replace('-', "_");
             let root = src_root.to_string();
-            match rust_crate_roots.entry(name) {
-                std::collections::btree_map::Entry::Vacant(slot) => {
-                    slot.insert(Some(root));
+            Self::claim_rust_crate_name(&mut rust_crate_roots, name, root);
+        }
+        // The names a manifest gives the same roots. A package whose library
+        // is `[lib] name = "xlib"` is spelled `use xlib::…` by every caller,
+        // and its directory name is no help (GitPulse: `src-tauri`, package
+        // `gitpulse`, lib `gitpulse_lib`). Only where the crate's own root
+        // file is indexed, and under the same abstain-on-conflict rule.
+        for manifest in &self.rust_manifest_crates {
+            let src_root = if manifest.dir.is_empty() {
+                "src".to_string()
+            } else {
+                format!("{}/src", manifest.dir)
+            };
+            let indexed = ["lib.rs", "main.rs"].iter().any(|file| {
+                self.file_symbols
+                    .contains_key(&format!("{src_root}/{file}"))
+            });
+            if !indexed {
+                continue;
+            }
+            for name in &manifest.names {
+                if rust_crate_roots.get(name).and_then(Option::as_deref) == Some(src_root.as_str())
+                {
+                    continue;
                 }
-                std::collections::btree_map::Entry::Occupied(mut held) => {
-                    // A crate with both a `lib.rs` and a `main.rs` is one crate
-                    // with one root, not two claimants. Two *directories* of
-                    // the same name are the ambiguity this abstains on.
-                    if held.get().as_deref() != Some(root.as_str()) {
-                        held.insert(None);
-                    }
-                }
+                Self::claim_rust_crate_name(&mut rust_crate_roots, name.clone(), src_root.clone());
             }
         }
         self.rust_crate_roots = rust_crate_roots;
+        // Python packages this corpus indexes, by the name an absolute import
+        // would spell: every directory holding an indexed `__init__.py`.
+        let python_packages: BTreeSet<String> = self
+            .file_symbols
+            .keys()
+            .filter_map(|path| {
+                let dir = path.strip_suffix("/__init__.py")?;
+                dir.rsplit('/').next().map(str::to_string)
+            })
+            .collect();
+        let rust_crates: BTreeSet<String> = self.rust_crate_roots.keys().cloned().collect();
 
         // Between the passes, and necessarily so: following a barrel needs the
         // complete symbol universe pass one builds, and pass two's import
@@ -2614,9 +2670,26 @@ impl Resolver {
                 })
                 .map(|imp| imp.module_specifier.clone())
                 .collect();
+            // An absolute specifier whose root names a package this corpus
+            // indexes — `from pkg.core import Engine` with `lib/pkg/__init__.py`
+            // indexed, `use xlib::engine` with `xlib` a `[lib] name` here — is
+            // an index gap however the ladder failed it, exactly as a
+            // repo-relative one is. Filing it `External` printed live code's
+            // only callers as "expected", and nothing vetoed the dead verdict.
+            let names_an_indexed_package = |specifier: &str| {
+                let root = Self::path_root(specifier.trim_matches(|c| c == '\'' || c == '"'));
+                match ext.language.as_str() {
+                    "python" => python_packages.contains(root),
+                    "rust" => rust_crates.contains(root),
+                    _ => false,
+                }
+            };
             let mut unresolved_import = |local: String, specifier: &str| {
                 let root = Self::path_root(specifier);
-                if Self::specifier_is_repo_relative(specifier) || ts_mapped.contains(specifier) {
+                if Self::specifier_is_repo_relative(specifier)
+                    || ts_mapped.contains(specifier)
+                    || names_an_indexed_package(specifier)
+                {
                     if !root.is_empty() {
                         file_local_roots.insert(root.to_string());
                     }

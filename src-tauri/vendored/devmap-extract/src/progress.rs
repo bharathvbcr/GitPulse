@@ -106,13 +106,23 @@ impl State {
 pub struct FileDelta {
     pub added: usize,
     pub changed: usize,
+    /// Indexed paths that are no longer in the tree.
     pub removed: usize,
+    /// Indexed paths still in the tree that grew past `MAX_SOURCE_BYTES`.
+    ///
+    /// Not folded into `removed`, though both lose the file's rows: "deleted"
+    /// and "skipped: over limit" call for opposite responses, and reporting a
+    /// 1.7 MB generated client as removed told a reader the callers it held
+    /// were gone from the code rather than from the index. Serialized under the
+    /// name `status.delta` uses, so the two surfaces spell one fact one way.
+    #[serde(rename = "skipped_over_limit")]
+    pub over_limit: usize,
     pub unchanged: usize,
 }
 
 impl FileDelta {
     pub fn is_unchanged(&self) -> bool {
-        self.added == 0 && self.changed == 0 && self.removed == 0
+        self.added == 0 && self.changed == 0 && self.removed == 0 && self.over_limit == 0
     }
 }
 

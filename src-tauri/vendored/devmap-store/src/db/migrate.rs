@@ -6,10 +6,10 @@ use crate::schema::{
     MIGRATION_V17_TO_V18_BACKFILL_EDGES, MIGRATION_V17_TO_V18_BACKFILL_UNRESOLVED,
     MIGRATION_V17_TO_V18_RENAME_EDGES, MIGRATION_V17_TO_V18_RENAME_UNRESOLVED,
     MIGRATION_V18_TO_V19, MIGRATION_V19_TO_V20, MIGRATION_V20_TO_V21, MIGRATION_V21_TO_V22,
-    MIGRATION_V23_TO_V24, MIGRATION_V25_TO_V26, MIGRATION_V3_TO_V4, MIGRATION_V4_TO_V5,
-    MIGRATION_V4_TO_V5_EDGE_INDEXES, MIGRATION_V5_TO_V6, MIGRATION_V6_TO_V7, MIGRATION_V7_TO_V8,
-    MIGRATION_V8_TO_V9, MIGRATION_V9_TO_V10, MIN_READER_SCHEMA_VERSION, READER_COMPAT_TABLE,
-    VALIDITY_RANGE_TABLES,
+    MIGRATION_V23_TO_V24, MIGRATION_V25_TO_V26, MIGRATION_V26_TO_V27, MIGRATION_V3_TO_V4,
+    MIGRATION_V4_TO_V5, MIGRATION_V4_TO_V5_EDGE_INDEXES, MIGRATION_V5_TO_V6, MIGRATION_V6_TO_V7,
+    MIGRATION_V7_TO_V8, MIGRATION_V8_TO_V9, MIGRATION_V9_TO_V10, MIN_READER_SCHEMA_VERSION,
+    READER_COMPAT_TABLE, VALIDITY_RANGE_TABLES,
 };
 use rusqlite::OptionalExtension;
 use rusqlite::{params, Connection, Result, TransactionBehavior};
@@ -20,6 +20,21 @@ impl Store {
         let mut stmt = conn.prepare(&format!("PRAGMA table_info(\"{table}\")"))?;
         let mut names = stmt.query_map([], |row| row.get::<_, String>(1))?;
         names.try_fold(false, |found, name| Ok(found || name? == column))
+    }
+
+    /// The v27 rung: the dead-row evidence columns, added only when absent.
+    ///
+    /// Probed for the reason every `ADD COLUMN` rung here is: the statement is
+    /// not repeatable, and the ladder must be re-entrant — racing openers of a
+    /// mid-chain store, and a store walked up from an old version through
+    /// batches that already recreated the table, both reach this rung on a
+    /// table that may have the columns. The three are added by one batch, so
+    /// the first is the probe for all of them.
+    fn add_dead_evidence_columns(conn: &Connection) -> Result<()> {
+        if !Self::has_column(conn, "generation_dead_symbols", "evidence_sites")? {
+            conn.execute_batch(MIGRATION_V26_TO_V27)?;
+        }
+        Ok(())
     }
 
     /// Whether `name` exists and is a base table rather than a view.
@@ -358,6 +373,7 @@ impl Store {
             // After v21's drop of the same index, as on the ladder.
             tx.execute_batch(MIGRATION_V23_TO_V24)?;
             tx.execute_batch(MIGRATION_V25_TO_V26)?;
+            Self::add_dead_evidence_columns(tx)?;
             Self::stamp_reader_compat(tx)?;
             Self::validate_schema(tx)?;
             tx.execute(
@@ -750,6 +766,11 @@ impl Store {
             conn.execute_batch(MIGRATION_V25_TO_V26)?;
             conn.execute("PRAGMA user_version = 26", [])?;
             version = 26;
+        }
+        if version == 26 {
+            Self::add_dead_evidence_columns(conn)?;
+            conn.execute("PRAGMA user_version = 27", [])?;
+            version = 27;
         }
         if version != CURRENT_SCHEMA_VERSION {
             return Err(Self::unsupported_schema(store, version));

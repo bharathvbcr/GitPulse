@@ -63,6 +63,10 @@ name = "go_function_value_liveness"
 required-features = ["parse"]
 
 [[test]]
+name = "module_private_widening"
+required-features = ["parse"]
+
+[[test]]
 name = "member_use_liveness"
 required-features = ["parse"]
 

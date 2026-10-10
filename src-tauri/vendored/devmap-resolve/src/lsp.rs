@@ -3,8 +3,8 @@
 //! The syntax resolver remains the owner of every deterministic and
 //! unique-global claim. This pass may only *add* [`Resolution::LanguageServer`]
 //! or [`Resolution::LanguageServerDispatch`] edges for sites that are still in
-//! the unresolved ledger, and only when a server on `PATH` actually names a
-//! target inside the repository. A missing, hung, oversized, or disagreeing
+//! the unresolved ledger, and only when a server on `PATH`, installed outside
+//! the repository, actually names a target inside it. A missing, hung, oversized, or disagreeing
 //! answer never falls through to a bare-name [`Resolution::UniqueGlobal`].
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -49,8 +49,9 @@ const LSP_HEADER_LINE_CAP: u64 = 8 * 1024;
 const LSP_EXIT_GRACE: Duration = Duration::from_millis(500);
 
 /// Servers this pass will start, in order, and only when the binary is on
-/// `PATH`. A missing binary is a status line that the pass did not run — never
-/// "zero new edges from a run".
+/// `PATH` outside the repository (see `which_binary`). A missing or refused
+/// binary is a status line that the pass did not run — never "zero new edges
+/// from a run".
 pub const LSP_SERVERS: &[LspServerSpec] = &[
     LspServerSpec {
         binary: "rust-analyzer",
@@ -89,9 +90,15 @@ impl LspServerSpec {
 }
 
 /// Why a server did not produce edges for the files it was asked about.
+///
+/// `MissingBinary` is no candidate on PATH; `RefusedBinary` is a candidate
+/// found and refused without being started — inside the repository, reached
+/// through a link the repository carries, or through an empty or relative
+/// PATH entry — carrying what was refused and why.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LspDidNotRun {
     MissingBinary,
+    RefusedBinary(String),
     NonZeroExit { code: Option<i32> },
     TimedOut,
     OversizedPayload { bytes: usize },
@@ -103,6 +110,7 @@ impl LspDidNotRun {
     pub fn label(&self) -> &'static str {
         match self {
             LspDidNotRun::MissingBinary => "missing_binary",
+            LspDidNotRun::RefusedBinary(_) => "refused_binary",
             LspDidNotRun::NonZeroExit { .. } => "non_zero_exit",
             LspDidNotRun::TimedOut => "timed_out",
             LspDidNotRun::OversizedPayload { .. } => "oversized_payload",
@@ -273,6 +281,11 @@ impl LspPassReport {
                     server.files_considered,
                     server.files_finished
                 ));
+                // Which candidate was refused, and why, is what the operator
+                // needs to act on; the label alone does not say where it was.
+                if let LspDidNotRun::RefusedBinary(detail) = reason {
+                    lines.push(format!("lsp: {} refused: {detail}", server.binary));
+                }
             } else if server.ran {
                 lines.push(format!(
                     "lsp: {} {} — {} edge(s) from {} file(s)",
@@ -416,6 +429,8 @@ pub fn enrich_with_language_servers_with_sources(
     cancel: &AtomicBool,
 ) -> LspPassReport {
     let deadline = Instant::now() + LSP_PASS_BUDGET;
+    // Read once: every server is resolved against the same PATH.
+    let path_var = std::env::var_os("PATH");
     let mut report = LspPassReport {
         sites_left_unresolved: resolution.unresolved.len(),
         ..LspPassReport::default()
@@ -486,17 +501,20 @@ pub fn enrich_with_language_servers_with_sources(
         }
         let allowed: BTreeSet<&str> = files.iter().map(String::as_str).collect();
 
-        let Some(binary_path) = which_binary(spec.binary) else {
-            report.servers.push(LspServerStatus {
-                binary: spec.binary.to_string(),
-                version: None,
-                ran: false,
-                did_not_run: Some(LspDidNotRun::MissingBinary),
-                files_considered: considered,
-                files_finished: 0,
-                edges_added: 0,
-            });
-            continue;
+        let binary_path = match which_binary(spec.binary, path_var.as_deref(), repo_root) {
+            Ok(path) => path,
+            Err(reason) => {
+                report.servers.push(LspServerStatus {
+                    binary: spec.binary.to_string(),
+                    version: None,
+                    ran: false,
+                    did_not_run: Some(reason),
+                    files_considered: considered,
+                    files_finished: 0,
+                    edges_added: 0,
+                });
+                continue;
+            }
         };
 
         let mut client = match LspClient::spawn(spec, &binary_path, repo_root, deadline) {
@@ -569,6 +587,7 @@ pub fn enrich_with_language_servers_with_sources(
             Some(reason @ LspDidNotRun::OversizedPayload { .. })
             | Some(reason @ LspDidNotRun::NonZeroExit { .. })
             | Some(reason @ LspDidNotRun::MissingBinary)
+            | Some(reason @ LspDidNotRun::RefusedBinary(_))
             | Some(reason @ LspDidNotRun::Protocol(_))
             | Some(reason @ LspDidNotRun::TimedOut)
             | Some(reason @ LspDidNotRun::Cancelled) => Some(reason),
@@ -594,22 +613,32 @@ pub fn enrich_with_language_servers_with_sources(
     report
 }
 
-fn which_binary(name: &str) -> Option<PathBuf> {
-    let path = std::env::var_os("PATH")?;
-    for dir in std::env::split_paths(&path) {
-        let candidate = dir.join(name);
-        if candidate.is_file() {
-            return Some(candidate);
-        }
-        #[cfg(windows)]
+/// The language server `name` names on `path_var` (the `PATH` value), through
+/// the one resolver every process boundary in the workspace uses,
+/// `dc_proc::resolve_outside`.
+///
+/// The pass runs in the environment of whoever asked for `--lsp`, often an
+/// agent's, where a PATH entry can name a directory inside the repository
+/// being built. A server there is repository content, not a program to start,
+/// so a candidate inside `repo_root`, a link chain through it, or one found
+/// through an empty or relative entry (which names the directory the build
+/// runs in) is refused. Not found is [`LspDidNotRun::MissingBinary`]; refused
+/// is [`LspDidNotRun::RefusedBinary`], so a refusal never reads as an absent
+/// install.
+fn which_binary(
+    name: &str,
+    path_var: Option<&std::ffi::OsStr>,
+    repo_root: &Path,
+) -> Result<PathBuf, LspDidNotRun> {
+    match subprocess::resolve_outside(std::ffi::OsStr::new(name), path_var, repo_root) {
+        Ok(path) => Ok(path),
+        Err(subprocess::Failure::Spawn { error, .. })
+            if error.kind() == std::io::ErrorKind::NotFound =>
         {
-            let with_exe = dir.join(format!("{name}.exe"));
-            if with_exe.is_file() {
-                return Some(with_exe);
-            }
+            Err(LspDidNotRun::MissingBinary)
         }
+        Err(failure) => Err(LspDidNotRun::RefusedBinary(failure.to_string())),
     }
-    None
 }
 
 /// What the reader thread hands back: a decoded frame, or why it stopped.

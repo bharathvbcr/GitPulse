@@ -345,6 +345,18 @@ pub(crate) fn exemption(
             "Swift override invoked by the declaring superclass or framework",
         ));
     }
+    // An overload of a *standard* operator — `static func + (l: Meter, r:
+    // Meter)`, `==`, `<` — is called by operator syntax the call extractor
+    // does not record (every `a + b` on an `Int` would be a ledger row), so it
+    // has no call site by construction. A custom operator (`<+>`) is
+    // different: its uses are recorded as calls, so it keeps the ordinary
+    // verdict. The audit's Swift P1 was the custom case published dead at 0.9.
+    if is_standard_operator_name(&declaration.name) {
+        return Some((
+            WiringKind::StructuralExempt,
+            "Swift standard-operator overload, called by operator syntax the extractor does not record",
+        ));
+    }
     if declaration.declared_kind == SymbolKind::Function {
         // `XCTestCase` collects `test…` methods by reflection, exactly as pytest
         // collects `test_*`. Gated on the enclosing type actually inheriting
@@ -364,6 +376,58 @@ pub(crate) fn exemption(
         .iter()
         .find_map(|name| crate::wiring::swift_runtime_supertype_reason(name))
         .map(|reason| (WiringKind::RuntimeEntryPoint, reason))
+}
+
+/// Whether `name` spells one of Swift's standard operators.
+///
+/// The declared spelling of an overload: `+`, `==`, `+=`, `...`, `??`. A custom
+/// operator such as `<+>` is not in the list on purpose — its uses are
+/// recorded as calls, so it can be judged by them.
+fn is_standard_operator_name(name: &str) -> bool {
+    matches!(
+        name,
+        "+" | "-"
+            | "*"
+            | "/"
+            | "%"
+            | "=="
+            | "!="
+            | "==="
+            | "!=="
+            | "<"
+            | ">"
+            | "<="
+            | ">="
+            | "&&"
+            | "||"
+            | "!"
+            | "&"
+            | "|"
+            | "^"
+            | "~"
+            | "<<"
+            | ">>"
+            | "+="
+            | "-="
+            | "*="
+            | "/="
+            | "%="
+            | "&="
+            | "|="
+            | "^="
+            | "<<="
+            | ">>="
+            | "~="
+            | "..."
+            | "..<"
+            | "??"
+            | "&+"
+            | "&-"
+            | "&*"
+            | "&+="
+            | "&-="
+            | "&*="
+    )
 }
 
 /// Whether the type enclosing `node` inherits `XCTestCase`.

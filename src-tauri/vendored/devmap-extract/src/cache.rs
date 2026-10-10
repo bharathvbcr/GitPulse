@@ -569,7 +569,35 @@ pub const ANALYZER_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// the resolver joins to a Metal entry point of that name. Served warm, a row
 /// without them leaves every macro-stamped kernel unsearchable and every
 /// `pipeline("…")` host unlinked.
-pub const EXTRACTION_SCHEMA_VERSION: &str = "77";
+///
+/// v78 was stamped by two lanes on different payloads. The read-tools lane's
+/// v78 withholds what a secret file (`policy.SecretPathPatterns`) writes: its
+/// literal values become `secret::WITHHELD_LITERAL_VALUE`, its docstrings are
+/// dropped and its string-made references removed. A row without that for
+/// such a file holds the credentials themselves, and since a row is reused for
+/// as long as the file is unchanged, it would keep serving them — and keep
+/// them in a store that is copied between worktrees — until someone edited
+/// the file.
+///
+/// The dead-policy lane's v78 is the dead-policy card's extractor half: cgo
+/// `//export` and `//go:linkname` functions and `#[tauri::command]` functions
+/// are runtime entry points; every symbol inside a TypeScript `declare module`
+/// / `declare global` block or a `.d.ts` file is structurally exempt; a
+/// destructuring default (`{ sleep = defaultSleep }`) is a use, not a
+/// parameter binding; a Swift custom-operator use is a call and a
+/// standard-operator overload is exempt; and a Swift `Type.member` value
+/// carries its receiver. A row without them keeps every one of those symbols
+/// looking uncalled.
+///
+/// v79 is both v78 payloads together, under a number neither lane stamped: a
+/// row stamped 78 by either lane lacks the other's half.
+///
+/// v80 records `ParseOutcome::Partial::nameless_ranges`, the error regions
+/// that hold no identifier character. A v79 row reads back with that list
+/// empty, which charges every such region against the dead-code ceiling —
+/// a lone `}` would keep a whole language out of the confident tier until
+/// the file was edited.
+pub const EXTRACTION_SCHEMA_VERSION: &str = "80";
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct CacheKey {
