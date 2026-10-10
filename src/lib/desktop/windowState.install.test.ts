@@ -102,7 +102,7 @@ describe("installWindowStatePersistence", () => {
   it("pulls a rectangle saved on a monitor that is gone back onto one that exists", async () => {
     const offscreen = JSON.stringify({ x: 9000, y: 9000, width: 1280, height: 850, maximized: false });
     const dispose = await installWindowStatePersistence(true, memoryStorage({ [KEY]: offscreen }));
-    const position = win.setPosition.mock.calls[0]?.[0] as unknown as { x: number; y: number };
+    const position = (win.setPosition.mock.calls as unknown as [{ x: number; y: number }][])[0]?.[0] as { x: number; y: number };
     expect(position.x).toBeLessThan(1920);
     expect(position.y).toBeLessThan(1080);
     dispose();

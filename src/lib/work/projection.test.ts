@@ -80,6 +80,7 @@ function lease(task_id: string, over: Partial<TaskLease> = {}): TaskLease {
     status: "in_progress",
     created_at: "2026-09-01T12:00:00Z",
     expires_at: null,
+    expiry_error: null,
     ...over,
   };
 }

@@ -242,9 +242,16 @@ describe("the command gate judges the command that actually runs", () => {
       expect(body).toContain("guard(&repo_path, argv)");
     }
     const executor = fnBody(PRODUCTION_WRITER, "change_index_with")!;
+    // One git process applies the whole selection with its paths on stdin, so
+    // what runs is not the judged argv verbatim; it is the same pathspec set.
+    // Both the judged lines and the stdin are built from the one `paths` list,
+    // and every line is judged before git is started.
     expect(executor).toContain("judge(&args)?");
-    expect(executor).toContain("git_text(&repo, &args)");
-    expect(executor.indexOf("judge(&args)?")).toBeLessThan(executor.indexOf("git_text(&repo, &args)"));
+    expect(executor).toContain("git_with_stdin(&repo, &args, &input)");
+    expect(executor.indexOf("judge(&args)?")).toBeLessThan(executor.indexOf("git_with_stdin(&repo, &args, &input)"));
+    expect(executor.match(/for path in &paths \{/g)).toHaveLength(2);
+    expect(executor).toContain("argv.push(path.clone())");
+    expect(executor).toContain("input.extend_from_slice(path.as_bytes())");
   });
 
   it("stash save shares its options with the gate", () => {

@@ -85,7 +85,9 @@ function parseArgs(argv) {
     else throw new Error(`unknown argument ${flag}`);
     i += 1;
   }
-  for (const [name, number] of [["--budget-mib", options.budgetMib], ["--jobs", options.jobs], ["--top", options.top]]) {
+  /** @type {[string, number][]} */
+  const counts = [["--budget-mib", options.budgetMib], ["--jobs", options.jobs], ["--top", options.top]];
+  for (const [name, number] of counts) {
     if (!Number.isInteger(number) || number < 1) throw new Error(`${name} needs a positive integer`);
   }
   return options;
@@ -108,6 +110,10 @@ function libTestBinary() {
   throw new Error("cargo reported no lib test executable");
 }
 
+/**
+ * @param {string} binary
+ * @param {string} filter
+ */
 function listTests(binary, filter) {
   const listed = spawnSync(binary, ["--list", "--format", "terse"], { encoding: "utf8", maxBuffer: 64 * MIB });
   if (listed.status !== 0) throw new Error(`could not list tests:\n${listed.stderr}`);
@@ -118,6 +124,11 @@ function listTests(binary, filter) {
     .filter((name) => name.includes(filter));
 }
 
+/**
+ * @param {string} binary
+ * @param {string} test
+ * @param {string} reportFile
+ */
 function runOne(binary, test, reportFile) {
   return new Promise((resolve) => {
     const child = spawn(binary, ["--exact", test, "--test-threads=1"], {
@@ -136,6 +147,7 @@ async function main() {
   const scratch = mkdtempSync(path.join(os.tmpdir(), "gitpulse-diskio-"));
   const reportFile = path.join(scratch, "report.tsv");
   const queue = [...tests];
+  /** @type {{ test: string, code: number | null }[]} */
   const failed = [];
   await Promise.all(
     Array.from({ length: options.jobs }, async () => {
