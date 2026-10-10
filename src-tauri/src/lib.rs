@@ -38,6 +38,8 @@ pub mod stack;
 pub mod storage;
 pub mod syntax;
 pub mod tasks;
+pub mod singleflight;
+pub mod supervisor;
 pub mod teardown;
 pub mod terminal;
 #[cfg(test)]
@@ -517,6 +519,7 @@ pub fn run() {
             cmd_onboarding_clone_source,
             cmd_tool_capability_refresh,
             cmd_check_app_update,
+            supervisor::cmd_degraded_subsystems,
         ])
         .build(context())
         .expect("error while building GitPulse")

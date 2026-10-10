@@ -1,6 +1,7 @@
 use super::{
     cancel, execute_with_activity, invocation, local_checks, managed_cache_path, plans,
-    prepare_with_activity, providers, tree, HygienePlan, EXECUTION, MAX_PLANS, TTL,
+    exclusive, prepare_with_activity, providers, tree, HygienePlan, EXECUTION, INVENTORY, MAX_PLANS,
+    PREPARATION, TTL,
 };
 use std::fs::{self, File, FileTimes};
 use std::path::{Path, PathBuf};
@@ -567,4 +568,45 @@ fn differently_cased_credentials_and_known_model_formats_are_preserved() {
         );
         fs::remove_file(path).unwrap();
     }
+}
+
+/// Panics on another thread while it holds `lock`, which poisons it.
+fn poison<T: Send>(lock: &'static Mutex<T>) {
+    let _ = std::thread::spawn(move || {
+        let _held = lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        panic!("injected panic under a hygiene lock");
+    })
+    .join();
+    assert!(lock.is_poisoned());
+}
+
+/// The defect: a poisoned lock was reported as "another operation is running"
+/// for the rest of the process, so cleanup could never run again.
+#[test]
+fn a_panic_under_any_hygiene_lock_does_not_disable_cleanup() {
+    let _serial = TEST_LOCK.lock().unwrap();
+    for (lock, busy) in [
+        (&EXECUTION, "execution busy"),
+        (&PREPARATION, "preparation busy"),
+        (&INVENTORY, "inventory busy"),
+    ] {
+        poison(lock);
+        {
+            let taken = exclusive(lock, busy);
+            assert!(taken.is_ok(), "{busy}: a poisoned lock was refused");
+            // Genuine contention is still contention.
+            assert_eq!(exclusive(lock, busy).err().as_deref(), Some(busy));
+        }
+        lock.clear_poison();
+    }
+    // End to end through the real operation, with the plan store poisoned too.
+    let (_temp, repo) = fixture();
+    poison(plans());
+    poison(&EXECUTION);
+    let view = preview(&repo);
+    assert!(
+        execute_with_activity(repo.to_str().unwrap(), &view.id, |_, _| Ok(()), |_| Ok(())).is_ok()
+    );
+    plans().clear_poison();
+    EXECUTION.clear_poison();
 }

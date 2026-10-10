@@ -258,11 +258,10 @@ impl WorkbenchState {
         if let Some(notifications) = self.0.notifications.get() {
             notifications.wake();
         }
-        if let Ok(guard) = self.0.worker.lock() {
-            if let Some((_, worker)) = guard.as_ref() {
-                if !worker.shutdown() {
-                    log::warn!(target: "workbench", "profile worker shutdown could not acquire the active request; generation outcome may remain unresolved");
-                }
+        let guard = crate::supervisor::lock_or_recover(&self.0.worker);
+        if let Some((_, worker)) = guard.as_ref() {
+            if !worker.shutdown() {
+                log::warn!(target: "workbench", "profile worker shutdown could not acquire the active request; generation outcome may remain unresolved");
             }
         }
     }
@@ -281,12 +280,7 @@ impl WorkbenchState {
         &self,
         body: impl FnOnce(&Store) -> Result<T, WorkbenchError>,
     ) -> Result<T, WorkbenchError> {
-        let mut guard = self.0.store.lock().map_err(|_| {
-            WorkbenchError::new(
-                "store_error",
-                "Task storage lock failed; restart the application.",
-            )
-        })?;
+        let mut guard = crate::supervisor::lock_or_recover(&self.0.store);
         self.check_open()?;
         if guard.is_none() {
             let path = self.profile_path()?;
@@ -309,10 +303,7 @@ impl WorkbenchState {
         &self,
         body: impl FnOnce(&Store) -> Result<T, WorkbenchError>,
     ) -> Result<T, WorkbenchError> {
-        let guard =
-            self.0.store.lock().map_err(|_| {
-                WorkbenchError::new("store_error", "Task receipt storage lock failed.")
-            })?;
+        let guard = crate::supervisor::lock_or_recover(&self.0.store);
         let store = guard.as_ref().ok_or_else(|| {
             WorkbenchError::new("store_error", "No open task store owns this process.")
         })?;
@@ -468,12 +459,7 @@ impl WorkbenchState {
     fn worker_handshake(&self) -> Result<crate::harness::protocol::HelloResult, WorkbenchError> {
         self.check_open()?;
         let live = {
-            let guard = self.0.worker.lock().map_err(|_| {
-                WorkbenchError::new(
-                    "worker_error",
-                    "Task worker lock failed; restart the application.",
-                )
-            })?;
+            let guard = crate::supervisor::lock_or_recover(&self.0.worker);
             guard.as_ref().map(|(_, worker)| Arc::clone(worker))
         };
         let worker = match live {
@@ -503,12 +489,7 @@ impl WorkbenchState {
             .as_ref()
             .map(|s| (s.base_url.clone(), s.model.clone()));
         let worker = {
-            let mut guard = self.0.worker.lock().map_err(|_| {
-                WorkbenchError::new(
-                    "worker_error",
-                    "Task worker lock failed; restart the application.",
-                )
-            })?;
+            let mut guard = crate::supervisor::lock_or_recover(&self.0.worker);
             let rebuild = match guard.as_ref() {
                 Some((fp, _)) => *fp != fingerprint,
                 None => true,
@@ -1262,6 +1243,32 @@ done
             reopened.request("items.get", r#"{"id":"t1"}"#).unwrap()["item"]["description"],
             "Do not drop me"
         );
+    }
+
+    /// The defect: a panic while the store (or worker) lock was held turned
+    /// every later board read, run receipt and worker handshake into "restart
+    /// the application".
+    #[test]
+    fn a_panic_under_the_store_or_worker_lock_does_not_disable_the_board() {
+        let dir = tempfile::tempdir().unwrap();
+        let host = state(&dir.path().join("profile/workbench.sqlite"));
+        let repo = json!({"request_id":"r1","id":"r1","expected_revision":0,"name":"Repo","identity_key":"clone-1"});
+        host.request("repositories.put", &repo.to_string()).unwrap();
+        for poisoned in [0, 1] {
+            let inner = Arc::clone(&host.0);
+            let _ = std::thread::spawn(move || {
+                if poisoned == 0 {
+                    let _held = inner.store.lock().unwrap();
+                    panic!("injected panic under the store lock");
+                }
+                let _held = inner.worker.lock().unwrap();
+                panic!("injected panic under the worker lock");
+            })
+            .join();
+        }
+        assert!(host.0.store.is_poisoned() && host.0.worker.is_poisoned());
+        assert_eq!(host.request("items.list", "{}").unwrap()["total"], 0);
+        host.shutdown();
     }
 
     #[test]

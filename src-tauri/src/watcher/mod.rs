@@ -196,9 +196,7 @@ fn git_path_kind(path: &Path, internal_roots: &[PathBuf]) -> ChangeKind {
 
 impl WatcherState {
     fn lock_sessions(&self) -> Result<MutexGuard<'_, HashMap<String, WatchSession>>, String> {
-        self.sessions
-            .lock()
-            .map_err(|e| format!("Watcher lock poisoned: {}", e))
+        Ok(crate::supervisor::lock_or_recover(&self.sessions))
     }
 
     /// Drops a reserved slot only if it is still the session we inserted.

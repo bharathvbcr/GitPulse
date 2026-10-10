@@ -91,6 +91,7 @@
   let backendLines = $state<string[]>([]);
   let persistedLog = $state<PersistedLog | null>(null);
   let memoryReadError = $state<string | null>(null);
+  let degradedSubsystems = $state<{ subsystem: string; reason: string; panics: number }[]>([]);
   let backendLoadGeneration = 0;
   let backendLoad: Promise<void> | null = null;
   const diagnosticHealth = diagnostics.health;
@@ -138,9 +139,10 @@
   }
 
   async function loadBackendContext(generation: number): Promise<void> {
-    const [memoryResult, persistedResult] = await Promise.allSettled([
+    const [memoryResult, persistedResult, degradedResult] = await Promise.allSettled([
       invoke<string[]>("cmd_diagnostic_log_tail", {}),
       invoke<PersistedLog>("cmd_diagnostic_persisted_log", {}),
+      invoke<{ subsystem: string; reason: string; panics: number }[]>("cmd_degraded_subsystems", {}),
     ]);
     if (!isCurrentBackendLoad(generation, backendLoadGeneration, isOpen)) return;
 
@@ -161,6 +163,17 @@
               : null,
           }
         : unreadablePersistedLog(formatDiagnosticFailure(persistedResult.reason));
+    // A background thread that panicked and is being retried. Best effort: an
+    // unreadable list is not a claim that nothing is degraded, but it must not
+    // hide the logs either.
+    degradedSubsystems =
+      degradedResult.status === "fulfilled" && Array.isArray(degradedResult.value)
+        ? degradedResult.value.map((d) => ({
+            subsystem: redactDiagnosticText(String(d.subsystem)),
+            reason: redactDiagnosticText(String(d.reason)),
+            panics: Number(d.panics) || 1,
+          }))
+        : [];
     backendStatus = classifyBackendDiagnostics(memoryReadError, backendLines, persistedLog);
   }
 
@@ -170,6 +183,7 @@
     backendLines = [];
     persistedLog = null;
     memoryReadError = null;
+    degradedSubsystems = [];
     const request = loadBackendContext(generation);
     backendLoad = request;
     void request.finally(() => {
@@ -334,6 +348,11 @@
           {#if memoryReadError}
             <p class="text-[11px] text-amber-300 wrap-break-word">Current-session log could not be read: {memoryReadError}</p>
           {/if}
+          {#each degradedSubsystems as degraded (degraded.subsystem)}
+            <p class="text-[11px] text-amber-300 wrap-break-word">
+              {degraded.subsystem} hit an internal error{degraded.panics > 1 ? ` ${degraded.panics} times` : ""} and is retrying: {degraded.reason}
+            </p>
+          {/each}
           {#if persistedLog?.degraded}
             <p class="text-[11px] text-amber-300 wrap-break-word">Durable log is incomplete: {persistedLog.degraded}</p>
           {/if}

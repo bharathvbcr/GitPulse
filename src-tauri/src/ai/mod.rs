@@ -275,20 +275,30 @@ fn probe_model(base_url: &str, model: &str) -> Result<ProbeResult, String> {
     {
         return hit.outcome;
     }
-    let outcome = fetch_probe(base_url, model);
-    if let Ok(mut cache) = probe_cache().lock() {
-        // Entries for (url, model) pairs nobody asks about anymore would
-        // otherwise accumulate one per selection ever made; drop them here.
-        cache.retain(|_, entry| entry.fresh());
-        cache.insert(
-            key,
-            CachedProbe {
-                fetched_at: Instant::now(),
-                outcome: outcome.clone(),
-            },
-        );
-    }
-    outcome
+    // One probe per (url, model), however many callers ask while it runs: a
+    // status poll and a generation arriving together used to run it twice,
+    // each up to ten seconds.
+    static FLIGHTS: OnceLock<
+        crate::singleflight::SingleFlight<(String, String), Result<ProbeResult, String>>,
+    > = OnceLock::new();
+    FLIGHTS
+        .get_or_init(Default::default)
+        .run(key.clone(), || {
+            let outcome = fetch_probe(base_url, model);
+            if let Ok(mut cache) = probe_cache().lock() {
+                // Entries for (url, model) pairs nobody asks about anymore
+                // would otherwise accumulate one per selection ever made.
+                cache.retain(|_, entry| entry.fresh());
+                cache.insert(
+                    key.clone(),
+                    CachedProbe {
+                        fetched_at: Instant::now(),
+                        outcome: outcome.clone(),
+                    },
+                );
+            }
+            outcome
+        })
 }
 
 /// The uncached probe: one harness `capability.probe` round trip.
@@ -1657,6 +1667,33 @@ mod tests {
         );
         assert_eq!(first.context_window, second.context_window);
         assert_eq!(first.describe, second.describe);
+    }
+
+    /// The defect: concurrent callers for one (url, model) each ran the probe,
+    /// up to ten seconds apiece. They now share one run.
+    #[test]
+    fn concurrent_probes_for_one_key_reach_the_harness_once() {
+        let _serial = PROBE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _clear = ClearFakeProbe;
+        let hits = Arc::new(AtomicUsize::new(0));
+        let counter = hits.clone();
+        *FAKE_PROBE.lock().expect("fake probe registry") = Some(Arc::new(move |_, _| {
+            counter.fetch_add(1, Ordering::SeqCst);
+            std::thread::sleep(Duration::from_millis(300));
+            Ok(ProbeResult {
+                context_window: 4_096,
+                ..Default::default()
+            })
+        }));
+        let callers: Vec<_> = (0..6)
+            .map(|_| std::thread::spawn(|| probe_model("http://127.0.0.1:9", "single-flight")))
+            .collect();
+        for caller in callers {
+            assert_eq!(caller.join().unwrap().expect("probe").context_window, 4_096);
+        }
+        assert_eq!(hits.load(Ordering::SeqCst), 1, "the probe ran once per caller");
     }
 
     #[test]

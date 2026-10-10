@@ -834,28 +834,25 @@ pub fn start_scheduler() -> Result<(), String> {
     if SCHEDULER_STARTED.swap(true, Ordering::SeqCst) {
         return Ok(());
     }
-    std::thread::Builder::new()
-        .name("gitpulse-cleaner-clock".into())
-        .spawn(move || loop {
-            match cleaner.state() {
-                Ok(state)
-                    if state.config.enabled
-                        && !state.running
-                        && super::now() >= state.config.next_run_at =>
-                {
-                    if let Err(e) = cleaner.start(true, state.config.revision, super::now()) {
-                        log::warn!("Scheduled cleaner could not start: {e}");
-                    }
+    crate::supervisor::spawn_loop("gitpulse-cleaner-clock", Duration::from_secs(30), move || {
+        match cleaner.state() {
+            Ok(state)
+                if state.config.enabled
+                    && !state.running
+                    && super::now() >= state.config.next_run_at =>
+            {
+                if let Err(e) = cleaner.start(true, state.config.revision, super::now()) {
+                    log::warn!("Scheduled cleaner could not start: {e}");
                 }
-                Ok(_) => {}
-                Err(e) => log::warn!("Cleaner schedule is unavailable: {e}"),
             }
-            std::thread::sleep(Duration::from_secs(30));
-        })
-        .map_err(|e| {
-            SCHEDULER_STARTED.store(false, Ordering::SeqCst);
-            e.to_string()
-        })?;
+            Ok(_) => {}
+            Err(e) => log::warn!("Cleaner schedule is unavailable: {e}"),
+        }
+    })
+    .map_err(|e| {
+        SCHEDULER_STARTED.store(false, Ordering::SeqCst);
+        e.to_string()
+    })?;
     Ok(())
 }
 
