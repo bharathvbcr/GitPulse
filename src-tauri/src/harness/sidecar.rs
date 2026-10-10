@@ -1444,6 +1444,8 @@ impl ProfileConnection {
                 | "work.runs.managed.prepare"
                 | "work.runs.managed.activate"
                 | "work.runs.managed.stop"
+                | "work.verify.task"
+                | "work.verify.get"
         ) {
             return Err(HarnessError::Protocol(
                 "unsupported profile worker operation".into(),
