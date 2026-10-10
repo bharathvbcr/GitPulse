@@ -13,6 +13,24 @@ before that tag is pushed.
 
 ### Added
 
+- **Smart task search.** The board's search reads a query language — words,
+  `"phrases"`, `OR`, `-exclusions`, and `repo:`, `label:`, `owner:`, `kind:`,
+  `status:`, `priority:`, `severity:` and `is:` filters (comma lists for any
+  of several) — and ranks matches by title, labels, type, owner and
+  repository, finding word forms, related software terms ("login" finds
+  "sign-in"), parts of words and close spellings. It is lexical ranking, not
+  embeddings, and says so. A query searches every task on the board rather
+  than the loaded column pages: one status-less candidate set ranked locally,
+  plus one full-text read for the most selective word so descriptions are
+  matched too. A line under the search says what was searched, and a partial
+  answer always says it is partial and offers **Load more tasks**. Matches
+  order by **Relevance** or **Board order**; dragging is off under Relevance.
+  Cards say why they matched when it is not obvious. The search box completes
+  filter names and values, and every filter shows as a removable chip.
+- The Filters panel adds column, repository and severity filters and counts
+  per value. Its dropdowns write into the query text, so they never disagree
+  with what is typed, and a saved view's filters are part of its search;
+  views saved before keep their filters.
 - Task checklists with a done state per item, and links between tasks
   (parent, blocks, related, duplicate of), edited in the task sheet and read
   from both ends in the agent brief.

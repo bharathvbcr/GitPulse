@@ -34,7 +34,12 @@
   import { linkTaskToIssue, MAX_TASK_ISSUE_BATCH, prepareTaskIssues, runTaskIssues, summarizeTaskIssues, taskIssuesConfirmation, type TaskIssueResult, type TaskIssueTarget } from "../workbench/taskIssue";
   import { askConfirm } from "../stores/modalStore";
   import { openExternal } from "../desktop/openExternal";
-  import { cardChrome, cardMatchesFacet, collectFacetOptions, emptyFacet, facetActive, allLoadedCards, reorderPlan, partitionLanes, type TaskFacet, type TaskLane } from "../workbench/taskOrganize";
+  import { cardChrome, collectFacetOptions, emptyFacet, facetActive, allLoadedCards, reorderPlan, partitionLanes, type TaskLane } from "../workbench/taskOrganize";
+  import { hasFreeText, isEmptyQuery, mergeLegacyFacet, parseTaskQuery, type SuggestionSources } from "../workbench/taskQuery";
+  import { countBy, describeMatch, facetCounts, searchCards, type RankContext, type RankedCard, type SearchOrder } from "../workbench/taskRank";
+  import { CANDIDATE_PAGE, bucketByStatus, canLoadMore, candidatesComplete, describeSearch, mergeCandidates, planSearch, type CandidateSet, type SearchPlan } from "../workbench/taskSearchPlan";
+  import TaskSearchField from "./TaskSearchField.svelte";
+  import TaskSearchFilters from "./TaskSearchFilters.svelte";
   import { plural } from "../format";
   import { archiveAction, archivable, archiveState } from "../workbench/taskArchive";
   import { interfaceStore } from "../stores/interfaceStore";
@@ -122,13 +127,34 @@
   /** Deferred deletions being written now; a board writing one is busy. */
   let deletesRunning = $state(0);
   let loadedKey = $state("");
+  /** The scope the loaded columns were read for, whatever the query was. */
+  let loadedScope = $state("");
   let unreadError = $state("");
   let unreadRevision = 0, initializationRevision = 0, openingRevision = 0;
-  const boardKey = $derived(JSON.stringify([scope, search]));
+  // ---- Search (`taskQuery.ts`, `taskRank.ts`, `taskSearchPlan.ts`) --------
+  // The query text is the one source of truth for words and filters. A query
+  // switches the board from per-column pages to one ranked candidate set;
+  // the fetch key changes only with what the store is asked, so typing
+  // re-ranks what is loaded without a request.
+  const parsed = $derived(parseTaskQuery(search));
+  const plan = $derived(planSearch(scope, parsed, repositories));
+  const searching = $derived(plan.mode === "search");
+  let sort = $state<SearchOrder>("relevance");
+  /** The search's candidates; null while the board browses columns. */
+  let candidates = $state.raw<CandidateSet | null>(null);
+  const boardKey = $derived(JSON.stringify([scope, plan.key]));
   // A deletion waiting out its undo window is already gone from the board:
   // its cards, its counts and anything a selection could act on.
-  const displayColumns = $derived(loadedKey === boardKey ? (pendingDelete ? removeFromColumns(columns, pendingDelete.ids) : columns) : {});
-  $effect(() => { boardKey; facet; selected = new Set(); selectionAnchor = null; menu = null; });
+  /**
+   * A new search on the same scope while its candidates load, or a cleared
+   * one while its columns load: the cards already loaded are real tasks of
+   * this scope, so the board filters and ranks them at once instead of going
+   * blank. Another scope's cards are never shown, and nothing pages, counts
+   * or reports until the load lands.
+   */
+  const provisional = $derived(loadedKey !== "" && loadedKey !== boardKey && loadedScope === JSON.stringify(scope) && (searching || candidates !== null));
+  const displayColumns = $derived(loadedKey === boardKey || provisional ? (pendingDelete ? removeFromColumns(columns, pendingDelete.ids) : columns) : {});
+  $effect(() => { boardKey; search; sort; selected = new Set(); selectionAnchor = null; menu = null; });
   // An undo offer belongs to the board it was made on. A pending deletion is
   // not withdrawn by a scope change: it is still the reader's to undo.
   $effect(() => { JSON.stringify(scope); untrack(() => offerUndo(null)); });
@@ -162,7 +188,6 @@
    * start none.
    */
   let enhanceStart = $state(0);
-  let facet = $state<TaskFacet>(emptyFacet());
   let showFilters = $state(false);
   let quickAdding = $state(false);
   let quickAddEl = $state<{ focus: () => void }>();
@@ -224,10 +249,77 @@
     },
     onDismiss: (reason: string) => closeAddMenu({ restoreFocus: reason === "escape" }),
   });
-  const total = $derived(STATUSES.reduce((sum, status) => sum + (displayColumns[status]?.total ?? 0), 0));
   const loadedCards = $derived(allLoadedCards(displayColumns));
   const facetOptions = $derived(collectFacetOptions(loadedCards));
-  const filtering = $derived(facetActive(facet) || search.trim().length > 0);
+  const filtering = $derived(!isEmptyQuery(parsed));
+  /** Relevance reorders only a query with words; filters alone keep board order. */
+  const order = $derived<SearchOrder>(searching && hasFreeText(parsed) ? sort : "board");
+  // Description hits belong to the word they were read for: never credited
+  // to a new word while its own read is in flight.
+  const rankContext = $derived<RankContext>({ nowSec: now, repoName, serverHits: loadedKey === boardKey ? candidates?.textHits : undefined, serverWord: plan.word });
+  const outcome = $derived(searching && (loadedKey === boardKey || provisional) ? searchCards(loadedCards, parsed, rankContext, order) : null);
+  /** The matching cards per column, in the order the search gives them. */
+  const matched = $derived.by(() => {
+    const byStatus: Partial<Record<TaskStatus, TaskCard[]>> = {};
+    const ranked = new Map<string, RankedCard>();
+    for (const hit of outcome?.cards ?? []) {
+      (byStatus[hit.card.status] ??= []).push(hit.card);
+      ranked.set(hit.card.id, hit);
+    }
+    return { byStatus, ranked };
+  });
+  /**
+   * Cards keep their place under Relevance only as a reading order: a drop
+   * or a keyboard nudge there would write a position relative to neighbours
+   * that are not the column's.
+   */
+  const reorderLocked = $derived(searching && order === "relevance");
+  /** A column's count: the store's total while browsing, the matches while searching. */
+  function columnCount(status: TaskStatus): number {
+    return searching ? visibleIn(status).length : displayColumns[status]?.total ?? 0;
+  }
+  const total = $derived(searching ? outcome?.cards.length ?? 0 : STATUSES.reduce((sum, status) => sum + (displayColumns[status]?.total ?? 0), 0));
+  const searchReport = $derived.by(() => {
+    if (!searching) return parsed.warnings.length ? parsed.warnings.join(" · ") : null;
+    if (provisional) return "Searching every task on this board…";
+    if (!candidates || !outcome) return null;
+    return describeSearch({ matched: outcome.cards.length, set: candidates, word: plan.word, relaxed: outcome.relaxed, warnings: parsed.warnings, ranked: order === "relevance" });
+  });
+  const moreCandidates = $derived(searching && candidates !== null && loadedKey === boardKey && canLoadMore(candidates));
+  /** Completions for the search box: every loaded value, and every registered repository. */
+  const suggestionSources = $derived.by<SuggestionSources>(() => {
+    const cards = loadedCards;
+    const repoCounts = countBy(cards, (card) => card.repository_ids.map((id) => repoName(id) ?? ""));
+    const repos = [...repoCounts, ...repositories.filter((repo) => !repoCounts.some((row) => row.value === repo.name)).map((repo) => ({ value: repo.name, count: 0 }))];
+    return {
+      repo: scope.kind === "repository" ? [] : repos,
+      label: countBy(cards, (card) => card.labels),
+      owner: countBy(cards, (card) => card.owner?.trim() ? [card.owner.trim()] : []),
+      kind: countBy(cards, (card) => card.kind.trim() ? [card.kind] : []),
+      severity: countBy(cards, (card) => card.severity?.trim() ? [card.severity] : []),
+    };
+  });
+  /**
+   * The Filters dropdowns' values and counts, only while the panel is open.
+   * Every loaded value is offered, so the options do not shift under the
+   * reader; each count is what picking it would match with the rest of the
+   * query held, zero included.
+   */
+  const filterCounts = $derived.by(() => {
+    if (!showFilters) return {};
+    const cards = loadedCards, query = parsed, context = rankContext;
+    const facet = (key: "repo" | "kind" | "owner" | "label" | "severity", pick: (card: TaskCard) => readonly string[]) => {
+      const counted = new Map(facetCounts(cards, query, context, key, pick).map((row) => [row.value, row.count]));
+      return countBy(cards, pick).map((row) => ({ value: row.value, count: counted.get(row.value) ?? 0 }));
+    };
+    return {
+      repo: facet("repo", (card) => card.repository_ids.map((id) => repoName(id) ?? "")),
+      kind: facet("kind", (card) => card.kind.trim() ? [card.kind] : []),
+      owner: facet("owner", (card) => card.owner?.trim() ? [card.owner.trim()] : []),
+      label: facet("label", (card) => card.labels),
+      severity: facet("severity", (card) => card.severity?.trim() ? [card.severity] : []),
+    };
+  });
   // Layout, density, hidden columns and card chips are reader preferences the
   // profile remembers; the header and the View menu write them back.
   const layout = $derived($interfaceStore.taskLayout);
@@ -242,7 +334,7 @@
   const importableGroups = $derived(tabGroups($repoStore.openTabs, $repoStore.groupColors));
   let movingGroup = $state(false);
   let importingGroups = $state(false);
-  const columnTotals = $derived(Object.fromEntries(STATUSES.map((status) => [status, displayColumns[status]?.total ?? 0])) as Partial<Record<TaskStatus, number>>);
+  const columnTotals = $derived(Object.fromEntries(STATUSES.map((status) => [status, columnCount(status)])) as Partial<Record<TaskStatus, number>>);
   /**
    * Work a hidden column is keeping off screen.
    *
@@ -290,7 +382,12 @@
   let relinks = $state<{ taskId: string; number: number; title: string }[]>([]);
   const busy = $derived(moving || opening || deleting || deletesRunning > 0 || filingIssue || actionDialog !== null || mergeDialog !== null || pendingUpdate !== null);
   const openCardIds = $derived(openSavedTaskIds(taskTabs));
-  const inProgressCount = $derived(displayColumns.in_progress?.total ?? 0);
+  /**
+   * The scope's in-progress total. A search's candidates only know it when
+   * they are every task of the board's own scope; otherwise the last
+   * browsing total stands rather than a count of whatever loaded.
+   */
+  let inProgressCount = $state(0);
   /** The server's count of archived tasks in this scope, so the badge is not a page size. */
   let archivedCount = $state(0);
   $effect(() => {
@@ -302,6 +399,8 @@
     return visibleBoardStatuses(hiddenColumns, counts, drag !== null);
   });
   const listCards = $derived(shown.flatMap((status) => visibleIn(status)));
+  /** What is on screen per column, for range and select-all in the order it is drawn. */
+  const visibleColumns = $derived(Object.fromEntries(STATUSES.map((status) => [status, { items: visibleIn(status) }])) as Partial<Record<TaskStatus, { items: TaskCard[] }>>);
   // ---- Saved views, lanes and limits, per board (`taskBoardViews.ts`) -----
   const viewBoard = $derived(viewBoardKey(scope));
   const wipLimits = $derived(boardPrefs($interfaceStore.taskBoards, viewBoard).wip);
@@ -316,12 +415,14 @@
     swimlane: $interfaceStore.taskSwimlane,
     hiddenColumns: [...hiddenColumns],
     cardFields: [...$interfaceStore.taskCardFields],
-    facet: { ...facet },
+    // Filters live in the query text; `facet` is kept for the stored shape.
+    facet: emptyFacet(),
     search,
   });
   /** Against the store's total for the column, never its loaded page. */
   function wipOf(status: TaskStatus) {
-    return loadedKey === boardKey ? wipState(displayColumns[status]?.total, wipLimits[status]) : null;
+    // A search's counts are matches, not the column's load.
+    return loadedKey === boardKey && !searching ? wipState(displayColumns[status]?.total, wipLimits[status]) : null;
   }
   function laneAria(group: TaskLane): string {
     const by = swimlane === "label" ? "first label" : swimlane;
@@ -330,14 +431,14 @@
   /** Put a saved view back: the layout preferences, then this board's filters. */
   function applyView(view: SavedTaskView) {
     interfaceStore.applyTaskView(view);
-    facet = { ...view.facet };
-    search = view.search;
+    // A view saved before the query language kept its filters in `facet`.
+    search = mergeLegacyFacet(view.search, view.facet);
     if (facetActive(view.facet)) showFilters = true;
     announce = `Showing the saved view ${view.name}`;
   }
   function repoName(id: string) { return repositories.find((repo) => repo.id === id)?.name; }
   function visibleIn(status: TaskStatus): TaskCard[] {
-    return (displayColumns[status]?.items ?? []).filter((card) => cardMatchesFacet(card, facet, now));
+    return searching ? matched.byStatus[status] ?? [] : displayColumns[status]?.items ?? [];
   }
 
   async function catalog() {
@@ -347,18 +448,36 @@
     workspaces = groups.items; workspaceTotal = groups.total; workspaceCursor = groups.next_cursor;
     catalogError = "";
   }
-  async function loadBoard(target: Scope = scope, query: string = search) {
-    const generation = ++revision, key = JSON.stringify([target, query]); loading = true; error = "";
+  async function loadBoard(target: Scope = scope, current: SearchPlan = plan) {
+    const generation = ++revision, key = JSON.stringify([target, current.key]); loading = true; error = "";
     try {
       // Columns hold what is on the board: an archived task leaves them
       // whatever its status. The badge is the archive's own total for the
       // scope — the board's search does not narrow it; the dock has its own.
+      const archived = listTasks(target, null, "", undefined, 1, { archived: true });
+      if (current.mode === "search") {
+        // One status-less candidate set, ranked locally, and one full-text
+        // read for the word descriptions may hold (`taskSearchPlan.ts`).
+        const [broad, text, archive] = await Promise.all([
+          listTasks(current.scope, null, "", undefined, CANDIDATE_PAGE, BOARD),
+          current.word ? listTasks(current.scope, null, current.word, undefined, CANDIDATE_PAGE, BOARD) : null,
+          archived,
+        ]);
+        if (generation !== revision || disposed || key !== boardKey) return;
+        const set = mergeCandidates(null, broad, text);
+        const pages = bucketByStatus(set.cards);
+        candidates = set; columns = pages; loadedKey = key; loadedScope = JSON.stringify(target); archivedCount = archive.total;
+        if (candidatesComplete(set) && JSON.stringify(current.scope) === JSON.stringify(target)) inProgressCount = pages.in_progress?.total ?? 0;
+        selected = new Set([...selected].filter((id) => loadedHas(id, pages)));
+        return;
+      }
       const [pages, archive] = await Promise.all([
-        Promise.all(STATUSES.map(async (status) => [status, await listTasks(target, status, query, undefined, TASK_PAGE_SIZE, BOARD)] as const)),
-        listTasks(target, null, "", undefined, 1, { archived: true }),
+        Promise.all(STATUSES.map(async (status) => [status, await listTasks(target, status, "", undefined, TASK_PAGE_SIZE, BOARD)] as const)),
+        archived,
       ]);
       if (generation !== revision || disposed || key !== boardKey) return;
-      columns = Object.fromEntries(pages); loadedKey = key; archivedCount = archive.total;
+      columns = Object.fromEntries(pages); candidates = null; loadedKey = key; loadedScope = JSON.stringify(target); archivedCount = archive.total;
+      inProgressCount = columns.in_progress?.total ?? 0;
       selected = new Set([...selected].filter((id) => loadedHas(id, Object.fromEntries(pages))));
     } catch (cause) { if (generation === revision && !disposed) error = explainError(cause); }
     finally { if (generation === revision && !disposed) loading = false; }
@@ -496,9 +615,12 @@
   });
   $effect(() => {
     if (!initialized || !active) return;
-    const target = scope, query = search;
+    // Keyed on what the store is asked, not the text: a keystroke that only
+    // changes the ranking or a filter re-ranks what is loaded.
+    boardKey;
+    const target = untrack(() => scope), current = untrack(() => plan);
     loading = true;
-    const timer = setTimeout(() => { void loadBoard(target, query); void loadUnread(target); }, 250);
+    const timer = setTimeout(() => { void loadBoard(target, current); void loadUnread(target); }, 250);
     return () => { clearTimeout(timer); revision++; };
   });
   // ---- Where each repository's checkout is -------------------------------
@@ -833,12 +955,30 @@
     taskTabs = openTaskTab(taskTabs, { id: task.id, title: task.title, status: task.status, draft: false });
     session = { tabId: task.id, pane: task.id, value: task };
   }
-  async function pageColumn(status: TaskStatus, cursor?: string) {
-    if (loading || moving || loadedKey !== boardKey) return;
+  /** The next page of a search's candidates (and of its description hits). */
+  async function loadMoreCandidates() {
+    const set = candidates, current = plan;
+    if (!set || loading || moving || loadedKey !== boardKey || !canLoadMore(set)) return;
     const generation = revision, key = boardKey;
     loading = true; error = "";
     try {
-      const result = await listTasks(scope, status, search, cursor, TASK_PAGE_SIZE, BOARD);
+      const [broad, text] = await Promise.all([
+        set.broad.cursor ? listTasks(current.scope, null, "", set.broad.cursor, CANDIDATE_PAGE, BOARD) : null,
+        set.text?.cursor && current.word ? listTasks(current.scope, null, current.word, set.text.cursor, CANDIDATE_PAGE, BOARD) : null,
+      ]);
+      if (generation !== revision || disposed || key !== boardKey) return;
+      const next = mergeCandidates(set, broad, text);
+      candidates = next; columns = bucketByStatus(next.cards);
+      announce = `Searched ${next.broad.loaded} of ${next.broad.total} tasks.`;
+    } catch (cause) { if (generation === revision && !disposed) error = explainError(cause); }
+    finally { if (generation === revision && !disposed) loading = false; }
+  }
+  async function pageColumn(status: TaskStatus, cursor?: string) {
+    if (searching || loading || moving || loadedKey !== boardKey) return;
+    const generation = revision, key = boardKey;
+    loading = true; error = "";
+    try {
+      const result = await listTasks(scope, status, "", cursor, TASK_PAGE_SIZE, BOARD);
       if (generation !== revision || disposed || key !== boardKey) return;
       const items = cursor ? [...new Map([...(columns[status]?.items ?? []), ...result.items].map((item) => [item.id, item])).values()] : result.items;
       columns = { ...columns, [status]: { ...result, items, shown: items.length } };
@@ -874,7 +1014,7 @@
   }
   function onCardPointerDown(e: PointerEvent, card: TaskCard) {
     if (opening) return;
-    if (e.button !== 0 || busy || menu) return;
+    if (e.button !== 0 || busy || menu || reorderLocked) return;
     press = { card, x: e.clientX, y: e.clientY };
     (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
   }
@@ -910,7 +1050,7 @@
     const position = insertionPosition(before,after);
     if (after !== null && (position >= after || before !== null && position <= before)) {
       const plan = reorderPlan(items,card,insertIndex);
-      if (columns[over]?.next_cursor || plan.cards.length > MAX_TASK_SELECTION) { error = `This column needs re-spacing. Load its remaining tasks first; up to ${MAX_TASK_SELECTION} tasks can be reordered together. Priority and title sorting remain available.`; return; }
+      if (columns[over]?.next_cursor || (candidates && !candidatesComplete(candidates)) || plan.cards.length > MAX_TASK_SELECTION) { error = `This column needs re-spacing. Load its remaining tasks first; up to ${MAX_TASK_SELECTION} tasks can be reordered together. Priority and title sorting remain available.`; return; }
       await applyUpdate(new TaskBatch(plan.cards,{kind:"reorder",status:over,positions:plan.positions}));
     } else await moveCard(card, over, position);
   }
@@ -926,7 +1066,7 @@
       return;
     }
     if (e.shiftKey) {
-      const ids = flattenVisibleIds(displayColumns, shown, (item) => cardMatchesFacet(item, facet, now));
+      const ids = flattenVisibleIds(visibleColumns, shown, () => true);
       selected = rangeSelect(ids, selectionAnchor, card.id);
       return;
     }
@@ -1013,7 +1153,7 @@
       next.focus();
       const id = next.dataset.cardId;
       if (id && e.shiftKey && (e.key === "ArrowUp" || e.key === "ArrowDown")) {
-        const ids = flattenVisibleIds(displayColumns, shown, (item) => cardMatchesFacet(item, facet, now));
+        const ids = flattenVisibleIds(visibleColumns, shown, () => true);
         if (!selectionAnchor) selectionAnchor = card.id;
         selected = rangeSelect(ids, selectionAnchor, id);
       }
@@ -1046,6 +1186,7 @@
    */
   async function nudgeCard(card: TaskCard, delta: -1 | 1) {
     if (busy) return;
+    if (reorderLocked) { announce = "Matches are ordered by relevance. Switch to Board order to move a card within its column."; return; }
     const items = displayColumns[card.status]?.items ?? [];
     const from = items.findIndex((item) => item.id === card.id);
     const to = from + delta;
@@ -1073,7 +1214,7 @@
     }
     if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "a") {
       e.preventDefault();
-      selected = new Set(flattenVisibleIds(displayColumns, shown, (item) => cardMatchesFacet(item, facet, now)));
+      selected = new Set(flattenVisibleIds(visibleColumns, shown, () => true));
       selectionAnchor = [...selected][0] ?? null;
       return;
     }
@@ -1650,7 +1791,7 @@
   <span class="column-meta">
     <!-- The store's count for the column, not its loaded page: a column
          showing thirty of forty is over a limit of thirty-five. -->
-    <span data-testid="task-column-count" title={limit ? `${columns[status]?.total ?? 0} of a work-in-progress limit of ${limit}` : undefined}>{columns[status]?.total ?? "—"}{#if limit}<span class="limit">/{limit}</span>{/if}</span>
+    <span data-testid="task-column-count" title={searching ? `${columnCount(status)} matching in ${STATUS_LABELS[status]}` : limit ? `${columns[status]?.total ?? 0} of a work-in-progress limit of ${limit}` : undefined}>{columns[status] && !(provisional && !searching) ? columnCount(status) : "—"}{#if limit && !searching}<span class="limit">/{limit}</span>{/if}</span>
     {#if wip === "over"}<span class="over-badge" data-testid="task-column-over">Over limit<span class="sr-only">: {STATUS_LABELS[status]} holds {columns[status]?.total ?? 0} tasks against a limit of {limit}</span></span>{/if}
     <button type="button" class="gp-icon-btn" aria-label={`New task in ${STATUS_LABELS[status]}`} title={creation.blocked ?? creation.caveat ?? `New task in ${STATUS_LABELS[status]}`} disabled={!creation.allowed} onclick={() => void createTask(status)}><Plus size={11} /></button>
   </span>
@@ -1699,6 +1840,7 @@
       </div>
     {/if}
     {#if face.labels.length && cardFields.has("labels")}<div class="labels">{#each face.labels as label}<span>{label}</span>{/each}{#if chrome.extraLabels}<span>+{chrome.extraLabels}</span>{/if}</div>{/if}
+    {@render matchHint(card)}
   </button>
 {/snippet}
 {#snippet listRow(card: TaskCard)}
@@ -1731,7 +1873,15 @@
     {#if face.repo && cardFields.has("repo")}<span class="muted">{face.repo}{chrome.extraRepos ? ` +${chrome.extraRepos}` : ""}</span>{/if}
     {#if chrome.owner && cardFields.has("owner")}<span class="muted">{chrome.owner}</span>{/if}
     {#if dueLabel(chrome.due) && cardFields.has("due")}<span class="due" data-due={chrome.due}>{dueLabel(chrome.due)}</span>{/if}
+    {@render matchHint(card)}
   </button>
+{/snippet}
+{#snippet matchHint(card: TaskCard)}
+  <!-- Why a search matched a card it would not obviously match: a related
+       word, a close spelling, or a description only the store can read. -->
+  {@const hit = searching ? matched.ranked.get(card.id) : undefined}
+  {@const why = hit ? describeMatch(hit) : ""}
+  {#if why}<span class="match-hint" data-testid="task-match-hint">Matched {why}</span>{/if}
 {/snippet}
 {#snippet columnPaging(status: TaskStatus, named = false)}
   <!-- One control for both layouts. The list used to have none, so a task
@@ -1824,7 +1974,7 @@
         {#if repositoryPath}<button type="button" class="link" data-testid="task-board-all" title="Open the Tasks board for every repository and workspace" onclick={() => interfaceStore.setGlobalSurface("tasks")}>All tasks</button>{/if}
       </div>
       <div class="actions">
-        <label class="search"><Search size={12} /><input id="task-search" class="gp-field" aria-label="Search tasks" type="search" bind:value={search} placeholder="Search tasks" maxlength="512" /></label>
+        <div class="search"><TaskSearchField id="task-search" bind:value={search} sources={suggestionSources} busy={loading && searching} /></div>
         <div class="gp-segmented" class:gp-liquid-tabs={macos} role="group" aria-label="Task layout">
           <button type="button" class="gp-seg-btn" data-active={layout === "board"} aria-pressed={layout === "board"} onclick={() => interfaceStore.setTaskLayout("board")}><LayoutGrid size={12} /> Board</button>
           <button type="button" class="gp-seg-btn" data-active={layout === "list"} aria-pressed={layout === "list"} onclick={() => interfaceStore.setTaskLayout("list")}><List size={12} /> List</button>
@@ -1858,36 +2008,21 @@
         {/if}
       </div>
     </header>
-    {#if initialized && (showFilters || filtering)}
-      <div class="facets" aria-label="Organize tasks">
-        <select class="gp-select" aria-label="Filter by priority" bind:value={facet.priority}>
-          <option value="all">All priorities</option>
-          <option value={0}>Urgent</option>
-          <option value={1}>High</option>
-          <option value={2}>Normal</option>
-          <option value={3}>Low</option>
-        </select>
-        <select class="gp-select" aria-label="Filter by type" bind:value={facet.kind}>
-          <option value="all">All types</option>
-          {#each facetOptions.kinds as kind}<option value={kind}>{kind}</option>{/each}
-        </select>
-        <select class="gp-select" aria-label="Filter by owner" bind:value={facet.owner}>
-          <option value="all">All owners</option>
-          <option value="">Unassigned</option>
-          {#each facetOptions.owners as owner}<option value={owner}>{owner}</option>{/each}
-        </select>
-        <select class="gp-select" aria-label="Filter by label" bind:value={facet.label}>
-          <option value="all">All labels</option>
-          {#each facetOptions.labels as label}<option value={label}>{label}</option>{/each}
-        </select>
-        <select class="gp-select" aria-label="Filter by due date" bind:value={facet.due}>
-          <option value="all">Any due date</option>
-          <option value="overdue">Overdue</option>
-          <option value="soon">Due soon</option>
-          <option value="none">No due date</option>
-        </select>
-        {#if filtering}<button type="button" class="gp-btn" onclick={() => { facet = emptyFacet(); search = ""; }}>Clear filters</button>{/if}
-      </div>
+    {#if initialized}
+      <TaskSearchFilters
+        bind:value={search}
+        bind:sort
+        {parsed}
+        showSelects={showFilters}
+        counts={filterCounts}
+        showRepo={scope.kind !== "repository"}
+        report={searchReport}
+        relaxed={outcome?.relaxed ?? false}
+        sortable={searching && hasFreeText(parsed)}
+        canLoadMore={moreCandidates}
+        {loading}
+        onLoadMore={() => void loadMoreCandidates()}
+      />
     {/if}
     {#if creation.allowed}
       <div
@@ -2020,7 +2155,7 @@
            saved, because nothing had linked a repository. -->
       <EmptyState icon={Inbox} title="No tasks yet" hint={creation.blocked ?? creation.caveat ?? "Create a task in this scope. Cards stay on this board until you delete them."} action={creation.allowed ? { label: "New task", onClick: () => void createTask(), variant: "primary" } : undefined} />
     {:else if initialized && !loading && listCards.length === 0 && filtering}
-      <EmptyState icon={Search} title="No tasks match" hint="Clear search or filters to see the rest of this board. Server search only covers the current pages." action={{ label: "Clear filters", onClick: () => { facet = emptyFacet(); search = ""; }, variant: "secondary" }} />
+      <EmptyState icon={Search} title="No tasks match" hint={candidates && !candidatesComplete(candidates) ? `Only ${candidates.broad.loaded} of ${candidates.broad.total} tasks on this board were searched. Load more tasks to search the rest, or clear the search.` : "Nothing on this board matches every word and filter. Clear the search or remove a filter to see the rest."} action={moreCandidates ? { label: "Load more tasks", onClick: () => void loadMoreCandidates(), variant: "secondary" } : { label: "Clear filters", onClick: () => { search = ""; }, variant: "secondary" }} />
     {:else if layout === "list"}
       <div class="list" role="group" data-testid="task-columns" data-task-list aria-busy={loading || moving} aria-label="Task list">
         {#if laneList}
@@ -2267,15 +2402,15 @@
   header{padding:10px 14px;display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;border-bottom:1px solid rgb(var(--c-border) / 0.65)}
   h1{font-size:15px;line-height:1.2;font-weight:650;margin:0;display:flex;align-items:baseline;gap:8px}
   h1 span{font-size:11px;font-weight:500;color:rgb(var(--c-text-muted))}
-  .actions,.facets,.selection,.undo-strip{display:flex;gap:6px;align-items:center;flex-wrap:wrap}
-  .facets,.selection{padding:8px 14px}
+  .actions,.selection,.undo-strip{display:flex;gap:6px;align-items:center;flex-wrap:wrap}
+  .selection{padding:8px 14px}
   .selection,.undo-strip{margin:8px 14px 0;padding:8px 10px;border-radius:12px}
   .undo-strip>span{flex:1;min-width:0;font-size:12px}
-  button,input,select{font-size:12px}
+  button,input{font-size:12px}
   button:disabled{opacity:.5}
   .hint{font-size:11px;color:rgb(var(--c-text-muted))}
   .search{display:flex;align-items:center;gap:6px;color:rgb(var(--c-text-muted))}
-  .search input{width:160px}
+  .match-hint{display:block;margin-top:4px;font-size:10px;line-height:1.3;color:rgb(var(--c-text-muted));overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
   .columns{display:flex;gap:8px;padding:12px;overflow:auto;flex:1;min-height:0;align-items:stretch}
   .column{width:220px;min-width:196px;flex:1;display:flex;flex-direction:column;border-radius:12px;border:1px solid rgb(var(--c-border) / 0.65);overflow:hidden;min-height:0}
   .column.drop-target{border-color:rgb(var(--c-accent))}

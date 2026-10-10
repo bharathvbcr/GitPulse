@@ -765,7 +765,9 @@ if (params.has("check")) {
     check("empty searches explain the result and hide previous tasks", root.textContent.includes("No tasks match") && root.querySelectorAll('[data-task-card]').length === 0);
     await click("Clear task search"); await wait(() => card("task-1"));
     check("clearing search restores the board", Boolean(card("task-1")));
-    holdSearch = true; await change(search, "older"); await wait(() => heldSearch.length === 6);
+    // A query reads one status-less candidate set plus one full-text read for
+    // its most selective word; only the full-text read carries "older".
+    holdSearch = true; await change(search, "older"); await wait(() => heldSearch.length === 1);
     await change(search, "Ready task 01"); await wait(() => card("task-10"));
     heldSearch.forEach(release => release()); holdSearch = false; heldSearch = []; await settle();
     check("late search responses cannot replace newer results", Boolean(card("task-10")) && root.querySelectorAll('[data-task-card]').length === 1);
@@ -773,6 +775,35 @@ if (params.has("check")) {
     check("failed loads remain distinct from an empty task list", root.textContent.includes("Fixture task storage offline") && root.textContent.includes("Tasks unavailable") && !root.textContent.includes("No tasks match"));
     failList = false; await click("Retry loading tasks"); await settle(300);
     check("a failed search can be retried", root.textContent.includes("No tasks match") && !root.textContent.includes("Fixture task storage offline"));
+    await click("Clear task search"); await wait(() => card("task-1"));
+
+    // Smart search: word forms, close spellings, related words, filters.
+    const shownIds = () => [...root.querySelectorAll("[data-task-card]")].map(el => el.dataset.cardId).sort();
+    const report = () => root.querySelector('[data-testid="task-search-report"]')?.textContent ?? "";
+    await change(search, "sheet easer"); await settle(400);
+    check("search matches word forms and close spellings", JSON.stringify(shownIds()) === JSON.stringify(["task-2"]));
+    check("the search line says what was searched and how", report().includes("1 match in all") && report().includes("close spellings"));
+    await change(search, "bot"); await settle(400);
+    check("search finds related words and says why a card matched", JSON.stringify(shownIds()) === JSON.stringify(["task-3"])
+      && (card("task-3").querySelector('[data-testid="task-match-hint"]')?.textContent ?? "").includes("related word"));
+    await change(search, "label:usability"); await settle(400);
+    check("a typed filter narrows the board and shows as a removable chip", JSON.stringify(shownIds()) === JSON.stringify(["task-2"])
+      && Boolean(root.querySelector('[data-testid="task-search-chip"]')) && Boolean(button("Remove label: usability")));
+    await click("Remove label: usability"); await settle(400);
+    check("removing the chip removes the filter", search.value === "" && Boolean(card("task-1")));
+    await change(search, "repo:manvi"); await settle(400);
+    check("a repository filter matches every task linked to it", JSON.stringify(shownIds()) === JSON.stringify(["task-2", "task-3"]));
+    await change(search, "repo:manvi -review"); await settle(400);
+    check("an excluded word drops its tasks", JSON.stringify(shownIds()) === JSON.stringify(["task-2"]));
+    await change(search, "ready task"); await settle(400);
+    check("a worded search offers Relevance and Board order", Boolean(button("Relevance")) && button("Relevance").getAttribute("aria-pressed") === "true" && Boolean(button("Board order")));
+    search.focus(); await change(search, "label:us"); await settle(100);
+    const completions = () => document.querySelector('[role="listbox"][aria-label="Search completions"]');
+    check("the search box completes filter values from the loaded tasks", (completions()?.textContent ?? "").includes("label:usability"));
+    search.dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowDown", bubbles: true })); await settle();
+    search.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true })); await settle(400);
+    check("taking a completion writes it into the query", search.value.trim() === "label:usability" && JSON.stringify(shownIds()) === JSON.stringify(["task-2"]));
+    search.blur();
     await click("Clear task search"); await wait(() => card("task-1"));
 
     await click("Developer tools"); await wait(() => Boolean(card("task-3")) && !card("task-1"));
@@ -983,9 +1014,11 @@ if (params.has("check")) {
     check("bulk organization preserves both task briefs", ["task-14","task-15"].every(id=>tasks.find(task=>task.id===id).status==="review" && tasks.find(task=>task.id===id).description.includes("Keep changes focused")));
     await click("List view");
     check("list layout reuses the same task data", Boolean(root.querySelector('[aria-label="Task list"]')) && Boolean(card("task-14")));
-    await click("Filters"); await change(root.querySelector('[aria-label="Filter by priority"]'),"1","change");
+    // A filter searches every task on the board, not just the loaded pages,
+    // so it waits for its candidates like a typed search does.
+    await click("Filters"); await change(root.querySelector('[aria-label="Filter by priority"]'),"1","change"); await settle(400);
     check("priority filtering only shows matching loaded tasks", [...root.querySelectorAll('[data-task-card]')].every(el=>tasks.find(task=>task.id===el.dataset.cardId).priority===1) && root.querySelectorAll("[data-task-card]").length>0);
-    await change(root.querySelector('[aria-label="Filter by priority"]'),"0","change"); await change(root.querySelector('[aria-label="Filter by label"]'),"usability","change");
+    await change(root.querySelector('[aria-label="Filter by priority"]'),"0","change"); await change(root.querySelector('[aria-label="Filter by label"]'),"usability","change"); await settle(400);
     check("filtered empty states explain how to recover", root.textContent.includes("No tasks match") && Boolean(button("Clear filters")));
     await click("Clear filters"); await click("Board view");
     await selectCard("task-16"); await change(root.querySelector('[aria-label="Search tasks"]'),"Ready task"); await settle(400);
@@ -2484,7 +2517,7 @@ if (params.has("check")) {
       await change(root.querySelector('[aria-label="Filter by priority"]'), "1", "change");
       await saveAs("Owners");
       check("saving a view names it on the control and keeps it for this board", viewsToggle().textContent.trim() === "Owners"
-        && get(interfaceStore).taskBoards.global?.views.some(view => view.name === "Owners" && view.swimlane === "owner" && view.facet.priority === 1));
+        && get(interfaceStore).taskBoards.global?.views.some(view => view.name === "Owners" && view.swimlane === "owner" && view.search.split(" ").includes("priority:high")));
       check("a saved view survives a reload: it is in the stored preferences", JSON.stringify({ ...localStorage }).includes("Owners"));
       await closeViews();
       await openView(); viewMenu().querySelector('[data-task-lane-option="none"]').click(); await settle(); await closeView();

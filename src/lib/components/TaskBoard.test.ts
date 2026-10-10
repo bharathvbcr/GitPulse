@@ -341,7 +341,7 @@ describe("TaskBoard", () => {
     expect(source).toContain("Copy for agent");
     expect(source).toContain("copyAgent");
     expect(source).toContain("id=\"task-search\"");
-    expect(source).toContain("Unassigned");
+    expect(readFileSync(new URL("./TaskSearchFilters.svelte", import.meta.url), "utf8")).toContain("Unassigned");
     expect(source).toContain('e.key.toLowerCase() === "a"');
     expect(source).toContain("Open Quick Enhance?");
     expect(source).toContain("openQuickEnhance");
@@ -478,3 +478,36 @@ describe("the board can archive a task", () => {
   });
 });
 
+
+describe("TaskBoard search", () => {
+  const fn = (name: string) => {
+    const start = source.indexOf(`function ${name}(`);
+    return source.slice(start, source.indexOf("\n  }\n", start));
+  };
+
+  it("fetches on what the store is asked, not on every keystroke", () => {
+    expect(source).toContain("const boardKey = $derived(JSON.stringify([scope, plan.key]));");
+    expect(source).toContain("const target = untrack(() => scope), current = untrack(() => plan);");
+  });
+
+  it("never moves a card by a position read from a ranked order", () => {
+    expect(source).toContain('const reorderLocked = $derived(searching && order === "relevance");');
+    expect(fn("onCardPointerDown")).toContain("reorderLocked");
+    expect(fn("nudgeCard")).toContain("reorderLocked");
+    // Re-spacing a column needs all of it; a partial candidate set is not.
+    expect(fn("dropCard")).toContain("!candidatesComplete(candidates)");
+  });
+
+  it("selects across what is drawn, in the order it is drawn", () => {
+    expect(source).not.toContain("flattenVisibleIds(displayColumns");
+    expect(source.match(/flattenVisibleIds\(visibleColumns, shown, \(\) => true\)/g)?.length).toBe(3);
+  });
+
+  it("puts a saved view's old dropdown filters back as query text", () => {
+    expect(fn("applyView")).toContain("mergeLegacyFacet(view.search, view.facet)");
+  });
+
+  it("does not credit description hits read for another word", () => {
+    expect(source).toContain("serverHits: loadedKey === boardKey ? candidates?.textHits : undefined");
+  });
+});

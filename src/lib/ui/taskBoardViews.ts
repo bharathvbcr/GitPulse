@@ -15,6 +15,7 @@
 
 import { STATUSES, asTaskStatus, type TaskStatus } from "../workbench/vocabulary";
 import { emptyFacet, normalizePriority, type DueFilter, type TaskFacet } from "../workbench/taskOrganize";
+import { mergeLegacyFacet, splitQuery } from "../workbench/taskQuery";
 import {
   isBoardLayout,
   isTaskDensity,
@@ -270,5 +271,17 @@ export function setWipLimit(boards: Record<string, BoardPrefs>, key: string, sta
 
 /** Whether the board on screen is showing exactly this saved view. */
 export function sameSnapshot(a: TaskViewSnapshot, b: TaskViewSnapshot): boolean {
-  return JSON.stringify(sanitizeSnapshot(a)) === JSON.stringify(sanitizeSnapshot(b));
+  return JSON.stringify(comparable(a)) === JSON.stringify(comparable(b));
+}
+
+/**
+ * A snapshot with its filters read the way the board applies them: a view
+ * saved before the query language kept dropdown filters in `facet`, and the
+ * board now folds them into the search (`mergeLegacyFacet`). The same filters
+ * typed or picked compare equal either way.
+ */
+function comparable(snapshot: TaskViewSnapshot): TaskViewSnapshot {
+  const clean = sanitizeSnapshot(snapshot);
+  const search = splitQuery(mergeLegacyFacet(clean.search, clean.facet)).map((part) => part.raw).join(" ");
+  return { ...clean, facet: emptyFacet(), search };
 }

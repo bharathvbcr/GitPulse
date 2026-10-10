@@ -246,9 +246,16 @@ describe("the archive is separate from the Done column", () => {
   it("reads every board column without archived tasks", () => {
     expect(board).toContain("const BOARD: TaskListFilter = { archived: false };");
     // The filter is the contract; the page size is the board's to choose.
-    expect(board).toMatch(/listTasks\(target, status, query, undefined, \w+, BOARD\)/);
-    expect(board).toMatch(/listTasks\(scope, status, search, cursor, \w+, BOARD\)/);
-    expect(board.match(/listTasks\(/g)?.length, "a column read without the filter would draw archived cards").toBe(3);
+    expect(board).toMatch(/listTasks\(target, status, "", undefined, \w+, BOARD\)/);
+    expect(board).toMatch(/listTasks\(scope, status, "", cursor, \w+, BOARD\)/);
+    // A search reads one status-less candidate set, under the same filter.
+    expect(board).toMatch(/listTasks\(current\.scope, null, "", undefined, CANDIDATE_PAGE, BOARD\)/);
+    const reads = [...board.matchAll(/listTasks\(([^;]*?)\)(?=[,;\]]|\s*:)/g)].map((match) => match[1]);
+    expect(reads.length, "every read is checked").toBe(board.match(/listTasks\(/g)?.length);
+    for (const read of reads) {
+      expect(read.endsWith("BOARD") || read.endsWith("{ archived: true }"), `a read without the filter would draw archived cards: ${read}`).toBe(true);
+    }
+    expect(reads.filter((read) => read.endsWith("{ archived: true }")), "only the badge reads the archive").toHaveLength(1);
   });
 
   it("no longer couples the dock to the Done column's visibility", () => {
