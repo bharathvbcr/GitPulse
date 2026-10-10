@@ -13,17 +13,21 @@
 //! * **A call that could not run is never reported as one that passed.** A
 //!   missing binary, a dead child, a timeout and a refusal are four different
 //!   outcomes and stay four different outcomes all the way to the UI.
-//! * **Dispatch is serial**, because the harness's own dispatch is serial: it
-//!   writes exactly one response line per request and handles them in order.
-//!   Holding the lock across the round trip is what makes a stray line
-//!   attributable to the request that provoked it.
+//! * **Calls are correlated by id, never by lock.** Several requests may be
+//!   outstanding on one connection; each response line is routed to the call
+//!   whose id it carries, and a line nobody is waiting for is noise. The slot
+//!   lock guards only the bookkeeping (which child, which backoff) and is
+//!   never held across a round trip, so a slow `work.runs.managed.prepare`
+//!   cannot make a `managed.stop` for another run wait, and a timed-out call
+//!   cannot tear down a child that still hosts other sessions.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, TrySendError};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -34,6 +38,23 @@ use super::protocol::*;
 
 /// How long a single request may take before the child is considered wedged.
 pub const DEFAULT_CALL_TIMEOUT: Duration = Duration::from_secs(15);
+/// How long `work.runs.managed.prepare` may take. It starts the provider and
+/// waits for its handshake, and Claude's own handshake budget is 30 s, so the
+/// default would time out a healthy launch. Matches Manvi's lane deadline.
+pub const MANAGED_PREPARE_TIMEOUT: Duration = Duration::from_secs(180);
+/// How long `work.runs.managed.stop` may take: it closes a provider, which can
+/// outlast an ordinary call.
+pub const MANAGED_STOP_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// The deadline for one profile-worker operation. The one table: a caller does
+/// not pick its own, so no op can be given less than its provider needs.
+pub(crate) fn op_deadline(op: &str) -> Duration {
+    match op {
+        "work.runs.managed.prepare" => MANAGED_PREPARE_TIMEOUT,
+        "work.runs.managed.stop" => MANAGED_STOP_TIMEOUT,
+        _ => DEFAULT_CALL_TIMEOUT,
+    }
+}
 /// Handshake budget. A cold `manvi serve` has to resolve its configuration
 /// before it answers, so this is deliberately looser than a warm call.
 const HELLO_TIMEOUT: Duration = Duration::from_secs(20);
@@ -66,6 +87,10 @@ const RESPAWN_BACKOFF: Duration = Duration::from_secs(30);
 /// `std::sync::Mutex` has no timed acquire, so waiting is a bounded spin;
 /// this is the granularity of that spin, not a budget.
 const SLOT_POLL_INTERVAL: Duration = Duration::from_millis(20);
+/// How long a waiter sits on the reader lease or the mailbox before it looks
+/// again, so a call whose deadline passed never waits on a wakeup that is not
+/// coming.
+const INBOX_SLICE: Duration = Duration::from_millis(50);
 /// Lines of the child's stderr kept for diagnostics.
 const STDERR_TAIL_LINES: usize = 40;
 /// Grace period between closing the child's stdin (its documented clean
@@ -157,12 +182,19 @@ struct Sidecar {
     /// `None` once stdin has been closed for shutdown. An `Option` is what
     /// lets [`Drop`] hand the pipe back to the OS without moving out of
     /// `&mut self`.
-    stdin: Option<ChildStdin>,
-    lines: Receiver<String>,
+    stdin: Mutex<Option<ChildStdin>>,
+    inbox: Inbox,
     stderr: std::sync::Arc<Mutex<VecDeque<String>>>,
     hello: HelloResult,
     binary: String,
-    next_id: u64,
+    next_id: AtomicU64,
+    /// Calls currently waiting on this child, so a timeout is never read as
+    /// "the child is wedged" while others are still being answered.
+    in_flight: AtomicUsize,
+    /// Runs whose `work.runs.managed.prepare` went out and whose
+    /// `managed.stop` has not been answered: sessions this child may host. A
+    /// child that may host one is not killed over a slow call.
+    hosted: Mutex<HashSet<String>>,
     /// Deadline for one stdin write. Production always runs
     /// [`WRITE_DEADLINE`]; it is a field only so tests can shrink the deadline
     /// and exercise the stall path inside a unit-test budget.
@@ -172,13 +204,56 @@ struct Sidecar {
 
 impl Drop for Sidecar {
     fn drop(&mut self) {
-        let mut child = self
-            .child
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let stdin = self.stdin.take();
-        shutdown_child(&mut child, stdin, self.shutdown_grace, &self.guard);
+        self.terminate();
     }
+}
+
+/// Where responses are routed to the call that is waiting for them.
+///
+/// There is no reader thread: whichever waiter holds the `rx` lease reads the
+/// pump's channel and files every line under the id it carries, then wakes the
+/// others. Nothing drains the channel while no call is waiting, so the
+/// pump's bounded queue still faults an idle child that floods stdout.
+struct Inbox {
+    rx: Mutex<Receiver<String>>,
+    /// One mailbox per call in flight; a line for an id with no mailbox is
+    /// noise or a late answer to a call that already gave up.
+    mail: Mutex<HashMap<String, VecDeque<String>>>,
+    arrived: Condvar,
+}
+
+impl Inbox {
+    fn new(rx: Receiver<String>) -> Self {
+        Self {
+            rx: Mutex::new(rx),
+            mail: Mutex::new(HashMap::new()),
+            arrived: Condvar::new(),
+        }
+    }
+}
+
+fn relock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Marks a call in flight and owns its mailbox, whichever way it ends.
+struct Registered<'a> {
+    sidecar: &'a Sidecar,
+    id: String,
+}
+
+impl Drop for Registered<'_> {
+    fn drop(&mut self) {
+        relock(&self.sidecar.inbox.mail).remove(&self.id);
+        self.sidecar.in_flight.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// What one look at the inbox found for a call.
+enum Inbound {
+    Line(String),
+    Idle,
+    Closed,
 }
 
 /// Kills the child from a pipe-reader thread. A wedged or hostile child must
@@ -262,18 +337,111 @@ fn shutdown_child(
 }
 
 impl Sidecar {
+    /// Stops the child: closes stdin (its documented clean shutdown), waits
+    /// the grace, then kills its process group. Idempotent, and what makes
+    /// every call still waiting on this child see it exit instead of running
+    /// out its own deadline.
+    fn terminate(&self) {
+        let stdin = self
+            .stdin
+            .try_lock()
+            .ok()
+            .and_then(|mut stdin| stdin.take());
+        let mut child = relock(&self.child);
+        shutdown_child(&mut child, stdin, self.shutdown_grace, &self.guard);
+    }
+
+    /// True when this child may host a session that a kill would take with it.
+    fn hosts_sessions(&self) -> bool {
+        !relock(&self.hosted).is_empty()
+    }
+
+    /// Keeps `hosted` true to the wire: a prepare that went out may have
+    /// started a session whatever happens to its answer, and only an answered
+    /// stop (or a refused prepare) says there is none.
+    fn note_managed(
+        &self,
+        op: &str,
+        params: Option<&Value>,
+        outcome: Option<&Result<Value, HarnessError>>,
+    ) {
+        let Some(run) = params.and_then(|p| p.get("id")).and_then(Value::as_str) else {
+            return;
+        };
+        let mut hosted = relock(&self.hosted);
+        match (op, outcome) {
+            ("work.runs.managed.prepare", None) => {
+                hosted.insert(run.to_string());
+            }
+            ("work.runs.managed.prepare", Some(Err(HarnessError::Refused(_))))
+            | ("work.runs.managed.stop", Some(Ok(_) | Err(HarnessError::Refused(_)))) => {
+                hosted.remove(run);
+            }
+            _ => {}
+        }
+    }
+
+    /// Files lines the lease holder read, or hands back the one that is `id`'s.
+    fn next_for(&self, id: &str, remaining: Duration, response_bytes: &mut usize) -> Inbound {
+        if let Some(line) = relock(&self.inbox.mail)
+            .get_mut(id)
+            .and_then(VecDeque::pop_front)
+        {
+            return Inbound::Line(line);
+        }
+        let slice = remaining.min(INBOX_SLICE);
+        match self.inbox.rx.try_lock() {
+            Ok(rx) => match rx.recv_timeout(slice) {
+                Ok(raw) => {
+                    *response_bytes += raw.len() + 1;
+                    match serde_json::from_str::<Value>(&raw)
+                        .ok()
+                        .and_then(|v| v.get("id").and_then(Value::as_str).map(String::from))
+                    {
+                        Some(owner) if owner == id => Inbound::Line(raw),
+                        Some(owner) => {
+                            if let Some(mailbox) = relock(&self.inbox.mail).get_mut(&owner) {
+                                mailbox.push_back(raw);
+                                self.inbox.arrived.notify_all();
+                            }
+                            Inbound::Idle
+                        }
+                        None => Inbound::Idle,
+                    }
+                }
+                Err(RecvTimeoutError::Timeout) => Inbound::Idle,
+                Err(RecvTimeoutError::Disconnected) => Inbound::Closed,
+            },
+            Err(std::sync::TryLockError::Poisoned(p)) => match p.into_inner().recv_timeout(slice) {
+                Err(RecvTimeoutError::Disconnected) => Inbound::Closed,
+                _ => Inbound::Idle,
+            },
+            Err(std::sync::TryLockError::WouldBlock) => {
+                let mail = relock(&self.inbox.mail);
+                if !mail.get(id).is_some_and(|m| !m.is_empty()) {
+                    drop(
+                        self.inbox
+                            .arrived
+                            .wait_timeout(mail, slice)
+                            .unwrap_or_else(std::sync::PoisonError::into_inner),
+                    );
+                }
+                Inbound::Idle
+            }
+        }
+    }
+
     fn call(
-        &mut self,
+        &self,
         op: &str,
         params: Option<Value>,
         timeout: Duration,
     ) -> Result<Value, HarnessError> {
-        self.next_id += 1;
-        let id = self.next_id.to_string();
+        let id = (self.next_id.fetch_add(1, Ordering::AcqRel) + 1).to_string();
         let line = serde_json::to_string(&Request {
             id: id.clone(),
             op: op.to_string(),
-            params,
+            params: params.clone(),
         })
         .map_err(|e| HarnessError::Protocol(format!("could not encode {} request: {}", op, e)))?;
 
@@ -286,28 +454,50 @@ impl Sidecar {
             )));
         }
 
-        self.write_request_line(&line, op)?;
+        // Registered before the write, so the answer cannot beat its mailbox.
+        relock(&self.inbox.mail).insert(id.clone(), VecDeque::new());
+        self.in_flight.fetch_add(1, Ordering::AcqRel);
+        let _registered = Registered {
+            sidecar: self,
+            id: id.clone(),
+        };
+        self.note_managed(op, params.as_ref(), None);
+        let outcome = self
+            .write_request_line(&line, op)
+            .and_then(|()| self.await_answer(op, &id, timeout));
+        self.note_managed(op, params.as_ref(), Some(&outcome));
+        outcome
+    }
 
+    fn await_answer(&self, op: &str, id: &str, timeout: Duration) -> Result<Value, HarnessError> {
         let deadline = Instant::now() + timeout;
         let mut response_bytes = 0usize;
         loop {
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
                 return Err(HarnessError::Timeout(format!(
-                    "{} did not answer within {:?}{}",
+                    "{} did not answer within {:?}; the harness was left running and the call \
+                     can be retried{}",
                     op,
                     timeout,
                     self.stderr_hint()
                 )));
             }
-            match self.lines.recv_timeout(remaining) {
-                Ok(raw) => {
-                    // Every line the child emits during this cycle counts,
-                    // including ignored noise: a flood of unattributable
-                    // lines is just as much a wedged child as one oversized
-                    // frame. Protocol faults drop the sidecar and set the
-                    // respawn backoff, same as the other transport faults.
-                    response_bytes += raw.len() + 1;
+            match self.next_for(id, remaining, &mut response_bytes) {
+                Inbound::Idle => {
+                    // A child that died while a helper it forked still holds
+                    // its stdout open never closes the channel; its exit status
+                    // is the evidence, and every waiter fails on it at once.
+                    if self.guard.exited(&mut relock(&self.child)) {
+                        return Err(HarnessError::Unavailable(format!(
+                            "sidecar exited during {}{}",
+                            op,
+                            self.stderr_hint()
+                        )));
+                    }
+                    // Every line this call read counts, including noise: a
+                    // flood of unattributable lines is just as much a wedged
+                    // child as one oversized frame.
                     if response_bytes > MAX_RESPONSE_TOTAL_BYTES {
                         return Err(HarnessError::Protocol(format!(
                             "{} streamed {} bytes past this client's {} byte \
@@ -318,41 +508,32 @@ impl Sidecar {
                             self.stderr_hint()
                         )));
                     }
-                    match classify_line(&raw, &id) {
-                        LineOutcome::Ignore => {
-                            // Noise, a log line, or another call's answer: none of
-                            // these fault a healthy sidecar, so keep waiting
-                            // within the same deadline.
-                            continue;
-                        }
-                        LineOutcome::Answer(response) => {
-                            if !response.ok {
-                                return Err(HarnessError::Refused(response.error.unwrap_or(
-                                    WireError {
-                                        code: "E_INTERNAL".into(),
-                                        message: format!("{} failed without an error body", op),
-                                        retryable: false,
-                                    },
-                                )));
-                            }
-                            return Ok(response.result.unwrap_or(Value::Null));
-                        }
-                        LineOutcome::Fault(message) => {
-                            // Addressed to this very call yet undecodable: the
-                            // protocol itself is broken and retrying the read
-                            // cannot help.
-                            return Err(HarnessError::Protocol(message));
-                        }
-                    }
                 }
-                Err(RecvTimeoutError::Timeout) => continue,
-                Err(RecvTimeoutError::Disconnected) => {
+                Inbound::Closed => {
                     return Err(HarnessError::Unavailable(format!(
                         "sidecar exited during {}{}",
                         op,
                         self.stderr_hint()
                     )))
                 }
+                Inbound::Line(raw) => match classify_line(&raw, id) {
+                    LineOutcome::Ignore => continue,
+                    LineOutcome::Answer(response) => {
+                        if !response.ok {
+                            return Err(HarnessError::Refused(response.error.unwrap_or(
+                                WireError {
+                                    code: "E_INTERNAL".into(),
+                                    message: format!("{} failed without an error body", op),
+                                    retryable: false,
+                                },
+                            )));
+                        }
+                        return Ok(response.result.unwrap_or(Value::Null));
+                    }
+                    // Addressed to this very call yet undecodable: the
+                    // protocol itself is broken and retrying cannot help.
+                    LineOutcome::Fault(message) => return Err(HarnessError::Protocol(message)),
+                },
             }
         }
     }
@@ -371,10 +552,12 @@ impl Sidecar {
     /// *not* restored here, so every later call fails fast with
     /// "stdin closed" and the [`HarnessError::Unavailable`] returned drops the
     /// sidecar so a fresh one respawns.
-    fn write_request_line(&mut self, line: &str, op: &str) -> Result<(), HarnessError> {
+    fn write_request_line(&self, line: &str, op: &str) -> Result<(), HarnessError> {
         let hint = self.stderr_hint();
-        let mut stdin = self
-            .stdin
+        // Held for the whole write: two callers must not interleave one line,
+        // and a stalled write is bounded by `write_deadline` below.
+        let mut slot = relock(&self.stdin);
+        let mut stdin = slot
             .take()
             .ok_or_else(|| HarnessError::Unavailable("sidecar stdin closed".into()))?;
         let mut payload = line.as_bytes().to_vec();
@@ -392,7 +575,7 @@ impl Sidecar {
         });
         match rx.recv_timeout(self.write_deadline) {
             Ok((returned, Ok(()))) => {
-                self.stdin = Some(returned);
+                *slot = Some(returned);
                 Ok(())
             }
             Ok((_, Err(e))) => Err(HarnessError::Unavailable(format!(
@@ -947,12 +1130,14 @@ fn spawn_with_profile(
     let mut sidecar = Sidecar {
         child,
         guard,
-        stdin: Some(stdin),
-        lines: rx,
+        stdin: Mutex::new(Some(stdin)),
+        inbox: Inbox::new(rx),
         stderr: tail,
         hello: HelloResult::default(),
         binary: binary.clone(),
-        next_id: 0,
+        next_id: AtomicU64::new(0),
+        in_flight: AtomicUsize::new(0),
+        hosted: Mutex::new(HashSet::new()),
         write_deadline: WRITE_DEADLINE,
         shutdown_grace: if profile.is_some() {
             Duration::from_secs(6)
@@ -982,7 +1167,7 @@ fn spawn_with_profile(
 
 /// The process-wide sidecar, started on first use and restarted after a fault.
 struct Slot {
-    sidecar: Option<Sidecar>,
+    sidecar: Option<Arc<Sidecar>>,
     last_error: Option<HarnessError>,
     backoff_until: Option<Instant>,
     profile: Option<PathBuf>,
@@ -1024,7 +1209,7 @@ fn recover_slot_for<'a>(
     poisoned: std::sync::PoisonError<std::sync::MutexGuard<'a, Slot>>,
 ) -> std::sync::MutexGuard<'a, Slot> {
     let mut guard = poisoned.into_inner();
-    guard.sidecar = None;
+    guard.drop_sidecar();
     guard.last_error = None;
     guard.backoff_until = None;
     // `into_inner` recovers the data but leaves the poison flag raised: every
@@ -1037,7 +1222,16 @@ fn recover_slot_for<'a>(
 }
 
 impl Slot {
-    fn ensure(&mut self) -> Result<&mut Sidecar, HarnessError> {
+    /// Stops the child and forgets it. Stopping is explicit because callers
+    /// still waiting on it hold their own handle: without it the process
+    /// would outlive the slot until the last of them gave up.
+    fn drop_sidecar(&mut self) {
+        if let Some(sidecar) = self.sidecar.take() {
+            sidecar.terminate();
+        }
+    }
+
+    fn ensure(&mut self) -> Result<Arc<Sidecar>, HarnessError> {
         if self.closed {
             return Err(HarnessError::Unavailable(
                 "this harness session has been closed".into(),
@@ -1057,7 +1251,7 @@ impl Slot {
             };
             match started {
                 Ok(s) => {
-                    self.sidecar = Some(s);
+                    self.sidecar = Some(Arc::new(s));
                     self.last_error = None;
                     self.backoff_until = None;
                 }
@@ -1068,7 +1262,9 @@ impl Slot {
                 }
             }
         }
-        Ok(self.sidecar.as_mut().expect("sidecar just ensured"))
+        Ok(Arc::clone(
+            self.sidecar.as_ref().expect("sidecar just ensured"),
+        ))
     }
 }
 
@@ -1115,13 +1311,12 @@ fn acquire_slot_for(
 /// refusal by the harness leaves it running, because the harness is fine and
 /// the request was not.
 ///
-/// The slot lock is held across the whole round trip (serial dispatch is
-/// what makes a stray line attributable). Acquisition retries until `timeout`
-/// then fails with [`HarnessError::Busy`] so overlapping agent actions wait
-/// out a short in-flight call instead of failing on the first `try_lock`,
-/// without queueing behind a wedged request when the caller used a shorter
-/// budget. A Busy here is still a distinct, structured error: the harness may
-/// be perfectly healthy, just mid-dispatch.
+/// The slot lock is held only to pick (or start) the child and, afterwards,
+/// to record a fault; never across the round trip. Responses are correlated by
+/// id, so overlapping calls proceed side by side. Acquisition retries until
+/// `timeout` (capped at [`DEFAULT_CALL_TIMEOUT`], since only a spawn can make
+/// the slot slow) then fails with [`HarnessError::Busy`]: the harness may be
+/// perfectly healthy, just starting.
 pub fn call(op: &str, params: Option<Value>, timeout: Duration) -> Result<Value, HarnessError> {
     call_in_slot(slot(), op, params, timeout, None)
 }
@@ -1133,41 +1328,70 @@ fn call_in_slot(
     timeout: Duration,
     closing: Option<&std::sync::atomic::AtomicBool>,
 ) -> Result<Value, HarnessError> {
-    let mut guard = acquire_slot_for(owner, Instant::now() + timeout).ok_or_else(|| {
-        HarnessError::Busy(format!(
-            "another gated action held the harness for the whole {timeout:?} budget; \
-             '{op}' was not sent. Retry once the current commit/push/pull settles."
-        ))
-    })?;
-    if closing.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Acquire)) {
-        return Err(HarnessError::Unavailable(
-            "the profile worker is shutting down".into(),
-        ));
-    }
-    let requires_capability = guard.profile.is_some();
-    let sidecar = guard.ensure()?;
-    if requires_capability && !serves(&sidecar.hello, op) {
-        return Err(HarnessError::Refused(WireError {
-            code: "unsupported_operation".into(),
-            message: format!(
-                "This Manvi binary does not advertise {op}. Update Manvi to use task enhancements."
-            ),
-            retryable: false,
-        }));
-    }
-    match sidecar.call(op, params, timeout) {
-        Ok(v) => Ok(v),
-        Err(e) => {
-            if matches!(
-                e,
-                HarnessError::Timeout(_) | HarnessError::Unavailable(_) | HarnessError::Protocol(_)
-            ) {
-                guard.sidecar = None;
-                guard.last_error = Some(e.clone());
-                guard.backoff_until = Some(Instant::now() + RESPAWN_BACKOFF);
-            }
-            Err(e)
+    let sidecar = {
+        let mut guard = acquire_slot_for(owner, Instant::now() + timeout.min(DEFAULT_CALL_TIMEOUT))
+            .ok_or_else(|| {
+                HarnessError::Busy(format!(
+                    "another gated action held the harness for the whole {timeout:?} budget; \
+                     '{op}' was not sent. Retry once the current commit/push/pull settles."
+                ))
+            })?;
+        if closing.is_some_and(|flag| flag.load(Ordering::Acquire)) {
+            return Err(HarnessError::Unavailable(
+                "the profile worker is shutting down".into(),
+            ));
         }
+        let requires_capability = guard.profile.is_some();
+        let sidecar = guard.ensure()?;
+        if requires_capability && !serves(&sidecar.hello, op) {
+            return Err(HarnessError::Refused(WireError {
+                code: "unsupported_operation".into(),
+                message: format!(
+                    "This Manvi binary does not advertise {op}. Update Manvi to use task enhancements."
+                ),
+                retryable: false,
+            }));
+        }
+        sidecar
+    };
+    let outcome = sidecar.call(op, params, timeout);
+    if let Err(e) = &outcome {
+        if retriable_transport_fault(e) {
+            record_fault(owner, &sidecar, e);
+        }
+    }
+    outcome
+}
+
+/// Drops `sidecar` after a transport fault and arms the respawn backoff,
+/// unless doing so would take work with it.
+///
+/// A *timeout* is not proof the child is wedged: it says one call outlasted
+/// its deadline. While other calls are being answered, or the child may host a
+/// managed session, the child is kept and the caller simply sees a retryable
+/// error. Anything else (exit, a stalled stdin, a broken protocol) leaves the
+/// connection unusable, so it is replaced and the sessions it hosted are left
+/// to reconciliation, which records a run whose Manvi is gone as released.
+///
+/// The slot is changed only if it still holds this very child: a fault
+/// reported by a call that outlived its connection must not drop its successor.
+fn record_fault(owner: &Mutex<Slot>, sidecar: &Arc<Sidecar>, fault: &HarnessError) {
+    let keep = matches!(fault, HarnessError::Timeout(_))
+        && (sidecar.hosts_sessions() || sidecar.in_flight.load(Ordering::Acquire) > 0);
+    if keep {
+        return;
+    }
+    let Some(mut guard) = acquire_slot_for(owner, Instant::now() + DEFAULT_CALL_TIMEOUT) else {
+        return;
+    };
+    if guard
+        .sidecar
+        .as_ref()
+        .is_some_and(|live| Arc::ptr_eq(live, sidecar))
+    {
+        guard.drop_sidecar();
+        guard.last_error = Some(fault.clone());
+        guard.backoff_until = Some(Instant::now() + RESPAWN_BACKOFF);
     }
 }
 
@@ -1202,6 +1426,15 @@ impl ProfileConnection {
     }
 
     pub(crate) fn call(&self, op: &str, params: Value) -> Result<Value, HarnessError> {
+        self.call_within(op, params, op_deadline(op))
+    }
+
+    fn call_within(
+        &self,
+        op: &str,
+        params: Value,
+        timeout: Duration,
+    ) -> Result<Value, HarnessError> {
         if !matches!(
             op,
             "work.enhancements.generate"
@@ -1221,13 +1454,7 @@ impl ProfileConnection {
                 "the profile worker is shutting down".into(),
             ));
         }
-        call_in_slot(
-            &self.slot,
-            op,
-            Some(params),
-            DEFAULT_CALL_TIMEOUT,
-            Some(&self.closing),
-        )
+        call_in_slot(&self.slot, op, Some(params), timeout, Some(&self.closing))
     }
 
     /// What this worker's sidecar declared at handshake, spawning it if it has
@@ -1267,7 +1494,7 @@ impl ProfileConnection {
         else {
             return false;
         };
-        guard.sidecar = None;
+        guard.drop_sidecar();
         guard.last_error = None;
         guard.backoff_until = None;
         true
@@ -1282,7 +1509,7 @@ impl ProfileConnection {
             return false;
         };
         guard.closed = true;
-        guard.sidecar = None;
+        guard.drop_sidecar();
         true
     }
 }
@@ -1396,7 +1623,7 @@ fn in_respawn_backoff() -> bool {
 /// no way to reset it.
 pub fn reset() {
     let mut guard = slot().lock().unwrap_or_else(recover_slot);
-    guard.sidecar = None;
+    guard.drop_sidecar();
     guard.last_error = None;
     guard.backoff_until = None;
 }
@@ -1416,21 +1643,21 @@ pub fn serves(hello: &HelloResult, op: &str) -> bool {
 /// and safe to fire on both `RunEvent::ExitRequested` and `RunEvent::Exit`,
 /// whichever the platform delivers: a later harness call simply respawns.
 ///
-/// Lock safety: the slot lock is held across a whole round trip by an
-/// in-flight call, so this retries `try_lock` for ~1.2s and then gives up
-/// rather than stalling quit behind a 15s wedged request. Giving up is
-/// best-effort by design: once the process exits, the child's stdin closes
-/// and its documented EOF shutdown applies.
+/// Lock safety: the slot lock is held only for bookkeeping, so this normally
+/// gets it at once; it still retries `try_lock` for ~1.2s and then gives up
+/// rather than stalling quit. Giving up is best-effort by design: once the
+/// process exits, the child's stdin closes and its documented EOF shutdown
+/// applies.
 pub(crate) fn shutdown() {
     let deadline = Instant::now() + Duration::from_millis(1200);
     loop {
         match slot().try_lock() {
             Ok(mut guard) => {
-                guard.sidecar = None;
+                guard.drop_sidecar();
                 return;
             }
             Err(std::sync::TryLockError::Poisoned(poisoned)) => {
-                poisoned.into_inner().sidecar = None;
+                poisoned.into_inner().drop_sidecar();
                 return;
             }
             // Another caller is mid-round-trip; wait briefly, then let exit
@@ -1732,12 +1959,14 @@ mod tests {
         Sidecar {
             child,
             guard,
-            stdin: Some(stdin),
-            lines: rx,
+            stdin: Mutex::new(Some(stdin)),
+            inbox: Inbox::new(rx),
             stderr: tail,
             hello: HelloResult::default(),
             binary: "scripted".into(),
-            next_id: 0,
+            next_id: AtomicU64::new(0),
+            in_flight: AtomicUsize::new(0),
+            hosted: Mutex::new(HashSet::new()),
             write_deadline,
             shutdown_grace: SHUTDOWN_GRACE,
         }
@@ -1774,7 +2003,7 @@ mod tests {
             thread::sleep(Duration::from_millis(20));
         }
         assert_eq!(
-            sidecar.lines.try_iter().count(),
+            sidecar.inbox.rx.lock().unwrap().try_iter().count(),
             MAX_QUEUED_STDOUT_FRAMES,
             "the retained frame count must stay at the declared bound"
         );
@@ -1791,7 +2020,7 @@ mod tests {
         // `sleep` never reads stdin: once the kernel pipe buffer fills, our
         // write can only block. Half a mebibyte of payload guarantees the
         // fill on any OS's default pipe capacity.
-        let mut sidecar = scripted_sidecar("exec sleep 30", Duration::from_millis(400));
+        let sidecar = scripted_sidecar("exec sleep 30", Duration::from_millis(400));
 
         let blob = "x".repeat(512 * 1024);
         let started = Instant::now();
@@ -1851,7 +2080,7 @@ mod tests {
 
         {
             let mut guard = slot().lock().expect("seed the slot");
-            guard.sidecar = Some(scripted_sidecar("exec sleep 30", WRITE_DEADLINE));
+            guard.sidecar = Some(Arc::new(scripted_sidecar("exec sleep 30", WRITE_DEADLINE)));
             guard.last_error = Some(HarnessError::Unavailable("stale fault".into()));
             guard.backoff_until = Some(Instant::now() + RESPAWN_BACKOFF);
         }
@@ -2153,6 +2382,209 @@ done
             .is_err());
         assert!(connection.slot.lock().unwrap().sidecar.is_none());
         assert!(connection.shutdown());
+    }
+
+    /// A fake `manvi serve` with managed lanes: every request is handled in the
+    /// background, so a slow `work.runs.managed.prepare` does not stop the
+    /// others being answered (what Manvi's lane dispatch does). A session is
+    /// a file holding the pid of the sidecar that hosts it, so a session whose
+    /// sidecar was replaced or killed can no longer be stopped.
+    #[cfg(unix)]
+    const FAKE_MANAGED_SH: &str = r#"#!/bin/sh
+DIR="@DIR@"
+reply() { printf '{"id":"%s","ok":true,"result":%s}\n' "$1" "$2"; }
+refuse() { printf '{"id":"%s","ok":false,"error":{"code":"no_session","message":"no such session","retryable":false}}\n' "$1"; }
+handle() {
+  id=$(printf '%s' "$1" | sed -n 's/^{"id":"\([0-9]*\)".*/\1/p')
+  run=$(printf '%s' "$1" | sed -n 's/.*"params":{"id":"\([A-Za-z0-9_-]*\)".*/\1/p')
+  [ -f "$DIR/slow-$run" ] && sleep "$(cat "$DIR/slow-$run")"
+  case "$1" in
+    *'"op":"hello"'*) reply "$id" '{"protocol":1,"ops":["hello","work.runs.managed.prepare","work.runs.managed.activate","work.runs.managed.stop"],"posture":"host"}' ;;
+    *'managed.prepare'*)
+      printf '%s\n' "$$" > "$DIR/live-$run"
+      reply "$id" '{}' ;;
+    *'managed.activate'*) printf '%s\n' "$$" > "$DIR/live-$run"; reply "$id" '{}' ;;
+    *'managed.stop'*)
+      [ "$run" = crash ] && { kill -9 "$$"; exit; }
+      if [ "$(cat "$DIR/live-$run" 2>/dev/null)" = "$$" ]; then reply "$id" '{"stopped":true}'; else refuse "$id"; fi ;;
+  esac
+}
+while IFS= read -r line; do handle "$line" & done
+"#;
+
+    /// Installs [`FAKE_MANAGED_SH`] and returns the connection over it.
+    #[cfg(unix)]
+    fn managed_fixture(
+        serial: &SidecarTestGuard,
+        dir: &tempfile::TempDir,
+    ) -> (TestBinaryBinding, ProfileConnection) {
+        use std::os::unix::fs::PermissionsExt;
+        let binary = dir.path().join("managed-sidecar");
+        let script = FAKE_MANAGED_SH.replace("@DIR@", &dir.path().display().to_string());
+        std::fs::write(&binary, script).unwrap();
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let binding = bind_test_binary(serial, binary.to_str().unwrap());
+        let connection = ProfileConnection::new(dir.path().join("profile.sqlite"), None).unwrap();
+        (binding, connection)
+    }
+
+    #[cfg(unix)]
+    fn sidecar_pid(connection: &ProfileConnection) -> Option<u32> {
+        let slot = connection.slot.lock().unwrap();
+        slot.sidecar.as_ref().map(|s| s.child.lock().unwrap().id())
+    }
+
+    /// Reproduction: one slow `managed.prepare` used to outlast the call
+    /// timeout, drop the sidecar and take every other hosted session with it
+    /// (the real-time form of this test waited out the old 15 s), and hold the
+    /// slot meanwhile so a stop for another run was refused.
+    #[cfg(unix)]
+    #[test]
+    fn a_slow_prepare_neither_blocks_another_runs_stop_nor_kills_its_session() {
+        let serial = test_serial();
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(dir.path().join("slow-slow"), "3").unwrap();
+        let (_binary, connection) = managed_fixture(&serial, &dir);
+        let connection = std::sync::Arc::new(connection);
+        connection
+            .call(
+                "work.runs.managed.activate",
+                serde_json::json!({"id": "live"}),
+            )
+            .unwrap();
+        let pid = sidecar_pid(&connection).expect("sidecar running");
+
+        let slow = {
+            let connection = connection.clone();
+            thread::spawn(move || {
+                let started = Instant::now();
+                let outcome = connection.call_within(
+                    "work.runs.managed.prepare",
+                    serde_json::json!({"id": "slow"}),
+                    Duration::from_secs(1),
+                );
+                (outcome, started.elapsed())
+            })
+        };
+        thread::sleep(Duration::from_millis(300));
+
+        let started = Instant::now();
+        let stopped = connection.call("work.runs.managed.stop", serde_json::json!({"id": "live"}));
+        assert!(
+            stopped.is_ok(),
+            "stop for another run failed behind a slow prepare: {stopped:?}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "stop waited {:?} behind the slow prepare",
+            started.elapsed()
+        );
+
+        let (prepared, took) = slow.join().unwrap();
+        let error = prepared.expect_err("the slow prepare outlasted its deadline");
+        assert!(
+            matches!(&error, HarnessError::Timeout(m) if m.contains("can be retried")),
+            "expected a retryable timeout, got {error:?}"
+        );
+        assert!(
+            took < Duration::from_millis(2500),
+            "timeout was not bounded: {took:?}"
+        );
+        assert_eq!(
+            sidecar_pid(&connection),
+            Some(pid),
+            "a timed-out call dropped a sidecar that hosts sessions"
+        );
+        // The slow prepare finishes later, on the same child; its session is
+        // reachable and stoppable, and nothing was respawned or backed off.
+        thread::sleep(Duration::from_secs(3));
+        connection
+            .call("work.runs.managed.stop", serde_json::json!({"id": "slow"}))
+            .expect("the prepare that timed out still owns a stoppable session");
+        assert_eq!(sidecar_pid(&connection), Some(pid));
+        connection.shutdown();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_timeout_still_recycles_a_child_that_hosts_nothing() {
+        let serial = test_serial();
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(dir.path().join("slow-wedge"), "5").unwrap();
+        let (_binary, connection) = managed_fixture(&serial, &dir);
+        connection
+            .call(
+                "work.runs.managed.activate",
+                serde_json::json!({"id": "idle"}),
+            )
+            .unwrap();
+        let error = connection
+            .call_within(
+                "work.runs.managed.activate",
+                serde_json::json!({"id": "wedge"}),
+                Duration::from_millis(300),
+            )
+            .unwrap_err();
+        assert!(matches!(error, HarnessError::Timeout(_)));
+        assert_eq!(sidecar_pid(&connection), None, "a wedged child was kept");
+        connection.shutdown();
+    }
+
+    /// A child that dies mid-call fails every call waiting on it at once and
+    /// promptly, never leaving one to run out its own (here three minute)
+    /// deadline; the connection is dropped so the next call starts afresh.
+    #[cfg(unix)]
+    #[test]
+    fn a_child_that_dies_mid_call_fails_every_waiting_call_promptly() {
+        let serial = test_serial();
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(dir.path().join("slow-slow"), "30").unwrap();
+        let (_binary, connection) = managed_fixture(&serial, &dir);
+        let connection = std::sync::Arc::new(connection);
+        connection
+            .call(
+                "work.runs.managed.activate",
+                serde_json::json!({"id": "live"}),
+            )
+            .unwrap();
+        let waiting = {
+            let connection = connection.clone();
+            thread::spawn(move || {
+                connection.call(
+                    "work.runs.managed.prepare",
+                    serde_json::json!({"id": "slow"}),
+                )
+            })
+        };
+        thread::sleep(Duration::from_millis(300));
+        let started = Instant::now();
+        let crashed = connection.call("work.runs.managed.stop", serde_json::json!({"id": "crash"}));
+        assert!(
+            matches!(crashed, Err(HarnessError::Unavailable(_))),
+            "{crashed:?}"
+        );
+        let waited = waiting.join().unwrap();
+        assert!(
+            matches!(waited, Err(HarnessError::Unavailable(_))),
+            "{waited:?}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "waiting calls outlived their dead child: {:?}",
+            started.elapsed()
+        );
+        assert_eq!(sidecar_pid(&connection), None);
+        connection.shutdown();
+    }
+
+    #[test]
+    fn managed_prepare_is_given_longer_than_claudes_handshake() {
+        assert!(op_deadline("work.runs.managed.prepare") > Duration::from_secs(30));
+        assert!(op_deadline("work.runs.managed.stop") > DEFAULT_CALL_TIMEOUT);
+        assert_eq!(
+            op_deadline("work.enhancements.configuration"),
+            DEFAULT_CALL_TIMEOUT
+        );
     }
 
     #[test]
