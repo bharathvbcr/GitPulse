@@ -244,6 +244,31 @@ fn default_path() -> Result<PathBuf, String> {
         .ok_or_else(|| "no per-user cache directory (HOME / LOCALAPPDATA unset)".to_string())
 }
 
+/// Why an open failed, and whether the file itself is to blame.
+struct OpenFailure {
+    message: String,
+    /// The file is not a database, or is corrupt: only then is deleting it a
+    /// repair rather than an attack on whoever else has it open.
+    unreadable: bool,
+}
+
+impl OpenFailure {
+    fn new(message: String, error: &rusqlite::Error) -> Self {
+        let unreadable = matches!(
+            error,
+            rusqlite::Error::SqliteFailure(failure, _)
+                if matches!(
+                    failure.code,
+                    rusqlite::ErrorCode::NotADatabase | rusqlite::ErrorCode::DatabaseCorrupt
+                )
+        );
+        Self {
+            message,
+            unreadable,
+        }
+    }
+}
+
 pub(crate) struct Store {
     conn: Connection,
     cap: usize,
@@ -251,9 +276,13 @@ pub(crate) struct Store {
 }
 
 impl Store {
-    /// Opens the file at `path`, creating it. A file this build cannot use —
-    /// another schema version, or not a database at all — is a cache, so it
-    /// is discarded and created again.
+    /// Opens the file at `path`, creating it. A file that is not a database,
+    /// or is corrupt, is a cache, so it is discarded and created again. A
+    /// schema from another version is rebuilt in place by `ensure_schema`.
+    ///
+    /// Anything else — above all `SQLITE_BUSY` from another process using the
+    /// file, or a permission error — says nothing about the file's contents, so
+    /// it fails this open and leaves the file alone for the process that has it.
     pub(crate) fn open(path: &Path, cap: usize) -> Result<Self, String> {
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)
@@ -261,7 +290,9 @@ impl Store {
         }
         match Self::open_once(path, cap) {
             Ok(store) => Ok(store),
+            Err(first) if !first.unreadable => Err(first.message),
             Err(first) => {
+                let first = first.message;
                 for suffix in ["", "-wal", "-shm"] {
                     let mut doomed = path.as_os_str().to_owned();
                     doomed.push(suffix);
@@ -277,25 +308,26 @@ impl Store {
                     }
                 }
                 Self::open_once(path, cap)
-                    .map_err(|second| format!("{first}; recreated, and then {second}"))
+                    .map_err(|second| format!("{first}; recreated, and then {}", second.message))
             }
         }
     }
 
-    fn open_once(path: &Path, cap: usize) -> Result<Self, String> {
+    fn open_once(path: &Path, cap: usize) -> Result<Self, OpenFailure> {
         let conn = Connection::open_with_flags(
             path,
             OpenFlags::SQLITE_OPEN_READ_WRITE
                 | OpenFlags::SQLITE_OPEN_CREATE
                 | OpenFlags::SQLITE_OPEN_NO_MUTEX,
         )
-        .map_err(|e| format!("cannot open {}: {e}", path.display()))?;
-        conn.busy_timeout(BUSY_TIMEOUT)
-            .map_err(|e| format!("cannot configure {}: {e}", path.display()))?;
+        .map_err(|e| OpenFailure::new(format!("cannot open {}: {e}", path.display()), &e))?;
+        conn.busy_timeout(BUSY_TIMEOUT).map_err(|e| {
+            OpenFailure::new(format!("cannot configure {}: {e}", path.display()), &e)
+        })?;
         conn.pragma_update(None, "journal_mode", "WAL")
-            .map_err(|e| format!("{} is not usable: {e}", path.display()))?;
+            .map_err(|e| OpenFailure::new(format!("{} is not usable: {e}", path.display()), &e))?;
         conn.pragma_update(None, "synchronous", "NORMAL")
-            .map_err(|e| format!("{} is not usable: {e}", path.display()))?;
+            .map_err(|e| OpenFailure::new(format!("{} is not usable: {e}", path.display()), &e))?;
         let mut store = Self {
             conn,
             cap,
@@ -303,7 +335,7 @@ impl Store {
         };
         store
             .ensure_schema()
-            .map_err(|e| format!("{} is not usable: {e}", path.display()))?;
+            .map_err(|e| OpenFailure::new(format!("{} is not usable: {e}", path.display()), &e))?;
         Ok(store)
     }
 
@@ -1047,5 +1079,30 @@ mod tests {
             .err()
             .expect("cannot open");
         assert!(err.contains("cannot create"), "{err}");
+    }
+
+    /// A transient `SQLITE_BUSY` (another process holds the file) says nothing
+    /// about the file's contents: the open fails and the file, with its rows,
+    /// survives for whoever has it.
+    #[test]
+    fn a_busy_cache_is_kept_not_deleted() {
+        let cache = tempfile::tempdir().unwrap();
+        let path = cache.path().join(FILE_NAME);
+        let mut store = Store::open(&path, 10).unwrap();
+        store.insert(1, 2, "base", &one("a", 1)).unwrap();
+        drop(store);
+
+        // Another process using the cache exclusively for a while.
+        let holder = Connection::open(&path).unwrap();
+        holder
+            .execute_batch("PRAGMA locking_mode = EXCLUSIVE; BEGIN EXCLUSIVE;")
+            .unwrap();
+        let busy = Store::open(&path, 10).err().expect("the file is locked");
+        assert!(!busy.contains("recreated"), "{busy}");
+        assert!(path.exists(), "a busy cache was deleted");
+        drop(holder);
+
+        let store = Store::open(&path, 10).expect("the cache is usable again");
+        assert_eq!(store.rows(), 1, "the rows survived a busy open");
     }
 }

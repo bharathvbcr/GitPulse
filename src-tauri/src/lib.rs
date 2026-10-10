@@ -146,6 +146,34 @@ pub fn run() {
             {
                 log::warn!(target: "trust", "repository trust migration did not start: {error}");
             }
+            // The cleaner and launch-at-login agents each record one fixed
+            // executable path, rewritten only on a Settings save. Compare them
+            // with the running app so a moved, translocated or older copy is
+            // not started every minute; off this thread, since it may run
+            // launchctl.
+            #[cfg(target_os = "macos")]
+            {
+                use tauri_plugin_autostart::ManagerExt as _;
+                let handle = app.handle().clone();
+                let name = app.package_info().name.clone();
+                if let Err(error) = std::thread::Builder::new()
+                    .name("launch-agent-check".into())
+                    .spawn(move || {
+                        match storage::hygiene::background::refresh_if_stale() {
+                            Ok(desktop::launch_agent::Registration::Stale { registered }) => {
+                                log::warn!(target: "setup", "the cleaner LaunchAgent started {registered:?}; it now starts this app");
+                            }
+                            Ok(_) => {}
+                            Err(error) => log::warn!(target: "setup", "cleaner LaunchAgent check: {error}"),
+                        }
+                        desktop::launch_agent::refresh_autostart(&name, || {
+                            handle.autolaunch().enable().map_err(|e| e.to_string())
+                        });
+                    })
+                {
+                    log::warn!(target: "setup", "launch agent check did not start: {error}");
+                }
+            }
             // Installed before anything can mutate, so the first guarded action
             // of the session is announced like every one after it.
             crate::ledger::set_app_handle(app.handle().clone());

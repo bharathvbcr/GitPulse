@@ -558,6 +558,20 @@ pub(super) struct Swept {
     pub complete: bool,
 }
 
+impl Swept {
+    /// `error` as a refusal the caller may show, saying so when this pass left
+    /// held runs unexamined: "nothing could be released" is then a floor, not
+    /// a finding.
+    pub fn qualify(&self, mut error: WorkbenchError) -> WorkbenchError {
+        if !self.complete {
+            error.message.push_str(
+                " (reconciliation examined only part of the held runs, so more may be releasable)",
+            );
+        }
+        error
+    }
+}
+
 pub(super) fn sweep(state: &WorkbenchState) -> Result<Swept, WorkbenchError> {
     sweep_pages(state, MAX_PAGES)
 }
