@@ -3029,6 +3029,52 @@ done
         assert!(rendered.contains("scope.unplanned"), "{rendered}");
     }
 
+    /// Which commands count as writing a file is the harness's call, not the
+    /// hook's: the hook must not pre-filter by program name and must not alter
+    /// what it sends. Every argument-writing program the fence is asked about
+    /// reaches the harness verbatim, with the bound task's scope, so a
+    /// harness that learns to read one more writer fences it with no change
+    /// here. (The writers the shipped harness does not yet read are listed in
+    /// `tests/hook_scope_fence.rs` and the wiki.)
+    #[cfg(unix)]
+    #[test]
+    fn every_argument_writer_reaches_the_harness_verbatim_with_the_scope() {
+        let writers = [
+            "rm docs/elsewhere.md",
+            "truncate -s 0 docs/elsewhere.md",
+            "touch docs/elsewhere.md",
+            "dd if=seed.txt of=docs/elsewhere.md",
+            "perl -pi -e 's/a/b/' docs/elsewhere.md",
+            "install seed.txt docs/elsewhere.md",
+            "ln -sf seed.txt docs/elsewhere.md",
+            "rsync seed.txt docs/elsewhere.md",
+            "patch docs/elsewhere.md < x.diff",
+            "git apply x.diff",
+            "echo docs/elsewhere.md | xargs rm",
+            "find docs -name elsewhere.md -exec rm {} +",
+        ];
+        let (dir, repo, requests) = scoped_hook_fixture(true);
+        let serial = crate::harness::sidecar::test_serial();
+        let _binary = install_scoped_manvi(dir.path(), &requests, &serial);
+
+        for writer in writers {
+            let _ = std::fs::remove_file(&requests);
+            let _ = gate_here(&bash_call(&repo, writer));
+            let sent = std::fs::read_to_string(&requests).unwrap_or_default();
+            let request: Value = serde_json::from_str(
+                sent.lines()
+                    .next()
+                    .unwrap_or_else(|| panic!("`{writer}` was never put to the harness")),
+            )
+            .expect("the request is JSON");
+            assert_eq!(request["params"]["command"], writer, "altered in flight");
+            assert_eq!(
+                request["params"]["scope"]["task_id"], "TASK-HOOK",
+                "`{writer}` was judged without the bound scope: {request}"
+            );
+        }
+    }
+
     /// An unbound checkout declares nothing, and the same command keeps the
     /// answer it always had.
     #[cfg(unix)]

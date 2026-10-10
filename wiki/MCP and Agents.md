@@ -19,7 +19,7 @@ bun run mcp:doctor
 
 Both are required, and the hook is the one that fails quietly. A client that cannot spawn the server shows a failed MCP connection; a host that cannot spawn a hook records a non-blocking error and runs the tool call anyway, so an absent `gitpulse-hook` leaves the collision guard and command gate permanently disabled while every session looks normal. `mcp:doctor` exits non-zero if either is missing.
 
-The packaged app copies `plugins/gitpulse/` into `Contents/Resources/plugin`. Settings can copy the Codex / MCP manifests and will name the binary path, or why it could not be found.
+The packaged app copies `plugins/gitpulse/` into `Contents/Resources/plugin`. Settings resolves `gitpulse-mcp` and `gitpulse-hook` beside the app, says `not reachable` for a hook binary it cannot find, warns when either is not on `PATH`, and copies `.mcp.json` and `hooks.json` with the resolved absolute paths. A released app puts neither on `PATH`, which is why those copies, not the bare names in the plugin's own manifests, are what to install there. In the copied `hooks.json` the collision guard and command gate refuse the call when the binary is missing, and session start says the hooks are off.
 
 Portable MCP config (`plugins/gitpulse/.mcp.json`):
 
@@ -67,6 +67,14 @@ Four properties are deliberate:
 Off macOS the report would have nowhere to go even if the socket existed: desktop notifications are a macOS implementation, and every other platform's arm returns `unsupported`. The hooks stay installed and harmless, and GitPulse says so rather than offering a switch that does nothing. See [platform coverage](https://github.com/bharathvbcr/GitPulse/blob/main/docs/QUALIFICATION.md#platform-coverage).
 
 The command gate runs without a bound task scope, so it reaches the hard rungs (force-push, destructive commands) and not the scope rungs. That is a smaller gate than the desktop app's, and a real one.
+
+### What the task-scope fence does not cover
+
+In a checkout bound to a task, both hooks judge writes against the task's plan. The edges, each decided rather than forgotten:
+
+- **Argument-writing commands.** The harness reads redirections and the files `sed -i`, `tee`, `cp` and `mv` write. It does not read `rm`, `truncate`, `touch`, `dd of=`, `perl -i`, `install`, `ln`, `rsync`, `patch`, `git apply`, or a write run through `xargs` / `find -exec`: against a plan that excludes the file they are allowed. Reading a program's write targets is the harness's job (DevCouncil `policy`), and a second parser here would drift from it, so GitPulse does not fence them itself. The hook sends every command to the harness unaltered with the bound scope (one unit test covers every program above), so fencing one is a harness change and nothing here changes. `tests/hook_scope_fence.rs` pins the current gap against the real binary and fails when it closes.
+- **Descendants that escape.** A process that leaves the agent's process group (a daemonised child, `setsid`) writes with no tool call for a hook to judge. Hooks judge calls, not processes; GitPulse reaps what it launched and reports what it cannot, and does not claim more.
+- **A second profile or an agent GitPulse did not launch.** The fence exists only where the plugin's hooks are registered. An agent under another Claude profile, or one started outside GitPulse, has none, and nothing here can fence it. The task binding is per checkout, so such an agent is judged the moment its profile registers the hooks: Settings -> MCP copies a `hooks.json` with absolute paths for that.
 
 ## Package layout
 

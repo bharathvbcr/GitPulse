@@ -13,6 +13,15 @@ before that tag is pushed.
 
 ### Changed
 
+- **The task-scope fence's open edges are decided and documented.** `rm`,
+  `truncate`, `touch`, `dd of=`, `perl -i`, `install`, `ln`, `rsync`, `patch`,
+  `git apply` and `xargs` / `find -exec` writes are not read by the harness
+  and are allowed against a plan that excludes the file; fencing them belongs
+  to the harness, not a second parser here. The hook now has a test that every
+  one reaches the harness verbatim with the bound scope, and the real-harness
+  fence test pins the gap so it fails when it closes. Escaped descendants and
+  second-profile agents are documented as outside what a hook can judge. No
+  behaviour changed.
 - **`gitpulse-hook` correctness.** The hook now takes down any `git` or harness
   child a check abandoned at its deadline before it exits (a stalled `git
   status` used to outlive it and could hold `.git/index.lock`); one 8 s
