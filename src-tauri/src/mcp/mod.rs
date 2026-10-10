@@ -701,7 +701,7 @@ fn build_tools() -> Vec<Value> {
         mutating_tool(
             "gitpulse_complete_task",
             "Complete task",
-            "Move your GitPulse board task to done when the work is finished (or to review to hand it to a person, or in_progress when you start). Pass the task id from your brief's 'Task:' line, or the task_id it was filed with. Only the status changes, plus an optional summary appended to the task's logs so the person sees what you did; a person's concurrent edit is never overwritten. Call it only when the acceptance criteria are met and your verification passed. Idempotent: the same move twice is reported as unchanged. A task already done is never reopened. Requires the repository to be trusted in GitPulse.",
+            "Move your GitPulse board task to done when the work is finished. Done is evidence-gated: it lands only if Manvi's verification passed for your worktree's current head, otherwise the task goes to review with the reason (held_for_review: true) for a person to judge, and no argument changes that (or to review to hand it to a person, or in_progress when you start). Pass the task id from your brief's 'Task:' line, or the task_id it was filed with. Only the status changes, plus an optional summary appended to the task's logs so the person sees what you did; a person's concurrent edit is never overwritten. Call it only when the acceptance criteria are met and your verification passed. Idempotent: the same move twice is reported as unchanged. A task already done is never reopened. Requires the repository to be trusted in GitPulse.",
             json!({
                 "repo_path": repo_prop(),
                 "task_id": bounded_string_prop("The task id from your brief ('Task: <id>'), its board item_id, or the task_id it was filed with", 1, 128),
@@ -3125,6 +3125,13 @@ mod tests {
         crate::test_support::trust_repo(dir.path());
         let id = "6f1c2a7e-0d4b-4c1e-9a55-3b0e8f2d9c11";
         let (board, _) = board_task(profile.path(), &repo, id);
+        // An agent's `done` needs Manvi's passed verdict for the current head.
+        crate::test_support::git_in(dir.path(), &["commit", "-q", "--allow-empty", "-m", "base"]);
+        crate::workbench::intake::gate_tests::verified(
+            &dc_store::Store::open(profile.path().join("workbench.sqlite")).unwrap(),
+            &dir,
+            id,
+        );
         let before = board
             .board_request("items.get", &json!({"id": id}).to_string())
             .unwrap()["item"]
@@ -3176,7 +3183,11 @@ mod tests {
         }
         let logs = after["logs"].as_str().unwrap();
         assert!(
-            logs.starts_with("first trace\n\n--- Agent moved this task to done ("),
+            logs.starts_with("first trace\n\n--- Verification passed ("),
+            "the verdict is attached to the history: {logs}"
+        );
+        assert!(
+            logs.contains("\n\n--- Agent moved this task to done ("),
             "{logs}"
         );
         assert!(logs.ends_with(summary), "{logs}");
@@ -3219,6 +3230,11 @@ mod tests {
         crate::test_support::git_in(dir.path(), &["commit", "-q", "--allow-empty", "-m", "base"]);
         let id = "0b7d4e2a-91c3-4f6e-8a2d-5c4b3a291e70";
         let (board, _) = board_task(profile.path(), &repo, id);
+        crate::workbench::intake::gate_tests::verified(
+            &dc_store::Store::open(profile.path().join("workbench.sqlite")).unwrap(),
+            &dir,
+            id,
+        );
         let lane = dir.path().join(".gitpulse/worktrees/import-0b7d4e2a");
         crate::test_support::git_in(
             dir.path(),

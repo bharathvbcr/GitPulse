@@ -25,6 +25,7 @@ pub mod review;
 pub(crate) mod terminal_command;
 mod terminal_launch;
 mod terminal_run;
+pub(crate) mod verification_gate;
 
 const MAX_IN_FLIGHT: usize = 8;
 const MAX_INPUT: usize = 1024 * 1024;
@@ -363,6 +364,17 @@ impl WorkbenchState {
         // it is a host method rather than a raw store one.
         if method == "items.merge" {
             return self.with_store(|store| intake::merge_request(store, input));
+        }
+        // Verification is Manvi's: these only name the work to judge and read
+        // the verdict back. Completing a task never needs them (the gate reads
+        // the stored record), so a down sidecar cannot block or fake a verdict.
+        if method == "verifications.start" {
+            let params = verification_gate::start_params(input)?;
+            return self.worker_call("work.verify.task", params, None);
+        }
+        if method == "verifications.get" {
+            let params = verification_gate::get_params(input)?;
+            return self.worker_call("work.verify.get", params, None);
         }
         if matches!(
             method,

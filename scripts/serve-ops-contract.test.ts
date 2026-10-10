@@ -38,6 +38,7 @@ const contract: ServeContract = JSON.parse(read("contracts", "serve.ops.schema.j
 const policyRs = read("src-tauri", "src", "harness", "policy.rs");
 const protocolRs = read("src-tauri", "src", "harness", "protocol.rs");
 const sidecarRs = read("src-tauri", "src", "harness", "sidecar.rs");
+const gateRs = read("src-tauri", "src", "workbench", "verification_gate.rs");
 
 const declared = (type: string) => Object.keys(contract.types[type].fields ?? {});
 
@@ -149,7 +150,29 @@ describe("the ops GitPulse names are served", () => {
     expect(allow, "profile worker allowlist not found").not.toBeNull();
     const ops = [...allow![1].matchAll(/"([^"]+)"/g)].map((m) => m[1]);
     expect(ops.filter((op) => !served.has(op))).toEqual([]);
-    expect(ops).toHaveLength(7);
+    expect(ops).toHaveLength(9);
+    expect(ops).toEqual(expect.arrayContaining(["work.verify.task", "work.verify.get"]));
+  });
+
+  it("what GitPulse sends work.verify.task and work.verify.get is declared, and nothing required is missing", () => {
+    const fnBody = (name: string) => {
+      const at = gateRs.indexOf(`pub(crate) fn ${name}(`);
+      expect(at, `${name} not found`).toBeGreaterThanOrEqual(0);
+      const rest = gateRs.slice(at);
+      return rest.slice(0, rest.search(/\n\}\n/));
+    };
+    const start = paramKeys(fnBody("start_params"));
+    expect(undeclared(start, "VerifyTaskParams")).toEqual([]);
+    expect(missingRequired(start, "VerifyTaskParams")).toEqual([]);
+    const get = paramKeys(fnBody("get_params"));
+    expect(undeclared(get, "VerifyGetParams")).toEqual([]);
+    expect(missingRequired(get, "VerifyGetParams")).toEqual([]);
+  });
+
+  it("the evidence type the completion gate reads is the one Manvi stores a verification under", () => {
+    const type = /pub\(crate\) const EVIDENCE_TYPE: &str = "([^"]+)";/.exec(gateRs);
+    expect(type).not.toBeNull();
+    expect(contract.ops.optional).toContain(type![1]);
   });
 
   it("the profile worker ops are optional: a build without the module does not serve them", () => {
