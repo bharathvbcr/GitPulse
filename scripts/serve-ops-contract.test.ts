@@ -134,6 +134,32 @@ describe("what GitPulse sends is declared by the contract", () => {
     expect(fields).toEqual(expect.arrayContaining(["protocol", "ops", "posture"]));
     expect(undeclared(fields, "HelloResult")).toEqual([]);
   });
+
+  it("HelloResult reads the per-op deadlines Manvi advertises, and only fields Go sends", () => {
+    expect(structFields(protocolRs, "HelloResult")).toContain("op_limits");
+    const limit = structFields(protocolRs, "OpLimit");
+    expect(limit).toEqual(expect.arrayContaining(["lane", "deadline_ms"]));
+    expect(undeclared(limit, "OpLimit")).toEqual([]);
+  });
+
+  it("the sidecar sizes its timeouts from the advertised deadlines and says when it falls back", () => {
+    expect(sidecarRs).toMatch(/fn advertised_timeout\(/);
+    expect(sidecarRs).toMatch(/Budget::PerOp => match advertised_timeout\(/);
+    expect(sidecarRs).toMatch(/does not advertise op deadlines/);
+  });
+});
+
+describe("repository reads are bound to a root the request names", () => {
+  // Manvi refuses these with E_BAD_ROOT when the root is missing, so a host
+  // that builds one of these requests must send it; the contract pins which.
+  it.each([
+    ["DevmapStatusParams", "root"],
+    ["DevmapQueryParams", "root"],
+    ["RefineParams", "repo_root"],
+    ["GapScanParams", "repo_root"],
+  ])("%s requires %s", (type, field) => {
+    expect(contract.types[type].fields?.[field]?.required).toBe(true);
+  });
 });
 
 describe("the ops GitPulse names are served", () => {

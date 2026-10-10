@@ -25,7 +25,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, TrySendError};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread;
@@ -55,6 +55,39 @@ pub(crate) fn op_deadline(op: &str) -> Duration {
         _ => DEFAULT_CALL_TIMEOUT,
     }
 }
+/// Wire slack added to an advertised deadline: Manvi's own deadline ends the
+/// request, and the host's timeout must land after it so the refusal Manvi
+/// writes is read instead of the child being declared wedged first.
+pub(crate) const ADVERTISED_DEADLINE_MARGIN: Duration = Duration::from_secs(5);
+/// Upper bound on a timeout taken from the server, so a bad advertisement can
+/// never park a caller for longer than this.
+pub(crate) const MAX_ADVERTISED_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+
+/// The client timeout for `op` from what the running Manvi advertised in
+/// `hello`: its deadline plus [`ADVERTISED_DEADLINE_MARGIN`], clamped to
+/// [`MAX_ADVERTISED_TIMEOUT`]. `None` when it did not say (an older Manvi, an
+/// op it answers inline, or an unknown op), in which case the caller falls back
+/// to [`op_deadline`].
+pub(crate) fn advertised_timeout(hello: &HelloResult, op: &str) -> Option<Duration> {
+    let limit = hello.op_limits.as_ref()?.get(op)?;
+    if limit.deadline_ms == 0 {
+        return None;
+    }
+    Some(
+        (Duration::from_millis(limit.deadline_ms) + ADVERTISED_DEADLINE_MARGIN)
+            .min(MAX_ADVERTISED_TIMEOUT),
+    )
+}
+
+/// How a call's timeout is chosen.
+#[derive(Clone, Copy)]
+enum Budget {
+    /// The caller's own figure.
+    Fixed(Duration),
+    /// The server's advertised deadline for the op, falling back to the table.
+    PerOp,
+}
+
 /// Handshake budget. A cold `manvi serve` has to resolve its configuration
 /// before it answers, so this is deliberately looser than a warm call.
 const HELLO_TIMEOUT: Duration = Duration::from_secs(20);
@@ -1318,16 +1351,20 @@ fn acquire_slot_for(
 /// the slot slow) then fails with [`HarnessError::Busy`]: the harness may be
 /// perfectly healthy, just starting.
 pub fn call(op: &str, params: Option<Value>, timeout: Duration) -> Result<Value, HarnessError> {
-    call_in_slot(slot(), op, params, timeout, None)
+    call_in_slot(slot(), op, params, Budget::Fixed(timeout), None)
 }
 
 fn call_in_slot(
     owner: &Mutex<Slot>,
     op: &str,
     params: Option<Value>,
-    timeout: Duration,
+    budget: Budget,
     closing: Option<&std::sync::atomic::AtomicBool>,
 ) -> Result<Value, HarnessError> {
+    let timeout = match budget {
+        Budget::Fixed(t) => t,
+        Budget::PerOp => op_deadline(op),
+    };
     let sidecar = {
         let mut guard = acquire_slot_for(owner, Instant::now() + timeout.min(DEFAULT_CALL_TIMEOUT))
             .ok_or_else(|| {
@@ -1354,6 +1391,16 @@ fn call_in_slot(
         }
         sidecar
     };
+    let timeout = match budget {
+        Budget::Fixed(t) => t,
+        Budget::PerOp => match advertised_timeout(&sidecar.hello, op) {
+            Some(t) => t,
+            None => {
+                note_deadline_fallback(&sidecar.hello, op);
+                timeout
+            }
+        },
+    };
     let outcome = sidecar.call(op, params, timeout);
     if let Err(e) = &outcome {
         if retriable_transport_fault(e) {
@@ -1361,6 +1408,21 @@ fn call_in_slot(
         }
     }
     outcome
+}
+
+/// Says once per process that a timeout came from GitPulse's own table rather
+/// than from the server, so a host sizing calls from a table that may have
+/// drifted is visible in the log and not silent.
+fn note_deadline_fallback(hello: &HelloResult, op: &str) {
+    static SAID: AtomicBool = AtomicBool::new(false);
+    if hello.op_limits.is_some() || SAID.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    log::info!(
+        target: "harness",
+        "this Manvi does not advertise op deadlines (hello has no op_limits); '{op}' and other \
+         profile-worker calls use GitPulse's built-in timeout table"
+    );
 }
 
 /// Drops `sidecar` after a transport fault and arms the respawn backoff,
@@ -1426,15 +1488,10 @@ impl ProfileConnection {
     }
 
     pub(crate) fn call(&self, op: &str, params: Value) -> Result<Value, HarnessError> {
-        self.call_within(op, params, op_deadline(op))
+        self.call_within(op, params, Budget::PerOp)
     }
 
-    fn call_within(
-        &self,
-        op: &str,
-        params: Value,
-        timeout: Duration,
-    ) -> Result<Value, HarnessError> {
+    fn call_within(&self, op: &str, params: Value, budget: Budget) -> Result<Value, HarnessError> {
         if !matches!(
             op,
             "work.enhancements.generate"
@@ -1456,7 +1513,7 @@ impl ProfileConnection {
                 "the profile worker is shutting down".into(),
             ));
         }
-        call_in_slot(&self.slot, op, Some(params), timeout, Some(&self.closing))
+        call_in_slot(&self.slot, op, Some(params), budget, Some(&self.closing))
     }
 
     /// What this worker's sidecar declared at handshake, spawning it if it has
@@ -2401,7 +2458,12 @@ handle() {
   run=$(printf '%s' "$1" | sed -n 's/.*"params":{"id":"\([A-Za-z0-9_-]*\)".*/\1/p')
   [ -f "$DIR/slow-$run" ] && sleep "$(cat "$DIR/slow-$run")"
   case "$1" in
-    *'"op":"hello"'*) reply "$id" '{"protocol":1,"ops":["hello","work.runs.managed.prepare","work.runs.managed.activate","work.runs.managed.stop"],"posture":"host"}' ;;
+    *'"op":"hello"'*)
+      if [ -f "$DIR/advertise" ]; then
+        reply "$id" '{"protocol":1,"ops":["hello","work.runs.managed.prepare","work.runs.managed.activate","work.runs.managed.stop"],"posture":"host","op_limits":{"work.runs.managed.activate":{"lane":"managed","deadline_ms":1}}}'
+      else
+        reply "$id" '{"protocol":1,"ops":["hello","work.runs.managed.prepare","work.runs.managed.activate","work.runs.managed.stop"],"posture":"host"}'
+      fi ;;
     *'managed.prepare'*)
       printf '%s\n' "$$" > "$DIR/live-$run"
       reply "$id" '{}' ;;
@@ -2463,7 +2525,7 @@ while IFS= read -r line; do handle "$line" & done
                 let outcome = connection.call_within(
                     "work.runs.managed.prepare",
                     serde_json::json!({"id": "slow"}),
-                    Duration::from_secs(1),
+                    Budget::Fixed(Duration::from_secs(1)),
                 );
                 (outcome, started.elapsed())
             })
@@ -2507,6 +2569,118 @@ while IFS= read -r line; do handle "$line" & done
         connection.shutdown();
     }
 
+    fn limits(entries: &[(&str, u64)]) -> HelloResult {
+        HelloResult {
+            op_limits: Some(
+                entries
+                    .iter()
+                    .map(|(op, ms)| {
+                        (
+                            (*op).to_owned(),
+                            OpLimit {
+                                lane: "work".into(),
+                                deadline_ms: *ms,
+                            },
+                        )
+                    })
+                    .collect(),
+            ),
+            ..HelloResult::default()
+        }
+    }
+
+    #[test]
+    fn an_advertised_deadline_plus_margin_is_the_client_timeout() {
+        let hello = limits(&[("work.verify.task", 60_000)]);
+        assert_eq!(
+            advertised_timeout(&hello, "work.verify.task"),
+            Some(Duration::from_secs(60) + ADVERTISED_DEADLINE_MARGIN)
+        );
+    }
+
+    #[test]
+    fn an_advertised_deadline_is_clamped_to_a_sane_maximum() {
+        let hello = limits(&[("work.enhancements.generate", u64::MAX / 2)]);
+        assert_eq!(
+            advertised_timeout(&hello, "work.enhancements.generate"),
+            Some(MAX_ADVERTISED_TIMEOUT)
+        );
+    }
+
+    #[test]
+    fn nothing_advertised_means_the_table_not_a_guess() {
+        // An older Manvi: no op_limits at all.
+        assert_eq!(
+            advertised_timeout(&HelloResult::default(), "work.verify.task"),
+            None
+        );
+        // A newer one that does not name this op, or answers it inline (0).
+        let hello = limits(&[("work.verify.get", 0)]);
+        assert_eq!(advertised_timeout(&hello, "work.verify.get"), None);
+        assert_eq!(advertised_timeout(&hello, "work.verify.task"), None);
+    }
+
+    #[test]
+    fn hello_without_op_limits_decodes_as_not_said() {
+        let hello: HelloResult =
+            serde_json::from_value(serde_json::json!({"protocol": 1, "ops": ["hello"]})).unwrap();
+        assert!(hello.op_limits.is_none());
+        let hello: HelloResult = serde_json::from_value(serde_json::json!({
+            "protocol": 1,
+            "op_limits": {"work.verify.task": {"lane": "work", "deadline_ms": 60000}}
+        }))
+        .unwrap();
+        assert_eq!(
+            hello.op_limits.unwrap()["work.verify.task"].deadline_ms,
+            60_000
+        );
+    }
+
+    /// The call is bounded by what Manvi advertised, not by the built-in table:
+    /// the table gives `managed.activate` 15 s and the fake sleeps 7 s, so only
+    /// the advertised 1 ms + margin can end it.
+    #[cfg(unix)]
+    #[test]
+    fn a_call_is_bounded_by_the_advertised_deadline_not_the_table() {
+        let serial = test_serial();
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(dir.path().join("advertise"), "").unwrap();
+        std::fs::write(dir.path().join("slow-late"), "7").unwrap();
+        let (_binary, connection) = managed_fixture(&serial, &dir);
+        let started = Instant::now();
+        let error = connection
+            .call(
+                "work.runs.managed.activate",
+                serde_json::json!({"id": "late"}),
+            )
+            .expect_err("the advertised deadline should have ended the call");
+        assert!(matches!(error, HarnessError::Timeout(_)), "{error:?}");
+        assert!(
+            started.elapsed() < Duration::from_millis(6_800),
+            "waited on the table, not the advertisement: {:?}",
+            started.elapsed()
+        );
+        connection.shutdown();
+    }
+
+    /// Against a Manvi that advertises nothing the table still applies, and the
+    /// same slow call completes inside it.
+    #[cfg(unix)]
+    #[test]
+    fn without_an_advertisement_the_table_still_applies() {
+        let serial = test_serial();
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(dir.path().join("slow-late"), "1").unwrap();
+        let (_binary, connection) = managed_fixture(&serial, &dir);
+        connection
+            .call(
+                "work.runs.managed.activate",
+                serde_json::json!({"id": "late"}),
+            )
+            .expect("the table allows 15 s");
+        connection.shutdown();
+    }
+
     #[cfg(unix)]
     #[test]
     fn a_timeout_still_recycles_a_child_that_hosts_nothing() {
@@ -2524,7 +2698,7 @@ while IFS= read -r line; do handle "$line" & done
             .call_within(
                 "work.runs.managed.activate",
                 serde_json::json!({"id": "wedge"}),
-                Duration::from_millis(300),
+                Budget::Fixed(Duration::from_millis(300)),
             )
             .unwrap_err();
         assert!(matches!(error, HarnessError::Timeout(_)));

@@ -13,6 +13,13 @@ before that tag is pushed.
 
 ### Changed
 
+- The profile worker's per-call timeout now comes from Manvi's `hello`
+  (`op_limits`: the lane and server-side deadline of each op) plus a 5 s margin,
+  clamped to 15 minutes, instead of a hard-coded table. Against an older Manvi
+  that advertises nothing the built-in table still applies, and a log line says
+  so. The vendored `contracts/serve.ops.schema.json` is refreshed for it and for
+  the repository roots Manvi's `devmap.*`, refine and scan ops now require
+  (`E_BAD_ROOT` otherwise); GitPulse sends none of those ops today.
 - CI now fails when a vendored crate is edited in this repository, through the
   new `bun run check:vendor-edits` (`vendor-crates.mjs --check --allow-drift`),
   which `ci:local` runs too. Upstream drift is still printed but never fails a
