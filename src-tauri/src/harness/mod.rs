@@ -146,8 +146,10 @@ pub(crate) fn guard_command_allowing(
 /// will meet a missing directory on its own.
 ///
 /// Whether a scope was declared comes back beside the verdict, because the
-/// verdict cannot say: the harness stamps every command decision with its
-/// `host-scope` placeholder task, scope or no scope.
+/// verdict cannot say: a command decision carries either the declared task's
+/// id or the harness's `host-scope` placeholder (always the placeholder from a
+/// `manvi` older than the scope allowlist fix), so its task id is no evidence of
+/// a binding.
 pub(crate) fn check_command_in_scope(repo_path: &str, command: &str) -> ScopedVerdict {
     match hook_scope(repo_path) {
         HookScope::Declared(scope) => ScopedVerdict {
@@ -751,7 +753,7 @@ done
         let _binary = sidecar::bind_test_binary(&serial, script.to_string_lossy());
 
         // The hook learns the binding from here, never from the verdict's
-        // task id (the harness stamps `host-scope` on every command decision).
+        // task id, which may be the harness's `host-scope` placeholder.
         assert!(
             check_command_in_scope(repo, "ls").bound,
             "a bound checkout must report that it is bound"

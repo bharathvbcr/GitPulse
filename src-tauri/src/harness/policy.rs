@@ -224,9 +224,9 @@ impl PolicyVerdict {
     /// line, not because it read it and found something wrong.
     ///
     /// Whether the checkout is bound to a task is the caller's to supply (see
-    /// `harness::ScopedVerdict`): `task_id` cannot answer it, because the
-    /// harness stamps every command decision with its `host-scope` placeholder
-    /// whether or not a scope was sent.
+    /// `harness::ScopedVerdict`): `task_id` cannot answer it, because a command
+    /// decision may carry the harness's `host-scope` placeholder whether or not
+    /// a scope was sent.
     ///
     /// Each rule in [`UNREADABLE_CONSTRUCT_RULES`] is a statement about the
     /// gate's own reach: a `cd` moves where relative paths land, a heredoc body
