@@ -560,5 +560,16 @@ chmod checks but keeps the authenticating `git worktree list`, and the
 difference is inside the noise at this load: not established either way. The
 proposed ≤ 15 ms command-gate target (A19) is not met. What remains per call is
 process start, the `git worktree list` on initialised repositories, and the
-per-call `manvi serve --posture host` sidecar, which is ft-5a4e25c8's
-follow-up and out of scope here.
+per-call `manvi serve --posture host` sidecar, out of scope here.
+
+**Rulings (Fable, 2026-10-10).** D1: the zero-spawn shortcut stays. A
+hand-written gitfile into a repository with no ledger anywhere is answered
+"unbound": no binding can exist, trust is still required first, and the app
+gate (`repository_address`) still refuses it. D2: unimported legacy sibling
+history keeps failing closed (`legacy_ledger_unconsolidated`). One accepted
+difference from the app: a sibling ledger file with no schema is skipped by
+the hook (it holds no rows), where consolidation reports `legacy_read_failed`.
+D3: this change closes without the ≤ 15 ms target (A19). The target moves,
+with a per-component breakdown measured on a quiet machine, to
+ft-cb0d70b8 (long-lived `manvi serve` over the app socket). D4: that sidecar
+work is its own card rather than a note on ft-5a4e25c8.
