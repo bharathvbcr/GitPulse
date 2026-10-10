@@ -741,13 +741,19 @@ pub fn refused(message: &str) -> bool {
 /// the repository. Interleaved, a record renamed behind a revoke's listing
 /// survives it and the repository is trusted again. One lock around each whole
 /// act makes them take turns. It is an `flock` on a hidden file inside the
-/// directory (so another process, such as a second app instance, takes turns
-/// too) beneath a process-wide mutex.
+/// directory, so another process (a second app instance) takes turns too.
 fn with_store_lock<T>(root: &Path, f: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
-    static LOCAL: Mutex<()> = Mutex::new(());
-    let _local = LOCAL
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    // Windows has no `flock` here, so threads of one process take turns on a
+    // process-wide mutex instead; Unix needs only the file lock, which already
+    // separates two descriptors in one process, and must not serialise
+    // unrelated trust directories behind each other.
+    #[cfg(not(unix))]
+    let _local = {
+        static LOCAL: Mutex<()> = Mutex::new(());
+        LOCAL
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    };
     let _file = lock_directory(root)?;
     f()
 }
@@ -789,10 +795,55 @@ fn lock_directory(_root: &Path) -> Result<Option<File>, String> {
 /// The lock file's name. A leading dot keeps it out of migration and listing.
 const STORE_LOCK: &str = ".store.lock";
 
-/// Renames `source` to `dest` and never replaces an existing `dest`: a hard
-/// link fails when the name is taken, and the source is removed only after it
-/// succeeded. `fs::rename` replaces silently, which is how a grant saved
-/// between a free-name check and the move would be overwritten.
+/// Renames `source` to `dest` and never replaces an existing `dest`: the
+/// kernel refuses with `AlreadyExists` when the name is taken. `fs::rename`
+/// replaces silently, which is how a grant saved between a free-name check and
+/// the move would be overwritten.
+#[cfg(target_os = "macos")]
+fn rename_no_replace(source: &Path, dest: &Path) -> std::io::Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+    let c = |path: &Path| {
+        std::ffi::CString::new(path.as_os_str().as_bytes())
+            .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))
+    };
+    let (from, to) = (c(source)?, c(dest)?);
+    // SAFETY: both pointers are NUL-terminated strings that outlive the call.
+    if unsafe { libc::renamex_np(from.as_ptr(), to.as_ptr(), libc::RENAME_EXCL) } == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn rename_no_replace(source: &Path, dest: &Path) -> std::io::Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+    let c = |path: &Path| {
+        std::ffi::CString::new(path.as_os_str().as_bytes())
+            .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))
+    };
+    let (from, to) = (c(source)?, c(dest)?);
+    // SAFETY: both pointers are NUL-terminated strings that outlive the call.
+    let done = unsafe {
+        libc::syscall(
+            libc::SYS_renameat2,
+            libc::AT_FDCWD,
+            from.as_ptr(),
+            libc::AT_FDCWD,
+            to.as_ptr(),
+            libc::RENAME_NOREPLACE,
+        )
+    };
+    if done == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+/// Elsewhere: a hard link fails when the name is taken, and the source is
+/// removed only after it succeeded.
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 fn rename_no_replace(source: &Path, dest: &Path) -> std::io::Result<()> {
     fs::hard_link(source, dest)?;
     fs::remove_file(source)
@@ -920,16 +971,16 @@ pub fn migrate_store(root: &Path) -> Result<(), String> {
         }
         paths.push(entry.path());
     }
-    for path in &paths {
-        // One entry per lock hold: a revoke waits for at most one record's
-        // read-and-move, and never sees a record in flight.
-        if let Err(error) = with_store_lock(root, || {
+    // One lock hold for the whole pass (a few hundred milliseconds for the
+    // 4096-entry cap), so a revoke waits for it rather than interleaving with
+    // it, and the lock is not re-taken per record.
+    if let Err(error) = with_store_lock(root, || {
+        for path in &paths {
             migrate_entry(root, path);
-            Ok(())
-        }) {
-            log::warn!(target: "trust", "repository trust migration stopped: {error}");
-            break;
         }
+        Ok(())
+    }) {
+        log::warn!(target: "trust", "repository trust migration did not run: {error}");
     }
     if stopped_early {
         log::warn!(
