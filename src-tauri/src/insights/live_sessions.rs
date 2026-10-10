@@ -102,6 +102,7 @@ pub(crate) fn observe() -> Observation {
 
 /// [`observe`] with one registry directory and the liveness probe as
 /// arguments, so tests can point it at a fixture registry.
+#[cfg(test)]
 pub(crate) fn observe_with(
     claude_sessions: Option<&Path>,
     alive: &dyn Fn(u32, u128) -> Liveness,

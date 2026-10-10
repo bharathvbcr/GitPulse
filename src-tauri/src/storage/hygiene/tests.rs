@@ -575,6 +575,7 @@ fn differently_cased_credentials_and_known_model_formats_are_preserved() {
 #[cfg(unix)]
 #[test]
 fn an_unrelated_build_tool_process_does_not_block_cleanup() {
+    use crate::procguard::LockedSpawn;
     use std::os::unix::fs::PermissionsExt;
     let temp = tempfile::tempdir().unwrap();
     let artifact = temp.path().join("target");
@@ -587,7 +588,7 @@ fn an_unrelated_build_tool_process_does_not_block_cleanup() {
     let mut child = std::process::Command::new(&uv)
         .arg("30")
         .current_dir(elsewhere.path())
-        .spawn()
+        .spawn_locked()
         .expect("start the stand-in uv process");
     let verdict = super::activity_check(&artifact);
     let _ = child.kill();
@@ -633,9 +634,9 @@ fn a_symlinked_cache_root_is_an_error_not_zero_bytes() {
     fs::write(real.join("blob"), vec![0u8; 4096]).unwrap();
     let link = temp.path().join("link");
     std::os::unix::fs::symlink(&real, &link).unwrap();
-    let error = tree::snapshot(&link, false, &AtomicBool::new(false))
-        .err()
-        .expect("a symlinked root must not measure as an empty success");
+    let Err(error) = tree::snapshot(&link, false, &AtomicBool::new(false)) else {
+        panic!("a symlinked root must not measure as an empty success");
+    };
     assert!(error.contains("symlink"), "{error}");
 }
 
