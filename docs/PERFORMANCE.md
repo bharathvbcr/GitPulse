@@ -20,6 +20,17 @@ native commands.
   from the web view. Hidden and unfocused windows are not sampled; unreported
   samples are dropped when leaving the foreground. Very long gaps are labelled
   as potentially including system sleep or suspension.
+- `performance:nav`: a switch of surface, repository or view settled 250 ms
+  or more after it started, or was still changing the page after 10 s
+  (`src/lib/diagnostics/navigation.ts`). Settled is the last DOM change
+  before 500 ms without one, so it includes a cold repository's hydrate or a
+  lazy view's chunk, and any background update landing in that window; a
+  view waiting more than 500 ms on an IPC answer with nothing changing is
+  timed too early. Cold is the first visit to that destination this session.
+  Each entry names the worst navigation (`settled_ms`, `first_frame_ms`) and
+  carries the session's cold and warm p50/p95/max, so a fast session writes
+  nothing; at most one entry per 30 s. Navigations in a hidden document are
+  not timed. It carries view names only, never repository paths.
 - Backend `[performance]`: a command through the shared blocking wrapper took
   at least one second. `queue_ms` measures waiting for a blocking worker;
   `work_ms` includes everything inside that command, including subprocess and
