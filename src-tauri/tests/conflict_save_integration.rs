@@ -3,6 +3,8 @@ use gitpulse_lib::diff::{
     ConflictResolutionChoice,
 };
 use gitpulse_lib::engine::git_cli::{git, git_with_stdin};
+// Only the macOS extended-attribute test spawns.
+#[cfg(target_os = "macos")]
 use gitpulse_lib::procguard::LockedSpawn;
 use std::fs;
 use tempfile::TempDir;

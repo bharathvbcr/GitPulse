@@ -190,6 +190,8 @@ fn configure_at(
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Only the macOS-only lint below spawns.
+    #[cfg(target_os = "macos")]
     use crate::procguard::LockedSpawn;
     #[test]
     fn plist_escapes_paths_and_uses_only_explicit_headless_arguments() {
