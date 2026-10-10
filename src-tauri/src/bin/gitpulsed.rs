@@ -347,22 +347,24 @@ fn main() {
                     log::error!(target: "gitpulsed", "application config directory unavailable; cannot take the daemon lock");
                     gitpulse_lib::procguard::exit(1);
                 }
-                Some(dir) => match gitpulse_lib::daemon_lock::acquire(&dir, env!("CARGO_PKG_VERSION")) {
-                    gitpulse_lib::daemon_lock::Acquire::Held(lock) => lock,
-                    gitpulse_lib::daemon_lock::Acquire::Occupied(owner) => {
-                        log::error!(
-                            target: "gitpulsed",
-                            "another gitpulsed already runs for this profile (pid {}, version {}); not starting a second",
-                            owner.pid.map_or("unknown".into(), |pid| pid.to_string()),
-                            owner.version.as_deref().unwrap_or("unknown"),
-                        );
-                        gitpulse_lib::procguard::exit(3);
+                Some(dir) => {
+                    match gitpulse_lib::daemon_lock::acquire(&dir, env!("CARGO_PKG_VERSION")) {
+                        gitpulse_lib::daemon_lock::Acquire::Held(lock) => lock,
+                        gitpulse_lib::daemon_lock::Acquire::Occupied(owner) => {
+                            log::error!(
+                                target: "gitpulsed",
+                                "another gitpulsed already runs for this profile (pid {}, version {}); not starting a second",
+                                owner.pid.map_or("unknown".into(), |pid| pid.to_string()),
+                                owner.version.as_deref().unwrap_or("unknown"),
+                            );
+                            gitpulse_lib::procguard::exit(3);
+                        }
+                        gitpulse_lib::daemon_lock::Acquire::Unavailable(reason) => {
+                            log::error!(target: "gitpulsed", "the daemon lock could not be taken, so nothing runs: {reason}");
+                            gitpulse_lib::procguard::exit(1);
+                        }
                     }
-                    gitpulse_lib::daemon_lock::Acquire::Unavailable(reason) => {
-                        log::error!(target: "gitpulsed", "the daemon lock could not be taken, so nothing runs: {reason}");
-                        gitpulse_lib::procguard::exit(1);
-                    }
-                },
+                }
             };
             let mut cycle = 0u64;
             loop {

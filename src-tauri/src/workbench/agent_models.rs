@@ -559,7 +559,11 @@ mod tests {
         // The cache is free while the CLI runs.
         let started = Instant::now();
         assert!(cached("agy-test-other").is_none());
-        assert!(started.elapsed() < Duration::from_millis(200), "{:?}", started.elapsed());
+        assert!(
+            started.elapsed() < Duration::from_millis(200),
+            "{:?}",
+            started.elapsed()
+        );
         // A second request for the same launcher shares the running listing.
         let list = slow(calls.clone());
         let second = listed_models("agy-test-shared", true, list);
@@ -575,7 +579,9 @@ mod tests {
         };
         let failed = listed_models("agy-test-failing", false, failing);
         assert!(failed.error.is_some());
-        let again = listed_models("agy-test-failing", false, || panic!("a cached failure was rerun"));
+        let again = listed_models("agy-test-failing", false, || {
+            panic!("a cached failure was rerun")
+        });
         assert!(again.cached && again.error.is_some());
         assert_eq!(failures.load(std::sync::atomic::Ordering::SeqCst), 1);
         // `refresh` always asks.

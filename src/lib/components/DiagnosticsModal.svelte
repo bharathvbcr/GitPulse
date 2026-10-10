@@ -1,5 +1,5 @@
 <script module lang="ts">
-  import type { PersistedLog as PersistedLogShape } from "../diagnostics/types";
+  import type { DaemonStatus, Degraded, PersistedLog as PersistedLogShape } from "../diagnostics/types";
 
   export type BackendDiagnosticStatus =
     | "idle"
@@ -139,15 +139,6 @@
     }
   }
 
-  interface DaemonStatus {
-    running: boolean;
-    pid: number | null;
-    version: string | null;
-    app_version: string;
-    mismatch: boolean;
-    error: string | null;
-  }
-
   /** What to say about the attribution daemon, or null when there is nothing to say. */
   function daemonNoticeFor(status: DaemonStatus): string | null {
     if (status.error) return `The attribution daemon could not be checked: ${redactDiagnosticText(String(status.error))}`;
@@ -159,7 +150,7 @@
     const [memoryResult, persistedResult, degradedResult, daemonResult] = await Promise.allSettled([
       invoke<string[]>("cmd_diagnostic_log_tail", {}),
       invoke<PersistedLog>("cmd_diagnostic_persisted_log", {}),
-      invoke<{ subsystem: string; reason: string; panics: number }[]>("cmd_degraded_subsystems", {}),
+      invoke<Degraded[]>("cmd_degraded_subsystems", {}),
       invoke<DaemonStatus>("cmd_daemon_status", {}),
     ]);
     if (!isCurrentBackendLoad(generation, backendLoadGeneration, isOpen)) return;

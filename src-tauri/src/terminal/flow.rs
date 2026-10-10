@@ -37,6 +37,11 @@ struct State {
     shedding: bool,
     /// This view has shed before; it is waited for `RELAPSE_STALL` at most.
     lagged: bool,
+    /// Credit for chunks whose emit failed. A view may or may not have got
+    /// one, so an acknowledgement for it is accepted if it ever comes, but it
+    /// is not counted as outstanding: a view that never got it would never
+    /// repay it, and the window would stay shut past the resume mark.
+    uncertain: usize,
 }
 
 /// What the reader does with a chunk it has read.
@@ -114,6 +119,7 @@ impl OutputFlow {
         state.shedding = false;
         state.lagged = false;
         state.pending = 0;
+        state.uncertain = 0;
         self.changed.notify_all();
     }
     /// A view takes the session over. Returns whether it had been detached;
@@ -129,6 +135,7 @@ impl OutputFlow {
             state.shedding = false;
             state.lagged = false;
             state.pending = 0;
+            state.uncertain = 0;
             self.changed.notify_all();
         }
         was
@@ -139,17 +146,27 @@ impl OutputFlow {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .detached
     }
-    /// A chunk could not be handed to the event loop. Whether any view got
-    /// it is unknown (an emit goes to every webview and stops at the first
-    /// failure), so its credit is neither forfeited nor counted twice: the
-    /// session sheds, and resumes once acknowledgements bring the window
-    /// down, as after any stall. Returns whether this began the shedding.
-    pub(super) fn shed(&self) -> bool {
+    /// A chunk of `bytes`, already reserved, could not be handed to the event
+    /// loop. Whether any view got it is unknown (an emit goes to every webview
+    /// and stops at the first failure), so its credit is released from the
+    /// outstanding window and kept as `uncertain`: an acknowledgement for it
+    /// is still accepted and never counted twice, and one that never comes
+    /// cannot hold the window shut. The session sheds, and resumes once
+    /// acknowledgements bring the window down, as after any stall. Returns
+    /// whether this began the shedding.
+    pub(super) fn shed(&self, bytes: usize) -> bool {
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if state.stopped || state.detached || state.shedding {
+        if state.stopped || state.detached {
+            return false;
+        }
+        let released = bytes.min(state.pending);
+        state.pending -= released;
+        state.uncertain = (state.uncertain + released).min(OUTPUT_WINDOW);
+        self.changed.notify_all();
+        if state.shedding {
             return false;
         }
         state.shedding = true;
@@ -168,10 +185,12 @@ impl OutputFlow {
             .state
             .lock()
             .map_err(|_| "Terminal output lock failed")?;
-        if bytes == 0 || bytes > state.pending {
+        if bytes == 0 || bytes > state.pending + state.uncertain {
             return Err("Invalid terminal output acknowledgement".into());
         }
-        state.pending -= bytes;
+        let from_uncertain = bytes.min(state.uncertain);
+        state.uncertain -= from_uncertain;
+        state.pending -= bytes - from_uncertain;
         self.changed.notify_all();
         Ok(())
     }
@@ -338,14 +357,43 @@ mod tests {
     fn a_failed_emit_sheds_once_and_resumes_like_a_stall() {
         let flow = OutputFlow::default();
         assert_eq!(flow.reserve(4096, Duration::ZERO).unwrap(), Route::Deliver);
-        assert!(flow.shed());
-        assert!(!flow.shed(), "already shedding: no second notice");
+        assert!(flow.shed(4096));
+        assert!(!flow.shed(0), "already shedding: no second notice");
         assert_eq!(flow.reserve(1, Duration::ZERO).unwrap(), Route::Resume);
         flow.acknowledge(4097).unwrap();
         flow.detach();
-        assert!(!flow.shed(), "a detached session holds, it does not shed");
+        assert!(!flow.shed(1), "a detached session holds, it does not shed");
         flow.stop();
-        assert!(!flow.shed());
+        assert!(!flow.shed(1));
+    }
+
+    /// The defect: a failed emit kept its reserved bytes as outstanding, so
+    /// after enough of them (RESUME_AT / 4 KiB chunks) the window stayed past
+    /// the resume mark and `reserve` never returned `Resume` until the session
+    /// was detached and attached again, whatever the view acknowledged.
+    #[test]
+    fn failed_emits_do_not_leak_credit() {
+        let flow = OutputFlow::default();
+        for emit in 0..64 {
+            let route = flow.reserve(4096, Duration::ZERO).unwrap();
+            assert!(
+                matches!(route, Route::Deliver | Route::Resume),
+                "emit {emit}: {route:?}; failed emits leaked credit"
+            );
+            flow.shed(4096);
+        }
+        // One chunk a view did get and acknowledges, and the late
+        // acknowledgement of a failed one, are both accepted, once.
+        assert!(matches!(
+            flow.reserve(4096, Duration::ZERO).unwrap(),
+            Route::Deliver | Route::Resume
+        ));
+        flow.acknowledge(4096).unwrap();
+        flow.acknowledge(4096).unwrap();
+        assert!(
+            flow.acknowledge(OUTPUT_WINDOW).is_err(),
+            "over-acknowledged"
+        );
     }
 
     /// A view that lagged once is not waited the full stall timeout again:

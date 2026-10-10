@@ -10,7 +10,7 @@
 
 #![cfg(unix)]
 
-use gitpulse_lib::procguard;
+use gitpulse_lib::procguard::{self, LockedSpawn};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -44,8 +44,15 @@ fn child_role(dir: PathBuf) -> ! {
     procguard::set_shutdown_hook(move || {
         // The sweep has not run yet: the sleeper is still there.
         let seen = alive(i32::try_from(pid).expect("pid"));
-        std::fs::write(hook_dir.join("hook"), if seen { "sleeper-alive" } else { "sleeper-gone" })
-            .expect("marker");
+        std::fs::write(
+            hook_dir.join("hook"),
+            if seen {
+                "sleeper-alive"
+            } else {
+                "sleeper-gone"
+            },
+        )
+        .expect("marker");
     });
     std::fs::write(dir.join("ready"), "").expect("ready");
     // Parked until the watcher exits the process.
@@ -62,12 +69,19 @@ fn sigterm_runs_the_hook_then_sweeps_registered_children() {
     }
     let dir = tempfile::tempdir().expect("dir");
     let mut child = Command::new(std::env::current_exe().expect("exe"))
-        .args(["sigterm_runs_the_hook_then_sweeps_registered_children", "--exact", "--nocapture"])
+        .args([
+            "sigterm_runs_the_hook_then_sweeps_registered_children",
+            "--exact",
+            "--nocapture",
+        ])
         .env(ROLE, dir.path())
         .stdin(Stdio::null())
-        .spawn()
+        .spawn_locked()
         .expect("re-exec");
-    assert!(wait_for(Duration::from_secs(20), || dir.path().join("ready").exists()));
+    assert!(wait_for(Duration::from_secs(20), || dir
+        .path()
+        .join("ready")
+        .exists()));
     let sleeper: i32 = std::fs::read_to_string(dir.path().join("sleeper"))
         .expect("pid")
         .parse()
@@ -80,15 +94,26 @@ fn sigterm_runs_the_hook_then_sweeps_registered_children() {
         if let Some(status) = child.try_wait().expect("wait") {
             break status;
         }
-        assert!(started.elapsed() < Duration::from_secs(20), "the process ignored SIGTERM");
+        assert!(
+            started.elapsed() < Duration::from_secs(20),
+            "the process ignored SIGTERM"
+        );
         std::thread::sleep(Duration::from_millis(20));
     };
     use std::os::unix::process::ExitStatusExt;
-    assert_eq!(status.code(), Some(128 + libc::SIGTERM), "{status:?} {:?}", status.signal());
+    assert_eq!(
+        status.code(),
+        Some(128 + libc::SIGTERM),
+        "{status:?} {:?}",
+        status.signal()
+    );
     assert_eq!(
         std::fs::read_to_string(dir.path().join("hook")).expect("the hook did not run"),
         "sleeper-alive",
         "the hook must run before the sweep"
     );
-    assert!(wait_for(Duration::from_secs(3), || !alive(sleeper)), "the sweep left the sleeper");
+    assert!(
+        wait_for(Duration::from_secs(3), || !alive(sleeper)),
+        "the sweep left the sleeper"
+    );
 }

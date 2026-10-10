@@ -411,7 +411,7 @@ type Registry = Mutex<HashMap<PathBuf, Result<Mutex<Connection>, LedgerError>>>;
 type DroppedRegistry = Mutex<HashMap<PathBuf, u64>>;
 
 /// One connection per repository, opened once.
-fn registry() -> &'static Registry {
+pub(crate) fn registry() -> &'static Registry {
     static REGISTRY: OnceLock<Registry> = OnceLock::new();
     REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
 }
@@ -3337,7 +3337,11 @@ mod tests {
             .unwrap();
         let error = open(&db).expect_err("an older writer must be refused");
         assert_eq!(error.code, "writer_too_old", "{error:?}");
-        assert_eq!(version(&db), WRITER_VERSION + 1, "a refused writer changed the stamp");
+        assert_eq!(
+            version(&db),
+            WRITER_VERSION + 1,
+            "a refused writer changed the stamp"
+        );
     }
 
     #[test]

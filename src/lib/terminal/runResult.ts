@@ -214,6 +214,8 @@ export interface TerminalListing {
   launcher: string | null;
   run_id: string | null;
   detached: boolean;
+  /** Its terminal has closed but its process has not been reaped; it can be stopped, not shown. */
+  ending?: boolean;
 }
 
 /**

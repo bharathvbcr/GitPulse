@@ -165,7 +165,8 @@
   import { applyReduceMotion } from "./lib/motion/motionPreference";
   import { installWindowStatePersistence } from "./lib/desktop/windowState";
   import { askConfirm } from "./lib/stores/modalStore";
-  import { runningAgents, terminalSessions } from "./lib/terminal/sessionRegistry";
+  import { terminalSessions } from "./lib/terminal/sessionRegistry";
+  import { quitRisks } from "./lib/terminal/quitGuard";
   import {
     hasUnsavedEditorDrafts,
     unsavedEditorDrafts,
@@ -360,7 +361,9 @@
     // Quitting ends every PTY, and an agent's work in progress with it. Every
     // other way an agent's tab goes away now leaves it running; this one
     // cannot, so it asks.
-    const agents = runningAgents(get(terminalSessions));
+    const agents = await quitRisks(get(terminalSessions), {
+      onError: (what, error) => diagnostics.warn("desktop:quit-guard", `Could not check ${what}: ${formatError(error)}`),
+    });
     if (agents.length > 0) {
       const listed = agents.slice(0, 5).map((record) => `• ${record.label} — ${displayName(record.repoPath)}`).join("\n");
       const omitted = agents.length > 5 ? `\n…and ${agents.length - 5} more` : "";

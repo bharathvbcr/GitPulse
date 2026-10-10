@@ -4,7 +4,7 @@ import { get } from "svelte/store";
 vi.mock("./ptyBus.tauri", () => ({ ptyBus: { subscribe: () => () => {} } }));
 vi.mock("../ipc/invoke", () => ({ invoke: vi.fn() }));
 
-const { adoptDetachedSessions, handOverDetachedRun, keepDetached, parseListing, stopQuestion, DETACHED_STATUS } = await import("./detachedSessions");
+const { adoptDetachedSessions, handOverDetachedRun, keepDetached, parseListing, stopQuestion, DETACHED_STATUS, ENDING_STATUS } = await import("./detachedSessions");
 const { createSessionRegistry } = await import("./sessionRegistry");
 const { taskTerminalRequests, consumeTaskTerminalRequest } = await import("./taskLaunches");
 import type { PtyBus, PtySessionHandlers } from "./ptyBus";
@@ -51,6 +51,32 @@ describe("sessions a reloaded page left running", () => {
     // is one already adopted.
     expect(await adopt()).toBe(0);
     expect(get(registry)).toHaveLength(1);
+  });
+
+  it("are all adopted when the limit has been lowered below how many the host holds", async () => {
+    // The defect: `reserve` threw on the first session above the limit and
+    // aborted the loop, so the rest stayed running, unlisted and unstoppable.
+    const { setTerminalSessionLimit } = await import("./sessionLimit");
+    setTerminalSessionLimit(2);
+    try {
+      const rows = [1, 2, 3, 4].map((n) => row({ id: `term-${n}`, run_id: null }));
+      const { registry, adopt } = setup(rows);
+      expect(await adopt()).toBe(4);
+      expect(get(registry).map((record) => record.sessionId)).toEqual(["term-1", "term-2", "term-3", "term-4"]);
+      // The limit still governs new sessions.
+      expect(() => registry.reserve({ key: "tab-new", repoPath: "/repos/app", label: "Shell", status: "starting", close: async () => {} })).toThrow(/in use/);
+    } finally { setTerminalSessionLimit(undefined); }
+  });
+
+  it("lists a session whose terminal closed but whose process has not exited, stoppable and not showable", async () => {
+    const { registry, calls, adopt } = setup([row({ ending: true })]);
+    expect(await adopt()).toBe(1);
+    const [record] = get(registry);
+    expect(record.status).toBe(ENDING_STATUS);
+    expect(record.reveal).toBeUndefined();
+    await record.close();
+    expect(calls.at(-1)).toEqual({ command: "cmd_terminal_kill", args: { sessionId: "term-1-a" } });
+    expect(get(registry)).toEqual([]);
   });
 
   it("stop for real, and leave the list only once the host has stopped them", async () => {

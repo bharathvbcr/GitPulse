@@ -23,3 +23,32 @@ export interface PersistedLog {
 export function unreadablePersistedLog(reason: string): PersistedLog {
   return { path: "", lines: [], degraded: `could not be read: ${reason}` };
 }
+
+/**
+ * A background thread that panicked and is being retried, as
+ * `cmd_degraded_subsystems` returns it. Mirrors `Degraded` in
+ * src-tauri/src/supervisor.rs; the pairing is pinned by `npm run check:types`.
+ */
+export interface Degraded {
+  subsystem: string;
+  /** The panic's message, one bounded printable line. */
+  reason: string;
+  since_unix: number;
+  /** Ticks that have panicked since the record was made. */
+  panics: number;
+}
+
+/**
+ * The attribution daemon, as `cmd_daemon_status` returns it. Mirrors
+ * `DaemonStatus` in src-tauri/src/daemon_lock.rs.
+ */
+export interface DaemonStatus {
+  running: boolean;
+  pid: number | null;
+  version: string | null;
+  app_version: string;
+  /** A daemon is running and is not this build. */
+  mismatch: boolean;
+  /** Set when the lock could not be examined, which is not "not running". */
+  error: string | null;
+}

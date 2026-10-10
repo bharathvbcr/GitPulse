@@ -65,9 +65,7 @@ fn judge_identity(observed: Result<Option<Birth>, String>, expected: &str) -> Li
 /// so the one that was there is gone.
 pub(crate) fn running_since(pid: u32, instant: u128) -> Liveness {
     match observe(pid) {
-        Ok(Some(birth)) if birth.started_unix_nanos <= instant && !birth.zombie => {
-            Liveness::Alive
-        }
+        Ok(Some(birth)) if birth.started_unix_nanos <= instant && !birth.zombie => Liveness::Alive,
         Ok(_) => Liveness::Gone,
         Err(reason) => Liveness::Unknown(reason),
     }
@@ -331,7 +329,10 @@ mod tests {
         };
         assert_eq!(judge_identity(birth(false), "id"), Liveness::Alive);
         assert_eq!(judge_identity(birth(true), "id"), Liveness::Gone);
-        assert_eq!(judge_identity(Err("x".into()), "id"), Liveness::Unknown("x".into()));
+        assert_eq!(
+            judge_identity(Err("x".into()), "id"),
+            Liveness::Unknown("x".into())
+        );
     }
 
     /// An exited child its parent has not reaped is gone for the question "is
@@ -347,7 +348,11 @@ mod tests {
         while probe(pid, &id) == Liveness::Alive && std::time::Instant::now() < deadline {
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
-        assert_eq!(probe(pid, &id), Liveness::Gone, "a zombie counted as running");
+        assert_eq!(
+            probe(pid, &id),
+            Liveness::Gone,
+            "a zombie counted as running"
+        );
         assert_eq!(running_since(pid, now()), Liveness::Gone);
         child.wait().unwrap();
     }

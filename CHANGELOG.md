@@ -62,6 +62,38 @@ before that tag is pushed.
 
 ### Fixed
 
+- Quitting (Cmd-Q, the Dock, a logout) and a `SIGTERM`/`SIGHUP` now run one
+  teardown: launch forwarding stops first, every terminal is closed under a
+  deadline, the sidecar is asked to finish, then procguard's children are
+  swept. Before, a normal quit never swept `git fetch`/`ci_local` children and
+  a signal never closed the terminals, so runs stayed "running".
+- Closing a terminal hangs up every process group in its session (`cmd &`,
+  `nohup`, a dev server, a stopped editor), not only the foreground group, and
+  gives them 2.5 s to clean up (an agent's SessionEnd) before killing the rest.
+  A tab with a background or stopped job is no longer treated as idle when its
+  view goes away, and closing it asks.
+- A worktree is not removed or merged away while any process, including an
+  agent typed into a plain dock tab, has its working directory inside it, even
+  with no workbench profile. An exited-but-unreaped child no longer counts as
+  running, and the sidecar reaps its child when its stdout ends.
+- One panic no longer disables a subsystem until restart: the hygiene cleaner,
+  the terminal session map, the task board's store and worker, the watcher and
+  the recent-repositories list recover from a poisoned lock. A panic in the
+  cleaner's clock thread is recorded as a degraded subsystem (listed in
+  Diagnostics) and the thread keeps running. Concurrent model probes, agent
+  model listings and MCP completions share one run, and no longer hold a cache
+  lock across a CLI or git call; a failed model listing is remembered for 5 s.
+- `gitpulsed` holds a per-profile lock and refuses a second copy (exit 3,
+  naming the owner); the ledger stamps a writer generation and refuses a
+  writer older than its stamp; Diagnostics flags a running daemon from another
+  version.
+- Terminal sessions: sessions above a lowered limit are all adopted after a
+  reload; the quit guard counts host sessions no tab shows and agents typed
+  into shell tabs; `spawn` no longer waits on git and the ledger; one rejected
+  input write no longer ends the tab's input, and a cut-off bracketed paste is
+  closed; failed output emits no longer leak flow credit; a session whose
+  process outlives its terminal is listed as ending, with Stop.
+
 - The agentic workspaces plan no longer describes the flat graph export as
   "generation 1". It records the real path, `.devcouncil/graph/code_graph.json`,
   and how fresh each repository's export was on 2026-10-09.

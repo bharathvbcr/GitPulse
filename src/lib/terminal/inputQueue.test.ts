@@ -54,14 +54,34 @@ describe("terminal input transport", () => {
     expect(queue.write("🚀")).toBe(true);
     await queue.idle(); expect(send).toHaveBeenCalledWith("🚀", false);
   });
-  it("never retries a failed write or delivers queued input after failure", async () => {
-    const send = vi.fn(async () => { throw new Error("broken pipe"); }), error = vi.fn();
+  it("never retries a failed write or delivers queued input after the session is gone", async () => {
+    const send = vi.fn(async () => { throw new Error("Terminal session 'x' not found"); }), error = vi.fn();
     const queue = createTerminalInput(send, error);
     queue.write("a"); queue.write("b");
     await queue.idle();
     expect(send).toHaveBeenCalledTimes(1);
-    expect(error).toHaveBeenCalledWith(expect.stringContaining("broken pipe"), true);
+    expect(error).toHaveBeenCalledWith(expect.stringContaining("not found"), true);
     expect(queue.write("c")).toBe(false);
+  });
+  it("delivers the next write after one rejected send, without retrying or reordering", async () => {
+    // The defect: one rejected send (a 2 s write stall) stopped the pump for
+    // good and the tab could only be restarted, which kills an agent.
+    const delivered: string[] = [];
+    let fail = true;
+    const send = vi.fn(async (data: string) => {
+      if (fail) { fail = false; throw new Error("Terminal input timed out after writing 3 of 6 bytes"); }
+      delivered.push(data);
+    }), error = vi.fn();
+    const queue = createTerminalInput(send, error);
+    queue.write("a"); queue.write("b");
+    await queue.idle();
+    expect(error).toHaveBeenCalledWith(expect.stringContaining("not delivered"), false);
+    expect(error).not.toHaveBeenCalledWith(expect.anything(), true);
+    expect(delivered).toEqual([]);
+    expect(queue.write("c")).toBe(true);
+    await queue.idle();
+    expect(delivered).toEqual(["c"]);
+    expect(send).toHaveBeenCalledTimes(2);
   });
   it("drops queued input on disposal even when an old write later completes", async () => {
     let finish: (() => void) | undefined;

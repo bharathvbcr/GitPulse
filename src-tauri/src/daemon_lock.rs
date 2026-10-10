@@ -107,7 +107,12 @@ fn read_owner(path: &Path) -> Owner {
             lines.next().and_then(|l| l.trim().parse().ok()),
             lines
                 .next()
-                .map(|l| l.trim().chars().filter(|c| !c.is_control()).collect::<String>())
+                .map(|l| {
+                    l.trim()
+                        .chars()
+                        .filter(|c| !c.is_control())
+                        .collect::<String>()
+                })
                 .filter(|v| !v.is_empty()),
         )
     } else {
@@ -300,6 +305,12 @@ mod tests {
         assert!(version.len() <= MAX_RECORD as usize && !version.chars().any(char::is_control));
         // Garbage names no one rather than the wrong one.
         std::fs::write(&path, "not a pid\n\n").unwrap();
-        assert_eq!(read_owner(&path), Owner { pid: None, version: None });
+        assert_eq!(
+            read_owner(&path),
+            Owner {
+                pid: None,
+                version: None
+            }
+        );
     }
 }

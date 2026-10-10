@@ -61,8 +61,12 @@ fn stop_terminals(terminals: &TerminalSessions, deadline: Duration) {
     match spawned {
         Ok(_) => match finished.recv_timeout(deadline) {
             Ok(Ok(())) => {}
-            Ok(Err(error)) => log::warn!(target: "terminal", "terminal shutdown incomplete: {error}"),
-            Err(_) => log::warn!(target: "terminal", "terminal shutdown did not finish in {deadline:?}"),
+            Ok(Err(error)) => {
+                log::warn!(target: "terminal", "terminal shutdown incomplete: {error}")
+            }
+            Err(_) => {
+                log::warn!(target: "terminal", "terminal shutdown did not finish in {deadline:?}")
+            }
         },
         Err(error) => log::warn!(target: "terminal", "terminal shutdown did not start: {error}"),
     }

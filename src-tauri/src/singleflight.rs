@@ -124,7 +124,11 @@ mod tests {
             })
             .collect();
         let answers: Vec<usize> = handles.into_iter().map(|h| h.join().unwrap()).collect();
-        assert_eq!(runs.load(Ordering::SeqCst), 1, "the call ran more than once");
+        assert_eq!(
+            runs.load(Ordering::SeqCst),
+            1,
+            "the call ran more than once"
+        );
         assert!(answers.iter().all(|a| *a == 1), "{answers:?}");
         assert!(started.elapsed() < Duration::from_secs(2));
     }

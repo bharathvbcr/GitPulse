@@ -1119,15 +1119,20 @@ pub struct TerminalListing {
     pub run_id: Option<String>,
     /// No view holds it: the page that started it was reloaded.
     pub detached: bool,
+    /// Its terminal has closed (or it was told to stop) but the process has
+    /// not been reaped: `tracks_run` still counts it, so a run stays "running"
+    /// while nothing showed it. Listed so it can be seen and stopped, never
+    /// shown again.
+    #[serde(default)]
+    pub ending: bool,
 }
 
-/// Every live session. Bounded by `MAX_PTY_SESSIONS`.
+/// Every session this process still owns, live or ending. Bounded by
+/// `MAX_PTY_SESSIONS`.
 pub fn list_sessions(state: &TerminalSessions) -> Vec<TerminalListing> {
-    let guard = state
-        .lock_sessions();
+    let guard = state.lock_sessions();
     let mut listed: Vec<TerminalListing> = guard
         .values()
-        .filter(|s| !s.dead.load(Ordering::Acquire))
         .map(|s| TerminalListing {
             id: s.spawned.id.clone(),
             shell: s.spawned.shell.clone(),
@@ -1135,7 +1140,10 @@ pub fn list_sessions(state: &TerminalSessions) -> Vec<TerminalListing> {
             repo: s.repo.to_string_lossy().into_owned(),
             launcher: launcher_kind(&s.spawned.shell).map(str::to_owned),
             run_id: s.tracked_run.clone(),
-            detached: s.flow.is_detached(),
+            ending: s.dead.load(Ordering::Acquire),
+            // An ending session has no view to show it in: it is only ever
+            // listed, so it reads as detached.
+            detached: s.flow.is_detached() || s.dead.load(Ordering::Acquire),
         })
         .collect();
     listed.sort_by(|a, b| a.id.cmp(&b.id));
@@ -1146,8 +1154,7 @@ pub fn list_sessions(state: &TerminalSessions) -> Vec<TerminalListing> {
 /// Each live session stops waiting on that page's acknowledgements; none is
 /// stopped. Returns how many were detached.
 pub fn detach_all(state: &TerminalSessions) -> usize {
-    let guard = state
-        .lock_sessions();
+    let guard = state.lock_sessions();
     let mut detached = 0;
     for session in guard.values() {
         if !session.dead.load(Ordering::Acquire) {
@@ -1164,8 +1171,7 @@ pub fn detach_all(state: &TerminalSessions) -> usize {
 /// stops it. Returns whether it was live and is now detached; an id that has
 /// already ended is not an error, there is simply nothing left to keep.
 pub fn detach_session(state: &TerminalSessions, session_id: &str) -> Result<bool, String> {
-    let guard = state
-        .lock_sessions();
+    let guard = state.lock_sessions();
     let Some(session) = guard
         .get(session_id)
         .filter(|s| !s.dead.load(Ordering::Acquire))
@@ -1192,8 +1198,7 @@ pub fn attach_session(
     cols: u16,
 ) -> Result<TerminalSpawned, String> {
     let (spawned, master) = {
-        let guard = state
-            .lock_sessions();
+        let guard = state.lock_sessions();
         let session = guard
             .get(session_id)
             .filter(|s| !s.dead.load(Ordering::Acquire))
@@ -1221,8 +1226,7 @@ pub(crate) fn attach_tracked_session(
     cols: u16,
 ) -> Option<TerminalSpawned> {
     let (spawned, master, taken) = {
-        let guard = state
-            .lock_sessions();
+        let guard = state.lock_sessions();
         let session = guard.values().find(|s| {
             s.tracked_run.as_deref() == Some(run_id) && !s.dead.load(Ordering::Acquire)
         })?;
@@ -1442,8 +1446,7 @@ fn spawn_session_inner<R: tauri::Runtime>(
     };
 
     {
-        let mut guard = state
-            .lock_sessions();
+        let mut guard = state.lock_sessions();
         guard.insert(session_id.clone(), entry);
     }
 
@@ -1543,7 +1546,7 @@ fn spawn_session_inner<R: tauri::Runtime>(
                                     if !std::mem::replace(&mut emit_failing, true) {
                                         log::warn!(target: "terminal", "{program_for_log} terminal: failed to emit terminal-output, skipping output: {error}");
                                     }
-                                    if output_flow.shed() {
+                                    if output_flow.shed(n) {
                                         if let Err(error) = app_handle.emit("terminal-loss", TerminalLossPayload {
                                             id: sid_for_thread.clone(),
                                             message: SHED_NOTICE.into(),
@@ -1651,8 +1654,7 @@ fn spawn_session_inner<R: tauri::Runtime>(
             );
         });
     if let Err(e) = reader_thread {
-        let mut guard = state
-            .lock_sessions();
+        let mut guard = state.lock_sessions();
         guard.remove(&session_id);
         drop(guard);
         terminate_pty_child(&child, &master)?;
@@ -1670,46 +1672,18 @@ fn spawn_session_inner<R: tauri::Runtime>(
         return Err(format!("Task process bookkeeping failed; the child was asked to stop. Inspect the run before another attempt: {error}"));
     }
 
-    let actor_kind = if agent_launcher(&resolved).is_some() {
-        crate::ledger::ActorKind::Agent
-    } else {
-        crate::ledger::ActorKind::Human
-    };
-    let repository = repo.to_string_lossy().into_owned();
-    let address = crate::ledger::bindings::repository_address(&repository).ok();
-    let ledger_repo = address
-        .as_ref()
-        .map(|address| address.anchor.clone())
-        .unwrap_or_else(|| repository.clone());
-    let worktree_path = address
-        .as_ref()
-        .and_then(|address| (address.worktree != address.anchor).then(|| address.worktree.clone()));
-    let task_id = address.and_then(|address| {
-        crate::ledger::bindings::resolve(&address.anchor, &address.worktree)
-            .ok()
-            .flatten()
-    });
-    let draft = crate::ledger::Draft {
-        repo_path: ledger_repo,
-        worktree_path,
-        actor_kind: Some(actor_kind),
-        actor_id: Some(shell.clone()),
-        session_id: Some(session_id.clone()),
-        task_id,
-        action: "session.spawn".to_string(),
-        object: Some(shell.clone()),
-        argv_json: args.as_ref().and_then(|a| serde_json::to_string(a).ok()),
-        outcome: Some(crate::ledger::Outcome::Ok),
-        verdict_json: None,
-        before_ref: None,
-        after_ref: None,
-        duration_ms: None,
-        detail_json: None,
-    };
-    // `record` rather than `append`: a PTY that could not be logged is still a
-    // PTY the user asked for. The failure is counted and surfaced through
-    // LedgerStatus rather than refusing the session.
-    let _ = crate::ledger::record(draft);
+    // The ledger entry resolves the repository's address and task binding
+    // (git) and appends (a lock another writer may hold), and none of it can
+    // change what the caller is told: spawn used to wait on all of it, and a
+    // renderer watchdog then killed the new session for being slow to start.
+    // Done beside the session, never in front of it.
+    record_session_spawn(
+        repo.to_string_lossy().into_owned(),
+        shell.clone(),
+        session_id.clone(),
+        args.clone(),
+        agent_launcher(&resolved).is_some(),
+    );
 
     Ok(TerminalSpawned {
         // The resolved path, not the requested name: on a GUI launch these
@@ -1720,6 +1694,62 @@ fn spawn_session_inner<R: tauri::Runtime>(
         // Where the process started, the same value the session entry holds.
         cwd: start.to_string_lossy().into_owned(),
     })
+}
+
+/// Records `session.spawn` on a thread of its own. `record` rather than
+/// `append`: a PTY that could not be logged is still a PTY the user asked for.
+/// The failure is counted and surfaced through `LedgerStatus` rather than
+/// refusing the session.
+fn record_session_spawn(
+    repository: String,
+    shell: String,
+    session_id: String,
+    args: Option<Vec<String>>,
+    is_agent: bool,
+) {
+    let work = move || {
+        let actor_kind = if is_agent {
+            crate::ledger::ActorKind::Agent
+        } else {
+            crate::ledger::ActorKind::Human
+        };
+        let address = crate::ledger::bindings::repository_address(&repository).ok();
+        let ledger_repo = address
+            .as_ref()
+            .map(|address| address.anchor.clone())
+            .unwrap_or_else(|| repository.clone());
+        let worktree_path = address.as_ref().and_then(|address| {
+            (address.worktree != address.anchor).then(|| address.worktree.clone())
+        });
+        let task_id = address.and_then(|address| {
+            crate::ledger::bindings::resolve(&address.anchor, &address.worktree)
+                .ok()
+                .flatten()
+        });
+        let _ = crate::ledger::record(crate::ledger::Draft {
+            repo_path: ledger_repo,
+            worktree_path,
+            actor_kind: Some(actor_kind),
+            actor_id: Some(shell.clone()),
+            session_id: Some(session_id),
+            task_id,
+            action: "session.spawn".to_string(),
+            object: Some(shell),
+            argv_json: args.as_ref().and_then(|a| serde_json::to_string(a).ok()),
+            outcome: Some(crate::ledger::Outcome::Ok),
+            verdict_json: None,
+            before_ref: None,
+            after_ref: None,
+            duration_ms: None,
+            detail_json: None,
+        });
+    };
+    if let Err(error) = thread::Builder::new()
+        .name("session-spawn-ledger".into())
+        .spawn(work)
+    {
+        log::warn!(target: "terminal", "session.spawn was not recorded: {error}");
+    }
 }
 
 /// Writes user input bytes into a PTY session.
@@ -1816,8 +1846,7 @@ fn write_pty_bytes(state: &TerminalSessions, session_id: &str, data: &[u8]) -> R
         ));
     }
     let (writer, dead) = {
-        let guard = state
-            .lock_sessions();
+        let guard = state.lock_sessions();
         guard
             .get(session_id)
             .map(|session| (session.writer.clone(), session.dead.clone()))
@@ -1853,8 +1882,7 @@ pub fn resize_session(
     rows: u16,
     cols: u16,
 ) -> Result<(), String> {
-    let guard = state
-        .lock_sessions();
+    let guard = state.lock_sessions();
     if let Some(session) = guard.get(session_id) {
         let size = bounded_pty_size(rows, cols);
         session
@@ -1876,8 +1904,7 @@ pub fn resize_session(
 /// a timeout retains ownership so a retry cannot signal an unrelated process.
 pub fn kill_session(state: &TerminalSessions, session_id: &str) -> Result<(), String> {
     let handles = {
-        let guard = state
-            .lock_sessions();
+        let guard = state.lock_sessions();
         guard.get(session_id).map(|s| {
             (
                 s.child.clone(),
@@ -1894,9 +1921,7 @@ pub fn kill_session(state: &TerminalSessions, session_id: &str) -> Result<(), St
         flow.stop();
         let deadline = Instant::now() + Duration::from_secs(2);
         loop {
-            let present = state
-                .lock_sessions()
-                .contains_key(session_id);
+            let present = state.lock_sessions().contains_key(session_id);
             if !present {
                 break;
             }
@@ -1911,11 +1936,7 @@ pub fn kill_session(state: &TerminalSessions, session_id: &str) -> Result<(), St
 
 /// Application exit closes every owned PTY before the runtime disappears.
 pub fn shutdown_sessions(state: &TerminalSessions) -> Result<(), String> {
-    let ids: Vec<String> = state
-        .lock_sessions()
-        .keys()
-        .cloned()
-        .collect();
+    let ids: Vec<String> = state.lock_sessions().keys().cloned().collect();
     // Every session at once: each close waits for its own reader (a hangup
     // grace plus a reap), and quitting with a full dock one session after
     // another cost that wait once per session. At most MAX_PTY_SESSIONS threads.
@@ -3523,7 +3544,10 @@ mod tests {
             .join("ready")
             .exists()));
         kill_session(&state, &spawned.id).unwrap();
-        assert!(done.exists(), "the job was killed before its cleanup finished");
+        assert!(
+            done.exists(),
+            "the job was killed before its cleanup finished"
+        );
     }
 
     /// The jobs a close would kill are visible to the unmount check: a prompt
@@ -3543,7 +3567,11 @@ mod tests {
         );
         let job = read_pid(&dir.path().join("job"));
         let context = session_context(&state, &spawned.id).unwrap();
-        assert_eq!(context.busy, Some(false), "the foreground is the shell's own");
+        assert_eq!(
+            context.busy,
+            Some(false),
+            "the foreground is the shell's own"
+        );
         assert_eq!(context.jobs, Some(true));
         kill_session(&state, &spawned.id).unwrap();
         assert!(wait_until(Duration::from_secs(3), || !alive(job)));
@@ -3569,7 +3597,9 @@ mod tests {
         assert!(resize_session(&state, &spawned.id, 30, 90).is_ok());
         assert!(session_context(&state, &spawned.id).is_ok());
         // Whatever the flow says about 0 bytes, it is the flow's answer, not the lock's.
-        assert!(!acknowledge_output(&state, &spawned.id, 0).is_err_and(|e| e.contains("Lock error")));
+        assert!(
+            !acknowledge_output(&state, &spawned.id, 0).is_err_and(|e| e.contains("Lock error"))
+        );
         kill_session(&state, &spawned.id).unwrap();
         assert!(list_sessions(&state).is_empty());
     }
@@ -3583,7 +3613,10 @@ mod tests {
         let spawned = spawn_script(
             &state,
             dir.path(),
-            format!("echo $$ > '{}'; read finish", dir.path().join("shell").display()),
+            format!(
+                "echo $$ > '{}'; read finish",
+                dir.path().join("shell").display()
+            ),
         );
         let shell = read_pid(&dir.path().join("shell"));
         let map = state.sessions.clone();
@@ -3619,7 +3652,67 @@ mod tests {
         crate::teardown::steps(&state, Duration::from_secs(10), || {
             swept_with_job_alive.set(Some(alive(job)));
         });
-        assert_eq!(swept_with_job_alive.get(), Some(false), "the sweep ran before the terminals stopped");
+        assert_eq!(
+            swept_with_job_alive.get(),
+            Some(false),
+            "the sweep ran before the terminals stopped"
+        );
+        assert!(list_sessions(&state).is_empty());
+    }
+
+    /// The defect: spawn waited on the repository address (git), the task
+    /// binding and the ledger append before returning, so a ledger another
+    /// writer held, or a slow git, delayed the start until the renderer's own
+    /// watchdog killed the session it was starting.
+    #[cfg(unix)]
+    #[test]
+    fn spawn_returns_without_waiting_for_the_ledger() {
+        let dir = tempfile::tempdir().unwrap();
+        init_test_repo(dir.path());
+        let state = TerminalSessions::default();
+        let (held, release) = std::sync::mpsc::channel::<()>();
+        let (taken, wait_taken) = std::sync::mpsc::channel::<()>();
+        let holder = thread::spawn(move || {
+            let _guard = crate::ledger::registry()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            taken.send(()).unwrap();
+            let _ = release.recv_timeout(Duration::from_secs(3));
+        });
+        wait_taken.recv().unwrap();
+        let started = Instant::now();
+        let spawned = spawn_script(&state, dir.path(), "read finish".into());
+        let took = started.elapsed();
+        drop(held);
+        holder.join().unwrap();
+        kill_session(&state, &spawned.id).unwrap();
+        assert!(
+            took < Duration::from_secs(1),
+            "spawn waited on the ledger: {took:?}"
+        );
+    }
+
+    /// The defect: a session whose terminal closed but whose process was not
+    /// reaped vanished from the listing while `tracks_run` still counted it,
+    /// leaving a run "running" with nothing to adopt or stop.
+    #[cfg(unix)]
+    #[test]
+    fn a_dead_but_unreaped_session_is_listed_as_ending_and_can_be_stopped() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = TerminalSessions::default();
+        let spawned = spawn_script(&state, dir.path(), "read finish".into());
+        assert!(!list_sessions(&state)[0].ending);
+        state
+            .lock_sessions()
+            .get(&spawned.id)
+            .unwrap()
+            .dead
+            .store(true, Ordering::SeqCst);
+        let listed = list_sessions(&state);
+        assert_eq!(listed.len(), 1, "an ending session was hidden");
+        assert!(listed[0].ending && listed[0].detached);
+        // Stop still works on it.
+        kill_session(&state, &spawned.id).unwrap();
         assert!(list_sessions(&state).is_empty());
     }
 

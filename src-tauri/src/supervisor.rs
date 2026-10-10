@@ -105,13 +105,15 @@ pub fn spawn_loop(
     interval: Duration,
     mut tick: impl FnMut() + Send + 'static,
 ) -> io::Result<JoinHandle<()>> {
-    thread::Builder::new().name(name.into()).spawn(move || loop {
-        match catch_unwind(AssertUnwindSafe(&mut tick)) {
-            Ok(()) => recover(name),
-            Err(payload) => record(name, payload.as_ref()),
-        }
-        thread::sleep(interval);
-    })
+    thread::Builder::new()
+        .name(name.into())
+        .spawn(move || loop {
+            match catch_unwind(AssertUnwindSafe(&mut tick)) {
+                Ok(()) => recover(name),
+                Err(payload) => record(name, payload.as_ref()),
+            }
+            thread::sleep(interval);
+        })
 }
 
 /// The Tauri command the diagnostics view reads.
@@ -154,9 +156,12 @@ mod tests {
         assert!(wait(Duration::from_secs(5), || listed().is_some()));
         let first = listed().unwrap();
         assert!(first.reason.contains("injected panic"), "{first:?}");
-        assert!(wait(Duration::from_secs(5), || {
-            ticks.load(Ordering::SeqCst) >= 5 && listed().is_none()
-        }), "the loop did not survive the panic and recover");
+        assert!(
+            wait(Duration::from_secs(5), || {
+                ticks.load(Ordering::SeqCst) >= 5 && listed().is_none()
+            }),
+            "the loop did not survive the panic and recover"
+        );
     }
 
     #[test]

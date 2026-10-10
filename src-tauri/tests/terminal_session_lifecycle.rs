@@ -220,15 +220,18 @@ fn closing_stops_a_foreground_program_that_ignores_hangup() {
     assert!(wait_for_output(&h.output, "ready", Duration::from_secs(10)));
     let started = Instant::now();
     kill_session(&h.state, &session.id).unwrap();
-    assert!(started.elapsed() < Duration::from_secs(3));
+    // A program that ignores the hangup is given the 2.5 s grace (an agent's
+    // SessionEnd needs seconds) and is then killed; the bound is that grace
+    // plus slack, which is what keeps Close from hanging on it.
+    assert!(started.elapsed() < Duration::from_secs(6));
     h.exits
         .recv_timeout(Duration::from_secs(3))
         .expect("a closed session reports its exit");
 }
 
 /// Quitting closes every session at once. A shell that ignores the hangup
-/// costs its full kill grace; one after another, a dock of them made quitting
-/// wait for the sum.
+/// costs its full hangup grace (2.5 s); one after another, a dock of them made
+/// quitting wait for the sum.
 #[test]
 fn quitting_closes_every_session_concurrently() {
     const SESSIONS: usize = 12;
@@ -261,8 +264,9 @@ fn quitting_closes_every_session_concurrently() {
     let started = Instant::now();
     gitpulse_lib::terminal::shutdown_sessions(&h.state).unwrap();
     let took = started.elapsed();
-    // Each close waits out a 200 ms hangup grace: 2.4 s in sequence.
-    assert!(took < Duration::from_millis(1500), "shutdown took {took:?}");
+    // Each close waits out the 2.5 s hangup grace: 30 s in sequence. Together
+    // it is one grace, whatever the number of sessions.
+    assert!(took < Duration::from_secs(6), "shutdown took {took:?}");
     for _ in 0..SESSIONS {
         h.exits
             .recv_timeout(Duration::from_secs(2))

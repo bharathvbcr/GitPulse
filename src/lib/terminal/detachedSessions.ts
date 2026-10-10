@@ -31,6 +31,8 @@ import { LAUNCHERS, launcherLabel, type LauncherKind } from "./tabs";
 import { askConfirm } from "../stores/modalStore";
 
 export const DETACHED_STATUS = "Still running — not shown in any tab";
+/** A session whose terminal closed but whose process has not exited: stoppable, never shown. */
+export const ENDING_STATUS = "Ending — its process has not exited";
 
 type Invoke = <T>(command: string, args?: Record<string, unknown>) => Promise<T>;
 type Confirm = (options: { title: string; message: string; confirmLabel: string; destructive: boolean }) => Promise<boolean>;
@@ -86,6 +88,7 @@ export function parseListing(raw: unknown): TerminalListing | null {
     id: row.id as string, shell: row.shell as string, cwd: row.cwd as string, repo: row.repo as string,
     launcher: (row.launcher as string | null) ?? null, run_id: (row.run_id as string | null) ?? null,
     detached: row.detached,
+    ...(row.ending === true ? { ending: true } : {}),
   };
 }
 
@@ -117,29 +120,31 @@ function listDetached(
     launcher,
     ...(listing.run_id ? { title: "Task attempt", taskRunId: listing.run_id } : {}),
     ...(family ? { family } : {}),
-    status: DETACHED_STATUS,
+    status: listing.ending ? ENDING_STATUS : DETACHED_STATUS,
     sessionId: listing.id,
     async close() {
       await invoke("cmd_terminal_kill", { sessionId: listing.id });
       drop();
     },
     confirmClose: () => confirm({ ...stopQuestion(listing, label), confirmLabel: "Stop", destructive: true }),
-    reveal() {
-      // Queued first, so a refusal leaves the session listed. Then this
-      // record and its exit watch give way, before the tab that takes the
-      // session over reserves its own slot: never listed twice, never
-      // counted twice against the limit.
-      enqueueTaskTerminal({
-        runId: listing.run_id ?? key,
-        repoPath: listing.repo,
-        provider: launcher,
-        title: listing.run_id ? "Task attempt" : label,
-        ...(listing.run_id ? {} : { attach: { sessionId: listing.id } }),
-        ...(family ? { family } : {}),
-      });
-      drop();
-    },
+    // An ending session has no terminal left to show; Stop is all it offers.
+    ...(listing.ending ? {} : { reveal }),
   });
+  function reveal() {
+    // Queued first, so a refusal leaves the session listed. Then this record
+    // and its exit watch give way, before the tab that takes the session over
+    // reserves its own slot: never listed twice, never counted twice against
+    // the limit.
+    enqueueTaskTerminal({
+      runId: listing.run_id ?? key,
+      repoPath: listing.repo,
+      provider: launcher,
+      title: listing.run_id ? "Task attempt" : label,
+      ...(listing.run_id ? {} : { attach: { sessionId: listing.id } }),
+      ...(family ? { family } : {}),
+    });
+    drop();
+  }
   function drop() {
     unsubscribe?.(); unsubscribe = null;
     slot?.release(); slot = null;
@@ -202,9 +207,10 @@ export async function adoptDetachedSessions(deps: {
     // its repository can host; a plain session is taken over in its own.
     const family = listing.run_id && deps.familyOf ? await deps.familyOf(listing.repo).catch(() => null) : null;
     if (get(registry).some((record) => record.sessionId === listing.id)) continue;
-    // A refused reserve (the shared limit) throws out of here: sessions the
-    // host holds but this page cannot list are reported, not skipped.
-    listDetached(listing, family, (record) => registry.reserve(record), { invoke, confirm, bus });
+    // Adopted past the limit if need be: the host holds the process either
+    // way, and a refused reserve aborted the loop, leaving every session after
+    // the first over-limit one running and unlisted.
+    listDetached(listing, family, (record) => registry.adopt(record), { invoke, confirm, bus });
     adopted += 1;
   }
   return adopted;

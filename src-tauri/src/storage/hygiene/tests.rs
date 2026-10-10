@@ -1,6 +1,6 @@
 use super::{
-    cancel, execute_with_activity, invocation, local_checks, managed_cache_path, plans,
-    exclusive, prepare_with_activity, providers, tree, HygienePlan, EXECUTION, INVENTORY, MAX_PLANS,
+    cancel, exclusive, execute_with_activity, invocation, local_checks, managed_cache_path, plans,
+    prepare_with_activity, providers, tree, HygienePlan, EXECUTION, INVENTORY, MAX_PLANS,
     PREPARATION, TTL,
 };
 use std::fs::{self, File, FileTimes};
@@ -573,7 +573,9 @@ fn differently_cased_credentials_and_known_model_formats_are_preserved() {
 /// Panics on another thread while it holds `lock`, which poisons it.
 fn poison<T: Send>(lock: &'static Mutex<T>) {
     let _ = std::thread::spawn(move || {
-        let _held = lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _held = lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         panic!("injected panic under a hygiene lock");
     })
     .join();

@@ -60,14 +60,21 @@ fn a_second_daemon_for_one_profile_is_refused_and_a_later_one_is_admitted() {
                 break owner;
             }
         }
-        assert!(Instant::now() < deadline, "the first daemon never took the lock");
-        assert!(first.try_wait().unwrap().is_none(), "the first daemon exited early");
+        assert!(
+            Instant::now() < deadline,
+            "the first daemon never took the lock"
+        );
+        assert!(
+            first.try_wait().unwrap().is_none(),
+            "the first daemon exited early"
+        );
         std::thread::sleep(Duration::from_millis(20));
     };
     assert_eq!(owner.version.as_deref(), Some(env!("CARGO_PKG_VERSION")));
 
     let mut second = daemon(&dir, repo.path(), logs.path());
-    let refused = wait_exit(&mut second, Duration::from_secs(20)).expect("the second daemon kept running");
+    let refused =
+        wait_exit(&mut second, Duration::from_secs(20)).expect("the second daemon kept running");
     assert_eq!(refused.code(), Some(3), "{refused:?}");
 
     // SAFETY: signals the child this test spawned.

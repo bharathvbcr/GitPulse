@@ -281,24 +281,22 @@ fn probe_model(base_url: &str, model: &str) -> Result<ProbeResult, String> {
     static FLIGHTS: OnceLock<
         crate::singleflight::SingleFlight<(String, String), Result<ProbeResult, String>>,
     > = OnceLock::new();
-    FLIGHTS
-        .get_or_init(Default::default)
-        .run(key.clone(), || {
-            let outcome = fetch_probe(base_url, model);
-            if let Ok(mut cache) = probe_cache().lock() {
-                // Entries for (url, model) pairs nobody asks about anymore
-                // would otherwise accumulate one per selection ever made.
-                cache.retain(|_, entry| entry.fresh());
-                cache.insert(
-                    key.clone(),
-                    CachedProbe {
-                        fetched_at: Instant::now(),
-                        outcome: outcome.clone(),
-                    },
-                );
-            }
-            outcome
-        })
+    FLIGHTS.get_or_init(Default::default).run(key.clone(), || {
+        let outcome = fetch_probe(base_url, model);
+        if let Ok(mut cache) = probe_cache().lock() {
+            // Entries for (url, model) pairs nobody asks about anymore
+            // would otherwise accumulate one per selection ever made.
+            cache.retain(|_, entry| entry.fresh());
+            cache.insert(
+                key.clone(),
+                CachedProbe {
+                    fetched_at: Instant::now(),
+                    outcome: outcome.clone(),
+                },
+            );
+        }
+        outcome
+    })
 }
 
 /// The uncached probe: one harness `capability.probe` round trip.
@@ -1693,7 +1691,11 @@ mod tests {
         for caller in callers {
             assert_eq!(caller.join().unwrap().expect("probe").context_window, 4_096);
         }
-        assert_eq!(hits.load(Ordering::SeqCst), 1, "the probe ran once per caller");
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            1,
+            "the probe ran once per caller"
+        );
     }
 
     #[test]

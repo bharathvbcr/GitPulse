@@ -416,9 +416,8 @@ fn a_worktree_with_any_process_in_it_is_not_removed_even_without_a_profile() {
     let wait_seen = |expect: bool| {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         loop {
-            let refused = crate::commands::remove_worktree_guarded(
-                &state, repo_path, lane_path, true, &gate,
-            );
+            let refused =
+                crate::commands::remove_worktree_guarded(&state, repo_path, lane_path, true, &gate);
             if refused.is_err() == expect || std::time::Instant::now() > deadline {
                 return refused;
             }
