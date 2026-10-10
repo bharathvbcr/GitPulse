@@ -836,7 +836,9 @@ if (params.has("check")) {
     check("empty searches explain the result and hide previous tasks", root.textContent.includes("No tasks match") && root.querySelectorAll('[data-task-card]').length === 0);
     await click("Clear task search"); await wait(() => card("task-1"));
     check("clearing search restores the board", Boolean(card("task-1")));
-    holdSearch = true; await change(search, "older"); await wait(() => heldSearch.length === 6);
+    // A search reads one status-less candidate set plus one full-text read for
+    // its most selective word; only the full-text read carries "older".
+    holdSearch = true; await change(search, "older"); await wait(() => heldSearch.length === 1);
     await change(search, "Ready task 01"); await wait(() => card("task-10"));
     heldSearch.forEach(release => release()); holdSearch = false; heldSearch = []; await settle();
     check("late search responses cannot replace newer results", Boolean(card("task-10")) && root.querySelectorAll('[data-task-card]').length === 1);
@@ -844,6 +846,38 @@ if (params.has("check")) {
     check("failed loads remain distinct from an empty task list", root.textContent.includes("Fixture task storage offline") && root.textContent.includes("Tasks unavailable") && !root.textContent.includes("No tasks match"));
     failList = false; await click("Retry loading tasks"); await settle(300);
     check("a failed search can be retried", root.textContent.includes("No tasks match") && !root.textContent.includes("Fixture task storage offline"));
+    await click("Clear task search"); await wait(() => card("task-1"));
+
+    // Ranked search: word forms, close spellings, related words, OR, phrases,
+    // comma lists and completions, all through the one shared parser.
+    const shownIds = () => [...root.querySelectorAll("[data-task-card]")].map(el => el.dataset.cardId).sort();
+    const coverage = () => root.querySelector('[data-testid="task-query-coverage"]')?.textContent ?? "";
+    await change(search, "sheet easer"); await settle(400);
+    check("search matches word forms and close spellings", JSON.stringify(shownIds()) === JSON.stringify(["task-2"]));
+    check("the coverage line says what was searched and how", coverage().includes("1 match in all") && coverage().includes("close spellings"));
+    await change(search, "bot"); await settle(400);
+    check("search finds related words and says why a card matched", JSON.stringify(shownIds()) === JSON.stringify(["task-3"])
+      && (card("task-3").querySelector('[data-testid="task-match-hint"]')?.textContent ?? "").includes("related word"));
+    await change(search, "handoff OR sheets"); await settle(400);
+    check("OR matches either word", JSON.stringify(shownIds()) === JSON.stringify(["task-2", "task-3"]));
+    await change(search, '"agent handoff"'); await settle(400);
+    check("a quoted phrase matches the phrase", JSON.stringify(shownIds()) === JSON.stringify(["task-3"]));
+    await change(search, "label:usability,nothing"); await settle(400);
+    check("a comma list is any of its values and shows as one removable chip", JSON.stringify(shownIds()) === JSON.stringify(["task-2"])
+      && root.querySelectorAll(".query-chip").length === 1 && Boolean(root.querySelector('[aria-label="Remove filter label:usability,nothing"]')));
+    root.querySelector('[aria-label="Remove filter label:usability,nothing"]')?.click(); await settle(400);
+    check("removing the chip removes the whole list", search.value === "" && Boolean(card("task-1")));
+    await change(search, "repo:manvi -review"); await settle(400);
+    check("an excluded word drops its tasks", JSON.stringify(shownIds()) === JSON.stringify(["task-2"]));
+    await change(search, "ready task"); await settle(400);
+    check("a worded search offers Relevance and Board order", button("Relevance")?.getAttribute("aria-pressed") === "true" && Boolean(button("Board order")));
+    search.focus(); await change(search, "label:us"); await settle(100);
+    const completions = () => document.querySelector('[role="listbox"][aria-label="Search completions"]');
+    check("the search box completes filter values from the loaded tasks", (completions()?.textContent ?? "").includes("label:usability"));
+    search.dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowDown", bubbles: true })); await settle();
+    search.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true })); await settle(400);
+    check("taking a completion writes it into the query", search.value.trim() === "label:usability" && JSON.stringify(shownIds()) === JSON.stringify(["task-2"]));
+    search.blur();
     await click("Clear task search"); await wait(() => card("task-1"));
 
     // Filters typed into the search box. The store's search is full-text, so
@@ -855,8 +889,9 @@ if (params.has("check")) {
       Boolean(card("task-2")) && !card("task-1") && !card("task-3") && !root.textContent.includes("No tasks match"));
     check("a search of only filters does not reload the board from the store", listQueries.every(query => query === ""));
     await change(search, "is:improvement Make"); await settle(400);
+    // The store is asked for the search's most selective word, folded.
     check("words beside a filter still reach the store, without the filter",
-      Boolean(card("task-2")) && listQueries.includes("Make") && !listQueries.some(query => query.includes("is:")));
+      Boolean(card("task-2")) && listQueries.some(query => query.toLowerCase() === "make") && !listQueries.some(query => query.includes("is:")));
     await change(search, "-is:improvement"); await settle(400);
     check("a leading minus excludes the type", !card("task-2") && Boolean(card("task-1")) && Boolean(card("task-3")));
     await change(search, "repo:manvi"); await settle(400);
@@ -1112,9 +1147,11 @@ if (params.has("check")) {
     check("bulk organization preserves both task briefs", ["task-14","task-15"].every(id=>tasks.find(task=>task.id===id).status==="review" && tasks.find(task=>task.id===id).description.includes("Keep changes focused")));
     await click("List view");
     check("list layout reuses the same task data", Boolean(root.querySelector('[aria-label="Task list"]')) && Boolean(card("task-14")));
-    await click("Filters"); await change(root.querySelector('[aria-label="Filter by priority"]'),"1","change");
+    // A filter searches every task on the board, not just the loaded pages,
+    // so it waits for its candidates like a typed search does.
+    await click("Filters"); await change(root.querySelector('[aria-label="Filter by priority"]'),"1","change"); await settle(400);
     check("priority filtering only shows matching loaded tasks", [...root.querySelectorAll('[data-task-card]')].every(el=>tasks.find(task=>task.id===el.dataset.cardId).priority===1) && root.querySelectorAll("[data-task-card]").length>0);
-    await change(root.querySelector('[aria-label="Filter by priority"]'),"0","change"); await change(root.querySelector('[aria-label="Filter by label"]'),"usability","change");
+    await change(root.querySelector('[aria-label="Filter by priority"]'),"0","change"); await change(root.querySelector('[aria-label="Filter by label"]'),"usability","change"); await settle(400);
     check("filtered empty states explain how to recover", root.textContent.includes("No tasks match") && Boolean(button("Clear filters")));
     await click("Clear filters"); await click("Board view");
     await selectCard("task-16"); await change(root.querySelector('[aria-label="Search tasks"]'),"Ready task"); await settle(400);

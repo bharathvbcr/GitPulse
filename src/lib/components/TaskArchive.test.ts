@@ -198,7 +198,10 @@ describe("the dock reads only what the store actually has", () => {
   // went to the store's full-text query, so `is:bug` searched for two words.
   it("sends the store only the search's words and applies its filters to loaded rows", () => {
     expect(source).toContain("const parsed = $derived(parseTaskQuery(query));");
-    expect(source).toContain("rows = $derived(live.filter((card) => cardMatchesQuery(card, parsed, queryContext)))");
+    expect(source).toContain("passing = $derived(live.filter((card) => cardMatchesQuery(card, parsed, queryContext)))");
+    // OR alternatives and phrases the store could not be asked are checked
+    // here, by the board's ranking module, never relaxed into partial matches.
+    expect(source).toContain('{ order: "board", relax: false }');
     expect(source, "the raw search box still reaches the store").not.toMatch(/listTasks\([^)]*\bquery\b/);
     // Reloaded on the words, not on every filter keystroke; the pending-delete
     // count is not confused with rows a filter hid.
@@ -259,9 +262,18 @@ describe("the archive is separate from the Done column", () => {
   it("reads every board column without archived tasks", () => {
     expect(board).toContain("const BOARD: TaskListFilter = { archived: false };");
     // The filter is the contract; the page size is the board's to choose.
-    expect(board).toMatch(/listTasks\(target, status, query, undefined, \w+, BOARD\)/);
-    expect(board).toMatch(/listTasks\(scope, status, serverQuery, cursor, \w+, BOARD\)/);
-    expect(board.match(/listTasks\(/g)?.length, "a column read without the filter would draw archived cards").toBe(3);
+    // Columns read no search text: words are ranked over loaded cards, and a
+    // search reads its own candidate set (`taskSearchPlan.ts`).
+    expect(board).toMatch(/listTasks\(target, status, "", undefined, \w+, BOARD\)/);
+    expect(board).toMatch(/listTasks\(scope, status, "", cursor, \w+, BOARD\)/);
+    // A search reads one status-less candidate set, under the same filter.
+    expect(board).toMatch(/listTasks\(current\.scope, null, "", undefined, CANDIDATE_PAGE, BOARD\)/);
+    const reads = [...board.matchAll(/listTasks\(([^;]*?)\)(?=[,;\]]|\s*:)/g)].map((match) => match[1]);
+    expect(reads.length, "every read is checked").toBe(board.match(/listTasks\(/g)?.length);
+    for (const read of reads) {
+      expect(read.endsWith("BOARD") || read.endsWith("{ archived: true }"), `a read without the filter would draw archived cards: ${read}`).toBe(true);
+    }
+    expect(reads.filter((read) => read.endsWith("{ archived: true }")), "only the badge reads the archive").toHaveLength(1);
   });
 
   it("no longer couples the dock to the Done column's visibility", () => {

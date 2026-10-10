@@ -34,7 +34,10 @@
   import { linkTaskToIssue, MAX_TASK_ISSUE_BATCH, prepareTaskIssues, runTaskIssues, summarizeTaskIssues, taskIssuesConfirmation, type TaskIssueResult, type TaskIssueTarget } from "../workbench/taskIssue";
   import { askConfirm } from "../stores/modalStore";
   import { openExternal } from "../desktop/openExternal";
-  import { cardMatchesQuery, parseTaskQuery, queryHas, removeQueryTerm, repositoryMatches, toggleQueryTerm, QUERY_HELP, type QueryContext } from "../workbench/taskQuery";
+  import { cardMatchesQuery, parseTaskQuery, queryChips, queryHas, removeQueryTerm, repositoryMatches, toggleQueryTerm, QUERY_HELP, type QueryContext, type SuggestionSources } from "../workbench/taskQuery";
+  import { describeMatch, searchCards, type RankContext, type RankedCard, type SearchOrder } from "../workbench/taskRank";
+  import { CANDIDATE_PAGE, bucketByStatus, canLoadMore, candidatesComplete, describeSearch, mergeCandidates, planSearch, type CandidateSet, type SearchPlan } from "../workbench/taskSearchPlan";
+  import TaskSearchField from "./TaskSearchField.svelte";
   import { cardChrome, cardMatchesFacet, collectFacetOptions, emptyFacet, facetActive, allLoadedCards, reorderPlan, partitionLanes, type TaskFacet, type TaskLane } from "../workbench/taskOrganize";
   import { plural } from "../format";
   import { archiveAction, archivable, archiveState } from "../workbench/taskArchive";
@@ -123,19 +126,42 @@
   /** Deferred deletions being written now; a board writing one is busy. */
   let deletesRunning = $state(0);
   let loadedKey = $state("");
+  /** The scope the loaded columns were read for, whatever the search was. */
+  let loadedScope = $state("");
   let unreadError = $state("");
   let unreadRevision = 0, initializationRevision = 0, openingRevision = 0;
+  // ---- Search (`taskQuery.ts`, `taskRank.ts`, `taskSearchPlan.ts`) --------
   /**
-   * The search box read as store text plus board filters (`taskQuery.ts`).
-   * Only the text reaches the store, so typing `is:bug` filters the loaded
-   * cards instead of reloading the board for the words "is" and "bug".
+   * The search box read once, by the parser the archive and the navigator
+   * share: filters, words for ranking, and problems to report. Filters never
+   * reach the store, so typing `is:bug` does not search for "is" and "bug".
    */
   const parsedQuery = $derived(parseTaskQuery(search));
-  const serverQuery = $derived(parsedQuery.text);
-  const boardKey = $derived(JSON.stringify([scope, serverQuery]));
+  /** The Filters bar's choices: applied with the search's filters by `cardVisible`, kept by saved views. */
+  let facet = $state<TaskFacet>(emptyFacet());
+  /**
+   * A search or a Filters choice switches the board from per-column pages to
+   * one candidate set for the scope, ranked and filtered here. The fetch key
+   * changes only with what the store is asked, so typing re-ranks and
+   * re-filters what is loaded without a request.
+   */
+  const plan = $derived(planSearch(scope, parsedQuery, facet, repositories, repositoryCursor === null));
+  const searching = $derived(plan.mode === "search");
+  let sort = $state<SearchOrder>("relevance");
+  /** The search's candidates; null while the board browses columns. */
+  let candidates = $state.raw<CandidateSet | null>(null);
+  const boardKey = $derived(JSON.stringify([scope, plan.key]));
+  /**
+   * A new search on the same scope while its candidates load, or a cleared
+   * one while its columns load: the cards already loaded are real tasks of
+   * this scope, so the board filters and ranks them at once instead of going
+   * blank. Another scope's cards are never shown, and nothing pages, counts
+   * or reports until the load lands.
+   */
+  const provisional = $derived(loadedKey !== "" && loadedKey !== boardKey && loadedScope === JSON.stringify(scope) && (searching || candidates !== null));
   // A deletion waiting out its undo window is already gone from the board:
   // its cards, its counts and anything a selection could act on.
-  const displayColumns = $derived(loadedKey === boardKey ? (pendingDelete ? removeFromColumns(columns, pendingDelete.ids) : columns) : {});
+  const displayColumns = $derived(loadedKey === boardKey || provisional ? (pendingDelete ? removeFromColumns(columns, pendingDelete.ids) : columns) : {});
   // `JSON.stringify(facet)`, not `facet`: the Filters selects write a field in
   // place, which reading the object alone does not track, so a filter change
   // used to leave a selection it had hidden — for a bulk Delete to act on.
@@ -178,7 +204,6 @@
    * start none.
    */
   let enhanceStart = $state(0);
-  let facet = $state<TaskFacet>(emptyFacet());
   let showFilters = $state(false);
   let showSearchHelp = $state(false);
   /** One-click filters; each is a search filter, so a saved view keeps it and a chip removes it. */
@@ -251,7 +276,6 @@
     },
     onDismiss: (reason: string) => closeAddMenu({ restoreFocus: reason === "escape" }),
   });
-  const total = $derived(STATUSES.reduce((sum, status) => sum + (displayColumns[status]?.total ?? 0), 0));
   const loadedCards = $derived(allLoadedCards(displayColumns));
   const facetOptions = $derived(collectFacetOptions(loadedCards));
   /**
@@ -293,7 +317,7 @@
   const importableGroups = $derived(tabGroups($repoStore.openTabs, $repoStore.groupColors));
   let movingGroup = $state(false);
   let importingGroups = $state(false);
-  const columnTotals = $derived(Object.fromEntries(STATUSES.map((status) => [status, displayColumns[status]?.total ?? 0])) as Partial<Record<TaskStatus, number>>);
+  const columnTotals = $derived(Object.fromEntries(STATUSES.map((status) => [status, columnCount(status)])) as Partial<Record<TaskStatus, number>>);
   /**
    * Work a hidden column is keeping off screen.
    *
@@ -341,7 +365,12 @@
   let relinks = $state<{ taskId: string; number: number; title: string }[]>([]);
   const busy = $derived(moving || opening || deleting || deletesRunning > 0 || filingIssue || actionDialog !== null || mergeDialog !== null || pendingUpdate !== null);
   const openCardIds = $derived(openSavedTaskIds(taskTabs));
-  const inProgressCount = $derived(displayColumns.in_progress?.total ?? 0);
+  /**
+   * The scope's in-progress total. A search's candidates only know it when
+   * they are every task of the board's own scope; otherwise the last
+   * browsing total stands rather than a count of whatever loaded.
+   */
+  let inProgressCount = $state(0);
   /** The server's count of archived tasks in this scope, so the badge is not a page size. */
   let archivedCount = $state(0);
   $effect(() => {
@@ -353,6 +382,8 @@
     return visibleBoardStatuses(hiddenColumns, counts, drag !== null);
   });
   const listCards = $derived(shown.flatMap((status) => visibleIn(status)));
+  /** What is on screen per column, in the order it is drawn, for range and select-all. */
+  const drawnColumns = $derived(Object.fromEntries(STATUSES.map((status) => [status, { items: visibleIn(status) }])) as Partial<Record<TaskStatus, { items: TaskCard[] }>>);
   // ---- Saved views, lanes and limits, per board (`taskBoardViews.ts`) -----
   const viewBoard = $derived(viewBoardKey(scope));
   const wipLimits = $derived(boardPrefs($interfaceStore.taskBoards, viewBoard).wip);
@@ -370,9 +401,9 @@
     facet: { ...facet },
     search,
   });
-  /** Against the store's total for the column, never its loaded page. */
+  /** Against the store's total for the column, never its loaded page; a search's counts are matches, not the column's load. */
   function wipOf(status: TaskStatus) {
-    return loadedKey === boardKey ? wipState(displayColumns[status]?.total, wipLimits[status]) : null;
+    return loadedKey === boardKey && !searching ? wipState(displayColumns[status]?.total, wipLimits[status]) : null;
   }
   function laneAria(group: TaskLane): string {
     const by = swimlane === "label" ? "first label" : swimlane;
@@ -389,15 +420,69 @@
   function repoName(id: string) { return repositories.find((repo) => repo.id === id)?.name; }
   const repositoryById = $derived(new Map(repositories.map((repo) => [repo.id, repo])));
   const queryContext = $derived<QueryContext>({ repository: (id) => repositoryById.get(id), nowSec: now });
-  /** The one test for "on screen": the Filters bar and the search box's filters. */
-  function cardVisible(card: TaskCard): boolean {
+  /** The Filters bar and the search box's filters: what the words are ranked over. */
+  function filtersHold(card: TaskCard): boolean {
     return cardMatchesFacet(card, facet, now) && cardMatchesQuery(card, parsedQuery, queryContext);
+  }
+  /** Relevance reorders only a search with words; filters alone keep board order. */
+  const order = $derived<SearchOrder>(searching && parsedQuery.words ? sort : "board");
+  /**
+   * Cards keep their place under Relevance only as a reading order: a drop
+   * or a keyboard nudge there would write a position relative to neighbours
+   * that are not the column's.
+   */
+  const reorderLocked = $derived(searching && order === "relevance");
+  // Description hits belong to the word they were read for: never credited
+  // to a new word while its own read is in flight.
+  const rankContext = $derived.by<RankContext>(() => {
+    const hits = loadedKey === boardKey ? candidates?.textHits : undefined, word = plan.word;
+    return { repoName, storeMatched: (id, typed) => word !== null && hits !== undefined && hits.has(id) && typed.startsWith(word) };
+  });
+  /** The words ranked over the loaded cards the filters pass; null without words. */
+  const ranking = $derived(searching && parsedQuery.words && (loadedKey === boardKey || provisional)
+    ? searchCards(loadedCards.filter(filtersHold), parsedQuery.words, rankContext, { order })
+    : null);
+  /** The ranked cards by id, and per column in the order the ranking gives. */
+  const ranked = $derived.by(() => {
+    const byId = new Map<string, RankedCard>();
+    const byStatus: Partial<Record<TaskStatus, TaskCard[]>> = {};
+    for (const hit of ranking?.cards ?? []) {
+      byId.set(hit.card.id, hit);
+      (byStatus[hit.card.status] ??= []).push(hit.card);
+    }
+    return { byId, byStatus };
+  });
+  /** The one test for "on screen": the Filters bar, the search box's filters, and its words. */
+  function cardVisible(card: TaskCard): boolean {
+    return filtersHold(card) && (ranking === null || ranked.byId.has(card.id));
   }
   /** Cards on screen across every column, hidden ones included; the filter bar's count. */
   const visibleCount = $derived(loadedCards.filter(cardVisible).length);
   function visibleIn(status: TaskStatus): TaskCard[] {
+    if (ranking && order === "relevance") return ranked.byStatus[status] ?? [];
     return (displayColumns[status]?.items ?? []).filter(cardVisible);
   }
+  /** A column's count: the store's total while browsing, the matches while searching. */
+  function columnCount(status: TaskStatus): number {
+    return searching ? visibleIn(status).length : displayColumns[status]?.total ?? 0;
+  }
+  const total = $derived(searching ? visibleCount : STATUSES.reduce((sum, status) => sum + (displayColumns[status]?.total ?? 0), 0));
+  /** The coverage line: what a search read, matched and ranked, and whether it is partial. */
+  const searchReport = $derived.by(() => {
+    if (!searching) return null;
+    if (provisional) return "Searching every task on this board…";
+    if (!candidates || loadedKey !== boardKey) return null;
+    return describeSearch({ matched: visibleCount, set: candidates, word: plan.word, relaxed: ranking?.relaxed ?? false, ranked: order === "relevance" });
+  });
+  const moreCandidates = $derived(searching && candidates !== null && loadedKey === boardKey && canLoadMore(candidates));
+  /** Completions for the search box: the loaded values, and every registered repository. */
+  const suggestionSources = $derived.by<SuggestionSources>(() => ({
+    kind: facetOptions.kinds,
+    owner: facetOptions.owners,
+    label: facetOptions.labels,
+    severity: [...new Set(loadedCards.map((card) => card.severity?.trim() ?? "").filter(Boolean))].sort((a, b) => a.localeCompare(b)),
+    repo: scope.kind === "repository" ? [] : repositories.map((repo) => repo.name),
+  }));
 
   async function catalog() {
     const [repos, groups] = await Promise.all([listRepositories(), listWorkspaces()]);
@@ -406,18 +491,36 @@
     workspaces = groups.items; workspaceTotal = groups.total; workspaceCursor = groups.next_cursor;
     catalogError = "";
   }
-  async function loadBoard(target: Scope = scope, query: string = serverQuery) {
-    const generation = ++revision, key = JSON.stringify([target, query]); loading = true; error = "";
+  async function loadBoard(target: Scope = scope, current: SearchPlan = plan) {
+    const generation = ++revision, key = JSON.stringify([target, current.key]); loading = true; error = "";
     try {
       // Columns hold what is on the board: an archived task leaves them
       // whatever its status. The badge is the archive's own total for the
       // scope — the board's search does not narrow it; the dock has its own.
+      const archived = listTasks(target, null, "", undefined, 1, { archived: true });
+      if (current.mode === "search") {
+        // One status-less candidate set, filtered and ranked here, and one
+        // full-text read for the word descriptions may hold (`taskSearchPlan.ts`).
+        const [broad, text, archive] = await Promise.all([
+          listTasks(current.scope, null, "", undefined, CANDIDATE_PAGE, BOARD),
+          current.word ? listTasks(current.scope, null, current.word, undefined, CANDIDATE_PAGE, BOARD) : null,
+          archived,
+        ]);
+        if (generation !== revision || disposed || key !== boardKey) return;
+        const set = mergeCandidates(null, broad, text);
+        const pages = bucketByStatus(set.cards);
+        candidates = set; columns = pages; loadedKey = key; loadedScope = JSON.stringify(target); archivedCount = archive.total;
+        if (candidatesComplete(set) && JSON.stringify(current.scope) === JSON.stringify(target)) inProgressCount = pages.in_progress?.total ?? 0;
+        selected = new Set([...selected].filter((id) => loadedHas(id, pages)));
+        return;
+      }
       const [pages, archive] = await Promise.all([
-        Promise.all(STATUSES.map(async (status) => [status, await listTasks(target, status, query, undefined, TASK_PAGE_SIZE, BOARD)] as const)),
-        listTasks(target, null, "", undefined, 1, { archived: true }),
+        Promise.all(STATUSES.map(async (status) => [status, await listTasks(target, status, "", undefined, TASK_PAGE_SIZE, BOARD)] as const)),
+        archived,
       ]);
       if (generation !== revision || disposed || key !== boardKey) return;
-      columns = Object.fromEntries(pages); loadedKey = key; archivedCount = archive.total;
+      columns = Object.fromEntries(pages); candidates = null; loadedKey = key; loadedScope = JSON.stringify(target); archivedCount = archive.total;
+      inProgressCount = columns.in_progress?.total ?? 0;
       selected = new Set([...selected].filter((id) => loadedHas(id, Object.fromEntries(pages))));
     } catch (cause) { if (generation === revision && !disposed) error = explainError(cause); }
     finally { if (generation === revision && !disposed) loading = false; }
@@ -555,9 +658,12 @@
   });
   $effect(() => {
     if (!initialized || !active) return;
-    const target = scope, query = serverQuery;
+    // Keyed on what the store is asked, not the text: a keystroke that only
+    // changes the ranking or a filter re-reads nothing.
+    boardKey;
+    const target = untrack(() => scope), current = untrack(() => plan);
     loading = true;
-    const timer = setTimeout(() => { void loadBoard(target, query); void loadUnread(target); }, 250);
+    const timer = setTimeout(() => { void loadBoard(target, current); void loadUnread(target); }, 250);
     return () => { clearTimeout(timer); revision++; };
   });
   // ---- Where each repository's checkout is -------------------------------
@@ -894,12 +1000,30 @@
     taskTabs = openTaskTab(taskTabs, { id: task.id, title: task.title, status: task.status, draft: false });
     session = { tabId: task.id, pane: task.id, value: task };
   }
-  async function pageColumn(status: TaskStatus, cursor?: string) {
-    if (loading || moving || loadedKey !== boardKey) return;
+  /** The next page of a search's candidates (and of its description hits). */
+  async function loadMoreCandidates() {
+    const set = candidates, current = plan;
+    if (!set || loading || moving || loadedKey !== boardKey || !canLoadMore(set)) return;
     const generation = revision, key = boardKey;
     loading = true; error = "";
     try {
-      const result = await listTasks(scope, status, serverQuery, cursor, TASK_PAGE_SIZE, BOARD);
+      const [broad, text] = await Promise.all([
+        set.broad.cursor ? listTasks(current.scope, null, "", set.broad.cursor, CANDIDATE_PAGE, BOARD) : null,
+        set.text?.cursor && current.word ? listTasks(current.scope, null, current.word, set.text.cursor, CANDIDATE_PAGE, BOARD) : null,
+      ]);
+      if (generation !== revision || disposed || key !== boardKey) return;
+      const next = mergeCandidates(set, broad, text);
+      candidates = next; columns = bucketByStatus(next.cards);
+      announce = `Searched ${next.broad.loaded} of ${next.broad.total} tasks.`;
+    } catch (cause) { if (generation === revision && !disposed) error = explainError(cause); }
+    finally { if (generation === revision && !disposed) loading = false; }
+  }
+  async function pageColumn(status: TaskStatus, cursor?: string) {
+    if (searching || loading || moving || loadedKey !== boardKey) return;
+    const generation = revision, key = boardKey;
+    loading = true; error = "";
+    try {
+      const result = await listTasks(scope, status, "", cursor, TASK_PAGE_SIZE, BOARD);
       if (generation !== revision || disposed || key !== boardKey) return;
       const items = cursor ? [...new Map([...(columns[status]?.items ?? []), ...result.items].map((item) => [item.id, item])).values()] : result.items;
       columns = { ...columns, [status]: { ...result, items, shown: items.length } };
@@ -953,7 +1077,7 @@
   $effect(() => { if (!active) untrack(cancelDrag); });
   function onCardPointerDown(e: PointerEvent, card: TaskCard) {
     if (opening) return;
-    if (e.button !== 0 || busy || menu || press) return;
+    if (e.button !== 0 || busy || menu || press || reorderLocked) return;
     const target = e.currentTarget as HTMLElement;
     press = { card, pointerId: e.pointerId, x: e.clientX, y: e.clientY, grab: grabPoint({ x: e.clientX, y: e.clientY }, target.getBoundingClientRect()), target };
     // Capture keeps the moves coming once the pointer leaves the window. A
@@ -992,7 +1116,7 @@
     const position = insertionPosition(before,after);
     if (after !== null && (position >= after || before !== null && position <= before)) {
       const plan = reorderPlan(items,card,insertIndex);
-      if (columns[over]?.next_cursor || plan.cards.length > MAX_TASK_SELECTION) { error = `This column needs re-spacing. Load its remaining tasks first; up to ${MAX_TASK_SELECTION} tasks can be reordered together. Priority and title sorting remain available.`; return; }
+      if (columns[over]?.next_cursor || (candidates && !candidatesComplete(candidates)) || plan.cards.length > MAX_TASK_SELECTION) { error = `This column needs re-spacing. Load its remaining tasks first; up to ${MAX_TASK_SELECTION} tasks can be reordered together. Priority and title sorting remain available.`; return; }
       await applyUpdate(new TaskBatch(plan.cards,{kind:"reorder",status:over,positions:plan.positions}));
     } else await moveCard(card, over, position);
   }
@@ -1008,7 +1132,7 @@
       return;
     }
     if (e.shiftKey) {
-      const ids = flattenVisibleIds(displayColumns, shown, cardVisible);
+      const ids = flattenVisibleIds(drawnColumns, shown, cardVisible);
       selected = rangeSelect(ids, selectionAnchor, card.id);
       return;
     }
@@ -1093,7 +1217,7 @@
       next.focus();
       const id = next.dataset.cardId;
       if (id && e.shiftKey && (e.key === "ArrowUp" || e.key === "ArrowDown")) {
-        const ids = flattenVisibleIds(displayColumns, shown, cardVisible);
+        const ids = flattenVisibleIds(drawnColumns, shown, cardVisible);
         if (!selectionAnchor) selectionAnchor = card.id;
         selected = rangeSelect(ids, selectionAnchor, id);
       }
@@ -1126,6 +1250,7 @@
    */
   async function nudgeCard(card: TaskCard, delta: -1 | 1) {
     if (busy) return;
+    if (reorderLocked) { announce = "Matches are ordered by relevance. Switch to Board order to move a card within its column."; return; }
     const items = displayColumns[card.status]?.items ?? [];
     const from = items.findIndex((item) => item.id === card.id);
     const to = from + delta;
@@ -1160,7 +1285,7 @@
     }
     if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "a") {
       e.preventDefault();
-      selected = new Set(flattenVisibleIds(displayColumns, shown, cardVisible));
+      selected = new Set(flattenVisibleIds(drawnColumns, shown, cardVisible));
       selectionAnchor = [...selected][0] ?? null;
       return;
     }
@@ -1737,7 +1862,7 @@
   <span class="column-meta">
     <!-- The store's count for the column, not its loaded page: a column
          showing thirty of forty is over a limit of thirty-five. -->
-    <span data-testid="task-column-count" title={limit ? `${columns[status]?.total ?? 0} of a work-in-progress limit of ${limit}` : undefined}>{columns[status]?.total ?? "—"}{#if limit}<span class="limit">/{limit}</span>{/if}</span>
+    <span data-testid="task-column-count" title={searching ? `${columnCount(status)} matching in ${STATUS_LABELS[status]}` : limit ? `${columns[status]?.total ?? 0} of a work-in-progress limit of ${limit}` : undefined}>{columns[status] && !(provisional && !searching) ? columnCount(status) : "—"}{#if limit && !searching}<span class="limit">/{limit}</span>{/if}</span>
     {#if wip === "over"}<span class="over-badge" data-testid="task-column-over">Over limit<span class="sr-only">: {STATUS_LABELS[status]} holds {columns[status]?.total ?? 0} tasks against a limit of {limit}</span></span>{/if}
     <button type="button" class="gp-icon-btn" aria-label={`New task in ${STATUS_LABELS[status]}`} title={creation.blocked ?? creation.caveat ?? `New task in ${STATUS_LABELS[status]}`} disabled={!creation.allowed} onclick={() => void createTask(status)}><Plus size={11} /></button>
   </span>
@@ -1783,6 +1908,7 @@
       </div>
     {/if}
     {#if face.labels.length && cardFields.has("labels")}<div class="labels">{#each face.labels as label}<span>{label}</span>{/each}{#if chrome.extraLabels}<span>+{chrome.extraLabels}</span>{/if}</div>{/if}
+    {@render matchHint(card)}
   </button>
 {/snippet}
 {#snippet listRow(card: TaskCard)}
@@ -1815,7 +1941,15 @@
     {#if face.repo && cardFields.has("repo")}<span class="muted">{face.repo}{chrome.extraRepos ? ` +${chrome.extraRepos}` : ""}</span>{/if}
     {#if chrome.owner && cardFields.has("owner")}<span class="muted">{chrome.owner}</span>{/if}
     {#if dueLabel(chrome.due) && cardFields.has("due")}<span class="due" data-due={chrome.due}>{dueLabel(chrome.due)}</span>{/if}
+    {@render matchHint(card)}
   </button>
+{/snippet}
+{#snippet matchHint(card: TaskCard)}
+  <!-- Why a search matched a card it would not obviously match: a related
+       word, a close spelling, or a description only the store can read. -->
+  {@const hit = ranked.byId.get(card.id)}
+  {@const why = hit ? describeMatch(hit) : ""}
+  {#if why}<span class="match-hint" data-testid="task-match-hint">Matched {why}</span>{/if}
 {/snippet}
 {#snippet columnPaging(status: TaskStatus, named = false)}
   <!-- One control for both layouts. The list used to have none, so a task
@@ -1915,8 +2049,8 @@
         {#if repositoryPath}<button type="button" class="link" data-testid="task-board-all" title="Open the Tasks board for every repository and workspace" onclick={() => interfaceStore.setGlobalSurface("tasks")}>All tasks</button>{/if}
       </div>
       <div class="actions">
-        <label class="search"><Search size={12} /><input id="task-search" class="gp-field" aria-label="Search tasks" aria-describedby="task-search-hint" type="search" bind:value={search} placeholder="Search — is:bug repo:name" title="Words search titles and descriptions; is:bug, priority:high, repo:name, owner:, label:, status:, due:, severity: filter the board. A leading - excludes." maxlength="512" /></label>
-        <span id="task-search-hint" class="sr-only">Words search titles and descriptions. Filters such as is:bug, priority:high or repo:name narrow the loaded cards; a leading minus excludes.</span>
+        <div class="search"><TaskSearchField id="task-search" bind:value={search} sources={suggestionSources} busy={loading && searching} describedby="task-search-hint" title="Words are ranked over every task on this board — titles, labels, type, owner and repository, with word forms, related words and close spellings — and the store searches descriptions. is:bug, priority:high, repo:name, owner:, label:, status:, due:, severity: filter. OR between words, quotes for a phrase, commas for any of several values, a leading - excludes." /></div>
+        <span id="task-search-hint" class="sr-only">Words are ranked over every task on this board, including related words and close spellings. Filters such as is:bug, priority:high or repo:name narrow it; a comma list is any of its values; OR between words is either; quote a phrase; a leading minus excludes.</span>
         <button type="button" class="gp-icon-btn" aria-pressed={showSearchHelp} aria-controls="task-search-help" aria-label="Search syntax" title="Search syntax" onclick={() => { showSearchHelp = !showSearchHelp; }}>?</button>
         <div class="gp-segmented" class:gp-liquid-tabs={macos} role="group" aria-label="Task layout">
           <button type="button" class="gp-seg-btn" data-active={layout === "board"} aria-pressed={layout === "board"} onclick={() => interfaceStore.setTaskLayout("board")}><LayoutGrid size={12} /> Board</button>
@@ -2001,22 +2135,36 @@
         </div>
         {#if parsedQuery.terms.length}
           <ul class="query-chips" aria-label="Search filters">
-            {#each parsedQuery.terms as term (`${term.start}:${term.raw}`)}
+            {#each queryChips(parsedQuery) as term (`${term.start}:${term.raw}`)}
               <li class="gp-pill query-chip" class:negated={term.negated}><span>{term.raw}</span><button type="button" class="chip-remove" aria-label={`Remove filter ${term.raw}`} onclick={() => { search = removeQueryTerm(search, term); }}><X size={10} /></button></li>
             {/each}
           </ul>
         {/if}
-        {#if parsedQuery.terms.length && loadedKey === boardKey}
-          <span class="query-coverage" data-testid="task-query-coverage">{plural(visibleCount, "match", "matches")} in {plural(loadedCards.length, "loaded task")}{loadedCards.length < total ? ` of ${total} — Load more in a column to filter the rest` : ""}</span>
+        {#if searchReport}
+          <!-- What the search read, matched and ranked. A partial answer says
+               it is partial and offers the next page; it never reads as
+               everything that matches. -->
+          <span class="query-coverage" role="status" data-testid="task-query-coverage">{searchReport}</span>
+        {/if}
+        {#if moreCandidates}
+          <button type="button" class="gp-btn quick" disabled={loading} onclick={() => void loadMoreCandidates()}>Load more tasks</button>
+        {/if}
+        {#if searching && parsedQuery.words}
+          <div class="gp-segmented" role="group" aria-label="Order matches">
+            <button type="button" class="gp-seg-btn" data-active={sort === "relevance"} aria-pressed={sort === "relevance"} title="Best matches first. Cards cannot be moved within a column in this order." onclick={() => { sort = "relevance"; }}>Relevance</button>
+            <button type="button" class="gp-seg-btn" data-active={sort === "board"} aria-pressed={sort === "board"} title="Matches in the board's own order, where cards can be moved." onclick={() => { sort = "board"; }}>Board order</button>
+          </div>
         {/if}
         {#if parsedQuery.problems.length}
           <ul class="query-problems" role="status" aria-live="polite" data-testid="task-query-problems">
-            {#each parsedQuery.problems as problem}<li><AlertTriangle size={11} aria-hidden="true" /> {problem} Not applied.</li>{/each}
+            {#each parsedQuery.problems as problem}<li><AlertTriangle size={11} aria-hidden="true" /> {problem}</li>{/each}
           </ul>
         {/if}
         {#if showSearchHelp}
           <dl id="task-search-help" class="query-help" data-testid="task-search-help">
-            <div><dt>words</dt><dd>Search titles and descriptions (the store’s full-text search)</dd></div>
+            <div><dt>words</dt><dd>Every word must match: titles, labels, type, owner and repository (word forms, related words, close spellings), and descriptions through the store</dd></div>
+            <div><dt>login OR signin</dt><dd>Either word</dd></div>
+            <div><dt>"sign in"</dt><dd>That phrase in the title or a label</dd></div>
             {#each QUERY_HELP as row (row.example)}<div><dt><button type="button" class="link" title="Add to the search" onclick={() => { search = toggleQueryTerm(search, row.example); }}>{row.example}</button></dt><dd>{row.meaning}</dd></div>{/each}
           </dl>
         {/if}
@@ -2154,7 +2302,7 @@
            saved, because nothing had linked a repository. -->
       <EmptyState icon={Inbox} title="No tasks yet" hint={creation.blocked ?? creation.caveat ?? "Create a task in this scope. Cards stay on this board until you delete them."} action={creation.allowed ? { label: "New task", onClick: () => void createTask(), variant: "primary" } : undefined} />
     {:else if initialized && !loading && listCards.length === 0 && filtering}
-      <EmptyState icon={Search} title="No tasks match" hint="Clear search or filters to see the rest of this board. Server search only covers the current pages." action={{ label: "Clear filters", onClick: () => { facet = emptyFacet(); search = ""; }, variant: "secondary" }} />
+      <EmptyState icon={Search} title="No tasks match" hint={candidates && !candidatesComplete(candidates) ? `Only ${candidates.broad.loaded} of ${candidates.broad.total} tasks on this board were searched. Load more tasks to search the rest, or clear the search.` : "Nothing on this board matches every word and filter. Clear the search or remove a filter to see the rest."} action={moreCandidates ? { label: "Load more tasks", onClick: () => void loadMoreCandidates(), variant: "secondary" } : { label: "Clear filters", onClick: () => { facet = emptyFacet(); search = ""; }, variant: "secondary" }} />
     {:else if layout === "list"}
       <div class="list" role="group" data-testid="task-columns" data-task-list aria-busy={loading || moving} aria-label="Task list">
         {#if laneList}
@@ -2414,7 +2562,7 @@
   button:disabled{opacity:.5}
   .hint{font-size:11px;color:rgb(var(--c-text-muted))}
   .search{display:flex;align-items:center;gap:6px;color:rgb(var(--c-text-muted))}
-  .search input{width:200px}
+  .match-hint{display:block;margin-top:4px;font-size:10px;line-height:1.3;color:rgb(var(--c-text-muted));overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
   .nav-search{display:flex;align-items:center;gap:5px;margin:0 0 6px;color:rgb(var(--c-text-muted))}
   .nav-search input{flex:1;min-width:0;font-size:11px}
   .nav-empty{margin:2px 6px 6px;font-size:11px;color:rgb(var(--c-text-muted))}

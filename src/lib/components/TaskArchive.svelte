@@ -56,6 +56,8 @@
   import { MAX_TASK_SELECTION, type TaskAction } from "../workbench/taskActions";
   import { MAX_DELETE_BATCH } from "../workbench/taskDelete";
   import { cardMatchesQuery, parseTaskQuery, type QueryContext } from "../workbench/taskQuery";
+  import { searchCards } from "../workbench/taskRank";
+  import { words as lexiconWords } from "../workbench/taskLexicon";
   import { ARCHIVE_RULE, archiveStamp, archiveSummary, refreshPages, restoreAction, type ArchiveView } from "../workbench/taskArchive";
   import {
     STATUS_LABELS, explainError, listTasks,
@@ -110,7 +112,19 @@
   const queryContext = $derived<QueryContext>({ repository, nowSec: now });
   /** Loaded rows not waiting out the board's undo window. */
   const live = $derived((result?.items ?? []).filter((card) => !hiddenIds.has(card.id)));
-  const rows = $derived(live.filter((card) => cardMatchesQuery(card, parsed, queryContext)));
+  const passing = $derived(live.filter((card) => cardMatchesQuery(card, parsed, queryContext)));
+  /**
+   * The store has already matched every word it was sent (`parsed.text`),
+   * descriptions included, so only what it could not be asked is checked
+   * here: `OR` alternatives and phrases, read the board's way (`taskRank`).
+   * Never relaxed — the archive lists matches in completion order.
+   */
+  const sentWords = $derived(new Set(lexiconWords(storeQuery)));
+  const rows = $derived(parsed.words
+    ? searchCards(passing, parsed.words, { repoName: (id) => repository(id)?.name, storeMatched: (_, word) => sentWords.has(word) }, { order: "board", relax: false }).cards.map((hit) => hit.card)
+    : passing);
+  /** Words checked here rather than by the store: phrases, and clauses the store was not sent. */
+  const localWords = $derived(Boolean(parsed.words && (parsed.words.phrases.length || parsed.words.clauses.some((clause) => !clause.some((word) => sentWords.has(word))))));
   const hiddenHere = $derived((result?.items.length ?? 0) - live.length);
   // `null` until a read succeeds, so an unread dock never renders as an empty
   // archive. The dock defers while the window is in the background, which is
@@ -263,7 +277,7 @@
   <p class="summary" role="status" data-testid="task-archive-summary">
     {summary.text}
     {#if summary.partial}<span class="more-note">Load more to see the rest.</span>{/if}
-    {#if parsed.terms.length && !summary.pending}<span class="more-note" data-testid="task-archive-filter-note">Filters apply to the {live.length} loaded.</span>{/if}
+    {#if (parsed.terms.length || localWords) && !summary.pending}<span class="more-note" data-testid="task-archive-filter-note">Filters apply to the {live.length} loaded.</span>{/if}
     <!-- Deferring the query while the window is in the background is the
          Inbox's behaviour too, and worth the saved round trips. Leaving the
          reader to guess why the panel is blank is not. -->
@@ -277,7 +291,7 @@
 
   {#if parsed.problems.length}
     <ul class="problems" role="status" aria-live="polite" data-testid="task-archive-query-problems">
-      {#each parsed.problems as problem}<li>{problem} Not applied.</li>{/each}
+      {#each parsed.problems as problem}<li>{problem}</li>{/each}
     </ul>
   {/if}
   {#if error}<div role="alert">{error}</div>{/if}
