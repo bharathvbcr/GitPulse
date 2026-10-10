@@ -2889,20 +2889,80 @@ fn shared_budget_path() -> Result<PathBuf, String> {
 }
 
 /// Every child the gate actually started, so a test can count spawns in its
-/// own repository instead of inferring them from timing. Bounded: the whole
-/// suite shares it, and only the newest entries matter to a running test.
+/// own repository instead of inferring them from timing.
+///
+/// Kept per working directory. The suite shares one process, and a log shared
+/// by every test is evicted by whichever tests spawn the most: a test counting
+/// its own children by position (`spawns_in(cwd).len()` before and after) then
+/// lost its oldest entries to its neighbours and counted short, more often the
+/// longer it ran, which is to say under load. A test's directory is only ever
+/// pushed to by that test, so its entries are evicted by nothing but its own
+/// volume, and a directory that has gone quiet is the first to be dropped.
 #[cfg(test)]
 pub(crate) mod spawn_log {
-    use std::collections::VecDeque;
+    use std::collections::{HashMap, VecDeque};
     use std::path::{Path, PathBuf};
     use std::process::Command;
     use std::sync::Mutex;
 
     use super::Admission;
 
-    const CAPACITY: usize = 16_384;
-    type Entry = (PathBuf, Vec<String>, Admission);
-    static LOG: Mutex<VecDeque<Entry>> = Mutex::new(VecDeque::new());
+    /// Entries kept for one directory, and directories kept at once.
+    const PER_DIRECTORY: usize = 16_384;
+    const DIRECTORIES: usize = 1_024;
+    type Entry = (Vec<String>, Admission);
+
+    struct Log {
+        per_directory: usize,
+        directories: usize,
+        by_directory: HashMap<PathBuf, (u64, VecDeque<Entry>)>,
+        touched: u64,
+    }
+
+    impl Log {
+        fn bounded(per_directory: usize, directories: usize) -> Self {
+            Self {
+                per_directory,
+                directories,
+                by_directory: HashMap::new(),
+                touched: 0,
+            }
+        }
+
+        fn push(&mut self, cwd: &Path, entry: Entry) {
+            self.touched += 1;
+            let touched = self.touched;
+            if !self.by_directory.contains_key(cwd) && self.by_directory.len() >= self.directories {
+                // The directory nothing has spawned in for longest.
+                if let Some(stale) = self
+                    .by_directory
+                    .iter()
+                    .min_by_key(|(_, (last, _))| *last)
+                    .map(|(dir, _)| dir.clone())
+                {
+                    self.by_directory.remove(&stale);
+                }
+            }
+            let (last, entries) = self
+                .by_directory
+                .entry(cwd.to_path_buf())
+                .or_insert_with(|| (touched, VecDeque::new()));
+            *last = touched;
+            if entries.len() == self.per_directory {
+                entries.pop_front();
+            }
+            entries.push_back(entry);
+        }
+
+        fn entries(&self, cwd: &Path) -> Vec<Entry> {
+            self.by_directory
+                .get(cwd)
+                .map(|(_, entries)| entries.iter().cloned().collect())
+                .unwrap_or_default()
+        }
+    }
+
+    static LOG: Mutex<Option<Log>> = Mutex::new(None);
 
     pub(super) fn record(cmd: &Command) {
         let Some(cwd) = cmd.get_current_dir() else {
@@ -2912,13 +2972,11 @@ pub(crate) mod spawn_log {
             .get_args()
             .map(|arg| arg.to_string_lossy().into_owned())
             .collect();
-        let mut log = LOG
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if log.len() == CAPACITY {
-            log.pop_front();
-        }
-        log.push_back((cwd.to_path_buf(), argv, super::current_admission()));
+        let class = super::current_admission();
+        LOG.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get_or_insert_with(|| Log::bounded(PER_DIRECTORY, DIRECTORIES))
+            .push(cwd, (argv, class));
     }
 
     /// Argument vectors of every recorded child whose working directory was
@@ -2935,10 +2993,50 @@ pub(crate) mod spawn_log {
     pub(crate) fn classed_spawns_in(cwd: &Path) -> Vec<(Vec<String>, Admission)> {
         LOG.lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .iter()
-            .filter(|(dir, _, _)| dir == cwd)
-            .map(|(_, argv, class)| (argv.clone(), *class))
-            .collect()
+            .as_ref()
+            .map(|log| log.entries(cwd))
+            .unwrap_or_default()
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn entry() -> Entry {
+            (vec!["status".into()], Admission::Reactive)
+        }
+
+        /// The defect: a count taken by position was shortened by other tests'
+        /// spawns. One directory's volume no longer evicts another's entries.
+        #[test]
+        fn a_busy_neighbour_does_not_evict_a_quiet_directory() {
+            let mut log = Log::bounded(8, 4);
+            let (quiet, busy) = (Path::new("/quiet"), Path::new("/busy"));
+            for _ in 0..3 {
+                log.push(quiet, entry());
+            }
+            for _ in 0..100 {
+                log.push(busy, entry());
+            }
+            assert_eq!(log.entries(quiet).len(), 3);
+            assert_eq!(log.entries(busy).len(), 8, "bounded by its own volume");
+        }
+
+        #[test]
+        fn the_directory_that_went_quiet_is_the_one_dropped() {
+            let mut log = Log::bounded(8, 3);
+            let (first, live) = (Path::new("/first"), Path::new("/live"));
+            log.push(first, entry());
+            log.push(live, entry());
+            for other in ["/a", "/b", "/c", "/d"] {
+                log.push(Path::new(other), entry());
+                // A live directory keeps spawning, so it stays.
+                log.push(live, entry());
+            }
+            assert!(log.entries(first).is_empty(), "the quiet one went");
+            assert!(!log.entries(live).is_empty(), "the busy one stayed");
+            assert_eq!(log.by_directory.len(), 3, "never more than its bound");
+        }
     }
 }
 
@@ -8647,6 +8745,27 @@ mod admission_scope_tests {
         Box::leak(Box::new(gate))
     }
 
+    /// A gate whose bucket cannot refill during the test. The rate is real
+    /// time, so on a loaded machine the second between two spawns that a test
+    /// calls "budget spent" arrives, a token lands, and the spawn it expected
+    /// to be refused is admitted. Putting the bucket's clock in the future
+    /// makes elapsed time zero for as long as the test runs.
+    fn frozen(gate: SpawnGate) -> &'static SpawnGate {
+        let gate = leak(gate);
+        gate.state.lock().unwrap().tokens_at = Some(Instant::now() + Duration::from_secs(86_400));
+        gate
+    }
+
+    /// Keeps `repo`'s post-action credit open for the test: its window is real
+    /// time too, and thirty-two real process spawns do not fit in three
+    /// seconds on a busy machine. The window's own expiry is pinned by
+    /// `a_credit_expires_with_its_window`, against explicit instants.
+    fn hold_credit_open(repo: &Path) {
+        let mut credits = post_action_credits().lock().unwrap();
+        credits.get_mut(repo).expect("a credit was granted").until =
+            Instant::now() + Duration::from_secs(86_400);
+    }
+
     fn shared_gate(path: &Path, burst: u32, rate: u32) -> &'static SpawnGate {
         let gate = SpawnGate::with_rate(16, burst, rate).sharing(Ok(path.to_path_buf()));
         assert!(gate.shared.is_some(), "{:?}", gate.shared_note);
@@ -8895,8 +9014,8 @@ mod admission_scope_tests {
         let repo = dir.path().canonicalize().unwrap();
         let other = tempfile::tempdir().unwrap();
         let other = other.path().canonicalize().unwrap();
-        // One token, a refill too slow to matter inside this test.
-        let gate = leak(SpawnGate::with_rate(16, 1, 1));
+        // One token, and no refill at all inside this test.
+        let gate = frozen(SpawnGate::with_rate(16, 1, 1));
         reactive_spawn_in(gate, &repo).expect("the one token");
         let starved = reactive_spawn_in(gate, &repo).unwrap_err();
         assert!(
@@ -8913,19 +9032,18 @@ mod admission_scope_tests {
         let read: Result<(), String> = run_command_scope(|| Ok(()));
         read.unwrap();
         assert!(reactive_spawn_in(gate, &other).is_err());
-        let started = Instant::now();
+        hold_credit_open(&repo);
         for i in 0..POST_ACTION_CREDIT_SPAWNS {
             reactive_spawn_in(gate, &repo)
                 .unwrap_or_else(|e| panic!("credited spawn {i} refused: {e}"));
         }
-        // Spent: what is admitted now is only the 1/s refill, not more credit.
+        // Spent, and the bucket cannot refill: nothing more is admitted.
         let extra = (0..6)
             .take_while(|_| reactive_spawn_in(gate, &repo).is_ok())
             .count();
-        let refill = started.elapsed().as_secs() as usize + 1;
-        assert!(
-            extra <= refill,
-            "{extra} spawns past the {POST_ACTION_CREDIT_SPAWNS}-spawn credit (refill allows {refill})"
+        assert_eq!(
+            extra, 0,
+            "{extra} spawns past the {POST_ACTION_CREDIT_SPAWNS}-spawn credit"
         );
     }
 
@@ -8937,14 +9055,36 @@ mod admission_scope_tests {
     fn a_tab_activation_admits_its_hydrate_when_the_budget_is_spent() {
         let dir = crate::test_support::git_repo();
         let repo = dir.path().canonicalize().unwrap();
-        let gate = leak(SpawnGate::with_rate(16, 1, 1));
+        let gate = frozen(SpawnGate::with_rate(16, 1, 1));
         reactive_spawn_in(gate, &repo).expect("the one token");
         assert!(reactive_spawn_in(gate, &repo).is_err(), "budget spent");
 
         note_tab_activated(repo.to_str().unwrap()).expect("activation");
+        hold_credit_open(&repo);
         for i in 0..POST_ACTION_CREDIT_SPAWNS {
             reactive_spawn_in(gate, &repo)
                 .unwrap_or_else(|e| panic!("activation read {i} refused: {e}"));
+        }
+    }
+
+    /// What the two credit tests rely on: a frozen bucket takes no token from
+    /// the passing of time, however long a loaded machine makes a test, while
+    /// an ordinary one does.
+    #[test]
+    fn a_frozen_bucket_does_not_refill_and_an_ordinary_one_does() {
+        let later = Instant::now() + Duration::from_secs(30);
+        for (gate, refilled) in [
+            (frozen(SpawnGate::with_rate(16, 4, 1)), false),
+            (leak(SpawnGate::with_rate(16, 4, 1)), true),
+        ] {
+            let mut state = gate.state.lock().unwrap();
+            state.tokens = 0;
+            if refilled {
+                // An ordinary gate starts its clock at its first look.
+                state.tokens_at = Some(Instant::now());
+            }
+            gate.refill(&mut state, later);
+            assert_eq!(state.tokens > 0, refilled, "tokens {}", state.tokens);
         }
     }
 

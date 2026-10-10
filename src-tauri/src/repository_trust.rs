@@ -2643,6 +2643,12 @@ mod tests {
         assert_eq!(left, 1);
     }
 
+    /// How many times the cost of reading every record once a pass over the
+    /// store may take, and the least it is ever held to (a pass faster than
+    /// this cannot have scanned a store anything like this size).
+    const RELATIVE_COST: u32 = 60;
+    const MIN_ALLOWANCE: std::time::Duration = std::time::Duration::from_millis(50);
+
     #[test]
     fn trust_persistence_two_thousand_records_stay_under_budget() {
         let repo = fixture();
@@ -2678,6 +2684,15 @@ mod tests {
         )
         .unwrap();
 
+        // The unit of work any pass over the store needs: reading every record
+        // once. Measured here, beside the passes it is compared with, so a
+        // slow or contended machine slows the yardstick as much as the passes.
+        let started = std::time::Instant::now();
+        for entry in fs::read_dir(storage.path()).unwrap() {
+            std::hint::black_box(fs::read(entry.unwrap().path()).unwrap());
+        }
+        let yardstick = started.elapsed();
+
         let started = std::time::Instant::now();
         migrate_store(storage.path()).unwrap();
         let migrating = started.elapsed();
@@ -2685,10 +2700,25 @@ mod tests {
         let scope = read_grant(storage.path(), &current).unwrap();
         let reading = started.elapsed();
         assert_eq!(scope, TrustScope::Repository);
-        println!("records={RECORDS} migrate={migrating:?} read_grant={reading:?}");
+        println!(
+            "records={RECORDS} read_all={yardstick:?} migrate={migrating:?} read_grant={reading:?}"
+        );
+        // What matters is how the passes scale with the store: a per-record
+        // rescan costs many reads of every record, which no clock speed hides.
+        // A fixed wall-clock fraction of the hook budget also measured the
+        // machine's load, so it could fail under contention with the code
+        // unchanged.
         for (label, taken) in [("migrate", migrating), ("read_grant", reading)] {
             assert!(
-                taken < crate::hooks::BUDGET / 5,
+                taken <= yardstick.saturating_mul(RELATIVE_COST).max(MIN_ALLOWANCE),
+                "{label} took {taken:?} on {RECORDS} records; reading them all once takes {yardstick:?}"
+            );
+        }
+        // And the hook's own budget is a ceiling whatever the yardstick says,
+        // scaled for the machine like every wall-clock limit in the suite.
+        for (label, taken) in [("migrate", migrating), ("read_grant", reading)] {
+            assert!(
+                taken < crate::test_support::coverage_relaxed(crate::hooks::BUDGET),
                 "{label} took {taken:?} on {RECORDS} records, which threatens the {:?} hook budget",
                 crate::hooks::BUDGET
             );

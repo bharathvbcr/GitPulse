@@ -50,6 +50,12 @@ pub(crate) fn isolated_libtest_command(filter: &str) -> (Command, IsolatedHarnes
         .file_name()
         .expect("test executable name")
         .to_string_lossy();
+    static SWEPT: std::sync::Once = std::sync::Once::new();
+    SWEPT.call_once(|| {
+        if let Some(dir) = src.parent() {
+            sweep_dead_isolates(dir, &stem, process_is_alive);
+        }
+    });
     let path = src.with_file_name(format!(
         "{stem}-isolate-{}-{}",
         std::process::id(),
@@ -74,6 +80,57 @@ pub(crate) fn isolated_libtest_command(filter: &str) -> (Command, IsolatedHarnes
     let mut command = Command::new(&path);
     command.args(["--exact", filter, "--nocapture"]);
     (command, IsolatedHarnessGuard { path })
+}
+
+/// Removes copies a killed run left beside the harness. Each is a full copy of
+/// the test image (tens to hundreds of MB), removed by its guard's `Drop`,
+/// which a run that is killed (a timeout, a signal, a crash) never reaches; they
+/// then accumulate in `target/` run after run. A copy is named for the process
+/// that made it, so one whose process is gone is nobody's.
+#[cfg(test)]
+fn sweep_dead_isolates(dir: &Path, stem: &str, alive: impl Fn(u32) -> bool) -> usize {
+    let prefix = format!("{stem}-isolate-");
+    let Ok(entries) = fs::read_dir(dir) else {
+        return 0;
+    };
+    let mut removed = 0;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(rest) = name.to_str().and_then(|name| name.strip_prefix(&prefix)) else {
+            continue;
+        };
+        let Some(pid) = rest
+            .split('-')
+            .next()
+            .and_then(|pid| pid.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        if !alive(pid) && fs::remove_file(entry.path()).is_ok() {
+            removed += 1;
+        }
+    }
+    removed
+}
+
+/// Whether `pid` names a process that exists. A permission error still means it
+/// does (the copy is then left alone), and a reused pid keeps a stale copy
+/// until its new owner exits, which costs disk, never correctness.
+#[cfg(all(test, unix))]
+fn process_is_alive(pid: u32) -> bool {
+    extern "C" {
+        fn kill(pid: i32, signal: i32) -> i32;
+    }
+    let Ok(pid) = i32::try_from(pid) else {
+        return false;
+    };
+    // SAFETY: signal 0 only checks that the process exists.
+    unsafe { kill(pid, 0) == 0 || std::io::Error::last_os_error().raw_os_error() != Some(3) }
+}
+
+#[cfg(all(test, not(unix)))]
+fn process_is_alive(_pid: u32) -> bool {
+    true
 }
 
 #[cfg(test)]
@@ -255,15 +312,61 @@ mod tests {
         holder.join().unwrap();
     }
 
+    /// The defect: a killed run left its harness copies in `target/` for good.
     #[test]
-    fn coverage_relaxed_leaves_plain_runs_unchanged() {
+    fn copies_left_by_dead_processes_are_swept_and_live_ones_are_not() {
+        use super::{fs, sweep_dead_isolates};
+        let dir = tempfile::tempdir().unwrap();
+        let name = |pid: u32, seq: u32| format!("gitpulse_lib-abc-isolate-{pid}-{seq}");
+        let ours = std::process::id();
+        for file in [
+            name(4_000_001, 0),
+            name(4_000_001, 1),
+            name(ours, 0),
+            // Not ours to touch: another stem, and no pid at all.
+            "other_lib-abc-isolate-4000001-0".to_owned(),
+            "gitpulse_lib-abc-isolate-notapid-0".to_owned(),
+            "gitpulse_lib-abc".to_owned(),
+        ] {
+            fs::write(dir.path().join(file), b"image").unwrap();
+        }
+        let removed = sweep_dead_isolates(dir.path(), "gitpulse_lib-abc", |pid| pid == ours);
+        assert_eq!(removed, 2);
+        let left: Vec<String> = fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        for kept in [
+            name(ours, 0),
+            "other_lib-abc-isolate-4000001-0".to_owned(),
+            "gitpulse_lib-abc-isolate-notapid-0".to_owned(),
+            "gitpulse_lib-abc".to_owned(),
+        ] {
+            assert!(left.contains(&kept), "{kept} was removed: {left:?}");
+        }
+        assert_eq!(left.len(), 4);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn this_process_is_alive_and_an_unused_pid_is_not() {
+        use super::process_is_alive;
+        assert!(process_is_alive(std::process::id()));
+        assert!(!process_is_alive(4_000_001));
+    }
+
+    #[test]
+    fn coverage_relaxed_never_tightens_and_only_loosens_for_a_reason() {
         let budget = Duration::from_millis(400);
         let instrumented = std::env::var_os("CARGO_LLVM_COV").is_some()
             || std::env::var_os("LLVM_PROFILE_FILE").is_some();
         let relaxed = coverage_relaxed(budget);
+        assert!(relaxed >= budget, "{relaxed:?}");
         if instrumented {
             assert!(relaxed >= Duration::from_secs(5), "{relaxed:?}");
-        } else {
+        } else if super::env::host_load().is_none_or(|(load, cpus)| load < cpus as f64 * 0.8) {
+            // A host with a core free for every runnable task, by a margin the
+            // slow-moving average cannot cross between the two samples.
             assert_eq!(relaxed, budget);
         }
     }

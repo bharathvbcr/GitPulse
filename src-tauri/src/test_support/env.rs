@@ -434,21 +434,116 @@ pub(crate) mod hermetic {
 
 /// Wall-clock limits in tests go through this, and only this.
 ///
-/// Coverage instrumentation makes sub-second process and thread deadlines
-/// flake, so under `cargo llvm-cov` a limit is multiplied (and floored at five
-/// seconds). Production timeouts stay unchanged; only tests call this. A raw
-/// `Duration::from_millis(400)` in an assertion is a limit nobody scaled, which
-/// is how a suite that is green on a quiet laptop goes red on an instrumented
-/// or loaded runner; `tests/hermetic_contract.rs` refuses new ones.
+/// Two things make a limit that holds on a quiet laptop fail without the code
+/// changing, and both scale it here. Coverage instrumentation makes sub-second
+/// process and thread deadlines flake, so under `cargo llvm-cov` a limit is
+/// multiplied (and floored at five seconds). A machine busier than it has cores
+/// (a parallel suite on a small runner, a build beside the tests) stretches
+/// every process start and fs call, so a limit is multiplied by how
+/// oversubscribed the host is, up to [`MAX_LOAD_FACTOR`]. Production timeouts
+/// stay unchanged; only tests call this. A raw `Duration::from_millis(400)` in
+/// an assertion is a limit nobody scaled, which is how a suite that is green on
+/// a quiet laptop goes red on an instrumented or loaded runner;
+/// `tests/hermetic_contract.rs` refuses new ones.
 pub(crate) fn coverage_relaxed(duration: std::time::Duration) -> std::time::Duration {
-    if std::env::var_os("CARGO_LLVM_COV").is_some()
-        || std::env::var_os("LLVM_PROFILE_FILE").is_some()
-    {
-        duration
+    relaxed_for(duration, instrumented(), host_load())
+}
+
+/// The most a limit is stretched for host load. Bounded so a limit that exists
+/// to prove something did *not* wait (a deadline far shorter than the timeout
+/// it is racing) still discriminates on a busy machine.
+pub(crate) const MAX_LOAD_FACTOR: f64 = 4.0;
+
+fn instrumented() -> bool {
+    std::env::var_os("CARGO_LLVM_COV").is_some() || std::env::var_os("LLVM_PROFILE_FILE").is_some()
+}
+
+/// [`coverage_relaxed`] with its two inputs supplied, so the rule is testable
+/// without instrumenting or loading the machine running the test.
+pub(crate) fn relaxed_for(
+    duration: std::time::Duration,
+    instrumented: bool,
+    load: Option<(f64, usize)>,
+) -> std::time::Duration {
+    let mut limit = duration;
+    if instrumented {
+        limit = limit
             .saturating_mul(8)
-            .max(std::time::Duration::from_secs(5))
-    } else {
-        duration
+            .max(std::time::Duration::from_secs(5));
+    }
+    if let Some((one_minute, cpus)) = load {
+        let factor = (one_minute / cpus.max(1) as f64).clamp(1.0, MAX_LOAD_FACTOR);
+        if factor.is_finite() {
+            limit = limit.mul_f64(factor);
+        }
+    }
+    limit
+}
+
+/// The one-minute load average and the number of cores, where the OS reports
+/// them. `None` is "unknown", which scales nothing.
+pub(crate) fn host_load() -> Option<(f64, usize)> {
+    #[cfg(unix)]
+    {
+        extern "C" {
+            fn getloadavg(average: *mut f64, count: i32) -> i32;
+        }
+        let mut average = [0.0_f64; 1];
+        // SAFETY: `average` has room for the one sample requested.
+        let read = unsafe { getloadavg(average.as_mut_ptr(), 1) };
+        let cpus = std::thread::available_parallelism().ok()?.get();
+        (read == 1).then_some((average[0], cpus))
+    }
+    #[cfg(not(unix))]
+    {
+        None
+    }
+}
+
+#[cfg(test)]
+mod relaxed_tests {
+    #[test]
+    fn a_quiet_plain_run_is_unscaled() {
+        let limit = std::time::Duration::from_millis(400);
+        assert_eq!(super::relaxed_for(limit, false, None), limit);
+        assert_eq!(super::relaxed_for(limit, false, Some((3.0, 8))), limit);
+        // Fewer runnable tasks than cores is not "load".
+        assert_eq!(super::relaxed_for(limit, false, Some((0.0, 8))), limit);
+    }
+
+    #[test]
+    fn an_oversubscribed_host_stretches_the_limit_by_its_ratio_up_to_the_cap() {
+        let limit = std::time::Duration::from_secs(2);
+        assert_eq!(
+            super::relaxed_for(limit, false, Some((16.0, 8))),
+            std::time::Duration::from_secs(4)
+        );
+        assert_eq!(
+            super::relaxed_for(limit, false, Some((800.0, 8))),
+            limit.mul_f64(super::MAX_LOAD_FACTOR)
+        );
+        // Nonsense from the OS scales nothing.
+        assert_eq!(super::relaxed_for(limit, false, Some((f64::NAN, 8))), limit);
+        assert_eq!(
+            super::relaxed_for(limit, false, Some((16.0, 0))),
+            limit.mul_f64(super::MAX_LOAD_FACTOR)
+        );
+    }
+
+    #[test]
+    fn instrumentation_and_load_compose() {
+        let limit = std::time::Duration::from_millis(100);
+        assert_eq!(
+            super::relaxed_for(limit, true, Some((16.0, 8))),
+            std::time::Duration::from_secs(10)
+        );
+    }
+
+    #[test]
+    fn the_host_reports_a_load_the_scaling_can_use() {
+        if let Some((load, cpus)) = super::host_load() {
+            assert!(load >= 0.0 && cpus >= 1, "{load} on {cpus}");
+        }
     }
 }
 

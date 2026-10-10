@@ -296,7 +296,7 @@ fn release_batch_checks_every_path_and_policy_before_mutating() {
 }
 
 #[test]
-fn release_batch_deduplicates_and_reports_a_partial_git_failure() {
+fn release_batch_deduplicates_and_a_git_failure_leaves_the_index_untouched() {
     use gitpulse_lib::engine::git_writer::IndexAction;
     let repo = TestRepo::init();
     repo.write("valid", "work\n");
@@ -316,14 +316,21 @@ fn release_batch_deduplicates_and_reports_a_partial_git_failure() {
     let error =
         GitWriter::change_index_with(&repo.path_str(), &files, IndexAction::Stage, |_| Ok(()))
             .unwrap_err();
-    assert!(error.contains("after 128 of 129"), "{error}");
+    // One git process applies the whole selection under one lock, so a path
+    // git refuses fails the batch and none of the 128 valid ones is staged
+    // (the chunked form stopped partway and left 128 of them behind).
+    assert!(
+        error.contains("Index update failed for the 129 selected paths"),
+        "{error}"
+    );
     assert_eq!(
         GitReader::get_status(&repo.path_str())
             .unwrap()
             .iter()
             .filter(|s| s.is_staged)
             .count(),
-        129
+        1,
+        "only the earlier, successful `valid` is staged"
     );
     let lock = repo.dir.path().join(".git/index.lock");
     fs::write(&lock, "another writer").unwrap();
@@ -334,7 +341,10 @@ fn release_batch_deduplicates_and_reports_a_partial_git_failure() {
         |_| Ok(()),
     )
     .unwrap_err();
-    assert!(error.contains("after 0 of 1"), "{error}");
+    assert!(
+        error.contains("Index update failed for the 1 selected paths"),
+        "{error}"
+    );
     assert_eq!(fs::read_to_string(lock).unwrap(), "another writer");
 }
 

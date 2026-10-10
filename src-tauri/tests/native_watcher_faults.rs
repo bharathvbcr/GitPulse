@@ -22,8 +22,18 @@ const COMPLETE: &str = "GITPULSE_WATCH_PROBE_COMPLETE";
 /// measure.
 const STARTUP: Duration = Duration::from_secs(30);
 /// From READY, or the previous registration, to the next one retiring: a
-/// shutdown hang. The `purge` fixture sleeps well past it.
+/// shutdown hang. The `purge` fixture sleeps for a minute, well past even the
+/// stretched bound below.
 const REGISTRATION: Duration = Duration::from_secs(3);
+/// The most a registration may be stretched for a busy host. A registration is
+/// a round trip to `fseventsd` through a child process, so on a machine with
+/// more runnable work than cores it takes longer without hanging; the stretch
+/// stays far under the fixture's sleep so a real hang is still caught.
+const REGISTRATION_CEILING: Duration = Duration::from_secs(30);
+
+fn registration_bound() -> Duration {
+    hermetic_env::coverage_relaxed(REGISTRATION).min(REGISTRATION_CEILING)
+}
 
 fn finish(child: &mut Child, deadline: Duration) -> std::process::ExitStatus {
     let until = Instant::now() + deadline;
@@ -75,7 +85,11 @@ fn probe(mode: &str) {
         .spawn_locked()
         .unwrap();
     assert!(
-        finish(&mut compiler, Duration::from_secs(20)).success(),
+        finish(
+            &mut compiler,
+            hermetic_env::coverage_relaxed(Duration::from_secs(20))
+        )
+        .success(),
         "{}",
         fs::read_to_string(build_log).unwrap()
     );
@@ -128,7 +142,7 @@ fn probe(mode: &str) {
             window = now;
         }
         let bound = if ready.is_some() {
-            REGISTRATION
+            registration_bound()
         } else {
             STARTUP
         };
@@ -141,8 +155,9 @@ fn probe(mode: &str) {
                     "{mode}: the child never reached the probe within {STARTUP:?} of spawning: {log}"
                 ),
                 Some(ready) => panic!(
-                    "{mode}: registration {completed} exceeded {REGISTRATION:?} \
-                     (child ready {ready:?} after spawn; earlier registrations took {laps:?}): {log}"
+                    "{mode}: registration {completed} exceeded {:?} \
+                     (child ready {ready:?} after spawn; earlier registrations took {laps:?}): {log}",
+                    bound
                 ),
             }
         }

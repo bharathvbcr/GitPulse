@@ -304,7 +304,7 @@ describe("annotated but unregistered commands", () => {
     // `bun run check:ipc`
     // prints all three numbers, so a bump made without re-running it will not
     // agree.
-    expect(found.size).toBe(269);
+    expect(found.size).toBe(271);
     expect(found.has("cmd_repository_trust")).toBe(true);
     expect(found.has("cmd_grant_repository_trust")).toBe(true);
     expect(found.has("cmd_revoke_repository_trust")).toBe(true);

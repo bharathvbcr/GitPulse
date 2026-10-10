@@ -354,6 +354,15 @@ fn concurrent_writers_never_duplicate_or_lose_a_task() {
     let (_dir, path) = profile();
     let repo = git_repo();
     let repo_path = repo.path().to_str().unwrap().to_string();
+    // The profile's tables are built, and migrated, by its first request. A
+    // second handle arriving while that is under way meets a schema that is
+    // not yet current and is refused (`schema_upgrade_required`), because a
+    // reader never upgrades; that is dc-store's creation race and not what
+    // this test is about, so the profile exists before the writers start.
+    Store::open(&path)
+        .unwrap()
+        .workbench_request("repositories.list", "{}")
+        .unwrap();
     let threads = 16;
     let keys = 25;
     let handles: Vec<_> = (0..threads)
@@ -366,16 +375,26 @@ fn concurrent_writers_never_duplicate_or_lose_a_task() {
                 for i in 0..keys {
                     // Every worker races on every key, in a different order.
                     let k = (i * 7 + worker) % keys;
-                    match add_task(
-                        &store,
-                        &repo_path,
-                        task(&format!("gp-{k}"), &format!("Task {k}")),
-                        false,
-                        &[],
-                    ) {
-                        Ok(v) => outcomes.push(v["outcome"].as_str().unwrap().to_string()),
-                        Err(e) => outcomes.push(e.code),
-                    }
+                    // `board_changed` is the store saying the board moved
+                    // under this writer's scan, which sixteen writers filing
+                    // at once make routine. The documented answer is to call
+                    // again, so a writer does, a bounded number of times.
+                    let mut tries = 0;
+                    let outcome = loop {
+                        tries += 1;
+                        match add_task(
+                            &store,
+                            &repo_path,
+                            task(&format!("gp-{k}"), &format!("Task {k}")),
+                            false,
+                            &[],
+                        ) {
+                            Ok(v) => break v["outcome"].as_str().unwrap().to_string(),
+                            Err(e) if e.code == "board_changed" && tries < 200 => continue,
+                            Err(e) => break e.code,
+                        }
+                    };
+                    outcomes.push(outcome);
                 }
                 outcomes
             })
