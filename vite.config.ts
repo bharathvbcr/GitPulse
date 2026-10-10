@@ -155,6 +155,10 @@ export default defineConfig({
     __APP_BUILD_ID__: JSON.stringify(buildStamp.id),
   },
   build: {
+    // Pinned to Vite 8's own default ("baseline-widely-available") so a Vite
+    // upgrade cannot silently raise the oldest webview that parses the bundle:
+    // WKWebView/WebKitGTK follow the system WebKit, WebView2 follows Edge.
+    target: ["safari16.4", "chrome111", "edge111"],
     sourcemap: "hidden",
     rollupOptions: {
       input: { main: "index.html", status: "status.html" },
