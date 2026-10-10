@@ -3803,11 +3803,7 @@ fn git_run_inner(
                 );
                 continue;
             }
-            if diagnosis.len() > MAX_FAILURE_MESSAGE_BYTES {
-                let cut = truncate_utf8_bytes(diagnosis, MAX_FAILURE_MESSAGE_BYTES);
-                return Err(format!("{cut}… (git {} output truncated)", sub));
-            }
-            return Err(diagnosis.to_owned());
+            return Err(clamp_failure_message(diagnosis, sub));
         }
         return Err(format!(
             "git {} failed with status {}",
@@ -3863,16 +3859,38 @@ fn incomplete_is_failure(sub: &str, reason: Incomplete) -> String {
 /// drags megabytes into an error string.
 const MAX_FAILURE_MESSAGE_BYTES: usize = 2_000;
 
-/// Truncates `s` to at most `max_bytes` on a UTF-8 character boundary.
-fn truncate_utf8_bytes(s: &str, max_bytes: usize) -> &str {
-    if s.len() <= max_bytes {
-        return s;
+/// Share of [`MAX_FAILURE_MESSAGE_BYTES`] given to the head of a clamped
+/// failure; the tail gets the rest. A hook or command opens with routine
+/// chatter and *ends* with the reason it failed.
+const FAILURE_HEAD_SHARE_PERCENT: usize = 35;
+
+/// Bounds a failure diagnosis to [`MAX_FAILURE_MESSAGE_BYTES`], keeping both
+/// ends on UTF-8 boundaries and announcing what was dropped.
+///
+/// Head-only truncation kept the wrong half: a pre-push hook running CI
+/// printed its command banners and test-runner warnings first, so the 2 KB
+/// head held only those and the failing check at the end was discarded.
+/// The frontend's `clampMessage` keeps both ends for the same reason.
+fn clamp_failure_message(diagnosis: &str, sub: &str) -> String {
+    if diagnosis.len() <= MAX_FAILURE_MESSAGE_BYTES {
+        return diagnosis.to_owned();
     }
-    let mut cut = max_bytes;
-    while cut > 0 && !s.is_char_boundary(cut) {
-        cut -= 1;
+    let head_budget = MAX_FAILURE_MESSAGE_BYTES * FAILURE_HEAD_SHARE_PERCENT / 100;
+    let tail_budget = MAX_FAILURE_MESSAGE_BYTES - head_budget;
+    let mut head_end = head_budget;
+    while !diagnosis.is_char_boundary(head_end) {
+        head_end -= 1;
     }
-    &s[..cut]
+    let mut tail_start = diagnosis.len() - tail_budget;
+    while !diagnosis.is_char_boundary(tail_start) {
+        tail_start += 1;
+    }
+    format!(
+        "{}\n… {} bytes elided (git {sub} output truncated) …\n{}",
+        &diagnosis[..head_end],
+        tail_start - head_end,
+        &diagnosis[tail_start..],
+    )
 }
 
 #[cfg(test)]
@@ -4553,6 +4571,32 @@ mod tests {
             error.len()
         );
         assert!(error.contains("output truncated"));
+    }
+
+    /// End to end: a failing command whose cause is its last line keeps that
+    /// line in the error, however much it printed before it.
+    #[cfg(unix)]
+    #[test]
+    fn failure_diagnosis_keeps_the_last_line_of_long_output() {
+        let dir = crate::test_support::git_repo();
+        let error = git_run_capped(
+            Some(dir.path()),
+            &[
+                "-c",
+                "alias.noisy=!yes chatter | head -n 2000 >&2; echo 'error: failed to push some refs' >&2; exit 1",
+                "noisy",
+            ],
+            Duration::from_secs(5),
+            None,
+            1024,
+        )
+        .unwrap_err();
+        assert!(error.starts_with("chatter"), "{error}");
+        assert!(
+            error.ends_with("error: failed to push some refs"),
+            "failing tail dropped: …{}",
+            &error[error.len().saturating_sub(120)..]
+        );
     }
     #[test]
     #[cfg(unix)]
@@ -8210,12 +8254,41 @@ mod tests {
     }
 
     #[test]
-    fn truncate_utf8_bytes_cuts_on_a_character_boundary() {
-        let s = "éééé"; // each é is 2 bytes
-        assert_eq!(truncate_utf8_bytes(s, 100), s);
-        assert_eq!(truncate_utf8_bytes(s, 3).len(), 2);
-        assert!(truncate_utf8_bytes(s, 3).is_char_boundary(truncate_utf8_bytes(s, 3).len()));
-        assert!(!truncate_utf8_bytes(s, 3).contains('\u{FFFD}'));
+    fn clamp_failure_message_cuts_on_character_boundaries() {
+        let short = "éééé"; // each é is 2 bytes
+        assert_eq!(clamp_failure_message(short, "push"), short);
+        // Odd budgets land mid-character at both cut points.
+        let long = format!("x{}", "é".repeat(MAX_FAILURE_MESSAGE_BYTES));
+        let clamped = clamp_failure_message(&long, "push");
+        assert!(!clamped.contains('\u{FFFD}'));
+        assert!(clamped.len() < MAX_FAILURE_MESSAGE_BYTES + 100);
+        assert!(clamped.contains("bytes elided (git push output truncated)"));
+    }
+
+    /// A pre-push hook prints its banners and warnings first and the failing
+    /// check last; the clamp must keep the last line, not only the first.
+    #[test]
+    fn clamp_failure_message_keeps_the_failing_tail() {
+        let chatter = "stderr | Received `false` for a non-boolean attribute\n".repeat(200);
+        let diagnosis =
+            format!("$ node scripts/local-ci.js\n{chatter}FAIL src/a.test.ts > breaks\nerror: failed to push some refs");
+        let clamped = clamp_failure_message(&diagnosis, "push");
+        assert!(clamped.starts_with("$ node scripts/local-ci.js"));
+        assert!(clamped.ends_with("FAIL src/a.test.ts > breaks\nerror: failed to push some refs"));
+        let elided: usize = clamped
+            .split("… ")
+            .nth(1)
+            .and_then(|rest| rest.split(' ').next())
+            .and_then(|n| n.parse().ok())
+            .expect("elision notice names a byte count");
+        let kept = clamped.len()
+            - clamped
+                .lines()
+                .find(|l| l.contains("elided"))
+                .unwrap()
+                .len()
+            - 2;
+        assert_eq!(kept + elided, diagnosis.len());
     }
 
     fn init_plain_git_repo(dir: &Path) {
