@@ -135,3 +135,23 @@ describe("ft-0ff882a6 interfaceStore.patch no-op check", () => {
     expect(JSON.parse(storage.getItem("gitpulse_interface_prefs") ?? "{}").terminalDockHeight).toBe(321);
   });
 });
+
+describe("ft-0ff882a6 exit flush", () => {
+  it("saves deferred diagnostics and preferences on a quit that never fires pagehide", async () => {
+    // App's native exit flushed conflict drafts and the workspace by name;
+    // the deferred diagnostics and preference saves were not on that list.
+    const storage = countingStorage();
+    vi.stubGlobal("window", { localStorage: storage });
+    vi.stubGlobal("localStorage", storage);
+    vi.resetModules();
+    const { diagnostics } = await import("../diagnostics/diagnostics");
+    const { interfaceStore } = await import("../stores/interfaceStore");
+    const { flushPendingWrites } = await import("../async/deferredWrite");
+    diagnostics.warn("console", "recorded just before a native quit");
+    interfaceStore.setTerminalDockHeight(333);
+    expect(storage.setItem).not.toHaveBeenCalled();
+    expect(flushPendingWrites()).toEqual([]);
+    expect(storage.getItem(DIAGNOSTIC_STORAGE_KEY)).toContain("recorded just before a native quit");
+    expect(JSON.parse(storage.getItem("gitpulse_interface_prefs") ?? "{}").terminalDockHeight).toBe(333);
+  });
+});

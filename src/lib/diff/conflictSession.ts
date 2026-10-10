@@ -1,4 +1,5 @@
 import { recordEditorDrafts } from "../files/editorDraftRegistry";
+import { flushOnPageHide } from "../async/deferredWrite";
 import type { ConflictDocument, ConflictResolutionChoice } from "./conflict";
 
 export interface ConflictStage {
@@ -269,4 +270,4 @@ function recoveryStorage(): Storage | undefined {
   try { return typeof window === "undefined" ? undefined : window.localStorage; } catch { return undefined; }
 }
 export const conflictSessions = createConflictSessions(recoveryStorage());
-if (typeof window !== "undefined") window.addEventListener("pagehide", () => conflictSessions.flush());
+flushOnPageHide(() => conflictSessions.flush());

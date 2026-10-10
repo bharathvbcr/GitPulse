@@ -85,8 +85,33 @@ function lifecycleTarget<T extends LifecycleTarget>(value: unknown): T | null {
     : null;
 }
 
+/** Every flush registered by {@link flushOnPageHide} and not yet unbound. */
+const registered = new Set<() => void>();
+
 /**
- * Runs `flush` when the page is hidden or unloaded.
+ * Runs every registered flush now, for an exit the page may not see.
+ *
+ * A native quit can end the process without `pagehide`, so the app's exit
+ * path calls this instead of naming each store: a list kept by hand is how a
+ * store that defers its save gets left out of it. Each flush runs even when
+ * one before it throws; the failures come back so the caller can report them
+ * and still exit.
+ */
+export function flushPendingWrites(): unknown[] {
+  const failures: unknown[] = [];
+  for (const flush of [...registered]) {
+    try {
+      flush();
+    } catch (error) {
+      failures.push(error);
+    }
+  }
+  return failures;
+}
+
+/**
+ * Runs `flush` when the page is hidden or unloaded, and from
+ * {@link flushPendingWrites}.
  *
  * `pagehide` is the unload signal; a hidden document is the last moment a
  * WebKit page is guaranteed to run script before it may be suspended or
@@ -104,10 +129,15 @@ export function flushOnPageHide(
   const onVisibility = () => {
     if (visibilityTarget?.visibilityState === "hidden") flush();
   };
-  pageTarget?.addEventListener("pagehide", flush);
+  // A wrapper per registration, so the same function registered twice is
+  // two registrations and unbinding one leaves the other in place.
+  const entry = () => flush();
+  registered.add(entry);
+  pageTarget?.addEventListener("pagehide", entry);
   visibilityTarget?.addEventListener("visibilitychange", onVisibility);
   return () => {
-    pageTarget?.removeEventListener("pagehide", flush);
+    registered.delete(entry);
+    pageTarget?.removeEventListener("pagehide", entry);
     visibilityTarget?.removeEventListener("visibilitychange", onVisibility);
   };
 }

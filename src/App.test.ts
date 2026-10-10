@@ -255,7 +255,13 @@ describe("App overlay wiring", () => {
     expect(source).toContain("hasUnsavedEditorDrafts()");
     expect(source).toContain("Quit with Unsaved Edits?");
     expect(source).toContain("Conflict drafts are retained for recovery when local storage is available");
-    expect(source.indexOf("conflictSessions.flush()")).toBeLessThan(source.indexOf('await invoke("cmd_exit_app")'));
+    // Every deferred save is flushed before the native exit, through the one
+    // registry the stores join, not a list App keeps by hand.
+    const flushCall = source.indexOf("    flushBeforeExit();\n    exitApproved = true;");
+    expect(flushCall).toBeGreaterThan(-1);
+    expect(flushCall).toBeLessThan(source.indexOf('await invoke("cmd_exit_app")'));
+    expect(source).toContain("for (const failure of flushPendingWrites())");
+    expect(source).not.toContain("conflictSessions.flush()");
   });
 
   it("answers every native quit request it saw, so a held quit or logout is never stranded", () => {

@@ -171,7 +171,10 @@
     unsavedEditorDrafts,
   } from "./lib/files/editorDraftRegistry";
   import { editorFileSaveQueue } from "./lib/files/serialSave";
-  import { conflictSessions } from "./lib/diff/conflictSession";
+  // Loaded at startup: it restores recovered conflict drafts into the
+  // unsaved-drafts registry, and registers its own quit flush.
+  import "./lib/diff/conflictSession";
+  import { flushPendingWrites } from "./lib/async/deferredWrite";
 
   let isRebaseModalOpen = $state(false);
   let isCloneModalOpen = $state(false);
@@ -422,8 +425,7 @@
       cancelNativeExitRequest();
       return;
     }
-    conflictSessions.flush();
-    repoStore.flushPersistedWorkspace();
+    flushBeforeExit();
     exitApproved = true;
     try {
       await invoke("cmd_exit_app");
@@ -433,6 +435,18 @@
       diagnostics.error("desktop:exit", error);
       toastStore.error(`Could not quit GitPulse: ${formatError(error)}`);
     }
+  }
+
+  /**
+   * Saves everything still waiting on a timer — the workspace, conflict
+   * drafts, diagnostics, interface preferences. A native quit may end the
+   * process without `pagehide`, so it cannot be left to the page-hide flush.
+   * A failed save is reported and the quit goes ahead.
+   */
+  function flushBeforeExit() {
+    for (const failure of flushPendingWrites()) diagnostics.error("desktop:exit-flush", failure);
+    // Reporting a failure scheduled one more diagnostics save.
+    diagnostics.flush();
   }
 
   onMount(() => {
@@ -464,7 +478,7 @@
     }));
 
     const guardBrowserUnload = (event: BeforeUnloadEvent) => {
-      repoStore.flushPersistedWorkspace();
+      flushBeforeExit();
       if (exitApproved || !hasUnsavedEditorDrafts()) return;
       event.preventDefault();
       // Browsers intentionally ignore custom text but require a value to show

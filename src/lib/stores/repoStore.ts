@@ -145,6 +145,7 @@ import { decideCadence, readEventLoopDelay } from "../runtime/loadCadence";
 import { debounce, type Debounced } from "../async/debounce";
 import { beginGeneration } from "../async/guard";
 import { createCommitDraftStore } from "./commitDraftStore";
+import { flushOnPageHide } from "../async/deferredWrite";
 import type { FilePatch } from "../diff/patchBuilder";
 import type { ReleasePublishResult } from "../ops/model";
 
@@ -973,8 +974,6 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
   /** Monotonic poll ordering; a superseded tick's result is discarded. */
   let pollSequenceSource = 0;
   const pollRuns = new Map<string, number>();
-  /** Whether the quit-time persist flush is attached. It stays for the store's life. */
-  let pagehideWired = false;
 
   // Monotonic token source for diff-selection requests. Session `generation`
   // only moves on tab activation, so it cannot order two rapid selections of
@@ -1399,12 +1398,9 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
     }
   }
 
-  function installQuitFlush() {
-    if (pagehideWired || typeof document === "undefined") return;
-    document.addEventListener("pagehide", () => flushPersist(true));
-    pagehideWired = true;
-  }
-  installQuitFlush();
+  // For the life of the store, not only while the poll runs. `pagehide` is
+  // fired at window; this was once bound on document, where it never fired.
+  flushOnPageHide(() => flushPersist(true));
 
   function replaceWorkspace(next: WorkspaceTabs) {
     internal = { ...internal, workspace: next };

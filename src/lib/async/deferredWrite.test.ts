@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { createDeferredWrite, flushOnPageHide } from "./deferredWrite";
+import { createDeferredWrite, flushOnPageHide, flushPendingWrites } from "./deferredWrite";
 
 afterEach(() => {
   vi.useRealTimers();
@@ -100,5 +100,39 @@ describe("flushOnPageHide", () => {
   it("wires nothing on a window stub that has no event methods", () => {
     // Store tests stub `window` as `{ localStorage }`.
     expect(() => flushOnPageHide(() => {}, { localStorage: {} }, null)()).not.toThrow();
+  });
+});
+
+describe("flushPendingWrites", () => {
+  it("runs every registered flush, survives one that throws, and forgets unbound ones", () => {
+    const first = vi.fn();
+    const broken = vi.fn(() => {
+      throw new Error("quota");
+    });
+    const last = vi.fn();
+    const unbindFirst = flushOnPageHide(first, null, null);
+    const unbindBroken = flushOnPageHide(broken, null, null);
+    const unbindLast = flushOnPageHide(last, null, null);
+    const failures = flushPendingWrites();
+    expect(first).toHaveBeenCalledTimes(1);
+    expect(last).toHaveBeenCalledTimes(1);
+    expect(failures).toHaveLength(1);
+    expect(String(failures[0])).toContain("quota");
+    unbindFirst();
+    unbindBroken();
+    flushPendingWrites();
+    expect(first).toHaveBeenCalledTimes(1);
+    expect(last).toHaveBeenCalledTimes(2);
+    unbindLast();
+  });
+
+  it("keeps two registrations of the same function apart", () => {
+    const flush = vi.fn();
+    const unbindOne = flushOnPageHide(flush, null, null);
+    const unbindTwo = flushOnPageHide(flush, null, null);
+    unbindOne();
+    flushPendingWrites();
+    expect(flush).toHaveBeenCalledTimes(1);
+    unbindTwo();
   });
 });

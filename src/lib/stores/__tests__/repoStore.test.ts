@@ -1312,6 +1312,44 @@ describe("repoStore tabs", () => {
     expect(get(store).generation).toBeGreaterThan(genA2);
   });
 
+  it("writes a pending workspace change when the page is hidden or closed", async () => {
+    // The quit flush listened for `pagehide` on `document`, but the browser
+    // fires it at `window` and window events never reach document listeners,
+    // so a change inside the debounce window was lost on close.
+    const listeners = new Map<string, Set<() => void>>();
+    const win = {
+      addEventListener: (type: string, fn: () => void) => {
+        if (!listeners.has(type)) listeners.set(type, new Set());
+        listeners.get(type)!.add(fn);
+      },
+      removeEventListener: (type: string, fn: () => void) => void listeners.get(type)?.delete(fn),
+    };
+    vi.stubGlobal("window", win);
+    try {
+      const storage = memoryStorage();
+      const filter = makeFilter();
+      const store = createRepoStore({
+        invoke: makeInvoke(),
+        storage,
+        caseInsensitive: true,
+        graph: makeGraph().api,
+        filter,
+      });
+      await store.openRepo("/r/quit-a");
+      store.flushPersistedWorkspace();
+      // The search box is debounced state: it waits for the persist timer.
+      filter.setSearch("needle");
+      const read = () => (JSON.parse(storage.getItem(STORAGE_KEY_WORKSPACE) ?? "{}") as {
+        tabs?: Array<{ searchQuery?: string }>;
+      }).tabs?.[0]?.searchQuery ?? "";
+      expect(read()).toBe("");
+      for (const fn of listeners.get("pagehide") ?? []) fn();
+      expect(read()).toBe("needle");
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
   it("types a commit message without republishing the repository state", async () => {
     // ft-0ff882a6: the draft lived on the session, so each keystroke replaced
     // the session, rebuilt the active tab's row and notified every subscriber.
