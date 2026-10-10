@@ -8,10 +8,19 @@
 //! processes are alive right now, and which worktree each one's directory
 //! sits in.
 //!
-//! Each agent kind is observed by its own detector, and each detector reports
-//! whether it could look. A kind with no detector is reported as unknown,
-//! never as zero sessions: "we cannot see Codex sessions" and "no Codex
-//! session is running" are different facts.
+//! Sessions are found by the host-load process scan
+//! (`sysload::procscan`): a Claude Code or Codex process is recognised by its
+//! executable, wherever it was started and whichever `CLAUDE_CONFIG_DIR` it
+//! registered under. Claude Code's own registry (`<config>/sessions/*.json`)
+//! only adds what the process table cannot say — the entrypoint and the
+//! agent's last-reported status. Counting from that registry undercounted:
+//! a second account's config directory, or a session that never wrote an
+//! entry, was invisible (5 of 7 live sessions counted, 2026-10-09).
+//!
+//! Each kind reports whether it could look. Where there is no process scan
+//! (Windows) the registry is the detector again, and a kind with no detector
+//! is reported as unknown, never as zero sessions: "we cannot see Codex
+//! sessions" and "no Codex session is running" are different facts.
 
 use super::{LiveKindStatus, LiveSession, LiveSessionFacet, LiveWorktree};
 use crate::workbench::process_birth::{self, Liveness};
@@ -35,11 +44,12 @@ const MAX_ENTRY_BYTES: u64 = 64 * 1024;
 /// only a session that died and had its pid recycled that fast.
 const BIRTH_CLOCK_SLACK_NANOS: u128 = 5_000_000_000;
 
-/// Agent kinds GitPulse knows run as sessions but has no way to observe.
+/// Agent kinds the registry fallback (a platform with no process scan) has no
+/// way to observe.
 ///
 /// Codex keeps rollout logs under `~/.codex/sessions`, which record that a
 /// session happened, not that it is running or where. Listing it here is
-/// what makes its absence from the counts an explicit "unknown".
+/// what makes its absence from the fallback's counts an explicit "unknown".
 const UNOBSERVABLE_KINDS: &[(&str, &str)] = &[(
     "codex",
     "Codex keeps no registry of running sessions that GitPulse can read, so its live sessions cannot be counted",
@@ -87,16 +97,98 @@ struct ClaudeRegistryEntry {
 
 /// Observes every agent kind on this machine.
 pub(crate) fn observe() -> Observation {
-    observe_with(
-        crate::workbench::conversation::claude_home()
-            .map(|home| home.join("sessions"))
-            .as_deref(),
-        &process_birth::running_since,
-    )
+    let registry = crate::workbench::conversation::claude_home().map(|home| home.join("sessions"));
+    match crate::sysload::procscan::observe_sessions() {
+        Ok(sessions) => from_scan(&sessions, registry.as_deref()),
+        // A scan that exists and failed is a failed detector; falling back to
+        // the registry would report its undercount as if it were the answer.
+        Err(error) if crate::sysload::procscan::SCAN_SUPPORTED => failed_scan(&error),
+        Err(_) => observe_with(registry.as_deref(), &process_birth::running_since),
+    }
 }
 
-/// [`observe`] with the registry directory and the liveness probe as
-/// arguments, so tests can point it at a fixture registry.
+/// The kinds the process scan observes.
+const SCANNED_KINDS: [crate::sysload::AgentKind; 2] = [
+    crate::sysload::AgentKind::Claude,
+    crate::sysload::AgentKind::Codex,
+];
+
+/// Turns the process scan's sessions into per-kind observations, enriched
+/// from Claude Code's registry at `claude_sessions` where an entry names the
+/// same process.
+pub(crate) fn from_scan(
+    sessions: &[crate::sysload::AgentSession],
+    claude_sessions: Option<&Path>,
+) -> Observation {
+    let details = claude_sessions.map(registry_details).unwrap_or_default();
+    let mut kinds: Vec<KindObservation> = SCANNED_KINDS
+        .iter()
+        .map(|kind| KindObservation {
+            kind: kind.name().into(),
+            ok: true,
+            ..KindObservation::default()
+        })
+        .collect();
+    for session in sessions {
+        let Some(seen) = kinds.iter_mut().find(|k| k.kind == session.kind.name()) else {
+            continue;
+        };
+        let (Ok(pid), Some(cwd)) = (u32::try_from(session.pid), session.cwd.as_ref()) else {
+            // Running, but where is unknown: possibly in any repository.
+            seen.unverified.push(None);
+            continue;
+        };
+        // The entry describes this process only if the process was already
+        // running when the entry was written; a later process on the same pid
+        // is a reuse and inherits nothing from it.
+        let entry = details.get(&pid).filter(|entry| {
+            u128::from(session.start_us) * 1_000
+                <= u128::from(entry.started_at) * 1_000_000 + BIRTH_CLOCK_SLACK_NANOS
+        });
+        seen.live.push(LiveSession {
+            kind: session.kind.name().into(),
+            pid,
+            entrypoint: entry.map(|e| e.entrypoint.clone()).unwrap_or_default(),
+            status: entry.map(|e| e.status.clone()).unwrap_or_default(),
+            cwd: cwd.clone(),
+        });
+    }
+    kinds
+}
+
+fn failed_scan(error: &str) -> Observation {
+    SCANNED_KINDS
+        .iter()
+        .map(|kind| KindObservation {
+            kind: kind.name().into(),
+            error: format!("the process table could not be scanned: {error}"),
+            ..KindObservation::default()
+        })
+        .collect()
+}
+
+/// Claude Code's registry entries by pid, for enrichment only. Unreadable
+/// entries are skipped: the session they might describe is already counted
+/// from the process table.
+fn registry_details(dir: &Path) -> std::collections::HashMap<u32, ClaudeRegistryEntry> {
+    let mut details = std::collections::HashMap::new();
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return details;
+    };
+    for entry in entries.flatten().take(MAX_REGISTRY_ENTRIES) {
+        let path = entry.path();
+        if path.extension().is_some_and(|ext| ext == "json") {
+            if let Ok(parsed) = read_entry(&path) {
+                details.insert(parsed.pid, parsed);
+            }
+        }
+    }
+    details
+}
+
+/// The registry detector: what [`observe`] falls back to where there is no
+/// process scan, with the registry directory and the liveness probe as
+/// arguments so tests can point it at a fixture registry.
 pub(crate) fn observe_with(
     claude_sessions: Option<&Path>,
     alive: &dyn Fn(u32, u128) -> Liveness,
@@ -287,8 +379,9 @@ pub(crate) fn attribute(observation: &Observation, worktree_paths: &[String]) ->
 /// The facet for a repository whose worktree listing failed: nothing can be
 /// attributed, so every kind is reported as not looked at.
 pub(crate) fn unattributed(error: &str) -> LiveSessionFacet {
-    let kinds = std::iter::once("claude")
-        .chain(UNOBSERVABLE_KINDS.iter().map(|(kind, _)| *kind))
+    let kinds = SCANNED_KINDS
+        .iter()
+        .map(|kind| kind.name())
         .map(|kind| LiveKindStatus {
             kind: kind.into(),
             ok: false,
@@ -446,8 +539,10 @@ mod tests {
     /// Characterization (host-load governor, Part 0): seven live sessions,
     /// five counted. Claude Code writes its registry under the session's own
     /// `CLAUDE_CONFIG_DIR`, so sessions run under a second account's config
-    /// directory register where this detector never looks. Measured on the
-    /// host on 2026-10-09 as 5 counted of 7 live.
+    /// directory register where the registry detector never looks. Measured
+    /// on the host on 2026-10-09 as 5 counted of 7 live. The registry is now
+    /// only the fallback where there is no process scan; the scan's answer to
+    /// the same seven is the next test.
     #[test]
     fn characterization_sessions_registered_under_another_config_dir_go_uncounted() {
         let repo = tempfile::TempDir::new().unwrap();
@@ -465,6 +560,90 @@ mod tests {
         let seen = observe_with(Some(read_here.path()), &always(Liveness::Alive));
         let facet = attribute(&seen, &[repo.path().to_string_lossy().into_owned()]);
         assert_eq!(facet.sessions, 5, "seven are live; {facet:?}");
+    }
+
+    fn scanned(
+        kind: crate::sysload::AgentKind,
+        pid: i32,
+        cwd: Option<&Path>,
+    ) -> crate::sysload::AgentSession {
+        crate::sysload::AgentSession {
+            kind,
+            pid,
+            start_us: 1_000_000,
+            cwd: cwd.map(|c| c.to_string_lossy().into_owned()),
+            tree: None,
+            run_id: None,
+            footprint: crate::sysload::Reading::Value(1),
+            members: 1,
+            unreadable_members: 0,
+        }
+    }
+
+    /// The fix for the characterization above: all seven are counted from
+    /// the process table, five enriched from the registry that has them, and
+    /// Codex is observed rather than unknown.
+    #[test]
+    fn the_process_scan_counts_every_session_whichever_registry_it_used() {
+        use crate::sysload::AgentKind;
+        let repo = tempfile::TempDir::new().unwrap();
+        let rows: Vec<(String, String)> = (0..5)
+            .map(|i| (format!("{i}.json"), entry(300 + i, repo.path(), 2_000)))
+            .collect();
+        let refs: Vec<(&str, String)> = rows.iter().map(|(n, b)| (n.as_str(), b.clone())).collect();
+        let reg = registry(&refs);
+        let mut sessions: Vec<_> = (0..7)
+            .map(|i| scanned(AgentKind::Claude, 300 + i, Some(repo.path())))
+            .collect();
+        sessions.push(scanned(AgentKind::Codex, 400, Some(repo.path())));
+        let facet = attribute(
+            &from_scan(&sessions, Some(reg.path())),
+            &[repo.path().to_string_lossy().into_owned()],
+        );
+        assert_eq!(facet.sessions, 8, "{facet:?}");
+        assert!(
+            facet.ok,
+            "both kinds observed, nothing unverified: {facet:?}"
+        );
+        let claude = facet.kinds.iter().find(|k| k.kind == "claude").unwrap();
+        let codex = facet.kinds.iter().find(|k| k.kind == "codex").unwrap();
+        assert_eq!((claude.sessions, codex.sessions), (7, 1));
+        let rows = &facet.worktrees[0].sessions;
+        let busy = rows.iter().filter(|s| s.status == "busy").count();
+        assert_eq!(busy, 5, "the five with registry entries are enriched");
+    }
+
+    #[test]
+    fn a_registry_entry_never_enriches_a_later_process_on_the_same_pid() {
+        use crate::sysload::AgentKind;
+        let repo = tempfile::TempDir::new().unwrap();
+        // The entry was written at 1 s; this process started at 1000 s.
+        let reg = registry(&[("1.json", entry(77, repo.path(), 1_000))]);
+        let mut later = scanned(AgentKind::Claude, 77, Some(repo.path()));
+        later.start_us = 1_000_000_000;
+        let seen = from_scan(&[later], Some(reg.path()));
+        let claude = seen.iter().find(|k| k.kind == "claude").unwrap();
+        assert_eq!(claude.live.len(), 1);
+        assert_eq!(
+            claude.live[0].status, "",
+            "a reused pid inherited a stale status"
+        );
+    }
+
+    #[test]
+    fn a_scanned_session_with_no_readable_directory_is_unverified() {
+        use crate::sysload::AgentKind;
+        let repo = tempfile::TempDir::new().unwrap();
+        let seen = from_scan(&[scanned(AgentKind::Codex, 5, None)], None);
+        let facet = attribute(&seen, &[repo.path().to_string_lossy().into_owned()]);
+        let codex = facet.kinds.iter().find(|k| k.kind == "codex").unwrap();
+        assert_eq!((codex.sessions, codex.unverified), (0, 1));
+        assert!(!facet.ok);
+        let failed = attribute(&failed_scan("denied"), &[]);
+        assert!(failed
+            .kinds
+            .iter()
+            .all(|k| !k.ok && k.error.contains("denied")));
     }
 
     #[test]

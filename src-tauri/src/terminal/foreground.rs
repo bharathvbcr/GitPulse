@@ -39,38 +39,9 @@ pub(super) fn describe(pid: i32) -> ProcessView {
     }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn read_cwd(pid: i32) -> Option<PathBuf> {
-    use std::ffi::CStr;
-    use std::os::unix::ffi::OsStrExt;
-    let size = std::mem::size_of::<libc::proc_vnodepathinfo>();
-    let mut info = std::mem::MaybeUninit::<libc::proc_vnodepathinfo>::uninit();
-    // SAFETY: the buffer is exactly one `proc_vnodepathinfo`, and it is read
-    // only after the kernel reports that it filled every byte of it.
-    let written = unsafe {
-        libc::proc_pidinfo(
-            pid,
-            libc::PROC_PIDVNODEPATHINFO,
-            0,
-            info.as_mut_ptr().cast(),
-            i32::try_from(size).ok()?,
-        )
-    };
-    if usize::try_from(written).ok() != Some(size) {
-        return None;
-    }
-    // SAFETY: fully initialised, established above.
-    let info = unsafe { info.assume_init() };
-    // `vip_path` is MAXPATHLEN bytes split into rows for old rustc; it is one
-    // contiguous NUL-terminated C string.
-    let raw: &[libc::c_char] = info.pvi_cdir.vip_path.as_flattened();
-    // SAFETY: c_char and u8 share size and alignment.
-    let bytes: &[u8] = unsafe { std::slice::from_raw_parts(raw.as_ptr().cast(), raw.len()) };
-    let path = CStr::from_bytes_until_nul(bytes).ok()?.to_bytes();
-    if path.first() != Some(&b'/') {
-        return None;
-    }
-    Some(PathBuf::from(std::ffi::OsStr::from_bytes(path)))
+    crate::sysload::procscan::cwd_of(pid)
 }
 
 #[cfg(target_os = "macos")]
@@ -83,14 +54,6 @@ fn read_name(pid: i32) -> Option<String> {
         .ok()
         .filter(|n| *n > 0 && *n <= buf.len())?;
     Some(String::from_utf8_lossy(&buf[..len]).into_owned())
-}
-
-#[cfg(target_os = "linux")]
-fn read_cwd(pid: i32) -> Option<PathBuf> {
-    let path = std::fs::read_link(format!("/proc/{pid}/cwd")).ok()?;
-    // A deleted directory reads back as "/old/path (deleted)"; that is not a
-    // place a new shell can start.
-    path.is_absolute().then_some(path).filter(|p| p.is_dir())
 }
 
 #[cfg(target_os = "linux")]
@@ -115,11 +78,6 @@ fn read_name(_pid: i32) -> Option<String> {
     None
 }
 
-/// Upper bound on the processes one [`working_in`] scan inspects. A process
-/// table larger than this is reported as a scan that could not finish, not
-/// judged on a prefix of it.
-const MAX_SCANNED_PROCESSES: usize = 65_536;
-
 /// Every process, other than this one, whose working directory is `dir` or
 /// inside it — the processes still *in* a checkout, whoever started them.
 ///
@@ -129,75 +87,16 @@ const MAX_SCANNED_PROCESSES: usize = 65_536;
 /// such a process keeps the directory it was started in. A process whose
 /// directory the OS will not describe — another user's — is skipped: it cannot
 /// be the agent's, which runs as this user. `Err` when the process table
-/// itself could not be read; that is never "nobody is there".
+/// itself could not be read; that is never "nobody is there". The table walk
+/// is the host-load scan's (`sysload::procscan`), the one owner of it.
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 pub(crate) fn working_in(dir: &std::path::Path) -> Result<Vec<i32>, String> {
-    let me = i32::try_from(std::process::id()).unwrap_or(-1);
-    let mut found = Vec::new();
-    for pid in all_pids()? {
-        if pid <= 0 || pid == me {
-            continue;
-        }
-        if read_cwd(pid).is_some_and(|cwd| cwd.starts_with(dir)) {
-            found.push(pid);
-        }
-    }
-    Ok(found)
+    crate::sysload::procscan::working_in(dir)
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
 pub(crate) fn working_in(_dir: &std::path::Path) -> Result<Vec<i32>, String> {
     Err("listing the processes working in a directory is not supported on this platform".into())
-}
-
-#[cfg(target_os = "macos")]
-fn all_pids() -> Result<Vec<i32>, String> {
-    // Asked twice: once for the count, once with room to spare, because the
-    // table can grow between the calls.
-    // SAFETY: a null buffer asks only for the number of pids.
-    let count = unsafe { libc::proc_listallpids(std::ptr::null_mut(), 0) };
-    let count =
-        usize::try_from(count).map_err(|_| "the process table could not be read".to_string())?;
-    if count > MAX_SCANNED_PROCESSES {
-        return Err(format!(
-            "{count} processes are running, more than the {MAX_SCANNED_PROCESSES} this scan reads"
-        ));
-    }
-    let mut pids = vec![0i32; count + 64];
-    let bytes = i32::try_from(pids.len() * std::mem::size_of::<i32>())
-        .map_err(|_| "the process table is too large to read".to_string())?;
-    // SAFETY: `bytes` is the buffer's own size in bytes.
-    let written = unsafe { libc::proc_listallpids(pids.as_mut_ptr().cast(), bytes) };
-    let written =
-        usize::try_from(written).map_err(|_| "the process table could not be read".to_string())?;
-    if written >= pids.len() {
-        return Err("the process table grew while it was being read".into());
-    }
-    pids.truncate(written);
-    Ok(pids)
-}
-
-#[cfg(target_os = "linux")]
-fn all_pids() -> Result<Vec<i32>, String> {
-    let entries = std::fs::read_dir("/proc")
-        .map_err(|e| format!("the process table could not be read: {e}"))?;
-    let mut pids = Vec::new();
-    for entry in entries {
-        let entry = entry.map_err(|e| format!("the process table could not be read: {e}"))?;
-        if let Some(pid) = entry
-            .file_name()
-            .to_str()
-            .and_then(|n| n.parse::<i32>().ok())
-        {
-            pids.push(pid);
-            if pids.len() > MAX_SCANNED_PROCESSES {
-                return Err(format!(
-                    "more than {MAX_SCANNED_PROCESSES} processes are running"
-                ));
-            }
-        }
-    }
-    Ok(pids)
 }
 
 #[cfg(test)]

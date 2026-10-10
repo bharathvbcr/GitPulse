@@ -1379,6 +1379,17 @@ fn spawn_session_inner<R: tauri::Runtime>(
         // that is not ours.
         None => cmd.env_remove(crate::alerts::bridge::SOCKET_ENV),
     }
+    // The launch table's environment (the task run id), after the caller's
+    // map for the same reason as the two above: it names this launch, and an
+    // IPC caller must not be able to file a session under another run.
+    for (name, value) in
+        crate::workbench::terminal_command::launch_env(observer.as_ref().map(|o| o.run_id()))
+    {
+        match value {
+            Some(value) => cmd.env(name, value),
+            None => cmd.env_remove(name),
+        }
+    }
     if let Some(observer) = &observer {
         observer.before_spawn(&session_id)?;
     }
@@ -3263,6 +3274,67 @@ mod tests {
             observer.failed.load(Ordering::SeqCst),
             "a consumed launch claim must receive its failure receipt"
         );
+    }
+
+    /// A task attempt's terminal carries its run id in `GITPULSE_RUN_ID`; a
+    /// plain terminal carries none. Neither can be set by the IPC caller: a
+    /// spoofed value in the caller's map is replaced or removed.
+    #[cfg(unix)]
+    #[test]
+    fn a_task_terminal_carries_its_run_id_and_a_plain_one_none_whatever_the_caller_sent() {
+        struct Run;
+        impl SessionObserver for Run {
+            fn run_id(&self) -> &str {
+                "run-4f2a"
+            }
+            fn before_spawn(&self, _: &str) -> Result<(), String> {
+                Ok(())
+            }
+            fn started(&self, _: &str, _: Option<u32>) -> Result<(), String> {
+                Ok(())
+            }
+            fn spawn_failed(&self, _: &str, reason: &str) {
+                panic!("spawn failed: {reason}")
+            }
+            fn finished(&self, _: &TerminalExitPayload) {}
+        }
+        let dir = tempfile::tempdir().unwrap();
+        init_test_repo(dir.path());
+        let app = tauri::test::mock_builder().build(crate::context()).unwrap();
+        let state = TerminalSessions::default();
+        let spoof = HashMap::from([(
+            crate::sysload::RUN_ID_ENV.to_string(),
+            "run-spoofed".to_string(),
+        )]);
+        let seen = |marker: &str, observer: Option<Arc<dyn SessionObserver>>| {
+            let path = dir.path().join(marker);
+            spawn_session_inner(
+                app.handle(),
+                &state,
+                dir.path().to_str().unwrap(),
+                None,
+                24,
+                80,
+                Some("/bin/sh".into()),
+                Some(vec![
+                    "-c".into(),
+                    format!(
+                        "printf '[%s]' \"${{{}-unset}}\" > {marker}.tmp && mv {marker}.tmp {marker}",
+                        crate::sysload::RUN_ID_ENV
+                    ),
+                ]),
+                Some(spoof.clone()),
+                observer,
+            )
+            .unwrap();
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            while !path.exists() && std::time::Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(20));
+            }
+            std::fs::read_to_string(&path).unwrap()
+        };
+        assert_eq!(seen("task-marker", Some(Arc::new(Run))), "[run-4f2a]");
+        assert_eq!(seen("plain-marker", None), "[unset]");
     }
 
     /// The defect: a webview reload left every PTY running with nobody to
@@ -5746,5 +5818,65 @@ mod tests {
         kill_session(&state, &spawned.id).unwrap();
         assert!(!running.is_empty(), "the terminal claude never started");
         assert_eq!(facet.sessions, 0, "{facet:?}");
+    }
+
+    /// The fix for the characterization above. A `claude` started in a
+    /// GitPulse terminal, with no registry entry anywhere, is counted — by its
+    /// executable — and counted as launched, through the session id the PTY
+    /// seam gave it. The fixture is this test binary behind a symlink named
+    /// `claude`, because macOS hides the environment of Apple platform
+    /// binaries such as `/bin/sleep`.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn a_terminal_claude_with_no_registry_entry_is_counted_as_launched() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().canonicalize().unwrap();
+        init_test_repo(&repo);
+        let bin = tempfile::tempdir().unwrap();
+        let claude = bin.path().join("claude");
+        let (exe, args) = crate::sysload::procscan::tests::fixture_command();
+        std::os::unix::fs::symlink(&exe, &claude).unwrap();
+        let pidfile = bin.path().join("claude.pid");
+        let app = tauri::test::mock_builder().build(crate::context()).unwrap();
+        let state = TerminalSessions::default();
+        let spawned = spawn_session_inner(
+            app.handle(),
+            &state,
+            repo.to_str().unwrap(),
+            None,
+            24,
+            80,
+            Some(claude.to_string_lossy().into_owned()),
+            Some(args),
+            Some(HashMap::from([(
+                crate::sysload::procscan::tests::FIXTURE_ENV.to_string(),
+                format!("sleep=30,pidfile={}", pidfile.display()),
+            )])),
+            None,
+        )
+        .unwrap();
+        let pid = crate::sysload::procscan::tests::fixture_pid(&pidfile);
+        let seen = crate::insights::live_sessions::observe();
+        let facet =
+            crate::insights::live_sessions::attribute(&seen, &[repo.to_string_lossy().into()]);
+        let scanned = crate::sysload::procscan::observe_sessions().unwrap();
+        let probed = crate::sysload::procscan::probe_one(pid);
+        kill_session(&state, &spawned.id).unwrap();
+        let ours: Vec<_> = facet
+            .worktrees
+            .iter()
+            .flat_map(|w| &w.sessions)
+            .filter(|s| s.pid == pid as u32)
+            .collect();
+        assert_eq!(ours.len(), 1, "{facet:?}\n{probed:?}\n{scanned:?}");
+        assert_eq!(ours[0].kind, "claude");
+        let session = scanned.iter().find(|s| s.pid == pid).expect("scanned");
+        assert!(
+            session
+                .tree
+                .as_deref()
+                .is_some_and(|t| t.starts_with("session:term-")),
+            "launched through the PTY seam: {session:?}"
+        );
     }
 }

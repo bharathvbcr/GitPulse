@@ -1044,6 +1044,20 @@ fn policy(provider: &str, mode: &str) -> Result<(Vec<&'static str>, bool), Workb
     Ok((flags, mode == "inspect"))
 }
 
+/// The environment half of the launch table: what every PTY launch carries
+/// beside [`policy`]'s flags, by name, with `None` meaning "remove it".
+///
+/// `GITPULSE_RUN_ID` is the task attempt's run id, and absent from every
+/// other terminal — removed rather than left alone, because a GitPulse that
+/// was itself started inside an attempt (a dev build run from an agent's
+/// terminal) would otherwise hand that outer run's id to every shell tab, and
+/// each would be counted as part of a run it has nothing to do with. Every
+/// descendant inherits the value, which is how the host-load scan attributes a
+/// child that launchd adopted to the run that started it.
+pub(crate) fn launch_env(run_id: Option<&str>) -> [(&'static str, Option<String>); 1] {
+    [(crate::sysload::RUN_ID_ENV, run_id.map(str::to_owned))]
+}
+
 /// What a launched agent is told about finishing. How to work is not said
 /// here: the brief file is the store's export, which opens with the agent
 /// guidance every handoff carries (`dc_store::workbench::AGENT_GUIDANCE`), so

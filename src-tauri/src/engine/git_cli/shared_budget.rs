@@ -17,7 +17,7 @@
 //! bucket, counted. Failing closed instead would let one stopped process — a
 //! debugger, a `SIGSTOP` — defer every read in every other GitPulse process.
 
-use std::fs::{File, OpenOptions, TryLockError};
+use std::fs::{File, TryLockError};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -83,23 +83,7 @@ impl SharedBudget {
     /// Opens (creating if absent) the record at `path`, refusing one that is
     /// not a regular file this user alone owns and can read.
     pub(super) fn open(path: &Path) -> Result<Self, String> {
-        if let Some(dir) = path.parent() {
-            std::fs::create_dir_all(dir)
-                .map_err(|e| format!("could not create {}: {e}", dir.display()))?;
-        }
-        let mut options = OpenOptions::new();
-        options.read(true).write(true).create(true).truncate(false);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            // A symlink planted at the path would otherwise redirect the
-            // writes; with O_NOFOLLOW the open fails instead.
-            options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
-        }
-        let file = options
-            .open(path)
-            .map_err(|e| format!("could not open {}: {e}", path.display()))?;
-        verify_owner(&file, path)?;
+        let file = crate::fs_entry::open_private_record(path)?;
         Ok(Self {
             file,
             path: path.to_path_buf(),
@@ -275,47 +259,6 @@ fn wall_ns() -> u64 {
         .map(|elapsed| u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX))
         // Before 1970: anchor at zero; the backwards-clock clamp handles it.
         .unwrap_or(0)
-}
-
-#[cfg(unix)]
-fn verify_owner(file: &File, path: &Path) -> Result<(), String> {
-    use std::os::unix::fs::MetadataExt;
-    let meta = file
-        .metadata()
-        .map_err(|e| format!("could not inspect {}: {e}", path.display()))?;
-    if !meta.is_file() {
-        return Err(format!("{} is not a regular file", path.display()));
-    }
-    // SAFETY: geteuid has no preconditions and cannot fail.
-    let me = unsafe { libc::geteuid() };
-    if meta.uid() != me {
-        return Err(format!(
-            "{} is owned by uid {}, not this user (uid {me})",
-            path.display(),
-            meta.uid()
-        ));
-    }
-    if meta.mode() & 0o077 != 0 {
-        return Err(format!(
-            "{} is accessible to other users (mode {:o})",
-            path.display(),
-            meta.mode() & 0o777
-        ));
-    }
-    Ok(())
-}
-
-/// The per-user `APPDATA` directory is already private to its owner.
-#[cfg(not(unix))]
-fn verify_owner(file: &File, path: &Path) -> Result<(), String> {
-    let meta = file
-        .metadata()
-        .map_err(|e| format!("could not inspect {}: {e}", path.display()))?;
-    if meta.is_file() {
-        Ok(())
-    } else {
-        Err(format!("{} is not a regular file", path.display()))
-    }
 }
 
 #[cfg(test)]

@@ -37,6 +37,7 @@ pub mod secrets;
 pub mod stack;
 pub mod storage;
 pub mod syntax;
+pub mod sysload;
 pub mod tasks;
 pub mod terminal;
 #[cfg(test)]
