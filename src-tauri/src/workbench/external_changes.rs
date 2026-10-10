@@ -25,10 +25,9 @@ const HIDDEN_PERIOD: Duration = Duration::from_millis(2_000);
 pub(crate) fn install(app: &tauri::AppHandle) {
     let host = app.state::<WorkbenchState>().inner().clone();
     let app = app.clone();
-    if let Err(error) = std::thread::Builder::new()
-        .name("workbench-external-changes".into())
-        .spawn(move || run(host, app))
-    {
+    if let Err(error) = crate::supervisor::spawn_service("workbench-external-changes", move || {
+        run(host.clone(), app.clone())
+    }) {
         log::warn!(target: "workbench", "external change watcher did not start: {error}");
     }
 }

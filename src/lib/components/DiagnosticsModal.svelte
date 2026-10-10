@@ -92,7 +92,7 @@
   let persistedLog = $state<PersistedLog | null>(null);
   let memoryReadError = $state<string | null>(null);
   let daemonNotice = $state<string | null>(null);
-  let degradedSubsystems = $state<{ subsystem: string; reason: string; panics: number }[]>([]);
+  let degradedSubsystems = $state<{ subsystem: string; reason: string; panics: number; stopped: boolean }[]>([]);
   let backendLoadGeneration = 0;
   let backendLoad: Promise<void> | null = null;
   const diagnosticHealth = diagnostics.health;
@@ -181,6 +181,7 @@
             subsystem: redactDiagnosticText(String(d.subsystem)),
             reason: redactDiagnosticText(String(d.reason)),
             panics: Number(d.panics) || 1,
+            stopped: d.stopped === true,
           }))
         : [];
     daemonNotice =
@@ -365,7 +366,7 @@
           {/if}
           {#each degradedSubsystems as degraded (degraded.subsystem)}
             <p class="text-[11px] text-amber-300 wrap-break-word">
-              {degraded.subsystem} hit an internal error{degraded.panics > 1 ? ` ${degraded.panics} times` : ""} and is retrying: {degraded.reason}
+              {degraded.subsystem} hit an internal error{degraded.panics > 1 ? ` ${degraded.panics} times` : ""} and {degraded.stopped ? "has stopped; restart GitPulse to bring it back" : "is retrying"}: {degraded.reason}
             </p>
           {/each}
           {#if persistedLog?.degraded}

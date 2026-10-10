@@ -93,9 +93,8 @@ pub fn on_terminated<R: Runtime>(webview: &Webview<R>) {
         return;
     }
     let later = webview.clone();
-    let spawned = std::thread::Builder::new()
-        .name("webview-crash-reload".into())
-        .spawn(move || {
+    let spawned =
+        crate::supervisor::spawn_once("webview-crash-reload", "webview reload", move || {
             std::thread::sleep(delay);
             reload(&later);
         });

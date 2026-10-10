@@ -203,7 +203,7 @@ impl Watchlist {
 /// request arrives — so an idle server costs no wakeups and an overdue
 /// request is answered at its deadline rather than up to a tick late.
 fn spawn_watchdog(watchlist: Arc<Watchlist>, wire: Arc<Wire>) {
-    std::thread::spawn(move || {
+    let _ = gitpulse_lib::supervisor::spawn_service("mcp-watchdog", move || {
         let Ok(mut queue) = watchlist.queue.lock() else {
             return;
         };
@@ -271,9 +271,7 @@ fn dispatch(
 ) {
     dispatch_with(
         |work| {
-            std::thread::Builder::new()
-                .name("mcp-request".into())
-                .spawn(work)
+            gitpulse_lib::supervisor::spawn_once("mcp-request", "mcp request worker", work)
                 .map(drop)
         },
         ready,
@@ -418,9 +416,10 @@ impl HostInput {
         if let Ok(mut wake) = wire.input_wake.lock() {
             *wake = Some(sender.clone());
         }
-        std::thread::Builder::new()
-            .name("gitpulse-mcp-stdin".into())
-            .spawn(move || {
+        gitpulse_lib::supervisor::spawn_once(
+            "gitpulse-mcp-stdin",
+            "mcp stdin reader",
+            move || {
                 // `Wire` keeps a sender clone to wake the reader, so the
                 // channel cannot report this worker's death by disconnecting.
                 // Whatever ends the loop — EOF, an error, a panic — the reader
@@ -461,7 +460,8 @@ impl HostInput {
                         break;
                     }
                 }
-            })?;
+            },
+        )?;
         Ok(Self {
             receiver,
             buffered: io::Cursor::new(Vec::new()),

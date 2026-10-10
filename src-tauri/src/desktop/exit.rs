@@ -178,20 +178,18 @@ pub fn begin<R: Runtime>(app: &AppHandle<R>, origin: Origin) -> Begin {
         return Begin::Proceed;
     }
     let deadline = app.clone();
-    let spawned = std::thread::Builder::new()
-        .name("exit-ack-deadline".into())
-        .spawn(move || {
-            std::thread::sleep(ACK_DEADLINE);
-            let gate = &deadline.state::<DesktopState>().exit;
-            if let Some(pending) = gate.expire(id) {
-                log::warn!(
-                    target: "desktop",
-                    "the window did not acknowledge the quit within {}s; quitting",
-                    ACK_DEADLINE.as_secs()
-                );
-                settle(&deadline, pending, true);
-            }
-        });
+    let spawned = crate::supervisor::spawn_once("exit-ack-deadline", "exit deadline", move || {
+        std::thread::sleep(ACK_DEADLINE);
+        let gate = &deadline.state::<DesktopState>().exit;
+        if let Some(pending) = gate.expire(id) {
+            log::warn!(
+                target: "desktop",
+                "the window did not acknowledge the quit within {}s; quitting",
+                ACK_DEADLINE.as_secs()
+            );
+            settle(&deadline, pending, true);
+        }
+    });
     if let Err(error) = spawned {
         // Without a deadline an unanswered request could hold the app forever.
         log::warn!(target: "desktop", "exit deadline did not start ({error}); quitting");

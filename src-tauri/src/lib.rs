@@ -142,9 +142,10 @@ pub fn run() {
             // Once, off this thread. Dual-read still finds a record this has
             // not renamed yet, so a failed migration does not block startup.
             // MCP and gitpulsed do not run this path and stay read-only.
-            if let Err(error) = std::thread::Builder::new()
-                .name("repository-trust-migrate".into())
-                .spawn(|| match repository_trust::persistent_root() {
+            if let Err(error) = supervisor::spawn_once(
+                "repository-trust-migrate",
+                "trust migration",
+                || match repository_trust::persistent_root() {
                     Ok(root) => {
                         if let Err(error) = repository_trust::migrate_store(&root) {
                             log::warn!(target: "trust", "repository trust migration failed: {error}");
@@ -174,9 +175,10 @@ pub fn run() {
                 app.state::<terminal::TerminalSessions>().apply_stored_limit();
                 let state = app.state::<workbench::WorkbenchState>().inner().clone();
                 state.attach_terminals(app.state::<terminal::TerminalSessions>().inner().clone());
-                if let Err(error) = std::thread::Builder::new()
-                    .name("task-run-reconcile".into())
-                    .spawn(move || match state.reconcile_stale_runs() {
+                if let Err(error) = supervisor::spawn_once(
+                    "task-run-reconcile",
+                    "task run reconcile",
+                    move || match state.reconcile_stale_runs() {
                         Ok(0) => {}
                         Ok(released) => {
                             log::info!(target: "workbench", "released {released} task run(s) left behind by an earlier session");

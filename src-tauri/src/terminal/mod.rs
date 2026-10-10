@@ -1478,9 +1478,10 @@ fn spawn_session_inner<R: tauri::Runtime>(
     // the reader thread outlives every borrow it could otherwise take.
     let watcher = SessionWatcher::new(&session_id, &resolved, &repo);
 
-    let reader_thread = thread::Builder::new()
-        .name(format!("pty-read-{session_id}"))
-        .spawn(move || {
+    let reader_thread = crate::supervisor::spawn_once(
+        format!("pty-read-{session_id}"),
+        "terminal reader",
+        move || {
             let mut reservation = Some(reservation);
             let mut failure = None;
             let mut watcher = watcher;
@@ -1498,7 +1499,9 @@ fn spawn_session_inner<R: tauri::Runtime>(
                         // On close, drain kernel output until EOF. Leaving a
                         // full tty queue undrained can prevent a killed writer
                         // from completing on macOS, stranding its process slot.
-                        if dead_flag.load(Ordering::Relaxed) { continue; }
+                        if dead_flag.load(Ordering::Relaxed) {
+                            continue;
+                        }
                         let stall = Duration::from_millis(output_stall_ms.load(Ordering::Acquire));
                         let delivery = output_flow.reserve(n, stall).map(|route| {
                             let resumed = match route {
@@ -1561,7 +1564,9 @@ fn spawn_session_inner<R: tauri::Runtime>(
                             if !dead_flag.swap(true, Ordering::SeqCst) {
                                 failure = Some(error);
                                 output_flow.stop();
-                                if let Err(error) = terminate_pty_child(&thread_child, &thread_master) {
+                                if let Err(error) =
+                                    terminate_pty_child(&thread_child, &thread_master)
+                                {
                                     log::warn!(target: "terminal", "could not signal failed terminal: {error}");
                                 }
                             }
@@ -1584,9 +1589,12 @@ fn spawn_session_inner<R: tauri::Runtime>(
                         // remains bounded even if a child stops producing data.
                         if let Err(error) = input::wait_for_output(reader_fd) {
                             if !dead_flag.swap(true, Ordering::SeqCst) {
-                                failure = Some(format!("Terminal output readiness failed: {error}"));
+                                failure =
+                                    Some(format!("Terminal output readiness failed: {error}"));
                                 output_flow.stop();
-                                if let Err(error) = terminate_pty_child(&thread_child, &thread_master) {
+                                if let Err(error) =
+                                    terminate_pty_child(&thread_child, &thread_master)
+                                {
                                     log::warn!(target: "terminal", "could not signal failed terminal: {error}");
                                 }
                             }
@@ -1631,7 +1639,9 @@ fn spawn_session_inner<R: tauri::Runtime>(
                     }
                 },
                 |mut payload| {
-                    if payload.error.is_none() { payload.error = failure.take(); }
+                    if payload.error.is_none() {
+                        payload.error = failure.take();
+                    }
                     // Every end is on record with its cause. A session that
                     // vanished with nothing in the log was undiagnosable.
                     log::info!(
@@ -1641,7 +1651,9 @@ fn spawn_session_inner<R: tauri::Runtime>(
                     );
                     // Shutdown waits for session removal. Persist the owned
                     // process's outcome before telling shutdown it is cleaned up.
-                    if let Some(observer) = &thread_observer { observer.finished(&payload); }
+                    if let Some(observer) = &thread_observer {
+                        observer.finished(&payload);
+                    }
                     drop(reservation.take());
                     sessions_map
                         .lock()
@@ -1652,7 +1664,8 @@ fn spawn_session_inner<R: tauri::Runtime>(
                     }
                 },
             );
-        });
+        },
+    );
     if let Err(e) = reader_thread {
         let mut guard = state.lock_sessions();
         guard.remove(&session_id);
@@ -1744,9 +1757,8 @@ fn record_session_spawn(
             detail_json: None,
         });
     };
-    if let Err(error) = thread::Builder::new()
-        .name("session-spawn-ledger".into())
-        .spawn(work)
+    if let Err(error) =
+        crate::supervisor::spawn_once("session-spawn-ledger", "terminal ledger record", work)
     {
         log::warn!(target: "terminal", "session.spawn was not recorded: {error}");
     }

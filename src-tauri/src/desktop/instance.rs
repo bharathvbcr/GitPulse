@@ -513,11 +513,11 @@ impl Primary {
             .map_err(|error| format!("mailbox vanished: {error}"))?;
         self.socket_identity = Some((meta.dev(), meta.ino()));
         let shared = self.shared.clone();
-        std::thread::Builder::new()
-            .name("instance-mailbox".into())
-            .spawn(move || accept_loop(listener, shared))
-            .map(|_| ())
-            .map_err(|error| format!("cannot start the mailbox: {error}"))
+        crate::supervisor::spawn_once("instance-mailbox", "single-instance mailbox", move || {
+            accept_loop(listener, shared)
+        })
+        .map(|_| ())
+        .map_err(|error| format!("cannot start the mailbox: {error}"))
     }
 
     /// Why launches cannot reach this owner, when they cannot. The lock still
@@ -598,12 +598,14 @@ fn accept_loop(listener: UnixListener, shared: Arc<Shared>) {
             continue;
         }
         let handler = shared.clone();
-        let spawned = std::thread::Builder::new()
-            .name("instance-mailbox-conn".into())
-            .spawn(move || {
+        let spawned = crate::supervisor::spawn_once(
+            "instance-mailbox-conn",
+            "single-instance mailbox",
+            move || {
                 handle(stream, &handler);
                 handler.active.fetch_sub(1, Ordering::AcqRel);
-            });
+            },
+        );
         if let Err(error) = spawned {
             shared.active.fetch_sub(1, Ordering::AcqRel);
             log::warn!(target: "desktop", "instance mailbox could not answer a launch: {error}");

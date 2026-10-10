@@ -36,6 +36,8 @@ export interface Degraded {
   since_unix: number;
   /** Ticks that have panicked since the record was made. */
   panics: number;
+  /** The thread is gone and nothing is retrying it. */
+  stopped: boolean;
 }
 
 /**

@@ -298,7 +298,7 @@ fn spawn_stdout_pump(
     guard: std::sync::Arc<crate::procguard::Registration>,
 ) -> Receiver<String> {
     let (tx, rx) = mpsc::sync_channel::<String>(MAX_QUEUED_STDOUT_FRAMES);
-    thread::spawn(move || {
+    let _ = crate::supervisor::spawn_once("sidecar-stdout", "sidecar stdout pump", move || {
         let mut reader = BufReader::new(stdout);
         loop {
             match read_bounded_line(&mut reader, MAX_SIDECAR_FRAME_BYTES) {
@@ -1123,7 +1123,7 @@ fn spawn_with_profile(
     let tail_writer = tail.clone();
     let child_for_stderr = child.clone();
     let guard_for_stderr = guard.clone();
-    std::thread::spawn(move || {
+    let _ = crate::supervisor::spawn_once("sidecar-stderr", "sidecar stderr reader", move || {
         // Bounded exactly like stdout: stderr is untrusted bytes from the
         // same child, and `.lines()` would buffer an unlimited newline-less
         // flood just to keep a diagnostic tail. A frame past the cap faults
@@ -2012,6 +2012,62 @@ mod tests {
             unsafe { libc::kill(pid, 0) } != 0,
             "the exited sidecar was left unreaped"
         );
+    }
+
+    /// The criterion "a policy check completes in under 1 s while a 10 s
+    /// capability probe is in flight", against the real client path
+    /// (`call_in_slot`, the slot, the multiplexed inbox) and a fake sidecar
+    /// that holds the probe for 10 s while answering everything else at once.
+    /// It passes on main: the slot is held only to pick the child, never across
+    /// the round trip, and answers are routed by id. This is a regression
+    /// guard for that, not a fix.
+    #[test]
+    fn a_policy_check_is_not_queued_behind_a_ten_second_probe() {
+        let script = r#"while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')
+  case "$line" in
+    *capability.probe*) ( sleep 10; printf '{"id":"%s","ok":true,"result":{}}\n' "$id" ) & ;;
+    *) printf '{"id":"%s","ok":true,"result":{"verdict":"allow"}}\n' "$id" ;;
+  esac
+done"#;
+        let sidecar = Arc::new(scripted_sidecar(script, WRITE_DEADLINE));
+        let owner: &'static Mutex<Slot> = Box::leak(Box::new(Mutex::new(Slot {
+            sidecar: Some(sidecar),
+            last_error: None,
+            backoff_until: None,
+            profile: None,
+            selection: None,
+            closed: false,
+        })));
+        let probe = thread::spawn(move || {
+            call_in_slot(
+                owner,
+                "capability.probe",
+                None,
+                Duration::from_secs(20),
+                None,
+            )
+        });
+        thread::sleep(Duration::from_millis(300));
+        let started = Instant::now();
+        let verdict = call_in_slot(
+            owner,
+            "policy.check",
+            Some(serde_json::json!({"argv": ["git", "status"]})),
+            Duration::from_secs(5),
+            None,
+        )
+        .expect("the policy check was answered");
+        let took = started.elapsed();
+        assert_eq!(verdict["verdict"], "allow");
+        assert!(
+            took < Duration::from_secs(1),
+            "the policy check waited {took:?} behind the probe"
+        );
+        assert!(!probe.is_finished(), "the probe should still be in flight");
+        // Tear the fake down without waiting out the probe.
+        relock(owner).drop_sidecar();
+        let _ = probe.join();
     }
 
     /// Regression: the response byte budget is enforced by `call`, so it did

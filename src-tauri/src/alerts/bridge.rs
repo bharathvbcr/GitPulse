@@ -178,9 +178,10 @@ fn start(path: Option<std::path::PathBuf>) {
         }
     };
     state.listening.store(true, Ordering::SeqCst);
-    let spawned = std::thread::Builder::new()
-        .name("gitpulse-alert-bridge".into())
-        .spawn(move || accept_loop(listener, generation));
+    let spawned =
+        crate::supervisor::spawn_once("gitpulse-alert-bridge", "alert bridge", move || {
+            accept_loop(listener, generation)
+        });
     if let Err(error) = spawned {
         state.listening.store(false, Ordering::SeqCst);
         set_error(Some(format!("Hook bridge could not start: {error}")));
