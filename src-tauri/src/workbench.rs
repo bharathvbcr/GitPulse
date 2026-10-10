@@ -380,6 +380,24 @@ impl WorkbenchState {
         // What the card shows (read from the store, so it works with the
         // sidecar down) and its Verify action. Both use a connection of their
         // own: Verify waits on the sidecar and must not hold the board's.
+        if method == "verifications.board" {
+            let parsed: Value = serde_json::from_str(input)
+                .map_err(|e| WorkbenchError::new("invalid_input", e.to_string()))?;
+            let ids: Vec<String> = parsed["ids"]
+                .as_array()
+                .ok_or_else(|| WorkbenchError::new("invalid_input", "ids is required."))?
+                .iter()
+                .map(|id| id.as_str().map(str::to_owned))
+                .collect::<Option<_>>()
+                .ok_or_else(|| WorkbenchError::new("invalid_input", "ids are strings."))?;
+            let store = Store::open(&self.profile_path()?)
+                .map_err(|e| WorkbenchError::new("store_error", e.to_string()))?;
+            return verification_driver::status_batch(
+                &store,
+                &verification_driver::HostBackend(self.clone()),
+                &ids,
+            );
+        }
         if method == "verifications.status" || method == "verifications.run" {
             let parsed: Value = serde_json::from_str(input)
                 .map_err(|e| WorkbenchError::new("invalid_input", e.to_string()))?;

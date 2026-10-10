@@ -463,8 +463,49 @@ pub(crate) fn status(
     id: &str,
 ) -> Result<Value, WorkbenchError> {
     let record = gate::latest(store, id).map_err(|m| WorkbenchError::new("store_error", m))?;
+    Ok(describe(record, backend, &mut HashMap::new(), true))
+}
+
+/// Most cards one batched read answers for: a board page is at most 30 cards
+/// in each of seven columns.
+pub(crate) const MAX_BATCH: usize = 256;
+
+/// The verdict of many cards in one read, for the board. Only the cards that
+/// have ever been verified are named; the rest are `none` by absence. Any card
+/// whose record cannot be read fails the whole read, so the board says so
+/// rather than drawing the others as if the failure were a clean "none".
+pub(crate) fn status_batch(
+    store: &Store,
+    backend: &dyn Backend,
+    ids: &[String],
+) -> Result<Value, WorkbenchError> {
+    if ids.len() > MAX_BATCH {
+        return Err(WorkbenchError::new(
+            "invalid_input",
+            format!("A verdict read names at most {MAX_BATCH} tasks."),
+        ));
+    }
+    let mut heads = HashMap::new();
+    let mut items = serde_json::Map::new();
+    for id in ids {
+        let record = gate::latest(store, id).map_err(|m| WorkbenchError::new("store_error", m))?;
+        if record.is_some() {
+            items.insert(id.clone(), describe(record, backend, &mut heads, false));
+        }
+    }
+    Ok(json!({"ok": true, "items": items}))
+}
+
+/// One record as the board shows it. `heads` memoizes each worktree's head
+/// for the duration of a read; `full` includes the record itself.
+fn describe(
+    record: Option<Record>,
+    backend: &dyn Backend,
+    heads: &mut HashMap<String, Result<String, String>>,
+    full: bool,
+) -> Value {
     let Some(record) = record else {
-        return Ok(json!({"ok": true, "state": "none", "stale": false, "record": null}));
+        return json!({"ok": true, "state": "none", "stale": false, "record": null});
     };
     let state = if record.state == STATE_COULD_NOT_RUN {
         "could_not_run"
@@ -479,10 +520,16 @@ pub(crate) fn status(
         }
     };
     let stale = !record.worktree.is_empty()
-        && backend
-            .head_of(&record.worktree)
-            .is_ok_and(|head| head != record.head);
-    Ok(json!({"ok": true, "state": state, "stale": stale, "record": record}))
+        && heads
+            .entry(record.worktree.clone())
+            .or_insert_with(|| backend.head_of(&record.worktree))
+            .as_ref()
+            .is_ok_and(|head| *head != record.head);
+    if full {
+        json!({"ok": true, "state": state, "stale": stale, "record": record})
+    } else {
+        json!({"ok": true, "state": state, "stale": stale})
+    }
 }
 
 /// A card's manual Verify: the card's worktree is the one its newest claim

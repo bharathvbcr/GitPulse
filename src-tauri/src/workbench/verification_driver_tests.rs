@@ -6,7 +6,8 @@ use super::gate_tests::{head_of, record, store_record};
 use super::tests::{filed, live, person_edits, profile};
 use super::{complete_task, resolve};
 use crate::workbench::verification_driver::{
-    decide, status, target_of, Backend, Driver, Facts, Report, Step, Target, MAX_ACTIVE,
+    decide, status, status_batch, target_of, Backend, Driver, Facts, Report, Step, Target,
+    MAX_ACTIVE,
 };
 use crate::workbench::verification_gate::{self as gate, Record};
 use crate::workbench::WorkbenchError;
@@ -399,4 +400,55 @@ fn decide_is_a_pure_function_of_what_it_is_given() {
         ..passed
     };
     assert_eq!(base(Some(other_head), "h1", None), Step::Start);
+}
+
+#[test]
+fn a_batched_read_names_only_verified_cards_and_marks_a_moved_head_stale() {
+    let (_d, store, repo, id) = setup();
+    let other = filed(&store, &repo, "gp-other", "Unverified");
+    let fake = Fake::new();
+    let head = head_of(&repo);
+    store_record(&store, &id, &record(&id, "failed", "settled", &repo, &head));
+    let ids = [id.clone(), other.clone()];
+    let out = status_batch(&store, &fake, &ids).unwrap();
+    assert_eq!(out["items"][&id]["state"], "failed", "{out}");
+    assert_eq!(out["items"][&id]["stale"], false);
+    assert!(out["items"].get(&other).is_none(), "{out}");
+    crate::test_support::git_in(
+        repo.path(),
+        &["commit", "-q", "--allow-empty", "-m", "more"],
+    );
+    let out = status_batch(&store, &fake, &ids).unwrap();
+    assert_eq!(out["items"][&id]["stale"], true);
+}
+
+#[test]
+fn a_batched_read_that_cannot_read_a_record_fails_instead_of_reporting_none() {
+    let (_d, store, repo, id) = setup();
+    store_record(
+        &store,
+        &id,
+        &record(&id, "passed", "settled", &repo, &head_of(&repo)),
+    );
+    store
+        .evidence_append(
+            gate::EVIDENCE_TYPE,
+            Some(&id),
+            None,
+            None,
+            "{\"request_id\": 7}",
+        )
+        .unwrap();
+    let err = status_batch(&store, &Fake::new(), &[id]).unwrap_err();
+    assert_eq!(err.code, "store_error");
+}
+
+#[test]
+fn a_batched_read_is_bounded() {
+    let (_d, store, _repo, _id) = setup();
+    let ids: Vec<String> = (0..300).map(|n| format!("i{n}")).collect();
+    assert_eq!(
+        status_batch(&store, &Fake::new(), &ids).unwrap_err().code,
+        "invalid_input"
+    );
 }

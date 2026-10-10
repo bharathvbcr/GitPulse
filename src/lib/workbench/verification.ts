@@ -86,3 +86,29 @@ export async function runVerification(id: string): Promise<void> {
   const raw = await request("verifications.run", { id });
   if (typeof raw !== "object" || raw === null) throw new WorkbenchError("protocol_error", "Task storage returned an invalid verification.");
 }
+
+/** What a board card shows: the state, and whether it is for an earlier commit. */
+export interface CardVerdict { state: Exclude<VerdictState, "none">; stale: boolean }
+
+/** The host's cap on one batched read (a board page is 30 cards in each of 7 columns). */
+export const MAX_VERDICT_BATCH = 256;
+
+/**
+ * Verdicts for every card on the board in one read. Cards never verified are
+ * absent from the answer; a read that fails throws, so the caller can say so
+ * instead of drawing every card as unverified.
+ */
+export async function getVerdicts(ids: readonly string[]): Promise<Map<string, CardVerdict>> {
+  const unique = [...new Set(ids)];
+  const verdicts = new Map<string, CardVerdict>();
+  if (!unique.length) return verdicts;
+  if (unique.length > MAX_VERDICT_BATCH) throw new WorkbenchError("invalid_input", "Too many tasks for one verdict read.");
+  const raw = await request("verifications.board", { ids: unique });
+  const items = typeof raw === "object" && raw !== null && (raw as Record<string, unknown>).ok === true ? (raw as Record<string, unknown>).items : undefined;
+  if (typeof items !== "object" || items === null) throw new WorkbenchError("protocol_error", "Task storage returned an invalid verification.");
+  for (const [id, value] of Object.entries(items)) {
+    const one = decodeVerification(value);
+    if (one.state !== "none" && unique.includes(id)) verdicts.set(id, { state: one.state, stale: one.stale });
+  }
+  return verdicts;
+}

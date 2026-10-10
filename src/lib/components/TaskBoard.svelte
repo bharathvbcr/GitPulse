@@ -72,6 +72,8 @@
   import ScrollCue from "./ScrollCue.svelte";
   import TaskActionDialog from "./TaskActionDialog.svelte";
   import TaskMergeDialog from "./TaskMergeDialog.svelte";
+  import CardVerdict from "./CardVerdict.svelte";
+  import { getVerdicts, type CardVerdict as Verdict } from "../workbench/verification";
   import { mergeEligibility } from "../workbench/taskMerge";
   import TaskEditor from "./TaskEditor.svelte";
   import WorkspaceEditor from "./WorkspaceEditor.svelte";
@@ -99,6 +101,9 @@
   let repositoryCursor = $state<string | null>(null), workspaceCursor = $state<string | null>(null);
   let repositoryTotal = $state(0), workspaceTotal = $state(0);
   let columns = $state<Partial<Record<TaskStatus, Page<TaskCard>>>>({});
+  /** Verification verdicts for the cards loaded, read once per board load. */
+  let verdicts = $state<ReadonlyMap<string, Verdict>>(new Map());
+  let verdictError = $state("");
   let search = $state(""); let initialized = $state(false); let loading = $state(false);
   let error = $state(""); let catalogError = $state(""); let announce = $state("");
   let taskTabs = $state<TaskTabState>(emptyTaskTabs());
@@ -419,8 +424,22 @@
       if (generation !== revision || disposed || key !== boardKey) return;
       columns = Object.fromEntries(pages); loadedKey = key; archivedCount = archive.total;
       selected = new Set([...selected].filter((id) => loadedHas(id, Object.fromEntries(pages))));
+      void loadVerdicts(pages.flatMap(([, page]) => page.items.map((card) => card.id)), generation);
     } catch (cause) { if (generation === revision && !disposed) error = explainError(cause); }
     finally { if (generation === revision && !disposed) loading = false; }
+  }
+  /**
+   * One batched read of the verdicts for every card just loaded. A failure is
+   * shown, never drawn as "no verdicts": a card that was verified and failed
+   * must not look like one nobody checked.
+   */
+  async function loadVerdicts(ids: string[], generation: number) {
+    try {
+      const read = await getVerdicts(ids);
+      if (generation === revision && !disposed) { verdicts = read; verdictError = ""; }
+    } catch (cause) {
+      if (generation === revision && !disposed) { verdicts = new Map(); verdictError = explainError(cause); }
+    }
   }
   /**
    * A task write finished; tell the archive dock to reload.
@@ -903,6 +922,7 @@
       if (generation !== revision || disposed || key !== boardKey) return;
       const items = cursor ? [...new Map([...(columns[status]?.items ?? []), ...result.items].map((item) => [item.id, item])).values()] : result.items;
       columns = { ...columns, [status]: { ...result, items, shown: items.length } };
+      void loadVerdicts(Object.values(columns).flatMap((page) => page?.items.map((card) => card.id) ?? []), generation);
     } catch (cause) { if (generation === revision && !disposed) error = explainError(cause); }
     finally { if (generation === revision && !disposed) loading = false; }
   }
@@ -1774,6 +1794,7 @@
     </div>
     {#if agents}<span class="agents-chip" data-testid="card-agents" data-tone={agents.tone ?? undefined} data-asking={agents.asking || undefined} title={agentsTitle(agents)}><Bot size={11} aria-hidden="true" />{agents.working}{$boardAgents.complete ? "" : "+"}<span class="sr-only"> {agents.working === 1 ? "agent" : "agents"} working</span>{#if agents.asking}<span class="asking"> · {agents.asking} {agents.asking === 1 ? "needs" : "need"} you</span>{/if}</span>{/if}
     {#if flag}<span class="checkout-flag" data-testid="card-checkout" title={flag.detail}><AlertTriangle size={10} aria-hidden="true" /> {flag.label}</span>{/if}
+    {#if verdicts.get(card.id)}<CardVerdict verdict={verdicts.get(card.id)!} />{/if}
     {#if face.repo && cardFields.has("repo")}<div class="card-repos">{face.repo}{chrome.extraRepos ? ` +${chrome.extraRepos}` : ""}</div>{/if}
     {#if (chrome.kind && cardFields.has("type")) || (chrome.owner && cardFields.has("owner")) || (dueLabel(chrome.due) && cardFields.has("due"))}
       <div class="card-extra">
@@ -1811,6 +1832,7 @@
     <span class="row-title">{face.title}</span>{#if selected.has(card.id)}<span class="sr-only">, selected</span>{/if}
     {#if agents}<span class="agents-chip" data-testid="card-agents" data-tone={agents.tone ?? undefined} data-asking={agents.asking || undefined} title={agentsTitle(agents)}><Bot size={11} aria-hidden="true" />{agents.working}{$boardAgents.complete ? "" : "+"}<span class="sr-only"> {agents.working === 1 ? "agent" : "agents"} working</span>{#if agents.asking}<span class="asking"> · {agents.asking} {agents.asking === 1 ? "needs" : "need"} you</span>{/if}</span>{/if}
     {#if flag}<span class="checkout-flag" data-testid="card-checkout" title={flag.detail}>{flag.label}</span>{/if}
+    {#if verdicts.get(card.id)}<CardVerdict verdict={verdicts.get(card.id)!} />{/if}
     {#if openCardIds.has(card.id)}<span class="open-mark">Open</span>{/if}
     {#if face.repo && cardFields.has("repo")}<span class="muted">{face.repo}{chrome.extraRepos ? ` +${chrome.extraRepos}` : ""}</span>{/if}
     {#if chrome.owner && cardFields.has("owner")}<span class="muted">{chrome.owner}</span>{/if}
@@ -2136,6 +2158,7 @@
     {#if error}<div class="banner error" role="alert">{error}</div>{/if}
     <!-- Cards carry no agent marks while this stands: an old reading would
          claim agents nobody checked. -->
+    {#if verdictError}<p class="agents-unread" role="status" data-testid="board-verdicts-error">Verification verdicts could not be read, so cards show none: {verdictError}</p>{/if}
     {#if $boardAgents.error}<p class="agents-unread" role="status" data-testid="board-agents-error">Agents working on these tasks could not be read: {$boardAgents.error}</p>{/if}
     <!-- A check that could not run is said, not shown as a healthy checkout:
          those rows and cards carry no mark either way. -->
