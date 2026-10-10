@@ -813,8 +813,14 @@ const GENERIC_WORDS: &[&str] = &[
     "now",
     "still",
 ];
-/// Bound on the related tasks one refusal names.
+/// Bound on the related tasks one refusal names: a page of the review.
 pub(crate) const MAX_RELATED: usize = 25;
+/// Bound on the `item_id`s one `reviewed_related` may carry: every related
+/// task a repository can have that is worth reviewing one by one. A refusal
+/// names [`MAX_RELATED`] at a time, so a caller reviews page by page and passes
+/// back everything it has read so far; a cap equal to the page size would make
+/// the 26th related task impossible to file.
+pub(crate) const MAX_REVIEWED_RELATED: usize = 500;
 /// Bound on the open tasks read to look for related ones.
 const MAX_SCANNED_TASKS: usize = 2000;
 
@@ -1038,6 +1044,13 @@ pub(crate) fn add_task(
                     })
                     .collect();
                 let more = unreviewed.len().saturating_sub(MAX_RELATED);
+                let overflow = if related.tasks.len() > MAX_REVIEWED_RELATED {
+                    format!("\n{} open tasks look related, more than the {MAX_REVIEWED_RELATED} one call can review: fold this into one of them.", related.tasks.len())
+                } else if more > 0 {
+                    format!("\n…and {more} more. Review these, then call again with reviewed_related listing every item_id you have read so far; the next refusal names the following ones.")
+                } else {
+                    String::new()
+                };
                 return Err(WorkbenchError::new(
                     "related_tasks_exist",
                     format!(
@@ -1046,7 +1059,7 @@ pub(crate) fn add_task(
                         if unreviewed.len() == 1 { "" } else { "s" },
                         if unreviewed.len() == 1 { "it" } else { "them" },
                         listed.join("\n"),
-                        if more > 0 { format!("\n…and {more} more; narrow the title or fold this into one of these.") } else { String::new() },
+                        overflow,
                     ),
                 ));
             }
@@ -1480,12 +1493,6 @@ pub(crate) fn complete_task(
     for _ in 0..2 {
         let (id, item) = find_live_task(store, &repository_id, task)?;
         let revision = item["revision"].as_i64().unwrap_or_default();
-        if expected_revision.is_some_and(|expected| expected != revision) {
-            return Err(WorkbenchError::new(
-                "revision_conflict",
-                format!("The task is at revision {revision}, not {}; someone changed it. Re-read it with gitpulse_get_task before moving it.", expected_revision.unwrap_or_default()),
-            ));
-        }
         let previous = item["status"].as_str().unwrap_or_default().to_owned();
         let logs = item["logs"].as_str().unwrap_or_default();
         // An agent's `done` is a claim: it lands as `done` only where Manvi's
@@ -1525,8 +1532,18 @@ pub(crate) fn complete_task(
                 "sequence": sequence,
             })
         };
+        // Before the revision check: the identical call retried after its
+        // response was lost carries the revision it read, which its own first
+        // success has since moved. A retry whose state already matches is
+        // `unchanged`, not a conflict.
         if previous == status && (summary.is_none() || recorded) {
             return Ok(response("unchanged", &item, None));
+        }
+        if expected_revision.is_some_and(|expected| expected != revision) {
+            return Err(WorkbenchError::new(
+                "revision_conflict",
+                format!("The task is at revision {revision}, not {}; someone changed it. Re-read it with gitpulse_get_task before moving it.", expected_revision.unwrap_or_default()),
+            ));
         }
         if previous == "done" && status != "done" {
             return Err(WorkbenchError::new(
@@ -1979,7 +1996,19 @@ pub(crate) fn delete_task(
             Err(error) => return Err(error),
         };
         let revision = item["revision"].as_i64().unwrap_or_default();
-        if expected_revision.is_some_and(|expected| expected != revision) {
+        // A retry after a refused delete finds its own reason already there.
+        let recorded = ends_with_block(
+            item["logs"].as_str().unwrap_or_default(),
+            DELETION_MARKER,
+            reason,
+        );
+        // That earlier call's own block write moved the revision by one. Its
+        // error says "run the same call again", so the identical retry, still
+        // carrying the revision it first read, must not be refused for the
+        // change it made itself.
+        let finishing_own_delete =
+            recorded && expected_revision.is_some_and(|expected| revision == expected + 1);
+        if expected_revision.is_some_and(|expected| expected != revision) && !finishing_own_delete {
             return Err(WorkbenchError::new(
                 "revision_conflict",
                 format!("The task is at revision {revision}, not {}; someone changed it. Re-read it with gitpulse_get_task before deleting it.", expected_revision.unwrap_or_default()),
@@ -1987,12 +2016,6 @@ pub(crate) fn delete_task(
         }
         refuse_shared(&item, &repository_id)?;
         refuse_in_use(store, &id, &item, even_if_running)?;
-        // A retry after a refused delete finds its own reason already there.
-        let recorded = ends_with_block(
-            item["logs"].as_str().unwrap_or_default(),
-            DELETION_MARKER,
-            reason,
-        );
         let block = deletion_block(reason, now_millis());
         match record_and_delete(store, &id, &item, &block, recorded, "delete")? {
             Removal::Deleted(receipt) => {
