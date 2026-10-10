@@ -3566,7 +3566,7 @@ mod tests {
             Command::new("sh")
                 .arg("-c")
                 .arg(command)
-                .output()
+                .output_locked()
                 .expect("sh runs")
         };
         let commands = generated_commands(missing.to_str().unwrap());
