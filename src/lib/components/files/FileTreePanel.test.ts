@@ -306,4 +306,37 @@ describe("FileTreePanel rename and delete", () => {
     expect(remove.indexOf('"cmd_delete_path"')).toBeGreaterThan(asked);
     expect(remove).toContain("outcome.left_behind");
   });
+
+
+  /**
+   * The listing effect computed the status-membership key and then ignored
+   * it, so every store publish — each commit-message keystroke, each status
+   * poll — re-ran `cmd_list_repo_files`. It compares a value key now, and it
+   * has no teardown: Svelte runs a teardown before every re-run, so one that
+   * cancelled the load would drop it even on a memo hit.
+   */
+  it("reloads the listing only when the repository, status membership, or HEAD changes", () => {
+    expect(source).toContain("const currentRepo = $derived($repoStore.currentPath);");
+    expect(source).toContain("const statusMembership = $derived(statusPathKey($repoStore.statuses));");
+    const effect = source.slice(
+      source.indexOf("let lastListKey"),
+      source.indexOf("let listedPaths"),
+    );
+    expect(effect).not.toContain("$repoStore");
+    expect(effect).toContain("const key = `${repo}\\0${membership}\\0${head}`;");
+    const memo = effect.indexOf("if (key === lastListKey) return;");
+    expect(memo).toBeGreaterThan(-1);
+    expect(memo).toBeLessThan(effect.indexOf("void loadFiles(repo)"));
+    expect(effect).not.toMatch(/return \(\) =>/);
+    // Unmount cancellation stays, separate from the keyed effect.
+    expect(source).toContain("return () => inflight?.cancel();");
+  });
+
+  it("holds the listing as raw state and builds the tree apart from folding", () => {
+    expect(source).toContain("let files = $state.raw<string[]>([]);");
+    expect(source).toContain("let tree = $derived(buildFileTree(filteredPaths));");
+    const rows = source.slice(source.indexOf("let rows = $derived.by"), source.indexOf("let allCollapsed"));
+    expect(rows).toContain("flattenFileTree(tree,");
+    expect(rows).not.toContain("buildFileTree(");
+  });
 });

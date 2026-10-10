@@ -74,8 +74,14 @@
   let previewPaths = $derived(stagedFiles.map((s) => s.path));
   let previewPathsKey = $derived(previewPaths.slice().sort().join("\0"));
 
+  // `$repoStore.currentPath` read inside an effect tracks the whole store,
+  // which publishes a fresh object on every draft keystroke. A derived string
+  // compares by value, so the effects below re-run only when the repository
+  // or the staged-path key actually changes.
+  const currentRepo = $derived($repoStore.currentPath);
+
   $effect(() => {
-    const repo = $repoStore.currentPath;
+    const repo = currentRepo;
     void previewPathsKey;
     untrack(() => {
       void previewStore.refresh(repo, previewPaths);
@@ -88,7 +94,7 @@
   let blastGuard: AsyncGuard | null = null;
 
   $effect(() => {
-    const repo = $repoStore.currentPath;
+    const repo = currentRepo;
     void previewPathsKey;
     untrack(() => {
       const paths = previewPaths;

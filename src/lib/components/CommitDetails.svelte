@@ -172,10 +172,20 @@
   /** Monotonic: clicking through history faster than the fetch returns must
    *  never leave an earlier commit's provenance on a later one. */
   let provenanceToken = 0;
+  /** Reading `$repoStore.currentPath` in the effect would track the whole
+   *  store, which publishes on every draft keystroke and status poll; a
+   *  derived string compares by value and wakes the effect only on a switch. */
+  const provenanceRepo = $derived($repoStore.currentPath);
+  let provenanceKey = "";
 
   $effect(() => {
-    const repo = $repoStore.currentPath;
-    const id = $repoStore.selectedCommitId || $graphStore.selectedCommit?.id;
+    const repo = provenanceRepo;
+    const id = currentCommitId;
+    const key = `${repo ?? ""}\0${id ?? ""}`;
+    // Same repository, same commit: keep the badge and any fetch in flight.
+    // Only a new target blanks it and outdates the previous request.
+    if (key === provenanceKey) return;
+    provenanceKey = key;
     const mine = ++provenanceToken;
     provenance = null;
     if (!repo || !id) return;

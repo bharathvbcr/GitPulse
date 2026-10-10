@@ -263,9 +263,22 @@
     ),
   );
 
+  /**
+   * Selection fields as primitives, for the query effects below.
+   *
+   * repoStore publishes a fresh object on every commit-message keystroke and
+   * every ~6s status poll, and an effect that reads `$repoStore.x` directly
+   * re-runs on each of those publishes. A `$derived` of a primitive compares
+   * with strict equality, so an effect that reads these re-runs only when the
+   * repository, the file or the commit actually changed — not on every poll.
+   */
+  const currentRepoPath = $derived($repoStore.currentPath);
+  const currentFilePath = $derived($repoStore.selectedFilePath);
+  const currentCommitId = $derived($repoStore.selectedCommitId);
+
   $effect(() => {
-    const repoPath = $repoStore.currentPath;
-    const filePath = $repoStore.selectedFilePath;
+    const repoPath = currentRepoPath;
+    const filePath = currentFilePath;
     const rung = rungParam(minRung);
     impactGuard?.cancel();
     if (!repoPath || !filePath) {
@@ -569,10 +582,30 @@
     return hunkSymbols.get(key) ?? "";
   });
 
+  /**
+   * Last (repo, path, commit, hunk headers) the symbol lookup ran for. A plain
+   * `let`, never $state.
+   *
+   * The memo hit returns early, and Svelte runs an effect's teardown before
+   * every re-run — so cancellation lives in `hunkSymbolsGuard`, cancelled only
+   * when the key changes (or on destroy), never in a teardown that a memo hit
+   * would fire and leave the in-flight lookup dead with nothing to replace it.
+   */
+  let hunkSymbolsKey: string | null = null;
+  let hunkSymbolsGuard: AsyncGuard | null = null;
+
   $effect(() => {
-    const repo = $repoStore.currentPath;
+    const repo = currentRepoPath;
     const section = singleSection;
-    const commitId = $repoStore.selectedCommitId;
+    const commitId = currentCommitId;
+    const key =
+      repo && section?.path
+        ? [repo, section.path, commitId ?? "", ...section.hunks.map((h) => h.header)].join("\u0000")
+        : null;
+    if (key === hunkSymbolsKey) return;
+    hunkSymbolsKey = key;
+    hunkSymbolsGuard?.cancel();
+    hunkSymbolsGuard = null;
     if (!repo || !section?.path) {
       hunkSymbols = new Map();
       return;
@@ -588,7 +621,8 @@
         new_lines: nums.new_lines,
       };
     });
-    let cancelled = false;
+    const guard = createAsyncGuard();
+    hunkSymbolsGuard = guard;
     void (async () => {
       try {
         // Work: HEAD. History: parent first (old side), then the commit itself.
@@ -596,22 +630,21 @@
           ? [`${commitId}^`, commitId]
           : [await invoke<string>("cmd_get_head_id", { repoPath: repo })];
         for (const headSha of candidates) {
-          if (cancelled || !headSha) continue;
+          if (!guard.isLive() || !headSha) continue;
           const page = await symbolsForFile(repo, path, headSha);
-          if (cancelled) return;
+          if (!guard.isLive()) return;
           if (!page.available || !page.head_matches) continue;
           hunkSymbols = hunkSymbolLabels(hunks, page.items);
           return;
         }
-        if (!cancelled) hunkSymbols = new Map();
+        if (guard.isLive()) hunkSymbols = new Map();
       } catch {
-        if (!cancelled) hunkSymbols = new Map();
+        if (guard.isLive()) hunkSymbols = new Map();
       }
     })();
-    return () => {
-      cancelled = true;
-    };
   });
+
+  $effect(() => () => hunkSymbolsGuard?.cancel());
 
   // --- selection and staging ----------------------------------------------
 
@@ -718,7 +751,10 @@
   );
 
   $effect(() => {
-    const repo = $repoStore.currentPath;
+    // Both dependencies are strings compared by value, so a repoStore publish
+    // that changed neither the repository nor the change-set's paths does not
+    // re-issue the layered walk.
+    const repo = currentRepoPath;
     void changeSetPathsKey;
     untrack(() => {
       const paths = rail.entries.map((e) => e.path);

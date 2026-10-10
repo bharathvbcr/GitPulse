@@ -328,19 +328,38 @@
     $repoStore.branches.find((b) => b.is_default && !b.is_remote)?.name ?? null,
   );
 
-  $effect(() => {
-    const path = $repoStore.currentPath;
-    const tips = branchTips;
-    const base = defaultBranchName;
-    if (!path || tips.length === 0) return;
-    void freshnessStore.load(path, tips, base);
-  });
+  // Both reads below would otherwise track the whole repo store, which
+  // publishes a fresh object on every draft keystroke and status poll; and
+  // `branchTips` is a fresh array on every publish. Deriveds of strings compare
+  // by value, so this effect wakes only when the repository, the set of tips,
+  // or the base actually changes.
+  const freshnessRepo = $derived($repoStore.currentPath);
+  // Tip ids are shas — no newlines — so the key splits back losslessly.
+  const branchTipsKey = $derived(branchTips.join("\n"));
 
+  // `undefined` so the first run resets too, as it always has: the shared
+  // store may still hold another repository's answers from before mount.
+  let lastFreshnessRepo: string | null | undefined = undefined;
+  let lastFreshnessKey = "";
   $effect(() => {
+    const path = freshnessRepo;
+    const tipsKey = branchTipsKey;
+    const base = defaultBranchName;
     // A repository switch must not leave the previous repository's
-    // verifications painted onto this one's branches.
-    void $repoStore.currentPath;
-    freshnessStore.reset();
+    // verifications painted onto this one's branches. Only a real switch:
+    // the store is shared with GitHubPanel's PR badges, and a reset also
+    // voids whatever load is in flight. It runs before the load below, never
+    // after it, or it would void this effect's own request.
+    if (path !== lastFreshnessRepo) {
+      lastFreshnessRepo = path;
+      lastFreshnessKey = "";
+      freshnessStore.reset();
+    }
+    if (!path || tipsKey.length === 0) return;
+    const key = `${path}\0${tipsKey}\0${base ?? ""}`;
+    if (key === lastFreshnessKey) return;
+    lastFreshnessKey = key;
+    void freshnessStore.load(path, tipsKey.split("\n"), base);
   });
 
   function selectRef(name: string) {

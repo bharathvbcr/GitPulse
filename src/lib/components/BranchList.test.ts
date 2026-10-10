@@ -455,4 +455,32 @@ describe("BranchList at-a-glance tooltips", () => {
     expect(source).toContain('"{branch.ahead_count} ahead of upstream"');
     expect(source).toContain('"{branch.behind_count} behind upstream"');
   });
+
+
+  /**
+   * The freshness load and the reset used to be two effects that both tracked
+   * the whole repo store, so every keystroke and status poll ran load and then
+   * reset — and the reset bumped the shared store's token, voiding the load it
+   * had just issued and wiping GitHubPanel's PR badges with it. One effect now
+   * resets on a real repository switch, before loading, and loads only when
+   * the repository, the tip set, or the base changes.
+   */
+  it("resets freshness only on a repository switch and loads on a value key", () => {
+    const start = source.indexOf("const freshnessRepo = $derived($repoStore.currentPath);");
+    expect(start).toBeGreaterThan(-1);
+    const block = source.slice(start, source.indexOf("function selectRef"));
+    expect(block).toContain('const branchTipsKey = $derived(branchTips.join("\\n"));');
+    const effect = block.slice(block.indexOf("$effect(() => {"));
+    expect(effect).not.toContain("$repoStore");
+    expect(effect).not.toContain("branchTips;");
+    expect(effect).toContain("if (path !== lastFreshnessRepo) {");
+    expect(effect).toContain("const key = `${path}\\0${tipsKey}\\0${base ?? \"\"}`;");
+    expect(effect).toContain("if (key === lastFreshnessKey) return;");
+    // Reset strictly precedes load: the other order voids the load's own token.
+    expect(effect.indexOf("freshnessStore.reset()")).toBeLessThan(
+      effect.indexOf("freshnessStore.load("),
+    );
+    expect(source.match(/freshnessStore\.reset\(\)/g)).toHaveLength(1);
+    expect(source.match(/freshnessStore\.load\(/g)).toHaveLength(1);
+  });
 });

@@ -72,4 +72,26 @@ describe("LivePulseDashboard", () => {
   it("does not constrain the Active Changes list to a fixed small height window", () => {
     expect(source).not.toContain("max-h-64");
   });
+
+
+  /**
+   * The selection effect reads `$repoStore`, which publishes on every draft
+   * keystroke and status poll; without a key each publish cancelled and
+   * re-issued the history read for the file already shown. A moved HEAD is in
+   * the key so a commit, pull, or checkout still refreshes the history.
+   */
+  it("reloads file details only when repository, selection, or HEAD changes", () => {
+    const selectionEffect = source.slice(
+      source.lastIndexOf("$effect(() =>"),
+      source.indexOf("</script>"),
+    );
+    expect(selectionEffect).toContain("b.is_current && !b.is_remote");
+    expect(selectionEffect).toContain("const key = `${repo ?? \"\"}\\0${selectedFile ?? \"\"}\\0${head}`;");
+    const memo = selectionEffect.indexOf("if (key === lastDetailsKey) return;");
+    expect(memo).toBeGreaterThan(-1);
+    expect(memo).toBeLessThan(selectionEffect.indexOf("loadFileDetails(repo, selectedFile)"));
+    expect(memo).toBeLessThan(selectionEffect.indexOf("commitGuard?.cancel()"));
+    // No teardown: it would run before a memo-hit re-run and kill the load.
+    expect(selectionEffect).not.toMatch(/return \(\) =>/);
+  });
 });

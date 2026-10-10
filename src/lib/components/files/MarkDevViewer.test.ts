@@ -75,6 +75,21 @@ describe("MarkDevViewer", () => {
     expect(source).toContain("renderError = formatError(err);");
   });
 
+  it("re-renders and refetches backlinks only when the note itself changes", () => {
+    // repoStore publishes a fresh object per keystroke and per status poll.
+    // `note` and the backlinks effect read a strictly-equal derived of the
+    // repository path, so an unrelated publish rebuilds neither.
+    expect(source).toContain("const repoPath = $derived($repoStore.currentPath);");
+    const noteAt = source.indexOf("let note = $derived");
+    expect(noteAt).toBeGreaterThan(-1);
+    expect(source.slice(noteAt, source.indexOf(");", noteAt))).not.toContain("$repoStore");
+    const backlinksAt = source.indexOf("docsBacklinks(repo, path)");
+    expect(backlinksAt).toBeGreaterThan(-1);
+    const effect = source.slice(source.lastIndexOf("$effect(() => {", backlinksAt), backlinksAt);
+    expect(effect).toContain("const repo = repoPath;");
+    expect(effect).not.toContain("$repoStore");
+  });
+
   it("scrolls the rendered page inside the pane", () => {
     expect(source).toContain("min-h-0 min-w-0");
     expect(source).toContain("overflow-auto gp-scroll");

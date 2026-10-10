@@ -338,6 +338,44 @@ describe("DiffViewer store-emission memo guards", () => {
     expect(source.slice(idx, idx + 300)).toContain("guard.isLive()");
   });
 
+  /** Slice of the `$effect(() => {` block that contains `marker`. */
+  function effectContaining(marker: string): string {
+    const at = source.indexOf(marker);
+    expect(at).toBeGreaterThan(-1);
+    const start = source.lastIndexOf("$effect(() => {", at);
+    expect(start).toBeGreaterThan(-1);
+    const end = source.indexOf("\n  });\n", at);
+    return source.slice(start, end);
+  }
+
+  it("keys the codeintel query effects on primitives, not on every repoStore publish", () => {
+    // `$repoStore.x` inside an effect subscribes to the whole store, and the
+    // store publishes a fresh object per keystroke and per status poll. The
+    // query effects read strictly-equal deriveds instead.
+    expect(source).toContain("const currentRepoPath = $derived($repoStore.currentPath);");
+    expect(source).toContain("const currentFilePath = $derived($repoStore.selectedFilePath);");
+    expect(source).toContain("const currentCommitId = $derived($repoStore.selectedCommitId);");
+    for (const marker of [
+      "getImpactAtRung(repoPath, filePath",
+      'invoke<string>("cmd_get_head_id"',
+      "getImpactLayeredMany(repo, kept",
+    ]) {
+      expect(effectContaining(marker)).not.toContain("$repoStore");
+    }
+  });
+
+  it("memoizes the hunk-symbol lookup without cancelling it from a teardown", () => {
+    // A memo hit returns early, and Svelte runs the previous teardown before
+    // every re-run: a teardown-based cancel would kill the in-flight lookup
+    // and the early return would never restart it.
+    const effect = effectContaining('invoke<string>("cmd_get_head_id"');
+    expect(effect).toContain("if (key === hunkSymbolsKey) return;");
+    expect(effect).toContain("hunkSymbolsGuard?.cancel();");
+    expect(effect).toContain("guard.isLive()");
+    expect(effect).not.toMatch(/return \(\) => \{\s*cancelled = true;\s*\};/);
+    expect(source).toContain("$effect(() => () => hunkSymbolsGuard?.cancel());");
+  });
+
   it("loads change-set blast via getImpactLayeredMany and shows omitted counts", () => {
     expect(source).toContain("getImpactLayeredMany");
     expect(source).toContain("composeLayeredImpacts");

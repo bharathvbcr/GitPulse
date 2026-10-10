@@ -186,8 +186,22 @@
     lastRefreshed = Date.now();
   });
 
+  // `$repoStore.currentPath` tracks the whole store, which publishes a fresh
+  // object on every draft keystroke and status poll. The key keeps those
+  // re-runs from cancelling and re-issuing the history read for the same file.
+  // A new repository or selection reloads, and so does a moved HEAD — a
+  // commit, pull or checkout is what can change this file's history, and the
+  // per-publish reload used to pick that up by accident. No teardown cancels
+  // the load, so a memo hit leaves it in flight: `loadFileDetails` cancels its
+  // own predecessor, and unmount is handled in `onMount`.
+  let lastDetailsKey = "";
   $effect(() => {
     const repo = $repoStore.currentPath;
+    const head =
+      $repoStore.branches.find((b) => b.is_current && !b.is_remote)?.tip_commit_id ?? "";
+    const key = `${repo ?? ""}\0${selectedFile ?? ""}\0${head}`;
+    if (key === lastDetailsKey) return;
+    lastDetailsKey = key;
     if (repo && selectedFile) {
       void loadFileDetails(repo, selectedFile);
     } else {
