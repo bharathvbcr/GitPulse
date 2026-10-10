@@ -11,6 +11,16 @@ before that tag is pushed.
 
 ## [Unreleased]
 
+### Fixed
+
+- A new test holds what GitPulse sends Manvi to Manvi's published serve
+  contract (`contracts/serve.ops.schema.json`): a field on the Rust host scope
+  or policy params the contract does not declare, or a profile-worker op the
+  harness does not serve, now fails the build instead of being dropped silently
+  at runtime. That is how a task's allowed commands once stopped being honoured.
+- The module-integration guide no longer shows board edits going through Manvi;
+  they run in-process on the vendored store.
+
 ## [1.4.0] - 2026-10-09
 
 Agents that start in the background with a pane showing every one at work,

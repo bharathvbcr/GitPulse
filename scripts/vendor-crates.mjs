@@ -598,6 +598,24 @@ export function contractFiles(dir) {
 }
 
 /**
+ * Contracts Manvi owns, copied here by hand from Manvi's `contracts/`.
+ * DevCouncil's directory never carries them, so the vendor refresh must neither
+ * delete them nor report them as local edits; `scripts/serve-ops-contract.test.ts`
+ * holds this copy to Manvi's instead.
+ */
+export const MANVI_OWNED_CONTRACTS = new Set(["serve.ops.schema.json"]);
+
+/**
+ * The vendored contract files, without the ones Manvi owns.
+ * @param {string} dir
+ */
+function vendoredContractFiles(dir) {
+  const files = contractFiles(dir);
+  if (files === null) return null;
+  return Object.fromEntries(Object.entries(files).filter(([name]) => !MANVI_OWNED_CONTRACTS.has(name)));
+}
+
+/**
  * Record and copy DevCouncil's contracts into CONTRACTS_DIR.
  *
  * Runs after the crate tree is installed, and writes each file through a
@@ -636,7 +654,7 @@ function installContracts(from, contracts) {
     cpSync(path.join(from, name), temp);
     renameSync(temp, path.join(CONTRACTS_DIR, name));
   }
-  for (const name of Object.keys(contractFiles(CONTRACTS_DIR) ?? {})) {
+  for (const name of Object.keys(vendoredContractFiles(CONTRACTS_DIR) ?? {})) {
     if (!(name in contracts.files)) rmSync(path.join(CONTRACTS_DIR, name));
   }
 }
@@ -972,7 +990,7 @@ export function check(env = process.env) {
  */
 function checkContracts(manifest, bySource) {
   const recorded = manifest.contracts;
-  const local = contractFiles(CONTRACTS_DIR);
+  const local = vendoredContractFiles(CONTRACTS_DIR);
   if (!recorded && local === null) return null;
   /** @type {CrateCheck} */
   const result = { name: "contracts", edited: [], upstream: "unavailable", drifted: [], reason: "" };
