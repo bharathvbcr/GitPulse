@@ -33,6 +33,9 @@ describe("TaskBoard", () => {
     expect(source).toContain("onpointerdown");
     expect(source).toContain("onpointerup");
     expect(source).toContain("skipClick");
+    // The guard is lifted by a timer, never by a frame a hidden window does not run.
+    expect(source).toContain("skipClickTimer = setTimeout(() => { skipClick = false; }, 0);");
+    expect(source).not.toMatch(/requestAnimationFrame\(\(\) => \{ skipClick/);
     expect(source).toContain("onCardClick");
     expect(source).toContain("data-task-column");
     expect(source).toContain('draggable="false"');
@@ -486,17 +489,25 @@ describe("TaskBoard search and filters", () => {
    */
   it("sends the store only the search's free text, never its filters", () => {
     expect(source).toContain("const parsedQuery = $derived(parseTaskQuery(search));");
-    expect(source).toContain("const boardKey = $derived(JSON.stringify([scope, serverQuery]));");
-    expect(source).toContain("async function loadBoard(target: Scope = scope, query: string = serverQuery)");
-    expect(source).toContain("const target = scope, query = serverQuery;");
-    expect(source).toContain("await listTasks(scope, status, serverQuery, cursor, TASK_PAGE_SIZE, BOARD)");
+    // The store is asked for one word (`serverWord`) beside the candidate
+    // set; the fetch key is the plan's, so typing a filter re-reads nothing.
+    expect(source).toContain("const plan = $derived(planSearch(scope, parsedQuery, facet, repositories, repositoryCursor === null));");
+    expect(source).toContain("const boardKey = $derived(JSON.stringify([scope, plan.key]));");
+    expect(source).toContain("async function loadBoard(target: Scope = scope, current: SearchPlan = plan)");
+    expect(source).toContain("const target = untrack(() => scope), current = untrack(() => plan);");
+    expect(source).toContain("listTasks(current.scope, null, current.word, undefined, CANDIDATE_PAGE, BOARD)");
+    expect(source).toContain("await listTasks(scope, status, \"\", cursor, TASK_PAGE_SIZE, BOARD)");
     expect(source, "a listTasks call still sends the raw search box").not.toMatch(/listTasks\([^)]*\bsearch\b/);
   });
 
   it("decides what is on screen in one place, for the columns, selection and select-all", () => {
     expect(source).toContain("cardMatchesFacet(card, facet, now) && cardMatchesQuery(card, parsedQuery, queryContext)");
     expect(source.match(/cardMatchesFacet\(/g)).toHaveLength(1);
-    expect(source.match(/flattenVisibleIds\(displayColumns, shown, cardVisible\)/g)).toHaveLength(3);
+    // Range and select-all follow the drawn order, which Relevance reorders.
+    expect(source.match(/flattenVisibleIds\(drawnColumns, shown, cardVisible\)/g)).toHaveLength(3);
+    expect(source).not.toContain("flattenVisibleIds(displayColumns");
+    // The words narrow through the same test, never a second one.
+    expect(source).toContain("return filtersHold(card) && (ranking === null || ranked.byId.has(card.id));");
     // A filter change still clears a selection that may now be off screen.
     expect(source).toContain("$effect(() => { boardKey; JSON.stringify(facet); search; selected = new Set();");
   });
@@ -507,7 +518,11 @@ describe("TaskBoard search and filters", () => {
     expect(source).toContain("search = toggleQueryTerm(search, quick.filter)");
     expect(source).toContain('{ label: "Bugs", filter: "is:bug" }');
     expect(source).toContain('data-testid="task-query-coverage"');
-    expect(source).toContain("Load more in a column to filter the rest");
+    // Filters reach every task through the candidate set now, not just the
+    // loaded column pages; the coverage line says how much was read.
+    expect(source).toContain("describeSearch({ matched: visibleCount, set: candidates,");
+    expect(source).toContain(">Load more tasks</button>");
+    expect(source).toContain("queryChips(parsedQuery)");
     expect(source).toContain('data-testid="task-filter-repository"');
     // A repository filter carried onto a repository's board stays visible, or
     // it would empty that board with no control saying why.
@@ -527,5 +542,29 @@ describe("TaskBoard search and filters", () => {
     // Reordering against a filtered list would swap with a row the reader cannot see.
     expect(source).toContain("if (movingGroup || busy || navFiltering) return;");
     expect(source).toContain("search covers loaded rows");
+  });
+});
+
+describe("TaskBoard ranking", () => {
+  const fn = (name: string) => {
+    const start = source.indexOf(`function ${name}(`);
+    return source.slice(start, source.indexOf("\n  }\n", start));
+  };
+
+  it("never moves a card by a position read from a ranked order", () => {
+    expect(source).toContain('const reorderLocked = $derived(searching && order === "relevance");');
+    expect(fn("onCardPointerDown")).toContain("reorderLocked");
+    expect(fn("nudgeCard")).toContain("reorderLocked");
+    // Re-spacing a column needs all of it; a partial candidate set is not.
+    expect(fn("dropCard")).toContain("!candidatesComplete(candidates)");
+  });
+
+  it("does not credit description hits read for another word", () => {
+    expect(source).toContain("const hits = loadedKey === boardKey ? candidates?.textHits : undefined, word = plan.word;");
+  });
+
+  it("offers Relevance and Board order only for a search with words", () => {
+    expect(source).toContain("{#if searching && parsedQuery.words}");
+    expect(source).toContain('const order = $derived<SearchOrder>(searching && parsedQuery.words ? sort : "board");');
   });
 });

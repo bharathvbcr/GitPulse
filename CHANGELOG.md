@@ -80,6 +80,20 @@ before that tag is pushed.
   action and agent hook; dead-branch scans and cleans read the worktree list
   once rather than once per branch; the update check, persisted log and MCP
   info no longer block the interface thread or a shared runtime worker.
+- **Ranked task search on one shared parser.** The Tasks board, the archive dock
+  and the navigator's find box keep one search language (`taskQuery.ts`), which
+  now also reads `"phrases"`, `OR` between words, and comma lists for any of
+  several values (`label:ui,ci`), and reports a stray `OR` or an unknown
+  `todo:fix` instead of dropping it. A search or Filters choice reads one
+  candidate set for the board (200 at a time, **Load more tasks** up to 2,000)
+  plus one full-text read for the most selective word, so filters reach every
+  task rather than the loaded column pages and descriptions still match. Words
+  are ranked locally — word forms, related software terms, parts of words and
+  close spellings, weighted by field and rarity — with **Relevance** or **Board
+  order**; dragging and keyboard reordering are off under Relevance. A line
+  under the search says what was read and never lets a partial answer read as
+  complete, cards say why they matched when it is not obvious, and the search
+  box completes filter names and values. Lexical ranking, not embeddings.
 
 ### Fixed
 

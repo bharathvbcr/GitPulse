@@ -2,11 +2,16 @@ import { describe, expect, it } from "vitest";
 import type { TaskCard } from "./client";
 import {
   cardMatchesQuery,
+  isEmptyQuery,
   MAX_QUERY_TERMS,
   MAX_QUERY_TEXT,
   parseTaskQuery,
+  queryChips,
   queryHas,
   removeQueryTerm,
+  replaceToken,
+  suggest,
+  tokenAtCaret,
   toggleQueryTerm,
   type QueryContext,
 } from "./taskQuery";
@@ -254,5 +259,148 @@ describe("removeQueryTerm and toggleQueryTerm", () => {
     expect(toggleQueryTerm("crash", "nonsense")).toBe("crash");
     const full = "x".repeat(MAX_QUERY_TEXT - 2);
     expect(toggleQueryTerm(full, "is:bug")).toBe(full);
+  });
+});
+
+describe("words, phrases, OR and comma lists", () => {
+  it("reads words as clauses that must all match, folded for ranking", () => {
+    const parsed = parseTaskQuery("Login crash");
+    expect(parsed.words).toEqual({ clauses: [["login"], ["crash"]], phrases: [] });
+    expect(parsed.text).toBe("Login crash");
+    expect(isEmptyQuery(parsed)).toBe(false);
+  });
+
+  it("joins words around OR into one clause and keeps the alternatives away from the store", () => {
+    const parsed = parseTaskQuery("login OR signin crash");
+    expect(parsed.words?.clauses).toEqual([["login", "signin"], ["crash"]]);
+    // A prefix-AND store would demand both alternatives.
+    expect(parsed.text).toBe("crash");
+    expect(parsed.problems).toEqual([]);
+    expect(parseTaskQuery("bug | crash").words?.clauses).toEqual([["bug", "crash"]]);
+    // Lower-case "or" is a word, and a stopword.
+    expect(parseTaskQuery("login or signin").words?.clauses).toEqual([["login"], ["signin"]]);
+  });
+
+  it("reports an OR with nothing to join instead of dropping it silently", () => {
+    for (const query of ["OR crash", "crash OR", "crash OR is:bug", "is:bug OR crash"]) {
+      const parsed = parseTaskQuery(query);
+      expect(parsed.problems.join(" "), query).toMatch(/OR joins two words/);
+      expect(parsed.text.split(" "), query).toContain("crash");
+    }
+    // A doubled OR is reported once and the words still alternate.
+    const doubled = parseTaskQuery("crash OR OR fix");
+    expect(doubled.problems).toHaveLength(1);
+    expect(doubled.words?.clauses).toEqual([["crash", "fix"]]);
+  });
+
+  it("splits an OR alternative of several words like the branch did: first word alternates, the rest are required", () => {
+    expect(parseTaskQuery("crash OR dark-mode").words?.clauses).toEqual([["crash", "dark"], ["mode"]]);
+  });
+
+  it("reads quoted phrases for ranking and still sends their words to the store", () => {
+    const parsed = parseTaskQuery('the "Sign In" crash');
+    expect(parsed.words).toEqual({ clauses: [["crash"]], phrases: ["sign in"] });
+    expect(parsed.text).toBe('the Sign In crash');
+  });
+
+  it("searches stopwords only when they are all there is", () => {
+    expect(parseTaskQuery("the crash").words?.clauses).toEqual([["crash"]]);
+    expect(parseTaskQuery("the").words?.clauses).toEqual([["the"]]);
+  });
+
+  it("reads a comma list as any of its values, one term per value sharing the token's span", () => {
+    const parsed = parseTaskQuery("label:ui,ci,ui priority:urgent,p1");
+    expect(parsed.terms.map((term) => [term.key, term.value, term.raw])).toEqual([
+      ["label", "ui", "label:ui,ci,ui"], ["label", "ci", "label:ui,ci,ui"],
+      ["priority", "0", "priority:urgent,p1"], ["priority", "1", "priority:urgent,p1"],
+    ]);
+    expect(parseTaskQuery('owner:"Smith, Jo"').terms.map((term) => term.value)).toEqual(["smith, jo"]);
+    expect(matches("label:ci,ui")).toBe(true);
+    expect(matches("label:ci,docs")).toBe(false);
+    expect(matches("-label:ci,ui")).toBe(false);
+    expect(matches("priority:urgent,high")).toBe(true);
+  });
+
+  it("applies the readable values of a list and reports the rest", () => {
+    const parsed = parseTaskQuery("priority:high,huge");
+    expect(parsed.terms.map((term) => term.value)).toEqual(["1"]);
+    expect(parsed.problems[0]).toMatch(/priority:huge is not a priority/);
+  });
+
+  it("warns about a key that is not a filter, but not about a URL or a time", () => {
+    expect(parseTaskQuery("todo:fix").problems[0]).toMatch(/todo: is not a filter/);
+    expect(parseTaskQuery("https://x.y 10:30 note:").problems).toEqual([]);
+  });
+
+  it("is empty only with nothing to search or filter by", () => {
+    for (const query of ["", "   ", "!!! ...", "is:", "OR"]) expect(isEmptyQuery(parseTaskQuery(query)), query).toBe(true);
+    expect(isEmptyQuery(parseTaskQuery("is:bug"))).toBe(false);
+    expect(isEmptyQuery(parseTaskQuery('"x"'))).toBe(false);
+  });
+
+  it("never throws on odd input", () => {
+    for (const text of ['"', '-"', "-", ":", "-:", "a:", '"unterminated phrase', "\u0000\u{1F600}", "OR OR OR", "label:,,,", 'label:"', "|"]) {
+      expect(() => parseTaskQuery(text), text).not.toThrow();
+    }
+  });
+});
+
+describe("chips and toggles over comma lists", () => {
+  it("draws one chip per token", () => {
+    expect(queryChips(parseTaskQuery("label:ui,ci is:bug")).map((term) => term.raw)).toEqual(["label:ui,ci", "is:bug"]);
+  });
+
+  it("toggles one value out of a list and keeps the rest as typed", () => {
+    expect(toggleQueryTerm("crash is:bug,feature", "is:bug")).toBe("crash is:feature");
+    expect(toggleQueryTerm("is:feature,bug,research", "type:bug")).toBe("is:feature,research");
+    expect(toggleQueryTerm("is:bug,bugs", "is:bug")).toBe("is:bugs");
+    expect(toggleQueryTerm("priority:huge,urgent", "priority:p0")).toBe("priority:huge");
+    expect(toggleQueryTerm("label:ui,ci", "label:ui")).toBe("label:ci");
+  });
+});
+
+describe("completions", () => {
+  const sources = { label: ["ui", "a11y", "needs design"], kind: ["improvement"] };
+
+  it("completes key names from two letters", () => {
+    expect(suggest("la", sources).map((s) => s.insert)).toEqual(["label:"]);
+    expect(suggest("-re", sources).map((s) => s.insert)).toEqual(["-repo:"]);
+    expect(suggest("du", sources).map((s) => s.insert)).toEqual(["due:"]);
+    expect(suggest("l", sources)).toEqual([]);
+    expect(suggest("label", sources)).toEqual([]);
+    expect(suggest("login", sources)).toEqual([]);
+  });
+
+  it("completes values, prefix matches first, after the last comma, quoting as needed", () => {
+    expect(suggest("label:", sources).map((s) => s.insert)).toEqual(["label:ui", "label:a11y", 'label:"needs design"', "label:none"]);
+    expect(suggest("tag:ne", sources)[0]).toEqual({ label: "tag:needs design", detail: "", insert: 'tag:"needs design"' });
+    expect(suggest("label:ui,a", sources).map((s) => s.insert)).toEqual(["label:ui,a11y"]);
+    expect(suggest("label:ui,d", sources).map((s) => s.insert)).toEqual(['label:ui,"needs design"']);
+    expect(suggest("label:ui", sources)).toEqual([]);
+  });
+
+  it("offers fixed vocabularies and the board's own is: words without loaded tasks", () => {
+    expect(suggest("status:in", {}).map((s) => s.insert)).toEqual(["status:inbox", "status:in_progress"]);
+    expect(suggest("is:", sources).map((s) => s.insert)).toEqual(["is:open", "is:closed", "is:done", "is:unassigned", "is:overdue", "is:improvement"]);
+    expect(suggest("priority:", {}).length).toBe(4);
+    expect(suggest("due:", {}).map((s) => s.insert)).toEqual(["due:overdue", "due:soon", "due:later", "due:none", "due:any"]);
+    expect(suggest("nope:x", {})).toEqual([]);
+  });
+
+  it("every completion parses as the filter it names", () => {
+    for (const option of [...suggest("label:", sources), ...suggest("is:", sources), ...suggest("status:", {}), ...suggest("due:", {})]) {
+      const parsed = parseTaskQuery(option.insert);
+      expect(parsed.problems, option.insert).toEqual([]);
+      expect(parsed.terms.length, option.insert).toBeGreaterThan(0);
+    }
+  });
+
+  it("finds the token under the caret and replaces it", () => {
+    const at = tokenAtCaret("crash label:u", 13);
+    expect(at?.prefix).toBe("label:u");
+    expect(replaceToken("crash label:u", at?.index ?? -1, "label:ui")).toEqual({ text: "crash label:ui ", caret: 15 });
+    expect(replaceToken("la crash", 0, "label:")).toEqual({ text: "label: crash", caret: 6 });
+    expect(replaceToken("label:u crash", 0, "label:ui")).toEqual({ text: "label:ui crash", caret: 9 });
+    expect(tokenAtCaret("crash ", 6)).toBeNull();
   });
 });
