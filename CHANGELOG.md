@@ -11,6 +11,22 @@ before that tag is pushed.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Panels no longer reset or re-ask when the repository store publishes
+  something they do not read.** An armed "click again to remove" on a
+  worktree stayed armed through a status poll, the GitHub spinner clears when
+  its answer lands even if the store published mid-fetch, "Show more" on the
+  Overview keeps its rows, and the line-count, storage and language metrics
+  keep one subscription instead of resubscribing (and recording a pulse
+  history point) per publish. Effects now key on `repoStore.currentPath`, a
+  store that notifies only when the active repository changes, or on values
+  compared by value; the hand-kept `prev*` guards they replaced are gone, and
+  a contract test fails if an `$effect` reads `$repoStore` again. The branch
+  list and pull-request list each hold their own freshness token, so one
+  list's success no longer clears the other's error. `harness/repo-churn.html`
+  drives fifteen panels through unrelated publishes in Chrome and WebKit.
+
 ### Changed
 
 - CI now fails when a vendored crate is edited in this repository, through the

@@ -14,7 +14,7 @@
     WrapText,
   } from "@lucide/svelte";
   import { openInDefaultApp } from "../../desktop/openInShell";
-  import { repoStore } from "../../stores/repoStore";
+  import { currentRepoPath, repoStore } from "../../stores/repoStore";
   import type { LineEnding } from "../../files/types";
   import { formatError } from "../../ui/formatError";
   import { copyText } from "../../desktop/clipboard";
@@ -82,7 +82,7 @@
    * object each time, which re-rendered the page (re-encoding its pictures)
    * and refetched the backlinks on every publish.
    */
-  const repoPath = $derived($repoStore.currentPath);
+  const repoPath = $derived($currentRepoPath);
   let note = $derived<MarkdownNote | null>(
     repoPath && filePath ? { repoPath, path: filePath } : null,
   );

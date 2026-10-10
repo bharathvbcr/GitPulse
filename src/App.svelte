@@ -5,7 +5,7 @@
   import { onDestroy, onMount, tick, untrack } from "svelte";
   import { invoke } from "./lib/ipc/invoke";
   import { listen } from "@tauri-apps/api/event";
-  import { repoStore, pathsTrustedForBackground } from "./lib/stores/repoStore";
+  import { currentRepoPath, repoStore, pathsTrustedForBackground } from "./lib/stores/repoStore";
   import { repoMetrics } from "./lib/metrics/repoMetrics";
   import { liveIndex } from "./lib/codeintel/liveIndex";
   import { autoInit } from "./lib/codeintel/autoInit";
@@ -219,8 +219,6 @@
   });
   let dropActive = $state(false);
   let headerScroller: HTMLDivElement | undefined = $state();
-  /** Repo path the modal-close effect last saw; poll-tick emissions skip. */
-  let lastModalRepoPath: string | null = null;
   const macos = isMacOS();
 
   // --- terminal dock --------------------------------------------------------
@@ -260,8 +258,9 @@
   // looked away had nothing to report and nothing to copy. Diagnostics already
   // captures uncaught errors, rejections and console output; a store error is
   // the same class of event and belongs in the same log.
+  const repoError = $derived($repoStore.error);
   $effect(() => {
-    const err = $repoStore.error;
+    const err = repoError;
     if (err) {
       untrack(() => {
         diagnostics.error("repo:operation", err);
@@ -310,12 +309,15 @@
     };
   });
 
+  const activeView = $derived($repoStore.activeTab);
+  const activeSection = $derived(activeSectionFor($repoStore.activeTab, $repoStore.viewSections));
+  const selectedFilePath = $derived($repoStore.selectedFilePath);
   $effect(() => {
     paneCrashes.observe({
-      view: $repoStore.activeTab,
-      section: activeSectionFor($repoStore.activeTab, $repoStore.viewSections),
-      repo: $repoStore.currentPath,
-      file: $repoStore.selectedFilePath,
+      view: activeView,
+      section: activeSection,
+      repo: $currentRepoPath,
+      file: selectedFilePath,
     });
   });
 
@@ -890,10 +892,10 @@
   });
   onDestroy(() => graphScheduler.reset());
 
+  const trustRequired = $derived($repoStore.trustRequired);
   $effect(() => {
-    const refused = $repoStore.trustRequired;
     graphScheduler.sync({
-      path: refused ? null : $repoStore.currentPath,
+      path: trustRequired ? null : $currentRepoPath,
       query: $filterStore.searchQuery,
       revision: $filterStore.selectedBranch,
       // Which refs the graph walks is part of WHICH GRAPH this is, so a
@@ -947,30 +949,24 @@
     applyTabWidth($interfaceStore.tabWidth);
   });
 
+  const currentBranch = $derived($repoStore.currentBranch);
   $effect(() => {
-    void syncWindowChrome(
-      repoWindowTitle($repoStore.currentPath, $repoStore.currentBranch),
-      conflictedCount,
-    );
+    void syncWindowChrome(repoWindowTitle($currentRepoPath, currentBranch), conflictedCount);
   });
 
   // Catching up on a newly-opened repository.
   //
   // Correctness never depends on GitPulse having been running: git's reflog and
   // the agent transcripts both recorded what happened while it was closed, and
-  // this replays them into the ledger. Guarded on a genuine repo switch because
-  // the effect re-runs on every store emission — the ~6s status poll included.
-  let lastCaughtUpPath: string | null = null;
+  // this replays them into the ledger. Keyed on the repository and its trust,
+  // both compared by value: activating the journal on every status poll
+  // republished harnessStore synchronously, a second reactive clock on the
+  // same tick as every $harnessStore subscriber — the shape that becomes
+  // effect_update_depth_exceeded once any of those writes repoStore. Only a
+  // genuine path change, or trust arriving for it, may switch.
   $effect(() => {
-    const path = $repoStore.currentPath;
-    if ($repoStore.trustRequired) return;
-    // Status polls rebuild repoStore and re-run this effect. Activating the
-    // journal on every emission republishes harnessStore synchronously, which
-    // is a second reactive clock on the same tick as every $harnessStore
-    // subscriber — the shape that becomes effect_update_depth_exceeded once
-    // any of those writes repoStore. Only a genuine path change may switch.
-    if (path === lastCaughtUpPath) return;
-    lastCaughtUpPath = path;
+    const path = $currentRepoPath;
+    if (trustRequired) return;
     untrack(() => {
       harnessStore.activateRepository(path);
       if (path) void harnessStore.catchUp(path);
@@ -978,12 +974,9 @@
   });
 
   $effect(() => {
-    // Only a genuine repo switch closes the Rebase modal: this effect re-runs
-    // on every repoStore emission (status poll, stats batches) and must not
-    // dismiss a modal the user is working in.
-    const path = $repoStore.currentPath;
-    if (path === lastModalRepoPath) return;
-    lastModalRepoPath = path;
+    // Only a genuine repo switch closes the Rebase modal; a status poll or a
+    // stats batch must not dismiss a modal the user is working in.
+    void $currentRepoPath;
     untrack(() => {
       isRebaseModalOpen = false;
       isBranchCleanupOpen = false;

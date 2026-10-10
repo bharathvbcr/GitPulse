@@ -316,17 +316,19 @@ describe("FileTreePanel rename and delete", () => {
    * cancelled the load would drop it even on a memo hit.
    */
   it("reloads the listing only when the repository, status membership, or HEAD changes", () => {
-    expect(source).toContain("const currentRepo = $derived($repoStore.currentPath);");
+    // Each key compares by value, so the effect itself runs only when one of
+    // them changes; no hand-kept list key stands in front of the load.
     expect(source).toContain("const statusMembership = $derived(statusPathKey($repoStore.statuses));");
     const effect = source.slice(
-      source.indexOf("let lastListKey"),
+      source.indexOf("// No teardown: `loadFiles` cancels its predecessor"),
       source.indexOf("let listedPaths"),
     );
     expect(effect).not.toContain("$repoStore");
-    expect(effect).toContain("const key = `${repo}\\0${membership}\\0${head}`;");
-    const memo = effect.indexOf("if (key === lastListKey) return;");
-    expect(memo).toBeGreaterThan(-1);
-    expect(memo).toBeLessThan(effect.indexOf("void loadFiles(repo)"));
+    expect(effect).toContain("const repo = $currentRepoPath;");
+    expect(effect).toContain("void statusMembership;");
+    expect(effect).toContain("void $currentHeadTip;");
+    expect(effect).toContain("void loadFiles(repo)");
+    expect(source).not.toContain("lastListKey");
     expect(effect).not.toMatch(/return \(\) =>/);
     // Unmount cancellation stays, separate from the keyed effect.
     expect(source).toContain("return () => inflight?.cancel();");
@@ -335,12 +337,11 @@ describe("FileTreePanel rename and delete", () => {
   it("keys the listing on the real HEAD when it is detached, without new polling", () => {
     // A detached HEAD has no current branch, so a checkout between commits
     // left the branch-tip key unchanged and the listing stale.
-    expect(source).toContain('import { graphStore } from "../../stores/graphStore";');
-    expect(source).toContain("$graphStore.visiblePath === currentRepo ? ($graphStore.headId ?? \"\") : \"\"");
-    // The branch tip still wins on a branch, so an attached HEAD keys as before.
-    expect(source).toContain("const headTip = $derived(branchTip || graphHead);");
-    const effect = source.slice(source.indexOf("let lastListKey"), source.indexOf("let listedPaths"));
-    expect(effect).toContain("const head = headTip;");
+    // The rule (branch tip, else the graph's HEAD for the repository it
+    // shows) lives in one place; headTip.test.ts drives it.
+    expect(source).toContain('import { currentHeadTip } from "../../stores/headTip";');
+    const effect = source.slice(source.indexOf("// No teardown: `loadFiles` cancels its predecessor"), source.indexOf("let listedPaths"));
+    expect(effect).toContain("void $currentHeadTip;");
     expect(effect).not.toContain("$graphStore");
     expect(source).not.toContain("cmd_get_head_id");
   });

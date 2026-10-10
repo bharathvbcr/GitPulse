@@ -21,7 +21,7 @@
     Terminal,
     X,
   } from "@lucide/svelte";
-  import { repoStore } from "../stores/repoStore";
+  import { currentRepoPath, repoStore } from "../stores/repoStore";
   import { copyText } from "../desktop/clipboard";
   import { portal } from "../dom/portal";
   import { popover, restoreFocusTo, type DismissReason, type PopoverOptions } from "../ui/popover";
@@ -84,7 +84,7 @@
   let triggerEl = $state<HTMLButtonElement | null>(null);
   let noteEl = $state<HTMLInputElement | null>(null);
 
-  const repoPath = $derived($repoStore.currentPath);
+  const repoPath = $derived($currentRepoPath);
   const statuses = $derived($repoStore.statuses);
   const dirtyCount = $derived(statuses.length);
   const stagedCount = $derived(statuses.filter((s) => s.is_staged).length);

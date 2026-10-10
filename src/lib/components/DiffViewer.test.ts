@@ -288,7 +288,11 @@ describe("DiffViewer store-emission memo guards", () => {
   it("resets scroll only when the reader changed what they are looking at", () => {
     // repoStore republishes fresh objects every ~6s status poll; resetting
     // per emission erased selections mid-drag and yanked scroll to the top.
-    const effectIdx = source.indexOf("if (key === viewKey) return;");
+    // The reset key is a derived string, so the effect re-runs only when the
+    // reader's choice changes, never on a publish that left it equal.
+    const keyIdx = source.indexOf("const viewSelectionKey = $derived(");
+    expect(keyIdx).toBeGreaterThan(-1);
+    const effectIdx = source.indexOf("void viewSelectionKey;", keyIdx);
     expect(effectIdx).toBeGreaterThan(-1);
     for (const dep of [
       "$repoStore.selectedFilePath",
@@ -296,7 +300,8 @@ describe("DiffViewer store-emission memo guards", () => {
       "$repoStore.selectedIsStaged",
       "$repoStore.selectedIgnoreWhitespace",
     ]) {
-      expect(source.indexOf(dep)).toBeGreaterThan(-1);
+      expect(source.indexOf(dep, keyIdx)).toBeGreaterThan(keyIdx);
+      expect(source.indexOf(dep, keyIdx)).toBeLessThan(effectIdx);
     }
     const resetIdx = source.indexOf("unifiedScroll = 0;", effectIdx);
     expect(resetIdx).toBeGreaterThan(effectIdx);
@@ -308,7 +313,8 @@ describe("DiffViewer store-emission memo guards", () => {
     // post-mutation refetch replaces those lines without changing the path,
     // the commit or the staged side. Staging from stale indices stages lines
     // the reader never picked.
-    const idx = source.indexOf("if (key === contentKey) return;");
+    expect(source).toContain("const selectedDiffText = $derived($repoStore.selectedDiff);");
+    const idx = source.indexOf("void selectedDiffText;");
     expect(idx).toBeGreaterThan(-1);
     expect(source.indexOf("selectedLines = new Set();", idx)).toBeGreaterThan(idx);
     // …and leaves the scroll alone, because the reader has not gone anywhere.
@@ -352,7 +358,7 @@ describe("DiffViewer store-emission memo guards", () => {
     // `$repoStore.x` inside an effect subscribes to the whole store, and the
     // store publishes a fresh object per keystroke and per status poll. The
     // query effects read strictly-equal deriveds instead.
-    expect(source).toContain("const currentRepoPath = $derived($repoStore.currentPath);");
+    expect(source).toContain('import { currentRepoPath, repoStore } from "../stores/repoStore";');
     expect(source).toContain("const currentFilePath = $derived($repoStore.selectedFilePath);");
     expect(source).toContain("const currentCommitId = $derived($repoStore.selectedCommitId);");
     for (const marker of [
@@ -380,14 +386,15 @@ describe("DiffViewer store-emission memo guards", () => {
     // Keyed on primitives, these no longer re-ran every poll, so labels from
     // a stale index stuck until the selection changed.
     expect(source).toContain('import { liveIndex } from "../codeintel/liveIndex";');
-    expect(source).toContain("const headTip = $derived(branchHeadTip || graphHeadId);");
-    expect(source).toContain("$graphStore.visiblePath === currentRepoPath ? ($graphStore.headId ?? \"\") : \"\"");
-    expect(source).toContain("($indexSnapshots[currentRepoPath]?.revision ?? 0)");
+    // HEAD comes from the one shared derivation (branch tip, else the graph's
+    // rev-parse HEAD for a detached checkout); see headTip.test.ts.
+    expect(source).toContain('import { currentHeadTip } from "../stores/headTip";');
+    expect(source).toContain("($indexSnapshots[$currentRepoPath]?.revision ?? 0)");
     const impact = effectContaining("getImpactAtRung(repoPath, filePath");
-    expect(impact).toContain("void headTip;");
+    expect(impact).toContain("void $currentHeadTip;");
     expect(impact).toContain("void indexRevision;");
     const symbols = effectContaining('invoke<string>("cmd_get_head_id"');
-    expect(symbols).toContain('const head = commitId ? "" : headTip;');
+    expect(symbols).toContain('const head = commitId ? "" : $currentHeadTip;');
     expect(symbols).toContain("const index = indexRevision;");
     expect(symbols).toMatch(/\[repo, section\.path, commitId \?\? "", head, String\(index\)/);
     // The memo still precedes the cancel, so a hit leaves the lookup running.

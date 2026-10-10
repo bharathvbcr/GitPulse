@@ -308,7 +308,7 @@ describe("App overlay wiring", () => {
   it("forwards repoStore.error without tracking the diagnostics/toast/setError writes", () => {
     const { script } = scriptAndTemplate(source);
     expect(script).toMatch(/import\s*\{[^}]*\buntrack\b[^}]*\}\s*from\s*"svelte"/);
-    const start = script.indexOf("const err = $repoStore.error");
+    const start = script.indexOf("const err = repoError;");
     expect(start).toBeGreaterThan(-1);
     const effect = script.slice(script.lastIndexOf("$effect", start), start + 280);
     expect(effect).toContain("untrack(() => {");
@@ -319,13 +319,12 @@ describe("App overlay wiring", () => {
 
   it("catches up the harness journal only on a genuine repository path change", () => {
     const { script } = scriptAndTemplate(source);
-    const start = script.indexOf("let lastCaughtUpPath");
+    // Keyed on the canonical path store and a derived trust flag, both
+    // compared by value, so a status poll does not re-run it.
+    expect(script).toContain("const trustRequired = $derived($repoStore.trustRequired);");
+    const start = script.indexOf("const path = $currentRepoPath;\n    if (trustRequired) return;");
     expect(start).toBeGreaterThan(-1);
-    const effect = script.slice(start, start + 900);
-    expect(effect).toContain("if (path === lastCaughtUpPath) return");
-    expect(effect.indexOf("if (path === lastCaughtUpPath) return")).toBeLessThan(
-      effect.indexOf("harnessStore.activateRepository"),
-    );
+    const effect = script.slice(start, start + 400);
     expect(effect).toContain("untrack(() => {");
     expect(effect.indexOf("untrack(() => {")).toBeLessThan(
       effect.indexOf("harnessStore.activateRepository"),

@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { onMount, tick } from "svelte";
+  import { onMount, tick, untrack } from "svelte";
   import { createVisibleInterval } from "../dom/visibleInterval";
   import { bindForegroundChanges, readBackgroundDocument } from "../runtime/foreground";
   import { invoke } from "../ipc/invoke";
@@ -26,7 +26,7 @@
     Tag,
     Trash2,
   } from "@lucide/svelte";
-  import { repoStore } from "../stores/repoStore";
+  import { currentRepoPath, repoStore } from "../stores/repoStore";
   import { askConfirm } from "../stores/modalStore";
   import { toastStore } from "../stores/toastStore";
   import { harnessStore, verdictLabel } from "../stores/harnessStore";
@@ -106,7 +106,6 @@
   let releaseTag = $state("");
   let releaseMessage = $state("");
   let releaseConfirmed = $state(false);
-  let lastRepo: string | null = null;
 
   let repoTasks = $state<TaskCard[]>([]);
   let taskAddingNumber = $state<number | null>(null);
@@ -679,14 +678,16 @@
     };
   });
 
-  // `lastRepo` memoizes this effect's real dependency: repoStore republishes
-  // fresh objects on every status poll (~6s), and re-running the resets per
-  // emission would thrash panel state. A load skipped because an op holds
-  // `busy` is queued in pendingIssueRepo and drained by settleBusy().
+  // Keyed on the repository alone: repoStore republishes fresh objects on
+  // every status poll (~6s), and re-running the resets per emission would
+  // thrash panel state. A load skipped because an op holds `busy` is queued
+  // in pendingIssueRepo and drained by settleBusy().
+  const repoTags = $derived($repoStore.tags);
   $effect(() => {
-    const repo = $repoStore.currentPath;
-    if (repo === lastRepo) return;
-    lastRepo = repo;
+    const repo = $currentRepoPath;
+    untrack(() => resetForRepository(repo));
+  });
+  function resetForRepository(repo: string | null) {
     cleanup = null;
     selectedBranches = [];
     review = null;
@@ -694,7 +695,7 @@
     repoTasks = [];
     notice = null;
     pollError = null;
-    const tag = releaseTagSuggestion($repoStore.tags.map((tag) => tag.name));
+    const tag = releaseTagSuggestion(repoTags.map((tag) => tag.name));
     releaseTag = tag;
     releaseMessage = `Release ${tag}`;
     releaseConfirmed = false;
@@ -703,7 +704,7 @@
       void loadIssues(repo);
       void loadRepoTasks(repo);
     }
-  });
+  }
 </script>
 
 <div class="flex-1 overflow-auto bg-background p-4 text-xs text-textPrimary">

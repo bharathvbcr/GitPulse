@@ -4,7 +4,7 @@
   import { reportPanelError } from "../diagnostics/report";
   import { paneDetails } from "../diagnostics/paneCrash";
   import { keyedList } from "../ui/eachKeys";
-  import { repoStore } from "../stores/repoStore";
+  import { currentRepoPath, repoStore } from "../stores/repoStore";
   import { liveIndex } from "../codeintel/liveIndex";
   import { copyDevmapLogs } from "../codeintel/diagnostics";
   import {
@@ -194,7 +194,7 @@
   const brokenDisplay = $derived(brokenLinksHonesty(brokenLinks, BROKEN_LINKS_DISPLAY_CAP));
   const linksHonesty = $derived(linkCandidatesHonesty(linkResult));
 
-  const currentRepo = $derived($repoStore.currentPath);
+  const currentRepo = $derived($currentRepoPath);
   const indexSnapshots = liveIndex.snapshots;
   const contentRevisions = repoStore.contentRevisions;
   const indexRevision = $derived(currentRepo ? ($indexSnapshots[currentRepo]?.revision ?? 0) : 0);

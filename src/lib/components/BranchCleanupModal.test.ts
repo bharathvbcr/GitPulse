@@ -13,7 +13,7 @@ describe("BranchCleanupModal scan trigger", () => {
     // repoStore publishes a fresh object per keystroke and per status poll;
     // reading `$repoStore.currentPath` in the effect rescanned on each one
     // and reset the reader's selection to the defaults.
-    expect(source).toContain("const scanRepoPath = $derived($repoStore.currentPath);");
+    expect(source).toContain("const scanRepoPath = $derived($currentRepoPath);");
     const call = source.indexOf("void loadBackups();");
     expect(call).toBeGreaterThan(-1);
     const effect = source.slice(source.lastIndexOf("$effect(() => {", call), call);

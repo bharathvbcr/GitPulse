@@ -1,6 +1,6 @@
 <script lang="ts">
   import { untrack } from "svelte";
-  import { repoStore } from "../stores/repoStore";
+  import { currentRepoPath, repoStore } from "../stores/repoStore";
   import { toastStore } from "../stores/toastStore";
   import { trapFocus } from "../ui/focusTrap";
   import { LAYERS } from "../ui/layers";
@@ -138,7 +138,7 @@
    * per-input scan. The path is a strictly-equal derived and the calls are
    * untracked, so only `isOpen` and the repository path drive this.
    */
-  const scanRepoPath = $derived($repoStore.currentPath);
+  const scanRepoPath = $derived($currentRepoPath);
   $effect(() => {
     if (isOpen && scanRepoPath) {
       untrack(() => {

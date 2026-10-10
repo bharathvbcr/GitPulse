@@ -11,7 +11,7 @@
 
 <script lang="ts">
   import { onDestroy, untrack } from "svelte";
-  import { repoStore } from "../stores/repoStore";
+  import { currentRepoPath, repoStore } from "../stores/repoStore";
   import { invoke } from "../ipc/invoke";
   import {
     KeyRound,
@@ -70,7 +70,7 @@
   // time. Reading `$repoStore.currentPath` inside it subscribes to the whole
   // store, so every status or branch refresh during the first scan re-ran it
   // and started a second full Kingfisher scan.
-  const currentPath = $derived($repoStore.currentPath);
+  const currentPath = $derived($currentRepoPath);
   /** Path of the scan in flight, so a re-run never starts a duplicate. */
   let inflightPath: string | null = null;
 

@@ -137,15 +137,15 @@ describe("CommitComposer", () => {
    * effects read a derived repository path, which compares by value.
    */
   it("re-runs the preview and blast-radius effects on repo or staged-key change, not per keystroke", () => {
-    expect(source).toContain("const currentRepo = $derived($repoStore.currentPath);");
+    expect(source).toMatch(/import \{ currentRepoPath, repoStore \} from "\.\.\/stores\/repoStore";/);
     const region = source.slice(
-      source.indexOf("const currentRepo = $derived"),
+      source.indexOf("// The effects below key on the shared repository path"),
       source.indexOf("$effect(() => () => blastGuard?.cancel());"),
     );
     const effects = region.split("$effect(() => {").slice(1);
     expect(effects).toHaveLength(2);
     for (const effect of effects) {
-      expect(effect).toContain("const repo = currentRepo;");
+      expect(effect).toContain("const repo = $currentRepoPath;");
       expect(effect).toContain("void previewPathsKey;");
       expect(effect).not.toContain("$repoStore");
     }

@@ -328,7 +328,9 @@ describe("CoverageViewer flicker contracts", () => {
   });
 
   it("seeds the persisted selection instead of wiping it after the sync effect", () => {
-    expect(source).toContain("untrack(() => $repoStore.selectedFilePath)");
+    // Read inside the scan effect's untrack, so the seed adds no dependency.
+    expect(source).toContain("selectedPath = storeSelection;");
+    expect(source).toContain("const storeSelection = $derived($repoStore.selectedFilePath);");
   });
 
   it("resets file scroll and selected-scope flags without tracking those writes", () => {
@@ -337,7 +339,7 @@ describe("CoverageViewer flicker contracts", () => {
     expect(scroll).toContain("if (fileScrollTop !== 0) fileScrollTop = 0");
     expect(source).toContain("if (!selectedFile) untrack(() => { selectedScope = false; })");
     const sync = source.slice(
-      source.indexOf("let prevSyncedSelection"),
+      source.indexOf("const storeSelection = $derived"),
       source.indexOf("Repositories this session has already auto-started coverage"),
     );
     expect(sync).toContain("untrack(() => { selectedPath = selected; })");

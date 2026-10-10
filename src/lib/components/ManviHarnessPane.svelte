@@ -226,10 +226,10 @@
 </script>
 
 <script lang="ts">
-  import { onDestroy } from "svelte";
+  import { onDestroy, untrack } from "svelte";
   import { createVisibleInterval } from "../dom/visibleInterval";
   import { harnessStore, verdictLabel, type AiSelection } from "../stores/harnessStore";
-  import { repoStore } from "../stores/repoStore";
+  import { currentRepoPath, repoStore } from "../stores/repoStore";
   import { copyText } from "../desktop/clipboard";
   import { invoke } from "../ipc/invoke";
   import type { GrantView } from "../grants/types";
@@ -302,7 +302,6 @@
   let grantsLoading = $state(false);
   let grantsLoadError = $state<string | null>(null);
   let grantClock = $state(Date.now());
-  let grantsRepo: string | null = null;
   const grantRequests = beginGeneration();
   const grantRefreshTimer = createRepositoryRefreshTimer(
     10_000,
@@ -346,20 +345,19 @@
     }
   }
 
+  // Keyed on the repository alone, so the ~6s status poll does not reload.
   $effect(() => {
-    const repo = $repoStore.currentPath;
-    // Guarded on a genuine repo switch: this effect re-runs on every store
-    // emission, and the ~6s status poll is one.
-    if (repo === grantsRepo) return;
-    grantsRepo = repo;
-    if (!repo) {
-      grantRequests.next();
-      grants = null;
-      grantsLoadError = null;
-      grantsLoading = false;
-      return;
-    }
-    void refreshGrants(repo, true);
+    const repo = $currentRepoPath;
+    untrack(() => {
+      if (!repo) {
+        grantRequests.next();
+        grants = null;
+        grantsLoadError = null;
+        grantsLoading = false;
+        return;
+      }
+      void refreshGrants(repo, true);
+    });
   });
 
   // Grant consumption and expiry can change while this pane remains mounted.
@@ -367,8 +365,8 @@
   // can publish unrelated same-path status changes more frequently than the
   // interval, and resetting on each one would starve this refresh forever.
   $effect(() => {
-    const repo = $repoStore.currentPath;
-    grantRefreshTimer.update(repo);
+    const repo = $currentRepoPath;
+    untrack(() => grantRefreshTimer.update(repo));
   });
 
   /** MANVI persists oldest first; retain spent grants as reviewable history. */

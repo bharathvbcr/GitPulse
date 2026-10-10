@@ -18,6 +18,7 @@
    */
   import { get } from "svelte/store";
   import { Bot, CircleAlert, FolderOpen, ListChecks, RefreshCw, Rows3, SquareTerminal, X } from "@lucide/svelte";
+  import { untrack } from "svelte";
   import { repoStore } from "../stores/repoStore";
   import { interfaceStore } from "../stores/interfaceStore";
   import { toastStore } from "../stores/toastStore";
@@ -54,7 +55,6 @@
   const pathOpts = { caseInsensitive: isCaseInsensitiveFs() };
   const board = createBoardAgents();
   let now = $state(Date.now());
-  let sweepKey = "";
   /** Registered repositories, so a task names its repository and not its cwd. */
   const registered = createRegisteredRepositories();
   const registeredStatus = registered.status;
@@ -201,17 +201,19 @@
     };
   });
 
+  // The tab set as a value: repoStore rebuilds openTabs on every publish, so
+  // the sweep depends on this key and reads the tabs themselves untracked.
+  const openTabs = $derived($repoStore.openTabs);
+  const sweepTabsKey = $derived(
+    openTabs.map((tab) => `${tab.path}\0${tab.label}\0${tab.family ?? ""}\0${tab.familyRoot ?? ""}`).join("\n"),
+  );
   $effect(() => {
     const open = showing;
-    const key = $repoStore.openTabs.map((tab) => `${tab.path}\0${tab.label}\0${tab.family ?? ""}\0${tab.familyRoot ?? ""}`).join("\n");
-    if (!open) {
-      sweepKey = "";
-      agentPlaneStore.cancel();
-      return;
-    }
-    if (key === sweepKey) return;
-    sweepKey = key;
-    void agentPlaneStore.refresh(sweepTargets($repoStore.openTabs));
+    void sweepTabsKey;
+    untrack(() => {
+      if (!open) agentPlaneStore.cancel();
+      else void agentPlaneStore.refresh(sweepTargets(openTabs));
+    });
   });
 
   $effect(() => {

@@ -49,7 +49,7 @@ describe("LivePulseDashboard", () => {
       source.lastIndexOf("$effect(() =>"),
       source.indexOf("</script>"),
     );
-    expect(selectionEffect).toContain("const repo = $repoStore.currentPath;");
+    expect(selectionEffect).toContain("const repo = $currentRepoPath;");
     expect(selectionEffect).toContain("commitGuard?.cancel()");
     expect(selectionEffect).toContain("isLoadingCommits = false");
   });
@@ -85,13 +85,14 @@ describe("LivePulseDashboard", () => {
       source.lastIndexOf("$effect(() =>"),
       source.indexOf("</script>"),
     );
-    expect(selectionEffect).toContain("b.is_current && !b.is_remote");
-    expect(selectionEffect).toContain("const key = `${repo ?? \"\"}\\0${selectedFile ?? \"\"}\\0${head}`;");
-    const memo = selectionEffect.indexOf("if (key === lastDetailsKey) return;");
-    expect(memo).toBeGreaterThan(-1);
-    expect(memo).toBeLessThan(selectionEffect.indexOf("loadFileDetails(repo, selectedFile)"));
-    expect(memo).toBeLessThan(selectionEffect.indexOf("commitGuard?.cancel()"));
-    // No teardown: it would run before a memo-hit re-run and kill the load.
+    // Keyed by value on the repository, the selection and HEAD, so the
+    // effect runs only when one of them changes; the load runs untracked.
+    expect(selectionEffect).toContain("const repo = $currentRepoPath;");
+    expect(selectionEffect).toContain("const file = selectedFile;");
+    expect(selectionEffect).toContain("void $currentHeadTip;");
+    expect(selectionEffect.indexOf("untrack(() => {")).toBeLessThan(selectionEffect.indexOf("loadFileDetails(repo, file)"));
+    expect(source).not.toContain("lastDetailsKey");
+    // No teardown: `loadFileDetails` cancels its own predecessor.
     expect(selectionEffect).not.toMatch(/return \(\) =>/);
   });
 
@@ -102,11 +103,9 @@ describe("LivePulseDashboard", () => {
       source.lastIndexOf("$effect(() =>"),
       source.indexOf("</script>"),
     );
-    expect(source).toContain('import { graphStore } from "../../stores/graphStore";');
-    expect(selectionEffect).toContain("const graph = $graphStore;");
-    expect(selectionEffect).toContain(
-      'const head = branchTip || (repo && graph.visiblePath === repo ? (graph.headId ?? "") : "");',
-    );
+    // headTip.test.ts drives the fallback itself.
+    expect(source).toContain('import { currentHeadTip } from "../../stores/headTip";');
+    expect(selectionEffect).toContain("void $currentHeadTip;");
     expect(source).not.toContain("cmd_get_head_id");
   });
 });

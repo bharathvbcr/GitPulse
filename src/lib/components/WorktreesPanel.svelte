@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { untrack } from "svelte";
   import { worktreeSetupNotices, type MergeTeardownResult, type WorktreeCreated, type WorktreeInfo, type WorktreeRouteInfo } from "../branches/types";
   import { toastStore } from "../stores/toastStore";
   import type { TaskScope, TaskView } from "../tasks/types";
@@ -6,7 +7,7 @@
   import { loadTaskScopes } from "../tasks/scopes";
   import { invoke } from "../ipc/invoke";
   import { reportPanelError } from "../diagnostics/report";
-  import { repoStore } from "../stores/repoStore";
+  import { currentRepoPath, repoStore } from "../stores/repoStore";
   import { harnessStore, type Guarded } from "../stores/harnessStore";
   import { createAsyncGuard, type AsyncGuard } from "../async/guard";
   import {
@@ -69,33 +70,24 @@
   let liveRuns = $state<TaskRun[]>([]);
   let confirmTimer: ReturnType<typeof setTimeout> | null = null;
 
-  // Load trigger keyed on the real dependencies: active repo + its hydration
-  // epoch. Memoized because every store emission re-runs the effect — an
-  // unguarded rerun cancels in-flight loads and disarms the row-delete
-  // confirm on each ~6s poll tick.
-  let prevRepoPath: string | null = null;
-  let prevGeneration: number | null = null;
-  // Extending trust widens what every row here can report, and the offer that
-  // does it now lives above the branch list rather than in this panel — so the
-  // grant arrives as an announcement instead of a local `load()` call. Read as
-  // part of the same change check: a new count is a reason to reload for the
-  // same repository and generation, which nothing else in this effect is.
-  let prevExtended: number | null = null;
+  // Load trigger keyed on the real dependencies: the active repository and
+  // its hydration epoch, both compared by value, so the store's other
+  // publishes (every ~6s poll tick) neither cancel a load in flight nor disarm
+  // the row-delete confirm. Extending trust widens what every row here can
+  // report, and the offer that does it lives above the branch list rather
+  // than in this panel — so the grant arrives as an announcement, and a new
+  // count is a reason to reload for the same repository and generation.
+  const generation = $derived($repoStore.generation);
   $effect(() => {
-    const repo = $repoStore.currentPath;
-    const generation = $repoStore.generation;
-    const extended = $trustExtended;
-    if (repo === prevRepoPath && generation === prevGeneration && extended === prevExtended) return;
-    prevRepoPath = repo;
-    prevGeneration = generation;
-    prevExtended = extended;
-    void load();
+    void $currentRepoPath;
+    void generation;
+    void $trustExtended;
+    untrack(() => void load());
     return () => {
       // A load that outlives its repo/generation must not apply: the next
       // effect run (or unmount) cancels it here, and load() re-checks below.
       inflight?.cancel();
-      // Disarm any pending removal confirm; it must not leak across repos
-      // and there is no teardown left that would otherwise fire per tick.
+      // Disarm any pending removal confirm; it must not leak across repos.
       if (confirmTimer !== null) clearTimeout(confirmTimer);
       confirmTimer = null;
       removingPath = null;

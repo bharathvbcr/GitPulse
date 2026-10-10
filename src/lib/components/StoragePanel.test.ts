@@ -29,7 +29,7 @@ describe("StoragePanel source contracts & async hygiene", () => {
     // The old per-fetch AsyncGuard is replaced by the metric's generation
     // guard plus this teardown: a snapshot for a repository the panel has
     // moved off can no longer reach component state at all.
-    expect(source).toContain("return storageMetric.subscribe(path,");
+    expect(source).toContain("return untrack(() => storageMetric.subscribe(path,");
   });
 
   it("cleans up timers on unmount", () => {

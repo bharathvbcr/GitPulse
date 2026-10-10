@@ -1372,6 +1372,29 @@ describe("repoStore tabs", () => {
     unsubscribeDraft();
   });
 
+  it("notifies currentPath subscribers only when the active repository changes", async () => {
+    // Effects key on this instead of `$repoStore.currentPath`, which re-runs
+    // them on every publish: a status poll, a loading flag, an error.
+    const { store } = makeStore();
+    await store.openRepo("/r/path-a");
+    const seen: (string | null)[] = [];
+    let published = 0;
+    const unsubscribe = store.subscribe(() => (published += 1));
+    const unsubscribePath = store.currentPath.subscribe((path) => seen.push(path));
+    published = 0;
+    store.setError("unrelated");
+    store.setError(null);
+    expect(published).toBe(2);
+    expect(seen).toEqual(["/r/path-a"]);
+    await store.openRepo("/r/path-b");
+    expect(seen.at(-1)).toBe("/r/path-b");
+    const switched = seen.length;
+    store.setError("unrelated again");
+    expect(seen).toHaveLength(switched);
+    unsubscribe();
+    unsubscribePath();
+  });
+
   it("keeps one draft per tab and drops a closed tab's draft", async () => {
     const { store } = makeStore();
     await store.openRepo("/r/draft-a");
