@@ -18,12 +18,32 @@ before that tag is pushed.
   which `ci:local` runs too. Upstream drift is still printed but never fails a
   gate: DevCouncil commits land independently, so bare `vendor:check` stays the
   check to run right after `bun run vendor`.
+- An agent's `gitpulse_complete_task(done)` no longer takes its own word. The
+  task lands in `done` only when Manvi's `work.verify.task` stored a settled
+  `passed` verdict for the head its worktree is at now; with no record, a
+  `failed` or `degraded` one, one still running, one for an older head or
+  another task or repository, or an evidence store that cannot be read, it
+  lands in `review` with the reason in the task's history
+  (`held_for_review: true` in the reply). A passed verdict is attached to the
+  history ahead of the agent's summary. A person moving a card is unaffected.
+  Security impact: this narrows what an agent can do (it can no longer
+  self-certify done); nothing widens, and the check fails closed.
+- The profile worker may now call `work.verify.task` and `work.verify.get`
+  (host methods `verifications.start` and `verifications.get`), which only name
+  the work to judge; no command or criteria travel in the request.
 
 ### Fixed
 
 - The agentic workspaces plan no longer describes the flat graph export as
   "generation 1". It records the real path, `.devcouncil/graph/code_graph.json`,
   and how fresh each repository's export was on 2026-10-09.
+- A new test holds what GitPulse sends Manvi to Manvi's published serve
+  contract (`contracts/serve.ops.schema.json`): a field on the Rust host scope
+  or policy params the contract does not declare, or a profile-worker op the
+  harness does not serve, now fails the build instead of being dropped silently
+  at runtime. That is how a task's allowed commands once stopped being honoured.
+- The module-integration guide no longer shows board edits going through Manvi;
+  they run in-process on the vendored store.
 
 ## [1.4.0] - 2026-10-09
 

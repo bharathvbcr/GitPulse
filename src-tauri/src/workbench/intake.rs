@@ -21,6 +21,7 @@
 //! than the one the task is filed under, are folded into the description under
 //! their own headings — kept visible, not dropped.
 
+use super::verification_gate;
 use super::{query, WorkbenchError};
 use crate::tasks::file_tasks::{self, TaskBrief};
 use dc_store::Store;
@@ -1472,6 +1473,10 @@ pub(crate) fn complete_task(
     }
     let repository = board_repository(store, repo_path)?;
     let repository_id = repository["id"].as_str().unwrap_or_default().to_owned();
+    let repository_identity = repository["identity_key"]
+        .as_str()
+        .unwrap_or_default()
+        .to_owned();
     for _ in 0..2 {
         let (id, item) = find_live_task(store, &repository_id, task)?;
         let revision = item["revision"].as_i64().unwrap_or_default();
@@ -1483,6 +1488,17 @@ pub(crate) fn complete_task(
         }
         let previous = item["status"].as_str().unwrap_or_default().to_owned();
         let logs = item["logs"].as_str().unwrap_or_default();
+        // An agent's `done` is a claim: it lands as `done` only where Manvi's
+        // verification passed for the work as it stands. A task already done
+        // is never judged again (a retry is `unchanged`).
+        let gate = (status == "done" && previous != "done")
+            .then(|| verification_gate::check(store, &id, &repository_identity));
+        let held = match &gate {
+            Some(verification_gate::Gate::Held(reason)) => Some(reason.clone()),
+            _ => None,
+        };
+        let requested = status;
+        let status = if held.is_some() { "review" } else { status };
         let block = summary.map(|s| summary_block(status, s, now_millis()));
         // The marker carries a timestamp, so compare the summary text itself:
         // the same summary as the last block, under the same status, is a retry.
@@ -1498,6 +1514,12 @@ pub(crate) fn complete_task(
                 "previous_status": previous,
                 "status": item["status"],
                 "revision": item["revision"],
+                "requested_status": requested,
+                "held_for_review": held.is_some(),
+                "verification": held.as_deref().or(match &gate {
+                    Some(verification_gate::Gate::Passed(verdict)) => Some(verdict.as_str()),
+                    _ => None,
+                }),
                 "summary_recorded": summary.is_some() && (outcome == "updated" || recorded),
                 "repository": repository_summary(&repository),
                 "sequence": sequence,
@@ -1514,13 +1536,31 @@ pub(crate) fn complete_task(
         }
         let mut input = resend(&item, &id, revision, "complete");
         input.insert("status".into(), json!(status));
-        if let Some(block) = &block {
-            let joined = append_log(logs, block).ok_or_else(|| {
-                WorkbenchError::new(
-                    "invalid_input",
-                    "The task's logs are full; move it without a summary, or shorten the summary.",
+        // The verdict goes into the task's history ahead of the agent's own
+        // summary, so the summary stays the last block and a retry still
+        // recognises it.
+        let verdict_block = gate.as_ref().map(|gate| match gate {
+            verification_gate::Gate::Passed(verdict) => {
+                format!(
+                    "--- Verification passed ({}) ---\n{verdict}",
+                    timestamp(now_millis())
                 )
-            })?;
+            }
+            verification_gate::Gate::Held(reason) => format!(
+                "--- Agent asked for done; held in review ({}) ---\n{reason}",
+                timestamp(now_millis())
+            ),
+        });
+        if verdict_block.is_some() || block.is_some() {
+            let mut joined = logs.to_owned();
+            for part in verdict_block.iter().chain(block.iter()) {
+                joined = append_log(&joined, part).ok_or_else(|| {
+                    WorkbenchError::new(
+                        "invalid_input",
+                        "The task's logs are full; move it without a summary, or shorten the summary.",
+                    )
+                })?;
+            }
             input.insert("logs".into(), json!(joined));
         }
         match query(store, "items.put", &Value::Object(input).to_string()) {
@@ -2007,6 +2047,10 @@ pub(crate) use merge::{merge_request, merge_tasks, MergeTask, MAX_MERGE_SOURCES}
 #[cfg(test)]
 #[path = "intake_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "verification_gate_tests.rs"]
+pub(crate) mod gate_tests;
 
 #[cfg(test)]
 #[path = "intake_merge_tests.rs"]

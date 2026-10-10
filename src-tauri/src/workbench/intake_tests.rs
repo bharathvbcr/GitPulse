@@ -583,6 +583,12 @@ fn a_summary_is_recorded_unless_it_is_the_last_block_this_tool_wrote() {
     let repo = git_repo();
     let repo_path = repo.path().to_str().unwrap();
     let id = filed(&store, &repo, "gp-ship", "Ship the exporter");
+    // An agent's `done` needs Manvi's passed verdict for the current head.
+    crate::test_support::git_in(
+        repo.path(),
+        &["commit", "-q", "--allow-empty", "-m", "init"],
+    );
+    gate_tests::verified(&store, &repo, &id);
     complete_task(
         &store,
         repo_path,

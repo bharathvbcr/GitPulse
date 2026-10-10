@@ -2608,8 +2608,8 @@ mod tests {
     }
 
     /// The shape `manvi serve` really sends for a refused command, measured:
-    /// every command decision carries the `host-scope` placeholder task,
-    /// whether or not a scope was declared. A fixture with an empty `task_id`
+    /// an unscoped command decision carries the `host-scope` placeholder task
+    /// (and every one did, before `manvi` honoured the scope's allowlist). A fixture with an empty `task_id`
     /// passed these tests while the real binary still got denied — the binding
     /// has to come from GitPulse, never from the verdict.
     fn unreadable(rule: &str) -> PolicyVerdict {

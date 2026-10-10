@@ -1,0 +1,852 @@
+{
+  "$comment": "Generated from the Go types in manvi/serve by TestServeContractMatchesGoTypes; regenerate with MANVI_UPDATE_CONTRACT=1. Hosts mirror it and fail when they send a field or name an op this file does not declare. Additive-only within a protocol version.",
+  "protocol": 1,
+  "ops": {
+    "always": [
+      "capability.probe",
+      "chat.forget",
+      "chat.prepare",
+      "chat.settle",
+      "hello",
+      "local.scan",
+      "policy.check.command",
+      "policy.check.file"
+    ],
+    "optional": [
+      "devmap.query",
+      "devmap.status",
+      "work.attention.get",
+      "work.attention.list",
+      "work.attention.update",
+      "work.automation.get",
+      "work.automation.list",
+      "work.automation.prepare",
+      "work.automation.put",
+      "work.decisions.claim",
+      "work.decisions.create",
+      "work.decisions.decide",
+      "work.decisions.get",
+      "work.decisions.list",
+      "work.decisions.resolve",
+      "work.enhancements.accept",
+      "work.enhancements.claim",
+      "work.enhancements.complete",
+      "work.enhancements.configuration",
+      "work.enhancements.create",
+      "work.enhancements.dismiss",
+      "work.enhancements.generate",
+      "work.enhancements.get",
+      "work.enhancements.list",
+      "work.enhancements.recover",
+      "work.enhancements.refine",
+      "work.enhancements.revise",
+      "work.enhancements.undo",
+      "work.enhancements.wake",
+      "work.enhancements.worker",
+      "work.events.list",
+      "work.items.brief.get",
+      "work.items.delete",
+      "work.items.get",
+      "work.items.history",
+      "work.items.list",
+      "work.items.put",
+      "work.items.restore",
+      "work.notifications.ack",
+      "work.notifications.activate",
+      "work.notifications.activations.list",
+      "work.notifications.claim",
+      "work.notifications.delivery.get",
+      "work.notifications.finish",
+      "work.notifications.pending.list",
+      "work.notifications.settings.get",
+      "work.notifications.settings.put",
+      "work.repositories.get",
+      "work.repositories.list",
+      "work.repositories.put",
+      "work.repositories.relink",
+      "work.runs.cancel",
+      "work.runs.claim",
+      "work.runs.finish",
+      "work.runs.get",
+      "work.runs.list",
+      "work.runs.managed.activate",
+      "work.runs.managed.prepare",
+      "work.runs.managed.stop",
+      "work.runs.prepare",
+      "work.runs.protocol",
+      "work.runs.started",
+      "work.scan.cancel",
+      "work.scan.gaps",
+      "work.scan.get",
+      "work.verify.get",
+      "work.verify.task",
+      "work.workspaces.delete",
+      "work.workspaces.get",
+      "work.workspaces.list",
+      "work.workspaces.put"
+    ]
+  },
+  "types": {
+    "CommandCheckParams": {
+      "type": "object",
+      "required": false,
+      "fields": {
+        "allowed_commands": {
+          "type": "array",
+          "required": false,
+          "items": {
+            "type": "string",
+            "required": false
+          }
+        },
+        "command": {
+          "type": "string",
+          "required": true
+        },
+        "enforce_allowlist": {
+          "type": "boolean",
+          "required": false
+        },
+        "root": {
+          "type": "string",
+          "required": false
+        },
+        "scope": {
+          "type": "object",
+          "required": false,
+          "nullable": true,
+          "fields": {
+            "allowed_commands": {
+              "type": "array",
+              "required": false,
+              "items": {
+                "type": "string",
+                "required": false
+              }
+            },
+            "forbidden_changes": {
+              "type": "array",
+              "required": false,
+              "items": {
+                "type": "string",
+                "required": false
+              }
+            },
+            "planned_files": {
+              "type": "array",
+              "required": false,
+              "items": {
+                "type": "string",
+                "required": false
+              }
+            },
+            "task_id": {
+              "type": "string",
+              "required": true
+            },
+            "worktree": {
+              "type": "string",
+              "required": false
+            }
+          }
+        }
+      }
+    },
+    "FileCheckParams": {
+      "type": "object",
+      "required": false,
+      "fields": {
+        "internal": {
+          "type": "boolean",
+          "required": false
+        },
+        "op": {
+          "type": "string",
+          "required": false
+        },
+        "path": {
+          "type": "string",
+          "required": true
+        },
+        "root": {
+          "type": "string",
+          "required": true
+        },
+        "scope": {
+          "type": "object",
+          "required": false,
+          "nullable": true,
+          "fields": {
+            "allowed_commands": {
+              "type": "array",
+              "required": false,
+              "items": {
+                "type": "string",
+                "required": false
+              }
+            },
+            "forbidden_changes": {
+              "type": "array",
+              "required": false,
+              "items": {
+                "type": "string",
+                "required": false
+              }
+            },
+            "planned_files": {
+              "type": "array",
+              "required": false,
+              "items": {
+                "type": "string",
+                "required": false
+              }
+            },
+            "task_id": {
+              "type": "string",
+              "required": true
+            },
+            "worktree": {
+              "type": "string",
+              "required": false
+            }
+          }
+        }
+      }
+    },
+    "GapScanParams": {
+      "type": "object",
+      "required": false,
+      "fields": {
+        "max_proposals": {
+          "type": "integer",
+          "required": false
+        },
+        "repo_root": {
+          "type": "string",
+          "required": true
+        },
+        "since": {
+          "type": "string",
+          "required": false
+        }
+      }
+    },
+    "GapScanReadParams": {
+      "type": "object",
+      "required": false,
+      "fields": {
+        "scan_id": {
+          "type": "string",
+          "required": true
+        }
+      }
+    },
+    "HelloParams": {
+      "type": "object",
+      "required": false,
+      "fields": {
+        "host": {
+          "type": "string",
+          "required": false
+        },
+        "protocol": {
+          "type": "integer",
+          "required": true
+        }
+      }
+    },
+    "HelloResult": {
+      "type": "object",
+      "required": false,
+      "fields": {
+        "managed_providers": {
+          "type": "array",
+          "required": false,
+          "items": {
+            "type": "string",
+            "required": false
+          }
+        },
+        "ops": {
+          "type": "array",
+          "required": true,
+          "items": {
+            "type": "string",
+            "required": false
+          }
+        },
+        "posture": {
+          "type": "string",
+          "required": true
+        },
+        "protocol": {
+          "type": "integer",
+          "required": true
+        }
+      }
+    },
+    "HostScope": {
+      "type": "object",
+      "required": false,
+      "fields": {
+        "allowed_commands": {
+          "type": "array",
+          "required": false,
+          "items": {
+            "type": "string",
+            "required": false
+          }
+        },
+        "forbidden_changes": {
+          "type": "array",
+          "required": false,
+          "items": {
+            "type": "string",
+            "required": false
+          }
+        },
+        "planned_files": {
+          "type": "array",
+          "required": false,
+          "items": {
+            "type": "string",
+            "required": false
+          }
+        },
+        "task_id": {
+          "type": "string",
+          "required": true
+        },
+        "worktree": {
+          "type": "string",
+          "required": false
+        }
+      }
+    },
+    "ManagedPrepared": {
+      "type": "object",
+      "required": false,
+      "fields": {
+        "id": {
+          "type": "string",
+          "required": true
+        },
+        "owner_id": {
+          "type": "string",
+          "required": true
+        },
+        "phase": {
+          "type": "string",
+          "required": true
+        },
+        "process_id": {
+          "type": "integer",
+          "required": true
+        },
+        "protocol_version": {
+          "type": "integer",
+          "required": true
+        },
+        "session_id": {
+          "type": "string",
+          "required": true
+        }
+      }
+    },
+    "ManagedRun": {
+      "type": "object",
+      "required": false,
+      "fields": {
+        "brief": {
+          "type": "object",
+          "required": true,
+          "fields": {
+            "markdown": {
+              "type": "string",
+              "required": true
+            }
+          }
+        },
+        "bypass_acknowledged": {
+          "type": "boolean",
+          "required": true
+        },
+        "cwd": {
+          "type": "string",
+          "required": true
+        },
+        "effective_configuration": {
+          "type": "string",
+          "required": true
+        },
+        "id": {
+          "type": "string",
+          "required": true
+        },
+        "kind": {
+          "type": "string",
+          "required": true
+        },
+        "owner_id": {
+          "type": "string",
+          "required": true
+        },
+        "permission_mode": {
+          "type": "string",
+          "required": true
+        },
+        "provider": {
+          "type": "string",
+          "required": true
+        },
+        "provider_state": {
+          "type": "string",
+          "required": true
+        },
+        "provider_thread_id": {
+          "type": "string",
+          "required": true
+        },
+        "provider_turn_id": {
+          "type": "string",
+          "required": true,
+          "nullable": true
+        },
+        "revision": {
+          "type": "integer",
+          "required": true
+        },
+        "session_id": {
+          "type": "string",
+          "required": true
+        },
+        "source_revision": {
+          "type": "integer",
+          "required": true
+        },
+        "state": {
+          "type": "string",
+          "required": true
+        }
+      }
+    },
+    "ScanView": {
+      "type": "object",
+      "required": false,
+      "fields": {
+        "attached_count": {
+          "type": "integer",
+          "required": true
+        },
+        "board_complete": {
+          "type": "boolean",
+          "required": true
+        },
+        "complete": {
+          "type": "boolean",
+          "required": true
+        },
+        "coverage": {
+          "type": "array",
+          "required": true,
+          "items": {
+            "type": "object",
+            "required": false,
+            "fields": {
+              "category": {
+                "type": "string",
+                "required": true
+              },
+              "detail": {
+                "type": "string",
+                "required": false
+              },
+              "hidden": {
+                "type": "integer",
+                "required": false
+              },
+              "status": {
+                "type": "string",
+                "required": true
+              }
+            }
+          }
+        },
+        "error": {
+          "type": "string",
+          "required": false
+        },
+        "finished_at": {
+          "type": "integer",
+          "required": false
+        },
+        "index_generation": {
+          "type": "integer",
+          "required": false
+        },
+        "joined": {
+          "type": "boolean",
+          "required": false
+        },
+        "max_proposals": {
+          "type": "integer",
+          "required": true
+        },
+        "new_count": {
+          "type": "integer",
+          "required": true
+        },
+        "over_cap": {
+          "type": "integer",
+          "required": true
+        },
+        "proposals": {
+          "type": "array",
+          "required": true,
+          "items": {
+            "type": "object",
+            "required": false,
+            "fields": {
+              "attached_item_id": {
+                "type": "string",
+                "required": false
+              },
+              "attached_item_title": {
+                "type": "string",
+                "required": false
+              },
+              "category": {
+                "type": "string",
+                "required": true
+              },
+              "description": {
+                "type": "string",
+                "required": true
+              },
+              "fingerprint": {
+                "type": "string",
+                "required": true
+              },
+              "kind": {
+                "type": "string",
+                "required": true
+              },
+              "labels": {
+                "type": "array",
+                "required": true,
+                "items": {
+                  "type": "string",
+                  "required": false
+                }
+              },
+              "priority": {
+                "type": "integer",
+                "required": true
+              },
+              "signals": {
+                "type": "array",
+                "required": false,
+                "items": {
+                  "type": "object",
+                  "required": false,
+                  "fields": {
+                    "result": {
+                      "type": "string",
+                      "required": true
+                    },
+                    "source": {
+                      "type": "string",
+                      "required": true
+                    }
+                  }
+                }
+              },
+              "status": {
+                "type": "string",
+                "required": true
+              },
+              "title": {
+                "type": "string",
+                "required": true
+              }
+            }
+          }
+        },
+        "repo_root": {
+          "type": "string",
+          "required": true
+        },
+        "scan_id": {
+          "type": "string",
+          "required": true
+        },
+        "since": {
+          "type": "string",
+          "required": false
+        },
+        "started_at": {
+          "type": "integer",
+          "required": true
+        },
+        "state": {
+          "type": "string",
+          "required": true
+        }
+      }
+    },
+    "VerifyGetParams": {
+      "type": "object",
+      "required": false,
+      "fields": {
+        "item_id": {
+          "type": "string",
+          "required": true
+        },
+        "request_id": {
+          "type": "string",
+          "required": false
+        }
+      }
+    },
+    "VerifyResult": {
+      "type": "object",
+      "required": false,
+      "fields": {
+        "record": {
+          "type": "object",
+          "required": true,
+          "fields": {
+            "base": {
+              "type": "string",
+              "required": true
+            },
+            "changes": {
+              "type": "object",
+              "required": true,
+              "fields": {
+                "capped": {
+                  "type": "boolean",
+                  "required": true
+                },
+                "paths": {
+                  "type": "array",
+                  "required": true,
+                  "items": {
+                    "type": "string",
+                    "required": false
+                  }
+                },
+                "total": {
+                  "type": "integer",
+                  "required": true
+                },
+                "untracked": {
+                  "type": "integer",
+                  "required": true
+                }
+              }
+            },
+            "criteria": {
+              "type": "array",
+              "required": true,
+              "items": {
+                "type": "object",
+                "required": false,
+                "fields": {
+                  "findings": {
+                    "type": "array",
+                    "required": true,
+                    "items": {
+                      "type": "string",
+                      "required": false
+                    }
+                  },
+                  "index": {
+                    "type": "integer",
+                    "required": true
+                  },
+                  "status": {
+                    "type": "string",
+                    "required": true
+                  },
+                  "text": {
+                    "type": "string",
+                    "required": true
+                  }
+                }
+              }
+            },
+            "critic_read_only": {
+              "type": "boolean",
+              "required": true
+            },
+            "critic_summary": {
+              "type": "string",
+              "required": true
+            },
+            "degraded": {
+              "type": "array",
+              "required": true,
+              "items": {
+                "type": "string",
+                "required": false
+              }
+            },
+            "finished_at": {
+              "type": "string",
+              "required": true
+            },
+            "head": {
+              "type": "string",
+              "required": true
+            },
+            "item_id": {
+              "type": "string",
+              "required": true
+            },
+            "outcome": {
+              "type": "string",
+              "required": true
+            },
+            "request_id": {
+              "type": "string",
+              "required": true
+            },
+            "rigor": {
+              "type": "object",
+              "required": true,
+              "nullable": true,
+              "fields": {
+                "degraded": {
+                  "type": "array",
+                  "required": true,
+                  "items": {
+                    "type": "string",
+                    "required": false
+                  }
+                },
+                "examined": {
+                  "type": "integer",
+                  "required": true
+                },
+                "findings": {
+                  "type": "array",
+                  "required": true,
+                  "items": {
+                    "type": "string",
+                    "required": false
+                  }
+                },
+                "omitted": {
+                  "type": "array",
+                  "required": true,
+                  "items": {
+                    "type": "string",
+                    "required": false
+                  }
+                },
+                "omitted_total": {
+                  "type": "integer",
+                  "required": true
+                },
+                "source": {
+                  "type": "string",
+                  "required": true
+                },
+                "verdict": {
+                  "type": "string",
+                  "required": true
+                }
+              }
+            },
+            "run_id": {
+              "type": "string",
+              "required": true
+            },
+            "started_at": {
+              "type": "string",
+              "required": true
+            },
+            "state": {
+              "type": "string",
+              "required": true
+            },
+            "tests": {
+              "type": "object",
+              "required": true,
+              "nullable": true,
+              "fields": {
+                "candidates": {
+                  "type": "array",
+                  "required": true,
+                  "items": {
+                    "type": "string",
+                    "required": false
+                  }
+                },
+                "generation": {
+                  "type": "integer",
+                  "required": true
+                },
+                "index_fresh": {
+                  "type": "boolean",
+                  "required": true
+                },
+                "queried": {
+                  "type": "boolean",
+                  "required": true
+                },
+                "total": {
+                  "type": "integer",
+                  "required": true
+                },
+                "truncated": {
+                  "type": "boolean",
+                  "required": true
+                },
+                "walk_incomplete": {
+                  "type": "string",
+                  "required": true
+                }
+              }
+            },
+            "worktree": {
+              "type": "string",
+              "required": true
+            }
+          }
+        },
+        "replayed": {
+          "type": "boolean",
+          "required": true
+        }
+      }
+    },
+    "VerifyTaskParams": {
+      "type": "object",
+      "required": false,
+      "fields": {
+        "base": {
+          "type": "string",
+          "required": true
+        },
+        "head": {
+          "type": "string",
+          "required": true
+        },
+        "item_id": {
+          "type": "string",
+          "required": true
+        },
+        "request_id": {
+          "type": "string",
+          "required": true
+        },
+        "worktree": {
+          "type": "string",
+          "required": true
+        }
+      }
+    }
+  }
+}
