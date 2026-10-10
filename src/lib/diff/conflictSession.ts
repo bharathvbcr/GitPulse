@@ -141,9 +141,54 @@ function snapshotSize(snapshot: ConflictSnapshot): number {
           + chunk.ours_crlf.length + chunk.theirs_crlf.length + (chunk.base_crlf?.length ?? 0) + 256 : (segment.Normal?.length ?? 0) + 32);
       }, 0) : 0);
 }
+// The retained states and snapshots inside `records` are never mutated in
+// place: an edit replaces `state` with a fresh copy, travel moves whole states
+// between the stacks, and callers only ever see copies. So their sizes and
+// serialized text can be remembered by identity instead of being recomputed
+// for every record on every keystroke. Never seed these with an object a
+// caller still holds; it could change after it was measured.
+const snapshotSizes = new WeakMap<ConflictSnapshot, number>();
+const stateSizes = new WeakMap<ResolutionState, number>();
+const stateTexts = new WeakMap<ResolutionState, string>();
+const stateTextLengths = new WeakMap<ResolutionState, number>();
+function retainedSnapshotSize(snapshot: ConflictSnapshot): number {
+  let size = snapshotSizes.get(snapshot);
+  if (size === undefined) { size = snapshotSize(snapshot); snapshotSizes.set(snapshot, size); }
+  return size;
+}
+function retainedStateSize(state: ResolutionState): number {
+  let size = stateSizes.get(state);
+  if (size === undefined) { size = stateSize(state); stateSizes.set(state, size); }
+  return size;
+}
+/** `JSON.stringify` of a retained current state, kept only while it is current. */
+function retainedStateText(state: ResolutionState): string {
+  let text = stateTexts.get(state);
+  if (text === undefined) { text = JSON.stringify(state); stateTexts.set(state, text); stateTextLengths.set(state, text.length); }
+  return text;
+}
+/** `JSON.stringify(state).length` of a retained state, without keeping the text. */
+function retainedStateTextLength(state: ResolutionState): number {
+  let length = stateTextLengths.get(state);
+  if (length === undefined) { length = JSON.stringify(state).length; stateTextLengths.set(state, length); }
+  return length;
+}
+/**
+ * Drops the oldest entries until at most 50 remain and `JSON.stringify(undo)`
+ * fits the history budget — the same stack the shift-and-reserialize loop
+ * left, in one pass. The array's text is "[" + entries joined by "," + "]".
+ */
+function trimHistory(undo: ResolutionState[]): void {
+  const lengths = undo.map(retainedStateTextLength);
+  let total = lengths.reduce((sum, length) => sum + length, 0);
+  let drop = 0;
+  const kept = () => undo.length - drop;
+  while (kept() > 50 || 2 + total + Math.max(kept() - 1, 0) > MAX_HISTORY_CHARS) { total -= lengths[drop]; drop += 1; }
+  if (drop) undo.splice(0, drop);
+}
 function draftSize(draft: ConflictDraft): number {
-  return snapshotSize(draft.snapshot) + stateSize(draft.state) + [...draft.undo, ...draft.redo].reduce((size, state) => size + stateSize(state), 0)
-    + draft.recovery.reduce((size, recovery) => size + snapshotSize(recovery.snapshot) + stateSize(recovery.state), 0) + (draft.pending ? snapshotSize(draft.pending) : 0);
+  return retainedSnapshotSize(draft.snapshot) + retainedStateSize(draft.state) + [...draft.undo, ...draft.redo].reduce((size, state) => size + retainedStateSize(state), 0)
+    + draft.recovery.reduce((size, recovery) => size + retainedSnapshotSize(recovery.snapshot) + retainedStateSize(recovery.state), 0) + (draft.pending ? retainedSnapshotSize(draft.pending) : 0);
 }
 
 export function materializeResolution(draft: RecoveredResolution): ConflictDocument | null {
@@ -226,13 +271,25 @@ export function createConflictSessions(storage?: Pick<Storage, "getItem" | "setI
     edit(repo: string, file: string, state: ResolutionState, group: string | null = null): ConflictDraft {
       const draft = records.get(keyFor(repo, file));
       if (!draft) throw new Error("Load this conflict before editing");
-      if (!isState(state) || state.choices.length !== draft.state.choices.length || stateSize(state) > 4 * 1024 * 1024) throw new Error("Replacement state exceeds the conflict editor limit or does not match this source");
-      if (JSON.stringify(draft.state) === JSON.stringify(state)) return copy(draft);
+      const invalid = "Replacement state exceeds the conflict editor limit or does not match this source";
+      if (!isState(state) || state.choices.length !== draft.state.choices.length) throw new Error(invalid);
+      const size = stateSize(state);
+      if (size > 4 * 1024 * 1024) throw new Error(invalid);
+      // The caller's state is serialized once; the retained one is remembered.
+      const text = JSON.stringify(state);
+      if (retainedStateText(draft.state) === text) return copy(draft);
       const undo = [...draft.undo];
       if (!(group && draft.group === group && Date.now() - draft.editedAt < 750)) undo.push(draft.state);
-      while (undo.length > 50 || JSON.stringify(undo).length > MAX_HISTORY_CHARS) undo.shift();
-      const next = { ...draft, undo, state: copy(state), redo: [], group, editedAt: Date.now(), pending: null };
-      storeDraft(keyFor(repo, file), next); changed(repo); return copy(next);
+      trimHistory(undo);
+      // A copy has the same text and size as what was measured above, and
+      // nobody else holds it, so it can be remembered from the start.
+      const retained = copy(state);
+      stateTexts.set(retained, text); stateTextLengths.set(retained, text.length); stateSizes.set(retained, size);
+      const next = { ...draft, undo, state: retained, redo: [], group, editedAt: Date.now(), pending: null };
+      storeDraft(keyFor(repo, file), next);
+      // The previous state, now history only, needs its length, not its text.
+      stateTexts.delete(draft.state);
+      changed(repo); return copy(next);
     },
     travel(repo: string, file: string, direction: "undo" | "redo"): ConflictDraft | null {
       const draft = records.get(keyFor(repo, file)); if (!draft) return null;
@@ -243,13 +300,13 @@ export function createConflictSessions(storage?: Pick<Storage, "getItem" | "setI
     pending(repo: string, file: string, snapshot: ConflictSnapshot, revision?: string, savedState?: ResolutionState) {
       const draft = records.get(keyFor(repo, file)); if (!draft) return;
       if (revision && draft.snapshot.revision !== revision && draft.pending?.revision !== revision) return;
-      if (savedState && JSON.stringify(draft.state) !== JSON.stringify(savedState)) return;
+      if (savedState && retainedStateText(draft.state) !== JSON.stringify(savedState)) return;
       if (snapshot.file_path !== file) throw new Error("Staging receipt belongs to a different file");
       storeDraft(keyFor(repo, file), { ...draft, pending: copy(snapshot) }); changed(repo); flush();
     },
     complete(repo: string, file: string, revision: string, savedState?: ResolutionState) {
       const key = keyFor(repo, file); const draft = records.get(key);
-      if (draft && savedState && JSON.stringify(draft.state) !== JSON.stringify(savedState)) return;
+      if (draft && savedState && retainedStateText(draft.state) !== JSON.stringify(savedState)) return;
       if (draft && (draft.snapshot.revision === revision || draft.pending?.revision === revision)) {
         if (draft.recovery.length) { draft.state = initialResolution(draft.snapshot); draft.pending = null; draft.undo = []; draft.redo = []; }
         else records.delete(key);

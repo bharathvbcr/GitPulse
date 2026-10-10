@@ -85,6 +85,43 @@ describe("conflict draft recovery", () => {
     sessions.pending("/repo", "file", snapshot("saved"), "a", saved);
     expect(sessions.get("/repo", "file")?.pending).toBeNull();
   });
+  it("trims history by its serialized budget to exactly the stack the reserialize-and-shift loop kept", () => {
+    // The old loop: push, then `while (undo.length > 50 || JSON.stringify(undo).length > 1 MiB) undo.shift()`.
+    const oracle = (states: ReturnType<typeof choice>[]) => {
+      let undo: unknown[] = [initialResolution(snapshot())];
+      for (const state of states.slice(0, -1)) {
+        undo = [...undo, state];
+        while (undo.length > 50 || JSON.stringify(undo).length > 1024 * 1024) undo.shift();
+      }
+      return undo;
+    };
+    for (const width of [1, 7_000, 90_000, 170_000, 400_000, 600_000]) {
+      const sessions = createConflictSessions(); sessions.open("/repo", snapshot());
+      const states = Array.from({ length: 60 }, (_, i) => choice(snapshot(), `${i}:`.padEnd(width + (i % 5) * 997, "x")));
+      for (const state of states) sessions.edit("/repo", "file", state);
+      const kept = sessions.get("/repo", "file")!;
+      expect(kept.state).toEqual(states.at(-1));
+      expect(kept.undo, `width ${width}`).toEqual(oracle(states));
+    }
+  });
+  it("still treats an unchanged state as no edit after the retained one went through history", () => {
+    const sessions = createConflictSessions(); sessions.open("/repo", snapshot());
+    sessions.edit("/repo", "file", choice(snapshot(), "one")); sessions.edit("/repo", "file", choice(snapshot(), "two"));
+    sessions.travel("/repo", "file", "undo");
+    const before = sessions.get("/repo", "file")!;
+    sessions.edit("/repo", "file", choice(snapshot(), "one"));
+    expect(sessions.get("/repo", "file")).toEqual(before);
+    sessions.edit("/repo", "file", choice(snapshot(), "three"));
+    expect(sessions.get("/repo", "file")?.undo.map(state => state.choices[0])).toEqual(["Unresolved", { Custom: "one" }]);
+  });
+  it("does not trust a measurement of a state the caller still holds", () => {
+    const sessions = createConflictSessions(); sessions.open("/repo", snapshot());
+    const state = choice(snapshot(), "first"); sessions.edit("/repo", "file", state);
+    state.choices[0] = { Custom: "changed" }; state.custom["0"] = "changed";
+    sessions.edit("/repo", "file", state);
+    expect(sessions.get("/repo", "file")?.state.choices).toEqual([{ Custom: "changed" }]);
+    expect(sessions.get("/repo", "file")?.undo).toHaveLength(2);
+  });
   it("returns defensive copies instead of letting a remounted owner mutate another owner", () => {
     const sessions = createConflictSessions(); const view = sessions.open("/repo", snapshot()); view.state.choices[0] = "AcceptOurs";
     expect(sessions.get("/repo", "file")?.state.choices).toEqual(["Unresolved"]);

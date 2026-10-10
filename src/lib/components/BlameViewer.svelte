@@ -44,7 +44,9 @@
   const AXIS_HEIGHT = 30;
 
   let filePath = $state("");
-  let blameLines: BlameLine[] = $state([]);
+  // Raw: replaced wholesale with each blame answer (thousands of rows), never
+  // edited in place.
+  let blameLines: BlameLine[] = $state.raw([]);
   /**
    * The instant this file's blame is measured against.
    *

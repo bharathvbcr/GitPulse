@@ -142,6 +142,19 @@ describe("ConflictEditor load-effect memo guard", () => {
   });
 });
 
+describe("ConflictEditor wholesale-replaced state", () => {
+  it("keeps the session draft and staged review diff out of deep proxies", () => {
+    // Each is a fresh object (a defensive copy from conflictSessions, an IPC
+    // answer) and is only ever reassigned, so proxying it is pure overhead.
+    expect(source).toContain("let draft = $state.raw<ConflictDraft | null>(null);");
+    expect(source).toContain("let reviewDiff = $state.raw<DiffPayload | null>(null);");
+    // Nothing writes into them in place, which raw state would not notice.
+    expect(source).not.toMatch(/\bdraft\.[\w.]+\s*=[^=]/);
+    expect(source).not.toMatch(/\bdraft\.(?:state|undo|redo|recovery)(?:\.\w+)*\.(?:push|pop|shift|splice|unshift)\(/);
+    expect(source).not.toMatch(/\breviewDiff\.\w+\s*=[^=]/);
+  });
+});
+
 describe("ConflictEditor journal completeness", () => {
   it("records the completed write before stale UI checks", () => {
     const body = source.slice(

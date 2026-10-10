@@ -92,7 +92,8 @@
   let isScanning = $state(false);
   let scanError = $state<string | null>(null);
   let selectedPath = $state<string | null>(null);
-  let sourceLines: string[] = $state([]);
+  // Raw: the whole file's lines, replaced wholesale on each load.
+  let sourceLines: string[] = $state.raw([]);
   let hitMap: Map<number, number> = $state(new Map());
   let fileError = $state<string | null>(null);
   let contentError = $state<string | null>(null);

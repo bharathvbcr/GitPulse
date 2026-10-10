@@ -69,4 +69,30 @@ describe("previewStore.refresh", () => {
     expect(omitted).toHaveLength(4);
     expect(omitted.every((file) => (file.reason ?? "").includes("fan-out capped"))).toBe(true);
   });
+
+  it("reads the staged files together, keeps their order, and reports each unreadable file on its own", async () => {
+    const releases = new Map<string, () => void>();
+    vi.mocked(invoke).mockImplementation((_cmd, args) => {
+      const filePath = (args as { filePath: string }).filePath;
+      return new Promise((resolve, reject) => {
+        releases.set(filePath, () => (filePath === "src/b.ts" ? reject("permission denied") : resolve(`// ${filePath}\n`)));
+      });
+    });
+    const paths = ["src/a.ts", "src/b.ts", "src/c.ts", "src/d.ts"];
+    const done = previewStore.refresh("/repo", paths);
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(invoke, "every read is in flight before the first answers").toHaveBeenCalledTimes(paths.length);
+    // Answer out of order: the pairs still follow the caller's order.
+    for (const path of ["src/d.ts", "src/b.ts", "src/a.ts", "src/c.ts"]) releases.get(path)!();
+    await done;
+    expect(previewDevmapEdits).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(previewDevmapEdits).mock.calls[0][1]).toEqual([
+      ["src/a.ts", "// src/a.ts\n"],
+      ["src/c.ts", "// src/c.ts\n"],
+      ["src/d.ts", "// src/d.ts\n"],
+    ]);
+    const unread = get(previewStore).files.filter((file) => !file.available);
+    expect(unread).toEqual([{ file_path: "src/b.ts", available: false, reason: "permission denied", report: null }]);
+  });
 });

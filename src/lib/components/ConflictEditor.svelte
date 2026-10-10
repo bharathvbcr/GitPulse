@@ -135,7 +135,10 @@
   let parked = $derived(operationState.operation !== null);
   let selectedFile = $state<string | null>(null);
   let parsedDoc = $state<ConflictDocument | null>(null);
-  let draft = $state<ConflictDraft | null>(null);
+  // Raw: every draft is a fresh copy from `conflictSessions` (source document,
+  // history and recovery included) and is only ever replaced, never edited in
+  // place, so a deep proxy over it would only cost.
+  let draft = $state.raw<ConflictDraft | null>(null);
   let sessionVersion = $state(0);
   let retained = $derived.by(() => { sessionVersion; return $repoStore.currentPath ? conflictSessions.summaries($repoStore.currentPath) : []; });
   let storageNotice = $state(conflictSessions.warning);
@@ -178,7 +181,7 @@
   let hasUnresolved = $derived(!wholeChoice && !pendingStage && (parsedDoc === null || chunks.length === 0 || remaining > 0 || diagnostics.length > 0));
   let canSave = $derived(Boolean(draft) && !isSaving && !isLoading && (wholeChoice !== null || pendingStage || (!hasUnresolved && !isPreviewing && !previewError && resolvedPreview !== null)));
   let reviewPath = $state<string | null>(null);
-  let reviewDiff = $state<DiffPayload | null>(null);
+  let reviewDiff = $state.raw<DiffPayload | null>(null);
   let reviewError = $state<string | null>(null);
   let reviewLoading = $state(false);
   let reviewGuard: AsyncGuard | null = null;

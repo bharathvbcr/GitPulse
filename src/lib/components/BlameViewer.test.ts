@@ -113,6 +113,12 @@ describe("BlameViewer audit fixes", () => {
     expect(source).toContain("{#if isLoading && blameLines.length === 0}");
   });
 
+  it("holds blame rows in raw state: replaced wholesale, never written in place", () => {
+    expect(source).toContain("let blameLines: BlameLine[] = $state.raw([]);");
+    expect(source).not.toMatch(/blameLines\.(?:push|pop|shift|unshift|splice|sort|reverse|fill)\(/);
+    expect(source).not.toMatch(/blameLines\[[^\]]+\](?:\.\w+)*\s*=[^=]/);
+  });
+
   it("guards blame lines with deep equality to avoid spurious re-renders and scroll/filter resets", () => {
     // Identical lines returned from background revalidations must not reassign
     // blameLines or reset scroll position and active selection filters.

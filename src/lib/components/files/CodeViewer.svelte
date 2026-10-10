@@ -159,9 +159,10 @@
    * language. `null` means "use the regex tokenizer" — either no grammar, or
    * the IPC call failed / is still in flight. Never treat an empty array as
    * "highlighted": that would paint a tree-sitter language as plain text
-   * while the request is outstanding.
+   * while the request is outstanding. Raw: a whole-document token table,
+   * only ever replaced, never edited in place.
    */
-  let treeSitterLines = $state<SyntaxToken[][] | null>(null);
+  let treeSitterLines = $state.raw<SyntaxToken[][] | null>(null);
   let treeSitterGuard: ReturnType<typeof createAsyncGuard> | null = null;
 
   $effect(() => {
