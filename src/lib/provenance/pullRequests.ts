@@ -41,9 +41,22 @@ export function prRevisionCandidates(headRef: string): string[] {
   return [`${PRIMARY_REMOTE}/${ref}`, ref];
 }
 
-/** Every revision a batch should carry for these pull requests, deduplicated. */
-export function prRevisions(prs: readonly { head_ref: string }[]): string[] {
-  return [...new Set(prs.flatMap((pr) => prRevisionCandidates(pr.head_ref)))];
+/** A pull request whose head branch is in a fork. Its `head_ref` names a
+ *  branch of the contributor's repository, so it says nothing about the
+ *  same-named local or `origin/` branch (a fork's `main` is not our `main`). */
+export function isForkPr(pr: { is_cross_repository?: boolean }): boolean {
+  return pr.is_cross_repository === true;
+}
+
+/** Every revision a batch should carry for these pull requests, deduplicated.
+ *  Fork heads are skipped: asking about `origin/<their branch>` would answer
+ *  for an unrelated branch of ours. */
+export function prRevisions(
+  prs: readonly { head_ref: string; is_cross_repository?: boolean }[],
+): string[] {
+  return [
+    ...new Set(prs.filter((pr) => !isForkPr(pr)).flatMap((pr) => prRevisionCandidates(pr.head_ref))),
+  ];
 }
 
 /**
@@ -67,4 +80,12 @@ export function prFreshness(
     lastSeen = answer;
   }
   return lastSeen;
+}
+
+/** The freshness badge value for a pull request: none for a fork head. */
+export function prHeadFreshness(
+  byRevision: Readonly<Record<string, ProvenanceFreshness>>,
+  pr: { head_ref: string; is_cross_repository?: boolean },
+): ProvenanceFreshness | null {
+  return isForkPr(pr) ? null : prFreshness(byRevision, pr.head_ref);
 }
