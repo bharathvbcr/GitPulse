@@ -6,6 +6,7 @@ pub mod codeintel;
 pub mod commands;
 pub(crate) mod coverage_toolchain;
 pub mod desktop;
+pub mod daemon_lock;
 pub mod devmap;
 pub mod diff;
 pub mod docs;
@@ -520,6 +521,7 @@ pub fn run() {
             cmd_tool_capability_refresh,
             cmd_check_app_update,
             supervisor::cmd_degraded_subsystems,
+            daemon_lock::cmd_daemon_status,
         ])
         .build(context())
         .expect("error while building GitPulse")
