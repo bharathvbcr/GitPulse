@@ -39,6 +39,16 @@ pub struct EntityCollisionVerdict {
     pub shared_symbols: Vec<String>,
 }
 
+impl EntityCollisionVerdict {
+    /// The symbol join was stale rather than absent: an index built for another
+    /// HEAD than the one being read. The overlap is real but its symbols could
+    /// not be compared, so the finding is inconclusive, not a conflict.
+    pub fn index_stale(&self) -> bool {
+        self.kind == EntityCollisionKind::FileLevel
+            && (self.reason.contains("head_sha") || self.reason.contains("does not equal HEAD"))
+    }
+}
+
 /// Inclusive line range on the old (HEAD) side of a unified diff.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LineRange {
@@ -257,15 +267,23 @@ pub fn parse_old_side_ranges(diff: &str) -> Vec<LineRange> {
     ranges
 }
 
-/// Attach a symbol verdict to the first overlapping path only.
-pub fn enrich_first_item(
+/// Attach a symbol verdict to one overlapping path: `focus` when it names a
+/// row, else the first row.
+///
+/// One path only, because classifying costs git diffs and a DevMap open per
+/// party. The hook that asks about an edit passes the edited path: enriching the
+/// first row (sorted by path) spent that cost on an unrelated file and left the
+/// edited one without a symbol verdict.
+pub fn enrich_item(
     mut risk: crate::insights::CollisionRisk,
+    focus: Option<&str>,
 ) -> crate::insights::CollisionRisk {
-    if let Some(item) = risk.items.first().cloned() {
-        let verdict = classify_overlapping_path(&item);
-        if let Some(first) = risk.items.first_mut() {
-            first.entity = Some(verdict);
-        }
+    let index = focus
+        .and_then(|path| risk.items.iter().position(|item| item.path == path))
+        .or(if risk.items.is_empty() { None } else { Some(0) });
+    if let Some(index) = index {
+        let verdict = classify_overlapping_path(&risk.items[index]);
+        risk.items[index].entity = Some(verdict);
     }
     risk
 }
@@ -359,5 +377,58 @@ mod tests {
 ";
         let ranges = parse_old_side_ranges(diff);
         assert_eq!(ranges, vec![LineRange { start: 10, end: 11 }]);
+    }
+
+    fn risk_with(paths: &[&str]) -> crate::insights::CollisionRisk {
+        crate::insights::CollisionRisk {
+            ok: true,
+            error: String::new(),
+            overlapping_files: paths.len() as u32,
+            worktrees_involved: 2,
+            scanned_worktrees: 2,
+            unscanned_worktrees: 0,
+            failed_worktrees: 0,
+            truncated: false,
+            items: paths
+                .iter()
+                .map(|path| crate::insights::CollisionItem {
+                    path: (*path).to_string(),
+                    worktrees: Vec::new(),
+                    entity: None,
+                })
+                .collect(),
+            shared_worktree_files: 0,
+            shared_worktrees: Vec::new(),
+            sessions_ok: true,
+            sessions_error: String::new(),
+        }
+    }
+
+    /// The hook asks about the file being edited. Rows are sorted by path, so
+    /// enriching the first one spent two git diffs and a DevMap open on an
+    /// unrelated file and left the edited path with no verdict.
+    #[test]
+    fn the_verdict_goes_to_the_focused_path_not_the_first_row() {
+        let enriched = enrich_item(risk_with(&["a.rs", "b.rs", "c.rs"]), Some("b.rs"));
+        let entities: Vec<bool> = enriched.items.iter().map(|i| i.entity.is_some()).collect();
+        assert_eq!(entities, vec![false, true, false]);
+        // No focus, or a focus naming no row, keeps the old first-row behaviour.
+        let first = enrich_item(risk_with(&["a.rs", "b.rs"]), None);
+        assert!(first.items[0].entity.is_some() && first.items[1].entity.is_none());
+        let unknown = enrich_item(risk_with(&["a.rs", "b.rs"]), Some("zzz.rs"));
+        assert!(unknown.items[0].entity.is_some() && unknown.items[1].entity.is_none());
+        assert!(enrich_item(risk_with(&[]), Some("a.rs")).items.is_empty());
+    }
+
+    #[test]
+    fn a_stale_index_is_told_apart_from_other_file_level_reasons() {
+        let stale = classify_party_symbols(
+            "x.rs",
+            &[],
+            &["indexed generation head_sha abc is not the requested def".into()],
+        );
+        assert!(stale.index_stale());
+        let other = classify_party_symbols("x.rs", &[], &["file is untracked".into()]);
+        assert!(!other.index_stale());
     }
 }

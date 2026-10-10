@@ -28,11 +28,23 @@ use std::io;
 use gitpulse_lib::hooks::{self, IDENTITY_FLAGS, SUBCOMMANDS};
 
 fn main() {
+    // The one deadline for the whole process starts here, before anything that
+    // can block, so every later wait is cut to what the host's timeout leaves.
+    hooks::start_deadline();
     // A hook runs git for the user's own agent, so it spends the per-user
     // spawn budget the app and the agent servers spend. First, before any
     // spawn builds the gate.
     gitpulse_lib::engine::git_cli::run_process_with_shared_spawn_budget();
     let code = run_guarded(decide);
+    // The decision is already on stdout. Anything a check abandoned at its
+    // deadline is still running: a `git status` or the harness sidecar, in its
+    // own process group, able to hold `.git/index.lock` after the hook is gone.
+    // `process::exit` runs no destructor, so they are taken down here, as the
+    // servers do. Free when nothing is registered; otherwise one `CHILD_GRACE`.
+    let sweep = gitpulse_lib::procguard::reap_all(gitpulse_lib::procguard::CHILD_GRACE);
+    if !sweep.is_complete() {
+        log::warn!(target: "hook", "{}", sweep.describe());
+    }
     // Not a bare return: a hook that finished while a caught signal was still
     // being swept would exit out from under it, leaving the git or harness
     // subprocess the sweep was killing.

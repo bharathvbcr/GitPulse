@@ -13,6 +13,21 @@ before that tag is pushed.
 
 ### Changed
 
+- **`gitpulse-hook` correctness.** The hook now takes down any `git` or harness
+  child a check abandoned at its deadline before it exits (a stalled `git
+  status` used to outlive it and could hold `.git/index.lock`); one 8 s
+  deadline starts when the process does and every wait is cut to what is left,
+  so a late stdin no longer adds up to the host's 10 s timeout and drops the
+  decision; the collision verdict is computed for the file being edited rather
+  than the first overlapping file; a file touched in another worktree on
+  different symbols (or with a stale index) informs the agent through
+  additional context instead of asking, which a launched agent turned into a
+  refused edit; a Cursor deny or ask is shown as a warning instead of looking
+  like a clean pass; and the `MultiEdit` tool the guard judges is now in the
+  plugin's matcher, with a test that keeps the two lists equal. Security
+  impact: the guard now also covers `MultiEdit` and no longer leaves orphans;
+  the disjoint-symbol case stops asking, which narrows nothing that was
+  blocking a real conflict (shared-symbol and file-level overlaps still ask).
 - **A released app's safety hooks and MCP server now resolve, and a hook that
   cannot launch no longer fails open.** The plugin's manifests name bare
   `gitpulse-hook` / `gitpulse-mcp`, which only a developer's `mcp:install`

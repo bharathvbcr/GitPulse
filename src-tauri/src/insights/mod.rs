@@ -1531,21 +1531,28 @@ fn collision_from_list(list: &[WorktreeInfo], live: &LiveSessionFacet) -> Collis
 ///
 /// The porcelain path scan stays bounded and cheap. Symbol classification runs
 /// afterwards on the first overlapping path only — see
-/// [`entity_collision::enrich_first_item`].
+/// [`entity_collision::enrich_item`].
 pub fn collision_risk(repo_path: &str) -> CollisionRisk {
-    collision_risk_observed(repo_path, &live_sessions::observe())
+    collision_risk_observed(repo_path, &live_sessions::observe(), None)
+}
+
+/// [`collision_risk`] whose symbol verdict is computed for `path`, the file
+/// being edited, instead of the first overlapping row.
+pub fn collision_risk_for_path(repo_path: &str, path: &str) -> CollisionRisk {
+    collision_risk_observed(repo_path, &live_sessions::observe(), Some(path))
 }
 
 /// [`collision_risk`] over a live-session observation the caller made.
 fn collision_risk_observed(
     repo_path: &str,
     observation: &live_sessions::Observation,
+    focus: Option<&str>,
 ) -> CollisionRisk {
     match worktree::list_worktrees_lite(repo_path) {
-        Ok(list) => entity_collision::enrich_first_item(collision_from_list(
-            &list,
-            &live_in(observation, &list),
-        )),
+        Ok(list) => entity_collision::enrich_item(
+            collision_from_list(&list, &live_in(observation, &list)),
+            focus,
+        ),
         Err(error) => empty_collisions(error),
     }
 }
@@ -2251,7 +2258,7 @@ mod tests {
         let claude = observation.iter().find(|k| k.kind == "claude").unwrap();
         assert_eq!(claude.live.len(), 2, "both stand-ins are alive: {claude:?}");
 
-        let risk = collision_risk_observed(repo, &observation);
+        let risk = collision_risk_observed(repo, &observation, None);
         assert!(risk.ok, "{risk:?}");
         assert_eq!(risk.overlapping_files, 0, "one worktree overlaps nothing");
         assert_eq!(risk.shared_worktree_files, 1, "{risk:?}");
@@ -2309,7 +2316,7 @@ mod tests {
             &crate::workbench::process_birth::running_since,
         );
 
-        let risk = collision_risk_observed(repo, &observation);
+        let risk = collision_risk_observed(repo, &observation, None);
         assert!(risk.ok, "{risk:?}");
         assert!(risk.shared_worktrees.is_empty(), "{risk:?}");
         assert_eq!(risk.shared_worktree_files, 0);
