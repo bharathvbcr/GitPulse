@@ -64,7 +64,7 @@ function messageOf(error: unknown): string {
  */
 function retryKey(cmd: string, args: InvokeArgs | undefined): string | null {
   if (args === undefined) return JSON.stringify([cmd]);
-  if (args instanceof ArrayBuffer || ArrayBuffer.isView(args)) return null;
+  if (isBinary(args)) return null;
   let plain = true;
   const text = JSON.stringify([cmd, args], (_key, value: unknown) => {
     if (value !== null && typeof value === "object") {
@@ -76,6 +76,23 @@ function retryKey(cmd: string, args: InvokeArgs | undefined): string | null {
     return value;
   });
   return plain ? text : null;
+}
+
+function isBinary(args: InvokeArgs | undefined): boolean {
+  return args instanceof ArrayBuffer || ArrayBuffer.isView(args);
+}
+
+/**
+ * `retryKey` that never throws. Arguments that cannot be serialized (a cycle,
+ * a `bigint`) are simply not retryable: the call goes out as given, and a
+ * deferral is its answer rather than a serializer error in its place.
+ */
+function lazyRetryKey(cmd: string, args: InvokeArgs | undefined): string | null {
+  try {
+    return retryKey(cmd, args);
+  } catch {
+    return null;
+  }
 }
 
 const defaultSleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
@@ -124,24 +141,42 @@ export function withDeferralRetry(raw: Raw, options: DeferralRetryOptions = {}) 
   //
   // Not an `async` function: each extra `await` layer delays every answer by
   // microtasks, and callers that publish an answer to a store and are read in
-  // the same turn saw the delay. A call that cannot be retried adds nothing
-  // here; one that can adds a single `.catch`. The exported `invoke` sits one
-  // microtask above `tauriInvoke`, for the stall-attribution note below.
+  // the same turn saw the delay. A call known up front not to be retryable
+  // (options, a byte buffer) adds nothing here; any other adds a single
+  // `.catch`, and is checked for plain data only if it is actually deferred.
+  // The exported `invoke` sits one microtask above `tauriInvoke`, for the
+  // stall-attribution note below.
   return function invoke<T>(cmd: string, ...rest: Rest): Promise<T> {
     // A call carrying options (request headers, for raw-body commands) is
     // treated like one with non-plain arguments: neither retried nor joined.
-    const key = rest.length > 1 ? null : retryKey(cmd, rest[0]);
-    if (key === null) return call<T>(cmd, rest);
-    const pending = retrying.get(key);
-    if (pending) return pending as Promise<T>;
+    // So is a byte buffer; both are known without serializing anything.
+    if (rest.length > 1 || isBinary(rest[0])) return call<T>(cmd, rest);
+    // The key exists only to join a call already waiting to retry. With none
+    // waiting there is nothing to join, so it is not computed up front: every
+    // file save and terminal write would otherwise serialize its whole payload
+    // for nothing. It is computed below instead, at the moment this call is
+    // deferred and registers its own retry, so a later identical call still
+    // finds and joins it.
+    let key: string | null | undefined;
+    if (retrying.size > 0) {
+      key = lazyRetryKey(cmd, rest[0]);
+      if (key === null) return call<T>(cmd, rest);
+      const pending = retrying.get(key);
+      if (pending) return pending as Promise<T>;
+    }
     return call<T>(cmd, rest).catch((error: unknown) => {
       if (!isDeferredUnderLoad(messageOf(error))) throw error;
-      const joined = retrying.get(key);
+      if (key === undefined) key = lazyRetryKey(cmd, rest[0]);
+      // Not plain data: the deferral is the answer, exactly as if the call
+      // had never been eligible for a retry.
+      if (key === null) throw error;
+      const settledKey = key;
+      const joined = retrying.get(settledKey);
       if (joined) return joined as Promise<T>;
       const chain = retry<T>(cmd, rest, error).finally(() => {
-        if (retrying.get(key) === chain) retrying.delete(key);
+        if (retrying.get(settledKey) === chain) retrying.delete(settledKey);
       });
-      retrying.set(key, chain);
+      retrying.set(settledKey, chain);
       return chain;
     });
   };

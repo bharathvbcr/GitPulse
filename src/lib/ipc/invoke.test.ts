@@ -150,6 +150,60 @@ describe("withDeferralRetry", () => {
     expect(h.raw).toHaveBeenCalledTimes(2);
   });
 
+  // A save or terminal write used to serialize its whole payload into a key
+  // on every call, though the key only matters while a retry is waiting.
+  it("does not serialize the arguments of a call nobody could join", async () => {
+    const h = harness(["ok"]);
+    let reads = 0;
+    const args = {
+      repoPath: "/r",
+      get content() {
+        reads += 1;
+        return "x".repeat(1_000);
+      },
+    };
+    await expect(h.invoke("cmd_write_file_content", args)).resolves.toBe("ok");
+    expect(reads, "no retry was pending, so no key was computed").toBe(0);
+  });
+
+  it("computes the key when a call is deferred, so a later identical call still joins it", async () => {
+    const h = harness([DEFERRAL, "answer"]);
+    let reads = 0;
+    const args = () => ({
+      get repoPath() {
+        reads += 1;
+        return "/r";
+      },
+    });
+    const first = h.invoke("cmd_stash_list", args());
+    await h.settle();
+    expect(h.sleeping(), "first was declined and is waiting to retry").toBe(1);
+    expect(reads, "keyed once, at the deferral").toBe(1);
+    const second = h.invoke("cmd_stash_list", args());
+    await h.tick();
+    await expect(Promise.all([first, second])).resolves.toEqual(["answer", "answer"]);
+    expect(h.raw, "the identical call joined the waiting retry").toHaveBeenCalledTimes(2);
+  });
+
+  it("joins two identical calls that are both deferred before either is keyed", async () => {
+    const h = harness([DEFERRAL, DEFERRAL, "answer"]);
+    const first = h.invoke("cmd_stash_list", { repoPath: "/r" });
+    const second = h.invoke("cmd_stash_list", { repoPath: "/r" });
+    await h.settle();
+    expect(h.sleeping(), "one retry chain for both").toBe(1);
+    await h.tick();
+    await expect(Promise.all([first, second])).resolves.toEqual(["answer", "answer"]);
+    expect(h.raw).toHaveBeenCalledTimes(3);
+  });
+
+  it("gives back the deferral, not a serializer error, for arguments that cannot be keyed", async () => {
+    const h = harness([DEFERRAL]);
+    const cyclic: Record<string, unknown> = { repoPath: "/r" };
+    cyclic.self = cyclic;
+    await expect(h.invoke("cmd_stream", cyclic as never)).rejects.toBe(DEFERRAL);
+    expect(h.raw).toHaveBeenCalledTimes(1);
+  });
+
   it("starts a fresh chain once the previous one has settled", async () => {
     const h = harness([DEFERRAL, "one", DEFERRAL, "two"]);
     const first = h.invoke("cmd_last_fetch_at", { repoPath: "/r" });
