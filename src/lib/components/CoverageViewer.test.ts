@@ -287,6 +287,13 @@ describe("CoverageViewer flicker contracts", () => {
     expect(source).toContain("{#if isScanning && !report}");
   });
 
+  it("holds the file's source lines in raw state: replaced wholesale, never written in place", () => {
+    expect(source).toContain("let sourceLines: string[] = $state.raw([]);");
+    expect(source).not.toMatch(/sourceLines\.(?:push|pop|shift|unshift|splice|sort|reverse|fill)\(/);
+    expect(source).not.toMatch(/sourceLines\[[^\]]+\]\s*=[^=]/);
+    expect(source).not.toContain("bind:items={sourceLines}");
+  });
+
   it("surfaces a capped scan as unknown coverage, not uncovered source", () => {
     // The detail payload's truncated flag must reach the UI: a capped scan's
     // missing gutters mean "unknown", and rendering them as plain misses is

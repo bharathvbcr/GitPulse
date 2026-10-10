@@ -112,8 +112,24 @@ describe("build evidence retention", () => {
     } finally { await rm(root, { recursive: true, force: true }); }
   });
 
-  it("lists the commit a release tag points at, peeled through annotated tags", () => {
-    const tagged = execFileSync("git", ["rev-list", "-n", "1", "--tags"], { encoding: "utf8" }).trim();
-    expect(releaseRevisions()).toContain(tagged);
+  // Hermetic: a shallow or tag-less checkout of this repository (CI's default
+  // clone, a fresh cloud session) has no tags to read, so the fixture makes
+  // its own — one lightweight tag and one annotated tag on distinct commits.
+  it("lists the commit a release tag points at, peeled through annotated tags", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "gitpulse-tags-"));
+    try {
+      const git = (...args: string[]) =>
+        execFileSync("git", ["-c", "user.name=t", "-c", "user.email=t@example.com", "-c", "commit.gpgsign=false", "-c", "tag.gpgsign=false", ...args], { cwd: root, encoding: "utf8" }).trim();
+      git("init", "-q");
+      git("commit", "-q", "--allow-empty", "-m", "one");
+      git("tag", "v1.0.0");
+      const light = git("rev-parse", "HEAD");
+      git("commit", "-q", "--allow-empty", "-m", "two");
+      git("tag", "-a", "v1.1.0", "-m", "release");
+      const annotated = git("rev-parse", "HEAD");
+      const revisions = releaseRevisions(root);
+      expect(revisions).toContain(light);
+      expect(revisions).toContain(annotated);
+    } finally { await rm(root, { recursive: true, force: true }); }
   });
 });

@@ -1268,6 +1268,12 @@ pub fn tail_newest(
     read_after(repo_path, cursor, limit, true)
 }
 
+/// Any row attributed to a repository other than the two spellings `?1 <= ?2`.
+/// See [`latest_binding`] for why this is range probes rather than `NOT IN`.
+const FOREIGN_ROW_SQL: &str = "SELECT 1 FROM events
+     WHERE repo_path < ?1 OR (repo_path > ?1 AND repo_path < ?2) OR repo_path > ?2
+     LIMIT 1";
+
 /// The newest bind or unbind recorded for a worktree under either spelling of
 /// its path: `Some(Some(task))` for a binding, `Some(None)` for an unbind (or
 /// a bind naming no task), `None` when neither was ever recorded.
@@ -1289,11 +1295,21 @@ fn latest_binding(
     tests::LEDGER_READS.with(|reads| reads.set(reads.get() + 1));
     let canonical_repo_path = canonical_repo(repo_path);
     let stored_repo_path = redact::text(&canonical_repo_path);
+    // `NOT IN` cannot seek, and in the normal case — no foreign row — `LIMIT 1`
+    // never stops it early, so it scanned all of `idx_events_repo_ts` on every
+    // gated mutation and every hook process. Three range probes around the two
+    // spellings ask the same question with index seeks. `repo_path` is
+    // `TEXT NOT NULL` under BINARY collation, so `<`/`>` partition it exactly.
+    let (lo, hi) = if canonical_repo_path <= stored_repo_path {
+        (&canonical_repo_path, &stored_repo_path)
+    } else {
+        (&stored_repo_path, &canonical_repo_path)
+    };
     with_conn(repo_path, |conn| {
         let foreign = conn
             .query_row(
-                "SELECT 1 FROM events WHERE repo_path NOT IN (?1, ?2) LIMIT 1",
-                params![canonical_repo_path, stored_repo_path],
+                FOREIGN_ROW_SQL,
+                params![lo, hi],
                 |row| row.get::<_, i64>(0),
             )
             .optional()

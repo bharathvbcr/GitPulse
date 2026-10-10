@@ -16,6 +16,11 @@ describe("CodeViewer", () => {
     expect(body).not.toContain("Save (⌘S)");
     expect(body).toContain('aria-readonly="true"');
   });
+  it("holds the whole-document tree-sitter tokens in raw state: replaced wholesale, never written in place", () => {
+    expect(source).toContain("let treeSitterLines = $state.raw<SyntaxToken[][] | null>(null);");
+    expect(source).not.toMatch(/treeSitterLines\??\.(?:push|pop|shift|unshift|splice|sort|reverse|fill)\(/);
+    expect(source).not.toMatch(/treeSitterLines\??\[[^\]]+\](?:\.\w+|\[[^\]]+\])*\s*=[^=]/);
+  });
   it("integrates syntax tokenizer and language detection", () => {
     expect(source).toContain("detectLanguageFromPath");
     expect(source).toContain("tokenizeLine");

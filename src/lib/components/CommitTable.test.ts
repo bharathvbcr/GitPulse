@@ -143,3 +143,19 @@ describe("tag standing on graph chips", () => {
     expect(source).toContain("comparedTo: standing?.base ?? null");
   });
 });
+
+describe("CommitTable palette invalidation", () => {
+  it("drops cached graph tiles only when the theme or accent changes", () => {
+    // interfaceStore publishes a fresh object per preference write, so
+    // `$interfaceStore.accent` inside the effect invalidated every tile on
+    // unrelated emissions. The accent is read through a strictly-equal derived.
+    expect(source).toContain("const graphAccent = $derived($interfaceStore.accent);");
+    const marker = source.indexOf("    graphAccent;\n");
+    expect(marker).toBeGreaterThan(-1);
+    const start = source.lastIndexOf("$effect(() => {", marker);
+    const effect = source.slice(start, source.indexOf("\n  });\n", marker));
+    expect(effect).toContain("$themeStore;");
+    expect(effect).toContain("graphCache.invalidate();");
+    expect(effect).not.toContain("$interfaceStore");
+  });
+});

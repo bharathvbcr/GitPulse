@@ -31,6 +31,20 @@ before that tag is pushed.
 - The profile worker may now call `work.verify.task` and `work.verify.get`
   (host methods `verifications.start` and `verifications.get`), which only name
   the work to judge; no command or criteria travel in the request.
+- **Less background work while you type and while the window idles.** A
+  commit-message keystroke or status poll no longer re-runs code-impact
+  queries, re-lists every file in the tree, re-walks a file's history,
+  refetches provenance or markdown backlinks, or rescans dead branches
+  (which also reset the cleanup selection); those refresh when the
+  repository, selection, staged paths or HEAD change. Dragging the terminal
+  dock writes preferences once on release instead of every frame, an
+  unrelated preference change no longer resets the graph's tile cache or
+  native zoom, and the Agents clock stops while the window is hidden.
+- **Fewer spawns and faster ledger reads.** The ledger's foreign-repository
+  check uses index seeks instead of scanning every event on each gated
+  action and agent hook; dead-branch scans and cleans read the worktree list
+  once rather than once per branch; the update check, persisted log and MCP
+  info no longer block the interface thread or a shared runtime worker.
 
 ### Fixed
 
@@ -84,6 +98,11 @@ before that tag is pushed.
   branch the branch listing already resolved, and runs `merge-tree` only for
   the selected branches (none with force). A 50-branch clean went from 457 git
   processes to 109.
+- Branch freshness badges in the sidebar were requested and then discarded:
+  the reset that clears them on a repository switch ran after every load,
+  voiding it, and wiped the GitHub panel's PR badges with it. It now runs only
+  when the repository changes.
+
 
 ## [1.4.0] - 2026-10-09
 

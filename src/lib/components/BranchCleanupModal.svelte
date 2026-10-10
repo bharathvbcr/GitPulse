@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { untrack } from "svelte";
   import { repoStore } from "../stores/repoStore";
   import { toastStore } from "../stores/toastStore";
   import { trapFocus } from "../ui/focusTrap";
@@ -124,10 +125,26 @@
     }
   }
 
+  /**
+   * Scan when the modal opens, or when the repository under it changes —
+   * and at no other time.
+   *
+   * `$repoStore.currentPath` read here subscribed the effect to the whole
+   * store, which publishes per commit-message keystroke and per ~6s status
+   * poll: every publish rescanned and reset the reader's checkboxes to the
+   * default selection. And `runScan` reads the filter state synchronously
+   * before its first await, so those reads were tracked too — the filter
+   * controls already rescan from their own `onchange`, so that was a second,
+   * per-input scan. The path is a strictly-equal derived and the calls are
+   * untracked, so only `isOpen` and the repository path drive this.
+   */
+  const scanRepoPath = $derived($repoStore.currentPath);
   $effect(() => {
-    if (isOpen && $repoStore.currentPath) {
-      void runScan();
-      void loadBackups();
+    if (isOpen && scanRepoPath) {
+      untrack(() => {
+        void runScan();
+        void loadBackups();
+      });
     }
   });
 

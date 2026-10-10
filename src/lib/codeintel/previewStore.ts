@@ -82,8 +82,12 @@ async function collectFilePairs(
 }> {
   const pairs: Array<[string, string]> = [];
   const unread: DevmapPreviewFileResult[] = [];
-  for (const path of paths) {
-    const read = await readWorkingTreeContent(repoPath, path);
+  // Read together, not one round trip after another; `readWorkingTreeContent`
+  // never rejects, so one unreadable file cannot sink the rest, and results
+  // are walked in the caller's path order below.
+  const reads = await Promise.all(paths.map((path) => readWorkingTreeContent(repoPath, path)));
+  for (const [index, path] of paths.entries()) {
+    const read = reads[index];
     if (!read.ok) {
       unread.push({
         file_path: path,

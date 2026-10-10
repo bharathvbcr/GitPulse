@@ -74,8 +74,17 @@
   let stats = $derived<DocumentStats>(calculateDocumentStats(rawContent));
   let outline = $derived(rendered.headings);
   let backlinks = $state<DocBacklink[]>([]);
+  /**
+   * The repository as a primitive, so `note` and the effects below depend on
+   * a string compared by value rather than on the whole store. repoStore
+   * publishes a fresh object per commit-message keystroke and per ~6s status
+   * poll; a `note` built straight from `$repoStore.currentPath` was a new
+   * object each time, which re-rendered the page (re-encoding its pictures)
+   * and refetched the backlinks on every publish.
+   */
+  const repoPath = $derived($repoStore.currentPath);
   let note = $derived<MarkdownNote | null>(
-    $repoStore.currentPath && filePath ? { repoPath: $repoStore.currentPath, path: filePath } : null,
+    repoPath && filePath ? { repoPath, path: filePath } : null,
   );
 
   /**
@@ -116,7 +125,7 @@
   });
 
   $effect(() => {
-    const repo = $repoStore.currentPath;
+    const repo = repoPath;
     const path = filePath;
     let cancelled = false;
     backlinks = [];

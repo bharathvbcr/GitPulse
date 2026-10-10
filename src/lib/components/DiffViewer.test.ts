@@ -338,6 +338,69 @@ describe("DiffViewer store-emission memo guards", () => {
     expect(source.slice(idx, idx + 300)).toContain("guard.isLive()");
   });
 
+  /** Slice of the `$effect(() => {` block that contains `marker`. */
+  function effectContaining(marker: string): string {
+    const at = source.indexOf(marker);
+    expect(at).toBeGreaterThan(-1);
+    const start = source.lastIndexOf("$effect(() => {", at);
+    expect(start).toBeGreaterThan(-1);
+    const end = source.indexOf("\n  });\n", at);
+    return source.slice(start, end);
+  }
+
+  it("keys the codeintel query effects on primitives, not on every repoStore publish", () => {
+    // `$repoStore.x` inside an effect subscribes to the whole store, and the
+    // store publishes a fresh object per keystroke and per status poll. The
+    // query effects read strictly-equal deriveds instead.
+    expect(source).toContain("const currentRepoPath = $derived($repoStore.currentPath);");
+    expect(source).toContain("const currentFilePath = $derived($repoStore.selectedFilePath);");
+    expect(source).toContain("const currentCommitId = $derived($repoStore.selectedCommitId);");
+    for (const marker of [
+      "getImpactAtRung(repoPath, filePath",
+      'invoke<string>("cmd_get_head_id"',
+      "getImpactLayeredMany(repo, kept",
+    ]) {
+      expect(effectContaining(marker)).not.toContain("$repoStore");
+    }
+  });
+
+  it("memoizes the hunk-symbol lookup without cancelling it from a teardown", () => {
+    // A memo hit returns early, and Svelte runs the previous teardown before
+    // every re-run: a teardown-based cancel would kill the in-flight lookup
+    // and the early return would never restart it.
+    const effect = effectContaining('invoke<string>("cmd_get_head_id"');
+    expect(effect).toContain("if (key === hunkSymbolsKey) return;");
+    expect(effect).toContain("hunkSymbolsGuard?.cancel();");
+    expect(effect).toContain("guard.isLive()");
+    expect(effect).not.toMatch(/return \(\) => \{\s*cancelled = true;\s*\};/);
+    expect(source).toContain("$effect(() => () => hunkSymbolsGuard?.cancel());");
+  });
+
+  it("refreshes impact and hunk labels when HEAD moves or the index republishes, without polling", () => {
+    // Keyed on primitives, these no longer re-ran every poll, so labels from
+    // a stale index stuck until the selection changed.
+    expect(source).toContain('import { liveIndex } from "../codeintel/liveIndex";');
+    expect(source).toContain("const headTip = $derived(branchHeadTip || graphHeadId);");
+    expect(source).toContain("$graphStore.visiblePath === currentRepoPath ? ($graphStore.headId ?? \"\") : \"\"");
+    expect(source).toContain("($indexSnapshots[currentRepoPath]?.revision ?? 0)");
+    const impact = effectContaining("getImpactAtRung(repoPath, filePath");
+    expect(impact).toContain("void headTip;");
+    expect(impact).toContain("void indexRevision;");
+    const symbols = effectContaining('invoke<string>("cmd_get_head_id"');
+    expect(symbols).toContain('const head = commitId ? "" : headTip;');
+    expect(symbols).toContain("const index = indexRevision;");
+    expect(symbols).toMatch(/\[repo, section\.path, commitId \?\? "", head, String\(index\)/);
+    // The memo still precedes the cancel, so a hit leaves the lookup running.
+    expect(symbols.indexOf("if (key === hunkSymbolsKey) return;")).toBeLessThan(symbols.indexOf("hunkSymbolsGuard?.cancel();"));
+  });
+
+  it("opens the rail for a new working-tree read without re-running on every repoStore publish", () => {
+    const rail = effectContaining("railOpen = true");
+    expect(rail).not.toContain("$repoStore");
+    expect(rail).toContain("if (pending && !currentCommitId) railOpen = true;");
+    expect(source).toContain("const pending = $derived($repoStore.selectedDiffPending);");
+  });
+
   it("loads change-set blast via getImpactLayeredMany and shows omitted counts", () => {
     expect(source).toContain("getImpactLayeredMany");
     expect(source).toContain("composeLayeredImpacts");

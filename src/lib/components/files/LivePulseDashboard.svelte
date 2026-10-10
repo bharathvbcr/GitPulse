@@ -4,6 +4,7 @@
   import { onMount } from "svelte";
   import { createVisibleInterval } from "../../dom/visibleInterval";
   import { repoStore } from "../../stores/repoStore";
+  import { graphStore } from "../../stores/graphStore";
   import { invoke } from "../../ipc/invoke";
   import {
     Activity,
@@ -186,8 +187,29 @@
     lastRefreshed = Date.now();
   });
 
+  // `$repoStore.currentPath` tracks the whole store, which publishes a fresh
+  // object on every draft keystroke and status poll. The key keeps those
+  // re-runs from cancelling and re-issuing the history read for the same file.
+  // A new repository or selection reloads, and so does a moved HEAD — a
+  // commit, pull or checkout is what can change this file's history, and the
+  // per-publish reload used to pick that up by accident. No teardown cancels
+  // the load, so a memo hit leaves it in flight: `loadFileDetails` cancels its
+  // own predecessor, and unmount is handled in `onMount`.
+  //
+  // A detached HEAD has no current branch, so its tip is empty; the graph
+  // store's `headId` (`rev-parse HEAD`, re-read by every refresh) stands in
+  // for the repository it is showing, so a checkout between commits still
+  // reloads. On a branch the branch tip is used, exactly as before.
+  let lastDetailsKey = "";
   $effect(() => {
     const repo = $repoStore.currentPath;
+    const branchTip =
+      $repoStore.branches.find((b) => b.is_current && !b.is_remote)?.tip_commit_id ?? "";
+    const graph = $graphStore;
+    const head = branchTip || (repo && graph.visiblePath === repo ? (graph.headId ?? "") : "");
+    const key = `${repo ?? ""}\0${selectedFile ?? ""}\0${head}`;
+    if (key === lastDetailsKey) return;
+    lastDetailsKey = key;
     if (repo && selectedFile) {
       void loadFileDetails(repo, selectedFile);
     } else {

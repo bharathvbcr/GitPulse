@@ -128,4 +128,27 @@ describe("CommitComposer", () => {
       expect(standIn, `stand-in footer is missing ${label}`).toContain(label);
     }
   });
+
+
+  /**
+   * `$repoStore.currentPath` read in an effect tracks the whole store, and the
+   * store publishes a fresh object on every draft keystroke — so each key
+   * typed cancelled the staged blast-radius query and issued it again. The
+   * effects read a derived repository path, which compares by value.
+   */
+  it("re-runs the preview and blast-radius effects on repo or staged-key change, not per keystroke", () => {
+    expect(source).toContain("const currentRepo = $derived($repoStore.currentPath);");
+    const region = source.slice(
+      source.indexOf("const currentRepo = $derived"),
+      source.indexOf("$effect(() => () => blastGuard?.cancel());"),
+    );
+    const effects = region.split("$effect(() => {").slice(1);
+    expect(effects).toHaveLength(2);
+    for (const effect of effects) {
+      expect(effect).toContain("const repo = currentRepo;");
+      expect(effect).toContain("void previewPathsKey;");
+      expect(effect).not.toContain("$repoStore");
+    }
+    expect(effects[1]).toContain("getImpactLayeredMany(repo");
+  });
 });

@@ -3,6 +3,7 @@
   import { densityStore } from "../../stores/densityStore";
   import { rowHeight } from "../../ui/density";
   import { repoStore, type FileStatus } from "../../stores/repoStore";
+  import { graphStore } from "../../stores/graphStore";
   import { invoke } from "../../ipc/invoke";
   import {
     ChevronDown,
@@ -98,7 +99,9 @@
   type StatusFilter = "all" | "modified" | "staged" | "untracked" | "conflicted";
   type SortOrder = "name-asc" | "name-desc" | "status" | "churn";
 
-  let files = $state<string[]>([]);
+  // Replaced wholesale by each listing, never edited in place — a deep proxy
+  // over tens of thousands of paths would buy nothing.
+  let files = $state.raw<string[]>([]);
   let isLoading = $state(false);
   let errorMsg = $state<string | null>(null);
   let inflight: AsyncGuard | null = null;
@@ -191,11 +194,36 @@
     return () => inflight?.cancel();
   });
 
+  // `$repoStore.x` inside an effect tracks the whole store, and the store
+  // publishes a fresh object on every change — each commit-message keystroke
+  // and every status poll. Deriveds compare with strict equality, so these
+  // strings change only when the repository, the set of dirty paths, or HEAD
+  // does, and the reload below runs only then. HEAD stands in for "the
+  // tracked tree changed underneath a clean status" (a checkout or pull),
+  // which the poll-driven reload used to catch by accident.
+  //
+  // On a branch, HEAD is that branch's tip. A detached HEAD belongs to no
+  // branch, so the tip is empty and a checkout from one commit to another
+  // would change nothing here; the graph store's `headId` (the backend's
+  // `rev-parse HEAD`, re-read by every refresh, no polling of its own) is the
+  // HEAD for the repository it is showing. It is consulted only then, so an
+  // attached HEAD keys exactly as before and a commit reloads once, not twice.
+  const currentRepo = $derived($repoStore.currentPath);
+  const statusMembership = $derived(statusPathKey($repoStore.statuses));
+  const branchTip = $derived(
+    $repoStore.branches.find((b) => b.is_current && !b.is_remote)?.tip_commit_id ?? "",
+  );
+  const graphHead = $derived(
+    currentRepo && $graphStore.visiblePath === currentRepo ? ($graphStore.headId ?? "") : "",
+  );
+  const headTip = $derived(branchTip || graphHead);
+
   let lastRepo = "";
+  let lastListKey = "";
   $effect(() => {
-    const repo = $repoStore.currentPath;
-    const membership = statusPathKey($repoStore.statuses);
-    void membership;
+    const repo = currentRepo;
+    const membership = statusMembership;
+    const head = headTip;
     if (!repo) {
       inflight?.cancel();
       files = [];
@@ -203,17 +231,21 @@
       isLoading = false;
       selectedIndex = -1;
       lastRepo = "";
+      lastListKey = "";
       return;
     }
+    const key = `${repo}\0${membership}\0${head}`;
+    // Memo hit: leave the in-flight listing alone. There is deliberately no
+    // teardown here — Svelte runs it before every re-run, so a teardown that
+    // cancelled the load would drop it even on this early return. `loadFiles`
+    // cancels its predecessor itself, and unmount is the effect above.
+    if (key === lastListKey) return;
+    lastListKey = key;
     if (repo !== lastRepo) {
       collapsed = {};
       lastRepo = repo;
     }
     void loadFiles(repo);
-    const started = inflight;
-    return () => {
-      if (inflight === started) started?.cancel();
-    };
   });
 
   let listedPaths = $derived.by(() =>
@@ -294,8 +326,11 @@
 
 
   // Flattened rows
+  // The tree depends only on the listing; a folder toggle re-flattens it
+  // without rebuilding it. `flattenFileTree` reads the tree, never mutates it.
+  let tree = $derived(buildFileTree(filteredPaths));
   let rows = $derived.by<FileRow[]>(() => {
-    const flattened = flattenFileTree(buildFileTree(filteredPaths), (dirPath) =>
+    const flattened = flattenFileTree(tree, (dirPath) =>
       isFiltering ? false : collapsed[dirPath] === true,
     );
     if (sortOrder === "name-asc") return flattened;

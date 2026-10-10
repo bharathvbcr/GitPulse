@@ -249,3 +249,50 @@ fn safety_guards_protect_default_branch_and_wip() {
     assert!(err.is_err());
     assert!(err.unwrap_err().contains("default branch"));
 }
+
+/// The scan and the clean read every worktree's checkout from one
+/// `worktree list`; a branch held by a linked worktree must still be marked
+/// and refused, and a free sibling must not be.
+#[test]
+fn a_branch_held_by_a_linked_worktree_is_marked_and_refused() {
+    let repo = TestRepo::init();
+    repo.write("seed.txt", "Initial\n");
+    repo.commit_all("Seed");
+    run_git(repo.dir.path(), &["branch", "feature/held"]);
+    run_git(repo.dir.path(), &["branch", "feature/free"]);
+    let linked = TempDir::new().expect("tempdir");
+    let linked_path = linked.path().join("held");
+    run_git(
+        repo.dir.path(),
+        &[
+            "worktree",
+            "add",
+            &linked_path.to_string_lossy(),
+            "feature/held",
+        ],
+    );
+
+    let scan = scan_stale_branches(
+        &repo.path_str(),
+        &DeadbranchConfig {
+            merged_only: false,
+            days_threshold: 0,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let flag = |name: &str| {
+        scan.branches
+            .iter()
+            .find(|b| b.short_name == name)
+            .unwrap_or_else(|| panic!("{name} scanned"))
+            .is_current_or_worktree
+    };
+    assert!(flag("feature/held"));
+    assert!(!flag("feature/free"));
+    assert!(flag("main"), "the main worktree's checkout counts too");
+
+    let err = clean_branches(&repo.path_str(), &["feature/held".to_string()], true, false)
+        .expect_err("a worktree's branch is refused");
+    assert!(err.contains("linked worktree"), "{err}");
+}

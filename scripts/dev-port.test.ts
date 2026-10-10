@@ -32,6 +32,7 @@ import {
   tauriConfigForPort,
   tryListen,
   withTauriDevUrl,
+  lacksIpv6Loopback,
 } from "./dev-port.mjs";
 
 const repoRoot = defaultRepoRoot();
@@ -586,6 +587,16 @@ describe("findFreePort argument handling", () => {
     } finally {
       await Promise.all(servers.map(closeServer));
     }
+  });
+});
+
+describe("IPv4-only hosts", () => {
+  it("reads a missing IPv6 loopback as no holder, not a busy port", () => {
+    expect(lacksIpv6Loopback(["::1:5173 EAFNOSUPPORT"])).toBe(true);
+    expect(lacksIpv6Loopback(["::1:5173 EADDRNOTAVAIL"])).toBe(true);
+    // EADDRINUSE never reaches diagnostics; an empty list is a real holder.
+    expect(lacksIpv6Loopback([])).toBe(false);
+    expect(lacksIpv6Loopback(["::1:5173 EACCES"])).toBe(false);
   });
 });
 
