@@ -311,17 +311,56 @@ checkout, which then held another session's uncommitted workbench edits):
   with an `aria-label`, which the launcher now has. No terminal tab was ever
   opened, so its `depthExceeded=0` says nothing.
 
-**Installed build, not measured.** Native WKWebView frame pacing, cold/warm
-navigation, idle CPU/memory and the eight-hour soak were not run: the release
-build was not installed over the user's app (their choice), and no number here
-stands in for them. `scripts/native-sample.mjs` records the installed app's
+**Release build in an isolated profile, 2026-10-09/10 (partial).** The
+release build of `f1854185` plus the `performance:nav` probe (build id
+`d4124c1d`, arm64, Apple M5 Pro, 64 GB, macOS 27.0.1) ran as a copy with
+bundle id `com.gitpulse.desktop.perfqual` and `HOME=/private/tmp/gpe-perf`,
+so the user's installed 1.4.0 and its profile were not touched. Its
+workspace held the first ten of the user's thirteen tabs, and their trust
+records were copied in after a first run refused every repository command
+with `REPOSITORY_TRUST_REQUIRED`. Without the user's `gh` login,
+`github-alerts:check` failed throughout. Stage Manager was on.
+
+- **Launch, verified:** process spawn (launchd) to WebKit's
+  `DidFirstMeaningfulPaint`, both millisecond timestamps from the unified
+  log: 394 ms for the first launch of the new bundle, then 414, 384 and
+  396 ms. A fifth launch, after trust was copied in, took 360 ms. File
+  caches were not purged (no `sudo`), so the first is not a cold-boot launch.
+  This is the shell's first paint, not the ten tabs hydrated.
+- **Repository navigation, warm only, verified:** four repository switches
+  were timed by `performance:nav`: settled p50 549 ms, max 762 ms (worst
+  `repository/work`, first frame 118 ms). Each switch was an open request
+  sent to the running instance (`open -a … <repo>`), 4 s apart. Cold is
+  **not measured**: the first pass ran while the window sat in the Stage
+  Manager strip, where the document is hidden, so those visits were
+  remembered but not timed, and the later visits counted as warm. View switches
+  (Work/History/Code) were not driven; this host blocks synthetic input.
+- **Frame pacing, not measured:** no `performance:ui` entry was recorded, but
+  the window was focused for seconds, not minutes. The probe samples only
+  a focused window, so this is an unobserved period, not a clean one.
+- **Idle CPU/memory, not measured:** the one ten-minute idle sample ran
+  while every repository command was refused for trust. It read 120 MiB and
+  0.03 % CPU for an app doing no repository work, and is not an idle reading.
+  The trusted run was quit from the keyboard (AppKit `performKeyEquivalent:`
+  then `terminate:`, 02:33:51) before its idle phase began. While hydrating,
+  shortly after the trusted launch, the app process read 140 MiB and 5.9 % CPU.
+- **Eight-hour soak, not run.**
+
+The sampler cannot see WKWebView content processes. Its companion here took
+the set difference of WebKit process ids before and after launch: the GPU,
+WebContent and Networking processes read 40, 109 and 15 MiB during the
+untrusted idle. `scripts/native-sample.mjs` records the installed app's
 resident memory and CPU over a soak (`--duration 8h --interval 60 --out
 soak.jsonl`) and prints the least-squares memory slope. It keeps the app, its
 bundled helpers and the processes it hosts (agent CLIs and shells in terminal
 tabs) apart, and it cannot see the WKWebView content processes, which launchd
 starts. Frame pacing comes from the app's own responsiveness monitor
-(`performance:ui` entries in the diagnostics log during the soak); cold and
-warm navigation need a stopwatch or an instrumented build. A two-second smoke
+(`performance:ui` entries in the diagnostics log during the soak) and
+navigation from `performance:nav`. A remaining run needs a person at the Mac:
+a launch from a background shell is not activated (macOS cooperative
+activation), and a window in the Stage Manager strip hydrates nothing and is
+not timed. An open request to the running instance (`open -a <app> <repo>`)
+brings it on stage. A two-second smoke
 run against the running 1.4.0 app read 167 MiB resident for the app process —
 a wiring check, not an idle measurement: agents were working in its tabs.
 
