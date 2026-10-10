@@ -24,6 +24,22 @@ const appCss = readFileSync(
 const open = () => render(SettingsModal, { props: { isOpen: true } }).body;
 
 /**
+ * Markup comments removed, repeated until nothing changes: one pass over
+ * `<!<!---->--` leaves a fresh `<!--` behind.
+ */
+function withoutComments(markup: string): string {
+  for (let previous = ""; previous !== markup; ) {
+    previous = markup;
+    markup = markup.replace(/<!--[\s\S]*?-->/g, "");
+  }
+  return markup;
+}
+
+it("strips a comment whose removal exposes another opener", () => {
+  expect(withoutComments('<!<!---->-- <div data-setting="x"> -->')).toBe("");
+});
+
+/**
  * Every `data-setting` div opened while another one is still open, as
  * "inner in outer". Walks div open and close tags in order, comments
  * stripped; a tag cut short by an arrow inside an attribute still counts as
@@ -32,7 +48,7 @@ const open = () => render(SettingsModal, { props: { isOpen: true } }).body;
 function nestedSettings(markup: string): string[] {
   const found: string[] = [];
   const open: (string | null)[] = [];
-  for (const tag of markup.replace(/<!--[\s\S]*?-->/g, "").matchAll(/<div\b[^>]*>|<\/div>/g)) {
+  for (const tag of withoutComments(markup).matchAll(/<div\b[^>]*>|<\/div>/g)) {
     if (tag[0] === "</div>") { open.pop(); continue; }
     const id = /data-setting="([^"]+)"/.exec(tag[0])?.[1] ?? null;
     const outer = open.filter((entry): entry is string => entry !== null).at(-1);

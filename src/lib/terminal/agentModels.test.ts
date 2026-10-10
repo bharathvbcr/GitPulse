@@ -52,7 +52,9 @@ const arms = (() => {
   expect(start, "model_control not found").toBeGreaterThan(-1);
   const body = rust.slice(start, rust.indexOf("\n}\n", start));
   const out: { provider: string; field: string }[] = [];
-  for (const arm of body.matchAll(/\(((?:"[a-z]+"\s*\|?\s*)+),\s*"([a-z]+)"\)\s*=>/g)) {
+  // One way to match a provider list: each `|` must sit between two names.
+  // An optional separator let whitespace split across iterations (ReDoS).
+  for (const arm of body.matchAll(/\(("[a-z]+"(?:\s*\|\s*"[a-z]+")*)\s*,\s*"([a-z]+)"\)\s*=>/g)) {
     for (const provider of arm[1].matchAll(/"([a-z]+)"/g)) out.push({ provider: provider[1], field: arm[2] });
   }
   // A reshaped table must fail loudly rather than silently stop checking.
