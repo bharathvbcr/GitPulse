@@ -513,11 +513,11 @@ impl Primary {
             .map_err(|error| format!("mailbox vanished: {error}"))?;
         self.socket_identity = Some((meta.dev(), meta.ino()));
         let shared = self.shared.clone();
-        std::thread::Builder::new()
-            .name("instance-mailbox".into())
-            .spawn(move || accept_loop(listener, shared))
-            .map(|_| ())
-            .map_err(|error| format!("cannot start the mailbox: {error}"))
+        crate::supervisor::spawn_once("instance-mailbox", "single-instance mailbox", move || {
+            accept_loop(listener, shared)
+        })
+        .map(|_| ())
+        .map_err(|error| format!("cannot start the mailbox: {error}"))
     }
 
     /// Why launches cannot reach this owner, when they cannot. The lock still
@@ -601,9 +601,11 @@ fn accept_loop(listener: UnixListener, shared: Arc<Shared>) {
         // gives it back like one that returns. Eight panics would otherwise
         // fill MAX_HANDLERS and silently drop every later relaunch.
         let slot = HandlerSlot(shared.clone());
-        let spawned = std::thread::Builder::new()
-            .name("instance-mailbox-conn".into())
-            .spawn(move || handle(stream, &slot.0));
+        let spawned = crate::supervisor::spawn_once(
+            "instance-mailbox-conn",
+            "single-instance mailbox",
+            move || handle(stream, &slot.0),
+        );
         if let Err(error) = spawned {
             // The closure, and the slot it owned, were dropped by the failed
             // spawn, which released the count already.

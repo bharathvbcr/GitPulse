@@ -445,10 +445,14 @@ pub fn begin_cancellable_query(token: Option<&str>) -> Cancel {
         map.insert(token.to_string(), cancel.clone());
     }
     let timed = cancel.clone();
-    std::thread::spawn(move || {
-        std::thread::sleep(QUERY_CANCEL_DEADLINE);
-        timed.cancel();
-    });
+    let _ = crate::supervisor::spawn_once(
+        "codeintel-cancel-deadline",
+        "codeintel deadline",
+        move || {
+            std::thread::sleep(QUERY_CANCEL_DEADLINE);
+            timed.cancel();
+        },
+    );
     cancel
 }
 

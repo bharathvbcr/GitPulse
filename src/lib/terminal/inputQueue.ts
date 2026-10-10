@@ -10,6 +10,19 @@ export function terminalDeadline<T>(work: Promise<T>, ms: number, label: string)
   });
 }
 
+/**
+ * Whether a failed send ends the tab's input for good. Two things do: the
+ * session is gone (nothing left to type into), or the send never answered, so
+ * it may still be in flight and a later write could land out of order. A
+ * rejected write is different: the backend answered, the outcome is known, and
+ * ending the tab over it (a restart kills the process, an agent included)
+ * destroys more than the write.
+ */
+export function inputIsDead(error: unknown): boolean {
+  if (error instanceof Error && error.message === "Terminal input timed out") return true;
+  return /\bnot found\b|\bsession is closed\b|\bTerminal closed\b/i.test(String(error));
+}
+
 export function createTerminalInput(
   send: (data: string, binary: boolean) => Promise<void>,
   onError: (message: string, fatal: boolean) => void,
@@ -28,8 +41,18 @@ export function createTerminalInput(
       }
     } catch (error) {
       if (!stopped) {
-        stopped = true;
-        onError(`Input delivery failed; restart before typing again. ${String(error)}`, true);
+        if (inputIsDead(error)) {
+          stopped = true;
+          onError(`Input delivery failed; restart before typing again. ${String(error)}`, true);
+        } else {
+          // The failed chunk may have been partly accepted, so it is never
+          // retried, and what was queued behind it was typed after the gap and
+          // would land in the wrong place. Both are dropped and said so; the
+          // next thing the user types goes through.
+          queue.length = 0;
+          bytes = 0;
+          onError(`Some input was not delivered and was dropped. ${String(error)}`, false);
+        }
       }
     } finally {
       if (stopped) { queue.length = 0; bytes = 0; }

@@ -150,6 +150,41 @@ CREATE TABLE IF NOT EXISTS fleet_languages (
 /// This build's event schema version, written into every row.
 pub const SCHEMA_VERSION: i64 = 1;
 
+/// The writer generation stamped into the ledger (`PRAGMA user_version`).
+///
+/// Distinct from [`SCHEMA_VERSION`], which versions one event row: this
+/// versions the *rules writers follow*, such as which cursors a `session.*`
+/// row must move. A build that predates a rule writes rows the newer rules
+/// treat as new (a 1.3.1 daemon appended transcript rows without moving 1.4.0's
+/// `transcript_cursors`, and the app then re-ingested those bytes as
+/// duplicates). Bump this whenever a rule like that changes; every build that
+/// knows about the stamp refuses a ledger stamped newer than itself, and a
+/// build older than the stamp's introduction is stopped by the daemon lock and
+/// the version check in Health instead.
+pub const WRITER_VERSION: i64 = 1;
+
+/// Refuses a ledger a newer writer has stamped, and stamps one a writer of
+/// this generation is now using. Never lowers the stamp.
+fn check_writer_version(conn: &Connection, db_path: &Path) -> Result<(), LedgerError> {
+    let stamped: i64 = conn
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .map_err(|e| LedgerError::new("pragma_failed", format!("user_version: {e}")))?;
+    if stamped > WRITER_VERSION {
+        return Err(LedgerError::new(
+            "writer_too_old",
+            format!(
+                "{} was written by a newer GitPulse (writer generation {stamped}; this build is {WRITER_VERSION}). Update GitPulse, or restart the old gitpulsed, before writing to it.",
+                db_path.display()
+            ),
+        ));
+    }
+    if stamped < WRITER_VERSION {
+        conn.pragma_update(None, "user_version", WRITER_VERSION)
+            .map_err(|e| LedgerError::new("pragma_failed", format!("user_version: {e}")))?;
+    }
+    Ok(())
+}
+
 /// Who acted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -412,7 +447,7 @@ type Registry = Mutex<HashMap<PathBuf, std::sync::Arc<Slot>>>;
 type DroppedRegistry = Mutex<HashMap<PathBuf, u64>>;
 
 /// One connection per repository, opened once.
-fn registry() -> &'static Registry {
+pub(crate) fn registry() -> &'static Registry {
     static REGISTRY: OnceLock<Registry> = OnceLock::new();
     REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
 }
@@ -795,6 +830,8 @@ fn open(db_path: &Path) -> Result<Connection, LedgerError> {
         .map_err(|e| LedgerError::new("pragma_failed", format!("journal_mode: {e}")))?;
     conn.pragma_update(None, "synchronous", "NORMAL")
         .map_err(|e| LedgerError::new("pragma_failed", format!("synchronous: {e}")))?;
+    // Before the schema batch: a refused writer must not alter anything.
+    check_writer_version(&conn, db_path)?;
     conn.execute_batch(SCHEMA)
         .map_err(|e| LedgerError::new("schema_failed", e.to_string()))?;
     checked_state_directory(dir, Some(repo), false)?;
@@ -3543,6 +3580,46 @@ mod tests {
         // The flag has to follow its own family both ways, or a repository
         // stays marked "coverage incomplete" forever after one bad scan.
         assert!(found.health_complete);
+    }
+
+    /// The defect: the ledger had no version stamp, so an older writer was
+    /// never refused. A fresh ledger is stamped; a ledger stamped by a newer
+    /// writer is refused without being altered; an unstamped (pre-stamp)
+    /// ledger is adopted and stamped.
+    #[test]
+    fn a_ledger_stamped_by_a_newer_writer_is_refused_unaltered() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path().to_string_lossy().into_owned();
+        let db = ledger_path(&repo);
+        let version = |db: &Path| -> i64 {
+            Connection::open(db)
+                .unwrap()
+                .pragma_query_value(None, "user_version", |r| r.get(0))
+                .unwrap()
+        };
+        drop(open(&db).expect("a fresh ledger opens"));
+        assert_eq!(version(&db), WRITER_VERSION, "a fresh ledger is stamped");
+
+        // A pre-stamp ledger (stamp 0) is adopted.
+        Connection::open(&db)
+            .unwrap()
+            .pragma_update(None, "user_version", 0)
+            .unwrap();
+        drop(open(&db).expect("an unstamped ledger is adopted"));
+        assert_eq!(version(&db), WRITER_VERSION);
+
+        // A newer writer's ledger is refused, and left exactly as found.
+        Connection::open(&db)
+            .unwrap()
+            .pragma_update(None, "user_version", WRITER_VERSION + 1)
+            .unwrap();
+        let error = open(&db).expect_err("an older writer must be refused");
+        assert_eq!(error.code, "writer_too_old", "{error:?}");
+        assert_eq!(
+            version(&db),
+            WRITER_VERSION + 1,
+            "a refused writer changed the stamp"
+        );
     }
 
     #[test]

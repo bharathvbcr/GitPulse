@@ -621,7 +621,8 @@
       idle: async (sessionId) => {
         if (launcher !== "shell") return false;
         const context = parseTerminalContext(await invoke<unknown>("cmd_terminal_context", { sessionId }));
-        return context?.busy === false;
+        // `busy` is only the foreground; a `cmd &` or a `^Z`'d editor is a job too.
+        return context?.busy === false && context.jobs === false;
       },
       // Listed in Sessions, where it can be shown again or stopped. Looked up
       // while this tab still holds the slot, which it then hands over.

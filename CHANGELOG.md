@@ -11,7 +11,6 @@ before that tag is pushed.
 
 ## [Unreleased]
 
-<<<<<<< HEAD
 ### Added
 
 - An agent's `done` that is held in review for lack of a passing verification
@@ -31,7 +30,6 @@ before that tag is pushed.
   applies only what you select, at the revision you reviewed: a task that
   changed since is refused and re-read. Nothing Manvi proposes is applied
   automatically, and a sidecar that is down is an error, never an empty scan.
-=======
 ### Fixed
 
 - **Store reliability.** The ledger no longer caches a failed open for the
@@ -64,11 +62,9 @@ before that tag is pushed.
   more than 25 related open tasks can be filed: `reviewed_related` takes up to
   500 ids and a refusal names 25 at a time. A server timeout says the work may
   still finish and a write's outcome is unknown.
->>>>>>> hx/store-reliability
 
 ### Changed
 
-<<<<<<< HEAD
 - The profile is compacted once a day: the host runs dc-store's `store.compact`
   (expired receipts, events and revisions, a bounded number per pass) from its
   existing background loop, off the UI thread, never beside itself, never
@@ -94,7 +90,6 @@ before that tag is pushed.
   so. The vendored `contracts/serve.ops.schema.json` is refreshed for it and for
   the repository roots Manvi's `devmap.*`, refine and scan ops now require
   (`E_BAD_ROOT` otherwise); GitPulse sends none of those ops today.
-=======
 - **The update check announces releases, not tags.** `git ls-remote --tags`
   only says a tag exists, and the release workflow runs for many minutes after
   a tag is pushed and may never publish, so a `vX.Y.Z` pushed early (or a
@@ -136,7 +131,6 @@ before that tag is pushed.
   function floor has a margin of over one point instead of 0.05. The coverage
   workflow now reports Rust branch coverage (nightly `--branch`); it is reported,
   not gated, until a floor has been measured.
->>>>>>> hx/test-hermetic
 - CI now fails when a vendored crate is edited in this repository, through the
   new `bun run check:vendor-edits` (`vendor-crates.mjs --check --allow-drift`),
   which `ci:local` runs too. Upstream drift is still printed but never fails a
@@ -199,6 +193,37 @@ before that tag is pushed.
   list and pull-request list each hold their own freshness token, so one
   list's success no longer clears the other's error. `harness/repo-churn.html`
   drives fifteen panels through unrelated publishes in Chrome and WebKit.
+- Quitting (Cmd-Q, the Dock, a logout) and a `SIGTERM`/`SIGHUP` now run one
+  teardown: launch forwarding stops first, every terminal is closed under a
+  deadline, the sidecar is asked to finish, then procguard's children are
+  swept. Before, a normal quit never swept `git fetch`/`ci_local` children and
+  a signal never closed the terminals, so runs stayed "running".
+- Closing a terminal hangs up every process group in its session (`cmd &`,
+  `nohup`, a dev server, a stopped editor), not only the foreground group, and
+  gives them 2.5 s to clean up (an agent's SessionEnd) before killing the rest.
+  A tab with a background or stopped job is no longer treated as idle when its
+  view goes away, and closing it asks.
+- A worktree is not removed or merged away while any process, including an
+  agent typed into a plain dock tab, has its working directory inside it, even
+  with no workbench profile. An exited-but-unreaped child no longer counts as
+  running, and the sidecar reaps its child when its stdout ends.
+- One panic no longer disables a subsystem until restart: the hygiene cleaner,
+  the terminal session map, the task board's store and worker, the watcher and
+  the recent-repositories list recover from a poisoned lock. A panic in the
+  cleaner's clock thread is recorded as a degraded subsystem (listed in
+  Diagnostics) and the thread keeps running. Concurrent model probes, agent
+  model listings and MCP completions share one run, and no longer hold a cache
+  lock across a CLI or git call; a failed model listing is remembered for 5 s.
+- `gitpulsed` holds a per-profile lock and refuses a second copy (exit 3,
+  naming the owner); the ledger stamps a writer generation and refuses a
+  writer older than its stamp; Diagnostics flags a running daemon from another
+  version.
+- Terminal sessions: sessions above a lowered limit are all adopted after a
+  reload; the quit guard counts host sessions no tab shows and agents typed
+  into shell tabs; `spawn` no longer waits on git and the ledger; one rejected
+  input write no longer ends the tab's input, and a cut-off bracketed paste is
+  closed; failed output emits no longer leak flow credit; a session whose
+  process outlives its terminal is listed as ending, with Stop.
 
 - The agentic workspaces plan no longer describes the flat graph export as
   "generation 1". It records the real path, `.devcouncil/graph/code_graph.json`,

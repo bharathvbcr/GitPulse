@@ -15,6 +15,10 @@ pub(super) struct Birth {
     pub identity: String,
     /// When that process started, in nanoseconds since the Unix epoch.
     pub started_unix_nanos: u128,
+    /// Exited but not yet reaped by its parent. It still holds its PID and its
+    /// start time, but it runs nothing and holds nothing: for "is it still
+    /// running" it is gone, for "what was its identity at launch" it is not.
+    pub zombie: bool,
 }
 
 /// Whether a recorded process still exists.
@@ -40,8 +44,14 @@ pub(super) fn read(pid: u32) -> Result<String, String> {
 /// Is the process recorded as `pid` with creation identity `expected` still
 /// running? A PID now held by a different process means ours is gone.
 pub(super) fn probe(pid: u32, expected: &str) -> Liveness {
-    match observe(pid) {
-        Ok(Some(birth)) if birth.identity == expected => Liveness::Alive,
+    judge_identity(observe(pid), expected)
+}
+
+/// [`probe`]'s decision, apart from reading the OS so a zombie can be tested
+/// on a platform whose kernel hides them.
+fn judge_identity(observed: Result<Option<Birth>, String>, expected: &str) -> Liveness {
+    match observed {
+        Ok(Some(birth)) if birth.identity == expected && !birth.zombie => Liveness::Alive,
         Ok(_) => Liveness::Gone,
         Err(reason) => Liveness::Unknown(reason),
     }
@@ -55,7 +65,7 @@ pub(super) fn probe(pid: u32, expected: &str) -> Liveness {
 /// so the one that was there is gone.
 pub(crate) fn running_since(pid: u32, instant: u128) -> Liveness {
     match observe(pid) {
-        Ok(Some(birth)) if birth.started_unix_nanos <= instant => Liveness::Alive,
+        Ok(Some(birth)) if birth.started_unix_nanos <= instant && !birth.zombie => Liveness::Alive,
         Ok(_) => Liveness::Gone,
         Err(reason) => Liveness::Unknown(reason),
     }
@@ -100,7 +110,18 @@ fn observe(pid: u32) -> Result<Option<Birth>, String> {
         ),
         started_unix_nanos: u128::from(info.pbi_start_tvsec) * 1_000_000_000
             + u128::from(info.pbi_start_tvusec) * 1_000,
+        zombie: info.pbi_status == libc::SZOMB,
     }))
+}
+
+/// Whether a `/proc/<pid>/stat` line says the process is a zombie (`Z`) or
+/// already dead (`X`). The state is the first field after the parenthesised
+/// command name, which may itself contain parentheses and spaces.
+#[cfg(any(target_os = "linux", test))]
+fn stat_is_zombie(stat: &str) -> bool {
+    stat.rsplit_once(')')
+        .and_then(|(_, rest)| rest.split_whitespace().next())
+        .is_some_and(|state| matches!(state, "Z" | "X"))
 }
 
 #[cfg(target_os = "linux")]
@@ -161,6 +182,7 @@ fn observe(pid: u32) -> Result<Option<Birth>, String> {
         identity: format!("linux:{boot}:{pid}:{start}"),
         started_unix_nanos: u128::from(booted) * 1_000_000_000
             + u128::from(ticks) * 1_000_000_000 / hz,
+        zombie: stat_is_zombie(&stat),
     }))
 }
 
@@ -228,6 +250,7 @@ fn observe(pid: u32) -> Result<Option<Birth>, String> {
     Ok(Some(Birth {
         identity: format!("windows:{pid}:{ticks}"),
         started_unix_nanos: (u128::from(ticks) * 100).saturating_sub(UNIX_EPOCH_TICKS * 100),
+        zombie: false,
     }))
 }
 
@@ -236,7 +259,7 @@ compile_error!("Task terminal process identity requires a platform adapter");
 
 #[cfg(test)]
 mod tests {
-    use super::{probe, read, running_since, Liveness};
+    use super::{judge_identity, probe, read, running_since, stat_is_zombie, Birth, Liveness};
     use crate::procguard::LockedSpawn;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -279,6 +302,59 @@ mod tests {
         child.wait().unwrap();
         // Reaped: the PID names nothing, or something that started later.
         assert_eq!(probe(pid, &id), Liveness::Gone);
+    }
+
+    /// The defect: Linux never read the state field, so an exited child its
+    /// parent had not reaped still counted as running and held its slot.
+    #[test]
+    fn the_state_field_of_a_stat_line_names_a_zombie_whatever_the_command_is_called() {
+        assert!(stat_is_zombie("123 (sleep) Z 1 123 123 0 -1 4194560"));
+        assert!(stat_is_zombie("123 (sleep) X 1 123 123 0 -1 4194560"));
+        assert!(!stat_is_zombie("123 (sleep) S 1 123 123 0 -1 4194560"));
+        assert!(!stat_is_zombie("123 (sleep) R 1 123 123 0 -1 4194560"));
+        // A command named to look like a zombie, with parentheses of its own.
+        assert!(!stat_is_zombie("123 (a) Z (b) S 1 123 123 0"));
+        assert!(stat_is_zombie("123 (a) S (b) Z 1 123 123 0"));
+        assert!(!stat_is_zombie(""));
+    }
+
+    #[test]
+    fn a_zombie_with_the_recorded_identity_is_gone_not_alive() {
+        let birth = |zombie| {
+            Ok(Some(Birth {
+                identity: "id".into(),
+                started_unix_nanos: 1,
+                zombie,
+            }))
+        };
+        assert_eq!(judge_identity(birth(false), "id"), Liveness::Alive);
+        assert_eq!(judge_identity(birth(true), "id"), Liveness::Gone);
+        assert_eq!(
+            judge_identity(Err("x".into()), "id"),
+            Liveness::Unknown("x".into())
+        );
+    }
+
+    /// An exited child its parent has not reaped is gone for the question "is
+    /// it still running", while its identity can still be read.
+    #[cfg(unix)]
+    #[test]
+    fn an_exited_but_unreaped_child_is_gone() {
+        let mut child = std::process::Command::new("true").spawn_locked().unwrap();
+        let pid = child.id();
+        let id = read(pid).unwrap();
+        // Exited, deliberately not waited for.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while probe(pid, &id) == Liveness::Alive && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert_eq!(
+            probe(pid, &id),
+            Liveness::Gone,
+            "a zombie counted as running"
+        );
+        assert_eq!(running_since(pid, now()), Liveness::Gone);
+        child.wait().unwrap();
     }
 
     #[test]

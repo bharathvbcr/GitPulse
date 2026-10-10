@@ -5,6 +5,7 @@ pub mod ci_local;
 pub mod codeintel;
 pub mod commands;
 pub(crate) mod coverage_toolchain;
+pub mod daemon_lock;
 pub mod desktop;
 pub mod devmap;
 pub mod diff;
@@ -34,10 +35,13 @@ pub mod output;
 pub mod procguard;
 pub mod repository_trust;
 pub mod secrets;
+pub mod singleflight;
 pub mod stack;
 pub mod storage;
+pub mod supervisor;
 pub mod syntax;
 pub mod tasks;
+pub mod teardown;
 pub mod terminal;
 #[cfg(test)]
 pub(crate) mod test_support;
@@ -128,12 +132,20 @@ pub fn run() {
         .manage(desktop::DesktopState::default())
         .manage(workbench::WorkbenchState::default())
         .setup(|app| {
+            // A signal exit stops what procguard does not own; the normal exit
+            // reaches the same teardown from `RunEvent::Exit`.
+            {
+                use tauri::Manager;
+                let terminals = app.state::<terminal::TerminalSessions>().inner().clone();
+                procguard::set_shutdown_hook(move || teardown::run(&terminals));
+            }
             // Once, off this thread. Dual-read still finds a record this has
             // not renamed yet, so a failed migration does not block startup.
             // MCP and gitpulsed do not run this path and stay read-only.
-            if let Err(error) = std::thread::Builder::new()
-                .name("repository-trust-migrate".into())
-                .spawn(|| match repository_trust::persistent_root() {
+            if let Err(error) = supervisor::spawn_once(
+                "repository-trust-migrate",
+                "trust migration",
+                || match repository_trust::persistent_root() {
                     Ok(root) => {
                         if let Err(error) = repository_trust::migrate_store(&root) {
                             log::warn!(target: "trust", "repository trust migration failed: {error}");
@@ -199,9 +211,10 @@ pub fn run() {
                 app.state::<terminal::TerminalSessions>().apply_stored_limit();
                 let state = app.state::<workbench::WorkbenchState>().inner().clone();
                 state.attach_terminals(app.state::<terminal::TerminalSessions>().inner().clone());
-                if let Err(error) = std::thread::Builder::new()
-                    .name("task-run-reconcile".into())
-                    .spawn(move || match state.reconcile_stale_runs() {
+                if let Err(error) = supervisor::spawn_once(
+                    "task-run-reconcile",
+                    "task run reconcile",
+                    move || match state.reconcile_stale_runs() {
                         Ok(0) => {}
                         Ok(released) => {
                             log::info!(target: "workbench", "released {released} task run(s) left behind by an earlier session");
@@ -545,19 +558,15 @@ pub fn run() {
             cmd_onboarding_clone_source,
             cmd_tool_capability_refresh,
             cmd_check_app_update,
+            supervisor::cmd_degraded_subsystems,
+            daemon_lock::cmd_daemon_status,
         ])
         .build(context())
         .expect("error while building GitPulse")
         .run(|app, event| {
             if matches!(event, tauri::RunEvent::Exit) {
                 use tauri::Manager;
-                // First, so a terminal shutdown that stalls cannot lose it.
-                logging::performance::flush();
-                if let Err(error) =
-                    terminal::shutdown_sessions(&app.state::<terminal::TerminalSessions>())
-                {
-                    log::warn!(target: "terminal", "terminal shutdown incomplete: {error}");
-                }
+                teardown::run(&app.state::<terminal::TerminalSessions>());
             }
             desktop::handle_run_event(app, &event);
         });

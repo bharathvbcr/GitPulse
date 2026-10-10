@@ -144,26 +144,40 @@ fn template_arguments(uri: &str) -> Result<Vec<&'static str>, CompleteError> {
 /// on the next word rather than the next session.
 const SUGGESTION_TTL: std::time::Duration = std::time::Duration::from_secs(2);
 
+type WorktreeCache = std::sync::Mutex<Option<(std::time::Instant, Vec<String>)>>;
+type WorktreeScans = crate::singleflight::SingleFlight<(), Vec<String>>;
+
 /// The worktree paths this process last saw, and when.
 fn cached_worktrees() -> Vec<String> {
-    use std::sync::Mutex;
-    use std::time::Instant;
-    static CACHE: Mutex<Option<(Instant, Vec<String>)>> = Mutex::new(None);
+    static CACHE: WorktreeCache = std::sync::Mutex::new(None);
+    static SCANS: std::sync::OnceLock<WorktreeScans> = std::sync::OnceLock::new();
+    worktrees_cached_by(&CACHE, SCANS.get_or_init(Default::default), scan_worktrees)
+}
 
-    // A poisoned lock means a previous caller panicked mid-refresh; completion
-    // is a convenience, so it degrades to "no suggestions" rather than
-    // propagating. It never degrades to a *wrong* list.
-    let Ok(mut cache) = CACHE.lock() else {
-        return Vec::new();
+/// [`cached_worktrees`] over an explicit cache, with the scan injected. The
+/// cache lock is held only to read or write the entry, never across the `git`
+/// spawn: a keystroke burst shares one scan instead of queueing behind it, and
+/// nothing else waits on a slow one.
+fn worktrees_cached_by(
+    cache: &WorktreeCache,
+    scans: &WorktreeScans,
+    scan: impl FnOnce() -> Vec<String>,
+) -> Vec<String> {
+    let fresh = || {
+        crate::supervisor::lock_or_recover(cache)
+            .as_ref()
+            .filter(|(at, _)| at.elapsed() < SUGGESTION_TTL)
+            .map(|(_, paths)| paths.clone())
     };
-    if let Some((at, paths)) = cache.as_ref() {
-        if at.elapsed() < SUGGESTION_TTL {
-            return paths.clone();
-        }
+    if let Some(paths) = fresh() {
+        return paths;
     }
-    let fresh = scan_worktrees();
-    *cache = Some((Instant::now(), fresh.clone()));
-    fresh
+    scans.run((), || {
+        let found = scan();
+        *crate::supervisor::lock_or_recover(cache) =
+            Some((std::time::Instant::now(), found.clone()));
+        found
+    })
 }
 
 fn scan_worktrees() -> Vec<String> {
@@ -362,6 +376,37 @@ mod tests {
         assert!(
             per_call < std::time::Duration::from_millis(2),
             "{per_call:?} per completion — the worktree scan is not being reused"
+        );
+    }
+
+    /// The defect: the cache lock was held across the `git` spawn, so every
+    /// keystroke's completion queued behind a slow scan.
+    #[test]
+    fn a_slow_worktree_scan_is_shared_and_does_not_hold_the_cache() {
+        let cache: WorktreeCache = std::sync::Mutex::new(None);
+        let scans = WorktreeScans::default();
+        let runs = std::sync::atomic::AtomicUsize::new(0);
+        let slow = || {
+            runs.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            vec!["/repo".to_owned()]
+        };
+        std::thread::scope(|scope| {
+            let first = scope.spawn(|| worktrees_cached_by(&cache, &scans, slow));
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            // The cache itself answers at once while the scan runs.
+            let started = std::time::Instant::now();
+            assert!(crate::supervisor::lock_or_recover(&cache).is_none());
+            assert!(started.elapsed() < std::time::Duration::from_millis(100));
+            let second = worktrees_cached_by(&cache, &scans, || panic!("a second scan ran"));
+            assert_eq!(second, vec!["/repo".to_owned()]);
+            assert_eq!(first.join().unwrap(), second);
+        });
+        assert_eq!(runs.load(std::sync::atomic::Ordering::SeqCst), 1);
+        // Inside the TTL the entry answers without a scan.
+        assert_eq!(
+            worktrees_cached_by(&cache, &scans, || panic!("rescanned inside the TTL")),
+            vec!["/repo".to_owned()]
         );
     }
 

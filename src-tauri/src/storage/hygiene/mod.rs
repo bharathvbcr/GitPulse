@@ -82,12 +82,7 @@ struct Plans {
 struct ActivePlan<'a>(&'a str);
 impl Drop for ActivePlan<'_> {
     fn drop(&mut self) {
-        match plans().lock() {
-            Ok(mut store) => {
-                store.active.remove(self.0);
-            }
-            Err(_) => log::error!("Hygiene active-plan store is unavailable"),
-        }
+        lock_plans().active.remove(self.0);
     }
 }
 
@@ -108,6 +103,31 @@ impl ProcessObserver for Cancellation<'_> {
 
 fn plans() -> &'static Mutex<Plans> {
     PLANS.get_or_init(|| Mutex::new(Plans::default()))
+}
+
+/// The plan store, recovering from a poisoned lock. One poison policy for
+/// every lock in this module: each holder inserts or removes whole entries, so
+/// a panic under the lock leaves a usable map, whereas refusing it would
+/// report "unavailable" (or, for the try-locks below, "already running") until
+/// the app restarts.
+fn lock_plans() -> std::sync::MutexGuard<'static, Plans> {
+    plans()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Takes one of the exclusive-operation locks without waiting. Only contention
+/// means "busy"; a lock poisoned by a panic guards no data (`()`), so it is
+/// simply taken.
+fn exclusive(
+    lock: &'static Mutex<()>,
+    busy: &'static str,
+) -> Result<std::sync::MutexGuard<'static, ()>, String> {
+    match lock.try_lock() {
+        Ok(guard) => Ok(guard),
+        Err(std::sync::TryLockError::Poisoned(poisoned)) => Ok(poisoned.into_inner()),
+        Err(std::sync::TryLockError::WouldBlock) => Err(busy.into()),
+    }
 }
 fn now() -> u64 {
     SystemTime::now()
@@ -239,9 +259,7 @@ fn invocation(id: &str, path: &Path, home: &Path) -> Result<Invocation, String> 
 }
 
 pub fn cache_inventory() -> Result<CacheInventory, String> {
-    let _lock = INVENTORY
-        .try_lock()
-        .map_err(|_| "A shared-cache scan is already running")?;
+    let _lock = exclusive(&INVENTORY, "A shared-cache scan is already running")?;
     let home = home_dir()?;
     let mut entries = Vec::new();
     let started = Instant::now();
@@ -416,9 +434,7 @@ fn prepare_with_activity(
     min_age_days: u32,
     activity: impl Fn(&Path) -> Result<(), String>,
 ) -> Result<HygienePlan, String> {
-    let _lock = PREPARATION
-        .try_lock()
-        .map_err(|_| "Another cleanup preview is being inspected")?;
+    let _lock = exclusive(&PREPARATION, "Another cleanup preview is being inspected")?;
     let repo = validate_repo(repo_path)?;
     devmap_query::hygiene::validate_retention(min_age_days, false)?;
     let cancel = Arc::new(AtomicBool::new(false));
@@ -479,7 +495,7 @@ fn prepare_with_activity(
         expires_at: now() + TTL.as_secs(),
         warning: warning.into(),
     };
-    let mut store = plans().lock().map_err(|_| "Plan store is unavailable")?;
+    let mut store = lock_plans();
     store.pending.retain(|_, p| p.created.elapsed() < TTL);
     if store.pending.len() >= MAX_PLANS {
         return Err("Too many pending previews; cancel one or wait for it to expire".into());
@@ -502,7 +518,7 @@ pub fn cancel(repo_path: &str, id: &str) -> Result<(), String> {
     let repo = crate::engine::git_cli::validate_repo_path(repo_path)?
         .to_string_lossy()
         .into_owned();
-    let mut store = plans().lock().map_err(|_| "Plan store is unavailable")?;
+    let mut store = lock_plans();
     if let Some(plan) = store.pending.get(id) {
         if plan.view.repo_path != repo {
             return Err("Plan belongs to another repository".into());
@@ -534,12 +550,13 @@ fn execute_with_activity<T>(
     mut gate: impl FnMut(Option<&[String]>, &str) -> Result<T, String>,
     activity: impl Fn(&Path) -> Result<(), String>,
 ) -> Result<(T, HygieneOutcome), String> {
-    let _lock = EXECUTION
-        .try_lock()
-        .map_err(|_| "Another hygiene operation is running; wait for it to finish")?;
+    let _lock = exclusive(
+        &EXECUTION,
+        "Another hygiene operation is running; wait for it to finish",
+    )?;
     let repo = validate_repo(repo_path)?;
     let plan = {
-        let mut store = plans().lock().map_err(|_| "Plan store is unavailable")?;
+        let mut store = lock_plans();
         let plan = store
             .pending
             .get(id)

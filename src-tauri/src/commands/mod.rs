@@ -2492,9 +2492,9 @@ pub(crate) fn remove_worktree_guarded(
     force: bool,
     gate: WorktreeGate<'_>,
 ) -> Result<Guarded<()>, String> {
-    // A task run's agent may be working in it; removal would pull its files
-    // out from under it.
-    workbench.refuse_if_run_working_in(target_path)?;
+    // A task run's agent, a dock tab's agent or any process may be working in
+    // it; removal would pull its files out from under it.
+    workbench.refuse_if_in_use(target_path)?;
     let argv_owned = crate::engine::worktree::remove_worktree_argv(target_path, force);
     let refs: Vec<&str> = argv_owned.iter().map(String::as_str).collect();
     let policy = gate(repo_path, &refs)?;
@@ -2581,7 +2581,7 @@ pub(crate) fn merge_teardown_guarded(
 ) -> Result<Guarded<crate::engine::worktree::MergeTeardownResult>, String> {
     // Before the merge, not only before the removal: merging a branch an
     // agent is still committing to takes half its work.
-    workbench.refuse_if_run_working_in(worktree_path)?;
+    workbench.refuse_if_in_use(worktree_path)?;
     // Each step is judged as it runs, with what runs (see the engine's
     // doc). The verdict reported is the merge's: the first mutation, and
     // the one the rest depend on.

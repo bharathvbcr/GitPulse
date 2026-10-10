@@ -317,6 +317,21 @@ fn force_kill(child: &Mutex<Child>, guard: &crate::procguard::Registration) {
     let _ = guard.stop_and_reap(&mut child, Duration::ZERO);
 }
 
+/// How long a child that has closed its stdout gets to finish exiting before
+/// its group is stopped. A child honouring a shutdown closes stdout as it goes
+/// and exits within moments; the wait is only ever paid by one that does not.
+const EOF_REAP_GRACE: Duration = Duration::from_millis(500);
+
+/// Reaps the child from the pump that saw its stdout end, and sweeps any
+/// helper it left in its group. A clean shutdown holds the child lock for its
+/// own, longer grace, so this waits behind it and then finds nothing to do.
+fn reap_after_eof(child: &Mutex<Child>, guard: &crate::procguard::Registration) {
+    let mut child = child
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _ = guard.stop_and_reap(&mut child, EOF_REAP_GRACE);
+}
+
 /// Starts the one canonical stdout pump used by production and live sidecar
 /// tests. The bounded channel covers time spent between calls, when no request
 /// loop exists to enforce [`MAX_RESPONSE_TOTAL_BYTES`]. Backpressure alone is
@@ -328,7 +343,7 @@ fn spawn_stdout_pump(
     guard: std::sync::Arc<crate::procguard::Registration>,
 ) -> Receiver<String> {
     let (tx, rx) = mpsc::sync_channel::<String>(MAX_QUEUED_STDOUT_FRAMES);
-    thread::spawn(move || {
+    let _ = crate::supervisor::spawn_once("sidecar-stdout", "sidecar stdout pump", move || {
         let mut reader = BufReader::new(stdout);
         loop {
             match read_bounded_line(&mut reader, MAX_SIDECAR_FRAME_BYTES) {
@@ -345,7 +360,13 @@ fn spawn_stdout_pump(
                         }
                     }
                 }
-                Ok(None) => return,
+                // The child closed its stdout: it is exiting or has exited. Reaped
+                // here, not left a zombie holding its pid (and its runs
+                // "still running") until some later call happens to look.
+                Ok(None) => {
+                    reap_after_eof(&child, &guard);
+                    return;
+                }
                 Err(_) => {
                     force_kill(&child, &guard);
                     return;
@@ -1167,7 +1188,7 @@ fn spawn_with_profile(
     let tail_writer = tail.clone();
     let child_for_stderr = child.clone();
     let guard_for_stderr = guard.clone();
-    std::thread::spawn(move || {
+    let _ = crate::supervisor::spawn_once("sidecar-stderr", "sidecar stderr reader", move || {
         // Bounded exactly like stdout: stderr is untrusted bytes from the
         // same child, and `.lines()` would buffer an unlimited newline-less
         // flood just to keep a diagnostic tail. A frame past the cap faults
@@ -2065,6 +2086,81 @@ mod tests {
             write_deadline,
             shutdown_grace: SHUTDOWN_GRACE,
         }
+    }
+
+    /// The defect: the stdout pump returned on EOF without reaping, so a child
+    /// that exited stayed a zombie holding its pid, and its runs "still
+    /// running", until the next harness call looked.
+    #[test]
+    fn a_child_that_closes_its_stdout_is_reaped_by_the_pump() {
+        let sidecar = scripted_sidecar("exit 0", WRITE_DEADLINE);
+        let pid = i32::try_from(relock(&sidecar.child).id()).expect("pid");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        // SAFETY: signal 0 only probes; a zombie still answers it, a reaped
+        // pid does not.
+        while unsafe { libc::kill(pid, 0) } == 0 && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            unsafe { libc::kill(pid, 0) } != 0,
+            "the exited sidecar was left unreaped"
+        );
+    }
+
+    /// The criterion "a policy check completes in under 1 s while a 10 s
+    /// capability probe is in flight", against the real client path
+    /// (`call_in_slot`, the slot, the multiplexed inbox) and a fake sidecar
+    /// that holds the probe for 10 s while answering everything else at once.
+    /// It passes on main: the slot is held only to pick the child, never across
+    /// the round trip, and answers are routed by id. This is a regression
+    /// guard for that, not a fix.
+    #[test]
+    fn a_policy_check_is_not_queued_behind_a_ten_second_probe() {
+        let script = r#"while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')
+  case "$line" in
+    *capability.probe*) ( sleep 10; printf '{"id":"%s","ok":true,"result":{}}\n' "$id" ) & ;;
+    *) printf '{"id":"%s","ok":true,"result":{"verdict":"allow"}}\n' "$id" ;;
+  esac
+done"#;
+        let sidecar = Arc::new(scripted_sidecar(script, WRITE_DEADLINE));
+        let owner: &'static Mutex<Slot> = Box::leak(Box::new(Mutex::new(Slot {
+            sidecar: Some(sidecar),
+            last_error: None,
+            backoff_until: None,
+            profile: None,
+            selection: None,
+            closed: false,
+        })));
+        let probe = thread::spawn(move || {
+            call_in_slot(
+                owner,
+                "capability.probe",
+                None,
+                Duration::from_secs(20),
+                None,
+            )
+        });
+        thread::sleep(Duration::from_millis(300));
+        let started = Instant::now();
+        let verdict = call_in_slot(
+            owner,
+            "policy.check",
+            Some(serde_json::json!({"argv": ["git", "status"]})),
+            Duration::from_secs(5),
+            None,
+        )
+        .expect("the policy check was answered");
+        let took = started.elapsed();
+        assert_eq!(verdict["verdict"], "allow");
+        assert!(
+            took < Duration::from_secs(1),
+            "the policy check waited {took:?} behind the probe"
+        );
+        assert!(!probe.is_finished(), "the probe should still be in flight");
+        // Tear the fake down without waiting out the probe.
+        relock(owner).drop_sidecar();
+        let _ = probe.join();
     }
 
     /// Regression: the response byte budget is enforced by `call`, so it did

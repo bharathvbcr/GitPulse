@@ -280,9 +280,8 @@ fn watch() -> &'static Watch {
     WATCHDOG.call_once(|| {
         // One thread per process, parked while nothing is in flight. A spawn
         // failure leaves completion records working and says so once.
-        if let Err(error) = std::thread::Builder::new()
-            .name("gitpulse-perf-watch".into())
-            .spawn(move || run_watchdog(watch))
+        if let Err(error) =
+            crate::supervisor::spawn_service("gitpulse-perf-watch", move || run_watchdog(watch))
         {
             log::warn!(target: "performance", "still-running watchdog unavailable: {error}");
         }

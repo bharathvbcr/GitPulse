@@ -230,11 +230,17 @@ fn sigterm(child: &Child) {
 fn sigterm_reaps_the_git_child_and_its_grandchild() {
     let fixture = Fixture::new();
     let log_dir = tempfile::tempdir().expect("log dir");
+    // The daemon takes a per-profile lock; a scratch profile keeps this test
+    // off the developer's real one (and off a daemon running there).
+    let profile = tempfile::tempdir().expect("profile dir");
     let mut command = Command::new(env!("CARGO_BIN_EXE_gitpulsed"));
     command
         .arg("--once")
         .arg(fixture.repo())
         .env("GITPULSE_LOG_DIR", log_dir.path())
+        .env("HOME", profile.path())
+        .env("XDG_CONFIG_HOME", profile.path())
+        .env("APPDATA", profile.path())
         .stdin(Stdio::null())
         // To files rather than to `null`: a failure here has to be able to say
         // what the daemon thought it was doing, and pipes would need a drain

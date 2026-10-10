@@ -13,8 +13,8 @@
  *   (c) a shared field whose normalized wire type or backend-required
  *       presence no longer agrees.
  *
- * SCOPE: see CONTRACTS below for exactly what is checked — 83 contracts over
- * 211 structs, spanning both wire surfaces: command returns and event payloads.
+ * SCOPE: see CONTRACTS below for exactly what is checked — 85 contracts over
+ * 213 structs, spanning both wire surfaces: command returns and event payloads.
  * Enums are still skipped here and covered separately, by
  * scripts/enum-variant-contract.test.ts. That is most, not all, of the named types crossing the IPC
  * boundary: the ones still missing declare their TypeScript interface inside a
@@ -258,6 +258,10 @@ export const CONTRACTS = Object.freeze([
   // The durable log's self-report. `degraded` is the field that must not
   // drift: drop it and an incomplete log renders as a complete one.
   { label: "diagnostics", rustPath: rust("logging.rs"), tsPath: ts("diagnostics", "types.ts"), structs: ["PersistedLog"] },
+  // A degraded subsystem and a mismatched daemon are only ever shown, so a
+  // dropped field would silently stop saying so.
+  { label: "degraded-subsystems", rustPath: rust("supervisor.rs"), tsPath: ts("diagnostics", "types.ts"), structs: ["Degraded"] },
+  { label: "daemon-status", rustPath: rust("daemon_lock.rs"), tsPath: ts("diagnostics", "types.ts"), structs: ["DaemonStatus"] },
 ]);
 
 /**

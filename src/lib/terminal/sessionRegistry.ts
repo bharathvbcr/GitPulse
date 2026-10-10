@@ -209,6 +209,18 @@ export function createSessionRegistry() {
       if (records.size >= limit) throw new SessionCapacityError(limit);
       return admit(record);
     },
+    /**
+     * Records a session the host already holds, with no capacity check. The
+     * process exists whatever this page's limit says: a limit lowered after it
+     * started, or a reload that lost the page's own count, must not hide it.
+     * Refusing it left the host running a session nothing listed, and its
+     * slot unreachable for Stop. The limit then applies to the next `reserve`,
+     * which is refused until sessions are closed.
+     */
+    adopt(record: TerminalSessionRecord) {
+      if (records.has(record.key)) throw new Error("This terminal already owns a session slot");
+      return admit(record);
+    },
   };
   function admit(record: TerminalSessionRecord) {
     records.set(record.key, record);

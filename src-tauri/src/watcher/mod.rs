@@ -14,7 +14,6 @@ use std::ffi::{OsStr, OsString};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::thread;
 use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter};
 
@@ -196,9 +195,7 @@ fn git_path_kind(path: &Path, internal_roots: &[PathBuf]) -> ChangeKind {
 
 impl WatcherState {
     fn lock_sessions(&self) -> Result<MutexGuard<'_, HashMap<String, WatchSession>>, String> {
-        self.sessions
-            .lock()
-            .map_err(|e| format!("Watcher lock poisoned: {}", e))
+        Ok(crate::supervisor::lock_or_recover(&self.sessions))
     }
 
     /// Drops a reserved slot only if it is still the session we inserted.
@@ -1160,71 +1157,69 @@ where
     let thread_stop = stop.clone();
     let session_stop = stop.clone();
     let loop_sessions = state.sessions.clone();
-    if let Err(e) = thread::Builder::new()
-        .name("gitpulse-fs-watch".into())
-        .spawn(move || {
-            // The loop runs under catch_unwind so a panic inside it can
-            // neither kill its thread silently nor leak the session slot:
-            // the supervisor logs the outcome and, on panic, performs the
-            // same ptr_eq-guarded reap the DeadRepo path uses.
-            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                run_watch_loop(
-                    &watcher,
-                    WatchLoopContext {
-                        git_dir,
-                        internal_roots,
-                        emit_path: emit_path.clone(),
-                    },
-                    thread_stop,
-                    Some(loop_sessions.clone()),
-                    session_stop.clone(),
-                    on_change,
-                )
-            }));
-            match result {
-                Ok(WatchLoopExit::Stopped) => {
-                    log::debug!(target: "watcher", "watch on {emit_path} stopped by request");
-                }
-                Ok(WatchLoopExit::DeadRepo) => {
-                    log::info!(target: "watcher", "watch on {emit_path} ended: repository disappeared");
-                    // One announcement, not a change: nothing may refresh a
-                    // path that no longer exists.
-                    on_gone(RepoGonePayload {
-                        path: emit_path.clone(),
-                    });
-                }
-                Ok(WatchLoopExit::EventStreamClosed) => {
-                    log::warn!(
-                        target: "watcher",
-                        "watch event stream closed unexpectedly for {emit_path}; \
-                         UI refresh for this repo is dead until it is re-watched"
-                    );
-                }
-                Err(panic) => {
-                    log::error!(
-                        target: "watcher",
-                        "fs-watch thread PANICKED for {emit_path}: {}; reaping session slot",
-                        panic_payload_text(&*panic)
-                    );
-                    if let Ok(mut guard) = loop_sessions.lock() {
-                        if guard
-                            .get(&emit_path)
-                            .is_some_and(|session| Arc::ptr_eq(&session.stop, &session_stop))
-                        {
-                            guard.remove(&emit_path);
-                        }
+    if let Err(e) = crate::supervisor::spawn_once("gitpulse-fs-watch", "file watcher", move || {
+        // The loop runs under catch_unwind so a panic inside it can
+        // neither kill its thread silently nor leak the session slot:
+        // the supervisor logs the outcome and, on panic, performs the
+        // same ptr_eq-guarded reap the DeadRepo path uses.
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            run_watch_loop(
+                &watcher,
+                WatchLoopContext {
+                    git_dir,
+                    internal_roots,
+                    emit_path: emit_path.clone(),
+                },
+                thread_stop,
+                Some(loop_sessions.clone()),
+                session_stop.clone(),
+                on_change,
+            )
+        }));
+        match result {
+            Ok(WatchLoopExit::Stopped) => {
+                log::debug!(target: "watcher", "watch on {emit_path} stopped by request");
+            }
+            Ok(WatchLoopExit::DeadRepo) => {
+                log::info!(target: "watcher", "watch on {emit_path} ended: repository disappeared");
+                // One announcement, not a change: nothing may refresh a
+                // path that no longer exists.
+                on_gone(RepoGonePayload {
+                    path: emit_path.clone(),
+                });
+            }
+            Ok(WatchLoopExit::EventStreamClosed) => {
+                log::warn!(
+                    target: "watcher",
+                    "watch event stream closed unexpectedly for {emit_path}; \
+                     UI refresh for this repo is dead until it is re-watched"
+                );
+            }
+            Err(panic) => {
+                crate::supervisor::note_stopped("file watcher", &*panic);
+                log::error!(
+                    target: "watcher",
+                    "fs-watch thread PANICKED for {emit_path}: {}; reaping session slot",
+                    panic_payload_text(&*panic)
+                );
+                if let Ok(mut guard) = loop_sessions.lock() {
+                    if guard
+                        .get(&emit_path)
+                        .is_some_and(|session| Arc::ptr_eq(&session.stop, &session_stop))
+                    {
+                        guard.remove(&emit_path);
                     }
                 }
             }
-            // Release the callback and native handles before acknowledging
-            // retirement. No sessions mutex is held while waiting here.
-            let retired = watcher.shutdown();
-            if let Err(error) = &retired {
-                log::warn!(target: "watcher", "{emit_path}: {error}");
-            }
-            let _ = retired_tx.send(retired);
-        })
-    {
+        }
+        // Release the callback and native handles before acknowledging
+        // retirement. No sessions mutex is held while waiting here.
+        let retired = watcher.shutdown();
+        if let Err(error) = &retired {
+            log::warn!(target: "watcher", "{emit_path}: {error}");
+        }
+        let _ = retired_tx.send(retired);
+    }) {
         let _ = state.abandon_watch_slot(&key, &stop);
         return Err(format!("Failed to start watcher: {}", e));
     }
@@ -1331,6 +1326,7 @@ mod tests {
     use crate::procguard::LockedSpawn;
     use std::path::PathBuf;
     use std::process::Command;
+    use std::thread;
     use tempfile::TempDir;
 
     fn git_init(dir: &Path, bare: bool) {

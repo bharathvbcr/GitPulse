@@ -356,9 +356,10 @@ pub(crate) fn install(app: &tauri::AppHandle) {
     }
     let app = app.clone();
     let failure = status.clone();
-    if let Err(error) = std::thread::Builder::new()
-        .name("workbench-notifications".into())
-        .spawn(move || run(host, app, receiver, status))
+    if let Err(error) =
+        crate::supervisor::spawn_once("workbench-notifications", "task notifications", move || {
+            run(host, app, receiver, status)
+        })
     {
         if let Ok(mut current) = failure.lock() {
             current.available = false;

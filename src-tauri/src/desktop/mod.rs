@@ -605,11 +605,7 @@ pub fn set_recent_menu<R: Runtime>(app: &AppHandle<R>, paths: Vec<String>) -> Re
     app.set_menu(menu).map_err(|e| e.to_string())?;
     {
         let state = app.state::<DesktopState>();
-        let mut recents = state
-            .recents
-            .lock()
-            .map_err(|e| format!("Recent-repo lock poisoned: {e}"))?;
-        *recents = capped.clone();
+        *crate::supervisor::lock_or_recover(&state.recents) = capped.clone();
     }
     Ok(())
 }
