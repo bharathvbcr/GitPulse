@@ -716,7 +716,8 @@ fn build_tools() -> Vec<Value> {
                     "description": "Only move it if the task is still at this revision (from your brief or gitpulse_get_task); otherwise it is refused so you can re-read it",
                     "minimum": 1,
                     "maximum": 9_007_199_254_740_991_i64
-                }
+                },
+                "request_id": request_id_prop()
             }),
             &["repo_path", "task_id"],
             json!({
@@ -753,7 +754,8 @@ fn build_tools() -> Vec<Value> {
                 "even_if_running": {
                     "type": "boolean",
                     "description": "Delete it even though an agent attempt on it may still be working (task_in_use). Only when that agent is you, or the person asked for this. Default false"
-                }
+                },
+                "request_id": request_id_prop()
             }),
             &["repo_path", "task_id", "reason"],
             json!({
@@ -1062,6 +1064,18 @@ fn validate_arguments(name: &str, arguments: &Value) -> Result<(), String> {
     ))
 }
 
+/// A caller's idempotency key for a task write: the same key with the same
+/// request replays the first answer instead of writing again, so a call whose
+/// response was lost can be sent again safely.
+fn request_id_prop() -> Value {
+    json!({
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 120,
+        "description": "Optional idempotency key (letters, digits, '-' and '_'). Send the same key to repeat this call after a lost response; the store answers with the first result instead of writing twice"
+    })
+}
+
 fn parse_string_vec(val: &Value) -> Option<Vec<String>> {
     val.as_array().map(|arr| {
         arr.iter()
@@ -1082,13 +1096,21 @@ fn open_task_profile(create: bool) -> Result<Option<dc_store::Store>, String> {
             std::fs::create_dir_all(parent)
                 .map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
         }
-        return dc_store::Store::open(&path)
-            .map(Some)
-            .map_err(|e| e.to_string());
+        return open_shared_profile(dc_store::Store::open(&path));
     }
-    dc_store::Store::open_existing(&path)
-        .map(Some)
-        .map_err(|e| e.to_string())
+    open_shared_profile(dc_store::Store::open_existing(&path))
+}
+
+/// The task profile is shared with the desktop app, which owns its schema.
+/// This server may be older or newer than the app, so its handle never
+/// upgrades: a request that needs the upgrade fails with
+/// `schema_upgrade_required` and leaves the profile as it found it.
+fn open_shared_profile(
+    opened: Result<dc_store::Store, dc_store::StoreError>,
+) -> Result<Option<dc_store::Store>, String> {
+    let mut store = opened.map_err(|e| e.to_string())?;
+    store.refuse_workbench_upgrades();
+    Ok(Some(store))
 }
 
 #[cfg(not(test))]
@@ -1261,6 +1283,7 @@ fn handle_tool_call(name: &str, arguments: &Value) -> Result<Value, String> {
                 status,
                 arguments["expected_revision"].as_i64(),
                 arguments["summary"].as_str(),
+                arguments["request_id"].as_str(),
             )
             .map_err(workbench_message)
         }
@@ -1278,6 +1301,7 @@ fn handle_tool_call(name: &str, arguments: &Value) -> Result<Value, String> {
                 arguments["expected_revision"].as_i64(),
                 reason,
                 arguments["even_if_running"].as_bool().unwrap_or(false),
+                arguments["request_id"].as_str(),
             )
             .map_err(workbench_message)
         }
@@ -3064,6 +3088,69 @@ mod tests {
         let path = profile.path().join("workbench.sqlite");
         PROFILE_OVERRIDE.with(|cell| *cell.borrow_mut() = Some(path));
         (dir, profile, repo)
+    }
+
+    /// The task profile belongs to the desktop app. An MCP server that shares
+    /// it may be older or newer, so it never moves the schema: a request that
+    /// needs the upgrade is refused with a typed error and leaves the profile,
+    /// and every other host's view of it, untouched.
+    #[test]
+    fn the_mcp_server_never_upgrades_a_shared_task_profile() {
+        let (dir, profile, repo) = task_fixture();
+        crate::test_support::trust_repo(dir.path());
+        let database = profile.path().join("workbench.sqlite");
+        let (error, added) = tool_json(
+            "gitpulse_add_task",
+            json!({"repo_path": repo, "title": "Filed before the profile aged"}),
+        );
+        assert!(!error, "{added}");
+
+        // The profile as an older desktop app left it.
+        let held_back = rusqlite::Connection::open(&database).unwrap();
+        held_back
+            .execute("UPDATE work_meta SET version = 11 WHERE id = 1", [])
+            .unwrap();
+        drop(held_back);
+
+        for (tool, arguments) in [
+            (
+                "gitpulse_add_task",
+                json!({"repo_path": repo, "title": "Needs the upgrade"}),
+            ),
+            ("gitpulse_list_tasks", json!({"repo_path": repo})),
+        ] {
+            let (error, refused) = tool_json(tool, arguments);
+            assert!(error, "{tool}: {refused}");
+            assert!(
+                refused
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("schema_upgrade_required"),
+                "{tool}: {refused}"
+            );
+        }
+        // A write that fails for another reason still must not upgrade first:
+        // the schema step runs before the request is read.
+        let store = open_task_profile(true).unwrap().unwrap();
+        let error = store
+            .workbench_request("items.put", "{}")
+            .expect_err("refused before the request is looked at");
+        assert_eq!(error.code, "schema_upgrade_required", "{}", error.message);
+        drop(store);
+        let after = rusqlite::Connection::open(&database).unwrap();
+        let version: i64 = after
+            .query_row("SELECT version FROM work_meta WHERE id = 1", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(version, 11, "the profile was left at the schema it had");
+        assert!(
+            !profile
+                .path()
+                .join("workbench.sqlite.pre-schema-11.bak")
+                .exists(),
+            "an upgrade that did not run took no backup"
+        );
     }
 
     /// The defect this replaced: `gitpulse_add_task` reported success and the

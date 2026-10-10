@@ -45,6 +45,12 @@ export interface TaskLease {
    * reclaimable on that basis.
    */
   expires_at: string | null;
+  /**
+   * Set when the stored expiry is not a timestamp: the lease is still marked
+   * active but cannot be judged live or lapsed, so it is listed with the stored
+   * text. Null for every readable lease.
+   */
+  expiry_error: string | null;
 }
 
 export interface TaskEvidence {

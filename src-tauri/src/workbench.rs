@@ -287,10 +287,15 @@ impl WorkbenchState {
         self.check_open()?;
         if guard.is_none() {
             let path = self.profile_path()?;
-            *guard = Some(
-                Store::open(&path)
-                    .map_err(|e| WorkbenchError::new("store_error", e.to_string()))?,
-            );
+            let store = Store::open(&path)
+                .map_err(|e| WorkbenchError::new("store_error", e.to_string()))?;
+            // The desktop app owns the profile: it alone moves the schema
+            // forward, once, with the store's own backup first, and before the
+            // first read (a read never upgrades). A handle is cached only
+            // after that succeeds, so a failure is reported by every request
+            // until it is fixed rather than leaving reads against an old schema.
+            upgrade_owned_profile(&store)?;
+            *guard = Some(store);
         }
         body(
             guard
@@ -763,8 +768,47 @@ fn generation_input(method: &str, input: &str) -> Result<HostControl, WorkbenchE
     })
 }
 
+/// The Diagnostics name of the profile upgrade.
+const PROFILE_UPGRADE_SUBSYSTEM: &str = "workbench profile upgrade";
+
+/// Brings the profile this host owns to the current schema, and says so
+/// loudly when it cannot: the error goes to the caller, the log and the
+/// Diagnostics list, never into a silent fallback to a profile of the wrong
+/// shape.
+fn upgrade_owned_profile(store: &Store) -> Result<(), WorkbenchError> {
+    match store.upgrade_workbench_profile() {
+        Ok(report) => {
+            crate::supervisor::note_recovered(PROFILE_UPGRADE_SUBSYSTEM);
+            if let Some(backup) = report.backup {
+                log::info!(target: "workbench", "profile upgraded from schema {} to {}; backup at {backup}", report.from, report.to);
+            }
+            Ok(())
+        }
+        Err(error) => {
+            let reason = format!("{}: {}", error.code, error.message);
+            log::error!(target: "workbench", "profile upgrade failed: {reason}");
+            crate::supervisor::note_degraded(PROFILE_UPGRADE_SUBSYSTEM, &reason);
+            Err(error.into())
+        }
+    }
+}
+
+/// What a person is told when Manvi's worker refuses because the profile has
+/// not been upgraded: the host owns that step, so the way out is to let it.
+const SCHEMA_UPGRADE_REQUIRED: &str = "The task profile is on an older schema and Manvi's worker does not upgrade a shared profile. GitPulse upgrades it, after a backup, the first time it opens the profile: restart GitPulse, and see Diagnostics if it reports the upgrade failed.";
+
 fn worker_error(error: crate::harness::HarnessError) -> WorkbenchError {
     match error {
+        crate::harness::HarnessError::Refused(error) if error.code == "schema_upgrade_required" => {
+            crate::supervisor::note_degraded(
+                PROFILE_UPGRADE_SUBSYSTEM,
+                &format!("the profile worker refused: {}", error.message),
+            );
+            WorkbenchError::new(
+                "schema_upgrade_required",
+                format!("{SCHEMA_UPGRADE_REQUIRED} ({})", error.message),
+            )
+        }
         crate::harness::HarnessError::Refused(error) => {
             WorkbenchError::new(&error.code, error.message)
         }
@@ -897,6 +941,10 @@ pub async fn cmd_workbench_relink_repository(
     announce(&app, &response);
     Ok(response.to_string())
 }
+
+#[cfg(test)]
+#[path = "workbench/profile_owner_tests.rs"]
+mod profile_owner_tests;
 
 #[cfg(test)]
 mod tests {

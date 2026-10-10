@@ -69,6 +69,11 @@ pub struct TaskLease {
     /// computing "safe to reclaim" from expiry must treat null as never
     /// reclaimable on that basis.
     pub expires_at: Option<String>,
+    /// Set when the stored `expires_at` is not a timestamp: the lease is still
+    /// marked active and this row alone cannot say whether it has lapsed, so it
+    /// is listed with the stored text rather than dropped or called live. A
+    /// readable lease carries null.
+    pub expiry_error: Option<String>,
 }
 
 /// One evidence row from `dc-store`.
@@ -179,13 +184,16 @@ fn parse_paths(json: &str) -> Vec<String> {
         .collect()
 }
 
-/// Opens the store for `repo_path`, or reports why not.
+/// Opens the store for `repo_path` for reading only, or reports why not.
+///
+/// `SQLITE_OPEN_READ_ONLY`: a view can never migrate the store, sweep a lease
+/// or contend for its write lock, whatever the agent that owns it is doing.
 fn open(repo_path: &str) -> Result<Option<dc_store::Store>, String> {
     let path = store_path(repo_path);
     if !path.exists() {
         return Ok(None);
     }
-    dc_store::Store::open_existing(&path)
+    dc_store::Store::open_readonly(&path)
         .map(Some)
         .map_err(|e| format!("{e}"))
 }
@@ -213,11 +221,16 @@ fn read_view(
     path: String,
     task_id: Option<&str>,
 ) -> Result<TaskView, String> {
+    // `observe_leases` judges expiry in memory and never writes, which a
+    // read-only handle requires. A lapsed lease is left as it is and not
+    // listed (it is no longer held); one whose expiry cannot be read is listed
+    // with that text, for its row alone.
     let leases = store
-        .active_leases()
+        .observe_leases()
         .map_err(|e| format!("{e}"))?
         .into_iter()
-        .map(|l| TaskLease {
+        .filter(|(_, state)| *state != dc_store::LeaseState::Expired)
+        .map(|(l, state)| TaskLease {
             task_id: l.task_id,
             owner: l.owner,
             agent: l.agent,
@@ -225,6 +238,10 @@ fn read_view(
             status: l.status,
             created_at: l.created_at,
             expires_at: l.expires_at,
+            expiry_error: match state {
+                dc_store::LeaseState::BadExpiry(stored) => Some(stored),
+                _ => None,
+            },
         })
         .collect();
 
@@ -488,10 +505,10 @@ mod tests {
     fn a_store_from_before_the_gap_output_columns_still_reads_its_gaps() {
         // `stdout_path` / `stderr_path` were added to `gaps` after schema 9
         // shipped, without a schema bump, so a long-lived store can lack them
-        // while claiming the current version. The view selects both columns;
-        // what makes that safe is `open_existing` (read-write, not read-only)
-        // running dc-store's additive upgrade before anything is read. Without
-        // it this view reads "no such column" and reports the store unavailable.
+        // while claiming the current version. The view opens the store read-only
+        // and so cannot add them; what makes that safe is dc-store's `gaps_list`
+        // reading a missing column as absent. Without it this view reads "no such
+        // column" and reports the store unavailable.
         let dir = tempfile::tempdir().unwrap();
         let repo = dir.path().to_str().unwrap();
         let db = store_path(repo);
@@ -710,5 +727,103 @@ mod tests {
         );
         assert!(real_view.error.is_empty());
         assert!(real_view.leases.is_empty(), "nothing was leased");
+    }
+
+    /// A lease row as a writer would have left it.
+    fn lease_row(db: &Path, task: &str, expires_at: Option<&str>) {
+        let conn = rusqlite::Connection::open(db).unwrap();
+        conn.execute(
+            "INSERT INTO task_leases (id, task_id, owner, lease_token, status, created_at, expires_at)
+             VALUES (?1, ?1, 'agent', 'token', 'active', '2026-01-01T00:00:00Z', ?2)",
+            rusqlite::params![task, expires_at],
+        )
+        .unwrap();
+    }
+
+    fn lease_status(db: &Path, task: &str) -> String {
+        rusqlite::Connection::open(db)
+            .unwrap()
+            .query_row(
+                "SELECT status FROM task_leases WHERE id = ?1",
+                [task],
+                |r| r.get(0),
+            )
+            .unwrap()
+    }
+
+    /// The view is a read. It used to open the store read-write and sweep every
+    /// lapsed lease to `stale` on the way, so looking at a repository changed
+    /// the file an agent was working against; and one lease with an unreadable
+    /// expiry failed the whole listing.
+    #[test]
+    fn a_view_writes_nothing_and_judges_each_lease_by_itself() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().to_str().unwrap();
+        let db = store_path(repo);
+        std::fs::create_dir_all(db.parent().unwrap()).unwrap();
+        drop(dc_store::Store::open(&db).unwrap());
+        lease_row(&db, "live", Some("2999-01-01T00:00:00Z"));
+        lease_row(&db, "lapsed", Some("2001-01-01T00:00:00Z"));
+        lease_row(&db, "garbled", Some("sometime next week"));
+        lease_row(&db, "forever", None);
+
+        let v = view(repo);
+        assert!(v.available, "{}", v.error);
+        assert!(
+            v.error.is_empty(),
+            "one bad row does not fail the view: {}",
+            v.error
+        );
+        let listed: Vec<(&str, Option<&str>)> = v
+            .leases
+            .iter()
+            .map(|l| (l.task_id.as_str(), l.expiry_error.as_deref()))
+            .collect();
+        assert_eq!(
+            listed,
+            vec![
+                ("forever", None),
+                ("garbled", Some("sometime next week")),
+                ("live", None),
+            ],
+            "a lapsed lease is not held; an unreadable one is shown, not hidden"
+        );
+
+        // Nothing was swept: the lapsed row is still marked active.
+        assert_eq!(lease_status(&db, "lapsed"), "active");
+        // And reading again says the same thing.
+        assert_eq!(view(repo).leases.len(), 3);
+    }
+
+    /// Scopes are read through the same read-only handle.
+    #[test]
+    fn scope_reads_a_store_it_cannot_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().to_str().unwrap();
+        let db = store_path(repo);
+        std::fs::create_dir_all(db.parent().unwrap()).unwrap();
+        let store = dc_store::Store::open(&db).unwrap();
+        store
+            .connection()
+            .execute(
+                "INSERT INTO tasks (id, title, description, planned_files_json,
+                     forbidden_changes_json, allowed_commands_json, status)
+                 VALUES ('TASK-7', 'Read only', '', '[\"a.rs\"]', '[]', '[]', 'in_progress')",
+                [],
+            )
+            .unwrap();
+        drop(store);
+        let mut permissions = std::fs::metadata(&db).unwrap().permissions();
+        permissions.set_readonly(true);
+        std::fs::set_permissions(&db, permissions).unwrap();
+
+        let found = scopes(repo, &["TASK-7".to_owned()]).unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].planned_files, vec!["a.rs"]);
+        assert_eq!(scope(repo, "TASK-7").unwrap().unwrap().id, "TASK-7");
+        let mut permissions = std::fs::metadata(&db).unwrap().permissions();
+        #[allow(clippy::permissions_set_readonly_false)]
+        permissions.set_readonly(false);
+        std::fs::set_permissions(&db, permissions).unwrap();
     }
 }

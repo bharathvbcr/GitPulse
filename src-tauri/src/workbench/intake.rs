@@ -600,7 +600,29 @@ pub(crate) fn place(
     replace: bool,
     position: i64,
 ) -> Result<Placed, WorkbenchError> {
-    place_once(store, repository, task, replace, position, false)
+    place_once(store, repository, task, replace, position, None, false)
+}
+
+/// [`place`] for a task created from a scan of the board: the creating write
+/// names the newest event the scan saw, and the store refuses it with
+/// `board_changed` when any task was added, edited or removed since.
+fn place_scanned(
+    store: &Store,
+    repository: &Value,
+    task: &ExternalTask,
+    replace: bool,
+    position: i64,
+    scan_sequence: Option<u64>,
+) -> Result<Placed, WorkbenchError> {
+    place_once(
+        store,
+        repository,
+        task,
+        replace,
+        position,
+        scan_sequence,
+        false,
+    )
 }
 
 fn place_once(
@@ -609,6 +631,7 @@ fn place_once(
     task: &ExternalTask,
     replace: bool,
     position: i64,
+    scan_sequence: Option<u64>,
     retried: bool,
 ) -> Result<Placed, WorkbenchError> {
     let repository_id = repository["id"]
@@ -663,6 +686,9 @@ fn place_once(
     match &current {
         None => {
             input.insert("expected_revision".into(), json!(0));
+            if let Some(sequence) = scan_sequence {
+                input.insert("scan_sequence".into(), json!(sequence));
+            }
             input.insert("repository_ids".into(), json!([repository_id]));
             input.insert("primary_repository_id".into(), json!(repository_id));
             input.insert("home_workspace_id".into(), Value::Null);
@@ -734,7 +760,15 @@ fn place_once(
                     sequence: None,
                 })
             }
-            Some(_) => place_once(store, repository, task, replace, position, true),
+            Some(_) => place_once(
+                store,
+                repository,
+                task,
+                replace,
+                position,
+                scan_sequence,
+                true,
+            ),
             None => Err(error),
         },
         Err(error) => Err(error),
@@ -984,11 +1018,65 @@ pub(crate) fn add_task(
     replace: bool,
     reviewed_related: &[String],
 ) -> Result<Value, WorkbenchError> {
+    // The related-task scan and the creating write are one decision: the write
+    // carries the sequence the scan started from, and the store refuses it
+    // when the board moved since. One rescan answers a race; a board that keeps
+    // changing under it is reported, not retried forever.
+    add_task_racing(
+        store,
+        repo_path,
+        &task,
+        replace,
+        reviewed_related,
+        &mut || {},
+    )
+}
+
+/// [`add_task`] with a seam between the board scan and the creating write,
+/// where another writer would land: `between` runs once per attempt, after the
+/// scan and before the write.
+fn add_task_racing(
+    store: &Store,
+    repo_path: &str,
+    task: &ExternalTask,
+    replace: bool,
+    reviewed_related: &[String],
+    between: &mut dyn FnMut(),
+) -> Result<Value, WorkbenchError> {
+    match add_task_once(store, repo_path, task, replace, reviewed_related, between) {
+        Err(error) if error.code == "board_changed" => {
+            add_task_once(store, repo_path, task, replace, reviewed_related, between)
+        }
+        other => other,
+    }
+}
+
+/// The newest event sequence on the board, read before a scan so the scan can
+/// only be as new as the number says.
+fn latest_sequence(store: &Store) -> Result<u64, WorkbenchError> {
+    let page = query(store, "events.list", &json!({"limit": 1}).to_string())?;
+    page["latest_sequence"].as_u64().ok_or_else(|| {
+        WorkbenchError::new(
+            "protocol_error",
+            "The store did not report the board's latest sequence.",
+        )
+    })
+}
+
+fn add_task_once(
+    store: &Store,
+    repo_path: &str,
+    task: &ExternalTask,
+    replace: bool,
+    reviewed_related: &[String],
+    between: &mut dyn FnMut(),
+) -> Result<Value, WorkbenchError> {
     let local = resolve_for_agent(repo_path)?;
     // Validate before registering, so a bad request leaves no trace.
     task.item_fields(&local.name)
         .map_err(|message| WorkbenchError::new("invalid_input", message))?;
     let mut related_seen = None;
+    let mut scan_sequence = None;
     if let Some(repository) = find(store, &local.identity)? {
         let repository_id = repository["id"].as_str().unwrap_or_default();
         let own = item_id(repository_id, &task.key);
@@ -1013,7 +1101,8 @@ pub(crate) fn add_task(
             }
         }
         if creating {
-            let related = related_open_tasks(store, repository_id, &own, &task)?;
+            scan_sequence = Some(latest_sequence(store)?);
+            let related = related_open_tasks(store, repository_id, &own, task)?;
             let unreviewed: Vec<&Value> = related
                 .tasks
                 .iter()
@@ -1071,9 +1160,17 @@ pub(crate) fn add_task(
             }));
         }
     }
+    between();
     let registered = register(store, &local, &fresh_id("repo"), &fresh_id("intake"))?;
     let repository = &registered["repository"];
-    let placed = place(store, repository, &task, replace, now_millis())?;
+    let placed = place_scanned(
+        store,
+        repository,
+        task,
+        replace,
+        now_millis(),
+        scan_sequence,
+    )?;
     match placed.outcome {
         Outcome::AlreadyPresent => Err(WorkbenchError::new(
             "already_exists",
@@ -1368,6 +1465,30 @@ fn task_candidates(repository_id: &str, task: &str) -> Vec<String> {
 /// Every field `items.put` replaces, sent back exactly as read under the
 /// revision it was read at, so a write changes only what its caller sets on
 /// top and a person's edit in between is a conflict rather than overwritten.
+/// Longest caller-supplied request id: the store takes 128, and the record write
+/// of a delete derives its own from it with a suffix.
+const MAX_REQUEST_ID: usize = 120;
+
+/// A caller's own idempotency key for a write, checked at the boundary so a
+/// malformed one is refused before anything is written. The store keys its
+/// receipts by it: the same key with the same payload replays the first
+/// answer instead of writing twice.
+fn check_request_id(supplied: Option<&str>) -> Result<Option<&str>, WorkbenchError> {
+    let Some(id) = supplied else { return Ok(None) };
+    if id.is_empty()
+        || id.len() > MAX_REQUEST_ID
+        || !id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
+    {
+        return Err(WorkbenchError::new(
+            "invalid_input",
+            format!("request_id must be 1 to {MAX_REQUEST_ID} letters, digits, '-' or '_'."),
+        ));
+    }
+    Ok(Some(id))
+}
+
 fn resend(item: &Value, id: &str, revision: i64, request: &str) -> Map<String, Value> {
     let mut input = Map::new();
     for key in [
@@ -1475,7 +1596,9 @@ pub(crate) fn complete_task(
     status: &str,
     expected_revision: Option<i64>,
     summary: Option<&str>,
+    request_id: Option<&str>,
 ) -> Result<Value, WorkbenchError> {
+    let request_id = check_request_id(request_id)?;
     if !AGENT_STATUSES.contains(&status) {
         return Err(WorkbenchError::new(
             "invalid_input",
@@ -1557,6 +1680,9 @@ pub(crate) fn complete_task(
             ));
         }
         let mut input = resend(&item, &id, revision, "complete");
+        if let Some(request_id) = request_id {
+            input.insert("request_id".into(), json!(request_id));
+        }
         input.insert("status".into(), json!(status));
         // The verdict goes into the task's history ahead of the agent's own
         // summary, so the summary stays the last block and a retry still
@@ -1889,6 +2015,16 @@ fn refuse_in_use(
     ))
 }
 
+/// What a caller decided about one delete, handed to the store with it.
+#[derive(Clone, Copy, Default)]
+pub(super) struct DeleteOptions<'a> {
+    /// The caller knows a run may still be working on the task and deletes it
+    /// anyway; the store's own live-run refusal is waived for exactly this.
+    pub even_if_running: bool,
+    /// The caller's idempotency key, already validated by [`check_request_id`].
+    pub request_id: Option<&'a str>,
+}
+
 /// What removing one task came to.
 enum Removal {
     /// Deleted; the store's receipt.
@@ -1919,6 +2055,7 @@ fn record_and_delete(
     block: &str,
     recorded: bool,
     request: &str,
+    delete: DeleteOptions<'_>,
 ) -> Result<Removal, WorkbenchError> {
     let mut revision = item["revision"]
         .as_i64()
@@ -1932,6 +2069,9 @@ fn record_and_delete(
             )
         })?;
         let mut input = resend(item, id, revision, request);
+        if let Some(request_id) = delete.request_id {
+            input.insert("request_id".into(), json!(format!("{request_id}-log")));
+        }
         input.insert("logs".into(), json!(joined));
         match query(store, "items.put", &Value::Object(input).to_string()) {
             Ok(saved) => {
@@ -1948,7 +2088,17 @@ fn record_and_delete(
             Err(error) => return Err(error),
         }
     }
-    let input = json!({"id": id, "request_id": fresh_id(request), "expected_revision": revision});
+    let mut input = json!({
+        "id": id,
+        "request_id": delete.request_id.map_or_else(|| fresh_id(request), str::to_owned),
+        "expected_revision": revision,
+    });
+    // The caller already passed (or waived) this check in the host. The store
+    // repeats it inside the delete's own transaction, so a run that prepared in
+    // between is still refused, and only a caller that said so skips it there.
+    if delete.even_if_running {
+        input["even_if_running"] = json!(true);
+    }
     match query(store, "items.delete", &input.to_string()) {
         Ok(receipt) => {
             // The receipt the board's own delete holds the store to.
@@ -1994,7 +2144,9 @@ pub(crate) fn delete_task(
     expected_revision: Option<i64>,
     reason: &str,
     even_if_running: bool,
+    request_id: Option<&str>,
 ) -> Result<Value, WorkbenchError> {
+    let request_id = check_request_id(request_id)?;
     let reason = check_reason(reason, "this task is being deleted")?;
     let repository = board_repository(store, repo_path)?;
     let repository_id = repository["id"].as_str().unwrap_or_default().to_owned();
@@ -2053,7 +2205,11 @@ pub(crate) fn delete_task(
         refuse_shared(&item, &repository_id)?;
         refuse_in_use(store, &id, &item, even_if_running)?;
         let block = deletion_block(reason, now_millis());
-        match record_and_delete(store, &id, &item, &block, recorded, "delete")? {
+        let options = DeleteOptions {
+            even_if_running,
+            request_id,
+        };
+        match record_and_delete(store, &id, &item, &block, recorded, "delete", options)? {
             Removal::Deleted(receipt) => {
                 return Ok(response(
                     "deleted",
@@ -2116,6 +2272,10 @@ mod tests;
 #[cfg(test)]
 #[path = "intake_proposals_tests.rs"]
 mod proposals_tests;
+
+#[cfg(test)]
+#[path = "intake_store_tests.rs"]
+mod store_tests;
 
 #[cfg(test)]
 #[path = "verification_gate_tests.rs"]

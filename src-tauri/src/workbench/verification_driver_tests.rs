@@ -82,6 +82,7 @@ fn claim(store: &Store, repo: &tempfile::TempDir, id: &str) {
         "done",
         None,
         Some("done"),
+        None,
     )
     .unwrap();
     assert_eq!(r["status"], "review", "{r}");

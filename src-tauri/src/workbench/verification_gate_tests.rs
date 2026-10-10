@@ -61,6 +61,7 @@ fn claim(store: &Store, repo: &tempfile::TempDir, id: &str, summary: Option<&str
         "done",
         None,
         summary,
+        None,
     )
     .unwrap()
 }
@@ -282,6 +283,7 @@ fn concurrent_claims_never_land_unverified_work_in_done() {
                     "done",
                     None,
                     Some(&format!("claim {n}")),
+                    None,
                 )
             })
         })

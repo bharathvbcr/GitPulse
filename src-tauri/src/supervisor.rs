@@ -194,6 +194,19 @@ pub fn run_supervised(subsystem: &str, policy: Policy, mut body: impl FnMut()) {
     }
 }
 
+/// Records a subsystem as degraded for a failure that is not a panic (an
+/// upgrade that could not be backed up, a profile that cannot be read), so
+/// Diagnostics lists it beside the panicked threads. Cleared by
+/// [`note_recovered`].
+pub fn note_degraded(subsystem: &str, reason: &str) {
+    record_with(subsystem, &reason.to_owned(), false);
+}
+
+/// Clears a record made by [`note_degraded`] once the subsystem works again.
+pub fn note_recovered(subsystem: &str) {
+    recover(subsystem);
+}
+
 /// Records that a supervised-in-spirit thread caught its own panic and ended,
 /// for a body that has its own cleanup and so handles the unwind itself.
 pub fn note_stopped(subsystem: &str, payload: &(dyn std::any::Any + Send)) {

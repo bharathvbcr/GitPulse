@@ -596,6 +596,7 @@ fn a_summary_is_recorded_unless_it_is_the_last_block_this_tool_wrote() {
         "done",
         None,
         Some("Exporter shipped"),
+        None,
     )
     .unwrap();
     person_edits(&store, &id, |input| {
@@ -613,6 +614,7 @@ fn a_summary_is_recorded_unless_it_is_the_last_block_this_tool_wrote() {
         "done",
         None,
         Some("release notes shipped"),
+        None,
     )
     .unwrap();
     assert_eq!(again["outcome"], "updated", "{again}");
@@ -633,6 +635,7 @@ fn a_summary_is_recorded_unless_it_is_the_last_block_this_tool_wrote() {
         "done",
         None,
         Some("release notes shipped"),
+        None,
     )
     .unwrap();
     assert_eq!(retry["outcome"], "unchanged");
@@ -657,7 +660,16 @@ fn a_deletion_reason_is_written_as_its_own_block() {
             json!("--- Agent is deleting this task (2026-01-01T00:00:00Z) ---\nOlder attempt\n\nNote: duplicate of gp-ship"),
         );
     });
-    let deleted = delete_task(&store, repo_path, &id, None, "duplicate of gp-ship", false).unwrap();
+    let deleted = delete_task(
+        &store,
+        repo_path,
+        &id,
+        None,
+        "duplicate of gp-ship",
+        false,
+        None,
+    )
+    .unwrap();
     assert_eq!(deleted["outcome"], "deleted");
     let last = last_revision(&store, &id).unwrap().unwrap();
     assert!(
@@ -735,18 +747,19 @@ fn a_task_another_agent_is_running_is_not_deleted_by_default() {
 
     let id = filed(&store, &repo, "gp-busy", "Card an agent is working on");
     prepare_run(&store, &repo, &id, "run-busy");
-    let error = delete_task(&store, repo_path, &id, None, "duplicate", false).expect_err("refused");
+    let error =
+        delete_task(&store, repo_path, &id, None, "duplicate", false, None).expect_err("refused");
     assert_eq!(error.code, "task_in_use", "{}", error.message);
     assert!(error.message.contains("run-busy"), "{}", error.message);
     assert!(live(&store, &id).is_some());
 
     assert_eq!(
-        delete_task(&store, repo_path, &other, None, "duplicate", false).unwrap()["outcome"],
+        delete_task(&store, repo_path, &other, None, "duplicate", false, None).unwrap()["outcome"],
         "deleted"
     );
 
     // The caller who is that agent, or was asked by the person, says so.
-    let forced = delete_task(&store, repo_path, &id, None, "duplicate", true).unwrap();
+    let forced = delete_task(&store, repo_path, &id, None, "duplicate", true, None).unwrap();
     assert_eq!(forced["outcome"], "deleted");
 }
 
@@ -766,11 +779,13 @@ fn an_agent_whose_task_was_deleted_is_told_so_and_why() {
         None,
         "Folded into the exporter card",
         false,
+        None,
     )
     .unwrap();
 
     for error in [
-        complete_task(&store, repo_path, &id, "done", None, Some("did it")).expect_err("deleted"),
+        complete_task(&store, repo_path, &id, "done", None, Some("did it"), None)
+            .expect_err("deleted"),
         get_task(&store, repo_path, &id).expect_err("deleted"),
     ] {
         assert_eq!(error.code, "task_deleted", "{}", error.message);
@@ -865,9 +880,26 @@ fn complete_retry_with_expected_revision_is_unchanged() {
     let repo_path = repo.path().to_str().unwrap();
     let id = filed(&store, &repo, "gp-retry", "Retry me");
     let rev = live(&store, &id).unwrap()["revision"].as_i64().unwrap();
-    let first = complete_task(&store, repo_path, &id, "done", Some(rev), Some("did it")).unwrap();
+    let first = complete_task(
+        &store,
+        repo_path,
+        &id,
+        "done",
+        Some(rev),
+        Some("did it"),
+        None,
+    )
+    .unwrap();
     assert_eq!(first["outcome"], "updated", "{first}");
-    let retry = complete_task(&store, repo_path, &id, "done", Some(rev), Some("did it"));
+    let retry = complete_task(
+        &store,
+        repo_path,
+        &id,
+        "done",
+        Some(rev),
+        Some("did it"),
+        None,
+    );
     assert!(
         retry.as_ref().is_ok_and(|v| v["outcome"] == "unchanged"),
         "identical retry: {:?}",
@@ -887,7 +919,7 @@ fn complete_with_a_stale_revision_that_would_change_the_task_is_refused() {
     person_edits(&store, &id, |input| {
         input.insert("title".into(), json!("Edited by a person"));
     });
-    let error = complete_task(&store, repo_path, &id, "review", Some(rev), None).unwrap_err();
+    let error = complete_task(&store, repo_path, &id, "review", Some(rev), None, None).unwrap_err();
     assert_eq!(error.code, "revision_conflict");
 }
 
@@ -899,9 +931,9 @@ fn delete_retry_after_success_is_unchanged() {
     let repo_path = repo.path().to_str().unwrap();
     let id = filed(&store, &repo, "gp-del", "Delete me");
     let rev = live(&store, &id).unwrap()["revision"].as_i64().unwrap();
-    let first = delete_task(&store, repo_path, &id, Some(rev), "duplicate", false).unwrap();
+    let first = delete_task(&store, repo_path, &id, Some(rev), "duplicate", false, None).unwrap();
     assert_eq!(first["outcome"], "deleted", "{first}");
-    let retry = delete_task(&store, repo_path, &id, Some(rev), "duplicate", false);
+    let retry = delete_task(&store, repo_path, &id, Some(rev), "duplicate", false, None);
     assert!(
         retry.as_ref().is_ok_and(|v| v["outcome"] == "unchanged"),
         "identical retry: {:?}",
@@ -925,7 +957,7 @@ fn delete_retry_after_interrupted_delete_finishes() {
         let joined = append_log(&logs, &deletion_block("duplicate", now_millis())).unwrap();
         input.insert("logs".into(), json!(joined));
     });
-    let retry = delete_task(&store, repo_path, &id, Some(rev), "duplicate", false);
+    let retry = delete_task(&store, repo_path, &id, Some(rev), "duplicate", false, None);
     assert!(
         retry.as_ref().is_ok_and(|v| v["outcome"] == "deleted"),
         "'run the same call again' after Interrupted: {:?}",
@@ -945,6 +977,7 @@ fn delete_retry_after_an_unrelated_edit_is_still_a_conflict() {
     person_edits(&store, &id, |input| {
         input.insert("title".into(), json!("Edited by a person"));
     });
-    let error = delete_task(&store, repo_path, &id, Some(rev), "duplicate", false).unwrap_err();
+    let error =
+        delete_task(&store, repo_path, &id, Some(rev), "duplicate", false, None).unwrap_err();
     assert_eq!(error.code, "revision_conflict");
 }

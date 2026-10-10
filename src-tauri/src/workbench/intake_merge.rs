@@ -515,7 +515,11 @@ fn rounds(
             let logs = item["logs"].as_str().unwrap_or_default();
             let recorded = ends_with_block(logs, &marker, reason);
             let block = format!("{marker}{}) ---\n{reason}", timestamp(now_millis()));
-            match record_and_delete(store, &source.id, item, &block, recorded, "merge")? {
+            let options = DeleteOptions {
+                even_if_running,
+                request_id: None,
+            };
+            match record_and_delete(store, &source.id, item, &block, recorded, "merge", options)? {
                 Removal::Deleted(receipt) => {
                     progress.wrote = true;
                     progress.sequence = receipt["sequence"].as_u64().or(progress.sequence);

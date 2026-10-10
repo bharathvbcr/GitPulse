@@ -164,7 +164,7 @@ fn a_merge_folds_each_source_into_the_target_and_deletes_it() {
             }
         );
         // An agent launched on a merged task is pointed at where it went.
-        let error = complete_task(&store, repo_path, source, "done", None, None).unwrap_err();
+        let error = complete_task(&store, repo_path, source, "done", None, None, None).unwrap_err();
         assert_eq!(error.code, "task_merged");
         assert!(error.message.contains(&target), "{}", error.message);
     }
@@ -850,7 +850,7 @@ fn concurrent_merges_and_edits_never_lose_a_cards_work() {
                             1 => {
                                 let status = ["in_progress", "review", "done"][rng.below(3)];
                                 let summary = format!("progress-{worker}-{op}");
-                                match complete_task(&store, &repo_path, &into, status, None, Some(&summary)) {
+                                match complete_task(&store, &repo_path, &into, status, None, Some(&summary), None) {
                                     Ok(report) => seen.push(format!("complete-{}", report["outcome"].as_str().unwrap())),
                                     Err(e) => {
                                         assert!(
@@ -1026,6 +1026,7 @@ fn a_delete_task_whose_delete_fails_says_the_reason_was_recorded() {
         None,
         "Not needed.",
         false,
+        None,
     )
     .unwrap_err();
     assert_eq!(error.code, "store_error");
