@@ -138,7 +138,7 @@ fn a_shell_that_exits_is_over_even_while_a_background_job_holds_the_terminal() {
         .exits
         .recv_timeout(Duration::from_secs(5))
         .expect("the shell exited, so the session must end without waiting for its job");
-    assert!(started.elapsed() < Duration::from_secs(5));
+    assert!(started.elapsed() < common::env::coverage_relaxed(Duration::from_secs(5)));
     assert_eq!(exit["id"], session.id.as_str());
     assert_eq!(exit["exit_code"], 3);
     assert!(
@@ -182,7 +182,7 @@ fn closing_an_idle_shell_hangs_up_its_jobs_and_finishes_promptly() {
     assert!(alive(job));
     let started = Instant::now();
     kill_session(&h.state, &session.id).expect("Close must finish, not ask for a retry");
-    assert!(started.elapsed() < Duration::from_secs(3));
+    assert!(started.elapsed() < common::env::coverage_relaxed(Duration::from_secs(3)));
     let deadline = Instant::now() + Duration::from_secs(3);
     while alive(job) && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(20));
@@ -220,7 +220,7 @@ fn closing_stops_a_foreground_program_that_ignores_hangup() {
     assert!(wait_for_output(&h.output, "ready", Duration::from_secs(10)));
     let started = Instant::now();
     kill_session(&h.state, &session.id).unwrap();
-    assert!(started.elapsed() < Duration::from_secs(3));
+    assert!(started.elapsed() < common::env::coverage_relaxed(Duration::from_secs(3)));
     h.exits
         .recv_timeout(Duration::from_secs(3))
         .expect("a closed session reports its exit");

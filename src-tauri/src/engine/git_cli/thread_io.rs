@@ -368,7 +368,9 @@ mod tests {
         .unwrap();
         let started = Instant::now();
         drop(worker);
-        assert!(started.elapsed() < Duration::from_millis(100));
+        assert!(
+            started.elapsed() < crate::test_support::coverage_relaxed(Duration::from_millis(100))
+        );
         assert!(
             weak.upgrade().is_some(),
             "blocked worker escaped admission budget"

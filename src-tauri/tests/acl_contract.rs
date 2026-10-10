@@ -36,6 +36,11 @@
 //!   would be a gate that looks like it checks something it does not. Those
 //!   grants were audited by hand for this change and found complete.
 
+// The hermetic test environment: a per-process home, git config and trust
+// store, rewritten before `main`. See `src/test_support/env.rs`.
+#[path = "../src/test_support/env.rs"]
+mod hermetic_env;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};

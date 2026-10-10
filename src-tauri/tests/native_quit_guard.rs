@@ -16,6 +16,11 @@
 //! process id is read with WebKit's private `_webProcessIdentifier`; that is a
 //! test-only use, never shipped.
 
+// The hermetic test environment: a per-process home, git config and trust
+// store, rewritten before `main`. See `src/test_support/env.rs`.
+#[path = "../src/test_support/env.rs"]
+mod hermetic_env;
+
 #[cfg(not(target_os = "macos"))]
 fn main() {
     println!("SKIP native_quit_guard: requires macOS/AppKit");

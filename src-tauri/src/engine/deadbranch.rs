@@ -1110,30 +1110,22 @@ fn local_branch_tips(repo: &Path) -> Result<HashMap<String, String>, String> {
 mod tests {
     use super::*;
     use crate::test_support::{git_in, git_repo};
-    use std::sync::Mutex;
 
-    /// `GITPULSE_BACKUPS_DIR` is process-wide; tests that set it take turns.
-    static BACKUPS_ENV: Mutex<()> = Mutex::new(());
-
+    /// `GITPULSE_BACKUPS_DIR` is process-wide; the binding holds the process's
+    /// environment lock and restores the variable when the store drops, including
+    /// on a failing test.
     struct BackupStore {
         dir: tempfile::TempDir,
-        _turn: std::sync::MutexGuard<'static, ()>,
+        _env: crate::test_support::env::EnvBinding<'static>,
     }
 
     impl BackupStore {
         fn new() -> Self {
-            let turn = BACKUPS_ENV
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
             let dir = tempfile::tempdir().unwrap();
-            std::env::set_var("GITPULSE_BACKUPS_DIR", dir.path());
-            Self { dir, _turn: turn }
-        }
-    }
-
-    impl Drop for BackupStore {
-        fn drop(&mut self) {
-            std::env::remove_var("GITPULSE_BACKUPS_DIR");
+            let env =
+                crate::test_support::env::bind_env_owned(crate::test_support::env::env_serial())
+                    .set("GITPULSE_BACKUPS_DIR", dir.path());
+            Self { dir, _env: env }
         }
     }
 

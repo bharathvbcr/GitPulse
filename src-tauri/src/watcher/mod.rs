@@ -2743,7 +2743,7 @@ mod tests {
             notify::Event::new(notify::EventKind::Any).add_path(root.join("src").join(long_name));
         assert!(event_has_signal(&long, &[], root, Some(root), &rules));
         assert!(
-            started.elapsed() < Duration::from_secs(2),
+            started.elapsed() < crate::test_support::coverage_relaxed(Duration::from_secs(2)),
             "40k classifications took {:?}",
             started.elapsed()
         );

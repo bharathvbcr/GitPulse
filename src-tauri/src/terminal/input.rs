@@ -133,7 +133,7 @@ mod tests {
         reader.set_nonblocking(true).unwrap();
         let start = Instant::now();
         wait_for_output(reader.as_raw_fd()).unwrap();
-        assert!(start.elapsed() < Duration::from_secs(1));
+        assert!(start.elapsed() < crate::test_support::coverage_relaxed(Duration::from_secs(1)));
         assert_eq!(
             reader.read(&mut [0]).unwrap_err().kind(),
             io::ErrorKind::WouldBlock
@@ -185,7 +185,9 @@ mod tests {
             .unwrap_err();
             assert!(error.contains("3 of 6"), "{error}");
             assert!(error.contains("timed out"), "{error}");
-            assert!(start.elapsed() < Duration::from_secs(1));
+            assert!(
+                start.elapsed() < crate::test_support::coverage_relaxed(Duration::from_secs(1))
+            );
         }
     }
 
@@ -210,6 +212,6 @@ mod tests {
         )
         .unwrap_err()
         .contains("0 of 1"));
-        assert!(start.elapsed() < Duration::from_secs(1));
+        assert!(start.elapsed() < crate::test_support::coverage_relaxed(Duration::from_secs(1)));
     }
 }

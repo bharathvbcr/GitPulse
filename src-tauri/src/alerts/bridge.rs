@@ -852,7 +852,8 @@ mod tests {
         // sleep between accepts that cost every report 200 ms and made this
         // loop take 40 seconds.
         assert!(
-            started.elapsed() < std::time::Duration::from_secs(5),
+            started.elapsed()
+                < crate::test_support::coverage_relaxed(std::time::Duration::from_secs(5)),
             "200 reports took {:?}",
             started.elapsed()
         );

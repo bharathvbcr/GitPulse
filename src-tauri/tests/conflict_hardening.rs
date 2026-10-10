@@ -1,3 +1,8 @@
+// The hermetic test environment: a per-process home, git config and trust
+// store, rewritten before `main`. See `src/test_support/env.rs`.
+#[path = "../src/test_support/env.rs"]
+mod hermetic_env;
+
 use gitpulse_lib::diff::{ConflictResolutionChoice, ConflictResolver, FileSegment};
 
 #[test]

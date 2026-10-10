@@ -450,18 +450,9 @@ mod tests {
         format!("/{tail}")
     }
 
-    /// Serialises the tests that override the transcript root.
-    ///
-    /// The override is an environment variable, which is process-global: two
-    /// tests setting and clearing it in parallel let one of them run against
-    /// the developer's real `~/.claude/projects`.
-    static ROOT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     /// Restores the root even when `f` panics — see `test_env` for the class.
     fn with_transcript_root<T>(root: &std::path::Path, f: impl FnOnce() -> T) -> T {
-        let serial = ROOT_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let serial = crate::test_env::env_serial();
         let _env = crate::test_env::bind_env(&serial).set("GITPULSE_TRANSCRIPT_ROOT", root);
         f()
     }

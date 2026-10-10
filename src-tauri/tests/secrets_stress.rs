@@ -253,7 +253,7 @@ fn oversized_output_fails_closed_instead_of_listing_a_prefix() {
         !diagnostic.contains("    "),
         "truncated stdout reached the diagnostic: {diagnostic}"
     );
-    assert!(started.elapsed() < Duration::from_secs(30));
+    assert!(started.elapsed() < common::env::coverage_relaxed(Duration::from_secs(30)));
 }
 
 #[test]
@@ -350,7 +350,7 @@ fn a_hung_scanner_is_killed_at_the_deadline() {
         "scanner stderr reached the report"
     );
     assert!(
-        started.elapsed() < Duration::from_secs(10),
+        started.elapsed() < common::env::coverage_relaxed(Duration::from_secs(10)),
         "{:?}",
         started.elapsed()
     );

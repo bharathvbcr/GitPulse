@@ -18,17 +18,6 @@ use std::sync::{Mutex, OnceLock};
 pub const CONFIG_VERSION: u32 = 1;
 pub const TOOL_CONFIG_ENV: &str = "GITPULSE_TOOL_CONFIG";
 
-#[cfg(test)]
-static CONFIG_ENV_LOCK: Mutex<()> = Mutex::new(());
-
-/// Serialize tests that mutate [`TOOL_CONFIG_ENV`].
-#[cfg(test)]
-pub(crate) fn lock_config_env() -> std::sync::MutexGuard<'static, ()> {
-    CONFIG_ENV_LOCK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-}
-
 fn is_false(v: &bool) -> bool {
     !*v
 }
@@ -1190,7 +1179,7 @@ mod tests {
     use super::*;
 
     fn with_temp_config(f: impl FnOnce(&Path)) {
-        let serial = crate::tool_config::lock_config_env();
+        let serial = crate::test_support::env::env_serial();
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("tools.json");
         // Dropped before `dir`, so the variable stops naming the temporary
@@ -1713,7 +1702,7 @@ mod model_setting_tests {
     use super::*;
 
     fn with_temp_config(f: impl FnOnce(&Path)) {
-        let serial = crate::tool_config::lock_config_env();
+        let serial = crate::test_support::env::env_serial();
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("tools.json");
         let _env = crate::test_support::env::bind_env(&serial)

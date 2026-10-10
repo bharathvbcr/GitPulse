@@ -8,7 +8,6 @@ mod env;
 
 use std::collections::BTreeSet;
 use std::path::Path;
-use std::sync::Mutex;
 
 use gitpulse_lib::engine::git_cli::{
     current_admission_name, run_process_as_background, run_process_with_shared_spawn_budget,
@@ -140,8 +139,6 @@ fn every_shipped_binary_opts_into_the_shared_spawn_budget() {
     }
 }
 
-static ENV_SERIAL: Mutex<()> = Mutex::new(());
-
 /// The behaviour the guard above stands for: a process that opts in opens
 /// the per-user record. Its counterpart, a process that does not and never
 /// touches it, is `tests/spawn_budget_isolation.rs`. In this executable
@@ -149,7 +146,7 @@ static ENV_SERIAL: Mutex<()> = Mutex::new(());
 /// reads `HOME`, and one that did would race this one for the first spawn.
 #[test]
 fn a_process_that_opts_in_draws_from_the_per_user_spawn_budget() {
-    let serial = ENV_SERIAL.lock().unwrap();
+    let serial = env::env_serial();
     let home = tempfile::tempdir().unwrap();
     let _env = env::bind_env(&serial)
         .set("HOME", home.path())

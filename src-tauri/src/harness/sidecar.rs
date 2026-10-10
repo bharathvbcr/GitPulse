@@ -823,6 +823,22 @@ pub(crate) struct SidecarTestGuard {
     /// mutex and is what will release it.
     #[allow(dead_code)]
     outer: Option<std::sync::MutexGuard<'static, ()>>,
+    /// The process's one environment lock, taken *before* the slot lock and
+    /// released after it (fields drop in declaration order). Which binary a
+    /// spawn finds is decided by the environment, so a sidecar test is an
+    /// environment test; holding the environment lock here is what lets it
+    /// borrow this guard as the serial for `bind_env` through `Deref` without a
+    /// second lock that nothing else takes.
+    env: crate::test_support::env::EnvGuard,
+}
+
+#[cfg(test)]
+impl std::ops::Deref for SidecarTestGuard {
+    type Target = crate::test_support::env::EnvGuard;
+
+    fn deref(&self) -> &Self::Target {
+        &self.env
+    }
 }
 
 #[cfg(test)]
@@ -841,13 +857,14 @@ fn slot_test_owner() -> std::sync::MutexGuard<'static, Option<(std::thread::Thre
 /// data behind this lock is the emptiness of `()`.
 #[cfg(test)]
 pub(crate) fn test_serial() -> SidecarTestGuard {
+    let env = crate::test_support::env::env_serial();
     let me = std::thread::current().id();
     {
         let mut owner = slot_test_owner();
         if let Some((thread, depth)) = owner.as_mut() {
             if *thread == me {
                 *depth += 1;
-                return SidecarTestGuard { outer: None };
+                return SidecarTestGuard { outer: None, env };
             }
         }
     }
@@ -858,7 +875,10 @@ pub(crate) fn test_serial() -> SidecarTestGuard {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     *slot_test_owner() = Some((me, 1));
-    SidecarTestGuard { outer: Some(guard) }
+    SidecarTestGuard {
+        outer: Some(guard),
+        env,
+    }
 }
 
 #[cfg(test)]
@@ -1808,7 +1828,7 @@ mod tests {
         );
         drop(acquired);
         assert!(
-            started.elapsed() < Duration::from_secs(5),
+            started.elapsed() < crate::test_support::coverage_relaxed(Duration::from_secs(5)),
             "the waiter should wake as soon as the holder releases"
         );
         holder.join().expect("holder thread");
@@ -2056,7 +2076,7 @@ mod tests {
             .expect_err("no stdin remains");
         assert!(matches!(err, HarnessError::Unavailable(_)));
         assert!(
-            started.elapsed() < Duration::from_millis(500),
+            started.elapsed() < crate::test_support::coverage_relaxed(Duration::from_millis(500)),
             "follow-up call blocked again: {:?}",
             started.elapsed()
         );
@@ -2065,7 +2085,7 @@ mod tests {
         let started = Instant::now();
         drop(sidecar);
         assert!(
-            started.elapsed() < Duration::from_secs(3),
+            started.elapsed() < crate::test_support::coverage_relaxed(Duration::from_secs(3)),
             "shutdown escalation overran: {:?}",
             started.elapsed()
         );
@@ -2123,7 +2143,7 @@ mod tests {
             Duration::from_millis(250),
         );
         assert!(
-            started.elapsed() < Duration::from_secs(10),
+            started.elapsed() < crate::test_support::coverage_relaxed(Duration::from_secs(10)),
             "request after recovery hung for {:?}",
             started.elapsed()
         );
@@ -2477,7 +2497,7 @@ while IFS= read -r line; do handle "$line" & done
             "stop for another run failed behind a slow prepare: {stopped:?}"
         );
         assert!(
-            started.elapsed() < Duration::from_secs(1),
+            started.elapsed() < crate::test_support::coverage_relaxed(Duration::from_secs(1)),
             "stop waited {:?} behind the slow prepare",
             started.elapsed()
         );
@@ -2571,7 +2591,7 @@ while IFS= read -r line; do handle "$line" & done
             "{waited:?}"
         );
         assert!(
-            started.elapsed() < Duration::from_secs(5),
+            started.elapsed() < crate::test_support::coverage_relaxed(Duration::from_secs(5)),
             "waiting calls outlived their dead child: {:?}",
             started.elapsed()
         );

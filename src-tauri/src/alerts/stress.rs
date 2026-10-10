@@ -186,7 +186,7 @@ fn a_full_queue_refuses_rather_than_blocking_its_producer() {
     let (status, depth) = drive(offered, 4);
     assert_eq!(accounted(&status), count);
     assert!(
-        started.elapsed() < Duration::from_secs(30),
+        started.elapsed() < crate::test_support::coverage_relaxed(Duration::from_secs(30)),
         "{count} offers took {:?}",
         started.elapsed()
     );

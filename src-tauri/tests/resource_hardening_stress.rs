@@ -185,7 +185,7 @@ fn the_spawn_gate_reclaims_permits_from_failures_timeouts_and_panics() {
         handle.join().expect("thread").expect("rev-parse");
     }
     assert!(
-        started.elapsed() < Duration::from_secs(30),
+        started.elapsed() < common::env::coverage_relaxed(Duration::from_secs(30)),
         "the gate leaked permits: 24 trivial calls took {:?}",
         started.elapsed()
     );

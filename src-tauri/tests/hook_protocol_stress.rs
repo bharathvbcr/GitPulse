@@ -17,6 +17,11 @@
 //! is why the harness failure modes below stand up deliberately broken `manvi`
 //! executables rather than mocking a verdict.
 
+// The hermetic test environment: a per-process home, git config and trust
+// store, rewritten before `main`. See `src/test_support/env.rs`.
+#[path = "../src/test_support/env.rs"]
+mod hermetic_env;
+
 use gitpulse_lib::procguard::LockedSpawn;
 use std::io::Write;
 use std::path::{Path, PathBuf};

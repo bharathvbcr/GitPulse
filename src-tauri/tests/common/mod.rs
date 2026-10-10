@@ -17,6 +17,13 @@
 
 use gitpulse_lib::procguard::LockedSpawn;
 use std::path::Path;
+
+/// The test environment owner: the hermetic home every test process runs in,
+/// the one environment lock, and the scoped `bind_env` guard. Declaring `common`
+/// is what makes a crate hermetic, so a new suite gets it with the helpers it
+/// already needs; `tests/hermetic_contract.rs` fails a suite that has neither.
+#[path = "../../src/test_support/env.rs"]
+pub mod env;
 use std::process::Command;
 
 /// Runs `git` in `cwd` and asserts it succeeded.

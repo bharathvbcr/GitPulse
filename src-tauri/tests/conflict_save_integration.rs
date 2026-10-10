@@ -706,7 +706,7 @@ fn special_files_are_rejected_without_blocking() {
     assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
     let started = std::time::Instant::now();
     assert!(conflict_session::snapshot(dir.path().to_str().unwrap(), "file").is_err());
-    assert!(started.elapsed() < std::time::Duration::from_secs(10));
+    assert!(started.elapsed() < common::env::coverage_relaxed(std::time::Duration::from_secs(10)));
 }
 
 #[test]

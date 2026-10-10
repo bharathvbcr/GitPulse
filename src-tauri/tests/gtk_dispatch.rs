@@ -2,6 +2,11 @@
 
 // Test the actual adapter linked by the patched TAO runtime, including shutdown
 // and main-thread ownership. No second implementation in the test fixture.
+// The hermetic test environment: a per-process home, git config and trust
+// store, rewritten before `main`. See `src/test_support/env.rs`.
+#[path = "../src/test_support/env.rs"]
+mod hermetic_env;
+
 #[path = "../framework/tao/src/platform_impl/linux/main_context_channel.rs"]
 mod main_context_channel;
 

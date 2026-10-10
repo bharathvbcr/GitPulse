@@ -7,6 +7,11 @@
 //! repository, and the functions are pure, so the property worth asserting is
 //! simply that they are total.
 
+// The hermetic test environment: a per-process home, git config and trust
+// store, rewritten before `main`. See `src/test_support/env.rs`.
+#[path = "../src/test_support/env.rs"]
+mod hermetic_env;
+
 use gitpulse_lib::analyzer::LanguageDetector as D;
 
 /// Paths chosen to break assumptions rather than to be realistic.

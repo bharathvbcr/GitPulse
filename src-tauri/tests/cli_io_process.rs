@@ -1,4 +1,9 @@
 //! Exercise inherited OS streams at the real executable boundary.
+// The hermetic test environment: a per-process home, git config and trust
+// store, rewritten before `main`. See `src/test_support/env.rs`.
+#[path = "../src/test_support/env.rs"]
+mod hermetic_env;
+
 use gitpulse_lib::procguard::LockedSpawn;
 use std::fs::{self, File};
 use std::process::{Child, Command, ExitStatus, Stdio};

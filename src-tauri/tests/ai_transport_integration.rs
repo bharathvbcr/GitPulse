@@ -6,6 +6,11 @@
 //! misconfigured base URL therefore fails as a refusal, never as a silent
 //! upload". That is the property under test.
 
+// The hermetic test environment: a per-process home, git config and trust
+// store, rewritten before `main`. See `src/test_support/env.rs`.
+#[path = "../src/test_support/env.rs"]
+mod hermetic_env;
+
 use gitpulse_lib::ai::http::parse_base_url;
 
 #[test]

@@ -1102,7 +1102,8 @@ mod tests {
         let started = std::time::Instant::now();
         let result = super::run_tree_killer(&mut cmd, std::time::Duration::from_millis(100));
         assert!(
-            started.elapsed() < std::time::Duration::from_secs(1),
+            started.elapsed()
+                < crate::test_support::coverage_relaxed(std::time::Duration::from_secs(1)),
             "tree killer waited {:?}",
             started.elapsed()
         );

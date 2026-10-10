@@ -209,7 +209,7 @@ fn interactive_round_trips_do_not_accumulate_polling_delays() {
         acknowledge_output(&state, &spawned.id, bytes.len()).unwrap();
         write_to_session(&state, &spawned.id, "\n").unwrap();
         assert!(
-            started.elapsed() < Duration::from_secs(4),
+            started.elapsed() < common::env::coverage_relaxed(Duration::from_secs(4)),
             "round {round}: readiness must wake the reader without a fixed delay"
         );
     }
@@ -272,7 +272,7 @@ fn a_blocked_writer_does_not_block_other_sessions_or_close() {
     resize_session(&state, &b.id, 40, 120).unwrap();
     kill_session(&state, &a.id).unwrap();
     kill_session(&state, &b.id).unwrap();
-    assert!(start.elapsed() < Duration::from_secs(3));
+    assert!(start.elapsed() < common::env::coverage_relaxed(Duration::from_secs(3)));
     assert!(written_receive
         .recv_timeout(Duration::from_secs(3))
         .expect("closing a session must release its blocked input request")
@@ -417,7 +417,7 @@ fn closing_after_stdio_eof_still_reaps_the_live_child() {
     std::thread::sleep(Duration::from_millis(100));
     let start = Instant::now();
     kill_session(&state, &session.id).unwrap();
-    assert!(start.elapsed() < Duration::from_secs(3));
+    assert!(start.elapsed() < common::env::coverage_relaxed(Duration::from_secs(3)));
     gitpulse_lib::terminal::shutdown_sessions(&state).unwrap();
 }
 
