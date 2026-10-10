@@ -21,10 +21,12 @@ pub(crate) mod notifications;
 pub(crate) mod process_birth;
 mod receipts;
 mod reconcile;
+pub(crate) mod retention;
 pub mod review;
 pub(crate) mod terminal_command;
 mod terminal_launch;
 mod terminal_run;
+pub(crate) mod verification_driver;
 pub(crate) mod verification_gate;
 
 const MAX_IN_FLIGHT: usize = 8;
@@ -375,6 +377,79 @@ impl WorkbenchState {
         if method == "verifications.get" {
             let params = verification_gate::get_params(input)?;
             return self.worker_call("work.verify.get", params, None);
+        }
+        // What the card shows (read from the store, so it works with the
+        // sidecar down) and its Verify action. Both use a connection of their
+        // own: Verify waits on the sidecar and must not hold the board's.
+        if method == "verifications.board" {
+            let parsed: Value = serde_json::from_str(input)
+                .map_err(|e| WorkbenchError::new("invalid_input", e.to_string()))?;
+            let ids: Vec<String> = parsed["ids"]
+                .as_array()
+                .ok_or_else(|| WorkbenchError::new("invalid_input", "ids is required."))?
+                .iter()
+                .map(|id| id.as_str().map(str::to_owned))
+                .collect::<Option<_>>()
+                .ok_or_else(|| WorkbenchError::new("invalid_input", "ids are strings."))?;
+            let store = Store::open(&self.profile_path()?)
+                .map_err(|e| WorkbenchError::new("store_error", e.to_string()))?;
+            return verification_driver::status_batch(
+                &store,
+                &verification_driver::HostBackend(self.clone()),
+                &ids,
+            );
+        }
+        if method == "verifications.status" || method == "verifications.run" {
+            let parsed: Value = serde_json::from_str(input)
+                .map_err(|e| WorkbenchError::new("invalid_input", e.to_string()))?;
+            let id = parsed["id"].as_str().unwrap_or_default();
+            if id.is_empty() || id.len() > 128 {
+                return Err(WorkbenchError::new(
+                    "invalid_input",
+                    "A task id is required.",
+                ));
+            }
+            let store = Store::open(&self.profile_path()?)
+                .map_err(|e| WorkbenchError::new("store_error", e.to_string()))?;
+            let backend = verification_driver::HostBackend(self.clone());
+            return if method == "verifications.status" {
+                verification_driver::status(&store, &backend, id)
+            } else {
+                verification_driver::run_now(&store, &backend, id)
+            };
+        }
+        // Manvi proposes; these only start, read or stop a scan, and file or
+        // apply what a person accepted. A sidecar that is down is the caller's
+        // error to see, never an empty scan.
+        if method == "scans.start" {
+            let params = intake::scan_start_params(input)?;
+            return self.worker_call("work.scan.gaps", params, None);
+        }
+        if method == "scans.get" {
+            let params = intake::scan_ref_params(input)?;
+            return self.worker_call("work.scan.get", params, None);
+        }
+        if method == "scans.cancel" {
+            let params = intake::scan_ref_params(input)?;
+            return self.worker_call("work.scan.cancel", params, None);
+        }
+        if method == "proposals.file" {
+            return self.with_store(|store| intake::file_proposal(store, input));
+        }
+        if method == "proposals.apply" {
+            return self.with_store(|store| intake::apply_refinement(store, input));
+        }
+        // Refinement is grounded in the repository's code index, so Manvi is
+        // told which root: the host's resolution of the open repository, never
+        // the sidecar's working directory.
+        if method == "enhancements.refine" {
+            let (root, rest) = intake::refine_split(input)?;
+            let HostControl {
+                mut params,
+                selection,
+            } = generation_input(method, &rest)?;
+            params["repo_root"] = json!(root);
+            return self.worker_call("work.enhancements.refine", params, selection);
         }
         if matches!(
             method,

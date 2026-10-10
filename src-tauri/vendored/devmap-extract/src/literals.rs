@@ -188,7 +188,10 @@ fn propagate_rust_consts(
         let node = cursor.node();
         if matches!(node.kind(), "const_item" | "static_item") && module_level(node) {
             if let Some(name_node) = node.child_by_field_name("name") {
-                let name = name_node.utf8_text(source.as_bytes()).unwrap_or("").to_string();
+                let name = name_node
+                    .utf8_text(source.as_bytes())
+                    .unwrap_or("")
+                    .to_string();
                 if !name.is_empty() {
                     let mut direct = Vec::new();
                     let mut aliases = Vec::new();
@@ -262,8 +265,13 @@ fn module_level(node: Node) -> bool {
     let mut current = node.parent();
     while let Some(ancestor) = current {
         match ancestor.kind() {
-            "function_item" | "impl_item" | "closure_expression" | "trait_item"
-            | "function_signature_item" | "macro_invocation" | "block" => return false,
+            "function_item"
+            | "impl_item"
+            | "closure_expression"
+            | "trait_item"
+            | "function_signature_item"
+            | "macro_invocation"
+            | "block" => return false,
             _ => current = ancestor.parent(),
         }
     }
@@ -335,7 +343,10 @@ fn dedup_sort(sites: &mut Vec<ExtractedLiteral>) {
         left.start_byte
             .cmp(&right.start_byte)
             .then(left.value.cmp(&right.value))
-            .then(left.enclosing_qualified_name.cmp(&right.enclosing_qualified_name))
+            .then(
+                left.enclosing_qualified_name
+                    .cmp(&right.enclosing_qualified_name),
+            )
     });
     sites.dedup_by(|left, right| {
         left.start_byte == right.start_byte

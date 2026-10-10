@@ -569,6 +569,14 @@ fn consumer_manifest_json(
         // of 61 with an empty candidate list is how "we did not look" came
         // to read as "nothing is unwired". The paths are the work list.
         "import_blind_files": import_blind_files,
+        // Source files discovery skipped for exceeding the size limit, with
+        // their sizes: whatever they declared or called is in none of the
+        // lists above. `null` when the generation did not record a walk —
+        // "not measured", which an empty list would misstate.
+        "over_limit_files": analysis.over_limit_files.as_ref().map(|files| json!({
+            "count": files.len(),
+            "files": files,
+        })),
         // Computed since W1.1, from the strongly-connected-component pass
         // rather than from a BFS out of the entry roots. The distinction is the
         // whole reason this key could be filled in at all: a static BFS is

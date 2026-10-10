@@ -30,7 +30,7 @@ pub(super) fn file_edge_coverage_gap(outcome: &ParseOutcome) -> Option<String> {
              the pattern scanner extracts no calls and no imports at all, so an empty or short \
              list here is not evidence the file has no dependencies"
         )),
-        ParseOutcome::Partial { error_ranges } => Some(format!(
+        ParseOutcome::Partial { error_ranges, .. } => Some(format!(
             "this file parsed with {} error range(s); a call or import inside an error region \
              is invisible to extraction, so this list is a lower bound",
             error_ranges.len()
@@ -64,6 +64,10 @@ pub(super) struct CallBlindStarts {
     pub(super) checked: usize,
     /// Distinct start files the bound left unread.
     pub(super) unchecked: usize,
+    /// Checked start files whose stored parse was `Clean`. Read from the same
+    /// row the call-blind verdict is, so the leaf answer in `traverse_walked`
+    /// costs no second store read per target.
+    pub(super) clean: BTreeSet<String>,
 }
 
 impl CallBlindStarts {
@@ -202,7 +206,64 @@ pub(super) enum RadiusSide {
     FileCallees,
 }
 
+/// Most never-indexed paths an "outside index" answer names.
+const OUTSIDE_INDEX_SAMPLE: usize = 5;
+
 impl StoreQueryEngine<'_> {
+    /// Why a name lookup that matched nothing cannot answer "no such symbol":
+    /// the paths this generation never indexed, or `None` when it indexed
+    /// every path discovery met.
+    ///
+    /// `search detect_stubs` answered `resolution: Available, total: 0` over a
+    /// repository whose `crates/dc-verify` — where `detect_stubs` is declared
+    /// — was a symlink out of the tree that discovery refused. "Available, 0"
+    /// is a completed check that found nothing; this was a check over a corpus
+    /// with a hole exactly where the answer lives. A refused path and an
+    /// over-limit file both have no rows, so a symbol declared in either is
+    /// invisible to every name lookup, and an empty answer has to say so in
+    /// the field a caller branches on, not only in a caveat.
+    ///
+    /// `scope_paths`, when given, narrows the holes to those under the
+    /// caller's path prefixes: a lookup scoped to `src/` is not made
+    /// unavailable by a refusal under `vendor/`.
+    pub(super) fn outside_index_reason(
+        &self,
+        scope_paths: &[String],
+    ) -> anyhow::Result<Option<String>> {
+        let inventory = self.store.latest_discovery_inventory()?;
+        let in_scope = |path: &str| {
+            scope_paths.is_empty()
+                || scope_paths.iter().any(|prefix| {
+                    let prefix = prefix.trim_end_matches('/');
+                    path == prefix || path.starts_with(&format!("{prefix}/"))
+                })
+        };
+        let holes: Vec<&str> = inventory
+            .refusals
+            .iter()
+            .chain(inventory.over_limit.iter())
+            .map(|row| row.path.as_str())
+            .filter(|path| in_scope(path))
+            .collect();
+        if holes.is_empty() {
+            return Ok(None);
+        }
+        let shown: Vec<&str> = holes.iter().take(OUTSIDE_INDEX_SAMPLE).copied().collect();
+        let more = holes.len() - shown.len();
+        Ok(Some(format!(
+            "outside index: no indexed symbol matches, and {} path(s) this generation never \
+             indexed — refused by discovery or over the source size limit — may declare it: \
+             {}{}",
+            holes.len(),
+            shown.join(", "),
+            if more > 0 {
+                format!(", and {more} more")
+            } else {
+                String::new()
+            }
+        )))
+    }
+
     /// Whether calls the resolver could not bind touch *this* answer.
     ///
     /// [`attribution_coverage_gap`] is a fact about the repository — "212,976

@@ -341,6 +341,19 @@ pub struct FederatedSearch {
     pub truncated: bool,
 }
 
+/// Every link candidate across a workspace, and what could not be examined.
+///
+/// The gaps are part of the answer, as `FederatedSearch::unavailable` is part
+/// of a federated search: "no links" over a workspace one of whose stores would
+/// not open is not "no links".
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LinkCandidates {
+    pub links: Vec<LinkCandidate>,
+    /// One row per repository and thing in it that could not be read — a
+    /// store, a `go.mod`, a directory — with why.
+    pub coverage_gaps: Vec<RepoUnavailable>,
+}
+
 /// A module one repository imports and another declares, or a Metal entry point
 /// one repository declares and another names in a string.
 ///

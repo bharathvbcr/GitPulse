@@ -140,3 +140,53 @@ lease. A UI process that takes a lease can strand a task when the window
 closes.
 
 Migrations are owned by `dc-store`. New columns land in `schema.rs` first.
+
+---
+
+## Workbench profile schema 12: refinement proposals
+
+The workbench profile database (`work_meta.version`, distinct from the
+repository lease store above) reached schema 12 with refinement proposals.
+It changes no table. It changes what a host must understand, so it is a hard
+fence: a build that knows only schema 11 compares the stored version with `!=`
+and refuses a 12 profile with `schema_unsupported`. Upgrade every host that
+shares a profile together. `dcstore --version` reports `workbench_schema`.
+
+An enhancement proposal (`work_enhancements.body`) gains `kind`:
+
+| `kind` | Proposes | `fields` names |
+|---|---|---|
+| `text` (absent before 12) | `title`, `description` | any of `title`, `description` |
+| `refine` | acceptance criteria, splits, duplicate links | any of `acceptance_criteria`, `split_into`, `duplicate_of` |
+
+A task's `locked_fields` may now also name `acceptance_criteria`. A `refine`
+proposal over a locked `acceptance_criteria` is refused with `field_locked`
+at create, claim and accept.
+
+A `refine` proposal uses the ordinary `enhancements.*` methods and keeps their
+invariants: it stores the complete source task snapshot (logs removed);
+`create` refuses a stale `source_revision` and a locked field; at most one
+unexpired pending or running generation exists per profile, whatever the kind;
+`dismiss` rejects it and an unclaimed pending proposal expires. It is never
+`automatic`, and it cannot be revised or undone.
+
+`enhancements.complete` for a `refine` proposal supplies exactly the requested
+parts (an empty array is "nothing to propose") and optional `rationale` and
+`grounding` (an object of at most 16 KiB, opaque to the store):
+
+| Part | Value | Bounds |
+|---|---|---|
+| `acceptance_criteria` | array of strings | at most 32; none repeating another or the task's own; at most 128 on the task after accept |
+| `split_into` | array of `{title, description}` | at most 16; title nonblank, at most 300 characters |
+| `duplicate_of` | array of `{id, reason}` | at most 16; each id a distinct live task, not this one, sharing a repository with it |
+
+`enhancements.accept` takes `expected_revision` (proposal), `expected_task_revision`,
+`fields` (the parts to apply) and, when `split_into` is selected, `split_ids`:
+one new, never-used task identifier per proposed split. It adds and never
+removes: criteria are appended, `duplicate_of` links are merged into the
+task's `links`, and each split becomes a new `inbox` task in the same
+repositories carrying a `parent` link to the refined task. The task changes in
+one revisioned update (`applied_task_revision`), a stale task revision is
+`revision_conflict`, a changed field the proposal was drafted from is
+`field_conflict`, and a conflict consumes nothing. The accepted proposal lists
+`created_item_ids`.

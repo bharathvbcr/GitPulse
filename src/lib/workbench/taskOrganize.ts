@@ -135,7 +135,7 @@ export function hiddenTaskDetails(
   repoName: (id: string) => string | undefined,
 ): HiddenDetail[] {
   const extraRepos = task.repository_ids.slice(1).map((id) => repoName(id) ?? id);
-  const locks = (task.locked_fields ?? []).map((field) => field === "title" ? "Title" : "Description");
+  const locks = (task.locked_fields ?? []).map((field) => field === "title" ? "Title" : field === "description" ? "Description" : "Acceptance criteria");
   const due = task.due_at && task.due_at > 0 ? new Date(task.due_at * 1000).toLocaleString() : "";
   const description = line(task.description);
   const criteria = task.acceptance_criteria.map((item) => item.trim()).filter(Boolean);

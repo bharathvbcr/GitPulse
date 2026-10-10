@@ -21,6 +21,7 @@
 //! than the one the task is filed under, are folded into the description under
 //! their own headings — kept visible, not dropped.
 
+use super::verification_driver;
 use super::verification_gate;
 use super::{query, WorkbenchError};
 use crate::tasks::file_tasks::{self, TaskBrief};
@@ -498,7 +499,7 @@ fn links(item: &Value, repository_id: &str) -> bool {
         .is_some_and(|ids| ids.iter().any(|v| v.as_str() == Some(repository_id)))
 }
 
-fn get_item(store: &Store, id: &str) -> Result<Option<Value>, WorkbenchError> {
+pub(crate) fn get_item(store: &Store, id: &str) -> Result<Option<Value>, WorkbenchError> {
     match query(store, "items.get", &json!({"id":id}).to_string()) {
         Ok(response) => Ok(Some(response["item"].clone())),
         Err(error) if error.code == "not_found" => Ok(None),
@@ -1403,7 +1404,7 @@ fn append_log(logs: &str, block: &str) -> Option<String> {
 /// longer reads as this tool's own last write. A body that itself quotes the
 /// marker on a line of its own is not recognised and would be written again on
 /// a retry: a duplicate, never a write reported that did not happen.
-fn last_block<'a>(logs: &'a str, marker: &str) -> Option<(&'a str, &'a str)> {
+pub(crate) fn last_block<'a>(logs: &'a str, marker: &str) -> Option<(&'a str, &'a str)> {
     let logs = logs.trim_end();
     let start = logs.rfind(marker)?;
     if start > 0 && !logs[..start].ends_with('\n') {
@@ -1427,6 +1428,10 @@ fn ends_with_block(logs: &str, marker: &str, body: &str) -> bool {
 pub(crate) const AGENT_STATUSES: [&str; 3] = ["in_progress", "review", "done"];
 /// Bound on the completion summary appended to the task's logs.
 pub(crate) const MAX_SUMMARY_CHARS: usize = 4000;
+
+/// Opens the log block that records an agent's `done` held in review. The
+/// host's verification driver finds the held claims by it.
+pub(crate) const HELD_MARKER: &str = "--- Agent asked for done; held in review (";
 
 /// The block a completion summary is recorded as in the task's logs.
 fn summary_block(status: &str, summary: &str, at_ms: i64) -> String {
@@ -1547,8 +1552,9 @@ pub(crate) fn complete_task(
                 )
             }
             verification_gate::Gate::Held(reason) => format!(
-                "--- Agent asked for done; held in review ({}) ---\n{reason}",
-                timestamp(now_millis())
+                "{HELD_MARKER}{}) ---\n{reason}{}",
+                timestamp(now_millis()),
+                verification_driver::target_line(repo_path)
             ),
         });
         if verdict_block.is_some() || block.is_some() {
@@ -1585,6 +1591,36 @@ pub(crate) fn complete_task(
     ))
 }
 
+/// Append `block` to a task's logs and, when `status` is given, move it, on
+/// behalf of the host's verification driver. Held to `expected_revision`: a
+/// task a person changed since the driver last read it is refused with
+/// `revision_conflict` and left exactly as they left it.
+pub(crate) fn annotate_task(
+    store: &Store,
+    id: &str,
+    expected_revision: i64,
+    status: Option<&str>,
+    block: &str,
+) -> Result<Value, WorkbenchError> {
+    let item = get_item(store, id)?
+        .ok_or_else(|| WorkbenchError::new("not_found", "The task no longer exists."))?;
+    let revision = item["revision"].as_i64().unwrap_or_default();
+    if revision != expected_revision {
+        return Err(WorkbenchError::new(
+            "revision_conflict",
+            format!("The task is at revision {revision}, not {expected_revision}."),
+        ));
+    }
+    let mut input = resend(&item, id, revision, "verify");
+    if let Some(status) = status {
+        input.insert("status".into(), json!(status));
+    }
+    let logs = append_log(item["logs"].as_str().unwrap_or_default(), block)
+        .ok_or_else(|| WorkbenchError::new("invalid_input", "The task's logs are full."))?;
+    input.insert("logs".into(), json!(logs));
+    Ok(query(store, "items.put", &Value::Object(input).to_string())?["item"].clone())
+}
+
 /// Bound on the reason an agent gives for deleting or merging a task.
 pub(crate) const MAX_REASON_CHARS: usize = 1000;
 /// Opens the log block a deletion reason is recorded in. Present tense on
@@ -1595,7 +1631,7 @@ const DELETION_MARKER: &str = "--- Agent is deleting this task (";
 /// item id follows, so a deleted task can say where its work went.
 const MERGE_MARKER: &str = "--- Agent merged this task into ";
 
-fn timestamp(at_ms: i64) -> String {
+pub(crate) fn timestamp(at_ms: i64) -> String {
     crate::ledger::ids::iso8601_utc(u64::try_from(at_ms).unwrap_or_default())
 }
 
@@ -2033,7 +2069,7 @@ pub(crate) fn delete_task(
     ))
 }
 
-fn now_millis() -> i64 {
+pub(crate) fn now_millis() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
@@ -2044,13 +2080,27 @@ fn now_millis() -> i64 {
 mod merge;
 pub(crate) use merge::{merge_request, merge_tasks, MergeTask, MAX_MERGE_SOURCES};
 
+#[path = "intake_proposals.rs"]
+mod proposals;
+pub(crate) use proposals::{
+    apply_refinement, file_proposal, refine_split, scan_ref_params, scan_start_params,
+};
+
 #[cfg(test)]
 #[path = "intake_tests.rs"]
 mod tests;
 
 #[cfg(test)]
+#[path = "intake_proposals_tests.rs"]
+mod proposals_tests;
+
+#[cfg(test)]
 #[path = "verification_gate_tests.rs"]
 pub(crate) mod gate_tests;
+
+#[cfg(test)]
+#[path = "verification_driver_tests.rs"]
+mod driver_tests;
 
 #[cfg(test)]
 #[path = "intake_merge_tests.rs"]

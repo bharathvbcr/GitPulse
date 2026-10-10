@@ -1097,6 +1097,8 @@ export interface WorkspaceLinkCandidate {
 
 export interface WorkspaceLinksResult {
   links: WorkspaceLinkCandidate[];
+  /** What could not be read, per repository and why. Empty `links` means "none" only when this is empty too. */
+  coverage_gaps: { repo: string; reason: string }[];
   count: number;
   repos_considered: number;
 }

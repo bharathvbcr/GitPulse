@@ -69,6 +69,9 @@ pub enum BlameRefusal {
     GitRefused { status: String, stderr: String },
     /// The output did not parse as `--line-porcelain`.
     Unparsable { detail: String },
+    /// The revision was refused before blame ran; see
+    /// [`crate::history::commit_oid`].
+    RevisionRefused { reason: String },
 }
 
 impl BlameRefusal {
@@ -92,6 +95,7 @@ impl BlameRefusal {
             BlameRefusal::Unparsable { detail } => {
                 format!("git blame output could not be read: {detail}")
             }
+            BlameRefusal::RevisionRefused { reason } => reason.clone(),
         }
     }
 }
@@ -124,8 +128,18 @@ pub fn blame_file_with_program(
     rev: &str,
     path: &str,
 ) -> Result<FileBlame, BlameRefusal> {
-    let mut command = git_with_program(program, repo);
-    command.args([
+    // Only an object id reaches blame: a `rev` beginning with `-` would be
+    // read as an option. See [`crate::history::commit_oid`].
+    let rev = crate::history::commit_oid(program, repo, rev).map_err(|refusal| match refusal {
+        crate::history::HistoryRefusal::RevisionRefused { .. } => BlameRefusal::RevisionRefused {
+            reason: refusal.describe(),
+        },
+        crate::history::HistoryRefusal::Deadline { .. } => BlameRefusal::Deadline,
+        other => BlameRefusal::GitUnavailable {
+            reason: other.describe(),
+        },
+    })?;
+    let args = [
         "blame",
         "--line-porcelain",
         // Whitespace-only reformatting must not re-attribute a line. Without
@@ -145,13 +159,21 @@ pub fn blame_file_with_program(
         // hidden: a line moved *between* files is credited to the commit that
         // moved it, so a file-splitting commit can appear as a suspect.
         "-M",
-        rev,
+        &rev,
         // `--` terminates options, so a path beginning with a dash is a path.
         // No pathspec magic: `path` is a literal name, and `:(literal)` is not
         // used because the argument is already after `--`.
         "--",
         path,
-    ]);
+    ];
+    let mut command = match git_with_program(program, repo, args) {
+        Ok(command) => command,
+        Err(failure) => {
+            return Err(BlameRefusal::GitUnavailable {
+                reason: failure.to_string(),
+            })
+        }
+    };
     let captured = match run_bounded(
         &mut command,
         Bounds {

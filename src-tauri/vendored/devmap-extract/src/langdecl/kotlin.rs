@@ -249,5 +249,48 @@ pub(crate) fn exemption(
     if declaration.declared_kind == SymbolKind::Function && declaration.name == "main" {
         return Some((WiringKind::RuntimeEntryPoint, "Program entry point"));
     }
-    None
+    // An Android component is instantiated by the framework from its
+    // registration — the manifest, a layout, WorkManager — and no call in the
+    // corpus constructs it. Read from what the class extends, because
+    // `AndroidManifest.xml` is not indexed.
+    supertype_names(node, source)
+        .iter()
+        .find_map(|name| crate::wiring::android_component_supertype_reason(name))
+        .map(|reason| (WiringKind::RuntimeEntryPoint, reason))
+}
+
+/// The bare names a class declaration's supertype list writes:
+/// `class BootReceiver : BroadcastReceiver()` gives `BroadcastReceiver`.
+fn supertype_names(node: Node, source: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        if !child.kind().starts_with("delegation_specifier") {
+            continue;
+        }
+        let mut specifiers = vec![child];
+        if child.kind() == "delegation_specifiers" {
+            let mut inner = child.walk();
+            specifiers = child
+                .named_children(&mut inner)
+                .filter(|specifier| specifier.kind() == "delegation_specifier")
+                .collect();
+        }
+        for specifier in specifiers {
+            let text = get_node_text(specifier, source);
+            let head = text
+                .split(['(', '<', ' '])
+                .next()
+                .unwrap_or("")
+                .rsplit('.')
+                .next()
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            if !head.is_empty() {
+                names.push(head);
+            }
+        }
+    }
+    names
 }

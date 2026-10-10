@@ -298,6 +298,14 @@ pub fn rust_attribute_entry_reason(attribute_path: &str) -> Option<&'static str>
             "language item invoked by the runtime"
         }
         "wasm_bindgen" => "exported to the JavaScript host",
+        // `#[tauri::command]`, or `#[command]` after `use tauri::command`. The
+        // webview invokes it over IPC by the name `generate_handler!` lists;
+        // no Rust call site exists, so a private command was published dead
+        // at 0.9 (the audit's Rust C39). Only the bare spelling or the
+        // `tauri::` path: another crate's `command` attribute says nothing.
+        "command" if matches!(attribute_path.trim(), "command" | "tauri::command") => {
+            "Tauri command, invoked from the webview over IPC"
+        }
         _ => return None,
     })
 }
@@ -709,6 +717,115 @@ pub fn go_runtime_entry_reason(
     }
 }
 
+/// The manifest kinds that scope module privacy, by file name: `"js"` for a
+/// `package.json`, `"gradle"` for a Gradle build script. `None` for anything
+/// else. Liveness assigns each source file to its nearest manifest of the kind
+/// its language is built by, so a library nested inside an application keeps
+/// its own verdict.
+pub fn module_manifest_family(path: &str) -> Option<&'static str> {
+    match path.rsplit('/').next().unwrap_or(path) {
+        "package.json" => Some("js"),
+        "build.gradle" | "build.gradle.kts" => Some("gradle"),
+        _ => None,
+    }
+}
+
+/// Why the package or module this manifest roots has no consumer outside the
+/// corpus, or `None` when it may have one (or this is not such a manifest).
+///
+/// * A `package.json` with none of the fields a consumer resolves an import
+///   through — `exports`, `main`, `module`, `types`, `typings`, `browser`,
+///   `bin` — is an application, not a library: nothing can import it.
+/// * A Gradle script applying `com.android.application` builds an APK, which
+///   nothing links against. `apply false` on the line (a root script declaring
+///   the plugin version for its modules) does not apply it.
+///
+/// A manifest this cannot parse is answered `None`: widening on no evidence is
+/// the one direction this must not err in.
+pub fn module_private_scope_reason(path: &str, source: &str) -> Option<&'static str> {
+    match module_manifest_family(path)? {
+        "js" => {
+            let manifest: serde_json::Value = serde_json::from_str(source).ok()?;
+            let object = manifest.as_object()?;
+            const PUBLISHED: &[&str] = &[
+                "exports", "main", "module", "types", "typings", "browser", "bin",
+            ];
+            (!PUBLISHED.iter().any(|field| object.contains_key(*field))).then_some(
+                "its package.json publishes no entry point (no `exports`, `main`, `module`, \
+                 `types` or `bin`), so nothing outside the corpus can import it",
+            )
+        }
+        "gradle" => source
+            .lines()
+            .any(|line| line.contains("com.android.application") && !line.contains("apply false"))
+            .then_some(
+                "its Gradle module applies `com.android.application`, and nothing links against \
+                 an application",
+            ),
+        _ => None,
+    }
+}
+
+/// Android component supertypes: a class extending one is instantiated by the
+/// framework by name — from `AndroidManifest.xml`, a layout or WorkManager —
+/// never by a call in the corpus.
+///
+/// The model the Kotlin widening waits on. `AndroidManifest.xml` is not indexed,
+/// so the component is recognised by what it extends rather than by the line
+/// that registers it; that also covers a component the manifest of another
+/// variant registers, and errs toward withholding.
+pub fn android_component_supertype_reason(supertype: &str) -> Option<&'static str> {
+    matches!(
+        supertype,
+        "Activity"
+            | "AppCompatActivity"
+            | "ComponentActivity"
+            | "FragmentActivity"
+            | "Service"
+            | "IntentService"
+            | "LifecycleService"
+            | "JobService"
+            | "BroadcastReceiver"
+            | "ContentProvider"
+            | "Application"
+            | "MultiDexApplication"
+            | "Fragment"
+            | "DialogFragment"
+            | "BottomSheetDialogFragment"
+            | "Worker"
+            | "CoroutineWorker"
+            | "ListenableWorker"
+            | "AppWidgetProvider"
+            | "TileService"
+            | "AccessibilityService"
+            | "InputMethodService"
+            | "FirebaseMessagingService"
+    )
+    .then_some("Android component the framework instantiates by name, not by a call in the corpus")
+}
+
+/// Go functions the toolchain publishes to code outside the corpus by a
+/// directive comment above the declaration.
+///
+/// `//export Name` hands `Name` to C through cgo, and `//go:linkname Name
+/// target` lets the linker bind it from another package. Neither leaves a call
+/// site in any Go file, so both are reachable with the evidence outside the
+/// corpus — the case `RuntimeEntryPoint` names. Matched on the directive's own
+/// first argument, so a directive about a different function in the same
+/// comment block cannot exempt this one.
+pub fn go_directive_entry_reason(comment: &str, name: &str) -> Option<&'static str> {
+    let line = comment.trim();
+    let named = |rest: &str| rest.split_whitespace().next() == Some(name);
+    if let Some(rest) = line.strip_prefix("//export ") {
+        return named(rest).then_some("exported to C by a cgo //export directive");
+    }
+    if let Some(rest) = line.strip_prefix("//go:linkname ") {
+        return named(rest)
+            .then_some("named by a //go:linkname directive; the linker binds it across packages");
+    }
+    None
+}
+
 /// Go framework entry points recognised by a parameter's declared type.
 ///
 /// Ruleguard rules are ordinary package-level functions whose first parameter
@@ -814,13 +931,20 @@ pub fn swift_runtime_supertype_reason(supertype: &str) -> Option<&'static str> {
 
 /// Kotlin annotations that hand a declaration to a runtime.
 ///
-/// Compose calls a `@Composable` from a composition it owns, JUnit collects
-/// `@Test` by reflection, and every dependency-injection and
+/// Compose tooling renders a `@Preview` with no caller in the corpus, JUnit
+/// collects `@Test` by reflection, and every dependency-injection and
 /// serialization-plugin annotation names a caller in generated or framework code
 /// that this corpus does not contain.
+///
+/// `@Composable` is **not** here. It marks a function the compiler plugin lets
+/// run inside a composition — and a composable runs only when another composable
+/// calls it, by an ordinary call the extractor records. Treating the annotation
+/// as an entry point exempted every unused composable in an app: the
+/// 2026-10-09 audit's `UnusedBadge` shape. The root of a composition is reached
+/// from `setContent { … }` in an Activity, which is an ordinary call too.
 pub fn kotlin_annotation_entry_reason(annotation: &str) -> Option<&'static str> {
     Some(match annotation {
-        "Composable" | "Preview" => "invoked by the Jetpack Compose runtime",
+        "Preview" => "rendered by the Compose preview tooling, which no code in the corpus calls",
         "Test" | "Before" | "After" | "BeforeEach" | "AfterEach" | "BeforeClass" | "AfterClass"
         | "BeforeAll" | "AfterAll" | "ParameterizedTest" | "RepeatedTest" => JVM_TEST_RUNNER,
         "Inject" | "Provides" | "Binds" | "Module" | "Component" | "HiltAndroidApp"
@@ -1289,6 +1413,14 @@ fn is_language_main(path: &str, source: &str) -> bool {
 
 pub fn extract_wiring_annotations(path: &str, source: &str) -> Vec<WiringAnnotation> {
     let mut annotations = Vec::new();
+
+    if let Some(reason) = module_private_scope_reason(path, source) {
+        annotations.push(WiringAnnotation {
+            kind: WiringKind::ModulePrivateScope,
+            target_symbol: path.to_string(),
+            details: reason.to_string(),
+        });
+    }
 
     if is_vendored_path(path) {
         annotations.push(WiringAnnotation {
@@ -1880,7 +2012,7 @@ mod tests {
             rust_attribute_entry_reason("main"),
             rust_attribute_entry_reason("no_mangle"),
             python_harness_entry_reason("pytest_configure"),
-            kotlin_annotation_entry_reason("Composable"),
+            kotlin_annotation_entry_reason("Preview"),
         ] {
             let reason = reason.expect("an entry point has a reason");
             assert!(!is_test_harness_reason(reason), "{reason}");
@@ -2080,6 +2212,63 @@ mod tests {
         // A method named `init` is callable and is not the package initializer.
         assert!(go_runtime_entry_reason("init", Some("worker"), true).is_none());
         assert!(go_runtime_entry_reason("helper", Some("main"), false).is_none());
+    }
+
+    #[test]
+    fn only_a_manifest_that_publishes_nothing_scopes_module_privacy() {
+        let app = r#"{ "name": "@acme/web", "dependencies": { "react": "18.3.1" } }"#;
+        let lib = r#"{ "name": "@acme/shared", "main": "src/index.ts", "types": "src/index.ts" }"#;
+        let exported = r#"{ "name": "x", "exports": { ".": "./index.js" } }"#;
+        assert!(module_private_scope_reason("apps/web/package.json", app).is_some());
+        assert!(module_private_scope_reason("packages/shared/package.json", lib).is_none());
+        assert!(module_private_scope_reason("package.json", exported).is_none());
+        assert!(module_private_scope_reason("package.json", "{ not json").is_none());
+
+        let android_app = "plugins {\n    id(\"com.android.application\")\n}\n";
+        let root =
+            "plugins {\n    id(\"com.android.application\") version \"8.7.0\" apply false\n}\n";
+        let library = "plugins { id(\"com.android.library\") }\n";
+        assert!(module_private_scope_reason("app/build.gradle.kts", android_app).is_some());
+        assert!(module_private_scope_reason("build.gradle.kts", root).is_none());
+        assert!(module_private_scope_reason("core/build.gradle.kts", library).is_none());
+        assert!(module_private_scope_reason("app/src/Main.kt", android_app).is_none());
+    }
+
+    #[test]
+    fn android_components_are_entry_points_and_ordinary_bases_are_not() {
+        assert!(android_component_supertype_reason("BroadcastReceiver").is_some());
+        assert!(android_component_supertype_reason("AppCompatActivity").is_some());
+        assert!(android_component_supertype_reason("ViewModel").is_none());
+    }
+
+    #[test]
+    fn a_composable_is_called_and_a_preview_is_rendered() {
+        assert_eq!(kotlin_annotation_entry_reason("Composable"), None);
+        assert!(kotlin_annotation_entry_reason("Preview").is_some());
+    }
+
+    #[test]
+    fn a_tauri_command_is_an_entry_point_and_another_crates_command_is_not() {
+        assert!(rust_attribute_entry_reason("tauri::command").is_some());
+        assert!(rust_attribute_entry_reason("command").is_some());
+        assert!(rust_attribute_entry_reason("clap::command").is_none());
+    }
+
+    #[test]
+    fn go_directives_exempt_only_the_function_they_name() {
+        assert!(go_directive_entry_reason("//export SecretCallback", "SecretCallback").is_some());
+        assert!(go_directive_entry_reason(
+            "//go:linkname LinkedClock example.com/app/svc.linkedClock",
+            "LinkedClock"
+        )
+        .is_some());
+        // Another function's directive, a prose mention, and a spaced
+        // `// export` (which cgo does not honour) exempt nothing.
+        assert!(go_directive_entry_reason("//export Other", "SecretCallback").is_none());
+        assert!(
+            go_directive_entry_reason("// SecretCallback is exported", "SecretCallback").is_none()
+        );
+        assert!(go_directive_entry_reason("// export SecretCallback", "SecretCallback").is_none());
     }
 
     #[test]

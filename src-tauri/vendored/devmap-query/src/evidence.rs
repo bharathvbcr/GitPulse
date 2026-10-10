@@ -423,6 +423,7 @@ mod tests {
             source_unavailable_reason: None,
             source_span_omitted_bytes: None,
             source_indent: None,
+            withheld: None,
             score,
         }
     }

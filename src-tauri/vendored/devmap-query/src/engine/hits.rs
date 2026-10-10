@@ -116,6 +116,11 @@ pub(super) fn read_verified_source(
 /// unavailability reason. When the file cannot be read the reason is recorded
 /// on the hit rather than dropped, so an empty `source_span` is never mistaken
 /// for a symbol with no body.
+///
+/// It is also the one place search, ask, ask's evidence pack and explore get
+/// source text from, so a secret file's text is withheld here: the file is
+/// still read for its line numbers, and `source_span` comes back empty with
+/// `withheld` set.
 pub(super) fn hit_from_stored(
     row: devmap_store::StoredSymbol,
     repo_root: Option<&str>,
@@ -137,8 +142,11 @@ pub(super) fn hit_from_stored(
         )
     });
     let source = source_result.ok();
+    let withheld = devmap_extract::secret::is_secret_path(&row.path)
+        .then(|| devmap_extract::secret::WITHHELD_SECRET_PATH.to_string());
     let source_span = source
         .as_deref()
+        .filter(|_| withheld.is_none())
         .and_then(|text| text.get(row.span_start..row.span_end))
         .unwrap_or("")
         .to_string();
@@ -154,6 +162,7 @@ pub(super) fn hit_from_stored(
         .unwrap_or((0, 0));
     let source_indent = source
         .as_deref()
+        .filter(|_| withheld.is_none())
         .and_then(|text| line_indent_before(text, row.span_start));
     let (source_span, source_span_omitted_bytes) = cap_source_span(source_span, token_budget);
     SymbolHit {
@@ -165,6 +174,7 @@ pub(super) fn hit_from_stored(
         source_unavailable_reason,
         source_span_omitted_bytes,
         source_indent,
+        withheld,
         score,
     }
 }

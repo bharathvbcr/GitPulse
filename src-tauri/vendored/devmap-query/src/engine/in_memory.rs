@@ -45,6 +45,7 @@ impl<'a> QueryEngine<'a> {
                 dead_clusters: None,
                 dead_clusters_truncated: 0,
                 dead_clusters_incomplete: None,
+                excluded: None,
                 unresolved_namesakes: None,
                 scope: None,
             };
@@ -82,8 +83,13 @@ impl<'a> QueryEngine<'a> {
                     .as_deref()
                     .or(disk_content.as_deref())
                     .unwrap_or("");
+                // The in-memory engine reads its own source, so it withholds
+                // a secret file's text itself, as `hit_from_stored` does.
+                let withheld = devmap_extract::secret::is_secret_path(&ext.file_path)
+                    .then(|| devmap_extract::secret::WITHHELD_SECRET_PATH.to_string());
                 let source_span = code_str
                     .get(sym.span.start_byte..sym.span.end_byte)
+                    .filter(|_| withheld.is_none())
                     .unwrap_or("")
                     .to_string();
                 let line_span = byte_span_to_line_range(code_str, &sym.span);
@@ -101,6 +107,7 @@ impl<'a> QueryEngine<'a> {
                     source_unavailable_reason,
                     source_span_omitted_bytes,
                     source_indent: None,
+                    withheld,
                     score,
                 });
             }

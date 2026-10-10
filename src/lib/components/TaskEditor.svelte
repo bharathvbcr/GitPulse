@@ -6,6 +6,9 @@
   import TaskAgentPanel from "./TaskAgentPanel.svelte";
   import NativeNotificationSettings from "./NativeNotificationSettings.svelte";
   import TaskManviAssist from "./TaskManviAssist.svelte";
+  import TaskVerification from "./TaskVerification.svelte";
+  import TaskRefine from "./TaskRefine.svelte";
+  import { repoStore } from "../stores/repoStore";
   import TaskRepositoryPicker from "./TaskRepositoryPicker.svelte";
   import TaskDuePicker from "./TaskDuePicker.svelte";
   import LabelInput from "./LabelInput.svelte";
@@ -575,6 +578,7 @@
           model's suggestions are not a seventh section; they live inside assist.
         -->
         <div class="steps">
+          {#if current}<TaskVerification taskId={current.id} revision={current.revision} />{/if}
           {#each sections as section (section.id)}
             <section class="step" data-editor-section={section.id} data-assist-open={section.id === "assist" ? String(assistChrome.open) : undefined}>
               <div class="step-head">
@@ -660,6 +664,9 @@
                     onStatus={({ state, uncertain }) => { assistState = state; assistUncertain = uncertain; }}
                     disabled={saving || reloading || pending !== null || pendingDelete !== null}
                   />
+                  {#if current}
+                    <TaskRefine task={current} repositoryPath={$repoStore.currentPath ?? ""} disabled={dirty || saving || reloading || pending !== null || pendingDelete !== null || enhancementBusy} onApplied={applied} />
+                  {/if}
                 </div>
               {:else if section.id === "title"}
                 <fieldset disabled={enhancementBusy}>

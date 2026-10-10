@@ -35,8 +35,11 @@ pub(crate) fn install(app: &tauri::AppHandle) {
 
 fn run(host: WorkbenchState, app: tauri::AppHandle) {
     let mut watcher = Watcher::default();
+    let mut retention = super::retention::Retention::new();
     let mut last_error: Option<String> = None;
     while host.check_open().is_ok() {
+        // Daily retention, hidden window or not; the pass runs on its own thread.
+        retention.tick(&host);
         let visible = app.get_webview_window("main").is_some_and(|window| {
             window.is_visible().unwrap_or(false) && !window.is_minimized().unwrap_or(true)
         });

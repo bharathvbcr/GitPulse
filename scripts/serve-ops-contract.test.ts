@@ -39,6 +39,8 @@ const policyRs = read("src-tauri", "src", "harness", "policy.rs");
 const protocolRs = read("src-tauri", "src", "harness", "protocol.rs");
 const sidecarRs = read("src-tauri", "src", "harness", "sidecar.rs");
 const gateRs = read("src-tauri", "src", "workbench", "verification_gate.rs");
+const proposalsRs = read("src-tauri", "src", "workbench", "intake_proposals.rs");
+const workbenchRs = read("src-tauri", "src", "workbench.rs");
 
 const declared = (type: string) => Object.keys(contract.types[type].fields ?? {});
 
@@ -134,6 +136,32 @@ describe("what GitPulse sends is declared by the contract", () => {
     expect(fields).toEqual(expect.arrayContaining(["protocol", "ops", "posture"]));
     expect(undeclared(fields, "HelloResult")).toEqual([]);
   });
+
+  it("HelloResult reads the per-op deadlines Manvi advertises, and only fields Go sends", () => {
+    expect(structFields(protocolRs, "HelloResult")).toContain("op_limits");
+    const limit = structFields(protocolRs, "OpLimit");
+    expect(limit).toEqual(expect.arrayContaining(["lane", "deadline_ms"]));
+    expect(undeclared(limit, "OpLimit")).toEqual([]);
+  });
+
+  it("the sidecar sizes its timeouts from the advertised deadlines and says when it falls back", () => {
+    expect(sidecarRs).toMatch(/fn advertised_timeout\(/);
+    expect(sidecarRs).toMatch(/Budget::PerOp => match advertised_timeout\(/);
+    expect(sidecarRs).toMatch(/does not advertise op deadlines/);
+  });
+});
+
+describe("repository reads are bound to a root the request names", () => {
+  // Manvi refuses these with E_BAD_ROOT when the root is missing, so a host
+  // that builds one of these requests must send it; the contract pins which.
+  it.each([
+    ["DevmapStatusParams", "root"],
+    ["DevmapQueryParams", "root"],
+    ["RefineParams", "repo_root"],
+    ["GapScanParams", "repo_root"],
+  ])("%s requires %s", (type, field) => {
+    expect(contract.types[type].fields?.[field]?.required).toBe(true);
+  });
 });
 
 describe("the ops GitPulse names are served", () => {
@@ -150,8 +178,8 @@ describe("the ops GitPulse names are served", () => {
     expect(allow, "profile worker allowlist not found").not.toBeNull();
     const ops = [...allow![1].matchAll(/"([^"]+)"/g)].map((m) => m[1]);
     expect(ops.filter((op) => !served.has(op))).toEqual([]);
-    expect(ops).toHaveLength(9);
-    expect(ops).toEqual(expect.arrayContaining(["work.verify.task", "work.verify.get"]));
+    expect(ops).toHaveLength(13);
+    expect(ops).toEqual(expect.arrayContaining(["work.verify.task", "work.verify.get", "work.scan.gaps", "work.scan.get", "work.scan.cancel", "work.enhancements.refine"]));
   });
 
   it("what GitPulse sends work.verify.task and work.verify.get is declared, and nothing required is missing", () => {
@@ -167,6 +195,24 @@ describe("the ops GitPulse names are served", () => {
     const get = paramKeys(fnBody("get_params"));
     expect(undeclared(get, "VerifyGetParams")).toEqual([]);
     expect(missingRequired(get, "VerifyGetParams")).toEqual([]);
+  });
+
+  it("what GitPulse sends work.scan.* and work.enhancements.refine is declared, and the root is always sent", () => {
+    const fnBody = (name: string) => {
+      const at = proposalsRs.indexOf(`pub(crate) fn ${name}(`);
+      expect(at, `${name} not found`).toBeGreaterThanOrEqual(0);
+      const rest = proposalsRs.slice(at);
+      return rest.slice(0, rest.search(/\n\}\n/));
+    };
+    const start = paramKeys(fnBody("scan_start_params"));
+    expect(undeclared(start, "GapScanParams")).toEqual([]);
+    expect(missingRequired(start, "GapScanParams")).toEqual([]);
+    const ref = paramKeys(fnBody("scan_ref_params"));
+    expect(undeclared(ref, "GapScanReadParams")).toEqual([]);
+    expect(missingRequired(ref, "GapScanReadParams")).toEqual([]);
+    // refine: id, request_id and expected_revision come from the generation request; the root is added by the host.
+    expect(workbenchRs).toMatch(/params\["repo_root"\] = json!\(root\);\s*return self\.worker_call\("work\.enhancements\.refine"/);
+    expect(declared("RefineParams")).toEqual(expect.arrayContaining(["id", "request_id", "expected_revision", "repo_root"]));
   });
 
   it("the evidence type the completion gate reads is the one Manvi stores a verification under", () => {

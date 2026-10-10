@@ -3,7 +3,7 @@
 
 use super::{
     Affected, Entity, Error, Input, MAX_INTEGER, Result, automation, collect_page, page,
-    page_response, record_change,
+    page_response, record_change, refine,
 };
 use rusqlite::{OptionalExtension, params};
 
@@ -11,29 +11,80 @@ use rusqlite::{OptionalExtension, params};
 /// Must stay above Manvi's enhancement job timeout (150s) plus settle margin.
 const ENHANCEMENT_LEASE_SECONDS: i64 = 180;
 
-pub(super) fn fields(input: &Input<'_>, key: &str, required: bool) -> Result<Vec<String>> {
-    let fields = input.strings(key, 2, 32, required)?;
+/// Task fields a person can lock against enhancement. `acceptance_criteria`
+/// joined them in schema 12, with refinement proposals.
+const LOCKABLE: &[&str] = &["title", "description", "acceptance_criteria"];
+
+/// A nonempty-when-required list of distinct names drawn from `allowed`.
+pub(super) fn names(
+    input: &Input<'_>,
+    key: &str,
+    required: bool,
+    allowed: &[&str],
+) -> Result<Vec<String>> {
+    let fields = input.strings(key, allowed.len() + 1, 32, required)?;
     if (required && fields.is_empty())
+        || fields.iter().any(|f| !allowed.contains(&f.as_str()))
         || fields
             .iter()
-            .any(|f| !matches!(f.as_str(), "title" | "description"))
-        || (fields.len() == 2 && fields[0] == fields[1])
+            .enumerate()
+            .any(|(i, f)| fields[..i].contains(f))
     {
-        return Err(Error::invalid(
-            "fields must name distinct title or description fields",
-        ));
+        return Err(Error::invalid(format!(
+            "{key} must name distinct fields among {}",
+            allowed.join(", ")
+        )));
     }
     Ok(fields)
 }
 
-fn refusal(code: &'static str, message: &str) -> Error {
+pub(super) fn fields(input: &Input<'_>, key: &str, required: bool) -> Result<Vec<String>> {
+    names(input, key, required, &["title", "description"])
+}
+
+/// A task's `locked_fields`.
+pub(super) fn locks(input: &Input<'_>, key: &str) -> Result<Vec<String>> {
+    names(input, key, false, LOCKABLE)
+}
+
+/// Whether every text field is locked, so no text proposal can be made.
+pub(super) fn text_locked(locked: &[String]) -> bool {
+    ["title", "description"]
+        .iter()
+        .all(|f| locked.iter().any(|l| l == f))
+}
+
+/// What a proposal proposes. Absent on proposals written before schema 12.
+#[derive(Clone, Copy, PartialEq)]
+pub(super) enum Kind {
+    Text,
+    Refine,
+}
+
+pub(super) fn kind(prior: &Input<'_>) -> Result<Kind> {
+    match prior.text("kind", 16)?.as_deref() {
+        None | Some("text") => Ok(Kind::Text),
+        Some("refine") => Ok(Kind::Refine),
+        Some(_) => Err(Error::invalid("unknown enhancement kind")),
+    }
+}
+
+/// The fields a stored proposal asked for, whatever its kind.
+fn requested(prior: &Input<'_>) -> Result<Vec<String>> {
+    match kind(prior)? {
+        Kind::Text => fields(prior, "fields", true),
+        Kind::Refine => refine::parts(prior, "fields", true),
+    }
+}
+
+pub(super) fn refusal(code: &'static str, message: &str) -> Error {
     Error {
         code,
         message: message.into(),
     }
 }
 
-fn task_body(input: &Input<'_>, id: &str) -> Result<String> {
+pub(super) fn task_body(input: &Input<'_>, id: &str) -> Result<String> {
     input
         .conn
         .query_row(
@@ -45,8 +96,8 @@ fn task_body(input: &Input<'_>, id: &str) -> Result<String> {
         .ok_or_else(Error::missing)
 }
 
-fn unlocked(task: &Input<'_>, requested: &[String]) -> Result<()> {
-    let locked = fields(task, "locked_fields", false)?;
+pub(super) fn unlocked(task: &Input<'_>, requested: &[String]) -> Result<()> {
+    let locked = locks(task, "locked_fields")?;
     if requested.iter().any(|field| locked.contains(field)) {
         return Err(refusal("field_locked", "a selected task field is locked"));
     }
@@ -100,7 +151,7 @@ pub(super) fn mutate(
                 conn: input.conn,
                 raw: &current_body,
             };
-            unlocked(&current, &fields(&prior, "fields", true)?)?;
+            unlocked(&current, &requested(&prior)?)?;
             if current.integer("revision", None, MAX_INTEGER)?
                 != prior.integer("source_revision", None, MAX_INTEGER)?
             {
@@ -158,6 +209,17 @@ pub(super) fn mutate(
                 .query_row("SELECT json_set(?1,'$.state','dismissed')", [&body], |r| {
                     r.get(0)
                 })?
+        }
+        "enhancements.accept" | "enhancements.revise" | "enhancements.undo"
+            if kind(&prior)? == Kind::Refine && method != "enhancements.accept" =>
+        {
+            return Err(refusal(
+                "invalid_transition",
+                "a refinement proposal cannot be revised or undone: dismiss it and refine again",
+            ));
+        }
+        "enhancements.accept" if state == "ready" && kind(&prior)? == Kind::Refine => {
+            refine::accept(input, &prior, now)?
         }
         "enhancements.accept" if state == "ready" => apply(input, &prior, now, false)?,
         "enhancements.revise" if state == "ready" => revise(input, &prior)?,
@@ -249,6 +311,7 @@ fn create(input: &Input<'_>, id: &str, revision: i64, now: i64) -> Result<()> {
         "provider",
         "model",
         "automatic",
+        "kind",
     ])?;
     if revision != 1 {
         return Err(Error::invalid(
@@ -274,11 +337,24 @@ fn create(input: &Input<'_>, id: &str, revision: i64, now: i64) -> Result<()> {
             "the task changed before enhancement preparation",
         ));
     }
-    let requested = fields(input, "fields", true)?;
+    let kind = match input.text("kind", 16)?.as_deref() {
+        None | Some("text") => Kind::Text,
+        Some("refine") => Kind::Refine,
+        Some(_) => return Err(Error::invalid("kind must be text or refine")),
+    };
+    let requested = match kind {
+        Kind::Text => fields(input, "fields", true)?,
+        Kind::Refine => refine::parts(input, "fields", true)?,
+    };
     unlocked(&task, &requested)?;
     let provider = input.required_text("provider", 128)?;
     let model = input.required_text("model", 512)?;
     let automatic = input.boolean("automatic", false)?;
+    if automatic && kind == Kind::Refine {
+        return Err(Error::invalid(
+            "a refinement is never automatic: it proposes new tasks",
+        ));
+    }
     let settings_revision = if automatic {
         Some(automation::check_selection(input, &provider, &model, None)?)
     } else {
@@ -306,7 +382,7 @@ fn create(input: &Input<'_>, id: &str, revision: i64, now: i64) -> Result<()> {
             "the profile has reached 20 automatic enhancements in the last hour",
         ));
     }
-    let body: String = input.conn.query_row("SELECT json_object('id',?1,'revision',1,'task_id',?2,'source_revision',?3,'source',json(?4),'fields',json(json_extract(?5,'$.fields')),'provider',?6,'model',?7,'automatic',json(CASE WHEN ?8 THEN 'true' ELSE 'false' END),'state','pending','created_at',?9,'updated_at',?9,'expires_at',?10)", params![id,task_id,source_revision,source,input.raw,provider,model,automatic,now,now.saturating_add(ENHANCEMENT_LEASE_SECONDS)], |r|r.get(0))?;
+    let body: String = input.conn.query_row("SELECT json_object('id',?1,'revision',1,'task_id',?2,'source_revision',?3,'source',json(?4),'fields',json(json_extract(?5,'$.fields')),'provider',?6,'model',?7,'automatic',json(CASE WHEN ?8 THEN 'true' ELSE 'false' END),'state','pending','created_at',?9,'updated_at',?9,'expires_at',?10,'kind',?11)", params![id,task_id,source_revision,source,input.raw,provider,model,automatic,now,now.saturating_add(ENHANCEMENT_LEASE_SECONDS),if kind==Kind::Refine {"refine"} else {"text"}], |r|r.get(0))?;
     let body = if let Some(settings_revision) = settings_revision {
         input.conn.query_row(
             "SELECT json_set(?1,'$.automation_settings_revision',?2)",
@@ -333,16 +409,32 @@ fn create(input: &Input<'_>, id: &str, revision: i64, now: i64) -> Result<()> {
 }
 
 fn complete(input: &Input<'_>, prior: &Input<'_>, now: i64) -> Result<String> {
-    input.fields(&[
-        "id",
-        "request_id",
-        "expected_revision",
-        "title",
-        "description",
-        "rationale",
-        "failure",
-        "worker_id",
-    ])?;
+    let refinement = kind(prior)? == Kind::Refine;
+    input.fields(if refinement {
+        &[
+            "id",
+            "request_id",
+            "expected_revision",
+            "acceptance_criteria",
+            "split_into",
+            "duplicate_of",
+            "grounding",
+            "rationale",
+            "failure",
+            "worker_id",
+        ]
+    } else {
+        &[
+            "id",
+            "request_id",
+            "expected_revision",
+            "title",
+            "description",
+            "rationale",
+            "failure",
+            "worker_id",
+        ]
+    })?;
     let state = prior.required_text("state", 32)?;
     if state != "pending" {
         check_worker(input, prior)?;
@@ -361,10 +453,17 @@ fn complete(input: &Input<'_>, prior: &Input<'_>, now: i64) -> Result<String> {
         ));
     }
     if let Some(failure) = failure {
+        let mut proposes_parts = false;
+        if refinement {
+            for part in refine::PARTS {
+                proposes_parts |= input.kind(part)?.is_some();
+            }
+        }
         if failure.trim().is_empty()
             || input.text("title", 1200)?.is_some()
             || input.text("description", 65_536)?.is_some()
             || input.text("rationale", 2048)?.is_some()
+            || proposes_parts
         {
             return Err(Error::invalid(
                 "failed enhancements need a reason and cannot include proposed changes",
@@ -383,6 +482,9 @@ fn complete(input: &Input<'_>, prior: &Input<'_>, now: i64) -> Result<String> {
             ],
             |r| r.get(0),
         )?);
+    }
+    if refinement {
+        return refine::complete(input, prior);
     }
     let requested = fields(prior, "fields", true)?;
     let mut proposed = "{}".to_string();
@@ -577,7 +679,7 @@ pub(super) fn list(input: &Input<'_>) -> Result<String> {
         |r| r.get(0),
     )?;
     let (compare, direction) = if newest { ("<", "DESC") } else { (">", "ASC") };
-    let mut statement = input.conn.prepare(&format!("SELECT json_remove(body,'$.source','$.proposed','$.original_proposed','$.rationale'),created_at,id FROM work_enhancements WHERE (?1 IS NULL OR task_id=?1) AND (?2 IS NULL OR automatic=?2) AND (?3 IS NULL OR state IN (SELECT value FROM json_each(?3))) AND (created_at,id){compare}(?4,?5) ORDER BY created_at {direction},id {direction} LIMIT ?6"))?;
+    let mut statement = input.conn.prepare(&format!("SELECT json_remove(body,'$.source','$.proposed','$.original_proposed','$.rationale','$.grounding'),created_at,id FROM work_enhancements WHERE (?1 IS NULL OR task_id=?1) AND (?2 IS NULL OR automatic=?2) AND (?3 IS NULL OR state IN (SELECT value FROM json_each(?3))) AND (created_at,id){compare}(?4,?5) ORDER BY created_at {direction},id {direction} LIMIT ?6"))?;
     let rows = collect_page(
         &mut statement.query(params![
             task,

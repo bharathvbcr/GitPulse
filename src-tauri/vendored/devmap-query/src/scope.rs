@@ -278,9 +278,7 @@ impl NameQueryFilter {
         for raw in kinds {
             let trimmed = raw.trim();
             if trimmed.is_empty() {
-                anyhow::bail!(
-                    "kinds entry {raw:?} is empty; omit `kinds` to admit every kind"
-                );
+                anyhow::bail!("kinds entry {raw:?} is empty; omit `kinds` to admit every kind");
             }
             let Some(kind) = SymbolKind::ALL
                 .iter()
@@ -331,7 +329,11 @@ impl NameQueryFilter {
 }
 
 /// A requested kind labels nothing in the corpus the caller narrowed to.
-pub fn missing_kind_message(missing: &[String], present: &BTreeSet<String>, scoped: bool) -> String {
+pub fn missing_kind_message(
+    missing: &[String],
+    present: &BTreeSet<String>,
+    scoped: bool,
+) -> String {
     let place = if scoped {
         "under the path/language"
     } else {

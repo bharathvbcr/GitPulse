@@ -5,11 +5,13 @@
 mod attention;
 mod automation;
 mod briefs;
+mod compaction;
 mod decisions;
 mod enhancements;
 mod input;
 mod items;
 mod notifications;
+mod refine;
 mod runs;
 
 pub use briefs::{AGENT_GUIDANCE, AGENT_GUIDANCE_HEADING};
@@ -25,7 +27,7 @@ const SCHEMA: &str = include_str!("schema.sql");
 /// version is refused, so every host sharing a profile must be built at the
 /// same one; `dcstore --version` reports it so a host can check that before
 /// handing a profile to a store it did not build.
-pub const WORKBENCH_SCHEMA: i64 = 11;
+pub const WORKBENCH_SCHEMA: i64 = 12;
 const MAX_INTEGER: i64 = 9_007_199_254_740_990;
 // Reserve envelope/cursor space within a 2 MiB response. The collector stops
 // fetching rows at this bound, including for full revision and event documents.
@@ -166,6 +168,7 @@ impl Store {
                 | "decisions.decide"
                 | "decisions.claim"
                 | "decisions.resolve"
+                | "store.compact"
         );
         if !writing
             && !matches!(
@@ -209,7 +212,11 @@ impl Store {
         let tx = Transaction::new_unchecked(&self.conn, behavior)?;
         let result = if writing {
             let now_ms = self.workbench_now_millis()?;
-            mutate(&input, method, now_ms / 1000, now_ms)?
+            if method == "store.compact" {
+                compaction::compact(&input, now_ms / 1000)?
+            } else {
+                mutate(&input, method, now_ms / 1000, now_ms)?
+            }
         } else {
             let now = if matches!(
                 method,
@@ -370,6 +377,20 @@ fn ensure_schema(conn: &Connection) -> Result<()> {
             // task it saves, so older hosts must refuse this profile.
             conn.execute_batch(include_str!("items.sql"))?;
             version = 11;
+        }
+        tx.commit()?;
+    }
+    if version == 11 {
+        let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+        version = conn.query_row("SELECT version FROM work_meta WHERE id=1", [], |r| r.get(0))?;
+        if version == 11 {
+            // Refinement proposals: enhancement bodies gain `kind`, and the
+            // lock vocabulary gains `acceptance_criteria`. No table changes. A
+            // host that does not know them would complete a refinement as a
+            // title/description proposal or ignore a criteria lock, so older
+            // hosts must refuse this profile.
+            conn.execute("UPDATE work_meta SET version=12 WHERE id=1", [])?;
+            version = 12;
         }
         tx.commit()?;
     }
@@ -842,7 +863,7 @@ fn put_item(input: &Input<'_>, id: &str, revision: i64, now: i64, now_ms: i64) -
         "checklist",
         "links",
     ])?;
-    enhancements::fields(input, "locked_fields", false)?;
+    enhancements::locks(input, "locked_fields")?;
     input.text("logs", input::MAX_LOGS_BYTES)?;
     let title = input.required_text("title", 1200)?;
     if title.chars().count() > 300 {

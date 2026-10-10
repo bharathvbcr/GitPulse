@@ -289,3 +289,8 @@ required-features = ["parse"]
 [[test]]
 name = "literal_sites"
 required-features = ["parse"]
+
+# Builds its generations from extracted source.
+[[test]]
+name = "secret_paths_are_withheld"
+required-features = ["parse"]

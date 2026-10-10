@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { page, taskCard, task, taskDraft, taskWrite, scopeParams } from "./client";
+import { enhancement, enhancementKind, enhancementSummary, page, storedRefinement, taskCard, task, taskDraft, taskWrite, scopeParams } from "./client";
 
 const full = { id: "t1", revision: 2, updated_at: 1, title: "Preserve task evidence", description: "exact error: E42", acceptance_criteria: ["Round-trip evidence"], kind: "bug", status: "ready", priority: 1, severity: null, owner: null, due_at: null, labels: ["regression"], repository_ids: ["r1", "r2"], primary_repository_id: "r1", home_workspace_id: null, position: 10 };
 describe("workbench boundary", () => {
@@ -31,6 +31,23 @@ describe("workbench boundary", () => {
     for (const locked_fields of [["title", "title"], ["push"], "title", ["title", "description", "title"]]) {
       expect(() => task({ ...full, locked_fields })).toThrow("invalid response");
     }
+  });
+  it("decodes the acceptance_criteria lock schema 12 added, so a locked task still loads", () => {
+    const loaded = task({ ...full, locked_fields: ["title", "acceptance_criteria"] });
+    expect(loaded.locked_fields).toEqual(["title", "acceptance_criteria"]);
+    expect(taskWrite(full.id, full.revision, taskDraft(loaded))).toHaveProperty("locked_fields", ["title", "acceptance_criteria"]);
+  });
+  it("tells refinement proposals from text ones, and never reads one as the other", () => {
+    const stored = { id: "e1", revision: 2, updated_at: 1, kind: "refine", state: "ready", task_id: "t1", source_revision: 2, fields: ["acceptance_criteria", "split_into"], provider: "p", model: "m", automatic: false, created_at: 1, expires_at: 2,
+      proposed: { acceptance_criteria: ["a"], split_into: [{ title: "T", description: "D" }], duplicate_of: [] } };
+    expect(enhancementKind(stored)).toBe("refine");
+    expect(enhancementKind({ ...stored, kind: undefined })).toBe("text");
+    expect(() => enhancementKind({ ...stored, kind: "other" })).toThrow("invalid response");
+    expect(() => enhancementSummary(stored)).toThrow("invalid response");
+    expect(() => enhancement({ ...stored, source: full })).toThrow("invalid response");
+    expect(storedRefinement(stored).proposed.split_into).toEqual([{ title: "T", description: "D" }]);
+    expect(storedRefinement({ ...stored, state: "accepted", accepted_fields: ["split_into"], created_item_ids: ["ft-a"], applied_task_revision: 3 })).toMatchObject({ created_item_ids: ["ft-a"], applied_task_revision: 3 });
+    for (const bad of [{ fields: ["title"] }, { fields: [] }, { created_item_ids: [1] }, { kind: "text" }]) expect(() => storedRefinement({ ...stored, ...bad })).toThrow("invalid response");
   });
   it("round-trips pasted logs and treats a missing field as absent rather than invalid", () => {
     expect(task(full).logs).toBeUndefined();

@@ -52,7 +52,10 @@ pub fn extract_swift_call(
     let Some(call) = swift_call_identity(node, source) else {
         return;
     };
-    if !is_callee_identity(&call.callee_name) {
+    // An operator's name is punctuation, which `is_callee_identity` refuses by
+    // design for an *expression*. A `custom_operator` node is a declared
+    // operator's own spelling, so it is an identity and passes.
+    if call.name_node.kind() != "custom_operator" && !is_callee_identity(&call.callee_name) {
         return;
     }
     let enclosing = enclosing_emitted_symbol(node, source, LANG, file_symbol_name);
@@ -139,6 +142,27 @@ fn swift_call_identity<'tree>(node: Node<'tree>, source: &str) -> Option<SwiftCa
                 receiver_expr,
                 name_node: constructed,
                 kind: ReferenceKind::Constructor,
+            })
+        }
+        // `a <+> b`. A custom operator is a call of the `static func <+>` some
+        // type declares; tree-sitter-swift spells the use as an
+        // `infix_expression` whose `op` is a `custom_operator`, and before this
+        // arm nothing recorded it, so a `fileprivate static func <+>` used only
+        // through its operator was published dead at 0.9 (the audit's Swift
+        // P1). Standard operators (`+`, `==`) parse as their own expression
+        // kinds and are not recorded: every `a + b` on an `Int` would be a
+        // ledger row. Their in-repo overloads are exempt at the declaration
+        // instead — see `swift_operator_declaration_reason`.
+        "infix_expression" => {
+            let op = node.child_by_field_name("op")?;
+            if op.kind() != "custom_operator" {
+                return None;
+            }
+            Some(SwiftCall {
+                callee_name: get_node_text(op, source),
+                receiver_expr: None,
+                name_node: op,
+                kind: ReferenceKind::Call,
             })
         }
         _ => None,

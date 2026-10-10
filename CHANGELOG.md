@@ -11,8 +11,53 @@ before that tag is pushed.
 
 ## [Unreleased]
 
+### Added
+
+- An agent's `done` that is held in review for lack of a passing verification
+  now starts that verification itself (one per task and head, at most two at a
+  time, off the MCP response path) and moves the card to done when Manvi's
+  verdict is `passed` for the head and nobody has touched the card since.
+  `failed`, `degraded` and a verification that could not run keep it in review,
+  each recorded distinctly. Task details show the verdict chip with
+  per-criterion results and a Verify action.
+- Review Manvi's proposals. A **Proposals** panel beside the task board runs
+  Manvi's repository gap scan and lists what it found with its evidence and its
+  coverage (a capped or partial scan says so, with both numbers). Accept files
+  the task in the inbox through the board's own intake, so the related-task
+  check still applies and a double click files one card; Edit changes it first;
+  Dismiss hides it for you. The task sheet gains **Suggest refinements**, which
+  shows Manvi's acceptance criteria, splits and duplicate links as a diff and
+  applies only what you select, at the revision you reviewed: a task that
+  changed since is refused and re-read. Nothing Manvi proposes is applied
+  automatically, and a sidecar that is down is an error, never an empty scan.
+
 ### Changed
 
+- The profile is compacted once a day: the host runs dc-store's `store.compact`
+  (expired receipts, events and revisions, a bounded number per pass) from its
+  existing background loop, off the UI thread, never beside itself, never
+  creating a profile. The last attempt is stamped beside the profile, so a
+  restart does not start another window and a failure is logged and retried next
+  window. The log line carries deleted, eligible and truncated per table.
+- Accepting a refinement's splits runs the board's related-task check on each
+  split title. A split that looks like open work holds the whole accept, and the
+  sheet offers "They are separate: apply anyway". DevCouncil is re-vendored at
+  `c0bc26d5` and the serve contract refreshed from Manvi's `work.store.compact`.
+- DevCouncil is re-vendored at `acb5e3b9`: dc-store workbench schema 12 (refinement
+  proposals, an `acceptance_criteria` lock) and `dc-glob`. A profile that
+  Manvi's dc-store has taken to 12 is refused by a GitPulse built at 11, so the
+  installer now requires a `dcstore` that reports schema 12. Suggest
+  refinements now accepts through the proposal Manvi stored (parts chosen
+  against the proposal and task revisions reviewed; each accepted split is a new
+  inbox task with an id the host makes), and the Map panel says when a
+  workspace's link scan could not read part of it.
+- The profile worker's per-call timeout now comes from Manvi's `hello`
+  (`op_limits`: the lane and server-side deadline of each op) plus a 5 s margin,
+  clamped to 15 minutes, instead of a hard-coded table. Against an older Manvi
+  that advertises nothing the built-in table still applies, and a log line says
+  so. The vendored `contracts/serve.ops.schema.json` is refreshed for it and for
+  the repository roots Manvi's `devmap.*`, refine and scan ops now require
+  (`E_BAD_ROOT` otherwise); GitPulse sends none of those ops today.
 - CI now fails when a vendored crate is edited in this repository, through the
   new `bun run check:vendor-edits` (`vendor-crates.mjs --check --allow-drift`),
   which `ci:local` runs too. Upstream drift is still printed but never fails a

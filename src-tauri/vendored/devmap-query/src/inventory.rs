@@ -770,8 +770,7 @@ pub fn churn(root: &Path) -> FileChurn {
 /// [`churn`] with the program named, so a test can stand a script in for it.
 #[doc(hidden)]
 pub fn churn_with_program(program: &OsStr, root: &Path) -> FileChurn {
-    let mut command = devmap_extract::subprocess::git_with_program(program, root);
-    command.args([
+    let args = [
         "log",
         &format!("--since={CHURN_SINCE}"),
         &format!("--max-count={CHURN_COMMIT_CAP}"),
@@ -782,7 +781,11 @@ pub fn churn_with_program(program: &OsStr, root: &Path) -> FileChurn {
         // the bytes it is rather than as a C-escaped rendering that would
         // never match an extraction's `file_path`.
         "-z",
-    ]);
+    ];
+    let mut command = match devmap_extract::subprocess::git_with_program(program, root, args) {
+        Ok(command) => command,
+        Err(failure) => return FileChurn::unavailable(format!("could not run git log: {failure}")),
+    };
     let bounds = Bounds {
         deadline: CHURN_DEADLINE,
         stdout_cap: CHURN_OUTPUT_CAP,
