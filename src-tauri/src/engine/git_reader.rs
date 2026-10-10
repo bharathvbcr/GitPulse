@@ -7,6 +7,7 @@ use crate::engine::git_cli::{
 };
 use crate::engine::git_writer::validate_ref_name;
 use crate::engine::ref_cache::{self, FileIdentity};
+use crate::engine::remotes;
 use crate::engine::text_shape::{self, LineEnding};
 use crate::graph::lane_solver::RawCommitNode;
 use crate::graph::RefScope;
@@ -521,6 +522,7 @@ impl GitReader {
             base: default_base,
             ..
         } = default_base(&repo).checked()?;
+        let remote_names = configured_remote_names(&repo);
 
         let mut format = String::from(BRANCH_LIST_FORMAT);
         if let Some((_, base_oid)) = default_base.as_ref() {
@@ -574,7 +576,7 @@ impl GitReader {
             }
             let is_current = parts[0].trim() == "*";
             let refname = parts[1];
-            if refname.ends_with("/HEAD") {
+            if is_remote_head(&remote_names, refname) {
                 continue;
             }
             let tip = parts[2].to_string();
@@ -584,7 +586,8 @@ impl GitReader {
             let is_remote = refname.starts_with("refs/remotes/");
             let (name, remote_name) = if is_remote {
                 let rest = refname.trim_start_matches("refs/remotes/");
-                let remote = rest.split('/').next().map(String::from);
+                let remote = remotes::split_tracking_ref(&remote_names, rest)
+                    .map(|(owner, _)| owner.to_string());
                 (rest.to_string(), remote)
             } else {
                 (refname.trim_start_matches("refs/heads/").to_string(), None)
@@ -664,6 +667,7 @@ impl GitReader {
             base: probed_default,
             ..
         } = default_base(&repo).checked()?;
+        let remote_names = configured_remote_names(&repo);
 
         // Cheap listing only: refnames and tips, no history walks here.
         // Refnames and object ids cannot contain NULs, so %00 fields stay
@@ -687,13 +691,14 @@ impl GitReader {
                 continue;
             }
             let refname = parts[0];
-            if refname.ends_with("/HEAD") {
+            if is_remote_head(&remote_names, refname) {
                 continue;
             }
             let is_remote = refname.starts_with("refs/remotes/");
             let (name, remote_name) = if is_remote {
                 let rest = refname.trim_start_matches("refs/remotes/");
-                let remote = rest.split('/').next().map(String::from);
+                let remote = remotes::split_tracking_ref(&remote_names, rest)
+                    .map(|(owner, _)| owner.to_string());
                 (rest.to_string(), remote)
             } else {
                 (refname.trim_start_matches("refs/heads/").to_string(), None)
@@ -827,10 +832,8 @@ impl GitReader {
         scope: RefScope,
     ) -> Result<Vec<RawCommitNode>, String> {
         let repo = validate_repo(repo_path)?;
-        let count = Self::page_count_limit(max_count).to_string();
-        let skipped = skip.min(Self::MAX_HISTORY_COMMITS).to_string();
-        let count_arg = format!("-n{}", count);
-        let skip_arg = format!("--skip={}", skipped);
+        let count = Self::page_count_limit(max_count);
+        let skipped = skip.min(Self::MAX_HISTORY_COMMITS);
         // History reads Git objects, not today's filesystem. A historical
         // file may now be a dangling link or live below a replaced directory.
         // Lexical confinement and a literal pathspec bound the object query.
@@ -841,6 +844,49 @@ impl GitReader {
             }
             None => None,
         };
+        let chunk = history_chunk_size();
+        let mut commits = if count <= chunk {
+            Self::history_chunk(&repo, skipped, count, revision, spec.as_deref(), scope)?
+        } else {
+            // A long window is read as aligned chunks, each kept on its own.
+            // One 100k-commit answer exceeded the cache's per-entry cap and
+            // was never kept, so every "load more" walked and parsed the whole
+            // window again; chunks stay under the cap, and growing the window
+            // reads only the chunks it has not seen. (Git still skips past
+            // the earlier commits for a new chunk: `--skip` has to walk them.)
+            let end = skipped.saturating_add(count);
+            let mut start = skipped - skipped % chunk;
+            let mut commits = Vec::with_capacity(count);
+            while start < end {
+                let rows =
+                    Self::history_chunk(&repo, start, chunk, revision, spec.as_deref(), scope)?;
+                let ended = rows.len() < chunk;
+                let from = skipped.saturating_sub(start).min(rows.len());
+                let to = (end - start).min(rows.len());
+                commits.extend(rows.into_iter().skip(from).take(to - from));
+                if ended {
+                    break;
+                }
+                start += chunk;
+            }
+            commits
+        };
+        mark_shallow_boundary(&repo, &mut commits)?;
+        Ok(commits)
+    }
+
+    /// One `git log` page: `count` commits after `skip`, parsed. Each distinct
+    /// (skip, count) is its own kept answer in [`ref_cache`].
+    fn history_chunk(
+        repo: &Path,
+        skip: usize,
+        count: usize,
+        revision: Option<&str>,
+        spec: Option<&str>,
+        scope: RefScope,
+    ) -> Result<Vec<RawCommitNode>, String> {
+        let count_arg = format!("-n{count}");
+        let skip_arg = format!("--skip={skip}");
         let mut args: Vec<&str> = Vec::new();
         if spec.is_some() {
             // Path bytes reach us raw rather than octal-escaped, matching the
@@ -874,7 +920,7 @@ impl GitReader {
             // decides the set for both sides; see crate::graph::ref_scope.
             args.extend_from_slice(crate::graph::history_rev_args(scope));
         }
-        if let Some(spec) = spec.as_deref() {
+        if let Some(spec) = spec {
             args.push("--");
             args.push(spec);
         }
@@ -889,7 +935,7 @@ impl GitReader {
         } else {
             &crate::graph::ref_scope::NAMED_REF_PATTERNS
         };
-        let stdout = ref_cache::git_text(&repo, namespaces, &args)?;
+        let stdout = ref_cache::git_text(repo, namespaces, &args)?;
 
         // Each record is exactly six NUL-delimited fields plus its terminator.
         // `format:` separates entries with a bare newline AFTER our %x00, so
@@ -1077,6 +1123,7 @@ impl GitReader {
                 }
             }
 
+            warnings.extend(undecodable_path_warning(&path));
             statuses.push(FileStatus {
                 path,
                 old_path,
@@ -1439,6 +1486,10 @@ impl GitReader {
             &[
                 "show",
                 "-s",
+                // `%ad`/`%cd` follow `log.date`; pin git's default rendering
+                // so a developer's `relative` or `human` does not stale the
+                // dates the panel shows.
+                "--date=default",
                 "--format=%H%x00%P%x00%an%x00%ae%x00%ad%x00%cn%x00%ce%x00%cd%x00%G?%x00%s%x00%b",
                 commit_id,
             ],
@@ -1606,20 +1657,7 @@ impl GitReader {
     /// Exit 1 is git's answer "HEAD is detached"; any other failure is a read
     /// that did not happen and is an error, never reported as detached.
     pub fn current_branch(repo_path: &str) -> Result<Option<String>, String> {
-        let repo = validate_repo(repo_path)?;
-        let run = git_cli::git_captured(&repo, &["symbolic-ref", "--quiet", "--short", "HEAD"])?;
-        match run.status_code {
-            0 => {
-                let name = String::from_utf8_lossy(&run.stdout).trim().to_string();
-                validate_ref_name(&name)?;
-                Ok(Some(name))
-            }
-            1 => Ok(None),
-            code => Err(format!(
-                "Could not read the current branch (git exited {code}): {}",
-                String::from_utf8_lossy(&run.stderr).trim()
-            )),
-        }
+        head_branch(&validate_repo(repo_path)?)
     }
 
     /// Reads what a reset of HEAD's branch to `target` would take off it.
@@ -1924,6 +1962,16 @@ impl GitReader {
         repo_path: &str,
         max_files: Option<usize>,
     ) -> Result<KnowledgeReport, String> {
+        Self::knowledge_report_with(repo_path, max_files, budget::MAX_BLAME_BYTES)
+    }
+
+    /// [`Self::knowledge_report`] with the per-file blame budget injected, so a
+    /// test can cut a blame short without a 16 MiB fixture.
+    fn knowledge_report_with(
+        repo_path: &str,
+        max_files: Option<usize>,
+        blame_cap: usize,
+    ) -> Result<KnowledgeReport, String> {
         let started = Instant::now();
         let repo = validate_repo(repo_path)?;
         let has_mailmap = repo.join(".mailmap").is_file();
@@ -2007,6 +2055,9 @@ impl GitReader {
         let mut age_dist = CodeAgeDistribution::default();
         let mut orphaned_files: Vec<OrphanedFile> = Vec::new();
         let mut scanned_files = 0;
+        // A blame cut off at its byte cap or its deadline is a prefix of the
+        // file, so every count built from it is a lower bound.
+        let mut blame_cut_short = false;
         let mut scanned_lines = 0;
 
         for file_path in selected_files {
@@ -2021,8 +2072,11 @@ impl GitReader {
             args.push("--");
             args.push(&file_path);
 
-            let stdout = match git_text_capped(&repo, &args, budget::MAX_BLAME_BYTES) {
-                Ok((out, _)) => out,
+            let stdout = match git_text_capped(&repo, &args, blame_cap) {
+                Ok((out, incomplete)) => {
+                    blame_cut_short |= incomplete.is_some();
+                    out
+                }
                 Err(_) => continue,
             };
 
@@ -2137,7 +2191,7 @@ impl GitReader {
             orphaned_files,
             age_distribution: age_dist,
             half_life_days,
-            truncated: truncated || scanned_files < candidate_files,
+            truncated: truncated || blame_cut_short || scanned_files < candidate_files,
             duration_ms: started.elapsed().as_millis() as u64,
         })
     }
@@ -2620,30 +2674,44 @@ pub(crate) fn parse_pulse_stream(
 ///
 /// Priority: `checkout.defaultRemote`, the current branch's configured
 /// upstream remote, a lone configured remote, else "origin".
+#[cfg(test)]
 pub(crate) fn resolve_default_remote(repo: &Path) -> String {
+    default_remote_reads(repo).0
+}
+
+/// [`resolve_default_remote`] plus the reason, when a read it depends on
+/// produced no answer (config, the current branch, the remote list). The name
+/// is then a guess built from "not set"; a caller guarding a destructive
+/// action refuses on the reason instead of trusting the guess.
+fn default_remote_reads(repo: &Path) -> (String, Option<String>) {
+    let mut unread: Option<String> = None;
     // One read of the effective config answers what used to be two
-    // `config --get` processes and, usually, `git remote` too. A failed read
-    // is "not set", as each failed `--get` was; the spawn gate's failure
-    // counter is what marks the answer unclean (see `default_base`).
-    let config = config_snapshot(repo).unwrap_or_default();
+    // `config --get` processes and, usually, `git remote` too.
+    let config = match config_snapshot(repo) {
+        Ok(config) => config,
+        Err(error) => {
+            unread = Some(error);
+            HashMap::new()
+        }
+    };
     if let Some(configured) = config.get("checkout.defaultremote") {
         let trimmed = configured.trim();
         if !trimmed.is_empty() {
-            return trimmed.to_string();
+            return (trimmed.to_string(), unread);
         }
     }
-    if let Ok(branch) = ref_cache::git_text(
-        repo,
-        &["refs/heads"],
-        &["symbolic-ref", "--quiet", "--short", "HEAD"],
-    ) {
-        let branch = branch.trim();
-        if !branch.is_empty() {
-            if let Some(upstream) = config.get(&format!("branch.{branch}.remote")) {
-                let trimmed = upstream.trim();
-                if !trimmed.is_empty() {
-                    return trimmed.to_string();
-                }
+    let branch = match head_branch_cached(repo) {
+        Ok(branch) => branch,
+        Err(error) => {
+            unread.get_or_insert(error);
+            None
+        }
+    };
+    if let Some(branch) = branch.filter(|branch| !branch.is_empty()) {
+        if let Some(upstream) = config.get(&format!("branch.{branch}.remote")) {
+            let trimmed = upstream.trim();
+            if !trimmed.is_empty() {
+                return (trimmed.to_string(), unread);
             }
         }
     }
@@ -2658,15 +2726,18 @@ pub(crate) fn resolve_default_remote(repo: &Path) -> String {
                 .filter(|s| !s.is_empty())
                 .map(str::to_string)
                 .collect(),
-            Err(_) => Vec::new(),
+            Err(error) => {
+                unread.get_or_insert(error);
+                Vec::new()
+            }
         }
     } else {
         configured
     };
     if let [only] = names.as_slice() {
-        return only.clone();
+        return (only.clone(), unread);
     }
-    "origin".to_string()
+    ("origin".to_string(), unread)
 }
 
 /// The effective config as `git config --list -z` prints it, last value of a
@@ -2703,6 +2774,26 @@ fn configured_remotes(config: &HashMap<String, String>) -> Vec<String> {
     names.sort();
     names.dedup();
     names
+}
+
+/// True for a remote's own HEAD pointer, `refs/remotes/<remote>/HEAD`, which
+/// names the branch the remote considers default rather than being one. Only
+/// that exact shape: a branch *called* `release/HEAD` (`refs/remotes/origin/
+/// release/HEAD`, or a local `refs/heads/release/HEAD`) is a real branch and
+/// was hidden by an "ends in /HEAD" test.
+pub(crate) fn is_remote_head(remote_names: &[String], refname: &str) -> bool {
+    refname
+        .strip_prefix("refs/remotes/")
+        .and_then(|rest| remotes::split_tracking_ref(remote_names, rest))
+        .is_some_and(|(_, branch)| branch == "HEAD")
+}
+
+/// Names of the remotes configured for `repo`, for attributing remote-tracking
+/// refs through [`remotes::split_tracking_ref`].
+pub(crate) fn configured_remote_names(repo: &Path) -> Vec<String> {
+    config_snapshot(repo)
+        .map(|config| configured_remotes(&config))
+        .unwrap_or_default()
 }
 
 /// Whether the repository still has pre-config remote definitions, which
@@ -2807,25 +2898,12 @@ pub(crate) fn default_base(repo: &Path) -> DefaultBase {
             }
         }
     }
-    // The lookups below read a failed spawn as "not set". Under load that is
-    // a refusal, not an answer, so a value computed while any of them failed
+    // The lookups read a failed spawn as "not set". Under load that is a
+    // refusal, not an answer, so a value computed while any of them failed
     // is marked unclean: shared with the callers already queued behind it,
     // never served to one that arrives later.
-    let failures_before = git_cli::process_failures();
-    let remote = resolve_default_remote(repo);
-    let head_ref = remote_head_ref(&remote);
-    let remote_head = git_text(repo, &["symbolic-ref", "--quiet", head_ref.as_str()]).ok();
-    let base = resolve_default_base_on(repo, &remote, remote_head.as_deref());
-    let clean = git_cli::process_failures() == failures_before;
-    let value = DefaultBase {
-        remote,
-        remote_head,
-        base,
-        incomplete: (!clean).then(|| {
-            git_cli::last_process_failure()
-                .unwrap_or_else(|| "a default-branch lookup produced no answer".into())
-        }),
-    };
+    let value = compute_default_base(repo);
+    let clean = value.incomplete.is_none();
     if let Some(stamp) = stamp {
         let mut memo = memo.lock().unwrap_or_else(PoisonError::into_inner);
         if memo.len() >= MAX_MEMOIZED_REPOS && !memo.contains_key(repo) {
@@ -2842,6 +2920,39 @@ pub(crate) fn default_base(repo: &Path) -> DefaultBase {
         );
     }
     value
+}
+
+/// The uncached default-base lookup behind [`default_base`]. A read that gave
+/// no answer (a refused spawn, a deadline, an unreadable ref) sets
+/// `incomplete`; it never reads as "no remote HEAD". Callers that guard a
+/// destructive action use this directly, so a memoized answer from before the
+/// read started failing cannot stand in for the state they are acting on.
+pub(crate) fn compute_default_base(repo: &Path) -> DefaultBase {
+    let failures_before = git_cli::process_failures();
+    let (remote, mut unread) = default_remote_reads(repo);
+    let head_ref = remote_head_ref(&remote);
+    let remote_head = match symbolic_ref_target(repo, head_ref.as_str()) {
+        Ok(target) => target,
+        Err(error) => {
+            unread.get_or_insert(error);
+            None
+        }
+    };
+    let base = resolve_default_base_on(repo, &remote, remote_head.as_deref());
+    let incomplete = if git_cli::process_failures() != failures_before {
+        Some(
+            git_cli::last_process_failure()
+                .unwrap_or_else(|| "a default-branch lookup produced no answer".into()),
+        )
+    } else {
+        unread
+    };
+    DefaultBase {
+        remote,
+        remote_head,
+        base,
+        incomplete,
+    }
 }
 
 #[derive(Clone)]
@@ -2936,6 +3047,70 @@ fn pick_default_branch(local_names: &[String], remote_head: Option<&str>, remote
 /// commit.
 const TAG_LIST_FORMAT: &str =
     "%(refname:short)%00%(objectname)%00%(contents:subject)%00%(*objectname)";
+
+/// Where the symbolic ref `refname` points, as the full ref name.
+///
+/// `--quiet` makes exit 1 git's answer "this is not a symbolic ref" (a
+/// detached HEAD, an absent `origin/HEAD`): `Ok(None)`. Any other failure is a
+/// read that did not happen (a refused spawn, a deadline, an unreadable ref
+/// file) and is an `Err`, never "not set": callers that guard a destructive
+/// action on the answer must not take an unreadable ref for an absent one.
+pub(crate) fn symbolic_ref_target(repo: &Path, refname: &str) -> Result<Option<String>, String> {
+    let run = git_cli::git_captured(repo, &["symbolic-ref", "--quiet", refname])?;
+    match run.status_code {
+        0 => {
+            let target = String::from_utf8_lossy(&run.stdout).trim().to_string();
+            Ok((!target.is_empty()).then_some(target))
+        }
+        1 => Ok(None),
+        code => Err(format!(
+            "Could not read {refname} (git exited {code}): {}",
+            String::from_utf8_lossy(&run.stderr).trim()
+        )),
+    }
+}
+
+/// The local branch HEAD is on, as its short name; `None` when detached.
+///
+/// Asks for the full ref and strips `refs/heads/` itself: `--short` shortens
+/// to the shortest *unambiguous* name, which is `heads/main` when a tag is
+/// also called `main`. The canonical owner of the question: a failed read is
+/// an `Err` (see [`symbolic_ref_target`]) and never "detached".
+pub(crate) fn head_branch(repo: &Path) -> Result<Option<String>, String> {
+    let branch = head_branch_name(repo)?;
+    if let Some(name) = &branch {
+        validate_ref_name(name)?;
+    }
+    Ok(branch)
+}
+
+/// [`head_branch`] without the argv-safety check on the name, for readers that
+/// only *show* the branch (the graph's HEAD chip, the remote lookup): a branch
+/// the writers would refuse to name in a command, `fix(ui)` among them, is
+/// still the one HEAD is on.
+fn head_branch_name(repo: &Path) -> Result<Option<String>, String> {
+    symbolic_ref_target(repo, "HEAD")?
+        .map(|target| branch_of_head_target(&target))
+        .transpose()
+}
+
+/// [`head_branch_name`] answered through the ref cache, for the readers that
+/// ask on every refresh. The cached read cannot tell a detached HEAD (exit 1,
+/// an answer) from a refusal, so a failed cached read is asked again, uncached,
+/// and that one decides.
+pub(crate) fn head_branch_cached(repo: &Path) -> Result<Option<String>, String> {
+    match ref_cache::git_text(repo, &["refs/heads"], &["symbolic-ref", "--quiet", "HEAD"]) {
+        Ok(target) => branch_of_head_target(target.trim()).map(Some),
+        Err(_) => head_branch_name(repo),
+    }
+}
+
+fn branch_of_head_target(target: &str) -> Result<String, String> {
+    target
+        .strip_prefix("refs/heads/")
+        .map(str::to_string)
+        .ok_or_else(|| format!("HEAD points at {target}, which is not a local branch"))
+}
 
 /// What a branch listing over `refs/heads/` and `refs/remotes/` reads.
 const BRANCH_NAMESPACES: &[&str] = &["refs/heads", "refs/remotes"];
@@ -3526,6 +3701,91 @@ fn read_sized_blob(repo: &Path, oid: &str) -> Result<Vec<u8>, String> {
         return Err("Git object size did not match cat-file".into());
     }
     Ok(bytes)
+}
+
+/// Commits per kept history chunk. See [`GitReader::read_commit_history_paged`].
+const HISTORY_CHUNK: usize = 5_000;
+
+#[cfg(not(test))]
+fn history_chunk_size() -> usize {
+    HISTORY_CHUNK
+}
+
+#[cfg(test)]
+thread_local! {
+    static CHUNK_OVERRIDE: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+fn history_chunk_size() -> usize {
+    CHUNK_OVERRIDE
+        .with(|cell| cell.get())
+        .unwrap_or(HISTORY_CHUNK)
+}
+
+/// Runs `body` with a small history chunk, so a test can cross chunk
+/// boundaries without a 5,000-commit fixture.
+#[cfg(test)]
+pub(crate) fn with_history_chunk<T>(size: usize, body: impl FnOnce() -> T) -> T {
+    struct Restore(Option<usize>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            CHUNK_OVERRIDE.with(|cell| cell.set(self.0));
+        }
+    }
+    let _restore = Restore(CHUNK_OVERRIDE.with(|cell| cell.replace(Some(size))));
+    body()
+}
+
+/// The warning a status row carries when its path cannot be trusted to name
+/// the file on disk. Git paths are bytes; the IPC carries UTF-8, so a Linux
+/// path that is not valid UTF-8 arrives with U+FFFD in place of each bad byte
+/// and any action sent back for it would name a file that does not exist. The
+/// row says so instead of looking like any other file.
+pub(crate) fn undecodable_path_warning(path: &str) -> Option<String> {
+    path.contains('\u{FFFD}').then(|| {
+        "This path is not valid UTF-8, so it is shown with replacement characters and \
+         actions sent for it will not find the file. Use git on the command line for it."
+            .to_string()
+    })
+}
+
+/// Commits whose parents exist in the real history but not in this clone, from
+/// the `shallow` file in the common git directory. Git prints no parents for
+/// them (`%P` is empty), which the lane solver reads as a root; a root is a
+/// commit that has no parents, not one whose parents were cut off.
+///
+/// `Ok(empty)` only when there is no such file. A file that exists and cannot
+/// be read fails the page: its commits would be drawn as roots.
+fn shallow_commits(repo: &Path) -> Result<HashSet<String>, String> {
+    let (_private, common) = crate::repository_trust::git_directories(repo)?;
+    match std::fs::read_to_string(common.join("shallow")) {
+        Ok(text) => Ok(text
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(str::to_string)
+            .collect()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(HashSet::new()),
+        Err(error) => Err(format!("Could not read the shallow boundary: {error}")),
+    }
+}
+
+/// Gives each shallow-boundary commit the unknown parent it is missing, so it
+/// is drawn as a stub rather than as the root of the history.
+fn mark_shallow_boundary(repo: &Path, commits: &mut [RawCommitNode]) -> Result<(), String> {
+    if !commits.iter().any(|commit| commit.parent_ids.is_empty()) {
+        return Ok(());
+    }
+    let shallow = shallow_commits(repo)?;
+    for commit in commits.iter_mut() {
+        if commit.parent_ids.is_empty() && shallow.contains(&commit.id) {
+            commit
+                .parent_ids
+                .push(crate::graph::UNKNOWN_PARENT.to_string());
+        }
+    }
+    Ok(())
 }
 
 /// Decodes one `\x01`-separated history record laid out by
@@ -5347,18 +5607,7 @@ mod tests {
         use std::sync::atomic::{AtomicBool, Ordering};
         let dir = init_repo_with_remotes(&["origin", "upstream"], "main");
         let repo = dir.path().canonicalize().unwrap();
-        let uncached = |repo: &Path| {
-            let remote = resolve_default_remote(repo);
-            let head_ref = remote_head_ref(&remote);
-            let remote_head = git_text(repo, &["symbolic-ref", "--quiet", head_ref.as_str()]).ok();
-            let base = resolve_default_base_on(repo, &remote, remote_head.as_deref());
-            DefaultBase {
-                remote,
-                remote_head,
-                base,
-                incomplete: None,
-            }
-        };
+        let uncached = compute_default_base;
         let stop = std::sync::Arc::new(AtomicBool::new(false));
         let readers: Vec<_> = (0..3)
             .map(|_| {
@@ -7591,6 +7840,119 @@ __GP_PULSE__\0def456\0abc123\x001700000100\0N\0second\0Ada\0ada@example.com\0\0\
         assert!(report.bus_factor >= 1);
         assert!(!report.primary_authors.is_empty());
         assert_eq!(report.age_distribution.total_lines, report.scanned_lines);
+    }
+
+    /// A blame cut off at its byte budget is a prefix of the file. The report
+    /// built from it used to count as a full scan, with `truncated` false.
+    #[test]
+    fn a_blame_cut_at_its_cap_marks_the_ownership_report_truncated() {
+        let dir = init_repo_with_remotes(&[], "main");
+        let path = dir.path().to_str().unwrap();
+        let body: String = (0..200)
+            .map(|n| format!("let value_{n} = {n};\n"))
+            .collect();
+        std::fs::write(dir.path().join("code.rs"), body).unwrap();
+        git_in(dir.path(), &["add", "code.rs"]);
+        git_in(dir.path(), &["commit", "-m", "feat: many lines"]);
+
+        let whole = GitReader::knowledge_report(path, Some(10)).expect("whole");
+        assert!(!whole.truncated, "the control must be a whole scan");
+
+        let cut = GitReader::knowledge_report_with(path, Some(10), 8192).expect("cut");
+        assert!(
+            cut.truncated,
+            "a blame cut at its cap reported as a whole scan: {cut:?}"
+        );
+    }
+
+    /// A path git printed as bytes that are not UTF-8 reaches us as U+FFFD.
+    /// (The filesystem here may refuse such a name, so the replacement
+    /// character stands in for what the decoder would have produced.)
+    #[test]
+    fn a_path_with_replacement_characters_carries_a_warning() {
+        let dir = init_repo_with_remotes(&[], "main");
+        let path = dir.path().to_str().unwrap();
+        std::fs::write(dir.path().join("bad\u{FFFD}name.txt"), "x").unwrap();
+        std::fs::write(dir.path().join("fine.txt"), "x").unwrap();
+
+        let statuses = GitReader::get_status(path).expect("status");
+        let bad = statuses
+            .iter()
+            .find(|s| s.path.contains('\u{FFFD}'))
+            .expect("row");
+        assert!(
+            bad.warnings.iter().any(|w| w.contains("not valid UTF-8")),
+            "{:?}",
+            bad.warnings
+        );
+        let fine = statuses.iter().find(|s| s.path == "fine.txt").expect("row");
+        assert!(fine.warnings.is_empty(), "{:?}", fine.warnings);
+    }
+
+    /// Growing the window reads only the chunks it has not seen, and the
+    /// result is the window a single walk would have produced.
+    #[test]
+    fn growing_the_history_window_reads_only_the_new_chunk() {
+        let _held = ref_cache::retention();
+        let dir = init_repo_with_remotes(&[], "main");
+        for n in 0..40 {
+            git_in(
+                dir.path(),
+                &["commit", "--allow-empty", "-m", &format!("c{n}")],
+            );
+        }
+        let repo = dir.path().canonicalize().unwrap();
+        let path = repo.to_str().unwrap();
+        let log_skips = |since: usize| -> Vec<String> {
+            git_cli::spawn_log::spawns_in(&repo)[since..]
+                .iter()
+                .filter(|argv| argv.iter().any(|a| a == "log"))
+                .filter_map(|argv| argv.iter().find(|a| a.starts_with("--skip=")).cloned())
+                .collect()
+        };
+        let ids = |rows: &[RawCommitNode]| rows.iter().map(|r| r.id.clone()).collect::<Vec<_>>();
+
+        let whole = with_history_chunk(usize::MAX, || {
+            GitReader::read_commit_history_paged(path, 0, 30, None, None, RefScope::Named)
+        })
+        .unwrap();
+        assert_eq!(whole.len(), 30);
+
+        let (first, second, before, middle) = with_history_chunk(10, || {
+            ref_cache::eager(|| {
+                let first =
+                    GitReader::read_commit_history_paged(path, 0, 20, None, None, RefScope::Named)
+                        .unwrap();
+                let before = git_cli::spawn_log::spawns_in(&repo).len();
+                let second =
+                    GitReader::read_commit_history_paged(path, 0, 30, None, None, RefScope::Named)
+                        .unwrap();
+                let middle = git_cli::spawn_log::spawns_in(&repo).len();
+                (first, second, before, middle)
+            })
+        });
+        assert_eq!(ids(&first), ids(&whole[..20]));
+        assert_eq!(
+            ids(&second),
+            ids(&whole),
+            "chunked read differs from one walk"
+        );
+        assert_eq!(
+            log_skips(before),
+            vec!["--skip=20".to_string()],
+            "the larger window re-read chunks it already held (spawns {before}..{middle})"
+        );
+        // A page that starts mid-chunk is still exact.
+        let mid = with_history_chunk(10, || {
+            GitReader::read_commit_history_paged(path, 7, 18, None, None, RefScope::Named)
+        })
+        .unwrap();
+        let direct = with_history_chunk(usize::MAX, || {
+            GitReader::read_commit_history_paged(path, 7, 18, None, None, RefScope::Named)
+        })
+        .unwrap();
+        assert_eq!(ids(&mid), ids(&direct));
+        assert_eq!(mid.len(), 18);
     }
 
     #[test]

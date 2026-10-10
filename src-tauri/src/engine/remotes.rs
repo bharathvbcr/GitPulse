@@ -16,7 +16,7 @@
 //! clone path uses, rather than a second copy that could drift. It is what
 //! keeps a "URL" of `--upload-pack=…` from becoming a flag.
 
-use crate::engine::git_cli::{git_text, git_text_network, validate_repo};
+use crate::engine::git_cli::{git_captured, git_text, git_text_network, validate_repo};
 use crate::engine::git_writer::{repo_mutation_lock, validate_clone_url, validate_ref_name};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -82,6 +82,35 @@ fn split_remote_key(key: &str) -> Option<(String, String)> {
     Some((name.to_string(), field.to_ascii_lowercase()))
 }
 
+/// Splits a remote-tracking name (the part after `refs/remotes/`) into the
+/// remote that owns it and the branch, by the LONGEST configured remote name
+/// that prefixes it: a remote named `team/fork` and one named `team` can both
+/// prefix `team/fork/main`, and the longer one owns the ref. The canonical
+/// owner of the question, so no reader attributes by "first path segment" and
+/// files `team/fork`'s branches under `team`.
+///
+/// With no configured remote matching (a legacy `.git/remotes` definition, or
+/// an empty name list) the first segment is the remote, as git's own default
+/// layout has it.
+pub(crate) fn split_tracking_ref<'a>(
+    remotes: &[String],
+    rest: &'a str,
+) -> Option<(&'a str, &'a str)> {
+    let owner = remotes
+        .iter()
+        .filter(|name| {
+            rest.len() > name.len()
+                && rest.starts_with(name.as_str())
+                && rest.as_bytes()[name.len()] == b'/'
+        })
+        .map(String::len)
+        .max();
+    match owner {
+        Some(len) => Some((&rest[..len], &rest[len + 1..])),
+        None => rest.split_once('/'),
+    }
+}
+
 /// Assembles remotes from config records and remote-tracking ref names.
 ///
 /// Split out from the git calls so the assembly is directly testable against
@@ -114,6 +143,7 @@ fn assemble(records: &[(String, String)], tracking_refs: &[String]) -> RemoteLis
         }
     }
 
+    let names: Vec<String> = by_name.keys().cloned().collect();
     for refname in tracking_refs {
         let Some(rest) = refname.strip_prefix("refs/remotes/") else {
             continue;
@@ -121,13 +151,8 @@ fn assemble(records: &[(String, String)], tracking_refs: &[String]) -> RemoteLis
         // Longest-prefix match: a remote named `origin/mirror` and a remote
         // named `origin` can both prefix `refs/remotes/origin/mirror/main`,
         // and the longer one owns the ref.
-        let owner = by_name
-            .keys()
-            .filter(|name| rest.starts_with(&format!("{name}/")))
-            .max_by_key(|name| name.len())
-            .cloned();
-        if let Some(owner) = owner {
-            if let Some(entry) = by_name.get_mut(&owner) {
+        if let Some((owner, _)) = split_tracking_ref(&names, rest) {
+            if let Some(entry) = by_name.get_mut(owner) {
                 entry.tracking_branches += 1;
             }
         }
@@ -161,20 +186,36 @@ fn assemble(records: &[(String, String)], tracking_refs: &[String]) -> RemoteLis
 /// Lists configured remotes with their URLs and tracking-ref counts.
 pub fn list(repo_path: &str) -> Result<RemoteList, String> {
     let repo = validate_repo(repo_path)?;
-    // A repository with no remotes makes `--get-regexp` exit non-zero; that is
-    // an honest empty answer, not a failure to report.
-    let records = git_text(
+    // `--get-regexp` exits 1 with nothing on stderr when no key matches: a
+    // repository with no remotes, an honest empty answer. Any other outcome (a
+    // refused or timed-out spawn, a config git cannot parse, a cut-off stream)
+    // is a read that did not happen, and used to read as "no remotes".
+    let run = git_captured(
         repo.as_path(),
         &["config", "--get-regexp", "-z", "^remote\\..*"],
-    )
-    .map(|raw| parse_config_records(&raw))
-    .unwrap_or_default();
+    )?;
+    let records = if run.success && run.incomplete.is_none() {
+        parse_config_records(&String::from_utf8_lossy(&run.stdout))
+    } else if run.status_code == 1 && run.incomplete.is_none() && run.stderr.is_empty() {
+        Vec::new()
+    } else {
+        return Err(format!(
+            "Could not read the remote configuration: {}",
+            match &run.incomplete {
+                Some(reason) => format!("git config {}", reason.describe()),
+                None => String::from_utf8_lossy(&run.stderr).trim().to_string(),
+            }
+        ));
+    };
     let tracking: Vec<String> = git_text(
         repo.as_path(),
         &["for-each-ref", "--format=%(refname)", "refs/remotes/"],
     )
-    .map(|raw| raw.lines().map(str::trim).map(str::to_string).collect())
-    .unwrap_or_default();
+    .map_err(|e| format!("Could not list remote-tracking branches: {e}"))?
+    .lines()
+    .map(str::trim)
+    .map(str::to_string)
+    .collect();
     Ok(assemble(&records, &tracking))
 }
 
@@ -594,5 +635,29 @@ mod tests {
             !list.truncated,
             "an exact-fit listing is complete, not truncated"
         );
+    }
+
+    fn repo() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        crate::test_support::git_in(dir.path(), &["init", "-q", "-b", "main"]);
+        dir
+    }
+
+    /// No remote is an answer; a read that failed is not.
+    #[test]
+    fn a_repository_without_remotes_lists_none_but_a_failed_read_is_an_error() {
+        let dir = repo();
+        let path = dir.path().to_str().unwrap();
+        let none = list(path).expect("an unconfigured repository has no remotes");
+        assert!(none.remotes.is_empty());
+
+        for failing in ["--get-regexp", "for-each-ref"] {
+            let refused =
+                crate::engine::git_cli::with_forced_spawn_failure_of(failing, || list(path));
+            assert!(
+                refused.is_err(),
+                "a refused {failing} read listed {refused:?} instead of failing"
+            );
+        }
     }
 }

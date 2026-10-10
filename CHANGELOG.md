@@ -62,6 +62,58 @@ before that tag is pushed.
   more than 25 related open tasks can be filed: `reviewed_related` takes up to
   500 ids and a refusal names 25 at a time. A server timeout says the work may
   still finish and a write's outcome is unknown.
+### Fixed
+
+- Destructive git actions are bound to the state they checked. A release tag is
+  created on the commit the release checks were made against, not on whatever
+  HEAD is by then; a local CI note is written only if HEAD and the tree are the
+  ones the run started on; merge-and-teardown holds one lock from its checks
+  through the removal and re-reads the worktree and the branch tip before
+  `worktree remove --force` and `branch -D`. A git read that produced no answer
+  (the current branch, `origin/HEAD`) is an error, never "detached" or "not the
+  default branch", so a rebase or restack can no longer finish with HEAD
+  detached and a force delete can no longer remove the default branch after an
+  unreadable `origin/HEAD`. A failed `rebase --abort` during a restack is
+  reported instead of "rolled back". With a tag named like the branch, the
+  current branch is still found.
+- Git's output format and environment no longer depend on the developer's
+  settings. Every git child gets `log.showSignature`, colour and diff-prefix
+  settings pinned, patch-printing commands skip `diff.external`, and the
+  environment is decided once for both the git builder and the `gh`/tool
+  builder: `LC_ALL=C`, no credential prompt, no optional locks, and
+  `GIT_LITERAL_PATHSPECS` (and its glob/icase siblings), `GIT_SSH`,
+  `GIT_PROXY_COMMAND`, `GIT_TRACE*`, `GIT_DIFF_OPTS`, `GIT_SHALLOW_FILE` and
+  `GIT_ATTR_SOURCE` stripped. A signed commit under `log.showSignature=true` no
+  longer produces a "No signature" graph id, `color.ui=always` no longer puts
+  escapes in the diff viewer, and the identity GitPulse shows follows git's
+  order (environment before config).
+- A cancelled or timed-out git command is asked to stop before it is killed:
+  SIGTERM to its process group, then SIGKILL after the 500 ms grace, so git
+  removes its own `.git/index.lock` and the next commit does not fail on it.
+  Reads that were cut short no longer pass for complete ones: a notes listing
+  killed at its deadline is an error rather than "nothing is verified", a blame
+  cut at its byte cap marks the ownership report truncated, and a failed or
+  malformed submodule or remote read is an error rather than "none". The shared
+  spawn-rate budget's file IO no longer runs under the gate mutex, so a user
+  action does not queue behind a background re-poll. SHA-256 repositories
+  resolve revisions for provenance.
+- Git parsers read unusual but legal repositories correctly. Worktree paths
+  with a newline or a trailing space round-trip through one `-z` parser used by
+  every caller; a tag named like the branch no longer hides the graph's HEAD
+  chip; a remote named `team/fork` owns its branches (one longest-prefix owner
+  in `remotes.rs`) instead of `team`; a branch named `release/HEAD` is listed
+  while a remote's own `HEAD` pointer still is not; a `--depth 1` boundary
+  commit is drawn as a stub rather than the root of the history; and a path
+  git printed as non-UTF-8 carries a warning instead of silently naming a file
+  that does not exist.
+- Long histories and wide graphs say what they leave out. A graph wider than
+  the 4,096 px canvas shows how many lanes are not drawn; a filter that joins
+  more than 32 ancestors onto a commit reports how many parent links the cap
+  dropped instead of cutting them silently; and a window longer than 5,000
+  commits is read and kept as chunks, so "load more" no longer re-reads and
+  re-parses every earlier commit (one 100k-commit answer exceeded the cache's
+  per-entry cap and was never kept). Git still skips past earlier commits for a
+  new chunk, and lane solving still covers the whole window.
 
 ### Changed
 

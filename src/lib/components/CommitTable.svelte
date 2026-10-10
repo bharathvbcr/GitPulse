@@ -67,6 +67,7 @@
   import CommitRow, { type RefItem } from "./CommitRow.svelte";
   import GraphNodeTooltip from "./GraphNodeTooltip.svelte";
   import ScrollCue from "./ScrollCue.svelte";
+  import GraphClipNotice from "./GraphClipNotice.svelte";
 
   let isLoadingMore = $state(false);
 
@@ -940,6 +941,10 @@
       </div>
     </div>
     <ScrollCue target={graphViewport} axis="x" hint={graphOverflow} />
+    <GraphClipNotice
+      clippedWidth={graphLayout.clippedWidth}
+      laneWidth={renderer.getConfig().laneWidth}
+    />
   </div>
 
   <div

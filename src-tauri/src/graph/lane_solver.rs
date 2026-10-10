@@ -13,6 +13,12 @@ pub struct RawCommitNode {
     pub summary: String,
 }
 
+/// The parent id of a commit whose real parents are known to exist but were not
+/// given: a shallow clone's boundary. The solver draws an edge to it as a
+/// dangling stub (it names no row), and the row is not a root, which a commit
+/// with no parent ids at all is.
+pub const UNKNOWN_PARENT: &str = "";
+
 /// A visual connection link drawn between rows.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct LaneConnection {

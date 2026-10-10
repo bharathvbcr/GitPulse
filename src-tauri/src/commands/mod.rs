@@ -33,8 +33,8 @@ use crate::github::{
     DependabotReport, GitHubContext,
 };
 use crate::graph::{
-    mainline_chain_ids, simplify_history, BezierGeometryCalculator, CubicBezierCurve, LaneSolver,
-    MainlineHint, RawCommitNode, RefDecoration, RefKind, RefScope, VisualCommitRow,
+    mainline_chain_ids, simplify_history_reporting, BezierGeometryCalculator, CubicBezierCurve,
+    LaneSolver, MainlineHint, RawCommitNode, RefDecoration, RefKind, RefScope, VisualCommitRow,
 };
 use crate::stack::StackTreeEngine;
 use crate::watcher::{start_watch, unwatch, WatcherState};
@@ -183,12 +183,21 @@ pub fn resolve_mainline_hint(
             .iter()
             .filter(|r| r.kind == RefKind::Local && r.name == name)
             .collect();
-        // Remote-tracking names carry the remote as their first segment.
         let remotes: Vec<&RefDecoration> = refs
             .iter()
             .filter(|r| {
+                // The owning remote was decided with the longest-prefix rule
+                // when the ref was listed (`team/fork` owns `team/fork/main`);
+                // the first segment is only the fallback for a decoration
+                // that carries none.
                 r.kind == RefKind::Remote
-                    && r.name.split_once('/').map(|(_, short)| short) == Some(name)
+                    && match r.remote.as_deref() {
+                        Some(remote) => r
+                            .name
+                            .strip_prefix(remote)
+                            .and_then(|rest| rest.strip_prefix('/')),
+                        None => r.name.split_once('/').map(|(_, short)| short),
+                    } == Some(name)
             })
             .collect();
         if locals.is_empty() && remotes.is_empty() {
@@ -296,7 +305,7 @@ pub fn assemble_commit_graph(
     refs: Vec<RefDecoration>,
     default_branch: Option<&str>,
     head_id: Option<String>,
-    notes: GraphNotes,
+    mut notes: GraphNotes,
 ) -> CommitGraphPayload {
     let has_more = raw_commits.len() > max_commits;
     if has_more {
@@ -315,7 +324,10 @@ pub fn assemble_commit_graph(
             .collect();
         if keep.iter().any(|kept| !kept) {
             let chain = mainline_chain_ids(&raw_commits, &hint);
-            raw_commits = simplify_history(&raw_commits, &keep);
+            let simplified = simplify_history_reporting(&raw_commits, &keep);
+            // The parent cap protects the solver's width; say when it cut.
+            notes.notices.extend(simplified.notice());
+            raw_commits = simplified.commits;
             let kept: HashSet<&str> = raw_commits.iter().map(|c| c.id.as_str()).collect();
             let survivor = chain.iter().find(|id| kept.contains(id.as_str())).cloned();
             if survivor.is_some() {
@@ -2786,6 +2798,7 @@ pub async fn cmd_publish_release(
                     plan.tag.as_str(),
                     "-m",
                     plan.message.as_str(),
+                    plan.head.as_str(),
                 ],
             )?)
         } else {
@@ -2798,7 +2811,12 @@ pub async fn cmd_publish_release(
         )?;
 
         if plan.create_tag {
-            GitWriter::create_tag(&repo_path, &plan.tag, None, Some(&plan.message))?;
+            GitWriter::create_tag(
+                &repo_path,
+                &plan.tag,
+                Some(plan.head.as_str()),
+                Some(&plan.message),
+            )?;
         }
         let output =
             GitWriter::push_tag(&repo_path, &plan.remote, &plan.tag).map_err(|error| {
@@ -2990,10 +3008,9 @@ fn rebase_planned_commands(
     }
 
     let original_head = git_text(&repo, &["rev-parse", "HEAD"])?.trim().to_string();
-    let original_branch = git_text(&repo, &["symbolic-ref", "--quiet", "--short", "HEAD"])
-        .ok()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty());
+    // Must agree with the writer this previews: a refused read is an error,
+    // never "detached".
+    let original_branch = crate::engine::git_reader::head_branch(&repo)?;
 
     let mut planned: Vec<Vec<String>> = vec![vec![
         "git".into(),
@@ -3853,6 +3870,7 @@ mod tests {
 
     fn decoration(name: &str, kind: RefKind, commit_id: &str, is_head: bool) -> RefDecoration {
         RefDecoration {
+            remote: None,
             name: name.to_string(),
             kind,
             commit_id: commit_id.to_string(),
@@ -5625,6 +5643,7 @@ mod assemble_tests {
             kind: RefKind::Local,
             commit_id: "m0".to_string(),
             is_head: true,
+            remote: None,
         }]
     }
 
@@ -5638,6 +5657,31 @@ mod assemble_tests {
             Some("m0".to_string()),
             GraphNotes::default(),
         )
+    }
+
+    /// The parent cap's cut reaches the screen as a notice, not just the log.
+    #[test]
+    fn a_filtered_graph_that_hit_the_parent_cap_says_so() {
+        let beyond: Vec<String> = (0..40).map(|n| format!("beyond{n}")).collect();
+        let refs: Vec<&str> = beyond.iter().map(String::as_str).collect();
+        let raw = vec![
+            commit("a0", &refs, "Ada", "feat: wide octopus"),
+            commit("b0", &[], "Bob", "fix: unrelated"),
+        ];
+        let payload = assemble_commit_graph(
+            raw,
+            10,
+            &CommitFilter::parse("author:Ada"),
+            Vec::new(),
+            None,
+            None,
+            GraphNotes::default(),
+        );
+        assert!(
+            payload.notices.iter().any(|n| n.contains("parent link")),
+            "{:?}",
+            payload.notices
+        );
     }
 
     fn ids(payload: &CommitGraphPayload) -> Vec<&str> {

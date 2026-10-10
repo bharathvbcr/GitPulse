@@ -41,6 +41,25 @@ export interface GraphLayout {
   /** Width left for hashes, summaries, refs, authors and dates. */
   remainingWidth: number;
   isHorizontallyScrollable: boolean;
+  /**
+   * Width of lane area that lies beyond [`MAX_GRAPH_CONTENT_WIDTH`] and is
+   * therefore not drawn; 0 when the whole topology fits.
+   */
+  clippedWidth: number;
+}
+
+/**
+ * The sentence for lanes the canvas cannot draw, or `null` when none are
+ * cut. A graph wider than the surface used to end at the ceiling with no
+ * mark, so the missing branches looked like branches that do not exist.
+ */
+export function graphClipNotice(clippedWidth: number, laneWidth: number): string | null {
+  if (!(clippedWidth > 0)) return null;
+  const lanes = laneWidth > 0 ? Math.max(1, Math.ceil(clippedWidth / laneWidth)) : null;
+  const limit = MAX_GRAPH_CONTENT_WIDTH.toLocaleString("en-US");
+  return lanes === null
+    ? `Some branch lanes extend past the ${limit} px the graph can draw and are not shown.`
+    : `${lanes} branch lane${lanes === 1 ? "" : "s"} extend${lanes === 1 ? "s" : ""} past the ${limit} px the graph can draw and ${lanes === 1 ? "is" : "are"} not shown.`;
 }
 
 /** Graph gutter overflow; same shape as the shared overflow hint. */
@@ -70,6 +89,7 @@ export function resolveGraphLayout(input: GraphLayoutInput): GraphLayout {
   const avatarSlotWidth = finiteNonNegative(input.avatarSlotWidth, 0);
   const naturalWidth = measuredLaneWidth + avatarSlotWidth;
   const contentWidth = Math.min(MAX_GRAPH_CONTENT_WIDTH, naturalWidth);
+  const clippedWidth = Math.max(0, naturalWidth - contentWidth);
 
   if (availableWidth === 0) {
     return {
@@ -78,6 +98,7 @@ export function resolveGraphLayout(input: GraphLayoutInput): GraphLayout {
       viewportWidth: 0,
       remainingWidth: 0,
       isHorizontallyScrollable: contentWidth > 0,
+      clippedWidth,
     };
   }
 
@@ -101,6 +122,7 @@ export function resolveGraphLayout(input: GraphLayoutInput): GraphLayout {
     viewportWidth,
     remainingWidth,
     isHorizontallyScrollable: contentWidth > viewportWidth + 0.5,
+    clippedWidth,
   };
 }
 

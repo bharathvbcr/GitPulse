@@ -64,16 +64,11 @@ pub fn resolve_worktree_family(
         ));
     }
 
-    // `-z` makes paths containing newlines unambiguous. IPC repository paths
-    // are UTF-8 strings, so an unrepresentable list entry cannot equal either
-    // validated input and is safely ignored.
-    let raw = git_text(&repo, &["worktree", "list", "--porcelain", "-z"])?;
+    // IPC repository paths are UTF-8 strings, so an unrepresentable list entry
+    // cannot equal either validated input and is safely ignored.
     let mut registered = Vec::new();
-    for field in raw.split('\0') {
-        let Some(path) = field.strip_prefix("worktree ") else {
-            continue;
-        };
-        let Ok(canonical) = std::fs::canonicalize(path) else {
+    for entry in read_worktree_entries(&repo)? {
+        let Ok(canonical) = std::fs::canonicalize(&entry.path) else {
             // Prunable entries are history, not active authority targets.
             continue;
         };
@@ -180,26 +175,48 @@ pub struct WorktreeInfo {
     pub scan_note: Option<String>,
 }
 
-/// One parsed block of `worktree list --porcelain`, before dirty counting.
+/// One parsed block of `worktree list --porcelain -z`, before dirty counting.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-struct ParsedWorktree {
-    path: String,
-    head: String,
-    branch: Option<String>,
-    is_bare: bool,
-    is_detached: bool,
-    is_locked: bool,
-    is_prunable: bool,
+pub(crate) struct ParsedWorktree {
+    pub(crate) path: String,
+    pub(crate) head: String,
+    pub(crate) branch: Option<String>,
+    pub(crate) is_bare: bool,
+    pub(crate) is_detached: bool,
+    pub(crate) is_locked: bool,
+    pub(crate) is_prunable: bool,
 }
 
-/// Parses `git worktree list --porcelain` output.
+/// Every worktree of `repo`, from `git worktree list --porcelain -z`.
 ///
-/// The format is newline-separated fields in blank-line-delimited blocks:
-/// `worktree <path>`, `HEAD <sha>`, one of `branch <ref>` / `detached`,
-/// optionally `bare`, `locked [reason]`, `prunable [reason]`. Unknown lines are
-/// skipped rather than rejected so a newer git can add fields without breaking
-/// this parser.
-fn parse_worktree_porcelain(raw: &str) -> Vec<ParsedWorktree> {
+/// The one reader of the worktree list: the listing, the checked-out-branch
+/// guards, the branch-cleanup plan and the agent-worktree reuse check all ask
+/// here. Without `-z` a path containing a newline split into two fields (the
+/// second read as an unknown line, or as a bogus entry), and a trailing space
+/// was trimmed into a different directory.
+pub(crate) fn read_worktree_entries(repo: &Path) -> Result<Vec<ParsedWorktree>, String> {
+    let run =
+        crate::engine::git_cli::git_captured(repo, &["worktree", "list", "--porcelain", "-z"])
+            .and_then(|run| run.require_complete("Worktree listing"))?;
+    if !run.success {
+        return Err(format!(
+            "Could not list this repository's worktrees: {}",
+            String::from_utf8_lossy(&run.stderr).trim()
+        ));
+    }
+    Ok(parse_worktree_porcelain_z(&String::from_utf8_lossy(
+        &run.stdout,
+    )))
+}
+
+/// Parses `git worktree list --porcelain -z` output.
+///
+/// Fields are NUL-terminated and a block ends with an empty field:
+/// `worktree <path>`, `HEAD <oid>`, one of `branch <ref>` / `detached`,
+/// optionally `bare`, `locked [reason]`, `prunable [reason]`. Unknown fields
+/// are skipped rather than rejected so a newer git can add some without
+/// breaking this parser. Values are taken verbatim: a path may end in a space.
+fn parse_worktree_porcelain_z(raw: &str) -> Vec<ParsedWorktree> {
     let mut out: Vec<ParsedWorktree> = Vec::new();
     let mut current: Option<ParsedWorktree> = None;
     let flush = |current: &mut Option<ParsedWorktree>, out: &mut Vec<ParsedWorktree>| {
@@ -210,74 +227,39 @@ fn parse_worktree_porcelain(raw: &str) -> Vec<ParsedWorktree> {
         }
     };
 
-    for line in raw.lines() {
-        let line = line.trim_end();
-        if line.is_empty() {
+    for field in raw.split('\0') {
+        if field.is_empty() {
             flush(&mut current, &mut out);
             continue;
         }
-        let Some((key, value)) = line.split_once(' ') else {
-            // A field with no payload ("detached" never appears alone, but a
-            // bare "locked" or "prunable" can).
-            match line {
-                "detached" => {
-                    if let Some(entry) = current.as_mut() {
-                        entry.is_detached = true;
-                    }
-                }
-                // `bare` carries no payload either.
-                "bare" => {
-                    if let Some(entry) = current.as_mut() {
-                        entry.is_bare = true;
-                    }
-                }
-                "locked" => {
-                    if let Some(entry) = current.as_mut() {
-                        entry.is_locked = true;
-                    }
-                }
-                "prunable" => {
-                    if let Some(entry) = current.as_mut() {
-                        entry.is_prunable = true;
-                    }
-                }
-                _ => {}
-            }
+        // A field with no payload ("detached", "bare", a bare "locked") has
+        // no space to split at.
+        let (key, value) = field.split_once(' ').unwrap_or((field, ""));
+        if key == "worktree" {
+            flush(&mut current, &mut out);
+            current = Some(ParsedWorktree {
+                path: value.to_string(),
+                ..ParsedWorktree::default()
+            });
+            continue;
+        }
+        let Some(entry) = current.as_mut() else {
             continue;
         };
         match key {
-            "worktree" => {
-                flush(&mut current, &mut out);
-                current = Some(ParsedWorktree {
-                    path: value.to_string(),
-                    ..ParsedWorktree::default()
-                });
-            }
-            "HEAD" => {
-                if let Some(entry) = current.as_mut() {
-                    entry.head = value.to_string();
-                }
-            }
+            "HEAD" => entry.head = value.to_string(),
             "branch" => {
-                if let Some(entry) = current.as_mut() {
-                    entry.branch = Some(value.trim_start_matches("refs/heads/").to_string());
-                }
+                entry.branch = Some(
+                    value
+                        .strip_prefix("refs/heads/")
+                        .unwrap_or(value)
+                        .to_string(),
+                )
             }
-            "bare" => {
-                if let Some(entry) = current.as_mut() {
-                    entry.is_bare = true;
-                }
-            }
-            "locked" => {
-                if let Some(entry) = current.as_mut() {
-                    entry.is_locked = true;
-                }
-            }
-            "prunable" => {
-                if let Some(entry) = current.as_mut() {
-                    entry.is_prunable = true;
-                }
-            }
+            "detached" => entry.is_detached = true,
+            "bare" => entry.is_bare = true,
+            "locked" => entry.is_locked = true,
+            "prunable" => entry.is_prunable = true,
             _ => {}
         }
     }
@@ -940,8 +922,7 @@ fn before_publish_hook() {
 /// One listing with no sharing: what [`list_worktrees_scanned`] runs.
 fn scan_listing(repo_path: &str, depth: ScanDepth) -> Result<Vec<WorktreeInfo>, String> {
     let repo = validate_repo(repo_path)?;
-    let stdout = git_text(&repo, &["worktree", "list", "--porcelain"])?;
-    let parsed = parse_worktree_porcelain(&stdout);
+    let parsed = read_worktree_entries(&repo)?;
     if depth == ScanDepth::Listing {
         return Ok(parsed
             .into_iter()
@@ -1316,15 +1297,19 @@ pub fn merge_and_teardown_worktree(
     // The merge runs in the main checkout, onto whatever it has checked out.
     // It used to run there regardless and then report `target`: a main
     // checkout on another branch took the merge, and the panel said "main".
-    let current = git_text(&repo, &["symbolic-ref", "--quiet", "--short", "HEAD"])
-        .map(|head| head.trim().to_string())
-        .unwrap_or_default();
-    if current != target {
-        return Err(format!(
-            "The main checkout is on {}, not {target}. Switch it to {target} first; nothing was merged.",
-            if current.is_empty() { "a detached HEAD".to_string() } else { current }
-        ));
-    }
+    let main_is_on_target = || -> Result<(), String> {
+        // A refused read is an error, not "a detached HEAD": naming the wrong
+        // reason would send the user to fix the wrong thing.
+        let current = crate::engine::git_reader::head_branch(&repo)?.unwrap_or_default();
+        if current != target {
+            return Err(format!(
+                "The main checkout is on {}, not {target}. Switch it to {target} first; nothing was merged.",
+                if current.is_empty() { "a detached HEAD".to_string() } else { current }
+            ));
+        }
+        Ok(())
+    };
+    main_is_on_target()?;
 
     // 2. Pre-merge hooks
     let hooks = load_worktree_hooks(&repo);
@@ -1339,14 +1324,36 @@ pub fn merge_and_teardown_worktree(
         ],
     )?;
 
+    // Steps 3-6 hold one lock: the checks that the worktree is clean and that
+    // the branch is what will be merged, the merge, and the removal and branch
+    // deletion that destroy the worktree. They used to run in separate scopes,
+    // so anything written between the check and the removal was destroyed with
+    // it. The lock fences GitPulse's own writers; an outside process takes no
+    // lock, so each destructive step re-reads the state it is about to destroy
+    // and refuses, keeping the worktree and branch, when it moved.
+    let _repo_lock = repo_mutation_lock(&repo);
+    let _guard = _repo_lock
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+    // The pre-merge hooks above may have switched the main checkout.
+    main_is_on_target()?;
+
     // 3. Collision / uncommitted changes check
-    let (changed, _) = changed_paths(&worktree.to_string_lossy())?;
+    let worktree_text = worktree.to_string_lossy().to_string();
+    let (changed, _) = changed_paths(&worktree_text)?;
     if !changed.is_empty() {
         return Err(format!(
             "Worktree has {} uncommitted file changes; commit or stash them before merging",
             changed.len()
         ));
     }
+    // The branch tip being merged. Anything that lands on the branch after
+    // this is not in the merge and must not be deleted with it.
+    let branch_ref = format!("refs/heads/{branch}");
+    let merged_tip = git_text(&repo, &["rev-parse", "--verify", branch_ref.as_str()])?
+        .trim()
+        .to_string();
 
     // Count commits being merged
     let count_stdout = git_text(
@@ -1357,51 +1364,72 @@ pub fn merge_and_teardown_worktree(
     let commits_merged: usize = count_stdout.trim().parse().unwrap_or(0);
 
     // 4. Merge in anchor repository
-    {
-        let _repo_lock = repo_mutation_lock(&repo);
-        let _guard = _repo_lock
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-
-        if squash {
-            // Nothing staged means the branch's changes are already on the
-            // target and there is nothing to commit — not a failure. A failed
-            // commit fails closed before anything is torn down: it used to be
-            // discarded, and the next steps removed the worktree and
-            // force-deleted the branch whose work was never committed.
-            GitWriter::squash_merge_locked(&repo, &branch, gate).map_err(
-                |failure| match failure {
-                    SquashFailure::Merge(e) => e,
-                    SquashFailure::Commit(e) => {
-                        format!("{e} The worktree and the branch {branch} were kept on {target}.")
-                    }
-                },
-            )?;
-        } else {
-            let fast_forward = merge_teardown_argv(&branch, false);
-            let fast_forward: Vec<&str> = fast_forward.iter().map(String::as_str).collect();
-            gate(&fast_forward)?;
-            if let Err(ff_err) = git_text(&repo, &fast_forward) {
-                let commit_msg = format!("Merge branch '{branch}' into {target}");
-                let merge = ["merge", branch.as_str(), "-m", commit_msg.as_str()];
-                gate(&merge)?;
-                git_text(&repo, &merge)
-                    .map_err(|e| format!("Merge failed (ff error: {ff_err}): {e}"))?;
+    if squash {
+        // Nothing staged means the branch's changes are already on the
+        // target and there is nothing to commit — not a failure. A failed
+        // commit fails closed before anything is torn down: it used to be
+        // discarded, and the next steps removed the worktree and
+        // force-deleted the branch whose work was never committed.
+        GitWriter::squash_merge_locked(&repo, &branch, gate).map_err(|failure| match failure {
+            SquashFailure::Merge(e) => e,
+            SquashFailure::Commit(e) => {
+                format!("{e} The worktree and the branch {branch} were kept on {target}.")
             }
+        })?;
+    } else {
+        let fast_forward = merge_teardown_argv(&branch, false);
+        let fast_forward: Vec<&str> = fast_forward.iter().map(String::as_str).collect();
+        gate(&fast_forward)?;
+        if let Err(ff_err) = git_text(&repo, &fast_forward) {
+            let commit_msg = format!("Merge branch '{branch}' into {target}");
+            let merge = ["merge", branch.as_str(), "-m", commit_msg.as_str()];
+            gate(&merge)?;
+            git_text(&repo, &merge)
+                .map_err(|e| format!("Merge failed (ff error: {ff_err}): {e}"))?;
         }
     }
 
+    // What the destructive steps below may destroy is what was merged.
+    let unchanged_since_merge = |repo: &Path, worktree_present: bool| -> Result<(), String> {
+        let kept = format!(
+            "The merge of {branch} into {target} is done; the worktree and the branch were kept"
+        );
+        if worktree_present {
+            let (changed, _) = changed_paths(&worktree_text).map_err(|e| {
+                format!("{kept}, because the worktree could not be re-checked: {e}")
+            })?;
+            if !changed.is_empty() {
+                return Err(format!(
+                    "{kept}: {} file change(s) appeared in the worktree after the merge was checked.",
+                    changed.len()
+                ));
+            }
+        }
+        let tip = git_text(repo, &["rev-parse", "--verify", branch_ref.as_str()])
+            .map_err(|e| format!("{kept}, because the branch could not be re-read: {e}"))?;
+        if tip.trim() != merged_tip {
+            return Err(format!(
+                "{kept}: {branch} moved from {merged_tip} to {} after the merge was checked.",
+                tip.trim()
+            ));
+        }
+        Ok(())
+    };
+
     // 5. Remove worktree
-    let worktree_text = worktree.to_string_lossy().to_string();
     let remove = remove_worktree_argv(&worktree_text, true);
     // That builder spells the program; the gate takes git's arguments.
     let remove: Vec<&str> = remove.iter().skip(1).map(String::as_str).collect();
     gate(&remove)?;
-    remove_worktree(repo_path, &worktree_text, true)?;
+    unchanged_since_merge(&repo, true)?;
+    remove_worktree_locked(&repo, &worktree_text, true)?;
 
     // 6. Delete merged branch
     let delete = ["branch", if squash { "-D" } else { "-d" }, branch.as_str()];
-    let branch_deleted = gate(&delete).is_ok() && git_text(&repo, &delete).is_ok();
+    let branch_deleted = gate(&delete).is_ok()
+        && unchanged_since_merge(&repo, false).is_ok()
+        && git_text(&repo, &delete).is_ok();
+    drop(_guard);
 
     // 7. Post-merge hooks
     let hook_error = execute_worktree_hooks(
@@ -1446,7 +1474,12 @@ pub fn remove_worktree(repo_path: &str, target_path: &str, force: bool) -> Resul
     let _guard = _repo_lock
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
+    remove_worktree_locked(&repo, target_path, force)
+}
 
+/// [`remove_worktree`] for a caller that already holds `repo`'s mutation lock
+/// (the merge-and-teardown span, which checks and removes under one lock).
+fn remove_worktree_locked(repo: &Path, target_path: &str, force: bool) -> Result<(), String> {
     validate_target_path(target_path)?;
     // Git scans the target's status internally. Its config.worktree helpers
     // can execute even though the parent is the process's current directory.
@@ -1457,7 +1490,7 @@ pub fn remove_worktree(repo_path: &str, target_path: &str, force: bool) -> Resul
         args.push("--force");
     }
     args.push(target_path);
-    git_text(&repo, &args)?;
+    git_text(repo, &args)?;
     Ok(())
 }
 
@@ -1578,6 +1611,60 @@ mod tests {
     use super::*;
     use crate::procguard::LockedSpawn;
     use std::path::PathBuf;
+
+    /// The fixtures below are written in `--porcelain`'s newline layout for
+    /// readability; the parser reads the `-z` layout, whose NUL is that
+    /// layout's newline and whose empty field is its blank line.
+    fn parse_worktree_porcelain(raw: &str) -> Vec<ParsedWorktree> {
+        parse_worktree_porcelain_z(&raw.replace('\n', "\0"))
+    }
+
+    /// A worktree path may hold a newline or end in a space. Without `-z` the
+    /// first split into two fields and the second was trimmed into a
+    /// different directory, so the listing named worktrees that do not exist.
+    #[cfg(unix)]
+    #[test]
+    fn worktree_paths_with_a_newline_or_trailing_space_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("main");
+        std::fs::create_dir(&main).unwrap();
+        crate::test_support::git_in(&main, &["init", "-q", "-b", "main"]);
+        crate::test_support::git_in(&main, &["commit", "-q", "--allow-empty", "-m", "init"]);
+        let main = main.canonicalize().unwrap();
+        let odd = [dir.path().join("trail "), dir.path().join("new\nline")];
+        for (n, path) in odd.iter().enumerate() {
+            crate::test_support::git_in(
+                &main,
+                &[
+                    "worktree",
+                    "add",
+                    "-q",
+                    "-b",
+                    &format!("b{n}"),
+                    path.to_str().unwrap(),
+                ],
+            );
+        }
+
+        let entries = read_worktree_entries(&main).expect("entries");
+        let paths: Vec<String> = entries.iter().map(|entry| entry.path.clone()).collect();
+        assert_eq!(entries.len(), 3, "{paths:?}");
+        for path in &odd {
+            let canonical = path.canonicalize().unwrap();
+            assert!(
+                paths.iter().any(|listed| Path::new(listed) == canonical),
+                "{canonical:?} did not round-trip through {paths:?}"
+            );
+        }
+        let listed = list_worktrees(main.to_str().unwrap()).expect("listing");
+        assert_eq!(listed.len(), 3);
+        assert!(
+            crate::engine::git_writer::checked_out_branches(&main)
+                .unwrap()
+                .contains("b1"),
+            "the branch of the newline-path worktree was lost"
+        );
+    }
 
     #[test]
     fn test_parse_porcelain_full_blocks() {
@@ -2699,6 +2786,68 @@ some-future-field whatever
         let worktrees = list_worktrees(repo_path).expect("worktrees");
         assert_eq!(worktrees.len(), 1);
         assert_eq!(worktrees[0].branch.as_deref(), Some("main"));
+    }
+
+    /// Runs a teardown whose gate performs `outside_write` on the worktree
+    /// when asked about the removal: an outside agent writing after the merge
+    /// was checked and before the worktree is destroyed.
+    #[cfg(unix)]
+    fn teardown_with_outside_write(
+        outside_write: impl Fn(&Path),
+    ) -> (
+        Result<MergeTeardownResult, String>,
+        tempfile::TempDir,
+        tempfile::TempDir,
+    ) {
+        let (dir, wt) = teardown_fixture(None);
+        let wt_path = wt.path().to_path_buf();
+        let mut gate = |argv: &[&str]| -> Result<(), String> {
+            if argv.first() == Some(&"worktree") && argv.get(1) == Some(&"remove") {
+                outside_write(&wt_path);
+            }
+            Ok(())
+        };
+        let result = merge_and_teardown_worktree(
+            dir.path().to_str().unwrap(),
+            wt.path().to_str().unwrap(),
+            Some("main"),
+            false,
+            &mut gate,
+        );
+        (result, dir, wt)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_file_written_after_the_check_keeps_the_worktree() {
+        let (result, dir, wt) = teardown_with_outside_write(|wt| {
+            std::fs::write(wt.join("outside.txt"), "an agent's work\n").unwrap();
+        });
+        let error = result.expect_err("the late write must stop the removal");
+        assert!(error.contains("kept"), "{error}");
+        assert!(
+            wt.path().join("outside.txt").exists(),
+            "the file was destroyed"
+        );
+        assert!(
+            branch_exists(dir.path(), "feature-x"),
+            "the branch was deleted"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_commit_landing_after_the_check_keeps_the_worktree_and_branch() {
+        let (result, dir, wt) = teardown_with_outside_write(|wt| {
+            crate::test_support::git_in(wt, &["commit", "-q", "--allow-empty", "-m", "late"]);
+        });
+        let error = result.expect_err("the late commit must stop the removal");
+        assert!(error.contains("moved"), "{error}");
+        assert!(wt.path().exists(), "the worktree was removed");
+        assert!(
+            branch_exists(dir.path(), "feature-x"),
+            "the unmerged commit's branch was deleted"
+        );
     }
 
     fn spawned_with(cwds: &[PathBuf], needle: &str) -> usize {

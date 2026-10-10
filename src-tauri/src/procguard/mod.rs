@@ -271,6 +271,27 @@ impl Registration {
         self.reap(|| child.wait())
     }
 
+    /// [`Self::stop_and_reap`] for a child nobody has asked to stop yet: sends
+    /// the ask (SIGTERM to its group) itself, gives it [`CHILD_GRACE`] to act
+    /// on it, then kills and reaps.
+    ///
+    /// For a cancel or a deadline, where the child is out of budget but may be
+    /// holding something it can clean up: `git` removes `.git/index.lock` when
+    /// it is asked and cannot when it is killed, and a slow hook it spawned is
+    /// in the same group and is asked too. Where the platform cannot ask
+    /// (Windows) there is nothing to wait for, so the grace is skipped.
+    pub fn ask_then_stop_and_reap(&self, child: &mut Child) -> io::Result<ExitStatus> {
+        let grace = if sys::CAN_ASK_TO_STOP {
+            if let Some(pid) = *lock(&self.slot.pid) {
+                let _ = sys::request_stop(pid);
+            }
+            CHILD_GRACE
+        } else {
+            Duration::ZERO
+        };
+        self.stop_and_reap(child, grace)
+    }
+
     /// True once the child has exited, **without** reaping it.
     ///
     /// Reaping is what frees the pid for reuse, and on Unix the pid *is* the

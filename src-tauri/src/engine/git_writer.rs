@@ -822,9 +822,11 @@ Unset the local override with `git config --local --unset-all user.name` and \
         }
     }
 
-    /// The identity a commit in `repo` would be recorded under. The
-    /// environment counts only when it covers author and committer both,
-    /// which is what git needs to record a commit without configuration.
+    /// The identity a commit in `repo` would be recorded under, resolved in
+    /// git's own order: the `GIT_AUTHOR_*` / `GIT_COMMITTER_*` environment
+    /// first, then `user.*` config, then `EMAIL`. The environment counts only
+    /// when it covers author and committer both, which is what git needs to
+    /// record a commit without configuration.
     pub fn identity(repo_path: &str) -> Result<GitIdentity, String> {
         let repo = validate_repo(repo_path)?;
         Self::identity_in(&repo)
@@ -836,6 +838,11 @@ Unset the local override with `git config --local --unset-all user.name` and \
 
     /// [`Self::identity_in`] with the environment passed in: git's child
     /// inherits this process's `GIT_AUTHOR_*` / `GIT_COMMITTER_*` / `EMAIL`.
+    ///
+    /// The environment outranks config, as it does in git (`git var
+    /// GIT_AUTHOR_IDENT` prints `GIT_AUTHOR_NAME` even when `user.name` is
+    /// set). This used to read config first, so the identity shown and
+    /// refused-on was not the one a commit would record.
     fn identity_with(
         repo: &Path,
         lookup: &dyn Fn(&str) -> Option<String>,
@@ -843,13 +850,13 @@ Unset the local override with `git config --local --unset-all user.name` and \
         let env = |name: &str| lookup(name).filter(|v| !v.trim().is_empty());
         let env_pair =
             |author: &str, committer: &str| env(author).filter(|_| env(committer).is_some());
-        let name = match Self::config_value(repo, "user.name")? {
+        let name = match env_pair("GIT_AUTHOR_NAME", "GIT_COMMITTER_NAME") {
             Some(name) => Some(name),
-            None => env_pair("GIT_AUTHOR_NAME", "GIT_COMMITTER_NAME"),
+            None => Self::config_value(repo, "user.name")?,
         };
-        let email = match Self::config_value(repo, "user.email")? {
+        let email = match env_pair("GIT_AUTHOR_EMAIL", "GIT_COMMITTER_EMAIL") {
             Some(email) => Some(email),
-            None => env_pair("GIT_AUTHOR_EMAIL", "GIT_COMMITTER_EMAIL").or_else(|| env("EMAIL")),
+            None => Self::config_value(repo, "user.email")?.or_else(|| env("EMAIL")),
         };
         Ok(GitIdentity { name, email })
     }
@@ -1124,7 +1131,11 @@ Unset the local override with `git config --local --unset-all user.name` and \
         if force {
             // `-d` leaves these to git's own safety nets; `-D` bypasses them,
             // so the checks must be re-done server side.
-            if is_default_branch(&repo, branch_name) {
+            if is_default_branch(&repo, branch_name).map_err(|error| {
+                format!(
+                    "refusing to force-delete '{branch_name}': could not tell whether it is the default branch: {error}"
+                )
+            })? {
                 return Err(format!(
                     "refusing to force-delete '{branch_name}': it resolves to the repository's default branch"
                 ));
@@ -1238,10 +1249,9 @@ Unset the local override with `git config --local --unset-all user.name` and \
                 ));
             }
         }
-        let original_branch = git_text(&repo, &["symbolic-ref", "--quiet", "--short", "HEAD"])
-            .ok()
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty());
+        // A refused read is an error: taking it for "detached" would skip the
+        // final `branch -f` and report success with HEAD left detached.
+        let original_branch = crate::engine::git_reader::head_branch(&repo)?;
 
         // Recovery must never swallow its own failure: the checkout outcome is
         // captured so a locked index or full disk cannot hide that HEAD was
@@ -1712,15 +1722,9 @@ Unset the local override with `git config --local --unset-all user.name` and \
         Self::refuse_fixture_identity(repo_canon, false)?;
 
         // symbolic-ref fails on detached HEAD; then there is no branch to restore.
-        let original_head = git_text(repo_canon, &["symbolic-ref", "--quiet", "HEAD"])
-            .ok()
-            .map(|s| {
-                s.trim()
-                    .trim_start_matches("refs/heads/")
-                    .trim()
-                    .to_string()
-            })
-            .filter(|s| !s.is_empty());
+        // A refused read is an error, never "detached": the restore below
+        // would then be skipped and the repository left on the wrong branch.
+        let original_head = crate::engine::git_reader::head_branch(repo_canon)?;
 
         let restore_checkout = |repo_canon: &Path, target: &str| -> Result<(), String> {
             if git_text(repo_canon, &["checkout", target]).is_ok() {
@@ -1753,7 +1757,23 @@ Unset the local override with `git config --local --unset-all user.name` and \
                 // their original branch (--abort lands on `branch`, not where
                 // the user was). Neither cleanup failure hides the primary
                 // error; the message names the true end-state instead.
-                let _ = git_text(repo_canon, &["rebase", "--abort"]);
+                let abort = git_text(repo_canon, &["rebase", "--abort"]);
+                // An abort with no rebase to abort (the rebase never started)
+                // fails harmlessly; one that failed with a rebase still parked
+                // is not a rollback, and an undecidable state is treated the
+                // same way.
+                let still_parked = !matches!(crate::engine::repo_op::detect(repo_canon), Ok(None));
+                if let (Err(abort_err), true) = (&abort, still_parked) {
+                    // Nothing was rolled back, and checking out another
+                    // branch now would fail or compound it.
+                    return Err(format!(
+                        "Restack of '{branch}' onto '{onto}' failed and could not be rolled back \
+                         (git rebase --abort failed: {}); the repository is still mid-rebase. \
+                         Original failure: {}",
+                        summarize_git_failure(abort_err),
+                        summarize_git_failure(&rebase_err)
+                    ));
+                }
                 let end_state = match &original_head {
                     Some(orig) if orig != branch => {
                         if restore_checkout(repo_canon, orig).is_err() {
@@ -2354,12 +2374,15 @@ impl BranchDeleteJournal {
 /// True when `branch_name` is the branch the repository's HEAD resolves to by
 /// default: the primary remote's HEAD branch first, then conventional
 /// main/master/trunk/develop — the same resolution `list_branches` uses.
-pub(crate) fn is_default_branch(repo: &Path, branch_name: &str) -> bool {
-    let remote = crate::engine::git_reader::resolve_default_remote(repo);
-    let head_ref = crate::engine::git_reader::remote_head_ref(&remote);
-    let remote_head = git_text(repo, &["symbolic-ref", "--quiet", head_ref.as_str()]).ok();
-    crate::engine::git_reader::resolve_default_base_on(repo, &remote, remote_head.as_deref())
-        .is_some_and(|(short, _)| short == branch_name)
+///
+/// `Err` when a read the answer depends on produced none (a refused spawn, a
+/// deadline, an unreadable `origin/HEAD`): an unknown is never "not the
+/// default", so a destructive caller refuses. Reads the repository afresh
+/// rather than through the memoized default base, which would answer from
+/// before the read started failing.
+pub(crate) fn is_default_branch(repo: &Path, branch_name: &str) -> Result<bool, String> {
+    let base = crate::engine::git_reader::compute_default_base(repo).checked()?;
+    Ok(base.base.is_some_and(|(short, _)| short == branch_name))
 }
 
 /// True when any worktree of `repo` (including the main one) has
@@ -2374,12 +2397,9 @@ pub(crate) fn is_checked_out_in_any_worktree(
 /// Short names of every local branch checked out in any worktree of `repo`
 /// (including the main one), from a single `git worktree list`.
 pub(crate) fn checked_out_branches(repo: &Path) -> Result<HashSet<String>, String> {
-    let stdout = git_text(repo, &["worktree", "list", "--porcelain"])?;
-    Ok(stdout
-        .lines()
-        .filter_map(|line| line.strip_prefix("branch "))
-        .filter_map(|refname| refname.trim().strip_prefix("refs/heads/"))
-        .map(str::to_string)
+    Ok(crate::engine::worktree::read_worktree_entries(repo)?
+        .into_iter()
+        .filter_map(|entry| entry.branch)
         .collect())
 }
 
@@ -2474,17 +2494,7 @@ fn branch_has_upstream(repo: &Path) -> bool {
 }
 
 fn current_branch_name(repo: &Path) -> Result<String, String> {
-    match git_text(repo, &["symbolic-ref", "--quiet", "--short", "HEAD"]) {
-        Ok(name) => {
-            let name = name.trim();
-            if name.is_empty() {
-                Err(PUSH_DETACHED.into())
-            } else {
-                Ok(name.to_string())
-            }
-        }
-        Err(_) => Err(PUSH_DETACHED.into()),
-    }
+    crate::engine::git_reader::head_branch(repo)?.ok_or_else(|| PUSH_DETACHED.to_string())
 }
 
 fn configured_remotes(repo: &Path) -> Result<Vec<String>, String> {
@@ -4219,6 +4229,68 @@ mod tests {
         assert_eq!(head_oid(&dir), before);
     }
 
+    /// A cancel or a deadline asks git to stop before it insists: git removes
+    /// its own `.git/index.lock` on SIGTERM, and loses the ability to on
+    /// SIGKILL. The next commit must not trip over the dead one's lock.
+    #[cfg(unix)]
+    fn assert_no_stale_index_lock_and_next_commit_lands(dir: &tempfile::TempDir) {
+        let lock = dir.path().join(".git/index.lock");
+        assert!(!lock.exists(), "the stopped commit left {}", lock.display());
+        std::fs::remove_file(dir.path().join(".git/hooks/pre-commit")).unwrap();
+        let before = head_oid(dir);
+        GitWriter::commit_files(&repo_path(dir), "after the stop", &["tracked.txt".into()])
+            .expect("the next commit succeeds first try");
+        assert_ne!(head_oid(dir), before);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_cancelled_commit_leaves_no_index_lock() {
+        let dir = init_repo_with_commit();
+        let marker = dir.path().join(".git/hook-started");
+        install_hook(
+            dir.path(),
+            "pre-commit",
+            &format!("touch '{}'\nsleep 30", marker.display()),
+        );
+        std::fs::write(dir.path().join("tracked.txt"), "changed\n").unwrap();
+        git_in(dir.path(), &["add", "tracked.txt"]);
+        let canonical = dir.path().canonicalize().unwrap();
+        let canceller = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+            while !marker.exists() {
+                assert!(std::time::Instant::now() < deadline, "hook never started");
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            crate::engine::git_cli::cancel_hooked_git(&canonical)
+        });
+        // `--only` keeps `.git/index.lock` held while the hook runs.
+        let err = GitWriter::commit_files(&repo_path(&dir), "never lands", &["tracked.txt".into()])
+            .unwrap_err();
+        assert_eq!(canceller.join().unwrap(), 1, "one run was in flight");
+        assert!(
+            crate::engine::git_cli::is_hooked_git_cancelled(&err),
+            "{err}"
+        );
+        assert_no_stale_index_lock_and_next_commit_lands(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_commit_stopped_at_its_deadline_leaves_no_index_lock() {
+        let dir = init_repo_with_commit();
+        install_hook(dir.path(), "pre-commit", "sleep 30");
+        std::fs::write(dir.path().join("tracked.txt"), "changed\n").unwrap();
+        git_in(dir.path(), &["add", "tracked.txt"]);
+        let err = crate::engine::git_cli::hooks::with_hook_timeout(
+            std::time::Duration::from_secs(2),
+            || GitWriter::commit_files(&repo_path(&dir), "never lands", &["tracked.txt".into()]),
+        )
+        .unwrap_err();
+        assert!(err.contains("timed out"), "{err}");
+        assert_no_stale_index_lock_and_next_commit_lands(&dir);
+    }
+
     /// Overrides any global identity with an empty one, which git refuses
     /// to commit under, so the repository has no usable identity at all.
     fn blank_identity(dir: &std::path::Path) {
@@ -4227,7 +4299,7 @@ mod tests {
     }
 
     #[test]
-    fn identity_reads_config_then_an_environment_covering_author_and_committer() {
+    fn identity_reads_an_environment_covering_author_and_committer_then_config() {
         let dir = init_repo_with_commit();
         blank_identity(dir.path());
         let none = |_: &str| None;
@@ -4259,8 +4331,17 @@ mod tests {
                 .unwrap()
                 .name
                 .as_deref(),
+            Some("Ada"),
+            "the environment wins over configuration, as `git var GIT_AUTHOR_IDENT` has it"
+        );
+        let env_name_absent = |_: &str| None;
+        assert_eq!(
+            GitWriter::identity_with(dir.path(), &env_name_absent)
+                .unwrap()
+                .name
+                .as_deref(),
             Some("Grace"),
-            "configuration wins over the environment"
+            "without the environment, configuration answers"
         );
     }
 
@@ -4693,5 +4774,181 @@ mod tests {
         GitWriter::commit(&repo_path(&dir), "slow hook", false)
             .expect("a slow hook is not a hung git");
         assert_eq!(head_message(&dir).trim(), "slow hook");
+    }
+}
+
+/// Destructive actions are bound to a read that happened: a git read that
+/// produced no answer is never taken as "not the default branch" or "HEAD is
+/// detached".
+#[cfg(all(test, unix))]
+mod bound_to_checked_state {
+    use super::*;
+    use crate::procguard::LockedSpawn;
+    use crate::test_support::git_in;
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::Path;
+
+    fn rev(dir: &Path, rev: &str) -> String {
+        git_text(dir, &["rev-parse", rev])
+            .unwrap()
+            .trim()
+            .to_string()
+    }
+
+    fn commit_file(dir: &Path, name: &str) -> String {
+        std::fs::write(dir.join(name), name).unwrap();
+        git_in(dir, &["add", "--", name]);
+        git_in(dir, &["commit", "-q", "-m", name]);
+        rev(dir, "HEAD")
+    }
+
+    fn repo_on(branch: &str) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        git_in(dir.path(), &["init", "-q", "-b", branch]);
+        git_in(dir.path(), &["commit", "-q", "--allow-empty", "-m", "init"]);
+        dir
+    }
+
+    fn branch_exists(dir: &Path, name: &str) -> bool {
+        git_text(
+            dir,
+            &[
+                "show-ref",
+                "--verify",
+                "--quiet",
+                &format!("refs/heads/{name}"),
+            ],
+        )
+        .is_ok()
+    }
+
+    /// The default branch is `trunk2`, named only by origin/HEAD. When that
+    /// read fails, a force delete must refuse rather than assume "not default".
+    #[test]
+    fn a_force_delete_refuses_when_the_default_branch_read_fails() {
+        let dir = repo_on("trunk2");
+        let p = dir.path();
+        git_in(p, &["remote", "add", "origin", "/nonexistent/origin.git"]);
+        git_in(p, &["update-ref", "refs/remotes/origin/trunk2", "HEAD"]);
+        git_in(
+            p,
+            &[
+                "symbolic-ref",
+                "refs/remotes/origin/HEAD",
+                "refs/remotes/origin/trunk2",
+            ],
+        );
+        git_in(p, &["checkout", "-q", "-b", "feature"]);
+
+        let head = p.join(".git/refs/remotes/origin/HEAD");
+        std::fs::set_permissions(&head, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let read_fails =
+            git_text(p, &["symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"]).is_err();
+        let result = GitWriter::delete_branch(p.to_str().unwrap(), "trunk2", true);
+        std::fs::set_permissions(&head, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        assert!(read_fails, "precondition: the remote-HEAD read must fail");
+        assert!(
+            result.is_err() && branch_exists(p, "trunk2"),
+            "force-deleted the default branch after a failed remote-HEAD read: {result:?}"
+        );
+    }
+
+    /// A refused `symbolic-ref HEAD` read is not "HEAD is detached": the
+    /// rebase would skip `branch -f` and report success with HEAD detached.
+    #[test]
+    fn a_rebase_does_not_treat_a_failed_head_read_as_detached() {
+        let dir = repo_on("main");
+        let p = dir.path();
+        let c1 = commit_file(p, "a.txt");
+        commit_file(p, "b.txt");
+        let c3 = commit_file(p, "c.txt");
+
+        let result = crate::engine::git_cli::with_forced_spawn_failure_of("symbolic-ref", || {
+            GitWriter::execute_rebase_sequence(
+                p.to_str().unwrap(),
+                &c1,
+                &[RebaseStep {
+                    commit_id: c3.clone(),
+                    action: RebaseActionKind::Pick,
+                }],
+            )
+        });
+
+        let on_branch = git_text(p, &["symbolic-ref", "--quiet", "HEAD"]).is_ok();
+        assert!(
+            result.is_err(),
+            "a failed HEAD read let the rebase report {result:?}"
+        );
+        assert!(on_branch, "HEAD was left detached");
+        assert_eq!(rev(p, "refs/heads/main"), c3, "main must not have moved");
+    }
+
+    /// Same class for restack: a refused HEAD read must stop it before the
+    /// rebase starts, not be read as "no branch to restore".
+    #[test]
+    fn a_restack_does_not_treat_a_failed_head_read_as_detached() {
+        let dir = repo_on("main");
+        let p = dir.path();
+        git_in(p, &["checkout", "-q", "-b", "feature"]);
+        let tip = commit_file(p, "f.txt");
+        git_in(p, &["checkout", "-q", "main"]);
+        commit_file(p, "m.txt");
+        let main_tip = rev(p, "main");
+
+        let result = crate::engine::git_cli::with_forced_spawn_failure_of("symbolic-ref", || {
+            GitWriter::execute_restack(p, "feature", "main", &main_tip)
+        });
+
+        assert!(
+            result.is_err(),
+            "a failed HEAD read let the restack report {result:?}"
+        );
+        assert_eq!(
+            rev(p, "refs/heads/feature"),
+            tip,
+            "feature must not have moved"
+        );
+        assert!(
+            git_text(p, &["symbolic-ref", "--quiet", "HEAD"]).is_ok(),
+            "HEAD was left detached"
+        );
+    }
+
+    /// The identity shown (and checked) is the one a commit records: git
+    /// prefers `GIT_AUTHOR_*` to `user.*`, so the environment wins here too.
+    #[test]
+    fn the_environment_outranks_config_for_the_identity_as_it_does_in_git() {
+        let dir = repo_on("main");
+        let p = dir.path();
+        git_in(p, &["config", "user.name", "Config Name"]);
+        git_in(p, &["config", "user.email", "config@example.test"]);
+        let env = |name: &str| match name {
+            "GIT_AUTHOR_NAME" | "GIT_COMMITTER_NAME" => Some("Env Name".to_string()),
+            "GIT_AUTHOR_EMAIL" | "GIT_COMMITTER_EMAIL" => Some("env@example.test".to_string()),
+            _ => None,
+        };
+        let ours = GitWriter::identity_with(p, &env).unwrap();
+
+        let git_var = std::process::Command::new("git")
+            .args(["var", "GIT_AUTHOR_IDENT"])
+            .current_dir(p)
+            .env("GIT_AUTHOR_NAME", "Env Name")
+            .env("GIT_AUTHOR_EMAIL", "env@example.test")
+            .env("GIT_COMMITTER_NAME", "Env Name")
+            .env("GIT_COMMITTER_EMAIL", "env@example.test")
+            .output_locked()
+            .unwrap();
+        let ident = String::from_utf8_lossy(&git_var.stdout).to_string();
+        assert!(
+            ident.starts_with(&format!(
+                "{} <{}>",
+                ours.name.as_deref().unwrap(),
+                ours.email.as_deref().unwrap()
+            )),
+            "identity {ours:?} is not what git records: {ident}"
+        );
+        assert_eq!(ours.name.as_deref(), Some("Env Name"));
+        assert_eq!(ours.email.as_deref(), Some("env@example.test"));
     }
 }
