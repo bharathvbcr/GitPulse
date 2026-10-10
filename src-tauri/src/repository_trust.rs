@@ -2784,13 +2784,14 @@ mod tests {
             scope.spawn(move || {
                 done_tx.send(revoke_at(root, path)).unwrap();
             });
-            assert!(
-                done_rx
-                    .recv_timeout(std::time::Duration::from_millis(400))
-                    .is_err(),
-                "a revoke ran while a migration held the store lock"
-            );
-            release_tx.send(()).unwrap();
+            let waited = done_rx
+                .recv_timeout(std::time::Duration::from_millis(400))
+                .is_err();
+            // Released before asserting, so a failure cannot leave the holder
+            // thread blocked and hang the scope.
+            let released = release_tx.send(());
+            assert!(waited, "a revoke ran while a migration held the store lock");
+            released.unwrap();
             done_rx
                 .recv_timeout(std::time::Duration::from_secs(10))
                 .expect("the revoke finishes once the lock is free")

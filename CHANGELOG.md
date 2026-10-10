@@ -11,6 +11,39 @@ before that tag is pushed.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Store reliability.** The ledger no longer caches a failed open for the
+  process lifetime, holds one lock per repository instead of one for every
+  repository across its IO, reopens a database whose `.devcouncil/` was deleted,
+  takes an IMMEDIATE transaction for every multi-statement write (fleet metrics,
+  languages and history are one), and validates action names against the event
+  schema. `gitpulse_status`, `gitpulse_ledger_events` and the ledger resource
+  open the ledger read-only (no DDL, no chmod, no legacy consolidation); the
+  resource pages like the tool, returns `next_cursor`, and `truncated` is exact.
+  URL userinfo that is a bare token, or a password containing `/` or `@`, is
+  redacted. Reflog catch-up dedups with one indexed query against redacted
+  identities and stops when it cannot read what is recorded. The instance
+  mailbox releases a handler's slot even when the handler panics.
+  Security impact: redaction only removes more; binding resolution still
+  enforces a legacy sibling binding, now through a read-only connection.
+- **Profile durability.** Repository-trust grant, revoke and migration take one
+  directory lock and move records with a no-replace link, closing a window in
+  which a migration could undo a revoke (no access widened). The churn cache
+  deletes its database only when it is not a database or is corrupt, not on a
+  transient busy error. Startup re-registers a hygiene or launch-at-login
+  LaunchAgent that still starts a moved or replaced app (never a translocated
+  path). DevCouncil's dc-store now upgrades the workbench profile only on a
+  write and after an online backup; this lands here when that change is
+  re-vendored.
+- **Task MCP retries.** `gitpulse_complete_task`, `gitpulse_delete_task` and
+  `gitpulse_merge_tasks` recognise their own earlier work before comparing
+  `expected_revision`, so an identical retry is `unchanged` and an interrupted
+  delete or merge (including one started from the board) finishes. A task with
+  more than 25 related open tasks can be filed: `reviewed_related` takes up to
+  500 ids and a refusal names 25 at a time. A server timeout says the work may
+  still finish and a write's outcome is unknown.
+
 ### Changed
 
 - CI now fails when a vendored crate is edited in this repository, through the
