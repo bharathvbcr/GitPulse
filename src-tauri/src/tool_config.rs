@@ -500,6 +500,52 @@ where
     }))
 }
 
+/// The host-load sensor's kill switch (`host_load.enabled`).
+///
+/// On unless the user turns it off. The sampler publishes the value in every
+/// snapshot it writes, so hooks and other GitPulse processes learn it from
+/// `host-load.v1` without ever reading this file, and a flip reaches them on
+/// the next tick. Off still publishes — a heartbeat with no readings — so
+/// "switched off" never reads as "no sampler".
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct HostLoadSettings {
+    #[serde(default = "host_load_enabled_default")]
+    pub enabled: bool,
+}
+
+fn host_load_enabled_default() -> bool {
+    true
+}
+
+impl Default for HostLoadSettings {
+    fn default() -> Self {
+        Self { enabled: true }
+    }
+}
+
+impl HostLoadSettings {
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+/// Read leniently, like `lappi`: a malformed block keeps the default (on)
+/// and says so, rather than costing every other setting in the file.
+fn lenient_host_load<'de, D>(deserializer: D) -> Result<HostLoadSettings, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = serde_json::Value::deserialize(deserializer)?;
+    Ok(serde_json::from_value(raw).unwrap_or_else(|error| {
+        log::warn!(
+            target: "tool_config",
+            "ignoring unreadable host_load block, the sensor stays on: {error}"
+        );
+        HostLoadSettings::default()
+    }))
+}
+
 /// Whether merging an agent attempt's commits needs a recorded review
 /// (`docs/AGENT_OUTPUT_REVIEW.md`): a host-wide default, and a per-repository
 /// override keyed by the repository's canonical common Git directory, so every
@@ -607,6 +653,13 @@ pub struct ToolConfig {
         skip_serializing_if = "ReviewGateSettings::is_default"
     )]
     pub review_gate: ReviewGateSettings,
+    /// The host-load sensor's kill switch.
+    #[serde(
+        default,
+        deserialize_with = "lenient_host_load",
+        skip_serializing_if = "HostLoadSettings::is_default"
+    )]
+    pub host_load: HostLoadSettings,
     /// Top-level keys this build does not know, written back as they were
     /// read. Without this, saving any setting here would delete what a newer
     /// build stored, so moving between versions would quietly cost settings.
@@ -626,6 +679,7 @@ impl Default for ToolConfig {
             agent_launch: StoredAgentLaunch::default(),
             lappi: LappiSettings::default(),
             review_gate: ReviewGateSettings::default(),
+            host_load: HostLoadSettings::default(),
             unknown: serde_json::Map::new(),
         }
     }
@@ -1141,6 +1195,22 @@ pub fn set_review_gate(common_dir: Option<&str>, enabled: Option<bool>) -> Resul
     Ok(())
 }
 
+/// The stored host-load switch, or the default (on).
+///
+/// An unreadable file is "on": the sensor only measures and publishes, and a
+/// broken config must not be what silently blinds every consumer of it. The
+/// read error is surfaced through [`view`].
+pub fn host_load_settings() -> HostLoadSettings {
+    load().map(|cfg| cfg.host_load).unwrap_or_default()
+}
+
+pub fn set_host_load_settings(next: HostLoadSettings) -> Result<(), String> {
+    let mut cfg = load()?;
+    cfg.host_load = next;
+    save(&cfg)?;
+    Ok(())
+}
+
 pub fn set_lappi_settings(next: LappiSettings) -> Result<(), String> {
     let mut cfg = load()?;
     cfg.lappi = next;
@@ -1249,6 +1319,39 @@ mod tests {
                 serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap();
             assert_eq!(stored["review_gate"]["default_on"], "yes please");
             assert!(review_gate_enabled("/repo/.git").is_err());
+        });
+    }
+
+    /// The host-load kill switch is on until turned off, is written only
+    /// when it differs from that, and a malformed block degrades to on
+    /// without costing the file's other settings.
+    #[test]
+    fn the_host_load_switch_is_on_by_default_and_survives_a_malformed_block() {
+        with_temp_config(|path| {
+            assert!(host_load_settings().enabled, "on by default");
+            set_host_load_settings(HostLoadSettings { enabled: false }).unwrap();
+            invalidate_cache();
+            assert!(!host_load_settings().enabled);
+            let stored: serde_json::Value =
+                serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap();
+            assert_eq!(stored["host_load"]["enabled"], false);
+            set_host_load_settings(HostLoadSettings::default()).unwrap();
+            let stored: serde_json::Value =
+                serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap();
+            assert!(
+                stored.get("host_load").is_none(),
+                "the default is not written"
+            );
+
+            write_raw(
+                path,
+                r#"{"version":1,"devmap":{"binary":"/tmp/fake"},"host_load":{"enabled":"nope"}}"#,
+            );
+            assert!(host_load_settings().enabled);
+            assert_eq!(
+                load().map(|c| c.devmap.binary).unwrap_or_default(),
+                Some("/tmp/fake".to_owned())
+            );
         });
     }
 

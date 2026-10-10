@@ -13,8 +13,8 @@
  *   (c) a shared field whose normalized wire type or backend-required
  *       presence no longer agrees.
  *
- * SCOPE: see CONTRACTS below for exactly what is checked — 83 contracts over
- * 211 structs, spanning both wire surfaces: command returns and event payloads.
+ * SCOPE: see CONTRACTS below for exactly what is checked — 89 contracts over
+ * 230 structs, spanning both wire surfaces: command returns and event payloads.
  * Enums are still skipped here and covered separately, by
  * scripts/enum-variant-contract.test.ts. That is most, not all, of the named types crossing the IPC
  * boundary: the ones still missing declare their TypeScript interface inside a
@@ -208,6 +208,16 @@ export const CONTRACTS = Object.freeze([
   { label: "session-alert-settings", rustPath: rust("tool_config.rs"), tsPath: ts("stores", "sessionAlertsStore.ts"), structs: ["SessionAlertSettings"] },
   { label: "lappi", rustPath: rust("lappi", "mod.rs"), tsPath: ts("stores", "lappiStore.ts"), structs: ["LappiView"] },
   { label: "lappi-store", rustPath: rust("lappi", "record.rs"), tsPath: ts("stores", "lappiStore.ts"), structs: ["StoreStatus"] },
+  // Host load (`sysload`). Health reads these to say how much memory agents
+  // use and whether the sampler is alive; a renamed field would read as
+  // undefined, and an undefined footprint or tick count renders as nothing at
+  // all — the "could not look" that must never pass for "nothing there".
+  { label: "host-load-sampler", rustPath: rust("sysload", "sampler.rs"), tsPath: ts("stores", "hostLoadStore.ts"), structs: ["HostLoadStatus", "HostLoadPulse"] },
+  { label: "host-load-sensor", rustPath: rust("sysload.rs"), tsPath: ts("stores", "hostLoadStore.ts"), structs: ["SensorReport", "Clock"] },
+  { label: "host-load-snapshot", rustPath: rust("sysload", "snapshot.rs"), tsPath: ts("stores", "hostLoadStore.ts"), structs: ["Snapshot", "WriterIdentity", "TickStats"] },
+  { label: "host-load-readings", rustPath: rust("sysload", "sensor.rs"), tsPath: ts("stores", "hostLoadStore.ts"), structs: ["HostSample", "Compressor", "CompressorDelta", "Cores"] },
+  { label: "host-load-processes", rustPath: rust("sysload", "procscan.rs"), tsPath: ts("stores", "hostLoadStore.ts"), structs: ["ProcView", "AgentSession", "LaunchedTree", "ForeignProcess", "Orphan", "MemguardHealth", "SessionCount"] },
+  { label: "host-load-settings", rustPath: rust("tool_config.rs"), tsPath: ts("stores", "hostLoadStore.ts"), structs: ["HostLoadSettings"] },
   // What an agent CLI starts with in a terminal tab, and which modes this
   // build can expand. `modes` and `launchers` are what the chooser renders, so
   // a renamed field would empty the chooser rather than fail — leaving a panel
@@ -390,6 +400,14 @@ function normalizeRustType(type) {
   if (/^(?:u|i)(?:8|16|32|64|128|size)$/.test(compact) || /^(?:f32|f64)$/.test(compact)) {
     return "number";
   }
+  // A generic wire type (`Reading<u64>`) is its name with each argument read
+  // the same way, so `Reading<u64>` and TypeScript's `Reading<number>` meet.
+  // Without this no field of a generic type could ever agree with its twin.
+  const generic = /^((?:[A-Za-z_]\w*::)*[A-Za-z_]\w*)<(.*)>$/.exec(compact);
+  if (generic) {
+    const args = splitTopLevel(generic[2], ",").map(normalizeRustType);
+    return `${stripTypePath(generic[1])}<${args.join(",")}>`;
+  }
   // `crate::graph::RefDecoration` and `RefDecoration` are one wire type; serde
   // never writes a struct's path, and TypeScript has no notion of one. Keeping
   // the qualifier made every cross-module field read as drift, which is why
@@ -457,6 +475,20 @@ function normalizeTsType(type) {
   // `Record<string, V>` and `{ [key: string]: V }` are the same JSON object.
   const record = /^Record<string,(.*)>$/.exec(compact) ?? /^\{\[\w+:string\]:(.*?);?\}$/.exec(compact);
   if (record) return `Record<string,${normalizeTsType(record[1])}>`;
+  // A tuple of one element type is the JSON array a Rust `[T; N]` writes:
+  // `[number, number, number]` is `[f64; 3]`. A mixed tuple stays a tuple.
+  const tuple = /^\[(.+)\]$/.exec(compact);
+  if (tuple) {
+    const elements = splitTopLevel(tuple[1], ",").map(normalizeTsType);
+    if (elements.every((element) => element === elements[0])) return `${elements[0]}[]`;
+    return `[${elements.join(",")}]`;
+  }
+  // A generic wire type, argument by argument, as on the Rust side.
+  const generic = /^([A-Za-z_]\w*)<(.*)>$/.exec(compact);
+  if (generic) {
+    const args = splitTopLevel(generic[2], ",").map(normalizeTsType);
+    return `${generic[1]}<${args.join(",")}>`;
+  }
   if (compact === "string" || compact === "boolean" || compact === "number" || compact === "null" || compact === "undefined") {
     return compact;
   }

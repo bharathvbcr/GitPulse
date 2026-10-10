@@ -73,6 +73,7 @@
   import SessionAlertSettings from "./SessionAlertSettings.svelte";
   import AgentDefaultsSettings from "./AgentDefaultsSettings.svelte";
   import LappiSettings from "./LappiSettings.svelte";
+  import HostLoadSetting from "./HostLoadSetting.svelte";
   import AgentLimitSetting from "./AgentLimitSetting.svelte";
   import { DEFAULT_LIVE_RUNS, MAX_LIVE_RUNS } from "../workbench/vocabulary";
   import { DEFAULT_TERMINAL_SESSIONS, MAX_TERMINAL_SESSIONS } from "../terminal/sessionLimit";
@@ -1140,6 +1141,9 @@
                 </div>
                 <div class="border-border/70 mt-3 border-t pt-3" data-setting="lappi" hidden={!shown("lappi")}>
                   <LappiSettings active={isOpen && activeSection === "agents"} />
+                </div>
+                <div class="border-border/70 mt-3 border-t pt-3" data-setting="host-load" hidden={!shown("host-load")}>
+                  <HostLoadSetting active={isOpen && activeSection === "agents"} />
                 </div>
                 <div data-setting="mcp-plugin" hidden={!shown("mcp-plugin")}>
                   <p class="text-textMuted text-[10px] leading-snug mb-2">

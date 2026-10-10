@@ -675,7 +675,9 @@ mod imp {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sysload::sensor::{Reading, Why};
+    use crate::sysload::sensor::Reading;
+    #[cfg(not(target_os = "macos"))]
+    use crate::sysload::sensor::Why;
 
     #[test]
     fn boot_ids_hash_stably_and_never_to_the_unknown_value() {
