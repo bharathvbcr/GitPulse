@@ -232,6 +232,16 @@ pub struct Lease {
     pub released_at: Option<String>,
 }
 
+/// How [`Store::observe_leases`] judged one active row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LeaseState {
+    Live,
+    /// Past its expiry; a writing call would mark it stale.
+    Expired,
+    /// The stored `expires_at` is not a timestamp; carries it as stored.
+    BadExpiry(String),
+}
+
 /// What a caller supplies when acquiring.
 #[derive(Debug, Clone, Default)]
 pub struct AcquireRequest {
@@ -254,6 +264,11 @@ pub struct Store {
     /// Injected clock, in whole seconds since the epoch. Tests drive expiry
     /// without sleeping.
     now_fn: Option<Box<dyn Fn() -> i64 + Send + Sync>>,
+    /// Whether a workbench request may upgrade an older profile's schema.
+    /// True by default; a host that must never be the one to move a shared
+    /// profile forward (a read-only server, a daemon) clears it with
+    /// [`Store::refuse_workbench_upgrades`].
+    workbench_upgrades: bool,
 }
 
 impl std::fmt::Debug for Store {
@@ -303,6 +318,53 @@ impl Store {
         Self::prepare(conn)
     }
 
+    /// Opens a store that must already exist, for reading only.
+    ///
+    /// `SQLITE_OPEN_READ_ONLY`: no DDL, no WAL switch, no column additions and
+    /// no lease sweep, so a view of the store can never change it or contend
+    /// for its write lock. The schema is checked by reading, not repaired: a
+    /// store this build cannot read reports that rather than being migrated by
+    /// a reader. Writing methods fail with `SQLITE_READONLY`.
+    pub fn open_readonly(path: impl AsRef<Path>) -> Result<Self> {
+        let path = path.as_ref();
+        if !path.exists() {
+            return Err(StoreError::MissingDatabase {
+                path: path.display().to_string(),
+            });
+        }
+        let conn = Connection::open_with_flags(
+            path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .map_err(|e| match e {
+            rusqlite::Error::SqliteFailure(f, _) if f.code == rusqlite::ErrorCode::CannotOpen => {
+                StoreError::MissingDatabase {
+                    path: path.display().to_string(),
+                }
+            }
+            other => StoreError::Sql(other),
+        })?;
+        conn.busy_timeout(BUSY_TIMEOUT)?;
+        let known: Option<u32> = conn
+            .query_row(
+                "SELECT version FROM schema_version WHERE id = 'singleton'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(found) = known.filter(|found| *found > SCHEMA_VERSION) {
+            return Err(StoreError::SchemaTooNew {
+                found,
+                known: SCHEMA_VERSION,
+            });
+        }
+        Ok(Store {
+            conn,
+            now_fn: None,
+            workbench_upgrades: false,
+        })
+    }
+
     /// Opens an in-memory store, for tests.
     pub fn open_in_memory() -> Result<Self> {
         Self::prepare(Connection::open_in_memory()?)
@@ -338,7 +400,20 @@ impl Store {
                 StoreError::SchemaVersion { detail }
             }
         })?;
-        Ok(Store { conn, now_fn: None })
+        Ok(Store {
+            conn,
+            now_fn: None,
+            workbench_upgrades: true,
+        })
+    }
+
+    /// Stops this handle from upgrading an older workbench profile. A request
+    /// that would need the upgrade fails with `schema_upgrade_required` and
+    /// leaves the profile untouched, so only the host that owns the profile
+    /// (the desktop app) ever moves its schema forward — and an older app,
+    /// MCP server or sidecar that shares it is never locked out by a reader.
+    pub fn refuse_workbench_upgrades(&mut self) {
+        self.workbench_upgrades = false;
     }
 
     /// Replaces the clock. Tests use this to move past a TTL instantly.
@@ -558,6 +633,38 @@ impl Store {
                 row_to_lease,
             )
             .optional()?)
+    }
+
+    /// Every row still marked active, with its expiry judged in memory.
+    ///
+    /// Unlike [`Store::active_leases`] this never writes: a lapsed lease is
+    /// reported as [`LeaseState::Expired`] and left as it is, and a lease whose
+    /// `expires_at` cannot be read is [`LeaseState::BadExpiry`] for that row
+    /// alone instead of failing the whole listing. Safe on a read-only handle.
+    pub fn observe_leases(&self) -> Result<Vec<(Lease, LeaseState)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, task_id, owner, agent, client_id, run_id, branch,
+                    lease_token, status, created_at, expires_at, released_at
+             FROM task_leases WHERE status = 'active' ORDER BY task_id",
+        )?;
+        let leases = stmt
+            .query_map([], row_to_lease)?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let now = self.now_epoch();
+        Ok(leases
+            .into_iter()
+            .map(|lease| {
+                let state = match lease.expires_at.as_deref() {
+                    None => LeaseState::Live,
+                    Some(expires) => match parse_iso_utc(expires) {
+                        Some(epoch) if now > epoch => LeaseState::Expired,
+                        Some(_) => LeaseState::Live,
+                        None => LeaseState::BadExpiry(expires.to_string()),
+                    },
+                };
+                (lease, state)
+            })
+            .collect())
     }
 
     /// Every currently-live lease, with expiry applied.

@@ -128,6 +128,20 @@ impl Entity {
 }
 
 impl Store {
+    /// Brings the workbench profile to this build's schema, taking the online
+    /// backup first. The explicit path for the host that owns the profile (the
+    /// desktop app, at startup): a read never upgrades, and a handle that
+    /// called [`Store::refuse_workbench_upgrades`] refuses this too.
+    pub fn upgrade_workbench_profile(&self) -> Result<UpgradeReport> {
+        if !self.workbench_upgrades {
+            return Err(Error {
+                code: "schema_upgrade_required",
+                message: "this host does not upgrade a shared workbench profile".into(),
+            });
+        }
+        ensure_schema(&self.conn, true)
+    }
+
     /// Shared CLI/served boundary for the workbench. The Go host supplies a
     /// distinct profile database; no task operation reads or changes repo leases.
     pub fn workbench_request(&self, method: &str, raw: &str) -> Result<String> {
@@ -169,6 +183,7 @@ impl Store {
                 | "decisions.claim"
                 | "decisions.resolve"
                 | "store.compact"
+                | "store.upgrade"
         );
         if !writing
             && !matches!(
@@ -203,7 +218,9 @@ impl Store {
                 message: format!("unknown workbench method {method}"),
             });
         }
-        ensure_schema(&self.conn)?;
+        // Reads never upgrade a profile; a write upgrades it only when this
+        // handle may, and only after an online backup.
+        let upgraded = ensure_schema(&self.conn, writing && self.workbench_upgrades)?;
         let behavior = if writing {
             TransactionBehavior::Immediate
         } else {
@@ -212,7 +229,16 @@ impl Store {
         let tx = Transaction::new_unchecked(&self.conn, behavior)?;
         let result = if writing {
             let now_ms = self.workbench_now_millis()?;
-            if method == "store.compact" {
+            if method == "store.upgrade" {
+                // The upgrade already ran, with its backup, above; this
+                // reports it. It commits no event, like `store.compact`.
+                input.fields(&[])?;
+                self.conn.query_row(
+                    "SELECT json_object('ok',json('true'),'item',json_object('id','schema','revision',?1,'from',?2,'to',?1,'upgraded',json(CASE WHEN ?2>0 AND ?2<?1 THEN 'true' ELSE 'false' END),'backup',?3))",
+                    params![upgraded.to, upgraded.from, upgraded.backup],
+                    |r| r.get(0),
+                )?
+            } else if method == "store.compact" {
                 compaction::compact(&input, now_ms / 1000)?
             } else {
                 mutate(&input, method, now_ms / 1000, now_ms)?
@@ -255,7 +281,55 @@ impl Store {
     }
 }
 
-fn ensure_schema(conn: &Connection) -> Result<()> {
+/// Copies the profile to `<profile>.pre-schema-<version>.bak` with SQLite's
+/// own `VACUUM INTO` before the first migration step, so an upgrade — which
+/// older hosts cannot undo by refusing the profile — can be rolled back by
+/// restoring the copy. An in-memory profile has nothing to lose. A backup that
+/// cannot be made refuses the upgrade; one already made for this version (an
+/// earlier, interrupted upgrade) is kept, not overwritten.
+fn backup_before_upgrade(conn: &Connection, version: i64) -> Result<Option<String>> {
+    let Some(path) = conn.path().filter(|path| !path.is_empty()) else {
+        return Ok(None);
+    };
+    let backup = std::path::PathBuf::from(format!("{path}.pre-schema-{version}.bak"));
+    if backup.exists() {
+        return Ok(Some(backup.display().to_string()));
+    }
+    let fail = |detail: String| Error {
+        code: "backup_failed",
+        message: format!(
+            "the workbench profile is at schema {version} and cannot be upgraded to {WORKBENCH_SCHEMA} \
+             because its backup {} could not be written: {detail}",
+            backup.display()
+        ),
+    };
+    let partial = backup.with_extension("bak.partial");
+    let _ = std::fs::remove_file(&partial);
+    let target = partial
+        .to_str()
+        .ok_or_else(|| fail("the path is not UTF-8".into()))?;
+    conn.execute("VACUUM INTO ?1", [target])
+        .map_err(|error| fail(error.to_string()))?;
+    std::fs::rename(&partial, &backup).map_err(|error| fail(error.to_string()))?;
+    Ok(Some(backup.display().to_string()))
+}
+
+/// What [`Store::upgrade_workbench_profile`] did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UpgradeReport {
+    /// The schema the profile was at; 0 when this call created it.
+    pub from: i64,
+    pub to: i64,
+    /// The online backup taken before the first step, when there was one.
+    pub backup: Option<String>,
+}
+
+fn ensure_schema(conn: &Connection, may_upgrade: bool) -> Result<UpgradeReport> {
+    let mut report = UpgradeReport {
+        from: 0,
+        to: WORKBENCH_SCHEMA,
+        backup: None,
+    };
     conn.pragma_update(None, "foreign_keys", true)?;
     let foreign_keys: bool = conn.pragma_query_value(None, "foreign_keys", |r| r.get(0))?;
     if !foreign_keys {
@@ -269,6 +343,9 @@ fn ensure_schema(conn: &Connection) -> Result<()> {
         [],
         |r| r.get(0),
     )?;
+    // A profile this call creates holds nothing to protect and has nothing to
+    // refuse: it is built and brought to the current schema whoever asked.
+    let mut created = false;
     if !exists {
         let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
         let exists: bool = conn.query_row(
@@ -278,11 +355,27 @@ fn ensure_schema(conn: &Connection) -> Result<()> {
         )?;
         if !exists {
             conn.execute_batch(SCHEMA)?;
+            created = true;
         }
         tx.commit()?;
     }
     let mut version: i64 =
         conn.query_row("SELECT version FROM work_meta WHERE id=1", [], |r| r.get(0))?;
+    if !created {
+        report.from = version;
+    }
+    if version < WORKBENCH_SCHEMA && !created {
+        if !may_upgrade {
+            return Err(Error {
+                code: "schema_upgrade_required",
+                message: format!(
+                    "workbench schema {version} must be upgraded to {WORKBENCH_SCHEMA} before this request, \
+                     and this host does not upgrade a shared profile; open the desktop app once to upgrade it"
+                ),
+            });
+        }
+        report.backup = backup_before_upgrade(conn, version)?;
+    }
     if version == 1 {
         let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
         version = conn.query_row("SELECT version FROM work_meta WHERE id=1", [], |r| r.get(0))?;
@@ -401,7 +494,7 @@ fn ensure_schema(conn: &Connection) -> Result<()> {
         });
     }
     ensure_index(conn, MEMBER_INDEX, MEMBER_INDEX_SQL)?;
-    Ok(())
+    Ok(report)
 }
 
 /// Lets a workspace's membership join check `deleted` and read `position`
@@ -578,9 +671,16 @@ fn mutate(input: &Input<'_>, method: &str, now: i64, now_ms: i64) -> Result<Stri
             Affected::none()
         }
         _ => {
-            input.fields(&["request_id", "id", "expected_revision"])?;
+            input.fields(&["request_id", "id", "expected_revision", "even_if_running"])?;
             if current.is_none() {
                 return Err(Error::missing());
+            }
+            // Every entry point to a task delete — the board's raw delete, an
+            // agent's tool, a merge — meets the same refusal here, in the
+            // transaction that deletes, rather than each host checking first
+            // and racing a run that prepares in between.
+            if matches!(entity, Entity::Item) && !input.boolean("even_if_running", false)? {
+                refuse_live_runs(input, &id, now)?;
             }
             delete(input, entity, &id, revision, now)?
         }
@@ -596,6 +696,27 @@ fn mutate(input: &Input<'_>, method: &str, now: i64, now_ms: i64) -> Result<Stri
         params![request, method, normalized, response],
     )?;
     Ok(response)
+}
+
+/// Refuses to delete a task a run may still be working on: one that is
+/// starting, running or unresolved, or prepared and not yet expired.
+fn refuse_live_runs(input: &Input<'_>, id: &str, now: i64) -> Result<()> {
+    let (live, first): (i64, Option<String>) = input.conn.query_row(
+        "SELECT count(*), min(id) FROM work_runs
+         WHERE task_id=?1 AND (state IN ('starting','running','unresolved') OR (state='prepared' AND expires_at>?2))",
+        params![id, now],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    if live > 0 {
+        return Err(Error {
+            code: "task_in_use",
+            message: format!(
+                "task {id} has {live} run(s) that may still be working on it (for example {}); pass even_if_running to delete it anyway",
+                first.unwrap_or_default()
+            ),
+        });
+    }
+    Ok(())
 }
 
 fn record_change(
@@ -862,7 +983,29 @@ fn put_item(input: &Input<'_>, id: &str, revision: i64, now: i64, now_ms: i64) -
         "archived",
         "checklist",
         "links",
+        "scan_sequence",
     ])?;
+    // Optimistic guard for a host that decided to create this task from a scan
+    // of the board (the related-task check): when it passes the newest event
+    // sequence it scanned at, a creation after the board has changed since is
+    // refused, so the scan and the write are one decision. Other edits of the
+    // same board also trip it; the host rescans and retries.
+    if revision == 1 && input.kind("scan_sequence")?.is_some() {
+        let scanned = input.integer("scan_sequence", Some(0), MAX_INTEGER)?;
+        let moved: i64 = input.conn.query_row(
+            "SELECT count(*) FROM work_events WHERE sequence>?1 AND kind IN ('items.put','items.delete','items.restore')",
+            [scanned],
+            |r| r.get(0),
+        )?;
+        if moved > 0 {
+            return Err(Error {
+                code: "board_changed",
+                message: format!(
+                    "{moved} task change(s) were recorded after sequence {scanned}; scan the board again before creating this task"
+                ),
+            });
+        }
+    }
     enhancements::locks(input, "locked_fields")?;
     input.text("logs", input::MAX_LOGS_BYTES)?;
     let title = input.required_text("title", 1200)?;
@@ -1598,7 +1741,13 @@ fn list_events(input: &Input<'_>) -> Result<String> {
     )?;
     let mut stmt=input.conn.prepare("SELECT json_object('sequence',sequence,'kind',kind,'entity_id',entity_id,'revision',revision,'at',at,'payload',json(payload)),sequence,'' FROM work_events WHERE sequence>?1 ORDER BY sequence LIMIT ?2")?;
     let rows = collect_page(&mut stmt.query(params![after, limit + 1])?, limit)?;
-    series_response(input.conn, rows, total, after)
+    let page = series_response(input.conn, rows, total, after)?;
+    // The high-water mark, so a host can name "the board as I scanned it".
+    Ok(input.conn.query_row(
+        "SELECT json_set(?1,'$.latest_sequence',(SELECT coalesce(max(sequence),0) FROM work_events))",
+        [page],
+        |r| r.get(0),
+    )?)
 }
 
 fn history(input: &Input<'_>) -> Result<String> {

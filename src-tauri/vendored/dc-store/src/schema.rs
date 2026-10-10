@@ -417,7 +417,7 @@ pub fn ensure_gap_output_columns(conn: &Connection) -> rusqlite::Result<()> {
     Ok(())
 }
 
-fn gaps_has_column(conn: &Connection, name: &str) -> rusqlite::Result<bool> {
+pub(crate) fn gaps_has_column(conn: &Connection, name: &str) -> rusqlite::Result<bool> {
     let mut stmt = conn.prepare("PRAGMA table_info(gaps)")?;
     let mut rows = stmt.query([])?;
     while let Some(row) = rows.next()? {

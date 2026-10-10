@@ -79,6 +79,7 @@
       "work.scan.gaps",
       "work.scan.get",
       "work.store.compact",
+      "work.store.upgrade",
       "work.tasks.suggest",
       "work.verify.get",
       "work.verify.task",

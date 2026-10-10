@@ -515,6 +515,16 @@ pub fn gap_history_list(
 /// Lists gaps, optionally filtered by task. Cap + truncate flag as evidence.
 pub fn gaps_list(conn: &Connection, task_id: Option<&str>) -> Result<(Vec<GapRow>, bool)> {
     let limit = (MAX_LIST_ROWS + 1) as i64;
+    // A read-only handle cannot add the two output columns a long-lived store
+    // may lack, so a missing column reads as absent rather than failing the
+    // whole list.
+    let output_columns = if crate::schema::gaps_has_column(conn, "stdout_path")?
+        && crate::schema::gaps_has_column(conn, "stderr_path")?
+    {
+        "stdout_path, stderr_path"
+    } else {
+        "NULL, NULL"
+    };
     let map_row = |row: &rusqlite::Row<'_>| {
         let blocking: i64 = row.get(8)?;
         Ok(GapRow {
@@ -537,23 +547,23 @@ pub fn gaps_list(conn: &Connection, task_id: Option<&str>) -> Result<(Vec<GapRow
         })
     };
     let rows: Vec<GapRow> = if let Some(tid) = task_id {
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare(&format!(
             "SELECT id, severity, gap_type, requirement_id, task_id, description, evidence_json,
                     recommended_fix, blocking, file, line, suggested_command,
                     acceptance_criterion_id, expected_verification_method,
-                    stdout_path, stderr_path
-             FROM gaps WHERE task_id = ?1 ORDER BY id LIMIT ?2",
-        )?;
+                    {output_columns}
+             FROM gaps WHERE task_id = ?1 ORDER BY id LIMIT ?2"
+        ))?;
         stmt.query_map(params![tid, limit], map_row)?
             .collect::<std::result::Result<Vec<_>, _>>()?
     } else {
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare(&format!(
             "SELECT id, severity, gap_type, requirement_id, task_id, description, evidence_json,
                     recommended_fix, blocking, file, line, suggested_command,
                     acceptance_criterion_id, expected_verification_method,
-                    stdout_path, stderr_path
-             FROM gaps ORDER BY id LIMIT ?1",
-        )?;
+                    {output_columns}
+             FROM gaps ORDER BY id LIMIT ?1"
+        ))?;
         stmt.query_map(params![limit], map_row)?
             .collect::<std::result::Result<Vec<_>, _>>()?
     };
