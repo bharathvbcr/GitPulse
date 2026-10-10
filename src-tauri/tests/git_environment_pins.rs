@@ -11,6 +11,7 @@ mod common;
 use common::{run_git, trust_repo};
 use gitpulse_lib::engine::{GitReader, GitWriter};
 use gitpulse_lib::graph::RefScope;
+use gitpulse_lib::procguard::LockedSpawn;
 use std::path::Path;
 use std::process::Command;
 use std::sync::Mutex;
@@ -36,7 +37,7 @@ fn head(dir: &Path) -> String {
     let out = Command::new("git")
         .args(["rev-parse", "HEAD"])
         .current_dir(dir)
-        .output()
+        .output_locked()
         .expect("git rev-parse");
     String::from_utf8_lossy(&out.stdout).trim().to_string()
 }
@@ -58,7 +59,7 @@ fn log_showsignature_never_reaches_a_commit_id() {
         .args(["-q", "-t", "ed25519", "-N", ""])
         .arg("-f")
         .arg(&key)
-        .output()
+        .output_locked()
         .expect("ssh-keygen is required to sign the fixture commit");
     assert!(keygen.status.success(), "ssh-keygen failed");
     run_git(dir.path(), &["config", "gpg.format", "ssh"]);
@@ -166,7 +167,7 @@ fn ambient_pathspec_switches_do_not_retarget_stage() {
     let cached = Command::new("git")
         .args(["diff", "--cached", "--name-only", "-z"])
         .current_dir(dir.path())
-        .output()
+        .output_locked()
         .expect("git diff --cached");
     assert_eq!(
         String::from_utf8_lossy(&cached.stdout).trim_end_matches('\0'),

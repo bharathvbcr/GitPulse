@@ -183,12 +183,21 @@ pub fn resolve_mainline_hint(
             .iter()
             .filter(|r| r.kind == RefKind::Local && r.name == name)
             .collect();
-        // Remote-tracking names carry the remote as their first segment.
         let remotes: Vec<&RefDecoration> = refs
             .iter()
             .filter(|r| {
+                // The owning remote was decided with the longest-prefix rule
+                // when the ref was listed (`team/fork` owns `team/fork/main`);
+                // the first segment is only the fallback for a decoration
+                // that carries none.
                 r.kind == RefKind::Remote
-                    && r.name.split_once('/').map(|(_, short)| short) == Some(name)
+                    && match r.remote.as_deref() {
+                        Some(remote) => r
+                            .name
+                            .strip_prefix(remote)
+                            .and_then(|rest| rest.strip_prefix('/')),
+                        None => r.name.split_once('/').map(|(_, short)| short),
+                    } == Some(name)
             })
             .collect();
         if locals.is_empty() && remotes.is_empty() {
@@ -3852,6 +3861,7 @@ mod tests {
 
     fn decoration(name: &str, kind: RefKind, commit_id: &str, is_head: bool) -> RefDecoration {
         RefDecoration {
+            remote: None,
             name: name.to_string(),
             kind,
             commit_id: commit_id.to_string(),
@@ -5624,6 +5634,7 @@ mod assemble_tests {
             kind: RefKind::Local,
             commit_id: "m0".to_string(),
             is_head: true,
+            remote: None,
         }]
     }
 

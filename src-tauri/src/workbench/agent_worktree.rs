@@ -48,7 +48,7 @@
 //! keeps a branch with commits, and a tree something still has open is kept.
 
 use super::WorkbenchError;
-use crate::engine::git_cli::{git_captured, resolve_git_common_dir, resolve_git_dir};
+use crate::engine::git_cli::{resolve_git_common_dir, resolve_git_dir};
 use crate::engine::worktree::{gitpulse_lane_container, GITPULSE_LANE_DIR as EXCLUDED};
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
@@ -130,24 +130,16 @@ fn main_checkout(selected: &Path) -> Result<PathBuf, WorkbenchError> {
 
 /// Whether `path` is already a worktree of this repository on `branch`.
 fn existing(selected: &Path, path: &Path, branch: &str) -> Result<bool, WorkbenchError> {
-    let run = git_captured(selected, &["worktree", "list", "--porcelain"])
-        .and_then(|r| r.require_complete("Worktree listing"))
-        .map_err(refused)?;
-    if run.status_code != 0 {
-        return Err(refused("Could not list this repository's worktrees."));
-    }
-    let text = String::from_utf8_lossy(&run.stdout);
+    let entries = crate::engine::worktree::read_worktree_entries(selected).map_err(refused)?;
     let wanted = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-    let mut here = false;
-    for line in text.lines() {
-        if let Some(entry) = line.strip_prefix("worktree ") {
-            let entry = Path::new(entry);
-            here = entry.canonicalize().unwrap_or_else(|_| entry.to_path_buf()) == wanted;
-        } else if here && line == format!("branch refs/heads/{branch}") {
-            return Ok(true);
-        }
-    }
-    Ok(false)
+    Ok(entries.iter().any(|entry| {
+        let listed = Path::new(&entry.path);
+        listed
+            .canonicalize()
+            .unwrap_or_else(|_| listed.to_path_buf())
+            == wanted
+            && entry.branch.as_deref() == Some(branch)
+    }))
 }
 
 /// The one naming rule: an attempt's worktree directory name, from the task

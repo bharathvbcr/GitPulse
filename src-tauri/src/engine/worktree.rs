@@ -64,16 +64,11 @@ pub fn resolve_worktree_family(
         ));
     }
 
-    // `-z` makes paths containing newlines unambiguous. IPC repository paths
-    // are UTF-8 strings, so an unrepresentable list entry cannot equal either
-    // validated input and is safely ignored.
-    let raw = git_text(&repo, &["worktree", "list", "--porcelain", "-z"])?;
+    // IPC repository paths are UTF-8 strings, so an unrepresentable list entry
+    // cannot equal either validated input and is safely ignored.
     let mut registered = Vec::new();
-    for field in raw.split('\0') {
-        let Some(path) = field.strip_prefix("worktree ") else {
-            continue;
-        };
-        let Ok(canonical) = std::fs::canonicalize(path) else {
+    for entry in read_worktree_entries(&repo)? {
+        let Ok(canonical) = std::fs::canonicalize(&entry.path) else {
             // Prunable entries are history, not active authority targets.
             continue;
         };
@@ -180,26 +175,48 @@ pub struct WorktreeInfo {
     pub scan_note: Option<String>,
 }
 
-/// One parsed block of `worktree list --porcelain`, before dirty counting.
+/// One parsed block of `worktree list --porcelain -z`, before dirty counting.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-struct ParsedWorktree {
-    path: String,
-    head: String,
-    branch: Option<String>,
-    is_bare: bool,
-    is_detached: bool,
-    is_locked: bool,
-    is_prunable: bool,
+pub(crate) struct ParsedWorktree {
+    pub(crate) path: String,
+    pub(crate) head: String,
+    pub(crate) branch: Option<String>,
+    pub(crate) is_bare: bool,
+    pub(crate) is_detached: bool,
+    pub(crate) is_locked: bool,
+    pub(crate) is_prunable: bool,
 }
 
-/// Parses `git worktree list --porcelain` output.
+/// Every worktree of `repo`, from `git worktree list --porcelain -z`.
 ///
-/// The format is newline-separated fields in blank-line-delimited blocks:
-/// `worktree <path>`, `HEAD <sha>`, one of `branch <ref>` / `detached`,
-/// optionally `bare`, `locked [reason]`, `prunable [reason]`. Unknown lines are
-/// skipped rather than rejected so a newer git can add fields without breaking
-/// this parser.
-fn parse_worktree_porcelain(raw: &str) -> Vec<ParsedWorktree> {
+/// The one reader of the worktree list: the listing, the checked-out-branch
+/// guards, the branch-cleanup plan and the agent-worktree reuse check all ask
+/// here. Without `-z` a path containing a newline split into two fields (the
+/// second read as an unknown line, or as a bogus entry), and a trailing space
+/// was trimmed into a different directory.
+pub(crate) fn read_worktree_entries(repo: &Path) -> Result<Vec<ParsedWorktree>, String> {
+    let run =
+        crate::engine::git_cli::git_captured(repo, &["worktree", "list", "--porcelain", "-z"])
+            .and_then(|run| run.require_complete("Worktree listing"))?;
+    if !run.success {
+        return Err(format!(
+            "Could not list this repository's worktrees: {}",
+            String::from_utf8_lossy(&run.stderr).trim()
+        ));
+    }
+    Ok(parse_worktree_porcelain_z(&String::from_utf8_lossy(
+        &run.stdout,
+    )))
+}
+
+/// Parses `git worktree list --porcelain -z` output.
+///
+/// Fields are NUL-terminated and a block ends with an empty field:
+/// `worktree <path>`, `HEAD <oid>`, one of `branch <ref>` / `detached`,
+/// optionally `bare`, `locked [reason]`, `prunable [reason]`. Unknown fields
+/// are skipped rather than rejected so a newer git can add some without
+/// breaking this parser. Values are taken verbatim: a path may end in a space.
+fn parse_worktree_porcelain_z(raw: &str) -> Vec<ParsedWorktree> {
     let mut out: Vec<ParsedWorktree> = Vec::new();
     let mut current: Option<ParsedWorktree> = None;
     let flush = |current: &mut Option<ParsedWorktree>, out: &mut Vec<ParsedWorktree>| {
@@ -210,74 +227,39 @@ fn parse_worktree_porcelain(raw: &str) -> Vec<ParsedWorktree> {
         }
     };
 
-    for line in raw.lines() {
-        let line = line.trim_end();
-        if line.is_empty() {
+    for field in raw.split('\0') {
+        if field.is_empty() {
             flush(&mut current, &mut out);
             continue;
         }
-        let Some((key, value)) = line.split_once(' ') else {
-            // A field with no payload ("detached" never appears alone, but a
-            // bare "locked" or "prunable" can).
-            match line {
-                "detached" => {
-                    if let Some(entry) = current.as_mut() {
-                        entry.is_detached = true;
-                    }
-                }
-                // `bare` carries no payload either.
-                "bare" => {
-                    if let Some(entry) = current.as_mut() {
-                        entry.is_bare = true;
-                    }
-                }
-                "locked" => {
-                    if let Some(entry) = current.as_mut() {
-                        entry.is_locked = true;
-                    }
-                }
-                "prunable" => {
-                    if let Some(entry) = current.as_mut() {
-                        entry.is_prunable = true;
-                    }
-                }
-                _ => {}
-            }
+        // A field with no payload ("detached", "bare", a bare "locked") has
+        // no space to split at.
+        let (key, value) = field.split_once(' ').unwrap_or((field, ""));
+        if key == "worktree" {
+            flush(&mut current, &mut out);
+            current = Some(ParsedWorktree {
+                path: value.to_string(),
+                ..ParsedWorktree::default()
+            });
+            continue;
+        }
+        let Some(entry) = current.as_mut() else {
             continue;
         };
         match key {
-            "worktree" => {
-                flush(&mut current, &mut out);
-                current = Some(ParsedWorktree {
-                    path: value.to_string(),
-                    ..ParsedWorktree::default()
-                });
-            }
-            "HEAD" => {
-                if let Some(entry) = current.as_mut() {
-                    entry.head = value.to_string();
-                }
-            }
+            "HEAD" => entry.head = value.to_string(),
             "branch" => {
-                if let Some(entry) = current.as_mut() {
-                    entry.branch = Some(value.trim_start_matches("refs/heads/").to_string());
-                }
+                entry.branch = Some(
+                    value
+                        .strip_prefix("refs/heads/")
+                        .unwrap_or(value)
+                        .to_string(),
+                )
             }
-            "bare" => {
-                if let Some(entry) = current.as_mut() {
-                    entry.is_bare = true;
-                }
-            }
-            "locked" => {
-                if let Some(entry) = current.as_mut() {
-                    entry.is_locked = true;
-                }
-            }
-            "prunable" => {
-                if let Some(entry) = current.as_mut() {
-                    entry.is_prunable = true;
-                }
-            }
+            "detached" => entry.is_detached = true,
+            "bare" => entry.is_bare = true,
+            "locked" => entry.is_locked = true,
+            "prunable" => entry.is_prunable = true,
             _ => {}
         }
     }
@@ -940,8 +922,7 @@ fn before_publish_hook() {
 /// One listing with no sharing: what [`list_worktrees_scanned`] runs.
 fn scan_listing(repo_path: &str, depth: ScanDepth) -> Result<Vec<WorktreeInfo>, String> {
     let repo = validate_repo(repo_path)?;
-    let stdout = git_text(&repo, &["worktree", "list", "--porcelain"])?;
-    let parsed = parse_worktree_porcelain(&stdout);
+    let parsed = read_worktree_entries(&repo)?;
     if depth == ScanDepth::Listing {
         return Ok(parsed
             .into_iter()
@@ -1630,6 +1611,60 @@ mod tests {
     use super::*;
     use crate::procguard::LockedSpawn;
     use std::path::PathBuf;
+
+    /// The fixtures below are written in `--porcelain`'s newline layout for
+    /// readability; the parser reads the `-z` layout, whose NUL is that
+    /// layout's newline and whose empty field is its blank line.
+    fn parse_worktree_porcelain(raw: &str) -> Vec<ParsedWorktree> {
+        parse_worktree_porcelain_z(&raw.replace('\n', "\0"))
+    }
+
+    /// A worktree path may hold a newline or end in a space. Without `-z` the
+    /// first split into two fields and the second was trimmed into a
+    /// different directory, so the listing named worktrees that do not exist.
+    #[cfg(unix)]
+    #[test]
+    fn worktree_paths_with_a_newline_or_trailing_space_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("main");
+        std::fs::create_dir(&main).unwrap();
+        crate::test_support::git_in(&main, &["init", "-q", "-b", "main"]);
+        crate::test_support::git_in(&main, &["commit", "-q", "--allow-empty", "-m", "init"]);
+        let main = main.canonicalize().unwrap();
+        let odd = [dir.path().join("trail "), dir.path().join("new\nline")];
+        for (n, path) in odd.iter().enumerate() {
+            crate::test_support::git_in(
+                &main,
+                &[
+                    "worktree",
+                    "add",
+                    "-q",
+                    "-b",
+                    &format!("b{n}"),
+                    path.to_str().unwrap(),
+                ],
+            );
+        }
+
+        let entries = read_worktree_entries(&main).expect("entries");
+        let paths: Vec<String> = entries.iter().map(|entry| entry.path.clone()).collect();
+        assert_eq!(entries.len(), 3, "{paths:?}");
+        for path in &odd {
+            let canonical = path.canonicalize().unwrap();
+            assert!(
+                paths.iter().any(|listed| Path::new(listed) == canonical),
+                "{canonical:?} did not round-trip through {paths:?}"
+            );
+        }
+        let listed = list_worktrees(main.to_str().unwrap()).expect("listing");
+        assert_eq!(listed.len(), 3);
+        assert!(
+            crate::engine::git_writer::checked_out_branches(&main)
+                .unwrap()
+                .contains("b1"),
+            "the branch of the newline-path worktree was lost"
+        );
+    }
 
     #[test]
     fn test_parse_porcelain_full_blocks() {

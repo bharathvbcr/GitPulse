@@ -46,6 +46,15 @@ before that tag is pushed.
   spawn-rate budget's file IO no longer runs under the gate mutex, so a user
   action does not queue behind a background re-poll. SHA-256 repositories
   resolve revisions for provenance.
+- Git parsers read unusual but legal repositories correctly. Worktree paths
+  with a newline or a trailing space round-trip through one `-z` parser used by
+  every caller; a tag named like the branch no longer hides the graph's HEAD
+  chip; a remote named `team/fork` owns its branches (one longest-prefix owner
+  in `remotes.rs`) instead of `team`; a branch named `release/HEAD` is listed
+  while a remote's own `HEAD` pointer still is not; a `--depth 1` boundary
+  commit is drawn as a stub rather than the root of the history; and a path
+  git printed as non-UTF-8 carries a warning instead of silently naming a file
+  that does not exist.
 
 ### Changed
 

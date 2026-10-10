@@ -170,10 +170,10 @@ pub fn branch_cleanup_plan(repo_path: &str) -> Result<BranchCleanupPlan, String>
         .filter(|s| !s.is_empty())
         .collect();
 
-    let worktree_output = git_text(&repo, &["worktree", "list", "--porcelain"])?;
-    let checked_out_elsewhere: HashSet<&str> = worktree_output
-        .lines()
-        .filter_map(|line| line.strip_prefix("branch refs/heads/"))
+    let worktrees = crate::engine::worktree::read_worktree_entries(&repo)?;
+    let checked_out_elsewhere: HashSet<&str> = worktrees
+        .iter()
+        .filter_map(|entry| entry.branch.as_deref())
         .filter(|name| *name != current.name)
         .collect();
 

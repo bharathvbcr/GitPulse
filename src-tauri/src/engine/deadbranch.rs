@@ -1414,16 +1414,17 @@ mod tests {
         let tail = |a: &Vec<String>, end: &[&str]| {
             a.iter().rev().zip(end.iter().rev()).all(|(x, y)| x == y) && a.len() >= end.len()
         };
-        // The clean's own listing, behind its labels and its refusal.
-        let worktree_lists = count(&|a| tail(a, &["worktree", "list", "--porcelain"]));
-        // The ledger authenticating the worktree family for its rows.
-        let ledger_addresses = count(&|a| tail(a, &["worktree", "list", "--porcelain", "-z"]));
+        // Two listings, both `-z` now that every reader of the worktree list
+        // goes through `worktree::read_worktree_entries`: the clean's own,
+        // behind its labels and its refusal, and the ledger authenticating the
+        // worktree family for its rows. Still one each, whatever the number of
+        // branches.
+        let worktree_lists = count(&|a| tail(a, &["worktree", "list", "--porcelain", "-z"]));
         let any_worktree = count(&|a| a.iter().any(|x| x == "worktree"));
         let default_lookups = count(&|a| a.iter().any(|x| x == "refs/remotes/origin/HEAD"));
         let merge_trees = count(&|a| a.iter().any(|x| x == "merge-tree"));
         let deletes = count(&|a| a.iter().any(|x| x == "-D" || x == "-d"));
-        assert_eq!(worktree_lists, 1, "worktree listings: {used:#?}");
-        assert_eq!(ledger_addresses, 1, "ledger address lookups: {used:#?}");
+        assert_eq!(worktree_lists, 2, "worktree listings: {used:#?}");
         assert_eq!(any_worktree, 2, "no other worktree listing: {used:#?}");
         assert_eq!(default_lookups, 1, "default-branch lookups: {used:#?}");
         assert_eq!(merge_trees, BRANCHES, "merge-tree per target: {used:#?}");

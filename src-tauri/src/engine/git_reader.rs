@@ -7,6 +7,7 @@ use crate::engine::git_cli::{
 };
 use crate::engine::git_writer::validate_ref_name;
 use crate::engine::ref_cache::{self, FileIdentity};
+use crate::engine::remotes;
 use crate::engine::text_shape::{self, LineEnding};
 use crate::graph::lane_solver::RawCommitNode;
 use crate::graph::RefScope;
@@ -521,6 +522,7 @@ impl GitReader {
             base: default_base,
             ..
         } = default_base(&repo).checked()?;
+        let remote_names = configured_remote_names(&repo);
 
         let mut format = String::from(BRANCH_LIST_FORMAT);
         if let Some((_, base_oid)) = default_base.as_ref() {
@@ -574,7 +576,7 @@ impl GitReader {
             }
             let is_current = parts[0].trim() == "*";
             let refname = parts[1];
-            if refname.ends_with("/HEAD") {
+            if is_remote_head(&remote_names, refname) {
                 continue;
             }
             let tip = parts[2].to_string();
@@ -584,7 +586,8 @@ impl GitReader {
             let is_remote = refname.starts_with("refs/remotes/");
             let (name, remote_name) = if is_remote {
                 let rest = refname.trim_start_matches("refs/remotes/");
-                let remote = rest.split('/').next().map(String::from);
+                let remote = remotes::split_tracking_ref(&remote_names, rest)
+                    .map(|(owner, _)| owner.to_string());
                 (rest.to_string(), remote)
             } else {
                 (refname.trim_start_matches("refs/heads/").to_string(), None)
@@ -664,6 +667,7 @@ impl GitReader {
             base: probed_default,
             ..
         } = default_base(&repo).checked()?;
+        let remote_names = configured_remote_names(&repo);
 
         // Cheap listing only: refnames and tips, no history walks here.
         // Refnames and object ids cannot contain NULs, so %00 fields stay
@@ -687,13 +691,14 @@ impl GitReader {
                 continue;
             }
             let refname = parts[0];
-            if refname.ends_with("/HEAD") {
+            if is_remote_head(&remote_names, refname) {
                 continue;
             }
             let is_remote = refname.starts_with("refs/remotes/");
             let (name, remote_name) = if is_remote {
                 let rest = refname.trim_start_matches("refs/remotes/");
-                let remote = rest.split('/').next().map(String::from);
+                let remote = remotes::split_tracking_ref(&remote_names, rest)
+                    .map(|(owner, _)| owner.to_string());
                 (rest.to_string(), remote)
             } else {
                 (refname.trim_start_matches("refs/heads/").to_string(), None)
@@ -903,6 +908,7 @@ impl GitReader {
                 commits.push(node);
             }
         }
+        mark_shallow_boundary(&repo, &mut commits)?;
         Ok(commits)
     }
 
@@ -1077,6 +1083,7 @@ impl GitReader {
                 }
             }
 
+            warnings.extend(undecodable_path_warning(&path));
             statuses.push(FileStatus {
                 path,
                 old_path,
@@ -2729,6 +2736,26 @@ fn configured_remotes(config: &HashMap<String, String>) -> Vec<String> {
     names
 }
 
+/// True for a remote's own HEAD pointer, `refs/remotes/<remote>/HEAD`, which
+/// names the branch the remote considers default rather than being one. Only
+/// that exact shape: a branch *called* `release/HEAD` (`refs/remotes/origin/
+/// release/HEAD`, or a local `refs/heads/release/HEAD`) is a real branch and
+/// was hidden by an "ends in /HEAD" test.
+pub(crate) fn is_remote_head(remote_names: &[String], refname: &str) -> bool {
+    refname
+        .strip_prefix("refs/remotes/")
+        .and_then(|rest| remotes::split_tracking_ref(remote_names, rest))
+        .is_some_and(|(_, branch)| branch == "HEAD")
+}
+
+/// Names of the remotes configured for `repo`, for attributing remote-tracking
+/// refs through [`remotes::split_tracking_ref`].
+pub(crate) fn configured_remote_names(repo: &Path) -> Vec<String> {
+    config_snapshot(repo)
+        .map(|config| configured_remotes(&config))
+        .unwrap_or_default()
+}
+
 /// Whether the repository still has pre-config remote definitions, which
 /// `git remote` lists and no config key shows.
 fn has_legacy_remotes(repo: &Path) -> bool {
@@ -3010,28 +3037,39 @@ pub(crate) fn symbolic_ref_target(repo: &Path, refname: &str) -> Result<Option<S
 /// also called `main`. The canonical owner of the question: a failed read is
 /// an `Err` (see [`symbolic_ref_target`]) and never "detached".
 pub(crate) fn head_branch(repo: &Path) -> Result<Option<String>, String> {
+    let branch = head_branch_name(repo)?;
+    if let Some(name) = &branch {
+        validate_ref_name(name)?;
+    }
+    Ok(branch)
+}
+
+/// [`head_branch`] without the argv-safety check on the name, for readers that
+/// only *show* the branch (the graph's HEAD chip, the remote lookup): a branch
+/// the writers would refuse to name in a command, `fix(ui)` among them, is
+/// still the one HEAD is on.
+fn head_branch_name(repo: &Path) -> Result<Option<String>, String> {
     symbolic_ref_target(repo, "HEAD")?
         .map(|target| branch_of_head_target(&target))
         .transpose()
 }
 
-/// [`head_branch`] answered through the ref cache, for the readers that ask on
-/// every refresh. The cached read cannot tell a detached HEAD (exit 1, an
-/// answer) from a refusal, so a failed cached read is asked again, uncached,
+/// [`head_branch_name`] answered through the ref cache, for the readers that
+/// ask on every refresh. The cached read cannot tell a detached HEAD (exit 1,
+/// an answer) from a refusal, so a failed cached read is asked again, uncached,
 /// and that one decides.
 pub(crate) fn head_branch_cached(repo: &Path) -> Result<Option<String>, String> {
     match ref_cache::git_text(repo, &["refs/heads"], &["symbolic-ref", "--quiet", "HEAD"]) {
         Ok(target) => branch_of_head_target(target.trim()).map(Some),
-        Err(_) => head_branch(repo),
+        Err(_) => head_branch_name(repo),
     }
 }
 
 fn branch_of_head_target(target: &str) -> Result<String, String> {
-    let name = target
+    target
         .strip_prefix("refs/heads/")
-        .ok_or_else(|| format!("HEAD points at {target}, which is not a local branch"))?;
-    validate_ref_name(name)?;
-    Ok(name.to_string())
+        .map(str::to_string)
+        .ok_or_else(|| format!("HEAD points at {target}, which is not a local branch"))
 }
 
 /// What a branch listing over `refs/heads/` and `refs/remotes/` reads.
@@ -3623,6 +3661,57 @@ fn read_sized_blob(repo: &Path, oid: &str) -> Result<Vec<u8>, String> {
         return Err("Git object size did not match cat-file".into());
     }
     Ok(bytes)
+}
+
+/// The warning a status row carries when its path cannot be trusted to name
+/// the file on disk. Git paths are bytes; the IPC carries UTF-8, so a Linux
+/// path that is not valid UTF-8 arrives with U+FFFD in place of each bad byte
+/// and any action sent back for it would name a file that does not exist. The
+/// row says so instead of looking like any other file.
+pub(crate) fn undecodable_path_warning(path: &str) -> Option<String> {
+    path.contains('\u{FFFD}').then(|| {
+        "This path is not valid UTF-8, so it is shown with replacement characters and \
+         actions sent for it will not find the file. Use git on the command line for it."
+            .to_string()
+    })
+}
+
+/// Commits whose parents exist in the real history but not in this clone, from
+/// the `shallow` file in the common git directory. Git prints no parents for
+/// them (`%P` is empty), which the lane solver reads as a root; a root is a
+/// commit that has no parents, not one whose parents were cut off.
+///
+/// `Ok(empty)` only when there is no such file. A file that exists and cannot
+/// be read fails the page: its commits would be drawn as roots.
+fn shallow_commits(repo: &Path) -> Result<HashSet<String>, String> {
+    let (_private, common) = crate::repository_trust::git_directories(repo)?;
+    match std::fs::read_to_string(common.join("shallow")) {
+        Ok(text) => Ok(text
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(str::to_string)
+            .collect()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(HashSet::new()),
+        Err(error) => Err(format!("Could not read the shallow boundary: {error}")),
+    }
+}
+
+/// Gives each shallow-boundary commit the unknown parent it is missing, so it
+/// is drawn as a stub rather than as the root of the history.
+fn mark_shallow_boundary(repo: &Path, commits: &mut [RawCommitNode]) -> Result<(), String> {
+    if !commits.iter().any(|commit| commit.parent_ids.is_empty()) {
+        return Ok(());
+    }
+    let shallow = shallow_commits(repo)?;
+    for commit in commits.iter_mut() {
+        if commit.parent_ids.is_empty() && shallow.contains(&commit.id) {
+            commit
+                .parent_ids
+                .push(crate::graph::UNKNOWN_PARENT.to_string());
+        }
+    }
+    Ok(())
 }
 
 /// Decodes one `\x01`-separated history record laid out by
@@ -7700,6 +7789,30 @@ __GP_PULSE__\0def456\0abc123\x001700000100\0N\0second\0Ada\0ada@example.com\0\0\
             cut.truncated,
             "a blame cut at its cap reported as a whole scan: {cut:?}"
         );
+    }
+
+    /// A path git printed as bytes that are not UTF-8 reaches us as U+FFFD.
+    /// (The filesystem here may refuse such a name, so the replacement
+    /// character stands in for what the decoder would have produced.)
+    #[test]
+    fn a_path_with_replacement_characters_carries_a_warning() {
+        let dir = init_repo_with_remotes(&[], "main");
+        let path = dir.path().to_str().unwrap();
+        std::fs::write(dir.path().join("bad\u{FFFD}name.txt"), "x").unwrap();
+        std::fs::write(dir.path().join("fine.txt"), "x").unwrap();
+
+        let statuses = GitReader::get_status(path).expect("status");
+        let bad = statuses
+            .iter()
+            .find(|s| s.path.contains('\u{FFFD}'))
+            .expect("row");
+        assert!(
+            bad.warnings.iter().any(|w| w.contains("not valid UTF-8")),
+            "{:?}",
+            bad.warnings
+        );
+        let fine = statuses.iter().find(|s| s.path == "fine.txt").expect("row");
+        assert!(fine.warnings.is_empty(), "{:?}", fine.warnings);
     }
 
     #[test]

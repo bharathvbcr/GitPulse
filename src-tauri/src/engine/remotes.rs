@@ -82,6 +82,35 @@ fn split_remote_key(key: &str) -> Option<(String, String)> {
     Some((name.to_string(), field.to_ascii_lowercase()))
 }
 
+/// Splits a remote-tracking name (the part after `refs/remotes/`) into the
+/// remote that owns it and the branch, by the LONGEST configured remote name
+/// that prefixes it: a remote named `team/fork` and one named `team` can both
+/// prefix `team/fork/main`, and the longer one owns the ref. The canonical
+/// owner of the question, so no reader attributes by "first path segment" and
+/// files `team/fork`'s branches under `team`.
+///
+/// With no configured remote matching (a legacy `.git/remotes` definition, or
+/// an empty name list) the first segment is the remote, as git's own default
+/// layout has it.
+pub(crate) fn split_tracking_ref<'a>(
+    remotes: &[String],
+    rest: &'a str,
+) -> Option<(&'a str, &'a str)> {
+    let owner = remotes
+        .iter()
+        .filter(|name| {
+            rest.len() > name.len()
+                && rest.starts_with(name.as_str())
+                && rest.as_bytes()[name.len()] == b'/'
+        })
+        .map(String::len)
+        .max();
+    match owner {
+        Some(len) => Some((&rest[..len], &rest[len + 1..])),
+        None => rest.split_once('/'),
+    }
+}
+
 /// Assembles remotes from config records and remote-tracking ref names.
 ///
 /// Split out from the git calls so the assembly is directly testable against
@@ -114,6 +143,7 @@ fn assemble(records: &[(String, String)], tracking_refs: &[String]) -> RemoteLis
         }
     }
 
+    let names: Vec<String> = by_name.keys().cloned().collect();
     for refname in tracking_refs {
         let Some(rest) = refname.strip_prefix("refs/remotes/") else {
             continue;
@@ -121,13 +151,8 @@ fn assemble(records: &[(String, String)], tracking_refs: &[String]) -> RemoteLis
         // Longest-prefix match: a remote named `origin/mirror` and a remote
         // named `origin` can both prefix `refs/remotes/origin/mirror/main`,
         // and the longer one owns the ref.
-        let owner = by_name
-            .keys()
-            .filter(|name| rest.starts_with(&format!("{name}/")))
-            .max_by_key(|name| name.len())
-            .cloned();
-        if let Some(owner) = owner {
-            if let Some(entry) = by_name.get_mut(&owner) {
+        if let Some((owner, _)) = split_tracking_ref(&names, rest) {
+            if let Some(entry) = by_name.get_mut(owner) {
                 entry.tracking_branches += 1;
             }
         }

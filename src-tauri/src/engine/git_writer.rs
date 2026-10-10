@@ -2397,12 +2397,9 @@ pub(crate) fn is_checked_out_in_any_worktree(
 /// Short names of every local branch checked out in any worktree of `repo`
 /// (including the main one), from a single `git worktree list`.
 pub(crate) fn checked_out_branches(repo: &Path) -> Result<HashSet<String>, String> {
-    let stdout = git_text(repo, &["worktree", "list", "--porcelain"])?;
-    Ok(stdout
-        .lines()
-        .filter_map(|line| line.strip_prefix("branch "))
-        .filter_map(|refname| refname.trim().strip_prefix("refs/heads/"))
-        .map(str::to_string)
+    Ok(crate::engine::worktree::read_worktree_entries(repo)?
+        .into_iter()
+        .filter_map(|entry| entry.branch)
         .collect())
 }
 
