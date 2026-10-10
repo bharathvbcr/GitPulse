@@ -150,6 +150,36 @@ pub(crate) fn working_in(_dir: &std::path::Path) -> Result<Vec<i32>, String> {
     Err("listing the processes working in a directory is not supported on this platform".into())
 }
 
+/// Every other process in the session `sid`, with its process group.
+///
+/// A terminal's shell leads a session of its own, and every job it starts
+/// stays in it: a job-control shell puts each job in a group of its own
+/// (`set -m`, any interactive shell), so the tty's foreground group names at
+/// most one of them. A process that leaves the session (`setsid`, a daemon)
+/// is not here and is not this terminal's to stop. `Err` when the process
+/// table could not be read; that is never "nobody is there".
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+pub(crate) fn session_members(sid: i32) -> Result<Vec<(i32, i32)>, String> {
+    let mut found = Vec::new();
+    for pid in all_pids()? {
+        if pid <= 0 || pid == sid {
+            continue;
+        }
+        // SAFETY: getsid/getpgid take numeric ids and read nothing else; a
+        // process that exited between the listing and here answers -1.
+        let (session, group) = unsafe { (libc::getsid(pid), libc::getpgid(pid)) };
+        if session == sid && group > 1 {
+            found.push((pid, group));
+        }
+    }
+    Ok(found)
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+pub(crate) fn session_members(_sid: i32) -> Result<Vec<(i32, i32)>, String> {
+    Err("listing a terminal session's processes is not supported on this platform".into())
+}
+
 #[cfg(target_os = "macos")]
 fn all_pids() -> Result<Vec<i32>, String> {
     // Asked twice: once for the count, once with room to spare, because the

@@ -240,6 +240,8 @@ export interface TerminalContext {
   process: string | null;
   /** A job other than the session's own process holds the foreground. */
   busy: boolean | null;
+  /** The shell has a job left under it, foreground or not (`cmd &`, a `^Z`'d editor). */
+  jobs?: boolean | null;
   cwd: string | null;
   /** `cwd` relative to the repository root (`""` is the root), or null outside it. */
   repo_dir: string | null;
