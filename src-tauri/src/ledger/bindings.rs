@@ -493,6 +493,49 @@ mod tests {
         assert_eq!(error.code, "repository_mismatch");
     }
 
+    /// The foreign-row probe must seek the repository index. The `NOT IN` it
+    /// replaced scanned the whole index on every gated mutation.
+    #[test]
+    fn the_foreign_row_probe_seeks_its_index() {
+        let (_d, repo) = repo();
+        bind(&repo, &repo, "TASK-1").unwrap();
+        let plan = super::super::with_conn(&repo, |conn| {
+            let mut stmt = conn
+                .prepare(&format!(
+                    "EXPLAIN QUERY PLAN {}",
+                    super::super::FOREIGN_ROW_SQL
+                ))
+                .unwrap();
+            let rows = stmt
+                .query_map(rusqlite::params!["a", "b"], |row| row.get::<_, String>(3))
+                .unwrap();
+            Ok(rows.map(Result::unwrap).collect::<Vec<_>>().join(" | "))
+        })
+        .unwrap();
+        assert!(plan.contains("SEARCH"), "{plan}");
+        assert!(!plan.contains("SCAN"), "{plan}");
+    }
+
+    /// The probes cover both sides of the two spellings and the gap between
+    /// them, not only paths that sort below the repository.
+    #[test]
+    fn a_foreign_row_sorting_after_the_repository_still_refuses() {
+        let (_d, repo) = repo();
+        bind(&repo, &repo, "TASK-1").unwrap();
+        super::super::with_conn(&repo, |conn| {
+            conn.execute(
+                "UPDATE events SET repo_path = repo_path || '~elsewhere'
+                 WHERE id = (SELECT MIN(id) FROM events)",
+                [],
+            )
+            .unwrap();
+            Ok(())
+        })
+        .unwrap();
+        let error = resolve(&repo, &repo).expect_err("a foreign row refuses the read");
+        assert_eq!(error.code, "repository_mismatch");
+    }
+
     #[test]
     fn resolution_pages_past_the_first_window() {
         // The newest binding is at the END of an append-only log, so a scan
