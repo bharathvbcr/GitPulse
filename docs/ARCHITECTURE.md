@@ -348,6 +348,7 @@ for contracts, regression evidence and platform verification limits.
 - **`ingest/`**: Attribution sources beyond live commands (reflog and transcript replay) that feed durable provenance and audit history.
 - **`ledger/`**: WAL-backed action store with redaction, cursors, and bounded replay for history projection.
 - **`mcp/`**: Read-only MCP 2.0 + Agent Plugins 1.0 server surface, including tool caching and capability discovery.
+- **`sysload/`**: The host-load sensor. A sampler in the app process only reads memory pressure, swap, compressor counters, load, open files, disk, thermal state and power every 2 s, scans the process table for agent sessions (by executable, launched vs observed through `GITPULSE_RUN_ID` / `GITPULSE_SESSION_ID`), launched-tree footprints and disk-write rates, memguard and foreign orphans, and publishes `host-load.v1`: a fixed-size sequence-locked record in the per-user config directory that any GitPulse process reads without asking the app. It measures and publishes only; admission, shedding and leases consume it. See [Load governor](LOAD_GOVERNOR.md).
 - **`logging.rs`**: Diagnostics for the backend. A 1,000-entry in-memory ring behind the `log` facade, a panic hook that records the payload, the location and a bounded backtrace, and a durable append-only mirror under the platform log directory (`~/Library/Logs/GitPulse` on macOS, `%LOCALAPPDATA%\\GitPulse\\logs` on Windows, `$XDG_STATE_HOME/gitpulse` otherwise; `GITPULSE_LOG_DIR` overrides all three). See [Diagnostics](#5-diagnostics) below.
 
 ---

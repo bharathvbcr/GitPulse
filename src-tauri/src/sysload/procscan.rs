@@ -381,7 +381,7 @@ impl ProcView {
 
 /// What a scan needs to know about the process doing it.
 #[derive(Debug, Clone)]
-pub(crate) struct ScanContext {
+pub struct ScanContext {
     pub me_pid: i32,
     pub now_us: u64,
     /// `$HOME`, for the memguard log-location check.
@@ -391,7 +391,8 @@ pub(crate) struct ScanContext {
 }
 
 impl ScanContext {
-    pub(crate) fn here() -> Self {
+    /// The context of the calling process, now.
+    pub fn here() -> Self {
         Self {
             me_pid: i32::try_from(std::process::id()).unwrap_or(-1),
             now_us: now_us(),
@@ -410,7 +411,7 @@ pub(crate) fn now_us() -> u64 {
 
 /// A scan that remembers what it saw, for disk-write rates and to read each
 /// process's identity once.
-pub(crate) struct Scanner {
+pub struct Scanner {
     source: Box<dyn ProcSource>,
     facts: Vec<ProcFacts>,
     index: HashMap<i32, usize>,
@@ -440,11 +441,12 @@ impl Scanner {
     }
 
     /// The scanner over this operating system's process table.
-    pub(crate) fn os() -> Self {
+    pub fn os() -> Self {
         Self::new(Box::new(os::OsSource::new()))
     }
 
-    pub(crate) fn scan(&mut self, ctx: &ScanContext) -> ProcView {
+    /// Reads the whole table once and attributes it.
+    pub fn scan(&mut self, ctx: &ScanContext) -> ProcView {
         if let Err(error) = self.source.read(&mut self.facts) {
             self.previous_us = None;
             return ProcView::failed(error, ctx.governed);
@@ -941,6 +943,33 @@ fn memguard_of(f: &ProcFacts, ctx: &ScanContext, source: &dyn ProcSource) -> Mem
     }
 }
 
+/// Each process's identity, read once per (pid, start time) and reused while
+/// that same process lives.
+type IdentityCache = HashMap<i32, (u64, Arc<Identity>)>;
+
+/// The cached identity of `pid` when the cache holds this very process, or a
+/// fresh one from `read`. A pid now held by a process that started at a
+/// different time is a reuse, and inherits nothing — a recycled pid must never
+/// keep a dead Claude's "session" label or a dead run's launch id. A start
+/// time of 0 (another user's process, whose start the OS would not give) can
+/// tell no two processes apart, so it is never reused.
+#[cfg_attr(not(any(target_os = "macos", target_os = "linux")), allow(dead_code))]
+fn cached_identity(
+    cache: &mut IdentityCache,
+    pid: i32,
+    start_us: u64,
+    read: impl FnOnce() -> Identity,
+) -> Arc<Identity> {
+    if let Some((start, ident)) = cache.get(&pid) {
+        if *start == start_us && start_us != 0 {
+            return ident.clone();
+        }
+    }
+    let ident = Arc::new(read());
+    cache.insert(pid, (start_us, ident.clone()));
+    ident
+}
+
 /// One process's live facts, for a decision that must re-check them
 /// (the orphan Terminate).
 pub(crate) fn probe_one(pid: i32) -> Option<ProcFacts> {
@@ -961,7 +990,7 @@ pub(crate) fn probe_one(pid: i32) -> Option<ProcFacts> {
 /// Security: this signals only a process the current user already owns and
 /// could `kill` from a shell, on an explicit click; it widens no access.
 pub fn terminate_orphan(pid: i32, start_us: u64) -> Result<String, String> {
-    if pid <= 1 || i32::try_from(std::process::id()).ok() == Some(pid) {
+    if pid <= 1 || start_us == 0 || i32::try_from(std::process::id()).ok() == Some(pid) {
         return Err("that process is not one GitPulse will terminate".into());
     }
     let f = probe_one(pid).ok_or("the process is no longer running; nothing was signalled")?;
@@ -1329,23 +1358,95 @@ mod os {
         unsafe { libc::getuid() }
     }
 
+    /// What every process has, whoever owns it.
+    struct Basic {
+        ppid: i32,
+        uid: u32,
+        /// Microseconds since the epoch; 0 when the OS would not say.
+        start_us: u64,
+        zombie: bool,
+        name: String,
+    }
+
+    /// The owner a process is filed under when the OS will not even say who
+    /// owns it: counted as another user's, not inspected — never dropped.
+    pub(super) const UNKNOWN_OWNER: u32 = u32::MAX;
+
+    /// `PROC_PIDTBSDINFO` describes only this user's processes; for anyone
+    /// else's it is `EPERM` (232 of 943 on the host this was written on). The
+    /// short form still gives the parent, owner and name, which is all a
+    /// process this user cannot measure needs to be counted. `None` only when
+    /// the process is gone.
+    fn basic(pid: i32) -> Option<Basic> {
+        match bsdinfo(pid) {
+            Ok(info) => {
+                let mut name = c_name(&info.pbi_name);
+                if name.is_empty() {
+                    name = c_name(&info.pbi_comm);
+                }
+                return Some(Basic {
+                    ppid: i32::try_from(info.pbi_ppid).unwrap_or(0),
+                    uid: info.pbi_uid,
+                    start_us: info
+                        .pbi_start_tvsec
+                        .saturating_mul(1_000_000)
+                        .saturating_add(info.pbi_start_tvusec),
+                    zombie: info.pbi_status == libc::SZOMB,
+                    name,
+                });
+            }
+            Err(Some(libc::ESRCH)) => return None,
+            Err(_) => {}
+        }
+        let size = std::mem::size_of::<libc::proc_bsdshortinfo>();
+        let mut info = std::mem::MaybeUninit::<libc::proc_bsdshortinfo>::uninit();
+        // SAFETY: the buffer matches the requested SHORTBSDINFO layout and is
+        // read only after the kernel reports filling all of it.
+        let written = unsafe {
+            libc::proc_pidinfo(
+                pid,
+                libc::PROC_PIDT_SHORTBSDINFO,
+                0,
+                info.as_mut_ptr().cast(),
+                size as i32,
+            )
+        };
+        if usize::try_from(written).ok() == Some(size) {
+            // SAFETY: fully initialised, established above.
+            let info = unsafe { info.assume_init() };
+            return Some(Basic {
+                ppid: i32::try_from(info.pbsi_ppid).unwrap_or(0),
+                uid: info.pbsi_uid,
+                start_us: 0,
+                zombie: info.pbsi_status == libc::SZOMB,
+                name: c_name(&info.pbsi_comm),
+            });
+        }
+        if errno() == Some(libc::ESRCH) {
+            return None;
+        }
+        Some(Basic {
+            ppid: 0,
+            uid: UNKNOWN_OWNER,
+            start_us: 0,
+            zombie: false,
+            name: String::new(),
+        })
+    }
+
     fn facts(
         pid: i32,
         me: u32,
         timebase: (u32, u32),
-        ident: impl FnOnce(&libc::proc_bsdinfo, u64) -> Arc<Identity>,
+        ident: impl FnOnce(&Basic) -> Arc<Identity>,
     ) -> Option<ProcFacts> {
-        let info = bsdinfo(pid).ok()?;
+        let basic = basic(pid)?;
         // A zombie holds no memory and does no work; it is not a process
         // anyone should be told about.
-        if info.pbi_status == libc::SZOMB {
+        if basic.zombie {
             return None;
         }
-        let start_us = info
-            .pbi_start_tvsec
-            .saturating_mul(1_000_000)
-            .saturating_add(info.pbi_start_tvusec);
-        let (footprint, written, cpu_ns) = if info.pbi_uid == me {
+        let (footprint, written, cpu_ns) = if basic.uid == me {
             let u = usage(pid, timebase);
             (u.footprint, u.written, u.cpu_ns)
         } else {
@@ -1354,35 +1455,33 @@ mod os {
         };
         Some(ProcFacts {
             pid,
-            ppid: i32::try_from(info.pbi_ppid).unwrap_or(0),
-            uid: info.pbi_uid,
-            start_us,
-            ident: ident(&info, start_us),
+            ppid: basic.ppid,
+            uid: basic.uid,
+            start_us: basic.start_us,
+            ident: ident(&basic),
             footprint,
             written,
             cpu_ns,
         })
     }
 
-    fn read_identity(pid: i32, info: &libc::proc_bsdinfo, me: u32, buf: &mut Vec<u8>) -> Identity {
-        let mut name = c_name(&info.pbi_name);
-        if name.is_empty() {
-            name = c_name(&info.pbi_comm);
-        }
-        if info.pbi_uid != me {
-            return Identity::new(name, None, Vec::new(), None);
+    fn read_identity(pid: i32, basic: &Basic, me: u32, buf: &mut Vec<u8>) -> Identity {
+        if basic.uid != me {
+            return Identity::new(basic.name.clone(), None, Vec::new(), None);
         }
         match procargs(pid, buf) {
-            Some((exec, argv, launch)) => Identity::new(name, Some(exec), argv, launch),
-            None => Identity::new(name, None, Vec::new(), None),
+            Some((exec, argv, launch)) => {
+                Identity::new(basic.name.clone(), Some(exec), argv, launch)
+            }
+            None => Identity::new(basic.name.clone(), None, Vec::new(), None),
         }
     }
 
     pub(crate) fn probe_one(pid: i32) -> Option<ProcFacts> {
         let me = uid();
         let mut buf = vec![0u8; argmax()];
-        facts(pid, me, timebase(), |info, _| {
-            Arc::new(read_identity(pid, info, me, &mut buf))
+        facts(pid, me, timebase(), |basic| {
+            Arc::new(read_identity(pid, basic, me, &mut buf))
         })
     }
 
@@ -1391,7 +1490,7 @@ mod os {
         args: Vec<u8>,
         timebase: (u32, u32),
         me: u32,
-        cache: HashMap<i32, (u64, Arc<Identity>)>,
+        cache: super::IdentityCache,
         seen: Vec<i32>,
     }
 
@@ -1420,13 +1519,10 @@ mod os {
                 }
                 let cache = &mut self.cache;
                 let args = &mut self.args;
-                let fact = facts(pid, me, timebase, |info, start_us| match cache.get(&pid) {
-                    Some((start, ident)) if *start == start_us => ident.clone(),
-                    _ => {
-                        let ident = Arc::new(read_identity(pid, info, me, args));
-                        cache.insert(pid, (start_us, ident.clone()));
-                        ident
-                    }
+                let fact = facts(pid, me, timebase, |basic| {
+                    super::cached_identity(cache, pid, basic.start_us, || {
+                        read_identity(pid, basic, me, args)
+                    })
                 });
                 if let Some(fact) = fact {
                     self.seen.push(pid);
@@ -1678,7 +1774,7 @@ mod os {
         me: u32,
         ticks: u64,
         page: u64,
-        cache: HashMap<i32, (u64, Arc<Identity>)>,
+        cache: super::IdentityCache,
     }
 
     impl OsSource {
@@ -1701,14 +1797,7 @@ mod os {
             for &pid in &self.pids {
                 let cache = &mut self.cache;
                 let fact = facts(pid, me, ticks, page, |name, ours, start_us| {
-                    match cache.get(&pid) {
-                        Some((start, ident)) if *start == start_us => ident.clone(),
-                        _ => {
-                            let ident = Arc::new(read_identity(pid, name, ours));
-                            cache.insert(pid, (start_us, ident.clone()));
-                            ident
-                        }
-                    }
+                    super::cached_identity(cache, pid, start_us, || read_identity(pid, name, ours))
                 });
                 if let Some(fact) = fact {
                     out.push(fact);
@@ -2482,6 +2571,57 @@ pub(crate) mod tests {
             matches!(tree.footprint, Reading::Value(bytes) if bytes >= 128 << 20),
             "{tree:?}"
         );
+    }
+
+    /// Real: the scan describes every process the table lists, other users'
+    /// included. `PROC_PIDTBSDINFO` refuses those with `EPERM`; before the
+    /// short-info fallback a quarter of this host's table (232 of 943) was
+    /// dropped and "other users" read 0, an undercount reported as complete.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn real_scan_counts_other_users_processes_instead_of_dropping_them() {
+        let mut listed = Vec::new();
+        os::list_pids(&mut listed).unwrap();
+        let view = Scanner::os().scan(&ScanContext::here());
+        assert!(view.ok, "{:?}", view.error);
+        // launchd / init, pid 1, is root's on every host this runs on.
+        assert!(view.other_users >= 1, "{view:?}");
+        // Processes come and go between the two reads; a whole class of them
+        // missing does not.
+        let floor = listed.len() * 9 / 10;
+        assert!(
+            view.processes as usize >= floor,
+            "described {} of {} listed",
+            view.processes,
+            listed.len()
+        );
+    }
+
+    /// A recycled pid: the same number, a later start. Its identity is read
+    /// again, never inherited — so a pid a dead Claude held does not keep
+    /// counting as a session once `sleep` (or anything else) is given it.
+    #[test]
+    fn a_recycled_pid_never_inherits_the_cached_identity() {
+        let mut cache = IdentityCache::new();
+        let reads = std::cell::Cell::new(0);
+        let read = |exec: &str| {
+            reads.set(reads.get() + 1);
+            Identity::new("x".into(), Some(exec.into()), Vec::new(), None)
+        };
+        let first = cached_identity(&mut cache, 77, 1_000, || read(CLAUDE));
+        assert_eq!(first.kind, Some(AgentKind::Claude));
+        // The same process, next tick: read once, reused.
+        let again = cached_identity(&mut cache, 77, 1_000, || read("/bin/sleep"));
+        assert_eq!(again.kind, Some(AgentKind::Claude));
+        assert_eq!(reads.get(), 1);
+        // The pid recycled to a process that started later.
+        let reused = cached_identity(&mut cache, 77, 2_000, || read("/bin/sleep"));
+        assert_eq!(reused.kind, None);
+        assert_eq!(reads.get(), 2);
+        // No start time to compare: never trusted from the cache.
+        cached_identity(&mut cache, 88, 0, || read(CLAUDE));
+        cached_identity(&mut cache, 88, 0, || read(CLAUDE));
+        assert_eq!(reads.get(), 4);
     }
 
     #[test]

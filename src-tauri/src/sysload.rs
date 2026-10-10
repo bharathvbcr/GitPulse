@@ -43,7 +43,7 @@ mod snapshot;
 
 pub use procscan::{
     terminate_orphan, AgentKind, AgentSession, ForeignProcess, LaunchedTree, MemguardHealth,
-    Orphan, ProcView, SessionCount,
+    Orphan, ProcView, ScanContext, Scanner as ProcessScanner, SessionCount,
 };
 pub use sampler::{
     pulse_of, start, start_app, status, HostLoadPulse, HostLoadStatus, PressureInput, Role,
@@ -54,8 +54,8 @@ pub use sensor::{
     Reading, ReplaySensor, Sensor, Thermal, Why,
 };
 pub use snapshot::{
-    read, report, Snapshot, SnapshotError, TickStats, WriterIdentity, LOCK_FILE_NAME, RECORD_LEN,
-    SNAPSHOT_FILE_NAME, VERSION,
+    read, report, Snapshot, SnapshotError, TickStats, Writer as SnapshotWriter, WriterIdentity,
+    LOCK_FILE_NAME, RECORD_LEN, SNAPSHOT_FILE_NAME, VERSION,
 };
 
 use serde::{Deserialize, Serialize};

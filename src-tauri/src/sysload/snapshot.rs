@@ -790,7 +790,7 @@ pub fn report(path: &Path, now: Clock) -> (SensorReport, Option<Snapshot>) {
 }
 
 /// The elected writer: holds the lock for as long as it lives.
-pub(super) struct Writer {
+pub struct Writer {
     file: File,
     /// Held, never read: dropping it is what releases the election.
     _lock: File,
@@ -801,7 +801,7 @@ pub(super) struct Writer {
 impl Writer {
     /// Tries to become the one writer for `dir`. `Ok(None)` when another
     /// process holds the election.
-    pub(super) fn elect(dir: &Path) -> Result<Option<Self>, String> {
+    pub fn elect(dir: &Path) -> Result<Option<Self>, String> {
         let lock = crate::fs_entry::open_private_record(&dir.join(LOCK_FILE_NAME))?;
         match lock.try_lock() {
             Ok(()) => {}
@@ -834,12 +834,12 @@ impl Writer {
         }))
     }
 
-    pub(super) fn path(&self) -> &Path {
+    pub fn path(&self) -> &Path {
         &self.path
     }
 
     /// Publishes `snap` under the sequence lock.
-    pub(super) fn publish(&mut self, snap: &Snapshot) -> Result<(), String> {
+    pub fn publish(&mut self, snap: &Snapshot) -> Result<(), String> {
         let next = self.seq.wrapping_add(2) & !1;
         let record = encode(snap, next);
         let io = |e: std::io::Error| format!("could not write {}: {e}", self.path.display());

@@ -106,9 +106,10 @@
   }
 
   const PLATFORM_LABEL = {
-    governed: "macOS: measured and governed",
-    advise: "Linux: measured through PSI, advice only (not verified on a real Linux host)",
-    unavailable: "This platform has no host-load sensor",
+    governed: "Measured and governed on this computer",
+    advise:
+      "Measured through pressure-stall information and advised on, never governed (not yet verified on a real host of this kind)",
+    unavailable: "This computer has no host-load sensor",
   } as const;
 
   function roleLine(): string {
