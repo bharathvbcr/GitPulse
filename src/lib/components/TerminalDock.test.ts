@@ -99,6 +99,28 @@ describe("TerminalDock", () => {
     expect(source).toContain("fitTerminalDockHeight(TERMINAL_DOCK_MAX_HEIGHT, containerHeight, 0)");
     expect(source).toContain("aria-valuemax={heightCeiling}");
   });
+
+  it("commits a drag to the store once on release, not on every pointermove", () => {
+    // setTerminalDockHeight is a synchronous localStorage write plus an
+    // interfaceStore publish; per pointermove it re-ran every subscriber.
+    const start = source.indexOf("function startDrag(");
+    const stop = source.indexOf("function handleSeparatorKey(");
+    expect(start).toBeGreaterThan(-1);
+    const drag = source.slice(start, stop);
+    const move = drag.slice(drag.indexOf("const move = "), drag.indexOf("const end = "));
+    expect(move).toContain("dragHeight = clampTerminalDockHeight(");
+    expect(move).not.toContain("interfaceStore.");
+    const end = drag.slice(drag.indexOf("const end = "));
+    expect(end).toContain("commitDragHeight();");
+    expect(drag).toContain('handle.addEventListener("pointerup", end);');
+    expect(drag).toContain('handle.addEventListener("pointercancel", end);');
+    // The rendered height follows the pending drag value while one exists.
+    expect(source).toContain("fitTerminalDockHeight(dragHeight, containerHeight)");
+    // Keyboard nudges still write straight through.
+    const keys = source.slice(stop);
+    expect(keys).toContain("interfaceStore.setTerminalDockHeight(currentHeight + TERMINAL_DOCK_RESIZE_STEP)");
+    expect(keys).toContain("interfaceStore.setTerminalDockHeight(currentHeight - TERMINAL_DOCK_RESIZE_STEP)");
+  });
 });
 
 describe("App hosts the terminal as a dock, not a view", () => {

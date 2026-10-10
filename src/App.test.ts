@@ -382,6 +382,19 @@ describe("App display preferences", () => {
     expect(source, `${name} is imported but never called from the store`).toContain(call);
   });
 
+  it("re-applies the UI scale only when the scale itself changes", () => {
+    // interfaceStore publishes a fresh object per preference write; reading
+    // `$interfaceStore.uiFontScale` inside the effect re-ran the webview
+    // setZoom IPC on every unrelated emission.
+    const { script } = scriptAndTemplate(source);
+    expect(script).toContain("const uiFontScale = $derived($interfaceStore.uiFontScale);");
+    const call = script.indexOf("applyUiScale(scale");
+    expect(call).toBeGreaterThan(-1);
+    const effect = script.slice(script.lastIndexOf("$effect(() => {", call), call);
+    expect(effect).toContain("const scale = uiFontScale;");
+    expect(effect).not.toContain("$interfaceStore");
+  });
+
   it("re-applies the accent when the resolved theme flips", () => {
     // Each accent is a light/dark pair; keying only on the choice would leave
     // the dark shade painted on a light window.

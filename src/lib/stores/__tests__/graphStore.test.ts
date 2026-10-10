@@ -399,6 +399,45 @@ describe("graphStore background reload stability", () => {
     unsub();
   });
 
+  it("compares a reload against the signature stored with the cache entry", async () => {
+    // The cached payload's signature is computed once, when the entry is set;
+    // a reload must not re-serialize every cached row to compare against it.
+    // A getter on a field only the signature reads counts serializations of
+    // the FIRST payload's rows.
+    let reads = 0;
+    const counted = grow("a");
+    const email = counted.author_email;
+    Object.defineProperty(counted, "author_email", {
+      enumerable: true,
+      get: () => {
+        reads += 1;
+        return email;
+      },
+    });
+    let graphCalls = 0;
+    const store = createGraphStore({
+      invoke: async (cmd, args) => {
+        if (cmd === "cmd_get_commit_graph") {
+          graphCalls += 1;
+          return (graphCalls === 1 ? { ...payload(), rows: [counted] } : clone(payload())) as never;
+        }
+        return details(cmd, args);
+      },
+    });
+    store.showRepo("/r/sig");
+    await store.loadGraph("/r/sig");
+    const rowsBefore = get(store).rows;
+    const readsAfterFirst = reads;
+    expect(readsAfterFirst).toBeGreaterThan(0);
+
+    await store.loadGraph("/r/sig");
+    await store.loadGraph("/r/sig");
+    // Still recognized as identical (row identity survives) without touching
+    // the cached rows again.
+    expect(get(store).rows).toBe(rowsBefore);
+    expect(reads).toBe(readsAfterFirst);
+  });
+
   it("a genuinely changed payload still republishes", async () => {
     const firstPayload = {
       rows: [{ id: "a", summary: "a", author_name: "ada", timestamp: 1, lane: 0, parent_ids: [] }],

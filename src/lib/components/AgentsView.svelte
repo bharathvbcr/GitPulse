@@ -21,6 +21,7 @@
   import { repoStore } from "../stores/repoStore";
   import { interfaceStore } from "../stores/interfaceStore";
   import { toastStore } from "../stores/toastStore";
+  import { bindForegroundChanges, readHiddenDocument } from "../runtime/foreground";
   import { isCaseInsensitiveFs } from "../repos/paths";
   import { terminalSessions } from "../terminal/sessionRegistry";
   import { sessionActivity } from "../terminal/sessionActivity";
@@ -189,11 +190,30 @@
   $effect(() => {
     if (!showing) return;
     board.start();
-    const timer = setInterval(() => {
+    // The clock only feeds "how long ago" wording, so it ticks only while the
+    // window can be seen — the same start/stop shape as TaskAgentPanel's.
+    // Hidden rather than merely unfocused: this page on a second display while
+    // the reader types elsewhere is still in plain view.
+    let timer: ReturnType<typeof setInterval> | null = null;
+    const startClock = () => {
+      if (timer || readHiddenDocument()) return;
       now = Date.now();
-    }, 1000);
+      timer = setInterval(() => {
+        now = Date.now();
+      }, 1000);
+    };
+    const stopClock = () => {
+      if (timer) clearInterval(timer);
+      timer = null;
+    };
+    startClock();
+    const unbind = bindForegroundChanges(document, typeof window === "undefined" ? null : window, () => {
+      if (readHiddenDocument()) stopClock();
+      else startClock();
+    });
     return () => {
-      clearInterval(timer);
+      unbind();
+      stopClock();
       board.stop();
     };
   });

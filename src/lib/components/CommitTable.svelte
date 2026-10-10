@@ -808,9 +808,14 @@
   // `--accent-color` for its selection ring, and an accent change writes
   // `--c-accent` without touching the theme class. Listed here so picking a
   // new accent repaints the graph instead of leaving one blue ring behind.
+  //
+  // Read through a strictly-equal derived: interfaceStore publishes a fresh
+  // object for every preference write, and `$interfaceStore.accent` here would
+  // throw away every cached graph tile on a dock resize or a surface switch.
+  const graphAccent = $derived($interfaceStore.accent);
   $effect(() => {
     $themeStore;
-    $interfaceStore.accent;
+    graphAccent;
     cachedTheme = null;
     gutterRect = null;
     rootRect = null;

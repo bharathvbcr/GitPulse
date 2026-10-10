@@ -236,6 +236,14 @@ interface CachedGraph {
   notices: string[];
   mainlineId: string | null;
   mainlineName: string | null;
+  /**
+   * {@link graphPayloadSignature} of the payload this entry was built from,
+   * computed once when the entry is set. A reload compares against it rather
+   * than re-serializing every cached row a second time per load; the signed
+   * fields (rows, refs, head, has_more, notices, mainline) are never mutated
+   * in place after `cache.set`, so the stored value cannot go stale.
+   */
+  signature: string;
 }
 function emptyVisible(
   path: string | null,
@@ -331,34 +339,6 @@ export function graphPayloadSignature(payload: {
   // leave a stale count on screen.
   const notices = (payload.notices ?? []).join("\u0002");
   return `${payload.head_id ?? ""}\u0001${payload.has_more === true ? "more" : "end"}\u0001${refs}\u0001${mainline}\u0001${notices}\u0001${rows}`;
-}
-
-/**
- * One comparable string for "did the rendered history change". A watcher
- * refresh re-walks history every few seconds; on a quiet repo the payload is
- * structurally identical (fresh identities, same content) and must not
- * republish — every emission wipes the canvas strip cache and re-renders the
- * table. Delegates to {@link graphPayloadSignature} so both call sites share
- * one canonical definition of "structurally identical payload".
- */
-function cachedSignature(cache: {
-  rows: VisualCommitRow[];
-  headId: string | null;
-  refs: RefDecoration[];
-  hasMore: boolean;
-  notices: string[];
-  mainlineId: string | null;
-  mainlineName: string | null;
-}): string {
-  return graphPayloadSignature({
-    rows: cache.rows,
-    head_id: cache.headId,
-    refs: cache.refs,
-    has_more: cache.hasMore,
-    notices: cache.notices,
-    mainline_id: cache.mainlineId,
-    mainline_name: cache.mainlineName,
-  });
 }
 
 export function createGraphStore(
@@ -614,6 +594,14 @@ export function createGraphStore(
           }
         }
 
+        // One comparable string for "did the rendered history change". A
+        // watcher refresh re-walks history every few seconds; on a quiet repo
+        // the payload is structurally identical (fresh identities, same
+        // content) and must not republish — every emission wipes the canvas
+        // strip cache and re-renders the table. Computed once per load and
+        // stored on the entry below, so the previous payload's signature is
+        // read back rather than re-serialized.
+        const signature = graphPayloadSignature(payload);
         const previous = cache.get(repoPath);
         if (
           previous &&
@@ -621,7 +609,7 @@ export function createGraphStore(
           previous.revision === revision &&
           previous.refScope === refScope &&
           previous.maxCommits === max &&
-          cachedSignature(previous) === graphPayloadSignature(payload)
+          previous.signature === signature
         ) {
           // Identical reload: retire the flag, keep every array identity so
           // downstream caches (canvas strips) survive untouched.
@@ -657,6 +645,7 @@ export function createGraphStore(
           notices: payload.notices ?? [],
           mainlineId: payload.mainline_id ?? null,
           mainlineName: payload.mainline_name ?? null,
+          signature,
         };
         cache.set(repoPath, next);
         if (visiblePath === repoPath) {

@@ -44,6 +44,20 @@ describe("AgentsView", () => {
     expect(source).toContain("agentKindLabel(row.kind)");
   });
 
+  it("stops the elapsed-time clock while the window is hidden", () => {
+    // A 1s interval re-rendering every row of a minimised window is work no
+    // one sees. It pauses on hide and resumes (with a fresh reading) on show.
+    expect(source).toContain('import { bindForegroundChanges, readHiddenDocument } from "../runtime/foreground";');
+    const at = source.indexOf("const startClock = () => {");
+    expect(at).toBeGreaterThan(-1);
+    const effect = source.slice(at, source.indexOf("board.stop();", at));
+    expect(effect).toContain("if (timer || readHiddenDocument()) return;");
+    expect(effect).toContain("if (readHiddenDocument()) stopClock();");
+    expect(effect).toContain("else startClock();");
+    expect(effect).toContain("unbind();");
+    expect(effect).toContain("stopClock();");
+  });
+
   it("watches task attempts only while this surface is showing", () => {
     expect(source).toContain("createBoardAgents");
     expect(source).toContain("board.start()");

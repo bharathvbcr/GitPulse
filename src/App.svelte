@@ -862,8 +862,14 @@
   let zoomSetter: ((scale: number) => Promise<void>) | null = null;
   let zoomSetterResolved = false;
 
+  // A strictly-equal derived, not `$interfaceStore.uiFontScale` in the
+  // effect: interfaceStore publishes a fresh object for every preference
+  // write (a dock resize, a surface switch), and each re-run here is a
+  // webview setZoom IPC round-trip for a scale that did not change.
+  const uiFontScale = $derived($interfaceStore.uiFontScale);
+
   $effect(() => {
-    const scale = $interfaceStore.uiFontScale;
+    const scale = uiFontScale;
     void (async () => {
       if (!zoomSetterResolved) {
         zoomSetter = await nativeZoomSetter(isTauri());
