@@ -383,6 +383,60 @@ fn a_worktree_with_a_live_run_in_it_is_not_torn_down() {
     assert!(!lane.exists());
 }
 
+/// The defect: removal asked only the run rows, so an agent typed into a plain
+/// dock tab (no row, and with no workbench profile no rows to read at all) had
+/// its worktree deleted out from under it.
+#[cfg(test)]
+#[cfg(unix)]
+#[test]
+fn a_worktree_with_any_process_in_it_is_not_removed_even_without_a_profile() {
+    use std::os::unix::process::CommandExt;
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("repo");
+    repo(&root);
+    let lane = dir.path().join("lane");
+    git_text(
+        &root,
+        &["worktree", "add", "-b", "dock", lane.to_str().unwrap()],
+    )
+    .unwrap();
+    crate::test_support::trust_repo(&lane);
+    // A profile file that was never created: there are no run rows to read.
+    let state = host(&dir.path().join("never-created.sqlite"));
+    let mut tab = std::process::Command::new("sh")
+        .args(["-c", "read line"])
+        .current_dir(&lane)
+        .stdin(std::process::Stdio::piped())
+        .process_group(0)
+        .spawn_locked()
+        .unwrap();
+    let pid = tab.id();
+    let (repo_path, lane_path) = (root.to_str().unwrap(), lane.to_str().unwrap());
+    let gate = |repo: &str, argv: &[&str]| crate::harness::guard_command(repo, argv);
+    let wait_seen = |expect: bool| {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let refused = crate::commands::remove_worktree_guarded(
+                &state, repo_path, lane_path, true, &gate,
+            );
+            if refused.is_err() == expect || std::time::Instant::now() > deadline {
+                return refused;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    };
+    let refusal = match wait_seen(true) {
+        Err(error) => error,
+        Ok(_) => panic!("a worktree was removed under a live process"),
+    };
+    assert!(refusal.contains(&format!("pid {pid}")), "{refusal}");
+    assert!(lane.is_dir());
+    drop(tab.stdin.take());
+    tab.wait().unwrap();
+    crate::commands::remove_worktree_guarded(&state, repo_path, lane_path, true, &gate).unwrap();
+    assert!(!lane.exists());
+}
+
 #[cfg(unix)]
 #[test]
 fn a_sweep_releases_only_the_attempts_with_proof_and_is_idempotent() {

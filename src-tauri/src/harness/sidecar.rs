@@ -272,6 +272,21 @@ fn force_kill(child: &Mutex<Child>, guard: &crate::procguard::Registration) {
     let _ = guard.stop_and_reap(&mut child, Duration::ZERO);
 }
 
+/// How long a child that has closed its stdout gets to finish exiting before
+/// its group is stopped. A child honouring a shutdown closes stdout as it goes
+/// and exits within moments; the wait is only ever paid by one that does not.
+const EOF_REAP_GRACE: Duration = Duration::from_millis(500);
+
+/// Reaps the child from the pump that saw its stdout end, and sweeps any
+/// helper it left in its group. A clean shutdown holds the child lock for its
+/// own, longer grace, so this waits behind it and then finds nothing to do.
+fn reap_after_eof(child: &Mutex<Child>, guard: &crate::procguard::Registration) {
+    let mut child = child
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _ = guard.stop_and_reap(&mut child, EOF_REAP_GRACE);
+}
+
 /// Starts the one canonical stdout pump used by production and live sidecar
 /// tests. The bounded channel covers time spent between calls, when no request
 /// loop exists to enforce [`MAX_RESPONSE_TOTAL_BYTES`]. Backpressure alone is
@@ -300,7 +315,13 @@ fn spawn_stdout_pump(
                         }
                     }
                 }
-                Ok(None) => return,
+                // The child closed its stdout: it is exiting or has exited. Reaped
+                // here, not left a zombie holding its pid (and its runs
+                // "still running") until some later call happens to look.
+                Ok(None) => {
+                    reap_after_eof(&child, &guard);
+                    return;
+                }
                 Err(_) => {
                     force_kill(&child, &guard);
                     return;
@@ -1972,6 +1993,25 @@ mod tests {
             write_deadline,
             shutdown_grace: SHUTDOWN_GRACE,
         }
+    }
+
+    /// The defect: the stdout pump returned on EOF without reaping, so a child
+    /// that exited stayed a zombie holding its pid, and its runs "still
+    /// running", until the next harness call looked.
+    #[test]
+    fn a_child_that_closes_its_stdout_is_reaped_by_the_pump() {
+        let sidecar = scripted_sidecar("exit 0", WRITE_DEADLINE);
+        let pid = i32::try_from(relock(&sidecar.child).id()).expect("pid");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        // SAFETY: signal 0 only probes; a zombie still answers it, a reaped
+        // pid does not.
+        while unsafe { libc::kill(pid, 0) } == 0 && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            unsafe { libc::kill(pid, 0) } != 0,
+            "the exited sidecar was left unreaped"
+        );
     }
 
     /// Regression: the response byte budget is enforced by `call`, so it did

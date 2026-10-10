@@ -130,6 +130,33 @@ impl WorkbenchState {
         crate::storage::hygiene::open_files_under(path)
     }
 
+    /// Refuses to tear down `worktree_path` while anything is working in it:
+    /// a task run (see [`Self::refuse_if_run_working_in`]) or any process at
+    /// all whose working directory is inside it. Run rows know only the
+    /// attempts GitPulse launched; an agent typed into a dock tab, a dev
+    /// server, a shell sitting in the directory has no row, and with no
+    /// workbench profile there are no rows to read. A process table that
+    /// cannot be read refuses: it is not "nobody is there".
+    pub(crate) fn refuse_if_in_use(&self, worktree_path: &str) -> Result<(), String> {
+        self.refuse_if_run_working_in(worktree_path)?;
+        let target = std::path::Path::new(worktree_path);
+        let target = target
+            .canonicalize()
+            .unwrap_or_else(|_| target.to_path_buf());
+        match crate::terminal::foreground::working_in(&target) {
+            Ok(pids) if pids.is_empty() => Ok(()),
+            Ok(pids) => Err(format!(
+                "{} still working in this worktree ({}). Close {} before removing the worktree.",
+                if pids.len() == 1 { "A process is" } else { "Processes are" },
+                crate::terminal::foreground::describe_pids(&pids),
+                if pids.len() == 1 { "it" } else { "them" },
+            )),
+            Err(error) => Err(format!(
+                "Could not check whether a process is still working in this worktree, so it was left alone: {error}"
+            )),
+        }
+    }
+
     /// Refuses to tear down `worktree_path` while a task run is working in
     /// it, naming the run and its task. "Working" is what run reconciliation
     /// would keep: a held run that is not provably over. A profile that does

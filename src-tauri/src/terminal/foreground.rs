@@ -150,6 +150,33 @@ pub(crate) fn working_in(_dir: &std::path::Path) -> Result<Vec<i32>, String> {
     Err("listing the processes working in a directory is not supported on this platform".into())
 }
 
+/// "name (pid N)" for up to five of `pids`, then a count of the rest: enough
+/// to find a process by, never a listing of the machine.
+#[cfg(unix)]
+pub(crate) fn describe_pids(pids: &[i32]) -> String {
+    const SHOWN: usize = 5;
+    let mut parts: Vec<String> = pids
+        .iter()
+        .take(SHOWN)
+        .map(|pid| match describe(*pid).name {
+            Some(name) => format!("{name}, pid {pid}"),
+            None => format!("pid {pid}"),
+        })
+        .collect();
+    if pids.len() > SHOWN {
+        parts.push(format!("and {} more", pids.len() - SHOWN));
+    }
+    parts.join("; ")
+}
+
+#[cfg(not(unix))]
+pub(crate) fn describe_pids(pids: &[i32]) -> String {
+    pids.iter()
+        .map(|pid| format!("pid {pid}"))
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
 /// Every other process in the session `sid`, with its process group.
 ///
 /// A terminal's shell leads a session of its own, and every job it starts
