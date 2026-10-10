@@ -2285,42 +2285,70 @@ fn resolve_clone_destination(dest: &Path) -> Result<PathBuf, String> {
     }
 }
 
-/// Journals the tip SHA of a branch about to be deleted.
+/// Journals the tip SHA of a branch [`GitWriter::delete_branch`] just deleted.
 ///
 /// Gate rows authorise the request; this row is the restore record. `before_ref`
 /// holds the tip so `create_branch(name, tip)` can put the ref back after the
-/// in-memory Undo toast is gone. Uses [`crate::ledger::record`] so a ledger
-/// outage never blocks the delete itself.
+/// in-memory Undo toast is gone.
 pub(crate) fn record_deleted_branch_tip(
     repo_path: &str,
     branch_name: &str,
     tip: &str,
     force: bool,
 ) {
-    use crate::ledger::{ActorKind, Draft, Outcome};
-
     let flag = if force { "-D" } else { "-d" };
-    let argv = ["git", "branch", flag, branch_name];
-    let address = crate::ledger::bindings::repository_address(repo_path).ok();
-    let ledger_repo = address
-        .as_ref()
-        .map(|address| address.anchor.clone())
-        .unwrap_or_else(|| repo_path.to_string());
-    let worktree_path = address
-        .and_then(|address| (address.worktree != address.anchor).then_some(address.worktree));
+    BranchDeleteJournal::resolve(repo_path).record(
+        &["git", "branch", flag, branch_name],
+        branch_name,
+        tip,
+        crate::ledger::Outcome::Ok,
+    );
+}
 
-    let _ = crate::ledger::record(Draft {
-        repo_path: ledger_repo,
-        worktree_path,
-        actor_kind: Some(ActorKind::Human),
-        action: crate::ledger::action_for_argv(&argv),
-        object: Some(branch_name.to_string()),
-        argv_json: serde_json::to_string(&argv).ok(),
-        outcome: Some(Outcome::Ok),
-        before_ref: Some(tip.to_string()),
-        detail_json: Some(r#"{"phase":"mutate","kind":"branch.delete"}"#.to_string()),
-        ..Default::default()
-    });
+/// Where a repository's branch-delete rows go, resolved once so a batch of
+/// deletes does not re-resolve the ledger address per branch.
+///
+/// Writes through [`crate::ledger::record`] so a ledger outage never blocks
+/// the delete itself.
+pub(crate) struct BranchDeleteJournal {
+    repo: String,
+    worktree: Option<String>,
+}
+
+impl BranchDeleteJournal {
+    pub(crate) fn resolve(repo_path: &str) -> Self {
+        let address = crate::ledger::bindings::repository_address(repo_path).ok();
+        let repo = address
+            .as_ref()
+            .map(|address| address.anchor.clone())
+            .unwrap_or_else(|| repo_path.to_string());
+        let worktree = address
+            .and_then(|address| (address.worktree != address.anchor).then_some(address.worktree));
+        Self { repo, worktree }
+    }
+
+    /// One row for one delete that ran: `argv` is what ran, `outcome` what
+    /// git reported, `tip` the commit the branch pointed at beforehand.
+    pub(crate) fn record(
+        &self,
+        argv: &[&str],
+        branch_name: &str,
+        tip: &str,
+        outcome: crate::ledger::Outcome,
+    ) {
+        let _ = crate::ledger::record(crate::ledger::Draft {
+            repo_path: self.repo.clone(),
+            worktree_path: self.worktree.clone(),
+            actor_kind: Some(crate::ledger::ActorKind::Human),
+            action: crate::ledger::action_for_argv(argv),
+            object: Some(branch_name.to_string()),
+            argv_json: serde_json::to_string(argv).ok(),
+            outcome: Some(outcome),
+            before_ref: Some(tip.to_string()),
+            detail_json: Some(r#"{"phase":"mutate","kind":"branch.delete"}"#.to_string()),
+            ..Default::default()
+        });
+    }
 }
 
 /// True when `branch_name` is the branch the repository's HEAD resolves to by
@@ -2340,11 +2368,19 @@ pub(crate) fn is_checked_out_in_any_worktree(
     repo: &Path,
     branch_name: &str,
 ) -> Result<bool, String> {
+    Ok(checked_out_branches(repo)?.contains(branch_name))
+}
+
+/// Short names of every local branch checked out in any worktree of `repo`
+/// (including the main one), from a single `git worktree list`.
+pub(crate) fn checked_out_branches(repo: &Path) -> Result<HashSet<String>, String> {
     let stdout = git_text(repo, &["worktree", "list", "--porcelain"])?;
-    let target = format!("refs/heads/{branch_name}");
     Ok(stdout
         .lines()
-        .any(|line| line.strip_prefix("branch ").map(str::trim) == Some(target.as_str())))
+        .filter_map(|line| line.strip_prefix("branch "))
+        .filter_map(|refname| refname.trim().strip_prefix("refs/heads/"))
+        .map(str::to_string)
+        .collect())
 }
 
 /// Rewrites only the subject line of a commit message, keeping the body —

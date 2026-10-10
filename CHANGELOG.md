@@ -11,6 +11,34 @@ before that tag is pushed.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Dead-branch backups belong to one repository and never overwrite each
+  other.** Backups were filed by folder name and second, so two repositories
+  called `app` shared a directory and two cleans in one second wrote the same
+  file. Each repository now has its own directory, keyed by its git common
+  directory and shared by its worktrees, and every backup claims a new file
+  name. Backups written by 1.4.0 are still listed and restorable, but only by
+  the repository their header names.
+- **Restoring a backup can no longer run a git option.** Restore reads only
+  this repository's own backup files, up to 4 MiB. Each line must be
+  `git branch <name> <full commit id>` and is run as
+  `git branch -- <name> <commit>`. A line such as `git branch foo -D` used to
+  delete `foo` and report it restored.
+- **Restore reports what happened to each branch.** A branch counts as
+  restored only when it exists at the backed-up commit afterwards. Git's exit
+  status alone no longer decides.
+- **The ledger records a branch deletion after it happens, with its outcome.**
+  A dead-branch clean journaled every branch as deleted while writing the
+  backup, before the policy check and before any delete. A refused or failed
+  clean still recorded deletions. Each row is now written after its delete,
+  as `ok` or `failed`, with the command that ran.
+- **A dead-branch clean no longer spawns git several times per branch while
+  holding the repository lock.** It lists worktrees once, reuses the default
+  branch the branch listing already resolved, and runs `merge-tree` only for
+  the selected branches (none with force). A 50-branch clean went from 457 git
+  processes to 109.
+
 ## [1.4.0] - 2026-10-09
 
 Agents that start in the background with a pane showing every one at work,
