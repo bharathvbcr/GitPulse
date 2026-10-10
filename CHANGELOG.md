@@ -13,6 +13,18 @@ before that tag is pushed.
 
 ### Changed
 
+- **Repository hooks need your approval.** `.gitpulse/hooks.json` and
+  `hooks.toml` come from the working tree, so a pulled branch or a compromised
+  agent could write shell commands that GitPulse then ran on every agent
+  launch, worktree add and merge. They now run only after you approve the
+  exact file text (the Worktrees panel shows it); any edit asks again. Each
+  command goes through the command gate and the ledger before it runs, "Run
+  repository hooks" is its own option and off by default (split from "Share
+  build caches"), a file that does not parse is an error instead of falling
+  back to the other format, and TOML commands containing commas are no longer
+  cut apart. Unapproved hooks are skipped with a notice, never run. Security
+  impact: this narrows what repository content can execute; nothing widens.
+
 - CI now fails when a vendored crate is edited in this repository, through the
   new `bun run check:vendor-edits` (`vendor-crates.mjs --check --allow-drift`),
   which `ci:local` runs too. Upstream drift is still printed but never fails a

@@ -371,6 +371,8 @@ pub fn run() {
             cmd_revoke_repository_trust,
             cmd_list_worktrees,
             cmd_add_worktree,
+            cmd_preview_worktree_hooks,
+            cmd_approve_worktree_hooks,
             cmd_remove_worktree,
             cmd_lock_worktree,
             cmd_unlock_worktree,

@@ -278,3 +278,19 @@ describe("WorktreesPanel GitPulse task worktrees", () => {
     expect(source).toContain("{lane.task_title || \"Task\"} · {runStateLabel(lane.state)}");
   });
 });
+
+describe("WorktreesPanel repository hooks consent", () => {
+  it("keeps hooks off by default, apart from build-cache sharing, and sends the choice", () => {
+    expect(source).toContain("let runHooks = $state(false);");
+    expect(source).toContain("Run repository hooks");
+    expect(source).toContain("Share build caches");
+    const body = source.slice(source.indexOf("async function create"), source.indexOf("function removeArmTitle"));
+    expect(body.slice(body.indexOf('("cmd_add_worktree"'))).toMatch(/cowCaches,\s*runHooks,/);
+  });
+
+  it("approves exactly the text it showed", () => {
+    const body = source.slice(source.indexOf("async function approveHooks"), source.indexOf("let prevRepoPath"));
+    expect(body).toContain('"cmd_approve_worktree_hooks"');
+    expect(body).toContain("content: shown.content");
+  });
+});

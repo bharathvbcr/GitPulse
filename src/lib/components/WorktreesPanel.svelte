@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { worktreeSetupNotices, type MergeTeardownResult, type WorktreeCreated, type WorktreeInfo, type WorktreeRouteInfo } from "../branches/types";
+  import { worktreeSetupNotices, type MergeTeardownResult, type WorktreeCreated, type WorktreeHooksPreview, type WorktreeInfo, type WorktreeRouteInfo } from "../branches/types";
   import { toastStore } from "../stores/toastStore";
   import type { TaskScope, TaskView } from "../tasks/types";
   import { loadWorktreeTasks } from "../tasks/bindings";
@@ -54,6 +54,45 @@
   let newBranch = $state("");
   let startPoint = $state("");
   let cowCaches = $state(true);
+  // Repository hooks run shell commands from a file the working tree
+  // controls, so they are off until asked for and, even then, run only when the
+  // exact file text was approved here.
+  let runHooks = $state(false);
+  let hooksPreview = $state<WorktreeHooksPreview | null>(null);
+  let hooksError = $state<string | null>(null);
+  let hooksBusy = $state(false);
+
+  async function readHooksPreview() {
+    const repo = $repoStore.currentPath;
+    hooksPreview = null;
+    hooksError = null;
+    if (!repo || !runHooks) return;
+    hooksBusy = true;
+    try {
+      const preview = await invoke<WorktreeHooksPreview | null>("cmd_preview_worktree_hooks", { repoPath: repo });
+      if ($repoStore.currentPath === repo) hooksPreview = preview;
+    } catch (err: unknown) {
+      if ($repoStore.currentPath === repo) hooksError = reportPanelError("worktrees", err);
+    } finally {
+      hooksBusy = false;
+    }
+  }
+
+  async function approveHooks() {
+    const repo = $repoStore.currentPath;
+    const shown = hooksPreview;
+    if (!repo || !shown) return;
+    hooksBusy = true;
+    hooksError = null;
+    try {
+      await invoke("cmd_approve_worktree_hooks", { repoPath: repo, content: shown.content });
+    } catch (err: unknown) {
+      hooksError = reportPanelError("worktrees", err);
+    } finally {
+      hooksBusy = false;
+    }
+    await readHooksPreview();
+  }
   let mergeConfirmPath = $state<string | null>(null);
   let mergingPath = $state<string | null>(null);
   let mergeTimer: ReturnType<typeof setTimeout> | null = null;
@@ -270,6 +309,7 @@
         startPoint: base || null,
         detach: !branch,
         cowCaches,
+        runHooks,
       });
       createCompleted = true;
       // Created, but not everything it was asked to do happened. Said now,
@@ -532,8 +572,41 @@
       </div>
       <label class="flex items-center gap-1.5 text-[9px] text-textMuted cursor-pointer select-none">
         <input type="checkbox" bind:checked={cowCaches} class="rounded border-border text-accent focus:ring-accent" />
-        <span>CoW Build Cache Sharing (reflink / clonefile)</span>
+        <span>Share build caches (reflink / clonefile)</span>
       </label>
+      <label class="flex items-center gap-1.5 text-[9px] text-textMuted cursor-pointer select-none">
+        <input
+          type="checkbox"
+          bind:checked={runHooks}
+          onchange={readHooksPreview}
+          class="rounded border-border text-accent focus:ring-accent"
+        />
+        <span>Run repository hooks (.gitpulse/hooks)</span>
+      </label>
+      {#if runHooks}
+        <div class="rounded border border-border/80 p-1.5 text-[9px] text-textMuted" data-testid="worktree-hooks-consent">
+          {#if hooksError}
+            <p class="text-rose-400">{hooksError}</p>
+          {:else if hooksBusy && !hooksPreview}
+            <p>Reading the hooks file…</p>
+          {:else if !hooksPreview}
+            <p>This repository has no hooks file.</p>
+          {:else}
+            <p>
+              {hooksPreview.file} runs these as shell commands in the new worktree and when merging:
+            </p>
+            <pre class="mt-1 max-h-32 overflow-auto whitespace-pre-wrap font-mono text-textPrimary">{hooksPreview.content}</pre>
+            {#if hooksPreview.approved}
+              <p class="mt-1">Approved. Editing the file asks again.</p>
+            {:else}
+              <p class="mt-1">Not approved: nothing runs until you approve exactly this text.</p>
+              <button type="button" class="gp-btn-primary px-2! py-0.5! text-[10px]! mt-1" disabled={hooksBusy} onclick={approveHooks}>
+                Approve these hooks
+              </button>
+            {/if}
+          {/if}
+        </div>
+      {/if}
       <div class="flex items-center justify-between">
         <span class="text-[9px] text-textMuted">No branch name creates a detached checkout.</span>
         <button type="submit" disabled={isCreating || !newPath.trim()} class="gp-btn-primary px-2! py-0.5! text-[10px]!">

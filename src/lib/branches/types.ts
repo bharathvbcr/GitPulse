@@ -268,6 +268,27 @@ export interface MergeTeardownResult {
   branch_deleted: boolean;
   /** A `post_merge` hook failed after the merge and teardown had happened. */
   hook_error: string | null;
+  /** Hooks the repository lists were not approved, so did not run. */
+  hook_notice?: string | null;
+}
+
+/** `engine::worktree_hooks::WorktreeHooksConfig`. */
+export interface WorktreeHooksConfig {
+  post_create: string[];
+  pre_merge: string[];
+  post_merge: string[];
+}
+
+/**
+ * The repository's `.gitpulse/hooks` file as the approval dialog shows it.
+ * Mirrors `engine::worktree_hooks::WorktreeHooksPreview`. `approved` is true
+ * only for this exact text; any edit asks again.
+ */
+export interface WorktreeHooksPreview {
+  file: string;
+  content: string;
+  config: WorktreeHooksConfig;
+  approved: boolean;
 }
 
 /**
@@ -280,6 +301,8 @@ export interface WorktreeCreated {
   cache_error: string | null;
   /** A `post_create` hook failed, timed out, or was refused. */
   hook_error: string | null;
+  /** Hooks were asked for but the repository's file was not approved, so none ran. */
+  hook_notice?: string | null;
 }
 
 /**
@@ -287,7 +310,7 @@ export interface WorktreeCreated {
  * left undone: one sentence per step, empty when there is nothing to say.
  */
 export function worktreeSetupNotices(
-  done: { cache_error?: string | null; hook_error?: string | null },
+  done: { cache_error?: string | null; hook_error?: string | null; hook_notice?: string | null },
   when: "create" | "merge",
 ): string[] {
   const notices: string[] = [];
@@ -297,6 +320,7 @@ export function worktreeSetupNotices(
       ? `The worktree was created, but its post_create hook did not finish, so it may not be set up: ${done.hook_error}`
       : `The merge and teardown finished, but the post_merge hook did not: ${done.hook_error}`);
   }
+  if (done.hook_notice) notices.push(done.hook_notice);
   return notices;
 }
 

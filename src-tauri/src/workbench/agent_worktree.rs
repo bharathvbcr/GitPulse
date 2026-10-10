@@ -232,6 +232,8 @@ pub(super) fn provision(
         None,
         false,
         true,
+        // Approved hooks only: an unapproved file is reported, not run.
+        true,
     )
     .map_err(refused)?;
     let provisioned = Provisioned {
@@ -243,6 +245,9 @@ pub(super) fn provision(
     if let Some(cache) = created.cache_error {
         // Caches only save a rebuild; the agent can work without them.
         log::warn!(target: "workbench", "agent worktree {} has no copied build caches: {cache}", provisioned.path);
+    }
+    if let Some(notice) = created.hook_notice {
+        log::warn!(target: "workbench", "agent worktree {}: {notice}", provisioned.path);
     }
     if let Some(hook) = created.hook_error {
         // The repository's own setup did not finish (dependencies, seeds), so
@@ -446,11 +451,9 @@ mod tests {
         git_global(&["init", "-b", "main", root.to_str().unwrap()]).unwrap();
         crate::test_support::trust_repo(&root);
         std::fs::create_dir_all(root.join(".gitpulse")).unwrap();
-        std::fs::write(
-            root.join(".gitpulse/hooks.json"),
-            r#"{"worktree":{"post_create":["echo npm ci failed >&2; exit 7"]}}"#,
-        )
-        .unwrap();
+        let hooks = r#"{"worktree":{"post_create":["echo npm ci failed >&2; exit 7"]}}"#;
+        std::fs::write(root.join(".gitpulse/hooks.json"), hooks).unwrap();
+        crate::engine::approve_worktree_hooks(&root, hooks).unwrap();
         git_text(&root, &["add", "."]).unwrap();
         git_text(
             &root,

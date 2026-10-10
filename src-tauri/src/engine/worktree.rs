@@ -127,7 +127,7 @@ const DIRTY_SCAN_FAN_OUT: usize = 4;
 
 use crate::engine::cow_clone::reflink_ignored_caches;
 use crate::engine::portless::{detect_worktree_routes, WorktreeRouteInfo};
-use crate::engine::worktree_hooks::{execute_worktree_hooks, load_worktree_hooks};
+use crate::engine::worktree_hooks::run_repo_hooks;
 
 /// Diff stats for uncommitted changes in a worktree (`HEAD±`).
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -1219,9 +1219,15 @@ pub struct WorktreeCreated {
     pub cache_error: Option<String>,
     /// A `post_create` hook failed, timed out, or was refused.
     pub hook_error: Option<String>,
+    /// Hooks were asked for and the repository's file lists some that were not
+    /// approved, so none ran. Not a failure: the worktree is as plain as one
+    /// made without hooks, and this says why.
+    #[serde(default)]
+    pub hook_notice: Option<String>,
 }
 
-/// Creates a linked worktree with optional Copy-on-Write cache cloning and lifecycle hooks.
+/// Creates a linked worktree with optional Copy-on-Write cache cloning and,
+/// when `run_hooks` is set, the repository's approved `post_create` hooks.
 pub fn add_worktree_extended(
     repo_path: &str,
     target_path: &str,
@@ -1229,30 +1235,34 @@ pub fn add_worktree_extended(
     start_point: Option<&str>,
     detach: bool,
     cow_caches: bool,
+    run_hooks: bool,
 ) -> Result<WorktreeCreated, String> {
     let path = add_worktree(repo_path, target_path, new_branch, start_point, detach)?;
     let mut created = WorktreeCreated {
         path,
         cache_error: None,
         hook_error: None,
+        hook_notice: None,
     };
     if cow_caches {
         let repo = validate_repo(repo_path)?;
-        let target = Path::new(target_path);
-        created.cache_error = reflink_ignored_caches(&repo, target).err();
-        let hooks = load_worktree_hooks(&repo);
+        created.cache_error = reflink_ignored_caches(&repo, Path::new(target_path)).err();
+    }
+    if run_hooks {
+        let repo = validate_repo(repo_path)?;
         let branch_name = new_branch.unwrap_or("");
-        created.hook_error = execute_worktree_hooks(
+        match run_repo_hooks(
             &repo,
-            target,
-            &hooks.post_create,
+            Path::new(target_path),
             "post_create",
             &[
                 ("GITPULSE_BRANCH", branch_name),
                 ("GITPULSE_WORKTREE_PATH", target_path),
             ],
-        )
-        .err();
+        ) {
+            Ok(outcome) => created.hook_notice = outcome.skipped,
+            Err(e) => created.hook_error = Some(e),
+        }
     }
     Ok(created)
 }
@@ -1269,6 +1279,9 @@ pub struct MergeTeardownResult {
     /// the teardown had already happened; this says the cleanup after them
     /// did not, where it used to be discarded.
     pub hook_error: Option<String>,
+    /// Hooks the repository lists that were not approved, so did not run.
+    #[serde(default)]
+    pub hook_notice: Option<String>,
 }
 
 /// Merges a worktree branch into target_branch (defaulting to main/master) in the primary
@@ -1327,17 +1340,19 @@ pub fn merge_and_teardown_worktree(
     }
 
     // 2. Pre-merge hooks
-    let hooks = load_worktree_hooks(&repo);
-    execute_worktree_hooks(
-        &repo,
-        &worktree,
-        &hooks.pre_merge,
-        "pre_merge",
-        &[
-            ("GITPULSE_BRANCH", &branch),
-            ("GITPULSE_WORKTREE_PATH", &worktree.to_string_lossy()),
-        ],
-    )?;
+    let mut hook_notices: Vec<String> = Vec::new();
+    hook_notices.extend(
+        run_repo_hooks(
+            &repo,
+            &worktree,
+            "pre_merge",
+            &[
+                ("GITPULSE_BRANCH", &branch),
+                ("GITPULSE_WORKTREE_PATH", &worktree.to_string_lossy()),
+            ],
+        )?
+        .skipped,
+    );
 
     // 3. Collision / uncommitted changes check
     let (changed, _) = changed_paths(&worktree.to_string_lossy())?;
@@ -1404,17 +1419,19 @@ pub fn merge_and_teardown_worktree(
     let branch_deleted = gate(&delete).is_ok() && git_text(&repo, &delete).is_ok();
 
     // 7. Post-merge hooks
-    let hook_error = execute_worktree_hooks(
+    let mut hook_error = None;
+    match run_repo_hooks(
         &repo,
         &repo,
-        &hooks.post_merge,
         "post_merge",
         &[
             ("GITPULSE_BRANCH", &branch),
             ("GITPULSE_TARGET_BRANCH", target),
         ],
-    )
-    .err();
+    ) {
+        Ok(outcome) => hook_notices.extend(outcome.skipped),
+        Err(e) => hook_error = Some(e),
+    }
 
     Ok(MergeTeardownResult {
         merged_branch: branch,
@@ -1423,6 +1440,11 @@ pub fn merge_and_teardown_worktree(
         worktree_removed: true,
         branch_deleted,
         hook_error,
+        hook_notice: if hook_notices.is_empty() {
+            None
+        } else {
+            Some(hook_notices.join(" "))
+        },
     })
 }
 
@@ -2400,12 +2422,18 @@ some-future-field whatever
         git(repo, &["add", "."]);
         git(repo, &["commit", "-m", "initial commit"]);
         crate::test_support::trust_repo(repo);
+        if let Some(hooks) = hooks {
+            // These tests exercise what approved hooks do; consent itself is
+            // tested in worktree_hooks.
+            crate::engine::approve_worktree_hooks(repo, hooks).expect("approve fixture hooks");
+        }
         let wt = tempfile::tempdir().expect("wt tempdir");
         let created = add_worktree_extended(
             repo.to_str().unwrap(),
             wt.path().to_str().unwrap(),
             Some("feature-x"),
             None,
+            false,
             false,
             false,
         )
@@ -2447,6 +2475,7 @@ some-future-field whatever
             None,
             false,
             true,
+            true,
         )
         .expect("the worktree itself was created");
         let hook = created.hook_error.expect("the failed hook was reported");
@@ -2464,9 +2493,71 @@ some-future-field whatever
             None,
             false,
             false,
+            false,
         )
         .unwrap();
         assert_eq!((created.cache_error, created.hook_error), (None, None));
+    }
+
+    /// Agent provisioning and the worktree dialog both ask for hooks; a
+    /// repository's file that nobody approved is reported, never run.
+    #[cfg(unix)]
+    #[test]
+    fn unapproved_post_create_hooks_do_not_run_from_provisioning() {
+        let (dir, _) = teardown_fixture(None);
+        let hooks = r#"{"worktree":{"post_create":["touch ran.marker"]}}"#;
+        std::fs::create_dir_all(dir.path().join(".gitpulse")).unwrap();
+        std::fs::write(dir.path().join(".gitpulse/hooks.json"), hooks).unwrap();
+        let wt = tempfile::tempdir().unwrap();
+        let created = add_worktree_extended(
+            dir.path().to_str().unwrap(),
+            wt.path().to_str().unwrap(),
+            Some("feature-q"),
+            None,
+            false,
+            true,
+            true,
+        )
+        .expect("the worktree itself was created");
+        assert_eq!(created.hook_error, None);
+        let notice = created.hook_notice.expect("the skip is reported");
+        assert!(notice.contains("not been approved"), "{notice}");
+        assert!(!wt.path().join("ran.marker").exists());
+
+        // The same file, approved, runs; edited afterwards, it does not.
+        crate::engine::approve_worktree_hooks(dir.path(), hooks).unwrap();
+        let ok = tempfile::tempdir().unwrap();
+        let created = add_worktree_extended(
+            dir.path().to_str().unwrap(),
+            ok.path().to_str().unwrap(),
+            Some("feature-r"),
+            None,
+            false,
+            false,
+            true,
+        )
+        .unwrap();
+        assert_eq!((created.hook_error, created.hook_notice), (None, None));
+        assert!(ok.path().join("ran.marker").exists());
+
+        std::fs::write(
+            dir.path().join(".gitpulse/hooks.json"),
+            r#"{"worktree":{"post_create":["touch ran.marker","touch extra.marker"]}}"#,
+        )
+        .unwrap();
+        let changed = tempfile::tempdir().unwrap();
+        let created = add_worktree_extended(
+            dir.path().to_str().unwrap(),
+            changed.path().to_str().unwrap(),
+            Some("feature-s"),
+            None,
+            false,
+            false,
+            true,
+        )
+        .unwrap();
+        assert!(created.hook_notice.is_some());
+        assert!(!changed.path().join("extra.marker").exists());
     }
 
     /// The merge runs in the main checkout, onto what it has checked out. On
@@ -2663,9 +2754,16 @@ some-future-field whatever
         // Add linked worktree
         let wt_dir = tempfile::tempdir().expect("wt tempdir");
         let wt_path = wt_dir.path().to_str().unwrap();
-        let created =
-            add_worktree_extended(repo_path, wt_path, Some("feature-x"), None, false, false)
-                .expect("created worktree");
+        let created = add_worktree_extended(
+            repo_path,
+            wt_path,
+            Some("feature-x"),
+            None,
+            false,
+            false,
+            false,
+        )
+        .expect("created worktree");
         assert_eq!(created.path, wt_path);
         assert_eq!((created.cache_error, created.hook_error), (None, None));
         crate::test_support::trust_repo(wt_dir.path());
