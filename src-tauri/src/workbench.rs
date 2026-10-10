@@ -191,7 +191,7 @@ impl WorkbenchState {
         if !self.profile_path()?.exists() {
             return Ok(0);
         }
-        let released = reconcile::sweep(self);
+        let released = reconcile::sweep(self).map(|swept| swept.released);
         // Startup only, not every capacity sweep: each candidate costs an
         // open-file scan, and a launch must not wait on that.
         reconcile::reclaim_expired(self);

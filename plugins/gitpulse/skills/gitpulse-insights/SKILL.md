@@ -10,7 +10,7 @@ metadata:
 
 # GitPulse insights
 
-GitPulse's MCP server is **read-only**. It never checks out a branch, writes a file, or takes a task lease. Ask it what is true, then mutate through the agent that already holds the writer lease.
+GitPulse's MCP server never touches git state: it does not check out a branch, write a file in your repository, or take a task lease. Its read tools (`gitpulse_insights`, `gitpulse_status`, `gitpulse_ledger_events`, and the rest of the `readOnlyHint` set) create and migrate nothing. The server does have five write tools, and they change only the GitPulse task board: `gitpulse_add_task`, `gitpulse_import_tasks`, `gitpulse_complete_task`, `gitpulse_delete_task` and `gitpulse_merge_tasks`. Ask it what is true, then mutate through the agent that already holds the writer lease.
 
 It surfaces GitPulse-owned facts and selected **DevCouncil** modules (in-process DevMap). Policy and agent hosting go through **Manvi**, not this server.
 

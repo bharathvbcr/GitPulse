@@ -1146,7 +1146,7 @@ fn handle_tool_call(name: &str, arguments: &Value) -> Result<Value, String> {
                 .as_u64()
                 .map(|n| n as u32)
                 .unwrap_or(LEDGER_DEFAULT_LIMIT);
-            let address = crate::ledger::bindings::repository_address(repo)
+            let address = crate::ledger::bindings::repository_address_readonly(repo)
                 .map_err(|error| error.to_string())?;
             // `tail` pages *forward* from a cursor — deliberately, so a
             // consumer holding the last id it saw gets the same answer whether
@@ -1158,32 +1158,11 @@ fn handle_tool_call(name: &str, arguments: &Value) -> Result<Value, String> {
             // any size; `returned` says what it is, `truncated` says when more
             // follow, and `next_cursor` is what to pass to get them.
             let cursor = arguments["cursor"].as_i64().unwrap_or(0);
-            match crate::ledger::tail_readonly(&address.anchor, cursor, limit)
-                .map_err(|e| e.to_string())?
-            {
-                Some(events) => {
-                    let truncated = events.len() as u32 >= limit;
-                    let next_cursor = events.last().map(|event| event.id);
-                    Ok(json!({
-                        "ok": true,
-                        "returned": events.len(),
-                        "truncated": truncated,
-                        "next_cursor": next_cursor,
-                        "events": events,
-                    }))
-                }
-                None => Ok(json!({
-                    "ok": false,
-                    "error": "no ledger in this repository yet; nothing has been recorded",
-                    "returned": 0,
-                    "truncated": false,
-                    "events": [],
-                })),
-            }
+            resources::ledger_page(&address.anchor, cursor, limit)
         }
         "gitpulse_task_view" => {
             let repo = arguments["repo_path"].as_str().ok_or("missing repo_path")?;
-            let address = crate::ledger::bindings::repository_address(repo)
+            let address = crate::ledger::bindings::repository_address_readonly(repo)
                 .map_err(|error| error.to_string())?;
             let task_id = arguments["task_id"].as_str();
             let view = crate::tasks::view_filtered(&address.anchor, task_id);

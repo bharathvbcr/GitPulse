@@ -1,4 +1,4 @@
-use super::{judge, manvi_owner, native_owner, Verdict};
+use super::{judge, manvi_owner, native_owner, sweep, sweep_pages, Verdict};
 use crate::engine::git_cli::{git_global, git_text};
 use crate::procguard::LockedSpawn;
 use crate::workbench::process_birth::{self, Liveness};
@@ -818,5 +818,20 @@ fn an_escaped_descendant_in_the_worktree_holds_the_checkout() {
     assert!(
         matches!(&verdict, Verdict::Keep(r) if r.contains(&child.id().to_string())),
         "{verdict:?}"
+    );
+}
+
+#[test]
+fn a_sweep_that_stopped_at_its_page_cap_says_it_is_incomplete() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("profile.sqlite");
+    let state = host(&path);
+    state.with_store(|_| Ok(())).expect("create the profile");
+    let full = sweep(&state).expect("sweep");
+    assert!(full.complete, "an empty profile is fully examined");
+    let capped = sweep_pages(&state, 0).expect("capped sweep");
+    assert!(
+        !capped.complete,
+        "no page was read, so nothing was examined"
     );
 }

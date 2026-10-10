@@ -531,7 +531,7 @@ fn prepare_in(
         // a refusal is rolled back, so the same request_id is still unused.
         Err(error) if matches!(error.code.as_str(), "checkout_busy" | "capacity_reached") => {
             match super::reconcile::sweep(state) {
-                Ok(released) if released > 0 => prepare(),
+                Ok(swept) if swept.released > 0 => prepare(),
                 Ok(_) => Err(error),
                 Err(sweep) => {
                     log::warn!(target: "workbench", "run reconciliation before a launch failed: {}: {}", sweep.code, sweep.message);
@@ -561,7 +561,7 @@ fn ensure_room(state: &WorkbenchState) -> Result<(), WorkbenchError> {
         return Ok(());
     }
     match super::reconcile::sweep(state) {
-        Ok(released) if released > 0 => {
+        Ok(swept) if swept.released > 0 => {
             if super::reconcile::live_count(state)? < u64::from(limit) {
                 return Ok(());
             }

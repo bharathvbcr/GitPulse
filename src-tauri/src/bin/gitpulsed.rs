@@ -207,6 +207,10 @@ struct CycleReport {
     transcripts: i64,
     skipped_lines: i64,
     reflog_entries: i64,
+    /// True when the catch-up deadline stopped the pass early: the counts are
+    /// a floor, and what was not reached is the next cycle's. Carried as its
+    /// own field so a partial pass is not only a substring of `error`.
+    truncated: bool,
     /// The ledger's own status. A cycle that recorded nothing because the
     /// ledger could not be opened must never read like one that recorded
     /// nothing because nothing happened.
@@ -243,6 +247,7 @@ fn guarded_cycle(
                 transcripts: 0,
                 skipped_lines: 0,
                 reflog_entries: 0,
+                truncated: false,
                 // Unknown, so not claimed: the panic may have hit the ledger.
                 recording: false,
                 error: format!("catch-up panicked: {what}"),
@@ -275,6 +280,7 @@ fn run_cycle(repo: &str, cycle: u64) -> CycleReport {
                 transcripts: 0,
                 skipped_lines: 0,
                 reflog_entries: 0,
+                truncated: false,
                 recording: false,
                 error: reason,
                 elapsed_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
@@ -282,8 +288,11 @@ fn run_cycle(repo: &str, cycle: u64) -> CycleReport {
         }
     };
 
-    let status = ledger::status(&address.anchor);
+    // After the catch-up, not before: catching up is what opens (and so can
+    // create or fail to open) the ledger, so a status read first described the
+    // state the cycle was about to change.
     let caught = ingest::catch_up_into(&address.anchor, &address.worktree);
+    let status = ledger::status(&address.anchor);
     CycleReport {
         repo: repo.to_string(),
         cycle,
@@ -291,6 +300,7 @@ fn run_cycle(repo: &str, cycle: u64) -> CycleReport {
         transcripts: caught.transcripts,
         skipped_lines: caught.skipped_lines,
         reflog_entries: caught.reflog_entries,
+        truncated: caught.truncated,
         recording: status.recording,
         error: if caught.error.is_empty() {
             status.error
@@ -411,6 +421,7 @@ mod tests {
                         transcripts: 0,
                         skipped_lines: 0,
                         reflog_entries: 0,
+                        truncated: false,
                         recording: true,
                         error: String::new(),
                         elapsed_ms: 0,

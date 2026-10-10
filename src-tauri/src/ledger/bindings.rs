@@ -90,6 +90,15 @@ pub fn repository_address(repo_path: &str) -> Result<BindingAddress, LedgerError
     address(repo_path, repo_path)
 }
 
+/// [`repository_address`] for a read-only caller: the same anchor, without the
+/// legacy consolidation, which imports rows into (and so creates) the anchor
+/// database. Rows a sibling still holds are not visible through it, which a
+/// read-only status says; running the migration to make the answer complete
+/// is not a read's call to make.
+pub fn repository_address_readonly(repo_path: &str) -> Result<BindingAddress, LedgerError> {
+    resolve_address(repo_path, repo_path).map(|family| family.address)
+}
+
 /// Status is the one family entrypoint that can still return a useful object
 /// when an old sibling ledger is unreadable. Reads and binding resolution fail
 /// closed; status names the canonical destination and loudly marks it degraded.

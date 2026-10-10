@@ -409,10 +409,22 @@ pub(super) fn walk(
     state: &WorkbenchState,
     run_state: &str,
     newest: bool,
+    visit: impl FnMut(&Value) -> bool,
+) -> Result<bool, WorkbenchError> {
+    walk_pages(state, run_state, newest, MAX_PAGES, visit)
+}
+
+/// [`walk`] with the page cap as a parameter, so a test can exercise the
+/// capped path without recording thousands of runs.
+fn walk_pages(
+    state: &WorkbenchState,
+    run_state: &str,
+    newest: bool,
+    max_pages: usize,
     mut visit: impl FnMut(&Value) -> bool,
 ) -> Result<bool, WorkbenchError> {
     let mut cursor: Option<String> = None;
-    for _ in 0..MAX_PAGES {
+    for _ in 0..max_pages {
         let mut input = json!({"state": run_state, "limit": PAGE, "newest": newest});
         if let Some(cursor) = &cursor {
             input["cursor"] = json!(cursor);
@@ -537,18 +549,35 @@ pub(super) fn working_in(
         }))
 }
 
-pub(super) fn sweep(state: &WorkbenchState) -> Result<usize, WorkbenchError> {
+/// What one reconciliation pass did, and whether it saw every held run.
+pub(super) struct Swept {
+    pub released: usize,
+    /// False when a walk stopped at the page cap: runs past it were not
+    /// examined, so `released` is a floor, never a statement that nothing else
+    /// is stranded.
+    pub complete: bool,
+}
+
+pub(super) fn sweep(state: &WorkbenchState) -> Result<Swept, WorkbenchError> {
+    sweep_pages(state, MAX_PAGES)
+}
+
+fn sweep_pages(state: &WorkbenchState, max_pages: usize) -> Result<Swept, WorkbenchError> {
     // Receipts that storage refused when their runs ended are stored first,
     // so a recorded exit code is never overwritten by `outcome_uncertain`.
     super::receipts::replay(state, None);
     let mut ids = Vec::new();
+    let mut complete = true;
     for held in HELD {
-        walk(state, held, false, |run| {
+        complete &= walk_pages(state, held, false, max_pages, |run| {
             if let Some(id) = run["id"].as_str() {
                 ids.push(id.to_owned());
             }
             true
         })?;
+    }
+    if !complete {
+        log::warn!(target: "workbench", "run reconciliation stopped at its page cap; some held runs were not examined");
     }
     let mut released = 0;
     for id in ids {
@@ -562,7 +591,7 @@ pub(super) fn sweep(state: &WorkbenchState) -> Result<usize, WorkbenchError> {
             }
         }
     }
-    Ok(released)
+    Ok(Swept { released, complete })
 }
 
 #[cfg(test)]

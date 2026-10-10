@@ -261,6 +261,48 @@ fn server_document(name: &str) -> Result<Value, ReadError> {
     }
 }
 
+/// One page of the ledger from `cursor`, shared by `gitpulse_ledger_events` and
+/// the `ledger` resource so the two cannot drift.
+///
+/// `tail` pages *forward* from a cursor — deliberately, so a consumer holding
+/// the last id it saw gets the same answer whether it has been listening for
+/// an hour or just opened. `returned` says how many came back, `truncated` is
+/// true only when more events really follow (an exactly-full final page is not
+/// truncated), and `next_cursor` is what to pass to get them.
+pub fn ledger_page(anchor: &str, cursor: i64, limit: u32) -> Result<Value, String> {
+    match crate::ledger::tail_readonly(anchor, cursor, limit).map_err(|e| e.to_string())? {
+        Some(events) => {
+            let next_cursor = events.last().map(|event| event.id);
+            // A full page might be the last one. One more row of lookahead
+            // settles it, and only a full page pays for it.
+            let truncated = match next_cursor {
+                Some(last) if events.len() as u32 >= limit => {
+                    !crate::ledger::tail_readonly(anchor, last, 1)
+                        .map_err(|e| e.to_string())?
+                        .unwrap_or_default()
+                        .is_empty()
+                }
+                _ => false,
+            };
+            Ok(json!({
+                "ok": true,
+                "returned": events.len(),
+                "truncated": truncated,
+                "next_cursor": next_cursor,
+                "events": events,
+            }))
+        }
+        // No ledger is not an empty ledger, and must not read as one.
+        None => Ok(json!({
+            "ok": false,
+            "error": "no ledger in this repository yet; nothing has been recorded",
+            "returned": 0,
+            "truncated": false,
+            "events": [],
+        })),
+    }
+}
+
 /// The composed repository status document.
 ///
 /// The tool dispatch calls this too — it is the one shape that genuinely had
@@ -270,6 +312,10 @@ pub fn status_document(repo: &str) -> Result<Value, String> {
     // The read-only variant: the creating one opens the database (which makes
     // it) and runs the legacy consolidation (which migrates rows), neither of
     // which a tool annotated `readOnlyHint: true` may do to someone's repo.
+    // `?` is the repository boundary: an untrusted, missing or unrelated path
+    // is refused whole. A ledger that exists but cannot be read is not that —
+    // `status_readonly` reports it inside the ledger facet (`recording: false`
+    // plus `error`), so the worktree and code-graph facets still answer.
     let ledger_status = crate::ledger::bindings::repository_status_readonly(repo)
         .map_err(|error| error.to_string())?;
     let codeintel_status = crate::codeintel::status(repo);
@@ -326,25 +372,13 @@ fn repo_facet(facet: &str, repo: &str) -> Result<Value, ReadError> {
         "changes" => Ok(json!(crate::insights::active_changes(repo, None, None))),
         "context" => Ok(json!(crate::insights::change_context(repo, None))),
         "ledger" => {
-            let address = crate::ledger::bindings::repository_address(repo)
+            let address = crate::ledger::bindings::repository_address_readonly(repo)
                 .map_err(|error| ReadError::Internal(error.to_string()))?;
-            match crate::ledger::tail_readonly(&address.anchor, 0, super::LEDGER_DEFAULT_LIMIT)
-                .map_err(|error| ReadError::Internal(error.to_string()))?
-            {
-                Some(events) => Ok(json!({
-                    "ok": true, "returned": events.len(), "events": events
-                })),
-                // No ledger is not an empty ledger, and must not read as one.
-                None => Ok(json!({
-                    "ok": false,
-                    "error": "no ledger in this repository yet; nothing has been recorded",
-                    "returned": 0,
-                    "events": [],
-                })),
-            }
+            ledger_page(&address.anchor, 0, super::LEDGER_DEFAULT_LIMIT)
+                .map_err(ReadError::Internal)
         }
         "tasks" => {
-            let address = crate::ledger::bindings::repository_address(repo)
+            let address = crate::ledger::bindings::repository_address_readonly(repo)
                 .map_err(|error| ReadError::Internal(error.to_string()))?;
             Ok(json!(crate::tasks::view(&address.anchor)))
         }
@@ -538,5 +572,92 @@ mod tests {
         // `gitpulse://server/...` is parsed by the `server` authority, so a facet
         // called `server` would be unreachable.
         assert!(!facet_names().contains(&"server"));
+    }
+
+    fn trusted_repo() -> (tempfile::TempDir, String) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        crate::test_support::git_in(dir.path(), &["init", "-q"]);
+        crate::test_support::trust_repo(dir.path());
+        let repo = dir.path().canonicalize().expect("canonical");
+        let repo = repo.to_string_lossy().into_owned();
+        (dir, repo)
+    }
+
+    fn record_events(repo: &str, count: usize) {
+        for _ in 0..count {
+            crate::ledger::append(crate::ledger::Draft {
+                repo_path: repo.to_string(),
+                action: "git.commit".to_string(),
+                actor_kind: Some(crate::ledger::ActorKind::Human),
+                outcome: Some(crate::ledger::Outcome::Ok),
+                ..Default::default()
+            })
+            .expect("append");
+        }
+    }
+
+    #[test]
+    fn the_ledger_resource_pages_like_the_tool() {
+        let (_dir, repo) = trusted_repo();
+        record_events(&repo, 60);
+        let page = repo_facet("ledger", &repo).expect("ledger facet");
+        assert_eq!(page["returned"], 50, "{page}");
+        assert_eq!(page["truncated"], true, "{page}");
+        let next = page["next_cursor"].as_i64().expect("next_cursor");
+        assert_eq!(next, 50);
+        let rest = ledger_page(&repo, next, 50).expect("second page");
+        assert_eq!(rest["returned"], 10);
+        assert_eq!(rest["truncated"], false);
+    }
+
+    #[test]
+    fn an_exactly_full_final_page_is_not_truncated() {
+        let (_dir, repo) = trusted_repo();
+        record_events(&repo, 3);
+        let full = ledger_page(&repo, 0, 3).expect("page");
+        assert_eq!(full["returned"], 3);
+        assert_eq!(full["truncated"], false, "{full}");
+        let short = ledger_page(&repo, 0, 2).expect("page");
+        assert_eq!(short["truncated"], true, "{short}");
+        assert_eq!(short["next_cursor"], 2);
+    }
+
+    #[test]
+    fn reading_the_ledger_resource_creates_nothing() {
+        let (dir, repo) = trusted_repo();
+        let page = repo_facet("ledger", &repo).expect("ledger facet");
+        assert_eq!(page["ok"], false, "{page}");
+        assert!(
+            !dir.path().join(".devcouncil").exists(),
+            "a resource read created the ledger"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_ledger_that_cannot_be_read_degrades_one_facet_not_the_status() {
+        let (dir, repo) = trusted_repo();
+        let state = dir.path().join(".devcouncil");
+        std::fs::create_dir(&state).expect("state dir");
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        std::fs::write(
+            state.join("ledger.sqlite"),
+            b"this is not a sqlite database at all",
+        )
+        .expect("corrupt ledger");
+        let status = status_document(&repo).expect("the status call must not fail whole");
+        assert_eq!(status["ledger"]["recording"], false, "{status}");
+        assert!(
+            !status["ledger"]["error"]
+                .as_str()
+                .unwrap_or_default()
+                .is_empty(),
+            "{status}"
+        );
+        assert!(status["worktrees"].is_object(), "{status}");
+        assert!(status["codeintel"].is_object(), "{status}");
     }
 }
