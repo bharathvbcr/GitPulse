@@ -127,6 +127,25 @@ before that tag is pushed.
 
 ### Changed
 
+- **The task profile's schema moves only when the desktop app moves it.**
+  The app upgrades an older profile once, after dc-store's own backup
+  (`<profile>.pre-schema-<n>.bak`) and before the first read, and a failed
+  upgrade is returned to the caller, logged and listed in Diagnostics. The MCP
+  server's handles refuse upgrades (`schema_upgrade_required`), so an older or
+  newer server never migrates a profile the app and Manvi share. Manvi's own
+  `schema_upgrade_required` is shown as what to do. Task views and scopes open
+  the repository store read-only and judge leases without sweeping them: a
+  lapsed lease is no longer rewritten by looking at it, and a lease whose
+  expiry cannot be read is listed with that text (`expiry_error`) instead of
+  failing the list.
+- **Task writes are safer to repeat.** `gitpulse_complete_task` and
+  `gitpulse_delete_task` take an optional `request_id`, which the store keys its
+  receipts by, so a call whose answer was lost can be sent again. A delete the
+  caller allowed with `even_if_running` carries that to the store, which now
+  refuses a delete under a live run inside its own transaction. `gitpulse_add_task`
+  files a new task only against the board it scanned for related work: the write
+  names the scan's sequence, and a board that changed in between is scanned
+  again once, then reported as `board_changed`.
 - The profile is compacted once a day: the host runs dc-store's `store.compact`
   (expired receipts, events and revisions, a bounded number per pass) from its
   existing background loop, off the UI thread, never beside itself, never
@@ -193,15 +212,17 @@ before that tag is pushed.
   function floor has a margin of over one point instead of 0.05. The coverage
   workflow now reports Rust branch coverage (nightly `--branch`); it is reported,
   not gated, until a floor has been measured.
-- **The task-scope fence's open edges are decided and documented.** `rm`,
-  `truncate`, `touch`, `dd of=`, `perl -i`, `install`, `ln`, `rsync`, `patch`,
-  `git apply` and `xargs` / `find -exec` writes are not read by the harness
-  and are allowed against a plan that excludes the file; fencing them belongs
-  to the harness, not a second parser here. The hook now has a test that every
-  one reaches the harness verbatim with the bound scope, and the real-harness
-  fence test pins the gap so it fails when it closes. Escaped descendants and
-  second-profile agents are documented as outside what a hook can judge. No
-  behaviour changed.
+- **The task-scope fence covers argument-writing commands.** With DevCouncil
+  `ec26e906` in the harness (Manvi `hx/wave2` or later), `rm`, `truncate`,
+  `touch`, `dd of=`, `perl -i`, `install`, `ln`, `rsync` and `patch FILE` against
+  a plan that excludes the file are refused as `scope.unplanned`, and a write
+  whose target is not in the command (`git apply`, `xargs`, `find -exec`) is
+  refused as `command.substitution` while a scope is bound. GitPulse still
+  runs no parser of its own: the hook forwards every command verbatim with the
+  bound scope, and a test proves each one arrives. The real-harness fence test
+  now asserts the refusals against a Manvi built from `hx/wave2`. Escaped
+  descendants and second-profile agents stay documented as outside what a hook
+  can judge.
 - **`gitpulse-hook` correctness.** The hook now takes down any `git` or harness
   child a check abandoned at its deadline before it exits (a stalled `git
   status` used to outlive it and could hold `.git/index.lock`); one 8 s

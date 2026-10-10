@@ -5,44 +5,43 @@
 //! The unit tests in `src/hooks/mod.rs` prove the hook sends the scope and
 //! renders what comes back, against a scripted sidecar. What they cannot prove
 //! is the half that lives in the harness: which files a command line is read
-//! as writing. `sed -i`, `tee`, `cp` and `mv` write through their arguments,
-//! and until DevCouncil `fix/argument-write-targets` the harness read only
-//! redirections — so each came back a demoted allow while `echo x > f` into the
-//! same file was refused. Only a real harness can show that gap closed.
+//! as writing. Only a real harness can show that gap closed, and the harness
+//! owns it: DevCouncil `policy` reads the files a command writes through its
+//! arguments and gives each to the same file gate `policy.check.file` uses.
 //!
-//! It is `#[ignore]` because it needs that harness: run it with
-//! `GITPULSE_MANVI_BIN` naming the candidate binary, e.g.
+//! It is `#[ignore]` because it needs that harness: a Manvi built from
+//! `hx/wave2` or later, whose DevCouncil pin is at or after `ec26e906`
+//! (`fix(policy): command gate judges every file rm/truncate/touch/install/ln/
+//! rsync/patch/dd/perl -i write against the file gate`). Run it with
+//! `GITPULSE_MANVI_BIN` naming that binary:
 //!
 //! ```text
 //! GITPULSE_MANVI_BIN=/path/to/manvi cargo test --test hook_scope_fence -- --ignored
 //! ```
 //!
-//! # What the fence does not cover
+//! # What the fence covers
 //!
-//! The harness reads a command line's redirections and the files `sed -i`,
-//! `tee`, `cp` and `mv` write through their arguments. It does **not** read the
-//! other argument-writing programs, and the last section of the test pins that
-//! with the real binary: `rm`, `truncate`, `touch`, `dd of=`, `perl -i`,
-//! `install`, `ln`, `rsync`, `patch`, `git apply`, and anything run through
-//! `xargs` or `find -exec` come back allowed against a plan that excludes the
-//! file. Reading them is write-target extraction, which belongs to the harness
-//! (DevCouncil `policy`), so it is not reimplemented here in a second, drifting
-//! parser; the hook forwards every one of them verbatim with the bound scope
+//! Against a plan that excludes `docs/other.md`, every command that writes it
+//! through an argument is refused with `scope.unplanned`: `sed -i`, `tee`, `cp`
+//! and `mv`, and `rm`, `truncate`, `touch`, `dd of=`, `perl -i`, `install`,
+//! `ln`, `rsync` and `patch FILE`. A write whose target is not in the command
+//! text cannot be judged against a scope, so with a scope bound it is refused
+//! as `command.substitution`, with a reason naming the declared scope: `git
+//! apply`, anything run through `xargs`, and `find -exec`. The hook forwards
+//! every one of them verbatim with the bound scope
 //! (`every_argument_writer_reaches_the_harness_verbatim_with_the_scope` in
 //! `src/hooks/mod.rs`, which CI runs), so fencing one more writer is a harness
-//! change with no change in this repository. When one starts to be refused, the
-//! assertion below fails and moves that program into the refused list above it.
+//! change with no change in this repository. When one stops being refused, the
+//! assertion below fails and says so.
 //!
-//! The same decision applies to the two other open edges: a descendant that
-//! escapes the agent's process group acts outside any hook (the hook judges
-//! calls, not processes; teardown reaping owns processes), and an agent running
-//! under a second Claude profile has no hook registered at all, which no hook
-//! can fence (Settings -> MCP now copies a `hooks.json` for that profile).
-//! `wiki/MCP and Agents.md` states all three.
+//! Two edges stay open, and no hook can close them: a descendant that escapes
+//! the agent's process group acts outside any hook (the hook judges calls, not
+//! processes; teardown reaping owns processes), and an agent running under a
+//! second Claude profile has no hook registered at all (Settings -> MCP copies
+//! a `hooks.json` for that profile). `wiki/MCP and Agents.md` states both.
 //!
-//! CI does not run this file: it needs a Manvi built from DevCouncil
-//! `fix/argument-write-targets`, and no such build exists at a ref CI can fetch.
-//! Run it by hand when the harness changes.
+//! CI does not run this file: it needs that Manvi build, and none exists at a
+//! ref CI can fetch. Run it by hand when the harness changes.
 //!
 //! Its `HOME` is scoped to the test through `bind_env`: trust records live under
 //! it, and a fixture must not write the developer's own.
@@ -113,7 +112,7 @@ fn denied(answer: &Option<serde_json::Value>) -> bool {
 }
 
 #[test]
-#[ignore = "requires GITPULSE_MANVI_BIN: a manvi built with DevCouncil fix/argument-write-targets"]
+#[ignore = "requires GITPULSE_MANVI_BIN: a manvi built from Manvi hx/wave2 (DevCouncil >= ec26e906)"]
 fn a_task_bound_session_cannot_write_outside_its_plan_through_any_tool() {
     let home = tempfile::tempdir().expect("home");
     let logs = tempfile::tempdir().expect("logs");
@@ -162,21 +161,35 @@ fn a_task_bound_session_cannot_write_outside_its_plan_through_any_tool() {
         })
     };
 
-    // Outside the plan: every way of writing docs/other.md is refused, the
-    // redirect that always was and the four that were demoted allows.
+    let reason_of = |answer: &Option<serde_json::Value>| {
+        answer.as_ref().unwrap()["hookSpecificOutput"]["permissionDecisionReason"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string()
+    };
+
+    // Outside the plan: every way of writing docs/other.md is refused as an
+    // unplanned write, whether the harness reads it from a redirection or from
+    // the arguments of the program that writes it.
     for command in [
         "echo x > docs/other.md",
         "sed -i.bak s/a/b/ docs/other.md",
         "printf x | tee docs/other.md",
         "cp seed.txt docs/other.md",
         "mv seed.txt docs/other.md",
+        "rm docs/other.md",
+        "truncate -s 0 docs/other.md",
+        "touch docs/other.md",
+        "dd if=seed.txt of=docs/other.md",
+        "perl -pi -e 's/a/b/' docs/other.md",
+        "install seed.txt docs/other.md",
+        "ln -sf seed.txt docs/other.md",
+        "rsync seed.txt docs/other.md",
+        "patch docs/other.md < x.diff",
     ] {
         let answer = ask("command-gate", &bash(command), home.path(), logs.path());
         assert!(denied(&answer), "{command} was not refused: {answer:?}");
-        let reason = answer.unwrap()["hookSpecificOutput"]["permissionDecisionReason"]
-            .as_str()
-            .unwrap_or_default()
-            .to_string();
+        let reason = reason_of(&answer);
         assert!(reason.contains("scope.unplanned"), "{command}: {reason}");
     }
     let answer = ask(
@@ -190,27 +203,21 @@ fn a_task_bound_session_cannot_write_outside_its_plan_through_any_tool() {
         "an Edit outside the plan was not refused: {answer:?}"
     );
 
-    // The argument writers the harness does not read are allowed today. This
-    // pins that gap with the real binary, so it cannot close unnoticed.
+    // A writer whose target is not in the command text cannot be judged against
+    // a scope, so a bound scope refuses it rather than guessing.
     for command in [
-        "rm docs/other.md",
-        "truncate -s 0 docs/other.md",
-        "touch docs/other.md",
-        "dd if=seed.txt of=docs/other.md",
-        "perl -pi -e 's/a/b/' docs/other.md",
-        "install seed.txt docs/other.md",
-        "ln -sf seed.txt docs/other.md",
-        "rsync seed.txt docs/other.md",
-        "patch docs/other.md < x.diff",
         "git apply x.diff",
         "echo docs/other.md | xargs rm",
         "find docs -name other.md -exec rm {} +",
     ] {
         let answer = ask("command-gate", &bash(command), home.path(), logs.path());
+        assert!(denied(&answer), "{command} was not refused: {answer:?}");
+        let reason = reason_of(&answer);
         assert!(
-            !denied(&answer),
-            "{command} is now refused: the harness learned a writer. Move it to the refused list above and update wiki/MCP and Agents.md: {answer:?}"
+            reason.contains("command.substitution"),
+            "{command}: {reason}"
         );
+        assert!(reason.contains("declared scope"), "{command}: {reason}");
     }
 
     // Inside the plan, nothing is refused.
