@@ -1479,6 +1479,9 @@ fn latest_binding(
     })
 }
 
+/// A binding's `(ts_utc, ulid)` precedence key and the task it names, if any.
+pub(crate) type NewestBinding = ((String, String), Option<String>);
+
 /// The newest bind or unbind for a worktree in one *legacy sibling* ledger,
 /// with its `(ts_utc, ulid)` precedence key, read through a read-only
 /// connection. For resolving a binding while the family's own ledger does not
@@ -1488,7 +1491,7 @@ pub(crate) fn newest_binding_readonly(
     sibling_repo: &str,
     worktree: &str,
     stored_worktree: &str,
-) -> Result<Option<((String, String), Option<String>)>, LedgerError> {
+) -> Result<Option<NewestBinding>, LedgerError> {
     with_access(sibling_repo, Access::ReadOnly, |conn| {
         conn.query_row(
             "SELECT ts_utc, ulid, action, task_id FROM events

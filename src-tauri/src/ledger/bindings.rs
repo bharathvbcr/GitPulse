@@ -239,7 +239,7 @@ pub(crate) struct ResolvedBinding {
 /// read, and a read must not create or migrate the family ledger.
 fn newest_sibling_binding(family: FamilyAddress) -> Result<Option<ResolvedBinding>, LedgerError> {
     let stored_worktree = super::redact::text(&family.address.worktree);
-    let mut newest: Option<((String, String), Option<String>)> = None;
+    let mut newest: Option<super::NewestBinding> = None;
     for member in &family.members {
         let member = member.to_string_lossy();
         if member.as_ref() == family.address.anchor || !super::is_initialised(&member) {
