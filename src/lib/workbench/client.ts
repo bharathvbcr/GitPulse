@@ -32,6 +32,11 @@ export interface ChecklistEntry { text: string; done: boolean }
 /** The store's caps (dc-store `workbench/items.rs`). */
 export const MAX_CHECKLIST = 128, MAX_CHECKLIST_TEXT = 4096, MAX_TASK_LINKS = 64;
 export type EnhancementField = "title" | "description";
+/** What a refinement proposal (dc-store schema 12) may propose; accepting selects among them. */
+export const REFINE_PARTS = ["acceptance_criteria", "split_into", "duplicate_of"] as const;
+export type RefinePart = (typeof REFINE_PARTS)[number];
+/** A task field a person can lock against Manvi: `acceptance_criteria` joined the text fields in schema 12. */
+export type LockableField = EnhancementField | "acceptance_criteria";
 export const ENHANCEMENT_STATES = ["pending", "running", "cancel_requested", "ready", "failed", "cancelled", "interrupted", "dismissed", "accepted", "undone"] as const;
 export type EnhancementState = (typeof ENHANCEMENT_STATES)[number];
 export interface EnhancementSummary extends RecordVersion {
@@ -47,7 +52,7 @@ export interface AutomationSettings extends RecordVersion { enabled: boolean; pr
 export const AUTOMATIC_STATES = ["not_started", "checking", "idle", "disabled", "waiting", "generating", "stopping", "paused", "stopped"] as const;
 export interface AutomaticStatus { state: typeof AUTOMATIC_STATES[number]; reason: string; task_id: string; proposal_id: string; next_check_at: number }
 export type EnhancementMutation = "enhancements.create" | "enhancements.generate" | "enhancements.accept" | "enhancements.dismiss" | "enhancements.undo" | "enhancements.recover" | "enhancements.revise";
-export interface Task extends TaskCard { description: string; acceptance_criteria: string[]; checklist: ChecklistEntry[]; links: TaskLink[]; locked_fields?: EnhancementField[]; logs?: string }
+export interface Task extends TaskCard { description: string; acceptance_criteria: string[]; checklist: ChecklistEntry[]; links: TaskLink[]; locked_fields?: LockableField[]; logs?: string }
 export interface BriefReference extends RecordVersion { name: string }
 export interface TaskBrief extends RecordVersion { format_version: 1; task: Task; repositories: BriefReference[]; workspace: BriefReference | null; markdown: string }
 export const RUN_STATES = ["prepared", "starting", "running", "exited", "failed", "cancelled", "unresolved"] as const;
@@ -364,19 +369,34 @@ function links(value: unknown): TaskLink[] {
     return { kind, item_id: id };
   });
 }
-function lockFields(value: unknown): EnhancementField[] {
+function distinct(value: unknown, max: number): string[] {
   const fields = strings(value);
-  if (fields.length > 2 || new Set(fields).size !== fields.length) return invalid();
-  return fields.map((field) => field === "title" || field === "description" ? field : invalid());
+  if (fields.length > max || new Set(fields).size !== fields.length) return invalid();
+  return fields;
+}
+function lockFields(value: unknown): EnhancementField[] {
+  return distinct(value, 2).map((field) => field === "title" || field === "description" ? field : invalid());
+}
+function taskLocks(value: unknown): LockableField[] {
+  return distinct(value, 3).map((field) => field === "title" || field === "description" || field === "acceptance_criteria" ? field : invalid());
+}
+function refineParts(value: unknown): RefinePart[] {
+  return distinct(value, REFINE_PARTS.length).map((part) => REFINE_PARTS.find((known) => known === part) ?? invalid());
 }
 export function task(value: unknown): Task {
   const raw = object(value);
   const logs = raw.logs === undefined ? undefined : text(raw.logs);
   if (logs !== undefined && (logs.includes("\0") || new TextEncoder().encode(logs).length > 1024 * 1024)) return invalid();
-  return { ...taskCard(raw), description: text(raw.description), acceptance_criteria: strings(raw.acceptance_criteria), checklist: checklist(raw.checklist), links: links(raw.links), ...(logs === undefined ? {} : { logs }), ...(raw.locked_fields === undefined ? {} : { locked_fields: lockFields(raw.locked_fields) }) };
+  return { ...taskCard(raw), description: text(raw.description), acceptance_criteria: strings(raw.acceptance_criteria), checklist: checklist(raw.checklist), links: links(raw.links), ...(logs === undefined ? {} : { logs }), ...(raw.locked_fields === undefined ? {} : { locked_fields: taskLocks(raw.locked_fields) }) };
+}
+/** Stored proposals are text (title/description) or, from schema 12, refinements; a body written before it has no kind. */
+export function enhancementKind(value: unknown): "text" | "refine" {
+  const kind = object(value).kind;
+  return kind === undefined || kind === "text" ? "text" : kind === "refine" ? "refine" : invalid();
 }
 export function enhancementSummary(value: unknown): EnhancementSummary {
   const raw = object(value);
+  if (enhancementKind(raw) !== "text") return invalid();
   const state = ENHANCEMENT_STATES.find((state) => state === raw.state);
   const fields = lockFields(raw.fields);
   const taskID = text(raw.task_id), sourceRevision = integer(raw.source_revision);
@@ -420,6 +440,32 @@ export function enhancement(value: unknown): Enhancement {
   const original = raw.original_proposed === undefined ? null : proposalFields(raw.original_proposed, summary.fields, true);
   if ((summary.edited_fields.length && original === null) || (original && summary.fields.some((field) => (original[field] !== proposed[field]) !== summary.edited_fields.includes(field)))) return invalid();
   return { ...summary, source, proposed, original_proposed: original, rationale: raw.rationale === undefined ? "" : text(raw.rationale) };
+}
+/** A stored refinement proposal, as the review of it needs it. */
+export interface StoredRefinement extends RecordVersion {
+  task_id: string; source_revision: number; state: EnhancementState; fields: RefinePart[]; accepted_fields: RefinePart[];
+  created_item_ids: string[]; applied_task_revision: number | null;
+  proposed: { acceptance_criteria: string[]; split_into: { title: string; description: string }[]; duplicate_of: { id: string; reason: string }[] };
+}
+export function storedRefinement(value: unknown): StoredRefinement {
+  const raw = object(value);
+  if (enhancementKind(raw) !== "refine") return invalid();
+  const state = ENHANCEMENT_STATES.find((state) => state === raw.state);
+  const taskID = text(raw.task_id), sourceRevision = integer(raw.source_revision), fields = refineParts(raw.fields);
+  const proposed = raw.proposed === undefined ? {} : object(raw.proposed);
+  const list = (value: unknown): unknown[] => value === undefined ? [] : Array.isArray(value) && value.length <= 64 ? value : invalid();
+  const ids = list(raw.created_item_ids).map(text);
+  if (!state || !fields.length || !sourceRevision || !/^[A-Za-z0-9_-]{1,128}$/.test(taskID) || ids.some((id) => !/^[A-Za-z0-9_-]{1,128}$/.test(id))) return invalid();
+  return {
+    ...version(raw), task_id: taskID, source_revision: sourceRevision, state, fields,
+    accepted_fields: raw.accepted_fields === undefined ? [] : refineParts(raw.accepted_fields),
+    created_item_ids: ids, applied_task_revision: raw.applied_task_revision === undefined ? null : integer(raw.applied_task_revision),
+    proposed: {
+      acceptance_criteria: list(proposed.acceptance_criteria).map(text),
+      split_into: list(proposed.split_into).map((entry) => { const row = object(entry); return { title: text(row.title), description: row.description === undefined ? "" : text(row.description) }; }),
+      duplicate_of: list(proposed.duplicate_of).map((entry) => { const row = object(entry); return { id: text(row.id), reason: row.reason === undefined ? "" : text(row.reason) }; }),
+    },
+  };
 }
 export function page<T>(value: unknown, decode: (raw: unknown) => T): Page<T> {
   const raw = object(value);
@@ -627,8 +673,15 @@ export async function getTaskBrief(id: string, expectedRevision: number): Promis
   return brief;
 }
 export async function getEnhancement(id: string): Promise<Enhancement> { return record(await request("enhancements.get", { id }), enhancement); }
+/** The stored refinement a Manvi refine reply named (`enhancement_id`): its revision is what accepting it is conditional on. */
+export async function getRefinement(id: string): Promise<StoredRefinement> { return record(await request("enhancements.get", { id }), storedRefinement); }
+/** A page of summaries with refinement proposals left out: those are reviewed in the refine panel, not as text suggestions. */
+function textPage(value: unknown): Page<EnhancementSummary> {
+  const rows = page(value, (raw) => enhancementKind(raw) === "text" ? enhancementSummary(raw) : null);
+  return { ...rows, items: rows.items.filter((row): row is EnhancementSummary => row !== null) };
+}
 export async function listEnhancements(taskID: string, cursor?: string): Promise<Page<EnhancementSummary>> {
-  return page(await request("enhancements.list", { task_id: taskID, newest: true, limit: 30, ...(cursor ? { cursor } : {}) }), enhancementSummary);
+  return textPage(await request("enhancements.list", { task_id: taskID, newest: true, limit: 30, ...(cursor ? { cursor } : {}) }));
 }
 /** States in which a proposal still has a worker on it. */
 export const LIVE_ENHANCEMENT_STATES = ["pending", "running", "cancel_requested"] as const satisfies readonly EnhancementState[];
@@ -644,7 +697,7 @@ export const ACTIVE_ENHANCEMENT_STATES = [...LIVE_ENHANCEMENT_STATES, "ready"] a
  * generation start beside it.
  */
 export async function latestEnhancement(taskID: string, states: readonly EnhancementState[]): Promise<EnhancementSummary | null> {
-  const result = page(await request("enhancements.list", { task_id: taskID, newest: true, limit: 1, states: [...states] }), enhancementSummary);
+  const result = textPage(await request("enhancements.list", { task_id: taskID, newest: true, limit: 30, states: [...states] }));
   return result.items[0] ?? null;
 }
 export async function changeEnhancement(method: EnhancementMutation, input: Record<string, unknown>): Promise<Enhancement> {

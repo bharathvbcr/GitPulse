@@ -53,6 +53,10 @@ describe("TaskRefine renders", () => {
     expect(body).toContain("already on the task");
     expect(body).toContain("Apply selected");
     expect(body).toContain("Indexer");
+    // Criteria start chosen; splits create tasks and duplicates link one, so they wait for a choice.
+    expect(body).toMatch(/data-testid="task-refine-part-acceptance_criteria"[^>]*checked/);
+    expect(body).not.toMatch(/data-testid="task-refine-part-split_into"[^>]*checked/);
+    expect(body).not.toMatch(/data-testid="task-refine-part-duplicate_of"[^>]*checked/);
     expect(body).toContain("were dropped");
   });
   it("a task that moved since the proposal disables Apply and says to ask again", () => {

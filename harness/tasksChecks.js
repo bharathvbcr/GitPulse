@@ -67,6 +67,7 @@ const deleted = new Set(), deleteWrites = [], restoreWrites = [], mergeWrites = 
 let mergeFailSource = "";
 let failList = false, corruptSave = false, loseSave = false, holdSave = false, releaseSave, holdSearch = false, heldSearch = [], holdGet = false, releaseGet;
 const receipts = new Map(), proposals = new Map(), enhancementWrites = [], enhancementReads = [];
+const verdicts = new Map(), verdictReads = [];
 let failConfiguration = false, blankConfiguration = false, loseEnhancement = false, holdDelete = false, releaseDelete;
 // Relinking a moved checkout and importing tab groups (see the end of the run).
 let pickFolderResult = null, registerUnknown = false, loseRelink = false;
@@ -218,6 +219,13 @@ mockIPCWithEvents(async (cmd, args) => {
       return result;
     }
     case "runs.list": return JSON.stringify(page([]));
+    // What Manvi's verification says about a card, as the host reads it from the
+    // store. `verdicts` holds the cards that have one; every other card is "none".
+    case "verifications.board": {
+      verdictReads.push([...input.ids]);
+      return JSON.stringify({ok: true, items: Object.fromEntries(input.ids.filter(id => verdicts.has(id)).map(id => [id, verdicts.get(id)]))});
+    }
+    case "verifications.status": return JSON.stringify(verdicts.get(input.id) ?? {ok: true, state: "none", stale: false, record: null});
     case "enhancements.configuration": {
       if(failConfiguration) throw {code:"worker_error",message:"Manvi temporarily unavailable"};
       return JSON.stringify({ok:true,provider:"local",model:blankConfiguration ? "" : "quick-fixture",model_source:"fixture",providers:["local"]});
@@ -531,8 +539,17 @@ if (params.has("check")) {
     check("repository prop changes reload the board scope", !card("task-3") && Boolean(card("task-1")));
     await click("Manvi fixture"); await settle(400);
     check("switching repository tabs replaces prior task cards", Boolean(card("task-3")) && !card("task-1"));
+    check("each board load reads verdicts in one batch of at most 256 distinct ids", verdictReads.length > 0 && verdictReads.every(ids => ids.length > 0 && ids.length <= 256 && new Set(ids).size === ids.length));
+    check("a card nobody has verified shows no verdict chip", root.querySelectorAll('[data-testid="card-verdict"]').length === 0);
+    verdicts.set("task-1", {ok: true, state: "passed", stale: false, record: null});
     await click("Global fixture"); await settle(400);
+    check("a verified card shows its verdict on the card", card("task-1")?.querySelector('[data-testid="card-verdict"]')?.dataset.state === "passed");
     card("task-1").click(); await wait(editor);
+    await wait(() => editor().querySelector('[data-testid="verification-chip"]'));
+    check("the task sheet shows the verdict, a Verify action and the refine action",
+      editor().querySelector('[data-testid="verification-chip"]').dataset.state === "passed"
+      && Boolean(editor().querySelector('[data-testid="task-verify"]')) && Boolean(editor().querySelector('[data-testid="task-refine-ask"]')));
+    verdicts.delete("task-1");
     const title = field("Title"); await change(title, "Unsaved task title");
     confirmations = 0;
     confirmAnswer = false;

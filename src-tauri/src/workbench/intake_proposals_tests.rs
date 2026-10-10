@@ -110,30 +110,6 @@ fn a_proposal_that_looks_like_open_work_is_not_filed_until_the_person_names_it()
 }
 
 #[test]
-fn split_parts_are_one_card_each_however_often_they_are_accepted() {
-    let (_d, store, repo) = setup();
-    let part = |index: u32, title: &str| {
-        json!({
-            "repo_path": repo.path().to_str().unwrap(),
-            "origin": {"kind": "split", "task_id": "ft-parent", "request_id": "req-1", "index": index},
-            "title": title,
-            "description": "Part of the parent.",
-        })
-        .to_string()
-    };
-    let a = file_proposal(&store, &part(0, "Alpha indexer")).unwrap();
-    let b = file_proposal(&store, &part(1, "Zebra exporter")).unwrap();
-    assert_eq!(a["outcome"], "filed", "{a}");
-    assert_eq!(b["outcome"], "filed", "{b}");
-    assert_ne!(a["item_id"], b["item_id"]);
-    assert_eq!(
-        file_proposal(&store, &part(0, "Alpha indexer")).unwrap()["outcome"],
-        "already_filed"
-    );
-    assert_eq!(board(&store, &repo).len(), 2);
-}
-
-#[test]
 fn filing_refuses_malformed_proposals_before_touching_the_board() {
     let (_d, store, repo) = setup();
     let path = repo.path().to_str().unwrap();
@@ -143,8 +119,7 @@ fn filing_refuses_malformed_proposals_before_touching_the_board() {
         file_input(&repo, json!({"priority": 9})),
         file_input(&repo, json!({"surprise": true})),
         "[]".to_owned(),
-        json!({"repo_path": path, "origin": {"kind": "split", "task_id": "../x", "request_id": "r", "index": 0}, "title": "t"}).to_string(),
-        json!({"repo_path": path, "origin": {"kind": "split", "task_id": "t", "request_id": "r", "index": 99}, "title": "t"}).to_string(),
+        json!({"repo_path": path, "origin": {"kind": "split", "task_id": "t", "request_id": "r", "index": 0}, "title": "t"}).to_string(),
         "x".repeat(super::proposals::MAX_REQUEST_BYTES + 1),
     ] {
         let error = file_proposal(&store, &bad).unwrap_err();
@@ -175,42 +150,74 @@ fn reviewed(store: &Store, repo: &tempfile::TempDir) -> (String, i64) {
     )
 }
 
-fn apply_input(repo: &tempfile::TempDir, id: &str, revision: i64, extra: Value) -> String {
-    let mut input = json!({
+/// Store a refinement the way Manvi's `work.enhancements.refine` does: reserve
+/// it for the task at its revision, then complete it with the proposal.
+fn stored_refinement(store: &Store, task: &str, revision: i64, other: &str) -> String {
+    let id = format!("enh-{task}");
+    let create = json!({
+        "id": id, "request_id": format!("create-{id}"), "expected_revision": 0,
+        "task_id": task, "source_revision": revision, "kind": "refine",
+        "fields": ["acceptance_criteria", "split_into", "duplicate_of"],
+        "provider": "local", "model": "test-model",
+    });
+    query(store, "enhancements.create", &create.to_string()).unwrap();
+    let complete = json!({
+        "id": id, "request_id": format!("complete-{id}"), "expected_revision": 1,
+        "acceptance_criteria": ["Exports CSV with a header row"],
+        "split_into": [
+            {"title": "Alpha indexer", "description": "Part of the exporter."},
+            {"title": "Zebra exporter", "description": "Part of the exporter."},
+        ],
+        "duplicate_of": [{"id": other, "reason": "same exporter"}],
+        "rationale": "grounded",
+    });
+    query(store, "enhancements.complete", &complete.to_string()).unwrap();
+    id
+}
+
+fn apply_input(repo: &tempfile::TempDir, id: &str, task_revision: i64, fields: Value) -> String {
+    json!({
         "repo_path": repo.path().to_str().unwrap(),
         "id": id,
-        "expected_revision": revision,
-        "acceptance_criteria": ["Exports CSV with a header row"],
-    });
-    for (key, value) in extra.as_object().unwrap() {
-        input[key] = value.clone();
-    }
-    input.to_string()
+        "expected_revision": 2,
+        "expected_task_revision": task_revision,
+        "fields": fields,
+    })
+    .to_string()
+}
+
+fn original(store: &Store, repo: &tempfile::TempDir) -> String {
+    let repository = registered(store, repo);
+    place(
+        store,
+        &repository,
+        &task("gp-orig", "Original exporter"),
+        false,
+        now_millis(),
+    )
+    .unwrap()
+    .item_id
+}
+
+fn all_parts() -> Value {
+    json!(["acceptance_criteria", "split_into", "duplicate_of"])
 }
 
 #[test]
-fn an_accepted_refinement_is_one_revisioned_write_that_keeps_what_was_there() {
+fn an_accepted_refinement_goes_through_the_stored_proposal_and_keeps_what_was_there() {
     let (_d, store, repo) = setup();
     let (id, revision) = reviewed(&store, &repo);
-    let other = {
-        let repository = registered(&store, &repo);
-        place(
-            &store,
-            &repository,
-            &task("gp-orig", "Original exporter"),
-            false,
-            now_millis(),
-        )
-        .unwrap()
-        .item_id
-    };
+    let other = original(&store, &repo);
+    let proposal = stored_refinement(&store, &id, revision, &other);
     let applied = apply_refinement(
         &store,
-        &apply_input(&repo, &id, revision, json!({"duplicate_of": [other]})),
+        &apply_input(&repo, &proposal, revision, all_parts()),
     )
     .unwrap();
     assert_eq!(applied["outcome"], "applied", "{applied}");
     assert_eq!(applied["revision"], revision + 1);
+    assert_eq!(applied["criteria_added"], 1);
+    assert_eq!(applied["links_added"], 1);
     let card = get_item(&store, &id).unwrap().unwrap();
     assert_eq!(
         card["acceptance_criteria"],
@@ -222,85 +229,168 @@ fn an_accepted_refinement_is_one_revisioned_write_that_keeps_what_was_there() {
         card["title"], "Ship the exporter",
         "title is not Manvi's to change"
     );
+    // Each split is one inbox task, parented to this one, with an id the host made.
+    let created = applied["created_item_ids"].as_array().unwrap();
+    assert_eq!(created.len(), 2, "{applied}");
+    for (index, title) in ["Alpha indexer", "Zebra exporter"].iter().enumerate() {
+        let split = get_item(&store, created[index].as_str().unwrap())
+            .unwrap()
+            .unwrap();
+        assert_eq!(split["title"], *title);
+        assert_eq!(split["status"], "inbox");
+        assert_eq!(split["links"][0]["kind"], "parent");
+        assert_eq!(split["links"][0]["item_id"], id.as_str());
+    }
+    // The proposal is spent: a second accept is refused, not a second write.
+    let again = apply_refinement(
+        &store,
+        &apply_input(
+            &repo,
+            &proposal,
+            revision + 1,
+            json!(["acceptance_criteria"]),
+        ),
+    );
+    assert!(again.is_err(), "{again:?}");
+    assert_eq!(
+        get_item(&store, &id).unwrap().unwrap()["revision"],
+        revision + 1
+    );
+}
+
+#[test]
+fn only_the_selected_parts_are_applied() {
+    let (_d, store, repo) = setup();
+    let (id, revision) = reviewed(&store, &repo);
+    let other = original(&store, &repo);
+    let proposal = stored_refinement(&store, &id, revision, &other);
+    let applied = apply_refinement(
+        &store,
+        &apply_input(&repo, &proposal, revision, json!(["duplicate_of"])),
+    )
+    .unwrap();
+    assert_eq!(applied["criteria_added"], 0);
+    assert_eq!(applied["created_item_ids"], json!([]));
+    let card = get_item(&store, &id).unwrap().unwrap();
+    assert_eq!(card["acceptance_criteria"], json!(["Existing criterion"]));
+    assert_eq!(card["links"][0]["item_id"], other.as_str());
+    assert_eq!(board(&store, &repo).len(), 2, "no split was created");
 }
 
 #[test]
 fn a_task_that_changed_since_review_is_refused_and_left_as_the_person_made_it() {
     let (_d, store, repo) = setup();
     let (id, revision) = reviewed(&store, &repo);
+    let other = original(&store, &repo);
+    let proposal = stored_refinement(&store, &id, revision, &other);
     // The person edits the card after the proposal was shown.
     let item = get_item(&store, &id).unwrap().unwrap();
     let mut edit = resend(&item, &id, revision, "person");
     edit.insert("title".into(), json!("Ship the exporter, retitled"));
     query(&store, "items.put", &Value::Object(edit).to_string()).unwrap();
 
-    let error =
-        apply_refinement(&store, &apply_input(&repo, &id, revision, json!({}))).unwrap_err();
+    let error = apply_refinement(
+        &store,
+        &apply_input(&repo, &proposal, revision, all_parts()),
+    )
+    .unwrap_err();
     assert_eq!(error.code, "revision_conflict", "{error:?}");
-    assert!(
-        error
-            .message
-            .contains(&format!("revision {}", revision + 1)),
-        "{error:?}"
-    );
     let card = get_item(&store, &id).unwrap().unwrap();
     assert_eq!(card["acceptance_criteria"], json!(["Existing criterion"]));
     assert_eq!(card["title"], "Ship the exporter, retitled");
     assert_eq!(card["revision"], revision + 1, "nothing was written");
+    assert_eq!(board(&store, &repo).len(), 2, "no split was created");
 }
 
 #[test]
-fn applying_the_same_acceptance_again_is_unchanged_not_a_second_write() {
+fn a_proposal_that_moved_on_is_refused() {
     let (_d, store, repo) = setup();
     let (id, revision) = reviewed(&store, &repo);
-    let first = apply_refinement(&store, &apply_input(&repo, &id, revision, json!({}))).unwrap();
-    let again = apply_refinement(
-        &store,
-        &apply_input(&repo, &id, first["revision"].as_i64().unwrap(), json!({})),
-    )
+    let other = original(&store, &repo);
+    let proposal = stored_refinement(&store, &id, revision, &other);
+    let mut stale: Value = serde_json::from_str(&apply_input(
+        &repo,
+        &proposal,
+        revision,
+        json!(["acceptance_criteria"]),
+    ))
     .unwrap();
-    assert_eq!(again["outcome"], "unchanged", "{again}");
-    assert_eq!(again["revision"], first["revision"]);
+    stale["expected_revision"] = json!(1);
+    let error = apply_refinement(&store, &stale.to_string()).unwrap_err();
+    assert_eq!(error.code, "revision_conflict", "{error:?}");
+    assert_eq!(
+        get_item(&store, &id).unwrap().unwrap()["revision"],
+        revision
+    );
 }
 
 #[test]
-fn refinement_refuses_nothing_accepted_missing_originals_and_foreign_tasks() {
+fn refinement_refuses_nothing_selected_unknown_parts_text_proposals_and_foreign_tasks() {
     let (_d, store, repo) = setup();
     let (id, revision) = reviewed(&store, &repo);
-    let none = json!({"acceptance_criteria": []});
+    let other = original(&store, &repo);
+    let proposal = stored_refinement(&store, &id, revision, &other);
+    for bad in [
+        json!([]),
+        json!(["title"]),
+        json!(["split_into", "split_into"]),
+    ] {
+        assert_eq!(
+            apply_refinement(&store, &apply_input(&repo, &proposal, revision, bad))
+                .unwrap_err()
+                .code,
+            "invalid_input"
+        );
+    }
+    // The renderer never names the new tasks' ids.
+    let mut named: Value = serde_json::from_str(&apply_input(
+        &repo,
+        &proposal,
+        revision,
+        json!(["split_into"]),
+    ))
+    .unwrap();
+    named["split_ids"] = json!(["ft-chosen-by-renderer"]);
     assert_eq!(
-        apply_refinement(&store, &apply_input(&repo, &id, revision, none))
+        apply_refinement(&store, &named.to_string())
             .unwrap_err()
             .code,
-        "invalid_input"
-    );
-    let missing = apply_input(
-        &repo,
-        &id,
-        revision,
-        json!({"duplicate_of": ["ft-does-not-exist"]}),
-    );
-    assert_eq!(
-        apply_refinement(&store, &missing).unwrap_err().code,
-        "not_found"
-    );
-    let itself = apply_input(&repo, &id, revision, json!({"duplicate_of": [id]}));
-    assert_eq!(
-        apply_refinement(&store, &itself).unwrap_err().code,
         "invalid_input"
     );
 
     // A task of another repository is not this board's to edit.
     let other_repo = git_repo();
     let (foreign, foreign_revision) = reviewed(&store, &other_repo);
+    let foreign_other = original(&store, &other_repo);
+    let foreign_proposal = stored_refinement(&store, &foreign, foreign_revision, &foreign_other);
     let error = apply_refinement(
         &store,
-        &apply_input(&repo, &foreign, foreign_revision, json!({})),
+        &apply_input(
+            &repo,
+            &foreign_proposal,
+            foreign_revision,
+            json!(["acceptance_criteria"]),
+        ),
     )
     .unwrap_err();
     assert_eq!(error.code, "not_found", "{error:?}");
-    let card = get_item(&store, &id).unwrap().unwrap();
-    assert_eq!(card["revision"], revision);
+
+    // A text proposal is not a refinement. (Created last: a pending one holds the profile's generation slot.)
+    let text = json!({"id": "enh-text", "request_id": "create-text", "expected_revision": 0, "task_id": id, "source_revision": revision, "fields": ["title"], "provider": "local", "model": "test-model"});
+    query(&store, "enhancements.create", &text.to_string()).unwrap();
+    assert_eq!(
+        apply_refinement(
+            &store,
+            &apply_input(&repo, "enh-text", revision, json!(["acceptance_criteria"]))
+        )
+        .unwrap_err()
+        .code,
+        "invalid_input"
+    );
+    assert_eq!(
+        get_item(&store, &id).unwrap().unwrap()["revision"],
+        revision
+    );
 }
 
 #[test]

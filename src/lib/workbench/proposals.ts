@@ -9,13 +9,15 @@
  *
  * - `proposals.file` files a proposal through the board's task-intake path, so
  *   the related-task protection holds and filing twice is one card;
- * - `proposals.apply` applies a refinement at the revision that was reviewed,
- *   and is refused if the task moved.
+ * - `proposals.apply` accepts the selected parts of the refinement Manvi stored,
+ *   at the proposal and task revisions that were reviewed, and is refused if
+ *   the task moved. It is the one apply path: dc-store's own accept, which
+ *   appends the criteria, merges the duplicate links and creates the splits.
  *
  * Nothing here calls a write on its own: every function that writes is called
  * from a person's click.
  */
-import { newID, request, WorkbenchError, type Task } from "./client";
+import { getRefinement, newID, request, WorkbenchError, type RefinePart, type Task } from "./client";
 import { selectionWire, type ModelSelection } from "./taskModel";
 
 export type ProposalMethod =
@@ -148,7 +150,7 @@ const CATEGORY_LABELS: Record<string, string> = {
 export function categoryLabel(category: string): string { return CATEGORY_LABELS[category] ?? category; }
 
 // ---------------------------------------------------------------------------
-// Filing a scan proposal (or a refine split)
+// Filing a scan proposal
 // ---------------------------------------------------------------------------
 
 export interface RelatedTask { item_id: string; title: string; status: string }
@@ -157,9 +159,7 @@ export type FileOutcome =
   | { outcome: "related_tasks_exist"; related: RelatedTask[] };
 export interface FileDraft { title: string; description: string; kind: string; priority: number; labels: string[] }
 
-type Origin =
-  | { kind: "scan"; fingerprint: string }
-  | { kind: "split"; task_id: string; request_id: string; index: number };
+type Origin = { kind: "scan"; fingerprint: string };
 
 async function file(repoPath: string, origin: Origin, draft: FileDraft, reviewedRelated: readonly string[]): Promise<FileOutcome> {
   const raw = obj(await request("proposals.file", {
@@ -180,10 +180,6 @@ async function file(repoPath: string, origin: Origin, draft: FileDraft, reviewed
 /** File a scan proposal, as edited. Filing it again returns `already_filed`. */
 export function fileScanProposal(repoPath: string, proposal: ScanProposal, draft: FileDraft, reviewedRelated: readonly string[] = []): Promise<FileOutcome> {
   return file(repoPath, { kind: "scan", fingerprint: proposal.fingerprint }, draft, reviewedRelated);
-}
-/** File one part of a refinement's split as its own task. */
-export function fileSplitPart(repoPath: string, task: Task, requestId: string, index: number, draft: FileDraft, reviewedRelated: readonly string[] = []): Promise<FileOutcome> {
-  return file(repoPath, { kind: "split", task_id: task.id, request_id: requestId, index }, draft, reviewedRelated);
 }
 export function draftOf(proposal: ScanProposal): FileDraft {
   return { title: proposal.title, description: proposal.description, kind: proposal.kind, priority: proposal.priority, labels: [...proposal.labels] };
@@ -215,6 +211,8 @@ export function dismissFingerprint(repoPath: string, fingerprint: string): Set<s
 export interface RefineCite { text: string; cites: string[] }
 export interface RefineGrounding { status: string; reason: string; index_fresh: boolean; symbols: { symbol: string; found: boolean; error: string; truncated: boolean; walk_incomplete: string }[] }
 export interface RefineResult {
+  /** The proposal Manvi stored in dc-store, and its revision when it was reviewed: what accepting is conditional on. */
+  enhancement_id: string; enhancement_revision: number;
   task_id: string; request_id: string; source_revision: number; provider: string; model: string;
   criteria: RefineCite[]; splits: { title: string; description: string; cites: string[] }[];
   duplicates: { id: string; reason: string; cites: string[] }[]; rationale: string;
@@ -230,6 +228,7 @@ export function refineResult(value: unknown): RefineResult {
   const proposal = obj(raw.proposal, "refinement");
   const grounding = obj(raw.grounding, "refinement grounding");
   return {
+    enhancement_id: str(raw.enhancement_id, "refinement"), enhancement_revision: 0,
     task_id: str(raw.task_id, "refinement"), request_id: str(raw.request_id, "refinement"),
     source_revision: int(raw.source_revision, "refinement"), provider: str(raw.provider, "refinement"), model: str(raw.model, "refinement"),
     criteria: list(proposal.acceptance_criteria, "refinement", (c) => { const r = obj(c, "refinement"); return { text: str(r.text, "refinement"), cites: cites(r.cites) }; }, 64),
@@ -255,8 +254,11 @@ export async function requestRefine(repoPath: string, task: Task, selection: Mod
   const result = refineResult(await request("enhancements.refine", {
     repo_path: repoPath, id: task.id, request_id: requestId, expected_revision: task.revision, ...selectionWire(selection),
   }));
-  if (result.task_id !== task.id) return invalid("refinement");
-  return result;
+  if (result.task_id !== task.id || !/^[A-Za-z0-9_-]{1,128}$/.test(result.enhancement_id)) return invalid("refinement");
+  // What was stored is what is reviewed and accepted: a reply that names a proposal the store does not hold as ready for this task is not one.
+  const stored = await getRefinement(result.enhancement_id);
+  if (stored.task_id !== task.id || stored.state !== "ready" || stored.source_revision !== result.source_revision) return invalid("refinement");
+  return { ...result, enhancement_revision: stored.revision };
 }
 
 export type DiffState = "add" | "present";
@@ -279,17 +281,25 @@ export function refineDiff(task: Task, result: RefineResult): RefineDiff {
   };
 }
 
-export interface ApplyReceipt { outcome: "applied" | "unchanged"; revision: number; criteriaAdded: number; linksAdded: number }
+export interface ApplyReceipt { revision: number; criteriaAdded: number; linksAdded: number; createdTaskIds: string[] }
 /**
- * Apply the accepted criteria and duplicate links to the task they were
- * reviewed against. The write is conditional on `result.source_revision`; a task
- * that moved since is refused (`revision_conflict`) and nothing is written.
+ * Accept the selected parts of the stored refinement. Conditional on the
+ * proposal's revision and on the task still being at `source_revision`; a task
+ * that moved since is refused (`revision_conflict`) and nothing is written. The
+ * new tasks' ids are made by the host, not here.
  */
-export async function applyRefine(repoPath: string, result: RefineResult, accepted: { criteria: readonly string[]; duplicates: readonly string[] }): Promise<ApplyReceipt> {
+export async function applyRefine(repoPath: string, result: RefineResult, parts: readonly RefinePart[]): Promise<ApplyReceipt> {
   const raw = obj(await request("proposals.apply", {
-    repo_path: repoPath, id: result.task_id, expected_revision: result.source_revision,
-    acceptance_criteria: accepted.criteria, duplicate_of: accepted.duplicates,
+    repo_path: repoPath, id: result.enhancement_id, expected_revision: result.enhancement_revision,
+    expected_task_revision: result.source_revision, fields: parts,
   }), "apply receipt");
-  if (raw.ok !== true || (raw.outcome !== "applied" && raw.outcome !== "unchanged")) return invalid("apply receipt");
-  return { outcome: raw.outcome, revision: int(raw.revision, "apply receipt"), criteriaAdded: int(raw.criteria_added, "apply receipt"), linksAdded: int(raw.links_added, "apply receipt") };
+  if (raw.ok !== true || raw.outcome !== "applied") return invalid("apply receipt");
+  return {
+    revision: int(raw.revision, "apply receipt"), criteriaAdded: int(raw.criteria_added, "apply receipt"), linksAdded: int(raw.links_added, "apply receipt"),
+    createdTaskIds: list(raw.created_item_ids, "apply receipt", (id) => str(id, "apply receipt"), 16),
+  };
+}
+/** Reject the stored refinement, so it does not wait for the next review. The task is untouched. */
+export async function dismissRefine(result: RefineResult): Promise<void> {
+  await request("enhancements.dismiss", { id: result.enhancement_id, request_id: newID(), expected_revision: result.enhancement_revision });
 }

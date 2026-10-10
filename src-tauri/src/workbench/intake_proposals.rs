@@ -6,14 +6,13 @@
 //! protections the board already has hold for it too.
 //!
 //! * **Filing** goes through [`add_task`], the path `gitpulse_add_task` uses,
-//!   with a key derived from the proposal's own identity (a scan fingerprint,
-//!   or a refine request and part). Filing twice therefore finds the card the
-//!   first filing made instead of making a second, and the related-task check
+//!   with a key derived from the proposal's own identity (a scan fingerprint).
+//!   Filing twice therefore finds the card the first filing made instead of making a second, and the related-task check
 //!   still runs: a proposal that looks like open work is *not filed* until the
 //!   person has seen those tasks and confirmed, by naming them.
-//! * **Applying** a refinement is one `items.put` at the revision the person
-//!   reviewed. A task that has changed since is refused with the revision it
-//!   is at, never overwritten.
+//! * **Applying** a refinement is dc-store's own accept of the proposal Manvi
+//!   stored, at the proposal and task revisions the person reviewed. A task
+//!   that has changed since is refused, never overwritten.
 //! * Nothing here is reachable without a person's action: Manvi's ops are
 //!   read-only proposals, and these methods are the only writers.
 
@@ -22,10 +21,6 @@ use serde::Deserialize;
 
 /// Bound on one request's JSON, before any parsing or store access.
 pub(super) const MAX_REQUEST_BYTES: usize = 64 * 1024;
-/// Most criteria one apply may add; Manvi's own per-run cap is ten.
-const MAX_APPLY_CRITERIA: usize = 20;
-/// Most duplicate links one apply may add.
-const MAX_APPLY_DUPLICATES: usize = 12;
 
 fn invalid(message: impl Into<String>) -> WorkbenchError {
     WorkbenchError::new("invalid_input", message)
@@ -134,12 +129,6 @@ pub(crate) fn scan_ref_params(input: &str) -> Result<Value, WorkbenchError> {
 enum Origin {
     /// A gap-scan proposal, by Manvi's 16-hex fingerprint.
     Scan { fingerprint: String },
-    /// One part of a refine proposal's `split_into`.
-    Split {
-        task_id: String,
-        request_id: String,
-        index: u32,
-    },
 }
 
 #[derive(Deserialize)]
@@ -193,23 +182,6 @@ fn filed_task(input: FileInput) -> Result<(String, ExternalTask, Vec<String>), W
                 description = format!("{}\n\n{marker}", description.trim_end());
             }
             format!("scan-{fingerprint}")
-        }
-        Origin::Split {
-            task_id,
-            request_id,
-            index,
-        } => {
-            if !valid_ref(&task_id) || !valid_ref(&request_id) || index >= 16 {
-                return Err(invalid(
-                    "A split part is named by its task, request and index.",
-                ));
-            }
-            let note = format!("Split from {task_id}.");
-            if !description.contains(&note) {
-                description = format!("{}\n\n{note}", description.trim_end());
-            }
-            let id = item_id(&task_id, &format!("{request_id}:{index}"));
-            format!("split-{}", &id[ITEM_PREFIX.len()..ITEM_PREFIX.len() + 16])
         }
     };
     let task = ExternalTask {
@@ -294,124 +266,132 @@ fn existing(store: &Store, repo_path: &str, key: &str) -> Result<(String, Value)
 // Applying a refinement
 // ---------------------------------------------------------------------------
 
+/// The parts of a refinement proposal (dc-store schema 12) a person selects
+/// among.
+const REFINE_PARTS: [&str; 3] = ["acceptance_criteria", "split_into", "duplicate_of"];
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ApplyInput {
     repo_path: String,
+    /// The stored proposal (`enhancement_id` of Manvi's refine reply).
     id: String,
+    /// The proposal's own revision, as reviewed.
     expected_revision: i64,
-    #[serde(default)]
-    acceptance_criteria: Vec<String>,
-    #[serde(default)]
-    duplicate_of: Vec<String>,
+    /// The task's revision, as reviewed.
+    expected_task_revision: i64,
+    fields: Vec<String>,
 }
 
-/// Apply the parts of a refinement the person accepted to the task they were
-/// reviewed against: acceptance criteria appended, `duplicate_of` links added.
+/// Accept the parts of a stored refinement proposal a person selected.
 ///
-/// One `items.put` at `expected_revision`. A task at any other revision is
-/// refused with `revision_conflict` naming the revision it is at, so the
-/// caller re-reads and the person re-reviews; nothing is merged into a task
-/// that moved. Everything already present is left alone, so applying the same
-/// acceptance twice is `unchanged`, not a second write. A `duplicate_of` target
-/// must be a live task of the same repository, re-checked here because the
-/// proposal was made against the board as it was then.
+/// The one apply path: dc-store's `enhancements.accept` for a refinement
+/// appends the criteria, merges `duplicate_of` links and creates each split as
+/// an inbox task linked to this one as its parent, in one transaction, with the
+/// proposal and task revisions checked. A task that moved since review is
+/// refused (`revision_conflict`) and nothing is written. The host's part is
+/// what the store leaves to its caller: the proposal must be of this
+/// repository's board, and the new tasks' ids are made here, never by the
+/// renderer. They are derived from the proposal and the split's index, so a
+/// retry of the same accept names the same tasks.
 pub(crate) fn apply_refinement(store: &Store, input: &str) -> Result<Value, WorkbenchError> {
     let parsed: ApplyInput = object_input(input)?;
-    if !valid_ref(&parsed.id) || parsed.expected_revision < 1 {
+    if !valid_ref(&parsed.id) || parsed.expected_revision < 1 || parsed.expected_task_revision < 1 {
         return Err(invalid(
-            "Applying needs a task id and the revision reviewed.",
+            "Applying needs a proposal id and the revisions reviewed.",
         ));
     }
-    if parsed.acceptance_criteria.is_empty() && parsed.duplicate_of.is_empty() {
-        return Err(invalid("Nothing was accepted."));
-    }
-    if parsed.acceptance_criteria.len() > MAX_APPLY_CRITERIA
-        || parsed.duplicate_of.len() > MAX_APPLY_DUPLICATES
+    if parsed.fields.is_empty()
+        || parsed.fields.len() > REFINE_PARTS.len()
+        || parsed
+            .fields
+            .iter()
+            .any(|f| !REFINE_PARTS.contains(&f.as_str()))
+        || parsed
+            .fields
+            .iter()
+            .enumerate()
+            .any(|(i, f)| parsed.fields[..i].contains(f))
     {
-        return Err(invalid("That is more than one refinement may apply."));
+        return Err(invalid(
+            "Select distinct parts among acceptance_criteria, split_into and duplicate_of.",
+        ));
     }
     let repository = board_repository(store, &parsed.repo_path)?;
     let repository_id = repository["id"].as_str().unwrap_or_default().to_owned();
-    let item = get_item(store, &parsed.id)?
+    let proposal = query(
+        store,
+        "enhancements.get",
+        &json!({"id": parsed.id}).to_string(),
+    )?["item"]
+        .clone();
+    let task_id = proposal["task_id"].as_str().unwrap_or_default();
+    let task = get_item(store, task_id)?
         .filter(|item| links(item, &repository_id) && item["deleted"] != true)
         .ok_or_else(|| {
-            WorkbenchError::new("not_found", "That task is not on this repository's board.")
-        })?;
-    let revision = item["revision"].as_i64().unwrap_or_default();
-    if revision != parsed.expected_revision {
-        return Err(WorkbenchError::new(
-            "revision_conflict",
-            format!(
-                "The task is at revision {revision}, not {}; it changed after the proposal was reviewed. Re-read it and review again.",
-                parsed.expected_revision
-            ),
-        ));
-    }
-
-    let mut criteria: Vec<String> = item["acceptance_criteria"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(|c| c.as_str().map(str::to_owned))
-        .collect();
-    let mut added_criteria = 0;
-    for text in parsed.acceptance_criteria.iter().map(|c| c.trim()) {
-        if text.is_empty() || text.chars().any(char::is_control) {
-            return Err(invalid("An acceptance criterion is one non-empty line."));
-        }
-        if !criteria.iter().any(|c| c == text) {
-            criteria.push(text.to_owned());
-            added_criteria += 1;
-        }
-    }
-
-    let mut task_links: Vec<Value> = item["links"].as_array().cloned().unwrap_or_default();
-    let mut added_links = 0;
-    for target in &parsed.duplicate_of {
-        if !valid_ref(target) || target == &parsed.id {
-            return Err(invalid("A duplicate link names another task by its id."));
-        }
-        let live = get_item(store, target)?
-            .is_some_and(|t| links(&t, &repository_id) && t["deleted"] != true);
-        if !live {
-            return Err(WorkbenchError::new(
+            WorkbenchError::new(
                 "not_found",
-                format!("{target} is not a live task of this repository, so it cannot be linked as the original."),
-            ));
-        }
-        let present = task_links
-            .iter()
-            .any(|l| l["kind"] == "duplicate_of" && l["item_id"] == target.as_str());
-        if !present {
-            task_links.push(json!({"kind": "duplicate_of", "item_id": target}));
-            added_links += 1;
-        }
+                "That proposal is not on this repository's board.",
+            )
+        })?;
+    if proposal["kind"] != "refine" {
+        return Err(invalid("That proposal is not a refinement."));
     }
-
-    if added_criteria == 0 && added_links == 0 {
-        return Ok(json!({
-            "ok": true,
-            "outcome": "unchanged",
-            "item_id": parsed.id,
-            "revision": revision,
-            "criteria_added": 0,
-            "links_added": 0,
-        }));
+    let proposed = &proposal["proposed"];
+    let selected = |part: &str| parsed.fields.iter().any(|f| f == part);
+    let mut accept = json!({
+        "id": parsed.id,
+        "request_id": item_id(&repository_id, &format!("refine-accept:{}:{}", parsed.id, parsed.expected_revision))
+            .replacen(ITEM_PREFIX, "rfa-", 1),
+        "expected_revision": parsed.expected_revision,
+        "expected_task_revision": parsed.expected_task_revision,
+        "fields": parsed.fields,
+    });
+    if selected("split_into") {
+        let count = proposed["split_into"].as_array().map_or(0, Vec::len);
+        accept["split_ids"] = json!((0..count)
+            .map(|index| item_id(
+                &repository_id,
+                &format!("refine-split:{}:{index}", parsed.id)
+            ))
+            .collect::<Vec<_>>());
     }
-    let mut put = resend(&item, &parsed.id, revision, "refine");
-    put.insert("acceptance_criteria".into(), json!(criteria));
-    if added_links > 0 {
-        put.insert("links".into(), json!(task_links));
-    }
-    let saved = query(store, "items.put", &Value::Object(put).to_string())?;
+    let have_links = |target: &str| {
+        task["links"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .any(|l| l["kind"] == "duplicate_of" && l["item_id"] == target)
+    };
+    let criteria_added = if selected("acceptance_criteria") {
+        proposed["acceptance_criteria"]
+            .as_array()
+            .map_or(0, Vec::len)
+    } else {
+        0
+    };
+    let links_added = if selected("duplicate_of") {
+        proposed["duplicate_of"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|d| !d["id"].as_str().is_some_and(have_links))
+            .count()
+    } else {
+        0
+    };
+    let saved = query(store, "enhancements.accept", &accept.to_string())?;
+    let accepted = &saved["item"];
     Ok(json!({
         "ok": true,
         "outcome": "applied",
-        "item_id": parsed.id,
-        "revision": saved["item"]["revision"],
-        "criteria_added": added_criteria,
-        "links_added": added_links,
+        "item_id": task_id,
+        "enhancement_id": parsed.id,
+        "revision": accepted["applied_task_revision"],
+        "accepted_fields": accepted["accepted_fields"],
+        "created_item_ids": accepted["created_item_ids"],
+        "criteria_added": criteria_added,
+        "links_added": links_added,
         "sequence": saved["sequence"],
     }))
 }

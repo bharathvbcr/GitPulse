@@ -33,6 +33,14 @@ before that tag is pushed.
 
 ### Changed
 
+- DevCouncil is re-vendored at `acb5e3b9`: dc-store workbench schema 12 (refinement
+  proposals, an `acceptance_criteria` lock) and `dc-glob`. A profile that
+  Manvi's dc-store has taken to 12 is refused by a GitPulse built at 11, so the
+  installer now requires a `dcstore` that reports schema 12. Suggest
+  refinements now accepts through the proposal Manvi stored (parts chosen
+  against the proposal and task revisions reviewed; each accepted split is a new
+  inbox task with an id the host makes), and the Map panel says when a
+  workspace's link scan could not read part of it.
 - The profile worker's per-call timeout now comes from Manvi's `hello`
   (`op_limits`: the lane and server-side deadline of each op) plus a 5 s margin,
   clamped to 15 minutes, instead of a hard-coded table. Against an older Manvi

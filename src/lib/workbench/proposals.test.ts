@@ -1,9 +1,9 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { invoke } from "@tauri-apps/api/core";
-import { WorkbenchError } from "./client";
-import { FP, proposal, refine, task, view } from "./proposals.fixtures";
+import { latestEnhancement, listEnhancements, WorkbenchError } from "./client";
+import { FP, proposal, refine, storedRefine, task, view } from "./proposals.fixtures";
 import {
-  applyRefine, coverageNotes, dismissFingerprint, dismissedFingerprints, fileScanProposal, getScan, refineDiff, refineResult,
+  applyRefine, coverageNotes, dismissFingerprint, dismissRefine, dismissedFingerprints, fileScanProposal, getScan, refineDiff, refineResult,
   requestRefine, scanIsPartial, scanView, startScan,
 } from "./proposals";
 
@@ -90,7 +90,7 @@ describe("dismissal is per viewer and never needs storage", () => {
 
 describe("refinement", () => {
   it("sends the repository, the task and its revision; a proposal that claims it applied is refused", async () => {
-    native.mockResolvedValueOnce(JSON.stringify(refine()));
+    native.mockResolvedValueOnce(JSON.stringify(refine())).mockResolvedValueOnce(JSON.stringify(storedRefine()));
     const result = await requestRefine("/r", task, null, "q1");
     expect(method()).toBe("enhancements.refine");
     expect(wire()).toEqual({ repo_path: "/r", id: "t1", request_id: "q1", expected_revision: 4 });
@@ -107,13 +107,57 @@ describe("refinement", () => {
     expect(refineDiff({ ...task, revision: 5 }, result).stale).toBe(true);
     expect(refineDiff({ ...task, links: [{ kind: "duplicate_of", item_id: "t9" }] }, result).duplicates[0]?.state).toBe("present");
   });
-  it("applies at the reviewed revision, and a stale task is a visible refusal", async () => {
-    const result = refineResult(refine());
-    native.mockResolvedValueOnce(JSON.stringify({ ok: true, outcome: "applied", revision: 5, criteria_added: 1, links_added: 0 }));
-    expect((await applyRefine("/r", result, { criteria: ["Exports CSV"], duplicates: [] })).criteriaAdded).toBe(1);
+  it("reads the stored proposal back for the revision an accept is conditional on", async () => {
+    native.mockResolvedValueOnce(JSON.stringify(refine())).mockResolvedValueOnce(JSON.stringify(storedRefine()));
+    const result = await requestRefine("/r", task, null, "q1");
+    expect(method(1)).toBe("enhancements.get");
+    expect(wire(1)).toEqual({ id: "enh-1" });
+    expect(result.enhancement_id).toBe("enh-1");
+    expect(result.enhancement_revision).toBe(2);
+  });
+  it.each([
+    ["not ready", storedRefine({ state: "dismissed" })],
+    ["another task's", storedRefine({ task_id: "t2" })],
+    ["drafted against another revision", storedRefine({ source_revision: 3 })],
+    ["a text proposal", storedRefine({ kind: "text", fields: ["title"] })],
+  ])("a reply naming a stored proposal that is %s is not a proposal", async (_name, stored) => {
+    native.mockResolvedValueOnce(JSON.stringify(refine())).mockResolvedValueOnce(JSON.stringify(stored));
+    await expect(requestRefine("/r", task, null, "q1")).rejects.toBeInstanceOf(WorkbenchError);
+  });
+  it("a reply without a stored proposal id is refused", () => {
+    const { enhancement_id: _gone, ...bare } = refine();
+    expect(() => refineResult(bare)).toThrow(WorkbenchError);
+  });
+  it("accepts the selected parts of the stored proposal at the reviewed revisions", async () => {
+    const result = { ...refineResult(refine()), enhancement_revision: 2 };
+    native.mockResolvedValueOnce(JSON.stringify({ ok: true, outcome: "applied", revision: 5, criteria_added: 1, links_added: 0, created_item_ids: ["ft-a"] }));
+    const receipt = await applyRefine("/r", result, ["acceptance_criteria", "split_into"]);
+    expect(receipt).toEqual({ revision: 5, criteriaAdded: 1, linksAdded: 0, createdTaskIds: ["ft-a"] });
     expect(method()).toBe("proposals.apply");
-    expect(wire()).toMatchObject({ id: "t1", expected_revision: 4, acceptance_criteria: ["Exports CSV"], duplicate_of: [] });
-    native.mockRejectedValueOnce({ code: "revision_conflict", message: "The task is at revision 6, not 4" });
-    await expect(applyRefine("/r", result, { criteria: ["x"], duplicates: [] })).rejects.toMatchObject({ code: "revision_conflict" });
+    expect(wire()).toEqual({ repo_path: "/r", id: "enh-1", expected_revision: 2, expected_task_revision: 4, fields: ["acceptance_criteria", "split_into"] });
+    expect(wire()).not.toHaveProperty("split_ids");
+  });
+  it("a stale task is a visible refusal", async () => {
+    const result = { ...refineResult(refine()), enhancement_revision: 2 };
+    native.mockRejectedValueOnce({ code: "revision_conflict", message: "the task changed before refinement acceptance" });
+    await expect(applyRefine("/r", result, ["acceptance_criteria"])).rejects.toMatchObject({ code: "revision_conflict" });
+  });
+  it("rejecting a proposal dismisses the stored one at its revision", async () => {
+    native.mockResolvedValueOnce(JSON.stringify({ ok: true }));
+    await dismissRefine({ ...refineResult(refine()), enhancement_revision: 2 });
+    expect(method()).toBe("enhancements.dismiss");
+    expect(wire()).toMatchObject({ id: "enh-1", expected_revision: 2 });
+  });
+});
+
+describe("stored refinements stay out of the text suggestions list", () => {
+  const text = { id: "e0", revision: 2, updated_at: 1, state: "ready", task_id: "t1", source_revision: 4, fields: ["title"], provider: "p", model: "m", automatic: false, created_at: 1, expires_at: 2 };
+  const rows = (items: unknown[]) => JSON.stringify({ ok: true, items, shown: items.length, total: items.length, has_more: false, next_cursor: null });
+  it("a ready refinement newer than a text proposal does not hide it, and is not decoded as one", async () => {
+    native.mockResolvedValueOnce(rows([storedRefine().item, text]));
+    expect((await listEnhancements("t1")).items.map((row) => row.id)).toEqual(["e0"]);
+    native.mockResolvedValueOnce(rows([storedRefine().item, text]));
+    expect((await latestEnhancement("t1", ["ready"]))?.id).toBe("e0");
+    expect(wire(1)).toMatchObject({ limit: 30, states: ["ready"] });
   });
 });

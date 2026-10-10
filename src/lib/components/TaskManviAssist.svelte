@@ -19,6 +19,7 @@
     type Enhancement,
     type EnhancementConfiguration,
     type EnhancementField,
+    type LockableField,
     type EnhancementMutation,
     type EnhancementSummary,
     type Task,
@@ -56,7 +57,7 @@
     description = $bindable(""),
     repositoryIds = [],
     repositoryNames = [],
-    lockedFields = $bindable<EnhancementField[]>([]),
+    lockedFields = $bindable<LockableField[]>([]),
     prepareTask = async (): Promise<Task | null> => task,
     onApplied,
     onBusy,
@@ -86,7 +87,7 @@
      * around. A caller that has no names passes none and the line is omitted.
      */
     repositoryNames?: readonly string[];
-    lockedFields?: EnhancementField[];
+    lockedFields?: LockableField[];
     prepareTask?: () => Promise<Task | null>;
     onApplied: (task: Task) => void;
     onBusy: (busy: boolean) => void;
