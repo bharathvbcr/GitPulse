@@ -156,6 +156,20 @@
       };
       const count = (cmd) => calls.filter((c) => c === cmd).length;
       /**
+       * Waits for something asynchronous to arrive, up to `deadlineMs`, then
+       * returns either way so the check after it reports what is true. Only
+       * for arrivals: the "nothing happened during churn" checks keep their
+       * short, fixed settle, because waiting longer there proves nothing more.
+       */
+      async function until(fn, deadlineMs = 5000) {
+        const stop = Date.now() + deadlineMs;
+        while (Date.now() < stop) {
+          try { if (fn()) return; } catch { /* not there yet */ }
+          await tick();
+          await new Promise((r) => setTimeout(r, 20));
+        }
+      }
+      /**
        * Publishes the store three times with nothing any panel reads: an
        * error set and cleared, the way a failed background read reports.
        * Every field but `error` keeps its identity across these publishes.
@@ -219,7 +233,9 @@
 
         // ---- WorktreesPanel: an armed confirmation is local state.
         await show(WorktreesPanel);
-        const remove = buttons().find((b) => b.getAttribute("aria-label") === "Remove this worktree");
+        const findRemove = () => buttons().find((b) => b.getAttribute("aria-label") === "Remove this worktree");
+        await until(findRemove);
+        const remove = findRemove();
         check("WorktreesPanel: a removable worktree row is rendered", () => remove);
         remove.click();
         await settle(3);
@@ -233,13 +249,14 @@
         freshnessStore.forRepo(null);
         let before = count("cmd_provenance_freshness_batch");
         await show(BranchList);
-        const asked = count("cmd_provenance_freshness_batch") - before;
+        const badges = () => app.querySelectorAll('[data-testid="freshness-dot"]').length;
         const landed = () => Object.keys(get(freshnessStore).byRevision).length;
+        await until(() => landed() === 2 && badges() === 2);
+        const asked = count("cmd_provenance_freshness_batch") - before;
         check(`BranchList: one freshness batch on mount (saw ${asked})`, () => asked === 1);
         check(`BranchList: the batch's rows are kept after mount (have ${landed()})`, () => landed() === 2);
         // The badges themselves, with nothing else happening: the reset effect
         // used to run right after the load in the same flush and discard it.
-        const badges = () => app.querySelectorAll('[data-testid="freshness-dot"]').length;
         check(`BranchList: a freshness badge renders for each branch after mount (rendered ${badges()})`, () => badges() === 2);
         const branchCalls = (await callsDuring(churn)).filter((cmd) => cmd === "cmd_provenance_freshness_batch");
         check(`BranchList: no batch during unrelated publishes (saw ${branchCalls.join(", ") || "none"})`, () => branchCalls.length === 0);
@@ -254,10 +271,11 @@
         releaseContext = null;
         before = count("cmd_github_context");
         await show(GitHubPanel);
+        await until(() => typeof releaseContext === "function");
         check("GitHubPanel: the context call is in flight", () => typeof releaseContext === "function");
         const ghCalls = (await callsDuring(churn)).filter((cmd) => cmd.startsWith("cmd_github_"));
         releaseContext?.();
-        await settle(10);
+        await until(() => !app.querySelector(".animate-spin"));
         check(`GitHubPanel: one context call across unrelated publishes (saw ${count("cmd_github_context") - before})`, () => count("cmd_github_context") - before === 1);
         check(`GitHubPanel: nothing re-asked during unrelated publishes (saw ${ghCalls.join(", ") || "none"})`, () => ghCalls.length === 0);
         check("GitHubPanel: the spinner clears when the answer lands", () => !app.querySelector(".animate-spin"));
@@ -288,13 +306,14 @@
 
         // ---- WorkView: "Show more" is the reader's, not the store's.
         await show(WorkView);
-        await settle(10);
         const rows = () => app.querySelectorAll("[data-work-row]").length;
+        const findMore = () => buttons().find((b) => /show more/i.test(b.textContent ?? ""));
+        await until(() => rows() >= 100 && findMore());
         const shown = rows();
-        const more = buttons().find((b) => /show more/i.test(b.textContent ?? ""));
+        const more = findMore();
         check(`WorkView: more rows than the first page (rendered ${shown})`, () => more && shown > 0);
         more.click();
-        await settle(5);
+        await until(() => rows() > shown);
         const expanded = rows();
         check(`WorkView: "Show more" renders more rows (${shown} -> ${expanded})`, () => expanded > shown);
         await churn();
