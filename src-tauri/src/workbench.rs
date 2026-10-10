@@ -376,6 +376,39 @@ impl WorkbenchState {
             let params = verification_gate::get_params(input)?;
             return self.worker_call("work.verify.get", params, None);
         }
+        // Manvi proposes; these only start, read or stop a scan, and file or
+        // apply what a person accepted. A sidecar that is down is the caller's
+        // error to see, never an empty scan.
+        if method == "scans.start" {
+            let params = intake::scan_start_params(input)?;
+            return self.worker_call("work.scan.gaps", params, None);
+        }
+        if method == "scans.get" {
+            let params = intake::scan_ref_params(input)?;
+            return self.worker_call("work.scan.get", params, None);
+        }
+        if method == "scans.cancel" {
+            let params = intake::scan_ref_params(input)?;
+            return self.worker_call("work.scan.cancel", params, None);
+        }
+        if method == "proposals.file" {
+            return self.with_store(|store| intake::file_proposal(store, input));
+        }
+        if method == "proposals.apply" {
+            return self.with_store(|store| intake::apply_refinement(store, input));
+        }
+        // Refinement is grounded in the repository's code index, so Manvi is
+        // told which root: the host's resolution of the open repository, never
+        // the sidecar's working directory.
+        if method == "enhancements.refine" {
+            let (root, rest) = intake::refine_split(input)?;
+            let HostControl {
+                mut params,
+                selection,
+            } = generation_input(method, &rest)?;
+            params["repo_root"] = json!(root);
+            return self.worker_call("work.enhancements.refine", params, selection);
+        }
         if matches!(
             method,
             "enhancements.generate"

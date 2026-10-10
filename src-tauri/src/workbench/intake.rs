@@ -2044,9 +2044,19 @@ fn now_millis() -> i64 {
 mod merge;
 pub(crate) use merge::{merge_request, merge_tasks, MergeTask, MAX_MERGE_SOURCES};
 
+#[path = "intake_proposals.rs"]
+mod proposals;
+pub(crate) use proposals::{
+    apply_refinement, file_proposal, refine_split, scan_ref_params, scan_start_params,
+};
+
 #[cfg(test)]
 #[path = "intake_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "intake_proposals_tests.rs"]
+mod proposals_tests;
 
 #[cfg(test)]
 #[path = "verification_gate_tests.rs"]

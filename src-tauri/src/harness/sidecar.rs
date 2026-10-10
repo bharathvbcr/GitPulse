@@ -46,12 +46,22 @@ pub const MANAGED_PREPARE_TIMEOUT: Duration = Duration::from_secs(180);
 /// outlast an ordinary call.
 pub const MANAGED_STOP_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// How long `work.enhancements.refine` may take: Manvi's model-call budget
+/// (150 s) plus the 30 s it allows for grounding and board reads around it.
+pub const REFINE_TIMEOUT: Duration = Duration::from_secs(180);
+/// How long `work.scan.gaps` may take to *claim* a scan. The scan itself runs
+/// on after the answer; this covers git, the index status and the lane's own
+/// minute, which is Manvi's deadline for the request.
+pub const SCAN_START_TIMEOUT: Duration = Duration::from_secs(65);
+
 /// The deadline for one profile-worker operation. The one table: a caller does
 /// not pick its own, so no op can be given less than its provider needs.
 pub(crate) fn op_deadline(op: &str) -> Duration {
     match op {
         "work.runs.managed.prepare" => MANAGED_PREPARE_TIMEOUT,
         "work.runs.managed.stop" => MANAGED_STOP_TIMEOUT,
+        "work.enhancements.refine" => REFINE_TIMEOUT,
+        "work.scan.gaps" => SCAN_START_TIMEOUT,
         _ => DEFAULT_CALL_TIMEOUT,
     }
 }
@@ -1446,6 +1456,10 @@ impl ProfileConnection {
                 | "work.runs.managed.stop"
                 | "work.verify.task"
                 | "work.verify.get"
+                | "work.enhancements.refine"
+                | "work.scan.gaps"
+                | "work.scan.get"
+                | "work.scan.cancel"
         ) {
             return Err(HarnessError::Protocol(
                 "unsupported profile worker operation".into(),

@@ -2,6 +2,7 @@ import { invoke } from "../ipc/invoke";
 import { bindForegroundChanges, readBackgroundDocument } from "../runtime/foreground";
 import { decideCadence, readEventLoopDelay } from "../runtime/loadCadence";
 import { selectionWire, type ModelSelection } from "./taskModel";
+import type { ProposalMethod } from "./proposals";
 import { isSessionId } from "../terminal/tabs";
 import type { ModelChoice as LaunchModelChoice } from "../terminal/agentDefaults";
 import { PERMISSION_MODES, STATUSES, asAgentProvider, supportsManaged, type AgentProvider, type ManagedProvider, type PermissionMode, type RunKind, type TaskStatus } from "./vocabulary";
@@ -433,7 +434,7 @@ export function explainError(error: unknown): string {
   return typeof error === "string" ? error : "Task storage is unavailable. Try again.";
 }
 export function newID(): string { return crypto.randomUUID(); }
-export async function request(method: WorkbenchMethod, input: Record<string, unknown>): Promise<unknown> {
+export async function request(method: WorkbenchMethod | ProposalMethod, input: Record<string, unknown>): Promise<unknown> {
   try { return decodeJSON(await invoke<unknown>("cmd_workbench_request", { method, input: JSON.stringify(input) })); }
   catch (error) {
     const code = typeof error === "object" && error !== null && "code" in error && typeof error.code === "string" ? error.code : "transport_error";
