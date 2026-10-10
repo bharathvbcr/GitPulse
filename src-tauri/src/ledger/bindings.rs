@@ -1314,6 +1314,29 @@ mod readonly_tests {
         assert_eq!(error.code, "legacy_ledger_unconsolidated", "{error}");
     }
 
+    /// The one outcome the zero-spawn shortcut changes, pinned so a later
+    /// tightening meets a test rather than a surprise: a directory claiming a
+    /// repository's git dir without being registered, where *no* checkout has
+    /// a ledger, is answered unbound — membership is never checked, because
+    /// with no ledger no checkout of that repository can be bound. Once a
+    /// ledger exists the same directory is refused (see below).
+    #[test]
+    fn an_unregistered_gitfile_into_a_ledgerless_repository_is_unbound() {
+        let other = fresh_repo();
+        let other_repo = canonical(other.path());
+        let forged_parent = tempfile::tempdir().unwrap();
+        let forged = forged_parent.path().join("forged");
+        std::fs::create_dir(&forged).unwrap();
+        std::fs::write(forged.join(".git"), format!("gitdir: {other_repo}/.git\n")).unwrap();
+        crate::test_support::trust_repo(&forged);
+        let forged = canonical(&forged);
+        assert_eq!(
+            resolve_binding_readonly(&other_repo, &forged).expect("no ledger, no binding"),
+            None
+        );
+        assert!(!super::super::is_initialised(&other_repo));
+    }
+
     /// Fail-closed outcomes survive the read-only path, each under the code
     /// the gate sorts it by: Untrusted, Missing, and Broken (a foreign row,
     /// an unregistered gitfile into a repository that has a ledger).
