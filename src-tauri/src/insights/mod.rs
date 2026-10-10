@@ -6,7 +6,7 @@
 //! nothing. Nothing here mutates a repository.
 
 mod entity_collision;
-mod live_sessions;
+pub(crate) mod live_sessions;
 
 pub use entity_collision::{
     classify_overlapping_path, classify_party_symbols, parse_old_side_ranges,

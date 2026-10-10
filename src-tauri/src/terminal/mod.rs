@@ -5681,4 +5681,70 @@ mod tests {
         let shell = default_shell();
         assert!(!shell.trim().is_empty());
     }
+
+    /// Characterization (host-load governor, Part 0), recorded on the code as
+    /// it stood: a terminal launch is admitted on the session count alone.
+    /// `reserve_session` takes no host-load input, so a launch is admitted at
+    /// memory-pressure level 4 exactly as at level 1. Admission under load is
+    /// card 1b's change; this pins the starting point it changes.
+    #[test]
+    fn characterization_a_launch_is_admitted_on_the_session_count_alone() {
+        let state = TerminalSessions::default();
+        let limit = state.session_limit();
+        let held: Vec<_> = (0..limit)
+            .map(|_| reserve_session(&state).expect("admitted under the limit"))
+            .collect();
+        assert!(
+            reserve_session(&state).is_err(),
+            "the count is the only gate"
+        );
+        drop(held);
+        assert!(reserve_session(&state).is_ok());
+    }
+
+    /// Characterization (host-load governor, Part 0): a `claude` started in a
+    /// GitPulse terminal is invisible to the registry-based session count
+    /// unless Claude Code wrote a registry entry where GitPulse looks — and an
+    /// entry under another `CLAUDE_CONFIG_DIR` is not where it looks.
+    #[cfg(unix)]
+    #[test]
+    fn characterization_a_terminal_claude_with_no_registry_entry_goes_uncounted() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().canonicalize().unwrap();
+        init_test_repo(&repo);
+        let bin = tempfile::tempdir().unwrap();
+        let claude = bin.path().join("claude");
+        std::os::unix::fs::symlink("/bin/sleep", &claude).unwrap();
+        let app = tauri::test::mock_builder().build(crate::context()).unwrap();
+        let state = TerminalSessions::default();
+        let spawned = spawn_session_inner(
+            app.handle(),
+            &state,
+            repo.to_str().unwrap(),
+            None,
+            24,
+            80,
+            Some(claude.to_string_lossy().into_owned()),
+            Some(vec!["30".into()]),
+            None,
+            None,
+        )
+        .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let mut running = Vec::new();
+        while running.is_empty() && std::time::Instant::now() < deadline {
+            running = foreground::working_in(&repo).unwrap();
+            thread::sleep(Duration::from_millis(20));
+        }
+        let registry = tempfile::tempdir().unwrap();
+        let seen = crate::insights::live_sessions::observe_with(
+            Some(registry.path()),
+            &crate::workbench::process_birth::running_since,
+        );
+        let facet =
+            crate::insights::live_sessions::attribute(&seen, &[repo.to_string_lossy().into()]);
+        kill_session(&state, &spawned.id).unwrap();
+        assert!(!running.is_empty(), "the terminal claude never started");
+        assert_eq!(facet.sessions, 0, "{facet:?}");
+    }
 }

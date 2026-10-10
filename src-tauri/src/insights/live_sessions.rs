@@ -443,6 +443,30 @@ mod tests {
         assert!(seen.iter().find(|k| k.kind == "claude").unwrap().ok);
     }
 
+    /// Characterization (host-load governor, Part 0): seven live sessions,
+    /// five counted. Claude Code writes its registry under the session's own
+    /// `CLAUDE_CONFIG_DIR`, so sessions run under a second account's config
+    /// directory register where this detector never looks. Measured on the
+    /// host on 2026-10-09 as 5 counted of 7 live.
+    #[test]
+    fn characterization_sessions_registered_under_another_config_dir_go_uncounted() {
+        let repo = tempfile::TempDir::new().unwrap();
+        let mine: Vec<(String, String)> = (0..5)
+            .map(|i| (format!("{i}.json"), entry(300 + i, repo.path(), 1)))
+            .collect();
+        let theirs: Vec<(String, String)> = (5..7)
+            .map(|i| (format!("{i}.json"), entry(300 + i, repo.path(), 1)))
+            .collect();
+        fn as_refs(rows: &[(String, String)]) -> Vec<(&str, String)> {
+            rows.iter().map(|(n, b)| (n.as_str(), b.clone())).collect()
+        }
+        let read_here = registry(&as_refs(&mine));
+        let _other_account = registry(&as_refs(&theirs));
+        let seen = observe_with(Some(read_here.path()), &always(Liveness::Alive));
+        let facet = attribute(&seen, &[repo.path().to_string_lossy().into_owned()]);
+        assert_eq!(facet.sessions, 5, "seven are live; {facet:?}");
+    }
+
     #[test]
     fn a_registry_past_its_cap_is_truncated_not_sampled() {
         let repo = tempfile::TempDir::new().unwrap();
