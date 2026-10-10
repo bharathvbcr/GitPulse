@@ -4165,9 +4165,15 @@ pub async fn cmd_manvi_run_action(
 /// Infallible by design — every failure arrives as an [`UpdateCheck`] with
 /// `checked: false` and a reason, so a transport error can never be rendered
 /// as "you are up to date".
+///
+/// `async fn` + [`off_thread`]: a sync body under `(async)` still runs on an
+/// async runtime worker, and this one is a network `git ls-remote` that may
+/// take its full timeout — holding a worker every other command needs.
 #[tauri::command(async)]
-pub fn cmd_check_app_update() -> crate::updates::UpdateCheck {
-    crate::updates::check_for_update()
+pub async fn cmd_check_app_update() -> crate::updates::UpdateCheck {
+    off_thread(|| Ok(crate::updates::check_for_update()))
+        .await
+        .unwrap_or_else(crate::updates::UpdateCheck::failed)
 }
 
 // --- the action ledger -------------------------------------------------
@@ -5064,9 +5070,11 @@ pub async fn cmd_delete_path(
 }
 
 /// MCP 2.0 / Agent Plugins 1.0 installer facts: binary path, plugin manifests, tool catalog.
-#[tauri::command]
-pub fn cmd_mcp_info() -> crate::insights::McpInfo {
-    crate::insights::mcp_info()
+/// Off the main thread: it stats, canonicalizes and reads files, and a plain
+/// `#[tauri::command]` runs on the GUI thread.
+#[tauri::command(async)]
+pub async fn cmd_mcp_info() -> Result<crate::insights::McpInfo, String> {
+    off_thread(|| Ok(crate::insights::mcp_info())).await
 }
 
 /// Probe whether `devmap` / `manvi` are installed, which path answered, and

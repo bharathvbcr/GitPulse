@@ -827,9 +827,19 @@ pub fn cmd_diagnostic_log_tail(max_lines: Option<usize>) -> Vec<String> {
     diagnostic_tail(max_lines.unwrap_or(DEFAULT_TAIL_LINES))
 }
 
-#[tauri::command]
-pub fn cmd_diagnostic_persisted_log(max_lines: Option<usize>) -> PersistedLog {
-    persisted_log(max_lines.unwrap_or(DEFAULT_TAIL_LINES))
+/// On the blocking pool, not the GUI thread a plain `#[tauri::command]` runs
+/// on: the read can wait up to [`GENERATION_LOCK_WAIT`] for the cross-process
+/// lock, then reads and redacts two generations of the durable log.
+#[tauri::command(async)]
+pub async fn cmd_diagnostic_persisted_log(max_lines: Option<usize>) -> PersistedLog {
+    let max_lines = max_lines.unwrap_or(DEFAULT_TAIL_LINES);
+    tauri::async_runtime::spawn_blocking(move || persisted_log(max_lines))
+        .await
+        .unwrap_or_else(|error| PersistedLog {
+            path: String::new(),
+            lines: Vec::new(),
+            degraded: Some(format!("could not read the durable log: {error}")),
+        })
 }
 
 pub fn install_panic_hook() {

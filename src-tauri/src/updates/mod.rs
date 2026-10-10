@@ -75,7 +75,7 @@ pub struct UpdateCheck {
 }
 
 impl UpdateCheck {
-    fn failed(error: String) -> Self {
+    pub(crate) fn failed(error: String) -> Self {
         Self {
             current_version: CURRENT_VERSION.to_string(),
             latest_version: String::new(),
