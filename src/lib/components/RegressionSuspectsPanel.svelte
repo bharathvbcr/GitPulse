@@ -24,7 +24,7 @@
    * a bar relative to the top hit, never as a percentage or a probability.
    */
   import { Loader2, Search } from "@lucide/svelte";
-  import { repoStore } from "../stores/repoStore";
+  import { currentRepoPath, repoStore } from "../stores/repoStore";
   import { createAsyncGuard, type AsyncGuard } from "../async/guard";
   import { getSuspects, MAX_SUSPECT_CONE_DEPTH } from "../codeintel/client";
   import type { CodeintelSuspect, CodeintelSuspectScope } from "../codeintel/types";
@@ -61,7 +61,7 @@
 
   let inflight: AsyncGuard | null = null;
 
-  const repoPath = $derived($repoStore.currentPath);
+  const repoPath = $derived($currentRepoPath);
   const canRun = $derived(
     Boolean(repoPath) && symptom.trim().length > 0 && since.trim().length > 0 && !loading,
   );

@@ -119,10 +119,14 @@ describe("ConflictEditor load-effect memo guard", () => {
   it("reloads only when the conflicted file or repo actually changes", () => {
     // repoStore republishes fresh objects every ~6s status poll; reloading
     // per emission would churn IPC and replace parsedDoc mid-edit.
-    expect(source).toContain("if (key === loadedKey && loadedRetry === retryRevision) return;");
-    expect(source).toContain("loadedKey = key;");
-    // The memo key derives only from repo path + conflicted file.
-    expect(source).toContain("`${repo}\\u0000${file}`");
+    // The load effect depends only on the repository key, the conflicted file
+    // and Retry, each compared by value, and runs the load untracked.
+    const start = source.indexOf("$effect(() => {\n    const repo = $currentRepoPath;\n    const file = selectedFile;");
+    expect(start).toBeGreaterThan(-1);
+    const effect = source.slice(start, source.indexOf("function loadConflict", start));
+    expect(effect).toContain("void retryRevision;");
+    expect(effect).toContain("untrack(() => loadConflict(repo, file));");
+    expect(source).not.toContain("loadedKey");
   });
 
   it("does not cancel an in-flight load via effect teardown on memo hits", () => {

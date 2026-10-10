@@ -1,5 +1,5 @@
 import type { RebaseStep } from "../rebase/planner";
-import { get, writable } from "svelte/store";
+import { derived, get, writable } from "svelte/store";
 import { invoke } from "../ipc/invoke";
 import { formatError } from "../ui/formatError";
 import { diagnostics } from "../diagnostics/diagnostics";
@@ -2160,6 +2160,19 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
 
   const store = {
     subscribe,
+    /**
+     * The active repository's path, and nothing else.
+     *
+     * The store publishes a fresh object for every change — a status poll, a
+     * loading flag, an error — so an `$effect` that reads `$repoStore.x`
+     * re-runs on all of them: it re-lists, re-fetches, resubscribes, cancels
+     * its own load mid-flight and resets the reader's local state. A derived
+     * string is compared by value, so this notifies only when the active
+     * repository changes. It is the one key effects use for "which
+     * repository"; `repoStoreEffects.contract.test.ts` keeps `$repoStore`
+     * out of effect bodies.
+     */
+    currentPath: derived({ subscribe }, (state) => state.currentPath),
     /** The active tab's commit message; see `commitDraftStore`. */
     commitDraft: commitDrafts,
     mutationActivity: { subscribe: mutationActivity.subscribe },
@@ -4041,3 +4054,5 @@ function mutationOutput<T>(result: unknown): T | undefined {
 }
 
 export const repoStore = createRepoStore();
+/** `repoStore.currentPath`, importable as a store of its own. */
+export const currentRepoPath = repoStore.currentPath;

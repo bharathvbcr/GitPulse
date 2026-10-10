@@ -35,7 +35,7 @@
 
 <script lang="ts">
   import { untrack } from "svelte";
-  import { repoStore } from "../stores/repoStore";
+  import { currentRepoPath, repoStore } from "../stores/repoStore";
   import { interfaceStore } from "../stores/interfaceStore";
   import { invoke } from "../ipc/invoke";
   import { openExternal as openExternalUrl } from "../desktop/openExternal";
@@ -842,7 +842,7 @@
   });
 
   $effect(() => {
-    const path = $repoStore.currentPath;
+    const path = $currentRepoPath;
     if (!path) {
       inflight?.cancel();
       dependabotInflight?.cancel();

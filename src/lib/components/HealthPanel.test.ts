@@ -295,7 +295,7 @@ describe("HealthPanel coding-agent prompt bar", () => {
     const teardown = source.slice(teardownStart, source.indexOf("};", teardownStart));
     expect(teardown).toContain("fixInflight?.cancel();");
     expect(teardown).toContain("cancelHealthAgentLaunch()");
-    const pathEffect = source.slice(source.indexOf("const path = $repoStore.currentPath;"), source.indexOf("async function openExternal"));
+    const pathEffect = source.slice(source.indexOf("const path = $currentRepoPath;"), source.indexOf("async function openExternal"));
     expect(pathEffect.match(/cancelHealthAgentLaunch\(\)/g)?.length).toBeGreaterThanOrEqual(2);
   });
 });

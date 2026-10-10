@@ -28,7 +28,7 @@
     buildDevcouncilInstallCommand,
   } from "../../tools/devcouncilInstall";
   import { enqueueConsoleLaunch } from "../../terminal/consoleLaunches";
-  import { repoStore } from "../../stores/repoStore";
+  import { currentRepoPath, repoStore } from "../../stores/repoStore";
   import { copyText } from "../../desktop/clipboard";
 
   const wizard = onboardingStore.wizard;
@@ -56,7 +56,7 @@
   const toolStatus = $derived(
     $status ? ($wizard.tool === "devmap" ? $status.devmap : $status.manvi) : null,
   );
-  const repoPath = $derived($repoStore.currentPath);
+  const repoPath = $derived($currentRepoPath);
   const installSpec = $derived(
     $wizard.tool === "devmap"
       ? buildDevcouncilInstallCommand({

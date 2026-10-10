@@ -471,13 +471,15 @@ describe("BranchList freshness badges", () => {
   it("asks for a batch only when the repository, the tips or the base change", () => {
     // Reading `$repoStore` inside an effect re-runs it on every store
     // emission; each re-run here was a freshness batch (~54 in the first
-    // 30 s of one launch). The effects read derived values instead.
-    const load = effectAround(source, "freshnessStore.load(");
+    // 30 s of one launch). The effects read the shared repository key and
+    // derived values instead, and the reset depends on the repository alone.
+    const load = effectAround(source, "freshness.load(");
     expect(load).not.toContain("$repoStore");
-    expect(load).toContain("const path = freshnessRepo;");
+    expect(load).toContain("const path = $currentRepoPath;");
     const repo = effectAround(source, "freshnessStore.forRepo(");
     expect(repo).not.toContain("$repoStore");
-    expect(source).toContain("const freshnessRepo = $derived($repoStore.currentPath);");
+    expect(repo).toContain("freshnessStore.forRepo($currentRepoPath);");
+    expect(source).toContain('const freshness = freshnessStore.consumer("branches");');
     expect(source).toContain("const branchInfos = $derived($repoStore.branches);");
   });
 

@@ -22,7 +22,7 @@
 
 <script lang="ts">
   import { untrack } from "svelte";
-  import { repoStore } from "../stores/repoStore";
+  import { currentRepoPath, repoStore } from "../stores/repoStore";
   import { invoke } from "../ipc/invoke";
   import {
     Percent,
@@ -1285,14 +1285,11 @@
     };
   });
 
-  // Memoized on the actual dependency: every status-poll / stats-drain
-  // emission re-runs the effect (project() hands out fresh objects), and an
-  // unguarded rerun would clobber the locally selected coverage file.
-  let prevSyncedSelection: string | null = null;
+  // Keyed on the selection by value: a status-poll or stats-drain publish
+  // re-running this would clobber the locally selected coverage file.
+  const storeSelection = $derived($repoStore.selectedFilePath);
   $effect(() => {
-    const selected = $repoStore.selectedFilePath;
-    if (selected === prevSyncedSelection) return;
-    prevSyncedSelection = selected;
+    const selected = storeSelection;
     if (selected) {
       untrack(() => { selectedPath = selected; });
     }
@@ -1326,12 +1323,11 @@
     void runMissingCoverage();
   }
 
-  // Repo-scoped scan lifecycle: depend on the scalar path, not every store
+  // Repo-scoped scan lifecycle: depend on the repository key, not every store
   // emission. An early return after effect cleanup would lose the subscription
   // on selection/poll updates. Initialization reads must not add dependencies.
-  const coverageRepo = $derived($repoStore.currentPath);
   $effect(() => {
-    const repo = coverageRepo;
+    const repo = $currentRepoPath;
     return untrack(() => {
       clearFileFilters();
       fileSort = "missed";
@@ -1351,7 +1347,7 @@
       // would discard the selection that effect just restored and make the sync
       // dead code; scan() still validates membership (case-insensitively) when
       // the report lands.
-      selectedPath = untrack(() => $repoStore.selectedFilePath);
+      selectedPath = storeSelection;
       fileError = null;
       contentError = null;
       sourceLines = [];
@@ -1393,11 +1389,11 @@
 
   // Keep a pending detail load alive across unrelated store publications.
   // Only its repository, selected path or measurement version owns cleanup.
-  const coverageDetailKey = $derived(`${coverageRepo ?? "\u0000"}\u0000${selectedPath ?? "\u0000"}\u0000${reportVersion}`);
+  const coverageDetailKey = $derived(`${$currentRepoPath ?? "\u0000"}\u0000${selectedPath ?? "\u0000"}\u0000${reportVersion}`);
   $effect(() => {
     void coverageDetailKey;
     return untrack(() => {
-      const repo = coverageRepo;
+      const repo = $currentRepoPath;
       const path = selectedPath;
       if (!repo || !path) {
         // The load this replaces was cancelled, and a cancelled load never

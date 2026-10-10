@@ -205,30 +205,27 @@ describe("WorktreesPanel store-emission churn guards", () => {
   it("keeps exactly one mount trigger for the worktree list load", () => {
     // The load effect runs on mount; a second onMount(load) double-fetched.
     expect(source).not.toContain("onMount");
-    const effect = source.slice(source.indexOf("let prevRepoPath"), source.indexOf("async function load"));
-    expect(effect).toContain("void load();");
+    const effect = source.slice(source.indexOf("const generation = $derived($repoStore.generation);"), source.indexOf("async function load"));
+    expect(effect).toContain("untrack(() => void load());");
   });
 
-  it("memo-guards the load effect so unrelated store emissions are no-ops", () => {
-    const effect = source.slice(source.indexOf("let prevRepoPath"), source.indexOf("async function load"));
-    const guard = effect.match(/if \(([^)]*)\) return;/)?.[1] ?? "";
-    expect(guard, "the load effect must open with a memo guard").not.toBe("");
-    // Derived rather than spelled out: every reactive value the effect reads
-    // has to appear in the memo key. One that is read but not compared makes
-    // the guard a no-op for that value, and the ~6s poll tick publishes on
-    // every repository — which is the churn this guard exists to absorb. A
-    // literal copy of the condition had to be re-typed each time the effect
-    // learned to watch something new, and re-typing it is how a term gets
-    // dropped.
-    const reads = [...effect.matchAll(/const (\w+) = \$[\w.]+;/g)].map((m) => m[1]);
-    expect(reads.length, "the effect must read something").toBeGreaterThan(0);
-    for (const name of reads) {
-      expect(guard, `${name} is read by the effect but absent from the memo key`).toContain(name);
-    }
+  it("depends only on value-compared keys, so unrelated store emissions are no-ops", () => {
+    // The hand-copied memo guard this replaced had to list every value the
+    // effect read, and re-typing it is how a term got dropped. Now the effect
+    // reads only keys that compare by value — the repository path store, a
+    // derived generation, the trust count — and runs the load untracked, so
+    // nothing else it touches can re-run it. The browser harness
+    // (harness/repo-churn.html) proves the armed confirm survives a publish.
+    const effect = source.slice(source.indexOf("const generation = $derived($repoStore.generation);"), source.indexOf("async function load"));
+    expect(effect).toContain("void $currentRepoPath;");
+    expect(effect).toContain("void generation;");
+    expect(effect).toContain("void $trustExtended;");
+    expect(effect).not.toMatch(/\bprev[A-Z]\w* =/);
+    expect(effect.slice(effect.indexOf("$effect("))).not.toContain("$repoStore.");
   });
 
   it("resets the armed remove confirm only on real repo/generation change or unmount", () => {
-    const effect = source.slice(source.indexOf("let prevRepoPath"), source.indexOf("async function load"));
+    const effect = source.slice(source.indexOf("const generation = $derived($repoStore.generation);"), source.indexOf("async function load"));
     expect(effect).toContain("clearTimeout(confirmTimer)");
     // Clearing the timer without disarming would strand a permanently armed confirm.
     expect(effect).toContain("removingPath = null;");
@@ -249,10 +246,9 @@ describe("WorktreesPanel legacy-trust extension", () => {
     // across a grant, so an unconsidered count would return early and leave
     // every row showing the gaps the grant just closed.
     expect(source).toContain('import { trustExtended } from "../repos/trustExtension"');
-    const effect = source.slice(source.indexOf("let prevRepoPath"), source.indexOf("async function load"));
-    expect(effect).toContain("const extended = $trustExtended;");
-    expect(effect).toMatch(/if \(repo === prevRepoPath &&[\s\S]*?extended === prevExtended\) return;/);
-    expect(effect).toContain("prevExtended = extended;");
+    const effect = source.slice(source.indexOf("const generation = $derived($repoStore.generation);"), source.indexOf("async function load"));
+    expect(effect).toContain("void $trustExtended;");
+    expect(effect).not.toContain("return;");
   });
 
   it("no longer carries a second copy of the offer", () => {

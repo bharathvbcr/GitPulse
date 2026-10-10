@@ -1,6 +1,7 @@
 <script lang="ts">
   import { keyedList } from "../ui/eachKeys";
-  import { repoStore } from "../stores/repoStore";
+  import { untrack } from "svelte";
+  import { currentRepoPath, repoStore } from "../stores/repoStore";
   import { requestManviFocus } from "../ui/manviFocus";
   import {
     HardDrive,
@@ -312,9 +313,10 @@
 
   // One subscription per repository. The metric measures once however many
   // panels are watching, revalidates when the watcher reports a change, and
-  // hands back the last known report immediately on a remount.
+  // hands back the last known report immediately on a remount. Keyed on the
+  // repository alone, so the store's other publishes do not resubscribe.
   $effect(() => {
-    const path = $repoStore.currentPath;
+    const path = $currentRepoPath;
     if (!path) {
       report = null;
       errorMsg = null;
@@ -324,7 +326,7 @@
       return;
     }
     recordedAt = null;
-    return storageMetric.subscribe(path, (snap) => applySnapshot(path, snap));
+    return untrack(() => storageMetric.subscribe(path, (snap) => applySnapshot(path, snap)));
   });
 
 </script>

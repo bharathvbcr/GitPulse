@@ -2,8 +2,8 @@
   import { untrack } from "svelte";
   import { densityStore } from "../../stores/densityStore";
   import { rowHeight } from "../../ui/density";
-  import { repoStore, type FileStatus } from "../../stores/repoStore";
-  import { graphStore } from "../../stores/graphStore";
+  import { currentRepoPath, repoStore, type FileStatus } from "../../stores/repoStore";
+  import { currentHeadTip } from "../../stores/headTip";
   import { invoke } from "../../ipc/invoke";
   import {
     ChevronDown,
@@ -195,57 +195,35 @@
   });
 
   // `$repoStore.x` inside an effect tracks the whole store, and the store
-  // publishes a fresh object on every change — each commit-message keystroke
-  // and every status poll. Deriveds compare with strict equality, so these
-  // strings change only when the repository, the set of dirty paths, or HEAD
-  // does, and the reload below runs only then. HEAD stands in for "the
-  // tracked tree changed underneath a clean status" (a checkout or pull),
-  // which the poll-driven reload used to catch by accident.
-  //
-  // On a branch, HEAD is that branch's tip. A detached HEAD belongs to no
-  // branch, so the tip is empty and a checkout from one commit to another
-  // would change nothing here; the graph store's `headId` (the backend's
-  // `rev-parse HEAD`, re-read by every refresh, no polling of its own) is the
-  // HEAD for the repository it is showing. It is consulted only then, so an
-  // attached HEAD keys exactly as before and a commit reloads once, not twice.
-  const currentRepo = $derived($repoStore.currentPath);
+  // publishes a fresh object on every change — every status poll, loading
+  // flag and error. The repository key, this membership string and HEAD
+  // (see `currentHeadTip`) compare by value, so the listing below reloads only
+  // when the repository, the set of dirty paths, or HEAD changes.
   const statusMembership = $derived(statusPathKey($repoStore.statuses));
-  const branchTip = $derived(
-    $repoStore.branches.find((b) => b.is_current && !b.is_remote)?.tip_commit_id ?? "",
-  );
-  const graphHead = $derived(
-    currentRepo && $graphStore.visiblePath === currentRepo ? ($graphStore.headId ?? "") : "",
-  );
-  const headTip = $derived(branchTip || graphHead);
 
-  let lastRepo = "";
-  let lastListKey = "";
+  // A new repository starts with every folder expanded again.
   $effect(() => {
-    const repo = currentRepo;
-    const membership = statusMembership;
-    const head = headTip;
-    if (!repo) {
-      inflight?.cancel();
-      files = [];
-      errorMsg = null;
-      isLoading = false;
-      selectedIndex = -1;
-      lastRepo = "";
-      lastListKey = "";
-      return;
-    }
-    const key = `${repo}\0${membership}\0${head}`;
-    // Memo hit: leave the in-flight listing alone. There is deliberately no
-    // teardown here — Svelte runs it before every re-run, so a teardown that
-    // cancelled the load would drop it even on this early return. `loadFiles`
-    // cancels its predecessor itself, and unmount is the effect above.
-    if (key === lastListKey) return;
-    lastListKey = key;
-    if (repo !== lastRepo) {
-      collapsed = {};
-      lastRepo = repo;
-    }
-    void loadFiles(repo);
+    void $currentRepoPath;
+    untrack(() => (collapsed = {}));
+  });
+
+  // No teardown: `loadFiles` cancels its predecessor itself, and unmount is
+  // the effect above.
+  $effect(() => {
+    const repo = $currentRepoPath;
+    void statusMembership;
+    void $currentHeadTip;
+    untrack(() => {
+      if (!repo) {
+        inflight?.cancel();
+        files = [];
+        errorMsg = null;
+        isLoading = false;
+        selectedIndex = -1;
+        return;
+      }
+      void loadFiles(repo);
+    });
   });
 
   let listedPaths = $derived.by(() =>

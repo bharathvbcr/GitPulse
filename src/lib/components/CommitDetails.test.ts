@@ -39,17 +39,15 @@ describe("CommitDetails", () => {
    * a new key blanks the badge or outdates an in-flight request.
    */
   it("fetches provenance once per repository and commit, not per store publish", () => {
-    expect(source).toContain("const provenanceRepo = $derived($repoStore.currentPath);");
-    const effect = source.slice(
-      source.indexOf("$effect(() => {\n    const repo = provenanceRepo;"),
-      source.indexOf("function gpgLabel"),
-    );
-    expect(effect).toContain("const id = currentCommitId;");
+    // Keyed on the shared repository path and the derived commit id, both
+    // compared by value: the effect itself runs only on a new target, so it
+    // needs no hand-kept key in front of the fetch.
+    const start = source.indexOf("$effect(() => {\n    const repo = $currentRepoPath;\n    const id = currentCommitId;");
+    expect(start).toBeGreaterThan(-1);
+    const effect = source.slice(start, source.indexOf("function gpgLabel"));
     expect(effect).not.toContain("$repoStore");
-    const memo = effect.indexOf("if (key === provenanceKey) return;");
-    expect(memo).toBeGreaterThan(-1);
-    expect(memo).toBeLessThan(effect.indexOf("++provenanceToken"));
-    expect(memo).toBeLessThan(effect.indexOf("provenance = null"));
+    expect(source).not.toContain("provenanceKey");
+    expect(effect.indexOf("++provenanceToken")).toBeLessThan(effect.indexOf("provenance = null"));
     expect(effect).toContain('"cmd_provenance_freshness"');
   });
 });

@@ -752,6 +752,7 @@
     });
   });
 
+  const selectedCommitId = $derived($repoStore.selectedCommitId);
   $effect(() => {
     filteredRows;
     startIndex;
@@ -759,9 +760,9 @@
     containerHeight;
     graphContentWidth;
     graphViewportWidth;
-    $repoStore.selectedCommitId;
+    selectedCommitId;
     // The canvas ring must not wait on the async diff round-trip: selecting
-    // updates graphStore synchronously, repoStore.selectedCommitId only after
+    // updates graphStore synchronously, repoStore's selectedCommitId only after
     // the diff resolves (or never, when it fails). Both are dependencies.
     $graphStore.selectedCommit;
     $graphStore.headId;

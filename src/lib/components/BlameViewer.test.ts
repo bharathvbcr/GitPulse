@@ -95,7 +95,10 @@ describe("BlameViewer audit fixes", () => {
     // so watcher refreshes after external edits/commits refresh stale blame.
     expect(source).toContain("s.path === selected");
     expect(source).toContain("tip_commit_id");
-    expect(source).toContain("if (key === prevKey) return;");
+    // The fingerprint is a derived string, so the effect re-runs only when it
+    // changes; there is no hand-kept key to fall out of step with it.
+    expect(source).toContain("void blameFingerprint;");
+    expect(source).not.toContain("prevKey");
   });
 
   it("re-blames on full refresh and repo events through content revisions while preserving SWR stability", () => {

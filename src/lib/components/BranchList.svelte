@@ -2,7 +2,7 @@
   import type { AiGeneration } from "../stores/harnessStore";
   import { onMount, untrack } from "svelte";
   import { invoke } from "../ipc/invoke";
-  import { repoStore, type BranchInfo, type TagInfo } from "../stores/repoStore";
+  import { currentRepoPath, repoStore, type BranchInfo, type TagInfo } from "../stores/repoStore";
   import { askConfirm, askText } from "../stores/modalStore";
   import { toastStore } from "../stores/toastStore";
   import { filterStore } from "../stores/filterStore";
@@ -323,14 +323,15 @@
    * far the mainline has moved past the point where it was checked. Without a
    * default branch we send null and the backend measures against HEAD.
    *
-   * Both effects read only these derived values, never `$repoStore` itself:
-   * reading the store makes an effect re-run on every emission — a status
-   * poll, a diff selection, a loading flag — and each re-run here was a batch.
-   * A derived value notifies only when it changes, so the batch is asked again
-   * when the branches are re-read (a refresh, which is also when a new note
-   * can have been written) or the repository changes, and not otherwise.
+   * Both effects read only the repository key and these derived values, never
+   * `$repoStore` itself: reading the store makes an effect re-run on every
+   * emission — a status poll, a diff selection, a loading flag — and each
+   * re-run here was a batch. These notify only when they change, so the batch
+   * is asked again when the branches are re-read (a refresh, which is also
+   * when a new note can have been written) or the repository changes, and not
+   * otherwise. The reset depends on the repository alone.
    */
-  const freshnessRepo = $derived($repoStore.currentPath);
+  const freshness = freshnessStore.consumer("branches");
   const branchInfos = $derived($repoStore.branches);
   const branchTips = $derived([...new Set(branchInfos.map((b) => b.tip_commit_id))]);
   const defaultBranchName = $derived(
@@ -338,18 +339,18 @@
   );
 
   $effect(() => {
-    const path = freshnessRepo;
+    const path = $currentRepoPath;
     const tips = branchTips;
     const base = defaultBranchName;
     if (!path || tips.length === 0) return;
-    void freshnessStore.load(path, tips, base);
+    void freshness.load(path, tips, base);
   });
 
   $effect(() => {
     // A repository switch must not leave the previous repository's
     // verifications painted onto this one's branches. Idempotent, so it
     // cannot drop a load already made for this repository.
-    freshnessStore.forRepo(freshnessRepo);
+    freshnessStore.forRepo($currentRepoPath);
   });
 
   function selectRef(name: string) {
@@ -739,9 +740,7 @@
   });
 
   $effect(() => {
-    if ($repoStore.currentPath) {
-      loadPinned();
-    }
+    if ($currentRepoPath) untrack(loadPinned);
   });
 
   onMount(() => {

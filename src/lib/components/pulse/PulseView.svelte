@@ -1,6 +1,6 @@
 <script lang="ts">
   import { untrack } from "svelte";
-  import { repoStore } from "../../stores/repoStore";
+  import { currentRepoPath, repoStore } from "../../stores/repoStore";
   import { pulseStore } from "../../pulse/pulseStore";
   import PulseHeatmap from "./PulseHeatmap.svelte";
   import PulseRhythm from "./PulseRhythm.svelte";
@@ -47,10 +47,6 @@
   let workspaceLoc = $state<
     { path: string; name: string; value: number | null; truncated: boolean; failed: boolean }[]
   >([]);
-  /** Last path this view loaded. A plain `let`, never $state: the load
-   *  effect reads and writes it, and a reactive read there would recreate
-   *  the self-dependency the workspace-LOC strip was fixed to avoid. */
-  let loadedPath: string | null = null;
 
   // The tab set as a VALUE, not a reference. repoStore rebuilds openTabs with
   // .map() on every status poll (~6s), so an effect that depends on the array
@@ -83,9 +79,7 @@
   }
 
   $effect(() => {
-    const path = $repoStore.currentPath;
-    if (path === loadedPath) return;
-    loadedPath = path;
+    const path = $currentRepoPath;
     untrack(() => {
       if (!path) {
         pulseStore.reset();
@@ -99,33 +93,37 @@
   // LOC now tracks the repository instead of the tab that opened it: the
   // metric revalidates on every settled write, so the headline line count
   // moves as the user works rather than freezing at whatever it was when this
-  // view was first mounted.
+  // view was first mounted. Keyed on the repository alone: a subscription
+  // delivers its snapshot synchronously and may record it, so resubscribing
+  // per store publish was a history write per publish.
   $effect(() => {
-    const path = $repoStore.currentPath;
+    const path = $currentRepoPath;
     if (!path) {
       locState = { status: "idle" };
       return;
     }
-    return locMetric.subscribe(path, (snap) => {
+    return untrack(() => locMetric.subscribe(path, (snap) => {
       locState = toLocState(snap);
       // Only a complete, current measurement is worth recording as a history
       // point; a truncated or stale one would put a false dip in the trend.
       if (snap.value && snap.stale === null && snap.value.truncated !== true) {
         void pulseStore.recordSnapshot(totalCodeLines(snap.value) ?? 0);
       }
-    });
+    }));
   });
 
   // One shared coverage measurement. This view and CoverageViewer used to
   // invoke `cmd_scan_coverage` separately and could disagree about the result.
   $effect(() => {
-    const path = $repoStore.currentPath;
+    const path = $currentRepoPath;
     if (!path || activeTab !== "hotspots") return;
     coverageRequested = true;
-    return coverageMetric.subscribe(path, (snap) => {
-      coverageReport = snap.value;
-      coverageFailed = snap.state === "failed" && snap.value === null;
-    });
+    return untrack(() =>
+      coverageMetric.subscribe(path, (snap) => {
+        coverageReport = snap.value;
+        coverageFailed = snap.state === "failed" && snap.value === null;
+      }),
+    );
   });
 
   // Per-tab line counts for the workspace comparison strip. Same metric, so a

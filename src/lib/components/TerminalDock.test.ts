@@ -43,7 +43,7 @@ describe("TerminalDock", () => {
     // dock or showing the repository; the queued request is what asks for
     // the panel. Matched by the same identity rule the panel consumes with.
     expect(source).toContain("awaitedTabIds($repoStore.openTabs, $taskTerminalRequests, { caseInsensitive: isCaseInsensitiveFs() })");
-    expect(source).toMatch(/nextHostedTerminals\(\s*hostedIds,[\s\S]*?open,\s*awaited,\s*\)/);
+    expect(source).toMatch(/nextHostedTerminals\(\s*hostedIds,[\s\S]*?open,\s*awaited,?\s*\)/);
     const body = render(TerminalDock, { props: { open: false, onClose: () => {}, load: loader } }).body;
     expect(body).not.toContain("data-terminal-dock");
   });

@@ -385,8 +385,9 @@
 
   // A tab closed while its menu was open leaves zombie state that only
   // Escape could dismiss; drop the menu the moment its tab vanishes.
+  const menuTabOpen = $derived(!menu || $repoStore.openTabs.some((tab) => tab.id === menu?.id));
   $effect(() => {
-    if (menu && !$repoStore.openTabs.some((tab) => tab.id === menu?.id)) {
+    if (!menuTabOpen) {
       untrack(() => { menu = null; });
     }
   });
@@ -926,12 +927,13 @@
     endDrag();
   }
 
+  const activeRepoTabId = $derived($repoStore.activeTabId);
   $effect(() => {
     // Re-run on activation changes, not just on element binding — otherwise
-    // the newly active tab never scrolls into view (mirrors ViewTabBar).
-    const tabs = $repoStore.openTabs;
-    const activeId = tabs.find((tab) => tab.isActive)?.id ?? null;
-    void activeId;
+    // the newly active tab never scrolls into view (mirrors ViewTabBar). Keyed
+    // on the id by value, so a status poll does not yank the strip back to
+    // the active tab while someone is scrolling it.
+    void activeRepoTabId;
     const active = scroller?.querySelector("[data-active-repo='true']");
     if (active instanceof HTMLElement) {
       active.scrollIntoView({ block: "nearest", inline: "nearest" });

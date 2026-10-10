@@ -79,7 +79,7 @@ describe("MarkDevViewer", () => {
     // repoStore publishes a fresh object per keystroke and per status poll.
     // `note` and the backlinks effect read a strictly-equal derived of the
     // repository path, so an unrelated publish rebuilds neither.
-    expect(source).toContain("const repoPath = $derived($repoStore.currentPath);");
+    expect(source).toContain("const repoPath = $derived($currentRepoPath);");
     const noteAt = source.indexOf("let note = $derived");
     expect(noteAt).toBeGreaterThan(-1);
     expect(source.slice(noteAt, source.indexOf(");", noteAt))).not.toContain("$repoStore");

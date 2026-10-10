@@ -73,14 +73,12 @@
    * panel alive after the user leaves it.
    */
   let hostedIds = $state(new Set<string>());
+  // The tab ids as a value: repoStore rebuilds openTabs on every publish.
+  const openTabIdsKey = $derived($repoStore.openTabs.map((tab) => tab.id).join("\n"));
+  const activeTabId = $derived($repoStore.activeTabId);
   $effect(() => {
-    const next = nextHostedTerminals(
-      hostedIds,
-      $repoStore.openTabs.map((tab) => tab.id),
-      $repoStore.activeTabId,
-      open,
-      awaited,
-    );
+    const ids = openTabIdsKey === "" ? [] : openTabIdsKey.split("\n");
+    const next = nextHostedTerminals(hostedIds, ids, activeTabId, open, awaited);
     if (next !== hostedIds) untrack(() => { hostedIds = next; });
   });
 

@@ -108,17 +108,16 @@ describe("WorkView", () => {
   it("clears the narrowing when the repository changes", () => {
     // A filter carried across a repository switch hides rows the reader has
     // never seen, for a reason that scrolled off screen with the old repo.
-    expect(source).toContain("facetRepo");
+    // Keyed on the repository path store, which notifies only on a switch.
     expect(source).toMatch(/facet = "all";\s+query = "";/);
-    const start = source.indexOf("let facetRepo");
+    const start = source.indexOf("$effect(() => {\n    void $currentRepoPath;\n    untrack(() => {\n      facet = \"all\";");
     expect(start).toBeGreaterThan(-1);
-    const effect = source.slice(start, start + 360);
-    expect(effect).toContain("if (repo === facetRepo) return");
+    const effect = source.slice(start, start + 200);
     expect(effect.indexOf("untrack(() => {")).toBeLessThan(effect.indexOf('facet = "all"'));
   });
 
   it("resets the row page without tracking the limit write", () => {
-    const start = source.indexOf("void facet; void query; void $repoStore.currentPath");
+    const start = source.indexOf("void facet; void query; void $currentRepoPath");
     expect(start).toBeGreaterThan(-1);
     const effect = source.slice(start, start + 160);
     expect(effect).toContain("untrack(() => {");
@@ -174,8 +173,13 @@ describe("WorkView", () => {
   });
 
   it("refreshes when repository status generation changes", () => {
-    expect(source).toContain("$repoStore.generation");
-    expect(source).toContain("previousGeneration");
+    expect(source).toContain("const generation = $derived($repoStore.generation);");
+    const start = source.indexOf("$effect(() => {\n    const repo = $currentRepoPath;\n    void generation;");
+    expect(start).toBeGreaterThan(-1);
+    expect(source.slice(start, start + 220)).toContain("if (repo) refresh(repo);");
+    // The hydration from cache keys on the repository alone and is declared
+    // first, so a switch hydrates before it refreshes.
+    expect(source.indexOf("projection = cached?.projection ?? null;")).toBeLessThan(start);
   });
 
   it("shows an insights strip derived from the projection, not a second guess", () => {

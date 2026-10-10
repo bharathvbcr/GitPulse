@@ -53,7 +53,8 @@
 <script lang="ts">
   import { untrack } from "svelte";
   import type { FileBlob } from "../files/types";
-  import { repoStore } from "../stores/repoStore";
+  import { currentRepoPath, repoStore } from "../stores/repoStore";
+  import { currentHeadTip } from "../stores/headTip";
   import { graphStore } from "../stores/graphStore";
   import { liveIndex } from "../codeintel/liveIndex";
   import type { CommitFileChange } from "../stores/graphStore";
@@ -271,13 +272,13 @@
   /**
    * Selection fields as primitives, for the query effects below.
    *
-   * repoStore publishes a fresh object on every commit-message keystroke and
-   * every ~6s status poll, and an effect that reads `$repoStore.x` directly
-   * re-runs on each of those publishes. A `$derived` of a primitive compares
-   * with strict equality, so an effect that reads these re-runs only when the
-   * repository, the file or the commit actually changed — not on every poll.
+   * repoStore publishes a fresh object on every change — every ~6s status
+   * poll, loading flag and error — and an effect that reads `$repoStore.x`
+   * directly re-runs on each of those publishes. A `$derived` of a primitive
+   * compares with strict equality, so an effect that reads these (and the
+   * shared `$currentRepoPath`) re-runs only when the repository, the file or
+   * the commit actually changed — not on every poll.
    */
-  const currentRepoPath = $derived($repoStore.currentPath);
   const currentFilePath = $derived($repoStore.selectedFilePath);
   const currentCommitId = $derived($repoStore.selectedCommitId);
 
@@ -286,30 +287,21 @@
    * on every poll — so an index that was stale when the file was opened
    * would otherwise keep its labels until the selection changed.
    *
-   * HEAD: on a branch, that branch's tip; with a detached HEAD there is no
-   * current branch, so the graph store's `headId` (`rev-parse HEAD`, re-read
-   * by every refresh) for the repository it shows. The index: the live
-   * index's per-repository count of successful publications. Both are
-   * existing published state; neither polls anything.
+   * HEAD: `currentHeadTip`. The index: the live index's per-repository count
+   * of successful publications. Both are existing published state; neither
+   * polls anything.
    */
-  const branchHeadTip = $derived(
-    $repoStore.branches.find((b) => b.is_current && !b.is_remote)?.tip_commit_id ?? "",
-  );
-  const graphHeadId = $derived(
-    currentRepoPath && $graphStore.visiblePath === currentRepoPath ? ($graphStore.headId ?? "") : "",
-  );
-  const headTip = $derived(branchHeadTip || graphHeadId);
   const indexSnapshots = liveIndex.snapshots;
   const indexRevision = $derived(
-    currentRepoPath ? ($indexSnapshots[currentRepoPath]?.revision ?? 0) : 0,
+    $currentRepoPath ? ($indexSnapshots[$currentRepoPath]?.revision ?? 0) : 0,
   );
 
   $effect(() => {
-    const repoPath = currentRepoPath;
+    const repoPath = $currentRepoPath;
     const filePath = currentFilePath;
     const rung = rungParam(minRung);
     // Re-ask when HEAD moves or the index publishes a new generation.
-    void headTip;
+    void $currentHeadTip;
     void indexRevision;
     impactGuard?.cancel();
     if (!repoPath || !filePath) {
@@ -626,13 +618,13 @@
   let hunkSymbolsGuard: AsyncGuard | null = null;
 
   $effect(() => {
-    const repo = currentRepoPath;
+    const repo = $currentRepoPath;
     const section = singleSection;
     const commitId = currentCommitId;
     // A working-tree diff is labelled from HEAD, so a moved HEAD re-asks; a
     // commit's labels are pinned to that commit. A new index generation can
     // turn a head mismatch into labels for either.
-    const head = commitId ? "" : headTip;
+    const head = commitId ? "" : $currentHeadTip;
     const index = indexRevision;
     const key =
       repo && section?.path
@@ -709,8 +701,8 @@
   let filesGuard: AsyncGuard | null = null;
 
   $effect(() => {
-    const repo = $repoStore.currentPath;
-    const commitId = $repoStore.selectedCommitId;
+    const repo = $currentRepoPath;
+    const commitId = currentCommitId;
     // Nothing to fetch when there is no commit, or when the graph store's
     // details already cover this one.
     if (!repo || !commitId || details?.id === commitId) return;
@@ -790,7 +782,7 @@
     // Both dependencies are strings compared by value, so a repoStore publish
     // that changed neither the repository nor the change-set's paths does not
     // re-issue the layered walk.
-    const repo = currentRepoPath;
+    const repo = $currentRepoPath;
     void changeSetPathsKey;
     untrack(() => {
       const paths = rail.entries.map((e) => e.path);
@@ -1107,46 +1099,47 @@
   /**
    * Two reset keys, not one.
    *
-   * `viewKey` covers what the reader chose — a different file, side of the
+   * `viewSelectionKey` covers what the reader chose — a different file, side of the
    * index, or whitespace mode — and resets scroll with the selection, because
    * a new file starts at its top.
    *
-   * `contentKey` covers the diff TEXT changing under a selection that did
+   * `selectedDiffText` covers the diff TEXT changing under a selection that did
    * not: the watcher refetches after an external edit, and a mutation
    * refetches after staging. Line indices are what a patch is built from, so
    * a stale selection would stage lines the reader never picked. It clears
    * the selection and leaves the scroll alone, because the reader has not
    * gone anywhere.
    */
-  let viewKey: string | null = null;
-  let contentKey: string | null = null;
-
-  $effect(() => {
-    const key = [
+  const viewSelectionKey = $derived(
+    [
       $repoStore.selectedFilePath,
       $repoStore.selectedCommitId,
       $repoStore.selectedIsStaged,
       $repoStore.selectedIgnoreWhitespace,
-    ].join("\u0000");
-    if (key === viewKey) return;
-    viewKey = key;
-    selectedLines = new Set();
-    isDragging = false;
-    dragAnchor = null;
-    unifiedScroll = 0;
-    splitScroll = 0;
+    ].join("\u0000"),
+  );
+  const selectedDiffText = $derived($repoStore.selectedDiff);
+
+  $effect(() => {
+    void viewSelectionKey;
+    untrack(() => {
+      selectedLines = new Set();
+      isDragging = false;
+      dragAnchor = null;
+      unifiedScroll = 0;
+      splitScroll = 0;
+    });
   });
 
   $effect(() => {
-    const text = $repoStore.selectedDiff;
-    // Reference identity, not content: the parse cache already relies on the
-    // store handing back the same string object for an unchanged diff.
-    const key = text === null ? "\u0000null" : text;
-    if (key === contentKey) return;
-    contentKey = key;
-    selectedLines = new Set();
-    isDragging = false;
-    dragAnchor = null;
+    // Compared by value: the store hands back the same string for an
+    // unchanged diff, and an equal refetch is not new content either.
+    void selectedDiffText;
+    untrack(() => {
+      selectedLines = new Set();
+      isDragging = false;
+      dragAnchor = null;
+    });
   });
 
   /** Toggling layout keeps the reader's place instead of jumping to the top. */
@@ -1164,9 +1157,9 @@
   let imageBlobKey: string | null = null;
 
   $effect(() => {
-    const path = singleSection?.path ?? $repoStore.selectedFilePath;
-    const repo = $repoStore.currentPath;
-    const commitId = $repoStore.selectedCommitId;
+    const path = singleSection?.path ?? currentFilePath;
+    const repo = $currentRepoPath;
+    const commitId = currentCommitId;
     const key =
       showingImage && path && repo ? `${repo}\u0000${path}\u0000${commitId ?? ""}` : null;
     if (key === imageBlobKey) return;
