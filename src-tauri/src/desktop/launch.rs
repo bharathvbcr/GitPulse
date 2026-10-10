@@ -52,6 +52,11 @@ const _: () = assert!(CAPTURE_LIMIT.as_millis() < instance::HANDLER_TIMEOUT.as_m
 /// launch defers to it. An approved quit is over in about a second; the
 /// sidecar's reaping, its slowest step, gives up after ~1.2s.
 const UNGUARDED_QUIT_WAIT: Duration = Duration::from_secs(3);
+/// The identifier GitPulse ships under, as `tauri.conf.json` names it. A binary
+/// run outside its bundle (`tauri dev`, `target/*/gitpulse`) has no identifier
+/// of its own, yet the copy it must not double is the one LaunchServices knows
+/// by this one.
+const SHIPPED_IDENTIFIER: &str = "com.gitpulse.desktop";
 
 #[link(name = "AppKit", kind = "framework")]
 extern "C" {
@@ -76,24 +81,22 @@ pub enum Launch {
 pub fn establish() -> Launch {
     let Some(dir) = crate::tool_config::default_config_dir() else {
         log::error!(target: "desktop", "single-instance guard did not run: the profile directory cannot be resolved");
-        return Launch::Proceed;
+        return unless_already_running();
     };
     match instance::claim(&dir, instance::CLAIM_DEADLINE) {
         Claim::Primary(primary) => {
             if let Some(error) = primary.mailbox_error() {
                 log::warn!(target: "desktop", "single instance: owner, but other launches cannot reach it: {error}");
             }
-            if let Some(pid) = unguarded_instance() {
-                // A GitPulse that answers to no lock here: one from before this
-                // guard existed, or (in a test) one on another profile. Only
-                // LaunchServices can see it. `primary` drops on return, taking
-                // its mailbox with it.
-                log::warn!(target: "desktop", "single instance: GitPulse {pid} is running but not under this profile's guard; bringing it forward instead of starting");
-                bring_forward(pid);
-                return Launch::Exit;
+            // A GitPulse that answers to no lock here: one from before this
+            // guard existed, or (in a test) one on another profile. Only
+            // LaunchServices can see it. On `Exit`, `primary` drops on return,
+            // taking its mailbox with it.
+            let launch = unless_already_running();
+            if let Launch::Proceed = launch {
+                let _ = PRIMARY.set(primary);
             }
-            let _ = PRIMARY.set(primary);
-            Launch::Proceed
+            launch
         }
         Claim::Secondary(owner) => {
             let pid = owner.owner_pid();
@@ -124,8 +127,8 @@ pub fn establish() -> Launch {
             Launch::Exit
         }
         Claim::Unavailable(reason) => {
-            log::error!(target: "desktop", "single-instance guard could not run, starting unguarded: {reason}");
-            Launch::Proceed
+            log::error!(target: "desktop", "single-instance guard could not run: {reason}");
+            unless_already_running()
         }
     }
 }
@@ -318,11 +321,32 @@ fn listen() -> Heard {
     Heard { opened, response }
 }
 
+/// `Proceed` only when LaunchServices knows no other GitPulse. The last word
+/// for every launch that would start, whether or not the profile guard ran:
+/// a guard that could not run is no reason to double a GitPulse it cannot see.
+fn unless_already_running() -> Launch {
+    let Some(pid) = unguarded_instance() else {
+        return Launch::Proceed;
+    };
+    log::warn!(target: "desktop", "single instance: GitPulse {pid} is running but not under this profile's guard; bringing it forward instead of starting");
+    bring_forward(pid);
+    Launch::Exit
+}
+
+/// Whose running copies count as GitPulse for this launch: its own bundle's,
+/// or the shipped app's when it was started outside a bundle.
+fn watched_identifier(own: Option<String>) -> String {
+    own.unwrap_or_else(|| SHIPPED_IDENTIFIER.to_owned())
+}
+
 /// Another process that LaunchServices knows as GitPulse and that is not this
 /// one: the signature of a copy started before this guard existed. Waits,
 /// bounded, for one that is quitting to finish.
 fn unguarded_instance() -> Option<i32> {
-    let identifier = objc2_foundation::NSBundle::mainBundle().bundleIdentifier()?;
+    let own_identifier = objc2_foundation::NSBundle::mainBundle()
+        .bundleIdentifier()
+        .map(|identifier| identifier.to_string());
+    let identifier = NSString::from_str(&watched_identifier(own_identifier));
     let own = std::process::id() as i32;
     let started = Instant::now();
     loop {
@@ -469,6 +493,38 @@ mod tests {
             Some(Request::Open {
                 paths: vec!["/r".into()]
             })
+        );
+    }
+
+    #[test]
+    fn a_launch_outside_a_bundle_still_looks_for_the_shipped_app() {
+        // Before this, a `tauri dev` or `target/*/gitpulse` launch had no
+        // identifier to look under and started beside the installed app.
+        assert_eq!(watched_identifier(None), SHIPPED_IDENTIFIER);
+        // A bundle's own identifier wins, so a test copy under another
+        // identifier only defers to copies of itself.
+        assert_eq!(
+            watched_identifier(Some("com.gitpulse.desktop.e2e".into())),
+            "com.gitpulse.desktop.e2e"
+        );
+    }
+
+    #[test]
+    fn the_shipped_identifier_is_the_one_the_bundle_is_built_with() {
+        let config: serde_json::Value = serde_json::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tauri.conf.json"
+        )))
+        .expect("tauri.conf.json parses");
+        assert_eq!(config["identifier"], SHIPPED_IDENTIFIER);
+        let macos: serde_json::Value = serde_json::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tauri.macos.conf.json"
+        )))
+        .expect("tauri.macos.conf.json parses");
+        assert!(
+            macos.get("identifier").is_none(),
+            "the macOS overlay must not rename the bundle out from under the fallback"
         );
     }
 
