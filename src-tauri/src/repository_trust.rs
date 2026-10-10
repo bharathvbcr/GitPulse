@@ -230,13 +230,15 @@ fn directory(path: &Path) -> Result<DirectoryIdentity, String> {
     })
 }
 
-fn bounded_text(path: &Path, limit: u64) -> Result<String, String> {
+/// Reads a regular file of at most `limit` bytes, refusing a larger one rather
+/// than returning a prefix, and refusing anything that is not a regular file.
+pub(crate) fn bounded_text(path: &Path, limit: u64) -> Result<String, String> {
     let mut options = OpenOptions::new();
     options.read(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        // A substituted FIFO must not park the trust prompt indefinitely.
+        // A substituted FIFO must not park the reader indefinitely.
         options.custom_flags(libc::O_NONBLOCK);
     }
     let file = options
@@ -250,10 +252,7 @@ fn bounded_text(path: &Path, limit: u64) -> Result<String, String> {
         .read_to_string(&mut text)
         .map_err(|e| format!("Cannot read {}: {e}", path.display()))?;
     if text.len() as u64 > limit {
-        return Err(format!(
-            "Repository metadata exceeds {limit} bytes: {}",
-            path.display()
-        ));
+        return Err(format!("File exceeds {limit} bytes: {}", path.display()));
     }
     Ok(text)
 }
