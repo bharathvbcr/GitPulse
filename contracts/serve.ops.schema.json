@@ -38,6 +38,7 @@
       "work.enhancements.get",
       "work.enhancements.list",
       "work.enhancements.recover",
+      "work.enhancements.refine",
       "work.enhancements.revise",
       "work.enhancements.undo",
       "work.enhancements.wake",
@@ -74,6 +75,11 @@
       "work.runs.prepare",
       "work.runs.protocol",
       "work.runs.started",
+      "work.scan.cancel",
+      "work.scan.gaps",
+      "work.scan.get",
+      "work.verify.get",
+      "work.verify.task",
       "work.workspaces.delete",
       "work.workspaces.get",
       "work.workspaces.list",
@@ -204,6 +210,34 @@
               "required": false
             }
           }
+        }
+      }
+    },
+    "GapScanParams": {
+      "type": "object",
+      "required": false,
+      "fields": {
+        "max_proposals": {
+          "type": "integer",
+          "required": false
+        },
+        "repo_root": {
+          "type": "string",
+          "required": true
+        },
+        "since": {
+          "type": "string",
+          "required": false
+        }
+      }
+    },
+    "GapScanReadParams": {
+      "type": "object",
+      "required": false,
+      "fields": {
+        "scan_id": {
+          "type": "string",
+          "required": true
         }
       }
     },
@@ -391,6 +425,424 @@
           "required": true
         },
         "state": {
+          "type": "string",
+          "required": true
+        }
+      }
+    },
+    "ScanView": {
+      "type": "object",
+      "required": false,
+      "fields": {
+        "attached_count": {
+          "type": "integer",
+          "required": true
+        },
+        "board_complete": {
+          "type": "boolean",
+          "required": true
+        },
+        "complete": {
+          "type": "boolean",
+          "required": true
+        },
+        "coverage": {
+          "type": "array",
+          "required": true,
+          "items": {
+            "type": "object",
+            "required": false,
+            "fields": {
+              "category": {
+                "type": "string",
+                "required": true
+              },
+              "detail": {
+                "type": "string",
+                "required": false
+              },
+              "hidden": {
+                "type": "integer",
+                "required": false
+              },
+              "status": {
+                "type": "string",
+                "required": true
+              }
+            }
+          }
+        },
+        "error": {
+          "type": "string",
+          "required": false
+        },
+        "finished_at": {
+          "type": "integer",
+          "required": false
+        },
+        "index_generation": {
+          "type": "integer",
+          "required": false
+        },
+        "joined": {
+          "type": "boolean",
+          "required": false
+        },
+        "max_proposals": {
+          "type": "integer",
+          "required": true
+        },
+        "new_count": {
+          "type": "integer",
+          "required": true
+        },
+        "over_cap": {
+          "type": "integer",
+          "required": true
+        },
+        "proposals": {
+          "type": "array",
+          "required": true,
+          "items": {
+            "type": "object",
+            "required": false,
+            "fields": {
+              "attached_item_id": {
+                "type": "string",
+                "required": false
+              },
+              "attached_item_title": {
+                "type": "string",
+                "required": false
+              },
+              "category": {
+                "type": "string",
+                "required": true
+              },
+              "description": {
+                "type": "string",
+                "required": true
+              },
+              "fingerprint": {
+                "type": "string",
+                "required": true
+              },
+              "kind": {
+                "type": "string",
+                "required": true
+              },
+              "labels": {
+                "type": "array",
+                "required": true,
+                "items": {
+                  "type": "string",
+                  "required": false
+                }
+              },
+              "priority": {
+                "type": "integer",
+                "required": true
+              },
+              "signals": {
+                "type": "array",
+                "required": false,
+                "items": {
+                  "type": "object",
+                  "required": false,
+                  "fields": {
+                    "result": {
+                      "type": "string",
+                      "required": true
+                    },
+                    "source": {
+                      "type": "string",
+                      "required": true
+                    }
+                  }
+                }
+              },
+              "status": {
+                "type": "string",
+                "required": true
+              },
+              "title": {
+                "type": "string",
+                "required": true
+              }
+            }
+          }
+        },
+        "repo_root": {
+          "type": "string",
+          "required": true
+        },
+        "scan_id": {
+          "type": "string",
+          "required": true
+        },
+        "since": {
+          "type": "string",
+          "required": false
+        },
+        "started_at": {
+          "type": "integer",
+          "required": true
+        },
+        "state": {
+          "type": "string",
+          "required": true
+        }
+      }
+    },
+    "VerifyGetParams": {
+      "type": "object",
+      "required": false,
+      "fields": {
+        "item_id": {
+          "type": "string",
+          "required": true
+        },
+        "request_id": {
+          "type": "string",
+          "required": false
+        }
+      }
+    },
+    "VerifyResult": {
+      "type": "object",
+      "required": false,
+      "fields": {
+        "record": {
+          "type": "object",
+          "required": true,
+          "fields": {
+            "base": {
+              "type": "string",
+              "required": true
+            },
+            "changes": {
+              "type": "object",
+              "required": true,
+              "fields": {
+                "capped": {
+                  "type": "boolean",
+                  "required": true
+                },
+                "paths": {
+                  "type": "array",
+                  "required": true,
+                  "items": {
+                    "type": "string",
+                    "required": false
+                  }
+                },
+                "total": {
+                  "type": "integer",
+                  "required": true
+                },
+                "untracked": {
+                  "type": "integer",
+                  "required": true
+                }
+              }
+            },
+            "criteria": {
+              "type": "array",
+              "required": true,
+              "items": {
+                "type": "object",
+                "required": false,
+                "fields": {
+                  "findings": {
+                    "type": "array",
+                    "required": true,
+                    "items": {
+                      "type": "string",
+                      "required": false
+                    }
+                  },
+                  "index": {
+                    "type": "integer",
+                    "required": true
+                  },
+                  "status": {
+                    "type": "string",
+                    "required": true
+                  },
+                  "text": {
+                    "type": "string",
+                    "required": true
+                  }
+                }
+              }
+            },
+            "critic_read_only": {
+              "type": "boolean",
+              "required": true
+            },
+            "critic_summary": {
+              "type": "string",
+              "required": true
+            },
+            "degraded": {
+              "type": "array",
+              "required": true,
+              "items": {
+                "type": "string",
+                "required": false
+              }
+            },
+            "finished_at": {
+              "type": "string",
+              "required": true
+            },
+            "head": {
+              "type": "string",
+              "required": true
+            },
+            "item_id": {
+              "type": "string",
+              "required": true
+            },
+            "outcome": {
+              "type": "string",
+              "required": true
+            },
+            "request_id": {
+              "type": "string",
+              "required": true
+            },
+            "rigor": {
+              "type": "object",
+              "required": true,
+              "nullable": true,
+              "fields": {
+                "degraded": {
+                  "type": "array",
+                  "required": true,
+                  "items": {
+                    "type": "string",
+                    "required": false
+                  }
+                },
+                "examined": {
+                  "type": "integer",
+                  "required": true
+                },
+                "findings": {
+                  "type": "array",
+                  "required": true,
+                  "items": {
+                    "type": "string",
+                    "required": false
+                  }
+                },
+                "omitted": {
+                  "type": "array",
+                  "required": true,
+                  "items": {
+                    "type": "string",
+                    "required": false
+                  }
+                },
+                "omitted_total": {
+                  "type": "integer",
+                  "required": true
+                },
+                "source": {
+                  "type": "string",
+                  "required": true
+                },
+                "verdict": {
+                  "type": "string",
+                  "required": true
+                }
+              }
+            },
+            "run_id": {
+              "type": "string",
+              "required": true
+            },
+            "started_at": {
+              "type": "string",
+              "required": true
+            },
+            "state": {
+              "type": "string",
+              "required": true
+            },
+            "tests": {
+              "type": "object",
+              "required": true,
+              "nullable": true,
+              "fields": {
+                "candidates": {
+                  "type": "array",
+                  "required": true,
+                  "items": {
+                    "type": "string",
+                    "required": false
+                  }
+                },
+                "generation": {
+                  "type": "integer",
+                  "required": true
+                },
+                "index_fresh": {
+                  "type": "boolean",
+                  "required": true
+                },
+                "queried": {
+                  "type": "boolean",
+                  "required": true
+                },
+                "total": {
+                  "type": "integer",
+                  "required": true
+                },
+                "truncated": {
+                  "type": "boolean",
+                  "required": true
+                },
+                "walk_incomplete": {
+                  "type": "string",
+                  "required": true
+                }
+              }
+            },
+            "worktree": {
+              "type": "string",
+              "required": true
+            }
+          }
+        },
+        "replayed": {
+          "type": "boolean",
+          "required": true
+        }
+      }
+    },
+    "VerifyTaskParams": {
+      "type": "object",
+      "required": false,
+      "fields": {
+        "base": {
+          "type": "string",
+          "required": true
+        },
+        "head": {
+          "type": "string",
+          "required": true
+        },
+        "item_id": {
+          "type": "string",
+          "required": true
+        },
+        "request_id": {
+          "type": "string",
+          "required": true
+        },
+        "worktree": {
           "type": "string",
           "required": true
         }
