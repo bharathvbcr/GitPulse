@@ -9,6 +9,7 @@
 
 #![cfg(unix)]
 
+mod common;
 #[path = "common/process_trust.rs"]
 mod process_trust;
 
@@ -92,7 +93,10 @@ fn a_stalled_child_is_reaped_and_the_total_stays_under_the_host_timeout() {
         if child.try_wait().unwrap().is_some() {
             break;
         }
-        assert!(started.elapsed() < Duration::from_secs(30), "hook hung");
+        assert!(
+            started.elapsed() < common::env::coverage_relaxed(Duration::from_secs(30)),
+            "hook hung"
+        );
         std::thread::sleep(Duration::from_millis(20));
     }
     let hook_secs = started.elapsed();

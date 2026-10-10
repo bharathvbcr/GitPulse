@@ -168,9 +168,10 @@ pub fn run() {
                 use tauri_plugin_autostart::ManagerExt as _;
                 let handle = app.handle().clone();
                 let name = app.package_info().name.clone();
-                if let Err(error) = std::thread::Builder::new()
-                    .name("launch-agent-check".into())
-                    .spawn(move || {
+                if let Err(error) = crate::supervisor::spawn_once(
+                    "launch-agent-check",
+                    "launch agent check",
+                    move || {
                         match storage::hygiene::background::refresh_if_stale() {
                             Ok(desktop::launch_agent::Registration::Stale { registered }) => {
                                 log::warn!(target: "setup", "the cleaner LaunchAgent started {registered:?}; it now starts this app");
@@ -181,8 +182,8 @@ pub fn run() {
                         desktop::launch_agent::refresh_autostart(&name, || {
                             handle.autolaunch().enable().map_err(|e| e.to_string())
                         });
-                    })
-                {
+                    },
+                ) {
                     log::warn!(target: "setup", "launch agent check did not start: {error}");
                 }
             }

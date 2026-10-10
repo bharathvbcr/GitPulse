@@ -415,7 +415,7 @@ pub fn action_for_argv(argv: &[&str]) -> String {
 /// its caller and retried by the next one, so one transient `SQLITE_BUSY` or
 /// permission race cannot disable the ledger for the process lifetime.
 #[derive(Default)]
-struct Slot {
+pub(crate) struct Slot {
     conn: Mutex<Option<Live>>,
 }
 

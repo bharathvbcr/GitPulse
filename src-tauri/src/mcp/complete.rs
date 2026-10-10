@@ -397,7 +397,10 @@ mod tests {
             // The cache itself answers at once while the scan runs.
             let started = std::time::Instant::now();
             assert!(crate::supervisor::lock_or_recover(&cache).is_none());
-            assert!(started.elapsed() < std::time::Duration::from_millis(100));
+            assert!(
+                started.elapsed()
+                    < crate::test_support::coverage_relaxed(std::time::Duration::from_millis(100))
+            );
             let second = worktrees_cached_by(&cache, &scans, || panic!("a second scan ran"));
             assert_eq!(second, vec!["/repo".to_owned()]);
             assert_eq!(first.join().unwrap(), second);

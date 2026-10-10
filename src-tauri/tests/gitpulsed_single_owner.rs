@@ -7,6 +7,7 @@
 
 #![cfg(unix)]
 
+mod common;
 use gitpulse_lib::procguard::LockedSpawn;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};

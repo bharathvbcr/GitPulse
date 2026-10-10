@@ -130,7 +130,7 @@ mod tests {
             "the call ran more than once"
         );
         assert!(answers.iter().all(|a| *a == 1), "{answers:?}");
-        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(started.elapsed() < crate::test_support::coverage_relaxed(Duration::from_secs(2)));
     }
 
     #[test]
@@ -148,7 +148,9 @@ mod tests {
         std::thread::sleep(Duration::from_millis(50));
         let started = Instant::now();
         assert_eq!(flights.run("fast", || 2), 2);
-        assert!(started.elapsed() < Duration::from_millis(400));
+        assert!(
+            started.elapsed() < crate::test_support::coverage_relaxed(Duration::from_millis(400))
+        );
         assert_eq!(slow.join().unwrap(), 1);
     }
 

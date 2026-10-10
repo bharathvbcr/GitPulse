@@ -2138,7 +2138,7 @@ done"#;
                 owner,
                 "capability.probe",
                 None,
-                Duration::from_secs(20),
+                Budget::Fixed(Duration::from_secs(20)),
                 None,
             )
         });
@@ -2148,7 +2148,7 @@ done"#;
             owner,
             "policy.check",
             Some(serde_json::json!({"argv": ["git", "status"]})),
-            Duration::from_secs(5),
+            Budget::Fixed(Duration::from_secs(5)),
             None,
         )
         .expect("the policy check was answered");
@@ -2789,7 +2789,7 @@ while IFS= read -r line; do handle "$line" & done
             .expect_err("the advertised deadline should have ended the call");
         assert!(matches!(error, HarnessError::Timeout(_)), "{error:?}");
         assert!(
-            started.elapsed() < Duration::from_millis(6_800),
+            started.elapsed() < crate::test_support::coverage_relaxed(Duration::from_millis(6_800)),
             "waited on the table, not the advertisement: {:?}",
             started.elapsed()
         );

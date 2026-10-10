@@ -14,11 +14,6 @@ use gitpulse_lib::graph::RefScope;
 use gitpulse_lib::procguard::LockedSpawn;
 use std::path::Path;
 use std::process::Command;
-use std::sync::Mutex;
-
-/// A test that edits this process's environment takes the turn, and so does
-/// every other test: a spawned child inherits the edit.
-static ENV: Mutex<()> = Mutex::new(());
 
 fn repo() -> tempfile::TempDir {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -52,7 +47,8 @@ fn is_oid(id: &str) -> bool {
 /// commit hermetic: no gpg, no keyring.
 #[test]
 fn log_showsignature_never_reaches_a_commit_id() {
-    let _turn = ENV.lock().unwrap_or_else(|e| e.into_inner());
+    // Every test takes the environment turn: a spawned child inherits an edit.
+    let _serial = common::env::env_serial();
     let dir = repo();
     let key = dir.path().join("signing-key");
     let keygen = Command::new("ssh-keygen")
@@ -102,7 +98,8 @@ fn log_showsignature_never_reaches_a_commit_id() {
 /// replaced git's diff with a program's output.
 #[test]
 fn colour_and_external_diff_settings_do_not_reach_the_diff() {
-    let _turn = ENV.lock().unwrap_or_else(|e| e.into_inner());
+    // Every test takes the environment turn: a spawned child inherits an edit.
+    let _serial = common::env::env_serial();
     let dir = repo();
     commit_file(dir.path(), "a.txt", "one\n");
     std::fs::write(dir.path().join("a.txt"), "two\n").unwrap();
@@ -142,7 +139,8 @@ fn colour_and_external_diff_settings_do_not_reach_the_diff() {
 /// something other than the file named.
 #[test]
 fn ambient_pathspec_switches_do_not_retarget_stage() {
-    let _turn = ENV.lock().unwrap_or_else(|e| e.into_inner());
+    // Every test takes the environment turn: a spawned child inherits an edit.
+    let serial = common::env::env_serial();
     let dir = repo();
     commit_file(dir.path(), "base.txt", "base");
     std::fs::write(dir.path().join("f*.txt"), "star").unwrap();
@@ -155,13 +153,12 @@ fn ambient_pathspec_switches_do_not_retarget_stage() {
         "GIT_GLOB_PATHSPECS",
         "GIT_ICASE_PATHSPECS",
     ];
+    let mut pins = common::env::bind_env(&serial);
     for name in names {
-        std::env::set_var(name, "1");
+        pins = pins.set(name, "1");
     }
     let staged = GitWriter::stage_file(path, "f*.txt");
-    for name in names {
-        std::env::remove_var(name);
-    }
+    drop(pins);
     staged.expect("stage the one file named f*.txt");
 
     let cached = Command::new("git")
@@ -180,7 +177,8 @@ fn ambient_pathspec_switches_do_not_retarget_stage() {
 /// ago" into the commit panel.
 #[test]
 fn log_date_does_not_change_the_commit_dates() {
-    let _turn = ENV.lock().unwrap_or_else(|e| e.into_inner());
+    // Every test takes the environment turn: a spawned child inherits an edit.
+    let _serial = common::env::env_serial();
     let dir = repo();
     commit_file(dir.path(), "a.txt", "a");
     run_git(dir.path(), &["config", "log.date", "relative"]);

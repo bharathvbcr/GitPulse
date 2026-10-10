@@ -170,9 +170,8 @@ impl Retention {
         }
         let running = Arc::clone(&self.running);
         let host = host.clone();
-        if let Err(error) = std::thread::Builder::new()
-            .name("workbench-retention".into())
-            .spawn(move || {
+        if let Err(error) =
+            crate::supervisor::spawn_once("workbench-retention", "workbench retention", move || {
                 let outcome = run_once(&profile, &running, now_secs(), || {
                     host.check_open().map_err(|e| e.message)?;
                     let store = dc_store::Store::open(&profile).map_err(|e| e.to_string())?;

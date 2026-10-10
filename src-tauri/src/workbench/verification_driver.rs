@@ -614,32 +614,29 @@ impl Backend for HostBackend {
 /// Start the driver thread. A thread that fails to start costs automatic
 /// verification only: the Verify action still works.
 pub(crate) fn install(host: WorkbenchState) {
-    if let Err(error) = std::thread::Builder::new()
-        .name("workbench-verification".into())
-        .spawn(move || {
-            let backend = HostBackend(host.clone());
-            let mut driver = Driver::default();
-            // Its own connection: a sweep waits on the sidecar, and the
-            // board's reads must not queue behind that.
-            let mut store: Option<Store> = None;
-            while host.check_open().is_ok() {
-                if store.is_none() {
-                    store = host
-                        .profile_path()
-                        .ok()
-                        .filter(|path| path.exists())
-                        .and_then(|path| Store::open(&path).ok());
-                }
-                if let Some(open) = &store {
-                    let report = driver.sweep(open, &backend);
-                    if report != Report::default() {
-                        log::info!(target: "workbench", "verification driver: {report:?}");
-                    }
-                }
-                std::thread::sleep(SWEEP_PERIOD);
+    if let Err(error) = crate::supervisor::spawn_service("workbench-verification", move || {
+        let backend = HostBackend(host.clone());
+        let mut driver = Driver::default();
+        // Its own connection: a sweep waits on the sidecar, and the
+        // board's reads must not queue behind that.
+        let mut store: Option<Store> = None;
+        while host.check_open().is_ok() {
+            if store.is_none() {
+                store = host
+                    .profile_path()
+                    .ok()
+                    .filter(|path| path.exists())
+                    .and_then(|path| Store::open(&path).ok());
             }
-        })
-    {
+            if let Some(open) = &store {
+                let report = driver.sweep(open, &backend);
+                if report != Report::default() {
+                    log::info!(target: "workbench", "verification driver: {report:?}");
+                }
+            }
+            std::thread::sleep(SWEEP_PERIOD);
+        }
+    }) {
         log::warn!(target: "workbench", "verification driver did not start: {error}");
     }
 }

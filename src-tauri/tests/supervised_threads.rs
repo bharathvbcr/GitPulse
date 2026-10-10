@@ -9,6 +9,7 @@
 //! Scoped threads (`thread::scope`) are bounded by their caller and not
 //! matched.
 
+mod common;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 

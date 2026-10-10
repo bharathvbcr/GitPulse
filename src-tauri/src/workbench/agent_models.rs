@@ -560,7 +560,7 @@ mod tests {
         let started = Instant::now();
         assert!(cached("agy-test-other").is_none());
         assert!(
-            started.elapsed() < Duration::from_millis(200),
+            started.elapsed() < crate::test_support::coverage_relaxed(Duration::from_millis(200)),
             "{:?}",
             started.elapsed()
         );

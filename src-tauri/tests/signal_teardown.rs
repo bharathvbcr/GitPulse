@@ -10,6 +10,7 @@
 
 #![cfg(unix)]
 
+mod common;
 use gitpulse_lib::procguard::{self, LockedSpawn};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
@@ -95,7 +96,7 @@ fn sigterm_runs_the_hook_then_sweeps_registered_children() {
             break status;
         }
         assert!(
-            started.elapsed() < Duration::from_secs(20),
+            started.elapsed() < common::env::coverage_relaxed(Duration::from_secs(20)),
             "the process ignored SIGTERM"
         );
         std::thread::sleep(Duration::from_millis(20));
