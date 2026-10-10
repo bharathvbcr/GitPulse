@@ -456,3 +456,33 @@ describe("BranchList at-a-glance tooltips", () => {
     expect(source).toContain('"{branch.behind_count} behind upstream"');
   });
 });
+
+/** The `$effect` block that encloses `needle`, from its opening line to its close. */
+function effectAround(text: string, needle: string): string {
+  const at = text.indexOf(needle);
+  expect(at, needle).toBeGreaterThan(-1);
+  const start = text.lastIndexOf("$effect(() => {", at);
+  const end = text.indexOf("\n  });", at);
+  expect(start).toBeGreaterThan(-1);
+  return text.slice(start, end);
+}
+
+describe("BranchList freshness badges", () => {
+  it("asks for a batch only when the repository, the tips or the base change", () => {
+    // Reading `$repoStore` inside an effect re-runs it on every store
+    // emission; each re-run here was a freshness batch (~54 in the first
+    // 30 s of one launch). The effects read derived values instead.
+    const load = effectAround(source, "freshnessStore.load(");
+    expect(load).not.toContain("$repoStore");
+    expect(load).toContain("const path = freshnessRepo;");
+    const repo = effectAround(source, "freshnessStore.forRepo(");
+    expect(repo).not.toContain("$repoStore");
+    expect(source).toContain("const freshnessRepo = $derived($repoStore.currentPath);");
+    expect(source).toContain("const branchInfos = $derived($repoStore.branches);");
+  });
+
+  it("never resets the shared store unconditionally", () => {
+    // An unconditional reset dropped the pull-request list's loads too.
+    expect(source).not.toContain("freshnessStore.reset(");
+  });
+});

@@ -111,7 +111,8 @@ describe("liveIndex controller", () => {
 
   it("backs off a busy writer instead of asking once a second", async () => {
     const maybeRefresh = vi.fn(async () => outcome("skip_building"));
-    const index = createLiveIndex({ debounceMs: 0, maybeRefresh });
+    // The base backoff, unspread: the spread has its own test below.
+    const index = createLiveIndex({ debounceMs: 0, maybeRefresh, random: () => 0 });
     index.onRepoChanged("/busy");
     // Asks at 0, 1, 3, 7, 15 and 31 s: a fixed one-second rest asked ~30 times.
     await vi.advanceTimersByTimeAsync(30_000);
@@ -120,6 +121,20 @@ describe("liveIndex controller", () => {
     expect(maybeRefresh).toHaveBeenCalledTimes(6);
     // Still retrying where the fixed rest had already given up.
     expect(index.get("/busy").phase).toBe("scheduled");
+    index.reset();
+  });
+
+  it("spreads a busy writer's retry upward, through the shared jitter", async () => {
+    const maybeRefresh = vi.fn(async () => outcome("skip_building"));
+    const index = createLiveIndex({ debounceMs: 0, maybeRefresh, random: () => 1 });
+    index.onRepoChanged("/busy");
+    await vi.advanceTimersByTimeAsync(0);
+    expect(maybeRefresh).toHaveBeenCalledTimes(1);
+    // 1 s lengthened by the whole jitter: not before 1.5 s.
+    await vi.advanceTimersByTimeAsync(1_400);
+    expect(maybeRefresh).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(200);
+    expect(maybeRefresh).toHaveBeenCalledTimes(2);
     index.reset();
   });
 
@@ -333,7 +348,8 @@ describe("liveIndex controller", () => {
       reason: "devmap deferred under load after 0.000s: background work is shed while the git spawn rate budget is low",
     });
     const maybeRefresh = vi.fn(async (_repo: string, _changed: boolean) => shed);
-    const index = createLiveIndex({ debounceMs: 0, maybeRefresh });
+    // The base backoff, unspread: the spread has its own test below.
+    const index = createLiveIndex({ debounceMs: 0, maybeRefresh, random: () => 0 });
     index.setScope({ activeKey: "/repo", retainedKeys: ["/repo"], visible: true });
     await vi.advanceTimersByTimeAsync(0);
     expect(maybeRefresh).toHaveBeenCalledTimes(1);
@@ -351,6 +367,26 @@ describe("liveIndex controller", () => {
     expect(maybeRefresh).toHaveBeenCalledTimes(3);
     expect(maybeRefresh.mock.calls.every(([, changed]) => changed === false)).toBe(true);
     expect(index.get("/repo").phase).toBe("ready");
+    index.reset();
+  });
+
+  it("spreads the retries of repositories one storm deferred, never shortening one", async () => {
+    // Every tab restored at launch is deferred by the same storm. Asked back
+    // on one schedule, they met the same empty budget together again.
+    const shed = outcome("skip_deferred", {
+      facts: { available: false, is_fresh: false, schema_ok: false, already_building: false },
+      reason: "devmap deferred under load after 0.000s: background work is shed while the git spawn rate budget is low",
+    });
+    const maybeRefresh = vi.fn(async (_repo: string, _changed: boolean) => shed);
+    const draws = [0, 0.5, 1];
+    const index = createLiveIndex({ debounceMs: 0, maybeRefresh, random: () => draws.shift() ?? 0 });
+    const tabs = ["/a", "/b", "/c"];
+    index.setScope({ activeKey: "/a", retainedKeys: tabs, visible: true });
+    await vi.advanceTimersByTimeAsync(2_500);
+    expect(maybeRefresh).toHaveBeenCalledTimes(3);
+    const waits = tabs.map((tab) => index.get(tab).reason?.match(/retrying in (\d+) s/)?.[1]);
+    // 3 s, 3.75 s and 4.5 s: the base backoff, lengthened by each draw.
+    expect([...waits].sort()).toEqual(["3", "4", "5"]);
     index.reset();
   });
 

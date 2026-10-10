@@ -55,16 +55,38 @@ export function createFreshnessStore(deps: FreshnessStoreDeps = {}) {
   const invokeFn = deps.invoke ?? invoke;
   const { subscribe, set, update } = writable<FreshnessState>({ ...EMPTY });
 
+  /** The repository every answer held belongs to. */
+  let repo: string | null = null;
+  /** Moves on every repository change; an answer from before it is dropped. */
+  let epoch = 0;
   /**
-   * Monotonic token. Loads overlap freely — a repo switch, a branch refresh
-   * and a PR refresh can all be in flight — and an older answer must never
-   * overwrite a newer one.
+   * Monotonic request number. Loads overlap freely — the branch list and the
+   * pull-request list each ask for their own rows, and either may ask again
+   * after a refresh — and an older answer must never overwrite a newer one.
    */
   let token = 0;
+  /** The newest request that asked about each revision. */
+  let newest = new Map<string, number>();
+  /** Requests still out, by what they asked, so an identical one joins. */
+  let inflight = new Map<string, Promise<void>>();
 
-  /** Drops everything. Called when the repository changes. */
-  function reset() {
-    token += 1;
+  /**
+   * Drops everything unless the answers held already belong to `repoPath`.
+   *
+   * Idempotent on purpose. The branch list called an unconditional reset from
+   * an effect that re-ran on every repository-store emission, so each one
+   * threw away whatever was in flight — its own load and the pull-request
+   * list's — and the next emission asked again: ~54 batches in a launch's
+   * first 30 s. A repeat for the same repository is now nothing, and a load
+   * for another repository switches by itself, so neither order of the two
+   * callers' effects can drop the other's answer.
+   */
+  function forRepo(repoPath: string | null) {
+    if (repoPath === repo) return;
+    repo = repoPath;
+    epoch += 1;
+    newest = new Map();
+    inflight = new Map();
     set({ ...EMPTY });
   }
 
@@ -73,20 +95,41 @@ export function createFreshnessStore(deps: FreshnessStoreDeps = {}) {
    *
    * Revisions may be shas or ref names; pull requests arrive as ref names.
    * Duplicates are collapsed before the call and expanded again on the way
-   * back, so a branch that is also a PR head costs one measurement.
+   * back, so a branch that is also a PR head costs one measurement. A request
+   * identical to one still out joins it rather than asking again.
    */
-  async function load(
+  function load(
     repoPath: string,
     revisions: readonly string[],
     baseBranch: string | null = null,
   ): Promise<void> {
     const unique = [...new Set(revisions.filter((r) => r.length > 0))];
-    if (repoPath.length === 0 || unique.length === 0) return;
+    if (repoPath.length === 0 || unique.length === 0) return Promise.resolve();
+    forRepo(repoPath);
 
     const truncated = unique.length > MAX_REVISIONS;
     const asked = truncated ? unique.slice(0, MAX_REVISIONS) : unique;
+    const key = JSON.stringify([baseBranch, [...asked].sort()]);
+    const joined = inflight.get(key);
+    if (joined) return joined;
 
+    const out = inflight;
+    const run = request(repoPath, asked, baseBranch, truncated).finally(() => {
+      if (out.get(key) === run) out.delete(key);
+    });
+    out.set(key, run);
+    return run;
+  }
+
+  async function request(
+    repoPath: string,
+    asked: string[],
+    baseBranch: string | null,
+    truncated: boolean,
+  ): Promise<void> {
     const mine = ++token;
+    const mineEpoch = epoch;
+    for (const rev of asked) newest.set(rev, mine);
     update((s) => ({ ...s, loading: true }));
 
     try {
@@ -95,10 +138,10 @@ export function createFreshnessStore(deps: FreshnessStoreDeps = {}) {
         revisions: asked,
         baseBranch,
       });
-      if (mine !== token) return;
+      if (mineEpoch !== epoch) return;
 
       update((s) => {
-        const byRevision = { ...s.byRevision };
+        const loading = inflight.size > 1;
         // The backend answers one row per input, in input order — that is its
         // documented contract, and zipping is what makes a ref name usable as
         // a key. A short answer would silently mis-key every row after the
@@ -106,22 +149,32 @@ export function createFreshnessStore(deps: FreshnessStoreDeps = {}) {
         if (rows.length !== asked.length) {
           return {
             ...s,
-            loading: false,
+            loading,
             error: `freshness: asked for ${asked.length} revisions and got ${rows.length}`,
           };
         }
+        // Each row is kept unless a newer request has asked about the same
+        // revision since: two lists' answers both land, and an older answer
+        // for one revision never overwrites a newer one.
+        const byRevision = { ...s.byRevision };
         asked.forEach((rev, i) => {
-          byRevision[rev] = rows[i];
+          if (newest.get(rev) === mine) byRevision[rev] = rows[i];
         });
-        return { byRevision, loading: false, error: "", truncated };
+        const latest = mine === token;
+        return {
+          byRevision,
+          loading,
+          error: latest ? "" : s.error,
+          truncated: latest ? truncated : s.truncated,
+        };
       });
     } catch (e) {
-      if (mine !== token) return;
-      update((s) => ({ ...s, loading: false, error: formatError(e) }));
+      if (mineEpoch !== epoch) return;
+      update((s) => ({ ...s, loading: inflight.size > 1, error: formatError(e) }));
     }
   }
 
-  return { subscribe, load, reset };
+  return { subscribe, load, forRepo };
 }
 
 export const freshnessStore = createFreshnessStore();
