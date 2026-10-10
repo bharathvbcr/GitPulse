@@ -70,6 +70,20 @@ before that tag is pushed.
   window is closed. A session that has finished is shown and is not counted.
 
 ### Changed
+- **Less background work while you type and while the window idles.** A
+  commit-message keystroke or status poll no longer re-runs code-impact
+  queries, re-lists every file in the tree, re-walks a file's history,
+  refetches provenance or markdown backlinks, or rescans dead branches
+  (which also reset the cleanup selection); those refresh when the
+  repository, selection, staged paths or HEAD change. Dragging the terminal
+  dock writes preferences once on release instead of every frame, an
+  unrelated preference change no longer resets the graph's tile cache or
+  native zoom, and the Agents clock stops while the window is hidden.
+- **Fewer spawns and faster ledger reads.** The ledger's foreign-repository
+  check uses index seeks instead of scanning every event on each gated
+  action and agent hook; dead-branch scans and cleans read the worktree list
+  once rather than once per branch; the update check, persisted log and MCP
+  info no longer block the interface thread or a shared runtime worker.
 - **More than 24 repositories can be open at once.** Opening a twenty-fifth
   used to be refused with "Too many open repositories (max 24)", because every
   tab held one of 24 native file watches. Tabs and watches are now separate:
@@ -103,6 +117,10 @@ before that tag is pushed.
 
 ### Fixed
 
+- Branch freshness badges in the sidebar were requested and then discarded:
+  the reset that clears them on a repository switch ran after every load,
+  voiding it, and wiped the GitHub panel's PR badges with it. It now runs only
+  when the repository changes.
 - **Black rectangles over the title bar and repository tab strip on macOS, staying until the pointer passed over them.** The WKWebView has a backdrop of its own between the page and the window's material, `underPageBackgroundColor`, and wry clears it only when a background colour is configured — `transparent: true` never reaches it. It stayed WebKit's opaque default (alpha 1.0, read off the live webview), so every region the page had not painted showed near-black instead of glass: tiles discarded while the window was inactive, occluded or on another Space, and the edge an elastic root dragged into view on a vertical swipe over the chrome. Both transparent windows now set a fully clear background colour, and the root no longer rubber-bands. The native material test reads the backdrop's alpha off the main and status webviews and fails against the old config.
 - **Unsaved edits to a suggestion are asked about.** Editing a Manvi or Apple
   Intelligence suggestion made every way off the task — another card, a tab,
