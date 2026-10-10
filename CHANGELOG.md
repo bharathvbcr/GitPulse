@@ -25,6 +25,17 @@ before that tag is pushed.
   unreadable `origin/HEAD`. A failed `rebase --abort` during a restack is
   reported instead of "rolled back". With a tag named like the branch, the
   current branch is still found.
+- Git's output format and environment no longer depend on the developer's
+  settings. Every git child gets `log.showSignature`, colour and diff-prefix
+  settings pinned, patch-printing commands skip `diff.external`, and the
+  environment is decided once for both the git builder and the `gh`/tool
+  builder: `LC_ALL=C`, no credential prompt, no optional locks, and
+  `GIT_LITERAL_PATHSPECS` (and its glob/icase siblings), `GIT_SSH`,
+  `GIT_PROXY_COMMAND`, `GIT_TRACE*`, `GIT_DIFF_OPTS`, `GIT_SHALLOW_FILE` and
+  `GIT_ATTR_SOURCE` stripped. A signed commit under `log.showSignature=true` no
+  longer produces a "No signature" graph id, `color.ui=always` no longer puts
+  escapes in the diff viewer, and the identity GitPulse shows follows git's
+  order (environment before config).
 
 ### Changed
 

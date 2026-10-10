@@ -822,9 +822,11 @@ Unset the local override with `git config --local --unset-all user.name` and \
         }
     }
 
-    /// The identity a commit in `repo` would be recorded under. The
-    /// environment counts only when it covers author and committer both,
-    /// which is what git needs to record a commit without configuration.
+    /// The identity a commit in `repo` would be recorded under, resolved in
+    /// git's own order: the `GIT_AUTHOR_*` / `GIT_COMMITTER_*` environment
+    /// first, then `user.*` config, then `EMAIL`. The environment counts only
+    /// when it covers author and committer both, which is what git needs to
+    /// record a commit without configuration.
     pub fn identity(repo_path: &str) -> Result<GitIdentity, String> {
         let repo = validate_repo(repo_path)?;
         Self::identity_in(&repo)
@@ -836,6 +838,11 @@ Unset the local override with `git config --local --unset-all user.name` and \
 
     /// [`Self::identity_in`] with the environment passed in: git's child
     /// inherits this process's `GIT_AUTHOR_*` / `GIT_COMMITTER_*` / `EMAIL`.
+    ///
+    /// The environment outranks config, as it does in git (`git var
+    /// GIT_AUTHOR_IDENT` prints `GIT_AUTHOR_NAME` even when `user.name` is
+    /// set). This used to read config first, so the identity shown and
+    /// refused-on was not the one a commit would record.
     fn identity_with(
         repo: &Path,
         lookup: &dyn Fn(&str) -> Option<String>,
@@ -843,13 +850,13 @@ Unset the local override with `git config --local --unset-all user.name` and \
         let env = |name: &str| lookup(name).filter(|v| !v.trim().is_empty());
         let env_pair =
             |author: &str, committer: &str| env(author).filter(|_| env(committer).is_some());
-        let name = match Self::config_value(repo, "user.name")? {
+        let name = match env_pair("GIT_AUTHOR_NAME", "GIT_COMMITTER_NAME") {
             Some(name) => Some(name),
-            None => env_pair("GIT_AUTHOR_NAME", "GIT_COMMITTER_NAME"),
+            None => Self::config_value(repo, "user.name")?,
         };
-        let email = match Self::config_value(repo, "user.email")? {
+        let email = match env_pair("GIT_AUTHOR_EMAIL", "GIT_COMMITTER_EMAIL") {
             Some(email) => Some(email),
-            None => env_pair("GIT_AUTHOR_EMAIL", "GIT_COMMITTER_EMAIL").or_else(|| env("EMAIL")),
+            None => Self::config_value(repo, "user.email")?.or_else(|| env("EMAIL")),
         };
         Ok(GitIdentity { name, email })
     }
@@ -4231,7 +4238,7 @@ mod tests {
     }
 
     #[test]
-    fn identity_reads_config_then_an_environment_covering_author_and_committer() {
+    fn identity_reads_an_environment_covering_author_and_committer_then_config() {
         let dir = init_repo_with_commit();
         blank_identity(dir.path());
         let none = |_: &str| None;
@@ -4263,8 +4270,17 @@ mod tests {
                 .unwrap()
                 .name
                 .as_deref(),
+            Some("Ada"),
+            "the environment wins over configuration, as `git var GIT_AUTHOR_IDENT` has it"
+        );
+        let env_name_absent = |_: &str| None;
+        assert_eq!(
+            GitWriter::identity_with(dir.path(), &env_name_absent)
+                .unwrap()
+                .name
+                .as_deref(),
             Some("Grace"),
-            "configuration wins over the environment"
+            "without the environment, configuration answers"
         );
     }
 
@@ -4706,6 +4722,7 @@ mod tests {
 #[cfg(all(test, unix))]
 mod bound_to_checked_state {
     use super::*;
+    use crate::procguard::LockedSpawn;
     use crate::test_support::git_in;
     use std::os::unix::fs::PermissionsExt;
     use std::path::Path;
@@ -4835,5 +4852,42 @@ mod bound_to_checked_state {
             git_text(p, &["symbolic-ref", "--quiet", "HEAD"]).is_ok(),
             "HEAD was left detached"
         );
+    }
+
+    /// The identity shown (and checked) is the one a commit records: git
+    /// prefers `GIT_AUTHOR_*` to `user.*`, so the environment wins here too.
+    #[test]
+    fn the_environment_outranks_config_for_the_identity_as_it_does_in_git() {
+        let dir = repo_on("main");
+        let p = dir.path();
+        git_in(p, &["config", "user.name", "Config Name"]);
+        git_in(p, &["config", "user.email", "config@example.test"]);
+        let env = |name: &str| match name {
+            "GIT_AUTHOR_NAME" | "GIT_COMMITTER_NAME" => Some("Env Name".to_string()),
+            "GIT_AUTHOR_EMAIL" | "GIT_COMMITTER_EMAIL" => Some("env@example.test".to_string()),
+            _ => None,
+        };
+        let ours = GitWriter::identity_with(p, &env).unwrap();
+
+        let git_var = std::process::Command::new("git")
+            .args(["var", "GIT_AUTHOR_IDENT"])
+            .current_dir(p)
+            .env("GIT_AUTHOR_NAME", "Env Name")
+            .env("GIT_AUTHOR_EMAIL", "env@example.test")
+            .env("GIT_COMMITTER_NAME", "Env Name")
+            .env("GIT_COMMITTER_EMAIL", "env@example.test")
+            .output_locked()
+            .unwrap();
+        let ident = String::from_utf8_lossy(&git_var.stdout).to_string();
+        assert!(
+            ident.starts_with(&format!(
+                "{} <{}>",
+                ours.name.as_deref().unwrap(),
+                ours.email.as_deref().unwrap()
+            )),
+            "identity {ours:?} is not what git records: {ident}"
+        );
+        assert_eq!(ours.name.as_deref(), Some("Env Name"));
+        assert_eq!(ours.email.as_deref(), Some("env@example.test"));
     }
 }

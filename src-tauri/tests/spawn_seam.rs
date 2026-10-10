@@ -149,6 +149,40 @@ fn no_production_code_spawns_outside_the_gated_seam() {
     );
 }
 
+/// A git child's environment is decided in one place. `engine::git_cli` builds
+/// a `Command` in exactly two production spots — `git_command_with_env` for git
+/// itself and `build_capture_command_in` for tools that shell out to git — and
+/// both call `pin_git_environment`. A third `Command::new` there would be a
+/// spawn that skips the pinned config, the stripped redirects and the locale,
+/// so the count is asserted, and each builder is asserted to call the owner.
+#[test]
+fn every_git_child_is_built_by_the_two_pinned_builders() {
+    let file = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/engine/git_cli.rs");
+    let text = std::fs::read_to_string(&file).expect("read git_cli.rs");
+    let production = strip_test_items(&text);
+    assert!(
+        production.len() > 1000,
+        "read only {} production lines of git_cli.rs",
+        production.len()
+    );
+    let constructions: Vec<usize> = production
+        .iter()
+        .filter(|(_, line)| line.contains("Command::new") && !line.trim_start().starts_with("//"))
+        .map(|(n, _)| *n)
+        .collect();
+    assert_eq!(
+        constructions.len(),
+        2,
+        "git_cli.rs builds a Command at lines {constructions:?}; every git child must come from \
+         git_command_with_env or build_capture_command_in, which pin the environment"
+    );
+    let calls = production
+        .iter()
+        .filter(|(_, line)| line.contains("pin_git_environment(&mut cmd)"))
+        .count();
+    assert_eq!(calls, 2, "each builder must call pin_git_environment once");
+}
+
 /// Creating a process, or a descriptor that is about to be made `FD_CLOEXEC`,
 /// must happen under `procguard::with_inheritance_lock`.
 ///

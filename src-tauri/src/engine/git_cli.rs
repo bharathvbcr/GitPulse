@@ -298,32 +298,127 @@ pub fn sandbox_write_edited_text(
     crate::diff::write_regular(&dest, &bytes)
 }
 
-/// True for inherited environment names that can redirect git's config,
-/// transport, or credential resolution away from what the user picked.
+/// Environment names git reads that can redirect it away from the repository
+/// and settings the caller picked, or change what it prints. Every git child
+/// has these removed ([`pin_git_environment`]), whichever builder spawned it.
 ///
-/// `GIT_CONFIG_PARAMETERS` is the shell-quoted config channel (`'alias.st=!sh
-/// -c …'` outranks even repo-local config), so it is injected by definition;
-/// `GIT_CONFIG_GLOBAL`/`GIT_CONFIG_SYSTEM` are listed here too so the
-/// classification stays in lockstep with the explicit strip list in
-/// [`git_command`] — anything stripped must classify as injected.
+/// - the repository pointers: where the index, objects, alternates, common dir,
+///   namespace and shallow file live;
+/// - the config channels, `GIT_CONFIG_PARAMETERS` being the shell-quoted one
+///   (`'alias.st=!sh -c …'` outranks even repo-local config);
+/// - transport and credential redirection: `GIT_SSH`, `GIT_SSH_COMMAND`,
+///   `GIT_PROXY_COMMAND`, `GIT_ASKPASS` and friends;
+/// - output and matching behaviour: `GIT_DIFF_OPTS` overrides `-U3`, and the
+///   pathspec switches (`GIT_LITERAL_PATHSPECS`, `GIT_GLOB_PATHSPECS`,
+///   `GIT_NOGLOB_PATHSPECS`, `GIT_ICASE_PATHSPECS`) retarget the `:(literal)`
+///   pathspecs the writers rely on, so `stage f*.txt` could touch other files;
+/// - `GIT_ATTR_SOURCE`, which swaps the attributes diffs and filters see.
+const STRIPPED_GIT_ENV: &[&str] = &[
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_INDEX_FILE",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_COMMON_DIR",
+    "GIT_NAMESPACE",
+    "GIT_SHALLOW_FILE",
+    "GIT_ATTR_SOURCE",
+    "GIT_CONFIG",
+    "GIT_CONFIG_GLOBAL",
+    "GIT_CONFIG_SYSTEM",
+    "GIT_CONFIG_COUNT",
+    "GIT_CONFIG_PARAMETERS",
+    "GIT_EXTERNAL_DIFF",
+    "GIT_SEQUENCE_EDITOR",
+    "GIT_EXEC_PATH",
+    "GIT_SSH",
+    "GIT_SSH_COMMAND",
+    "GIT_SSH_VARIANT",
+    "GIT_PROXY_COMMAND",
+    "GIT_ASKPASS",
+    "GIT_DIFF_OPTS",
+    "GIT_LITERAL_PATHSPECS",
+    "GIT_GLOB_PATHSPECS",
+    "GIT_NOGLOB_PATHSPECS",
+    "GIT_ICASE_PATHSPECS",
+];
+
+/// Families of names removed by prefix: the numbered config channel, credential
+/// helper overrides, and every tracing switch (`GIT_TRACE`, `GIT_TRACE2*`,
+/// `GIT_TRACE_PACKET`, ...), whose output floods stderr and pushes the fatal
+/// line out of the few bytes of it that are kept.
+const STRIPPED_GIT_ENV_PREFIXES: &[&str] = &[
+    "GIT_CONFIG_KEY_",
+    "GIT_CONFIG_VALUE_",
+    "GIT_CREDHELPER",
+    "GIT_TRACE",
+];
+
+/// True for inherited environment names [`pin_git_environment`] removes.
 fn is_injected_git_env(name: &str) -> bool {
     let upper = name.to_ascii_uppercase();
-    upper.starts_with("GIT_CONFIG_KEY_")
-        || upper.starts_with("GIT_CONFIG_VALUE_")
-        || upper.starts_with("GIT_CREDHELPER")
-        || matches!(
-            upper.as_str(),
-            "GIT_CONFIG_COUNT"
-                | "GIT_CONFIG_PARAMETERS"
-                | "GIT_CONFIG_GLOBAL"
-                | "GIT_CONFIG_SYSTEM"
-                | "GIT_SSH_COMMAND"
-                | "GIT_SSH_VARIANT"
-                | "GIT_ASKPASS"
-                | "GIT_EXTERNAL_DIFF"
-                | "GIT_SEQUENCE_EDITOR"
-                | "GIT_EXEC_PATH"
-        )
+    STRIPPED_GIT_ENV.contains(&upper.as_str())
+        || STRIPPED_GIT_ENV_PREFIXES
+            .iter()
+            .any(|prefix| upper.starts_with(prefix))
+}
+
+/// Config every git child is run with, ahead of its subcommand, so a
+/// developer's own settings cannot change what the parsers read:
+/// `core.quotepath` keeps non-ASCII paths as raw bytes; `log.showSignature`
+/// prints a "No signature" line (and runs gpg) in front of every commit id;
+/// the colour settings put ANSI escapes in diffs (the specific keys outrank
+/// `color.ui`, so they are pinned too); `diff.noprefix` and
+/// `diff.mnemonicPrefix` change the `a/` `b/` prefixes the diff parser keys on.
+const PINNED_GIT_CONFIG: &[&str] = &[
+    "core.quotepath=false",
+    "log.showSignature=false",
+    "color.ui=never",
+    "color.diff=never",
+    "color.status=never",
+    "color.branch=never",
+    "diff.noprefix=false",
+    "diff.mnemonicPrefix=false",
+];
+
+/// Subcommands that print a patch, where `diff.external` (a config key, which
+/// no `-c` can blank) would run a program instead of git's own diff.
+const PATCH_SUBCOMMANDS: &[&str] = &["diff", "show", "log"];
+
+/// The one place the environment of a git child is decided. Both spawn
+/// builders ([`git_command_with_env`] for git itself and
+/// [`build_capture_command_in`] for tools that shell out to git, such as `gh`)
+/// call it, so they cannot drift apart: a setting added here reaches both.
+///
+/// Prompts and pagers are off, the locale is `C` (the parsers match git's
+/// English words), optional locks are skipped so a read never contends with a
+/// writer, every name in [`STRIPPED_GIT_ENV`] and [`STRIPPED_GIT_ENV_PREFIXES`]
+/// is removed, and the editors are pinned to `true`.
+///
+/// Editors are neutralized AFTER the strip, which would otherwise remove
+/// `GIT_SEQUENCE_EDITOR` right back out again. Removal alone is not enough:
+/// with none set, git falls back to `core.editor` and then to vi, and any
+/// subcommand that wants a message (`rebase --continue`, `am --continue`,
+/// `merge --continue`, a bare `commit`) launches it against a null stdin and
+/// blocks until the command timeout — surfacing as "git timed out" rather than
+/// a result. `true` exits 0 immediately, so git accepts the message it
+/// prepared. Every message-bearing call here already passes `-m` or
+/// `--no-edit`, so no existing caller's behaviour changes.
+fn pin_git_environment(cmd: &mut Command) {
+    cmd.env("GIT_TERMINAL_PROMPT", "0")
+        .env("GCM_INTERACTIVE", "never")
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .env("LC_ALL", "C");
+    for name in STRIPPED_GIT_ENV {
+        cmd.env_remove(name);
+    }
+    for (name, _) in std::env::vars_os() {
+        if is_injected_git_env(&name.to_string_lossy()) {
+            cmd.env_remove(&name);
+        }
+    }
+    cmd.env("GIT_EDITOR", "true")
+        .env("GIT_SEQUENCE_EDITOR", "true");
 }
 
 /// Reads `PATH`/`HOME` from the process and defers to
@@ -366,62 +461,20 @@ fn git_command_with_env(
         )
     });
     let mut cmd = Command::new(program.as_deref().unwrap_or_else(|| Path::new("git")));
-    // `core.quotepath=false` keeps non-ASCII paths as raw bytes in every
-    // command's output (`status`, `diff --numstat`, `show`, ...). Without it,
-    // porcelain text output arrives C-quoted ("\\346\\226\\207...") while `-z`
-    // output emits raw bytes, so the same file matches under two different
-    // spellings. Harmless for commands whose output has no paths at all.
-    // Inherited CI-style environments can export GIT_* pointers that redirect
-    // git's index, object database, alternates, common dir, namespace, or
-    // config away from the repository the user actually picked. Strip them all
-    // so a GUI-initiated git call always operates on the repo it was given.
-    cmd.args(["-c", "core.quotepath=false"])
-        .args(args)
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .env("GCM_INTERACTIVE", "never")
-        .env("GIT_OPTIONAL_LOCKS", "0")
-        .env("LC_ALL", "C")
-        .env_remove("GIT_DIR")
-        .env_remove("GIT_WORK_TREE")
-        .env_remove("GIT_INDEX_FILE")
-        .env_remove("GIT_OBJECT_DIRECTORY")
-        .env_remove("GIT_ALTERNATE_OBJECT_DIRECTORIES")
-        .env_remove("GIT_COMMON_DIR")
-        .env_remove("GIT_NAMESPACE")
-        .env_remove("GIT_CONFIG")
-        .env_remove("GIT_CONFIG_GLOBAL")
-        .env_remove("GIT_CONFIG_SYSTEM")
-        // The numbered-config channel (GIT_CONFIG_COUNT + GIT_CONFIG_KEY_n /
-        // VALUE_n) and the shell-quoted GIT_CONFIG_PARAMETERS channel inject
-        // arbitrary config without any of the names above — the latter
-        // outranks even repo-local config, so an `alias.*=!sh -c …` planted
-        // there would execute on the next GUI status call.
-        .env_remove("GIT_CONFIG_COUNT")
-        .env_remove("GIT_CONFIG_PARAMETERS")
-        .env_remove("GIT_EXTERNAL_DIFF")
-        .env_remove("GIT_SEQUENCE_EDITOR")
-        .env_remove("GIT_EXEC_PATH");
-    for (name, _) in std::env::vars_os() {
-        if is_injected_git_env(&name.to_string_lossy()) {
-            cmd.env_remove(&name);
-        }
+    // The pinned config goes ahead of the caller's arguments, so a `-c` the
+    // caller passes itself still wins; `--no-ext-diff` goes right after the
+    // subcommand of a patch-printing command.
+    for pin in PINNED_GIT_CONFIG {
+        cmd.args(["-c", pin]);
     }
-    // Editors are neutralized AFTER the strip loop, which would otherwise
-    // remove GIT_SEQUENCE_EDITOR right back out again.
-    //
-    // Stripping the editor variables is not enough on its own: with none set,
-    // git falls back to `core.editor` and then to vi, and any subcommand that
-    // wants a message (`rebase --continue`, `am --continue`, `merge
-    // --continue`, a bare `commit`) launches it against a null stdin and
-    // blocks until the 90s command timeout — surfacing as "git timed out"
-    // rather than a result. `true` is a real program that exits 0 immediately,
-    // so git accepts the message it prepared and the command completes.
-    //
-    // This changes no existing caller's behavior: every message-bearing call
-    // in this codebase already passes `-m` or `--no-edit`, so no editor was
-    // ever supposed to open. It converts a whole class of hangs into success.
-    cmd.env("GIT_EDITOR", "true")
-        .env("GIT_SEQUENCE_EDITOR", "true");
+    match subcommand_index(args) {
+        Some(at) if PATCH_SUBCOMMANDS.contains(&args[at]) => cmd
+            .args(&args[..=at])
+            .arg("--no-ext-diff")
+            .args(&args[at + 1..]),
+        _ => cmd.args(args),
+    };
+    pin_git_environment(&mut cmd);
     // Git resolves its own helpers through the child's PATH, so a GUI launch
     // handed them the same minimal `/usr/bin:/bin:/usr/sbin:/sbin` that hid
     // `gh` and `cargo` from us: `gpg` for a signed commit, the interpreter a
@@ -1268,44 +1321,19 @@ fn build_capture_command_in(
 ) -> Command {
     let resolved = resolve_spawn_program_in(program, path_var, home, source);
     let mut cmd = Command::new(&resolved);
-    // The same injected-GIT-* strip [`git_command`] applies: captured tools
-    // shell out to git themselves (`gh pr checkout` fetches and merges in the
-    // repo; npm/go/cargo read git config), and CI-style inherited pointers
-    // (GIT_DIR, GIT_INDEX_FILE, GIT_CONFIG_PARAMETERS, ...) would redirect
-    // them off the repository the caller picked. Applied before `extra_env`,
-    // so a caller that explicitly passes one of these still wins.
-    for (name, _) in std::env::vars_os() {
-        if is_injected_git_env(&name.to_string_lossy()) {
-            cmd.env_remove(&name);
-        }
-    }
-    cmd.env_remove("GIT_DIR")
-        .env_remove("GIT_WORK_TREE")
-        .env_remove("GIT_INDEX_FILE")
-        .env_remove("GIT_OBJECT_DIRECTORY")
-        .env_remove("GIT_ALTERNATE_OBJECT_DIRECTORIES")
-        .env_remove("GIT_COMMON_DIR")
-        .env_remove("GIT_NAMESPACE")
-        .env_remove("GIT_CONFIG")
-        .env_remove("GIT_CONFIG_GLOBAL")
-        .env_remove("GIT_CONFIG_SYSTEM")
-        .env_remove("GIT_CONFIG_COUNT")
-        .env_remove("GIT_CONFIG_PARAMETERS")
-        .env_remove("GIT_EXTERNAL_DIFF")
-        .env_remove("GIT_EXEC_PATH")
-        // Same editor pin as [`git_command`], for the same two reasons: these
-        // tools shell out to git themselves (`gh pr checkout` fetches and
-        // merges), and a spawned editor against a null stdin blocks until the
-        // timeout. Removal alone would leave git's `core.editor` config
-        // fallback open, so both variables are pinned to a program that exits
-        // immediately.
-        .env("GIT_EDITOR", "true")
-        .env("GIT_SEQUENCE_EDITOR", "true")
-        .env("GH_PROMPT_DISABLED", "1")
+    // The same environment [`git_command`] gives git ([`pin_git_environment`]):
+    // captured tools shell out to git themselves (`gh pr checkout` fetches and
+    // merges in the repo; npm/go/cargo read git config), and CI-style inherited
+    // pointers (GIT_DIR, GIT_INDEX_FILE, GIT_CONFIG_PARAMETERS, ...) would
+    // redirect them off the repository the caller picked, a localized message
+    // would defeat the parsers, and a credential manager could prompt. Applied
+    // before `extra_env`, so a caller that explicitly passes one of these
+    // still wins.
+    pin_git_environment(&mut cmd);
+    cmd.env("GH_PROMPT_DISABLED", "1")
         // gh consults this before printing update notices; keep subprocess
         // output deterministic instead of interleaving a self-update banner.
         .env("GH_NO_UPDATE_NOTIFIER", "1")
-        .env("GIT_TERMINAL_PROMPT", "0")
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -1504,6 +1532,11 @@ const DEFERRED_MARKER: &str = " deferred under load after ";
 /// argument named `-c` for every read that set a config value, and an
 /// `--attr-source=<oid>` would have put an object id where a command belongs.
 pub(crate) fn subcommand<'a>(args: &[&'a str]) -> &'a str {
+    subcommand_index(args).map_or("", |at| args[at])
+}
+
+/// Where in `args` the subcommand is, past git's global options.
+fn subcommand_index(args: &[&str]) -> Option<usize> {
     /// Global options whose value is the next argument.
     const TAKES_VALUE: [&str; 6] = [
         "-c",
@@ -1513,15 +1546,15 @@ pub(crate) fn subcommand<'a>(args: &[&'a str]) -> &'a str {
         "--namespace",
         "--config-env",
     ];
-    let mut rest = args.iter();
-    while let Some(arg) = rest.next() {
+    let mut rest = args.iter().enumerate();
+    while let Some((at, arg)) = rest.next() {
         if TAKES_VALUE.contains(arg) {
             rest.next();
         } else if !arg.starts_with('-') {
-            return arg;
+            return Some(at);
         }
     }
-    ""
+    None
 }
 
 /// True when `err` is the gate declining to start a child under load. The
@@ -6650,6 +6683,137 @@ mod tests {
         }
     }
 
+    /// The environment of every git child, from either builder. `gh` and the
+    /// other captured tools shell out to git, so they must see the same locale,
+    /// credential, lock and redirect settings git itself is given — the capture
+    /// builder used to set only a third of them.
+    fn git_environment_of(cmd: &Command) -> std::collections::HashMap<String, Option<String>> {
+        cmd.get_envs()
+            .map(|(k, v)| {
+                (
+                    k.to_string_lossy().into_owned(),
+                    v.map(|v| v.to_string_lossy().into_owned()),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn both_builders_pin_the_same_git_environment() {
+        let git = git_environment_of(&git_command(Some(Path::new("/tmp")), &["status"]));
+        let capture = git_environment_of(&build_capture_command_in(
+            "gh",
+            &["--version"],
+            None,
+            &[],
+            None,
+            None,
+            PathSource::Inherited,
+        ));
+        for key in [
+            "LC_ALL",
+            "GCM_INTERACTIVE",
+            "GIT_OPTIONAL_LOCKS",
+            "GIT_TERMINAL_PROMPT",
+            "GIT_EDITOR",
+            "GIT_SEQUENCE_EDITOR",
+        ] {
+            assert!(
+                git.get(key).is_some_and(Option::is_some),
+                "git_command sets {key}"
+            );
+            assert_eq!(
+                capture.get(key),
+                git.get(key),
+                "the capture builder's {key}"
+            );
+        }
+        assert_eq!(git["LC_ALL"].as_deref(), Some("C"));
+        for key in [
+            "GIT_DIR",
+            "GIT_WORK_TREE",
+            "GIT_INDEX_FILE",
+            "GIT_COMMON_DIR",
+            "GIT_CONFIG_PARAMETERS",
+            "GIT_SHALLOW_FILE",
+            "GIT_ATTR_SOURCE",
+            "GIT_LITERAL_PATHSPECS",
+            "GIT_GLOB_PATHSPECS",
+            "GIT_NOGLOB_PATHSPECS",
+            "GIT_ICASE_PATHSPECS",
+            "GIT_SSH",
+            "GIT_SSH_COMMAND",
+            "GIT_PROXY_COMMAND",
+            "GIT_DIFF_OPTS",
+        ] {
+            assert_eq!(git.get(key), Some(&None), "git_command must remove {key}");
+            assert_eq!(
+                capture.get(key),
+                Some(&None),
+                "the capture builder must remove {key}"
+            );
+        }
+    }
+
+    /// Tracing floods stderr, of which only a few bytes are kept: the fatal
+    /// line is the one that goes missing. Every `GIT_TRACE*` switch is removed
+    /// by name or by prefix, including ones this build has never heard of.
+    #[test]
+    fn every_git_trace_switch_is_stripped() {
+        let name = "GIT_TRACE2_EVENT_NESTING_FROM_THE_FUTURE";
+        assert!(is_injected_git_env(name));
+        for name in [
+            "GIT_TRACE",
+            "GIT_TRACE_PACKET",
+            "GIT_TRACE2",
+            "git_trace_setup",
+        ] {
+            assert!(is_injected_git_env(name), "{name}");
+        }
+        assert!(
+            !is_injected_git_env("GIT_AUTHOR_NAME"),
+            "identity is not redirection"
+        );
+    }
+
+    /// A developer's `log.showSignature`, colour and diff-prefix settings change
+    /// what the parsers read, so each rides every invocation; and a patch
+    /// command never hands the diff to `diff.external`.
+    #[test]
+    fn git_command_pins_output_format_config_and_skips_the_external_diff() {
+        let argv = |args: &[&str]| -> Vec<String> {
+            git_command(Some(Path::new("/tmp")), args)
+                .get_args()
+                .map(|a| a.to_string_lossy().into_owned())
+                .collect()
+        };
+        let log = argv(&["log", "-n1", "--format=%H"]);
+        for pin in [
+            "log.showSignature=false",
+            "color.ui=never",
+            "diff.noprefix=false",
+            "diff.mnemonicPrefix=false",
+        ] {
+            assert!(
+                log.windows(2).any(|pair| pair[0] == "-c" && pair[1] == pin),
+                "missing -c {pin} in {log:?}"
+            );
+        }
+        for patch in ["diff", "show", "log"] {
+            let args = argv(&[patch, "HEAD"]);
+            let at = args.iter().position(|a| a == patch).expect("subcommand");
+            assert_eq!(args[at + 1], "--no-ext-diff", "{patch}: {args:?}");
+            assert_eq!(args[at + 2], "HEAD", "{patch}: {args:?}");
+        }
+        // A global option with a value before the subcommand does not hide it,
+        // and a command that prints no patch is left alone.
+        let notes = argv(&["-c", "x.y=z", "notes", "show", "HEAD"]);
+        assert!(!notes.iter().any(|a| a == "--no-ext-diff"), "{notes:?}");
+        let global = argv(&["-C", "/tmp", "diff", "--cached"]);
+        let at = global.iter().position(|a| a == "diff").unwrap();
+        assert_eq!(global[at + 1], "--no-ext-diff", "{global:?}");
+    }
+
     /// The editor variables are PINNED rather than removed, and the difference
     /// is a security property, not a style choice.
     ///
@@ -6975,16 +7139,17 @@ mod tests {
             "GIT_EXTERNAL_DIFF",
             "GIT_SEQUENCE_EDITOR",
             "GIT_EXEC_PATH",
+            // Tracing floods the few bytes of stderr that are kept, and the
+            // fatal line is the one that goes missing.
+            "GIT_TRACE",
+            "GIT_SSH",
+            "GIT_PROXY_COMMAND",
+            "GIT_DIFF_OPTS",
+            "GIT_LITERAL_PATHSPECS",
         ] {
             assert!(is_injected_git_env(name), "{name} must be stripped");
         }
-        for safe in [
-            "GIT_AUTHOR_NAME",
-            "GIT_PAGER",
-            "EDITOR",
-            "PATH",
-            "GIT_TRACE",
-        ] {
+        for safe in ["GIT_AUTHOR_NAME", "GIT_PAGER", "EDITOR", "PATH"] {
             assert!(!is_injected_git_env(safe), "{safe} must survive");
         }
     }

@@ -1439,6 +1439,10 @@ impl GitReader {
             &[
                 "show",
                 "-s",
+                // `%ad`/`%cd` follow `log.date`; pin git's default rendering
+                // so a developer's `relative` or `human` does not stale the
+                // dates the panel shows.
+                "--date=default",
                 "--format=%H%x00%P%x00%an%x00%ae%x00%ad%x00%cn%x00%ce%x00%cd%x00%G?%x00%s%x00%b",
                 commit_id,
             ],
@@ -2607,6 +2611,7 @@ pub(crate) fn parse_pulse_stream(
 ///
 /// Priority: `checkout.defaultRemote`, the current branch's configured
 /// upstream remote, a lone configured remote, else "origin".
+#[cfg(test)]
 pub(crate) fn resolve_default_remote(repo: &Path) -> String {
     default_remote_reads(repo).0
 }
