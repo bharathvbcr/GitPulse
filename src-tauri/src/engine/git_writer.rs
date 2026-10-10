@@ -4230,6 +4230,68 @@ mod tests {
         assert_eq!(head_oid(&dir), before);
     }
 
+    /// A cancel or a deadline asks git to stop before it insists: git removes
+    /// its own `.git/index.lock` on SIGTERM, and loses the ability to on
+    /// SIGKILL. The next commit must not trip over the dead one's lock.
+    #[cfg(unix)]
+    fn assert_no_stale_index_lock_and_next_commit_lands(dir: &tempfile::TempDir) {
+        let lock = dir.path().join(".git/index.lock");
+        assert!(!lock.exists(), "the stopped commit left {}", lock.display());
+        std::fs::remove_file(dir.path().join(".git/hooks/pre-commit")).unwrap();
+        let before = head_oid(dir);
+        GitWriter::commit_files(&repo_path(dir), "after the stop", &["tracked.txt".into()])
+            .expect("the next commit succeeds first try");
+        assert_ne!(head_oid(dir), before);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_cancelled_commit_leaves_no_index_lock() {
+        let dir = init_repo_with_commit();
+        let marker = dir.path().join(".git/hook-started");
+        install_hook(
+            dir.path(),
+            "pre-commit",
+            &format!("touch '{}'\nsleep 30", marker.display()),
+        );
+        std::fs::write(dir.path().join("tracked.txt"), "changed\n").unwrap();
+        git_in(dir.path(), &["add", "tracked.txt"]);
+        let canonical = dir.path().canonicalize().unwrap();
+        let canceller = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+            while !marker.exists() {
+                assert!(std::time::Instant::now() < deadline, "hook never started");
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            crate::engine::git_cli::cancel_hooked_git(&canonical)
+        });
+        // `--only` keeps `.git/index.lock` held while the hook runs.
+        let err = GitWriter::commit_files(&repo_path(&dir), "never lands", &["tracked.txt".into()])
+            .unwrap_err();
+        assert_eq!(canceller.join().unwrap(), 1, "one run was in flight");
+        assert!(
+            crate::engine::git_cli::is_hooked_git_cancelled(&err),
+            "{err}"
+        );
+        assert_no_stale_index_lock_and_next_commit_lands(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_commit_stopped_at_its_deadline_leaves_no_index_lock() {
+        let dir = init_repo_with_commit();
+        install_hook(dir.path(), "pre-commit", "sleep 30");
+        std::fs::write(dir.path().join("tracked.txt"), "changed\n").unwrap();
+        git_in(dir.path(), &["add", "tracked.txt"]);
+        let err = crate::engine::git_cli::hooks::with_hook_timeout(
+            std::time::Duration::from_secs(2),
+            || GitWriter::commit_files(&repo_path(&dir), "never lands", &["tracked.txt".into()]),
+        )
+        .unwrap_err();
+        assert!(err.contains("timed out"), "{err}");
+        assert_no_stale_index_lock_and_next_commit_lands(&dir);
+    }
+
     /// Overrides any global identity with an empty one, which git refuses
     /// to commit under, so the repository has no usable identity at all.
     fn blank_identity(dir: &std::path::Path) {

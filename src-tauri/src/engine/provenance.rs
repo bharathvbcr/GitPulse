@@ -10,7 +10,9 @@
 //! several repositories open to walk back into the "Too many open files" storm
 //! that [`crate::limits`] and the gate exist to prevent.
 
-use crate::engine::git_cli::{git, git_captured, git_captured_with_stdin, validate_repo};
+use crate::engine::git_cli::{
+    git, git_captured, git_captured_with_stdin, validate_repo, BoundedRun,
+};
 use crate::engine::{git_reader, ref_cache};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -718,7 +720,8 @@ fn resolve_revisions(repo: &Path, revs: &[String], limit: usize) -> Vec<Result<S
     let text = String::from_utf8_lossy(&run.stdout);
     for (line, row) in text.lines().zip(sent) {
         answers[row] = match line.split_once(' ') {
-            Some((sha, "commit")) if sha.len() == 40 => Ok(sha.to_string()),
+            // 40 hex digits (SHA-1) or 64 (SHA-256 repositories).
+            Some((sha, "commit")) if matches!(sha.len(), 40 | 64) => Ok(sha.to_string()),
             _ => Err(format!(
                 "{} does not name a commit in this repository",
                 revs[row]
@@ -750,25 +753,7 @@ fn noted_commits(repo: &Path, notes_ref: &str) -> Result<HashMap<String, String>
     let ref_arg = ref_arg(notes_ref);
     let args = ["notes", ref_arg.as_str(), "list"];
     let listing = ref_cache::through(repo, &[notes_ref], &args, || {
-        let run = git_captured(repo, &args)?;
-        if !run.success {
-            let stderr = String::from_utf8_lossy(&run.stderr).trim().to_string();
-            // "no note found" / a missing ref is absence, not failure.
-            if stderr.contains("Cannot load notes ref") || stderr.is_empty() {
-                return Ok((String::new(), false));
-            }
-            return Err(format!("git notes list failed: {stderr}"));
-        }
-        // A truncated listing would report noted commits as unnoted, which
-        // reads downstream as "this commit was never verified".
-        if let Some(reason) = &run.incomplete {
-            return Err(format!(
-                "git notes list {} for {notes_ref}; \
-                 the set of noted commits would be incomplete",
-                reason.describe()
-            ));
-        }
-        Ok((String::from_utf8_lossy(&run.stdout).into_owned(), true))
+        notes_listing(&git_captured(repo, &args)?, notes_ref)
     })?;
 
     // `<note blob> <annotated commit>`, one per line.
@@ -779,6 +764,39 @@ fn noted_commits(repo: &Path, notes_ref: &str) -> Result<HashMap<String, String>
                 .map(|(blob, commit)| (commit.trim().to_string(), blob.trim().to_string()))
         })
         .collect())
+}
+
+/// What one `git notes list` run says about the noted commits: the listing
+/// and whether it may be kept, or why it is not an answer.
+///
+/// Completeness is established *before* the exit status is read. A run killed
+/// at its deadline or cancelled has a non-zero status and an empty stderr,
+/// which is also how a ref that does not exist yet looks; reading the status
+/// first turned a timed-out listing into "nothing has been noted", and every
+/// commit then showed as unverified instead of unexamined.
+fn notes_listing(run: &BoundedRun, notes_ref: &str) -> Result<(String, bool), String> {
+    // A truncated listing would report noted commits as unnoted, which
+    // reads downstream as "this commit was never verified".
+    if let Some(reason) = &run.incomplete {
+        return Err(format!(
+            "git notes list {} for {notes_ref}; \
+             the set of noted commits would be incomplete",
+            reason.describe()
+        ));
+    }
+    if run.cancelled {
+        return Err(format!("git notes list for {notes_ref} was cancelled"));
+    }
+    if !run.success {
+        let stderr = String::from_utf8_lossy(&run.stderr).trim().to_string();
+        // A missing ref is absence, not failure. Only a run that finished
+        // can say so: this is the one empty-stderr non-zero exit that means it.
+        if stderr.contains("Cannot load notes ref") || stderr.is_empty() {
+            return Ok((String::new(), false));
+        }
+        return Err(format!("git notes list failed: {stderr}"));
+    }
+    Ok((String::from_utf8_lossy(&run.stdout).into_owned(), true))
 }
 
 /// The base a distance is measured against when the caller does not name one.
@@ -1191,6 +1209,7 @@ impl NoteSource {
 #[cfg(test)]
 mod batch_tests {
     use super::*;
+    use crate::engine::git_cli::Incomplete;
     use crate::procguard::LockedSpawn;
     use std::process::Command;
 
@@ -2053,5 +2072,70 @@ mod batch_tests {
             .filter(|argv| argv.iter().any(|a| a == "rev-list"))
             .count();
         assert_eq!(walks, 2, "one walk per commit no listing covered: {used:?}");
+    }
+
+    fn run(success: bool, stderr: &str, incomplete: Option<Incomplete>) -> BoundedRun {
+        BoundedRun {
+            stdout: Vec::new(),
+            stderr: stderr.as_bytes().to_vec(),
+            success,
+            status_code: if success { 0 } else { 1 },
+            incomplete,
+            stderr_incomplete: None,
+            cancelled: false,
+        }
+    }
+
+    /// A listing killed at its deadline exits non-zero with an empty stderr,
+    /// which is also how a notes ref that does not exist yet looks. It must be
+    /// an error, not "nothing has been noted": the latter shows every commit as
+    /// unverified instead of unexamined.
+    #[test]
+    fn a_notes_listing_cut_short_is_an_error_not_an_empty_set() {
+        let deadline = Incomplete::Deadline {
+            message: "git notes timed out after 30s".into(),
+            over_cap: None,
+        };
+        let cut = notes_listing(&run(false, "", Some(deadline)), VERIFICATION_NOTES_REF);
+        assert!(cut.is_err(), "a timed-out listing read as {cut:?}");
+
+        let over_cap = notes_listing(&run(true, "", Some(Incomplete::OverCap(8))), "refs/notes/x");
+        assert!(over_cap.is_err(), "{over_cap:?}");
+
+        let mut cancelled = run(false, "", None);
+        cancelled.cancelled = true;
+        assert!(notes_listing(&cancelled, "refs/notes/x").is_err());
+
+        // A finished run is what may call a missing ref absence.
+        assert_eq!(
+            notes_listing(&run(false, "", None), "refs/notes/x"),
+            Ok((String::new(), false))
+        );
+    }
+
+    /// Every revision failed to resolve in a SHA-256 repository: the resolver
+    /// accepted only 40-character object names.
+    #[test]
+    fn a_sha256_repository_resolves_and_notes_its_commits() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = Repo(dir);
+        repo.git(&["init", "-b", "main", "--object-format=sha256"]);
+        crate::test_support::trust_repo(repo.path());
+        repo.git(&["config", "user.name", "T"]);
+        repo.git(&["config", "user.email", "t@e.com"]);
+        std::fs::write(repo.path().join("f"), "1\n").unwrap();
+        repo.git(&["add", "-A"]);
+        repo.git(&["commit", "-m", "c0"]);
+        let sha = repo.rev("HEAD");
+        assert_eq!(sha.len(), 64, "the fixture must be a SHA-256 repository");
+
+        let resolved = resolve_revisions(repo.path(), &["HEAD".to_string()], 8);
+        assert_eq!(resolved, vec![Ok(sha.clone())]);
+
+        repo.verify("HEAD", "passed");
+        let f = freshness_batch(repo.as_str(), &[sha], Some("main"))
+            .pop()
+            .expect("one row");
+        assert!(f.verification.is_some(), "the note was not found: {f:?}");
     }
 }

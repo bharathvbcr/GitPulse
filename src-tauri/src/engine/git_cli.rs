@@ -2460,19 +2460,27 @@ impl SpawnGate {
     }
 
     /// Asks the shared budget for the token a non-interactive spawn is about
-    /// to spend. `true` when it was granted or could not be asked (counted,
-    /// and logged at most every [`REFUSAL_REPORT_INTERVAL`]); `false` when
-    /// the processes together have spent it.
-    fn take_shared(&self, state: &mut GateState, class: Admission) -> bool {
+    /// to spend. Does file IO and may wait on a lock another process holds, so
+    /// it must be called with the gate mutex released; the answer is applied
+    /// by [`Self::settle_shared`].
+    fn ask_shared(&self, class: Admission) -> shared_budget::Take {
         let Some(shared) = &self.shared else {
-            return true;
+            return shared_budget::Take::Granted;
         };
         let floor = if class == Admission::Background {
             self.background_reserve()
         } else {
             0
         };
-        match shared.take(floor, self.burst, self.refill_per_sec) {
+        shared.take(floor, self.burst, self.refill_per_sec)
+    }
+
+    /// Applies [`Self::ask_shared`]'s answer under the gate lock: `true` when
+    /// the token was granted or could not be asked (counted, and logged at
+    /// most every [`REFUSAL_REPORT_INTERVAL`]); `false` when the processes
+    /// together have spent it.
+    fn settle_shared(&self, state: &mut GateState, taken: shared_budget::Take) -> bool {
+        match taken {
             shared_budget::Take::Granted => true,
             shared_budget::Take::Denied => false,
             shared_budget::Take::Unavailable(reason) => {
@@ -2566,6 +2574,12 @@ impl SpawnGate {
         }
         reservation.held = background || interactive;
         let mut token_wait_started: Option<Instant> = None;
+        // A token the shared budget granted while the gate lock was released.
+        // Kept for the next pass, which re-reads the gate before spending it:
+        // the slot it was asked for may have gone to another waiter meanwhile.
+        // One that is never spent (the waiter is cancelled or times out first)
+        // is lost to the shared budget, which has no way to take it back.
+        let mut shared_token_held = false;
         let outcome = loop {
             // The cancel check is the caller's code. Under the gate lock, a
             // check that took a lock of its own or spawned anything would
@@ -2600,7 +2614,7 @@ impl SpawnGate {
             // available slot if no background child is running, so sustained
             // reactive traffic cannot indefinitely postpone all indexing. A
             // waiting user action outranks both.
-            let eligible = match class {
+            let eligibility = |state: &GateState| match class {
                 Admission::Interactive => true,
                 Admission::Background => {
                     state.waiting_interactive == 0 && state.background < (self.limit / 4).max(1)
@@ -2612,18 +2626,48 @@ impl SpawnGate {
                             || state.in_flight < self.limit.saturating_sub(1))
                 }
             };
-            self.refill(&mut state, now);
-            let mut tokens_ok = match class {
+            let tokens_available = |state: &GateState| match class {
                 Admission::Interactive => true,
                 Admission::Reactive => !rate_limited || state.tokens >= 1,
                 Admission::Background => !rate_limited || state.tokens > self.background_reserve(),
             };
+            let mut eligible = eligibility(&state);
+            self.refill(&mut state, now);
+            let mut tokens_ok = tokens_available(&state);
             // The shared budget is asked last, and only by a spawn that would
             // otherwise start now, so a granted token is spent at once below
             // and never taken for a waiter that then gives up.
-            if tokens_ok && rate_limited && !interactive && state.in_flight < self.limit && eligible
+            if tokens_ok
+                && rate_limited
+                && !interactive
+                && !shared_token_held
+                && state.in_flight < self.limit
+                && eligible
+                && self.shared.is_some()
             {
-                tokens_ok = self.take_shared(&mut state, class);
+                // The shared record is a file under a lock that may sleep-poll
+                // for [`shared_budget::LOCK_PATIENCE`], and a denial writes it
+                // too. None of that may happen under the gate mutex, where it
+                // would queue every other acquire, a user action included,
+                // behind a background re-poll. Released like the cancel check
+                // above, and everything is re-read once the answer is in.
+                drop(state);
+                let taken = self.ask_shared(class);
+                state = self
+                    .state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if self.settle_shared(&mut state, taken) {
+                    shared_token_held = true;
+                    // The lock was released: another waiter may have taken the
+                    // slot or the local token, so both are read again. The
+                    // deadline is not: a token already granted is spent, not
+                    // thrown away because the wait for it ran long.
+                    eligible = eligibility(&state);
+                    tokens_ok = tokens_available(&state);
+                } else {
+                    tokens_ok = false;
+                }
             }
             if !tokens_ok {
                 // Background is shed at once: it is the first thing to go
@@ -3532,7 +3576,9 @@ fn run_admitted_inner(
         input.pump();
         output.observe(observer, &mut cursors);
         if observer.cancelled() {
-            break match guard.stop_and_reap(&mut child, Duration::ZERO) {
+            // Asked first: git removes its own `.git/index.lock` when asked and
+            // cannot when killed, so a cancelled commit would block the next.
+            break match guard.ask_then_stop_and_reap(&mut child) {
                 Ok(status) => Halt::Exited(status, true),
                 Err(e) => Halt::Failed(format!("Failed to reap cancelled {label}: {e}")),
             };
@@ -3546,9 +3592,11 @@ fn run_admitted_inner(
                 if Instant::now() >= deadline {
                     let message = format!("{label}{TIMEOUT_MARKER}{}s", timeout.as_secs_f64());
                     // Reap before reading the rest of the pipes: a live child
-                    // can hold them open, and the prefix is whatever was
-                    // already printed, not a reason to wait out the grace.
-                    guard.stop_and_reap(&mut child, Duration::ZERO).ok();
+                    // can hold them open. The ask comes first so git can
+                    // release `.git/index.lock`; a child that ignores it is
+                    // killed after [`CHILD_GRACE`], which a child that exits
+                    // sooner does not wait out.
+                    guard.ask_then_stop_and_reap(&mut child).ok();
                     break Halt::Deadline(message);
                 }
                 #[cfg(unix)]
@@ -8642,6 +8690,58 @@ mod admission_scope_tests {
             shared.take(0, 3, 1),
             shared_budget::Take::Denied,
             "the click took no shared token"
+        );
+    }
+
+    /// The shared record's file lock can sleep-poll for a few milliseconds and
+    /// a denial writes the file. With the gate mutex held across that, every
+    /// other acquire, a user's click included, queued behind a background
+    /// re-poll.
+    #[test]
+    fn a_user_action_does_not_queue_behind_the_shared_budget_io() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("budget");
+        let gate = shared_gate(&path, 100_000, 100_000);
+        // Another process pinning the record: every shared take now waits out
+        // the whole lock patience before falling back.
+        let holder = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        holder.lock().unwrap();
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let pollers: Vec<_> = (0..3)
+            .map(|_| {
+                let stop = std::sync::Arc::clone(&stop);
+                std::thread::spawn(move || {
+                    while !stop.load(Ordering::Relaxed) {
+                        let _ = gate.acquire(Instant::now() + Duration::from_millis(200));
+                    }
+                })
+            })
+            .collect();
+        std::thread::sleep(Duration::from_millis(30));
+        let mut fastest = Duration::MAX;
+        for _ in 0..20 {
+            let started = Instant::now();
+            let clicked = with_admission(Admission::Interactive, || {
+                gate.acquire_until(Instant::now() + Duration::from_millis(500), &|| false)
+                    .map(|_| ())
+            });
+            fastest = fastest.min(started.elapsed());
+            assert_eq!(clicked, Ok(()));
+            std::thread::sleep(Duration::from_millis(3));
+        }
+        stop.store(true, Ordering::Relaxed);
+        for poller in pollers {
+            poller.join().unwrap();
+        }
+        holder.unlock().unwrap();
+        assert!(
+            fastest < Duration::from_millis(5),
+            "every user action waited behind shared-budget IO: fastest was {fastest:?}"
         );
     }
 

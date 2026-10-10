@@ -36,6 +36,16 @@ before that tag is pushed.
   longer produces a "No signature" graph id, `color.ui=always` no longer puts
   escapes in the diff viewer, and the identity GitPulse shows follows git's
   order (environment before config).
+- A cancelled or timed-out git command is asked to stop before it is killed:
+  SIGTERM to its process group, then SIGKILL after the 500 ms grace, so git
+  removes its own `.git/index.lock` and the next commit does not fail on it.
+  Reads that were cut short no longer pass for complete ones: a notes listing
+  killed at its deadline is an error rather than "nothing is verified", a blame
+  cut at its byte cap marks the ownership report truncated, and a failed or
+  malformed submodule or remote read is an error rather than "none". The shared
+  spawn-rate budget's file IO no longer runs under the gate mutex, so a user
+  action does not queue behind a background re-poll. SHA-256 repositories
+  resolve revisions for provenance.
 
 ### Changed
 

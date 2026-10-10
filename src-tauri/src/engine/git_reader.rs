@@ -1915,6 +1915,16 @@ impl GitReader {
         repo_path: &str,
         max_files: Option<usize>,
     ) -> Result<KnowledgeReport, String> {
+        Self::knowledge_report_with(repo_path, max_files, budget::MAX_BLAME_BYTES)
+    }
+
+    /// [`Self::knowledge_report`] with the per-file blame budget injected, so a
+    /// test can cut a blame short without a 16 MiB fixture.
+    fn knowledge_report_with(
+        repo_path: &str,
+        max_files: Option<usize>,
+        blame_cap: usize,
+    ) -> Result<KnowledgeReport, String> {
         let started = Instant::now();
         let repo = validate_repo(repo_path)?;
         let has_mailmap = repo.join(".mailmap").is_file();
@@ -1998,6 +2008,9 @@ impl GitReader {
         let mut age_dist = CodeAgeDistribution::default();
         let mut orphaned_files: Vec<OrphanedFile> = Vec::new();
         let mut scanned_files = 0;
+        // A blame cut off at its byte cap or its deadline is a prefix of the
+        // file, so every count built from it is a lower bound.
+        let mut blame_cut_short = false;
         let mut scanned_lines = 0;
 
         for file_path in selected_files {
@@ -2012,8 +2025,11 @@ impl GitReader {
             args.push("--");
             args.push(&file_path);
 
-            let stdout = match git_text_capped(&repo, &args, budget::MAX_BLAME_BYTES) {
-                Ok((out, _)) => out,
+            let stdout = match git_text_capped(&repo, &args, blame_cap) {
+                Ok((out, incomplete)) => {
+                    blame_cut_short |= incomplete.is_some();
+                    out
+                }
                 Err(_) => continue,
             };
 
@@ -2128,7 +2144,7 @@ impl GitReader {
             orphaned_files,
             age_distribution: age_dist,
             half_life_days,
-            truncated: truncated || scanned_files < candidate_files,
+            truncated: truncated || blame_cut_short || scanned_files < candidate_files,
             duration_ms: started.elapsed().as_millis() as u64,
         })
     }
@@ -7661,6 +7677,29 @@ __GP_PULSE__\0def456\0abc123\x001700000100\0N\0second\0Ada\0ada@example.com\0\0\
         assert!(report.bus_factor >= 1);
         assert!(!report.primary_authors.is_empty());
         assert_eq!(report.age_distribution.total_lines, report.scanned_lines);
+    }
+
+    /// A blame cut off at its byte budget is a prefix of the file. The report
+    /// built from it used to count as a full scan, with `truncated` false.
+    #[test]
+    fn a_blame_cut_at_its_cap_marks_the_ownership_report_truncated() {
+        let dir = init_repo_with_remotes(&[], "main");
+        let path = dir.path().to_str().unwrap();
+        let body: String = (0..200)
+            .map(|n| format!("let value_{n} = {n};\n"))
+            .collect();
+        std::fs::write(dir.path().join("code.rs"), body).unwrap();
+        git_in(dir.path(), &["add", "code.rs"]);
+        git_in(dir.path(), &["commit", "-m", "feat: many lines"]);
+
+        let whole = GitReader::knowledge_report(path, Some(10)).expect("whole");
+        assert!(!whole.truncated, "the control must be a whole scan");
+
+        let cut = GitReader::knowledge_report_with(path, Some(10), 8192).expect("cut");
+        assert!(
+            cut.truncated,
+            "a blame cut at its cap reported as a whole scan: {cut:?}"
+        );
     }
 
     #[test]
