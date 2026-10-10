@@ -2553,14 +2553,26 @@ pub(crate) mod tests {
             .unwrap();
         assert!(status.success());
         let pid = fixture_pid(&pidfile);
+        let me = i32::try_from(std::process::id()).unwrap();
+        // The shell that started it has exited, so the fixture was adopted:
+        // by launchd on macOS, and on Linux by pid 1 or whichever subreaper
+        // (`systemd --user`, a container's init) the host has. Either way it
+        // is out of this test's tree, so its own environment is the only way
+        // back to its run.
         let adopted = (0..100).any(|_| {
             std::thread::sleep(std::time::Duration::from_millis(20));
-            probe_one(pid).is_some_and(|f| f.ppid == 1)
+            probe_one(pid).is_some_and(|f| {
+                if cfg!(target_os = "macos") {
+                    f.ppid == 1
+                } else {
+                    f.ppid > 0 && f.ppid != me
+                }
+            })
         });
         let mut scanner = Scanner::os();
         let view = scanner.scan(&ScanContext::here());
         kill_fixture(pid);
-        assert!(adopted, "the fixture was never reparented to launchd");
+        assert!(adopted, "the fixture's starting shell never let go of it");
         let tree = view
             .trees
             .iter()

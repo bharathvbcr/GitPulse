@@ -48,11 +48,13 @@ fn only_the_app_starts_the_sampler() {
         for (n, line) in production(&source).lines().enumerate() {
             let code = line.split("//").next().unwrap_or("");
             if code.contains("sysload::start_app(") || code.contains("sysload::start(") {
+                // Forward slashes on every platform: Windows would display
+                // `src\lib.rs`, and the check below names `src/lib.rs`.
                 let rel = file
                     .strip_prefix(crate_dir())
                     .unwrap()
-                    .display()
-                    .to_string();
+                    .to_string_lossy()
+                    .replace('\\', "/");
                 starts.push(format!("{rel}:{}", n + 1));
             }
         }

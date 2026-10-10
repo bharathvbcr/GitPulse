@@ -269,7 +269,10 @@ baseline, not a rate.
 - **Codex's live state.** Codex sessions are counted by executable, but
   nothing reports whether one is busy or idle.
 - **Linux** footprints are resident set, not a compressed-memory-aware
-  footprint, and the PSI mapping is provisional.
+  footprint, and the PSI mapping is provisional. On a Linux host with a
+  subreaper (`systemd --user`, a container's init), an orphan is adopted by
+  the subreaper rather than pid 1, so the orphan rule below (parent is pid 1)
+  never lists it there.
 
 ## memguard
 
