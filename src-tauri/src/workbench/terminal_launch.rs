@@ -531,8 +531,8 @@ fn prepare_in(
         // a refusal is rolled back, so the same request_id is still unused.
         Err(error) if matches!(error.code.as_str(), "checkout_busy" | "capacity_reached") => {
             match super::reconcile::sweep(state) {
-                Ok(released) if released > 0 => prepare(),
-                Ok(_) => Err(error),
+                Ok(swept) if swept.released > 0 => prepare(),
+                Ok(swept) => Err(swept.qualify(error)),
                 Err(sweep) => {
                     log::warn!(target: "workbench", "run reconciliation before a launch failed: {}: {}", sweep.code, sweep.message);
                     Err(error)
@@ -560,25 +560,31 @@ fn ensure_room(state: &WorkbenchState) -> Result<(), WorkbenchError> {
     if super::reconcile::live_count(state)? < u64::from(limit) {
         return Ok(());
     }
+    let mut swept = None;
     match super::reconcile::sweep(state) {
-        Ok(released) if released > 0 => {
+        Ok(done) if done.released > 0 => {
             if super::reconcile::live_count(state)? < u64::from(limit) {
                 return Ok(());
             }
+            swept = Some(done);
         }
-        Ok(_) => {}
+        Ok(done) => swept = Some(done),
         Err(sweep) => {
             log::warn!(target: "workbench", "run reconciliation before a launch failed: {}: {}", sweep.code, sweep.message);
         }
     }
-    capacity_hint(Err(WorkbenchError::new(
+    let refusal = WorkbenchError::new(
         "capacity_reached",
         // The store's sentence (dc-store `runs::prepare`), word for word; a
         // test holds the two together.
         format!(
             "{limit} runs are already prepared, active or unresolved; finish or reconcile one before launching another"
         ),
-    )))
+    );
+    capacity_hint(Err(match swept {
+        Some(swept) => swept.qualify(refusal),
+        None => refusal,
+    }))
     .map(|_| ())
 }
 

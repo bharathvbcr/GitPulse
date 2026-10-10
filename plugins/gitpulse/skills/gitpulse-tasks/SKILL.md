@@ -67,7 +67,7 @@ what they share). Read them, then either fold your work into one (step 3), or,
 when it is genuinely separate work, call again with `reviewed_related` naming
 **every** listed `item_id`. Naming some of them is refused again. A finished
 (`done`) task never counts, nor does an archived one in any column — archiving
-is its own flag, separate from Done — and an overwrite is never checked. The success
+is its own flag, separate from Done — and an overwrite of an existing task is never checked. (An `overwrite: true` whose key matches no task files a new card, and is checked like any other new task.) The success
 answer carries `related_check`: how many related open tasks there were, how many
 open tasks were compared, and whether that was all of them (`scan_complete`).
 
@@ -122,7 +122,7 @@ the card is theirs: an overwrite that would change it is refused with
 | `repositories` | no | Other related repository names, kept as a `## Related repositories` section. |
 | `logs` | no | Raw evidence kept verbatim, at most 256 KiB. |
 | `overwrite` | no | Replace an existing task's content, by `task_id` or board `item_id`. |
-| `reviewed_related` | no | At most 25 `item_id`s: every task a `related_tasks_exist` refusal listed, once you have read them and judged this separate. |
+| `reviewed_related` | no | At most 500 `item_id`s: every task a `related_tasks_exist` refusal listed, once you have read them and judged this separate. A refusal names 25 at a time; pass back everything you have read so far and the next refusal names the following ones. |
 
 ## Importing briefs from `tasks/`
 

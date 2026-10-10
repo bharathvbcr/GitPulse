@@ -597,17 +597,27 @@ fn accept_loop(listener: UnixListener, shared: Arc<Shared>) {
             shared.active.fetch_sub(1, Ordering::AcqRel);
             continue;
         }
-        let handler = shared.clone();
+        // The slot is released by the guard's drop, so a handler that panics
+        // gives it back like one that returns. Eight panics would otherwise
+        // fill MAX_HANDLERS and silently drop every later relaunch.
+        let slot = HandlerSlot(shared.clone());
         let spawned = std::thread::Builder::new()
             .name("instance-mailbox-conn".into())
-            .spawn(move || {
-                handle(stream, &handler);
-                handler.active.fetch_sub(1, Ordering::AcqRel);
-            });
+            .spawn(move || handle(stream, &slot.0));
         if let Err(error) = spawned {
-            shared.active.fetch_sub(1, Ordering::AcqRel);
+            // The closure, and the slot it owned, were dropped by the failed
+            // spawn, which released the count already.
             log::warn!(target: "desktop", "instance mailbox could not answer a launch: {error}");
         }
+    }
+}
+
+/// One of the [`MAX_HANDLERS`] mailbox slots, released on drop.
+struct HandlerSlot(Arc<Shared>);
+
+impl Drop for HandlerSlot {
+    fn drop(&mut self) {
+        self.0.active.fetch_sub(1, Ordering::AcqRel);
     }
 }
 

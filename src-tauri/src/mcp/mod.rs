@@ -592,7 +592,7 @@ fn build_tools() -> Vec<Value> {
                     "type": "boolean",
                     "description": "Replace the content of the task already filed under this task_id, or of the board task whose item_id is task_id (default false). Its column position and links are kept. This is how related work is folded into an existing task: send its current content plus yours."
                 },
-                "reviewed_related": string_array_prop("item_ids of the open tasks a related_tasks_exist refusal listed, once you have read them and this task is genuinely separate work", crate::workbench::intake::MAX_RELATED, 128)
+                "reviewed_related": string_array_prop("item_ids of the open tasks a related_tasks_exist refusal listed, once you have read them and this task is genuinely separate work", crate::workbench::intake::MAX_REVIEWED_RELATED, 128)
             }),
             &["repo_path", "title"],
             json!({
@@ -1150,7 +1150,7 @@ fn handle_tool_call(name: &str, arguments: &Value) -> Result<Value, String> {
                 .as_u64()
                 .map(|n| n as u32)
                 .unwrap_or(LEDGER_DEFAULT_LIMIT);
-            let address = crate::ledger::bindings::repository_address(repo)
+            let address = crate::ledger::bindings::repository_address_readonly(repo)
                 .map_err(|error| error.to_string())?;
             // `tail` pages *forward* from a cursor — deliberately, so a
             // consumer holding the last id it saw gets the same answer whether
@@ -1162,32 +1162,11 @@ fn handle_tool_call(name: &str, arguments: &Value) -> Result<Value, String> {
             // any size; `returned` says what it is, `truncated` says when more
             // follow, and `next_cursor` is what to pass to get them.
             let cursor = arguments["cursor"].as_i64().unwrap_or(0);
-            match crate::ledger::tail_readonly(&address.anchor, cursor, limit)
-                .map_err(|e| e.to_string())?
-            {
-                Some(events) => {
-                    let truncated = events.len() as u32 >= limit;
-                    let next_cursor = events.last().map(|event| event.id);
-                    Ok(json!({
-                        "ok": true,
-                        "returned": events.len(),
-                        "truncated": truncated,
-                        "next_cursor": next_cursor,
-                        "events": events,
-                    }))
-                }
-                None => Ok(json!({
-                    "ok": false,
-                    "error": "no ledger in this repository yet; nothing has been recorded",
-                    "returned": 0,
-                    "truncated": false,
-                    "events": [],
-                })),
-            }
+            resources::ledger_page(&address.anchor, cursor, limit)
         }
         "gitpulse_task_view" => {
             let repo = arguments["repo_path"].as_str().ok_or("missing repo_path")?;
-            let address = crate::ledger::bindings::repository_address(repo)
+            let address = crate::ledger::bindings::repository_address_readonly(repo)
                 .map_err(|error| error.to_string())?;
             let task_id = arguments["task_id"].as_str();
             let view = crate::tasks::view_filtered(&address.anchor, task_id);
@@ -1469,11 +1448,15 @@ impl Ready {
             self.id.clone(),
             -32603,
             format!(
-                "{} exceeded the {} ms server budget and was abandoned",
+                "{} exceeded the {} ms server budget and the client stopped waiting; the work is not cancelled and may still finish, so a write's outcome is unknown. Read the state back before retrying",
                 self.method,
                 budget.as_millis()
             ),
-            Some(json!({ "method": self.method, "timeoutMs": budget.as_millis() as u64 })),
+            Some(json!({
+                "method": self.method,
+                "timeoutMs": budget.as_millis() as u64,
+                "outcomeUnknown": true,
+            })),
         )
     }
 
@@ -3270,7 +3253,7 @@ mod tests {
             format!("At most {} bytes. |", ft::MAX_OWNER_BYTES),
             format!(
                 "At most {} `item_id`s",
-                crate::workbench::intake::MAX_RELATED
+                crate::workbench::intake::MAX_REVIEWED_RELATED
             ),
             format!(
                 "`reason` is required (at most {} characters)",
@@ -4132,6 +4115,62 @@ mod tests {
         assert!(!error, "{filed}");
         assert_eq!(filed["outcome"], "created");
         assert_eq!(filed["related_check"]["related_open_tasks"], 1);
+    }
+
+    #[test]
+    fn a_timeout_says_the_work_may_still_finish_and_the_outcome_is_unknown() {
+        let ready = Ready {
+            id: json!(7),
+            modern: true,
+            method: "tools/call".into(),
+            params: json!({}),
+        };
+        let response = ready.timed_out(std::time::Duration::from_millis(1500));
+        let error = response.error.expect("an error");
+        let message = error["message"].as_str().unwrap();
+        assert!(message.contains("not cancelled"), "{message}");
+        assert!(message.contains("outcome is unknown"), "{message}");
+        assert!(!message.contains("was abandoned"), "{message}");
+        assert_eq!(error["data"]["outcomeUnknown"], true);
+    }
+
+    /// With 26 or more related open tasks, `add_task` used to be impossible:
+    /// it required every related id in `reviewed_related`, whose schema capped
+    /// the array at the 25 a refusal names.
+    #[test]
+    fn a_task_can_be_filed_after_reviewing_more_than_twenty_five_related_ones() {
+        let (dir, _profile, repo) = task_fixture();
+        crate::test_support::trust_repo(dir.path());
+        let mut ids: Vec<String> = Vec::new();
+        for n in 0..30 {
+            let (error, filed) = tool_json(
+                "gitpulse_add_task",
+                json!({
+                    "repo_path": repo, "task_id": format!("imp-{n}"),
+                    "title": format!("Importer crash handling case{n}x"), "labels": ["import"],
+                    "reviewed_related": ids,
+                }),
+            );
+            assert!(
+                !error,
+                "filing task {n} with {} reviewed: {filed}",
+                ids.len()
+            );
+            ids.push(filed["item_id"].as_str().unwrap().to_owned());
+        }
+        // A refusal names one page and says the rest follow.
+        let (error, refused) = tool_json(
+            "gitpulse_add_task",
+            json!({ "repo_path": repo, "task_id": "imp-last", "title": "Importer crash handling again", "labels": ["import"] }),
+        );
+        assert!(error, "{refused}");
+        let message = refused.as_str().unwrap();
+        assert!(message.contains("30 open tasks"), "{message}");
+        assert!(message.contains("and 5 more"), "{message}");
+        assert!(
+            message.contains("the next refusal names the following ones"),
+            "{message}"
+        );
     }
 
     #[test]

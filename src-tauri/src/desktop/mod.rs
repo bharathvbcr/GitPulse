@@ -4,6 +4,8 @@ pub mod exit;
 pub mod instance;
 #[cfg(target_os = "macos")]
 pub mod launch;
+#[cfg(any(target_os = "macos", test))]
+pub mod launch_agent;
 mod menu;
 pub mod popover;
 pub mod shell;

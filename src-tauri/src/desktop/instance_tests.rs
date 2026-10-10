@@ -887,3 +887,26 @@ fn a_killed_owner_frees_the_profile_even_if_its_child_lives_on() {
         other => panic!("a dead owner still holds the profile: {}", describe(&other)),
     }
 }
+
+#[test]
+fn a_panicking_mailbox_handler_releases_its_slot() {
+    let shared = Arc::new(Shared {
+        closing: AtomicBool::new(false),
+        active: AtomicUsize::new(0),
+        inbox: Mutex::new(Inbox::default()),
+        own_uid: 0,
+    });
+    // More panics than there are slots: without release-on-drop the mailbox
+    // would be full after MAX_HANDLERS of them and refuse every later launch.
+    for _ in 0..MAX_HANDLERS * 2 {
+        shared.active.fetch_add(1, Ordering::AcqRel);
+        let slot = HandlerSlot(shared.clone());
+        let panicked = std::thread::spawn(move || {
+            let _slot = slot;
+            panic!("handler panicked");
+        })
+        .join();
+        assert!(panicked.is_err());
+    }
+    assert_eq!(shared.active.load(Ordering::Acquire), 0);
+}

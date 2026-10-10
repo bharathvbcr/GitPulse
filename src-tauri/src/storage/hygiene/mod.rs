@@ -1,5 +1,5 @@
 //! Reviewable repository hygiene and tool-owned shared-cache maintenance.
-mod background;
+pub(crate) mod background;
 mod discovery;
 pub mod global;
 pub mod providers;

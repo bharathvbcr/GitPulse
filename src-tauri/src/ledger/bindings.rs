@@ -90,6 +90,15 @@ pub fn repository_address(repo_path: &str) -> Result<BindingAddress, LedgerError
     address(repo_path, repo_path)
 }
 
+/// [`repository_address`] for a read-only caller: the same anchor, without the
+/// legacy consolidation, which imports rows into (and so creates) the anchor
+/// database. Rows a sibling still holds are not visible through it, which a
+/// read-only status says; running the migration to make the answer complete
+/// is not a read's call to make.
+pub fn repository_address_readonly(repo_path: &str) -> Result<BindingAddress, LedgerError> {
+    resolve_address(repo_path, repo_path).map(|family| family.address)
+}
+
 /// Status is the one family entrypoint that can still return a useful object
 /// when an old sibling ledger is unreadable. Reads and binding resolution fail
 /// closed; status names the canonical destination and loudly marks it degraded.
@@ -224,19 +233,52 @@ pub(crate) struct ResolvedBinding {
     pub worktree: String,
 }
 
+/// Resolves a binding for a family whose own ledger does not exist yet: the
+/// newest bind or unbind across the siblings' old ledgers, read-only. A legacy
+/// binding must still be enforced after an upgrade, but resolving it is a
+/// read, and a read must not create or migrate the family ledger.
+fn newest_sibling_binding(family: FamilyAddress) -> Result<Option<ResolvedBinding>, LedgerError> {
+    let stored_worktree = super::redact::text(&family.address.worktree);
+    let mut newest: Option<super::NewestBinding> = None;
+    for member in &family.members {
+        let member = member.to_string_lossy();
+        if member.as_ref() == family.address.anchor || !super::is_initialised(&member) {
+            continue;
+        }
+        let found =
+            super::newest_binding_readonly(&member, &family.address.worktree, &stored_worktree)?;
+        if let Some(found) = found {
+            if newest.as_ref().is_none_or(|(key, _)| found.0 > *key) {
+                newest = Some(found);
+            }
+        }
+    }
+    Ok(newest
+        .and_then(|(_, task)| task)
+        .map(|task_id| ResolvedBinding {
+            task_id,
+            anchor: family.address.anchor,
+            worktree: family.address.worktree,
+        }))
+}
+
 pub(crate) fn resolve_binding(
     repo_path: &str,
     worktree_path: &str,
 ) -> Result<Option<ResolvedBinding>, LedgerError> {
-    let address = address(repo_path, worktree_path)?;
     // A binding *is* a ledger event, so a repository with no ledger has none —
     // and scanning for one would open the database, which creates it. That put
     // `.devcouncil/` into a fresh checkout on a `gitpulse_change_context` call,
     // a tool annotated `readOnlyHint: true`. `Ok(None)` here is the same answer
-    // the scan would have reached, without the side effect.
-    if !super::is_initialised(&address.anchor) {
-        return Ok(None);
+    // the scan would have reached, without the side effect. The check comes
+    // before the family consolidation, which would otherwise create the anchor
+    // database to import a sibling worktree's rows into it.
+    let family = resolve_address(repo_path, worktree_path)?;
+    if !super::is_initialised(&family.address.anchor) {
+        return newest_sibling_binding(family);
     }
+    super::consolidate_worktree_ledgers(&family.address.anchor, &family.members)?;
+    let address = family.address;
     let stored_worktree = super::redact::text(&address.worktree);
     // Imported rows receive new integer cursors in the anchor database. ULIDs
     // retain their original timestamp and are the ledger's cross-database sort
@@ -981,5 +1023,52 @@ mod tests {
         assert!(!status.recording);
         assert_eq!(status.error_code, "legacy_migration_failed");
         assert!(status.error.contains("legacy_ulid_conflict"));
+    }
+
+    #[test]
+    fn resolving_a_binding_never_creates_the_main_ledger_for_a_sibling_that_has_one() {
+        let repo = git_repo();
+        let (_parent, sibling) = linked_worktree(repo.path());
+        append(Draft {
+            repo_path: sibling.clone(),
+            worktree_path: Some(sibling.clone()),
+            action: "git.commit".to_string(),
+            actor_kind: Some(ActorKind::Human),
+            outcome: Some(Outcome::Ok),
+            ..Default::default()
+        })
+        .expect("sibling ledger row");
+        let main = repo.path().to_str().expect("utf8 repository");
+        assert!(
+            !super::super::is_initialised(main),
+            "fixture: main has no ledger"
+        );
+
+        assert_eq!(resolve(main, main).expect("resolve"), None);
+        assert_eq!(resolve(main, &sibling).expect("resolve sibling"), None);
+        append(Draft {
+            repo_path: sibling.clone(),
+            worktree_path: Some(sibling.clone()),
+            task_id: Some("TASK-OLD".to_string()),
+            action: BIND.to_string(),
+            object: Some(sibling.clone()),
+            actor_kind: Some(ActorKind::Human),
+            outcome: Some(Outcome::Ok),
+            ..Default::default()
+        })
+        .expect("legacy binding");
+        assert_eq!(
+            resolve(main, &sibling).expect("resolve legacy binding"),
+            Some("TASK-OLD".to_string()),
+            "a legacy binding must still be enforced"
+        );
+        assert!(
+            !repo
+                .path()
+                .join(".devcouncil")
+                .join("ledger.sqlite")
+                .exists(),
+            "a read created or migrated the main ledger"
+        );
     }
 }

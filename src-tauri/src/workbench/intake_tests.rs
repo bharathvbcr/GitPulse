@@ -855,3 +855,96 @@ fn an_archived_task_is_not_open_work_for_the_related_task_gate() {
     assert_eq!(error.code, "related_tasks_exist", "{}", error.message);
     assert!(!error.message.contains(&shelved), "{}", error.message);
 }
+
+/// The identical call, retried after its response was lost, must be `unchanged`.
+#[test]
+fn complete_retry_with_expected_revision_is_unchanged() {
+    let (_dir, path) = profile();
+    let store = Store::open(&path).unwrap();
+    let repo = git_repo();
+    let repo_path = repo.path().to_str().unwrap();
+    let id = filed(&store, &repo, "gp-retry", "Retry me");
+    let rev = live(&store, &id).unwrap()["revision"].as_i64().unwrap();
+    let first = complete_task(&store, repo_path, &id, "done", Some(rev), Some("did it")).unwrap();
+    assert_eq!(first["outcome"], "updated", "{first}");
+    let retry = complete_task(&store, repo_path, &id, "done", Some(rev), Some("did it"));
+    assert!(
+        retry.as_ref().is_ok_and(|v| v["outcome"] == "unchanged"),
+        "identical retry: {:?}",
+        retry.map_err(|e| (e.code, e.message))
+    );
+}
+
+/// A stale revision on a call that would change something is still refused.
+#[test]
+fn complete_with_a_stale_revision_that_would_change_the_task_is_refused() {
+    let (_dir, path) = profile();
+    let store = Store::open(&path).unwrap();
+    let repo = git_repo();
+    let repo_path = repo.path().to_str().unwrap();
+    let id = filed(&store, &repo, "gp-stale", "Stale");
+    let rev = live(&store, &id).unwrap()["revision"].as_i64().unwrap();
+    person_edits(&store, &id, |input| {
+        input.insert("title".into(), json!("Edited by a person"));
+    });
+    let error = complete_task(&store, repo_path, &id, "review", Some(rev), None).unwrap_err();
+    assert_eq!(error.code, "revision_conflict");
+}
+
+#[test]
+fn delete_retry_after_success_is_unchanged() {
+    let (_dir, path) = profile();
+    let store = Store::open(&path).unwrap();
+    let repo = git_repo();
+    let repo_path = repo.path().to_str().unwrap();
+    let id = filed(&store, &repo, "gp-del", "Delete me");
+    let rev = live(&store, &id).unwrap()["revision"].as_i64().unwrap();
+    let first = delete_task(&store, repo_path, &id, Some(rev), "duplicate", false).unwrap();
+    assert_eq!(first["outcome"], "deleted", "{first}");
+    let retry = delete_task(&store, repo_path, &id, Some(rev), "duplicate", false);
+    assert!(
+        retry.as_ref().is_ok_and(|v| v["outcome"] == "unchanged"),
+        "identical retry: {:?}",
+        retry.map_err(|e| (e.code, e.message))
+    );
+}
+
+/// The state `Removal::Interrupted` leaves (reason block recorded, revision
+/// bumped, item still live), whose error says "Run the same call again".
+#[test]
+fn delete_retry_after_interrupted_delete_finishes() {
+    let (_dir, path) = profile();
+    let store = Store::open(&path).unwrap();
+    let repo = git_repo();
+    let repo_path = repo.path().to_str().unwrap();
+    let id = filed(&store, &repo, "gp-int", "Interrupted delete");
+    let rev = live(&store, &id).unwrap()["revision"].as_i64().unwrap();
+    // Exactly what record_and_delete writes before its items.delete.
+    person_edits(&store, &id, |input| {
+        let logs = input["logs"].as_str().unwrap_or_default().to_owned();
+        let joined = append_log(&logs, &deletion_block("duplicate", now_millis())).unwrap();
+        input.insert("logs".into(), json!(joined));
+    });
+    let retry = delete_task(&store, repo_path, &id, Some(rev), "duplicate", false);
+    assert!(
+        retry.as_ref().is_ok_and(|v| v["outcome"] == "deleted"),
+        "'run the same call again' after Interrupted: {:?}",
+        retry.map_err(|e| (e.code, e.message))
+    );
+}
+
+/// A reason block with someone else's edit on top is not the call's own work.
+#[test]
+fn delete_retry_after_an_unrelated_edit_is_still_a_conflict() {
+    let (_dir, path) = profile();
+    let store = Store::open(&path).unwrap();
+    let repo = git_repo();
+    let repo_path = repo.path().to_str().unwrap();
+    let id = filed(&store, &repo, "gp-edit", "Edited");
+    let rev = live(&store, &id).unwrap()["revision"].as_i64().unwrap();
+    person_edits(&store, &id, |input| {
+        input.insert("title".into(), json!("Edited by a person"));
+    });
+    let error = delete_task(&store, repo_path, &id, Some(rev), "duplicate", false).unwrap_err();
+    assert_eq!(error.code, "revision_conflict");
+}
