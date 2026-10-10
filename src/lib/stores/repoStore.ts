@@ -126,8 +126,10 @@ import {
   type OperationState,
   type RepoOperation,
 } from "../repos/operation";
+import type { RepoChange } from "../repos/events";
 import {
   STATUS_POLL_INTERVAL_MS,
+  changeFromStatusPoll,
   shallowRecordListEqual,
   shouldRunStatusPoll,
   statusesEqual,
@@ -1084,6 +1086,9 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
     unbindStatusPollVisibility();
   }
 
+  /** Who hears what a status poll found moved; see `changeFromStatusPoll`. */
+  const polledChangeListeners = new Set<(path: string, change: RepoChange) => void>();
+
   async function runStatusPoll() {
     const session = activeSession();
     const hidden = readBackgroundDocument();
@@ -1157,7 +1162,13 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
       ) {
         return;
       }
+      const before = live && live.generation === generation ? live.statuses : [];
       applyToSession(sessionId, generation, { statuses });
+      // The watcher cannot see nested edits (its worktree watch is
+      // non-recursive); the poll can, so it announces them to the views
+      // derived from files.
+      const polled = changeFromStatusPoll(before, statuses);
+      if (polled) for (const listener of polledChangeListeners) listener(path, polled);
     } catch {
       /* a repo that vanished reports through the next full refresh */
     } finally {
@@ -2867,6 +2878,12 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
         // always answers exactly the query the scheduler keys on.
         void graph.loadGraph(latest.path, latest.searchQuery, latest.selectedBranch);
       }
+    },
+    /** Subscribes to worktree changes the status poll observed (the watcher
+     *  misses nested edits). Returns the unsubscribe. */
+    onPolledChange: (listener: (path: string, change: RepoChange) => void): (() => void) => {
+      polledChangeListeners.add(listener);
+      return () => void polledChangeListeners.delete(listener);
     },
     handleRepoChanged: async (changedPath?: string | null) => {
       // Watcher events arrive per file; a checkout or rebase fires many at

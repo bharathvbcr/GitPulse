@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  changeFromStatusPoll,
   shallowRecordListEqual,
   shouldRunStatusPoll,
   statusesEqual,
@@ -208,4 +209,36 @@ it("publishes side churn changes even when total churn and porcelain are unchang
   const after = { ...before, staged_additions: 2, unstaged_additions: 1 };
   expect(statusesEqual([before], [after])).toBe(false);
   expect(statusesEqual([after], [{ ...after }])).toBe(true);
+});
+
+describe("changeFromStatusPoll", () => {
+  it("is null when nothing moved", () => {
+    const rows = [status({ path: "a.ts" })];
+    expect(changeFromStatusPoll(rows, [status({ path: "a.ts" })])).toBeNull();
+  });
+
+  it("names a nested document edit as a worktree and documents change", () => {
+    const change = changeFromStatusPoll([], [status({ path: "docs/guide.md" })]);
+    expect(change).toEqual({
+      kinds: ["worktree", "documents"],
+      paths: ["docs/guide.md"],
+      paths_truncated: false,
+    });
+  });
+
+  it("does not mark documents for a source edit, and sees removals and edits", () => {
+    const before = [status({ path: "src/a.ts", additions: 1 }), status({ path: "src/gone.ts" })];
+    const after = [status({ path: "src/a.ts", additions: 2 })];
+    const change = changeFromStatusPoll(before, after)!;
+    expect(change.kinds).toEqual(["worktree"]);
+    expect(change.paths.sort()).toEqual(["src/a.ts", "src/gone.ts"]);
+  });
+
+  it("treats an extensionless entry as possibly holding documents and bounds the paths", () => {
+    expect(changeFromStatusPoll([], [status({ path: "notes/" })])!.kinds).toContain("documents");
+    const many = Array.from({ length: 100 }, (_, i) => status({ path: `src/f${i}.ts` }));
+    const change = changeFromStatusPoll([], many)!;
+    expect(change.paths).toHaveLength(64);
+    expect(change.paths_truncated).toBe(true);
+  });
 });

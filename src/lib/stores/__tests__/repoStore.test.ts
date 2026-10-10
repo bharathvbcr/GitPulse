@@ -2032,6 +2032,26 @@ describe("repoStore status poll lifecycle", () => {
     expect(arms()).toHaveLength(2);
   });
 
+  it("tells subscribers what a poll found moved, since the watcher cannot see nested edits", async () => {
+    vi.useFakeTimers();
+    let edited = false;
+    const row = { path: "docs/guide.md", status_code: "M", is_staged: false, is_conflicted: false, additions: 1, deletions: 0 };
+    const invoke = makeInvoke({
+      cmd_get_status: async (_cmd, args) =>
+        (edited ? [row] : snapshotFor(String(args?.repoPath)).statuses) as never,
+    });
+    const { store } = makeStore(invoke);
+    await store.openRepo("/r/poll-nested");
+    const heard: { path: string; kinds: string[]; paths: string[] }[] = [];
+    const stop = store.onPolledChange((path, change) => heard.push({ path, kinds: change.kinds, paths: change.paths }));
+    await vi.advanceTimersByTimeAsync(STATUS_POLL_INTERVAL_MS + 100);
+    expect(heard, "a quiet poll announces nothing").toEqual([]);
+    edited = true;
+    await vi.advanceTimersByTimeAsync(STATUS_POLL_INTERVAL_MS + 100);
+    expect(heard).toEqual([{ path: "/r/poll-nested", kinds: ["worktree", "documents"], paths: ["docs/guide.md", "README.md"] }]);
+    stop();
+  });
+
   it("restarts polling when a tab closes and another remains", async () => {
     const { clearSpy, arms } = pollSpies();
     const { store } = makeStore();
