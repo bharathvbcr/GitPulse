@@ -87,28 +87,78 @@ struct ClaudeRegistryEntry {
 
 /// Observes every agent kind on this machine.
 pub(crate) fn observe() -> Observation {
-    observe_with(
-        crate::workbench::conversation::claude_home()
-            .map(|home| home.join("sessions"))
-            .as_deref(),
+    let configs = crate::workbench::conversation::claude_config_dirs();
+    let registries: Vec<PathBuf> = configs
+        .dirs
+        .iter()
+        .map(|dir| dir.join("sessions"))
+        .collect();
+    observe_registries(
+        &registries,
+        configs.error.as_deref(),
         &process_birth::running_since,
     )
 }
 
-/// [`observe`] with the registry directory and the liveness probe as
+/// [`observe`] with one registry directory and the liveness probe as
 /// arguments, so tests can point it at a fixture registry.
 pub(crate) fn observe_with(
     claude_sessions: Option<&Path>,
     alive: &dyn Fn(u32, u128) -> Liveness,
 ) -> Observation {
-    let mut kinds = vec![match claude_sessions {
-        Some(dir) => read_claude_registry(dir, alive),
-        None => KindObservation {
-            kind: "claude".into(),
-            error: "no home directory to find Claude Code's session registry in".into(),
-            ..KindObservation::default()
-        },
-    }];
+    let dirs: Vec<PathBuf> = claude_sessions.map(Path::to_path_buf).into_iter().collect();
+    observe_registries(&dirs, None, alive)
+}
+
+/// Observes every agent kind, reading Claude Code's registry from each of
+/// `claude_sessions` and merging them into one `claude` observation.
+///
+/// The merge keeps the strictest reading: the kind is `ok` only when every
+/// directory was read, entries count as truncated if any directory was, and
+/// `discovery_error` (the config-directory list itself could not be completed)
+/// fails the kind so a missed directory never reads as a clean zero.
+pub(crate) fn observe_registries(
+    claude_sessions: &[PathBuf],
+    discovery_error: Option<&str>,
+    alive: &dyn Fn(u32, u128) -> Liveness,
+) -> Observation {
+    let mut claude = KindObservation {
+        kind: "claude".into(),
+        ok: true,
+        ..KindObservation::default()
+    };
+    if claude_sessions.is_empty() {
+        claude.ok = false;
+        claude.error = "no home directory to find Claude Code's session registry in".into();
+    }
+    let mut errors: Vec<String> = discovery_error.map(str::to_string).into_iter().collect();
+    for dir in claude_sessions {
+        let one = read_claude_registry(dir, alive);
+        claude.ok &= one.ok;
+        if !one.error.is_empty() {
+            errors.push(one.error);
+        }
+        claude.truncated |= one.truncated;
+        for session in one.live {
+            // One session registers in one directory; a repeat is the same
+            // directory reached through two spellings.
+            if !claude
+                .live
+                .iter()
+                .any(|s| s.pid == session.pid && s.cwd == session.cwd)
+            {
+                claude.live.push(session);
+            }
+        }
+        claude.unverified.extend(one.unverified);
+    }
+    if discovery_error.is_some() {
+        claude.ok = false;
+    }
+    if !errors.is_empty() {
+        claude.error = errors.join("; ");
+    }
+    let mut kinds = vec![claude];
     for (kind, why) in UNOBSERVABLE_KINDS {
         kinds.push(KindObservation {
             kind: (*kind).into(),
@@ -460,5 +510,60 @@ mod tests {
         assert!(claude.truncated);
         assert_eq!(claude.sessions as usize, MAX_REGISTRY_ENTRIES);
         assert!(!facet.ok);
+    }
+
+    /// A second account's config directory (`~/.claude-work`) holds live
+    /// sessions the default directory never sees; reading one directory
+    /// counted 5 of 15 here while reporting ok.
+    #[test]
+    fn sessions_under_every_config_dir_are_counted() {
+        let repo = tempfile::TempDir::new().unwrap();
+        let home = tempfile::TempDir::new().unwrap();
+        for (dir, pid) in [
+            (".claude", 301),
+            (".claude-work", 302),
+            (".claude-lab", 303),
+        ] {
+            let sessions = home.path().join(dir).join("sessions");
+            fs::create_dir_all(&sessions).unwrap();
+            fs::write(
+                sessions.join(format!("{pid}.json")),
+                entry(pid, repo.path(), 1),
+            )
+            .unwrap();
+        }
+        // Not a config dir: no `.claude-` prefix, so it is never read.
+        fs::create_dir_all(home.path().join("claude-notes/sessions")).unwrap();
+        let configs =
+            crate::workbench::conversation::config_dirs_in(None, None, None, Some(home.path()));
+        assert!(configs.error.is_none(), "{configs:?}");
+        let registries: Vec<PathBuf> = configs.dirs.iter().map(|d| d.join("sessions")).collect();
+        let seen = observe_registries(&registries, None, &always(Liveness::Alive));
+        let facet = attribute(&seen, &[repo.path().to_string_lossy().into_owned()]);
+        let claude = facet.kinds.iter().find(|k| k.kind == "claude").unwrap();
+        assert_eq!(claude.sessions, 3, "{facet:?}");
+        assert!(claude.ok, "{facet:?}");
+    }
+
+    /// A config-directory list that could not be completed fails the kind: a
+    /// directory that was never looked at must not read as zero sessions.
+    #[test]
+    fn an_incomplete_config_dir_discovery_fails_the_kind() {
+        let repo = tempfile::TempDir::new().unwrap();
+        let reg = registry(&[("1.json", entry(401, repo.path(), 1))]);
+        let seen = observe_registries(
+            &[reg.path().to_path_buf()],
+            Some("cannot list /home/x for `.claude-*` config directories"),
+            &always(Liveness::Alive),
+        );
+        let claude = seen.iter().find(|k| k.kind == "claude").unwrap();
+        assert!(!claude.ok);
+        assert!(
+            claude.error.contains("config directories"),
+            "{}",
+            claude.error
+        );
+        // What was found is still reported, so a partial answer stays useful.
+        assert_eq!(claude.live.len(), 1);
     }
 }

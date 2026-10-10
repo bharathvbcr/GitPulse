@@ -125,9 +125,23 @@ fn walk(
             "Measurement incomplete: traversal budget exceeded. Cleanup is unavailable.".into(),
         );
     }
-    let path = root.join(relative);
+    // `join("")` appends a separator, and a trailing slash makes lstat follow
+    // a symlinked root: the walk then measured the target as if it were the root.
+    let path = if relative.as_os_str().is_empty() {
+        root.to_path_buf()
+    } else {
+        root.join(relative)
+    };
     let meta = fs::symlink_metadata(&path).map_err(|e| format!("{}: {e}", path.display()))?;
     if meta.file_type().is_symlink() {
+        // A symlinked root measures nothing: returning an empty snapshot made
+        // the inventory report 0 bytes for a cache it never looked at.
+        if relative.as_os_str().is_empty() {
+            return Err(format!(
+                "{} is a symlink; it was not measured",
+                path.display()
+            ));
+        }
         if strict {
             return Err(format!("Symlink inside candidate: {}", relative.display()));
         }
@@ -229,7 +243,26 @@ mod unix {
         Ok(current)
     }
 
+    /// Removes the reviewed entries. A failure after some were already
+    /// unlinked says so: the directory is then partly gone, and "Entry was
+    /// replaced" alone reads as if nothing had happened.
     pub fn remove(root: &Path, expected: &Snapshot, cancel: &AtomicBool) -> Result<(), String> {
+        let mut removed = 0usize;
+        remove_counted(root, expected, cancel, &mut removed).map_err(|error| {
+            if removed == 0 || error.contains("already have been removed") {
+                error
+            } else {
+                format!("{error}; {removed} reviewed entries were already removed")
+            }
+        })
+    }
+
+    fn remove_counted(
+        root: &Path,
+        expected: &Snapshot,
+        cancel: &AtomicBool,
+        removed: &mut usize,
+    ) -> Result<(), String> {
         let slash = File::open("/").map_err(|e| e.to_string())?;
         let absolute = root.strip_prefix("/").map_err(|e| e.to_string())?;
         let parent = descend(&slash, absolute.parent().ok_or("Missing parent")?)?;
@@ -320,6 +353,7 @@ mod unix {
             {
                 return Err(std::io::Error::last_os_error().to_string());
             }
+            *removed += 1;
         }
         Ok(())
     }
