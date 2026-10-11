@@ -56,9 +56,10 @@ export type IpcBound = {
   /** Rejects with the signal's reason at once, and never sends the call if already aborted. */
   signal?: AbortSignal;
 };
-export type IpcOptions = InvokeOptions & IpcBound;
-/** Exactly what the caller passed after `cmd`, forwarded with the same arity. */
-type Rest = [args?: InvokeArgs, options?: IpcOptions];
+export type IpcOptions = Partial<InvokeOptions> & IpcBound;
+/** What the backend is sent: exactly what the caller passed after `cmd`, with the same arity. */
+type Rest = [args?: InvokeArgs, options?: InvokeOptions];
+type Given = [args?: InvokeArgs, options?: IpcOptions];
 
 /**
  * Commands that shell out to `gh` over the network and so can hang on a dead
@@ -212,11 +213,12 @@ export function withDeferralRetry(raw: Raw, options: DeferralRetryOptions = {}) 
     });
   }
 
-  return function invoke<T>(cmd: string, ...given: Rest): Promise<T> {
+  return function invoke<T>(cmd: string, ...given: Given): Promise<T> {
+    if (given.length < 2) return bound(cmd, given.length === 0 ? [] : [given[0]], COMMAND_DEADLINES_MS[cmd], undefined);
     const [args, options] = given;
-    if (options === undefined) return bound(cmd, given, COMMAND_DEADLINES_MS[cmd], undefined);
-    const { deadlineMs, signal, ...tauriOptions } = options;
-    const rest: Rest = Object.keys(tauriOptions).length > 0 ? [args, tauriOptions] : args === undefined ? [] : [args];
+    if (options === undefined) return bound(cmd, [args], COMMAND_DEADLINES_MS[cmd], undefined);
+    const { deadlineMs, signal, headers } = options;
+    const rest: Rest = headers !== undefined ? [args, { headers }] : args === undefined ? [] : [args];
     return bound(cmd, rest, deadlineMs ?? COMMAND_DEADLINES_MS[cmd], signal);
   };
 

@@ -67,6 +67,8 @@
     type RailEntry,
   } from "../diff/fileRail";
   import { buildCommitRail, type CommitEntry } from "../diff/commitRail";
+  import { createCommitPicker, type CommitFilesRead } from "../diff/commitPick";
+  import { formatError } from "../ui/formatError";
   import { invoke } from "../ipc/invoke";
   import {
     ArrowDownWideNarrow,
@@ -695,7 +697,9 @@
    * empty and the rail would silently render nothing, which looks exactly
    * like a commit that touched one file.
    */
-  let fetchedFiles = $state<{ commitId: string; files: CommitFileChange[] } | null>(null);
+  let fetchedFiles = $state<CommitFilesRead | null>(null);
+  /** Bumped by Retry so the effect below asks again for a commit whose list failed. */
+  let filesRetry = $state(0);
   /** Last commit this effect asked for. A plain `let`, never $state. */
   let fetchedFor: string | null = null;
   let filesGuard: AsyncGuard | null = null;
@@ -703,6 +707,7 @@
   $effect(() => {
     const repo = $currentRepoPath;
     const commitId = currentCommitId;
+    void filesRetry;
     // Nothing to fetch when there is no commit, or when the graph store's
     // details already cover this one.
     if (!repo || !commitId || details?.id === commitId) return;
@@ -718,12 +723,13 @@
           commitId,
         });
         if (!guard.isLive()) return;
-        fetchedFiles = { commitId, files };
-      } catch {
-        // The rail is an aid, not the content. A failed list leaves the diff
-        // itself untouched and simply renders no rail, rather than pushing an
-        // error banner over a file the reader can already see.
-        if (guard.isLive()) fetchedFiles = { commitId, files: [] };
+        fetchedFiles = { commitId, files, error: null };
+      } catch (error) {
+        // The rail is an aid, not the content: the diff itself stays as it
+        // is. But a failed list is not an empty one, so it is recorded as an
+        // error (shown beside the rail, with a retry) rather than cached as
+        // "no files" for good.
+        if (guard.isLive()) fetchedFiles = { commitId, files: null, error: formatError(error) };
       }
     })();
   });
@@ -738,6 +744,16 @@
     if (fetchedFiles?.commitId === commitId) return fetchedFiles.files;
     return null;
   });
+
+  /** Why this commit's file list is missing, when its read failed. */
+  const filesError = $derived(
+    fetchedFiles?.commitId === $repoStore.selectedCommitId ? fetchedFiles?.error ?? null : null,
+  );
+
+  function retryCommitFiles(): void {
+    fetchedFor = null;
+    filesRetry += 1;
+  }
 
   const rail = $derived(
     buildFileRail({
@@ -876,29 +892,17 @@
    * commit's file, so the first changed file is opened with it — the reader
    * asked to look at this change, not to be told it is selected.
    */
+  const pickCommitId = createCommitPicker({
+    repo: () => $repoStore.currentPath,
+    listFiles: (repo, commitId) => invoke<CommitFileChange[]>("cmd_get_commit_files", { repoPath: repo, commitId }),
+    cached: (commitId) => (fetchedFiles?.commitId === commitId ? fetchedFiles.files : null),
+    remember: (read) => (fetchedFiles = read),
+    openFile: (commitId, path) => void repoStore.selectCommitFileDiff(commitId, path),
+    openCommit: (commitId) => void repoStore.selectCommitDiff(commitId),
+  });
+
   async function pickCommit(entry: CommitEntry): Promise<void> {
-    const repo = $repoStore.currentPath;
-    if (!repo) return;
-    let files = fetchedFiles?.commitId === entry.id ? fetchedFiles.files : null;
-    if (!files) {
-      try {
-        files = await invoke<CommitFileChange[]>("cmd_get_commit_files", {
-          repoPath: repo,
-          commitId: entry.id,
-        });
-        fetchedFiles = { commitId: entry.id, files };
-      } catch {
-        files = [];
-      }
-    }
-    const first = files[0];
-    if (!first) {
-      // A commit that changed nothing (an empty or a merge with no diff) has
-      // no file to open; show the whole commit rather than nothing at all.
-      void repoStore.selectCommitDiff(entry.id);
-      return;
-    }
-    void repoStore.selectCommitFileDiff(entry.id, first.path);
+    await pickCommitId(entry.id);
   }
 
   /** Reuse the same working-tree preview as the workspace's change counts. */
@@ -1205,7 +1209,20 @@
   });
 
   const pending = $derived($repoStore.selectedDiffPending);
-  const showEmpty = $derived(!pending && lines.length === 0);
+  /** Why the selected diff could not be read; per selection, not the repository's `error`. */
+  const diffError = $derived($repoStore.selectedDiffError);
+  const showEmpty = $derived(!pending && !diffError && lines.length === 0);
+
+  /** Asks again for the selection whose read failed, through the same store call that failed. */
+  function retryDiff(): void {
+    const { selectedCommitId: commitId, selectedFilePath: path, selectedIsStaged: staged, selectionKind } = $repoStore;
+    if (selectionKind === "range" && path) {
+      const [from, to] = path.split("...");
+      if (from && to) void repoStore.selectRangeDiff(from, to);
+    } else if (commitId && path) void repoStore.selectCommitFileDiff(commitId, path);
+    else if (commitId) void repoStore.selectCommitDiff(commitId);
+    else if (path) void repoStore.selectFileDiff(path, staged);
+  }
 </script>
 
 <!-- Root-level: `svelte:window` may not sit inside a block, and the
@@ -1587,6 +1604,12 @@
        an image, and a pending fetch. Before this, each of those replaced the
        whole pane, so a clean merge or a `.png` left the reader with no way to
        reach the next file except by leaving for the Graph. -->
+  {#if filesError}
+    <div class="flex shrink-0 items-center gap-2 border-b border-border/60 bg-surface/60 px-3 py-1 font-sans text-[11px] text-amber-500" role="status">
+      <span class="min-w-0 truncate">Could not list this commit's files: {filesError}</span>
+      <button type="button" class="gp-btn shrink-0 text-xs py-0.5 px-2" onclick={retryCommitFiles}>Retry</button>
+    </div>
+  {/if}
   <div class="relative flex min-h-0 flex-1 overflow-hidden">
     {#if railOpen && hasRail}
       <DiffFileRail
@@ -1609,7 +1632,7 @@
 
     <div class="flex min-w-0 flex-1 flex-col">
       <!-- Where you are, when the file's own header has scrolled away. -->
-      {#if currentSection && !showingImage && !showEmpty && !pending && (outline.files.length > 1 || currentHunk)}
+      {#if currentSection && !showingImage && !showEmpty && !pending && !diffError && (outline.files.length > 1 || currentHunk)}
         <div
           class="flex shrink-0 select-none items-center gap-2 border-b border-border/60 bg-surfaceHover/60 px-3 py-0.5 font-sans text-[10px] text-textMuted"
         >
@@ -1642,6 +1665,11 @@
           >
             <Loader2 size={14} class="animate-spin" />
             <span>Reading the diff…</span>
+          </div>
+        {:else if diffError}
+          <div class="flex flex-1 flex-col items-center justify-center gap-2 px-4 text-center font-sans" role="alert">
+            <span class="text-[11px] text-amber-500">Could not read this diff: {diffError}</span>
+            <button type="button" class="gp-btn text-xs py-1 px-2.5" onclick={retryDiff}>Retry</button>
           </div>
         {:else if showingImage}
           <!-- Deferred: only an image diff reaches this pane, so it does not
@@ -1699,7 +1727,7 @@
 
         <!-- Minimap: ticks, file boundaries and the viewport band, all
              projected from the list actually on screen. -->
-        {#if ticks.length > 0 && !showingImage && !showEmpty && !pending}
+        {#if ticks.length > 0 && !showingImage && !showEmpty && !pending && !diffError}
           <!-- svelte-ignore a11y_no_static_element_interactions -->
           <!-- Justified: pointer-only by design, and marked presentation so
                assistive tech skips it. Everything it does has a keyboard

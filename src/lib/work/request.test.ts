@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { describe, expect, it } from "vitest";
 import { WORK_TIMEOUT_MS, workTimeout } from "./request";
 
 describe("workTimeout", () => {
