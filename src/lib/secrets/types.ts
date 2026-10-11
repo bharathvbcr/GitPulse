@@ -24,8 +24,8 @@ export interface SecretFinding {
   rule_name: string;
   /** Repo-relative, `/`-separated (absolute only for `outside`). */
   path: string;
-  /** 1-based; 0 when Kingfisher reported none. */
-  line: number;
+  /** 1-based; null when Kingfisher reported none. */
+  line: number | null;
   /** `low` | `medium` | `high`, or empty. */
   confidence: string;
   location: SecretLocation;
@@ -43,6 +43,8 @@ export interface SecretsReport {
   diagnostic?: string | null;
   kingfisher_present: boolean;
   kingfisher_version?: string | null;
+  /** The scan output named a version that was refused; see `kingfisher_version`. */
+  kingfisher_version_rejected: boolean;
   nested_repos_scanned: boolean;
   completeness: ScanCompleteness;
   findings: SecretFinding[];
@@ -122,7 +124,7 @@ export function parseSecretsReport(value: unknown): SecretsReport {
       rule_id,
       rule_name: typeof f.rule_name === "string" ? f.rule_name : "",
       path,
-      line: count(f.line),
+      line: typeof f.line === "number" && Number.isInteger(f.line) && f.line > 0 ? f.line : null,
       confidence: typeof f.confidence === "string" ? f.confidence : "",
       location,
       secret_group: count(f.secret_group),
@@ -146,6 +148,7 @@ export function parseSecretsReport(value: unknown): SecretsReport {
     kingfisher_present: raw.kingfisher_present === true,
     kingfisher_version:
       typeof raw.kingfisher_version === "string" ? raw.kingfisher_version : null,
+    kingfisher_version_rejected: raw.kingfisher_version_rejected === true,
     nested_repos_scanned: raw.nested_repos_scanned !== false,
     completeness,
     findings,

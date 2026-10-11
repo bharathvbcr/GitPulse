@@ -467,28 +467,63 @@ fn clean_branch_components(name: &str) -> String {
         .join("/")
 }
 
-/// Removes `<think>…</think>` blocks, including one left unclosed by a
-/// truncated reply.
-pub fn strip_think_tags(raw: &str) -> String {
+/// A reply with its reasoning removed.
+pub struct VisibleReply {
+    pub text: String,
+    /// The reply opened a `<think>` it never closed and nothing answerable
+    /// came before it: the model ran out inside its reasoning.
+    pub ended_in_reasoning: bool,
+}
+
+/// Removes reasoning from a reply.
+///
+/// Closed `<think>…</think>` blocks go. Text before an unclosed `<think>` is
+/// kept and the remainder dropped as reasoning. An orphan `</think>` with no
+/// opener (templates that put `<think>` in the prompt) ends reasoning that
+/// began before the reply, so everything up to it goes and the answer after it
+/// stays.
+pub fn split_think(raw: &str) -> VisibleReply {
+    const OPEN: &str = "<think>";
+    const CLOSE: &str = "</think>";
     let mut out = String::with_capacity(raw.len());
     let mut rest = raw;
     loop {
-        match rest.find("<think>") {
-            Some(start) => {
+        let open = rest.find(OPEN);
+        let close = rest.find(CLOSE);
+        match (open, close) {
+            (open, Some(close)) if open.is_none_or(|o| close < o) => {
+                out.clear();
+                rest = &rest[close + CLOSE.len()..];
+            }
+            (Some(start), _) => {
                 out.push_str(&rest[..start]);
-                let after = &rest[start + "<think>".len()..];
-                match after.find("</think>") {
-                    Some(end) => rest = &after[end + "</think>".len()..],
-                    // Unclosed: the whole remainder is thinking.
-                    None => return out.trim().to_string(),
+                let after = &rest[start + OPEN.len()..];
+                match after.find(CLOSE) {
+                    Some(end) => rest = &after[end + CLOSE.len()..],
+                    None => {
+                        let text = out.trim().to_string();
+                        let ended_in_reasoning = text.is_empty();
+                        return VisibleReply {
+                            text,
+                            ended_in_reasoning,
+                        };
+                    }
                 }
             }
-            None => {
+            (None, _) => {
                 out.push_str(rest);
-                return out.trim().to_string();
+                return VisibleReply {
+                    text: out.trim().to_string(),
+                    ended_in_reasoning: false,
+                };
             }
         }
     }
+}
+
+/// [`split_think`]'s text alone.
+pub fn strip_think_tags(raw: &str) -> String {
+    split_think(raw).text
 }
 
 fn strip_code_fence(text: &str) -> String {
@@ -574,6 +609,30 @@ mod tests {
         assert_eq!(strip_think_tags("<think>plan</think>feat: x"), "feat: x");
         assert_eq!(strip_think_tags("answer <think>tail"), "answer");
         assert_eq!(strip_think_tags("plain"), "plain");
+    }
+
+    #[test]
+    fn an_orphan_close_tag_drops_the_reasoning_before_it() {
+        assert_eq!(
+            strip_think_tags("plan the message</think>\n\nfeat: x"),
+            "feat: x"
+        );
+        // A closed block followed by an orphan close: the answer still wins.
+        assert_eq!(
+            strip_think_tags("<think>a</think>b</think>feat: y"),
+            "feat: y"
+        );
+        assert!(!split_think("reasoning</think>").ended_in_reasoning);
+        assert_eq!(strip_think_tags("reasoning</think>"), "");
+    }
+
+    #[test]
+    fn a_reply_that_ends_inside_its_reasoning_is_flagged() {
+        assert!(split_think("<think>still going").ended_in_reasoning);
+        assert!(split_think("  <think>").ended_in_reasoning);
+        // Text before the opener is an answer, not a lost one.
+        assert!(!split_think("answer <think>tail").ended_in_reasoning);
+        assert!(!split_think("").ended_in_reasoning);
     }
 
     #[test]
