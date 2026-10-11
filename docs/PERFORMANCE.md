@@ -267,6 +267,19 @@ skipped.**
   bounding the count by the measured window; reproduced and verified with
   `CARGO_LLVM_COV=1`, and a gate with its rate cap removed still fails.
 
+**Since that run, main is red again.** The host-load governor merge (`0d5f63a1`,
+ft-5d8b201f) was branched before the wave-4/5 contract guards, and on the merged
+tree (`c2fc9679`) four Rust guards fail (4,474 passed, 4 failed) and the
+`uncommitted` browser harness fails in Chrome and WebKit:
+`acl_contract` (the frontend calls `cmd_host_load_settings`,
+`cmd_host_load_settings_save`, `cmd_host_load_status` and
+`cmd_host_load_terminate_orphan`, none granted to the main window),
+`hermetic_contract` twice (`tests/host_load_soak.rs` is not hermetic;
+`sysload/snapshot.rs:1139` has a raw wall-clock loop), `supervised_threads`
+(`sysload/sampler.rs` starts a raw thread), and the harness's "No unexpected
+commands" check (`cmd_host_load_status`). Tracked on the board as
+gp-host-load-governor-integration.
+
 Not covered by `ci:local` at all: see the README's `ci:local` row (no `bun
 audit`, `cargo deny`, Go jobs, scheduled workflows, or Linux/Windows builds).
 
