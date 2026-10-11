@@ -23,6 +23,7 @@
 <script lang="ts">
   import { untrack } from "svelte";
   import { currentRepoPath, repoStore } from "../stores/repoStore";
+  import { invoke } from "../ipc/invoke";
   import { runManviAction } from "../terminal/manviAction";
   import {
     Percent,
@@ -747,7 +748,7 @@
     const runId = ++nextRunId;
     stepResults[step.id] = { running: true, runId };
     try {
-      return await runStepOnce(step, repoPath, guard, runId);
+      return await runStepOnce(step, step.argv, repoPath, guard, runId);
     } finally {
       const row = stepResults[step.id];
       if (row?.runId === runId && row.running) stepResults[step.id] = { running: false };
@@ -756,6 +757,7 @@
 
   async function runStepOnce(
     step: RunnableStep,
+    argv: string[],
     repoPath: string,
     guard: AsyncGuard,
     runId: number,
@@ -765,7 +767,7 @@
     try {
       const res = await runManviAction({
         repoPath,
-        argv: step.argv,
+        argv,
         actionKind: "coverage",
         journalKind: "coverage-step",
         label: actionLabel,

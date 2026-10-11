@@ -83,7 +83,7 @@ describe("CoverageViewer MANVI integration contracts", () => {
     // its own origin.
     expect(source).toContain("runManviAction({");
     expect(source).toContain('actionKind: "coverage"');
-    expect(source).toContain("argv: step.argv,");
+    expect(source).toContain("argv,\n        actionKind: \"coverage\",");
     expect(source).not.toContain('"cmd_manvi_run_action"');
   });
 
