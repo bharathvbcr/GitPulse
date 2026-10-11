@@ -578,7 +578,7 @@
           model's suggestions are not a seventh section; they live inside assist.
         -->
         <div class="steps">
-          {#if current}<TaskVerification taskId={current.id} revision={current.revision} />{/if}
+          {#if current}<TaskVerification taskId={current.id} revision={current.revision} repositoryPath={$repoStore.currentPath ?? ""} />{/if}
           {#each sections as section (section.id)}
             <section class="step" data-editor-section={section.id} data-assist-open={section.id === "assist" ? String(assistChrome.open) : undefined}>
               <div class="step-head">

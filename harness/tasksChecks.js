@@ -71,6 +71,8 @@ let mergeFailSource = "";
 let failList = false, corruptSave = false, loseSave = false, holdSave = false, releaseSave, holdSearch = false, heldSearch = [], holdGet = false, releaseGet;
 const receipts = new Map(), proposals = new Map(), enhancementWrites = [], enhancementReads = [];
 const verdicts = new Map(), verdictReads = [];
+let verifyOptIn = false;
+const verifyPosts = [];
 let failConfiguration = false, blankConfiguration = false, loseEnhancement = false, holdDelete = false, releaseDelete;
 // Relinking a moved checkout and importing tab groups (see the end of the run).
 let pickFolderResult = null, registerUnknown = false, loseRelink = false;
@@ -79,6 +81,9 @@ const missingCheckouts = new Set(), uncheckableCheckouts = new Set();
 // What `repoStore.openRepo` asks the host for, answered the way an empty,
 // healthy repository would. Only the tab-group checks open tabs.
 const fixtureRepoCommands = {
+  cmd_note_tab_activated: () => null,
+  cmd_verify_status_enabled: () => verifyOptIn,
+  cmd_verify_status_post: a => { verifyPosts.push(a); return { sha: "0123456789abcdef0123456789abcdef01234567", state: "success", description: "", dry_run: false, status_posted: true, commented: [], comment_note: null, would_run: [] }; },
   cmd_resolve_repo: a => ({ path: a.repoPath, name: a.repoPath.split("/").pop(), is_bare: false }),
   // A task terminal opens the checkout holding the attempt's directory; the
   // fixture's directories are checkout roots.
@@ -582,6 +587,25 @@ if (params.has("check")) {
     check("the task sheet shows the verdict, a Verify action and the refine action",
       editor().querySelector('[data-testid="verification-chip"]').dataset.state === "passed"
       && Boolean(editor().querySelector('[data-testid="task-verify"]')) && Boolean(editor().querySelector('[data-testid="task-refine-ask"]')));
+    // Post verify result: off until the repository opted in, and it asks first.
+    const postButton = () => editor().querySelector('[data-testid="task-verify-post"]');
+    check("Post verify result is disabled while the repository has not opted in", Boolean(postButton()) && postButton().disabled === true && verifyPosts.length === 0);
+    // The sheet posts for the repository tab the person has open.
+    await click("Close task details"); await settle();
+    await repoStore.openRepo("/fixture/GitPulse", { activate: true }); verifyOptIn = true;
+    card("task-1").click(); await wait(editor);
+    await wait(() => postButton() && postButton().disabled === false);
+    check("Post verify result is enabled once the repository opted in", postButton().disabled === false);
+    postButton().click(); await settle();
+    const postPrompt = [...document.querySelectorAll('[role="dialog"]')].find(node => node.getAttribute("aria-label") === "Post verify result?");
+    check("posting asks for confirmation and sends nothing before the answer", Boolean(postPrompt) && verifyPosts.length === 0);
+    button("Cancel", postPrompt)?.click(); await settle();
+    check("cancelling the confirmation posts nothing", verifyPosts.length === 0);
+    postButton().click(); await settle();
+    button("Post to GitHub", [...document.querySelectorAll('[role="dialog"]')].find(node => node.getAttribute("aria-label") === "Post verify result?"))?.click(); await settle(100);
+    check("confirming posts that task once, not as a dry run", verifyPosts.length === 1 && verifyPosts[0].taskId === "task-1" && verifyPosts[0].dryRun === false);
+    verifyOptIn = false;
+    await repoStore.removeRepo("/fixture/GitPulse");
     verdicts.delete("task-1");
     const title = field("Title"); await change(title, "Unsaved task title");
     confirmations = 0;

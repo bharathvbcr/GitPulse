@@ -74,7 +74,7 @@ describe("the store the record describes", () => {
     expect(store, "the migration ladder must end in a supported-version check").toContain(
       "if version != WORKBENCH_SCHEMA {",
     );
-    expect(terminal, "the store must name the schema it opens").toBe("12");
+    expect(terminal, "the store must name the schema it opens").toBe("13");
     expect(record).toContain(`Schema version is **${terminal}**.`);
   });
 

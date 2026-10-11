@@ -1,5 +1,6 @@
-//! Upgrading a real profile to the current dc-store schema (12; the 10 → 11
-//! step archives Done tasks, 11 → 12 adds refinement proposals), end to end,
+//! Upgrading a real profile to the current dc-store schema (13; the 10 → 11
+//! step archives Done tasks, 11 → 12 adds refinement proposals, 12 → 13 shortens
+//! request receipts), end to end,
 //! through the host GitPulse runs.
 //!
 //! Ignored by default: it needs a profile that was written by real use, which
@@ -179,7 +180,7 @@ fn a_real_profile_upgrades_to_the_current_schema_and_keeps_everything_it_held() 
     let before = read_before(&path);
     assert!(
         matches!(before.version, 10 | 11),
-        "this checks the 10 → 12 and 11 → 12 upgrades; the copy is at {}",
+        "this checks the 10 → 13 and 11 → 13 upgrades; the copy is at {}",
         before.version
     );
 
@@ -195,7 +196,7 @@ fn a_real_profile_upgrades_to_the_current_schema_and_keeps_everything_it_held() 
         .query_row("SELECT version FROM work_meta WHERE id=1", [], |r| r.get(0))
         .unwrap();
     assert_eq!(version, crate::workbench::WORKBENCH_SCHEMA);
-    assert_eq!(version, 12);
+    assert_eq!(version, 13);
 
     // Every Done task, and only those, is in the archive, most recently
     // completed first, with the completion its own history records.
@@ -379,12 +380,12 @@ fn list_inbox(host: &WorkbenchState) -> Result<Value, crate::workbench::Workbenc
     )
 }
 
-/// The 11 → 12 step, which a fixture can stand in for: it only moves the
-/// version (refinement proposals add no table). A profile Manvi's dc-store
-/// left at 12 is what a host built at 11 refuses, which is why GitPulse
-/// vendors schema 12.
+/// The 11 → 12 and 12 → 13 steps, which a fixture can stand in for: they only
+/// move the version (refinement proposals and short receipts add no table). A
+/// profile Manvi's dc-store left at 13 is what a host built at 12 refuses, which
+/// is why GitPulse vendors schema 13.
 #[test]
-fn a_schema_11_profile_upgrades_to_12_and_keeps_its_tasks() {
+fn a_schema_11_profile_upgrades_to_13_and_keeps_its_tasks() {
     let (_dir, path) = super::tests::profile();
     let repo = super::tests::git_repo();
     let created = {
@@ -400,7 +401,7 @@ fn a_schema_11_profile_upgrades_to_12_and_keeps_its_tasks() {
         .unwrap();
         placed.item.unwrap()
     };
-    assert_eq!(profile_version(&path), 12);
+    assert_eq!(profile_version(&path), 13);
 
     Connection::open(&path)
         .unwrap()
@@ -408,7 +409,7 @@ fn a_schema_11_profile_upgrades_to_12_and_keeps_its_tasks() {
         .unwrap();
     let upgraded = host_on(&path);
     let listed = list_inbox(&upgraded).unwrap();
-    assert_eq!(profile_version(&path), 12);
+    assert_eq!(profile_version(&path), 13);
     let titles: Vec<&str> = listed["items"]
         .as_array()
         .unwrap()

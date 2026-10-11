@@ -87,6 +87,22 @@ before that tag is pushed.
   hook judges the command itself as before, and never allows what that path
   would refuse. The mailbox's peer check now covers the connecting side too.
 
+- Post a task's verification verdict to GitHub as the `devcouncil/verify` commit
+  status for the verified commit, and optionally as a pull-request comment,
+  through your own `gh` login (`gh api`; GitPulse never reads the token). Off
+  for every repository until you turn it on, and only from a desktop command:
+  no MCP tool posts. A verdict that was not recorded, could not run, did not
+  settle, or covered a worktree with uncommitted changes posts `error`, never
+  `success`; a verdict that cannot be tied to the commit posts nothing. Posts
+  carry counts and criterion numbers only, never command output, environment,
+  diff text or criterion text. A dry run shows what would be sent. The task
+  sheet has a "Post verify result" action beside Verify: disabled until the
+  repository has opted in (and while the setting cannot be read), and it asks
+  before anything is sent. Every `gh` call it makes now passes the command gate
+  and is recorded in the ledger like each other `gh` mutation, and runs through
+  the one `gh` runner the GitHub actions use. The main window is granted the
+  three `cmd_verify_status_*` commands the sheet calls (without the grant the
+  app ACL refused them at runtime).
 - An agent's `done` that is held in review for lack of a passing verification
   now starts that verification itself (one per task and head, at most two at a
   time, off the MCP response path) and moves the card to done when Manvi's
@@ -104,6 +120,17 @@ before that tag is pushed.
   applies only what you select, at the revision you reviewed: a task that
   changed since is refused and re-read. Nothing Manvi proposes is applied
   automatically, and a sidecar that is down is an error, never an empty scan.
+
+### Changed
+
+- Workbench store at scale (dc-store re-vendored from DevCouncil `40b6bbbf`):
+  finding a repository by identity and reading a task's last revision are one
+  store request each (they paged 23 and 25 times at 5,000 repositories and
+  5,000 revisions, and failed past 10,000), a request receipt no longer copies
+  the record body, `events.list` and `items.history` bound their per-page count
+  (`total_exact` says when `total` is a floor), and a newly created profile is
+  `auto_vacuum=INCREMENTAL` so `store.compact` gives pages back. A profile that
+  already exists keeps its size until a full `VACUUM`. The workbench profile is now schema 13 (short receipts: a schema 12 host refuses it with `schema_unsupported`); the upgrade runs on the first write, after the backup, as for earlier schemas.
 
 ### Fixed
 

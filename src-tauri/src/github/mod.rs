@@ -1224,7 +1224,7 @@ fn fetch_alerts_worst_first(
 /// ("unknown flag"), which used to fail every Dependabot fetch. No repo flag
 /// is needed because the REST endpoint path already names the repository;
 /// hostname pinning still matters for GitHub Enterprise remotes.
-fn api_host_flags(remote: &GitHubRepoRef) -> Vec<String> {
+pub(crate) fn api_host_flags(remote: &GitHubRepoRef) -> Vec<String> {
     if remote.host.eq_ignore_ascii_case("github.com") {
         Vec::new()
     } else {

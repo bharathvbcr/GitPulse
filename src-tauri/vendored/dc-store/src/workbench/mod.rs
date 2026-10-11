@@ -27,7 +27,7 @@ const SCHEMA: &str = include_str!("schema.sql");
 /// version is refused, so every host sharing a profile must be built at the
 /// same one; `dcstore --version` reports it so a host can check that before
 /// handing a profile to a store it did not build.
-pub const WORKBENCH_SCHEMA: i64 = 12;
+pub const WORKBENCH_SCHEMA: i64 = 13;
 const MAX_INTEGER: i64 = 9_007_199_254_740_990;
 // Reserve envelope/cursor space within a 2 MiB response. The collector stops
 // fetching rows at this bound, including for full revision and event documents.
@@ -401,6 +401,14 @@ fn migrate_step(conn: &Connection, from: i64) -> Result<()> {
             // hosts must refuse this profile.
             conn.execute("UPDATE work_meta SET version=12 WHERE id=1", [])?;
         }
+        12 => {
+            // A request's receipt keeps its sequence instead of a copy of the
+            // response, and a retry rebuilds the response from the event. A
+            // schema 12 host would replay that short receipt verbatim as the
+            // response, so older hosts must refuse this profile. Receipts
+            // already stored in full keep replaying as written.
+            conn.execute("UPDATE work_meta SET version=13 WHERE id=1", [])?;
+        }
         other => {
             return Err(Error {
                 code: "schema_unsupported",
@@ -539,7 +547,7 @@ fn mutate(input: &Input<'_>, method: &str, now: i64, now_ms: i64) -> Result<Stri
                 message: "this launch claim was already consumed; inspect the run instead of spawning again".into(),
             });
         }
-        return Ok(response);
+        return replay_response(input.conn, &response);
     }
     let id = input.id("id")?;
     let expected = input.integer("expected_revision", None, MAX_INTEGER)?;
@@ -678,9 +686,46 @@ fn mutate(input: &Input<'_>, method: &str, now: i64, now_ms: i64) -> Result<Stri
     };
     input.conn.execute(
         "INSERT INTO work_requests(id,method,input,response,sequence) VALUES(?1,?2,?3,?4,json_extract(?4,'$.sequence'))",
-        params![request, method, normalized, response],
+        params![request, method, normalized, receipt_response(input.conn, &response)?],
     )?;
     Ok(response)
+}
+
+/// What a request's receipt keeps of its response. The response is the event's
+/// payload (the record's body) plus `ok` and `sequence`, and the event is kept
+/// at least as long as any receipt pointing at it, so the receipt keeps only
+/// the sequence and the one field that is not in the event: the body is stored
+/// once there, not a second time here. [`replay_response`] puts it back.
+fn receipt_response(conn: &Connection, response: &str) -> Result<String> {
+    Ok(conn.query_row(
+        "SELECT json_object('ok',json('true'),'sequence',json_extract(?1,'$.sequence'),'replay','event','automatic_enhancement_queued',json_extract(?1,'$.automatic_enhancement_queued'))",
+        [response],
+        |r| r.get(0),
+    )?)
+}
+
+/// The response a receipt stands for: the stored one as written by an earlier
+/// build, or one rebuilt from the event it names. A rebuild whose event is gone
+/// fails loudly rather than answering a retry with something else.
+fn replay_response(conn: &Connection, stored: &str) -> Result<String> {
+    let marked: bool = conn.query_row(
+        "SELECT coalesce(json_extract(?1,'$.replay')='event',0)",
+        [stored],
+        |r| r.get(0),
+    )?;
+    if !marked {
+        return Ok(stored.to_string());
+    }
+    conn.query_row(
+        "SELECT CASE WHEN json_extract(?1,'$.automatic_enhancement_queued') IS NULL THEN base ELSE json_set(base,'$.automatic_enhancement_queued',json(CASE WHEN json_extract(?1,'$.automatic_enhancement_queued') THEN 'true' ELSE 'false' END)) END FROM (SELECT json_set(e.payload,'$.ok',json('true'),'$.sequence',e.sequence) AS base FROM work_events e WHERE e.sequence=json_extract(?1,'$.sequence'))",
+        [stored],
+        |r| r.get(0),
+    )
+    .optional()?
+    .ok_or_else(|| Error {
+        code: "receipt_unreadable",
+        message: "the event this request's receipt names is gone; the original response cannot be replayed".into(),
+    })
 }
 
 /// Refuses to delete a task a run may still be working on: one that is
@@ -1156,7 +1201,7 @@ fn read(input: &Input<'_>, method: &str, now: i64) -> Result<String> {
         "decisions.get" => decisions::get(input, now),
         "decisions.list" => decisions::list(input, now),
         "workspaces.get" => get(input, Entity::Workspace),
-        "repositories.get" => get(input, Entity::Repository),
+        "repositories.get" => get_repository(input),
         "items.get" => get(input, Entity::Item),
         "items.brief.get" => briefs::get(input),
         "enhancements.get" => get(input, Entity::Enhancement),
@@ -1187,6 +1232,28 @@ fn get(input: &Input<'_>, entity: Entity) -> Result<String> {
     input.fields(&["id"])?;
     let id = input.id("id")?;
     input.conn.query_row(&format!("SELECT json_object('ok',json('true'),'item',json(body)) FROM {} WHERE id=?1 AND {}",entity.table(),entity.live()),[id],|r|r.get(0)).optional()?.ok_or_else(Error::missing)
+}
+
+/// `repositories.get` by `id`, or by `identity_key` through the UNIQUE index on
+/// it, so a host that knows a repository only by identity asks once instead of
+/// paging the whole registry. Exactly one of the two.
+fn get_repository(input: &Input<'_>) -> Result<String> {
+    input.fields(&["id", "identity_key"])?;
+    let Some(identity) = input.text("identity_key", 4096)? else {
+        return get(input, Entity::Repository);
+    };
+    if input.kind("id")?.is_some() {
+        return Err(Error::invalid("give id or identity_key, not both"));
+    }
+    input
+        .conn
+        .query_row(
+            "SELECT json_object('ok',json('true'),'item',json(body)) FROM work_repositories WHERE identity_key=?1",
+            [identity],
+            |r| r.get(0),
+        )
+        .optional()?
+        .ok_or_else(Error::missing)
 }
 
 struct Page {
@@ -1712,6 +1779,32 @@ mod item_query_tests;
 #[cfg(test)]
 mod logs_tests;
 
+/// The most rows a page's `total` counts past its own. A listing of a log that
+/// only grows must not walk all of it to answer every page.
+const TOTAL_CAP: i64 = 10_000;
+
+/// Rows matching `from_where` beyond a page, counted at most `cap` of them.
+/// `(total, exact)`: a last page needs no count (it is what it shows), and a
+/// count that reached `cap` is a floor, said so by `exact = false`.
+fn bounded_total(
+    conn: &Connection,
+    from_where: &str,
+    args: &[&dyn rusqlite::ToSql],
+    shown: i64,
+    has_more: bool,
+    cap: i64,
+) -> Result<(i64, bool)> {
+    if !has_more {
+        return Ok((shown, true));
+    }
+    let counted: i64 = conn.query_row(
+        &format!("SELECT count(*) FROM (SELECT 1 {from_where} LIMIT {cap})"),
+        args,
+        |r| r.get(0),
+    )?;
+    Ok((counted.max(shown), counted < cap))
+}
+
 fn list_events(input: &Input<'_>) -> Result<String> {
     input.fields(&["limit", "after"])?;
     let limit = input.integer("limit", Some(100), 200)?;
@@ -1719,14 +1812,18 @@ fn list_events(input: &Input<'_>) -> Result<String> {
         return Err(Error::invalid("limit must be at least one"));
     }
     let after = input.integer("after", Some(0), MAX_INTEGER)?;
-    let total: i64 = input.conn.query_row(
-        "SELECT count(*) FROM work_events WHERE sequence>?1",
-        [after],
-        |r| r.get(0),
-    )?;
     let mut stmt=input.conn.prepare("SELECT json_object('sequence',sequence,'kind',kind,'entity_id',entity_id,'revision',revision,'at',at,'payload',json(payload)),sequence,'' FROM work_events WHERE sequence>?1 ORDER BY sequence LIMIT ?2")?;
     let rows = collect_page(&mut stmt.query(params![after, limit + 1])?, limit)?;
-    let page = series_response(input.conn, rows, total, after)?;
+    let shown = i64::try_from(rows.records.len()).map_err(|_| Error::invalid("page too large"))?;
+    let (total, exact) = bounded_total(
+        input.conn,
+        "FROM work_events WHERE sequence>?1",
+        &[&after],
+        shown,
+        rows.has_more,
+        TOTAL_CAP,
+    )?;
+    let page = series_response(input.conn, rows, total, exact, after)?;
     // The high-water mark, so a host can name "the board as I scanned it".
     Ok(input.conn.query_row(
         "SELECT json_set(?1,'$.latest_sequence',(SELECT coalesce(max(sequence),0) FROM work_events))",
@@ -1735,22 +1832,66 @@ fn list_events(input: &Input<'_>) -> Result<String> {
     )?)
 }
 
+/// An item's revisions, oldest first from `after_revision`, or with
+/// `newest_first` the newest first from below `before_revision`: the latest
+/// revision is one request of `limit: 1`, not a walk from revision 0.
 fn history(input: &Input<'_>) -> Result<String> {
-    input.fields(&["id", "limit", "after_revision"])?;
+    input.fields(&[
+        "id",
+        "limit",
+        "after_revision",
+        "newest_first",
+        "before_revision",
+    ])?;
     let id = input.id("id")?;
     require_record(input, Entity::Item, Some(&id), true)?;
     let limit = input.integer("limit", Some(100), 200)?;
     if limit == 0 {
         return Err(Error::invalid("limit must be at least one"));
     }
-    let after = input.integer("after_revision", Some(0), MAX_INTEGER)?;
-    let total:i64=input.conn.query_row("SELECT count(*) FROM work_revisions WHERE entity_type='item' AND entity_id=?1 AND revision>?2",params![id,after],|r|r.get(0))?;
-    let mut stmt=input.conn.prepare("SELECT body,revision,'' FROM work_revisions WHERE entity_type='item' AND entity_id=?1 AND revision>?2 ORDER BY revision LIMIT ?3")?;
-    let rows = collect_page(&mut stmt.query(params![id, after, limit + 1])?, limit)?;
-    series_response(input.conn, rows, total, after)
+    let newest_first = input.boolean("newest_first", false)?;
+    if !newest_first && input.kind("before_revision")?.is_some() {
+        return Err(Error::invalid("before_revision needs newest_first"));
+    }
+    if newest_first && input.kind("after_revision")?.is_some() {
+        return Err(Error::invalid(
+            "newest_first pages with before_revision, not after_revision",
+        ));
+    }
+    let (select, bound, from_where) = if newest_first {
+        (
+            "SELECT body,revision,'' FROM work_revisions WHERE entity_type='item' AND entity_id=?1 AND revision<?2 ORDER BY revision DESC LIMIT ?3",
+            input.integer("before_revision", Some(MAX_INTEGER), MAX_INTEGER)?,
+            "FROM work_revisions WHERE entity_type='item' AND entity_id=?1 AND revision<?2",
+        )
+    } else {
+        (
+            "SELECT body,revision,'' FROM work_revisions WHERE entity_type='item' AND entity_id=?1 AND revision>?2 ORDER BY revision LIMIT ?3",
+            input.integer("after_revision", Some(0), MAX_INTEGER)?,
+            "FROM work_revisions WHERE entity_type='item' AND entity_id=?1 AND revision>?2",
+        )
+    };
+    let mut stmt = input.conn.prepare(select)?;
+    let rows = collect_page(&mut stmt.query(params![id, bound, limit + 1])?, limit)?;
+    let shown = i64::try_from(rows.records.len()).map_err(|_| Error::invalid("page too large"))?;
+    let (total, exact) = bounded_total(
+        input.conn,
+        from_where,
+        &[&id, &bound],
+        shown,
+        rows.has_more,
+        TOTAL_CAP,
+    )?;
+    series_response(input.conn, rows, total, exact, bound)
 }
 
-fn series_response(conn: &Connection, page: PageRows, total: i64, after: i64) -> Result<String> {
+fn series_response(
+    conn: &Connection,
+    page: PageRows,
+    total: i64,
+    exact: bool,
+    after: i64,
+) -> Result<String> {
     let cursor = page
         .records
         .last()
@@ -1765,5 +1906,29 @@ fn series_response(conn: &Connection, page: PageRows, total: i64, after: i64) ->
             .collect::<Vec<_>>()
             .join(",")
     );
-    Ok(conn.query_row("SELECT json_object('ok',json('true'),'items',json(?1),'total',?2,'shown',?3,'next_cursor',?4,'has_more',json(CASE WHEN ?5 THEN 'true' ELSE 'false' END))",params![docs,total,shown,cursor,page.has_more],|r|r.get(0))?)
+    Ok(conn.query_row("SELECT json_object('ok',json('true'),'items',json(?1),'total',?2,'total_exact',json(CASE WHEN ?6 THEN 'true' ELSE 'false' END),'shown',?3,'next_cursor',?4,'has_more',json(CASE WHEN ?5 THEN 'true' ELSE 'false' END))",params![docs,total,shown,cursor,page.has_more,exact],|r|r.get(0))?)
+}
+
+#[cfg(test)]
+mod bounded_total_tests {
+    use super::*;
+
+    #[test]
+    fn a_count_that_reaches_the_cap_is_a_floor_not_a_total() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE n(v INTEGER); INSERT INTO n VALUES (1),(2),(3),(4),(5),(6)",
+        )
+        .unwrap();
+        let after = 0_i64;
+        let (total, exact) =
+            bounded_total(&conn, "FROM n WHERE v>?1", &[&after], 2, true, 4).unwrap();
+        assert_eq!((total, exact), (4, false));
+        let (total, exact) =
+            bounded_total(&conn, "FROM n WHERE v>?1", &[&after], 2, true, 100).unwrap();
+        assert_eq!((total, exact), (6, true));
+        // A last page is exact without a count at all (no table needed).
+        let (total, exact) = bounded_total(&conn, "FROM missing", &[], 2, false, 4).unwrap();
+        assert_eq!((total, exact), (2, true));
+    }
 }
