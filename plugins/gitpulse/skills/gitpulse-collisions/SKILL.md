@@ -19,6 +19,6 @@ Coding agents isolate work under `<repo>/.<agent>/worktrees/<slug>`. GitPulse la
 
 If `unscanned_worktrees` is non-zero, the overlap list is incomplete. Do not treat it as "no collision".
 
-If `sessions_ok` is false, some agent kind could not be observed (Codex keeps no registry of running sessions), so an empty `shared_worktrees` is not proof you are alone in your checkout. Each kind in `agents.live.kinds` says whether it was observed; one with `ok: false` is unknown, not zero.
+If `sessions_ok` is false, some agent kind could not be observed (the process table could not be read, a session's directory was unreadable, or — on a platform with no process scan — Codex, which keeps no registry of running sessions), so an empty `shared_worktrees` is not proof you are alone in your checkout. Each kind in `agents.live.kinds` says whether it was observed; one with `ok: false` is unknown, not zero.
 
 A parked merge, rebase, cherry-pick or revert (`operation_kind` on a worktree, or `operation` on change context) is blocked on a person. Do not push more edits into that worktree until it is continued or aborted in GitPulse's Resolve view.

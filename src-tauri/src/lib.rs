@@ -40,6 +40,7 @@ pub mod stack;
 pub mod storage;
 pub mod supervisor;
 pub mod syntax;
+pub mod sysload;
 pub mod tasks;
 pub mod teardown;
 pub mod terminal;
@@ -70,6 +71,31 @@ use logging::{cmd_diagnostic_log_tail, cmd_diagnostic_persisted_log};
 /// real capabilities from the same source `run` uses.
 pub fn context<R: tauri::Runtime>() -> tauri::Context<R> {
     tauri::generate_context!()
+}
+
+/// Starts the app's host-load sampler, emitting each tick's pulse as
+/// `host-load-pulse`. A platform with no sensor, or no config directory,
+/// logs why and runs without one; Health then reports the sensor dead.
+fn start_host_load_sampler<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
+    use tauri::Emitter as _;
+    let Some(dir) = tool_config::default_config_dir() else {
+        log::warn!(target: "host_load", "no per-user config directory; the host-load sampler is not running");
+        return;
+    };
+    let mut options = sysload::SamplerOptions::new(dir);
+    options.enabled = Box::new(|| tool_config::host_load_settings().enabled);
+    let emitter = app.clone();
+    options.on_tick = Some(Box::new(move |pulse| {
+        if let Err(error) = emitter.emit("host-load-pulse", pulse) {
+            log::debug!(target: "host_load", "pulse not delivered: {error}");
+        }
+    }));
+    match sysload::start_app(options) {
+        // Runs for the life of the process; the handle is not needed to stop
+        // it, because the process exiting is what stops it.
+        Ok(handle) => std::mem::forget(handle),
+        Err(error) => log::warn!(target: "host_load", "host-load sampler not started: {error}"),
+    }
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -235,6 +261,11 @@ pub fn run() {
             // centre that failed to install is a fault the status readout has
             // to be able to report rather than a reason to have no worker.
             alerts::start(workbench::notifications::session_host(app.handle()));
+            // The host-load sampler: here and nowhere else, so only the app
+            // process ever samples (`tests/host_load_sampler_scope.rs` pins
+            // that). A second GitPulse beside this one loses the snapshot's
+            // writer election and reads instead.
+            start_host_load_sampler(app.handle());
             alerts::bridge::apply(tool_config::session_alerts().hook_bridge);
             crate::tool_install::set_app_handle(app.handle().clone());
             crate::devmap::set_build_progress_handle(app.handle().clone());
@@ -554,6 +585,10 @@ pub fn run() {
             cmd_session_attention_answered,
             cmd_lappi_settings,
             cmd_lappi_settings_save,
+            cmd_host_load_status,
+            cmd_host_load_terminate_orphan,
+            cmd_host_load_settings,
+            cmd_host_load_settings_save,
             cmd_attempt_review,
             cmd_attempt_review_record,
             cmd_review_gate_save,

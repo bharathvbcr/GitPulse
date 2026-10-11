@@ -298,6 +298,51 @@ describe("wire-shape normalization", () => {
    * this rule no map field could ever agree with its TypeScript twin, so a
    * contract could only cover structs that had none.
    */
+  /**
+   * A generic wire type is its name with each argument read as a wire type.
+   * Before this rule `Reading<u64>` could never agree with TypeScript's
+   * `Reading<number>`, so no contract could cover a struct with one.
+   */
+  it("reads a generic type argument by argument, fixed arrays as homogeneous tuples", () => {
+    const rust = structOf(
+      `pub struct G {
+         pub a: Reading<u64>,
+         pub b: crate::sysload::Reading<String>,
+         pub c: Reading<[f64; 3]>,
+         pub d: Option<Reading<u32>>,
+         pub e: Pair<u8, String>
+       }`,
+      "G",
+    );
+    expect(rust?.get("a")?.type).toBe("Reading<number>");
+    expect(rust?.get("b")?.type).toBe("Reading<string>");
+    expect(rust?.get("c")?.type).toBe("Reading<number[]>");
+    expect(rust?.get("d")?.type).toBe("Reading<number>|null");
+    expect(rust?.get("e")?.type).toBe("Pair<number,string>");
+    const ts = parseTsInterfaces(
+      `export interface G {
+         a: Reading<number>;
+         b: Reading<string>;
+         c: Reading<[number, number, number]>;
+         d: Reading<number> | null;
+         e: Pair<number, string>;
+       }`,
+      ["G"],
+    ).interfaces.get("G")?.props;
+    for (const field of ["a", "b", "c", "d", "e"]) {
+      expect(ts?.get(field)?.type, field).toBe(rust?.get(field)?.type);
+    }
+    // The arguments still count: a different argument, a different name or
+    // a mixed tuple is drift.
+    const wrong = parseTsInterfaces(
+      `export interface G { a: Reading<string>; b: Other<string>; c: Reading<[number, string]>; }`,
+      ["G"],
+    ).interfaces.get("G")?.props;
+    expect(wrong?.get("a")?.type).not.toBe(rust?.get("a")?.type);
+    expect(wrong?.get("b")?.type).not.toBe(rust?.get("b")?.type);
+    expect(wrong?.get("c")?.type).not.toBe(rust?.get("c")?.type);
+  });
+
   it("reads a string-keyed map as the Record its TypeScript twin declares, value type included", () => {
     const rust = structOf(
       `pub struct V {

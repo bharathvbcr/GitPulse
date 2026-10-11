@@ -244,6 +244,43 @@ pub async fn cmd_lappi_settings_save(
     .await
 }
 
+/// Host load as this app sees it: the sensor state with the last-known
+/// pressure and its age, the readings, and — when this process writes the
+/// snapshot — its sessions, launched trees, memguard and orphans
+/// (`docs/LOAD_GOVERNOR.md`).
+#[tauri::command(async)]
+pub async fn cmd_host_load_status() -> Result<crate::sysload::HostLoadStatus, String> {
+    off_thread(|| Ok(crate::sysload::status())).await
+}
+
+/// Sends SIGTERM to a foreign orphan Health listed, after the person clicked
+/// Terminate on it. Every condition is re-checked on the live process first
+/// (`sysload::terminate_orphan`); anything changed refuses. `start_us` is
+/// microseconds since the epoch, well inside a JavaScript number's exact
+/// range.
+#[tauri::command(async)]
+pub async fn cmd_host_load_terminate_orphan(pid: i32, start_us: u64) -> Result<String, String> {
+    off_thread(move || crate::sysload::terminate_orphan(pid, start_us)).await
+}
+
+/// The host-load kill switch, as stored.
+#[tauri::command(async)]
+pub async fn cmd_host_load_settings() -> Result<crate::tool_config::HostLoadSettings, String> {
+    off_thread(|| Ok(crate::tool_config::host_load_settings())).await
+}
+
+/// Stores the kill switch; the sampler publishes it on its next tick.
+#[tauri::command(async)]
+pub async fn cmd_host_load_settings_save(
+    settings: crate::tool_config::HostLoadSettings,
+) -> Result<crate::tool_config::HostLoadSettings, String> {
+    off_thread(move || {
+        crate::tool_config::set_host_load_settings(settings)?;
+        Ok(crate::tool_config::host_load_settings())
+    })
+    .await
+}
+
 /// Whether this repository posts verification results to GitHub. Off until
 /// turned on; an unreadable setting is an error, never a yes.
 #[tauri::command(async)]

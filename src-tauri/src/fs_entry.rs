@@ -819,3 +819,91 @@ mod tests {
         assert!(!source.exists() && target.is_dir());
     }
 }
+
+/// Opens (creating if absent, never truncating) a small per-user record that
+/// several GitPulse processes share — the spawn budget, the host-load
+/// snapshot and its writer lock — refusing one that is not a regular file
+/// this user alone owns and can read.
+///
+/// A symlink planted at the path would otherwise redirect the writes; with
+/// `O_NOFOLLOW` the open fails instead. The owner and mode are checked on the
+/// opened descriptor, not the path, so nothing can be swapped in between.
+pub(crate) fn open_private_record(path: &Path) -> Result<std::fs::File, String> {
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)
+            .map_err(|e| format!("could not create {}: {e}", dir.display()))?;
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true).write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+    }
+    let file = options
+        .open(path)
+        .map_err(|e| format!("could not open {}: {e}", path.display()))?;
+    verify_private_owner(&file, path)?;
+    Ok(file)
+}
+
+/// Opens an existing record [`open_private_record`] wrote, read-only, with the
+/// same refusals. `Ok(None)` when there is no record at `path`: a reader must
+/// never be what creates the file a writer is supposed to own.
+pub(crate) fn open_private_record_readonly(path: &Path) -> Result<Option<std::fs::File>, String> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    let file = match options.open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(format!("could not open {}: {error}", path.display())),
+    };
+    verify_private_owner(&file, path)?;
+    Ok(Some(file))
+}
+
+#[cfg(unix)]
+fn verify_private_owner(file: &std::fs::File, path: &Path) -> Result<(), String> {
+    use std::os::unix::fs::MetadataExt;
+    let meta = file
+        .metadata()
+        .map_err(|e| format!("could not inspect {}: {e}", path.display()))?;
+    if !meta.is_file() {
+        return Err(format!("{} is not a regular file", path.display()));
+    }
+    // SAFETY: geteuid has no preconditions and cannot fail.
+    let me = unsafe { libc::geteuid() };
+    if meta.uid() != me {
+        return Err(format!(
+            "{} is owned by uid {}, not this user (uid {me})",
+            path.display(),
+            meta.uid()
+        ));
+    }
+    if meta.mode() & 0o077 != 0 {
+        return Err(format!(
+            "{} is accessible to other users (mode {:o})",
+            path.display(),
+            meta.mode() & 0o777
+        ));
+    }
+    Ok(())
+}
+
+/// The per-user `APPDATA` directory is already private to its owner.
+#[cfg(not(unix))]
+fn verify_private_owner(file: &std::fs::File, path: &Path) -> Result<(), String> {
+    let meta = file
+        .metadata()
+        .map_err(|e| format!("could not inspect {}: {e}", path.display()))?;
+    if meta.is_file() {
+        Ok(())
+    } else {
+        Err(format!("{} is not a regular file", path.display()))
+    }
+}

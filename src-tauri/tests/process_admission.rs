@@ -3,10 +3,10 @@
 //! holds for the shared spawn budget opt-in, which the unit-test build cannot
 //! even name.
 
-#[path = "../src/test_support/env.rs"]
-mod env;
+mod common;
 
-use std::collections::BTreeSet;
+use common::{env, shipped_binaries};
+
 use std::path::Path;
 
 use gitpulse_lib::engine::git_cli::{
@@ -33,47 +33,6 @@ fn a_background_process_starts_every_thread_in_the_background_class() {
 
 fn manifest_dir() -> &'static Path {
     Path::new(env!("CARGO_MANIFEST_DIR"))
-}
-
-/// Every shipped binary's entry file, relative to the crate, derived two
-/// independent ways that must agree: the `[[bin]]` paths `Cargo.toml` builds,
-/// and the files a binary can live in (`src/main.rs` plus `src/bin/*.rs`). A
-/// `[[bin]]` with a custom path, or a new file in `src/bin/` that Cargo picks
-/// up on its own, fails here instead of escaping the guards below.
-fn shipped_binaries() -> BTreeSet<String> {
-    let manifest = std::fs::read_to_string(manifest_dir().join("Cargo.toml")).unwrap();
-    let mut declared = BTreeSet::new();
-    let mut in_bin = false;
-    for line in manifest.lines().map(str::trim) {
-        if line.starts_with('[') {
-            in_bin = line == "[[bin]]";
-        } else if in_bin {
-            if let Some(path) = line
-                .strip_prefix("path")
-                .map(str::trim_start)
-                .and_then(|rest| rest.strip_prefix('='))
-            {
-                declared.insert(path.trim().trim_matches('"').to_string());
-            }
-        }
-    }
-    let mut on_disk = BTreeSet::from(["src/main.rs".to_string()]);
-    for entry in std::fs::read_dir(manifest_dir().join("src/bin")).unwrap() {
-        let path = entry.unwrap().path();
-        if path.extension().is_some_and(|ext| ext == "rs") {
-            let name = path.file_name().unwrap().to_string_lossy();
-            on_disk.insert(format!("src/bin/{name}"));
-        }
-    }
-    assert_eq!(
-        declared, on_disk,
-        "Cargo.toml's [[bin]] paths and src/main.rs + src/bin/*.rs disagree"
-    );
-    assert!(
-        declared.len() >= 3,
-        "derived only {declared:?}: the walk or the parse is broken"
-    );
-    declared
 }
 
 /// The process-wide switches at the top of `bin`'s `main`: the consecutive

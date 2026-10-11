@@ -119,6 +119,13 @@ export const HEALTH_SECTIONS: readonly HealthSectionSpec[] = Object.freeze([
     heading: "Dead-code candidates",
     summary: "Symbols the code graph found no reference to.",
   },
+  {
+    id: "host-load",
+    label: "Host load",
+    heading: "Host load",
+    summary:
+      "This machine's memory pressure, the agent sessions running on it, and what is using memory — for every repository, not just this one.",
+  },
 ]);
 
 /** Section ids in rendered order. */
