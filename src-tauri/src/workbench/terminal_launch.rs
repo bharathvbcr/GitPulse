@@ -56,15 +56,10 @@ fn parse(input: &str) -> Result<Preparation, WorkbenchError> {
         &request.task_id,
         &request.repository_id,
     ];
-    if ids.iter().any(|id| {
-        id.is_empty()
-            || id.len() > 128
-            || !id
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
-    }) || [request.source_revision, request.repository_revision]
-        .iter()
-        .any(|r| *r == 0 || *r > 9_007_199_254_740_991)
+    if ids.iter().any(|id| !super::is_record_id(id))
+        || [request.source_revision, request.repository_revision]
+            .iter()
+            .any(|r| *r == 0 || *r > 9_007_199_254_740_991)
         || !super::terminal_command::is_terminal_provider(&request.provider)
         || ![
             "inspect",
@@ -678,13 +673,8 @@ pub(super) fn claim(state: &WorkbenchState, input: &str) -> Result<Value, Workbe
         &claim.session_id,
     ]
     .iter()
-    .any(|id| {
-        id.is_empty()
-            || id.len() > 128
-            || !id
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
-    }) || claim.expected_revision == 0
+    .any(|id| !super::is_record_id(id))
+        || claim.expected_revision == 0
         || claim.expected_revision > 9_007_199_254_740_991
     {
         return Err(WorkbenchError::new(
