@@ -702,6 +702,35 @@ if (params.has("check")) {
       && Boolean(primaryRadio().closest(".repo-row")?.querySelector('input[type="checkbox"]')?.checked)
       && repoSummaryText().includes("primary GitPulse")
       && !editor().textContent.includes("Linked repositories"));
+    // Collapsing the list into a dropdown costs nothing only if the closed
+    // trigger still names every link and marks the primary among them, with
+    // the summary sentence kept on screen for what chips cannot say.
+    {
+      const picker = editor().querySelector("[data-task-repo-picker]");
+      const chips = [...picker.querySelectorAll(".repo-trigger .repo-chip")];
+      const primaries = chips.filter(chip => chip.classList.contains("is-primary"));
+      check("the closed trigger names each linked repository and stars the primary",
+        chips.map(chip => chip.textContent.trim()).sort().join() === "GitPulse,Manvi"
+        && primaries.length === 1 && primaries[0].textContent.trim() === "GitPulse" && Boolean(primaries[0].querySelector("svg"))
+        && !chips.find(chip => !chip.classList.contains("is-primary"))?.querySelector("svg")
+        && picker.querySelector('[data-testid="task-repo-summary-line"]')?.textContent.includes("primary GitPulse")
+        && !picker.querySelector(".repo-trigger-label"));
+    }
+    // Tab inside the popup moves focus; Tab off its last control closes it
+    // rather than leaving a floating panel behind the reader's focus.
+    {
+      const focusables = () => [...(repoPopup()?.querySelectorAll("input:not(:disabled), button:not(:disabled)") ?? [])];
+      const tab = (el, shiftKey = false) => { if (!el) return; el.focus(); el.dispatchEvent(new KeyboardEvent("keydown", { key: "Tab", shiftKey, bubbles: true, cancelable: true })); };
+      tab(focusables()[0]); await settle(60);
+      const stayed = Boolean(repoPopup());
+      tab(focusables().at(-1)); await settle(60);
+      check("Tab within the repository dropdown keeps it open; Tab off its last control closes it",
+        stayed && !repoPopup() && Boolean(editor()));
+      await openRepoPicker();
+      tab(focusables()[0], true); await settle(60);
+      check("Shift+Tab off the dropdown's first control closes it too", !repoPopup() && Boolean(editor()));
+      await openRepoPicker();
+    }
     // A popover inside `.sheet-body` would be clipped by the scroller it is
     // trying to escape, so it is portaled — and then clamped into the viewport.
     const popupRect = () => repoPopup()?.getBoundingClientRect();
