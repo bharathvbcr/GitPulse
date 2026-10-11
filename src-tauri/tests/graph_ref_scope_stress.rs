@@ -201,14 +201,29 @@ fn no_scope_walks_history_it_cannot_label() {
             "tagsy/sneaky",
             "cmux/last-turn/abc",
         ] {
-            if let Some(d) = decorations.iter().find(|d| d.name == name) {
-                assert_eq!(
-                    d.kind,
-                    RefKind::Other,
-                    "{scope:?}: {name} was labelled {:?}, not Other",
+            // Where the ref is walked it must be labelled, and labelled
+            // Other; where it is not walked it must carry no label at all.
+            // Either way the condition itself is asserted, so a ref that
+            // vanishes (or appears) in the wrong scope fails here instead of
+            // skipping the kind check.
+            match (scope, decorations.iter().find(|d| d.name == name)) {
+                (RefScope::All, Some(d)) => {
+                    assert_eq!(
+                        d.kind,
+                        RefKind::Other,
+                        "{scope:?}: {name} was labelled {:?}, not Other",
+                        d.kind
+                    );
+                    assert!(!d.is_head, "{scope:?}: {name} must never be marked HEAD");
+                }
+                (RefScope::All, None) => {
+                    panic!("{scope:?}: {name} is walked under All but carries no label")
+                }
+                (RefScope::Named, None) => {}
+                (RefScope::Named, Some(d)) => panic!(
+                    "{scope:?}: {name} is outside the named set yet was labelled {:?}",
                     d.kind
-                );
-                assert!(!d.is_head, "{scope:?}: {name} must never be marked HEAD");
+                ),
             }
         }
         let labelled: HashSet<&str> = decorations.iter().map(|d| d.commit_id.as_str()).collect();

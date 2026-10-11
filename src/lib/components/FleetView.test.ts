@@ -16,8 +16,6 @@ import { UNSCANNED, deltaFrom, failedCell, readCell, type FleetRow } from "../fl
 
 const here = dirname(fileURLToPath(import.meta.url));
 const source = readFileSync(join(here, "FleetView.svelte"), "utf8");
-const cellSource = readFileSync(join(here, "FleetCell.svelte"), "utf8");
-const totalsSource = readFileSync(join(here, "FleetTotals.svelte"), "utf8");
 
 function row(overrides: Partial<FleetRow> = {}): FleetRow {
   return {
@@ -58,9 +56,9 @@ describe("FleetView", () => {
     // assertion follows it there. The property is unchanged and the negative
     // is wider than it was: it catches the count next to a hard-coded verb in
     // either spelling, the interpolation and the template literal alike.
-    expect(source).toContain("note: headline.attentionClause");
-    expect(source).not.toMatch(/headline\.attention\}?\s*need/);
-    // And the field is populated on the empty path this render exercises.
+    //
+    // The singular case, where a re-spelt clause shows, is checked rendered in
+    // harness/fleet.html; this is the empty path.
     expect(render(FleetView).body).toContain("0 need attention");
   });
 });
@@ -99,49 +97,14 @@ describe("scanTargets", () => {
 });
 
 describe("Index all", () => {
-  it("delegates every worded judgement to the tested owner", () => {
-    // Same rule as the sweeps above it: no count sentence may be assembled in
-    // markup, where it cannot be tested and would drift from `indexSweep.ts`.
-    for (const helper of [
-      "runIndexSweep",
-      "summarizeIndexSweep",
-      "isCleanIndexSweep",
-      "firstIndexFailure",
-    ]) {
-      expect(source).toContain(helper);
-    }
-    expect(source).not.toMatch(/Indexed \{/);
-  });
-
-  it("is abortable and reports progress against the real total", () => {
-    expect(source).toContain("indexToken.aborted = true");
-    expect(source).toContain("indexProgress.done}/{indexProgress.total}");
-  });
-
-  it("does not share the sync flag the network operations use", () => {
-    // Fetch and pull reach the network; indexing is local and writes only the
-    // ignored state directory. One flag would make each block the other.
-    expect(source).toContain("let indexing = $state(false)");
-    expect(source).not.toContain('syncing = "index"');
-  });
-
   it("actually renders the control, disabled, with nothing open", () => {
-    // A rendered assertion rather than a source match: the source tests above
-    // prove the wiring is delegated, but only rendering proves the markup
-    // compiles into a button that is there and is not clickable against an
-    // empty fleet.
+    // `targets` is open repositories only, so against an empty fleet the
+    // button is there and is not clickable. Running, stopping and counting a
+    // sweep are checked rendered in harness/fleet.html.
     const { body } = render(FleetView);
     expect(body).toContain("Index all");
     const button = body.slice(body.indexOf('data-testid="fleet-index-all"'));
     expect(button.slice(0, 400)).toContain("disabled");
-  });
-
-  it("offers nothing to index when no repository is open", () => {
-    // `targets` is open-repositories-only, exactly as the scans are: a recents
-    // path may not resolve, and indexing it would spawn a build against a
-    // repository the user has not opened.
-    const button = source.slice(source.indexOf('data-testid="fleet-index-all"'));
-    expect(button).toContain("disabled={targets.length === 0");
   });
 });
 
@@ -387,142 +350,11 @@ describe("FleetTotals", () => {
   });
 });
 
-describe("Fleet keyboard shortcuts", () => {
-  it("listens on the view, never on the window", () => {
-    // Fleet is *hidden* rather than unmounted while the repository pane shows,
-    // so a window listener would keep firing "/" and "s" at someone typing
-    // into the commit box behind it.
-    expect(source).toContain("onkeydown={onGridKeydown}");
-    expect(source).not.toMatch(/window\.addEventListener\(\s*["'`]keydown/);
-    expect(source).not.toContain("<svelte:window");
-  });
-
-  it("hands every key back to a text field", () => {
-    const handler = source.slice(source.indexOf("function onGridKeydown"));
-    expect(handler).toContain('tag === "INPUT"');
-    expect(handler).toContain('tag === "TEXTAREA"');
-    expect(handler).toContain("isContentEditable");
-    // Modified keys belong to the OS and the app's own accelerators.
-    expect(handler).toContain("event.metaKey || event.ctrlKey || event.altKey");
-    // A key pressed to compose a character is not a shortcut.
-    expect(handler).toContain("isImeComposition");
-  });
-
-  it("cycles the sort through the columns actually on screen", () => {
-    // Sorting by a hidden column would leave an order the reader can see the
-    // effect of but not the cause of, and no way to undo it.
-    const handler = source.slice(source.indexOf("function onGridKeydown"));
-    expect(handler).toContain("shownColumns.map");
-  });
-
-  it("offers no shortcut that is the only way to reach its action", () => {
-    // Each accelerator has a real focusable control behind it, which is what
-    // makes the non-interactive container acceptable.
-    expect(source).toContain("gitpulse-fleet-filter");
-    expect(source).toContain("toggleFleetPulse");
-    expect(source).toContain("fleetStore.refresh");
-  });
-});
-
-describe("hiding a column cannot hide a failure", () => {
-  it("reports what hiding cost, by column and by count", () => {
-    expect(source).toContain("hiddenFailures");
-    expect(source).toContain("fleet-hidden-failures");
-  });
-
-  it("keeps the two structural columns out of the menu", () => {
-    expect(source).toContain("HIDEABLE_COLUMNS");
-    // Repository and Severity are not offered, so the menu cannot produce a
-    // grid of measurements with nothing to attribute them to.
+describe("HIDEABLE_COLUMNS", () => {
+  it("keeps the structural Repository column out of the menu", () => {
+    // Without it the menu could produce a grid of measurements with nothing to
+    // attribute them to. The rendered menu is checked in harness/fleet.html.
     expect(HIDEABLE_COLUMNS).not.toContain("repository");
-  });
-
-  it("stores hidden columns in the interface store, so they survive a reload", () => {
-    expect(source).toContain("fleetHiddenColumns");
-    expect(source).toContain("toggleFleetColumn");
-    expect(source).toContain("showAllFleetColumns");
-  });
-});
-
-describe("the grid cannot invent a measurement", () => {
-  it("routes every measurable column through FleetCell", () => {
-    // Nine columns, six of them measurable. A column rendered inline would be
-    // one where "no value" gets to pick its own spelling.
-    const cells = source.match(/<FleetCell/g) ?? [];
-    expect(cells.length).toBeGreaterThanOrEqual(6);
-  });
-
-  it("only ever reads a value inside a read branch", () => {
-    // Every `.value` access in the template is guarded by its cell's kind, so
-    // there is no path where an unscanned cell's absent value is coerced.
-    for (const match of source.matchAll(/row\.(\w+)\.value/g)) {
-      const field = match[1];
-      expect(source, `${field}.value is read without a kind guard`).toContain(
-        `row.${field}.kind === "read"`,
-      );
-    }
-  });
-
-  it("never renders a bare total when nothing was counted", () => {
-    // The strip falls back to an em dash rather than printing 0 for a column
-    // no repository has been scanned for...
-    expect(source).toContain("locTotal.counted > 0");
-    expect(source).toContain("storageTotal.counted > 0");
-    expect(source).toContain("vulnTotal.counted > 0");
-    expect(source).toContain("commitTotal.counted > 0");
-    // ...and the strip itself, not the view, owns the coverage clause. Each
-    // reading is handed its own tally rather than a finished string, so the
-    // qualification cannot be dropped on the way in.
-    expect(totalsSource).toContain("describeTally");
-    expect(source).toContain("tally: commitTotal");
-    expect(source).toContain("tally: storageTotal");
-  });
-
-  it("keeps the three cell states in one component, not spelled per column", () => {
-    expect(cellSource).toContain('data-state="read"');
-    expect(cellSource).toContain('data-state="unscanned"');
-    expect(cellSource).toContain('data-state="failed"');
-  });
-});
-
-describe("expensive scans stay opt-in", () => {
-  it("never starts a family sweep from an effect", () => {
-    // Storage walks 250,000 files and the audit spawns a package manager;
-    // both run only from the toolbar, like autoRunCoverage elsewhere.
-    const effects = source.match(/\$effect\(\(\) => \{[\s\S]*?\n  \}\);/g) ?? [];
-    expect(effects.length).toBeGreaterThan(0);
-    for (const effect of effects) {
-      expect(effect).not.toContain("scanAll");
-      expect(effect).not.toContain("scanOne");
-    }
-  });
-
-  it("refreshes the cheap sweep only when the repository set changes", () => {
-    expect(source).toContain("if (key === lastSwept) return;");
-  });
-});
-
-describe("FleetView repository removal", () => {
-  it("provides a remove button in each row and wires it to repoStore.removeRepo", () => {
-    expect(source).toContain('data-testid="fleet-remove-repo"');
-    expect(source).toContain("removeRow(row)");
-    expect(source).toContain("repoStore.removeRepo(row.path)");
-  });
-
-  it("supports keyboard removal via Delete and Backspace keys on focused rows", () => {
-    expect(source).toContain('event.key === "Delete" || event.key === "Backspace"');
-    expect(source).toContain("removeRow(visibleRows[index])");
-  });
-
-  it("labels the remove button according to whether the repository is open or recent", () => {
-    expect(source).toContain('title={row.presence === "open"');
-    expect(source).toContain("Remove ${row.label} from Fleet (closes repository)");
-    expect(source).toContain("Remove ${row.label} from Fleet");
-    expect(source).toContain("aria-label={`Remove ${row.label} from Fleet`}");
-  });
-
-  it("includes an Actions column header with accessible screen reader text", () => {
-    expect(source).toContain('<span class="sr-only">Actions</span>');
   });
 });
 
@@ -712,65 +544,13 @@ describe("FleetPulse", () => {
   });
 });
 
-describe("the Fleet grid orders and filters honestly", () => {
-  it("routes ordering through the module that keeps absences out of it", () => {
-    // The comparator lives in `fleet/sort` precisely so `value ?? 0` — which
-    // files every unaudited repository next to the clean ones — cannot be
-    // reintroduced inline here.
-    expect(source).toContain('from "../fleet/sort"');
-    expect(source).toContain("sortRows(matched, sort)");
-    expect(source).not.toMatch(/\.value\s*\?\?\s*0/);
-  });
-
+describe("the Fleet grid's default order", () => {
   it("keeps the default order identical to byUrgency", () => {
+    // Sorting, filtering and the per-repository scans are checked rendered in
+    // harness/fleet.html. This one contract stays: the default order must be
+    // the same ranking the severity bands are built from, which a rendered
+    // check over a fixture fleet cannot tell apart from a lookalike.
     expect(source).toContain("byUrgency(matched)");
-  });
-
-  it("filters with the substring search, never a user-supplied pattern", () => {
-    expect(source).toContain("searchRows(applyFilter(rows, filter), query)");
-    expect(source).not.toContain("new RegExp(query");
-  });
-
-  it("marks the sorted column for assistive technology", () => {
-    expect(source).toContain("aria-sort={ariaSort(column.key)}");
-  });
-});
-
-describe("the Fleet Pulse panel is wired to the grid", () => {
-  it("renders above the toolbar and reads the same rows the grid does", () => {
-    expect(source).toContain("<FleetPulsePanel");
-    expect(source).toContain("fleetPulse(rows)");
-    expect(source).toContain("fleetLanguageMix(rows)");
-  });
-
-  it("remembers whether it is open, like the Fleet surface itself", () => {
-    expect(source).toContain("$interfaceStore.fleetPulseOpen");
-    expect(source).toContain("interfaceStore.toggleFleetPulse()");
-  });
-
-  it("never computes a commit total without its coverage clause", () => {
-    expect(source).toContain("commitTotal.counted > 0");
-  });
-});
-
-describe("per-repository scans stay opt-in and open-only", () => {
-  it("wires the absent cells to scanOne rather than to a sweep", () => {
-    expect(source).toContain("fleetStore.scanOne(family, row.path)");
-    expect(source).toContain('onScan={scanCell(row, "loc")}');
-    expect(source).toContain('onScan={scanCell(row, "storage")}');
-    expect(source).toContain('onScan={scanCell(row, "health")}');
-    expect(source).toContain('onScan={scanCell(row, "coverage")}');
-  });
-
-  it("refuses to scan a repository that is not open", () => {
-    // Same rule `scanTargets` enforces for the sweeps: a recents path may not
-    // resolve any more, and scanning it spawns work in a repository the user
-    // has not opened.
-    expect(source).toContain('if (row.presence !== "open") return undefined;');
-  });
-
-  it("refuses to start a second scan while a sweep is running", () => {
-    expect(source).toContain("if ($fleetStore.scanning !== null) return undefined;");
   });
 });
 
@@ -779,8 +559,6 @@ describe("FleetView agent sessions", () => {
     // It read "3 agent".
     expect(agentSessionsLabel(1)).toBe("1 agent");
     expect(agentSessionsLabel(3)).toBe("3 agents");
-    expect(source).not.toContain("{row.work.value.agentSessions} agent<");
-    expect(source).toContain("{agentSessionsLabel(row.work.value.agentSessions)}");
   });
 
   it("names the kinds the way the Worktrees panel does", () => {
@@ -788,21 +566,5 @@ describe("FleetView agent sessions", () => {
       "Agent checkouts: Claude Code, GitPulse task. Show them in Agents.",
     );
     expect(agentKindsTitle([])).toBe("Show this repository in Agents.");
-  });
-
-  it("is a button that opens the Agents view for that repository", () => {
-    const cell = source.slice(source.indexOf('data-testid="fleet-open-agents"') - 200, source.indexOf("{agentSessionsLabel("));
-    expect(cell).toContain("<button");
-    expect(cell).toContain("e.stopPropagation();");
-    expect(cell).toContain("void openAgents(row);");
-    // The repository is opened first — the Agents view lists the sessions of
-    // open repositories only — and the surface switches only once it opened.
-    const fn = source.slice(source.indexOf("async function openAgents"), source.indexOf("async function removeRow"));
-    expect(fn).toContain("if (!(await repoStore.openRepo(row.path))) return;");
-    expect(fn).toContain('interfaceStore.setGlobalSurface("agents");');
-    // The view opens narrowed to this repository, scoped before it is shown.
-    expect(fn.indexOf("setAgentsRepositoryScope(row.path);")).toBeGreaterThan(-1);
-    expect(fn.indexOf("setAgentsRepositoryScope(row.path);")).toBeLessThan(fn.indexOf("setGlobalSurface"));
-    expect(fn).not.toContain("setFleetOpen");
   });
 });

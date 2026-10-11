@@ -11,7 +11,9 @@
  * against fixture IPC: what a backend-truncated diff lets the reader stage,
  * which patch each staging action sends, how find reads a row, what the change
  * stepper does, how split pairs a change, how wrapping treats a long line, and
- * what the pane says while it reads and when there is nothing to show. Nothing
+ * what the pane says while it reads and when there is nothing to show, each
+ * row's language, the gutter, the minimap, late impact and image answers, and
+ * the preferences a pane opens with. Nothing
  * here executes git.
  */
 import "../src/app.css";
@@ -93,6 +95,14 @@ const stagingCalls=[];
 fixtures.cmd_get_file_diff=async a=>{calls.push(a);if(delayMs)await new Promise(r=>setTimeout(r,delayMs));return answer;};
 fixtures.cmd_stage_selective_patch=a=>{stagingCalls.push({kind:"stage",...a});return {policy:null,output:""};};
 fixtures.cmd_unstage_selective_patch=a=>{stagingCalls.push({kind:"unstage",...a});return {policy:null,output:""};};
+// Impact answers are per target so a check can hold one back; blobs are per path.
+const impactAnswers={}, cancels=[], blobCalls=[];
+const unavailableImpact={source_freshness:{fresh:null,reason:"fixture"},available:false,reason:"Not indexed in fixture",items:[],shown:0,total:0,truncated:false};
+const impactTokens=[];
+fixtures.cmd_codeintel_impact_at_rung=async a=>{impactTokens.push({target:a.target,token:a.cancelToken});return impactAnswers[a.target]?impactAnswers[a.target](a):unavailableImpact;};
+fixtures.cmd_codeintel_cancel=a=>{cancels.push(a.cancelToken);return true;};
+const blobs={};
+fixtures.cmd_get_file_blob=async a=>{blobCalls.push({path:a.filePath,commitId:a.commitId});const b=blobs[a.filePath]??{};if(b.delay)await new Promise(r=>setTimeout(r,b.delay));return {path:a.filePath,is_binary:true,is_image:true,mime:b.mime??"image/png",base64:b.base64??"AAAA",invalid_utf8_bytes:0};};
 files=[status(FILE),status("src/other.ts")];
 window.__TAURI_INTERNALS__={invoke:async(cmd,args)=>{if(cmd.startsWith("plugin:event|"))return 1;if(fixtures[cmd])return fixtures[cmd](args);unexpected.push(cmd);throw Error(`Unconfigured command: ${cmd}`);},transformCallback:cb=>cb};
 const {mount,unmount,tick}=await import("svelte");
@@ -235,6 +245,143 @@ const lineBoxes=()=>[...preview.querySelectorAll('button[aria-label="Select line
  // --- nothing to show -----------------------------------------------------
  await open({text:"",truncated:false});
  check("an empty diff draws no rows and says there is nothing to show",()=>!text().includes("new two")&&!preview.querySelector('[aria-busy="true"]')&&text().trim().length>0);
+ // --- whose language a row is, and what the header shows ------------------
+ const section=(path,removed,added)=>[`diff --git a/${path} b/${path}`,`--- a/${path}`,`+++ b/${path}`,"@@ -1,1 +1,1 @@",`-${removed}`,`+${added}`,""].join("\n");
+ /** Opens `selected` while the diff read answers `body`, which may name other files. */
+ async function openAs(selected,body){
+  if(view){await unmount(view);preview.replaceChildren();}
+  answer={text:body,truncated:false};
+  await repoStore.openRepo(root);
+  view=mount(DiffViewer,{target:preview});
+  await repoStore.selectFileDiff("src/other.ts",false);
+  await repoStore.selectFileDiff(selected,false);
+  await wait(300);
+ }
+ const titleButton=()=>[...preview.querySelectorAll("button")].find(b=>b.title.endsWith("click to copy"));
+ const headerLogo=()=>titleButton().parentElement.querySelector('[role="img"]');
+ const spanOf=(word)=>[...preview.querySelectorAll(".gp-diff-text span")].find(el=>el.textContent===word);
+ await open({text:twoHunks(),truncated:false});
+ check("the header's language icon is the one file's own language, named for a screen reader",()=>/typescript/i.test(headerLogo()?.getAttribute("aria-label")??""));
+ const stacked=section("src/lib.rs","let old = 1;","pub fn main() {}")+section("data.json",'{"a": 1}','{"b": 2}');
+ await openAs("data.json",stacked);
+ check("a two-file diff is titled by its count, not by the file the reader last clicked",()=>titleButton().textContent.trim()==="2 files");
+ check("and wears no single-language icon, because no one language describes it",()=>headerLogo()===null);
+ check("each file's section header carries its own file's icon",()=>Boolean(preview.querySelector('[aria-label="Rust"]'))&&Boolean(preview.querySelector('[aria-label="JSON"]')));
+ check("a Rust row is coloured as Rust even though the reader's selection is a .json",()=>/purple/.test(spanOf("fn")?.className??""));
+ const jsonRow=[...preview.querySelectorAll(".gp-diff-text")].find(el=>el.textContent.includes('"b"'));
+ check("and the .json row beneath it is not coloured with the Rust tokenizer",()=>Boolean(jsonRow)&&![...jsonRow.querySelectorAll("span")].some(el=>/purple/.test(el.className)));
+ // --- the gutter -----------------------------------------------------------
+ const gutterCells=()=>[...preview.querySelectorAll(".gp-diff-text")].flatMap(code=>[...code.closest('[style*="height"]').querySelectorAll("span.tabular-nums")]).filter(el=>el.textContent.trim());
+ await open({text:twoHunks(),truncated:false});
+ check("a small file's line numbers get the three-digit minimum column",()=>gutterCells().length>0&&gutterCells().every(el=>el.style.width==="3ch"));
+ await open({text:["diff --git a/src/app.ts b/src/app.ts","--- a/src/app.ts","+++ b/src/app.ts","@@ -123456,1 +123457,1 @@","-before","+after",""].join("\n"),truncated:false});
+ check("a six-digit line number widens the column to six characters, and none of it is clipped",()=>gutterCells().length>0&&gutterCells().every(el=>el.style.width==="6ch"&&el.scrollWidth<=el.clientWidth+1)&&gutterCells().some(el=>el.textContent.trim()==="123457"));
+ // --- row sizing while wrapping -------------------------------------------
+ const longLine="word ".repeat(600);
+ const wrapDiff=["diff --git a/src/app.ts b/src/app.ts","--- a/src/app.ts","+++ b/src/app.ts","@@ -1,2 +1,3 @@",line(1),"+"+longLine,line(3),""].join("\n");
+ await open({text:wrapDiff,truncated:false});
+ const rowAround=(needle)=>[...preview.querySelectorAll(".gp-diff-text")].find(el=>el.textContent.includes(needle))?.closest('[style*="height"]');
+ const rowHeights=()=>[...preview.querySelectorAll(".gp-diff-text")].map(el=>el.closest('[style*="height"]').getBoundingClientRect().height);
+ const wrapToggle=()=>preview.querySelector('[aria-label="Toggle word wrap"]');
+ if(wrapToggle().getAttribute("aria-pressed")==="true"){wrapToggle().click();await tick();await wait(150);}
+ const flatHeight=rowAround("context line 1").getBoundingClientRect().height;
+ check("with wrapping off every row is one fixed height, however long its line",()=>new Set(rowHeights().map(h=>Math.round(h))).size===1&&flatHeight>0);
+ wrapToggle().click();await tick();await wait(250);
+ const wrapped=rowAround("word word"), neighbour=rowAround("context line 3");
+ check("a wrapped line's row grows to hold every visual line, drawn clear of the row beneath",()=>wrapped.getBoundingClientRect().height>=flatHeight*3&&wrapped.scrollHeight<=wrapped.clientHeight+1&&neighbour.getBoundingClientRect().top>=wrapped.getBoundingClientRect().bottom-1);
+ check("and the rows that do not wrap keep the fixed height",()=>Math.abs(rowAround("context line 1").getBoundingClientRect().height-flatHeight)<1);
+ // --- the gutter stays put while a long line scrolls ----------------------
+ const wideNoSpace="+"+"x".repeat(3000);
+ await open({text:["diff --git a/src/app.ts b/src/app.ts","--- a/src/app.ts","+++ b/src/app.ts","@@ -1,1 +1,2 @@",line(1),wideNoSpace,""].join("\n"),truncated:false});
+ if(wrapToggle().getAttribute("aria-pressed")==="true"){wrapToggle().click();await tick();await wait(150);}
+ const sideScroller=[...preview.querySelectorAll("*")].find(el=>el.scrollWidth>el.clientWidth+200&&["auto","scroll"].includes(getComputedStyle(el).overflowX));
+ sideScroller.scrollLeft=600;await wait(200);
+ const pinned=rowAround("xxxx").firstElementChild;
+ const opaque=color=>color!=="transparent"&&!/rgba\(.*,\s*0(\.\d+)?\)$/.test(color)&&!/\/\s*(0|0?\.\d+)%?\)$/.test(color);
+ check("scrolling a long line sideways leaves its line numbers where they were",()=>sideScroller.scrollLeft>=500&&Math.abs(pinned.getBoundingClientRect().left-sideScroller.getBoundingClientRect().left)<=2);
+ check("and the pinned gutter is opaque, so the code does not show through it",()=>opaque(getComputedStyle(pinned).backgroundColor));
+ // --- split pairing --------------------------------------------------------
+ const block=["diff --git a/src/app.ts b/src/app.ts","--- a/src/app.ts","+++ b/src/app.ts","@@ -1,5 +1,4 @@",line(1),"-gone-1","-gone-2","-gone-3","+came-1","+came-2",line(5),""].join("\n");
+ await open({text:block,truncated:false});
+ button("Split").click();await tick();await wait(200);
+ const rowText=needle=>rowAround(needle)?.textContent.replace(/\s+/g," ")??"";
+ check("split pairs a block of three removals and two additions one to one, in order",()=>rowText("gone-1").includes("came-1")&&rowText("gone-2").includes("came-2"));
+ check("and the removal with no partner stands alone opposite nothing",()=>rowText("gone-3").includes("gone-3")&&!/came/.test(rowText("gone-3")));
+ check("so the block is three rows, not five",()=>new Set(["gone-1","gone-2","gone-3"].map(n=>rowAround(n))).size===3&&rowAround("came-2")===rowAround("gone-2"));
+ // --- the layout change keeps the reader's place ---------------------------
+ await open({text:longHunk(),truncated:false});
+ const inUnified=scroller();inUnified.scrollTop=1200;await wait(200);
+ button("Split").click();await tick();await wait(300);
+ check("switching to split keeps the same lines on screen rather than jumping to the top",()=>{const s=scroller();return Boolean(s)&&Math.abs(s.scrollTop-1200)<=flatHeight*3;});
+ // --- the minimap ----------------------------------------------------------
+ const paired=["diff --git a/src/app.ts b/src/app.ts","--- a/src/app.ts","+++ b/src/app.ts","@@ -1,120 +1,120 @@",...Array.from({length:10},(_,i)=>line(i+1)),...Array.from({length:100},(_,i)=>`-old ${i}`),...Array.from({length:100},(_,i)=>`+new ${i}`),...Array.from({length:10},(_,i)=>line(i+111)),""].join("\n");
+ const map=()=>preview.querySelector('[title^="Diff map"]');
+ const band=()=>[...map().children].find(el=>/bg-accent\/15/.test(el.className));
+ const marks=()=>[...map().children].filter(el=>/h-px/.test(el.className));
+ const ticks=()=>[...map().children].filter(el=>el!==band()&&!/h-px/.test(el.className));
+ Element.prototype.setPointerCapture=function(){};
+ const clickMap=async ratio=>{const r=map().getBoundingClientRect();map().dispatchEvent(new PointerEvent("pointerdown",{bubbles:true,pointerId:1,buttons:1,clientX:r.left+2,clientY:r.top+ratio*r.height}));await wait(250);};
+ await open({text:twoHunks()+section("src/b.ts","x","y"),truncated:false});
+ check("the minimap has a tick for each block of change and a line where the second file starts",()=>Boolean(map())&&ticks().length>=2&&marks().length===1);
+ await open({text:paired,truncated:false});
+ const pane2=scroller();
+ pane2.scrollTop=0;await wait(200);
+ check("with the diff at the top, the minimap's band sits at the top",()=>Number.parseFloat(band().style.top)<1);
+ pane2.scrollTop=1000;await wait(250);
+ check("scrolling moves the band to the same fraction of the strip",()=>Math.abs(Number.parseFloat(band().style.top)-pane2.scrollTop/pane2.scrollHeight*100)<1.5);
+ const anyScroller=()=>{let node=preview.querySelector(".gp-diff-text");while(node&&node!==preview){const o=getComputedStyle(node).overflowY;if((o==="auto"||o==="scroll")&&node.scrollHeight>node.clientHeight+50)return node;node=node.parentElement;}return null;};
+ const centreRatio=()=>{const s=anyScroller();return (s.scrollTop+s.clientHeight/2)/s.scrollHeight;};
+ await clickMap(0.5);
+ check("clicking the middle of the strip centres the middle of the unified diff",()=>Math.abs(centreRatio()-0.5)<0.03);
+ button("Split").click();await tick();await wait(300);
+ await clickMap(0.5);
+ check("and in split view, where the list is half as long, it centres the middle of what is drawn",()=>Math.abs(centreRatio()-0.5)<0.03);
+ await clickMap(1);
+ check("clicking the very bottom reaches the end of the list",()=>{const s=anyScroller();return s.scrollTop+s.clientHeight>=s.scrollHeight-2;});
+ // --- a late impact answer for the file just left --------------------------
+ const impact=total=>({source_freshness:{fresh:null,reason:"fixture"},available:true,reason:null,items:[],shown:0,total,truncated:false});
+ let release; const held=new Promise(r=>{release=r;});
+ impactAnswers["src/other.ts"]=async()=>impact(3);
+ impactAnswers[FILE]=async()=>{await held;return impact(77);};
+ const chip=()=>[...preview.querySelectorAll("span")].find(el=>/callers?\s*·/.test(el.textContent.replace(/\s+/g," "))&&el.title.includes("downstream"));
+ cancels.length=0;
+ await open({text:twoHunks(),truncated:false});
+ await repoStore.selectFileDiff("src/other.ts",false);
+ await until(()=>chip()&&/3/.test(chip().textContent),"the current file's impact chip");
+ release();await wait(300);
+ check("an impact answer that arrives after the reader moved on does not overwrite the current file's count",()=>chip()&&/3/.test(chip().textContent)&&!/77/.test(chip().textContent));
+ check("and the walk the reader left is cancelled in the backend, not merely ignored",()=>{const left=impactTokens.filter(t=>t.target===FILE).at(-1);return Boolean(left?.token)&&cancels.includes(left.token);});
+ delete impactAnswers[FILE];delete impactAnswers["src/other.ts"];
+ // --- image diffs ----------------------------------------------------------
+ const imgSrc=alt=>preview.querySelector(`img[alt^="${alt}"]`)?.getAttribute("src")??"";
+ blobs["logo.png"]={base64:"QUJD",mime:"image/png"};
+ blobCalls.length=0;
+ await openAs("logo.png"," ");
+ await until(()=>imgSrc("After version"),"image drawn");
+ check("an image diff shows the new and the old file read from the repository as pictures",()=>imgSrc("After version of logo.png")==="data:image/png;base64,QUJD"&&imgSrc("Before version of logo.png")==="data:image/png;base64,QUJD");
+ check("the current file is read from the worktree and the old one from HEAD",()=>blobCalls.length===2&&blobCalls[0].commitId===null&&blobCalls[1].commitId==="HEAD");
+ await repoStore.refresh(root);await wait(400);
+ check("a status refresh that leaves the selection alone does not read the pictures again",()=>blobCalls.length===2);
+ answer={text:"diff --git a/logo.png b/logo.png\nBinary files a/logo.png and b/logo.png differ\n",truncated:false};
+ await repoStore.selectFileDiff("logo.png",false);await wait(500);
+ check("and neither does the diff text being read again for the same picture",()=>blobCalls.length===2&&Boolean(imgSrc("After version of logo.png")));
+ blobs["slow.png"]={base64:"U0xPVw==",mime:"image/gif",delay:500};
+ blobs["fast.png"]={base64:"RkFTVA==",mime:"image/webp"};
+ blobCalls.length=0;
+ answer={text:" ",truncated:false};
+ await repoStore.selectFileDiff("slow.png",false);await wait(100);
+ await repoStore.selectFileDiff("fast.png",false);
+ await wait(1000);
+ check("a picture that arrives after the reader chose another is dropped, not shown under the new name",()=>imgSrc("After version of fast.png")==="data:image/webp;base64,RkFTVA=="&&!preview.innerHTML.includes("U0xPVw=="));
+ // --- opening at the configured defaults -----------------------------------
+ interfaceStore.setDiffLayout("split");interfaceStore.setDiffWordWrap(true);interfaceStore.setDiffSyntaxHighlight(false);
+ await open({text:twoHunks(),truncated:false});
+ check("a pane opened under the saved preferences starts split, wrapped and uncoloured",()=>button("Split").getAttribute("aria-pressed")==="true"&&wrapToggle().getAttribute("aria-pressed")==="true"&&preview.querySelector('[aria-label="Toggle syntax colouring"]').getAttribute("aria-pressed")==="false");
+ button("Unified").click();await tick();await wait(100);
+ interfaceStore.setDiffLayout("split");interfaceStore.setDiffSyntaxHighlight(true);await tick();await wait(150);
+ check("a preference changed under an open pane does not take the reader's toolbar choice away",()=>button("Unified").getAttribute("aria-pressed")==="true"&&preview.querySelector('[aria-label="Toggle syntax colouring"]').getAttribute("aria-pressed")==="false");
+ interfaceStore.setDiffLayout("unified");interfaceStore.setDiffWordWrap(false);interfaceStore.setDiffSyntaxHighlight(true);
+ await open({text:twoHunks(),truncated:false});
  // --- names ---------------------------------------------------------------
  await open({text:twoHunks(),truncated:false});
  check("every button in the pane has an accessible name",()=>{

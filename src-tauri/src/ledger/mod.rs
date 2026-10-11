@@ -3026,6 +3026,15 @@ mod tests {
         assert!(is_initialised(&repo));
     }
 
+    /// The one way a redaction test reports a leak: it names the field and
+    /// which secret, never the secret and never the haystack it was found in,
+    /// because a failing assert's message goes to the CI log.
+    fn assert_secret_free(haystack: &str, secrets: &[&str], what: &str) {
+        for (index, secret) in secrets.iter().enumerate() {
+            assert!(!haystack.contains(secret), "secret #{index} reached {what}");
+        }
+    }
+
     fn temp_repo() -> tempfile::TempDir {
         tempfile::tempdir().expect("tempdir")
     }
@@ -3769,23 +3778,21 @@ mod tests {
             }
         }
         let raw = String::from_utf8_lossy(&bytes);
-        assert!(
-            !raw.contains(key),
-            "the credential reached the database in full"
-        );
+        assert_secret_free(&raw, &[key], "the database");
 
         let events = tail(repo, 0, 10).expect("tail");
         assert!(events[0].argv_json.as_ref().unwrap().contains("ghp_"));
-        assert!(!events[0].argv_json.as_ref().unwrap().contains(key));
+        assert_secret_free(
+            events[0].argv_json.as_ref().unwrap(),
+            &[key],
+            "the argv field",
+        );
         let event_json = serde_json::to_string(&events[0]).expect("serialize event");
         assert!(
             event_json.contains("ghp_"),
             "credential shape stays identifiable"
         );
-        assert!(
-            !event_json.contains(key),
-            "a credential survived in a non-argv ledger field: {event_json}"
-        );
+        assert_secret_free(&event_json, &[key], "a ledger field read back");
     }
 
     #[test]
@@ -3822,14 +3829,14 @@ mod tests {
             }
         }
         let raw = String::from_utf8_lossy(&bytes);
-        for secret in [auth, cookie, password, cli_password, private_key] {
-            assert!(!raw.contains(secret), "contextual secret reached disk");
-        }
+        let secrets = [auth, cookie, password, cli_password, private_key];
+        assert_secret_free(&raw, &secrets, "disk");
 
         let event = tail(repo, 0, 10).expect("tail").pop().expect("event");
         assert!(event.object.as_deref().unwrap().contains("<redacted>"));
         for json in [event.argv_json, event.verdict_json, event.detail_json] {
             let json = json.expect("serialized field");
+            assert_secret_free(&json, &secrets, "a ledger field read back");
             serde_json::from_str::<serde_json::Value>(&json).unwrap_or_else(|error| {
                 panic!("redaction corrupted serialized JSON: {error}: {json}")
             });
@@ -3842,12 +3849,32 @@ mod tests {
 
     #[test]
     fn redaction_failure_messages_do_not_echo_the_secret() {
-        let src = include_str!("mod.rs");
-        let forbidden = String::from("reached disk: {") + "secret}";
+        let secret = "opaque-leaked-secret-value";
+        let haystack = format!(r#"{{"field":"{secret}","other":"x"}}"#);
+
+        // Drive the failure path itself and read everything it emits: the
+        // panic payload is what the test runner prints into the log.
+        let caught = std::panic::catch_unwind(|| {
+            assert_secret_free(&haystack, &[secret], "disk");
+        })
+        .expect_err("a leaked secret must fail the assertion");
+        let emitted = caught
+            .downcast_ref::<String>()
+            .cloned()
+            .or_else(|| caught.downcast_ref::<&str>().map(|s| (*s).to_string()))
+            .expect("the failure carries a message");
+
         assert!(
-            !src.contains(&forbidden),
-            "a failing assert must not write the secret into the log"
+            emitted.contains("disk"),
+            "the failure must still say where the leak was: {emitted}"
         );
+        assert!(
+            !emitted.contains(secret) && !emitted.contains(&haystack),
+            "the failure message echoed the secret or the text holding it"
+        );
+
+        // Control: a clean haystack does not trip it.
+        assert_secret_free("nothing here", &[secret], "disk");
     }
 
     #[cfg(unix)]

@@ -64,6 +64,36 @@ export function archiveState(tasks: readonly { archived: boolean }[]): ArchiveSt
   return archived === tasks.length ? "all" : "some";
 }
 
+/** What a control offering Archive says when every selected task is already in the archive. */
+export const ALREADY_ARCHIVED = "Already archived";
+
+/**
+ * The selection bar's Archive button.
+ *
+ * Disabled for an entirely archived selection, and it still says why rather
+ * than sitting there dead. Enabled, it says archiving keeps the status,
+ * since it once meant moving to Done.
+ */
+export function archiveControl(state: ArchiveState, busy: boolean): { disabled: boolean; title: string } {
+  return state === "all"
+    ? { disabled: true, title: ALREADY_ARCHIVED }
+    : { disabled: busy, title: "Archive — files the tasks away, keeping their status" };
+}
+
+/** The refusal for an Archive that would change nothing, said out loud rather than done silently. */
+export function archiveRefusal(count: number): string {
+  return count === 1 ? "That task is already archived." : "Those tasks are already archived.";
+}
+
+/**
+ * What an archive skipped, said apart from what it wrote: a skipped task is
+ * not a write and not a failure, so it is never folded into the count the
+ * write's receipt announces. Empty when nothing was skipped.
+ */
+export function archiveSkipped(already: number): string {
+  return already > 0 ? `${plural(already, "task")} already archived.` : "";
+}
+
 /**
  * The part of a selection that archiving would actually change.
  *

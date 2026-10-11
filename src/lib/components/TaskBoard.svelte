@@ -41,7 +41,7 @@
   import TaskSearchField from "./TaskSearchField.svelte";
   import { cardChrome, cardMatchesFacet, collectFacetOptions, emptyFacet, facetActive, allLoadedCards, priorityLabel, reorderPlan, partitionLanes, sortByPriority, type TaskFacet, type TaskLane } from "../workbench/taskOrganize";
   import { plural } from "../format";
-  import { archiveAction, archivable, archiveState } from "../workbench/taskArchive";
+  import { archiveAction, archivable, archiveControl, archiveRefusal, archiveSkipped, archiveState } from "../workbench/taskArchive";
   import { interfaceStore } from "../stores/interfaceStore";
   import { hiddenColumnReport, visibleBoardStatuses } from "../ui/taskView";
   import { boardKey as viewBoardKey, boardPrefs, effectiveSwimlane, wipState, type SavedTaskView, type TaskViewSnapshot } from "../ui/taskBoardViews";
@@ -397,6 +397,8 @@
    */
   let relinks = $state<{ taskId: string; number: number; title: string }[]>([]);
   const busy = $derived(moving || opening || deleting || deletesRunning > 0 || filingIssue || actionDialog !== null || mergeDialog !== null || pendingUpdate !== null);
+  /** The selection bar's Archive button: disabled with its reason when nothing would change. */
+  const archiveBar = $derived(archiveControl(selectionArchived, busy));
   const openCardIds = $derived(openSavedTaskIds(taskTabs));
   /**
    * The scope's in-progress total. A search's candidates only know it when
@@ -1614,7 +1616,7 @@
     if (busy || !cards.length) return;
     const wanted = archivable(cards);
     if (!wanted.length) {
-      error = cards.length === 1 ? "That task is already archived." : "Those tasks are already archived.";
+      error = archiveRefusal(cards.length);
       return;
     }
     const already = cards.length - wanted.length;
@@ -1622,7 +1624,8 @@
     // `applyUpdate` announces what it wrote. The skipped tasks are not a
     // failure and not a write, so they are said separately rather than
     // folded into a count that would then not match the receipt.
-    if (already > 0 && !error) announce = `${announce} ${plural(already, "task")} already archived.`;
+    const skipped = archiveSkipped(already);
+    if (skipped && !error) announce = `${announce} ${skipped}`;
   }
   /** Defaults a quick-added task inherits from wherever it was typed. */
   function quickAddDefaults(status: TaskStatus) {
@@ -2423,8 +2426,8 @@
           class="gp-btn"
           data-testid="task-archive-selected"
           onclick={() => void archiveCards(selectedCards)}
-          disabled={busy || selectionArchived === "all"}
-          title={selectionArchived === "all" ? "Already archived" : "Archive — files the tasks away, keeping their status"}
+          disabled={archiveBar.disabled}
+          title={archiveBar.title}
         ><Archive size={12} /> Archive</button>
         <!-- The merge gitpulse_merge_tasks runs, offered only for a
              selection it would not refuse on sight (taskMerge.ts). -->

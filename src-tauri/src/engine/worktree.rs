@@ -3306,15 +3306,28 @@ some-future-field whatever
         wait_until("queued behind the reading listing", || gathering(&root));
         // It does not read alongside the first: one scan of a repository at a
         // time.
-        std::thread::sleep(Duration::from_millis(150));
-        assert_eq!(
-            listings_in(&root) - before,
-            1,
-            "the later listing read early"
-        );
+        // Bounded negative: poll the whole window and fail at the first read
+        // that appears, rather than sampling once after a fixed sleep. The
+        // positive control is below: once released the later listing does
+        // read, so a counter that could never move would fail there.
+        let window = std::time::Instant::now() + Duration::from_millis(150);
+        while std::time::Instant::now() < window {
+            assert_eq!(
+                listings_in(&root) - before,
+                1,
+                "the later listing read early"
+            );
+            assert!(!late.is_finished(), "the later listing ended while queued");
+            std::thread::sleep(Duration::from_millis(2));
+        }
         release_tx.send(()).unwrap();
         let early = early.join().unwrap().expect("early");
         let late = late.join().unwrap().expect("late");
+        assert_eq!(
+            listings_in(&root) - before,
+            2,
+            "positive control: the later listing read once released"
+        );
         assert_eq!(early[1].dirty_files, Some(0), "read before the change");
         assert_eq!(
             late[1].dirty_files,

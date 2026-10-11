@@ -491,18 +491,27 @@ fn a_failed_probe_is_a_warning_not_a_notice() {
         "cmd_get_commit_graph",
         json!({ "repoPath": repo.path().to_string_lossy(), "maxCommits": 50 }),
     );
-    // Whether the load survives at all is git's call and not what is pinned
-    // here; what is pinned is that a degradation never arrives as a notice.
-    if let Ok(value) = value {
-        let notices = value["notices"].as_array().expect("notices array");
-        for notice in notices.iter().filter_map(|n| n.as_str()) {
-            assert!(
-                !notice.contains("unavailable")
-                    && !notice.contains("probe failed")
-                    && !notice.contains("thread panic"),
-                "a failure was filed as a notice: {notice}"
-            );
-        }
+    // The walk runs from the branch, so the load survives; a load that
+    // failed outright would leave nothing below to check, so it is asserted
+    // rather than skipped.
+    let value = value.expect("the graph still loads from the branch");
+    let warnings = value["warnings"].as_array().expect("warnings array");
+    assert!(
+        warnings
+            .iter()
+            .filter_map(|w| w.as_str())
+            .any(|w| w.contains("HEAD")),
+        "the failed HEAD probe must be reported as a warning: {warnings:?}"
+    );
+    let notices = value["notices"].as_array().expect("notices array");
+    for notice in notices.iter().filter_map(|n| n.as_str()) {
+        assert!(
+            !notice.contains("unavailable")
+                && !notice.contains("probe failed")
+                && !notice.contains("thread panic")
+                && !notice.contains("Could not read HEAD"),
+            "a failure was filed as a notice: {notice}"
+        );
     }
 }
 
