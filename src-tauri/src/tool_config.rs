@@ -11,7 +11,6 @@
 
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File};
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
@@ -646,9 +645,66 @@ pub struct ToolConfigView {
     pub stale: Vec<StalePath>,
 }
 
-fn cache() -> &'static Mutex<Option<(PathBuf, ToolConfig)>> {
-    static CACHE: OnceLock<Mutex<Option<(PathBuf, ToolConfig)>>> = OnceLock::new();
+/// What the cached copy was read from: path plus the file's modification time
+/// and length (`None` when the file did not exist), so a hand edit or another
+/// process's save is noticed on the next [`load`] instead of being overwritten
+/// by a stale in-memory copy.
+type Stamp = Option<(std::time::SystemTime, u64)>;
+
+fn cache() -> &'static Mutex<Option<(PathBuf, Stamp, ToolConfig)>> {
+    static CACHE: OnceLock<Mutex<Option<(PathBuf, Stamp, ToolConfig)>>> = OnceLock::new();
     CACHE.get_or_init(|| Mutex::new(None))
+}
+
+/// Serializes in-process writers; [`FileLock`] serializes processes.
+fn writer() -> &'static Mutex<()> {
+    static WRITER: OnceLock<Mutex<()>> = OnceLock::new();
+    WRITER.get_or_init(|| Mutex::new(()))
+}
+
+fn stamp_of(path: &Path) -> Stamp {
+    fs::metadata(path)
+        .ok()
+        .and_then(|m| m.modified().ok().map(|t| (t, m.len())))
+}
+
+/// How long a writer waits for another process's save before giving up.
+const WRITE_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Exclusive advisory lock on `tools.json.lock`, released on drop.
+struct FileLock(File);
+
+impl FileLock {
+    fn acquire(path: &Path) -> Result<Self, String> {
+        let lock_path = path.with_extension("json.lock");
+        let file = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&lock_path)
+            .map_err(|e| format!("failed to open {}: {e}", lock_path.display()))?;
+        let deadline = std::time::Instant::now() + WRITE_LOCK_WAIT;
+        loop {
+            match file.try_lock() {
+                Ok(()) => return Ok(Self(file)),
+                Err(fs::TryLockError::WouldBlock) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                Err(e) => {
+                    return Err(format!(
+                        "tools.json is being written by another process ({}): {e}",
+                        lock_path.display()
+                    ))
+                }
+            }
+        }
+    }
+}
+
+impl Drop for FileLock {
+    fn drop(&mut self) {
+        let _ = self.0.unlock();
+    }
 }
 
 /// Where the platform keeps application support / config for GitPulse.
@@ -730,29 +786,37 @@ fn parse_config(text: &str) -> Result<ToolConfig, String> {
     Ok(cfg)
 }
 
+fn read_disk(path: &Path) -> Result<ToolConfig, String> {
+    if path.is_file() {
+        let text = fs::read_to_string(path)
+            .map_err(|e| format!("failed to read {}: {e}", path.display()))?;
+        parse_config(&text)
+    } else {
+        Ok(ToolConfig::default())
+    }
+}
+
 /// Load the config from disk (or default). Does not refuse on missing file.
+///
+/// The in-process copy is reused only while the file still has the stamp it
+/// was read at; any outside change is picked up.
 pub fn load() -> Result<ToolConfig, String> {
     let path = config_path()?;
+    let stamp = stamp_of(&path);
     {
         let guard = cache()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some((cached_path, cfg)) = guard.as_ref() {
-            if *cached_path == path {
+        if let Some((cached_path, cached_stamp, cfg)) = guard.as_ref() {
+            if *cached_path == path && *cached_stamp == stamp {
                 return Ok(cfg.clone());
             }
         }
     }
-    let cfg = if path.is_file() {
-        let text = fs::read_to_string(&path)
-            .map_err(|e| format!("failed to read {}: {e}", path.display()))?;
-        parse_config(&text)?
-    } else {
-        ToolConfig::default()
-    };
+    let cfg = read_disk(&path)?;
     *cache()
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((path, cfg.clone()));
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((path, stamp, cfg.clone()));
     Ok(cfg)
 }
 
@@ -763,9 +827,10 @@ pub fn invalidate_cache() {
         .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
 }
 
-/// Atomic write: sibling temp, `sync_all`, rename.
-pub fn save(config: &ToolConfig) -> Result<PathBuf, String> {
-    let path = config_path()?;
+/// Atomically publishes `config` (`devmap_query::write_atomic`: unique
+/// sibling temp, rename) and refreshes the cache. Callers hold the writer and
+/// file locks.
+fn write_locked(path: &Path, config: &ToolConfig) -> Result<ToolConfig, String> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
             .map_err(|e| format!("failed to create {}: {e}", parent.display()))?;
@@ -774,27 +839,48 @@ pub fn save(config: &ToolConfig) -> Result<PathBuf, String> {
     to_write.version = CONFIG_VERSION;
     let body = serde_json::to_string_pretty(&to_write)
         .map_err(|e| format!("failed to serialise tools.json: {e}"))?;
-    let tmp = path.with_extension("json.tmp");
-    {
-        let mut file =
-            File::create(&tmp).map_err(|e| format!("failed to create {}: {e}", tmp.display()))?;
-        file.write_all(body.as_bytes())
-            .map_err(|e| format!("failed to write {}: {e}", tmp.display()))?;
-        file.sync_all()
-            .map_err(|e| format!("failed to sync {}: {e}", tmp.display()))?;
-    }
-    fs::rename(&tmp, &path).map_err(|e| {
-        let _ = fs::remove_file(&tmp);
-        format!(
-            "failed to rename {} → {}: {e}",
-            tmp.display(),
-            path.display()
-        )
-    })?;
+    devmap_query::write_atomic(path, body.as_bytes())
+        .map_err(|e| format!("failed to write {}: {e}", path.display()))?;
     *cache()
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((path.clone(), to_write));
+        .unwrap_or_else(std::sync::PoisonError::into_inner) =
+        Some((path.to_path_buf(), stamp_of(path), to_write.clone()));
     crate::tool_capability::invalidate_all();
+    Ok(to_write)
+}
+
+/// Read-modify-write under the writer lock and the file lock, starting from
+/// what is on disk now (never the cache), so concurrent updates of different
+/// fields do not lose each other and a hand edit is not overwritten by a
+/// stale copy. `edit` failing writes nothing.
+pub fn update<T>(edit: impl FnOnce(&mut ToolConfig) -> Result<T, String>) -> Result<T, String> {
+    let path = config_path()?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|e| format!("failed to create {}: {e}", parent.display()))?;
+    }
+    let _in_process = writer()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _cross_process = FileLock::acquire(&path)?;
+    let mut cfg = read_disk(&path)?;
+    let out = edit(&mut cfg)?;
+    write_locked(&path, &cfg)?;
+    Ok(out)
+}
+
+/// Replaces the whole config under the same locks as [`update`].
+pub fn save(config: &ToolConfig) -> Result<PathBuf, String> {
+    let path = config_path()?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|e| format!("failed to create {}: {e}", parent.display()))?;
+    }
+    let _in_process = writer()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _cross_process = FileLock::acquire(&path)?;
+    write_locked(&path, config)?;
     Ok(path)
 }
 
@@ -909,31 +995,31 @@ pub fn saved_source_root(tool: crate::tool_install::ExternalTool) -> Option<Path
 
 /// Persist a binary path after a successful install.
 pub fn set_binary(tool: crate::tool_install::ExternalTool, binary: &str) -> Result<(), String> {
-    let mut cfg = load()?;
-    match tool {
-        crate::tool_install::ExternalTool::Devmap => {
-            cfg.devmap.binary = Some(binary.to_string());
+    update(|cfg| {
+        match tool {
+            crate::tool_install::ExternalTool::Devmap => {
+                cfg.devmap.binary = Some(binary.to_string());
+            }
+            crate::tool_install::ExternalTool::Manvi => {
+                cfg.manvi.binary = Some(binary.to_string());
+            }
         }
-        crate::tool_install::ExternalTool::Manvi => {
-            cfg.manvi.binary = Some(binary.to_string());
-        }
-    }
-    save(&cfg)?;
-    Ok(())
+        Ok(())
+    })
 }
 
 pub fn set_source_root(tool: crate::tool_install::ExternalTool, root: &str) -> Result<(), String> {
-    let mut cfg = load()?;
-    match tool {
-        crate::tool_install::ExternalTool::Devmap => {
-            cfg.devmap.source_root = Some(root.to_string());
+    update(|cfg| {
+        match tool {
+            crate::tool_install::ExternalTool::Devmap => {
+                cfg.devmap.source_root = Some(root.to_string());
+            }
+            crate::tool_install::ExternalTool::Manvi => {
+                cfg.manvi.source_root = Some(root.to_string());
+            }
         }
-        crate::tool_install::ExternalTool::Manvi => {
-            cfg.manvi.source_root = Some(root.to_string());
-        }
-    }
-    save(&cfg)?;
-    Ok(())
+        Ok(())
+    })
 }
 
 /// The session-notification preferences, or the defaults when `tools.json`
@@ -1046,30 +1132,30 @@ pub fn set_agent_defaults(next: AgentDefaults) -> Result<(), String> {
         Some(sources) => canonical_setting_sources(sources)?,
         None => None,
     };
-    let mut cfg = load()?;
-    cfg.agent_defaults = StoredAgentPermissions {
-        permission: next.permission,
-    };
-    cfg.agent_launch = StoredAgentLaunch {
-        max_live_runs: next.max_live_runs,
-        claude_setting_sources: sources,
-        max_terminal_sessions: next.max_terminal_sessions,
-        models: next
-            .models
-            .into_iter()
-            .filter(|(_, choice)| !choice.is_empty())
-            .collect(),
-    };
-    save(&cfg)?;
-    Ok(())
+    update(|cfg| {
+        cfg.agent_defaults = StoredAgentPermissions {
+            permission: next.permission,
+        };
+        cfg.agent_launch = StoredAgentLaunch {
+            max_live_runs: next.max_live_runs,
+            claude_setting_sources: sources,
+            max_terminal_sessions: next.max_terminal_sessions,
+            models: next
+                .models
+                .into_iter()
+                .filter(|(_, choice)| !choice.is_empty())
+                .collect(),
+        };
+        Ok(())
+    })
 }
 
 pub fn set_session_alerts(next: SessionAlertSettings) -> Result<(), String> {
     next.validate()?;
-    let mut cfg = load()?;
-    cfg.session_alerts = next;
-    save(&cfg)?;
-    Ok(())
+    update(|cfg| {
+        cfg.session_alerts = next;
+        Ok(())
+    })
 }
 
 /// The stored Lappi switches, or both off.
@@ -1110,48 +1196,49 @@ pub fn review_gate_settings() -> Result<ReviewGateSettings, String> {
 /// Sets the host-wide default (`common_dir: None`), or one repository's
 /// override; `enabled: None` clears that override so the default applies.
 pub fn set_review_gate(common_dir: Option<&str>, enabled: Option<bool>) -> Result<(), String> {
-    let mut cfg = load()?;
-    if cfg.review_gate.unreadable {
-        return Err(
-            "the review_gate block in tools.json could not be read; fix or remove it first".into(),
-        );
-    }
-    match (common_dir, enabled) {
-        (None, Some(on)) => cfg.review_gate.default_on = on,
-        (None, None) => cfg.review_gate.default_on = false,
-        (Some(dir), Some(on)) => {
-            cfg.review_gate.repositories.insert(dir.to_string(), on);
+    update(|cfg| {
+        if cfg.review_gate.unreadable {
+            return Err(
+                "the review_gate block in tools.json could not be read; fix or remove it first"
+                    .into(),
+            );
         }
-        (Some(dir), None) => {
-            cfg.review_gate.repositories.remove(dir);
+        match (common_dir, enabled) {
+            (None, Some(on)) => cfg.review_gate.default_on = on,
+            (None, None) => cfg.review_gate.default_on = false,
+            (Some(dir), Some(on)) => {
+                cfg.review_gate.repositories.insert(dir.to_string(), on);
+            }
+            (Some(dir), None) => {
+                cfg.review_gate.repositories.remove(dir);
+            }
         }
-    }
-    save(&cfg)?;
-    Ok(())
+        Ok(())
+    })
 }
 
 pub fn set_lappi_settings(next: LappiSettings) -> Result<(), String> {
-    let mut cfg = load()?;
-    cfg.lappi = next;
-    save(&cfg)?;
-    Ok(())
+    update(|cfg| {
+        cfg.lappi = next;
+        Ok(())
+    })
 }
 
 pub fn set_onboarding(state: OnboardingState) -> Result<(), String> {
-    let mut cfg = load()?;
-    cfg.onboarding = state;
-    save(&cfg)?;
-    Ok(())
+    update(|cfg| {
+        cfg.onboarding = state;
+        Ok(())
+    })
 }
 
 pub fn clear_binary(tool: crate::tool_install::ExternalTool) -> Result<(), String> {
-    let mut cfg = load()?;
-    match tool {
-        crate::tool_install::ExternalTool::Devmap => cfg.devmap.binary = None,
-        crate::tool_install::ExternalTool::Manvi => cfg.manvi.binary = None,
-    }
-    save(&cfg)?;
-    Ok(())
+    update(|cfg| {
+        match tool {
+            crate::tool_install::ExternalTool::Devmap => cfg.devmap.binary = None,
+            crate::tool_install::ExternalTool::Manvi => cfg.manvi.binary = None,
+        }
+        Ok(())
+    })
 }
 
 pub fn is_disabled(tool: crate::tool_install::ExternalTool) -> bool {
@@ -1165,13 +1252,13 @@ pub fn is_disabled(tool: crate::tool_install::ExternalTool) -> bool {
 }
 
 pub fn set_disabled(tool: crate::tool_install::ExternalTool, disabled: bool) -> Result<(), String> {
-    let mut cfg = load()?;
-    match tool {
-        crate::tool_install::ExternalTool::Devmap => cfg.devmap.disabled = disabled,
-        crate::tool_install::ExternalTool::Manvi => cfg.manvi.disabled = disabled,
-    }
-    save(&cfg)?;
-    Ok(())
+    update(|cfg| {
+        match tool {
+            crate::tool_install::ExternalTool::Devmap => cfg.devmap.disabled = disabled,
+            crate::tool_install::ExternalTool::Manvi => cfg.manvi.disabled = disabled,
+        }
+        Ok(())
+    })
 }
 
 #[cfg(test)]
@@ -1649,6 +1736,74 @@ mod tests {
             invalidate_cache();
             let loaded = load().unwrap();
             assert_eq!(loaded.devmap.binary.as_deref(), Some("/tmp/fake-devmap"));
+        });
+    }
+
+    #[test]
+    fn concurrent_updates_of_different_fields_lose_nothing_and_leave_valid_json() {
+        with_temp_config(|path| {
+            std::thread::scope(|scope| {
+                for i in 0..8 {
+                    scope.spawn(move || {
+                        for round in 0..10 {
+                            if i % 2 == 0 {
+                                set_onboarding(OnboardingState::default()).unwrap();
+                            } else {
+                                set_source_root(
+                                    crate::tool_install::ExternalTool::Devmap,
+                                    &format!("/src/{i}/{round}"),
+                                )
+                                .unwrap();
+                            }
+                        }
+                    });
+                }
+            });
+            let text = fs::read_to_string(path).unwrap();
+            parse_config(&text).expect("concurrent saves interleaved into invalid JSON");
+            // Both writers' fields survive: no update was a lost overwrite.
+            assert!(load().unwrap().devmap.source_root.is_some());
+            let siblings: Vec<_> = fs::read_dir(path.parent().unwrap())
+                .unwrap()
+                .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                .filter(|n| n.contains(".tmp"))
+                .collect();
+            assert!(siblings.is_empty(), "temp files left behind: {siblings:?}");
+        });
+    }
+
+    #[test]
+    fn a_hand_edit_is_seen_and_not_overwritten_by_the_next_update() {
+        with_temp_config(|path| {
+            set_source_root(crate::tool_install::ExternalTool::Devmap, "/one").unwrap();
+            // Edited behind the cache's back, without invalidate_cache().
+            let mut edited: ToolConfig =
+                serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap();
+            edited.manvi.binary = Some("/hand/edited/manvi".into());
+            // A different length guarantees a new stamp even on coarse mtimes.
+            fs::write(
+                path,
+                serde_json::to_string_pretty(&edited).unwrap() + "\n\n",
+            )
+            .unwrap();
+            assert_eq!(
+                load().unwrap().manvi.binary.as_deref(),
+                Some("/hand/edited/manvi")
+            );
+            set_source_root(crate::tool_install::ExternalTool::Devmap, "/two").unwrap();
+            let after = load().unwrap();
+            assert_eq!(after.manvi.binary.as_deref(), Some("/hand/edited/manvi"));
+            assert_eq!(after.devmap.source_root.as_deref(), Some("/two"));
+        });
+    }
+
+    #[test]
+    fn set_binary_reports_a_failed_persist() {
+        with_temp_config(|path| {
+            // tools.json is a directory: the write cannot succeed.
+            fs::create_dir_all(path).unwrap();
+            let err = set_binary(crate::tool_install::ExternalTool::Devmap, "/x/devmap");
+            assert!(err.is_err(), "a failed persist reported success");
         });
     }
 
