@@ -510,6 +510,18 @@ if (params.has("check")) {
       check("another pointer cannot steal, move or end a drag in progress",
         Boolean(still) && Math.abs(still.left - shown.left) <= 1 && Math.abs(still.top - shown.top) <= 1);
 
+      // The drop target is measured once per frame, not once per pointer event.
+      {
+        const realFromPoint = document.elementFromPoint.bind(document);
+        let probes = 0;
+        document.elementFromPoint = (x, y) => { probes++; return realFromPoint(x, y); };
+        try {
+          for (let i = 0; i < 200; i++) pointer(card("task-1"), "pointermove", at.x + (i % 7), at.y + (i % 5));
+          check("200 pointermoves in one frame measure the drop target at most once", probes <= 1);
+          await settle();
+          check("the drop target is measured again once the frame runs", probes >= 1);
+        } finally { document.elementFromPoint = realFromPoint; }
+      }
       document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true })); await settle();
       check("Escape cancels a drag", !ghost());
       pointer(document.body, "pointerup", at.x, at.y); await settle();
@@ -2679,6 +2691,9 @@ if (params.has("check")) {
       const before = writes.length;
       card("task-2").focus(); card("task-2").dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowLeft", bubbles: true, cancelable: true }));
       await wait(() => writes.length > before && card("task-2")?.closest("[data-task-column]")?.dataset.taskColumn === to);
+      await settle();
+      check("after ArrowLeft the moved card holds focus", document.activeElement === card("task-2"));
+      check("after ArrowLeft the live region names the new column", /moved to /.test(root.querySelector('[role="status"][aria-live="polite"].sr-only')?.textContent ?? "") && root.querySelector('[role="status"][aria-live="polite"].sr-only').textContent.toLowerCase().includes(to.replace("_", " ")));
       check("a keyboard move in a lane changes the status and keeps the card in its lane", writes.at(-1).status === to && writes.at(-1).owner === ownerOf2 && laneOf("task-2") === `owner:${ownerOf2}`);
       guardStep = `views: lane move back; now ${card("task-2")?.closest("[data-task-column]")?.dataset.taskColumn} writes=${writes.length}`;
       card("task-2").focus(); card("task-2").dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowRight", bubbles: true, cancelable: true }));

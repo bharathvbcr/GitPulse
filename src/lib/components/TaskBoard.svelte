@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { createFrameScheduler } from "../motion/frameScheduler";
   import { crossfade } from "svelte/transition";
   import { liquidSelection } from "../ui/transitions";
   import { onMount, untrack } from "svelte";
@@ -697,7 +698,7 @@
     listeners.track(stopClock);
     listeners.track(bindForegroundChanges(document, typeof window === "undefined" ? null : window, onForeground));
     return () => {
-      disposed = true; revision++; unreadRevision++; initializationRevision++; openingRevision++; pendingUpdate?.stop(); clearTimeout(refreshTimer); clearTimeout(undoTimer); clearTimeout(skipClickTimer); listeners.dispose();
+      disposed = true; revision++; unreadRevision++; initializationRevision++; openingRevision++; pendingUpdate?.stop(); clearTimeout(refreshTimer); clearTimeout(undoTimer); clearTimeout(skipClickTimer); dropFrame.cancel(); listeners.dispose();
       // Leaving the board ends the undo window rather than dropping it: the
       // reader saw these tasks go, so they go.
       if (pendingDelete && !pendingDelete.running) void commitPendingDelete();
@@ -1137,6 +1138,8 @@
   /** Ends a press or drag without dropping it. */
   function cancelDrag() {
     const held = press;
+    dropFrame.cancel();
+    dropMeasure = null;
     drag = null;
     press = null;
     if (held) releasePointer(held.target, held.pointerId);
@@ -1154,18 +1157,37 @@
     // the window listeners still see that press through to its end.
     try { target.setPointerCapture(e.pointerId); } catch { /* uncaptured press, ended by the window listeners */ }
   }
+  // The preview follows every move; the drop target (an elementFromPoint plus
+  // a rect read per card) is measured once per frame, from the latest point.
+  const dropFrame = createFrameScheduler();
   function onCardPointerMove(e: PointerEvent) {
     if (!press || !ownsPointer(e)) return;
+    const first = !drag;
     if (!drag) {
       if (!dragExceeded(e.clientX - press.x, e.clientY - press.y)) return;
       menu = null;
       drag = { card: press.card, over: press.card.status, insertIndex: 0, lane: "", local: 0, x: e.clientX, y: e.clientY };
     }
-    const at = dropAtPoint(e.clientX, e.clientY, drag.card.id);
-    drag = { card: drag.card, over: at.over, insertIndex: at.index, lane: at.lane, local: at.local, x: e.clientX, y: e.clientY };
+    drag = { ...drag, x: e.clientX, y: e.clientY };
+    dropMeasure = { x: e.clientX, y: e.clientY, id: drag.card.id };
+    // The move that starts the drag is measured at once, against the layout the
+    // press was made on; every later one waits for its frame.
+    if (first) measureDrop(); else dropFrame.schedule(measureDrop);
+  }
+  let dropMeasure: { x: number; y: number; id: string } | null = null;
+  /** Measure the drop target for the newest pointer position not yet measured. */
+  function measureDrop() {
+    const at = dropMeasure;
+    dropMeasure = null;
+    if (!at || !drag || drag.card.id !== at.id) return;
+    const target = dropAtPoint(at.x, at.y, at.id);
+    drag = { card: drag.card, over: target.over, insertIndex: target.index, lane: target.lane, local: target.local, x: at.x, y: at.y };
   }
   function onCardPointerUp(e: PointerEvent) {
     if (!ownsPointer(e)) return;
+    // A frame may not have run since the last move; the drop is where the
+    // preview last pointed, so measure that move now, against the same layout.
+    if (dropFrame.isScheduled()) measureDrop();
     const current = drag;
     cancelDrag();
     if (!current) return;
@@ -1295,7 +1317,21 @@
     const next = neighborStatus(card.status, e.key === "ArrowRight" ? 1 : -1);
     if (!next) return;
     const last = (columns[next]?.items ?? []).at(-1);
-    void moveCard(card, next, insertionPosition(last?.position ?? null, null));
+    void moveCardAcross(card, next, insertionPosition(last?.position ?? null, null));
+  }
+  /**
+   * The keyboard move to a neighbouring column. The write reloads the board
+   * and the pressed card is replaced, which drops focus to <body>; focus goes
+   * back to it and the new column is named, as Alt+Arrow does. Announced only
+   * once the card is drawn in that column, so a refused write says nothing.
+   */
+  async function moveCardAcross(card: TaskCard, status: TaskStatus, position: number) {
+    await moveCard(card, status, position);
+    if (disposed) return;
+    const moved = boardEl?.querySelector<HTMLElement>(`[data-task-column="${status}"] [data-task-card][data-card-id="${CSS.escape(card.id)}"]`);
+    if (!moved) return;
+    announce = `${card.title} moved to ${STATUS_LABELS[status]}`;
+    moved.focus();
   }
   /**
    * The card a vertical key lands on: the next or previous card in the same
