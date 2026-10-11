@@ -552,6 +552,18 @@ fn extract_treesitter_before_deadline(
                         deadline,
                     );
                 }
+                // Ruby defines methods with no `def`: `attr_reader :tap` is the
+                // declaration of `tap`. After the walk, so a `def` of the same
+                // name anywhere in the class has already been emitted and wins.
+                if lang == "ruby" {
+                    let attributes = crate::langdecl::ruby::attribute_symbols(
+                        root,
+                        source,
+                        &file_symbol_name,
+                        &symbols,
+                    );
+                    symbols.extend(attributes);
+                }
                 if !crate::entry_names::collect(
                     root,
                     source,
@@ -675,8 +687,20 @@ fn extract_treesitter_before_deadline(
                             symbol.is_exported = true;
                         }
                     }
-                    symbols
-                        .retain(|symbol| symbol.kind != SymbolKind::Variable || symbol.is_exported);
+                    // An unexported object keeps its symbol when it owns a member
+                    // symbol: the member's `parent_symbol` and its qualified name
+                    // both name it, and a parent that is no node is a containment
+                    // edge from nothing.
+                    let owners: BTreeSet<String> = symbols
+                        .iter()
+                        .filter(|symbol| symbol.kind == SymbolKind::Method)
+                        .filter_map(|symbol| symbol.parent_symbol.clone())
+                        .collect();
+                    symbols.retain(|symbol| {
+                        symbol.kind != SymbolKind::Variable
+                            || symbol.is_exported
+                            || owners.contains(&symbol.qualified_name)
+                    });
                 }
 
                 for symbol in symbols.iter().filter(|symbol| symbol.is_exported) {
@@ -687,6 +711,7 @@ fn extract_treesitter_before_deadline(
                     if !exports.iter().any(|export| {
                         export.exported_name == symbol.name
                             || (export.module_specifier.is_none()
+                                && export.exported_name != "default"
                                 && export.local_name.as_deref() == Some(symbol.name.as_str()))
                     }) {
                         exports.push(ExtractedExport {
@@ -704,6 +729,15 @@ fn extract_treesitter_before_deadline(
                         b.span.start_byte,
                     ))
                 });
+                if lang == "rust" {
+                    rust_expand_local_macros(
+                        root,
+                        source,
+                        &file_symbol_name,
+                        &mut calls,
+                        &mut references,
+                    );
+                }
                 references.sort_by(|a, b| {
                     (a.span.start_byte, a.span.end_byte, &a.name).cmp(&(
                         b.span.start_byte,
@@ -730,12 +764,27 @@ fn extract_treesitter_before_deadline(
                 crate::clonesig::stamp_declaration_hashes(&mut symbols, root, source);
                 crate::returns::stamp_return_types(&mut symbols, root, source);
 
+                let rust_implicit_calls = if lang == "rust" {
+                    rust_collect_implicit_calls(root, source, &file_symbol_name)
+                } else {
+                    Vec::new()
+                };
+                // The implicit calls name receivers the resolver types from the
+                // same site bindings an explicit call's receiver does.
+                let binding_calls: std::borrow::Cow<[ExtractedCall]> =
+                    if rust_implicit_calls.is_empty() {
+                        std::borrow::Cow::Borrowed(&calls)
+                    } else {
+                        std::borrow::Cow::Owned(
+                            calls.iter().chain(&rust_implicit_calls).cloned().collect(),
+                        )
+                    };
                 let local_bindings = collect_site_bindings(
                     root,
                     source,
                     lang,
                     &file_symbol_name,
-                    &calls,
+                    &binding_calls,
                     &references,
                     &imports,
                 );
@@ -763,6 +812,11 @@ fn extract_treesitter_before_deadline(
                     );
                 }
 
+                let (rust_inline_modules, rust_deref_targets) = if lang == "rust" {
+                    collect_rust_item_facts(root, source)
+                } else {
+                    (Vec::new(), Vec::new())
+                };
                 // Bound rather than returned: the embedded-script merge below
                 // still has to run, and it mutates this value in place.
                 let mut extraction = Extraction {
@@ -785,14 +839,27 @@ fn extract_treesitter_before_deadline(
                     go_package: (lang == "go")
                         .then(|| go_package_name(root, source))
                         .flatten(),
+                    jvm_package: matches!(lang, "kotlin" | "java")
+                        .then(|| jvm_package_name(root, source))
+                        .flatten(),
+                    scope_receivers: if lang == "kotlin" {
+                        crate::langcalls::kotlin::scope_receivers(root, source)
+                    } else {
+                        Vec::new()
+                    },
                     go_build_constrained: lang == "go" && go_build_constrained(path, source),
                     go_interface_methods,
                     go_method_params,
                     go_member_names,
+                    go_facts: (lang == "go")
+                        .then(|| crate::gofacts::extract(root, source, &file_symbol_name)),
                     // After `walk_tree`, so the per-scope cache it warmed is
                     // reused rather than every callable's subtree being walked
                     // a second time.
-                    scope_locals: collect_scope_locals(root, source, &file_symbol_name),
+                    scope_locals: collect_scope_locals(root, source, &file_symbol_name, lang),
+                    rust_inline_modules,
+                    rust_deref_targets,
+                    rust_implicit_calls,
                     local_bindings,
                     source_code: Some(source.to_string()),
                     literals: Vec::new(),
@@ -1587,13 +1654,24 @@ fn python_import_bindings(node: Node, source: &str) -> (Vec<String>, Vec<String>
 /// module, and inventing one would bind a name the author never wrote.
 fn js_require_bindings(call: Node, source: &str) -> (Option<String>, Vec<String>, Vec<String>) {
     let unbound = (None, Vec::new(), Vec::new());
-    let Some(declarator) = call
+    // `const m = await import('./x')` binds the same handle `require` does; the
+    // `await` (and any parentheses) is how the promise becomes the module.
+    let mut value = call;
+    while let Some(parent) = value.parent().filter(|parent| {
+        matches!(
+            parent.kind(),
+            "await_expression" | "parenthesized_expression"
+        )
+    }) {
+        value = parent;
+    }
+    let Some(declarator) = value
         .parent()
         .filter(|parent| parent.kind() == "variable_declarator")
         .filter(|parent| {
             parent
                 .child_by_field_name("value")
-                .is_some_and(|value| value.id() == call.id())
+                .is_some_and(|bound| bound.id() == value.id())
         })
     else {
         return unbound;
@@ -1652,6 +1730,57 @@ fn js_require_bindings(call: Node, source: &str) -> (Option<String>, Vec<String>
             (None, names, locals)
         }
         _ => unbound,
+    }
+}
+
+/// The names a dynamic `import(...)` binds.
+///
+/// Two shapes bind something: `const m = await import('./x')` (the module
+/// handle, exactly as `require` binds it) and `const Page = lazy(() =>
+/// import('./Page'))` or `React.lazy(...)`, which binds `Page` to the module's
+/// **default** export — `lazy` demands one. A `.then(m => ({ default: m.X }))`
+/// thunk is not matched: which member becomes the component is the author's
+/// expression, not a name.
+fn js_dynamic_import_bindings(
+    call: Node,
+    source: &str,
+) -> (Option<String>, Vec<String>, Vec<String>) {
+    let bound = js_require_bindings(call, source);
+    if !bound.1.is_empty() {
+        return bound;
+    }
+    let lazy_binding = || -> Option<String> {
+        let thunk = call
+            .parent()
+            .filter(|parent| parent.kind() == "arrow_function")?;
+        if thunk
+            .child_by_field_name("body")
+            .is_none_or(|body| body.id() != call.id())
+        {
+            return None;
+        }
+        let arguments = thunk
+            .parent()
+            .filter(|parent| parent.kind() == "arguments")?;
+        let wrapper = arguments
+            .parent()
+            .filter(|parent| parent.kind() == "call_expression")?;
+        let callee = wrapper.child_by_field_name("function")?;
+        if !matches!(
+            get_node_text(callee, source).as_str(),
+            "lazy" | "React.lazy"
+        ) {
+            return None;
+        }
+        let declarator = wrapper
+            .parent()
+            .filter(|parent| parent.kind() == "variable_declarator")?;
+        let name = declarator.child_by_field_name("name")?;
+        (name.kind() == "identifier").then(|| get_node_text(name, source))
+    };
+    match lazy_binding() {
+        Some(local) => (None, vec!["default".to_string()], vec![local]),
+        None => bound,
     }
 }
 
@@ -1846,7 +1975,12 @@ pub(crate) fn refused_extraction(
 /// Shares its body with the refusal path deliberately. Both emit the `File`
 /// node and the wiring annotations and claim nothing else; when that shape was
 /// two copies, one of them was fixed and the other was not.
-fn skipped_extraction(path: &str, lang: &str, source: &str, reason: String) -> Extraction {
+pub(crate) fn skipped_extraction(
+    path: &str,
+    lang: &str,
+    source: &str,
+    reason: String,
+) -> Extraction {
     unparsed_extraction(
         path,
         lang,
@@ -1898,11 +2032,17 @@ fn unparsed_extraction(
         routes: Vec::new(),
         wiring: extract_wiring_annotations(path, source),
         go_package: None,
+        jvm_package: None,
+        scope_receivers: Vec::new(),
         go_build_constrained: false,
         go_interface_methods: Vec::new(),
         go_method_params: Vec::new(),
         go_member_names: None,
+        go_facts: None,
         scope_locals: Vec::new(),
+        rust_inline_modules: Vec::new(),
+        rust_deref_targets: Vec::new(),
+        rust_implicit_calls: Vec::new(),
         local_bindings: Vec::new(),
         source_code: Some(source.to_string()),
         literals: Vec::new(),
@@ -2106,11 +2246,17 @@ fn unavailable_extraction(path: &str, lang: &str, source: &str) -> Extraction {
         routes: Vec::new(),
         wiring: extract_wiring_annotations(path, source),
         go_package: None,
+        jvm_package: None,
+        scope_receivers: Vec::new(),
         go_build_constrained: false,
         go_interface_methods: Vec::new(),
         go_method_params: Vec::new(),
         go_member_names: None,
+        go_facts: None,
         scope_locals: Vec::new(),
+        rust_inline_modules: Vec::new(),
+        rust_deref_targets: Vec::new(),
+        rust_implicit_calls: Vec::new(),
         local_bindings: Vec::new(),
         source_code: Some(source.to_string()),
         literals: Vec::new(),
@@ -2214,6 +2360,59 @@ fn js_binding_clause(node: Node<'_>) -> Option<Node<'_>> {
     None
 }
 
+/// The local name a default import binds beside braced ones:
+/// `Card` in `import Card, { memo } from './x'`. The grammar puts the default
+/// as the first identifier of the `import_clause`.
+fn js_default_import_local(node: Node<'_>, source: &str) -> Option<String> {
+    let mut cursor = node.walk();
+    let clause = node
+        .named_children(&mut cursor)
+        .find(|child| child.kind() == "import_clause")?;
+    let mut inner = clause.walk();
+    let first = clause.named_children(&mut inner).next()?;
+    (first.kind() == "identifier").then(|| get_node_text(first, source))
+}
+
+/// The local binding an `export default …` statement publishes, when the
+/// statement names one: `export default function App() {}`,
+/// `export default Card;`, `export default memo(Card);`.
+///
+/// A component wrapper ([`JS_FUNCTION_WRAPPERS`]) returns the component it was
+/// given, so the default export is the wrapped identifier. Any other call
+/// (`connect(mapState)(Card)`, `withRouter(Card)`) is not looked through — what
+/// it returns is its own business — and neither is an anonymous function,
+/// class or object.
+fn js_default_export_local(statement: Node<'_>, source: &str) -> Option<String> {
+    if statement.kind() != "export_statement" {
+        return None;
+    }
+    let mut cursor = statement.walk();
+    let is_default = statement
+        .children(&mut cursor)
+        .any(|child| child.kind() == "default");
+    if !is_default {
+        return None;
+    }
+    if let Some(declaration) = statement.child_by_field_name("declaration") {
+        return get_child_text(declaration, "name", source).filter(|name| !name.is_empty());
+    }
+    let mut value = statement.child_by_field_name("value")?;
+    for _ in 0..=JS_WRAPPER_NESTING {
+        match value.kind() {
+            "identifier" => return Some(get_node_text(value, source)),
+            "call_expression" => {
+                let callee = value.child_by_field_name("function")?;
+                if !JS_FUNCTION_WRAPPERS.contains(&get_node_text(callee, source).as_str()) {
+                    return None;
+                }
+                value = value.child_by_field_name("arguments")?.named_child(0)?;
+            }
+            _ => return None,
+        }
+    }
+    None
+}
+
 fn find_string_child(node: Node, source: &str) -> Option<String> {
     if let Some(s) = node.child_by_field_name("source") {
         return Some(
@@ -2293,6 +2492,14 @@ pub(crate) fn enclosing_callable_qualified(
                 base = Some(format!("{file_symbol_name}::{type_name}.{name}"));
                 break;
             }
+            // A member of a module-level object literal is qualified by the
+            // object, as a class member is by its class.
+            if let Some(object) = js_object_member_owner(parent) {
+                if let Some(object_name) = get_child_text(object, "name", source) {
+                    base = Some(format!("{file_symbol_name}::{object_name}.{name}"));
+                    break;
+                }
+            }
             names.push(name);
             // This is the starting node the former recursive scope lookup
             // would receive, including its Python-default evaluation rules.
@@ -2364,6 +2571,12 @@ fn callable_binding_name(node: Node, source: &str) -> Option<String> {
     if parent.kind() == "variable_declarator" {
         return get_child_text(parent, "name", source);
     }
+    // `handle = () => …` in a class body, and `remove: () => …` in an object
+    // literal bound to a module-level `const`: the member is the binding, and
+    // the symbol emitter names it the same way.
+    if let Some(member) = js_function_valued_member(node, source) {
+        return Some(member);
+    }
     // `const save = useCallback(() => { … }, [deps])`: the binding *is* the
     // function, reached through a wrapper that returns something calling it.
     // Named by the declarator, exactly as the symbol emitter names it.
@@ -2401,6 +2614,106 @@ const JS_FUNCTION_WRAPPERS: &[&str] = &[
 
 /// How many wrappers deep `memo(forwardRef(() => …))` is followed.
 const JS_WRAPPER_NESTING: usize = 3;
+
+/// The member name a function-valued class field or object-literal pair gives
+/// its function: `handle` for `handle = () => …`, `remove` for
+/// `remove: () => …`. `None` when `function` is neither.
+///
+/// A pair counts only when its object is a module-level `const`'s value
+/// ([`js_object_member_owner`]); the same object passed as an argument names no
+/// binding a call could be attributed to.
+fn js_function_valued_member(function: Node, source: &str) -> Option<String> {
+    if !matches!(function.kind(), "arrow_function" | "function_expression") {
+        return None;
+    }
+    let parent = bounded_parent(function)?;
+    match parent.kind() {
+        "public_field_definition" | "field_definition" => {
+            let value = parent.child_by_field_name("value")?;
+            if value.id() != function.id() {
+                return None;
+            }
+            js_field_name(parent, source)
+        }
+        "pair" => {
+            js_object_member_owner(function)?;
+            js_pair_key(parent, source)
+        }
+        _ => None,
+    }
+}
+
+/// The name a class field declares. TypeScript calls the field `name`,
+/// JavaScript `property`; a computed or string-keyed field names nothing a call
+/// could write, so it is left out.
+fn js_field_name(field: Node, source: &str) -> Option<String> {
+    let name = field
+        .child_by_field_name("name")
+        .or_else(|| field.child_by_field_name("property"))?;
+    matches!(
+        name.kind(),
+        "property_identifier" | "private_property_identifier"
+    )
+    .then(|| get_node_text(name, source))
+}
+
+/// The identifier key of an object-literal pair.
+fn js_pair_key(pair: Node, source: &str) -> Option<String> {
+    let key = pair.child_by_field_name("key")?;
+    matches!(key.kind(), "property_identifier" | "identifier").then(|| get_node_text(key, source))
+}
+
+/// The module-level `variable_declarator` an object-literal member belongs to,
+/// when `node` is a member of the object that declarator initialises:
+/// `method() {}` (a `method_definition`) or the function of `name: () => {}`.
+/// The initializer may be wrapped in `as const`, `satisfies T` or parentheses.
+///
+/// Such a member is addressed as `owner.member` — `paperService.fetchOne()` —
+/// so it is a symbol qualified by the object, exactly as a method is qualified
+/// by its class. A member of an object that is returned, passed or nested is
+/// not: nothing names the object, and the factory case already owns its own
+/// shape ([`js_returned_object_method`]).
+fn js_object_member_owner(node: Node) -> Option<Node> {
+    let object = match node.kind() {
+        "method_definition" => bounded_parent(node)?,
+        "arrow_function" | "function_expression" => {
+            let pair = bounded_parent(node)?;
+            if pair.kind() != "pair"
+                || pair
+                    .child_by_field_name("value")
+                    .is_none_or(|value| value.id() != node.id())
+            {
+                return None;
+            }
+            bounded_parent(pair)?
+        }
+        _ => return None,
+    };
+    if object.kind() != "object" {
+        return None;
+    }
+    let mut child = object;
+    let mut parent = bounded_parent(object)?;
+    while matches!(
+        parent.kind(),
+        "as_expression"
+            | "satisfies_expression"
+            | "parenthesized_expression"
+            | "non_null_expression"
+    ) {
+        child = parent;
+        parent = bounded_parent(parent)?;
+    }
+    (parent.kind() == "variable_declarator"
+        && parent
+            .child_by_field_name("value")
+            .is_some_and(|value| value.id() == child.id())
+        && parent
+            .child_by_field_name("name")
+            .is_some_and(|name| name.kind() == "identifier")
+        && is_module_level(parent))
+    .then_some(parent)
+}
 
 /// The function a wrapper call binds, when `value` is one: the first argument
 /// of a [`JS_FUNCTION_WRAPPERS`] call, through at most [`JS_WRAPPER_NESTING`]
@@ -2597,6 +2910,20 @@ fn member_access_receiver(node: Node, source: &str) -> Option<String> {
         let text = receiver_identity(target, source, 0);
         return (!text.is_empty()).then_some(text);
     }
+    // Kotlin's `navigation_expression` has no fields: the object is the first
+    // named child and the member the last (`task.label`, `a.b.c`).
+    if parent.kind() == "navigation_expression" {
+        let count = parent.named_child_count();
+        if count < 2
+            || parent
+                .named_child(count - 1)
+                .is_none_or(|member| member.id() != node.id())
+        {
+            return None;
+        }
+        let text = receiver_identity(parent.named_child(0)?, source, 0);
+        return (!text.is_empty()).then_some(text);
+    }
     // The grammars spell the same shape several ways: `attribute` in Python,
     // `member_expression` in JS/TS, `selector_expression` in Go, Rust's
     // `field_expression` (`self.field`) and `scoped_identifier` (`Self::f`).
@@ -2772,7 +3099,20 @@ fn rust_attribute_callback_refs(
         "skip_serializing_if",
         "skip_deserializing_if",
     ];
-    let enclosing = enclosing_callable_qualified(node, source, file_symbol_name);
+    // A field's attribute belongs to the type that declares the field: the
+    // derive reads `#[serde(default = "f")]` when it expands the struct, so the
+    // struct is what uses `f`. A callable ancestor still wins.
+    let enclosing = enclosing_callable_qualified(node, source, file_symbol_name).or_else(|| {
+        let mut ancestor = bounded_parent(node);
+        while let Some(parent) = ancestor {
+            if matches!(parent.kind(), "struct_item" | "enum_item" | "union_item") {
+                return get_child_text(parent, "name", source)
+                    .map(|name| format!("{file_symbol_name}::{name}"));
+            }
+            ancestor = bounded_parent(parent);
+        }
+        None
+    });
     let mut stack = vec![node];
     while let Some(current) = stack.pop() {
         if current.kind() == "token_tree" {
@@ -3226,6 +3566,10 @@ fn go_interface_method_exemptions(
         });
     }
 }
+
+/// Why a Go interface's method requirement is never a dead-code candidate.
+pub const GO_INTERFACE_REQUIREMENT_REASON: &str = "Go interface method requirement — it \
+     declares what an implementer must provide, so no caller of its own is expected";
 
 /// Why an ambient TypeScript declaration is never a dead-code candidate.
 pub const TS_AMBIENT_REASON: &str = "ambient TypeScript declaration (`declare module`, `declare \
@@ -3861,6 +4205,37 @@ fn extract_node(
                     }
                 }
             }
+            // `with Engine(1) as eng:` calls `Engine.__enter__` with no call
+            // syntax anywhere. Recorded as that call, against the class the
+            // statement names, so the resolver can bind it (or say it could
+            // not). Only a capitalised identifier is read as a class: the
+            // result of an arbitrary function (`with open(p):`) has no type
+            // this extractor knows, and a row per such statement would bury
+            // the ledger in questions nothing can answer.
+            "with_item" => {
+                let constructed = node
+                    .child_by_field_name("value")
+                    .map(|value| {
+                        if value.kind() == "as_pattern" {
+                            value.named_child(0).unwrap_or(value)
+                        } else {
+                            value
+                        }
+                    })
+                    .filter(|expression| expression.kind() == "call")
+                    .and_then(|call| call.child_by_field_name("function"))
+                    .filter(|function| function.kind() == "identifier")
+                    .map(|function| get_node_text(function, source))
+                    .filter(|name| name.chars().next().is_some_and(char::is_uppercase));
+                if let Some(class_name) = constructed {
+                    calls.push(ExtractedCall {
+                        caller_symbol: enclosing_callable_qualified(node, source, file_symbol_name),
+                        callee_name: "__enter__".to_string(),
+                        receiver_expr: Some(class_name),
+                        span,
+                    });
+                }
+            }
             _ => {}
         },
         "javascript" | "typescript" | "tsx" => match kind {
@@ -3879,13 +4254,21 @@ fn extract_node(
                     let enclosing_type = (kind == "method_definition")
                         .then(|| enclosing_type_name(node, source))
                         .flatten();
+                    // `const svc = { fetch() {} }`: the method is `svc.fetch`.
+                    let object_owner = (kind == "method_definition" && enclosing_type.is_none())
+                        .then(|| js_object_member_owner(node))
+                        .flatten()
+                        .and_then(|declarator| get_child_text(declarator, "name", source))
+                        .map(|object| format!("{}::{}", file_symbol_name, object));
                     let parent_symbol = enclosing_type
                         .as_ref()
                         .map(|type_name| format!("{}::{}", file_symbol_name, type_name))
+                        .or_else(|| object_owner.clone())
                         .or_else(|| enclosing_callable_qualified(node, source, file_symbol_name))
                         .unwrap_or_else(|| file_symbol_name.to_string());
                     let qualified_name = enclosing_type
                         .map(|type_name| format!("{}::{}.{}", file_symbol_name, type_name, n))
+                        .or_else(|| object_owner.map(|object| format!("{object}.{n}")))
                         .unwrap_or_else(|| {
                             scoped_qualified_name(node, source, file_symbol_name, &n)
                         });
@@ -3928,6 +4311,43 @@ fn extract_node(
                         declaration_hash: None,
                         return_type: None,
                     });
+                }
+            }
+            // `handle = () => this.get(k)` in a class body and `remove: () => …`
+            // in an object literal bound to a module-level `const`: a function
+            // stored in a member is a method of its owner, and a call written
+            // `owner.handle()` names it. Without the symbol the arrow's own calls
+            // were attributed to the file and its callers had nothing to reach.
+            "public_field_definition" | "field_definition" | "pair" => {
+                let value = node.child_by_field_name("value");
+                let function = value.filter(|value| {
+                    matches!(value.kind(), "arrow_function" | "function_expression")
+                });
+                if let Some(function) = function {
+                    let member = js_function_valued_member(function, source);
+                    let owner = if kind == "pair" {
+                        js_object_member_owner(function)
+                            .and_then(|declarator| get_child_text(declarator, "name", source))
+                            .map(|object| format!("{}::{}", file_symbol_name, object))
+                    } else {
+                        enclosing_type_name(node, source)
+                            .map(|type_name| format!("{}::{}", file_symbol_name, type_name))
+                    };
+                    if let (Some(name), Some(owner)) = (member, owner) {
+                        symbols.push(ExtractedSymbol {
+                            qualified_name: format!("{owner}.{name}"),
+                            name,
+                            kind: SymbolKind::Method,
+                            span,
+                            is_exported: js_symbol_is_exported(node, source),
+                            docstring: None,
+                            signature: None,
+                            parent_symbol: Some(owner),
+                            body_signature: None,
+                            declaration_hash: None,
+                            return_type: None,
+                        });
+                    }
                 }
             }
             "variable_declarator" => {
@@ -4056,6 +4476,19 @@ fn extract_node(
                 }
             }
             "import_statement" | "export_statement" => {
+                if let Some(local) = js_default_export_local(node, source) {
+                    // `export default Card` / `export default memo(Card)`: the
+                    // module's default export *is* that local binding. Recorded
+                    // under the name `default`, which is the name an importer's
+                    // `import X from` and a barrel's `export { default } from`
+                    // ask for.
+                    exports.push(ExtractedExport {
+                        exported_name: "default".to_string(),
+                        local_name: Some(local),
+                        module_specifier: None,
+                        span: span.clone(),
+                    });
+                }
                 let text = get_node_text(node, source);
                 let mut alias = None;
                 let mut imported_names = vec![];
@@ -4085,6 +4518,14 @@ fn extract_node(
                     let (names, locals) = js_clause_bindings(clause, source);
                     imported_names = names;
                     local_names = locals;
+                    // `import Card, { memo } from './x'` binds the module's
+                    // default export beside its named ones. The braces were all
+                    // this branch read, so the default's local name was lost and
+                    // every use of it named a binding nothing declared.
+                    if let Some(default_local) = js_default_import_local(node, source) {
+                        imported_names.push("default".to_string());
+                        local_names.push(default_local);
+                    }
                     if text.trim_start().starts_with("export") {
                         for (local, exported) in imported_names.iter().zip(local_names.iter()) {
                             exports.push(ExtractedExport {
@@ -4189,7 +4630,7 @@ fn extract_node(
                                             if callee == "require" {
                                                 js_require_bindings(node, source)
                                             } else {
-                                                (None, vec![], vec![])
+                                                js_dynamic_import_bindings(node, source)
                                             };
                                         imports.push(ExtractedImport {
                                             raw_import: get_node_text(node, source),
@@ -4367,6 +4808,19 @@ fn extract_node(
             // list, so a declarative macro body contributes no fabricated call.
             "macro_invocation" => {
                 let caller = enclosing_callable_qualified(node, source, file_symbol_name);
+                // `tauri::generate_handler![a::cmd, cmd2]` hands each listed
+                // function to the IPC dispatcher: a use by name, with no call
+                // expression anywhere.
+                for (name, receiver_expr) in rust_handler_list(node, source) {
+                    references.push(ExtractedReference {
+                        name,
+                        kind: ReferenceKind::Name,
+                        span: span.clone(),
+                        enclosing_symbol: caller.clone(),
+                        assigned_to: None,
+                        receiver_expr,
+                    });
+                }
                 for (callee_name, receiver_expr) in rust_macro_calls(node, source, file_symbol_name)
                     .into_iter()
                     .map(|(callee_name, receiver_expr)| {
@@ -4763,10 +5217,21 @@ fn extract_node(
                     node
                 };
                 if let Some(n) = get_child_text(node_to_check, "name", source) {
+                    let qualified_name = scoped_qualified_name(node, source, file_symbol_name, &n);
+                    // An interface is an interface, not a struct: its method
+                    // requirements are symbols a call through the interface can
+                    // name, and what a dispatch edge's `via` points at.
+                    let interface = node_to_check
+                        .child_by_field_name("type")
+                        .filter(|ty| ty.kind() == "interface_type");
                     symbols.push(ExtractedSymbol {
                         name: n.clone(),
-                        qualified_name: scoped_qualified_name(node, source, file_symbol_name, &n),
-                        kind: SymbolKind::Struct,
+                        qualified_name: qualified_name.clone(),
+                        kind: if interface.is_some() {
+                            SymbolKind::Interface
+                        } else {
+                            SymbolKind::Struct
+                        },
                         span,
                         is_exported: n.chars().next().is_some_and(|c| c.is_uppercase()),
                         docstring: None,
@@ -4776,6 +5241,39 @@ fn extract_node(
                         declaration_hash: None,
                         return_type: None,
                     });
+                    if let Some(interface) = interface {
+                        let mut cursor = interface.walk();
+                        for member in interface.named_children(&mut cursor) {
+                            if member.kind() != "method_elem" {
+                                continue;
+                            }
+                            let Some(method) = get_child_text(member, "name", source) else {
+                                continue;
+                            };
+                            let method_qualified = format!("{qualified_name}.{method}");
+                            wiring.push(WiringAnnotation {
+                                kind: WiringKind::StructuralExempt,
+                                target_symbol: method_qualified.clone(),
+                                details: GO_INTERFACE_REQUIREMENT_REASON.to_string(),
+                            });
+                            symbols.push(ExtractedSymbol {
+                                name: method.clone(),
+                                qualified_name: method_qualified,
+                                kind: SymbolKind::Method,
+                                span: node_span(member),
+                                is_exported: method
+                                    .chars()
+                                    .next()
+                                    .is_some_and(|c| c.is_uppercase()),
+                                docstring: None,
+                                signature: None,
+                                parent_symbol: Some(qualified_name.clone()),
+                                body_signature: None,
+                                declaration_hash: None,
+                                return_type: None,
+                            });
+                        }
+                    }
                 }
             }
             // `const P, Q = 1, 2` declares two constants. `name` is a repeated
@@ -4838,9 +5336,21 @@ fn extract_node(
                     });
                 }
             }
-            "call_expression" | "composite_literal" => {
+            "call_expression" | "composite_literal" | "type_conversion_expression" => {
                 let callee_node = if kind == "call_expression" {
                     node.child_by_field_name("function")
+                } else if kind == "type_conversion_expression" {
+                    // `pkg.New[int](3)`: one explicit type argument followed by
+                    // value arguments parses as a conversion to the generic
+                    // *type* `pkg.New[int]`, not as a call, because `f[T](x)`
+                    // is also how a type is converted. The grammar cannot tell
+                    // them apart and neither can the extractor: it names the
+                    // callee and the resolver, which knows whether that name
+                    // is a function or a type, decides. A conversion to a
+                    // non-generic type is a plain `call_expression` already.
+                    node.child_by_field_name("type")
+                        .filter(|ty| ty.kind() == "generic_type")
+                        .and_then(|ty| ty.child_by_field_name("type"))
                 } else {
                     // `composite_literal` declares `type` as a required field
                     // (tree-sitter-go node-types.json), so this cannot be None
@@ -6346,7 +6856,16 @@ fn split_call_target_inner(
         // becomes the receiver, matching how `x.method()` already splits.
         "scoped_identifier" => {
             let name = get_child_text(function_node, "name", source);
-            let path = get_child_text(function_node, "path", source);
+            // `Wrapper::<u8>::new()`: the type arguments are not part of the
+            // type's name, exactly as they are not part of a callee's.
+            let path = function_node.child_by_field_name("path").map(|path| {
+                match (path.kind(), path.child_by_field_name("type")) {
+                    ("generic_type" | "generic_type_with_turbofish", Some(bare)) => {
+                        get_node_text(bare, source)
+                    }
+                    _ => get_node_text(path, source),
+                }
+            });
             match (name, path) {
                 (Some(name), path) if !name.is_empty() => (name, path),
                 _ => (get_node_text(function_node, source), None),
@@ -6507,6 +7026,293 @@ fn rust_macro_calls(
     found.sort();
     found.dedup();
     found
+}
+
+/// Most implicit calls one file records.
+const MAX_IMPLICIT_CALLS: usize = 20_000;
+
+/// The operator, index, drop and `into` calls a Rust file makes without writing
+/// one, as candidates (see `Extraction::rust_implicit_calls`).
+///
+/// Each is attached only to an operand whose type the syntax or a binding
+/// states: a constructor expression (`V(1)`, `V { .. }`, `T::new()`), a unit
+/// struct value, or a plain local (the resolver types it from its binding).
+/// Literals and casts are numbers and never qualify.
+fn rust_collect_implicit_calls(
+    root: Node,
+    source: &str,
+    file_symbol_name: &str,
+) -> Vec<ExtractedCall> {
+    let mut calls = Vec::new();
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        if walk_deadline_passed() || calls.len() >= MAX_IMPLICIT_CALLS {
+            break;
+        }
+        let candidate: Option<(&str, Option<String>)> = match node.kind() {
+            "binary_expression" | "compound_assignment_expr" => {
+                let op = node
+                    .child_by_field_name("operator")
+                    .map(|op| get_node_text(op, source));
+                let callee = match op.as_deref() {
+                    Some("+") => Some("add"),
+                    Some("-") => Some("sub"),
+                    Some("*") => Some("mul"),
+                    Some("/") => Some("div"),
+                    Some("%") => Some("rem"),
+                    Some("&") => Some("bitand"),
+                    Some("|") => Some("bitor"),
+                    Some("^") => Some("bitxor"),
+                    Some("<<") => Some("shl"),
+                    Some(">>") => Some("shr"),
+                    Some("+=") => Some("add_assign"),
+                    Some("-=") => Some("sub_assign"),
+                    Some("*=") => Some("mul_assign"),
+                    Some("/=") => Some("div_assign"),
+                    _ => None,
+                };
+                callee.map(|callee| {
+                    (
+                        callee,
+                        node.child_by_field_name("left")
+                            .and_then(|left| rust_typed_operand(left, source)),
+                    )
+                })
+            }
+            "index_expression" => Some((
+                "index",
+                node.named_child(0)
+                    .filter(|value| matches!(value.kind(), "identifier" | "field_expression"))
+                    .map(|value| receiver_identity(value, source, 0)),
+            )),
+            "let_declaration" => rust_let_implicit_call(node, source),
+            _ => None,
+        };
+        if let Some((callee, Some(receiver))) = candidate {
+            calls.push(ExtractedCall {
+                caller_symbol: enclosing_callable_qualified(node, source, file_symbol_name),
+                callee_name: callee.to_string(),
+                receiver_expr: Some(receiver),
+                span: node_span(node),
+            });
+        }
+        push_named_children(node, &mut stack);
+    }
+    calls.sort_by_key(|call| call.span.start_byte);
+    calls
+}
+
+/// The receiver text for an operand whose type is stated: see
+/// [`rust_collect_implicit_calls`].
+fn rust_typed_operand(operand: Node, source: &str) -> Option<String> {
+    match operand.kind() {
+        "parenthesized_expression" | "reference_expression" => operand
+            .child_by_field_name("value")
+            .or_else(|| operand.named_child(0))
+            .and_then(|inner| rust_typed_operand(inner, source)),
+        "identifier" => Some(get_node_text(operand, source)),
+        "struct_expression" => rust_type_name(operand.child_by_field_name("name")?, source, 0),
+        "call_expression" => {
+            let function = operand.child_by_field_name("function")?;
+            let named = match function.kind() {
+                "identifier" => get_node_text(function, source),
+                "scoped_identifier" => get_node_text(function.child_by_field_name("path")?, source)
+                    .rsplit("::")
+                    .next()?
+                    .to_string(),
+                _ => return None,
+            };
+            named
+                .starts_with(|c: char| c.is_ascii_uppercase())
+                .then(|| receiver_identity(operand, source, 0))
+        }
+        _ => None,
+    }
+}
+
+/// `drop` for `let g = <constructed value>;` and `from` for `let m: T =
+/// x.into();`.
+fn rust_let_implicit_call(node: Node, source: &str) -> Option<(&'static str, Option<String>)> {
+    let value = node.child_by_field_name("value")?;
+    if let Some(ty) = node.child_by_field_name("type") {
+        if value.kind() == "call_expression" {
+            let function = value.child_by_field_name("function")?;
+            let is_into = function.kind() == "field_expression"
+                && get_child_text(function, "field", source).as_deref() == Some("into")
+                && value
+                    .child_by_field_name("arguments")
+                    .is_some_and(|arguments| arguments.named_child_count() == 0);
+            if is_into {
+                return Some(("from", rust_type_name(ty, source, 0)));
+            }
+        }
+        return None;
+    }
+    let receiver = match value.kind() {
+        "identifier" => get_node_text(value, source)
+            .starts_with(|c: char| c.is_ascii_uppercase())
+            .then(|| get_node_text(value, source)),
+        "struct_expression" | "call_expression" => rust_typed_operand(value, source),
+        _ => None,
+    };
+    Some(("drop", receiver))
+}
+
+/// Most calls one file's `macro_rules!` expansions may add.
+const MAX_MACRO_EXPANSION_CALLS: usize = 10_000;
+
+/// Give each invocation of a `macro_rules!` macro this file defines the calls
+/// that macro's rules make.
+///
+/// `log!("x")` with `macro_rules! log { ($m:expr) => { $crate::emit($m) } }`
+/// calls `emit`, and the only place that call is written is the rule's body,
+/// which the grammar parses as a loose token tree and which belongs to no
+/// function. Read as the token stream it is (the same scan a macro argument
+/// the grammar cannot parse gets), every call on a rule's right-hand side is
+/// attributed to the callable that invokes the macro. Textual, and stated as
+/// such: a call whose callee is built from a macro variable is not a plain
+/// identifier and is not read, and a macro this file does not define (it comes
+/// from `use`, or another crate) is not expanded — that is the import
+/// resolver's question.
+///
+/// An invocation inside a macro definition is not expanded, so a macro that
+/// invokes itself cannot grow the result, and the total is bounded.
+fn rust_expand_local_macros(
+    root: Node,
+    source: &str,
+    file_symbol_name: &str,
+    calls: &mut Vec<ExtractedCall>,
+    references: &mut Vec<ExtractedReference>,
+) {
+    let mut bodies: HashMap<String, Vec<(String, Option<String>)>> = HashMap::new();
+    let mut invocations = Vec::new();
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        if walk_deadline_passed() {
+            return;
+        }
+        match node.kind() {
+            "macro_definition" => {
+                if let Some(name) = get_child_text(node, "name", source) {
+                    let mut found = Vec::new();
+                    let mut cursor = node.walk();
+                    for rule in node
+                        .named_children(&mut cursor)
+                        .filter(|child| child.kind() == "macro_rule")
+                    {
+                        let Some(right) = rule.child_by_field_name("right") else {
+                            continue;
+                        };
+                        let text = get_node_text(right, source);
+                        let inner = text
+                            .strip_prefix(['(', '[', '{'])
+                            .and_then(|rest| rest.strip_suffix([')', ']', '}']))
+                            .unwrap_or(&text);
+                        // `$crate` is the defining crate's root, which is `crate`
+                        // to every caller in this file.
+                        found.extend(scan_rust_token_tree_calls(
+                            &inner.replace("$crate", "crate"),
+                        ));
+                    }
+                    found.sort();
+                    found.dedup();
+                    bodies.insert(name, found);
+                }
+                // The rules' own invocations are the macro's, not a caller's.
+                continue;
+            }
+            "macro_invocation" => invocations.push(node),
+            _ => {}
+        }
+        push_named_children(node, &mut stack);
+    }
+    let mut added = 0usize;
+    for node in invocations {
+        let Some(name) = node
+            .child_by_field_name("macro")
+            .map(|name| get_node_text(name, source))
+        else {
+            continue;
+        };
+        let Some(body) = bodies.get(&name) else {
+            continue;
+        };
+        let caller = enclosing_callable_qualified(node, source, file_symbol_name);
+        for (callee_name, receiver_expr) in body {
+            added += 1;
+            if added > MAX_MACRO_EXPANSION_CALLS {
+                return;
+            }
+            let receiver_expr = receiver_expr.clone();
+            let span = node_span(node);
+            references.push(extracted_reference(
+                node,
+                source,
+                file_symbol_name,
+                callee_name.clone(),
+                ReferenceKind::Call,
+                None,
+            ));
+            calls.push(ExtractedCall {
+                caller_symbol: caller.clone(),
+                callee_name: callee_name.clone(),
+                receiver_expr,
+                span,
+            });
+        }
+    }
+}
+
+/// The functions a `generate_handler![ .. ]` invocation lists, as `(name,
+/// path receiver)`: `commands::cmd` is `("cmd", Some("commands"))`, a bare `cmd`
+/// has no receiver.
+///
+/// Only that macro, matched on its last path segment (`generate_handler!` or
+/// `tauri::generate_handler!`). The list is comma separated paths, each
+/// optionally preceded by `#[cfg(..)]`; an item that is not a plain path is
+/// skipped rather than guessed at.
+fn rust_handler_list(node: Node, source: &str) -> Vec<(String, Option<String>)> {
+    let Some(macro_name) = node.child_by_field_name("macro") else {
+        return Vec::new();
+    };
+    let macro_name = get_node_text(macro_name, source);
+    if macro_name.rsplit("::").next().map(str::trim) != Some("generate_handler") {
+        return Vec::new();
+    }
+    let mut cursor = node.walk();
+    let Some(tokens) = node
+        .named_children(&mut cursor)
+        .find(|child| child.kind() == "token_tree")
+    else {
+        return Vec::new();
+    };
+    let text = get_node_text(tokens, source);
+    let Some(inner) = text
+        .strip_prefix(['(', '[', '{'])
+        .and_then(|rest| rest.strip_suffix([')', ']', '}']))
+    else {
+        return Vec::new();
+    };
+    let mut listed = Vec::new();
+    for item in inner.split(',') {
+        let mut item = item.trim();
+        while let Some(rest) = item.strip_prefix("#[") {
+            let Some(close) = rest.find(']') else {
+                item = "";
+                break;
+            };
+            item = rest[close + 1..].trim_start();
+        }
+        if item.is_empty() || !item.split("::").all(is_user_ident) {
+            continue;
+        }
+        let (receiver, name) = match item.rsplit_once("::") {
+            Some((receiver, name)) => (Some(receiver.to_string()), name),
+            None => (None, item),
+        };
+        listed.push((name.to_string(), receiver));
+    }
+    listed
 }
 
 /// Strip a token tree's outer delimiter pair, if it has one worth probing.
@@ -6703,7 +7509,14 @@ fn scan_rust_token_tree_calls(source: &str) -> Vec<(String, Option<String>)> {
                 pending_callee = Some(ident);
                 after_dot = false;
             } else if after_path {
-                pending_receiver = pending_callee.take();
+                // The whole path before the name, as a call written outside a
+                // macro records it: `crate::macros::emit` has the receiver
+                // `crate::macros`, not its last segment.
+                pending_receiver = match (pending_receiver.take(), pending_callee.take()) {
+                    (Some(path), Some(segment)) => Some(format!("{path}::{segment}")),
+                    (None, segment) => segment,
+                    (path, None) => path,
+                };
                 pending_callee = Some(ident);
                 after_path = false;
             } else {
@@ -7093,6 +7906,55 @@ fn rust_absorb_inline_super(node: Node, receiver: Option<String>) -> Option<Stri
         return Some(segments.join("::"));
     }
     Some(format!("self::{}", segments.join("::")))
+}
+
+/// The inline `mod name { … }` blocks and the `impl Deref for T { type Target
+/// = U; }` pairs of a Rust file, each sorted and deduplicated.
+///
+/// A `mod name;` declaration has no body and names a file, so it is not an
+/// inline module. The walk is an explicit worklist, bounded by the same
+/// deadline every other whole-tree pass here honours.
+fn collect_rust_item_facts(root: Node, source: &str) -> (Vec<String>, Vec<(String, String)>) {
+    let mut modules = BTreeSet::new();
+    let mut derefs = BTreeSet::new();
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        if walk_deadline_passed() {
+            break;
+        }
+        match node.kind() {
+            "mod_item" if node.child_by_field_name("body").is_some() => {
+                if let Some(name) = get_child_text(node, "name", source) {
+                    modules.insert(name);
+                }
+            }
+            "impl_item" => {
+                if let Some(pair) = rust_deref_impl(node, source) {
+                    derefs.insert(pair);
+                }
+            }
+            _ => {}
+        }
+        push_named_children(node, &mut stack);
+    }
+    (modules.into_iter().collect(), derefs.into_iter().collect())
+}
+
+/// `(Guard, Inner)` for `impl Deref for Guard { type Target = Inner; .. }`.
+fn rust_deref_impl(node: Node, source: &str) -> Option<(String, String)> {
+    let trait_name = get_node_text(node.child_by_field_name("trait")?, source);
+    if trait_name.rsplit("::").next()?.trim() != "Deref" {
+        return None;
+    }
+    let owner = rust_type_name(node.child_by_field_name("type")?, source, 0)?;
+    let body = node.child_by_field_name("body")?;
+    let mut cursor = body.walk();
+    let target = body
+        .named_children(&mut cursor)
+        .filter(|item| item.kind() == "type_item")
+        .find(|item| get_child_text(*item, "name", source).as_deref() == Some("Target"))?;
+    let target = rust_type_name(target.child_by_field_name("type")?, source, 0)?;
+    Some((owner, target))
 }
 
 fn rust_inline_module_depth(node: Node) -> usize {
@@ -7655,8 +8517,33 @@ fn go_type_name(node: Node, source: &str, depth: usize) -> Option<String> {
             let text = get_node_text(node, source);
             text.rsplit('.').next().map(str::to_string)
         }),
+        // `Box[T]`, `*Box[T]`, `pkg.Box[int]`: the type arguments are not part
+        // of the type's name, so a method declared on `(b *Box[T])` is `Box`'s
+        // and a value typed `Box[int]` is a `Box`.
+        "generic_type" => node
+            .child_by_field_name("type")
+            .and_then(|inner| go_type_name(inner, source, depth + 1)),
         _ => None,
     }
+}
+
+/// The dotted package a Kotlin or Java file declares, if it declares one.
+fn jvm_package_name(root: Node, source: &str) -> Option<String> {
+    let mut cursor = root.walk();
+    let header = root
+        .named_children(&mut cursor)
+        .find(|child| matches!(child.kind(), "package_header" | "package_declaration"))?;
+    let name = header.named_children(&mut header.walk()).find(|child| {
+        matches!(
+            child.kind(),
+            "qualified_identifier" | "scoped_identifier" | "identifier"
+        )
+    })?;
+    let text: String = get_node_text(name, source)
+        .chars()
+        .filter(|ch| !ch.is_whitespace())
+        .collect();
+    (!text.is_empty()).then_some(text)
 }
 
 fn go_package_name(root: Node, source: &str) -> Option<String> {
@@ -7852,6 +8739,7 @@ fn maybe_push_name_reference(
         || is_defining_name(node)
         || is_inside_import_or_export(node)
         || is_call_callee(node)
+        || rust_macro_member_name(node, lang)
     {
         return;
     }
@@ -7905,6 +8793,23 @@ fn maybe_push_name_reference(
         // `cfg.enabled` from a bare local named `enabled`.
         receiver_expr: member_access_receiver(node, source),
     });
+}
+
+/// Whether `node` is the member name of a `recv.name` written inside a macro's
+/// token tree.
+///
+/// A macro argument is an unstructured `token_tree`, so `assert_eq!(g.level(), 1)`
+/// reaches here as the loose tokens `g` `.` `level` and a `( )` group. The
+/// identifier after the dot names something `g` owns, never a file-level item,
+/// yet as a bare `Name` it bound to the free `fn level` beside it (`References`,
+/// 1.0, `SameFile`) and kept that function alive. The method call itself is
+/// recovered, with its receiver, by `rust_macro_calls`; a field read has no
+/// graph node to reference.
+fn rust_macro_member_name(node: Node, lang: &str) -> bool {
+    lang == "rust"
+        && node.kind() == "identifier"
+        && bounded_parent(node).is_some_and(|parent| parent.kind() == "token_tree")
+        && node.prev_sibling().is_some_and(|prev| prev.kind() == ".")
 }
 
 /// Grammar keys with a language-specific arm in `extract_node`.
@@ -8199,6 +9104,18 @@ fn is_defining_name(node: Node) -> bool {
     // — which is the self-reference shape
     // `c_family_declarations_do_not_reference_themselves` already pins for C.
     if bounded_parent(node).is_some_and(|parent| parent.kind() == "enum_entry") {
+        return true;
+    }
+    // Kotlin names a local (`val clock = …`, `for (item in …)`) in the first
+    // identifier of a `variable_declaration`, and a function parameter in the
+    // first identifier of a `parameter`; neither carries a `name` field, so the
+    // field test below cannot see them and a local was never a local.
+    if bounded_parent(node).is_some_and(|parent| {
+        matches!(parent.kind(), "variable_declaration" | "parameter")
+            && parent
+                .named_child(0)
+                .is_some_and(|first| first.id() == node.id())
+    }) {
         return true;
     }
     // R spells every function declaration as an assignment — `helper <-
@@ -8513,6 +9430,7 @@ pub(crate) fn walk_deadline_passed() -> bool {
 /// suppressing genuine references there. Extraction of a file must never depend
 /// on what was extracted before it.
 fn reset_scope_locals() {
+    crate::swiftscope::reset();
     SCOPE_LOCALS.with(|cache| cache.borrow_mut().clear());
 }
 
@@ -8544,6 +9462,8 @@ pub(crate) fn is_callable_node(node: Node) -> bool {
             // of the *enclosing* function, so a later `marker("x")` in that
             // function was RA1-killed even though the binding is not in scope.
             | "closure_expression"
+            // Swift and Kotlin closures: their own scope for the same reason.
+            | "lambda_literal"
     )
 }
 
@@ -8605,7 +9525,7 @@ fn module_binding_is_symbol(node: Node, source: &str) -> bool {
             "variable_declarator" => {
                 return is_field_child(parent, "name", current)
                     && is_module_level(parent)
-                    && js_symbol_is_exported(parent, source);
+                    && (js_symbol_is_exported(parent, source) || js_owns_member_symbols(parent));
             }
             "const_spec" | "var_spec" => {
                 let mut cursor = parent.walk();
@@ -8717,9 +9637,11 @@ fn collect_non_symbol_locals(scope: Node, source: &str) -> HashSet<String> {
         if matches!(
             node.kind(),
             "identifier"
+                | "simple_identifier"
                 | "shorthand_property_identifier"
                 | "shorthand_property_identifier_pattern"
         ) && is_defining_name(node)
+            && !js_names_a_loaded_module(node, source)
         {
             let name = get_node_text(node, source);
             if is_user_ident(&name) {
@@ -8734,6 +9656,86 @@ fn collect_non_symbol_locals(scope: Node, source: &str) -> HashSet<String> {
     }
     locals.retain(|name| !module_bindings.contains(name));
     locals
+}
+
+/// Whether a module-level declarator's value is an object literal with a
+/// function-valued member, which makes the declarator the owner of those member
+/// symbols ([`js_object_member_owner`]) and therefore a symbol itself even when
+/// it is not exported: `const core = { log() {} }; export const l = { ...core }`.
+fn js_owns_member_symbols(declarator: Node) -> bool {
+    let Some(mut value) = declarator.child_by_field_name("value") else {
+        return false;
+    };
+    while matches!(
+        value.kind(),
+        "as_expression"
+            | "satisfies_expression"
+            | "parenthesized_expression"
+            | "non_null_expression"
+    ) {
+        let Some(inner) = value.named_child(0) else {
+            return false;
+        };
+        value = inner;
+    }
+    if value.kind() != "object" || !is_module_level(declarator) {
+        return false;
+    }
+    let mut cursor = value.walk();
+    let found = value.named_children(&mut cursor).any(|member| {
+        member.kind() == "method_definition"
+            || (member.kind() == "pair"
+                && member
+                    .child_by_field_name("value")
+                    .is_some_and(|function| js_object_member_owner(function).is_some()))
+    });
+    found
+}
+
+/// Whether `name` is bound by a declarator whose value is a module load —
+/// `const m = await import('./x')`, `const { a } = require('./y')`.
+///
+/// Such a name is an *import binding*, recorded as one in the file's imports;
+/// counting it as a local variable as well made every `m.f()` through it "a
+/// call on a local whose value is unknown", and the import rung never saw it.
+fn js_names_a_loaded_module(name: Node, source: &str) -> bool {
+    let mut pattern = name;
+    while let Some(parent) = pattern.parent() {
+        if !matches!(
+            parent.kind(),
+            "object_pattern" | "pair_pattern" | "object_assignment_pattern"
+        ) {
+            break;
+        }
+        pattern = parent;
+    }
+    let Some(declarator) = pattern
+        .parent()
+        .filter(|parent| parent.kind() == "variable_declarator")
+        .filter(|parent| {
+            parent
+                .child_by_field_name("name")
+                .is_some_and(|bound| bound.id() == pattern.id())
+        })
+    else {
+        return false;
+    };
+    let Some(mut value) = declarator.child_by_field_name("value") else {
+        return false;
+    };
+    while matches!(
+        value.kind(),
+        "await_expression" | "parenthesized_expression"
+    ) {
+        let Some(inner) = value.named_child(0) else {
+            return false;
+        };
+        value = inner;
+    }
+    value.kind() == "call_expression"
+        && value.child_by_field_name("function").is_some_and(|callee| {
+            matches!(get_node_text(callee, source).as_str(), "import" | "require")
+        })
 }
 
 /// Run `visit` over one scope's local-name set, computing it once per scope.
@@ -8892,7 +9894,8 @@ fn collect_site_bindings(
         };
         let mut ancestor = bounded_parent(node);
         while let Some(scope) = ancestor {
-            if is_callable_node(scope) {
+            let swift_scope = lang == "swift" && crate::swiftscope::is_scope(scope);
+            if is_callable_node(scope) || swift_scope {
                 // Python defaults run in the enclosing scope. The parameter's
                 // own declaration is still a binding site, but its value is not.
                 let in_default = scope.kind() == "function_definition"
@@ -8914,7 +9917,29 @@ fn collect_site_bindings(
                         }
                         value
                     });
-                if !in_default {
+                if swift_scope {
+                    // Swift's names and written types come from its own scope
+                    // reader; the shared passes read `identifier` and a
+                    // `parameters` list, neither of which the grammar has.
+                    let bound = crate::swiftscope::bindings(scope, source);
+                    if let Some(written) = bound.get(name) {
+                        let initializer = written.init.clone();
+                        let written = written.ty.clone();
+                        let scope_name = scope.child(0).and_then(|child| {
+                            enclosing_callable_qualified(child, source, file_symbol_name)
+                        });
+                        sites.insert(LocalBinding {
+                            start_byte: span.start_byte,
+                            name: name.to_string(),
+                            declared_type: written.or_else(|| {
+                                binding_declared_type_for(&declared_types, &scope_name, name)
+                            }),
+                            initializer,
+                            scope: scope_name,
+                        });
+                        break;
+                    }
+                } else if !in_default {
                     let names = parameters.entry(scope.id()).or_insert_with(|| {
                         let mut names = BTreeSet::new();
                         collect_parameter_names(scope, source, &mut names);
@@ -8951,16 +9976,40 @@ fn collect_site_bindings(
                             {
                                 break;
                             }
+                            // Kotlin's `val habit = habit(..)` is the same
+                            // shape: the local is not in scope in its own
+                            // initializer, so the call names the function.
+                            if lang == "kotlin"
+                                && kotlin_use_is_in_same_name_initializer(node, source, name)
+                                && !names.contains(name)
+                            {
+                                break;
+                            }
                             let named_scope = callable_binding_name(scope, source).is_some()
                                 || is_c_family_callable(scope);
                             let scope_name = named_scope
                                 .then(|| {
                                     scope.child(0).and_then(|child| {
-                                        enclosing_callable_qualified(
-                                            child,
-                                            source,
-                                            file_symbol_name,
-                                        )
+                                        // Kotlin names a member `Type.m` and an
+                                        // extension `Receiver.m`, which only the
+                                        // declaration emitter spells; the generic
+                                        // walk would answer `F::m`, so the binding
+                                        // would never meet the type facts keyed by
+                                        // the emitted identity.
+                                        if lang == "kotlin" {
+                                            crate::langcalls::scope::enclosing_emitted_symbol(
+                                                child,
+                                                source,
+                                                lang,
+                                                file_symbol_name,
+                                            )
+                                        } else {
+                                            enclosing_callable_qualified(
+                                                child,
+                                                source,
+                                                file_symbol_name,
+                                            )
+                                        }
                                     })
                                 })
                                 .flatten();
@@ -8999,7 +10048,74 @@ fn collect_site_bindings(
             ancestor = bounded_parent(scope);
         }
     }
+    if matches!(lang, "javascript" | "typescript" | "tsx") {
+        for call in calls {
+            let on_this = call
+                .receiver_expr
+                .as_deref()
+                .is_some_and(|receiver| receiver == "this" || receiver.starts_with("this."));
+            if !on_this {
+                continue;
+            }
+            let Some(node) =
+                root.descendant_for_byte_range(call.span.start_byte, call.span.end_byte)
+            else {
+                continue;
+            };
+            if let Some(class) = js_lexical_this_class(node, source) {
+                sites.insert(LocalBinding {
+                    start_byte: call.span.start_byte,
+                    name: "this".to_string(),
+                    scope: call.caller_symbol.clone(),
+                    declared_type: Some(class),
+                    initializer: None,
+                });
+            }
+        }
+    }
     sites.into_iter().collect()
+}
+
+/// The class `this` denotes at `node` when it is *lexical*: written inside a
+/// named arrow nested in a method or in a class field's initializer, where the
+/// arrow's own caller symbol (`Gateway.open.connect`) is not a member of the
+/// class and the enclosing-type rung cannot see the class in it.
+///
+/// An arrow has no `this` of its own, so the walk passes through arrows and
+/// stops at the first thing that does: a method or field names the class; a
+/// `function`, generator or nested class means `this` is something else, and
+/// nothing is claimed. A call whose nearest named callable is the member itself
+/// is the enclosing-type rung's, and is left to it, because that rung also
+/// knows an indexed subtype may override the method.
+fn js_lexical_this_class(node: Node, source: &str) -> Option<String> {
+    let mut through_named_arrow = false;
+    let mut ancestor = bounded_parent(node);
+    while let Some(parent) = ancestor {
+        match parent.kind() {
+            "arrow_function" => {
+                if callable_binding_name(parent, source).is_some()
+                    && js_function_valued_member(parent, source).is_none()
+                {
+                    through_named_arrow = true;
+                }
+            }
+            "method_definition" | "public_field_definition" | "field_definition" => {
+                return through_named_arrow
+                    .then(|| enclosing_type_name(parent, source))
+                    .flatten();
+            }
+            "function_declaration"
+            | "generator_function_declaration"
+            | "function_expression"
+            | "generator_function"
+            | "class_declaration"
+            | "abstract_class_declaration"
+            | "class" => return None,
+            _ => {}
+        }
+        ancestor = bounded_parent(parent);
+    }
+    None
 }
 
 /// Type refs with `assigned_to`, keyed by `(enclosing_symbol, binding name)`.
@@ -9357,6 +10473,118 @@ const PARAMETER_LIST_KINDS: [&str; 5] = [
     "parameter_list",
 ];
 
+/// Swift and Kotlin spell a parameter with `simple_identifier` (Swift) or a
+/// bare `identifier` inside `parameter` / `variable_declaration` (Kotlin), and
+/// neither sits under one of [`PARAMETER_LIST_KINDS`], so the generic walk found
+/// no parameter in either language. A parameter is a binding the bare-name rung
+/// must never bind to a project namesake: Swift's `completion`, Kotlin's
+/// `onStart`. Returns whether `callable` is one of their callables.
+///
+/// Covers Swift `func` and `init` parameters (the internal name, not the
+/// argument label) and closure parameters, and Kotlin `fun` parameters and
+/// lambda parameters. A lambda with no declared parameter binds the implicit
+/// `it` (Kotlin) or `$0`.. (Swift) instead.
+fn collect_swift_kotlin_parameter_names(
+    callable: Node,
+    source: &str,
+    out: &mut BTreeSet<String>,
+) -> bool {
+    let mut insert = |node: Node| {
+        let name = get_node_text(node, source);
+        if is_user_ident(&name) {
+            out.insert(name);
+        }
+    };
+    let mut cursor = callable.walk();
+    match callable.kind() {
+        // Swift `func` / `init`: `parameter` children hang off the declaration;
+        // the type is also a `name` field, so the kind picks the binding.
+        "function_declaration" | "init_declaration"
+            if callable
+                .child_by_field_name("body")
+                .is_some_and(|b| b.kind() == "function_body") =>
+        {
+            for parameter in callable
+                .children(&mut cursor)
+                .filter(|c| c.kind() == "parameter")
+            {
+                let mut inner = parameter.walk();
+                let name = parameter
+                    .children_by_field_name("name", &mut inner)
+                    .find(|n| n.kind() == "simple_identifier");
+                if let Some(name) = name {
+                    insert(name);
+                }
+            }
+            true
+        }
+        "lambda_literal" => {
+            let mut declared = false;
+            let mut stack = vec![callable];
+            while let Some(node) = stack.pop() {
+                let mut inner = node.walk();
+                for child in node.children(&mut inner) {
+                    match child.kind() {
+                        // Swift: `{ (a: Int, b) in … }` / `{ s in … }`.
+                        "lambda_parameter" => {
+                            let mut c = child.walk();
+                            let name = child
+                                .children_by_field_name("name", &mut c)
+                                .find(|n| n.kind() == "simple_identifier");
+                            if let Some(name) = name {
+                                insert(name);
+                                declared = true;
+                            }
+                        }
+                        // Kotlin: `{ a: Int, b -> … }`.
+                        "variable_declaration" if node.kind() == "lambda_parameters" => {
+                            if let Some(name) = child.named_child(0) {
+                                insert(name);
+                                declared = true;
+                            }
+                        }
+                        "lambda_function_type"
+                        | "lambda_function_type_parameters"
+                        | "lambda_parameters" => {
+                            stack.push(child);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            if !declared {
+                for implicit in ["it", "$0", "$1", "$2"] {
+                    out.insert(implicit.to_string());
+                }
+            }
+            true
+        }
+        // Kotlin `fun`: `function_value_parameters > parameter > identifier`.
+        "function_declaration" => {
+            let Some(list) = callable
+                .children(&mut cursor)
+                .find(|c| c.kind() == "function_value_parameters")
+            else {
+                return false;
+            };
+            let mut inner = list.walk();
+            for parameter in list
+                .children(&mut inner)
+                .filter(|c| c.kind() == "parameter")
+            {
+                if let Some(name) = parameter
+                    .named_child(0)
+                    .filter(|n| n.kind() == "identifier")
+                {
+                    insert(name);
+                }
+            }
+            true
+        }
+        _ => false,
+    }
+}
+
 /// Names a callable's own signature binds.
 ///
 /// Deliberately **not** folded into `collect_non_symbol_locals`, which answers a
@@ -9372,6 +10600,9 @@ const PARAMETER_LIST_KINDS: [&str; 5] = [
 /// `type` and `value` fields are not descended into: `def f(x: Widget)` binds
 /// `x` and refers to `Widget`.
 fn collect_parameter_names(callable: Node, source: &str, out: &mut BTreeSet<String>) {
+    if collect_swift_kotlin_parameter_names(callable, source, out) {
+        return;
+    }
     let mut params_cursor = callable.walk();
     let Some(params) = callable
         .children(&mut params_cursor)
@@ -9467,7 +10698,12 @@ fn collect_type_parameter_names(callable: Node, source: &str, out: &mut BTreeSet
     }
 }
 
-fn collect_scope_locals(root: Node, source: &str, file_symbol_name: &str) -> Vec<(String, String)> {
+fn collect_scope_locals(
+    root: Node,
+    source: &str,
+    file_symbol_name: &str,
+    lang: &str,
+) -> Vec<(String, String)> {
     let mut by_scope: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     let mut worklist = vec![root];
     while let Some(node) = worklist.pop() {
@@ -9506,6 +10742,9 @@ fn collect_scope_locals(root: Node, source: &str, file_symbol_name: &str) -> Vec
                     // value parameter is, and the resolver reads both from the same
                     // per-scope set.
                     collect_type_parameter_names(node, source, entry);
+                    if lang == "swift" {
+                        entry.extend(crate::swiftscope::bindings(node, source).keys().cloned());
+                    }
                 }
             }
         }
@@ -9617,6 +10856,24 @@ fn is_call_callee(node: Node) -> bool {
                 return true;
             }
         }
+    }
+    // Kotlin: the member half of `a.b(..)`. The call record already carries it,
+    // and the walker's own `Name` reference for it was a second row that
+    // resolved on the name alone — `super.go()` inside `Child.go` was read as a
+    // use of `Child.go` itself.
+    if parent.kind() == "navigation_expression"
+        && parent
+            .named_child(parent.named_child_count().saturating_sub(1))
+            .is_some_and(|member| member.id() == node.id())
+        && parent.named_child_count() >= 2
+        && bounded_parent(parent).is_some_and(|grand| {
+            grand.kind() == "call_expression"
+                && grand
+                    .named_child(0)
+                    .is_some_and(|callee| callee.id() == parent.id())
+        })
+    {
+        return true;
     }
     if matches!(
         parent.kind(),
@@ -10044,7 +11301,35 @@ fn rust_let_bound_from_value(mut node: Node, source: &str) -> Option<String> {
 fn rust_use_is_in_same_name_initializer(node: Node, source: &str, name: &str) -> bool {
     let mut ancestor = bounded_parent(node);
     while let Some(parent) = ancestor {
-        if is_callable_node(parent) {
+        // A closure is part of the initializer it is written in, so a *call* of
+        // the name walks through it: `let (n, f) = (1, opt.and_then(|p| f(p)))`
+        // calls the outer item `f` from inside the closure. A closure that
+        // binds the name itself (`|f| f()`) shadows it, and a name used as a
+        // value or receiver (`let w = spawn(move || w.run())`) is an earlier
+        // *local* the closure captured, not an item, so it still stops here.
+        if parent.kind() == "closure_expression" {
+            let shadowed = parent
+                .child_by_field_name("parameters")
+                .is_some_and(|parameters| rust_pattern_binds(parameters, source, name));
+            // The use is either the call node or its callee identifier,
+            // depending on which span the extractor recorded.
+            let callee_is_name = |call: Node| {
+                call.kind() == "call_expression"
+                    && call
+                        .child_by_field_name("function")
+                        .is_some_and(|function| {
+                            function.kind() == "identifier"
+                                && get_node_text(function, source) == name
+                        })
+            };
+            let called = callee_is_name(node)
+                || (node.kind() == "identifier"
+                    && get_node_text(node, source) == name
+                    && bounded_parent(node).is_some_and(callee_is_name));
+            if shadowed || !called {
+                return false;
+            }
+        } else if is_callable_node(parent) {
             return false;
         }
         if matches!(parent.kind(), "let_declaration" | "let_condition") {
@@ -10053,6 +11338,36 @@ fn rust_use_is_in_same_name_initializer(node: Node, source: &str, name: &str) ->
                 .child_by_field_name("pattern")
                 .is_some_and(|pattern| rust_pattern_binds(pattern, source, name));
             return in_value && binds;
+        }
+        ancestor = bounded_parent(parent);
+    }
+    false
+}
+
+/// Whether a use sits in the initializer of a Kotlin `val` / `var` that
+/// declares the same name — a position where that local is not yet in scope.
+fn kotlin_use_is_in_same_name_initializer(node: Node, source: &str, name: &str) -> bool {
+    let mut ancestor = bounded_parent(node);
+    while let Some(parent) = ancestor {
+        if is_callable_node(parent) {
+            return false;
+        }
+        if parent.kind() == "property_declaration" {
+            let declares = parent
+                .named_children(&mut parent.walk())
+                .find(|child| child.kind() == "variable_declaration")
+                .and_then(|declaration| declaration.named_child(0))
+                .is_some_and(|declared| get_node_text(declared, source) == name);
+            // A use inside the declaration's own name or type is not an
+            // initializer use; only what follows the `variable_declaration` is.
+            let in_declaration = parent
+                .named_children(&mut parent.walk())
+                .find(|child| child.kind() == "variable_declaration")
+                .is_some_and(|declaration| {
+                    declaration.start_byte() <= node.start_byte()
+                        && node.end_byte() <= declaration.end_byte()
+                });
+            return declares && !in_declaration;
         }
         ancestor = bounded_parent(parent);
     }
@@ -11388,7 +12703,10 @@ mod tests {
                 &[
                     (SymbolKind::File, "f.go", true),
                     (SymbolKind::Struct, "f.go::Client", true),
-                    (SymbolKind::Struct, "f.go::Runner", true),
+                    // An interface is an `Interface`, and each method it
+                    // requires is a symbol a call through it can name.
+                    (SymbolKind::Interface, "f.go::Runner", true),
+                    (SymbolKind::Method, "f.go::Runner.Run", true),
                     (SymbolKind::Method, "f.go::Client.Run", true),
                     (SymbolKind::Function, "f.go::New", true),
                     (SymbolKind::Function, "f.go::helper", false),
@@ -11500,7 +12818,9 @@ mod tests {
                     // endpoint no resolver can ever bind. It still appears in
                     // the export set below, which is where it belongs.
                 ],
-                vec!["d", "f.ts", "val", "x"],
+                // `default` is the name `export default function d` is
+                // published under, beside `d` itself.
+                vec!["d", "default", "f.ts", "val", "x"],
             ),
             (
                 "f.go",

@@ -11,6 +11,12 @@ before that tag is pushed.
 
 ## [Unreleased]
 
+### Changed
+
+- Re-vendored DevCouncil at `8229de20` (wave 6): the `devmap-*`, `dc-store`, `dc-redact`, `dc-glob` and `dc-proc` crates, and the shared contracts (`lease.schema.md`, `verdict.schema.json`, `CHECKSUMS`). `devmap-query` now links `dc-glob` (already vendored; `Cargo.lock` gains the edge); `dc-evidence` and `dc-sparse-encode` (and its git-pinned `tessl`) are not part of GitPulse's closure. A map built by the new devmap is store schema 27, and the devmap-store now refuses any store that carries a trigger.
+- A task whose planned file declares an `allowed_change` outside `create`, `modify`, `delete`, `read_only` is now an unreadable scope (the Go decoder refuses the whole task), reported through the same broken-scope path as damaged JSON instead of being read as a plain path. GitPulse writes no such value anywhere.
+- A failed `devmap ... --json` run (doctor, status, preview, integrate, build, live refresh, the index sweep and the map pane) now reports DevMap's own `{"error": ...}` envelope from stdout. Under `--json` stderr is empty for exactly the failures that have a reason, so the reason used to be replaced by "exited N".
+
 ### Fixed
 
 - Windows: `git worktree add` and `remove` are given an ordinary `C:\...` path rather than the canonical `\\?\C:\...` one git rejects, so a managed attempt's worktree can be created, reused and reclaimed; a task brief that is a directory or a link is refused as "not a regular file" instead of an access error or a followed link; the vendoring manifest records `/`-separated origin paths on every platform. Linux: closing an idle shell hangs up its jobs under bash, and a process ID past `pid_t` is reported unknown rather than gone.

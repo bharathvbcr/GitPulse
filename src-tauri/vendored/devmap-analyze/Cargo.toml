@@ -2,6 +2,7 @@
 name = "devmap-analyze"
 version = "0.2.4"
 edition = "2021"
+rust-version = "1.99"
 license = "Apache-2.0"
 repository = "https://github.com/bharathvbcr/DevCouncil"
 description = "Graph analysis: dead code, clones, PDG, and coverage over a persisted map"
@@ -43,6 +44,10 @@ parse = [
 # build. Nothing changes with default features on, where `parse` is enabled.
 
 [[test]]
+name = "android_manifest_components"
+required-features = ["parse"]
+
+[[test]]
 name = "c_family_liveness"
 required-features = ["parse"]
 
@@ -80,6 +85,14 @@ required-features = ["parse"]
 
 [[test]]
 name = "liveness_honesty_over_the_hard_shapes"
+required-features = ["parse"]
+
+[[test]]
+name = "accuracy_fixtures"
+required-features = ["parse"]
+
+[[test]]
+name = "real_corpus_accuracy"
 required-features = ["parse"]
 
 [[test]]

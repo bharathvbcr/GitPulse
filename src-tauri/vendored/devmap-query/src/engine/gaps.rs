@@ -410,6 +410,12 @@ pub(super) fn radius_note(
     let mut sites = 0usize;
     let mut more = false;
     let mut labels: BTreeSet<String> = BTreeSet::new();
+    // Sites written as a qualified path (`gitpulse_lib::hooks::dispatch(..)`).
+    // A path names a crate or module, never "an untyped receiver", so the
+    // reason differs: the resolver has no indexed root for what the path starts
+    // with.
+    let mut path_sites = 0usize;
+    let mut path_labels: BTreeSet<String> = BTreeSet::new();
     for (key, families) in keys {
         let (rows, truncated) = found.remove(key).unwrap_or_default();
         more |= truncated;
@@ -420,6 +426,11 @@ pub(super) fn radius_note(
                 if !families.iter().any(|reached| family.admits(*reached)) {
                     continue;
                 }
+            }
+            if let Some(path) = row.receiver.as_deref().filter(|r| r.contains("::")) {
+                path_sites += 1;
+                path_labels.insert(format!("{path}::{}", row.callee_name));
+                continue;
             }
             sites += 1;
             labels.insert(match &row.receiver {
@@ -449,6 +460,31 @@ pub(super) fn radius_note(
             RadiusSide::Callees | RadiusSide::FileCallees => format!(
                 "{count} call site(s) inside what this answer walked could not be bound \
                  ({sample}), so what they call is not in it"
+            ),
+        });
+    }
+    if path_sites > 0 {
+        let count = if more {
+            format!("at least {path_sites}")
+        } else {
+            path_sites.to_string()
+        };
+        let sample = path_labels
+            .into_iter()
+            .take(RADIUS_NOTE_SAMPLE)
+            .collect::<Vec<_>>()
+            .join(", ");
+        notes.push(match side {
+            RadiusSide::Callers => format!(
+                "{count} call site(s) written as a qualified path name a symbol this answer \
+                 reached ({sample}) — the crate or module the path starts with is not mapped \
+                 to an indexed root, which is not an untyped receiver — so callers through \
+                 them are not in it"
+            ),
+            RadiusSide::Callees | RadiusSide::FileCallees => format!(
+                "{count} call site(s) written as a qualified path inside what this answer \
+                 walked could not be bound ({sample}) — the crate or module the path starts \
+                 with is not mapped to an indexed root — so what they call is not in it"
             ),
         });
     }
@@ -724,5 +760,45 @@ pub(super) fn name_match_score(row: &devmap_store::StoredSymbol, query_lower: &s
         0.95
     } else {
         0.8
+    }
+}
+
+#[cfg(test)]
+mod radius_note_tests {
+    use super::*;
+
+    fn site(receiver: Option<&str>) -> RadiusSite {
+        RadiusSite {
+            source_file: "src/bin/tool.rs".into(),
+            callee_name: "dispatch".into(),
+            receiver: receiver.map(str::to_string),
+        }
+    }
+
+    fn note_for(receiver: Option<&str>) -> String {
+        let keys = vec![("dispatch".to_string(), BTreeSet::from([LangFamily::Rust]))];
+        let found = BTreeMap::from([("dispatch".to_string(), (vec![site(receiver)], false))]);
+        radius_note(RadiusSide::Callers, &keys, 0, found).expect("a site touches the answer")
+    }
+
+    #[test]
+    fn a_qualified_path_is_not_called_an_untyped_receiver() {
+        let note = note_for(Some("gitpulse_lib::hooks"));
+        assert!(note.contains("not mapped to an indexed root"), "{note}");
+        assert!(note.contains("gitpulse_lib::hooks::dispatch"), "{note}");
+        assert!(
+            !note.contains("an untyped receiver, a local binding"),
+            "{note}"
+        );
+    }
+
+    #[test]
+    fn a_value_receiver_keeps_the_untyped_receiver_reason() {
+        let note = note_for(Some("state"));
+        assert!(
+            note.contains("an untyped receiver, a local binding"),
+            "{note}"
+        );
+        assert!(!note.contains("indexed root"), "{note}");
     }
 }

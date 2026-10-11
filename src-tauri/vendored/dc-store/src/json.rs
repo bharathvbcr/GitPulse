@@ -37,31 +37,90 @@
 /// malformed input.
 const MAX_DEPTH: usize = 32;
 
+/// The whitespace JSON allows between tokens, and the only whitespace this
+/// store trims anywhere — validation, storage and the compare-and-swap all use
+/// this one definition. Rust's `str::trim` strips every Unicode space (a
+/// non-breaking space, a form feed), SQLite's `trim()` only U+0020 and Go's
+/// `bytes.TrimSpace` something in between; a value padded with a character one
+/// of them strips and another does not was stored, then unreadable, or could
+/// never be swapped.
+pub const JSON_WS: [char; 4] = [' ', '\t', '\n', '\r'];
+
+/// Trims JSON whitespace — and only that — from both ends.
+pub fn trim_ws(text: &str) -> &str {
+    text.trim_matches(JSON_WS)
+}
+
 /// Reports whether `text` is exactly one well-formed JSON array — no trailing
 /// bytes, no second value, nothing after the closing bracket.
 pub fn is_array(text: &str) -> bool {
     check_array(text).is_ok()
 }
 
-/// Like [`is_array`], but names what is wrong so a refusal can say why.
+/// Like [`is_array`], but names what is wrong so a refusal can say why. The
+/// bytes are validated exactly as given: padding is only legal where JSON
+/// allows it, so a caller that trimmed first with a wider definition cannot
+/// make an invalid column look valid.
 pub fn check_array(text: &str) -> Result<(), String> {
+    check_top(text, b'[')
+}
+
+/// Exactly one well-formed JSON object.
+pub fn check_object(text: &str) -> Result<(), String> {
+    check_top(text, b'{')
+}
+
+/// Exactly one well-formed JSON object or array.
+pub fn check_container(text: &str) -> Result<(), String> {
+    match text.trim_start_matches(JSON_WS).as_bytes().first() {
+        Some(b'{') => check_top(text, b'{'),
+        Some(b'[') => check_top(text, b'['),
+        Some(c) => Err(format!("it starts with {:?}, not '{{' or '['", *c as char)),
+        None => Err("it is empty".to_string()),
+    }
+}
+
+/// The changes a planned file may declare, the same set the Go side's
+/// `AllowedChange.Valid` accepts. An absent, null or empty value means
+/// `modify`, as it does there.
+pub const ALLOWED_CHANGES: [&str; 4] = ["create", "modify", "delete", "read_only"];
+
+/// [`check_array`], and every entry is a planned file the Go decoder accepts:
+/// a bare path string, or an object whose `allowed_change` is a string naming
+/// one of [`ALLOWED_CHANGES`].
+///
+/// The raw text is stored and handed to Go, whose decoder refuses an unknown
+/// change and so makes the whole task unreadable; refusing it at the write is
+/// the same fix as for malformed JSON. Keys are matched the way Go matches
+/// them — case-insensitively, after decoding escapes, every duplicate checked —
+/// so none of those spellings reaches the field unchecked.
+pub fn check_planned_files(text: &str) -> Result<(), String> {
+    check_scan(text, b'[', true)
+}
+
+fn check_top(text: &str, open: u8) -> Result<(), String> {
+    check_scan(text, open, false)
+}
+
+fn check_scan(text: &str, open: u8, planned: bool) -> Result<(), String> {
     let mut scanner = Scanner {
         bytes: text.as_bytes(),
         pos: 0,
+        planned,
     };
     scanner.skip_ws();
-    if scanner.peek() != Some(b'[') {
+    if scanner.peek() != Some(open) {
         return Err(match scanner.peek() {
             None => "it is empty".to_string(),
-            Some(c) => format!("it starts with {:?}, not '['", c as char),
+            Some(c) => format!("it starts with {:?}, not {:?}", c as char, open as char),
         });
     }
     scanner.value(0)?;
     scanner.skip_ws();
     if scanner.pos != scanner.bytes.len() {
-        // The injection case: the array closed and something else followed.
+        // The injection case: the value closed and something else followed.
         return Err(format!(
-            "the array ends at byte {} and {} more byte(s) follow it",
+            "the value ends at byte {} and {} more byte(s) follow it",
             scanner.pos,
             scanner.bytes.len() - scanner.pos
         ));
@@ -72,6 +131,36 @@ pub fn check_array(text: &str) -> Result<(), String> {
 struct Scanner<'a> {
     bytes: &'a [u8],
     pos: usize,
+    /// Also hold the entries of the top-level array to the planned-file shape.
+    planned: bool,
+}
+
+/// Decodes the escapes of a string body already proven well formed by
+/// [`Scanner::string`].
+fn unescape(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let mut chars = raw.chars();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('b') => out.push('\u{8}'),
+            Some('f') => out.push('\u{c}'),
+            Some('n') => out.push('\n'),
+            Some('r') => out.push('\r'),
+            Some('t') => out.push('\t'),
+            Some('u') => {
+                let hex: String = chars.by_ref().take(4).collect();
+                let unit = u32::from_str_radix(&hex, 16).unwrap_or(0xfffd);
+                out.push(char::from_u32(unit).unwrap_or('\u{fffd}'));
+            }
+            Some(other) => out.push(other),
+            None => {}
+        }
+    }
+    out
 }
 
 impl Scanner<'_> {
@@ -119,6 +208,15 @@ impl Scanner<'_> {
             return Ok(());
         }
         loop {
+            if self.planned && depth == 0 {
+                self.skip_ws();
+                if !matches!(self.peek(), Some(b'{' | b'"')) {
+                    return Err(format!(
+                        "the entry at byte {} is neither a path string nor an object",
+                        self.pos
+                    ));
+                }
+            }
             self.value(depth + 1)?;
             self.skip_ws();
             match self.peek() {
@@ -147,10 +245,18 @@ impl Scanner<'_> {
         }
         loop {
             self.skip_ws();
+            let key_at = self.pos;
             self.string()?;
+            let key = unescape(&String::from_utf8_lossy(
+                &self.bytes[key_at + 1..self.pos - 1],
+            ));
             self.skip_ws();
             self.expect(b':')?;
-            self.value(depth + 1)?;
+            if self.planned && depth == 1 && key.eq_ignore_ascii_case("allowed_change") {
+                self.allowed_change()?;
+            } else {
+                self.value(depth + 1)?;
+            }
             self.skip_ws();
             match self.peek() {
                 Some(b',') => self.pos += 1,
@@ -166,6 +272,33 @@ impl Scanner<'_> {
                 }
                 None => return Err("the object is unterminated".to_string()),
             }
+        }
+    }
+
+    /// The value of a planned file's `allowed_change`: null or a string, and a
+    /// string must be empty or one of [`ALLOWED_CHANGES`].
+    fn allowed_change(&mut self) -> Result<(), String> {
+        self.skip_ws();
+        match self.peek() {
+            Some(b'n') => self.literal("null"),
+            Some(b'"') => {
+                let start = self.pos;
+                self.string()?;
+                let value = unescape(&String::from_utf8_lossy(
+                    &self.bytes[start + 1..self.pos - 1],
+                ));
+                if value.is_empty() || ALLOWED_CHANGES.contains(&value.as_str()) {
+                    Ok(())
+                } else {
+                    Err(format!(
+                        "allowed_change {value:?} is not one of create, modify, delete, read_only"
+                    ))
+                }
+            }
+            _ => Err(format!(
+                "allowed_change at byte {} is not a string",
+                self.pos
+            )),
         }
     }
 
@@ -281,6 +414,26 @@ mod tests {
             !is_array(injected),
             "the shape check's exact blind spot is still accepted"
         );
+    }
+
+    #[test]
+    fn only_json_whitespace_is_trimmed_or_tolerated() {
+        assert_eq!(trim_ws(" \t\r\n[]\n "), "[]");
+        for padded in ["\u{a0}[]", "[]\u{a0}", "\x0c[]", "[]\x0c", "\u{2003}[]"] {
+            assert_eq!(trim_ws(padded), padded, "{padded:?} was trimmed");
+            assert!(check_array(padded).is_err(), "{padded:?} was accepted");
+        }
+    }
+
+    #[test]
+    fn object_and_container_checks_scan_the_whole_value() {
+        assert!(check_object(r#"{"a":[1,{"b":null}]}"#).is_ok());
+        assert!(check_object("{").is_err());
+        assert!(check_object("[]").is_err());
+        assert!(check_container("[]").is_ok() && check_container("{}").is_ok());
+        assert!(check_container("{").is_err());
+        assert!(check_container("1").is_err());
+        assert!(check_container(r#"[]}],"gaps":[],"x":[{"q":0"#).is_err());
     }
 
     #[test]

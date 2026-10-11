@@ -16,8 +16,10 @@
 //! Python dialect.
 
 mod secret_paths;
+mod test_paths;
 
 pub use secret_paths::{SECRET_PATH_PATTERNS, is_secret_path};
+pub use test_paths::{in_test_directory, is_test_file_name, is_test_path, parse_test_path_rows};
 
 /// Longest pattern or name, in Unicode scalar values, matched exactly.
 ///
@@ -256,26 +258,90 @@ fn parse_class(pat: &[char], open: usize) -> Option<(CharClass, usize)> {
         return None;
     }
 
-    let mut singles = Vec::new();
-    let mut ranges = Vec::new();
-    let mut k = 0;
-    while k < body.len() {
-        if k + 2 < body.len() && body[k + 1] == '-' {
-            ranges.push((body[k], body[k + 2]));
-            k += 3;
-        } else {
-            singles.push(body[k]);
-            k += 1;
-        }
+    if body.contains(&'-') {
+        return Some((dashed_class(negated, body), i));
     }
     Some((
         CharClass {
             negated,
-            singles,
-            ranges,
+            singles: body.to_vec(),
+            ranges: Vec::new(),
         },
         i,
     ))
+}
+
+/// Reads a set that holds a `-` the way CPython's `fnmatch.translate` does,
+/// which is not the way a regex parser would read the text: it cuts the set into
+/// chunks at each `-` that could be a range operator, drops every backwards
+/// range by merging the two chunks around it — taking both endpoints — and only
+/// then hands the joined chunks to the regex engine. `[]--!]` loses the range
+/// `]`-`-` and the `!` after it, leaving a negation with no members, which
+/// matches any one character. The Go twin is `dashedClass`.
+fn dashed_class(negated: bool, body: &[char]) -> CharClass {
+    let mut stuff: Vec<char> = Vec::with_capacity(body.len() + 1);
+    if negated {
+        stuff.push('!');
+    }
+    stuff.extend_from_slice(body);
+    let mut k = if negated { 2 } else { 1 };
+    let mut chunks: Vec<Vec<char>> = Vec::new();
+    let mut start = 0;
+    loop {
+        let found = (k..stuff.len()).find(|&idx| stuff[idx] == '-');
+        let Some(idx) = found else { break };
+        chunks.push(stuff[start..idx].to_vec());
+        start = idx + 1;
+        k = idx + 3;
+    }
+    if start < stuff.len() {
+        chunks.push(stuff[start..].to_vec());
+    } else if let Some(last) = chunks.last_mut() {
+        last.push('-');
+    }
+    let mut k = chunks.len();
+    while k > 1 {
+        k -= 1;
+        // CPython raises IndexError when a merge empties a chunk that an
+        // earlier pair then reads; such a pair is left as it is.
+        let (Some(&end), Some(&first)) = (chunks[k - 1].last(), chunks[k].first()) else {
+            continue;
+        };
+        if end > first {
+            let mut merged = chunks[k - 1][..chunks[k - 1].len() - 1].to_vec();
+            merged.extend_from_slice(&chunks[k][1..]);
+            chunks[k - 1] = merged;
+            chunks.remove(k);
+        }
+    }
+    // (char, is_range_operator)
+    let mut tokens: Vec<(char, bool)> = Vec::new();
+    for (n, chunk) in chunks.iter().enumerate() {
+        if n > 0 {
+            tokens.push(('-', true));
+        }
+        tokens.extend(chunk.iter().map(|&c| (c, false)));
+    }
+    let mut class = CharClass {
+        negated: false,
+        singles: Vec::new(),
+        ranges: Vec::new(),
+    };
+    let mut t = 0;
+    if matches!(tokens.first(), Some(&('!', false))) {
+        class.negated = true;
+        t = 1;
+    }
+    while t < tokens.len() {
+        if t + 2 < tokens.len() && tokens[t + 1].1 {
+            class.ranges.push((tokens[t].0, tokens[t + 2].0));
+            t += 3;
+        } else {
+            class.singles.push(tokens[t].0);
+            t += 1;
+        }
+    }
+    class
 }
 
 #[cfg(test)]

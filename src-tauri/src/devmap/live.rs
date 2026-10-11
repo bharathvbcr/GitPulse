@@ -654,13 +654,11 @@ pub fn maybe_refresh(repo_path: &str, repo_changed: bool) -> LiveRefreshOutcome 
                 reason: if build.ok {
                     None
                 } else {
-                    Some(
-                        build
-                            .stderr
-                            .trim()
-                            .to_string()
-                            .if_empty_then(|| "devmap refresh failed".into()),
-                    )
+                    Some(super::cli::failure_detail(
+                        &build.stdout,
+                        &build.stderr,
+                        "devmap refresh failed".into(),
+                    ))
                 },
                 build: Some(build),
                 cooldown_remaining_ms: None,
@@ -685,20 +683,6 @@ pub fn maybe_refresh(repo_path: &str, repo_changed: bool) -> LiveRefreshOutcome 
                 cooldown_remaining_ms: None,
                 artifacts_restored: false,
             }
-        }
-    }
-}
-
-trait IfEmpty {
-    fn if_empty_then(self, f: impl FnOnce() -> String) -> String;
-}
-
-impl IfEmpty for String {
-    fn if_empty_then(self, f: impl FnOnce() -> String) -> String {
-        if self.is_empty() {
-            f()
-        } else {
-            self
         }
     }
 }

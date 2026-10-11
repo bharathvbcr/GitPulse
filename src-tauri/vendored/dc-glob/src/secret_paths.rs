@@ -84,16 +84,25 @@ fn compiled() -> &'static [Option<Pattern>] {
     })
 }
 
-/// Lower-cases one scalar at a time, as Go's `unicode.ToLower` does.
+/// Folds one scalar at a time the way Go's `fnmatch.foldRune` does: simple
+/// case folding as a case-insensitive filesystem applies it.
 ///
 /// Rust's `char::to_lowercase` can expand a scalar into several (`İ` becomes
 /// `i` plus a combining dot); Go maps it to one. Keeping the first keeps the
 /// two folds equal on every name the patterns can tell apart, all of which
-/// are ASCII.
+/// are ASCII. `to_lowercase` leaves U+017F (long s) alone, and APFS folds it to
+/// `s`; U+212A (Kelvin sign) it already maps to `k`. Those are the only two
+/// scalars outside ASCII whose fold orbit holds an ASCII letter, and
+/// `fold_covers_every_ascii_orbit` walks the whole range to keep it so.
 fn fold(text: &str) -> String {
-    text.chars()
-        .map(|c| c.to_lowercase().next().unwrap_or(c))
-        .collect()
+    text.chars().map(fold_char).collect()
+}
+
+fn fold_char(c: char) -> char {
+    if c == '\u{17f}' {
+        return 's';
+    }
+    c.to_lowercase().next().unwrap_or(c)
 }
 
 #[cfg(test)]
@@ -181,5 +190,67 @@ mod tests {
     #[test]
     fn an_undecidable_name_counts_as_secret() {
         assert!(is_secret_path(&"a/".repeat(crate::MAX_UNITS)));
+    }
+
+    /// A case-insensitive filesystem opens `id_rſa` as `id_rsa`. The rows are
+    /// held by the Go gate too (policy/zfix_w6_fold_test.go reads the same file).
+    #[test]
+    fn folded_spellings_match_the_shared_fixture() {
+        let fixture = include_str!("../../../testdata/secret-paths-fold.tsv");
+        let mut checked = 0usize;
+        for (lineno, line) in fixture.lines().enumerate() {
+            if line.starts_with('#') || line.trim().is_empty() {
+                continue;
+            }
+            let cols: Vec<&str> = line.split('\t').collect();
+            assert_eq!(cols.len(), 2, "line {} is malformed: {line:?}", lineno + 1);
+            assert_eq!(
+                is_secret_path(cols[0]),
+                cols[1] == "true",
+                "is_secret_path({:?}) disagrees with the fixture (line {})",
+                cols[0],
+                lineno + 1
+            );
+            checked += 1;
+        }
+        assert!(checked >= 20, "only {checked} rows loaded from the fixture");
+    }
+
+    /// Every scalar outside ASCII that a case-insensitive filesystem folds to an
+    /// ASCII letter must fold to it here: the long s and the Kelvin sign today.
+    #[test]
+    fn fold_covers_every_ascii_orbit() {
+        let mut found = Vec::new();
+        for c in (0x80u32..=0x10FFFF).filter_map(char::from_u32) {
+            // Simple folding only: a scalar that case-maps to several (ß to SS)
+            // has no single-scalar fold.
+            let single = |mut it: Box<dyn Iterator<Item = char>>| match (it.next(), it.next()) {
+                (Some(one), None) => Some(one),
+                _ => None,
+            };
+            // U+0131 uppercases to I but CaseFolding.txt folds it only under the
+            // Turkic (T) status, which filesystems do not apply.
+            if c == '\u{131}' {
+                continue;
+            }
+            let lower = single(Box::new(c.to_lowercase()));
+            let upper = single(Box::new(c.to_uppercase()));
+            if let Some(ascii) = [lower, upper]
+                .into_iter()
+                .flatten()
+                .find(|o| o.is_ascii_alphabetic())
+            {
+                found.push(c);
+                assert_eq!(
+                    fold_char(c),
+                    ascii.to_ascii_lowercase(),
+                    "{c:?} folds to an ASCII letter on APFS but not here"
+                );
+            }
+        }
+        assert!(
+            found.contains(&'\u{17f}') && found.contains(&'\u{212a}'),
+            "walk found {found:?}"
+        );
     }
 }

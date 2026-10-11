@@ -943,6 +943,15 @@ impl ExtractedImport {
     }
 }
 
+/// A lambda body and the expression its implicit `this` is. See
+/// [`Extraction::scope_receivers`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScopeReceiver {
+    pub body_start: usize,
+    pub body_end: usize,
+    pub receiver: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExtractedCall {
     pub caller_symbol: Option<String>,
@@ -1522,6 +1531,19 @@ pub struct Extraction {
     /// so G20 stars and package-level import edges survive reload.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub go_package: Option<String>,
+    /// Kotlin/Java `package` header. Two files with the same clause share one
+    /// unqualified namespace — across source sets too, which is why a test in
+    /// `src/test` reaches a `src/main` class with no import. Kept on the
+    /// extraction (not derived from the path) because a package need not match
+    /// its directory, and a durable reload strips `source_code`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub jvm_package: Option<String>,
+    /// Kotlin lambdas whose implicit `this` is a written expression:
+    /// `editor.apply { .. }`, `x.run { .. }`, `with(x) { .. }`. A bare call
+    /// inside one is first a member of that receiver, and only then a function
+    /// in scope — which the call alone cannot say.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub scope_receivers: Vec<ScopeReceiver>,
     /// Whether a Go file carries a build constraint — a `//go:build` or
     /// `// +build` directive, or an implicit `_GOOS`/`_GOARCH` filename suffix.
     /// Always false for non-Go files.
@@ -1561,6 +1583,12 @@ pub struct Extraction {
     /// answer: this file declares no such name.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub go_member_names: Option<Vec<String>>,
+    /// Go declarations, local scopes and call receivers as structured facts, the
+    /// input the resolver's Go type evaluator reads. `None` for a non-Go file or
+    /// an extraction cached before it existed — the evaluator then abstains
+    /// rather than read absence as "no declarations".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub go_facts: Option<crate::gofacts::GoFacts>,
     /// `(qualified scope, local name)` for every value a callable binds itself:
     /// parameters, `let`/`:=`/`=` targets, loop variables, `with … as` handles.
     ///
@@ -1578,6 +1606,38 @@ pub struct Extraction {
     /// payload.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub scope_locals: Vec<(String, String)>,
+    /// The name of every inline `mod name { … }` block a Rust file declares, at
+    /// any nesting. Sorted and deduplicated; empty for every other language.
+    ///
+    /// The extractor files an inline module's items under the file's own
+    /// namespace, so `fast_impl::gated()` written beside `mod fast_impl { pub fn
+    /// gated() }` names a function this file declares — but nothing in the
+    /// symbol table says `fast_impl` is a module of *this file* rather than a
+    /// crate or a sibling file, and binding a path by its last segment alone
+    /// would hand `tokio::spawn()` to any local `spawn`. This is the fact that
+    /// tells the two apart.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rust_inline_modules: Vec<String>,
+    /// `(type, target)` for every `impl Deref for type { type Target = target; }`
+    /// a Rust file declares, both reduced to their bare names. Sorted and
+    /// deduplicated; empty for every other language.
+    ///
+    /// A method call the receiver's own type does not declare is looked up on
+    /// the type it dereferences to — `guard.inner()` through `Deref<Target =
+    /// Inner>` — and the symbol table has no record that `Guard` derefs at all.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rust_deref_targets: Vec<(String, String)>,
+    /// Calls Rust makes without writing one: `a + b` is `a.add(b)`, `t[i]` is
+    /// `t.index(i)`, `let g = Guard::new();` runs `Guard::drop` at the end of
+    /// the scope, `let m: Meters = x.into();` calls `Meters::from`. Empty for
+    /// every other language.
+    ///
+    /// Kept apart from `calls` because they are candidates, not statements: an
+    /// `a + b` on integers is the overwhelmingly common case and names no
+    /// symbol, so a candidate that binds to nothing is dropped rather than
+    /// recorded as an unresolved call. One that binds is a real edge.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rust_implicit_calls: Vec<ExtractedCall>,
     /// Locally bound names at exact call/reference start offsets. Unlike graph
     /// caller identities, these distinguish unnamed callbacks and captures.
     /// Sorted and deduplicated; persists after source text is stripped.
@@ -1630,6 +1690,16 @@ pub struct LocalBinding {
 }
 
 impl Extraction {
+    /// The implicit-`this` expression of the innermost scope-function lambda
+    /// containing `byte`, if any.
+    pub fn scope_receiver_at(&self, byte: usize) -> Option<&str> {
+        self.scope_receivers
+            .iter()
+            .filter(|scope| scope.body_start <= byte && byte < scope.body_end)
+            .min_by_key(|scope| scope.body_end - scope.body_start)
+            .map(|scope| scope.receiver.as_str())
+    }
+
     pub fn local_binding_at(&self, start_byte: usize, name: &str) -> Option<&LocalBinding> {
         self.local_bindings
             .binary_search_by(|binding| {

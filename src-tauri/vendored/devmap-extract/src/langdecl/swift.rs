@@ -45,18 +45,22 @@ pub(crate) fn declaration(node: Node, source: &str) -> Option<Declaration> {
         // and `subscript` is reached through `a[i]`, which `langcalls::swift`
         // deliberately refuses to record as a call.
         "init_declaration" | "deinit_declaration" | "subscript_declaration" => None,
-        // A protocol *requirement* is likewise not emitted, and this one was
-        // measured rather than assumed. Emitting `Greeter.greet` beside
-        // `Person.greet` puts two symbols carrying the short name `greet` in one
-        // file, and the resolver has no Swift receiver typing to tell them
-        // apart: on the fixture below, `person.greet()` fell from a correct
-        // `Person.greet` at 1.0 confidence to a wrong `Greeter.greet` at 0.2.
-        // The requirement has no body, so nothing is ever attributed to it and
-        // it can only be the target of a call the resolver cannot direct. A node
-        // that costs a correct edge and gains an unreachable one is not worth
-        // emitting; this becomes worth revisiting when receiver types are
-        // inferred from Swift property annotations.
-        "protocol_function_declaration" | "protocol_property_declaration" => None,
+        // A protocol property requirement is not emitted: a stored or computed
+        // property is no symbol anywhere in this graph.
+        //
+        // A protocol *function* requirement is, owned by its protocol. It was
+        // withheld while a receiver typed by a protocol could not be resolved at
+        // all — `person.greet()` fell from `Person.greet` at 1.0 to the
+        // requirement at 0.2 because nothing typed `person`. Receivers are typed
+        // now (`swiftscope`), and a call written against the protocol needs a
+        // node to name: it is what a dispatch edge's `via` points at.
+        "protocol_property_declaration" => None,
+        // A function declared inside another function's body is a name that body
+        // binds, not a symbol of the module: `func expectation(...)` written
+        // inside one XCTest case received 78 confident callers from every other
+        // test in the module (the audit's F1). Its calls belong to the function
+        // that contains it, as an unnamed closure's do.
+        "function_declaration" if is_local_function(node) => None,
         _ => {
             let (declared_kind, name) = self_identity(node, source)?;
             // An enum case belongs to its enum by that enum's *full* identity.
@@ -80,6 +84,26 @@ pub(crate) fn declaration(node: Node, source: &str) -> Option<Declaration> {
     }
 }
 
+/// Whether `node` is declared inside a function, initializer, deinitializer or
+/// closure body — before any enclosing type — rather than at file or type level.
+fn is_local_function(node: Node) -> bool {
+    let mut ancestor = crate::treesitter::bounded_parent(node);
+    while let Some(parent) = ancestor {
+        match parent.kind() {
+            "function_declaration"
+            | "init_declaration"
+            | "deinit_declaration"
+            | "lambda_literal" => {
+                return true;
+            }
+            "class_declaration" | "protocol_declaration" | "source_file" => return false,
+            _ => {}
+        }
+        ancestor = crate::treesitter::bounded_parent(parent);
+    }
+    false
+}
+
 /// What `node` declares, ignoring its ancestors.
 fn self_identity(node: Node, source: &str) -> Option<(SymbolKind, String)> {
     match node.kind() {
@@ -98,7 +122,7 @@ fn self_identity(node: Node, source: &str) -> Option<(SymbolKind, String)> {
         "protocol_declaration" => {
             Some((SymbolKind::Interface, get_child_text(node, "name", source)?))
         }
-        "function_declaration" => {
+        "function_declaration" | "protocol_function_declaration" => {
             Some((SymbolKind::Function, get_child_text(node, "name", source)?))
         }
         // An enum case, keyed on the *name node* rather than on `enum_entry`.
@@ -304,6 +328,15 @@ pub(crate) fn exemption(
     source: &str,
     declaration: &Declaration,
 ) -> Option<(WiringKind, &'static str)> {
+    // A protocol requirement declares what a conformer must provide. It has no
+    // body and no caller of its own is expected: calls are written against the
+    // conformers, or against the protocol and dispatched to them.
+    if node.kind() == "protocol_function_declaration" {
+        return Some((
+            WiringKind::StructuralExempt,
+            "Swift protocol requirement — declares what a conformer must provide, so no caller of its own is expected",
+        ));
+    }
     // An enum case is reached through leading-dot inference — `let m: Mode =
     // .fast`, `case .number(let n)` — which names the case without naming its
     // type. `split_call_target` refuses `.text` as a callee (SC32: it is not an

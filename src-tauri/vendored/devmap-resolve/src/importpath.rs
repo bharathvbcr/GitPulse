@@ -43,6 +43,24 @@ pub struct ImportPathRule {
     pub roots: &'static [&'static str],
 }
 
+/// The repository-level source roots a JVM import is probed under: the
+/// conventional Gradle/Maven source sets (`main`, `test`, `androidTest`) in
+/// both Java and Kotlin directories, plus the bare layouts.
+const JVM_SOURCE_ROOTS: &[&str] = &[
+    "",
+    "src",
+    "java",
+    "kotlin",
+    "src/main/java",
+    "src/main/kotlin",
+    "src/test/java",
+    "src/test/kotlin",
+    "src/androidTest/java",
+    "src/androidTest/kotlin",
+    "app/src/main/java",
+    "app/src/main/kotlin",
+];
+
 /// The one table. Ordered as the languages appear in `langimports`.
 pub const IMPORT_PATH_RULES: &[ImportPathRule] = &[
     // The C family. The specifier is already a path with its extension, and
@@ -60,34 +78,26 @@ pub const IMPORT_PATH_RULES: &[ImportPathRule] = &[
     // which is a rule the language specification fixes for Java and a strong
     // convention for the other two — either way a specifier that maps to no
     // indexed file produces no edge rather than a wrong one.
+    //
+    // A Kotlin project keeps Kotlin under `src/main/java` as often as under
+    // `src/main/kotlin`, and Java and Kotlin import each other, so both rows
+    // probe both extensions and every Gradle source set. A module's own roots
+    // (`core/src/main/java`) come from `settings.gradle` through
+    // [`module_candidates`], and the `package` headers resolve what no
+    // directory layout does (`resolve_jvm_import`).
     ImportPathRule {
         langs: &["java"],
         separator: '.',
-        extensions: &[".java"],
+        extensions: &[".java", ".kt"],
         index_files: &[],
-        roots: &[
-            "",
-            "src",
-            "src/main/java",
-            "app/src/main/java",
-            "java",
-            "test/java",
-            "src/test/java",
-        ],
+        roots: JVM_SOURCE_ROOTS,
     },
     ImportPathRule {
         langs: &["kotlin"],
         separator: '.',
-        extensions: &[".kt", ".kts"],
+        extensions: &[".kt", ".kts", ".java"],
         index_files: &[],
-        roots: &[
-            "",
-            "src",
-            "src/main/kotlin",
-            "app/src/main/kotlin",
-            "kotlin",
-            "src/test/kotlin",
-        ],
+        roots: JVM_SOURCE_ROOTS,
     },
     ImportPathRule {
         langs: &["scala"],
@@ -308,6 +318,38 @@ pub fn candidates(rule: &ImportPathRule, importing_dir: &str, specifier: &str) -
             }
             for index in rule.index_files {
                 push(format!("{rooted}/{index}"), &mut out);
+            }
+        }
+    }
+    out
+}
+
+/// Candidate paths for a JVM import under each Gradle module's own source
+/// sets: `<module>/src/{main,test,androidTest}/{java,kotlin}/<spec>.<ext>`.
+///
+/// `modules` is what `settings.gradle(.kts)` `include`s. Bounded like
+/// [`candidates`]: modules past the cap are not probed, so a settings script
+/// cannot turn one import into an unbounded search.
+pub fn module_candidates(
+    rule: &ImportPathRule,
+    modules: &[String],
+    specifier: &str,
+) -> Vec<String> {
+    let spec = specifier.trim().trim_matches(|c| c == '"' || c == '\'');
+    if spec.is_empty() || is_relative_specifier(spec) {
+        return Vec::new();
+    }
+    let form = spec.replace(rule.separator, "/");
+    let mut out: Vec<String> = Vec::new();
+    for module in modules {
+        for set in ["main", "test", "androidTest"] {
+            for language in ["java", "kotlin"] {
+                for extension in rule.extensions {
+                    if out.len() >= MAX_CANDIDATES_PER_SPECIFIER {
+                        return out;
+                    }
+                    out.push(format!("{module}/src/{set}/{language}/{form}{extension}"));
+                }
             }
         }
     }

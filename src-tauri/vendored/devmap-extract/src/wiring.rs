@@ -1,50 +1,50 @@
 use crate::model::*;
 
+/// Whether `path` is a test file for liveness.
+///
+/// The rule is `dc_glob::is_test_path`, the one implementation held to
+/// `protocols/test-paths/v1.json`. Liveness adds two things the shared rule does
+/// not say, and both are exemptions rather than a second rule:
+///
+/// * `conftest.py` and the Android `androidTest` directory, which pytest and
+///   Gradle give a meaning no path affix carries;
+/// * a dotfile is not a test for sitting in a test directory. The JVM layout
+///   used to `return true` outright, ahead of that guard, so the rule held for
+///   `tests/.eslintrc` and not for `app/src/test/.eslintrc` — the same file, one
+///   directory layout apart — and every dotfile a JVM project keeps beside its
+///   tests was annotated `TestFile`, exempting the whole file from liveness. A
+///   dotfile named like a test (`tests/.eslintrc.test.js`) still is one.
 pub fn is_test_path(path: &str) -> bool {
     let norm = path.replace('\\', "/");
-    let norm_lower = norm.to_lowercase();
     let name = norm.rsplit('/').next().unwrap_or(&norm);
-    let name_lower = name.to_lowercase();
-
-    let parts: Vec<&str> = norm_lower.split('/').collect();
-    let mut in_test_dir = parts.iter().rev().skip(1).any(|p| {
-        *p == "tests" || *p == "test" || *p == "__tests__" || *p == "spec" || *p == "androidtest"
-    });
-
-    // The Android / JVM layout, which contributes to the *directory* verdict
-    // and does not stand in for it. This used to `return true` outright, ahead
-    // of the `!name.starts_with('.')` guard below, so the rule the kernel
-    // published held for `tests/.eslintrc` and not for `app/src/test/.eslintrc`
-    // — the same file, one directory layout apart. Every dotfile a JVM project
-    // keeps beside its tests was annotated `TestFile`, which exempts the whole
-    // file from liveness.
-    //
-    // Kept as a branch rather than deleted even though the segment table above
-    // already answers `test` and `androidtest`: it mirrors
-    // `devcouncil.indexing.wiring.is_test_path`, which the parity module pins,
-    // and it is what keeps the JVM layout working if that table ever narrows.
-    if norm_lower.contains("/src/test/") || norm_lower.contains("/src/androidtest/") {
-        in_test_dir = true;
+    // A file with no extension that is merely named `test` is not an affix
+    // match: the JVM branch answers for the directory a file sits in, and
+    // `app/src/test` — a file — was once exempted from liveness as one.
+    let bare_name = !name.contains('.')
+        && matches!(
+            name.to_lowercase().as_str(),
+            "test" | "tests" | "spec" | "specs" | "androidtest"
+        );
+    if (!bare_name && dc_glob::is_test_file_name(name)) || name.eq_ignore_ascii_case("conftest.py")
+    {
+        return true;
     }
-
-    let looks_like_test = name_lower.starts_with("test_")
-        || name_lower == "conftest.py"
-        || name_lower.ends_with("_test.py")
-        || name_lower.ends_with("_test.go")
-        || name_lower.ends_with(".test.js")
-        || name_lower.ends_with(".test.ts")
-        || name_lower.ends_with(".test.jsx")
-        || name_lower.ends_with(".test.tsx")
-        || name_lower.ends_with(".spec.js")
-        || name_lower.ends_with(".spec.ts")
-        || name_lower.ends_with(".spec.jsx")
-        || name_lower.ends_with(".spec.tsx")
-        || name_lower.ends_with("_spec.rb")
-        || name.ends_with("Tests.swift")
-        || name.ends_with("Test.kt")
-        || name.ends_with("Tests.kt");
-
-    looks_like_test || (in_test_dir && !name.starts_with('.'))
+    if name.starts_with('.') {
+        return false;
+    }
+    // `testdata` is the shared rule's, and liveness answers it with its own
+    // fixture rule (`is_fixture_path`) and its own exemption reason, so it is
+    // left out here and the two never claim one file twice.
+    let directories: Vec<&str> = norm.split('/').collect();
+    let directories = &directories[..directories.len().saturating_sub(1)];
+    let outside_fixtures = directories
+        .iter()
+        .filter(|segment| !segment.eq_ignore_ascii_case("testdata"))
+        .fold(String::new(), |acc, segment| acc + segment + "/");
+    dc_glob::in_test_directory(&(outside_fixtures + name))
+        || directories
+            .iter()
+            .any(|segment| segment.eq_ignore_ascii_case("androidtest"))
 }
 
 /// Suffixes a minifier writes, and a human does not.
@@ -172,11 +172,11 @@ pub fn source_has_generated_header(source: &str) -> bool {
 /// (`devmap-analyze/src/liveness.rs`) exempts every symbol in a file carrying
 /// one — so a single such line hid a whole file from the dead-code scan.
 ///
-/// `devcouncil.indexing.wiring.is_wiring_decorated` is the spec, and this is
-/// its rule transcribed: split off everything from the first `(`, strip the
+/// The rule, transcribed from the Python `is_wiring_decorated` (deleted since):
+/// split off everything from the first `(`, strip the
 /// leading `@`, trim, lowercase, then split on `.` and whitespace for the
-/// segment set. The hint table itself is unchanged and is pinned equal to the
-/// Python one by `tests/unit/test_wiring_parity_with_kernel.py`.
+/// segment set. The hint table is pinned by this crate's own tests; the Python
+/// parity test that once compared it is deleted.
 pub fn is_wiring_decorator(decorator: &str) -> bool {
     let hints = [
         "app.",
@@ -421,9 +421,10 @@ pub fn has_shebang(source: &str) -> bool {
 
 /// Directory names that hold test data rather than program text.
 ///
-/// Kept apart from [`is_test_path`], which is pinned equal to
-/// `devcouncil.indexing.wiring.is_test_path` by a parity test — widening that
-/// one would break the parity rather than fix the finding.
+/// Kept apart from [`is_test_path`]: widening that one would move every
+/// test-path decision, not just this finding. The Python `is_test_path` it
+/// was once pinned equal to is deleted; the rule is pinned by this crate's own
+/// tests.
 const FIXTURE_DIR_SEGMENTS: &[&str] = &[
     "testdata",
     "test-data",
@@ -1311,8 +1312,8 @@ const ENTRY_POINT_CAP: usize = 512;
 
 /// Module paths one `pkg.mod:attr` target is tried against.
 ///
-/// Pinned equal to `wiring._add_module_file`'s candidate list by
-/// `tests/unit/test_wiring_parity_with_kernel.py`.
+/// Ported from the Python `wiring._add_module_file` candidate list (deleted
+/// since); the Rust tests pin it now.
 const ENTRY_POINT_CANDIDATES: usize = 4;
 
 /// Symbol identities a Python console-script declaration names, with a reason.
@@ -1347,6 +1348,9 @@ const ENTRY_POINT_CANDIDATES: usize = 4;
 pub fn config_entry_point_symbols(path: &str, source: &str) -> Vec<WiringAnnotation> {
     let normalized = normalize_path(path);
     let name = normalized.rsplit('/').next().unwrap_or(&normalized);
+    if name == "AndroidManifest.xml" {
+        return android_component_entry_points(&normalized, source);
+    }
     if name != "pyproject.toml" {
         return Vec::new();
     }
@@ -1392,6 +1396,46 @@ pub fn config_entry_point_symbols(path: &str, source: &str) -> Vec<WiringAnnotat
         }
     }
     annotations
+}
+
+/// Prefix of a [`WiringKind::ConfigEntryPoint`] target that names an Android
+/// component rather than a `file::symbol`: `android-component:<module dir>|<name>`.
+///
+/// A manifest names a class by its package-qualified name (or `.Name`, relative
+/// to a namespace the Gradle script declares), never by file, so the join to a
+/// symbol is made where the class's own `package` header is known: the
+/// analysis pass reads this target against each Kotlin or Java class's package
+/// and the module directory the manifest governs.
+pub const ANDROID_COMPONENT_TARGET_PREFIX: &str = "android-component:";
+
+/// The components an `AndroidManifest.xml` declares, as entry-point claims.
+/// A manifest the reader cannot read makes no claim here; the extraction
+/// records the failure itself.
+fn android_component_entry_points(path: &str, source: &str) -> Vec<WiringAnnotation> {
+    let Ok(components) = crate::androidmanifest::parse_components(source) else {
+        return Vec::new();
+    };
+    // The module is the directory above `src/`: `app/src/main/AndroidManifest.xml`
+    // governs `app/`.
+    let module = path
+        .split_once("/src/")
+        .map(|(module, _)| module)
+        .or_else(|| path.strip_prefix("src/").map(|_| ""))
+        .unwrap_or_default();
+    components
+        .into_iter()
+        .map(|component| WiringAnnotation {
+            kind: WiringKind::ConfigEntryPoint,
+            target_symbol: format!(
+                "{ANDROID_COMPONENT_TARGET_PREFIX}{module}|{}",
+                component.name
+            ),
+            details: format!(
+                "declared as an Android <{}> component by {path}: {}",
+                component.tag, component.name
+            ),
+        })
+        .collect()
 }
 
 fn is_language_main(path: &str, source: &str) -> bool {
@@ -1610,8 +1654,8 @@ pub fn extract_wiring_annotations(path: &str, source: &str) -> Vec<WiringAnnotat
 
 /// The author's explicit "this file is intentionally unwired" declaration.
 ///
-/// One spelling, matching `devcouncil.indexing.wiring.ALLOW_UNWIRED` exactly.
-/// The two are asserted equal by `tests/allow_unwired_and_dynamic_imports.rs`,
+/// One spelling. `tests/allow_unwired_and_dynamic_imports.rs` pins the literal
+/// and checks it against a file in this repository that carries the marker,
 /// because a marker the kernel spells differently is a marker the kernel
 /// ignores — silently, and only for the files that use it.
 pub const ALLOW_UNWIRED: &str = "devcouncil: allow-unwired";
@@ -2424,8 +2468,8 @@ mod tests {
     /// `register` and `@FastAPI_thing` a `fastapi`. Because the annotation this
     /// feeds targets the *file* and `is_file_exempt` exempts every symbol in
     /// the file, one such line hides a whole file from the dead-code scan.
-    /// `devcouncil.indexing.wiring.is_wiring_decorated` is the spec: dotted
-    /// hints match as prefixes, bare hints as whole segments.
+    /// Dotted hints match as prefixes, bare hints as whole segments. (The Python
+    /// `is_wiring_decorated` this was ported from is deleted.)
     #[test]
     fn wiring_decorator_hints_are_prefixes_and_segments_not_substrings() {
         for decorator in [
@@ -2906,5 +2950,26 @@ u = \"pkg.b:run [fast]\"
         assert!(annotations
             .iter()
             .any(|a| a.target_symbol == "pkg/mod0.py::main"));
+    }
+}
+
+#[cfg(test)]
+mod test_path_conformance {
+    use super::{is_fixture_path, is_test_path};
+
+    /// Held to the one rule every implementation shares.
+    #[test]
+    fn is_test_path_agrees_with_every_row_of_the_shared_fixture() {
+        let rows =
+            dc_glob::parse_test_path_rows(include_str!("../../../protocols/test-paths/v1.json"))
+                .expect("fixture");
+        let wrong: Vec<_> = rows
+            .iter()
+            // Liveness exempts a fixture directory under its own reason, so a
+            // row the shared rule calls a test is held to "test or fixture".
+            .filter(|(path, expected)| (is_test_path(path) || is_fixture_path(path)) != *expected)
+            .map(|(path, expected)| format!("{path} (expected {expected})"))
+            .collect();
+        assert!(wrong.is_empty(), "{wrong:?}");
     }
 }

@@ -1065,6 +1065,11 @@ pub struct Session {
     child: std::process::Child,
     program: String,
     killed: bool,
+    /// [`Session::try_status`] saw the child exit, which reaps it.
+    reaped: bool,
+    /// [`Session::kill`] sent the group a signal. Read by the tests that pin
+    /// when it must not.
+    group_signalled: bool,
 }
 
 impl Session {
@@ -1080,7 +1085,9 @@ impl Session {
 
     /// The exit status if the child has already exited, without waiting.
     pub fn try_status(&mut self) -> Option<ExitStatus> {
-        self.child.try_wait().ok().flatten()
+        let status = self.child.try_wait().ok().flatten();
+        self.reaped |= status.is_some();
+        status
     }
 
     /// The program this session runs, for messages.
@@ -1090,15 +1097,21 @@ impl Session {
 
     /// Signal the child's process group and reap the child. Idempotent.
     ///
-    /// The group is signalled even when the child has already exited: a
-    /// descendant it left behind is still in the group, and the group id
-    /// cannot be reused while any member lives.
+    /// The group is signalled even when the child has already exited and been
+    /// reaped by [`try_status`](Self::try_status), but only while a member is
+    /// left in it: a descendant the child left behind is still in the group,
+    /// and the group id cannot be reused while any member lives. With no member
+    /// left the id is free, and the kernel may already have handed it to an
+    /// unrelated process group that the `SIGKILL` would then take.
     pub fn kill(&mut self) {
         if self.killed {
             return;
         }
         self.killed = true;
-        kill_descendants(&mut self.child);
+        if !self.reaped || group_has_members(self.child.id()) {
+            self.group_signalled = true;
+            kill_descendants(&mut self.child);
+        }
         let _ = self.child.wait();
     }
 }
@@ -1135,6 +1148,8 @@ pub fn spawn_session(command: &mut Command, spawn_deadline: Duration) -> Result<
         child,
         program,
         killed: false,
+        reaped: false,
+        group_signalled: false,
     })
 }
 
@@ -1165,6 +1180,21 @@ fn kill_and_reap(
     let handback = Instant::now() + DRAIN_HANDBACK;
     let _ = stdout_rx.recv_timeout(handback.saturating_duration_since(Instant::now()));
     let _ = stderr_rx.recv_timeout(handback.saturating_duration_since(Instant::now()));
+}
+
+/// Whether the group `leader` led still has a member this process may signal:
+/// a signal-0 probe, which delivers nothing. `ESRCH` is an empty group, and
+/// `EPERM` is a group that is not ours (an id reused by someone else), which is
+/// not a member to kill either.
+#[cfg(unix)]
+fn group_has_members(leader: u32) -> bool {
+    signal_group(leader, Signal::Probe).is_ok()
+}
+
+/// Elsewhere there is no group to probe, and a reaped child has nothing left.
+#[cfg(not(unix))]
+fn group_has_members(_leader: u32) -> bool {
+    false
 }
 
 /// `SIGKILL` to the child's process group — the child and every descendant that
@@ -1323,6 +1353,67 @@ fn drain(pipe: Option<impl Read>, cap: usize) -> Drained {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    fn session_of(script: &str) -> Session {
+        let mut command = session_command("sh");
+        command.arg("-c").arg(script);
+        spawn_session(&mut command, Duration::from_secs(5)).expect("sh starts")
+    }
+
+    #[cfg(unix)]
+    fn wait_until_reaped(session: &mut Session) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while session.try_status().is_none() {
+            assert!(Instant::now() < deadline, "the child never exited");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    /// `try_status` reaps the child; the group id then names nothing of ours,
+    /// and a pid the kernel has since handed to another group would take the
+    /// SIGKILL. With no member left, `kill` must not signal at all.
+    #[cfg(unix)]
+    #[test]
+    fn killing_a_reaped_session_with_no_members_left_signals_no_group() {
+        let mut session = session_of("exit 0");
+        wait_until_reaped(&mut session);
+        session.kill();
+        assert!(
+            !session.group_signalled,
+            "SIGKILL went to the group of a child that was already reaped"
+        );
+    }
+
+    /// The case the signal exists for: the leader is gone, a descendant it left
+    /// behind still holds the group, and that one is still ended.
+    #[cfg(unix)]
+    #[test]
+    fn killing_a_reaped_session_still_ends_a_descendant_that_outlived_it() {
+        let mut session = session_of("sleep 60 & exit 0");
+        wait_until_reaped(&mut session);
+        let leader = session.child.id();
+        session.kill();
+        assert!(
+            session.group_signalled,
+            "a surviving member was not signalled"
+        );
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while signal_group(leader, Signal::Probe).is_ok() {
+            assert!(Instant::now() < deadline, "the descendant outlived kill");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// An unreaped child is always signalled: its group id is still ours.
+    #[cfg(unix)]
+    #[test]
+    fn killing_a_live_session_signals_its_group() {
+        let mut session = session_of("sleep 60");
+        session.kill();
+        assert!(session.group_signalled);
+        assert!(session.try_status().is_none() || session.reaped);
+    }
+
     use super::*;
     use std::io::ErrorKind;
 

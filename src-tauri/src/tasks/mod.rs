@@ -196,6 +196,23 @@ fn parse_paths(column: &str, json: &str) -> Result<Vec<String>, String> {
         .collect()
 }
 
+/// [`parse_paths`] for a planned-files column, which also carries each file's
+/// `allowed_change`.
+///
+/// DevCouncil's Go decoder refuses a planned file whose `allowed_change` is not
+/// one of `create`, `modify`, `delete`, `read_only`, and with it the whole task
+/// row. GitPulse reads the same row, so it applies the store's own check
+/// (`dc_store::json::check_planned_files`) rather than reading the path out of
+/// an entry the other reader would have rejected: a scope no DevCouncil host can
+/// load must not look like a scope GitPulse enforces.
+fn parse_planned(column: &str, json: &str) -> Result<Vec<String>, String> {
+    let paths = parse_paths(column, json)?;
+    dc_store::json::check_planned_files(json).map_err(|e| {
+        format!("task scope column {column} is not a readable planned-file list: {e}")
+    })?;
+    Ok(paths)
+}
+
 /// Opens the store for `repo_path` for reading only, or reports why not.
 ///
 /// `SQLITE_OPEN_READ_ONLY`: a view can never migrate the store, sweep a lease
@@ -395,8 +412,8 @@ fn scope_in(store: &dc_store::Store, task_id: &str) -> Result<Option<TaskScope>,
         id: task.id,
         title: task.title,
         status: task.status,
-        planned_files: parse_paths("planned_files_json", &task.planned_files_json)?,
-        agent_appended_files: parse_paths(
+        planned_files: parse_planned("planned_files_json", &task.planned_files_json)?,
+        agent_appended_files: parse_planned(
             "agent_appended_planned_files_json",
             &task.agent_appended_planned_files_json,
         )?,
@@ -516,6 +533,67 @@ mod tests {
         assert!(v.leases.is_empty());
     }
 
+    /// The gap types a configuration fault raises, and the run records that carry
+    /// command objects, read as themselves.
+    ///
+    /// `gate_config_invalid` and `verify_env_config_invalid` are blocking gaps
+    /// DevCouncil raises when its gate or verify-environment configuration
+    /// cannot be read; their remedy is the `fix_config` next action. This view
+    /// passes `gap_type` through as text and must keep doing so: a closed list
+    /// here would drop exactly the gaps that say verification never ran. A run's
+    /// `commands_json` is handed on verbatim whether its entries are bare strings
+    /// or `CommandRecord` objects.
+    #[test]
+    fn configuration_gaps_and_command_record_runs_are_shown_not_dropped() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().to_str().unwrap();
+        let db = store_path(repo);
+        std::fs::create_dir_all(db.parent().unwrap()).unwrap();
+        let store = dc_store::Store::open(&db).unwrap();
+        for gap_type in ["gate_config_invalid", "verify_env_config_invalid"] {
+            store
+                .gap_upsert(&dc_store::records::GapRow {
+                    id: format!("g-{gap_type}"),
+                    severity: "high".into(),
+                    gap_type: gap_type.into(),
+                    requirement_id: None,
+                    task_id: Some("TASK-1".into()),
+                    description: "config unreadable".into(),
+                    evidence_json: "[]".into(),
+                    recommended_fix: "fix the configuration".into(),
+                    blocking: true,
+                    file: None,
+                    line: None,
+                    suggested_command: None,
+                    acceptance_criterion_id: None,
+                    expected_verification_method: None,
+                    stdout_path: None,
+                    stderr_path: None,
+                })
+                .unwrap();
+        }
+        let commands = r#"[{"command":"cargo test","exit_code":0,"status":"passed"}]"#;
+        store
+            .connection()
+            .execute(
+                "INSERT INTO verification_runs (id, task_id, sandbox, status, started_at, commands_json)
+                 VALUES ('run-1', 'TASK-1', 'host', 'degraded', '2026-01-01T00:00:00Z', ?1)",
+                [commands],
+            )
+            .unwrap();
+        drop(store);
+
+        let v = view_filtered(repo, Some("TASK-1"));
+        assert!(v.available, "{}", v.error);
+        let mut kinds: Vec<_> = v.gaps.iter().map(|g| g.gap_type.as_str()).collect();
+        kinds.sort_unstable();
+        assert_eq!(kinds, ["gate_config_invalid", "verify_env_config_invalid"]);
+        assert!(v.gaps.iter().all(|g| g.blocking));
+        assert_eq!(v.runs.len(), 1);
+        assert_eq!(v.runs[0].status, "degraded");
+        assert_eq!(v.runs[0].commands_json, commands);
+    }
+
     #[test]
     fn a_store_from_before_the_gap_output_columns_still_reads_its_gaps() {
         // `stdout_path` / `stderr_path` were added to `gaps` after schema 9
@@ -572,7 +650,7 @@ mod tests {
                 requirement_id: Some("REQ-7".into()),
                 task_id: Some("TASK-1".into()),
                 description: "cargo test failed".into(),
-                evidence_json: r#"{"exit":101}"#.into(),
+                evidence_json: r#"[{"exit":101}]"#.into(),
                 recommended_fix: "fix the failing test".into(),
                 blocking: true,
                 file: Some("src/a.rs".into()),
@@ -592,7 +670,7 @@ mod tests {
                 requirement_id: None,
                 task_id: Some("TASK-1".into()),
                 description: "missing test".into(),
-                evidence_json: "{}".into(),
+                evidence_json: "[]".into(),
                 recommended_fix: "add a test".into(),
                 blocking: false,
                 file: None,
@@ -625,7 +703,7 @@ mod tests {
                 requirement_id: Some("REQ-7".into()),
                 task_id: Some("TASK-1".into()),
                 description: "cargo test failed".into(),
-                evidence_json: r#"{"exit":101}"#.into(),
+                evidence_json: r#"[{"exit":101}]"#.into(),
                 recommended_fix: "fix the failing test".into(),
                 blocking: true,
                 file: Some("src/a.rs".into()),
@@ -722,6 +800,51 @@ mod tests {
         assert!(err.contains("forbidden_changes_json"), "{err}");
         let err = scopes(repo, &["TASK-2".to_string()]).unwrap_err();
         assert!(err.contains("forbidden_changes_json"), "{err}");
+    }
+
+    #[test]
+    fn a_task_whose_planned_file_has_an_unknown_allowed_change_has_no_readable_scope() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().to_str().unwrap();
+        let db = store_path(repo);
+        std::fs::create_dir_all(db.parent().unwrap()).unwrap();
+        let store = dc_store::Store::open(&db).unwrap();
+        for (id, column, value) in [
+            (
+                "TASK-A",
+                "planned_files_json",
+                r#"[{"path":"a.rs","allowed_change":"rewrite"}]"#,
+            ),
+            (
+                "TASK-B",
+                "agent_appended_planned_files_json",
+                r#"[{"path":"a.rs","allowed_change":7}]"#,
+            ),
+        ] {
+            store
+                .connection()
+                .execute(
+                    &format!("INSERT INTO tasks (id, title, description, {column}, status) VALUES (?1, 't', '', ?2, 'in_progress')"),
+                    rusqlite::params![id, value],
+                )
+                .unwrap();
+            // The store hands back the union of the planned and agent-appended
+            // columns as `planned_files_json`, so that is the column named.
+            let err = scope(repo, id).unwrap_err();
+            assert!(err.contains("planned_files_json"), "{column}: {err}");
+        }
+        // The four names the Go decoder accepts, and a task with none, still read.
+        store
+            .connection()
+            .execute(
+                "INSERT INTO tasks (id, title, description, planned_files_json, status) VALUES ('TASK-C', 't', '', ?1, 'in_progress')",
+                [r#"[{"path":"a","allowed_change":"create"},{"path":"b","allowed_change":"read_only"},{"path":"c"},"d"]"#],
+            )
+            .unwrap();
+        assert_eq!(
+            scope(repo, "TASK-C").unwrap().unwrap().planned_files,
+            ["a", "b", "c", "d"]
+        );
     }
 
     #[test]

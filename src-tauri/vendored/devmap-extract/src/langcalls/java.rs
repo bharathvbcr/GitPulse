@@ -11,6 +11,7 @@
 use super::jvm_dotnet::{receiver_of, record, CallSite};
 use super::scope::receiver_from;
 use crate::model::{ExtractedCall, ExtractedReference, ReferenceKind};
+use crate::treesitter::get_node_text;
 use tree_sitter::Node;
 
 pub(crate) fn extract_java_call(
@@ -88,6 +89,19 @@ fn call_site<'tree>(node: Node<'tree>, source: &str) -> Option<CallSite<'tree>> 
 /// `qualified_identifier` and for Go through `qualified_type`.
 fn java_receiver(object: Node, source: &str) -> Option<String> {
     match object.kind() {
+        // A Kotlin `object` is reached from Java as `pkg.Type.INSTANCE` (or
+        // `.Companion`): the qualified path is the only evidence of which
+        // package's `Type` it is, and the accessor says it is Kotlin's.
+        "field_access"
+            if object.child_by_field_name("field").is_some_and(|field| {
+                matches!(
+                    get_node_text(field, source).as_str(),
+                    "INSTANCE" | "Companion"
+                )
+            }) =>
+        {
+            receiver_from(object, source)
+        }
         "field_access" => object
             .child_by_field_name("field")
             .and_then(|field| receiver_from(field, source))

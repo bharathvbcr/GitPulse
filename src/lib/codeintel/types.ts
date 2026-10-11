@@ -491,6 +491,24 @@ export interface DevmapBuildOutcome {
   report?: unknown;
 }
 
+/**
+ * Why a failed devmap build failed, in the CLI's own words.
+ *
+ * Under `--json` the CLI answers a refusal as one `{"error": ...}` document on
+ * stdout and keeps its human lines off stderr, so stderr is empty for exactly
+ * the failures that have a reason. The envelope comes first, then stderr, then
+ * the caller's fallback. This helper never quotes stdout: it is a JSON document,
+ * not a sentence.
+ */
+export function buildFailureReason(outcome: DevmapBuildOutcome, fallback: string): string {
+  const report: unknown = outcome.report;
+  if (report && typeof report === "object") {
+    const error = (report as { error?: unknown }).error;
+    if (typeof error === "string" && error.trim() !== "") return error.trim();
+  }
+  return outcome.stderr.trim() || fallback;
+}
+
 export interface DevmapCliStatus {
   available: boolean;
   binary?: string | null;

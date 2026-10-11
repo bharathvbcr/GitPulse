@@ -120,8 +120,8 @@ CREATE TABLE IF NOT EXISTS gaps (
     suggested_command VARCHAR,
     acceptance_criterion_id VARCHAR,
     expected_verification_method VARCHAR,
-    -- Added after schema 9 shipped, so a store created earlier gains them in
-    -- `ensure_gap_output_columns`, not here.
+    -- Added after schema 9 shipped; a store created earlier gains them in
+    -- `migrate`, which adds every column this DDL defines that the table lacks.
     stdout_path VARCHAR,
     stderr_path VARCHAR,
     PRIMARY KEY (id)
@@ -383,38 +383,176 @@ fn normalise_ddl(sql: &str) -> String {
         .collect()
 }
 
-/// Columns added to `gaps` after schema 9 shipped, with their types.
-const GAP_OUTPUT_COLUMNS: &[(&str, &str)] =
-    &[("stdout_path", "VARCHAR"), ("stderr_path", "VARCHAR")];
+/// One column as `PRAGMA table_info` reports it.
+struct Column {
+    name: String,
+    ty: String,
+    not_null: bool,
+    default: Option<String>,
+    primary_key: bool,
+}
 
-/// Adds the gap output-path columns to a `gaps` table created without them.
+fn table_columns(conn: &Connection, table: &str) -> rusqlite::Result<Vec<Column>> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let rows = stmt.query_map([], |row| {
+        Ok(Column {
+            name: row.get("name")?,
+            ty: row.get("type")?,
+            not_null: row.get::<_, i64>("notnull")? != 0,
+            default: row.get("dflt_value")?,
+            primary_key: row.get::<_, i64>("pk")? != 0,
+        })
+    })?;
+    rows.collect()
+}
+
+/// Every column [`SCHEMA`] defines that `conn`'s tables lack, as
+/// `(table, column)`, in a stable order.
 ///
-/// `CREATE TABLE IF NOT EXISTS` leaves an existing table as it is, so without
-/// this a store in use before the columns existed would refuse every
-/// `gap-upsert` with "no such column" — the longest-lived stores first.
-///
-/// The change is additive and nullable, and it deliberately does not move
-/// `SCHEMA_VERSION`. That number is asserted by the Go client and shared with
-/// DevCouncil's planner; it exists to stop a binary reading rows through the
-/// wrong column layout. Two optional columns that older binaries never name in
-/// an INSERT or SELECT cannot produce that, while bumping it would make every
-/// installed client refuse every store this build has opened.
-///
-/// Two processes opening the same old store can both see a column missing and
-/// both add it; the loser's "duplicate column" is re-checked rather than
-/// reported, the same way `ensure_schema_version` treats its insert race.
-pub fn ensure_gap_output_columns(conn: &Connection) -> rusqlite::Result<()> {
-    for (name, ty) in GAP_OUTPUT_COLUMNS {
-        if gaps_has_column(conn, name)? {
-            continue;
-        }
-        if let Err(err) = conn.execute_batch(&format!("ALTER TABLE gaps ADD COLUMN {name} {ty}"))
-            && !gaps_has_column(conn, name)?
-        {
-            return Err(err);
+/// Derived from [`SCHEMA`] itself — created in a scratch database and read back
+/// through `PRAGMA table_info` — rather than from a second hand-kept list, so
+/// a column added to the DDL above is ensured on old stores without anyone
+/// remembering to name it twice. `CREATE TABLE IF NOT EXISTS` leaves an
+/// existing table as it is; before this, only the two `gaps` output columns
+/// were added, so a store from before schema 7 passed health, was stamped as
+/// current, and then failed every `task` read with "no such column".
+fn missing_columns(conn: &Connection) -> rusqlite::Result<Vec<(String, Column)>> {
+    let scratch = Connection::open_in_memory()?;
+    scratch.execute_batch(SCHEMA)?;
+    let mut tables = scratch.prepare(
+        "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name",
+    )?;
+    let tables: Vec<String> = tables
+        .query_map([], |row| row.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    let mut missing = Vec::new();
+    for table in tables {
+        let have: Vec<String> = table_columns(conn, &table)?
+            .into_iter()
+            .map(|c| c.name)
+            .collect();
+        for column in table_columns(&scratch, &table)? {
+            if !have.contains(&column.name) {
+                missing.push((table.clone(), column));
+            }
         }
     }
+    Ok(missing)
+}
+
+fn add_missing_columns(
+    conn: &Connection,
+    budget: &mut Option<usize>,
+) -> std::result::Result<(), String> {
+    let missing =
+        missing_columns(conn).map_err(|e| format!("columns could not be compared: {e}"))?;
+    for (table, column) in missing {
+        // SQLite refuses to add a primary key, and a NOT NULL column with no
+        // default (existing rows would have nothing to hold). Neither can be
+        // repaired in place, so say so rather than half-migrate.
+        if column.primary_key || (column.not_null && column.default.is_none()) {
+            return Err(format!(
+                "table {table} lacks column {}, which cannot be added to an existing table",
+                column.name
+            ));
+        }
+        spend(budget)?;
+        let mut ddl = format!(
+            "ALTER TABLE {table} ADD COLUMN {} {}",
+            column.name, column.ty
+        );
+        if column.not_null {
+            ddl.push_str(" NOT NULL");
+        }
+        if let Some(default) = &column.default {
+            ddl.push_str(&format!(" DEFAULT {default}"));
+        }
+        conn.execute_batch(&ddl)
+            .map_err(|e| format!("column {table}.{} could not be added: {e}", column.name))?;
+    }
     Ok(())
+}
+
+/// Brings an existing store's columns and `schema_version` up to this build,
+/// as one transaction.
+///
+/// The columns and the stamp commit together or not at all: stamping first, or
+/// stamping without the columns, is what left a v6 store reading as v9 while
+/// missing the column `task` selects. A newer-than-known version is refused
+/// before anything is touched. An up-to-date store takes no write lock — this
+/// runs on every open.
+pub fn migrate(conn: &Connection, known: u32) -> std::result::Result<(), String> {
+    migrate_inner(conn, known, &mut None)
+}
+
+/// Fails the migration after `steps` write steps (each column added, then the
+/// version stamp), so a test can crash it at every point and check that the
+/// store is left exactly as it was found.
+#[doc(hidden)]
+pub fn migrate_failing_after(
+    conn: &Connection,
+    known: u32,
+    steps: usize,
+) -> std::result::Result<(), String> {
+    migrate_inner(conn, known, &mut Some(steps))
+}
+
+fn spend(budget: &mut Option<usize>) -> std::result::Result<(), String> {
+    match budget {
+        Some(0) => Err("injected failure".to_string()),
+        Some(n) => {
+            *n -= 1;
+            Ok(())
+        }
+        None => Ok(()),
+    }
+}
+
+fn migrate_inner(
+    conn: &Connection,
+    known: u32,
+    budget: &mut Option<usize>,
+) -> std::result::Result<(), String> {
+    let read_version = |conn: &Connection| -> std::result::Result<Option<i64>, String> {
+        conn.query_row(
+            "SELECT version FROM schema_version WHERE id = 'singleton'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|e| format!("schema_version could not be read: {e}"))
+    };
+    let current = read_version(conn)?;
+    if let Some(v) = current {
+        check_version(v, known)?;
+    }
+    let missing =
+        missing_columns(conn).map_err(|e| format!("columns could not be compared: {e}"))?;
+    if missing.is_empty() && current == Some(known as i64) {
+        return Ok(());
+    }
+
+    conn.execute_batch("BEGIN IMMEDIATE")
+        .map_err(|e| format!("migration could not take the write lock: {e}"))?;
+    let outcome = (|| {
+        // Re-read under the lock: another process may have migrated, or a
+        // newer binary may have stamped a higher version, since the look above.
+        if let Some(v) = read_version(conn)? {
+            check_version(v, known)?;
+        }
+        add_missing_columns(conn, budget)?;
+        spend(budget)?;
+        ensure_schema_version(conn, known)
+    })();
+    match outcome {
+        Ok(()) => conn
+            .execute_batch("COMMIT")
+            .map_err(|e| format!("migration could not commit: {e}")),
+        Err(e) => {
+            let _ = conn.execute_batch("ROLLBACK");
+            Err(e)
+        }
+    }
 }
 
 pub(crate) fn gaps_has_column(conn: &Connection, name: &str) -> rusqlite::Result<bool> {

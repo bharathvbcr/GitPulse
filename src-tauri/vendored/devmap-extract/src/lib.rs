@@ -2,6 +2,7 @@
 // and its grammars; everything above it — the model types, language detection,
 // go.mod parsing, the ignore rules — does not, and is what a *query* consumer
 // actually uses.
+pub mod androidmanifest;
 pub mod cache;
 pub mod clonesig;
 #[cfg(feature = "parse")]
@@ -14,7 +15,9 @@ mod entry_names;
 pub mod embedded;
 pub mod fallback;
 pub mod frameworks;
+pub mod gofacts;
 pub mod gomod;
+pub mod gradle;
 #[cfg(feature = "parse")]
 pub mod heritage;
 #[cfg(feature = "parse")]
@@ -22,6 +25,7 @@ pub mod langcalls;
 #[cfg(feature = "parse")]
 pub(crate) mod langdecl;
 pub mod rustsig;
+pub mod swifttargets;
 // Takes a `tree_sitter::Node` for the same reason `langimports` does, and is
 // called from the same seam.
 #[cfg(feature = "parse")]
@@ -70,12 +74,19 @@ mod returns;
 // tree; its one caller is `treesitter::collect_site_bindings`.
 #[cfg(feature = "parse")]
 mod literals;
+pub mod pyproject;
 #[cfg(feature = "parse")]
 mod rustlocal;
+// The names a Swift callable binds and the types it writes for them. Walks a
+// parse tree; its callers are `treesitter::collect_site_bindings` and
+// `treesitter::collect_scope_locals`.
+#[cfg(feature = "parse")]
+mod swiftscope;
 #[cfg(feature = "parse")]
 pub mod treesitter;
 pub mod tsconfig;
 pub mod wiring;
+pub mod workspaces;
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -87,7 +98,8 @@ use rayon::prelude::*;
 
 pub use gomod::{
     collect_go_modules, collect_project_manifests, git_worktree_root, go_dirs_with_unindexed_files,
-    parse_cargo_crate_names, parse_go_mod, GoModule, ProjectManifests, RustCrateManifest,
+    parse_cargo_crate_names, parse_go_mod, GoModule, GradleSettings, ProjectManifests,
+    RustCrateManifest,
 };
 pub use languages::{
     declared_language_ids, detect_language, is_default_index_excluded, is_ignored_path,
@@ -98,6 +110,7 @@ pub use paths::{
     code_graph_path, compact_code_graph_path, content_cache_path, plugin_dir, repo_map_path,
     state_dir, store_path, workspace_path,
 };
+pub use swifttargets::SwiftTarget;
 #[cfg(feature = "parse")]
 pub use treesitter::{extract_treesitter, linked_grammar_count, linked_grammar_keys};
 
@@ -706,6 +719,27 @@ fn extract_file_unfiltered(path: &str, source: &str) -> Extraction {
                 MAX_SOURCE_BYTES
             ),
         );
+    }
+    // An Android manifest is data the framework reads, not source: the
+    // components it names are entry points, and a manifest the reader cannot
+    // read is a recorded failure, not "no components" (which would silently
+    // un-exempt every one of them).
+    if androidmanifest::is_android_manifest(path) {
+        return match androidmanifest::parse_components(source) {
+            Ok(_) => treesitter::skipped_extraction(
+                path,
+                "config",
+                source,
+                "not parsed as source: an Android manifest, read for the components it declares"
+                    .to_string(),
+            ),
+            Err(reason) => treesitter::refused_extraction(
+                path,
+                "config",
+                source,
+                format!("AndroidManifest.xml could not be read: {reason}"),
+            ),
+        };
     }
     // Notebooks divert here rather than inside `extract_treesitter`, because
     // what they need is not a different grammar but a different *source*: the

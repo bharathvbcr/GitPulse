@@ -124,6 +124,25 @@ A NULL `expires_at` means **this lease does not expire**, not "expired" and not
 NULL as *never reclaimable on this basis*, and fall back to an explicit
 release.
 
+### An unreadable `expires_at` fails closed for its own task
+
+A row whose `expires_at` is not a timestamp is neither live nor expired. It
+fails closed for **its own task only**: `ready` leaves the task out and names
+it in `unreadable_leases`, `health` answers `degraded: true` with the same list,
+and `acquire` refuses it unless `--force` is given, in which case the lease is
+retired (`status = 'stale'`, `released_at` stamped, the bad value left in the
+row) and the reply carries `retired_unreadable_lease`. Every other task is
+served normally. A consumer must not read "no timestamp" as "no expiry".
+
+Lazy expiry is one conditional `UPDATE` naming the expiry that was observed,
+so a renewal that lands first wins; `release` and `force` only ever touch a row
+that is still `active`, and a `released` row is never rewritten to `stale`.
+
+Fields added to replies are additive: `degraded`, `unreadable_leases`,
+`retired_unreadable_lease`, and, on `gaps` / `evidence-list`, a per-row
+`evidence_error` / `data_error` beside a fallback value when the stored JSON
+text was not provably one value of the expected kind.
+
 ---
 
 ## Writers, and who may be one

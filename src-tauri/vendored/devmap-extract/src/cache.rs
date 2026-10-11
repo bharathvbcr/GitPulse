@@ -597,7 +597,54 @@ pub const ANALYZER_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// empty, which charges every such region against the dead-code ceiling —
 /// a lone `}` would keep a whole language out of the confident tier until
 /// the file was edited.
-pub const EXTRACTION_SCHEMA_VERSION: &str = "80";
+///
+/// v81 records the Rust facts the receiver and path rules read (inline modules,
+/// `Deref` targets, implicit operator/drop/from candidates, `generate_handler!`
+/// lists, `macro_rules!` expansions). v82 records a Go file's declarations,
+/// local scopes and call receivers as structured facts (`go_facts`), the input
+/// of the resolver's Go type evaluator. Two lanes each stamped 81 on these
+/// different payloads; the later one is 82, so no two extractions share a
+/// version.
+///
+/// v83 records the TypeScript lane's extraction: the workspace-package map
+/// (`workspaces.rs`), member-qualified ids for class-field and object-literal
+/// members (`store.ts::paperService.fetchOne`, not `store.ts::fetchOne`), and
+/// `export default` as an export named `default`. That lane changed what a
+/// TypeScript file extracts to without stamping a version, so a v82 row would
+/// keep serving the old ids.
+///
+/// v84 binds a Swift or Kotlin callable's parameters and a closure's parameters
+/// (and the implicit `it` / `$0`) as local bindings of that scope. A v83 row has
+/// none, so a bare call to a function-typed parameter, or a receiver typed by
+/// another function's same-named parameter, would still be bound to a project
+/// namesake from a warm cache. The resolver lane stamped 81 on this payload; it
+/// landed after the Rust, Go and TypeScript lanes, so it is 84.
+///
+/// v85 records the implicit `__enter__` call of a Python `with Class(...)`
+/// statement. A v84 row has no such call, so the context manager's `__enter__`
+/// would keep looking uncalled until the file was edited. The Python lane
+/// stamped 82 on this payload; it landed after the others, so it is 85.
+///
+/// v86 records the Swift lane's extraction: protocol requirements as symbols
+/// (`Interface` members, so a call through a protocol-typed value has a direct
+/// edge), and scope-aware Swift locals (`swiftscope`). A v85 row lacks them, so
+/// the requirement would keep looking undeclared and the call unattributed from
+/// a warm cache. The Swift lane carried no stamp of its own, so it is 86.
+///
+/// v87 is the Kotlin accuracy payload: a Kotlin parameter, typed local and
+/// primary-constructor `val` carry a `Type` reference (so a receiver written
+/// through them is typed), a Kotlin/Java file records its `package` header, a
+/// Kotlin file records its scope-function lambdas, a callable reference, a
+/// `super.m()` and an explicit-type-argument call are calls, a Kotlin function
+/// carries its written return type and an extension property is a symbol; an
+/// `AndroidManifest.xml` is an indexed config whose components are entry
+/// points; a Ruby `attr_*` / `define_method` is a method symbol and an
+/// `include` / `prepend` is heritage. A v86 row has none of these, which
+/// leaves every receiver through a constructor property or a parameter
+/// untyped, and every manifest-only class a dead-code candidate, until the
+/// file is edited. The Kotlin lane stamped 82 on this payload; it landed after
+/// the others, so it is 87.
+pub const EXTRACTION_SCHEMA_VERSION: &str = "87";
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct CacheKey {

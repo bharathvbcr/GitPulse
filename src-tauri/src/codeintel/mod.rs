@@ -2141,6 +2141,35 @@ mod tests {
         );
     }
 
+    /// A store carrying a trigger is refused at open, on every read surface.
+    ///
+    /// SQL stored in a map's schema runs on the first write by whoever opens
+    /// it, and no devmap schema declares a trigger, so `devmap-store` refuses
+    /// the file. The refusal has to reach the caller as a reason: an answer
+    /// from such a store, or an empty one, would be a check that never ran
+    /// reporting like one that found nothing. GitPulse itself never creates a
+    /// trigger in a map; the only triggers it owns live in the task board's
+    /// own database.
+    #[test]
+    fn a_map_carrying_a_trigger_is_refused_not_answered() {
+        let repo = repo_with_empty_store();
+        let root = repo.path().to_string_lossy().to_string();
+        rusqlite::Connection::open(map_path(repo.path()))
+            .expect("raw connection")
+            .execute_batch(
+                "CREATE TRIGGER planted AFTER INSERT ON generations BEGIN SELECT 1; END;",
+            )
+            .expect("plant a trigger");
+
+        let status = status(&root);
+        assert!(!status.available, "a trigger-bearing map is not available");
+        let reason = status.reason.expect("the refusal states a reason");
+        assert!(reason.contains("trigger"), "{reason}");
+        let hits = search(&root, "anything", None);
+        assert!(!hits.available, "search must not answer from it");
+        assert!(hits.reason.unwrap_or_default().contains("trigger"));
+    }
+
     /// Every read surface must refuse rather than answer emptily.
     ///
     /// An empty `items` list with `available: true` would say "this symbol has

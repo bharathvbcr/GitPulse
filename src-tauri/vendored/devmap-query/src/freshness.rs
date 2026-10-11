@@ -7,13 +7,15 @@
 //! on every hook invocation — the second time the same tree had just been
 //! enumerated, because the build in front of it had already walked it.
 //!
-//! Computing them here is only useful if the answers are *identical*, so this
-//! module is a deliberate transcription of
+//! This module is a deliberate transcription of the Python
 //! `RepoMapper.get_git_files` / `_files_fingerprint` / `_content_fingerprint`
 //! and `indexing.graph.build.content_fingerprint`, down to the `\0` separator,
-//! the `c2:` scheme prefix and the `(size, mtime_ns, ctime_ns)` memo key.
-//! `tests/freshness_parity.rs` runs both implementations over a real tree and
-//! compares the strings; anything here that drifts from Python fails there.
+//! the `c2:` scheme prefix and the `(size, mtime_ns, ctime_ns)` memo key. The
+//! Python package is retired, so the kernel is the only producer and the only
+//! reader: `tests/freshness_parity.rs`, which compared the two over a real tree
+//! and printed SKIPPED (passing) once no interpreter could import `devcouncil`,
+//! was deleted rather than left to report ok without running. The scheme is
+//! pinned by `digest.rs`'s published test vectors and by the inventory tests.
 //!
 //! **Only the git path is implemented.** Python falls back to an `os.walk` when
 //! git cannot answer, and that fallback stays the Python side's: a second

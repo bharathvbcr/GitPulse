@@ -2393,6 +2393,10 @@ mod connection_tests;
 #[path = "db/tests/bounded_claim_tests.rs"]
 mod bounded_claim_tests;
 
+#[cfg(test)]
+#[path = "db/tests/hostile_store_tests.rs"]
+mod hostile_store_tests;
+
 // Gated `unix` at the module as well as at its test: the positive control that
 // ran everywhere moved to `tests/git_head_validates.rs` (it needs only the
 // public API), and with the stalled-git test compiled out on Windows the

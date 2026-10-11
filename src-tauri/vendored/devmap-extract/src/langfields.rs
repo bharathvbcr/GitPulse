@@ -82,13 +82,20 @@ pub(crate) fn extract_field_type(
     if field.name.is_empty() {
         return None;
     }
-    let owner = owning_type_name(node, source)?;
+    let enclosing = match owning_type_name(node, source) {
+        Some(owner) => format!("{file_symbol_name}::{owner}"),
+        // A Kotlin parameter, or a typed local, is the enclosing function's: the
+        // owner walk stops at a callable, and the binding is that callable's.
+        None if lang == "kotlin" => {
+            crate::langcalls::scope::enclosing_emitted_symbol(node, source, lang, file_symbol_name)?
+        }
+        None => return None,
+    };
     // Both halves are gated on the type resolving, which is the original Go
     // arm's shape and not an accident of it: a package qualifier with no type
     // beside it says a field came from somewhere without saying what it is, and
     // `field_type_on` has nothing to do with the first fact alone.
     let type_name = field.type_name.filter(|name| !name.is_empty())?;
-    let enclosing = format!("{file_symbol_name}::{owner}");
     let span = node_span(node);
     // Go names a foreign type through its package (`*pkg.Lease`), and that is
     // the half saying which file the type lives in. `declared_types` namespaces
@@ -177,7 +184,8 @@ fn field_node_kinds(lang: &str) -> Option<&'static [&'static str]> {
         "c" | "cpp" | "cuda" | "go" | "java" | "rust" => &["field_declaration"],
         "csharp" => &["field_declaration", "property_declaration"],
         "dart" => &["declaration"],
-        "kotlin" | "php" | "swift" => &["property_declaration"],
+        "kotlin" => &["property_declaration", "class_parameter", "parameter"],
+        "php" | "swift" => &["property_declaration"],
         "objc" => &["struct_declaration"],
         "pascal" => &["declField"],
         // Python has no field declaration; an annotated assignment is one.
@@ -257,19 +265,9 @@ fn field_of(lang: &str, node: Node, source: &str) -> Option<FieldType> {
             node.named_children(&mut node.walk())
                 .find(|child| child.kind() == "type_annotation"),
         ),
-        // Kotlin pairs them positionally inside `variable_declaration`.
-        "kotlin" => {
-            let declaration = node
-                .named_children(&mut node.walk())
-                .find(|child| child.kind() == "variable_declaration")?;
-            let mut cursor = declaration.walk();
-            let mut children = declaration.named_children(&mut cursor);
-            let name_node = children.next()?;
-            plain(
-                Some(get_node_text(name_node, source)),
-                children.find(|child| child.kind() != "modifiers"),
-            )
-        }
+        // Kotlin pairs them positionally inside `variable_declaration`, and a
+        // parameter pairs its name and type as two bare siblings.
+        "kotlin" => kotlin_field(node, source),
         // PHP's name is a `$`-sigil variable inside a `property_element`, and
         // the sigil is part of how every receiver in the language is spelled.
         "php" => {
@@ -331,6 +329,53 @@ fn field_of(lang: &str, node: Node, source: &str) -> Option<FieldType> {
                 _ => return None,
             };
             plain(Some(name), Some(type_node))
+        }
+        _ => None,
+    }
+}
+
+/// A Kotlin typed binding: a property, a function parameter, or a primary
+/// constructor `val`/`var` parameter (which is a property of the class).
+///
+/// A constructor parameter without `val`/`var` is not a member, so it is not a
+/// field and is refused here rather than typed as one.
+fn kotlin_field(node: Node, source: &str) -> Option<FieldType> {
+    let plain = |name: Node, type_node: Option<Node>| {
+        Some(FieldType {
+            name: get_node_text(name, source),
+            type_name: type_node.and_then(|ty| nominal_type_name(ty, source, 0)),
+            qualifier: None,
+        })
+    };
+    match node.kind() {
+        "property_declaration" => {
+            let declaration = node
+                .named_children(&mut node.walk())
+                .find(|child| child.kind() == "variable_declaration")?;
+            let mut cursor = declaration.walk();
+            let mut children = declaration.named_children(&mut cursor);
+            let name_node = children.next()?;
+            plain(
+                name_node,
+                children.find(|child| child.kind() != "modifiers"),
+            )
+        }
+        "class_parameter" | "parameter" => {
+            if node.kind() == "class_parameter"
+                && !node
+                    .children(&mut node.walk())
+                    .any(|child| matches!(child.kind(), "val" | "var"))
+            {
+                return None;
+            }
+            let mut cursor = node.walk();
+            let mut children = node
+                .named_children(&mut cursor)
+                .filter(|child| child.kind() != "modifiers");
+            let name_node = children
+                .next()
+                .filter(|child| child.kind() == "identifier")?;
+            plain(name_node, children.next())
         }
         _ => None,
     }
@@ -400,6 +445,18 @@ fn nominal_type_name(node: Node, source: &str, depth: usize) -> Option<String> {
         // reverse it with nothing on the page saying it had been decided.
         "array_type" | "slice_type" | "map_type" | "dictionary_type" | "tuple_type"
         | "function_type" | "lambda_type" | "channel_type" => None,
+        // Kotlin spells a qualified type as bare `identifier` children —
+        // `android.content.SharedPreferences.Editor` — and the last names it.
+        "user_type"
+            if node
+                .named_children(&mut node.walk())
+                .any(|child| child.kind() == "identifier") =>
+        {
+            node.named_children(&mut node.walk())
+                .filter(|child| child.kind() == "identifier")
+                .last()
+                .and_then(recurse)
+        }
         // Wrappers denoting the same value as their operand.
         "reference_type" | "pointer_type" | "optional_type" | "nullable_type"
         | "type_annotation" | "type" | "type_name" | "named_type" | "user_type"

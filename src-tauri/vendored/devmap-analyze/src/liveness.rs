@@ -1532,7 +1532,7 @@ pub const UNRESOLVED_NAMESAKE_REASON: &str =
 /// with affirmative evidence that the site meant something else — `Builtin`,
 /// `HostGlobal`, `External`, `NoNamesake`, `ModulePath` — must not veto. What is
 /// left is the three the ledger itself calls unattributed
-/// ([`UNATTRIBUTED_LABELS`]): `UninferredReceiver`, `Unresolved`, and
+/// ([`UNATTRIBUTED_LABELS`]): `UninferredReceiver`, `UnresolvedMember`, `Unresolved`, and
 /// `LocalBinding`.
 ///
 /// `LocalBinding` joined on 2026-10-09. It was excluded on the theory that a
@@ -1574,6 +1574,7 @@ fn is_namesake_veto_row(row: &UnresolvedReference) -> bool {
     ) && matches!(
         row.class,
         UnresolvedClass::UninferredReceiver
+            | UnresolvedClass::UnresolvedMember
             | UnresolvedClass::Unresolved
             | UnresolvedClass::LocalBinding
     ) && match &row.resolution {
@@ -1592,10 +1593,54 @@ fn is_ambiguous_edge(edge: &ResolvedEdge) -> bool {
     !matches!(
         edge.edge_kind,
         EdgeKind::Contains | EdgeKind::Defines | EdgeKind::MemberOf
-    ) && matches!(
-        edge.resolution.as_deref(),
-        Some(Resolution::AmbiguousGlobal { .. }) | Some(Resolution::LanguageServerDispatch { .. })
-    )
+    ) && edge
+        .resolution
+        .as_deref()
+        .is_some_and(Resolution::is_unproven_candidate_set)
+}
+
+/// The reason a symbol reached only through interface dispatch carries.
+pub const REACHED_BY_DISPATCH: &str = "reached_by_dispatch";
+
+/// Targets whose only unproven callers are interface dispatch edges.
+///
+/// A dispatch candidate and an ambiguous name match both leave a symbol at
+/// 0.4, but they are different evidence — the first is a type-system claim that
+/// the symbol *implements* what was called — and the reason says which. Keyed
+/// the way [`called_and_ambiguous_symbols`] keys its sets (qualified, short and
+/// member spellings), so the join cannot miss on spelling.
+fn dispatch_only_symbols(resolution: &ResolutionResult) -> HashSet<(String, String)> {
+    let spellings = |edge: &ResolvedEdge| -> Vec<(String, String)> {
+        let short = edge
+            .target_symbol
+            .rsplit("::")
+            .next()
+            .unwrap_or(edge.target_symbol.as_str());
+        let member = short.rsplit('.').next().unwrap_or(short);
+        [edge.target_symbol.as_str(), short, member]
+            .into_iter()
+            .map(|form| (edge.target_file.clone(), form.to_string()))
+            .collect()
+    };
+    let mut dispatched: HashSet<(String, String)> = HashSet::new();
+    let mut other: HashSet<(String, String)> = HashSet::new();
+    for edge in resolution
+        .edges
+        .iter()
+        .filter(|edge| is_ambiguous_edge(edge))
+    {
+        let bucket = if matches!(
+            edge.resolution.as_deref(),
+            Some(Resolution::Dispatch { .. })
+        ) {
+            &mut dispatched
+        } else {
+            &mut other
+        };
+        bucket.extend(spellings(edge));
+    }
+    dispatched.retain(|key| !other.contains(key));
+    dispatched
 }
 
 /// The manifests that scope module privacy, keyed by manifest family, each as
@@ -1670,6 +1715,22 @@ fn module_private_proof<'a>(ext: &Extraction, scopes: &ManifestScopes<'a>) -> Op
     nearest_manifest_proof(scopes, family, &ext.file_path)
 }
 
+/// How many ambiguous call sites reach a slot, and the smallest
+/// `(path, enclosing symbol, callee)` among them.
+type NamesakeSites<'a> = (u32, Option<(&'a str, &'a str, &'a str)>);
+
+/// Counts one call site against a slot and keeps the smallest site, so the
+/// reported example does not depend on edge order.
+fn record_namesake_site<'a>(entry: &mut NamesakeSites<'a>, site: (&'a str, &'a str, &'a str)) {
+    entry.0 = entry.0.saturating_add(1);
+    if entry
+        .1
+        .is_none_or(|best| (site.0, site.1) < (best.0, best.1))
+    {
+        entry.1 = Some(site);
+    }
+}
+
 /// Fill in the site evidence of every unconfirmed row in one pass.
 ///
 /// `sites` counts the ambiguous edges into the symbol and the unattributed
@@ -1701,7 +1762,7 @@ fn attach_site_evidence(
     }
 
     // Per slot: how many sites, and the smallest `(path, enclosing, callee)`.
-    let mut found: Vec<(u32, Option<(&str, &str, &str)>)> = vec![(0, None); pending.len()];
+    let mut found: Vec<NamesakeSites> = vec![(0, None); pending.len()];
 
     for edge in resolution
         .edges
@@ -1728,14 +1789,7 @@ fn attach_site_evidence(
                 edge.source_symbol.as_str(),
                 member,
             );
-            let entry = &mut found[slot];
-            entry.0 = entry.0.saturating_add(1);
-            if entry
-                .1
-                .map_or(true, |best| (site.0, site.1) < (best.0, best.1))
-            {
-                entry.1 = Some(site);
-            }
+            record_namesake_site(&mut found[slot], site);
         }
     }
     for row in resolution
@@ -1752,14 +1806,7 @@ fn attach_site_evidence(
                 row.source_symbol.as_str(),
                 row.callee_name.as_str(),
             );
-            let entry = &mut found[slot];
-            entry.0 = entry.0.saturating_add(1);
-            if entry
-                .1
-                .map_or(true, |best| (site.0, site.1) < (best.0, best.1))
-            {
-                entry.1 = Some(site);
-            }
+            record_namesake_site(&mut found[slot], site);
         }
     }
 
@@ -2124,6 +2171,52 @@ pub struct LivenessOutcome {
 /// resolutions count as reaching.
 type CallIndex = (HashSet<(String, String)>, HashSet<(String, String)>);
 
+/// Record `symbol` of `file` as something an ambiguous site might name, under
+/// the three spellings a declaration is looked up by: its identity, its short
+/// name, and the member name with its owner stripped.
+///
+/// `ExtractedSymbol::name` is the bare `toJson`, while a site names
+/// `File::RemoteTaskEntity.toJson`, so without the stripped form the two never
+/// meet and the ambiguity is recorded against nothing. This became load-bearing
+/// when Kotlin extension functions gained their receiver: one Android file
+/// declares seven `private fun <T>.toJson()` on seven different types and calls
+/// every one of them as `it.toJson()` inside a `map { }`. The receiver `it`
+/// cannot be typed, so the site is ambiguous — and the other six candidates,
+/// each genuinely called, were reported dead at 0.9 confidence.
+///
+/// Bounded to the ambiguous set on purpose: this can only move a finding from
+/// 0.9 to 0.4 `only_ambiguous_callers`, never exempt it, so it cannot hide a
+/// symbol nothing calls. Doing the same for `called_symbols` would silently
+/// exempt every same-named method in the file, which is a different and much
+/// worse trade.
+fn record_ambiguous(set: &mut HashSet<(String, String)>, file: &str, symbol: &str) {
+    set.insert((file.to_string(), symbol.to_string()));
+    if let Some(short_name) = symbol.rsplit("::").next() {
+        set.insert((file.to_string(), short_name.to_string()));
+        if let Some(member) = short_name.rsplit('.').next() {
+            set.insert((file.to_string(), member.to_string()));
+        }
+    }
+}
+
+/// The ambiguous *sites*: every call that named several candidates and bound
+/// none of them (S2). A bare-name site with in-repo namesakes is carried by its
+/// ledger row — `Resolution::AmbiguousGlobal` with the complete candidate list
+/// — and never by edges, so liveness reads the ambiguity from the ledger.
+fn ambiguous_ledger_rows(
+    resolution: &ResolutionResult,
+) -> impl Iterator<Item = (&UnresolvedReference, &[(String, String)])> {
+    resolution.unresolved.iter().filter_map(|row| {
+        if row.kind != UnresolvedKind::Call {
+            return None;
+        }
+        match &row.resolution {
+            Resolution::AmbiguousGlobal { candidates, .. } => Some((row, &candidates[..])),
+            _ => None,
+        }
+    })
+}
+
 fn called_and_ambiguous_symbols(resolution: &ResolutionResult) -> CallIndex {
     // File-scoped called symbols: (target_file, symbol_name_or_qualified_name)
     let mut called_symbols: HashSet<(String, String)> = HashSet::new();
@@ -2144,34 +2237,11 @@ fn called_and_ambiguous_symbols(resolution: &ResolutionResult) -> CallIndex {
         // symbol may be called, not proof that any one candidate is called.
         // Do not turn speculative resolution into a false liveness negative.
         if is_ambiguous_edge(edge) {
-            ambiguous_symbols.insert((edge.target_file.clone(), edge.target_symbol.clone()));
-            if let Some(short_name) = edge.target_symbol.rsplit("::").next() {
-                ambiguous_symbols.insert((edge.target_file.clone(), short_name.to_string()));
-                // …and the member name with its owner stripped.
-                //
-                // `ExtractedSymbol::name` is the bare `toJson`, while an edge
-                // names `File::RemoteTaskEntity.toJson`, so without this the two
-                // never meet and the ambiguity is recorded against nothing.
-                //
-                // This became load-bearing when Kotlin extension functions
-                // gained their receiver: one Android file declares seven
-                // `private fun <T>.toJson()` on seven different types and calls
-                // every one of them as `it.toJson()` inside a `map { }`. The
-                // receiver `it` cannot be typed, so the resolver emits an
-                // *ambiguous* edge naming one candidate — and the other six,
-                // each genuinely called, were reported dead at 0.9 confidence.
-                // Before the receiver fix all seven collapsed into one symbol
-                // and the question could not arise.
-                //
-                // Bounded to the ambiguous set on purpose: this can only move a
-                // finding from 0.9 to 0.4 `only_ambiguous_callers`, never exempt
-                // it, so it cannot hide a symbol nothing calls. Doing the same
-                // for `called_symbols` would silently exempt every same-named
-                // method in the file, which is a different and much worse trade.
-                if let Some(member) = short_name.rsplit('.').next() {
-                    ambiguous_symbols.insert((edge.target_file.clone(), member.to_string()));
-                }
-            }
+            record_ambiguous(
+                &mut ambiguous_symbols,
+                &edge.target_file,
+                &edge.target_symbol,
+            );
             continue;
         }
         if matches!(
@@ -2183,6 +2253,12 @@ fn called_and_ambiguous_symbols(resolution: &ResolutionResult) -> CallIndex {
         called_symbols.insert((edge.target_file.clone(), edge.target_symbol.clone()));
         if let Some(short_name) = edge.target_symbol.rsplit("::").next() {
             called_symbols.insert((edge.target_file.clone(), short_name.to_string()));
+        }
+    }
+
+    for (_, candidates) in ambiguous_ledger_rows(resolution) {
+        for (file, symbol) in candidates {
+            record_ambiguous(&mut ambiguous_symbols, file, symbol);
         }
     }
 
@@ -2229,6 +2305,43 @@ fn called_and_ambiguous_symbols(resolution: &ResolutionResult) -> CallIndex {
 /// The `.or_else` precedence of the original chain is preserved exactly, because
 /// the reason string is a machine token in three tests: symbol wiring, heritage
 /// override, Go interface, C header, exported owner, Go build variant.
+/// Why a Kotlin or Java class is live: an Android manifest declares it as a
+/// component. Matched on the class's package-qualified name, inside the module
+/// directory the manifest governs; a name written `.Name` is relative to the
+/// module's namespace, which only the build script knows, so it matches on its
+/// suffix.
+fn android_component_reason(
+    ext: &Extraction,
+    sym: &ExtractedSymbol,
+    components: &[(&str, &str, &str)],
+) -> Option<String> {
+    if components.is_empty()
+        || !matches!(ext.language.as_str(), "kotlin" | "java")
+        || sym.kind != SymbolKind::Class
+        || sym
+            .parent_symbol
+            .as_deref()
+            .is_some_and(|parent| parent != ext.file_path)
+    {
+        return None;
+    }
+    let package = ext.jvm_package.as_deref()?;
+    let qualified = format!("{package}.{}", sym.name);
+    components.iter().find_map(|(module, name, details)| {
+        let in_module = module.is_empty()
+            || ext
+                .file_path
+                .strip_prefix(module)
+                .is_some_and(|rest| rest.starts_with('/'));
+        let names_it = if name.starts_with('.') {
+            qualified.ends_with(name)
+        } else {
+            qualified == *name
+        };
+        (in_module && names_it).then(|| (*details).to_string())
+    })
+}
+
 fn symbol_exemption_index(
     extractions: &[Extraction],
     resolution: &ResolutionResult,
@@ -2258,6 +2371,19 @@ fn symbol_exemption_index(
         .flat_map(|ext| ext.wiring.iter())
         .filter(|w| w.kind == WiringKind::ConfigEntryPoint)
         .map(|w| (w.target_symbol.as_str(), w.details.as_str()))
+        .collect();
+
+    // The Android half of the same declaration: a manifest names a class by
+    // package-qualified name, so the join is made here, where each class's own
+    // `package` header is known. `(module dir, name as written, why)`.
+    let android_components: Vec<(&str, &str, &str)> = config_entry_points
+        .iter()
+        .filter_map(|(target, details)| {
+            let (module, name) = target
+                .strip_prefix(devmap_extract::wiring::ANDROID_COMPONENT_TARGET_PREFIX)?
+                .split_once('|')?;
+            Some((module, name, *details))
+        })
         .collect();
 
     let mut index: HashMap<(String, String), String> = HashMap::new();
@@ -2349,6 +2475,7 @@ fn symbol_exemption_index(
                         .get(sym.qualified_name.as_str())
                         .map(|details| (*details).to_string())
                 })
+                .or_else(|| android_component_reason(ext, sym, &android_components))
                 .or(heritage)
                 .or_else(|| {
                     go_interface_exemptions
@@ -2535,6 +2662,7 @@ pub fn analyze_liveness_with_coverage(
     let exemptions =
         symbol_exemption_index(extractions, resolution, &called_symbols, &ambiguous_symbols);
 
+    let dispatch_only = dispatch_only_symbols(resolution);
     let mut reports = Vec::new();
     // Unconfirmed rows awaiting their site evidence, by report index. Filled
     // in one pass over the edges and the ledger after the loop, so the cost is
@@ -2764,7 +2892,17 @@ pub fn analyze_liveness_with_coverage(
                     file_path: ext.file_path.clone(),
                     confidence: cap(0.4),
                     is_exempt: false,
-                    exemption_reason: Some("only_ambiguous_callers".to_string()),
+                    exemption_reason: Some(
+                        if dispatch_only
+                            .contains(&(ext.file_path.clone(), sym.qualified_name.clone()))
+                            || dispatch_only.contains(&(ext.file_path.clone(), sym.name.clone()))
+                        {
+                            REACHED_BY_DISPATCH
+                        } else {
+                            "only_ambiguous_callers"
+                        }
+                        .to_string(),
+                    ),
                     evidence: Some(DeadEvidence::none()),
                 });
             } else if !is_called

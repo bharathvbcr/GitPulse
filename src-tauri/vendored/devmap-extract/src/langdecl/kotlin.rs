@@ -58,6 +58,18 @@ fn self_identity(node: Node, source: &str) -> Option<(SymbolKind, String)> {
         "function_declaration" => {
             Some((SymbolKind::Function, get_child_text(node, "name", source)?))
         }
+        // `val Task.label: String get() = …` is an extension property: a
+        // callable keyed by its receiver exactly like an extension function, and
+        // the only kind of Kotlin property that is a symbol here. An ordinary
+        // property is a field or a local, which the typed-binding reader owns.
+        "property_declaration" => {
+            let _ = extension_property_receiver(node)?;
+            let declaration = node
+                .named_children(&mut node.walk())
+                .find(|child| child.kind() == "variable_declaration")?;
+            let name = declaration.named_child(0)?;
+            Some((SymbolKind::Function, get_node_text(name, source)))
+        }
         // `FAST` in `enum class Mode { FAST, SLOW }`. Emitted for the same
         // reason as the Swift case: a `Mode.FAST` reference is already recorded
         // and had no node it could resolve to.
@@ -95,20 +107,24 @@ fn class_kind(node: Node, source: &str) -> SymbolKind {
 /// after the name is a return type or a parameter list, so position is what
 /// separates them — the grammar gives the receiver no field of its own.
 fn extension_receiver(node: Node, source: &str) -> Option<String> {
-    if node.kind() != "function_declaration" {
-        return None;
-    }
-    let name = node.child_by_field_name("name")?;
-    let mut cursor = node.walk();
-    let mut receiver = None;
-    for child in node.children(&mut cursor) {
-        if child.id() == name.id() {
-            break;
+    let receiver = if node.kind() == "property_declaration" {
+        extension_property_receiver(node)
+    } else if node.kind() == "function_declaration" {
+        let name = node.child_by_field_name("name")?;
+        let mut cursor = node.walk();
+        let mut receiver = None;
+        for child in node.children(&mut cursor) {
+            if child.id() == name.id() {
+                break;
+            }
+            if child.kind() == "user_type" {
+                receiver = Some(child);
+            }
         }
-        if child.kind() == "user_type" {
-            receiver = Some(child);
-        }
-    }
+        receiver
+    } else {
+        None
+    };
     // `fun Map<String, Int>.pairs()` extends a specialised type; the identity a
     // call can join to is the bare type name, since that is what a declaration
     // of `Map` would be called.
@@ -123,6 +139,20 @@ fn extension_receiver(node: Node, source: &str) -> Option<String> {
         .trim()
         .to_string();
     (!bare.is_empty()).then_some(bare)
+}
+
+/// The receiver `user_type` of an extension property: the type written before
+/// the `variable_declaration` that names it.
+fn extension_property_receiver(node: Node) -> Option<Node> {
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        match child.kind() {
+            "user_type" => return Some(child),
+            "variable_declaration" => return None,
+            _ => {}
+        }
+    }
+    None
 }
 
 /// Kotlin's four visibilities, read from the declaration's own modifier list.

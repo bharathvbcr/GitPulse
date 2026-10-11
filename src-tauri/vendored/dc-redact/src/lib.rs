@@ -199,6 +199,27 @@ const SECRET_PATTERNS: &[SecretPattern] = &[
         min_len: 24,
         alphanumeric_body: false,
     },
+    // OpenAI admin keys: the Admin API Keys reference's create example returns
+    // a value beginning `sk-admin-`
+    // (https://platform.openai.com/docs/api-reference/admin-api-keys/create).
+    // The docs state no length; the floor is this table's usual one for a
+    // vendor prefix long enough not to occur in prose.
+    SecretPattern {
+        name: "openai admin api key",
+        prefix: "sk-admin-",
+        min_len: 24,
+        alphanumeric_body: false,
+    },
+    // OpenRouter: `sk-or-v1-` plus 64 hex characters, 73 in all. The format is
+    // read off the key examples on
+    // https://openrouter.ai/docs/api-reference/api-keys/create-api-key and is
+    // not stated there as a rule, so the floor sits well below 73.
+    SecretPattern {
+        name: "openrouter api key",
+        prefix: "sk-or-v1-",
+        min_len: 40,
+        alphanumeric_body: false,
+    },
     // Last of the `sk` family, because it is a prefix of the ones above and the
     // scan stops at its first match. The floor is high — a legacy OpenAI key is
     // `sk-` plus 48 characters — so `sk-test`, an `sk-` in prose, and this
@@ -208,6 +229,14 @@ const SECRET_PATTERNS: &[SecretPattern] = &[
         prefix: "sk-",
         min_len: 45,
         alphanumeric_body: true,
+    },
+    // Stripe endpoint signing secret: "a signing secret beginning with
+    // `whsec_`" (https://docs.stripe.com/webhooks). No length is stated.
+    SecretPattern {
+        name: "stripe webhook signing secret",
+        prefix: "whsec_",
+        min_len: 24,
+        alphanumeric_body: false,
     },
     SecretPattern {
         name: "xai api key",
@@ -260,6 +289,81 @@ const SECRET_PATTERNS: &[SecretPattern] = &[
     SecretPattern {
         name: "gitlab personal access token",
         prefix: "glpat-",
+        min_len: 26,
+        alphanumeric_body: false,
+    },
+    // GitLab token prefixes, from the table at
+    // https://docs.gitlab.com/security/tokens/ . The page states no length or
+    // character set, so the floor is the one `glpat-` already uses.
+    SecretPattern {
+        name: "gitlab deploy token",
+        prefix: "gldt-",
+        min_len: 26,
+        alphanumeric_body: false,
+    },
+    SecretPattern {
+        name: "gitlab runner authentication token",
+        prefix: "glrt-",
+        min_len: 26,
+        alphanumeric_body: false,
+    },
+    SecretPattern {
+        name: "gitlab runner registration-created token",
+        prefix: "glrtr-",
+        min_len: 26,
+        alphanumeric_body: false,
+    },
+    SecretPattern {
+        name: "gitlab oauth application secret",
+        prefix: "gloas-",
+        min_len: 26,
+        alphanumeric_body: false,
+    },
+    SecretPattern {
+        name: "gitlab ci job token",
+        prefix: "glcbt-",
+        min_len: 26,
+        alphanumeric_body: false,
+    },
+    SecretPattern {
+        name: "gitlab trigger token",
+        prefix: "glptt-",
+        min_len: 26,
+        alphanumeric_body: false,
+    },
+    SecretPattern {
+        name: "gitlab feed token",
+        prefix: "glft-",
+        min_len: 26,
+        alphanumeric_body: false,
+    },
+    SecretPattern {
+        name: "gitlab incoming mail token",
+        prefix: "glimt-",
+        min_len: 26,
+        alphanumeric_body: false,
+    },
+    SecretPattern {
+        name: "gitlab agent for kubernetes token",
+        prefix: "glagent-",
+        min_len: 26,
+        alphanumeric_body: false,
+    },
+    SecretPattern {
+        name: "gitlab workspace token",
+        prefix: "glwt-",
+        min_len: 26,
+        alphanumeric_body: false,
+    },
+    SecretPattern {
+        name: "gitlab scim token",
+        prefix: "glsoat-",
+        min_len: 26,
+        alphanumeric_body: false,
+    },
+    SecretPattern {
+        name: "gitlab feature flags client token",
+        prefix: "glffct-",
         min_len: 26,
         alphanumeric_body: false,
     },
@@ -351,6 +455,72 @@ const SECRET_PATTERNS: &[SecretPattern] = &[
         name: "npm access token",
         prefix: "npm_",
         min_len: 36,
+        alphanumeric_body: false,
+    },
+    // PyPI API token: `pypi-` and a base64 macaroon; the secret-reporting
+    // docs give the pattern as `pypi-[A-Za-z0-9-_]{85,}`, 90 bytes with the
+    // prefix (https://docs.pypi.org/api/secrets/).
+    SecretPattern {
+        name: "pypi api token",
+        prefix: "pypi-",
+        min_len: 90,
+        alphanumeric_body: false,
+    },
+    // DigitalOcean: `dop_v1_` personal access token, `doo_v1_` OAuth access
+    // token, `dor_v1_` OAuth refresh token
+    // (https://www.digitalocean.com/blog/updated-api-tokens-new-management-features,
+    // repeated in https://docs.digitalocean.com/reference/api/reference/security/).
+    // No length is stated.
+    SecretPattern {
+        name: "digitalocean personal access token",
+        prefix: "dop_v1_",
+        min_len: 32,
+        alphanumeric_body: false,
+    },
+    SecretPattern {
+        name: "digitalocean oauth access token",
+        prefix: "doo_v1_",
+        min_len: 32,
+        alphanumeric_body: false,
+    },
+    SecretPattern {
+        name: "digitalocean oauth refresh token",
+        prefix: "dor_v1_",
+        min_len: 32,
+        alphanumeric_body: false,
+    },
+    // Replicate: "40-character strings that always start with `r8_`"
+    // (https://replicate.com/docs/topics/security/api-tokens).
+    SecretPattern {
+        name: "replicate api token",
+        prefix: "r8_",
+        min_len: 40,
+        alphanumeric_body: false,
+    },
+    // Linear: personal API keys `lin_api_` and OAuth tokens `lin_oauth_`, from
+    // the changelog entry that introduced the prefixes so GitHub could scan for
+    // them (https://linear.app/changelog). No length is stated.
+    SecretPattern {
+        name: "linear api key",
+        prefix: "lin_api_",
+        min_len: 32,
+        alphanumeric_body: false,
+    },
+    SecretPattern {
+        name: "linear oauth token",
+        prefix: "lin_oauth_",
+        min_len: 32,
+        alphanumeric_body: false,
+    },
+    // Notion: new Public API tokens begin `ntn_` in place of `secret_` since
+    // 2024-09-25 (https://developers.notion.com/page/changelog). Notion advises
+    // against validating tokens by pattern; this is a leak detector, which
+    // errs the other way, and the old `secret_` prefix is left out as too
+    // common a word to stop a commit for.
+    SecretPattern {
+        name: "notion api token",
+        prefix: "ntn_",
+        min_len: 30,
         alphanumeric_body: false,
     },
     SecretPattern {
@@ -822,6 +992,41 @@ struct ValueEnds {
     continued: NextStop,
     /// The closing quote, per quote character.
     quotes: [NextStop; 3],
+    /// (where the last comma chain began, where it ended).
+    chain: Option<(usize, usize)>,
+}
+
+impl ValueEnds {
+    /// Where an unquoted value ending at `end` is redacted to: on past each
+    /// comma that is not followed by whitespace, to the next stop.
+    ///
+    /// The hop from a comma depends only on where it is, so every comma inside
+    /// a chain already walked ends at the chain's end. Walking it again from
+    /// each one made a line of `password=Ab12345678Ab12345678,` repeated
+    /// quadratic — one chain, as long as the line, started at every separator.
+    fn reach_past_commas(&mut self, line: &str, end: usize) -> usize {
+        if !line[end..].starts_with(',') {
+            return end;
+        }
+        if let Some((from, last)) = self.chain
+            && from <= end
+            && end <= last
+        {
+            return last;
+        }
+        let mut whole = end;
+        while line[whole..].starts_with(',') {
+            let next = whole + 1;
+            if next == line.len() || line[next..].starts_with(char::is_whitespace) {
+                break;
+            }
+            whole = self
+                .continued
+                .at_or_after(line, next, |c| c.is_whitespace() || ",;)}]\"'".contains(c));
+        }
+        self.chain = Some((end, whole));
+        whole
+    }
 }
 
 /// The span of the literal value starting at or after `from`, when it is one
@@ -851,23 +1056,20 @@ fn literal_after(line: &str, from: usize, ends: &mut ValueEnds) -> Option<std::o
     if !is_literal_secret(&line[start..end], false) {
         return None;
     }
-    let mut whole = end;
-    while line[whole..].starts_with(',') {
-        let next = whole + 1;
-        if next == line.len() || line[next..].starts_with(char::is_whitespace) {
-            break;
-        }
-        whole = ends
-            .continued
-            .at_or_after(line, next, |c| c.is_whitespace() || ",;)}]\"'".contains(c));
-    }
-    Some(start..whole)
+    Some(start..ends.reach_past_commas(line, end))
 }
 
 /// Whether `value` reads as a literal password or secret rather than a
 /// reference to one. `quoted` relaxes the expression test: inside quotes a
 /// `.` or `(` is a character, not member access or a call.
 fn is_literal_secret(value: &str, quoted: bool) -> bool {
+    // Judged on its first `MAX_JUDGED_VALUE` bytes. The detectors ask this at
+    // every separator, and the value after a separator can run to the end of
+    // the line: `password=` repeated made each ask read the whole rest, so a
+    // 400 KB line cost forty seconds. Every property read below is settled
+    // within a credential's first kilobyte, and the redaction span is
+    // unaffected: it still covers the whole value.
+    let value = judged_prefix(value);
     let has_digit = value.bytes().any(|b| b.is_ascii_digit());
     // A name, not a value: `session_token`, `settings.api_token`, `apiToken`,
     // and the kebab-case settings a credential-ish key often holds —
@@ -914,6 +1116,23 @@ fn is_literal_secret(value: &str, quoted: bool) -> bool {
         && !is_placeholder(value)
 }
 
+/// Most bytes of a value [`is_literal_secret`] reads. A real password, key or
+/// token is far shorter; the bound is what keeps judging a value at every
+/// separator of a long line linear.
+const MAX_JUDGED_VALUE: usize = 512;
+
+/// `value` cut to at most [`MAX_JUDGED_VALUE`] bytes at a character boundary.
+fn judged_prefix(value: &str) -> &str {
+    if value.len() <= MAX_JUDGED_VALUE {
+        return value;
+    }
+    let mut end = MAX_JUDGED_VALUE;
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    &value[..end]
+}
+
 /// Whether `text` is at least `min` and at most four words of three or more
 /// letters each — how an identifier reads, and how a random token does not.
 fn reads_as_words(text: &str, min: usize) -> bool {
@@ -923,10 +1142,25 @@ fn reads_as_words(text: &str, min: usize) -> bool {
             .all(|x| x.len() >= 3 && x.bytes().all(|b| b.is_ascii_alphabetic()))
 }
 
-/// A password given to a command-line client: the MySQL family's attached
-/// `-p<password>` (a detached `-p` prompts, and is not one), and
-/// `sshpass -p <password>`. Only after the client's own name, because `-p`
-/// means something else to nearly every other command (`mkdir -p`).
+/// A password given to a command-line client, in the spellings each client
+/// documents:
+///
+///   - the MySQL family's attached `-p<password>` (a detached `-p` prompts, and
+///     is not one) and `sshpass -p <password>`;
+///   - `curl -u user:password`, `--user user:password`, `-uuser:password`
+///     (curl manual, <https://curl.se/docs/manpage.html>: `-u name:password`);
+///   - `docker login -p <password>`, `--password <password>`, `-p<password>`
+///     (<https://docs.docker.com/reference/cli/docker/login/>: `-p, --password`,
+///     where `-` reads standard input and is no credential);
+///   - any `--password <value>`, `--passwd <value>` or `--passphrase <value>`;
+///   - a `.netrc` entry's `password <value>`, alone on a line or after
+///     `machine`/`login`/`default` on one
+///     (<https://everything.curl.dev/usingcurl/netrc.html>: entries may span
+///     lines or sit on one).
+///
+/// Only after the client's own name, because `-p` and `-u` mean something else
+/// to nearly every other command (`mkdir -p`, `ssh -u`). Every value is judged
+/// by the rule the other detectors use: a literal, not a reference to one.
 fn cli_password_spans(line: &str) -> Vec<std::ops::Range<usize>> {
     const ATTACHED: &[&str] = &[
         "mysql",
@@ -936,42 +1170,82 @@ fn cli_password_spans(line: &str) -> Vec<std::ops::Range<usize>> {
         "mariadb",
         "mariadb-dump",
     ];
+    const LONG_FLAGS: &[&str] = &["--password", "--passwd", "--passphrase"];
     let words: Vec<(usize, &str)> = line
         .split_whitespace()
         .map(|w| (w.as_ptr() as usize - line.as_ptr() as usize, w))
         .collect();
     let mut spans = Vec::new();
     let mut client: Option<&str> = None;
+    // Whether this command is a `.netrc` entry: it names a machine, a login or
+    // the default, or the line starts with `password`.
+    let netrc_entry = words.first().is_some_and(|&(_, w)| w == "password")
+        || words
+            .iter()
+            .any(|&(_, w)| matches!(w, "machine" | "login" | "default"));
+    let next_word_at = |i: usize| words.get(i + 1).map(|&(at, _)| at);
     for (i, &(at, word)) in words.iter().enumerate() {
         let program = word.rsplit('/').next().unwrap_or(word);
-        if ATTACHED.contains(&program) || program == "sshpass" {
+        if ATTACHED.contains(&program) || matches!(program, "sshpass" | "curl") {
             client = Some(program);
+            continue;
+        }
+        if program == "docker" && words.get(i + 1).is_some_and(|&(_, w)| w == "login") {
+            client = Some("docker login");
             continue;
         }
         if matches!(word, "|" | "&&" | "||" | ";") {
             client = None;
             continue;
         }
-        let start = match client {
-            Some("sshpass") if word == "-p" => match words.get(i + 1) {
-                Some(&(next_at, _)) => next_at,
-                None => continue,
-            },
-            Some(c)
-                if c != "sshpass"
-                    && word.len() > 2
-                    && word.starts_with("-p")
-                    && !word.starts_with("--") =>
-            {
-                at + 2
+        // A flag or keyword whose value is the next word.
+        let detached = LONG_FLAGS.contains(&word) || (netrc_entry && word == "password");
+        let start = if detached {
+            next_word_at(i)
+        } else {
+            match client {
+                Some("sshpass" | "docker login") if word == "-p" => next_word_at(i),
+                Some("docker login")
+                    if word.len() > 2 && word.starts_with("-p") && !word.starts_with("--") =>
+                {
+                    Some(at + 2)
+                }
+                Some("curl") if matches!(word, "-u" | "--user") => next_word_at(i),
+                Some("curl") if word.starts_with("--user=") => Some(at + "--user=".len()),
+                Some("curl")
+                    if word.len() > 2 && word.starts_with("-u") && !word.starts_with("--") =>
+                {
+                    Some(at + 2)
+                }
+                Some(c)
+                    if ATTACHED.contains(&c)
+                        && word.len() > 2
+                        && word.starts_with("-p")
+                        && !word.starts_with("--") =>
+                {
+                    Some(at + 2)
+                }
+                _ => None,
             }
-            _ => continue,
         };
+        let Some(mut start) = start else { continue };
         // The whole shell word, which a quoted space does not end:
         // `-pS3cr3t"x y"` is one argument, and redacting only the part before
         // the space left the rest of the password visible.
         let end = shell_word_end(line, start);
+        // curl's value is `user:password`; the credential is what follows the
+        // first colon, and a user with no colon makes curl prompt.
+        if client == Some("curl") && !detached {
+            match line[start..end].find(':') {
+                Some(colon) => start += colon + 1,
+                None => continue,
+            }
+        }
         let raw = &line[start..end];
+        // A flag after `--password` is the next option, not its value.
+        if raw.is_empty() || (LONG_FLAGS.contains(&word) && raw.starts_with('-')) {
+            continue;
+        }
         let quoted = raw.contains(['"', '\'']);
         // Judged without its quotes and its quoted spaces: after `-p` the
         // context already says this is a password, so a space in it is a

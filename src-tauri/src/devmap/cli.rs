@@ -555,6 +555,24 @@ fn parse_json_stdout(stdout: &str) -> Option<Value> {
     serde_json::from_str(trimmed).ok()
 }
 
+/// Why a failed `--json` devmap run failed.
+///
+/// Under `--json` DevMap answers a refusal on stdout as one `{"error": ...}`
+/// document and keeps its human lines off stderr, so stderr alone is empty for
+/// exactly the failures that have a reason. The envelope's text is DevMap's own
+/// and names the file or argument at fault; stderr is the fallback for a run
+/// that wrote no envelope (an older binary, a crash), and `fallback` the last
+/// resort. Never empty.
+pub(super) fn failure_detail(stdout: &str, stderr: &str, fallback: String) -> String {
+    let envelope = parse_json_stdout(stdout)
+        .and_then(|doc| doc.get("error").and_then(Value::as_str).map(str::to_string))
+        .map(|text| text.trim().to_string())
+        .filter(|text| !text.is_empty());
+    envelope
+        .or_else(|| Some(stderr.trim().to_string()).filter(|text| !text.is_empty()))
+        .unwrap_or(fallback)
+}
+
 fn timed_out(err: &str) -> bool {
     err.contains("timed out") || err.contains("timeout")
 }
@@ -767,11 +785,11 @@ pub fn doctor(repo_path: &str) -> DoctorReport {
     let stdout = bytes_to_string(run.stdout);
     let stderr = bytes_to_string(run.stderr);
     if !run.success {
-        let detail = if stderr.trim().is_empty() {
-            format!("devmap doctor exited {}", run.status_code)
-        } else {
-            stderr.trim().to_string()
-        };
+        let detail = failure_detail(
+            &stdout,
+            &stderr,
+            format!("devmap doctor exited {}", run.status_code),
+        );
         return unavailable(detail, Some(binary.path));
     }
     let Some(payload) = parse_json_stdout(&stdout) else {
@@ -927,11 +945,11 @@ pub fn status(repo_path: &str) -> CliStatus {
     let stdout = bytes_to_string(run.stdout);
     let stderr = bytes_to_string(run.stderr);
     if !run.success {
-        let detail = if stderr.trim().is_empty() {
-            format!("devmap status exited {}", run.status_code)
-        } else {
-            stderr.trim().to_string()
-        };
+        let detail = failure_detail(
+            &stdout,
+            &stderr,
+            format!("devmap status exited {}", run.status_code),
+        );
         return CliStatus {
             available: false,
             binary: Some(binary.path),
@@ -1047,11 +1065,11 @@ pub fn preview(repo_path: &str, file_path: &str, content: &str) -> PreviewFileRe
     let stdout = bytes_to_string(run.stdout);
     let stderr = bytes_to_string(run.stderr);
     if !run.success {
-        let detail = if stderr.trim().is_empty() {
-            format!("devmap preview exited {}", run.status_code)
-        } else {
-            stderr.trim().to_string()
-        };
+        let detail = failure_detail(
+            &stdout,
+            &stderr,
+            format!("devmap preview exited {}", run.status_code),
+        );
         return PreviewFileResult {
             file_path: file_path.to_string(),
             available: false,
@@ -1173,6 +1191,40 @@ fn omitted_preview_file(path: &str) -> PreviewFileResult {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_json_refusal_is_read_from_the_envelope_not_from_stderr() {
+        let envelope = r#"{"error":"refusing to rewrite /w/.mcp.json: not a JSON object"}"#;
+        // Under --json DevMap prints the envelope on stdout and nothing on stderr.
+        assert_eq!(
+            failure_detail(envelope, "", "devmap integrate exited 1".into()),
+            "refusing to rewrite /w/.mcp.json: not a JSON object"
+        );
+        // The envelope is DevMap's own text; a progress line on stderr does not replace it.
+        assert_eq!(
+            failure_detail(envelope, "indexing...\n", "x".into()),
+            "refusing to rewrite /w/.mcp.json: not a JSON object"
+        );
+    }
+
+    #[test]
+    fn a_failure_without_an_envelope_keeps_stderr_then_the_exit_fallback() {
+        assert_eq!(failure_detail("", " boom \n", "exited 2".into()), "boom");
+        for stdout in [
+            "",
+            "not json",
+            r#"{"error":""}"#,
+            r#"{"error":7}"#,
+            r#"{"files":3}"#,
+            "[]",
+        ] {
+            assert_eq!(
+                failure_detail(stdout, "  ", "exited 2".into()),
+                "exited 2",
+                "{stdout}"
+            );
+        }
+    }
+
     use super::*;
     use crate::procguard::LockedSpawn;
 

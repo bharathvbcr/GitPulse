@@ -175,6 +175,29 @@ pub struct ProjectManifests {
     /// resolver only knew by its directory and filed every such import
     /// `External` — "expected, not worth acting on" — about code it indexes.
     pub rust_crates: Vec<RustCrateManifest>,
+    /// The packages an npm / yarn / bun workspace links into the tree, by the
+    /// name an importer spells them: `@acme/shared` → `packages/shared`. See
+    /// [`crate::workspaces`].
+    pub ts_workspaces: Vec<crate::workspaces::WorkspacePackage>,
+    /// The Python source roots each `pyproject.toml` / `setup.cfg` declares
+    /// (see [`crate::pyproject`]), one entry per manifest that declares any.
+    pub python_roots: Vec<crate::pyproject::PythonSourceRoots>,
+    /// The Swift targets `Package.swift` and an XcodeGen `project.yml` declare,
+    /// and the folders each compiles. A folder two targets list belongs to
+    /// both; the path heuristic answers only for a file no manifest claims.
+    pub swift_targets: Vec<crate::swifttargets::SwiftTarget>,
+    /// Every Gradle settings script this pass read, with the module
+    /// directories its `include` statements name. A module's sources live under
+    /// `<module>/src/<set>/{java,kotlin}`, which no fixed root list can know.
+    pub gradle_modules: Vec<GradleSettings>,
+}
+
+/// One `settings.gradle(.kts)`: the directory it sits in and the module
+/// directories it includes, each repo-relative.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GradleSettings {
+    pub dir: String,
+    pub modules: Vec<String>,
 }
 
 /// One `Cargo.toml` package: the directory it governs and the crate names its
@@ -231,7 +254,11 @@ impl ProjectManifests {
 struct Found {
     modules: Vec<GoModule>,
     rust_crates: Vec<RustCrateManifest>,
+    python_roots: Vec<crate::pyproject::PythonSourceRoots>,
+    swift_targets: Vec<crate::swifttargets::SwiftTarget>,
+    gradle_modules: Vec<GradleSettings>,
     ts_configs: Vec<String>,
+    package_manifests: Vec<(String, crate::workspaces::PackageManifest)>,
     examined: BTreeSet<String>,
     refusals: Vec<(String, DiscoverySkipReason)>,
     /// A walk error about the pass as a whole: the root, or nothing at all.
@@ -251,7 +278,18 @@ fn visit_manifest_entry(root: &Path, entry: &ignore::DirEntry, found: &std::sync
     };
     let is_go_mod = file_name == "go.mod";
     let is_cargo_toml = file_name == "Cargo.toml";
-    if !is_go_mod && !is_cargo_toml && !crate::tsconfig::is_ts_config_name(file_name) {
+    let is_package_json = file_name == "package.json";
+    let is_python_manifest = file_name == "pyproject.toml" || file_name == "setup.cfg";
+    let is_swift_manifest = crate::swifttargets::is_swift_manifest_name(file_name);
+    let is_gradle_settings = crate::gradle::is_gradle_settings(file_name);
+    if !is_go_mod
+        && !is_cargo_toml
+        && !is_package_json
+        && !is_python_manifest
+        && !is_swift_manifest
+        && !is_gradle_settings
+        && !crate::tsconfig::is_ts_config_name(file_name)
+    {
         return;
     }
     // A link is a candidate whatever it points at. `is_file()` follows it and
@@ -269,6 +307,33 @@ fn visit_manifest_entry(root: &Path, entry: &ignore::DirEntry, found: &std::sync
         return;
     };
     let rel_str = rel_str.replace('\\', "/");
+    if is_python_manifest {
+        visit_python_manifest(root, &rel_str, found);
+        return;
+    }
+    if is_swift_manifest {
+        let read = read_manifest(root, &rel_str, crate::MAX_SOURCE_BYTES);
+        let mut found = crate::recover_lock(found);
+        found.examined.insert(rel_str.clone());
+        match read {
+            ManifestRead::Read(source) => {
+                match crate::swifttargets::parse_swift_manifest(&rel_str, &source) {
+                    Ok(targets) => found.swift_targets.extend(targets),
+                    // A manifest naming targets this reader could not follow is
+                    // a gap, not an empty answer: the files it governs fall back
+                    // to the path heuristic and the inventory says so.
+                    Err(reason) => found
+                        .refusals
+                        .push((rel_str, DiscoverySkipReason::Unreadable { reason })),
+                }
+            }
+            ManifestRead::Absent | ManifestRead::Skipped => {}
+            ManifestRead::Refused(reason) => found
+                .refusals
+                .push((rel_str, DiscoverySkipReason::Unreadable { reason })),
+        }
+        return;
+    }
     if is_cargo_toml {
         let read = read_manifest(root, &rel_str, crate::MAX_SOURCE_BYTES);
         let mut found = crate::recover_lock(found);
@@ -283,6 +348,64 @@ fn visit_manifest_entry(root: &Path, entry: &ignore::DirEntry, found: &std::sync
                     found.rust_crates.push(RustCrateManifest { dir, names });
                 }
             }
+            ManifestRead::Absent | ManifestRead::Skipped => {}
+            ManifestRead::Refused(reason) => found
+                .refusals
+                .push((rel_str, DiscoverySkipReason::Unreadable { reason })),
+        }
+        return;
+    }
+    if is_package_json {
+        let read = read_manifest(root, &rel_str, crate::tsconfig::MAX_CONFIG_BYTES);
+        let mut found = crate::recover_lock(found);
+        found.examined.insert(rel_str.clone());
+        match read {
+            ManifestRead::Read(source) => match crate::workspaces::parse_package_json(&source) {
+                Ok(manifest) => found.package_manifests.push((rel_str, manifest)),
+                Err(reason) => found
+                    .refusals
+                    .push((rel_str, DiscoverySkipReason::Unreadable { reason })),
+            },
+            ManifestRead::Absent | ManifestRead::Skipped => {}
+            ManifestRead::Refused(reason) => found
+                .refusals
+                .push((rel_str, DiscoverySkipReason::Unreadable { reason })),
+        }
+        return;
+    }
+    if is_gradle_settings {
+        let read = read_manifest(root, &rel_str, crate::MAX_SOURCE_BYTES);
+        let mut found = crate::recover_lock(found);
+        found.examined.insert(rel_str.clone());
+        match read {
+            ManifestRead::Read(source) => match crate::gradle::parse_modules(&source) {
+                Ok(modules) => {
+                    let dir = rel_str
+                        .rsplit_once('/')
+                        .map(|(dir, _)| dir.to_string())
+                        .unwrap_or_default();
+                    let modules = modules
+                        .into_iter()
+                        .map(|module| {
+                            if dir.is_empty() {
+                                module
+                            } else {
+                                format!("{dir}/{module}")
+                            }
+                        })
+                        .collect();
+                    found.gradle_modules.push(GradleSettings { dir, modules });
+                }
+                // An include list that cannot be read is not "no modules": every
+                // import into one would be filed external with nothing saying
+                // the settings script was the reason.
+                Err(reason) => found.refusals.push((
+                    rel_str,
+                    DiscoverySkipReason::Unreadable {
+                        reason: format!("could not be parsed: {reason}"),
+                    },
+                )),
+            },
             ManifestRead::Absent | ManifestRead::Skipped => {}
             ManifestRead::Refused(reason) => found
                 .refusals
@@ -319,6 +442,66 @@ fn visit_manifest_entry(root: &Path, entry: &ignore::DirEntry, found: &std::sync
         ManifestRead::Refused(reason) => found
             .refusals
             .push((rel_str, DiscoverySkipReason::Unreadable { reason })),
+    }
+}
+
+/// Read one `pyproject.toml` or `setup.cfg` for the source roots it declares.
+///
+/// A manifest that does not parse, or names a root outside the repository or
+/// one that is not a directory, is a refusal row — the same record a `go.mod`
+/// gets — so "this project declares no roots" and "this project's roots could
+/// not be read" are different answers downstream.
+fn visit_python_manifest(root: &Path, rel_str: &str, found: &std::sync::Mutex<Found>) {
+    let read = read_manifest(root, rel_str, crate::MAX_SOURCE_BYTES);
+    let dir = rel_str
+        .rsplit_once('/')
+        .map(|(dir, _)| dir.to_string())
+        .unwrap_or_default();
+    let mut found = crate::recover_lock(found);
+    found.examined.insert(rel_str.to_string());
+    let refuse = |found: &mut Found, reason: String| {
+        found.refusals.push((
+            rel_str.to_string(),
+            DiscoverySkipReason::Unreadable { reason },
+        ));
+    };
+    match read {
+        ManifestRead::Read(source) => {
+            let parsed = if rel_str.ends_with("setup.cfg") {
+                crate::pyproject::parse_setup_cfg_roots(&dir, &source)
+            } else {
+                crate::pyproject::parse_pyproject_roots(&dir, &source)
+            };
+            match parsed {
+                Ok(mut declared) => {
+                    // A root the manifest names that is not a directory on
+                    // disk is dropped from the set and reported: the resolver
+                    // would otherwise probe a path that cannot hold a module.
+                    let missing: Vec<String> = declared
+                        .roots
+                        .iter()
+                        .filter(|path| !root.join(path.as_str()).is_dir())
+                        .cloned()
+                        .collect();
+                    if !missing.is_empty() {
+                        declared.roots.retain(|path| !missing.contains(path));
+                        refuse(
+                            &mut found,
+                            format!(
+                                "names Python source root(s) that are not directories: {}",
+                                missing.join(", ")
+                            ),
+                        );
+                    }
+                    if !declared.roots.is_empty() {
+                        found.python_roots.push(declared);
+                    }
+                }
+                Err(reason) => refuse(&mut found, reason),
+            }
+        }
+        ManifestRead::Absent | ManifestRead::Skipped => {}
+        ManifestRead::Refused(reason) => refuse(&mut found, reason),
     }
 }
 
@@ -408,7 +591,11 @@ pub fn collect_project_manifests(root: &Path) -> anyhow::Result<ProjectManifests
     let Found {
         mut modules,
         mut rust_crates,
+        mut python_roots,
+        mut swift_targets,
+        mut gradle_modules,
         mut ts_configs,
+        mut package_manifests,
         mut examined,
         mut refusals,
         fatal,
@@ -433,6 +620,23 @@ pub fn collect_project_manifests(root: &Path) -> anyhow::Result<ProjectManifests
     });
     ts_configs.sort();
     rust_crates.sort_by(|left, right| left.dir.cmp(&right.dir));
+    package_manifests.sort_by(|left, right| left.0.cmp(&right.0));
+    let workspaces = crate::workspaces::link_workspaces(&package_manifests);
+    refusals.extend(
+        workspaces
+            .gaps
+            .into_iter()
+            .map(|(path, reason)| (path, DiscoverySkipReason::Unreadable { reason })),
+    );
+    python_roots.sort_by(|left, right| {
+        left.dir
+            .cmp(&right.dir)
+            .then_with(|| left.roots.cmp(&right.roots))
+    });
+    swift_targets.sort_by(|left, right| {
+        (&left.name, &left.paths, left.package).cmp(&(&right.name, &right.paths, right.package))
+    });
+    gradle_modules.sort_by(|left, right| left.dir.cmp(&right.dir));
     let ts = crate::tsconfig::build_ts_projects(root, &ts_configs);
     examined.extend(ts.examined);
     refusals.extend(
@@ -447,6 +651,10 @@ pub fn collect_project_manifests(root: &Path) -> anyhow::Result<ProjectManifests
         examined,
         refusals,
         rust_crates,
+        ts_workspaces: workspaces.packages,
+        python_roots,
+        swift_targets,
+        gradle_modules,
     })
 }
 

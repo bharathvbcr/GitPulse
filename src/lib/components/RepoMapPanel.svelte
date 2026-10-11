@@ -34,6 +34,7 @@
     RepoMapSubsystem,
     WorkspaceLinksResult,
   } from "../codeintel/types";
+  import { buildFailureReason } from "../codeintel/types";
   import {
     docsBrokenLinks,
     docsGraph,
@@ -401,7 +402,7 @@
       if (!live()) return;
       if (!outcome.ok) {
         actionNote = reportMapFailure(kind, repoPath,
-          outcome.stderr.trim() || outcome.stdout.trim() || `devmap ${kind} failed`);
+          buildFailureReason(outcome, outcome.stdout.trim() || `devmap ${kind} failed`));
       } else {
         actionNote = `Map ${kind === "build" ? "built" : "refreshed"}.`;
       }
