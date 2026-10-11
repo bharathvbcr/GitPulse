@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { wallClockBudget } from "../src/lib/testing/wallClock";
 import { CHECK_TIMEOUT_MS, ENV_SCRIPT_TIMEOUT_MS, parseEnvLines, spawnBounded } from "./gusset-check.mjs";
 
 describe("gusset:check child processes", () => {
@@ -6,7 +7,7 @@ describe("gusset:check child processes", () => {
     const started = Date.now();
     const result = spawnBounded("node", ["-e", "setTimeout(() => {}, 60000)"], { stdio: "ignore" }, 300);
     expect((result.error as NodeJS.ErrnoException | undefined)?.code).toBe("ETIMEDOUT");
-    expect(Date.now() - started).toBeLessThan(10_000);
+    expect(Date.now() - started).toBeLessThan(wallClockBudget(10_000));
   });
 
   it("passes a child that finishes in time through unchanged", () => {

@@ -8,6 +8,7 @@ import {
   summarizeWalkIncomplete,
   WALK_INCOMPLETE_MAX_CHARS,
 } from "./walkIncomplete";
+import { isRecord } from "../record";
 
 export interface CodeintelSymbolHit {
   symbol_name: string;
@@ -117,10 +118,6 @@ export interface CodeintelStatus {
   total_symbols?: number | null;
   total_edges?: number | null;
   reason?: string | null;
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
 function optionalBoolean(value: unknown): boolean | null | undefined {

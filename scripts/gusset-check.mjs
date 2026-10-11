@@ -72,7 +72,7 @@ function main() {
     console.error(`gusset-check: cgo-env.sh failed: ${envResult.error?.message ?? `exit ${envResult.status}`}`);
     return 2;
   }
-  const cgoEnv = parseEnvLines(envResult.stdout);
+  const cgoEnv = parseEnvLines(String(envResult.stdout));
   if (cgoEnv.CGO_ENABLED !== "1" || !cgoEnv.CGO_CFLAGS) {
     console.error("gusset-check: cgo-env.sh printed no cgo environment");
     return 2;

@@ -22,7 +22,7 @@
   import { repoStore } from "../stores/repoStore";
   import { interfaceStore } from "../stores/interfaceStore";
   import { toastStore } from "../stores/toastStore";
-  import { createVisibleInterval } from "../dom/visibleInterval";
+  import { createAdaptiveTimer } from "../runtime/adaptiveTimer";
   import { isCaseInsensitiveFs } from "../repos/paths";
   import { terminalSessions } from "../terminal/sessionRegistry";
   import { sessionActivity } from "../terminal/sessionActivity";
@@ -192,7 +192,7 @@
     board.start();
     // The "x ago" clock stops while the window is hidden and catches up when
     // it returns, rather than waking the renderer every second behind it.
-    const stopClock = createVisibleInterval(() => {
+    const stopClock = createAdaptiveTimer(() => {
       now = Date.now();
     }, 1000);
     return () => {

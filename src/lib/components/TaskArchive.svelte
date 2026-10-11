@@ -48,8 +48,9 @@
   import { onMount, untrack } from "svelte";
   import { Archive, ExternalLink } from "@lucide/svelte";
   import { createListenerTracker } from "../dom/listenerTracker";
+  import { createLiveLoader } from "../workbench/liveLoader";
   import { createAdaptiveTimer } from "../runtime/adaptiveTimer";
-  import { bindForegroundChanges, readBackgroundDocument } from "../runtime/foreground";
+  import { readBackgroundDocument } from "../runtime/foreground";
   import { formatRelativeTime } from "../format";
   import { MAX_TASK_SELECTION, type TaskAction } from "../workbench/taskActions";
   import { MAX_DELETE_BATCH } from "../workbench/taskDelete";
@@ -58,7 +59,7 @@
   import { words as lexiconWords } from "../workbench/taskLexicon";
   import { ARCHIVE_RULE, archiveStamp, archiveSummary, refreshPages, restoreAction, type ArchiveView } from "../workbench/taskArchive";
   import {
-    STATUS_LABELS, explainError, listTasks, subscribeWorkbenchChanges,
+    STATUS_LABELS, explainError, listTasks,
     type Page, type Scope, type TaskCard,
   } from "../workbench/client";
 
@@ -97,8 +98,6 @@
   let selected = $state<Set<string>>(new Set());
   let error = $state(""), notice = $state(""), visible = $state(!readBackgroundDocument()), working = $state(false);
   let now = $state(Math.floor(Date.now() / 1000));
-  let generation = 0, disposed = false, loading = false, again = false;
-  let refreshTimer: ReturnType<typeof setTimeout> | undefined;
 
   /**
    * The search read as the board reads its own (`taskQuery.ts`): the words go
@@ -145,55 +144,40 @@
    * `"first"` starts over (scope, search or view changed); `"more"` appends
    * the next page; `"refresh"` re-reads the pages already on screen.
    */
-  async function load(mode: "first" | "more" | "refresh" = "refresh") {
-    if (!active || !visible || disposed) return;
-    if (loading) { again = true; return; }
-    const epoch = generation;
-    loading = true;
-    try {
+  type LoadMode = "first" | "more" | "refresh";
+  const loader = createLiveLoader<LoadMode>({
+    canRun: () => active && visible,
+    read: async (requested, isCurrent) => {
+      const mode = requested ?? "refresh";
       if (mode === "more" && result?.next_cursor) {
         const next = await read(result.next_cursor);
-        if (epoch !== generation || disposed) return;
+        if (!isCurrent()) return;
         const items = [...new Map([...(result?.items ?? []), ...next.items].map((item) => [item.id, item])).values()];
         result = { ...next, items, shown: items.length };
         pages++;
       } else {
         const fresh = await refreshPages(mode === "first" || !result ? 1 : pages, read);
-        if (epoch !== generation || disposed) return;
+        if (!isCurrent()) return;
         result = { items: fresh.items, total: fresh.total, shown: fresh.items.length, has_more: fresh.next_cursor !== null, next_cursor: fresh.next_cursor };
         pages = fresh.pages;
       }
       const items = result.items;
       selected = new Set([...selected].filter((id) => items.some((item) => item.id === id)));
       error = "";
-    } catch (cause) {
-      if (epoch === generation && !disposed) error = explainError(cause);
-    } finally {
-      loading = false;
-      if (again) { again = false; void load(); }
-    }
-  }
-
-  function schedule() {
-    if (!active || !visible || disposed) return;
-    clearTimeout(refreshTimer);
-    refreshTimer = setTimeout(() => { void load(); }, 200);
-  }
+    },
+    onError: (cause) => { error = explainError(cause); },
+  });
+  const load = (mode: LoadMode = "refresh") => loader.load(mode);
 
   onMount(() => {
     const listeners = createListenerTracker();
-    listeners.track(subscribeWorkbenchChanges({
-      changed: schedule,
-      unavailable: (message) => { if (!disposed) notice = `Live updates unavailable: ${message}. Use Refresh.`; },
+    listeners.track(loader.connect({
+      onVisibility: (next) => { visible = next; },
+      onUnavailable: (message) => { notice = `Live updates unavailable: ${message}. Use Refresh.`; },
     }));
-    const onForeground = () => {
-      visible = !readBackgroundDocument();
-      if (visible) schedule();
-    };
     const stopClock = createAdaptiveTimer(() => { now = Math.floor(Date.now() / 1000); }, 30_000);
     listeners.track(stopClock);
-    listeners.track(bindForegroundChanges(document, typeof window === "undefined" ? null : window, onForeground));
-    return () => { disposed = true; generation++; clearTimeout(refreshTimer); listeners.dispose(); };
+    return () => { loader.dispose(); listeners.dispose(); };
   });
 
   // Scope, search and view each change what the list is, so the page starts
@@ -203,7 +187,7 @@
   // several pages survives a look at another app.
   $effect(() => {
     scope; storeQuery; view; active;
-    generation++; result = null; pages = 0; selected = new Set(); clearTimeout(refreshTimer);
+    loader.reset(); result = null; pages = 0; selected = new Set();
     untrack(() => { void load("first"); });
   });
   // Filters change which loaded rows show, not the list: no re-read, but a
@@ -231,7 +215,7 @@
     working = true;
     try { await onopen(card.id); }
     catch (cause) { error = explainError(cause); }
-    finally { if (!disposed) working = false; }
+    finally { if (!loader.isDisposed()) working = false; }
   }
 
   async function restore() {
@@ -240,7 +224,7 @@
     working = true;
     try { notice = await onrestoredeleted([...chosen]); error = ""; }
     catch (cause) { error = explainError(cause); }
-    finally { if (!disposed) { working = false; void load("refresh"); } }
+    finally { if (!loader.isDisposed()) { working = false; void load("refresh"); } }
   }
 
   function remove() {

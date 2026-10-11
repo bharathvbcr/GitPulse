@@ -96,7 +96,7 @@
   import { runTimelineRows } from "../github/runLifecycle";
   import { anyInFlight, failuresSince } from "../delivery/transitions";
   import { createLivePoll, type LiveState } from "../delivery/livePoll";
-  import { createVisibleInterval } from "../dom/visibleInterval";
+  import { createAdaptiveTimer } from "../runtime/adaptiveTimer";
   import type { GitHubRunsReport } from "../github/types";
 
   const macos = isMacOS();
@@ -264,7 +264,7 @@
   let clockTick = $state(Date.now());
   // Visibility-aware: a ticker whose only job is to re-render a relative
   // stamp must not wake the renderer behind other windows.
-  $effect(() => createVisibleInterval(() => (clockTick = Date.now()), 30_000));
+  $effect(() => createAdaptiveTimer(() => (clockTick = Date.now()), 30_000));
   const fetchedAgo = $derived(
     fetchedAt === null ? "" : relativeAge(new Date(fetchedAt).toISOString(), clockTick),
   );
@@ -358,7 +358,7 @@
     // this one fires every second, and `liveState` stays "live" while the
     // window is hidden — the poll's own timer stops, but this ticker would
     // not have.
-    return createVisibleInterval(() => (timelineNow = Date.now()), 1_000);
+    return createAdaptiveTimer(() => (timelineNow = Date.now()), 1_000);
   });
 
   function clearPrFilter() {

@@ -1,6 +1,7 @@
 import { recordEditorDrafts } from "../files/editorDraftRegistry";
 import { flushOnPageHide } from "../async/deferredWrite";
 import type { ConflictDocument, ConflictResolutionChoice } from "./conflict";
+import { isRecord } from "../record";
 
 export interface ConflictStage {
   stage: number;
@@ -63,10 +64,6 @@ export const initialResolution = (snapshot: ConflictSnapshot): ResolutionState =
   custom: {}, whole: null,
 });
 export const hasResolution = (draft: RecoveredResolution): boolean => draft.state.whole !== null || draft.state.choices.some(choice => choice !== "Unresolved") || Object.keys(draft.state.custom).length > 0;
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return !!value && typeof value === "object" && !Array.isArray(value);
-}
 function isChoice(value: unknown): value is ConflictResolutionChoice {
   return typeof value === "string"
     ? ["Unresolved", "AcceptOurs", "AcceptTheirs", "AcceptBothOursFirst", "AcceptBothTheirsFirst"].includes(value)
