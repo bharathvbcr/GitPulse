@@ -1702,6 +1702,16 @@ if (params.has("check")) {
     const expected = archivedCount();
     check("the board badges the server's archived total, not a page of it",
       expected > 30 && archiveToggle()?.textContent.trim() === String(expected));
+    // The dock has its own search, so the board's must not narrow the badge:
+    // a filtered board advertising fewer archived tasks misreports the archive.
+    {
+      const boardSearch = root.querySelector('[aria-label="Search tasks"]');
+      await change(boardSearch, "Ready task 01"); await settle(400);
+      const narrowed = archiveToggle()?.textContent.trim();
+      await change(boardSearch, ""); await settle(400);
+      check("the archive badge counts the scope's archive whatever the board search",
+        narrowed === String(expected) && archiveToggle()?.textContent.trim() === String(expected));
+    }
     // dc-store schema 11: Done and archived are separate. Archived Done work
     // is off the board, and the Done column holds only what is not archived.
     check("archived work is not drawn in the Done column",
@@ -1725,9 +1735,33 @@ if (params.has("check")) {
     // archive they have only partly seen.
     check("a partly loaded archive says so, with both numbers",
       archiveSummaryText() === `Showing 30 of ${expected} archived tasks. Load more to see the rest.`);
+    // Load more extends the rows, so it scrolls with them: a fixed row outside
+    // the scroller competed with the list for the panel's height.
+    {
+      const more = button("Load more", archive()), list = archive().querySelector(".entries");
+      check("Load more sits inside the row scroller, after the last row",
+        Boolean(more) && list.contains(more) && list.lastElementChild === more
+        && archiveRows().at(-1).compareDocumentPosition(more) === Node.DOCUMENT_POSITION_FOLLOWING);
+    }
     button("Load more", archive()).click(); await settle(200);
     check("Load more grows the page instead of replacing it",
       archiveRows().length === expected && archiveSummaryText() === `${expected} archived tasks.`);
+    check("Load more is gone once the store says there is no next page", !button("Load more", archive()));
+    // "Select all" over a paged list would claim rows the dock has not loaded;
+    // the head says how many it means and selects exactly those.
+    {
+      const head = archive().querySelector(".list-head");
+      const all = head.querySelector('input[type="checkbox"]');
+      all.click(); await settle();
+      const picked = archiveRows().filter(row => row.querySelector('input[type="checkbox"]').checked).length;
+      check("the select-all head names the loaded count and selects exactly those rows",
+        head.textContent.replace(/\s+/g, " ").trim() === `Select the ${expected} loaded`
+        && picked === expected && archive().querySelector(".actions")?.textContent.includes(`${expected} selected`));
+      button("Clear", archive().querySelector(".actions")).click(); await settle();
+      check("Clear empties the archive selection and takes its actions away",
+        !archive().querySelector(".actions") && archiveRows().every(row => !row.querySelector('input[type="checkbox"]').checked)
+        && all.checked === false);
+    }
     // A restore is the board's own update, so it must land in the board's
     // confirm dialog rather than writing straight through.
     archiveRows()[0].querySelector('input[type="checkbox"]').click(); await settle();
