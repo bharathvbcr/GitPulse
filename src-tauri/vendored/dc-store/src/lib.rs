@@ -375,6 +375,11 @@ impl Store {
         // busy timeout absorbs the contention two builders produce. Both are
         // set before any statement runs.
         conn.busy_timeout(BUSY_TIMEOUT)?;
+        // Before the first table: a database created here can give back the
+        // pages retention frees (`store.compact` runs the incremental vacuum).
+        // SQLite ignores it on a file that already holds tables, so an older
+        // profile keeps its mode until someone runs a full VACUUM on it.
+        conn.pragma_update(None, "auto_vacuum", 2)?;
         ensure_wal(&conn)?;
         conn.execute_batch(schema::SCHEMA)?;
         schema::ensure_gap_output_columns(&conn)?;
