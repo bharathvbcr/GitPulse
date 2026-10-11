@@ -37,8 +37,8 @@ function harness(answer: (cmd: string, args: Record<string, unknown>) => Promise
 
 const payload = { text: "diff", truncated: false, truncation_reason: null };
 const base: DiffSelectionSpec = {
-  command: "cmd_get_commit_diff", args: { commitId: "abc" }, filePath: null, commitId: "abc",
-  isStaged: false, kind: "commit", history: "never",
+  read: (invoke, repoPath) => invoke("cmd_get_commit_diff", { repoPath, commitId: "abc" }),
+  filePath: null, commitId: "abc", isStaged: false, kind: "commit", history: "never",
 };
 
 describe("createDiffSelection", () => {
@@ -53,7 +53,7 @@ describe("createDiffSelection", () => {
 
   it("a worktree read carries and records the session's whitespace preference", async () => {
     const h = harness(async () => payload);
-    await h.sel.select({ ...base, command: "cmd_get_file_diff", args: { filePath: "a.ts", isStaged: false }, filePath: "a.ts", commitId: null, kind: "file", history: "unlessNavigated", worktree: true });
+    await h.sel.select({ ...base, read: (invoke, repoPath, ignoreWhitespace) => invoke("cmd_get_file_diff", { repoPath, filePath: "a.ts", isStaged: false, ignoreWhitespace }), filePath: "a.ts", commitId: null, kind: "file", history: "unlessNavigated", worktree: true });
     expect(h.calls[0][1]).toMatchObject({ ignoreWhitespace: true });
     expect(h.applied.at(-1)).toMatchObject({ selectedIgnoreWhitespace: true, activeTab: "history" });
   });
@@ -75,7 +75,7 @@ describe("createDiffSelection", () => {
     const rejecters: Array<(e: unknown) => void> = [];
     const h = harness(() => new Promise((res, rej) => { resolvers.push(res); rejecters.push(rej); }));
     const first = h.sel.select(base);
-    const second = h.sel.select({ ...base, commitId: "def", args: { commitId: "def" } });
+    const second = h.sel.select({ ...base, commitId: "def", read: (invoke, repoPath) => invoke("cmd_get_commit_diff", { repoPath, commitId: "def" }) });
     rejecters[0](new Error("late failure"));
     resolvers[1](payload);
     await Promise.all([first, second]);

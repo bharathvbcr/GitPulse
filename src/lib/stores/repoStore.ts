@@ -2415,8 +2415,8 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
     },
     selectFileDiff: (filePath: string, isStaged: boolean = false) =>
       diffSelection.select({
-        command: "cmd_get_file_diff",
-        args: { filePath, isStaged },
+        read: (invoke, repoPath, ignoreWhitespace) =>
+          invoke<DiffPayload>("cmd_get_file_diff", { repoPath, filePath, isStaged, ignoreWhitespace }),
         filePath,
         commitId: null,
         isStaged,
@@ -2461,8 +2461,7 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
     },
     selectCommitDiff: (commitId: string) =>
       diffSelection.select({
-        command: "cmd_get_commit_diff",
-        args: { commitId },
+        read: (invoke, repoPath) => invoke<DiffPayload>("cmd_get_commit_diff", { repoPath, commitId }),
         filePath: null,
         commitId,
         isStaged: false,
@@ -2474,8 +2473,8 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
      */
     selectCommitFileDiff: (commitId: string, filePath: string) =>
       diffSelection.select({
-        command: "cmd_get_commit_file_diff",
-        args: { commitId, filePath },
+        read: (invoke, repoPath) =>
+          invoke<DiffPayload>("cmd_get_commit_file_diff", { repoPath, commitId, filePath }),
         filePath,
         commitId,
         isStaged: false,
@@ -2484,8 +2483,7 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
       }),
     selectRangeDiff: (from: string, to: string) =>
       diffSelection.select({
-        command: "cmd_get_range_diff",
-        args: { from, to },
+        read: (invoke, repoPath) => invoke<DiffPayload>("cmd_get_range_diff", { repoPath, from, to }),
         filePath: `${from}...${to}`,
         commitId: null,
         isStaged: false,

@@ -16,10 +16,12 @@ export interface DiffSelectionDeps {
 
 /** One diff the reader can ask for: which command reads it, and what it selects. */
 export interface DiffSelectionSpec {
-  /** The IPC command; every one answers with a `DiffPayload`. */
-  command: string;
-  /** Arguments beyond `repoPath`. A worktree read also gets `ignoreWhitespace`. */
-  args: Record<string, unknown>;
+  /**
+   * The IPC read, written out at the call site so each command name stays a
+   * literal `scripts/check-ipc-contract.mjs` can match against the Rust
+   * registry; a name passed through this module as data would hide it.
+   */
+  read(invoke: InvokeFn, repoPath: string, ignoreWhitespace: boolean): Promise<DiffPayload>;
   filePath: string | null;
   commitId: string | null;
   isStaged: boolean;
@@ -31,7 +33,7 @@ export interface DiffSelectionSpec {
    * list selects in place).
    */
   history: "always" | "unlessNavigated" | "never";
-  /** A worktree read carries the session's whitespace preference and records it with its answer. */
+  /** A worktree read honours the session's whitespace preference and records it with its answer. */
   worktree?: boolean;
 }
 
@@ -120,11 +122,7 @@ export function createDiffSelection(deps: DiffSelectionDeps) {
           ? { activeTab: "history" as const, viewSections: { ...current.viewSections, history: "diff" } }
           : {};
       try {
-        const diff = await deps.invoke<DiffPayload>(spec.command, {
-          repoPath: session.path,
-          ...spec.args,
-          ...(spec.worktree ? { ignoreWhitespace } : {}),
-        });
+        const diff = await spec.read(deps.invoke, session.path, ignoreWhitespace);
         if (!selectionGeneration.isCurrent(token)) return;
         deps.applyToSession(session.id, generation, (current) => ({
           ...target,
