@@ -1,3 +1,6 @@
+import { readFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { describe, expect, it, vi } from "vitest";
 import {
   findFragmentTarget,
@@ -190,5 +193,19 @@ describe("findFragmentTarget", () => {
     expect(findFragmentTarget(root, "1")).toBe(footnote);
     expect(findFragmentTarget(root, 'a"b]c')).toBe(odd);
     expect(findFragmentTarget(root, "a")).toBeNull();
+  });
+});
+
+describe("footnote ids", () => {
+  // The DOM pass runs in a browser, not under this node runner: harness/markdown.html
+  // checks the real page (a heading "Note" beside `[^note]` shares no id and the
+  // footnote link lands on its definition). Here: the pass exists and runs
+  // before the document-wide id prefix, which would otherwise hide the clash.
+  it("namespaces footnote definitions ahead of the id prefix", () => {
+    const source = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "markdownLinks.ts"), "utf8");
+    expect(source.indexOf("namespaceFootnotes(root);")).toBeGreaterThan(-1);
+    expect(source.indexOf("namespaceFootnotes(root);")).toBeLessThan(
+      source.indexOf("element.id = `${MARKDOWN_ID_PREFIX}${element.id}`"),
+    );
   });
 });

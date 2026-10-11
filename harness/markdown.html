@@ -100,6 +100,11 @@
       });
       check("a highlight wraps the bold inside it", () => page().querySelector("mark > strong")?.textContent === "strong");
       check("footnotes are listed with their labels", () => page().querySelectorAll(".footnote-definition").length === 2);
+      check("a footnote label equal to a heading slug shares no id with it, and its link lands on the footnote", () => {
+        const ids = [...page().querySelectorAll("[id]")].map(el => el.id);
+        const target = (() => { const id = decodeURIComponent(page().querySelector(".footnote-reference a[href$='note']")?.getAttribute("href").slice(1) ?? ""); return [...page().querySelectorAll("[id]")].find(el => el.id === "gp-md-" + id); })();
+        return new Set(ids).size === ids.length && page().querySelector("#gp-md-note")?.tagName === "H2" && target?.classList.contains("footnote-definition");
+      });
 
       // --- the stylesheet applies ------------------------------------------
       const h1 = page().querySelector("h1"), p = page().querySelector("p");

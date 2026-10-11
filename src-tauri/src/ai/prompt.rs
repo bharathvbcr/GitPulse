@@ -414,6 +414,11 @@ pub fn clean_commit_message(raw: &str) -> String {
 }
 
 /// Reads a model reply back into a branch name.
+///
+/// Empty when nothing usable is left. The result is checked against the same
+/// ref-name validator every branch the app creates passes through, so a
+/// suggestion the app would then refuse (`a..b`, `x.lock`) is repaired where
+/// it can be and dropped where it cannot.
 pub fn clean_branch_name(raw: &str) -> String {
     let text = strip_think_tags(raw);
     let text = strip_code_fence(text.trim());
@@ -431,17 +436,35 @@ pub fn clean_branch_name(raw: &str) -> String {
             ' ' | '\t' => '-',
             _ => continue,
         };
-        // Collapse runs of separators rather than emitting `feat//a--b`.
-        if (mapped == '-' || mapped == '/') && cleaned.ends_with(mapped) {
+        // Collapse runs of separators rather than emitting `feat//a--b`, and
+        // runs of dots, which git refuses as `..`.
+        if matches!(mapped, '-' | '/' | '.') && cleaned.ends_with(mapped) {
             continue;
         }
         cleaned.push(mapped);
     }
-    cleaned
-        .trim_matches(|c| c == '-' || c == '/' || c == '.')
-        .chars()
-        .take(60)
-        .collect()
+    let name = clean_branch_components(&cleaned);
+    // Truncation can expose a new trailing separator or `.lock`; clean again.
+    let name = clean_branch_components(&name.chars().take(60).collect::<String>());
+    match crate::engine::git_writer::validate_ref_name(&name) {
+        Ok(()) => name,
+        Err(_) => String::new(),
+    }
+}
+
+/// Each `/`-separated component without edge dots or dashes and without a
+/// `.lock` suffix; empty components vanish.
+fn clean_branch_components(name: &str) -> String {
+    name.split('/')
+        .filter_map(|component| {
+            let mut component = component.trim_matches(|c| c == '-' || c == '.');
+            while let Some(stem) = component.strip_suffix(".lock") {
+                component = stem.trim_matches(|c| c == '-' || c == '.');
+            }
+            (!component.is_empty()).then_some(component)
+        })
+        .collect::<Vec<_>>()
+        .join("/")
 }
 
 /// Removes `<think>…</think>` blocks, including one left unclosed by a
@@ -578,6 +601,49 @@ mod tests {
         assert_eq!(clean_branch_name("`fix/nil-guard`"), "fix/nil-guard");
         assert_eq!(clean_branch_name("feat//a  b"), "feat/a-b");
         assert_eq!(clean_branch_name("-- trailing --"), "trailing");
+    }
+
+    /// Every suggestion must survive `git check-ref-format --branch`, the rule
+    /// the app's own branch creation applies; names with no valid repair come
+    /// back empty rather than as something git would refuse.
+    #[test]
+    fn suggested_branch_names_pass_git_check_ref_format() {
+        use crate::procguard::LockedSpawn;
+        let sixty = format!("{}.lock", "a".repeat(57));
+        let replies = [
+            "a..b",
+            "feat/a...b",
+            "x.lock",
+            "feat/x.lock/y",
+            "fix/a.lock.lock",
+            "feat/.hidden/y",
+            "feat/a./b",
+            sixty.as_str(),
+            "..",
+            ".lock",
+            "///",
+            "feat/add-token-refresh",
+        ];
+        for reply in replies {
+            let name = clean_branch_name(reply);
+            if name.is_empty() {
+                continue;
+            }
+            let status = std::process::Command::new("git")
+                .args(["check-ref-format", "--branch", &name])
+                .output_locked()
+                .expect("git runs")
+                .status;
+            assert!(
+                status.success(),
+                "{reply:?} became {name:?}, which git refuses"
+            );
+            assert!(!name.contains("..") && !name.ends_with(".lock"), "{name:?}");
+        }
+        assert_eq!(clean_branch_name("a..b"), "a.b");
+        assert_eq!(clean_branch_name("x.lock"), "x");
+        assert_eq!(clean_branch_name("feat/x.lock/y"), "feat/x/y");
+        assert_eq!(clean_branch_name("..."), "");
     }
 
     #[test]
