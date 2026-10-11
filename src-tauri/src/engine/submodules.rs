@@ -370,6 +370,9 @@ where
         }
     }
 
+    if change.is_network() {
+        crate::engine::git_cli::require_git_for_clone(true)?;
+    }
     let argv = change.argv();
     let verdict = judge(&argv)?;
     let output = if change.is_network() {

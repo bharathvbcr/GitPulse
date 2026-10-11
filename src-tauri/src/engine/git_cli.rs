@@ -33,7 +33,10 @@ pub use hooks::{
 };
 
 mod preflight;
-pub use preflight::{git_preflight, GitPreflight, GitPreflightStatus, MIN_GIT_VERSION};
+pub use preflight::{
+    git_preflight, require_git_for_clone, GitPreflight, GitPreflightStatus, MIN_CLONE_GIT_VERSION,
+    MIN_GIT_VERSION, MIN_SUBMODULE_GIT_VERSION,
+};
 
 /// Shared grace window for pipe EOF after child exit. Unix closes unfinished
 /// descriptors; Windows cancels workers and retains their resource slots until
@@ -1045,14 +1048,16 @@ pub(crate) fn extended_child_path(
     if path_var.is_some_and(|value| value.len() >= MAX_INHERITED_PATH_BYTES) {
         return None;
     }
-    // Empty entries are dropped: POSIX reads one as "the current directory",
-    // which would let whatever repo the user has open inject executables into
-    // every spawned tool's lookup path.
+    // Only absolute entries survive. An empty entry is POSIX for "the current
+    // directory", and `.`, `bin` or `./node_modules/.bin` resolve against the
+    // child's cwd, which for git helpers and sidecars is the repository the
+    // user opened. Keeping any of them would let an untrusted clone put its
+    // own `git-*`, `node` or `npm` ahead of the real ones.
     let mut entries: Vec<PathBuf> = path_var
         .map(std::env::split_paths)
         .into_iter()
         .flatten()
-        .filter(|entry| !entry.as_os_str().is_empty())
+        .filter(|entry| entry.is_absolute())
         .collect();
     if path_var.is_none() && cfg!(unix) {
         // PATH entirely absent (daemon/launchd-style contexts): seed the Unix
@@ -5919,16 +5924,17 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn git_launch_preserves_relative_path_resolution_and_unset_path_defaults() {
-        // Relative PATH entries have child-cwd semantics; let the OS retain
-        // those semantics rather than silently bypassing a user-selected git.
+    fn git_launch_drops_relative_path_entries_and_unset_path_defaults() {
+        // A relative PATH entry has child-cwd semantics, and the child's cwd
+        // is the repository: it is dropped rather than honoured, so git is
+        // resolved from the absolute entries and never from inside the repo.
         let cmd = git_command_with_env(
             None,
             &["status"],
             Some(std::ffi::OsStr::new("relative:/usr/bin")),
             None,
         );
-        assert_eq!(cmd.get_program(), "git");
+        assert!(Path::new(cmd.get_program()).is_absolute());
         let cmd = git_command_with_env(None, &["status"], None, None);
         assert!(Path::new(cmd.get_program()).is_absolute());
     }
@@ -6237,6 +6243,26 @@ mod tests {
             [Path::new("/usr/bin"), Path::new("/bin")],
             "unset PATH must seed the Unix default search set"
         );
+    }
+
+    /// A relative entry resolves against the child's cwd, which is the repo.
+    #[cfg(unix)]
+    #[test]
+    fn extended_child_path_drops_relative_entries() {
+        let home = tempfile::TempDir::new().unwrap();
+        let hostile = extended_child_path(
+            Some(std::ffi::OsStr::new(
+                "./node_modules/.bin:.:bin:/usr/local/bin:../x:node_modules/.bin",
+            )),
+            Some(home.path().as_os_str()),
+        )
+        .expect("join");
+        let entries: Vec<PathBuf> = std::env::split_paths(&hostile).collect();
+        assert!(
+            entries.iter().all(|e| e.is_absolute()),
+            "relative PATH entries must be dropped: {entries:?}"
+        );
+        assert_eq!(entries.first(), Some(&PathBuf::from("/usr/local/bin")));
     }
 
     /// The extended child PATH appends only the fallback dirs that are not

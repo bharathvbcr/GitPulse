@@ -41,6 +41,29 @@ before that tag is pushed.
   UTF-8 decode.
 - A Markdown link to `other.md#section` opens that section, and a footnote
   whose label matches a heading no longer shares its id.
+### Security
+
+- The app now enforces an ACL on its own commands. The main window is granted
+  only the commands the frontend calls and the status popover only its three;
+  six registered commands nothing calls are denied everywhere. Webviews can no
+  longer navigate off the app origin.
+- Trusting a repository, and pointing devmap or manvi at a new binary or source
+  root, ask for a native confirmation drawn by the OS, not just the in-app
+  modal. Open-in-default-app requires a trusted repository and confirms
+  executables, `.app`, `.command`, `.terminal` and `.fileloc` before running.
+- Remote images in repository Markdown no longer load on render; click one to
+  load it.
+- Child processes drop relative `PATH` entries (`.`, `bin`,
+  `./node_modules/.bin`), which resolved inside the repository being opened.
+  A setup that relied on one must use an absolute path. The Manvi sidecar now
+  starts from an allowlisted environment, so provider API keys and tokens set in
+  the launching shell no longer reach it.
+- Remote tool installs build one pinned commit (`cargo install --rev`,
+  `go install @<sha>`) from a fixed working directory; curl is confined to
+  https for the request and every redirect; prebuilt installs need a version and
+  SHA-256 pinned in the app and refuse a downgrade (none are pinned yet, so
+  that rung reports itself unavailable). Clone refuses Git older than 2.45.1,
+  and submodule recursion Git older than 2.50.1, with the reason shown.
 
 ### Added
 

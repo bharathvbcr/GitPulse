@@ -935,6 +935,30 @@ pub fn grant(repo_path: &str, expected_identity: &str, remember: bool) -> Result
     }
 }
 
+/// [`grant`] with `remember`, for a request that came from the webview.
+///
+/// Trust is what lets a repository's hooks, filters and tools run, so the
+/// approval cannot be an in-page modal alone: script that reaches the IPC
+/// bridge could skip it. `confirm` (the OS dialog in production) names the
+/// exact directory and must say yes before anything is recorded.
+pub fn grant_confirmed(
+    repo_path: &str,
+    expected_identity: &str,
+    confirm: &dyn Fn(&str, &str) -> bool,
+) -> Result<(), String> {
+    let preview = inspect(repo_path)?;
+    let message = format!(
+        "Trust the repository at:\n\n{}\n\nGitPulse and its agents will be allowed to run \
+         this repository's Git hooks, filters and tools on this computer. Only continue if you \
+         trust everyone who can change it.",
+        preview.path
+    );
+    if !confirm("Trust this repository?", &message) {
+        return Err("Repository was not trusted: the approval was not confirmed".into());
+    }
+    grant(repo_path, expected_identity, true)
+}
+
 /// Filename digest written before record names moved to [`fnv1a64`].
 ///
 /// Lookup still accepts it. New records and [`migrate_store`] do not.
@@ -1386,6 +1410,31 @@ mod tests {
             .unwrap();
         assert!(status.success());
         dir
+    }
+
+    /// The desktop's grant command is plain IPC, so the approval has to be
+    /// raised from Rust: a declined (or undrawable) dialog grants nothing.
+    #[test]
+    fn a_grant_from_the_webview_needs_the_native_confirmation() {
+        let repo = fixture();
+        let path = repo.path().to_string_lossy().into_owned();
+        let identity = inspect(&path).unwrap().identity;
+
+        let shown = std::cell::RefCell::new(String::new());
+        let refused = grant_confirmed(&path, &identity, &|_, body| {
+            *shown.borrow_mut() = body.to_string();
+            false
+        })
+        .expect_err("declined");
+        assert!(refused.contains("not confirmed"), "{refused}");
+        assert!(shown.borrow().contains(&inspect(&path).unwrap().path));
+        assert!(
+            require(repo.path()).is_err(),
+            "a declined grant records nothing"
+        );
+
+        grant_confirmed(&path, &identity, &|_, _| true).expect("confirmed");
+        require(repo.path()).expect("granted after confirmation");
     }
 
     fn approval_for(current: &Identity) -> Grant {

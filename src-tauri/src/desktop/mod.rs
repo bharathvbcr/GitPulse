@@ -1,4 +1,5 @@
 pub mod actions;
+pub mod confirm;
 pub mod exit;
 #[cfg(target_os = "macos")]
 pub mod instance;
@@ -185,6 +186,48 @@ fn request_window_close<R: Runtime>(window: &Window<R>) -> bool {
         app.exit(0);
         false
     }
+}
+
+/// Whether a webview may navigate to `url`: the app's own origin only.
+///
+/// The app is a single page that opens external links through the opener
+/// plugin, so no legitimate flow leaves its origin. Anything else (a link
+/// that slipped past the opener, a redirect, injected markup) would load
+/// remote content into a webview that holds the IPC bridge. `tauri://` is the
+/// macOS/Linux scheme, `tauri.localhost` Windows's, and the Vite dev server is
+/// admitted in debug builds only.
+pub fn navigation_allowed(url: &tauri::Url) -> bool {
+    match url.scheme() {
+        "tauri" => url.host_str() == Some("localhost"),
+        "http" | "https" => {
+            url.host_str() == Some("tauri.localhost")
+                || (cfg!(debug_assertions)
+                    && matches!(url.host_str(), Some("localhost" | "127.0.0.1"))
+                    && url.port() == Some(5173))
+        }
+        "about" => url.as_str() == "about:blank",
+        _ => false,
+    }
+}
+
+/// Registers [`navigation_allowed`] for every webview the app creates, the
+/// configured main window included, which has no builder to hang it on.
+pub fn navigation_guard<R: Runtime>() -> tauri::plugin::TauriPlugin<R> {
+    tauri::plugin::Builder::new("navigation-guard")
+        .on_navigation(|webview, url| {
+            let allowed = navigation_allowed(url);
+            if !allowed {
+                log::warn!(
+                    target: "desktop",
+                    "blocked {} navigation to {}://{}",
+                    webview.label(),
+                    url.scheme(),
+                    url.host_str().unwrap_or("")
+                );
+            }
+            allowed
+        })
+        .build()
 }
 
 /// A reload replaces the page that acknowledged terminal output and the one
@@ -662,6 +705,34 @@ pub fn cmd_exit_request_answer(app: AppHandle, answer: exit::ExitAnswer) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn navigation_is_limited_to_the_app_origin() {
+        let allow = |u: &str| navigation_allowed(&tauri::Url::parse(u).unwrap());
+        assert!(allow("tauri://localhost/index.html"));
+        assert!(allow("http://tauri.localhost/status.html"));
+        assert!(allow("https://tauri.localhost/"));
+        assert!(allow("about:blank"));
+        for hostile in [
+            "https://example.com/",
+            "http://evil.test/tauri.localhost",
+            "https://tauri.localhost.evil.test/",
+            "http://localhost:5173/",
+            "tauri://evil/",
+            "file:///etc/passwd",
+            "data:text/html,<script>1</script>",
+            "javascript:alert(1)",
+            "blob:https://tauri.localhost/x",
+            "about:srcdoc",
+        ] {
+            // The dev server is admitted in debug builds, which is how tests run.
+            if hostile == "http://localhost:5173/" {
+                assert_eq!(allow(hostile), cfg!(debug_assertions));
+                continue;
+            }
+            assert!(!allow(hostile), "{hostile} must be refused");
+        }
+    }
 
     #[test]
     fn dismissing_status_does_not_request_app_exit_but_main_close_does() {

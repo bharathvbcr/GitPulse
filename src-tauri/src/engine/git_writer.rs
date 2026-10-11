@@ -2076,6 +2076,7 @@ Unset the local override with `git config --local --unset-all user.name` and \
     ) -> Result<String, String> {
         validate_clone_url(url)?;
         options.validate()?;
+        super::git_cli::require_git_for_clone(options.recurse_submodules)?;
         // Global Git runs from a neutral directory. Resolve local relative
         // sources first so that isolation does not reinterpret the user's URL.
         // Keep URL schemes and scp-like host:path syntax intact.

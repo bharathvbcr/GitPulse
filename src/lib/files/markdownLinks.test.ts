@@ -109,6 +109,8 @@ function element(attrs: Record<string, string>, matches: string[] = []) {
   return {
     id: attrs.id ?? "",
     getAttribute: (name: string) => attrs[name] ?? null,
+    setAttribute: (name: string, value: string) => void (attrs[name] = value),
+    removeAttribute: (name: string) => void delete attrs[name],
     closest(selector: string) {
       return matches.includes(selector) ? this : null;
     },
@@ -137,6 +139,22 @@ function context(overrides: Partial<MarkdownClickContext> = {}): MarkdownClickCo
 }
 
 describe("handleMarkdownClick", () => {
+  it("loads a withheld remote picture only when it is clicked, and only for network addresses", () => {
+    const attrs = { src: "#", "data-withheld-src": "https://tracker.example/p.png?u=1" };
+    const picture = element(attrs, ["img[data-withheld-src]"]);
+    const click = event(picture);
+    handleMarkdownClick(click, context());
+    expect(click.preventDefault).toHaveBeenCalled();
+    expect(attrs.src).toBe("https://tracker.example/p.png?u=1");
+    expect("data-withheld-src" in attrs).toBe(false);
+
+    for (const bad of ["javascript:alert(1)", "data:text/html,x", "file:///etc/passwd", ""]) {
+      const held = { src: "#", "data-withheld-src": bad };
+      handleMarkdownClick(event(element(held, ["img[data-withheld-src]"])), context());
+      expect(held.src, bad).toBe("#");
+    }
+  });
+
   it("never lets the webview follow a link, whatever the link is", () => {
     for (const href of ["https://example.com", "#x", "a.md", "javascript:x", "#", "../../../x"]) {
       const click = event(element({ href }, ["a[href]"]));

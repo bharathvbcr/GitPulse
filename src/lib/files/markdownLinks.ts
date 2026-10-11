@@ -128,12 +128,33 @@ function closest(target: EventTarget | null, selector: string): Element | null {
   return typeof candidate?.closest === "function" ? candidate.closest(selector) : null;
 }
 
+/** Withheld pictures: the renderer leaves `src="#"` and the address as data. */
+const WITHHELD_IMAGE = "img[data-withheld-src]";
+
+/**
+ * Repository Markdown is untrusted, and a remote picture is a request the
+ * reader never made (a beacon with their IP). The renderer withholds them;
+ * a click is the reader asking for this one. Only network addresses load.
+ */
+function loadWithheldImage(image: Element): void {
+  const address = image.getAttribute("data-withheld-src") ?? "";
+  if (!/^(https?:)?\/\//i.test(address.trim())) return;
+  image.setAttribute("src", address.trim());
+  image.removeAttribute("data-withheld-src");
+}
+
 /**
  * Handles a click (or middle click) inside rendered Markdown. Every link is
  * claimed — the webview never follows one — and resolved by
  * {@link resolveMarkdownLink}.
  */
 export function handleMarkdownClick(event: MouseEvent, context: MarkdownClickContext): void {
+  const withheld = closest(event.target, WITHHELD_IMAGE);
+  if (withheld) {
+    event.preventDefault();
+    loadWithheldImage(withheld);
+    return;
+  }
   const copyButton = closest(event.target, `.${COPY_CLASS}`);
   if (copyButton) {
     event.preventDefault();
