@@ -1637,6 +1637,7 @@ mod tests {
     }
 
     /// Commits a `post_create` hook, so a provisioned worktree runs it.
+    #[cfg(unix)]
     fn post_create(root: &Path, command: &str) {
         std::fs::create_dir_all(root.join(".gitpulse")).unwrap();
         let hooks = json!({"worktree":{"post_create":[command]}}).to_string();

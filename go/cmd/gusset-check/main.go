@@ -36,14 +36,20 @@ func run(out, errOut io.Writer) int {
 		err = closeErr
 	}
 	_, _ = gussetcheck.DrainLogs(errOut)
-	switch {
-	case errors.Is(err, gussetcheck.ErrNotLinked):
+	if err != nil {
 		fmt.Fprintf(errOut, "gusset-check: %v\n", err)
-		return 2
-	case err != nil:
-		fmt.Fprintf(errOut, "gusset-check: %v\n", err)
-		return 1
+		return exitCode(err)
 	}
 	fmt.Fprintln(out, "gusset-check: ok (parity, match-any, panic firewall)")
 	return 0
+}
+
+// exitCode separates "the engine failed" (1) from "the check could not run"
+// (2): an engine that is not linked or not built for this platform proved
+// nothing either way.
+func exitCode(err error) int {
+	if errors.Is(err, gussetcheck.ErrNotLinked) || errors.Is(err, gussetcheck.ErrUnsupported) {
+		return 2
+	}
+	return 1
 }

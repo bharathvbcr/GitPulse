@@ -1,7 +1,10 @@
 use super::{judge, manvi_owner, native_owner, sweep, sweep_pages, Verdict};
 use crate::engine::git_cli::{git_global, git_text};
+#[cfg(unix)]
 use crate::procguard::LockedSpawn;
-use crate::workbench::process_birth::{self, Liveness};
+#[cfg(unix)]
+use crate::workbench::process_birth;
+use crate::workbench::process_birth::Liveness;
 use crate::workbench::{query, Inner, WorkbenchState};
 use serde_json::{json, Value};
 use std::path::Path;
@@ -199,6 +202,7 @@ fn prepare(
 
 /// What a crashed host leaves: claimed and started under an owner whose
 /// process is `owner`, recording `child` as the agent.
+#[cfg(unix)]
 fn strand(state: &WorkbenchState, id: &str, owner: &str, child: Option<(u32, String)>) {
     let store = |method: &str, input: Value| {
         state
@@ -226,6 +230,7 @@ fn strand(state: &WorkbenchState, id: &str, owner: &str, child: Option<(u32, Str
 /// the file: without it, these fixture processes read as production code
 /// spawning outside the gated seam.
 #[cfg(test)]
+#[cfg(unix)]
 fn reaped() -> (u32, String) {
     let mut child = std::process::Command::new("sh")
         .args(["-c", "read line"])

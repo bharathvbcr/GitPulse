@@ -2245,6 +2245,7 @@ mod tests {
     /// The defect: the stdout pump returned on EOF without reaping, so a child
     /// that exited stayed a zombie holding its pid, and its runs "still
     /// running", until the next harness call looked.
+    #[cfg(unix)]
     #[test]
     fn a_child_that_closes_its_stdout_is_reaped_by_the_pump() {
         let sidecar = scripted_sidecar("exit 0", WRITE_DEADLINE);

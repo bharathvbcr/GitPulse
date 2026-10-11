@@ -31,6 +31,7 @@
 // clippy's `-D warnings` there.
 #[cfg(unix)]
 use gitpulse_lib::procguard::LockedSpawn;
+#[cfg(unix)]
 use std::process::{Command, Stdio};
 #[cfg(unix)]
 use std::time::{Duration, Instant};

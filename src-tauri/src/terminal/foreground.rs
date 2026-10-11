@@ -5,12 +5,15 @@
 //! the OS would not describe is `None`, not the repository root, because a
 //! guessed directory would open the next tab somewhere the user never went.
 
+#[cfg(unix)]
 use std::path::PathBuf;
 
 /// Longest program name this module reports. A process can rename itself to
 /// anything; a tab title is not the place to discover how long.
+#[cfg(unix)]
 pub(super) const MAX_PROCESS_NAME_CHARS: usize = 64;
 
+#[cfg(unix)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct ProcessView {
     pub pid: i32,
@@ -20,6 +23,7 @@ pub(super) struct ProcessView {
 
 /// Keeps printable characters only and clips to [`MAX_PROCESS_NAME_CHARS`].
 /// An empty result is `None`: a blank name is not a name.
+#[cfg(unix)]
 pub(super) fn clean_process_name(raw: &str) -> Option<String> {
     let cleaned: String = raw
         .chars()
@@ -118,6 +122,7 @@ fn read_name(_pid: i32) -> Option<String> {
 /// Upper bound on the processes one [`working_in`] scan inspects. A process
 /// table larger than this is reported as a scan that could not finish, not
 /// judged on a prefix of it.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 const MAX_SCANNED_PROCESSES: usize = 65_536;
 
 /// Every process, other than this one, whose working directory is `dir` or
@@ -202,7 +207,7 @@ pub(crate) fn session_members(sid: i32) -> Result<Vec<(i32, i32)>, String> {
     Ok(found)
 }
 
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+#[cfg(all(unix, not(any(target_os = "macos", target_os = "linux"))))]
 pub(crate) fn session_members(_sid: i32) -> Result<Vec<(i32, i32)>, String> {
     Err("listing a terminal session's processes is not supported on this platform".into())
 }
@@ -257,7 +262,7 @@ fn all_pids() -> Result<Vec<i32>, String> {
     Ok(pids)
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
 
@@ -298,6 +303,7 @@ mod tests {
         assert!(working_in(&empty).expect("scan").is_empty());
     }
 
+    #[cfg(unix)]
     #[test]
     fn process_names_are_printable_bounded_and_never_blank() {
         assert_eq!(clean_process_name("vim"), Some("vim".into()));

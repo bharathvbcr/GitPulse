@@ -19,28 +19,14 @@ import (
 	"github.com/bharathvbcr/gusset"
 )
 
-// Run checks the linked engine and refuses a poisoned handle.
-func Run(ctx context.Context) error {
-	if gusset.MaxPoolSize < 4 {
-		return fmt.Errorf("gusset: MaxPoolSize %d is below the bridge pool of 4", gusset.MaxPoolSize)
-	}
-	return classify(gussetfn.Check(ctx))
-}
-
-// SelfTest is Run plus a deliberate panic inside the engine archive on a
-// throwaway handle, proving the panic firewall (I2) against the archive this
-// program links. Rust prints the induced panic to stderr; that is the proof.
+// SelfTest checks the linked engine, then runs a deliberate panic inside the
+// engine archive on a throwaway handle, proving the panic firewall (I2)
+// against the archive this program links. Rust prints the induced panic to stderr; that is the proof.
 func SelfTest(ctx context.Context) error {
 	if gusset.MaxPoolSize < 4 {
 		return fmt.Errorf("gusset: MaxPoolSize %d is below the bridge pool of 4", gusset.MaxPoolSize)
 	}
 	return classify(gussetfn.SelfTest(ctx))
-}
-
-// Close releases the engine's shared handle, joining its workers without a
-// bound. At process exit use Shutdown.
-func Close() error {
-	return gussetfn.Close()
 }
 
 // DrainLogs writes the engine's Rust log ring to w; nothing else reads it,
@@ -56,6 +42,9 @@ func Shutdown(drain time.Duration) error {
 }
 
 func classify(err error) error {
+	if errors.Is(err, gussetfn.ErrUnsupported) {
+		return fmt.Errorf("%w: %w", ErrUnsupported, err)
+	}
 	if errors.Is(err, gusset.ErrPanic) || errors.Is(err, gusset.ErrPoisoned) {
 		return fmt.Errorf("gitpulse: gusset engine poisoned the handle: %w", err)
 	}

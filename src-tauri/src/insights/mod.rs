@@ -2208,8 +2208,10 @@ mod tests {
 
     /// A running process registered as one Claude Code session in `cwd`.
     /// Killed when dropped, so a failing assertion leaves nothing behind.
+    #[cfg(unix)]
     struct SimulatedSession(std::process::Child);
 
+    #[cfg(unix)]
     impl Drop for SimulatedSession {
         fn drop(&mut self) {
             let _ = self.0.kill();
@@ -2217,6 +2219,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     fn simulate_session(registry: &Path, cwd: &Path) -> SimulatedSession {
         let child = std::process::Command::new("sleep")
             .arg("60")

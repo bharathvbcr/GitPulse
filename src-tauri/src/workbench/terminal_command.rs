@@ -48,12 +48,15 @@ impl BriefFile {
             std::process::id(),
             FILE_SEQUENCE.fetch_add(1, Ordering::Relaxed)
         ));
-        let mut builder = std::fs::DirBuilder::new();
         #[cfg(unix)]
-        {
+        let builder = {
             use std::os::unix::fs::DirBuilderExt;
+            let mut builder = std::fs::DirBuilder::new();
             builder.mode(0o700);
-        }
+            builder
+        };
+        #[cfg(not(unix))]
+        let builder = std::fs::DirBuilder::new();
         // Not recursive: an existing directory at this name is refused rather
         // than adopted, so a planted one cannot become the agent's grant.
         builder

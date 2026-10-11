@@ -247,6 +247,7 @@ pub fn view(repo_path: &str) -> GrantView {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use crate::procguard::LockedSpawn;
 
     #[cfg(unix)]
