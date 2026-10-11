@@ -1445,6 +1445,9 @@ if (params.has("check")) {
     check("saving keeps the reader on the pane they were editing", editor().querySelector('[data-sheet-tab="agent"]').getAttribute("aria-selected")==="true");
     editor().querySelector('[data-sheet-tab="task"]').click(); await settle();
     await change(field("Description"),"Unsaved context");
+    check("a saved task's assist offers to improve it rather than compose a new one",
+      editor().querySelector(".assist-title")?.textContent.trim() === "Improve this task"
+      && editor().querySelector(".assist-hint")?.textContent.trim() === "Ask for a better title and description, or paste notes to rewrite them.");
     check("unsaved edits stay local until Manvi prepare saves", editor().querySelector("header small").textContent==="Unsaved" && Boolean(enhanceButton()) && !enhanceButton().matches(":disabled"));
     confirmAnswer=true; await click("Close task details");
     await click("New task");
@@ -1455,6 +1458,10 @@ if (params.has("check")) {
     // verb and the request's kind that `draftingKind`/`draftingVerb` were
     // extracted to end, so it was asserting the bug rather than the fix.
     check("new tasks start with one idea field and the current repository", Boolean(idea) && idea.getClientRects().length>0 && Boolean(button("Draft with Manvi")) && !editor().querySelector('.sheet-tabs'));
+    // The assist speaks compose copy only when the sheet says this is a new task.
+    check("a new task's assist asks what is needed and says notes become fields to accept",
+      editor().querySelector(".assist-title")?.textContent.trim() === "What do you need?"
+      && editor().querySelector(".assist-hint")?.textContent.trim() === "Notes become a title and description you accept below.");
     check("a new task does not fold its notes",
       !assistToggle() && assistBody() && !assistBody().hidden
       && (idea.compareDocumentPosition(field("Title")) & Node.DOCUMENT_POSITION_FOLLOWING) !== 0);
