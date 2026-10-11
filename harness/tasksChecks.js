@@ -49,6 +49,11 @@ const workspaces = [workspace, emptyWorkspace];
 const workspaceWrites = [];
 /** Every `query` the board sent `items.list`, to prove filters never reach the store. */
 const listQueries = [];
+/** Every `tasks.suggest` the board sent, in order, and the replies parked while `suggestMode` is "hold". */
+const suggestCalls = [], heldSuggest = [];
+let suggestMode = "ok";
+const suggestable = input => tasks.filter(task => task.status !== "done" && !deleted.has(task.id) && (!input.repository_id || task.repository_ids.includes(input.repository_id)) && (input.max_priority === undefined || task.priority <= input.max_priority));
+const suggestRanking = input => [...suggestable(input)].sort((a, b) => a.priority - b.priority || (a.id < b.id ? -1 : 1)).slice(0, input.limit ?? 5);
 const makeTask = (id, title, repository, status = "ready") => ({ id, title, kind: "feature", status, priority: 2, severity: null, owner: null, due_at: null, labels: [], repository_ids: [repository], primary_repository_id: repository, home_workspace_id: null, position: Number(id.replace(/\D/g, "")) || 1, revision: 1, updated_at: 1, description: "Keep changes focused and verify the result.", acceptance_criteria: [], locked_fields: [], checklist: [], links: [],
   // As dc-store schema 11's upgrade leaves a profile: work that was Done is
   // archived, with the time it was completed.
@@ -396,6 +401,17 @@ mockIPCWithEvents(async (cmd, args) => {
       if (corruptSave) { corruptSave = false; return JSON.stringify({ok:true, item:{}}); }
       if (loseSave) { loseSave = false; throw {code:"transport_error", message:"Fixture lost the save reply"}; }
       return result;
+    }
+    // Manvi's ranking of the open tasks, as the store would answer it: the
+    // priority order, scoped to a repository when one is asked for.
+    case "tasks.suggest": {
+      suggestCalls.push(structuredClone(input));
+      if (suggestMode === "fail") throw {code:"store_error", message:"Fixture suggestions offline"};
+      const open = suggestable(input), ranked = suggestRanking(input);
+      const answer = JSON.stringify({ok: true, generated_at: 1, candidates: open.length, blocked: [], excluded: {in_progress: 0, review: 0, duplicate: 0, blocked: 0, filtered: 0}, board: {scanned: open.length, complete: true, unhydrated: 0}, verification: {checked: 0, unchecked: 0, failed: 0},
+        suggestions: ranked.map((task, i) => ({rank: i + 1, id: task.id, title: task.title, status: task.status, priority: task.priority, score: 100 - i, reason: `fixture rank ${i + 1}`, signals: []}))});
+      if (suggestMode === "hold") return new Promise(resolve => heldSuggest.push(() => resolve(answer)));
+      return answer;
     }
     default: unknown.push(args.method); throw Error(`Unconfigured method: ${args.method}`);
   }
@@ -831,6 +847,54 @@ if (params.has("check")) {
         await click("Refresh");
         await wait(() => Boolean(card("task-1")));
       }
+    }
+
+    // The rows of that menu. A workspace holding nothing is offered every open
+    // tab and every registered repository, each with an "Add all" row, and what
+    // either adds is written to the workspace's membership and said in full.
+    try {
+      const emptyIndex = () => workspaces.findIndex(space => space.id === "workspace-empty");
+      const emptyIt = () => { workspaces[emptyIndex()] = { ...workspaces[emptyIndex()], repository_ids: [], repository_count: 0 }; };
+      await repoStore.openRepo("/fixture/GitPulse", { activate: false });
+      await repoStore.openRepo("/fixture/Manvi", { activate: false });
+      const fresh = workspaceTab("Fresh space");
+      fresh.click();
+      await wait(() => fresh.getAttribute("aria-pressed") === "true" && (addRepoTrigger()?.getAttribute("aria-label") ?? "").includes("Fresh space"));
+      await wait(() => !root.querySelector('[aria-label="Refresh"]')?.disabled);
+      const openAddMenu = async () => { for (let i = 0; i < 25 && !addRepoMenu(); i++) { addRepoTrigger()?.click(); await settle(80); } return addRepoMenu(); };
+      const rowsOf = menu => [...menu.querySelectorAll('[role="menuitem"]')].map(el => el.textContent.trim().replace(/\s+/g, " "));
+      let menu = await openAddMenu();
+      check("an empty workspace's add menu groups its open tabs and its registered repositories under their own headings",
+        Boolean(menu) && JSON.stringify([...menu.querySelectorAll(".add-menu-label")].map(el => el.textContent.trim())) === JSON.stringify(["Open", "Registered"]));
+      check("it offers Add all open and Add all registered, and Choose folder last",
+        Boolean(menu) && rowsOf(menu).includes("Add all open") && rowsOf(menu).includes("Add all registered") && rowsOf(menu).at(-1) === "Choose folder…");
+      let writesBefore = workspaceWrites.length;
+      button("Add all registered", menu).click();
+      await wait(() => workspaces[emptyIndex()].repository_ids.length === repos.length);
+      await settle(150);
+      check("Add all registered joins every registered repository to the workspace in one write",
+        workspaceWrites.length === writesBefore + 1 && JSON.stringify([...workspaceWrites.at(-1).repository_ids].sort()) === JSON.stringify(repos.map(repo => repo.id).sort()));
+      check("and says it joined the workspace, not only the catalog", document.body.textContent.includes(`Added ${repos.length} repositories to Fresh space`));
+      emptyIt();
+      await click("Refresh");
+      await wait(() => !root.querySelector('[aria-label="Refresh"]')?.disabled);
+      menu = await openAddMenu();
+      writesBefore = workspaceWrites.length;
+      button("Add all open", menu).click();
+      await wait(() => workspaces[emptyIndex()].repository_ids.length === 2);
+      await settle(150);
+      check("Add all open registers and joins every open tab in one write, naming the workspace",
+        workspaceWrites.length === writesBefore + 1 && JSON.stringify([...workspaceWrites.at(-1).repository_ids].sort()) === JSON.stringify(["repo-0", "repo-1"])
+        && document.body.textContent.includes("Added 2 repositories to Fresh space"));
+    } catch (error) { check(`the add menu row checks ran to the end (${error.message})`, false); }
+    finally {
+      if (addRepoMenu()) { document.body.dispatchEvent(new PointerEvent("pointerdown", { bubbles: true })); await settle(60); }
+      const at = workspaces.findIndex(space => space.id === "workspace-empty");
+      if (at >= 0) workspaces[at] = { ...workspaces[at], repository_ids: [], repository_count: 0 };
+      await repoStore.removeRepo("/fixture/GitPulse"); await repoStore.removeRepo("/fixture/Manvi");
+      workspaceTab("All")?.click();
+      await click("Refresh");
+      await wait(() => Boolean(card("task-1")));
     }
 
     await click("Add task to Ready");
@@ -1411,6 +1475,17 @@ if (params.has("check")) {
     loseEnhancement=true; acceptButton().click(); await settle();
     const retryInline=button("Retry pending action");
     check("a lost acceptance retains a retry and blocks closing", Boolean(retryInline) && button("Close task details").disabled);
+    {
+      // While that acceptance is unresolved, save and leave are refused, and each refusal names the wait.
+      const savesBefore = writes.length;
+      const notes = () => [...editor().querySelectorAll('[role="status"]')].map(el => el.textContent.trim());
+      field("Title").dispatchEvent(new KeyboardEvent("keydown", { key: "s", metaKey: true, ctrlKey: true, bubbles: true, cancelable: true })); await settle();
+      check("Command-S while an acceptance is unresolved saves nothing and says to wait for it",
+        writes.length === savesBefore && notes().includes("Wait for Manvi to finish before saving."));
+      field("Title").dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true })); await settle();
+      check("Escape then keeps the sheet open and says to wait for it",
+        Boolean(editor()) && notes().includes("Wait for Manvi to finish before leaving this task."));
+    }
     if(retryInline) await click("Retry pending action");
     await wait(()=>tasks.find(task=>task.id===quickProposal.task_id)?.title==="Reliable task notifications");
     check("applying the default quick enhancement updates title and description together", tasks.find(task=>task.id===quickProposal.task_id).description.includes("verify recovery"));
@@ -1825,6 +1900,8 @@ if (params.has("check")) {
     check("the selection bar offers Archive beside Delete",
       Boolean(bulkButton()) && !bulkButton().disabled
       && root.querySelector('[aria-label="Selected task actions"]').textContent.includes("2 selected"));
+    check("the enabled Archive says it keeps each task's status, and does not claim they are already archived",
+      bulkButton().title.includes("keeping their status") && !bulkButton().title.includes("Already archived"));
     bulkButton().click(); await settle(450);
     check("bulk Archive files each task away once, keeping its status",
       [second, third].every(id => of(id).archived === true && of(id).status === "ready" && !card(id))
@@ -2958,6 +3035,142 @@ if (params.has("check")) {
       check("Retry reads the workspace membership again, not just the board", workspaceGets > getsBeforeRetry);
       button("All", scopes).click(); await settle(400);
     } catch (error) { check(`the board claim checks ran to the end (${error.message} at ${guardStep})`, false); }
+
+    // ---- Suggest next, the severity filter, key e, scope labels, the sheet's controls
+    {
+      let step = "start";
+      const scopesNav = () => root.querySelector('nav[aria-label="Task scopes"]');
+      const toAll = async () => { button("All", scopesNav()).click(); await settle(300); };
+      const same = (a, b) => JSON.stringify(a) === JSON.stringify(b);
+      const toRepo = async id => { root.querySelector(`[data-repository-row="${id}"] button`).click(); await settle(300); };
+      try {
+        step = "suggest next";
+        const toggle = () => root.querySelector('[data-testid="task-suggest-toggle"]');
+        const panel = () => root.querySelector('[data-testid="task-suggest"]');
+        const listed = () => [...(panel()?.querySelectorAll('[data-testid="task-suggest-item"]') ?? [])].map(el => el.dataset.taskId);
+        const idle = () => panel()?.getAttribute("aria-busy") === "false";
+        const ids = input => suggestRanking(input).map(task => task.id);
+        await toAll();
+        suggestCalls.length = 0; suggestMode = "ok";
+        check("Suggest next asks nothing until it is pressed", suggestCalls.length === 0 && !panel() && toggle().getAttribute("aria-pressed") === "false");
+        toggle().click(); await wait(() => idle() && listed().length > 0);
+        check("pressing it asks once, for the whole board, and lists the ranking with each reason",
+          suggestCalls.length === 1 && suggestCalls[0].limit === 5 && !("repository_id" in suggestCalls[0]) && !("max_priority" in suggestCalls[0])
+          && toggle().getAttribute("aria-pressed") === "true" && same(listed(), ids({ limit: 5 })) && panel().textContent.includes("fixture rank 1"));
+        const globalIds = listed();
+        await toRepo("repo-1"); await wait(() => suggestCalls.length === 2 && idle());
+        check("moving to a repository's board asks again, for that repository only",
+          suggestCalls.at(-1).repository_id === "repo-1" && same(listed(), ids({ repository_id: "repo-1", limit: 5 })) && !same(listed(), globalIds));
+        await change(panel().querySelector('[aria-label="Suggest tasks at or above this priority"]'), "1", "change"); await wait(() => suggestCalls.length === 3 && idle());
+        check("the priority picker asks again with that ceiling, as a number",
+          suggestCalls.at(-1).max_priority === 1 && suggestCalls.at(-1).repository_id === "repo-1" && same(listed(), ids({ repository_id: "repo-1", max_priority: 1, limit: 5 })));
+        await change(panel().querySelector('[aria-label="Suggest tasks at or above this priority"]'), "all", "change"); await wait(() => suggestCalls.length === 4 && idle());
+        check("Any priority asks with no ceiling at all", !("max_priority" in suggestCalls.at(-1)));
+        // Two asks in flight: the board's own scope change makes the second. The answers
+        // arrive newest first, and the older one must not replace what is on screen.
+        suggestMode = "hold"; heldSuggest.length = 0;
+        button("All", scopesNav()).click(); await wait(() => heldSuggest.length === 1);
+        root.querySelector('[data-repository-row="repo-1"] button').click(); await wait(() => heldSuggest.length === 2);
+        heldSuggest[1](); await settle(100);
+        heldSuggest[0](); await settle(150);
+        check("an older answer that arrives after a newer one is dropped",
+          idle() && same(listed(), ids({ repository_id: "repo-1", limit: 5 })) && !same(listed(), globalIds));
+        suggestMode = "fail";
+        button("Refresh", panel()).click(); await wait(() => panel().querySelector('[data-testid="task-suggest-error"]'));
+        check("a failed ask shows its reason and clears the list instead of leaving the old one",
+          panel().querySelector('[data-testid="task-suggest-error"]').textContent.includes("Fixture suggestions offline") && listed().length === 0);
+        suggestMode = "ok";
+        // The failure dropped the old answer, so closing and reopening asks again
+        // instead of putting the list from before the failure back on screen.
+        const beforeReopen = suggestCalls.length;
+        button("Close suggestions", panel()).click(); await settle();
+        toggle().click(); await wait(() => idle() && listed().length > 0);
+        check("after a failure, reopening the panel asks again rather than showing the old list", suggestCalls.length === beforeReopen + 1);
+        button("Refresh", panel()).click(); await wait(() => idle() && listed().length > 0);
+        check("Refresh asks again and the list comes back", !panel().querySelector('[data-testid="task-suggest-error"]') && same(listed(), ids({ repository_id: "repo-1", limit: 5 })));
+        button("Close suggestions", panel()).click(); await settle();
+        check("Close puts the panel away", !panel() && toggle().getAttribute("aria-pressed") === "false");
+        await toAll();
+      } catch (error) { check(`the Suggest next checks ran to the end (${error.message} at ${step})`, false); }
+      finally { suggestMode = "ok"; for (const release of heldSuggest.splice(0)) release(); if (root.querySelector('[data-testid="task-suggest"]')) { button("Close suggestions", root)?.click(); await settle(); } }
+
+      try {
+        step = "severity filter";
+        const original = tasks;
+        const plain = [...root.querySelectorAll('[data-task-column="ready"] [data-task-card]')].map(el => el.dataset.cardId).find(id => !["task-1", "task-2", "task-3"].includes(id));
+        tasks = tasks.map(task => task.id === "task-1" ? { ...task, severity: "High" } : task.id === "task-3" ? { ...task, severity: "high" } : task.id === "task-2" ? { ...task, severity: "low" } : task);
+        await click("Refresh"); await wait(() => card("task-1") && card("task-2") && card("task-3") && card(plain));
+        const pick = () => root.querySelector('[aria-label="Filter by severity"]');
+        if (!pick()) await click("Filters");
+        const names = () => [card("task-1"), card("task-2"), card("task-3"), card(plain)].map(Boolean);
+        check("the severity filter offers each spelling once, case aside, after Any and No severity",
+          same([...pick().options].map(option => option.textContent.trim().toLowerCase()), ["any severity", "no severity", "high", "low"]));
+        await change(pick(), "high", "change"); await settle(300);
+        check("choosing High keeps every High card, however it is spelled, and takes the rest off the board", same(names(), [true, false, true, false]));
+        await change(pick(), "low", "change"); await settle(300);
+        check("choosing Low keeps only the Low card", same(names(), [false, true, false, false]));
+        await change(pick(), "", "change"); await settle(300);
+        check("No severity keeps only the cards with none", same(names(), [false, false, false, true]));
+        await change(pick(), "all", "change"); await settle(300);
+        check("Any severity brings every card back", same(names(), [true, true, true, true]));
+        tasks = original;
+        await click("Filters"); await click("Refresh"); await wait(() => card("task-1"));
+      } catch (error) { check(`the severity filter checks ran to the end (${error.message} at ${step})`, false); }
+
+      try {
+        step = "key e";
+        const enhanceSheet = () => document.querySelector('[aria-labelledby="quick-enhance-title"]');
+        card("task-3").focus();
+        card("task-3").dispatchEvent(new KeyboardEvent("keydown", { key: "e", metaKey: true, bubbles: true, cancelable: true })); await settle(200);
+        check("Command-E on a card does not open Quick Enhance", !enhanceSheet());
+        card("task-3").dispatchEvent(new KeyboardEvent("keydown", { key: "e", bubbles: true, cancelable: true })); await wait(enhanceSheet);
+        check("e on a focused card opens Quick Enhance on that task", [...enhanceSheet().querySelectorAll("input,textarea")].some(el => el.value.includes("Review the agent handoff")) || enhanceSheet().textContent.includes("Review the agent handoff"));
+        button("Close Quick Enhance", enhanceSheet()).click(); await wait(() => !enhanceSheet());
+      } catch (error) { check(`the key e checks ran to the end (${error.message} at ${step})`, false); }
+
+      try {
+        step = "scope labels";
+        const navButtons = [...scopesNav().querySelectorAll("button.gp-seg-btn")];
+        const label = btn => btn.querySelector(":scope > span:not(.gp-liquid-selection)");
+        check("every scope button keeps its name in a label span, with no loose text beside it",
+          navButtons.length >= 3 && navButtons.every(btn => label(btn)?.textContent.trim() && [...btn.childNodes].filter(node => node.nodeType === 3).every(node => !node.textContent.trim())));
+        if (document.documentElement.classList.contains("macos")) {
+          const picked = navButtons.find(btn => btn.dataset.active === "true");
+          check("on macOS the selected scope has its liquid pill and its label is lifted above it",
+            Boolean(picked?.querySelector(".gp-liquid-selection")) && getComputedStyle(label(picked)).position === "relative");
+        }
+      } catch (error) { check(`the scope label checks ran to the end (${error.message} at ${step})`, false); }
+
+      try {
+        step = "sheet controls";
+        const originalTasks = tasks;
+        tasks = tasks.map(task => task.id === "task-3" ? { ...task, kind: "custom-category" } : task);
+        card("task-3").dispatchEvent(new MouseEvent("click", { bubbles: true })); await wait(editor);
+        const severity = () => field("Severity");
+        check("Severity offers None and the four levels, and a task without one shows None",
+          same([...severity().options].map(option => option.textContent.trim()), ["None", "Low", "Medium", "High", "Critical"]) && severity().selectedOptions[0].textContent.trim() === "None");
+        const owner = editor().querySelector(".owner-field input");
+        check("the text controls carry the store's length limits",
+          field("Title").maxLength === 300 && field("Description").maxLength === 65536 && editor().querySelector('[data-testid="task-criteria"]').maxLength === 65536
+          && editor().querySelector('[data-testid="task-subtask-add-input"]').maxLength === 4096 && owner.maxLength === 300 && field("Custom type")?.maxLength === 64);
+        const notifications = editor().querySelector(".notifications-row");
+        check("a saved task offers its mute control under the profile-wide Notifications heading",
+          notifications?.querySelector(".notifications-label")?.textContent.trim() === "Notifications (profile-wide; mute this task)" && notifications.querySelectorAll("button").length > 0);
+        await change(severity(), "critical", "change");
+        const savesBefore = writes.length;
+        await click("Save task"); await wait(() => writes.length > savesBefore);
+        check("a chosen severity is what Save writes", writes.at(-1).severity === "critical");
+        severity().selectedIndex = 0; severity().dispatchEvent(new Event("change", { bubbles: true })); await settle();
+        const savesAfter = writes.length;
+        await click("Save task"); await wait(() => writes.length > savesAfter);
+        check("choosing None writes no severity at all", writes.at(-1).severity === null);
+        await click("Close task details"); await wait(() => !editor());
+        tasks = originalTasks.map(task => task.id === "task-3" ? { ...task, revision: tasks.find(item => item.id === "task-3").revision, severity: null } : task);
+        await click("New task"); await wait(editor);
+        check("a task not yet saved has no mute control to offer", !editor().querySelector(".notifications-row") && Boolean(field("Severity")));
+        await click("Close task details"); await wait(() => !editor());
+      } catch (error) { check(`the sheet control checks ran to the end (${error.message} at ${step})`, false); if (editor()) { await click("Close task details").catch(() => {}); } }
+    }
 
     // ---- A repository's board reaches the global board -------------------
     try {
