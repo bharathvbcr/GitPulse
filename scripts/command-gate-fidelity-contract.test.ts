@@ -217,9 +217,16 @@ describe("the command gate judges the command that actually runs", () => {
   it("conflict transactions gate the argv built by their canonical mutation owner", () => {
     const body = fnBody(PRODUCTION_COMMANDS, "cmd_save_conflict");
     expect(body).not.toBeNull();
+    expect(body).toContain("save_conflict_folded(");
     expect(body).toContain("guard_file(&repo_path, file, op)");
-    expect(body).toContain("conflict_session::save_with_gate");
-    expect(body).toContain("guard(&repo_path, argv)?");
+    expect(body).toContain("guard(&repo_path, argv)");
+    // The folded owner hands both judges to the native transaction and
+    // propagates a refusal from either before it records a verdict.
+    const folded = fnBody(PRODUCTION_COMMANDS, "save_conflict_folded");
+    expect(folded).not.toBeNull();
+    expect(folded).toContain("conflict_session::save_with_gate");
+    expect(folded).toContain("fold.record(judge_file(file, op)?)");
+    expect(folded).toContain("fold.record(judge_command(argv)?)");
     const session = readFileSync(new URL("../src-tauri/src/diff/conflict_session.rs", import.meta.url), "utf8");
     const mutation = fnBody(session, "mutation");
     expect(mutation).not.toBeNull();

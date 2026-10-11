@@ -36,7 +36,11 @@ describe("conflict file authorization", () => {
     expect(body).not.toBeNull();
     expect(body).not.toContain('guard_file(&repo_path, &request.file_path, "modify")');
     expect(body).toContain("guard_file(&repo_path, file, op)");
-    expect(body).toContain("conflict_session::save_with_gate");
+    expect(body).toContain("save_conflict_folded(");
+    const folded = fnBody(production(COMMANDS), "save_conflict_folded");
+    expect(folded).not.toBeNull();
+    expect(folded).toContain("conflict_session::save_with_gate");
+    expect(folded).toContain("judge_file(file, op)?");
   });
 });
 
