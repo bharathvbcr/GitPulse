@@ -22,21 +22,32 @@ guard let deadline = requestedDeadline, deadline.isFinite, deadline >= 1, deadli
 }
 
 let app = NSApplication.shared
-// `.regular`, not `.accessory`: for an accessory app WebKit stops treating the
-// view as one a person is using about 30 s into a run and aligns every timer to
-// a one-second tick, so each `settle()` in a long harness costs a second and
-// `tasks` ran out its deadline near check 263 with nothing hung. Measured per
-// ten seconds of the run: overrun of a 30 ms timer 2-10 ms before 30 s,
-// 830-980 ms after, under `.accessory` (with `beginActivity` held, and with the
-// occlusion SPI below, so neither is the cause); under `.regular` 2-4 ms for
-// the whole run. The cost is a Dock icon while a page runs.
-app.setActivationPolicy(.regular)
+app.setActivationPolicy(.accessory)
 let config = WKWebViewConfiguration()
 // The app under test may lose focus while the agent reports progress. Keep
 // fixture timers running; otherwise a hidden webview can suspend mid-assertion.
 // This affects only the ephemeral test view, not GitPulse's runtime settings.
 if #available(macOS 14.0, *) { config.preferences.inactiveSchedulingPolicy = .none }
 config.websiteDataStore = .nonPersistent()
+// A session whose screen is locked or whose display is off (an unattended
+// run) makes WebKit treat every page as unseen, and it then throttles on two
+// separate switches: WebCore aligns hidden-page timers to a one-second tick,
+// and the WebContent process is put to sleep between wake-ups. Both start
+// about 30 s into a run, which is where `tasks` stopped near check 263 (each
+// `settle()` cost a second) and where `scroll-cue` halved its frame rate.
+// Measured on a locked, display-off session: switching only one of them off
+// left `tasks` timing out at its 150 s deadline; switching both off ran its
+// 486 checks in about 100 s. They are WebKit SPI, so a build without one is
+// reported rather than silently throttled.
+for name in ["_setHiddenPageDOMTimerThrottlingEnabled:", "_setPageVisibilityBasedProcessSuppressionEnabled:"] {
+    let selector = NSSelectorFromString(name)
+    if let method = class_getInstanceMethod(WKPreferences.self, selector) {
+        typealias SetEnabled = @convention(c) (AnyObject, Selector, Bool) -> Void
+        unsafeBitCast(method_getImplementation(method), to: SetEnabled.self)(config.preferences, selector, false)
+    } else {
+        fputs("WebKit lacks \(name); a locked or sleeping display will throttle the page\n", stderr)
+    }
+}
 let frame = NSRect(x: 0, y: 0, width: 1400, height: 1000)
 let webview = WKWebView(frame: frame, configuration: config)
 let window = NSWindow(contentRect: frame, styleMask: [.titled, .closable], backing: .buffered, defer: false)
