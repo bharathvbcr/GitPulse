@@ -109,7 +109,9 @@ describe("what GitPulse sends is declared by the contract", () => {
   });
 
   it("policy.check.command params are declared and complete", () => {
-    const keys = paramKeys(block(policyRs, /pub fn check_command_allowing\(/));
+    // `check_command_allowing` delegates to `check_command_on`, which builds
+    // the params for every lane; that is the function that sends them.
+    const keys = paramKeys(block(policyRs, /pub\(crate\) fn check_command_on\(/));
     expect(keys).toEqual(expect.arrayContaining(["command", "root", "scope"]));
     expect(undeclared(keys, "CommandCheckParams")).toEqual([]);
     expect(missingRequired(keys, "CommandCheckParams")).toEqual([]);
