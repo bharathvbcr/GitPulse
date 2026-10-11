@@ -13,6 +13,8 @@ before that tag is pushed.
 
 ### Added
 
+- Run the board in waves: from a repository board, "Run in waves" launches the top N suggested tasks (default 3, at most 5) in their own worktrees, waits for each run, runs `work.verify.task`, and merges only tasks whose verdict is `passed` at the head the worktree is still at, one at a time with a re-verify after each, then launches the next N. Tasks whose file scopes overlap, or are unknown, never launch together. Degraded, failed and could-not-run verdicts, refused launches and merge conflicts hold that task and are shown; nothing is pushed. A wave is kept on its cards (a `wave:` label and one log line) and resumes after a restart without relaunching a claimed run; Stop ends launching and merging.
+
 - An agent's `done` that is held in review for lack of a passing verification
   now starts that verification itself (one per task and head, at most two at a
   time, off the MCP response path) and moves the card to done when Manvi's
