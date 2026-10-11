@@ -324,6 +324,100 @@ pub struct UpgradeReport {
     pub backup: Option<String>,
 }
 
+/// The profile's schema version; `None` when the database has no workbench
+/// schema at all (a zero-byte file, an empty database, or one holding only
+/// other components' tables). `work_meta` is the workbench's own marker:
+/// every store handle also creates its non-workbench tables on open, so
+/// "no tables" is not a usable test for a fresh profile.
+fn work_meta_version(conn: &Connection) -> Result<Option<i64>> {
+    let exists: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='work_meta')",
+        [],
+        |r| r.get(0),
+    )?;
+    if !exists {
+        return Ok(None);
+    }
+    Ok(Some(current_version(conn)?))
+}
+
+fn current_version(conn: &Connection) -> Result<i64> {
+    Ok(conn.query_row("SELECT version FROM work_meta WHERE id=1", [], |r| r.get(0))?)
+}
+
+/// Builds a profile that does not exist yet and migrates it to
+/// [`WORKBENCH_SCHEMA`] inside one immediate transaction. A second creator
+/// waits on the busy timeout, then finds the finished schema and creates
+/// nothing. Returns whether this call created it.
+fn create_profile(conn: &Connection) -> Result<bool> {
+    let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+    if work_meta_version(conn)?.is_some() {
+        tx.commit()?;
+        return Ok(false);
+    }
+    conn.execute_batch(SCHEMA)?;
+    let mut version = current_version(conn)?;
+    while version < WORKBENCH_SCHEMA {
+        migrate_step(conn, version)?;
+        version = current_version(conn)?;
+    }
+    tx.commit()?;
+    Ok(true)
+}
+
+/// One schema step, `from` to `from + 1`. Runs inside the caller's transaction.
+fn migrate_step(conn: &Connection, from: i64) -> Result<()> {
+    match from {
+        1 => conn.execute_batch(include_str!("enhancements.sql"))?,
+        2 => {
+            conn.execute("UPDATE work_meta SET version=3 WHERE id=1", [])?;
+        }
+        3 => conn.execute_batch(include_str!("automation.sql"))?,
+        4 => conn.execute_batch(include_str!("runs.sql"))?,
+        5 => conn.execute_batch(include_str!("attention.sql"))?,
+        6 => conn.execute_batch(include_str!("notifications.sql"))?,
+        7 => conn.execute_batch(include_str!("decisions.sql"))?,
+        8 => {
+            // New run kinds and claim/protocol invariants require every host to
+            // understand this contract before it may open the profile.
+            conn.execute("UPDATE work_meta SET version=9 WHERE id=1", [])?;
+        }
+        9 => {
+            // Native process identity now precedes provider initialization;
+            // failed initialization has no fabricated thread or configuration.
+            conn.execute("UPDATE work_meta SET version=10 WHERE id=1", [])?;
+        }
+        10 => {
+            // Archive, completion time, checklists and task links. A host that
+            // builds a task body without them would unarchive and unlink every
+            // task it saves, so older hosts must refuse this profile.
+            conn.execute_batch(include_str!("items.sql"))?;
+        }
+        11 => {
+            // Refinement proposals: enhancement bodies gain `kind`, and the
+            // lock vocabulary gains `acceptance_criteria`. No table changes. A
+            // host that does not know them would complete a refinement as a
+            // title/description proposal or ignore a criteria lock, so older
+            // hosts must refuse this profile.
+            conn.execute("UPDATE work_meta SET version=12 WHERE id=1", [])?;
+        }
+        other => {
+            return Err(Error {
+                code: "schema_unsupported",
+                message: format!("workbench schema {other} is not supported"),
+            });
+        }
+    }
+    let after = current_version(conn)?;
+    if after != from + 1 {
+        return Err(Error {
+            code: "store_error",
+            message: format!("workbench schema step {from} left the profile at {after}"),
+        });
+    }
+    Ok(())
+}
+
 fn ensure_schema(conn: &Connection, may_upgrade: bool) -> Result<UpgradeReport> {
     let mut report = UpgradeReport {
         from: 0,
@@ -338,29 +432,19 @@ fn ensure_schema(conn: &Connection, may_upgrade: bool) -> Result<UpgradeReport> 
             message: "foreign key enforcement is unavailable".into(),
         });
     }
-    let exists: bool = conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='work_meta')",
-        [],
-        |r| r.get(0),
-    )?;
     // A profile this call creates holds nothing to protect and has nothing to
     // refuse: it is built and brought to the current schema whoever asked.
-    let mut created = false;
-    if !exists {
-        let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
-        let exists: bool = conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='work_meta')",
-            [],
-            |r| r.get(0),
-        )?;
-        if !exists {
-            conn.execute_batch(SCHEMA)?;
-            created = true;
-        }
-        tx.commit()?;
-    }
-    let mut version: i64 =
-        conn.query_row("SELECT version FROM work_meta WHERE id=1", [], |r| r.get(0))?;
+    // `create_profile` does both in one transaction, so no other handle can
+    // observe a half-migrated profile and mistake it for a stale one.
+    let created = if work_meta_version(conn)?.is_none() {
+        create_profile(conn)?
+    } else {
+        false
+    };
+    let mut version = work_meta_version(conn)?.ok_or_else(|| Error {
+        code: "store_error",
+        message: "the workbench profile has no schema version".into(),
+    })?;
     if !created {
         report.from = version;
     }
@@ -376,114 +460,15 @@ fn ensure_schema(conn: &Connection, may_upgrade: bool) -> Result<UpgradeReport> 
         }
         report.backup = backup_before_upgrade(conn, version)?;
     }
-    if version == 1 {
+    // An existing profile moves one step per transaction, re-reading the
+    // version under the write lock so a concurrent upgrader's step is not
+    // repeated.
+    while version < WORKBENCH_SCHEMA {
         let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
-        version = conn.query_row("SELECT version FROM work_meta WHERE id=1", [], |r| r.get(0))?;
-        if version == 1 {
-            conn.execute_batch(include_str!("enhancements.sql"))?;
-            version = 2;
-        }
-        tx.commit()?;
-    }
-    if version == 2 {
-        let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
-        version = conn.query_row("SELECT version FROM work_meta WHERE id=1", [], |r| r.get(0))?;
-        if version == 2 {
-            conn.execute("UPDATE work_meta SET version=3 WHERE id=1", [])?;
-            version = 3;
-        }
-        tx.commit()?;
-    }
-    if version == 3 {
-        let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
-        version = conn.query_row("SELECT version FROM work_meta WHERE id=1", [], |r| r.get(0))?;
-        if version == 3 {
-            conn.execute_batch(include_str!("automation.sql"))?;
-            version = 4;
-        }
-        tx.commit()?;
-    }
-    if version == 4 {
-        let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
-        version = conn.query_row("SELECT version FROM work_meta WHERE id=1", [], |r| r.get(0))?;
-        if version == 4 {
-            conn.execute_batch(include_str!("runs.sql"))?;
-            version = 5;
-        }
-        tx.commit()?;
-    }
-    if version == 5 {
-        let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
-        version = conn.query_row("SELECT version FROM work_meta WHERE id=1", [], |r| r.get(0))?;
-        if version == 5 {
-            conn.execute_batch(include_str!("attention.sql"))?;
-            version = 6;
-        }
-        tx.commit()?;
-    }
-    if version == 6 {
-        let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
-        version = conn.query_row("SELECT version FROM work_meta WHERE id=1", [], |r| r.get(0))?;
-        if version == 6 {
-            conn.execute_batch(include_str!("notifications.sql"))?;
-            version = 7;
-        }
-        tx.commit()?;
-    }
-    if version == 7 {
-        let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
-        version = conn.query_row("SELECT version FROM work_meta WHERE id=1", [], |r| r.get(0))?;
-        if version == 7 {
-            conn.execute_batch(include_str!("decisions.sql"))?;
-            version = 8;
-        }
-        tx.commit()?;
-    }
-    if version == 8 {
-        let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
-        version = conn.query_row("SELECT version FROM work_meta WHERE id=1", [], |r| r.get(0))?;
-        if version == 8 {
-            // New run kinds and claim/protocol invariants require every host to
-            // understand this contract before it may open the profile.
-            conn.execute("UPDATE work_meta SET version=9 WHERE id=1", [])?;
-            version = 9;
-        }
-        tx.commit()?;
-    }
-    if version == 9 {
-        let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
-        version = conn.query_row("SELECT version FROM work_meta WHERE id=1", [], |r| r.get(0))?;
-        if version == 9 {
-            // Native process identity now precedes provider initialization;
-            // failed initialization has no fabricated thread or configuration.
-            conn.execute("UPDATE work_meta SET version=10 WHERE id=1", [])?;
-            version = 10;
-        }
-        tx.commit()?;
-    }
-    if version == 10 {
-        let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
-        version = conn.query_row("SELECT version FROM work_meta WHERE id=1", [], |r| r.get(0))?;
-        if version == 10 {
-            // Archive, completion time, checklists and task links. A host that
-            // builds a task body without them would unarchive and unlink every
-            // task it saves, so older hosts must refuse this profile.
-            conn.execute_batch(include_str!("items.sql"))?;
-            version = 11;
-        }
-        tx.commit()?;
-    }
-    if version == 11 {
-        let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
-        version = conn.query_row("SELECT version FROM work_meta WHERE id=1", [], |r| r.get(0))?;
-        if version == 11 {
-            // Refinement proposals: enhancement bodies gain `kind`, and the
-            // lock vocabulary gains `acceptance_criteria`. No table changes. A
-            // host that does not know them would complete a refinement as a
-            // title/description proposal or ignore a criteria lock, so older
-            // hosts must refuse this profile.
-            conn.execute("UPDATE work_meta SET version=12 WHERE id=1", [])?;
-            version = 12;
+        version = current_version(conn)?;
+        if version < WORKBENCH_SCHEMA {
+            migrate_step(conn, version)?;
+            version = current_version(conn)?;
         }
         tx.commit()?;
     }
