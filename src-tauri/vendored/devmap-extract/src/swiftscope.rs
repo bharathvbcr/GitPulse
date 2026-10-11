@@ -19,7 +19,7 @@
 //! Anything else is bound but untyped.
 
 use std::cell::RefCell;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::rc::Rc;
 
 use tree_sitter::Node;
@@ -42,12 +42,15 @@ pub(crate) type Bindings = BTreeMap<String, Bound>;
 
 thread_local! {
     static CACHE: RefCell<HashMap<usize, Rc<Bindings>>> = RefCell::new(HashMap::new());
+    /// Scopes whose bindings are being computed right now.
+    static IN_PROGRESS: RefCell<HashSet<usize>> = RefCell::new(HashSet::new());
 }
 
 /// Drop the per-scope cache. Node ids are arena addresses, reused once a tree
 /// is dropped, so the cache must not outlive its file.
 pub(crate) fn reset() {
     CACHE.with(|cache| cache.borrow_mut().clear());
+    IN_PROGRESS.with(|open| open.borrow_mut().clear());
 }
 
 /// Whether `node` opens a Swift scope that binds names.
@@ -85,7 +88,16 @@ pub(crate) fn bindings(scope: Node, source: &str) -> Rc<Bindings> {
     if let Some(known) = CACHE.with(|cache| cache.borrow().get(&id).cloned()) {
         return known;
     }
+    // Computing a scope looks names up in the enclosing scopes, and the walk
+    // up starts at the scope being computed: `for h in xs` where `xs` is not
+    // bound yet asks for this very scope. A scope that is already open
+    // answers with nothing, uncached, so the lookup moves on to its parent
+    // instead of recursing until the stack is gone.
+    if !IN_PROGRESS.with(|open| open.borrow_mut().insert(id)) {
+        return Rc::new(Bindings::new());
+    }
     let computed = Rc::new(compute(scope, source));
+    IN_PROGRESS.with(|open| open.borrow_mut().remove(&id));
     CACHE.with(|cache| cache.borrow_mut().insert(id, Rc::clone(&computed)));
     computed
 }
