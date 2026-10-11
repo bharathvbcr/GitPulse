@@ -536,6 +536,34 @@ export async function runCoverageChecks(ctx) {
     await until(() => header().includes("62.5%") && idle());
     ok("the persisted selection is seeded on remount, not wiped by the first scan", () => paneTitle() === "lib/rust.rs", paneTitle);
 
+    // ---- The file list keeps its place, and the file scope follows the file ----
+    const promptText = () => document.querySelector('textarea[aria-label="Coverage agent prompt"]')?.value ?? "";
+    const many = Array.from({ length: 300 }, (_, i) => ({ path: `src/f${i}.ts`, language: "TypeScript", color_hex: "#3178c6", lines_found: 10, lines_hit: 5, percentage: 50 }));
+    setMode("custom");
+    knobs.customReport = () => ({
+      ...empty([family("javascript", "JavaScript", { found: true })]), files: many,
+      artifacts: [{ path: "coverage/lcov.info", format: "lcov", family: "javascript", skipped: false, totals: { lines_found: 3000, lines_hit: 1500, percentage: 50 } }],
+      overall: { lines_found: 3000, lines_hit: 1500, percentage: 50 },
+    });
+    button("Rescan coverage artifacts").click();
+    await until(() => header().includes("50.0%") && idle());
+    const listScroller = () => [...region().querySelectorAll(".gp-scroll")].find(node => node.querySelector('button[aria-label$="missed lines"]'));
+    listScroller().scrollTop = 600; await wait(); await wait();
+    ok("scrolling the file list is not undone by the panel", () => listScroller().scrollTop > 300, () => listScroller().scrollTop);
+    const query = document.querySelector('input[aria-label="Search coverage files"]');
+    query.value = "f1"; query.dispatchEvent(new Event("input", { bubbles: true })); await wait(); await wait();
+    ok("changing the filter returns the list to the top", () => listScroller().scrollTop === 0, () => listScroller().scrollTop);
+    button("Clear filters").click(); await tick();
+    button("Improve this file’s coverage").click(); await tick();
+    ok("the file scope names the selected file", () => promptText().includes("Selected file: src/f0.ts"), promptText);
+    setMode("ojas");
+    button("Rescan coverage artifacts").click();
+    await until(() => !!card("python") && idle());
+    ok("the file scope is dropped when the selected file leaves the report", () => !promptText().includes("Selected file:"), promptText);
+    setMode("measured");
+    button("Rescan coverage artifacts").click();
+    await until(() => header().includes("62.5%") && idle());
+
     // ---- File details: no stale gutters, truncation, missing source ----------
     button("src/example.ts, 70.0%, 3 missed lines").click(); await until(() => !!document.querySelector("[data-coverage-line]"));
     knobs.contentHandler = () => new Promise(resolve => setTimeout(() => resolve("export const x = 1;\n"), 500));
