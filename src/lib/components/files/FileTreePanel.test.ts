@@ -9,7 +9,9 @@ const source = readFileSync(new URL("./FileTreePanel.svelte", import.meta.url), 
  * (`node scripts/browser-regressions.mjs --harness file-tree`) drives the real
  * panel for the single-select tree keys and the active item a screen reader
  * follows, the glob filter and status scopes, following the open file, the
- * context menu's keys and focus return, and the delete confirmation.
+ * context menu's keys and focus return, the delete and discard confirmations,
+ * create, rename and move, which index action each file is offered, the
+ * unverified-churn mark, the filter-budget caption, and long-name scrolling.
  * `harness/repo-churn.html` checks that a publish does not re-list the
  * repository. Only what a rendered page cannot see stays here.
  */
