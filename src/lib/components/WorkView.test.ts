@@ -93,18 +93,11 @@ describe("WorkView", () => {
     expect(source).toContain("{#each renderedRows as row");
   });
 
-  it("does not dress a filter that matches nothing as a repository with nothing in it", () => {
-    // "Nothing in flight" is a statement about the repository. Reusing it for
-    // a filter the reader can clear sends them looking for a problem that is
-    // their own search box.
-    expect(source).toContain("narrowedToNothing");
-    expect(source).toContain("No row matches this filter");
-    const narrowed = source.indexOf("narrowedToNothing}");
-    const nothing = source.indexOf("Nothing in flight");
-    expect(narrowed).toBeGreaterThan(-1);
-    expect(nothing).toBeGreaterThan(narrowed);
-  });
-
+  // Rendered in harness/repo-churn.html: a filter matching nothing says "No
+  // row matches this filter" (never "Nothing in flight") and counts what it
+  // hid; Clear filter brings the rows back; the Uncommitted changes facet is a
+  // pressed toggle that narrows the rows; a failed collision scan says it
+  // could not check; the Current repository section is drawn.
   it("clears the narrowing when the repository changes", () => {
     // A filter carried across a repository switch hides rows the reader has
     // never seen, for a reason that scrolled off screen with the old repo.
@@ -188,22 +181,10 @@ describe("WorkView", () => {
     expect(source).toContain("unscanned");
   });
 
-  it("never treats a failed collision scan as no overlap", () => {
-    expect(source).toContain("createWorkRefresh");
-    expect(source).toContain("Could not check overlapping files");
-    expect(source).toContain("Absence of a list is not");
-  });
-
   it("offers MCP setup without sending the reader to a system they may not run", () => {
     expect(source).toContain("gitpulse:settings");
     expect(source).toContain("Connect an agent");
     expect(source).toContain("gitpulse_insights");
-  });
-
-  it("exposes the existing dirty facet as an accessible filter", () => {
-    expect(source).toContain('aria-pressed={facet === "dirty"}');
-    expect(source).toContain('toggleFacet("dirty")');
-    expect(source).toContain("Uncommitted changes");
   });
 
   it("offers named review and repository navigation actions", () => {
@@ -212,8 +193,7 @@ describe("WorkView", () => {
     expect(source).toContain('repoStore.setActiveTab("history", "graph")');
   });
 
-  it("identifies the current checkout and renders worktree paths visibly", () => {
-    expect(source).toContain("Current repository");
+  it("marks the current worktree and shows each worktree's path", () => {
     expect(source).toContain("Current worktree");
     expect(source).toContain("{row.worktrees[0].worktree.path}");
   });

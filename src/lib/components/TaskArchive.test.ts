@@ -5,344 +5,132 @@ import { compile } from "svelte/compiler";
 const source = readFileSync(new URL("./TaskArchive.svelte", import.meta.url), "utf8");
 const board = readFileSync(new URL("./TaskBoard.svelte", import.meta.url), "utf8");
 
+/**
+ * The archive dock's behaviour is rendered and driven by the tasks harness
+ * (`harness/tasksChecks.js`, "The archive, and what it is willing to claim"
+ * and "Archiving a task"): the badge is the server's total and ignores the
+ * board search, archived work is off the Done column, the list is ordered and
+ * stamped by completion, the rule line shows with rows on screen, a partial
+ * page states both numbers, Load more lives inside the scroller and goes when
+ * the store has no next page, select-all names and selects exactly the loaded
+ * rows, the action bar and select-all head stay visible while only the rows
+ * scroll, restore goes through the board's confirm dialog and refreshes the
+ * loaded pages in place, filters are applied locally and never sent to the
+ * store, a backgrounded window never reports an unread archive as empty, and
+ * the Deleted view restores by id with no second Delete.
+ *
+ * What stays here is what a rendered page cannot show.
+ */
 describe("TaskArchive", () => {
   it("compiles", () => {
     const { warnings } = compile(source, { generate: "client", filename: "TaskArchive.svelte" });
     expect(warnings.filter((w) => w.code !== "css-unused-selector")).toEqual([]);
   });
-
-  it("lets the shared material system paint the dock, like the Inbox beside it", () => {
-    const rule = source.match(/\.archive\{([^}]*)\}/)?.[1];
-    expect(rule, "missing .archive rule").toBeDefined();
-    expect(rule, ".archive covers the shared material").not.toMatch(/(?:^|;)background(?:-color)?:/);
-    expect(source).toContain('class="archive gp-glass bg-surface"');
-  });
 });
 
 /**
- * The defect the panel was reported for. With thirty rows loaded on a 1024x768
- * window the panel's visible box ended at y=533 and the Restore/Delete bar
- * rendered at y=640 — inside the panel's own scroll container, 107px below its
- * fold, at scrollTop 0. Ticking a checkbox changed nothing a reader could see.
- *
- * The cause was two nested scrollers with independent caps: the panel capped
- * at 46vh, the row list capped at 280px inside it. The list won and the
- * actions were pushed out. These are source contracts rather than a rendered
- * measurement because jsdom computes no layout; the measured proof is the
- * tasks harness, which drives the real board in a real browser.
+ * Grounds. On macOS `html.macos` remaps `bg-surface` to a translucent
+ * material; a local `rgb(var(--c-surface))` is invisible to that remap and
+ * paints an opaque slab over a glass panel. The harness runs without the
+ * macOS class, where both spellings paint the same pixels, so this is the
+ * one place the difference can be caught. Same shape as
+ * `scripts/mac-material-contract.test.ts`, asserted beside the rules that need it.
  */
-describe("a selection's actions are never off screen", () => {
+describe("the dock takes its grounds from the shared material", () => {
   const styles = source.slice(source.lastIndexOf("<style>"));
-  // Escapes the whole selector, not just its leading dot: `.archive > *`
-  // carries three regex metacharacters, and a helper that silently matched
-  // nothing would report every rule below as absent — or, worse, as present.
   const rule = (selector: string) => {
     const escaped = selector.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
     const match = styles.match(new RegExp(`(?:^|[;}\\s])${escaped}\\{([^}]*)\\}`, "m"));
     expect(match, `no CSS rule for \`${selector}\``).not.toBeNull();
     return match?.[1] ?? "";
   };
+  const ownFill = /(?:^|;)background(?:-color)?:/;
 
-  /**
-   * The markup of one element, from `open` to its own closing `</div>`.
-   *
-   * Counts nesting rather than slicing to the next landmark, because the
-   * question here is whether a control sits *inside* the scroller, and a
-   * slice that overshot the closing tag answers "yes" either way.
-   */
-  const balanced = (open: string) => {
-    const start = source.indexOf(open);
-    expect(start, `no element matching \`${open}\``).toBeGreaterThan(-1);
-    let depth = 0;
-    for (let at = start; at < source.length; at += 1) {
-      if (source.startsWith("<div", at)) depth += 1;
-      else if (source.startsWith("</div>", at)) {
-        depth -= 1;
-        if (depth === 0) return source.slice(start, at + 6);
-      }
-    }
-    throw new Error(`\`${open}\` is never closed`);
-  };
-
-  it("keeps exactly one scroller between the panel and its rows", () => {
-    // `.entries` is it. The panel keeps `overflow:auto` only as the fallback
-    // for a window too short for its own chrome, where the sticky action bar
-    // below is what holds the promise.
-    expect(rule(".entries")).toContain("overflow:auto");
-    expect(rule(".entries")).toContain("min-height:0");
-    // No second cap racing the panel's.
-    expect(rule(".entries")).not.toMatch(/max-height/);
-    expect(rule(".archive")).toContain("max-height:");
-  });
-
-  it("makes the row list the only part of the panel that shrinks", () => {
-    expect(rule(".archive")).toContain("display:flex");
-    expect(rule(".archive")).toContain("flex-direction:column");
-    expect(rule(".archive > *")).toContain("flex:0 0 auto");
-    // Shrink, but never grow: three archived tasks draw a short panel.
-    expect(rule(".entries")).toContain("flex:0 1 auto");
-  });
-
-  it("pins the action bar for the case the list cannot shrink any further", () => {
-    expect(rule(".actions")).toContain("position:sticky");
-    expect(rule(".actions")).toContain("bottom:0");
-  });
-
-  // Sticky over scrolling rows needs a ground, and the ground has to be the
-  // one `html.macos` can remap. A local `rgb(var(--c-surface))` is invisible
-  // to that remap and paints an opaque bar across a glass panel — the same
-  // shape `scripts/mac-material-contract.test.ts` guards the whole components
-  // tree against, asserted here beside the rules that need it.
-  it("takes the pinned bar's ground from the shared material", () => {
-    expect(rule(".actions"), ".actions must not paint its own token fill")
-      .not.toMatch(/(?:^|;)background(?:-color)?:/);
+  it("paints the panel and the pinned action bar with the shared class, not a token fill", () => {
+    expect(rule(".archive")).not.toMatch(ownFill);
+    expect(source).toContain('class="archive gp-glass bg-surface"');
+    expect(rule(".actions")).not.toMatch(ownFill);
     expect(source).toContain('class="actions bg-surface"');
   });
 
-  it("spends no fixed row on a control that belongs in the list", () => {
-    // "Load more" was a fixed row competing with the list for the panel's
-    // height, and it extends the rows — it belongs after the last one.
-    //
-    // The region is the *balanced* `.entries` element, not everything up to
-    // the next landmark: a slice that ran past the closing tag would contain
-    // "Load more" whether or not it was still inside the scroller, which is
-    // exactly the move this asserts against.
-    const entries = balanced('<div class="entries">');
-    expect(entries, "Load more must extend the rows from inside the scroller").toContain("Load more");
-  });
-
-  /**
-   * The select-all head is the deliberate exception, and the comment in the
-   * component is the reason. Sticky inside the scroller saves the list 31px
-   * and costs legibility: `bg-surface` is a 50%-alpha material on macOS, and
-   * rows sliding under a half-transparent bar put a task title and the
-   * select-all label in the same pixels — observed, not predicted. Outside,
-   * `.entries` clips its own overflow and no row can reach it.
-   */
-  it("keeps the select-all head out of the scroller rather than floating it", () => {
-    const entries = balanced('<div class="entries">');
-    expect(entries, "a row can slide under a sticky head; it cannot reach a sibling")
-      .not.toMatch(/<div class="list-head[ "]/);
-    expect(rule(".list-head")).not.toContain("position:sticky");
-    // And it must not have acquired its own ground, which would only be
-    // needed by something rows can pass beneath.
-    expect(rule(".list-head")).not.toMatch(/(?:^|;)background(?:-color)?:/);
+  it("gives the select-all head no ground, because no row can pass beneath it", () => {
+    expect(rule(".list-head")).not.toMatch(ownFill);
     expect(source).not.toContain('class="list-head bg-surface"');
   });
 });
 
-describe("the dock says how a task gets into it", () => {
-  // It used to say so only in the empty state — the one moment a reader has
-  // no archived work to ask about. A panel called Archive that offers Restore
-  // and never names the thing that archives a task is the report this fixed.
-  it("carries the rule as header chrome, not as an empty state", () => {
-    expect(source).toContain('data-testid="task-archive-rule"');
-    const rule = source.indexOf('data-testid="task-archive-rule"');
-    const empty = source.indexOf("{#if summary.pending}");
-    expect(rule).toBeGreaterThan(-1);
-    expect(rule, "the rule must be above the list, not inside a branch").toBeLessThan(empty);
-  });
-
-  it("teaches the same rule whether or not it is empty, from one constant", () => {
-    expect(source).toContain("ARCHIVE_RULE");
-    // Two renderings, one owner: the header line and the empty state.
-    expect(source.match(/ARCHIVE_RULE/g)?.length).toBeGreaterThanOrEqual(3);
-    // Still no second spelling of the status here.
-    expect(source).not.toMatch(/["']done["']/);
-  });
-});
-
-describe("the dock owns no write path", () => {
-  // Restore and delete are the board's existing batch, run through the
-  // board's existing confirm dialog. A private `putTask` here would be a
-  // second owner of "move a task" with its own revision handling, and the
-  // interrupted-write recovery the dialog provides would not cover it.
+/**
+ * Ownership contracts. The harness proves restore and delete go through the
+ * board's dialog; these keep the dock from growing a second write path or a
+ * second policy beside it, which a rendered run cannot distinguish.
+ */
+describe("the dock owns no write path or policy of its own", () => {
   it("never calls the store's mutations itself", () => {
-    for (const forbidden of ["putTask", "deleteTask", "taskWrite", "new TaskBatch"]) {
+    for (const forbidden of ["putTask", "deleteTask", "taskWrite", "new TaskBatch", "restoreDeletedTask"]) {
       expect(source, `TaskArchive must not call ${forbidden}`).not.toContain(forbidden);
     }
   });
 
-  it("hands every action to the board", () => {
-    expect(source).toContain("onaction([...chosen], restoreAction())");
-    expect(source).toContain('onaction([...chosen], { kind: "delete" })');
-    // Bringing a deleted task back is the board's bounded restore pass, not
-    // a store call made from here.
-    expect(source).toContain("await onrestoredeleted([...chosen])");
-    expect(source).not.toContain("restoreDeletedTask");
-    expect(board).toContain("onrestoredeleted={restoreDeleted}");
-  });
-
-  it("stops at the same selection cap the batch enforces, rather than inventing one", () => {
-    // Two writers, two caps, both imported: the batch's for archive changes
-    // and the delete pass's for bringing deleted tasks back.
-    expect(source).toContain('view === "deleted" ? MAX_DELETE_BATCH : MAX_TASK_SELECTION');
-    expect(source).toContain("chosen.length > cap");
+  it("stops at the caps the batch and the delete pass enforce, rather than inventing one", () => {
+    // A cap of 100 (or 50) cannot be reached with the harness fixture's 34
+    // archived tasks; the claim is that both are imported, never re-declared.
+    expect(source).toMatch(/import \{[^}]*\bMAX_TASK_SELECTION\b[^}]*\} from "\.\.\/workbench\/taskActions"/);
+    expect(source).toMatch(/import \{[^}]*\bMAX_DELETE_BATCH\b[^}]*\} from "\.\.\/workbench\/taskDelete"/);
     expect(source).not.toMatch(/const\s+\w*[Cc]ap\w*\s*=\s*\d+/);
   });
-});
 
-describe("the dock reads only what the store actually has", () => {
-  // The archive is the `archived` flag, ordered by the store's own
-  // completion time; the deleted list is the deleted rows, most recently
-  // deleted first. Never a status, and never a client-side sort of one page.
-  it("asks the store for each list by its own filter and order", () => {
-    expect(source).toContain('{ archived: true, order: "completed" }');
-    expect(source).toContain('{ deleted: true, order: "updated" }');
-    expect(source).toContain("listTasks(scope, null, storeQuery, cursor, 30,");
-    expect(source).not.toMatch(/["']done["']/);
+  it("never sorts or re-spells the status of a page it was handed", () => {
+    // The fixture returns rows already in the store's order, so a client-side
+    // sort of one page would render identically there and be wrong on page two.
     expect(source).not.toMatch(/\.sort\(/);
-  });
-
-  // The dock had its own copy of the board's defect: the whole search box
-  // went to the store's full-text query, so `is:bug` searched for two words.
-  it("sends the store only the search's words and applies its filters to loaded rows", () => {
-    expect(source).toContain("const parsed = $derived(parseTaskQuery(query));");
-    expect(source).toContain("passing = $derived(live.filter((card) => cardMatchesQuery(card, parsed, queryContext)))");
-    // OR alternatives and phrases the store could not be asked are checked
-    // here, by the board's ranking module, never relaxed into partial matches.
-    expect(source).toContain('{ order: "board", relax: false }');
-    expect(source, "the raw search box still reaches the store").not.toMatch(/listTasks\([^)]*\bquery\b/);
-    // Reloaded on the words, not on every filter keystroke; the pending-delete
-    // count is not confused with rows a filter hid.
-    expect(source).toContain("scope; storeQuery; view; active;");
-    expect(source).not.toContain("scope; storeQuery; view; active; visible;");
-    expect(source).toContain("hiddenHere = $derived((result?.items.length ?? 0) - live.length)");
-    expect(source).toContain('data-testid="task-archive-query-problems"');
-  });
-
-  // The stamp states the completion the list is ordered by, and for a task
-  // archived without being finished says so rather than inventing one.
-  it("takes the row stamp from the seam", () => {
-    expect(source).toContain("archiveStamp(card, relative)");
-    expect(source).not.toMatch(/Completed \{/);
+    expect(source).not.toMatch(/["']done["']/);
   });
 });
 
-describe("the dock never presents a page as the whole archive", () => {
-  it("renders the summary that carries both numbers", () => {
-    // Less any task the board is about to delete in its undo window: those
-    // have left the dock too, and the total must not still count them.
-    expect(source).toContain("archiveSummary(result ? rows.length : null, Math.max(0, (result?.total ?? 0) - hiddenHere), view)");
-    expect(source).toContain("{summary.text}");
-    expect(source).toContain("summary.partial");
-    expect(source).toContain('data-testid="task-archive-summary"');
-  });
-
-  // The dock defers its query while the window is in the background, so an
-  // empty list is routinely a query that has not run. The empty state is
-  // gated on a successful read rather than on `rows.length`, or a paused
-  // dock claims the scope has no completed work.
-  it("holds its empty state back until a read has actually succeeded", () => {
-    expect(source).toContain("{#if summary.pending}");
-    const empty = source.indexOf("{#if summary.pending}");
-    const rowsEmpty = source.indexOf("{:else if rows.length === 0}");
-    expect(empty, "the pending branch must precede the empty branch").toBeGreaterThan(-1);
-    expect(rowsEmpty).toBeGreaterThan(empty);
-    expect(source).toContain("Paused while this window is in the background.");
-    expect(source).not.toContain("{#if rows.length === 0}");
-  });
-
-  it("offers more only while the server says there is more", () => {
-    expect(source).toContain("{#if result?.next_cursor}");
-    expect(source).toContain("Load more");
-  });
-
-  // "Select all" over a paged list would claim rows the dock has not loaded,
-  // and the action would then silently apply to fewer tasks than the label
-  // promised. The count is in the label instead.
-  it("scopes the bulk checkbox to the rows it has, and says so", () => {
-    expect(source).toContain("Select the {rows.length} loaded");
-    expect(source).toContain("selected = on ? new Set(rows.map((card) => card.id)) : new Set()");
-  });
-});
-
-describe("the archive is separate from the Done column", () => {
-  // An archived task leaves the board whatever its status, and a Done one
-  // that is not archived stays on it. Every column read says so.
-  it("reads every board column without archived tasks", () => {
-    expect(board).toContain("const BOARD: TaskListFilter = { archived: false };");
-    // The filter is the contract; the page size is the board's to choose.
-    // Columns read no search text: words are ranked over loaded cards, and a
-    // search reads its own candidate set (`taskSearchPlan.ts`).
-    expect(board).toMatch(/listTasks\(target, status, "", cursor, \w+, BOARD\)/);
-    expect(board).toMatch(/listTasks\(scope, status, "", cursor, \w+, BOARD\)/);
-    // A search reads one status-less candidate set, under the same filter.
-    expect(board).toMatch(/listTasks\(current\.scope, null, "", undefined, CANDIDATE_PAGE, BOARD\)/);
-    const reads = [...board.matchAll(/listTasks\(([^;]*?)\)(?=[,;\]]|\s*:)/g)].map((match) => match[1]);
-    expect(reads.length, "every read is checked").toBe(board.match(/listTasks\(/g)?.length);
-    for (const read of reads) {
-      expect(read.endsWith("BOARD") || read.endsWith("{ archived: true }"), `a read without the filter would draw archived cards: ${read}`).toBe(true);
-    }
-    expect(reads.filter((read) => read.endsWith("{ archived: true }")), "only the badge reads the archive").toHaveLength(1);
-  });
-
-  it("no longer couples the dock to the Done column's visibility", () => {
-    const mount = board.slice(board.indexOf("<TaskArchive"), board.indexOf("/>", board.indexOf("<TaskArchive")));
-    expect(mount).not.toContain("hiddenColumns");
-    expect(mount).not.toContain("ontogglecolumn");
-    expect(board).not.toContain("offersArchive");
-    expect(source).not.toContain("boardPresence");
-  });
-
-  it("is reachable from the board header", () => {
-    expect(board).toContain('aria-label="Archive"');
-    expect(board).toContain("aria-pressed={showArchive}");
-  });
-
-  // The badge is the server's total for the scope, not the loaded page size:
-  // a board with 412 archived tasks must not advertise the 30 it loaded.
-  // The board's search does not narrow it: the dock has its own search, and a
-  // badge that shrank while the board was filtered would misreport the archive.
-  it("badges the server's archived total for the scope, whatever the board search", () => {
-    expect(board).toContain("listTasks(target, null, \"\", undefined, 1, { archived: true })");
-    expect(board).toContain("archivedCount = archive.total;");
-    expect(board).toContain("{#if archivedCount > 0}<span class=\"gp-pill\">{archivedCount}</span>{/if}");
-  });
-});
-
+/**
+ * `workbench-changed` is a delivery hint the host may lose, so the board also
+ * nudges the dock directly wherever it knows a write committed. In the harness
+ * both paths fire for every write, so a rendered refresh cannot tell which one
+ * did the work; losing either is only visible here.
+ */
 describe("the dock stays current after a write", () => {
-  // A write used to reload the dock from its first page, because the store's
-  // cursor runs forward only. Re-reading the pages already loaded, each from
-  // where the fresh previous one ends, keeps the reader's place.
-  it("refreshes the pages it has in place instead of starting over", () => {
-    expect(source).toContain("await refreshPages(mode === \"first\" || !result ? 1 : pages, read)");
-    expect(source).toContain('untrack(() => { void load("refresh"); });');
-    // Scope, search or view changing is the one case that starts over.
-    expect(source).toContain('untrack(() => { void load("first"); });');
-  });
-
-  // `workbench-changed` is a delivery hint the host may lose, so the board
-  // also tells the dock directly at each point where it knows a write
-  // committed. Either path alone leaves a restored task sitting in the list.
-  it("listens for the live event and accepts a direct nudge", () => {
-    // The subscription lives in the shared loader, which both coalesces the
-    // event and refreshes on return to the window.
+  it("subscribes to the live event and accepts the board's direct nudge", () => {
     expect(source).toContain("loader.connect(");
     expect(readFileSync(new URL("../workbench/liveLoader.ts", import.meta.url), "utf8")).toContain("changed: schedule");
     expect(source).toContain("refreshToken");
     expect(board).toContain("refreshToken={archiveToken}");
   });
 
-  it("nudges from every place the board finishes a write, and nowhere else", () => {
+  it("nudges from every place the board finishes a write, and not from loadBoard", () => {
     const calls = board.match(/taskWritten\(\);/g) ?? [];
     expect(calls.length, "taskWritten must be called from all six write sites").toBe(6);
-    // Bringing deleted tasks back is a write too.
-    const restoring = board.slice(board.indexOf("async function restoreDeleted("), board.indexOf("async function archiveDockAction("));
-    expect(restoring).toContain("if (result.deleted.length) { taskWritten(); void loadBoard(); }");
-    expect(board).toContain("if (done) { taskWritten(); await loadBoard(); }");
-    expect(board).toContain("if (ids.length) taskWritten();");
-    expect(board).toContain("function onEditorSaved(saved: Task) {\n    taskWritten();");
-    // Linking tasks to the GitHub issues filed from them writes their labels,
-    // both in the run and in its Retry link.
-    const filing = board.slice(board.indexOf("async function fileTaskIssues("), board.indexOf("async function retryIssueLink("));
-    expect(filing).toContain("if (linked.length) {\n        taskWritten();");
-    const relinking = board.slice(board.indexOf("async function retryIssueLink("), board.indexOf("async function onMenuAction("));
-    expect(relinking).toContain("toastStore.success(announce);\n      taskWritten();");
     // Not from loadBoard: that also runs on every debounced keystroke, and
     // would reset the dock's paging and selection under a reader who is
     // only typing in the board's search box.
     const loadBoard = board.slice(board.indexOf("async function loadBoard("), board.indexOf("function taskWritten("));
     expect(loadBoard).not.toContain("taskWritten()");
+  });
+});
+
+/**
+ * Claims the harness fixture cannot discriminate. Its store matches the whole
+ * query as one substring, so OR alternatives and phrases never reach the
+ * dock's own ranking there; its scope always holds archived work, so the
+ * empty state is never drawn; and it has no undo window open while the dock
+ * is, so the pending-delete adjustment is never exercised.
+ */
+describe("what the fixture cannot reach", () => {
+  it("checks OR alternatives and phrases locally, never relaxed into partial matches", () => {
+    expect(source).toContain('{ order: "board", relax: false }');
+  });
+
+  it("teaches the archive rule in the empty state from the same constant as the header", () => {
+    expect(source).toContain("Nothing here yet. ${ARCHIVE_RULE}");
+    expect(source).toContain("ARCHIVE_RULE :");
+  });
+
+  it("does not count tasks in the board's undo window toward the archive total", () => {
+    expect(source).toContain("hiddenHere = $derived((result?.items.length ?? 0) - live.length)");
+    expect(source).toContain("Math.max(0, (result?.total ?? 0) - hiddenHere)");
   });
 });

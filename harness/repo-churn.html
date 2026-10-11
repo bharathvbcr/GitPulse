@@ -35,6 +35,11 @@
       addEventListener("unhandledrejection", (event) => crashes.push(String(event.reason)));
 
       const REPO = "/fixture/churn";
+      const stagedReadme = { path: "README.md", status_code: "M", is_staged: true, is_conflicted: false, additions: 1, deletions: 0 };
+      /** What `cmd_get_status` answers; the composer checks widen it. */
+      let statusRows = [stagedReadme];
+      /** Every commit the composer sent, staged-only or quick. */
+      const commits = [];
       const OTHER = "/fixture/churn-other";
       const now = Math.floor(Date.now() / 1000);
       const branch = (name, tip, extra = {}) => ({
@@ -62,7 +67,9 @@
       const fixtures = {
         cmd_resolve_repo: (a) => ({ path: a.repoPath ?? a.path, name: "churn", is_bare: false }),
         cmd_list_branches: () => [branch("main", "m1"), branch("feature/a", "a1")],
-        cmd_get_status: () => [{ path: "README.md", status_code: "M", is_staged: true, is_conflicted: false, additions: 1, deletions: 0 }],
+        cmd_get_status: () => statusRows,
+        cmd_commit: (a) => { commits.push({ kind: "commit", message: a.message, amend: a.amend }); return "ok"; },
+        cmd_quick_commit: (a) => { commits.push({ kind: "quick", message: a.message }); return "ok"; },
         cmd_last_fetch_at: () => null, cmd_note_tab_activated: () => null,
         cmd_list_tags: () => ({ tags: [], truncated: false }),
         cmd_stash_list: () => ({ entries: [], truncated: false }),
@@ -304,6 +311,43 @@
         await quietUnderChurn("DiffViewer", DiffViewer, ["cmd_codeintel_impact_at_rung", "cmd_get_head_id", "cmd_get_file_content", "cmd_get_file_diff"]);
         await quietUnderChurn("CommitComposer", CommitComposer, ["cmd_codeintel_impact_layered_many", "cmd_get_file_content", "cmd_codeintel_cancel"]);
 
+        // ---- CommitComposer: what a commit sends, and when it refuses.
+        // A staged file and an unstaged one, so staged-only and "Commit all"
+        // differ in what they would take.
+        statusRows = [stagedReadme, { path: "src/a.ts", status_code: "M", is_staged: false, is_conflicted: false, additions: 2, deletions: 0 }];
+        await repoStore.refresh(); await settle(10);
+        const commitButton = () => buttons().find((b) => /^(Commit|Commit all) \(\d+\)$/.test(b.textContent.trim()));
+        const message = () => app.querySelector("textarea");
+        const type = async (text) => { message().value = text; message().dispatchEvent(new Event("input", { bubbles: true })); await settle(5); };
+        const chord = async (shiftKey) => { message().dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", metaKey: true, ctrlKey: true, shiftKey, bubbles: true, cancelable: true })); await until(() => commits.length > sentBefore); await settle(10); };
+        let sentBefore = commits.length;
+        check("CommitComposer: the default commit takes the staged files only",
+          () => commitButton()?.textContent.trim() === "Commit (1)" && !buttons().some((b) => b.textContent.trim().startsWith("Commit all")));
+        check("CommitComposer: an empty message cannot commit", () => commitButton()?.disabled === true);
+        await type("Staged only");
+        await chord(false);
+        check("CommitComposer: Cmd/Ctrl+Enter commits the staged files, not amending",
+          () => commits.length === sentBefore + 1 && commits.at(-1).kind === "commit" && commits.at(-1).message === "Staged only" && commits.at(-1).amend === false);
+        sentBefore = commits.length;
+        await type("Everything");
+        await chord(true);
+        check("CommitComposer: Shift adds the unstaged files, as a quick commit",
+          () => commits.length === sentBefore + 1 && commits.at(-1).kind === "quick" && commits.at(-1).message === "Everything");
+        const include = app.querySelector('input[aria-label="Include unstaged files in this commit"]');
+        if (include && !include.checked) { include.click(); await settle(5); }
+        check("CommitComposer: Include unstaged names the wider commit and counts both files",
+          () => commitButton()?.textContent.trim() === "Commit all (2)");
+        statusRows = [{ path: "README.md", status_code: "UU", is_staged: false, is_conflicted: true, additions: 0, deletions: 0 }, stagedReadme];
+        await repoStore.refresh(); await settle(10);
+        await type("With conflicts");
+        sentBefore = commits.length;
+        message().dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", metaKey: true, ctrlKey: true, bubbles: true, cancelable: true }));
+        await settle(20);
+        check("CommitComposer: a conflict disables Commit and the chord sends nothing",
+          () => commitButton()?.disabled === true && commits.length === sentBefore);
+        statusRows = [stagedReadme];
+        await repoStore.refresh(); await settle(10);
+
         // ---- WorkView: "Show more" is the reader's, not the store's.
         await show(WorkView);
         const rows = () => app.querySelectorAll("[data-work-row]").length;
@@ -318,6 +362,31 @@
         check(`WorkView: "Show more" renders more rows (${shown} -> ${expanded})`, () => expanded > shown);
         await churn();
         check(`WorkView: "Show more" persists across unrelated publishes (${expanded} -> ${rows()})`, () => rows() === expanded);
+
+        // ---- WorkView: a filter that hides every row says so, in its own words.
+        const filterField = () => app.querySelector('input[aria-label="Filter work rows"]');
+        filterField().value = "zzz-matches-nothing"; filterField().dispatchEvent(new Event("input", { bubbles: true }));
+        await until(() => app.textContent.includes("No row matches this filter"));
+        check("WorkView: a filter matching nothing says so, never \"Nothing in flight\", and counts what it hid",
+          () => rows() === 0 && !app.textContent.includes("Nothing in flight") && app.textContent.includes(`0 of ${worktrees.length}`));
+        buttons().find((b) => b.textContent.trim() === "Clear filter")?.click();
+        await until(() => rows() > 0);
+        check("WorkView: Clear filter brings the rows back and empties the field", () => rows() > 0 && filterField().value === "");
+        const dirtyFacet = () => buttons().find((b) => b.textContent.trim() === "Uncommitted changes");
+        const pressedBefore = dirtyFacet()?.getAttribute("aria-pressed");
+        dirtyFacet()?.click(); await settle(5);
+        check("WorkView: the Uncommitted changes facet is a pressed toggle that narrows the rows",
+          () => pressedBefore === "false" && dirtyFacet()?.getAttribute("aria-pressed") === "true" && app.textContent.includes(`of ${worktrees.length}`));
+        dirtyFacet()?.click(); await settle(5);
+        check("WorkView: names the repository the reader is standing in", () => Boolean(app.querySelector('section[aria-label="Current repository"]')));
+        // A collision scan that failed is not a scan that found nothing.
+        const collisionFixture = fixtures.cmd_collision_risk;
+        fixtures.cmd_collision_risk = () => { throw new Error("fixture: collision scan unavailable"); };
+        await show(WorkView);
+        await until(() => app.textContent.includes("Could not check overlapping files"));
+        check("WorkView: a failed collision scan says it could not check, never that there is no overlap",
+          () => app.textContent.includes("fixture: collision scan unavailable") && app.textContent.includes("Absence of a list is not"));
+        fixtures.cmd_collision_risk = collisionFixture;
 
         check(`no crash (${crashes.join(" | ") || "none"})`, () => crashes.length === 0);
         check(`no unconfigured native command (${[...new Set(unexpected)].join(", ") || "none"})`, () => unexpected.length === 0);

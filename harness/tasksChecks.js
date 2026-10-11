@@ -702,6 +702,35 @@ if (params.has("check")) {
       && Boolean(primaryRadio().closest(".repo-row")?.querySelector('input[type="checkbox"]')?.checked)
       && repoSummaryText().includes("primary GitPulse")
       && !editor().textContent.includes("Linked repositories"));
+    // Collapsing the list into a dropdown costs nothing only if the closed
+    // trigger still names every link and marks the primary among them, with
+    // the summary sentence kept on screen for what chips cannot say.
+    {
+      const picker = editor().querySelector("[data-task-repo-picker]");
+      const chips = [...picker.querySelectorAll(".repo-trigger .repo-chip")];
+      const primaries = chips.filter(chip => chip.classList.contains("is-primary"));
+      check("the closed trigger names each linked repository and stars the primary",
+        chips.map(chip => chip.textContent.trim()).sort().join() === "GitPulse,Manvi"
+        && primaries.length === 1 && primaries[0].textContent.trim() === "GitPulse" && Boolean(primaries[0].querySelector("svg"))
+        && !chips.find(chip => !chip.classList.contains("is-primary"))?.querySelector("svg")
+        && picker.querySelector('[data-testid="task-repo-summary-line"]')?.textContent.includes("primary GitPulse")
+        && !picker.querySelector(".repo-trigger-label"));
+    }
+    // Tab inside the popup moves focus; Tab off its last control closes it
+    // rather than leaving a floating panel behind the reader's focus.
+    {
+      const focusables = () => [...(repoPopup()?.querySelectorAll("input:not(:disabled), button:not(:disabled)") ?? [])];
+      const tab = (el, shiftKey = false) => { if (!el) return; el.focus(); el.dispatchEvent(new KeyboardEvent("keydown", { key: "Tab", shiftKey, bubbles: true, cancelable: true })); };
+      tab(focusables()[0]); await settle(60);
+      const stayed = Boolean(repoPopup());
+      tab(focusables().at(-1)); await settle(60);
+      check("Tab within the repository dropdown keeps it open; Tab off its last control closes it",
+        stayed && !repoPopup() && Boolean(editor()));
+      await openRepoPicker();
+      tab(focusables()[0], true); await settle(60);
+      check("Shift+Tab off the dropdown's first control closes it too", !repoPopup() && Boolean(editor()));
+      await openRepoPicker();
+    }
     // A popover inside `.sheet-body` would be clipped by the scroller it is
     // trying to escape, so it is portaled — and then clamped into the viewport.
     const popupRect = () => repoPopup()?.getBoundingClientRect();
@@ -1411,11 +1440,41 @@ if (params.has("check")) {
     check("due dates round-trip through the task editor",
       tasks.some(task => task.id === "task-2" && task.due_at === dueExpected)
       && dueTrigger().textContent.includes("2026"));
+    {
+      // The calendar opens on the month the task is due in, not the month the
+      // reader last browsed; Escape closes the picker, not the sheet; Clear
+      // removes the date and has nothing to do once there is none.
+      const duePopup = () => document.querySelector('[data-testid="task-due-popup"]');
+      const month = () => duePopup()?.querySelector('[data-testid="task-due-month"]')?.textContent.trim();
+      const september = new Date(2026, 8, 1).toLocaleDateString(undefined, { month: "long", year: "numeric" });
+      dueTrigger().click(); await settle(80);
+      const openedOn = month();
+      duePopup()?.querySelector('[aria-label="Next month"]')?.click(); await settle(30);
+      const browsedTo = month();
+      document.body.dispatchEvent(new PointerEvent("pointerdown", { bubbles: true })); await settle(60);
+      dueTrigger().click(); await settle(80);
+      check("the due calendar opens on the due month, and forgets the browsing once closed",
+        openedOn === september && browsedTo !== september && month() === september);
+      duePopup()?.querySelector('[data-testid="task-due-phrase"]')?.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true }));
+      await settle(60);
+      check("Escape in the due picker closes it and leaves the sheet open", !duePopup() && Boolean(editor()));
+      dueTrigger().click(); await settle(80);
+      duePopup()?.querySelector('[data-testid="task-due-clear"]')?.click(); await settle(60);
+      const clearAfter = duePopup()?.querySelector('[data-testid="task-due-clear"]');
+      document.body.dispatchEvent(new PointerEvent("pointerdown", { bubbles: true })); await settle(60);
+      await click("Save task"); await settle(100);
+      check("Clear removes the due date, saves as none, and has nothing to clear after",
+        dueTrigger().textContent.includes("No due date") && tasks.find(task => task.id === "task-2")?.due_at === null
+        && (!clearAfter || clearAfter.disabled));
+    }
     editor().querySelector('[data-sheet-tab="agent"]').click(); await settle();
     await change(field("Owner"),"ada"); await click("Save task"); await settle(100);
     check("saving keeps the reader on the pane they were editing", editor().querySelector('[data-sheet-tab="agent"]').getAttribute("aria-selected")==="true");
     editor().querySelector('[data-sheet-tab="task"]').click(); await settle();
     await change(field("Description"),"Unsaved context");
+    check("a saved task's assist offers to improve it rather than compose a new one",
+      editor().querySelector(".assist-title")?.textContent.trim() === "Improve this task"
+      && editor().querySelector(".assist-hint")?.textContent.trim() === "Ask for a better title and description, or paste notes to rewrite them.");
     check("unsaved edits stay local until Manvi prepare saves", editor().querySelector("header small").textContent==="Unsaved" && Boolean(enhanceButton()) && !enhanceButton().matches(":disabled"));
     confirmAnswer=true; await click("Close task details");
     await click("New task");
@@ -1426,6 +1485,10 @@ if (params.has("check")) {
     // verb and the request's kind that `draftingKind`/`draftingVerb` were
     // extracted to end, so it was asserting the bug rather than the fix.
     check("new tasks start with one idea field and the current repository", Boolean(idea) && idea.getClientRects().length>0 && Boolean(button("Draft with Manvi")) && !editor().querySelector('.sheet-tabs'));
+    // The assist speaks compose copy only when the sheet says this is a new task.
+    check("a new task's assist asks what is needed and says notes become fields to accept",
+      editor().querySelector(".assist-title")?.textContent.trim() === "What do you need?"
+      && editor().querySelector(".assist-hint")?.textContent.trim() === "Notes become a title and description you accept below.");
     check("a new task does not fold its notes",
       !assistToggle() && assistBody() && !assistBody().hidden
       && (idea.compareDocumentPosition(field("Title")) & Node.DOCUMENT_POSITION_FOLLOWING) !== 0);
@@ -1702,6 +1765,16 @@ if (params.has("check")) {
     const expected = archivedCount();
     check("the board badges the server's archived total, not a page of it",
       expected > 30 && archiveToggle()?.textContent.trim() === String(expected));
+    // The dock has its own search, so the board's must not narrow the badge:
+    // a filtered board advertising fewer archived tasks misreports the archive.
+    {
+      const boardSearch = root.querySelector('[aria-label="Search tasks"]');
+      await change(boardSearch, "Ready task 01"); await settle(400);
+      const narrowed = archiveToggle()?.textContent.trim();
+      await change(boardSearch, ""); await settle(400);
+      check("the archive badge counts the scope's archive whatever the board search",
+        narrowed === String(expected) && archiveToggle()?.textContent.trim() === String(expected));
+    }
     // dc-store schema 11: Done and archived are separate. Archived Done work
     // is off the board, and the Done column holds only what is not archived.
     check("archived work is not drawn in the Done column",
@@ -1725,9 +1798,33 @@ if (params.has("check")) {
     // archive they have only partly seen.
     check("a partly loaded archive says so, with both numbers",
       archiveSummaryText() === `Showing 30 of ${expected} archived tasks. Load more to see the rest.`);
+    // Load more extends the rows, so it scrolls with them: a fixed row outside
+    // the scroller competed with the list for the panel's height.
+    {
+      const more = button("Load more", archive()), list = archive().querySelector(".entries");
+      check("Load more sits inside the row scroller, after the last row",
+        Boolean(more) && list.contains(more) && list.lastElementChild === more
+        && archiveRows().at(-1).compareDocumentPosition(more) === Node.DOCUMENT_POSITION_FOLLOWING);
+    }
     button("Load more", archive()).click(); await settle(200);
     check("Load more grows the page instead of replacing it",
       archiveRows().length === expected && archiveSummaryText() === `${expected} archived tasks.`);
+    check("Load more is gone once the store says there is no next page", !button("Load more", archive()));
+    // "Select all" over a paged list would claim rows the dock has not loaded;
+    // the head says how many it means and selects exactly those.
+    {
+      const head = archive().querySelector(".list-head");
+      const all = head.querySelector('input[type="checkbox"]');
+      all.click(); await settle();
+      const picked = archiveRows().filter(row => row.querySelector('input[type="checkbox"]').checked).length;
+      check("the select-all head names the loaded count and selects exactly those rows",
+        head.textContent.replace(/\s+/g, " ").trim() === `Select the ${expected} loaded`
+        && picked === expected && archive().querySelector(".actions")?.textContent.includes(`${expected} selected`));
+      button("Clear", archive().querySelector(".actions")).click(); await settle();
+      check("Clear empties the archive selection and takes its actions away",
+        !archive().querySelector(".actions") && archiveRows().every(row => !row.querySelector('input[type="checkbox"]').checked)
+        && all.checked === false);
+    }
     // A restore is the board's own update, so it must land in the board's
     // confirm dialog rather than writing straight through.
     archiveRows()[0].querySelector('input[type="checkbox"]').click(); await settle();

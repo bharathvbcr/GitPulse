@@ -20,31 +20,18 @@ describe("CommitComposer", () => {
     expect(body).not.toContain("Commit all");
   });
 
-  it("offers include-unstaged as the quick-commit option", () => {
-    expect(source).toContain("includeUnstaged");
-    expect(source).toContain("repoStore.quickCommit");
-    expect(source).toContain("Commit all");
-    expect(source).toContain("onclick={() => void handleCommit()}");
-  });
-
-  it("keeps staged-only commit as the default path", () => {
+  // Rendered in harness/repo-churn.html: the default commit takes the staged
+  // files only ("Commit (1)"); an empty message cannot commit; Cmd/Ctrl+Enter
+  // commits the staged files without amending; Shift adds the unstaged files
+  // as a quick commit; Include unstaged names "Commit all" and counts both;
+  // a conflict disables Commit and the chord sends nothing.
+  it("passes the amend choice through the staged-only commit", () => {
+    // The fixture never amends.
     expect(source).toContain("repoStore.commit(message, isAmending)");
-    expect(source).toContain("Amend");
   });
-
-  it("routes Cmd/Ctrl+Enter through the composer and Shift to include unstaged", () => {
-    expect(source).toContain("onMessageKeydown");
+  it("leaves an IME composition's Enter to the composition", () => {
     expect(source).toContain("isImeComposition");
-    expect(source).toContain('event.key !== "Enter"');
-    expect(source).toContain("event.shiftKey");
-    expect(source).toContain("handleCommit(true)");
-    expect(source).toContain("forceQuick");
   });
-
-  it("disables commit when conflicts are present", () => {
-    expect(source).toContain("conflictedCount > 0");
-  });
-
   it("previews staged edits via the shared codeintel preview store", () => {
     expect(source).toContain("previewStore.refresh");
     expect(source).toContain("What this commit breaks");

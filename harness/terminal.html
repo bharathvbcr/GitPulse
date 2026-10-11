@@ -28,6 +28,8 @@
       const detachedIds = new Set();
       /** `startDir` of every `cmd_terminal_spawn`, in order. */
       const startDirs = [];
+      /** Every `cmd_terminal_run` the Console sent, and the replies it gets, in order. */
+      const consoleRuns = [], consoleReplies = [];
       /** Every URL handed to the OS opener, so a refused scheme is provably
        * refused rather than merely unobserved. */
       const opened = [];
@@ -50,6 +52,7 @@
         switch (cmd) {
           case "cmd_resolve_repo": return { path: args.repoPath, name: args.repoPath.split("/").pop(), is_bare: false };
           case "plugin:opener|open_url": opened.push(args.url ?? args.path); return null;
+          case "cmd_terminal_run": consoleRuns.push(args); return consoleReplies.shift() ?? { exit_code: 0, timed_out: false, stdout_tail: "", stderr_tail: "", truncated: false, truncation_reason: null, policy: null };
           case "cmd_terminal_spawn": {
             const id = `fixture-${++report.spawned}`;
             sessions.set(id, args.repoPath);
@@ -342,12 +345,55 @@
           const height = dock.getBoundingClientRect().height;
           button("Expand terminal").click(); await wait(); check("expand grows the dock", () => dock.getBoundingClientRect().height > height);
           button("Restore terminal size").click(); await wait(); check("restore returns previous height", () => dock.getBoundingClientRect().height === height);
+          {
+            // The resize handle is a WAI-ARIA separator: it reports its value,
+            // and the arrow keys nudge the dock without a pointer.
+            const handle = visible('[role="separator"][aria-label="Resize the terminal dock"]')[0];
+            const valueBefore = Number(handle?.getAttribute("aria-valuenow"));
+            if (handle) await press(handle, "ArrowUp");
+            const grown = dock.getBoundingClientRect().height, valueUp = Number(handle?.getAttribute("aria-valuenow"));
+            if (handle) await press(handle, "ArrowDown");
+            check("the dock's resize separator grows on ArrowUp and shrinks back on ArrowDown, reporting its value",
+              () => Boolean(handle) && grown > height && valueUp > valueBefore
+                && Math.abs(dock.getBoundingClientRect().height - height) < 1 && Number(handle.getAttribute("aria-valuenow")) === valueBefore);
+          }
           button("Toggle narrow layout").click(); await wait();
           check("narrow toolbar stays inside its panel", () => label("Terminal").scrollWidth === label("Terminal").clientWidth);
           button("Toggle theme").click(); await wait(); check("theme switch preserves sessions", () => report.spawned === beforeHide + 1);
           check("terminal palette follows the completed theme transition", () => getComputedStyle(visible(".xterm-scrollable-element")[0]).backgroundColor === getComputedStyle(visible("[data-terminal-session]")[0]).backgroundColor);
           button("Console").click(); await wait();
           check("the console command field has an accessible name", () => !!label("Console command"));
+          {
+            // Console has no tabs: a tab chord there belongs to the command
+            // field, so it must open nothing and must not be swallowed.
+            const spawnedBefore = report.spawned;
+            const field = label("Console command");
+            field.focus();
+            const chord = new KeyboardEvent("keydown", { key: "T", ctrlKey: true, shiftKey: true, bubbles: true, cancelable: true });
+            field.dispatchEvent(chord); await wait();
+            check("a tab chord in the Console opens nothing and is left to the command field",
+              () => report.spawned === spawnedBefore && !chord.defaultPrevented);
+            const run = async (text) => {
+              field.value = text; field.dispatchEvent(new Event("input", { bubbles: true })); await wait();
+              await press(field, "Enter"); await wait(); await wait();
+            };
+            const consoleText = () => visible("[data-terminal-dock]")[0]?.textContent ?? document.body.textContent;
+            await run('echo "unterminated');
+            check("a command that does not tokenize is refused before anything runs", () => consoleRuns.length === 0);
+            consoleReplies.push({ exit_code: 0, timed_out: false, stdout_tail: "On branch main", stderr_tail: "", truncated: true, truncation_reason: null, policy: null });
+            await run("git status --short");
+            check("a Console command runs once, tokenized, against this repository",
+              () => consoleRuns.length === 1 && JSON.stringify(consoleRuns[0].args) === JSON.stringify(["git", "status", "--short"])
+                && typeof consoleRuns[0].repoPath === "string" && consoleRuns[0].repoPath.startsWith("/fixture/") && consoleRuns[0].timeoutSecs === 600);
+            check("an incomplete output says so even when the backend gave no reason",
+              () => consoleText().includes("On branch main") && consoleText().includes("[Output is incomplete: reason unavailable]"));
+            consoleReplies.push({ exit_code: 2, timed_out: false, stdout_tail: "", stderr_tail: "partial", truncated: true, truncation_reason: "the stream was not read to the end", policy: null });
+            await run("git log");
+            check("an incomplete output carries the backend's reason, never an invented cap",
+              () => consoleText().includes("[Output is incomplete: the stream was not read to the end]") && !consoleText().includes("exceeded cap") && consoleText().includes("exit 2"));
+            button("Clear")?.click(); await wait();
+            check("Clear empties the Console's output", () => !consoleText().includes("On branch main") && !consoleText().includes("the stream was not read"));
+          }
           button("Shell").click(); await wait(); check("Console switch preserves sessions", () => report.spawned === beforeHide + 1 && report.killed === 0);
           for (let i = 0; i < 20; i++) button("Increase terminal text size")?.click();
           await wait(); check("font size is bounded", () => button("Reset terminal text size").textContent === "24px" && button("Increase terminal text size").disabled);

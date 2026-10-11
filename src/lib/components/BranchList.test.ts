@@ -38,58 +38,15 @@ describe("BranchList", () => {
   });
 });
 
-describe("BranchList tag rows", () => {
-  it("shows how far a tag is ahead of the base, but only when it was compared", () => {
-    // A tag holding unmerged work is on no branch, so this chip is the only
-    // place the sidebar can say so. Both halves of the guard matter: without
-    // `compared_to` the counts are zeros meaning "not asked", and a release
-    // tag sitting on the base has nothing to report.
-    expect(source).toContain(
-      "{#if row.tag.compared_to && row.tag.commits_ahead_of_base > 0}",
-    );
-    expect(source).toContain(
-      'title="{row.tag.commits_ahead_of_base} commits not in {row.tag.compared_to}"',
-    );
-  });
-});
-
-describe("BranchList delete escalation", () => {
-  it("attempts the safe non-forced delete first", () => {
-    const safeIdx = source.indexOf("repoStore.deleteBranch(branch.name, false)");
-    expect(safeIdx).toBeGreaterThan(-1);
-    const forceIdx = source.indexOf("repoStore.deleteBranch(branch.name, true)");
-    expect(forceIdx).toBeGreaterThan(safeIdx);
-  });
-
-  it("escalates to force only through an explicit confirm fed by the decision helper", () => {
-    const decisionIdx = source.indexOf("escalateDeleteDecision(outcome.error ?? \"\", branch)");
-    expect(decisionIdx).toBeGreaterThan(-1);
-    const confirmIdx = source.indexOf('title: "Force-delete branch"');
-    expect(confirmIdx).toBeGreaterThan(decisionIdx);
-    // The retry is gated on both a positive decision and an explicit confirm.
-    expect(source).toContain("!decision.canRetryForce || !decision.message");
-    expect(source.indexOf("if (!forceOk) return;")).toBeGreaterThan(confirmIdx);
-  });
-
-  it("no longer deletes with a bare unconditional force", () => {
-    // The only `force=true` call sits after the escalation confirm block.
-    const confirmIdx = source.indexOf('title: "Force-delete branch"');
-    const forceIdx = source.indexOf("repoStore.deleteBranch(branch.name, true)");
-    expect(forceIdx).toBeGreaterThan(confirmIdx);
-    expect(source.indexOf("if (!ok) return;")).toBeLessThan(
-      source.indexOf("repoStore.deleteBranch(branch.name, false)")
-    );
-  });
-});
-
+/**
+ * Rendered in harness/branches.html ("delete, tags and create"): delete asks
+ * first and declining writes nothing; a confirmed delete is the safe one;
+ * git's unmerged refusal opens a separate force prompt naming the commits
+ * lost, and declining it never forces; a refusal force cannot fix offers no
+ * force prompt; a failed create keeps the form and the typed name; the
+ * upstream arrows and base counter titles say what they count.
+ */
 describe("BranchList create-form safety", () => {
-  it("keeps the typed name when creation fails (F14)", () => {
-    const outcomeCheck = source.indexOf("if (!outcome.ok) return;");
-    const clear = source.indexOf("createName = \"\";", source.indexOf("async function submitCreate"));
-    expect(outcomeCheck).toBeGreaterThan(-1);
-    expect(clear).toBeGreaterThan(outcomeCheck);
-  });
-
   it("bails out of suggestName when the repo changed mid-flight (race)", () => {
     const fn = source.slice(source.indexOf("async function suggestName"), source.indexOf("function openBranchMenu"));
     expect(fn).toContain("const repo = $repoStore.currentPath");
@@ -98,27 +55,12 @@ describe("BranchList create-form safety", () => {
 });
 
 describe("BranchList tags", () => {
-  it("says when the tag list failed or was capped, instead of looking complete", () => {
-    expect(source).toContain("$repoStore.tagsFailed");
-    expect(source).toContain("$repoStore.tagsTruncated");
-    expect(source).toContain("The tag list could not be read, so this may not be complete.");
-    expect(source).toContain("Older tags exist and are not listed.");
-  });
-
-  it("creates and deletes tags through the store, not a missing UI", () => {
+  // Rendered in harness/branches.html: the failed and capped tag-list notes,
+  // the ahead chip shown only for a compared tag, and the delete prompt
+  // answered no (nothing deleted) and yes (exactly that tag deleted).
+  it("offers tag creation from the sidebar", () => {
     expect(source).toContain("repoStore.createTag");
-    expect(source).toContain("repoStore.deleteTag");
     expect(source).toContain('aria-label="Create tag"');
-    expect(source).toContain("Checkout");
-    expect(source).toContain("Delete…");
-  });
-
-  it("confirms tag deletion before invoking it", () => {
-    const confirmIdx = source.indexOf('title: "Delete tag"');
-    const deleteIdx = source.indexOf("repoStore.deleteTag(tag.name)");
-    expect(confirmIdx).toBeGreaterThan(-1);
-    expect(deleteIdx).toBeGreaterThan(confirmIdx);
-    expect(source).toContain("if (!ok) return;");
   });
 });
 
@@ -435,26 +377,6 @@ describe("BranchList chip strip scrollbar", () => {
     expect(source).toContain("chip-strip");
     expect(source).toContain("scrollbar-width: none");
     expect(source).toContain("::-webkit-scrollbar");
-  });
-});
-
-describe("BranchList at-a-glance tooltips", () => {
-  it("explains the commits-ahead-of-base counter", () => {
-    expect(source).toContain(
-      "title=\"{branch.commits_ahead_of_base} commits ahead of {branch.compared_to || 'base'}"
-    );
-  });
-
-  it("also reports how far behind the base the branch is, which no chip shows", () => {
-    // commits_behind_base rode on BranchInfo unread. A branch 2 ahead and 90
-    // behind reads identically to one 2 ahead and current without it.
-    expect(source).toContain("branch.commits_behind_base > 0");
-    expect(source).toContain("${branch.commits_behind_base} behind");
-  });
-
-  it("gives upstream arrows descriptive titles", () => {
-    expect(source).toContain('"{branch.ahead_count} ahead of upstream"');
-    expect(source).toContain('"{branch.behind_count} behind upstream"');
   });
 });
 

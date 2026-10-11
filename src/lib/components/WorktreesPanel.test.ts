@@ -115,21 +115,13 @@ describe("WorktreesPanel controls say what they do", () => {
 });
 
 describe("WorktreesPanel removal safety", () => {
-  it("force-removes only a scanned dirty worktree after confirm, never an unscanned one", () => {
-    // dirty_files === null means the scan did not run. Coercing that to 0
-    // and passing --force is how an agent farm past the scan cap lost work.
-    expect(source).toContain(
-      "const force = typeof wt.dirty_files === \"number\" && wt.dirty_files > 0;",
-    );
-    expect(source).not.toContain("const force = (wt.dirty_files ?? 0) === 0;");
-    expect(source).not.toMatch(/cmd_remove_worktree[\s\S]{0,120}?force:\s*true/);
-    expect(source).toMatch(/cmd_remove_worktree[\s\S]{0,120}?force\s*\}/);
-  });
-
-  it("names the discard cost in the armed confirm when files would be lost", () => {
-    expect(source).toContain("`Discard ${wt.dirty_files} changed files? Click again to remove`");
-    expect(source).toContain("`Discard ${wt.dirty_files} changed files?`");
-    expect(source).toContain("Not scanned for changes");
+  // Rendered in harness/branches.html: arming removes nothing; the second
+  // click force-removes a scanned dirty worktree after the armed label named
+  // "Discard 12 changed files?"; an unscanned one (dirty_files null) says
+  // "Not scanned for changes" and is removed without force.
+  it("arms a clean worktree's remove without naming a cost it does not have", () => {
+    // The fixture has no clean linked worktree; the third branch of the label.
+    expect(source).toContain(': "Click again to remove";');
   });
 
   it("closes the stranded tab instead of leaving it on the removed directory (T-F09)", () => {
@@ -275,18 +267,11 @@ describe("WorktreesPanel GitPulse task worktrees", () => {
   });
 });
 
-describe("WorktreesPanel repository hooks consent", () => {
-  it("keeps hooks off by default, apart from build-cache sharing, and sends the choice", () => {
-    expect(source).toContain("let runHooks = $state(false);");
-    expect(source).toContain("Run repository hooks");
-    expect(source).toContain("Share build caches");
-    const body = source.slice(source.indexOf("async function create"), source.indexOf("function removeArmTitle"));
-    expect(body.slice(body.indexOf('("cmd_add_worktree"'))).toMatch(/cowCaches,\s*runHooks,/);
-  });
-
-  it("approves exactly the text it showed", () => {
-    const body = source.slice(source.indexOf("async function approveHooks"), source.indexOf("let prevRepoPath"));
-    expect(body).toContain('"cmd_approve_worktree_hooks"');
-    expect(body).toContain("content: shown.content");
-  });
-});
+/**
+ * Repository hooks consent is rendered in harness/branches.html: a new
+ * worktree starts with hooks off and cache sharing on and sends that choice;
+ * asking for hooks shows the file's exact text and says nothing runs until it
+ * is approved; approving after the file changed on disk sends the text that
+ * was shown, not the newer file, and leaves it unapproved; approving the text
+ * on screen marks it approved; creating then sends runHooks.
+ */

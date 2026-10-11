@@ -10,43 +10,25 @@ describe("TaskRepositoryPicker", () => {
     expect(warnings.filter((w) => w.code !== "css-unused-selector")).toEqual([]);
   });
 
-  it("links and picks the primary in one control instead of two that can disagree", () => {
-    // Moved here verbatim from the sheet's contract when the rows moved into
-    // this component. A checkbox says whether the task links a repository; a
-    // radio in one group says which of the linked ones is primary. Two
-    // separate controls could report different answers.
-    expect(source).toContain('name="task-primary-{name}"');
-    expect(source).toContain("onPrimary(row.id)");
-    expect(source).toContain('aria-label="Make {row.name} the primary repository"');
-    expect(source).toContain("onToggle(row.id, e.currentTarget.checked)");
-    // The sheet's negative, restated where a second, disagreeing control would
-    // most plausibly reappear. The primary is reported through `onPrimary`, so
-    // this component binds nothing to the draft; `filter` is its own view state.
+  // Rendered in harness/tasksChecks.js: "linking and the primary choice are
+  // one control", "the closed trigger names each linked repository and stars
+  // the primary", "Escape in the repository dropdown closes the dropdown, not
+  // the task", "Tab within the repository dropdown keeps it open...",
+  // "Shift+Tab off the dropdown's first control closes it too", "the
+  // repository dropdown escapes the sheet's own clip", "scrolling the sheet
+  // dismisses the repository dropdown", "the picker marks which repositories
+  // the home workspace already holds", "the sheet opens with nothing linked
+  // and refuses to save until one is", "linking updates the trigger without
+  // closing the dropdown". What stays below is what the two-repository
+  // fixture cannot reach, or a structural rule a render cannot see.
+  it("binds nothing to the draft, so a second control cannot disagree with the radio", () => {
     expect(source).not.toContain("primary_repository_id");
     expect([...source.matchAll(/bind:\w+/g)].map((m) => m[0])).toEqual(["bind:this", "bind:this", "bind:value"]);
   });
-
-  it("keeps the answer on the closed trigger", () => {
-    // A dropdown is only an improvement if collapsing it costs no information.
-    // The trigger now names the repositories rather than counting them, so the
-    // guard is that both halves of the answer survive being closed: a chip per
-    // link, and the primary marked among them.
-    expect(source).toMatch(/class="gp-btn repo-trigger"[\s\S]*?\{#each chips as chip \(chip\.id\)\}/);
-    expect(source).toContain("class:is-primary={chip.primary}");
-    expect(source).toContain("{#if chip.primary}<Star");
-    // A collapsed remainder is still counted, never silently dropped.
+  it("counts a collapsed remainder of chips rather than dropping it", () => {
+    // The fixture links two repositories, never enough to collapse any.
     expect(source).toContain("{#if overflow > 0}<span class=\"repo-more\">+{overflow}</span>{/if}");
-    // `summaryLine` stays the single owner of the sentence, and stays on
-    // screen — chips cannot say "no primary chosen".
-    expect(source).toContain("const label = $derived(summaryLine(summary))");
-    expect(source).toMatch(/repo-summary-line"[^>]*>\{label\}/);
-    // With nothing linked the trigger carries the refusal itself, because that
-    // is the one state that stops the task saving.
-    expect(source).toMatch(/\{#if summary\.linked === 0\}<span class="repo-trigger-label">\{label\}<\/span>\{\/if\}/);
-    expect(source).toContain('aria-expanded={open}');
-    expect(source).toContain('aria-haspopup="dialog"');
   });
-
   it("uses native checkboxes and radios rather than rebuilding a listbox", () => {
     // Same reasoning as `gp-select` in app.css: keep the platform widget and
     // replace only its painting. A listbox option also cannot carry a second,
@@ -70,50 +52,14 @@ describe("TaskRepositoryPicker", () => {
     expect(source).toMatch(/\.repo-list\{[^}]*max-height/);
   });
 
-  it("escapes the sheet's scroller instead of being clipped by it", () => {
-    // `.sheet-body` is `overflow:auto` and carries `container-type`, which
-    // makes it a containing block for fixed descendants. Either one alone
-    // would clip an in-place popover.
-    expect(source).toContain('use:portal={"body"}');
-    // Placement comes from the shared popover owner, applied after the portal
-    // so it measures the popup where it actually paints.
-    expect(source).toMatch(/use:portal=\{"body"\}\s*\n\s*use:popover=\{dismissal\}/);
-    expect(source).toContain("element: triggerEl");
-    expect(source).toContain("LAYERS.MENU");
-  });
-
-  it("dismisses for every reason the anchor stops being where it was", () => {
-    expect(source).toContain('inside: "[data-task-repo-picker], [data-task-repo-popup]"');
-    // Scroll does not bubble, so only a capture listener on window sees the
-    // sheet's own scroller move the trigger out from under the popup — and a
-    // scroll inside the popup must not dismiss. Both are the owner's job now,
-    // and popover.test.ts holds it to them; this is the opt-in.
-    expect(source).toContain("scroll: true");
-    expect(source).toContain("resize: true");
-    // A popover left open over a saving sheet is a panel of dead checkboxes.
+  it("closes over a saving sheet rather than leaving dead checkboxes open", () => {
     expect(source).toMatch(/if \(disabled && open\) close\(\)/);
+    expect(source).toContain("resize: true");
   });
-
-  it("closes itself on Escape without closing the task behind it", () => {
-    // The sheet also closes on Escape. `capture` is the owner's spelling for
-    // "listen on the capture phase and stop propagation", so one Escape
-    // dismisses one thing.
-    expect(source).toContain('escape: "capture"');
+  it("hands focus back only on Escape, never on a pointer dismissal", () => {
     expect(source).toContain('close({ restoreFocus: reason === "escape" })');
-    // Only Escape hands focus back; a pointer dismissal leaves the reader
-    // wherever they clicked.
     expect(source).not.toContain("close({ restoreFocus: true })");
   });
-
-  it("closes when Tab leaves the popup, and owns that itself", () => {
-    // The only surface with an *edge* check — the other menus that close on
-    // Tab close on any Tab — so it stays here rather than becoming a
-    // one-caller option on the shared owner, which does not reach into focus.
-    expect(source).toMatch(/addEventListener\("keydown", onKey, true\)/);
-    expect(source).toMatch(/event\.key !== "Tab"/);
-    expect(source).toContain("document.activeElement === edge");
-  });
-
   it("never renders an unread workspace membership as an empty one", () => {
     // `workspace` is null for "no home workspace". Membership is no longer a
     // per-row mark — it is the "In this workspace" group, and `groupRows` only
