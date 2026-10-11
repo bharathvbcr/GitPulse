@@ -11,6 +11,22 @@ before that tag is pushed.
 
 ## [Unreleased]
 
+### Fixed
+
+- Backend calls can now be bounded: `invoke` takes a deadline and an abort
+  signal, a timeout is a distinct `DeadlineError`, and the GitHub context, runs
+  and workflows reads time out with a message instead of a spinner that never
+  ends. The five separate timeout helpers are replaced by one. A switched-away
+  repository's Overview load no longer holds up the new one.
+- A failed read no longer looks like an empty or successful one: issue import
+  refuses while the task list is unread, a failed diff shows its own error with
+  a retry (and no longer disables Review changes or keeps the previous file's
+  diff), quick commit picks end on the last pick, Launch at login shows
+  "unknown" instead of Off, branch stats no longer revert a newer branch list,
+  an unreadable checkout-holder list forces a worktree, sticky error toasts
+  outlive other toasts, a failed notification read can be dismissed, and a typed
+  answer withdraws the session alert.
+
 ### Added
 
 - An agent's `done` that is held in review for lack of a passing verification

@@ -49,6 +49,7 @@
   } from "../ui/settingsSections";
   import { matchSettings, unsupportedSettingIds } from "../ui/settingsCatalog";
   import { hostPlatform } from "../stores/platformStore";
+  import { readLaunchAtLogin, writeLaunchAtLogin, type LaunchAtLogin } from "../desktop/launchAtLogin";
   import { launchAtLoginMechanism, shortcutTextLabel, statusIconLocationName, statusIconSettingLabel } from "../ui/platformCopy";
   import { appleIntelligenceStatus, appleReady, type AppleIntelligenceStatus } from "../ai/appleIntelligence";
   import { VIEW_NAV } from "../views/viewNav";
@@ -91,7 +92,7 @@
 
   let activeSection = $state<SettingsSectionId>("appearance");
   let themePreference = $state<ThemePreference>(themeStore.preference());
-  let launchAtLogin = $state(false);
+  let launchAtLogin = $state<LaunchAtLogin>({ state: "unknown", error: "still reading" });
 
   /**
    * Settings is the only entry point to the tour, so it has to get out of the
@@ -104,24 +105,11 @@
   }
 
   async function refreshLaunchAtLogin() {
-    try {
-      const { isEnabled } = await import("@tauri-apps/plugin-autostart");
-      launchAtLogin = await isEnabled();
-    } catch {
-      launchAtLogin = false;
-    }
+    launchAtLogin = await readLaunchAtLogin();
   }
 
   async function setLaunchAtLogin(next: boolean) {
-    try {
-      const { enable, disable, isEnabled } = await import("@tauri-apps/plugin-autostart");
-      if (next) await enable();
-      else await disable();
-      launchAtLogin = await isEnabled();
-    } catch (error) {
-      launchAtLogin = false;
-      console.warn("Launch at login unavailable:", error);
-    }
+    launchAtLogin = await writeLaunchAtLogin(next);
   }
 
   $effect(() => {
@@ -819,9 +807,13 @@
                         label="Launch at login"
                         description={`Start GitPulse when you sign in. Uses ${launchAtLoginMechanism($hostPlatform.os)}; the operating system is the source of truth.`}
                         ariaLabel="Launch GitPulse at login"
-                        checked={launchAtLogin}
+                        checked={launchAtLogin.state === "on"}
+                        disabled={launchAtLogin.state === "unknown"}
                         onchange={(next) => void setLaunchAtLogin(next)}
                       />
+                      {#if launchAtLogin.state === "unknown"}
+                        <p class="mt-1 text-[10px] text-amber-500" role="status">Launch at login is unknown: it could not be read ({launchAtLogin.error}).</p>
+                      {/if}
                     </div>
                   </div>
                   <div data-setting="status-bar" hidden={!shown("status-bar")}>

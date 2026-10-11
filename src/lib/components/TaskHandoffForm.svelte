@@ -42,7 +42,7 @@
     PROVIDER_LABELS,
     checkoutCandidates,
     defaultHandoff,
-    attemptHolding,
+    checkoutHolder,
     handoffGate,
     holdPendingPreparation,
     launchModelOverride,
@@ -161,6 +161,8 @@
    * busy checkout is still caught by the store's own refusal below.
    */
   let holding = $state<TaskRun[] | null>(null);
+  /** Why the holding list is null, when its read failed. */
+  let holdingError = $state<string | null>(null);
   let holdingTicket = 0;
   /**
    * The chosen checkout's Git directory — the key the store refuses a busy
@@ -184,17 +186,24 @@
     }, CHECKOUT_IDENTITY_SETTLE_MS);
     return () => clearTimeout(timer);
   });
-  const occupant = $derived(holding ? attemptHolding(holding, { path: checkout, git_dir: targetGitDir }, pathOpts) : null);
-  /** A checkout that already has an agent can only take this one in a worktree. */
-  const useWorktree = $derived(provisionWorktree || occupant !== null);
+  const holder = $derived(checkoutHolder(holding, holdingError, { path: checkout, git_dir: targetGitDir }, pathOpts));
+  const occupant = $derived(holder.kind === "held" ? holder.run : null);
+  /**
+   * A checkout that already has an agent can only take this one in a
+   * worktree, and so can one whose holders could not be read: unknown is
+   * treated as held, never as free.
+   */
+  const useWorktree = $derived(provisionWorktree || holder.kind !== "free");
 
   async function loadHolding(repository: string) {
     const ticket = ++holdingTicket;
+    holding = null;
+    holdingError = null;
     try {
       const runs = await listHoldingRuns(repository);
       if (!disposed && ticket === holdingTicket) holding = runs;
-    } catch {
-      if (!disposed && ticket === holdingTicket) holding = null;
+    } catch (error) {
+      if (!disposed && ticket === holdingTicket) { holding = null; holdingError = explainError(error); }
     }
   }
   $effect(() => { const repository = selected; untrack(() => { void loadHolding(repository); }); });
@@ -466,13 +475,15 @@
     <input
       type="checkbox"
       checked={useWorktree}
-      disabled={locked || occupant !== null}
+      disabled={locked || holder.kind !== "free"}
       onchange={(e) => { provisionWorktree = e.currentTarget.checked; }}
     />
     Run in a new worktree, so other tasks can run at the same time
   </label>
   {#if occupant}
     <p class="meta" data-testid="checkout-occupied">An agent is already working in this checkout ({occupant.task_title || "another task"}, {occupant.state}). This attempt gets its own worktree and branch beside it.</p>
+  {:else if holder.kind === "unknown"}
+    <p class="meta" role="status" data-testid="checkout-holder-unknown">Cannot tell whether an agent already works in this checkout ({holder.reason}), so this attempt runs in its own worktree. Launching in the checkout itself is disabled until that is known.</p>
   {:else if useWorktree}
     <p class="meta">GitPulse creates <code>.gitpulse/worktrees/…</code> on a new <code>gitpulse/…</code> branch from this checkout, keeps it out of <code>git status</code>, and removes it again if the attempt is refused.</p>
   {/if}

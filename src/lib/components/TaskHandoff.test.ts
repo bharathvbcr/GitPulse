@@ -61,7 +61,7 @@ describe("the agent handoff has one implementation", () => {
       expect(host, name).not.toContain("setTerminalOpen(");
     }
     // A checkout another agent holds forces the worktree, visibly.
-    expect(form).toContain("const useWorktree = $derived(provisionWorktree || occupant !== null)");
+    expect(form).toContain('const useWorktree = $derived(provisionWorktree || holder.kind !== "free")');
     expect(form).toContain('cause.code === "checkout_busy"');
   });
 
@@ -136,7 +136,7 @@ describe("the agent handoff has one implementation", () => {
   it("asks whether a checkout is taken by its Git directory, without ever waiting on the answer", () => {
     // The store refuses by `git_dir`; an agent in a subfolder of the chosen
     // checkout was invisible to a comparison of directories.
-    expect(form).toContain("attemptHolding(holding, { path: checkout, git_dir: targetGitDir }, pathOpts)");
+    expect(form).toContain("checkoutHolder(holding, holdingError, { path: checkout, git_dir: targetGitDir }, pathOpts)");
     const ask = form.slice(form.indexOf("let identityTicket"), form.indexOf("let identityTicket") + 900);
     // Debounced, bounded, ticketed, and a failure is only "unknown".
     expect(ask).toContain("setTimeout(");
