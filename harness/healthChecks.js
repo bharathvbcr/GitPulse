@@ -157,6 +157,15 @@ export async function runHealthChecks(ctx) {
     terminalLaunchRequests.take(REPO).complete(); await wait();
     button("Copy health agent prompt").click(); await wait();
     check("Copy prompt copies the prompt for this repository", () => copied.at(-1).includes(REPO));
+    await until(() => !!button("Copy health agent prompt"));
+    const execBefore = document.execCommand;
+    setClipboard(async () => { throw new Error("fixture denied"); });
+    document.execCommand = () => false;
+    button("Copy health agent prompt").click(); await wait();
+    check("a refused prompt copy says so and opens the preview to copy from", () =>
+      has(agentBar(), "Could not copy. Open Preview prompt and copy it from there.") && !!agentBar().querySelector('button[aria-expanded="true"]'));
+    document.execCommand = execBefore;
+    setClipboard(async text => { copied.push(text); });
 
     // ---- Local scans stay local; GitHub checks are the only credentialed path ---
     let mark = ipcLog.length;
