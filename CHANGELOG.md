@@ -11,6 +11,10 @@ before that tag is pushed.
 
 ## [Unreleased]
 
+### Fixed
+
+- `gitpulse-mcp` `devmap_neighbors` no longer fails every call with "data must be object": it answers the `CodeintelResponse` envelope (`source_freshness`, `available`/`reason`, `total`/`shown`/`truncated`, `walk_incomplete`) under a typed `outputSchema`, honours its advertised `depth` and `min_confidence` (it silently walked to depth 10 with confidence 0), and `devmap_trace` now declares the `min_rung` it reads. The output-schema contract test now runs and validates every DevMap tool instead of skipping the exempt ones.
+
 ### Changed
 
 - Re-vendored DevCouncil at `8229de20` (wave 6): the `devmap-*`, `dc-store`, `dc-redact`, `dc-glob` and `dc-proc` crates, and the shared contracts (`lease.schema.md`, `verdict.schema.json`, `CHECKSUMS`). `devmap-query` now links `dc-glob` (already vendored; `Cargo.lock` gains the edge); `dc-evidence` and `dc-sparse-encode` (and its git-pinned `tessl`) are not part of GitPulse's closure. A map built by the new devmap is store schema 27, and the devmap-store now refuses any store that carries a trigger.

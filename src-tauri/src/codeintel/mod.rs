@@ -949,15 +949,40 @@ pub struct CodeintelNeighbors {
     pub callees: CodeintelResponse<CodeintelEdge>,
 }
 
+/// Deepest walk the MCP surface advertises for `depth`.
+pub const MAX_WALK_DEPTH: usize = 64;
+
+/// Walk depth used when the caller names none (the engine's long-standing cap).
+const DEFAULT_WALK_DEPTH: usize = 10;
+
 /// Callers and callees for one or more targets (chunked at [`MAX_NEIGHBOR_TARGETS`]).
+///
+/// `min_confidence` (default 0.0, in `[0, 1]`) and `max_depth` (default 10, in
+/// `1..=`[`MAX_WALK_DEPTH`]) bound the walk; a value outside its range is
+/// refused rather than clamped, so a caller never reads a wider answer as the
+/// narrow one it asked for.
 pub fn neighbors(
     repo_path: &str,
     targets: &[String],
     token_budget: Option<u32>,
     min_rung: Option<&str>,
+    min_confidence: Option<f32>,
+    max_depth: Option<usize>,
 ) -> Result<Vec<CodeintelNeighbors>, String> {
     if targets.is_empty() {
         return Err("neighbors requires at least one target".into());
+    }
+    let min_confidence = min_confidence.unwrap_or(0.0);
+    if !(0.0..=1.0).contains(&min_confidence) {
+        return Err(format!(
+            "min_confidence must be within [0, 1], got {min_confidence}"
+        ));
+    }
+    let max_depth = max_depth.unwrap_or(DEFAULT_WALK_DEPTH);
+    if !(1..=MAX_WALK_DEPTH).contains(&max_depth) {
+        return Err(format!(
+            "depth must be within 1..={MAX_WALK_DEPTH}, got {max_depth}"
+        ));
     }
     let rung = parse_min_rung(min_rung)?;
     let store = open_repo_map(repo_path)?;
@@ -966,7 +991,7 @@ pub fn neighbors(
     let mut out = Vec::new();
     for chunk in targets.chunks(MAX_NEIGHBOR_TARGETS) {
         let report = engine
-            .neighbors_at_rung(chunk, budget, 0.0, 10, rung)
+            .neighbors_at_rung(chunk, budget, min_confidence, max_depth, rung)
             .map_err(|e| format!("neighbors failed: {e}"))?;
         for entry in report {
             out.push(CodeintelNeighbors {
@@ -977,6 +1002,60 @@ pub fn neighbors(
         }
     }
     Ok(out)
+}
+
+/// Wraps [`neighbors`] in the answer envelope every other query carries.
+///
+/// The bare `Vec` is what the app command and the frontend consume, but it
+/// serialises to a JSON array: it cannot satisfy an object `outputSchema` and
+/// has nowhere to say "truncated", "walk stopped at depth" or "freshness not
+/// checked". Each target's own callers/callees keep their envelopes; this one
+/// summarises them — `truncated` and `walk_incomplete` are raised when any
+/// facet raised them, `source_freshness` is the weakest of them, and
+/// `available` is false (with the first reason) when any facet could not
+/// answer, so a refusal never renders as "no callers". A failed walk becomes
+/// an unavailable envelope, as it does for every sibling query.
+pub fn neighbors_envelope(
+    result: Result<Vec<CodeintelNeighbors>, String>,
+) -> CodeintelResponse<CodeintelNeighbors> {
+    let items = match result {
+        Ok(items) => items,
+        Err(reason) => return CodeintelResponse::unavailable(reason),
+    };
+    let reason = items
+        .iter()
+        .flat_map(|entry| [&entry.callers, &entry.callees])
+        .find(|facet| !facet.available)
+        .map(|facet| {
+            facet
+                .reason
+                .clone()
+                .unwrap_or_else(|| "a facet of this answer was unavailable".to_string())
+        });
+    let truncated = items
+        .iter()
+        .any(|entry| entry.callers.truncated || entry.callees.truncated);
+    let walk_incomplete = fold_qualification_reason(
+        items.iter().flat_map(|entry| {
+            [&entry.callers, &entry.callees]
+                .into_iter()
+                .filter_map(|facet| facet.walk_incomplete.clone())
+        }),
+        QUALIFICATION_MAX_CHARS,
+    );
+    let source_freshness = items
+        .iter()
+        .flat_map(|entry| [&entry.callers, &entry.callees])
+        .map(|facet| facet.source_freshness.clone())
+        .reduce(merge_source_freshness)
+        .unwrap_or_else(CodeintelResponse::<CodeintelNeighbors>::unverified_freshness);
+    let count = items.len() as u32;
+    let mut out = CodeintelResponse::ok(items, count, count, truncated);
+    out.available = reason.is_none();
+    out.reason = reason;
+    out.walk_incomplete = walk_incomplete;
+    out.source_freshness = source_freshness;
+    out
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1942,7 +2021,7 @@ pub fn preview(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::procguard::LockedSpawn;
 
@@ -2282,7 +2361,7 @@ mod tests {
     ///     the map.
     ///   * only `src/caller.rs` exists on disk, so one search hit can read its
     ///     source span and the other cannot.
-    fn repo_with_one_generation() -> tempfile::TempDir {
+    pub(crate) fn repo_with_one_generation() -> tempfile::TempDir {
         let dir = git_repo();
         let root = dir.path().to_string_lossy().into_owned();
         std::fs::create_dir_all(dir.path().join("src")).expect("mkdir src");

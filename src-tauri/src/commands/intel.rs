@@ -141,7 +141,14 @@ pub async fn cmd_codeintel_neighbors(
     min_rung: Option<String>,
 ) -> Result<Vec<crate::codeintel::CodeintelNeighbors>, String> {
     off_thread(move || {
-        crate::codeintel::neighbors(&repo_path, &targets, token_budget, min_rung.as_deref())
+        crate::codeintel::neighbors(
+            &repo_path,
+            &targets,
+            token_budget,
+            min_rung.as_deref(),
+            None,
+            None,
+        )
     })
     .await
 }

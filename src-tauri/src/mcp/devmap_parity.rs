@@ -69,6 +69,40 @@ fn targets_prop() -> Value {
     })
 }
 
+/// `devmap_neighbors` answers `CodeintelResponse<CodeintelNeighbors>`: the
+/// envelope an agent reads before treating an empty list as "nothing exists".
+/// `items[].callers` / `.callees` are themselves `CodeintelResponse` envelopes
+/// of edges and are left open here; the envelope fields are the contract.
+fn neighbors_output_schema() -> Value {
+    let facet = json!({ "type": "object" });
+    json!({
+        "type": "object",
+        "properties": {
+            "source_freshness": { "type": "object" },
+            "available": { "type": "boolean" },
+            "reason": { "type": ["string", "null"] },
+            "items": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "target": { "type": "string" },
+                        "callers": facet,
+                        "callees": facet
+                    },
+                    "required": ["target", "callers", "callees"]
+                }
+            },
+            "total": { "type": "integer", "minimum": 0 },
+            "shown": { "type": "integer", "minimum": 0 },
+            "truncated": { "type": "boolean" },
+            "walk_incomplete": { "type": "string" },
+            "rungs": { "type": "object" }
+        },
+        "required": ["source_freshness", "available", "items", "total", "shown", "truncated"]
+    })
+}
+
 /// Tool definitions for the DevMap-parity surface, each requiring `repo_path`.
 pub fn tool_definitions() -> Vec<Value> {
     vec![
@@ -129,7 +163,8 @@ pub fn tool_definitions() -> Vec<Value> {
                 "from": path_prop("Origin symbol or file"),
                 "to": path_prop("Destination symbol or file"),
                 "budget": budget_default(),
-                "depth": depth_prop()
+                "depth": depth_prop(),
+                "min_rung": path_prop("Optional minimum resolution rung")
             }),
             &["repo_path", "from", "to"],
             json!({ "type": "object" }),
@@ -146,7 +181,7 @@ pub fn tool_definitions() -> Vec<Value> {
                 "min_confidence": confidence_prop()
             }),
             &["repo_path", "targets"],
-            json!({ "type": "object" }),
+            neighbors_output_schema(),
         ),
         tool(
             "devmap_dead_symbols",
@@ -271,13 +306,11 @@ pub fn handle(name: &str, arguments: &Value) -> Result<Value, String> {
         }
         "devmap_neighbors" => {
             let targets = string_args(arguments, &["targets"])?;
-            let min_rung = arguments["min_rung"].as_str().map(str::to_string);
-            Ok(json!(crate::codeintel::neighbors(
-                repo,
-                &targets,
-                budget,
-                min_rung.as_deref()
-            )?))
+            let min_confidence = arguments["min_confidence"].as_f64().map(|c| c as f32);
+            let depth = arguments["depth"].as_u64().map(|d| d as usize);
+            Ok(json!(crate::codeintel::neighbors_envelope(
+                crate::codeintel::neighbors(repo, &targets, budget, None, min_confidence, depth)
+            )))
         }
         "devmap_dead_symbols" => Ok(json!(crate::codeintel::dead_symbols(repo, budget))),
         "devmap_clones" => Ok(json!(crate::codeintel::clones(repo, budget))),
@@ -316,5 +349,160 @@ mod tests {
             .collect();
         assert_eq!(advertised, TOOL_NAMES);
         assert_eq!(TOOL_NAMES.len(), 11);
+    }
+
+    /// A two-hop chain behind one indexed generation: `probe_caller` calls
+    /// `probe_callee` (confidence 0.9), which calls `probe_island` (0.3).
+    fn two_hop_repo() -> (tempfile::TempDir, String) {
+        let dir = crate::codeintel::tests::repo_with_one_generation();
+        let root = dir.path().to_string_lossy().into_owned();
+        let conn = rusqlite::Connection::open(crate::codeintel::devmap_db_path(&root))
+            .expect("open fixture db");
+        conn.execute(
+            "INSERT INTO edge_rows
+               (edge_id, source_file_id, target_file_id,
+                source_symbol, target_symbol, edge_kind, confidence,
+                valid_from, valid_to)
+             VALUES (1, 2, 3, 'probe_callee', 'probe_island', 'Calls', 0.3, 1, NULL)",
+            [],
+        )
+        .expect("insert second hop");
+        conn.close().expect("close fixture db");
+        (dir, root)
+    }
+
+    fn callee_symbols(entry: &Value) -> Vec<String> {
+        entry["callees"]["items"]
+            .as_array()
+            .expect("callees.items")
+            .iter()
+            .map(|e| e["target_symbol"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn neighbors_answers_an_object_in_the_codeintel_envelope() {
+        let (_dir, root) = two_hop_repo();
+        let out = handle(
+            "devmap_neighbors",
+            &json!({ "repo_path": root, "targets": ["probe_caller"] }),
+        )
+        .expect("neighbors answers");
+        assert!(
+            out.is_object(),
+            "an array fails the declared outputSchema: {out}"
+        );
+        for key in [
+            "source_freshness",
+            "available",
+            "total",
+            "shown",
+            "truncated",
+        ] {
+            assert!(out.get(key).is_some(), "envelope lacks {key}: {out}");
+        }
+        assert_eq!(out["available"], true, "{out}");
+        assert_eq!(out["items"][0]["target"], "probe_caller", "{out}");
+    }
+
+    #[test]
+    fn neighbors_honours_depth() {
+        let (_dir, root) = two_hop_repo();
+        let walk = |depth: u64| {
+            let out = handle(
+                "devmap_neighbors",
+                &json!({ "repo_path": root, "targets": ["probe_caller"], "depth": depth }),
+            )
+            .expect("neighbors answers");
+            callee_symbols(&out["items"][0])
+        };
+        assert_eq!(
+            walk(1),
+            ["probe_callee"],
+            "depth 1 must not reach the second hop"
+        );
+        assert!(
+            walk(2).contains(&"probe_island".to_string()),
+            "depth 2 reaches the second hop"
+        );
+    }
+
+    #[test]
+    fn neighbors_honours_min_confidence() {
+        let (_dir, root) = two_hop_repo();
+        let out = handle(
+            "devmap_neighbors",
+            &json!({ "repo_path": root, "targets": ["probe_caller"], "depth": 2, "min_confidence": 0.5 }),
+        )
+        .expect("neighbors answers");
+        assert_eq!(
+            callee_symbols(&out["items"][0]),
+            ["probe_callee"],
+            "the 0.3 edge is below min_confidence: {out}"
+        );
+    }
+
+    #[test]
+    fn neighbors_reports_a_failed_walk_as_unavailable_not_an_error() {
+        let out = handle(
+            "devmap_neighbors",
+            &json!({ "repo_path": "/no/such/repo", "targets": ["x"] }),
+        )
+        .expect("an unavailable envelope, not a protocol error");
+        assert_eq!(out["available"], false, "{out}");
+        assert!(out["reason"].is_string(), "{out}");
+    }
+
+    /// A handler that reads an argument its `inputSchema` does not declare is
+    /// unreachable for a validating client (`additionalProperties: false`), and
+    /// one that never reads a declared argument advertises a control that does
+    /// nothing. `devmap_neighbors` did both (`min_rung` read undeclared, `depth`
+    /// and `min_confidence` declared and ignored).
+    #[test]
+    fn every_argument_a_handler_reads_is_declared_in_its_input_schema() {
+        let source = include_str!("devmap_parity.rs");
+        let body = &source[source.find("pub fn handle(").expect("handle")..];
+        let body = &body[..body.find("#[cfg(test)]").expect("tests follow handle")];
+        let read = |arm: &str| -> std::collections::BTreeSet<String> {
+            let mut keys = std::collections::BTreeSet::new();
+            let mut rest = arm;
+            while let Some(at) = rest.find("arguments[\"") {
+                rest = &rest[at + "arguments[\"".len()..];
+                keys.insert(rest[..rest.find('"').unwrap()].to_string());
+            }
+            keys
+        };
+        // The shared prologue reads `repo_path` for every arm; `budget` counts
+        // only for an arm that passes it on.
+        let (prologue, arms) = body.split_once("match name {").expect("dispatch");
+        let shared = read(prologue);
+        let shared: std::collections::BTreeSet<String> =
+            shared.into_iter().filter(|key| key != "budget").collect();
+        for definition in tool_definitions() {
+            let name = definition["name"].as_str().unwrap();
+            let marker = format!("\"{name}\" =>");
+            let start = arms
+                .find(&marker)
+                .unwrap_or_else(|| panic!("no arm for {name}"));
+            let arm = &arms[start + marker.len()..];
+            let end = arm.find("\n        \"devmap_").unwrap_or(arm.len());
+            let mut reads: std::collections::BTreeSet<String> =
+                read(&arm[..end]).union(&shared).cloned().collect();
+            if arm[..end].contains("budget") {
+                reads.insert("budget".to_string());
+            }
+            let declared: std::collections::BTreeSet<String> = definition["inputSchema"]
+                ["properties"]
+                .as_object()
+                .unwrap()
+                .keys()
+                .cloned()
+                .collect();
+            let undeclared: Vec<_> = reads.difference(&declared).collect();
+            assert!(
+                undeclared.is_empty(),
+                "{name} reads undeclared {undeclared:?}"
+            );
+        }
     }
 }
