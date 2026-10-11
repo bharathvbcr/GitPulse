@@ -29,15 +29,13 @@ describe("TerminalDock", () => {
     expect(body).toContain("Terminal");
   });
 
-  it("hides rather than unmounts, because closing must not kill the shell", () => {
-    // The whole reason the terminal could never really be a view: unmounting
-    // the pane ends the process. `mounted` latches true; hiding, a view
-    // switch, and a repository tab switch all keep the component alive.
-    expect(source).toContain("let mounted = $state(open)");
-    expect(source).toContain("if (open || awaited.size > 0) mounted = true;");
-    expect(source).toContain("class:hidden={!open}");
-  });
-
+  // Rendered in harness/terminal.html: "hide/show preserves both sessions";
+  // "switching repositories spawns nothing", "the other repository's dock is
+  // hidden", "each repository's strip holds only its own tabs", "returning
+  // restores both original tabs"; "Go to switches to that repository without
+  // spawning anything new" and "Go to leaves its dock showing"; "the dock's
+  // resize separator grows on ArrowUp and shrinks back on ArrowDown,
+  // reporting its value"; expand and restore.
   it("hosts a repository's panel, unseen, while a task terminal waits for it", () => {
     // A launch from a task sheet must start its agent without opening the
     // dock or showing the repository; the queued request is what asks for
@@ -48,29 +46,15 @@ describe("TerminalDock", () => {
     expect(body).not.toContain("data-terminal-dock");
   });
 
-  it("keeps one panel per visited repository tab, keyed so a close cannot recycle a shell", () => {
-    expect(source).toContain("nextHostedTerminals");
+  it("keys each hosted panel on its repository tab, so a close cannot recycle a shell", () => {
+    // The fixture never closes a repository tab whose panel holds a shell.
     expect(source).toContain("{#each hostedTabs as tab (tab.id)}");
-    expect(source).toContain("data-terminal-host={tab.id}");
-    expect(source).toContain("repoPath: tab.path");
-    expect(source).toContain("visible: open && tab.id === $repoStore.activeTabId");
   });
-
-  it("owns cross-repository session focus, because the panel may not", () => {
-    // TerminalPanel is bound to the single path it was handed and is barred
-    // from importing repoStore at all (TerminalPanel.test.ts holds that).
-    // Switching repository tabs to reveal a shell therefore has to live here,
-    // where the dock already spans every open repository.
-    expect(source).toContain("focusTerminalSession");
-    expect(source).toContain("onGoToSession: goToSession");
-    // The store actions are sessionFocus.ts's own default, shared with the
-    // alert bridge, so the two jumps cannot drift into different steps.
+  it("jumps to another repository's session through the shared focus owner", () => {
+    // The alert bridge uses the same owner (below), so the two jumps cannot
+    // drift into different steps.
     expect(source).toContain("return focusTerminalSession(session);");
-    const focus = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "../terminal/sessionFocus.ts"), "utf8");
-    expect(focus).toContain("setTerminalOpen: (open) => repoStore.setTerminalOpen(open)");
-    expect(focus).toContain('showRepositorySurface: () => interfaceStore.setGlobalSurface("repository")');
   });
-
   it("hands the panel the open tabs, so the Sessions list can name each checkout", () => {
     // The panel cannot read the store; the repository, checkout and agent
     // worktree a session runs in come from the tab on that checkout.
@@ -85,13 +69,6 @@ describe("TerminalDock", () => {
     const bridge = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "SessionNotificationBridge.svelte"), "utf8");
     expect(bridge).toContain("await focusTerminalSession(record)");
     expect(bridge).not.toMatch(/record\.reveal\(\)/);
-  });
-
-  it("offers the WAI-ARIA splitter, keyboard included", () => {
-    expect(source).toContain('role="separator"');
-    expect(source).toContain('aria-valuenow={height}');
-    expect(source).toContain('event.key === "ArrowUp"');
-    expect(source).toContain('event.key === "ArrowDown"');
   });
 
   it("sizes itself through the clamp rather than trusting the stored height", () => {

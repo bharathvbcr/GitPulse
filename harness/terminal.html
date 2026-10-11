@@ -345,6 +345,18 @@
           const height = dock.getBoundingClientRect().height;
           button("Expand terminal").click(); await wait(); check("expand grows the dock", () => dock.getBoundingClientRect().height > height);
           button("Restore terminal size").click(); await wait(); check("restore returns previous height", () => dock.getBoundingClientRect().height === height);
+          {
+            // The resize handle is a WAI-ARIA separator: it reports its value,
+            // and the arrow keys nudge the dock without a pointer.
+            const handle = visible('[role="separator"][aria-label="Resize the terminal dock"]')[0];
+            const valueBefore = Number(handle?.getAttribute("aria-valuenow"));
+            if (handle) await press(handle, "ArrowUp");
+            const grown = dock.getBoundingClientRect().height, valueUp = Number(handle?.getAttribute("aria-valuenow"));
+            if (handle) await press(handle, "ArrowDown");
+            check("the dock's resize separator grows on ArrowUp and shrinks back on ArrowDown, reporting its value",
+              () => Boolean(handle) && grown > height && valueUp > valueBefore
+                && Math.abs(dock.getBoundingClientRect().height - height) < 1 && Number(handle.getAttribute("aria-valuenow")) === valueBefore);
+          }
           button("Toggle narrow layout").click(); await wait();
           check("narrow toolbar stays inside its panel", () => label("Terminal").scrollWidth === label("Terminal").clientWidth);
           button("Toggle theme").click(); await wait(); check("theme switch preserves sessions", () => report.spawned === beforeHide + 1);
