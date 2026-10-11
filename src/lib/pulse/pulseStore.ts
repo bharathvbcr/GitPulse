@@ -196,45 +196,37 @@ export function createPulseStore(deps?: PulseStoreDeps): PulseStore {
     }
   }
 
-  async function loadKnowledge(maxFiles = 128): Promise<void> {
+  /**
+   * One path-guarded secondary fetch. `slot` names the state fields it owns
+   * (`knowledge`/`knowledgeLoading`/`knowledgeError`, `dora`/...), so the two
+   * Tier-2/3 panels share one loading/staleness/error protocol: a response for
+   * a repository that is no longer active is dropped, never rendered.
+   */
+  async function loadSecondary<
+    S extends "knowledge" | "dora",
+    R extends NonNullable<PulseState[S]>,
+  >(slot: S, fetch: (path: string) => Promise<R>): Promise<void> {
     if (!activePath) return;
     const path = activePath;
-    update((s) => ({ ...s, knowledgeLoading: true }));
+    const loadingKey = `${slot}Loading` as const;
+    const errorKey = `${slot}Error` as const;
+    update((s) => ({ ...s, [loadingKey]: true }));
     try {
-      const knowledge = await knowledgeFetcher(path, maxFiles);
+      const value = await fetch(path);
       if (activePath !== path) return;
-      update((s) => ({
-        ...s,
-        knowledge,
-        knowledgeLoading: false,
-        knowledgeError: null,
-      }));
+      update((s) => ({ ...s, [slot]: value, [loadingKey]: false, [errorKey]: null }));
     } catch (err) {
       if (activePath !== path) return;
       const message = reportPanelError("pulse", err);
-      update((s) => ({ ...s, knowledgeLoading: false, knowledgeError: message }));
+      update((s) => ({ ...s, [loadingKey]: false, [errorKey]: message }));
     }
   }
 
-  async function loadDora(windowDays = 90): Promise<void> {
-    if (!activePath) return;
-    const path = activePath;
-    update((s) => ({ ...s, doraLoading: true }));
-    try {
-      const dora = await doraFetcher(path, windowDays);
-      if (activePath !== path) return;
-      update((s) => ({
-        ...s,
-        dora,
-        doraLoading: false,
-        doraError: null,
-      }));
-    } catch (err) {
-      if (activePath !== path) return;
-      const message = reportPanelError("pulse", err);
-      update((s) => ({ ...s, doraLoading: false, doraError: message }));
-    }
-  }
+  const loadKnowledge = (maxFiles = 128): Promise<void> =>
+    loadSecondary("knowledge", (path) => knowledgeFetcher(path, maxFiles));
+
+  const loadDora = (windowDays = 90): Promise<void> =>
+    loadSecondary("dora", (path) => doraFetcher(path, windowDays));
 
   async function loadSnapshots(): Promise<void> {
     if (!activePath) return;

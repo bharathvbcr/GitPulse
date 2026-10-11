@@ -8,7 +8,7 @@
  * Three things keep it inside the budget every other subprocess shares
  * (the 2026-10 spawn-budget starvation is what happens when they do not):
  *
- * - The scheduler ticks on `createVisibleInterval`, so a hidden window runs
+ * - The scheduler ticks on `createAdaptiveTimer`, so a hidden window runs
  *   nothing and a lagging event loop stretches the period.
  * - At most one repository is fetched per tick, the active tab first, so
  *   enabling it on twenty tabs never fans out into twenty fetches at once.

@@ -1,5 +1,6 @@
 import {
   identityKey,
+  sameRepo,
   normalizeRepoPath,
   type PathIdentityOptions,
 } from "./paths";
@@ -409,7 +410,7 @@ export function rememberRecent(
   if (!normalized) return ws;
   const recents = [
     normalized,
-    ...ws.recents.filter((path) => !sameIdentity(path, normalized, options)),
+    ...ws.recents.filter((path) => !sameRepo(path, normalized, options)),
   ].slice(0, MAX_RECENT_REPOS);
   return { ...ws, recents };
 }
@@ -419,7 +420,7 @@ export function removeRecent(
   rawPath: string,
   options: PathIdentityOptions,
 ): WorkspaceTabs {
-  const recents = ws.recents.filter((path) => !sameIdentity(path, rawPath, options));
+  const recents = ws.recents.filter((path) => !sameRepo(path, rawPath, options));
   return { ...ws, recents };
 }
 
@@ -433,12 +434,6 @@ export function reopenLastClosed(
   }
   const without = { ...ws, lastClosed: ws.lastClosed.slice(1) };
   return openTab(without, next, options);
-}
-
-function sameIdentity(a: string, b: string, options: PathIdentityOptions): boolean {
-  const left = identityKey(a, options);
-  const right = identityKey(b, options);
-  return Boolean(left) && left === right;
 }
 
 function pushFrontUnique(list: string[], value: string, cap: number): string[] {

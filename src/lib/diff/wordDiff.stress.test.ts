@@ -4,7 +4,6 @@ import {
   annotateRange,
   classifyMetaLine,
   computeWordDiff,
-  filterFilePatch,
   parseUnifiedDiff,
   type DiffSegment,
   type IntraLineDiff,
@@ -256,7 +255,7 @@ describe("parseUnifiedDiff + annotateRange stress: 200-line document", () => {
 });
 
 // ---------------------------------------------------------------------------
-// Wave-2 adversarial additions: parseUnifiedDiff / filterFilePatch attacks.
+// Wave-2 adversarial additions: parseUnifiedDiff attacks.
 // Every expectation below was pinned against the current wordDiff.ts
 // implementation; anything the code gets wrong is marked it.fails with a BUG.
 // ---------------------------------------------------------------------------
@@ -534,7 +533,7 @@ describe("parseUnifiedDiff stress: commit meta interleaved mid-hunk", () => {
   });
 });
 
-describe("classifyMetaLine vs filterFilePatch agreement", () => {
+describe("classifyMetaLine on a multi-file payload", () => {
   const twoFilePayload = [
     "diff --git a/src/a.rs b/src/a.rs",
     "index 111..222 100644",
@@ -552,33 +551,22 @@ describe("classifyMetaLine vs filterFilePatch agreement", () => {
     "+new 😀",
   ].join("\n");
 
-  it("extracts exactly the matching section and nothing else", () => {
-    const patch = filterFilePatch(twoFilePayload, "sp ace/uniﬁé😀.txt");
-    expect(patch).toContain("diff --git a/sp ace/uniﬁé😀.txt");
-    expect(patch).toContain("+new 😀");
-    expect(patch).not.toContain("src/a.rs");
-    // Re-parsing the kept section standalone: its own header block rides
-    // along (diff --git + index classify as meta, ---/+++ as hdr), and the
-    // hunk body stays exactly del/add — nothing from the OTHER file leaks in.
-    const types = parseUnifiedDiff(patch).map((r) => r.type);
-    expect(types).toEqual(["meta", "meta", "hdr", "hdr", "hdr", "del", "add"]);
+  it("classifies each file's header block and hunk body without leaking between files", () => {
+    const types = parseUnifiedDiff(twoFilePayload).map((r) => r.type);
+    expect(types).toEqual([
+      "meta", "meta", "hdr", "hdr", "hdr", "del", "add",
+      "meta", "meta", "hdr", "hdr", "hdr", "del", "add",
+    ]);
   });
 
-  it("returns empty string — not a throw — when no section matches", () => {
-    expect(filterFilePatch(twoFilePayload, "nope/missing.txt")).toBe("");
-    expect(filterFilePatch(twoFilePayload, "")).toBe("");
-    expect(filterFilePatch("", "any.txt")).toBe("");
-    // Empty input parses to zero rows (see header degeneracy suite) — never
-    // a throw, never a phantom row.
+  it("empty input parses to zero rows, never a throw or a phantom row", () => {
     expect(parseUnifiedDiff("")).toEqual([]);
   });
 
-  it("agrees with classifyMetaLine: meta-classified lines never leak into a kept patch body", () => {
-    // For every line of every kept section, anything classifyMetaLine calls
-    // meta/binary sits only in the header block before the first hunk.
-    const patch = filterFilePatch(twoFilePayload, "src/a.rs");
+  it("agrees with classifyMetaLine: meta-classified lines never appear inside a hunk body", () => {
     let seenHunk = false;
-    for (const line of patch.split("\n")) {
+    for (const line of twoFilePayload.split("\n")) {
+      if (line.startsWith("diff --git ")) seenHunk = false;
       if (line.startsWith("@@")) seenHunk = true;
       if (seenHunk && classifyMetaLine(line)) {
         throw new Error(`meta leaked into hunk body: ${JSON.stringify(line)}`);

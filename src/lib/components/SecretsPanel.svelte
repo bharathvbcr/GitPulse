@@ -46,7 +46,7 @@
   import { copyText } from "../desktop/clipboard";
   import { formatError } from "../ui/formatError";
   import { formatRelativeTime, plural } from "../format";
-  import { createVisibleInterval } from "../dom/visibleInterval";
+  import { createAdaptiveTimer } from "../runtime/adaptiveTimer";
   import { revealInFileManager } from "../desktop/openInShell";
   import { toastStore } from "../stores/toastStore";
 
@@ -63,7 +63,7 @@
   let inflight: AsyncGuard | null = null;
 
   // Keeps "scanned 3m ago" true while the panel stays open.
-  const stopTick = createVisibleInterval(() => (nowMs = Date.now()), 30_000);
+  const stopTick = createAdaptiveTimer(() => (nowMs = Date.now()), 30_000);
   onDestroy(stopTick);
 
   // The effect below must re-run when the repository changes and at no other

@@ -6,7 +6,6 @@ const GATES = [
   "stores/repoStore.ts",
   "workbench/client.ts",
   "runtime/adaptiveTimer.ts",
-  "dom/visibleInterval.ts",
   "async/backgroundScope.ts",
   "components/TaskAgentPanel.svelte",
   "components/TaskManviAssist.svelte",
@@ -35,13 +34,11 @@ describe("background work shares one foreground rule", () => {
     expect(probe).not.toContain("readBackgroundDocument");
   });
 
-  it("routes both browser hosts through the same listener", () => {
-    for (const path of ["runtime/adaptiveTimer.ts", "dom/visibleInterval.ts"]) {
-      const source = read(path);
-      expect(source).toContain("addForegroundListener");
-      expect(source).toContain('addEventListener("focus"');
-      expect(source).toContain('addEventListener("blur"');
-    }
+  it("routes the browser host through the shared listener", () => {
+    const source = read("runtime/adaptiveTimer.ts");
+    expect(source).toContain("addForegroundListener");
+    expect(source).toContain('addEventListener("focus"');
+    expect(source).toContain('addEventListener("blur"');
   });
 
   it("polls a live task run through the shared delay", () => {

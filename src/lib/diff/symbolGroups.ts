@@ -22,12 +22,6 @@ export interface HunkLineRange {
   key: string;
 }
 
-export interface SymbolHunkGroup {
-  /** Empty string means no symbol spanned this hunk. */
-  symbol_name: string;
-  hunk_keys: string[];
-}
-
 function inclusiveRange(start: number, count: number): { start: number; end: number } | null {
   if (start <= 0 || count <= 0) return null;
   return { start, end: start + count - 1 };
@@ -65,30 +59,6 @@ export function symbolForHunk(
     }
   }
   return best?.symbol_name ?? "";
-}
-
-/**
- * Group hunks in outline order under their spanning symbol.
- *
- * Adjacent hunks with the same symbol share a group. Hunks with no symbol
- * each get their own empty-named group so the caller can still render them.
- */
-export function groupHunksBySymbol(
-  hunks: readonly HunkLineRange[],
-  symbols: readonly SymbolSpan[],
-): SymbolHunkGroup[] {
-  if (hunks.length === 0) return [];
-  const groups: SymbolHunkGroup[] = [];
-  for (const hunk of hunks) {
-    const name = symbolForHunk(hunk, symbols);
-    const last = groups[groups.length - 1];
-    if (last && last.symbol_name === name && name !== "") {
-      last.hunk_keys.push(hunk.key);
-    } else {
-      groups.push({ symbol_name: name, hunk_keys: [hunk.key] });
-    }
-  }
-  return groups;
 }
 
 /**

@@ -2,6 +2,7 @@
  * Shapes of the dependency-health report, shared by the Health view and the
  * report formatter. Field names mirror the Rust `DepsHealthReport` wire type.
  */
+import { isRecord } from "../record";
 
 export interface HealthIssue {
   severity: string;
@@ -203,10 +204,6 @@ export interface CodeScanningReport {
   error?: string | null;
   /** Present only when `available` is false; omitted on success (serde skip). */
   unavailable_reason?: GithubUnavailableReason;
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
 function stringArray(value: unknown, label: string): string[] {

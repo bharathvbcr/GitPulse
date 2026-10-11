@@ -1,5 +1,6 @@
 import type { Search } from "@lucide/svelte";
 import { fuzzyMatch } from "../branches/groupBranches";
+import { isRecord } from "../record";
 
 export type PaletteMode = "commands" | "files" | "repositories" | "commits" | "branches" | "symbols" | "workspace" | "help";
 export interface PaletteItem {
@@ -54,10 +55,6 @@ export type Frecency = ReadonlyMap<string, Usage>;
 export interface PaletteStorage { getItem(key: string): string | null; setItem(key: string, value: string): void }
 export const FRECENCY_KEY = "gitpulse_palette_frecency";
 const MAX_HISTORY = 120;
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return value !== null && typeof value === "object" && !Array.isArray(value);
-}
 
 /** Accept the old count-only format, but never trust persisted value types. */
 export function readFrecency(storage: PaletteStorage | null, now = Date.now()): Frecency {

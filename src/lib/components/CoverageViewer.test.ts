@@ -59,13 +59,14 @@ describe("CoverageViewer report copy contract", () => {
       source.indexOf("async function generateAiReport"),
     );
     expect(body).toContain("if (await copyText(");
-    expect(body).toContain("reportCopied = true;");
+    expect(body).toContain("reportFlash.flash();");
     expect(source).toContain('{reportCopied ? "Coverage report copied" : "Copy coverage report"}');
   });
 
   it("cleans up report-copy feedback on reset and unmount", () => {
-    expect(source).toContain("window.clearTimeout(reportCopyTimer);");
-    expect(source.match(/window\.clearTimeout\(reportCopyTimer\)/g)?.length).toBeGreaterThanOrEqual(2);
+    // The countdown itself is createCopyFlash's (desktop/clipboard.test.ts).
+    expect(source).toContain("reportFlash.reset();");
+    expect(source).toContain("reportFlash.dispose();");
   });
 });
 describe("CoverageViewer MANVI integration contracts", () => {
@@ -78,10 +79,13 @@ describe("CoverageViewer MANVI integration contracts", () => {
   });
 
   it("runs model-authored steps through the scoped Manvi runner", () => {
-    expect(source).toContain('"cmd_manvi_run_action"');
+    // The one bounded runner (terminal/manviAction.test.ts pins the IPC
+    // payload, the shared timeout and the journal entry); the panel names only
+    // its own origin.
+    expect(source).toContain("runManviAction({");
     expect(source).toContain('actionKind: "coverage"');
-    expect(source).toContain("args: step.argv,");
-    expect(source).toContain("timeoutSecs: 900");
+    expect(source).toContain("argv,\n        actionKind: \"coverage\",");
+    expect(source).not.toContain('"cmd_manvi_run_action"');
   });
 
   it("runs curated generator commands through their own scoped Manvi origin", () => {
@@ -94,14 +98,13 @@ describe("CoverageViewer MANVI integration contracts", () => {
 
   it("journals report generation, step execution and script runs into harnessStore", () => {
     expect(source).toContain('kind: "coverage-report"');
-    expect(source).toContain('kind: "coverage-step"');
-    expect(source).toContain('kind: "coverage-script"');
+    expect(source).toContain('journalKind: "coverage-step"');
+    expect(source).toContain('journalKind: "coverage-script"');
   });
 
   it("journals completed report and step calls before stale-UI returns", () => {
     for (const [start, end, awaitMarker] of [
       ["async function generateAiReport", "async function copyGeneration", "await harnessStore.coverageReport"],
-      ["async function runStep", "async function runAllSteps", "await invoke<TerminalRunResult>"],
     ] as const) {
       const body = source.slice(source.indexOf(start), source.indexOf(end));
       const settled = body.indexOf(awaitMarker);
@@ -118,22 +121,23 @@ describe("CoverageViewer MANVI integration contracts", () => {
     }
   });
 
-  it("journals every generator command at the shared IPC seam", () => {
+  it("journals every step and generator command at the shared runner, before any stale-UI return", () => {
+    // runManviAction journals the outcome (or the failure) before it returns or
+    // rethrows (terminal/manviAction.test.ts); the panels must therefore await
+    // it before their first liveness check, and never journal a step themselves.
+    const step = source.slice(
+      source.indexOf("async function runStepOnce"),
+      source.indexOf("async function runAllSteps"),
+    );
+    expect(step.indexOf("await runManviAction(")).toBeGreaterThan(-1);
+    expect(step.indexOf("await runManviAction(")).toBeLessThan(step.indexOf("if (!guard.isLive())"));
+    expect(step).not.toContain("harnessStore.recordAction");
     const runner = source.slice(
       source.indexOf("function invokeCoverageCommand"),
       source.indexOf("async function runCoverageScript"),
     );
-    const settled = runner.indexOf("await invoke<TerminalRunResult>");
-    const journal = runner.indexOf("harnessStore.recordAction", settled);
-    const returned = runner.indexOf("return res", settled);
-    expect(journal).toBeGreaterThan(settled);
-    expect(journal).toBeLessThan(returned);
-    const caught = runner.indexOf("} catch", returned);
-    const failureJournal = runner.indexOf("harnessStore.recordAction", caught);
-    const rethrown = runner.indexOf("throw err", caught);
-    expect(failureJournal).toBeGreaterThan(caught);
-    expect(failureJournal).toBeLessThan(rethrown);
-    expect(runner.match(/harnessStore\.recordAction/g)).toHaveLength(2);
+    expect(runner).toContain("return runManviAction(");
+    expect(runner).not.toContain("harnessStore.recordAction");
     expect(source).toContain("invokeCoverageCommand(step.argv, repoPath, step.command)");
     expect(source).toContain("invokeCoverageCommand(tokenized.argv, repoPath, command)");
   });
@@ -182,7 +186,8 @@ describe("CoverageViewer MANVI integration contracts", () => {
     // Unmount teardown cancels every guard and clears the copy timer.
     expect(source).toContain("generationInflight?.cancel();");
     expect(source).toContain("opsInflight?.cancel();");
-    expect(source).toContain("window.clearTimeout(aiCopyTimer);");
+    expect(source).toContain("aiFlash.reset();");
+    expect(source).toContain("aiFlash.dispose();");
   });
 
   it("keeps the generate button usable without a discovered model server", () => {
@@ -382,7 +387,8 @@ describe("CoverageViewer failure diagnostics and copy contracts", () => {
   it("cleans up all copy feedback timers on reset and unmount", () => {
     expect(source).toContain("window.clearTimeout(copiedScriptTimer);");
     expect(source).toContain("window.clearTimeout(copiedAllTimer);");
-    expect(source).toContain("window.clearTimeout(scanErrorCopyTimer);");
+    expect(source).toContain("scanErrorFlash.reset();");
+    expect(source).toContain("scanErrorFlash.dispose();");
     expect(source).toContain("window.clearTimeout(copiedStepTimer);");
   });
 });

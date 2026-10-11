@@ -20,6 +20,7 @@ import {
   summarizeWalkIncomplete,
   WALK_INCOMPLETE_MAX_CHARS,
 } from "./walkIncomplete";
+import { asRecord } from "../record";
 
 /**
  * Engine prose reaching a panel is bounded here, beside the walk fold.
@@ -32,12 +33,6 @@ import {
  */
 function boundEngineText(value: unknown): string | null {
   return typeof value === "string" ? boundText(value, WALK_INCOMPLETE_MAX_CHARS) : null;
-}
-
-function asRecord(value: unknown): Record<string, unknown> | null {
-  return value !== null && typeof value === "object" && !Array.isArray(value)
-    ? (value as Record<string, unknown>)
-    : null;
 }
 
 function asString(value: unknown, fallback = ""): string {

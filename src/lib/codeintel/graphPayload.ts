@@ -9,6 +9,7 @@ import type { GraphVizCounts, GraphVizLink, GraphVizNode } from "./types";
 import { DOC_GRAPH_EXTENT } from "../docs/docGraphPayload";
 import { getLanguageDisplayName, resolveLanguageIconKey, type LanguageIconKey } from "../language/languageLogos";
 import { nodeFilePath } from "./nodeLabel";
+import { asRecord } from "../record";
 
 /**
  * Metadata wins; older payloads can still identify a language by source path.
@@ -82,10 +83,6 @@ export interface TruncationLegend {
 
 function asFinite(n: unknown, fallback = 0): number {
   return typeof n === "number" && Number.isFinite(n) ? n : fallback;
-}
-
-function asRecord(value: unknown): Record<string, unknown> | null {
-  return value !== null && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : null;
 }
 
 function count(value: unknown): number {

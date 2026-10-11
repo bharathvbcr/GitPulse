@@ -5,9 +5,10 @@ import {
   listTasks, listWorkspaces, putTask, putWorkspace, registerRepository,
   request, taskDraft, taskWrite, workspaceDraft,
   getEnhancement, listEnhancements, latestEnhancement, LIVE_ENHANCEMENT_STATES, ACTIVE_ENHANCEMENT_STATES, changeEnhancement, enhancementConfiguration,
-  generateEnhancement, deleteTask, deleteWorkspace, mergeTasks, restoreDeletedTask,
+  deleteTask, deleteWorkspace, mergeTasks, restoreDeletedTask,
 } from "./client";
 import type { Task, Workspace } from "./client";
+import { selectionWire } from "./taskModel";
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
 const native = vi.mocked(invoke);
@@ -199,7 +200,7 @@ describe("native workbench boundary", () => {
       rationale: "",
     };
     native.mockResolvedValueOnce(JSON.stringify({ ok: true, item: proposal }));
-    await generateEnhancement({ id: "e", request_id: "r", expected_revision: 1 }, selection);
+    await changeEnhancement("enhancements.generate", { id: "e", request_id: "r", expected_revision: 1, ...selectionWire(selection) });
     expect(JSON.parse(String((native.mock.calls[1]?.[1] as { input: string }).input))).toMatchObject({
       id: "e", request_id: "r", expected_revision: 1, model: selection,
     });

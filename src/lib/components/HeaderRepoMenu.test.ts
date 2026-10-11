@@ -56,7 +56,7 @@ describe("HeaderRepoMenu", () => {
     expect(source).toContain('aria-controls="header-repo-menu"');
     expect(source).toContain("function onMenuKey");
     expect(source).toContain("cycleFocus");
-    expect(source).toContain("focusAdjacentToTrigger");
+    expect(source).toContain("focusAdjacentToMenuOpener");
     expect(source).toContain("close({ restoreFocus: true })");
     for (const key of ['"Escape"', '"Tab"', '"ArrowDown"', '"ArrowUp"', '"Home"', '"End"']) {
       expect(source).toContain(key);

@@ -4,6 +4,8 @@ import { invoke } from "../ipc/invoke";
 import { formatError } from "../ui/formatError";
 import { diagnostics } from "../diagnostics/diagnostics";
 import { askConfirm } from "./modalStore";
+import { confirmTerminalLoss } from "../repos/terminalLoss";
+import { createDiffSelection } from "../repos/diffSelection";
 // One-way: the terminal registry knows nothing about repositories, so this
 // cannot form a cycle. `sessionFocus` takes the store by injection for the
 // same reason.
@@ -11,7 +13,7 @@ import { sessionsByRepo, terminalSessions } from "../terminal/sessionRegistry";
 import { requestRepositoryTrust } from "../repos/repositoryTrust";
 import { harnessStore, type PolicyVerdict } from "./harnessStore";
 import { parseTagList, type BranchInfo, type TagInfo } from "../branches/types";
-import { filterStore, type FilterState } from "./filterStore";
+import { filterStore } from "./filterStore";
 import { graphStore } from "./graphStore";
 import { interfaceStore } from "./interfaceStore";
 import type { InvokeFn } from "./graphStore";
@@ -56,13 +58,12 @@ import {
   loadPersistedWorkspace,
   savePersistedWorkspace,
   workspaceToPersisted,
-  type StorageLike,
   type ViewTab,
 } from "../repos/persist";
 import * as workspaceSync from "../codeintel/workspaceSync";
 import { autoInit } from "../codeintel/autoInit";
 import { liveIndex } from "../codeintel/liveIndex";
-import { normalizeTabColor, type GroupColor, type TabColor } from "../repos/tabColors";
+import { type TabColor } from "../repos/tabColors";
 import { familyFromCommonDir } from "../repos/repoFamily";
 import { computeTabLayout, type StackingOptions } from "../repos/tabGroups";
 import {
@@ -89,7 +90,7 @@ import {
   type AutoFetchPrefs,
   type AutoFetchSetting,
 } from "../repos/autoFetch";
-import { createVisibleInterval } from "../dom/visibleInterval";
+import { createAdaptiveTimer } from "../runtime/adaptiveTimer";
 import { hasUnstagedChanges } from "../files/fileStatus";
 import { indexSelectionPaths } from "../repos/bulkOps";
 import {
@@ -100,7 +101,6 @@ import {
   watchFailed,
   watchStatesEqual,
   type WatchState,
-  type WatchStatus,
 } from "../repos/watchState";
 import { createWatchPool } from "../repos/watchPool";
 import { parseRemoteList, type RemoteChange, type RemoteInfo } from "../repos/remotes";
@@ -146,20 +146,15 @@ import {
 import { decideCadence, readEventLoopDelay } from "../runtime/loadCadence";
 import { debounce, type Debounced } from "../async/debounce";
 import { createSessionBook } from "../repos/sessionBook";
-import { beginGeneration } from "../async/guard";
 import { createCommitDraftStore } from "./commitDraftStore";
 import { flushOnPageHide } from "../async/deferredWrite";
 import type { FilePatch } from "../diff/patchBuilder";
 import type { ReleasePublishResult } from "../ops/model";
 
-/** What a mutating action reports back: whether it ran, and under what verdict. */
-export interface MutationOutcome<T = unknown> {
-  ok: boolean;
-  error?: string;
-  policy?: PolicyVerdict;
-  output?: T;
-}
+import type { MutationOutcome, ResetMode, IndexAction, FileStatus, ResolvedRepo, BranchStatsReport, DiffPayload, RepoSession, RepoState, InternalState, RepoStoreDeps } from "../repos/storeTypes";
+import { createProjectionCache, createSession, emptyProjected, project } from "../repos/projection";
 
+export type { MutationOutcome, ResetMode, IndexAction, SelectionKind, FileStatus, ResolvedRepo, BranchStatsReport, OpenRepoTab, DiffPayload, RepoSession, RepoState, RepoStoreDeps } from "../repos/storeTypes";
 export type { BranchInfo, TagInfo, ViewTab };
 export type { OperationAction, OperationState, RepoOperation };
 export type { StashAction, StashEntry, RemoteChange, SubmoduleChange };
@@ -168,415 +163,6 @@ export type { BulkRunReport, WorkspaceWip };
 export type { RepoFacts };
 export type { InvokeFn };
 
-/** Mirrors the Rust `ResetMode` under `rename_all = "lowercase"`. */
-export type ResetMode = "soft" | "mixed" | "keep" | "hard";
-export type IndexAction = "stage" | "unstage";
-
-/** How the current selection was created; decides what a preference flip may refetch. */
-export type SelectionKind = "file" | "commit" | "range";
-
-export interface FileStatus {
-  path: string;
-  old_path?: string | null;
-  status_code: string;
-  is_staged: boolean;
-  is_conflicted: boolean;
-  additions: number;
-  deletions: number;
-  staged_additions?: number;
-  staged_deletions?: number;
-  unstaged_additions?: number;
-  unstaged_deletions?: number;
-  /**
-   * Why this row's additions/deletions may understate reality — its numstat
-   * record could not be parsed. Rust omits the key entirely while empty, so
-   * this is absent on the overwhelming majority of rows.
-   */
-  warnings?: string[];
-}
-
-export interface ResolvedRepo {
-  path: string;
-  name: string;
-  is_bare: boolean;
-  /**
-   * Canonical common Git directory, shared by every worktree of the
-   * repository. Optional on the wire: older fixtures and a backend that could
-   * not read the metadata both leave the tab without a family.
-   */
-  common_dir?: string | null;
-}
-
-
-/** Wire shape of `cmd_branch_stats`; snake_case like every other command. */
-interface BranchStatsUpdate {
-  name: string;
-  tip_commit_id: string;
-  is_remote: boolean;
-  remote_name: string | null;
-  additions: number;
-  deletions: number;
-  files_changed: number;
-  commits_ahead_of_base: number;
-  commits_behind_base: number;
-}
-
-export interface BranchStatsReport {
-  compared_to: string;
-  updates: BranchStatsUpdate[];
-  computed: number;
-  cached: number;
-  capped: boolean;
-  /** Branches whose churn walk errored this call — missing, not pending. */
-  compute_failures: number;
-}
-
-export interface OpenRepoTab {
-  id: string;
-  path: string;
-  name: string;
-  label: string;
-  pinned: boolean;
-  group?: string | null;
-  /** Own color. Missing and null both inherit the group color, when the group has one. */
-  color?: TabColor | null;
-  /**
-   * Repository family: one key shared by every checkout of a repository
-   * (see repos/repoFamily.ts). Null until resolved, or when unreadable.
-   */
-  family?: string | null;
-  /** The family's own directory, for naming it; null with `family`. */
-  familyRoot?: string | null;
-  isActive: boolean;
-  isBare: boolean;
-  isDirty: boolean;
-  isLoading: boolean;
-  error: string | null;
-  /**
-   * Set when opening or hydrating this tab failed because the repository
-   * is not trusted. Cleared only by a hydrate that succeeds. Background
-   * work skips these paths so a refusal stays one state, not a stream.
-   */
-  trustRequired?: boolean;
-  /** The checkout was deleted or moved while open; see `RepoSession.missing`. */
-  missing?: boolean;
-  currentBranch: string | null;
-  conflictedCount: number;
-  changedCount: number;
-  /**
-   * Whether the repository is watched (see repos/watchPool.ts): `parked`
-   * means more repositories are open than are watched at once, and this one
-   * catches up when it is opened. Absent in fixtures that predate the pool.
-   */
-  watch?: WatchStatus;
-  /**
-   * False until the repository has been read once, so the counts above are
-   * not a clean bill of health for a parked tab restore never read.
-   */
-  countsKnown?: boolean;
-}
-
-/**
- * Wire shape of every diff-returning command.
- *
- * `truncated` is not optional: a payload that forgot it would default to
- * "complete", which is the exact failure the flag exists to prevent.
- */
-export interface DiffPayload {
-  text: string;
-  truncated: boolean;
-  /**
-   * Why the text is a prefix, as a clause to render after naming the subject;
-   * null when the diff is whole. The banner used to assert "larger than we
-   * read in one go" for every cut, which is one of two possible causes.
-   */
-  truncation_reason: string | null;
-}
-
-export interface RepoSession {
-  id: string;
-  path: string;
-  name: string;
-  isBare: boolean;
-  /** From `ResolvedRepo.common_dir`; null until resolved or when unreadable. */
-  commonDir: string | null;
-  pinned: boolean;
-  branches: BranchInfo[];
-  tags: TagInfo[];
-  currentBranch: string | null;
-  defaultBranch: string | null;
-  statuses: FileStatus[];
-  selectedCommitId: string | null;
-  selectedFilePath: string | null;
-  /** Which worktree side `selectedDiff` was fetched from; false for commit diffs. */
-  selectedIsStaged: boolean;
-  /** Whether `selectedDiff` was fetched with whitespace-only changes ignored. */
-  selectedIgnoreWhitespace: boolean;
-  /**
-   * Internal-only: how the current selection was made. Worktree-file
-   * selections can be refetched when the whitespace preference flips; a
-   * commit/range selection merely records the preference for the next click.
-   */
-  selectionKind: SelectionKind;
-  selectedDiff: string | null;
-  /**
-   * True when the backend cut this diff at its read budget.
-   *
-   * A prefix rendered as a whole diff is a lie the viewer cannot detect on
-   * its own: the last hunk on screen looks like the last hunk in the commit.
-   * The flag drives both the notice and the staging lockout, because staging
-   * a hunk from a prefix stages less than the rows imply.
-   */
-  selectedDiffTruncated: boolean;
-  /** Why it is a prefix, when it is; null when whole. See `DiffPayload`. */
-  selectedDiffTruncationReason: string | null;
-  /**
-   * True while a newly selected diff is still being fetched.
-   *
-   * The store publishes a selection's fields atomically on completion, so
-   * without this the pane keeps showing the PREVIOUS file — its path, its
-   * line count, its rows — for as long as the read takes. On a large commit
-   * that is over a second of a viewer confidently displaying the wrong file.
-   *
-   * Only a change of target raises it. A refetch of the diff already on
-   * screen (the one that follows a stage, or a watcher-driven refresh) leaves
-   * it false, because flashing a skeleton over content that is about to be
-   * replaced by nearly the same content is worse than the staleness it
-   * announces.
-   */
-  selectedDiffPending: boolean;
-  /**
-   * Why the selected diff could not be read, or null. Per selection and kept
-   * apart from `error` (the repository snapshot's): a failed diff read must
-   * not blank the status, disable Review changes, or leave the previous
-   * file's diff on screen under the new file's name.
-   */
-  selectedDiffError: string | null;
-  activeTab: ViewTab;
-  /**
-   * The section last open in each sectioned view, keyed by view id.
-   *
-   * Per view rather than one value: a section is a lens on that view's
-   * subject, so leaving History on Reflog and returning through Files should
-   * come back to Reflog. Unset views open on their registered default.
-   */
-  viewSections: Record<string, string>;
-  /**
-   * Whether the terminal dock is showing on THIS repository tab.
-   *
-   * Per tab because a shell belongs to a working tree. As one workspace-wide
-   * flag, opening a terminal in one repository opened the dock over every
-   * other repository the user switched to — and since hosting a panel starts
-   * a shell, it also spawned a process in each, spending the global
-   * `MAX_PTY_SESSIONS` budget on repositories nobody asked for a shell in.
-   *
-   * Closing the dock only hides it; the shells keep running and their
-   * scrollback survives. Closing the repository TAB is what ends them.
-   */
-  terminalOpen: boolean;
-  searchQuery: string;
-  selectedBranch: string | null;
-  isAmending: boolean;
-  isLoading: boolean;
-  error: string | null;
-  /**
-   * True when the last open or hydrate of this session failed with
-   * `REPOSITORY_TRUST_REQUIRED`. A later successful hydrate clears it.
-   * Schedulers treat it as "do not call the backend for this path".
-   */
-  trustRequired: boolean;
-  /**
-   * The watcher saw this checkout's git directory disappear (`repo-gone`).
-   * Background work skips it, as it does `trustRequired`; a later successful
-   * hydrate (the checkout was recreated) clears it.
-   */
-  missing: boolean;
-  generation: number;
-  /** True once this session's first snapshot has landed and rendered. */
-  hasHydrated: boolean;
-  /** True while this session's progressive branch-stats fetch is in flight. */
-  statsPending: boolean;
-  /**
-   * True when this path's last branch-stats attempt failed outright, so rows
-   * would otherwise show fake zeros; cleared by the next successful drain.
-   */
-  statsFailed: boolean;
-  /**
-   * The multi-step git operation this worktree is parked in, if any, plus
-   * whether the probe itself failed. Refreshed with every snapshot: an
-   * operation can start or end from the terminal panel, another GitPulse
-   * window, or an agent, so it is never inferred from our own mutations.
-   */
-  operation: OperationState;
-  /**
-   * The stash stack. Carried on the session because it is part of the
-   * work-in-progress answer: a stash is work that exists only here, and it is
-   * invisible from every other surface in the app.
-   */
-  stashEntries: StashEntry[];
-  /** True when the stash probe failed, so an empty list is not read as "none". */
-  stashFailed: boolean;
-  stashTruncated: boolean;
-  /** True when older tags exist beyond the listing cap. */
-  tagsTruncated: boolean;
-  /** True when the tag list could not be read, so empty is not "no tags". */
-  tagsFailed: boolean;
-  /**
-   * Whether this repository is receiving live filesystem updates.
-   *
-   * A failed watch used to be swallowed, leaving the session indistinguishable
-   * from a watched one while its branches, graph and operation state went
-   * stale. Recorded here so the poll can compensate and the UI can say so.
-   */
-  watch: WatchState;
-  /** Epoch ms of FETCH_HEAD mtime; null when absent or unread. */
-  fetchedAt: number | null;
-}
-
-export interface RepoState {
-  openTabs: OpenRepoTab[];
-  activeTabId: string | null;
-  recentRepos: string[];
-  lastClosed: string[];
-  collapsedGroups: string[];
-  groupColors: GroupColor[];
-  currentPath: string | null;
-  branches: BranchInfo[];
-  tags: TagInfo[];
-  currentBranch: string | null;
-  defaultBranch: string | null;
-  statuses: FileStatus[];
-  selectedCommitId: string | null;
-  selectedFilePath: string | null;
-  selectedIsStaged: boolean;
-  selectedIgnoreWhitespace: boolean;
-  selectedDiff: string | null;
-  /**
-   * True when the backend cut this diff at its read budget.
-   *
-   * A prefix rendered as a whole diff is a lie the viewer cannot detect on
-   * its own: the last hunk on screen looks like the last hunk in the commit.
-   * The flag drives both the notice and the staging lockout, because staging
-   * a hunk from a prefix stages less than the rows imply.
-   */
-  selectedDiffTruncated: boolean;
-  /** Why it is a prefix, when it is; null when whole. See `DiffPayload`. */
-  selectedDiffTruncationReason: string | null;
-  /**
-   * True while a newly selected diff is still being fetched.
-   *
-   * The store publishes a selection's fields atomically on completion, so
-   * without this the pane keeps showing the PREVIOUS file — its path, its
-   * line count, its rows — for as long as the read takes. On a large commit
-   * that is over a second of a viewer confidently displaying the wrong file.
-   *
-   * Only a change of target raises it. A refetch of the diff already on
-   * screen (the one that follows a stage, or a watcher-driven refresh) leaves
-   * it false, because flashing a skeleton over content that is about to be
-   * replaced by nearly the same content is worse than the staleness it
-   * announces.
-   */
-  selectedDiffPending: boolean;
-  /**
-   * Why the selected diff could not be read, or null. Per selection and kept
-   * apart from `error` (the repository snapshot's): a failed diff read must
-   * not blank the status, disable Review changes, or leave the previous
-   * file's diff on screen under the new file's name.
-   */
-  selectedDiffError: string | null;
-  /** What the selection is: a worktree file, a commit (optionally one of its files), or a range. */
-  selectionKind: SelectionKind;
-  activeTab: ViewTab;
-  /** Section last open in each sectioned view; see the session field. */
-  viewSections: Record<string, string>;
-  /** Whether the ACTIVE tab is showing the terminal dock; see the session field. */
-  terminalOpen: boolean;
-  isLoading: boolean;
-  error: string | null;
-  /** Active session needs trust before Git or background work may run. */
-  trustRequired: boolean;
-  isAmending: boolean;
-  isBare: boolean;
-  /** Hydration epoch of the active session; bumps on every activation. */
-  generation: number;
-  /** True while the active session's progressive branch-stats fetch is in flight. */
-  statsPending: boolean;
-  /** True when the active session's last branch-stats attempt failed. */
-  statsFailed: boolean;
-  /** The active session's parked operation, if any. */
-  operation: OperationState;
-  /** The active session's stash stack. */
-  stashEntries: StashEntry[];
-  /** True when the active session's stash probe failed. */
-  stashFailed: boolean;
-  stashTruncated: boolean;
-  /** True when older tags exist beyond the listing cap. */
-  tagsTruncated: boolean;
-  /** True when the active session's tag list could not be read. */
-  tagsFailed: boolean;
-  /** Whether the active session is receiving live filesystem updates. */
-  watch: WatchState;
-  /** Epoch ms of FETCH_HEAD mtime for the active repo; null when never fetched. */
-  fetchedAt: number | null;
-}
-
-interface InternalState {
-  workspace: WorkspaceTabs;
-  sessions: Record<string, RepoSession>;
-  workspaceError: string | null;
-}
-
-export interface RepoStoreDeps {
-  invoke?: InvokeFn;
-  storage?: StorageLike | null;
-  caseInsensitive?: boolean;
-  graph?: {
-    showRepo(path: string | null): void;
-    loadGraph(
-      path: string,
-      query?: string,
-      revision?: string | null,
-    ): Promise<void>;
-    evict(path: string): void;
-  };
-  filter?: {
-    subscribe(run: (value: FilterState) => void): () => void;
-    setSearch(query: string): void;
-    selectBranch(branch: string | null): void;
-    clear(): void;
-  };
-  /**
-   * How many live terminal sessions a repository holds.
-   *
-   * Injected rather than imported so the store stays testable without the
-   * terminal module, matching `graph` and `filter`. Closing a repository tab
-   * unmounts its terminal panel, which kills every shell in it — including a
-   * build or an agent still running — and that used to happen silently. It
-   * became likely enough to guard once the dock went per repository: before,
-   * only the repository in front could be holding one.
-   */
-  terminals?: {
-    countFor(repoPath: string): number;
-    /**
-     * Of `countFor`, those running in another checkout of the repository —
-     * agents this tab hosts (`taskLaunches.hostTabFor`). Closing the tab ends
-     * them too, which the question has to say: they are not in it.
-     */
-    hostedFor?(repoPath: string): number;
-  };
-}
-
-/**
- * Session generations never restart — not on close+reopen, not on workspace
- * restore, not on store re-creation. A pre-close in-flight hydrate still
- * carries its old (session id, generation) pair; if a fresh incarnation drew
- * generation 1 again, that stale response would pass the guard and overwrite
- * the new session's data.
- */
-let sessionGenerationSource = 0;
-function nextSessionGeneration(): number {
-  return ++sessionGenerationSource;
-}
 
 const MENU_RECENT_CAP = 12;
 /** Trailing debounce for localStorage writes and the native-menu rebuild. */
@@ -619,247 +205,6 @@ const REFETCH_SELECTION_KINDS = new Set([
   "discard",
   "commit",
 ]);
-
-function emptyProjected(): RepoState {
-  return {
-    openTabs: [],
-    activeTabId: null,
-    recentRepos: [],
-    lastClosed: [],
-    collapsedGroups: [],
-    groupColors: [],
-    currentPath: null,
-    branches: [],
-    tags: [],
-    currentBranch: null,
-    defaultBranch: null,
-    statuses: [],
-    selectedCommitId: null,
-    selectedFilePath: null,
-    selectedIsStaged: false,
-    selectedIgnoreWhitespace: false,
-    selectedDiff: null,
-    selectedDiffTruncated: false,
-    selectedDiffTruncationReason: null,
-    selectedDiffPending: false,
-    selectedDiffError: null,
-    selectionKind: "file",
-    activeTab: "work",
-    viewSections: {},
-    terminalOpen: false,
-    isLoading: false,
-    error: null,
-    trustRequired: false,
-    isAmending: false,
-    isBare: false,
-    generation: 0,
-    statsPending: false,
-    statsFailed: false,
-    operation: IDLE_OPERATION,
-    stashEntries: [],
-    stashFailed: false,
-    stashTruncated: false,
-    tagsTruncated: false,
-    tagsFailed: false,
-    watch: WATCH_UNKNOWN,
-    fetchedAt: null,
-  };
-}
-
-function createSession(
-  tab: { id: string; path: string; pinned: boolean },
-  extras: Partial<RepoSession> = {},
-): RepoSession {
-  return {
-    id: tab.id,
-    path: tab.path,
-    name: extras.name ?? displayName(tab.path),
-    isBare: extras.isBare ?? false,
-    commonDir: extras.commonDir ?? null,
-    pinned: tab.pinned,
-    branches: extras.branches ?? [],
-    tags: extras.tags ?? [],
-    currentBranch: extras.currentBranch ?? null,
-    defaultBranch: extras.defaultBranch ?? null,
-    statuses: extras.statuses ?? [],
-    selectedCommitId: extras.selectedCommitId ?? null,
-    selectedFilePath: extras.selectedFilePath ?? null,
-    selectedIsStaged: extras.selectedIsStaged ?? false,
-    // Seeded from the Settings > Diff & code preference rather than hardcoded
-    // off, so "ignore whitespace by default" survives opening the next
-    // repository. Read per session, not once at module load, so changing the
-    // preference takes effect on the next repository without a restart.
-    selectedIgnoreWhitespace:
-      extras.selectedIgnoreWhitespace ?? get(interfaceStore).diffIgnoreWhitespace,
-    selectionKind: extras.selectionKind ?? "file",
-    selectedDiff: extras.selectedDiff ?? null,
-    selectedDiffTruncated: extras.selectedDiffTruncated ?? false,
-    selectedDiffTruncationReason: extras.selectedDiffTruncationReason ?? null,
-    selectedDiffPending: extras.selectedDiffPending ?? false,
-    selectedDiffError: extras.selectedDiffError ?? null,
-    activeTab: extras.activeTab ?? "work",
-    viewSections: { ...(extras.viewSections ?? {}) },
-    terminalOpen: extras.terminalOpen ?? false,
-    searchQuery: extras.searchQuery ?? "",
-    selectedBranch: extras.selectedBranch ?? null,
-    isAmending: extras.isAmending ?? false,
-    isLoading: extras.isLoading ?? false,
-    error: extras.error ?? null,
-    trustRequired: extras.trustRequired ?? false,
-    missing: extras.missing ?? false,
-    generation: extras.generation ?? nextSessionGeneration(),
-    hasHydrated: extras.hasHydrated ?? false,
-    statsPending: extras.statsPending ?? false,
-    statsFailed: extras.statsFailed ?? false,
-    operation: extras.operation ?? IDLE_OPERATION,
-    stashEntries: extras.stashEntries ?? [],
-    stashFailed: extras.stashFailed ?? false,
-    stashTruncated: extras.stashTruncated ?? false,
-    tagsTruncated: extras.tagsTruncated ?? false,
-    tagsFailed: extras.tagsFailed ?? false,
-    watch: extras.watch ?? WATCH_UNKNOWN,
-    fetchedAt: extras.fetchedAt ?? null,
-  };
-}
-
-/**
- * What `project` kept from its last run, so publishing costs a reference
- * check per unchanged tab rather than a rebuild of every one. Every publish
- * used to re-derive each tab's labels and family from its paths: harmless at
- * 24 tabs, but restore publishes a few times per tab, which made opening a
- * workspace quadratic in its size (500 tabs took 4.5 s, nearly all of it
- * here). A row is reused only when its tab record, its session, its active
- * flag and its label are the same objects and values as last time — the
- * store replaces a session on every change, so that is exactly "nothing
- * this row reads has changed".
- */
-interface ProjectionCache {
-  tabs: readonly TabRecord[] | null;
-  labels: Map<string, string>;
-  rows: Map<string, { tab: TabRecord; session: RepoSession | undefined; active: boolean; label: string; row: OpenRepoTab }>;
-}
-
-function createProjectionCache(): ProjectionCache {
-  return { tabs: null, labels: new Map(), rows: new Map() };
-}
-
-function project(
-  internal: InternalState,
-  options: PathIdentityOptions,
-  cache: ProjectionCache = createProjectionCache(),
-): RepoState {
-  if (cache.tabs !== internal.workspace.tabs) {
-    cache.labels = disambiguateLabels(internal.workspace.tabs.map((tab) => tab.path));
-    cache.tabs = internal.workspace.tabs;
-    // Drop rows for tabs that are gone, so the cache is bounded by the strip.
-    const live = new Set(internal.workspace.tabs.map((tab) => tab.id));
-    for (const id of cache.rows.keys()) if (!live.has(id)) cache.rows.delete(id);
-  }
-  const labels = cache.labels;
-  const openTabs: OpenRepoTab[] = internal.workspace.tabs.map((tab) => {
-    const session = internal.sessions[tab.id];
-    const active = tab.id === internal.workspace.activeId;
-    const label = labels.get(tab.path) ?? displayName(tab.path);
-    const kept = cache.rows.get(tab.id);
-    if (kept && kept.tab === tab && kept.session === session && kept.active === active && kept.label === label) {
-      return kept.row;
-    }
-    const row = projectTab(tab, session, active, label, options);
-    cache.rows.set(tab.id, { tab, session, active, label, row });
-    return row;
-  });
-
-  const active = internal.workspace.activeId
-    ? internal.sessions[internal.workspace.activeId]
-    : undefined;
-  return projectRest(internal, openTabs, active);
-}
-
-function projectTab(
-  tab: TabRecord,
-  session: RepoSession | undefined,
-  isActive: boolean,
-  label: string,
-  options: PathIdentityOptions,
-): OpenRepoTab {
-    const statuses = session?.statuses ?? [];
-    const family = familyFromCommonDir(session?.commonDir, options);
-    return {
-      id: tab.id,
-      path: tab.path,
-      name: session?.name ?? displayName(tab.path),
-      label,
-      pinned: tab.pinned,
-      group: tab.group ?? null,
-      color: normalizeTabColor(tab.color),
-      family: family?.key ?? null,
-      familyRoot: family?.root ?? null,
-      isActive,
-      isBare: session?.isBare ?? false,
-      isDirty: statuses.some((file) => hasUnstagedChanges(file) || file.is_conflicted),
-      isLoading: session?.isLoading ?? false,
-      error: session?.error ?? null,
-      trustRequired: session?.trustRequired === true,
-      missing: session?.missing === true,
-      currentBranch: session?.currentBranch ?? null,
-      conflictedCount: statuses.filter((file) => file.is_conflicted).length,
-      changedCount: new Set(statuses.map((file) => file.path)).size,
-      watch: session?.watch.status ?? "unknown",
-      countsKnown: session?.hasHydrated === true,
-    };
-}
-
-function projectRest(
-  internal: InternalState,
-  openTabs: OpenRepoTab[],
-  active: RepoSession | undefined,
-): RepoState {
-  const base = emptyProjected();
-  return {
-    ...base,
-    openTabs,
-    activeTabId: internal.workspace.activeId,
-    recentRepos: internal.workspace.recents,
-    lastClosed: internal.workspace.lastClosed,
-    collapsedGroups: internal.workspace.collapsedGroups ?? [],
-    groupColors: internal.workspace.groupColors ?? [],
-    currentPath: active?.path ?? null,
-    branches: active?.branches ?? [],
-    tags: active?.tags ?? [],
-    currentBranch: active?.currentBranch ?? null,
-    defaultBranch: active?.defaultBranch ?? null,
-    statuses: active?.statuses ?? [],
-    selectedCommitId: active?.selectedCommitId ?? null,
-    selectedFilePath: active?.selectedFilePath ?? null,
-    selectedIsStaged: active?.selectedIsStaged ?? false,
-    selectedIgnoreWhitespace: active?.selectedIgnoreWhitespace ?? false,
-    selectedDiff: active?.selectedDiff ?? null,
-    selectedDiffTruncated: active?.selectedDiffTruncated ?? false,
-    selectedDiffTruncationReason: active?.selectedDiffTruncationReason ?? null,
-    selectedDiffPending: active?.selectedDiffPending ?? false,
-    selectedDiffError: active?.selectedDiffError ?? null,
-    selectionKind: active?.selectionKind ?? "file",
-    activeTab: active?.activeTab ?? "work",
-    viewSections: active?.viewSections ?? {},
-    terminalOpen: active?.terminalOpen ?? false,
-    isLoading: active?.isLoading ?? false,
-    error: active?.error ?? internal.workspaceError,
-    trustRequired: active?.trustRequired === true,
-    isAmending: active?.isAmending ?? false,
-    isBare: active?.isBare ?? false,
-    generation: active?.generation ?? 0,
-    statsPending: active?.statsPending ?? false,
-    statsFailed: active?.statsFailed ?? false,
-    operation: active?.operation ?? IDLE_OPERATION,
-    stashEntries: active?.stashEntries ?? [],
-    stashFailed: active?.stashFailed ?? false,
-    stashTruncated: active?.stashTruncated ?? false,
-    tagsTruncated: active?.tagsTruncated ?? false,
-    tagsFailed: active?.tagsFailed ?? false,
-    watch: active?.watch ?? WATCH_UNKNOWN,
-    fetchedAt: active?.fetchedAt ?? null,
-  };
-}
 
 const REPOSITORY_TRUST_REQUIRED = "REPOSITORY_TRUST_REQUIRED";
 
@@ -918,56 +263,6 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
       sessionsByRepo(get(terminalSessions).filter((record) => !!record.checkout), options).get(repoPath) ?? 0,
   };
 
-  /**
-   * True when these tabs may be closed: either nothing is running in any of
-   * them, or the user said to end it anyway.
-   *
-   * Takes a LIST because "Close Other Tabs" and "Close Tabs to the Right"
-   * discard several repositories at once and never route through `closeTab`.
-   * Guarding only the single close would leave the two paths that can lose
-   * the most work unguarded.
-   *
-   * Fails OPEN on a broken counter. A registry that threw would otherwise
-   * make every repository tab unclosable, which is a worse failure than a
-   * missing warning — the count is a courtesy, not a safety interlock.
-   */
-  async function confirmTerminalLoss(paths: readonly string[]): Promise<boolean> {
-    let running = 0;
-    let repos = 0;
-    let hosted = 0;
-    try {
-      for (const path of paths) {
-        const count = terminals.countFor(path);
-        if (!Number.isFinite(count) || count <= 0) continue;
-        running += count;
-        repos += 1;
-        const elsewhere = terminals.hostedFor?.(path) ?? 0;
-        if (Number.isFinite(elsewhere) && elsewhere > 0) hosted += Math.min(elsewhere, count);
-      }
-    } catch {
-      return true;
-    }
-    if (running <= 0) return true;
-    const shells = running === 1 ? "the shell" : `all ${running} shells`;
-    const subject = repos === 1 ? "this repository tab" : `these ${repos} repository tabs`;
-    const elsewhere = hosted === 0 ? ""
-      : hosted === running
-        ? `${hosted === 1 ? "It is an agent" : "They are agents"} working in another checkout of this repository, hosted here; ${hosted === 1 ? "it keeps" : "they keep"} running. `
-        : `${hosted} of them ${hosted === 1 ? "is an agent" : "are agents"} working in another checkout of this repository, hosted here; ${hosted === 1 ? "it keeps" : "they keep"} running. `;
-    return askConfirm({
-      title: running === 1 ? "End the terminal session?" : `End ${running} terminal sessions?`,
-      message:
-        `${paths.length === 1 ? `${paths[0]}\n\n` : ""}` +
-        `Closing ${subject} closes ${shells} in ${repos === 1 ? "it" : "them"} and their scrollback. ` +
-        elsewhere +
-        "A shell waiting at its prompt ends. Anything still running — a build, a test run, an agent — keeps running, " +
-        "listed under Sessions in the terminal dock, where it can be shown again or stopped.\n\n" +
-        "Hiding the terminal instead (⌃`) keeps the scrollback too.",
-      confirmLabel: running === 1 ? "Close and End Session" : "Close and End Sessions",
-      destructive: true,
-    });
-  }
-
   /** Rows `publish` can reuse; see `ProjectionCache`. */
   const projection = createProjectionCache();
   let internal: InternalState = {
@@ -1002,59 +297,14 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
   const sessionBook = createSessionBook((a, b) => sameRepo(a, b, options));
   const { familyUnknown, snapshotRuns, pollRuns, statsInflight, mutationEchoUntil } = sessionBook;
 
-  // Monotonic token source for diff-selection requests. Session `generation`
-  // only moves on tab activation, so it cannot order two rapid selections of
-  // the same tab; this does.
-  const selectionGeneration = beginGeneration();
-
-  /**
-   * Marks a diff fetch as in flight, but only when the target actually moves.
-   *
-   * The `select*Diff` calls are also how the app refetches the diff already
-   * on screen after a mutation or a watcher event. Raising the flag for those
-   * would blink a skeleton over content that is about to be replaced by
-   * nearly the same content, several times a minute.
-   */
-  const beginDiffFetch = (
-    session: RepoSession,
-    target: {
-      filePath: string | null;
-      commitId: string | null;
-      isStaged: boolean;
-      ignoreWhitespace: boolean;
-    },
-  ): void => {
-    const unchanged =
-      session.selectedFilePath === target.filePath &&
-      session.selectedCommitId === target.commitId &&
-      session.selectedIsStaged === target.isStaged &&
-      session.selectedIgnoreWhitespace === target.ignoreWhitespace &&
-      session.selectedDiff !== null;
-    if (unchanged) return;
-    applyToSession(session.id, session.generation, { selectedDiffPending: true, selectedDiffError: null });
-  };
-
-  /**
-   * A diff read that failed: the selection the reader asked for, no diff, and
-   * the reason, on the selection itself. The previous file's diff is cleared
-   * rather than left under the new file's name, and the repository snapshot's
-   * `error` is untouched (it means "status unavailable", which this is not).
-   */
-  const failDiffFetch = (
-    session: RepoSession,
-    generation: number,
-    err: unknown,
-    selection: Partial<RepoSession> | ((current: RepoSession) => Partial<RepoSession>),
-  ): void => {
-    applyToSession(session.id, generation, (current) => ({
-      ...(typeof selection === "function" ? selection(current) : selection),
-      selectedDiff: null,
-      selectedDiffTruncated: false,
-      selectedDiffTruncationReason: null,
-      selectedDiffError: formatError(err),
-      selectedDiffPending: false,
-    }));
-  };
+  // Diff selection: file, commit, commit file and range share one fetch path
+  // (`repos/diffSelection.ts`), which also owns the token that orders them.
+  const diffSelection = createDiffSelection({
+    invoke: invokeFn,
+    activeSession: () => activeSession(),
+    applyToSession: (id, generation, patch) => applyToSession(id, generation, patch),
+    openEpoch: () => openEpoch,
+  });
 
   /**
    * How many poll ticks between re-asserting the active repository's watch.
@@ -2629,7 +1879,7 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
       // in it. Ask first, and only when there is something to lose — a
       // confirmation on every close would train the user to dismiss it, which
       // is how the one that mattered gets dismissed too.
-      if (session && !(await confirmTerminalLoss([session.path]))) return;
+      if (session && !(await confirmTerminalLoss(terminals, [session.path]))) return;
       const result = closeTab(internal.workspace, id);
       if (result.reason === "missing") return;
       commitEdit(result.closedPath ? [result.closedPath] : []);
@@ -2659,7 +1909,7 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
       const keep = internal.sessions[id];
       if (!keep) return;
       const removed = internal.workspace.tabs.filter((tab) => tab.id !== id);
-      if (!(await confirmTerminalLoss(removed.map((tab) => tab.path)))) return;
+      if (!(await confirmTerminalLoss(terminals, removed.map((tab) => tab.path)))) return;
       commitEdit(removed.map((tab) => tab.path));
       replaceWorkspace(closeOtherTabs(internal.workspace, id));
       internal = { ...internal, sessions: { [id]: keep } };
@@ -2678,7 +1928,7 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
       const index = internal.workspace.tabs.findIndex((tab) => tab.id === id);
       if (index < 0) return;
       const removed = internal.workspace.tabs.slice(index + 1);
-      if (!(await confirmTerminalLoss(removed.map((tab) => tab.path)))) return;
+      if (!(await confirmTerminalLoss(terminals, removed.map((tab) => tab.path)))) return;
       commitEdit(removed.map((tab) => tab.path));
       replaceWorkspace(closeTabsToTheRight(internal.workspace, id));
       const remaining = new Set(internal.workspace.tabs.map((tab) => tab.id));
@@ -2815,7 +2065,7 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
     closeGroup: async (groupName: string) => {
       const groupTabs = internal.workspace.tabs.filter((t) => t.group === groupName);
       if (groupTabs.length === 0) return;
-      if (!(await confirmTerminalLoss(groupTabs.map((t) => t.path)))) return;
+      if (!(await confirmTerminalLoss(terminals, groupTabs.map((t) => t.path)))) return;
       const { workspace, closedPaths } = closeWorkspaceGroup(internal.workspace, groupName);
       commitEdit(groupTabs.map((tab) => tab.path));
       replaceWorkspace(workspace);
@@ -3146,7 +2396,7 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
       const side = isStaged === false && file && hasUnstagedChanges(file) ? false : file?.is_staged ?? false;
       openEpoch += 1;
       // Invalidate late commit/range reads even when this worktree became clean.
-      selectionGeneration.next();
+      diffSelection.supersede();
       applyToSession(session.id, session.generation, {
         selectedFilePath: file?.path ?? null,
         selectedCommitId: null,
@@ -3163,60 +2413,17 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
       interfaceStore.setFleetOpen(false);
       if (file) await store.selectFileDiff(file.path, side);
     },
-    selectFileDiff: async (filePath: string, isStaged: boolean = false) => {
-      const session = activeSession();
-      if (!session) return;
-      const generation = session.generation;
-      const navigationEpoch = openEpoch;
-      // The whitespace preference lives on the session, not on call sites:
-      // every refetch of this diff must carry whatever the user last chose.
-      const ignoreWhitespace = session.selectedIgnoreWhitespace;
-      const token = selectionGeneration.next();
-      beginDiffFetch(session, {
+    selectFileDiff: (filePath: string, isStaged: boolean = false) =>
+      diffSelection.select({
+        read: (invoke, repoPath, ignoreWhitespace) =>
+          invoke<DiffPayload>("cmd_get_file_diff", { repoPath, filePath, isStaged, ignoreWhitespace }),
         filePath,
         commitId: null,
         isStaged,
-        ignoreWhitespace,
-      });
-      try {
-        const diff = await invokeFn<DiffPayload>("cmd_get_file_diff", {
-          repoPath: session.path,
-          filePath,
-          isStaged,
-          ignoreWhitespace,
-        });
-        if (!selectionGeneration.isCurrent(token)) return;
-        applyToSession(session.id, generation, (current) => ({
-          selectedFilePath: filePath,
-          selectedCommitId: null,
-          selectedDiff: diff.text,
-          selectedDiffTruncated: diff.truncated,
-          selectedDiffTruncationReason: diff.truncation_reason ?? null,
-          selectedIsStaged: isStaged,
-          selectedIgnoreWhitespace: ignoreWhitespace,
-          selectedDiffPending: false,
-          selectedDiffError: null,
-          selectionKind: "file",
-          ...(navigationEpoch === openEpoch ? {
-            activeTab: "history" as const,
-            viewSections: { ...current.viewSections, history: "diff" },
-          } : {}),
-        }));
-      } catch (err: unknown) {
-        if (!selectionGeneration.isCurrent(token)) return;
-        // A fetch that errored is not still running: the flag clears with it.
-        failDiffFetch(session, generation, err, (current) => ({
-          selectedFilePath: filePath,
-          selectedCommitId: null,
-          selectedIsStaged: isStaged,
-          selectionKind: "file",
-          ...(navigationEpoch === openEpoch ? {
-            activeTab: "history" as const,
-            viewSections: { ...current.viewSections, history: "diff" },
-          } : {}),
-        }));
-      }
-    },
+        kind: "file",
+        history: "unlessNavigated",
+        worktree: true,
+      }),
     selectFilePath: (filePath: string | null) => {
       const session = activeSession();
       if (!session) return;
@@ -3252,136 +2459,37 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
       if (selectionKind !== "file" || !filePath) return;
       void store.selectFileDiff(filePath, isStaged);
     },
-    selectCommitDiff: async (commitId: string) => {
-      const session = activeSession();
-      if (!session) return;
-      const generation = session.generation;
-      const token = selectionGeneration.next();
-      beginDiffFetch(session, {
+    selectCommitDiff: (commitId: string) =>
+      diffSelection.select({
+        read: (invoke, repoPath) => invoke<DiffPayload>("cmd_get_commit_diff", { repoPath, commitId }),
         filePath: null,
         commitId,
         isStaged: false,
-        ignoreWhitespace: session.selectedIgnoreWhitespace,
-      });
-      try {
-        const diff = await invokeFn<DiffPayload>("cmd_get_commit_diff", {
-          repoPath: session.path,
-          commitId,
-        });
-        if (!selectionGeneration.isCurrent(token)) return;
-        applyToSession(session.id, generation, {
-          selectedCommitId: commitId,
-          selectedFilePath: null,
-          selectedDiff: diff.text,
-          selectedDiffTruncated: diff.truncated,
-          selectedDiffTruncationReason: diff.truncation_reason ?? null,
-          selectedIsStaged: false,
-          selectedDiffPending: false,
-          selectedDiffError: null,
-          selectionKind: "commit",
-        });
-      } catch (err: unknown) {
-        if (!selectionGeneration.isCurrent(token)) return;
-        // A fetch that errored is not still running: the flag clears with it.
-        failDiffFetch(session, generation, err, {
-          selectedCommitId: commitId,
-          selectedFilePath: null,
-          selectedIsStaged: false,
-          selectionKind: "commit",
-        });
-      }
-    },
+        kind: "commit",
+        history: "never",
+      }),
     /**
      * Opens one file of a commit while keeping the commit as the selection owner.
      */
-    selectCommitFileDiff: async (commitId: string, filePath: string) => {
-      const session = activeSession();
-      if (!session) return;
-      const generation = session.generation;
-      const token = selectionGeneration.next();
-      beginDiffFetch(session, {
+    selectCommitFileDiff: (commitId: string, filePath: string) =>
+      diffSelection.select({
+        read: (invoke, repoPath) =>
+          invoke<DiffPayload>("cmd_get_commit_file_diff", { repoPath, commitId, filePath }),
         filePath,
         commitId,
         isStaged: false,
-        ignoreWhitespace: session.selectedIgnoreWhitespace,
-      });
-      try {
-        const fileDiff = await invokeFn<DiffPayload>("cmd_get_commit_file_diff", {
-          repoPath: session.path,
-          commitId,
-          filePath,
-        });
-        if (!selectionGeneration.isCurrent(token)) return;
-        applyToSession(session.id, generation, (current) => ({
-          selectedCommitId: commitId,
-          selectedFilePath: filePath,
-          selectedDiff: fileDiff.text,
-          selectedDiffTruncated: fileDiff.truncated,
-          selectedDiffTruncationReason: fileDiff.truncation_reason ?? null,
-          selectedIsStaged: false,
-          selectedDiffPending: false,
-          selectedDiffError: null,
-          selectionKind: "commit",
-          activeTab: "history",
-          viewSections: { ...current.viewSections, history: "diff" },
-        }));
-      } catch (err: unknown) {
-        if (!selectionGeneration.isCurrent(token)) return;
-        // A fetch that errored is not still running: the flag clears with it.
-        failDiffFetch(session, generation, err, (current) => ({
-          selectedCommitId: commitId,
-          selectedFilePath: filePath,
-          selectedIsStaged: false,
-          selectionKind: "commit",
-          activeTab: "history" as const,
-          viewSections: { ...current.viewSections, history: "diff" },
-        }));
-      }
-    },
-    selectRangeDiff: async (from: string, to: string) => {
-      const session = activeSession();
-      if (!session) return;
-      const generation = session.generation;
-      const token = selectionGeneration.next();
-      beginDiffFetch(session, {
+        kind: "commit",
+        history: "always",
+      }),
+    selectRangeDiff: (from: string, to: string) =>
+      diffSelection.select({
+        read: (invoke, repoPath) => invoke<DiffPayload>("cmd_get_range_diff", { repoPath, from, to }),
         filePath: `${from}...${to}`,
         commitId: null,
         isStaged: false,
-        ignoreWhitespace: session.selectedIgnoreWhitespace,
-      });
-      try {
-        const diff = await invokeFn<DiffPayload>("cmd_get_range_diff", {
-          repoPath: session.path,
-          from,
-          to,
-        });
-        if (!selectionGeneration.isCurrent(token)) return;
-        applyToSession(session.id, generation, (current) => ({
-          selectedFilePath: `${from}...${to}`,
-          selectedCommitId: null,
-          selectedDiff: diff.text,
-          selectedDiffTruncated: diff.truncated,
-          selectedDiffTruncationReason: diff.truncation_reason ?? null,
-          selectedIsStaged: false,
-          selectedDiffPending: false,
-          selectedDiffError: null,
-          selectionKind: "range",
-          activeTab: "history",
-          viewSections: { ...current.viewSections, history: "diff" },
-        }));
-      } catch (err: unknown) {
-        if (!selectionGeneration.isCurrent(token)) return;
-        // A fetch that errored is not still running: the flag clears with it.
-        failDiffFetch(session, generation, err, (current) => ({
-          selectedFilePath: `${from}...${to}`,
-          selectedCommitId: null,
-          selectedIsStaged: false,
-          selectionKind: "range",
-          activeTab: "history" as const,
-          viewSections: { ...current.viewSections, history: "diff" },
-        }));
-      }
-    },
+        kind: "range",
+        history: "always",
+      }),
     stageFile: async (filePath: string) =>
       runMutating("stage", filePath, (path) =>
         invokeFn("cmd_stage_file", { repoPath: path, filePath }),
@@ -3752,7 +2860,7 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
         onError: (path, error) =>
           diagnostics.warn("autoFetch", `auto-fetch of ${path} failed: ${formatError(error)}`),
       });
-      return createVisibleInterval(() => void scheduler.tick(), AUTO_FETCH_TICK_MS);
+      return createAdaptiveTimer(() => void scheduler.tick(), AUTO_FETCH_TICK_MS);
     },
     push: async (remote?: string, branch?: string, force: boolean = false) =>
       runMutating(

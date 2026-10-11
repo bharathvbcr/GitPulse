@@ -1,7 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
   buildSplitRows,
-  hasContentLines,
   isChangeTone,
   lineForSplitRow,
   lineTones,
@@ -282,21 +281,5 @@ describe("nextChangeRow", () => {
     expect(nextChangeRow(t, 9_999, -1)).toBe(2);
     expect(nextChangeRow(t, 9_999, 1)).toBeNull();
     expect(nextChangeRow(t, -9_999, -1)).toBeNull();
-  });
-});
-
-describe("hasContentLines", () => {
-  it("is false for a diff of nothing but chrome", () => {
-    expect(hasContentLines(parseUnifiedDiff("diff --git a/x b/x\nindex 1..2\n"))).toBe(false);
-  });
-
-  it("is true as soon as one add, del or context row exists", () => {
-    expect(hasContentLines(diff(" ctx"))).toBe(true);
-    expect(hasContentLines(diff("+new"))).toBe(true);
-    expect(hasContentLines(diff("-old"))).toBe(true);
-  });
-
-  it("is false for an empty list", () => {
-    expect(hasContentLines([])).toBe(false);
   });
 });

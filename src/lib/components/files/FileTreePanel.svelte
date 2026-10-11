@@ -61,7 +61,7 @@
   import { portal } from "../../dom/portal";
   import { LAYERS } from "../../ui/layers";
   import { popover, restoreFocusTo } from "../../ui/popover";
-  import { enumerateFocusables } from "../../ui/focusTrap";
+  import { focusAdjacentToMenuOpener } from "../../ui/focusTrap";
   import VirtualList from "../VirtualList.svelte";
   import ScrollCue from "../ScrollCue.svelte";
   import EmptyState from "../EmptyState.svelte";
@@ -453,34 +453,6 @@
     }, 0);
     return () => window.clearTimeout(timer);
   });
-
-  function focusAdjacentToMenuOpener(
-    popup: HTMLElement,
-    opener: HTMLElement | null,
-    backwards: boolean,
-  ) {
-    const candidates = enumerateFocusables<HTMLElement>(document).filter(
-      (candidate) =>
-        candidate.tabIndex >= 0 &&
-        !popup.contains(candidate) &&
-        candidate.getClientRects().length > 0,
-    );
-    if (candidates.length === 0) return;
-
-    const openerIndex = opener ? candidates.indexOf(opener) : -1;
-    let target = openerIndex >= 0
-      ? candidates[openerIndex + (backwards ? -1 : 1)]
-      : undefined;
-    if (!target && opener?.isConnected) {
-      const direction = backwards
-        ? Node.DOCUMENT_POSITION_PRECEDING
-        : Node.DOCUMENT_POSITION_FOLLOWING;
-      const ordered = backwards ? [...candidates].reverse() : candidates;
-      target = ordered.find((candidate) => opener.compareDocumentPosition(candidate) & direction);
-    }
-    target ??= candidates[backwards ? candidates.length - 1 : 0];
-    window.setTimeout(() => target?.focus(), 0);
-  }
 
   function handleMenuKeydown(e: KeyboardEvent) {
     if (e.key === "Tab") {

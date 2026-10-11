@@ -11,7 +11,7 @@
   import { copyText as copyToClipboard } from "../desktop/clipboard";
   import { mergeRef, type MergeMode, type MergeRequest } from "../branches/mergeSelection";
   import MergeBranchDialog from "./MergeBranchDialog.svelte";
-  import { enumerateFocusables } from "../ui/focusTrap";
+  import { focusAdjacentToMenuOpener } from "../ui/focusTrap";
   import {
     branchLeafName,
     countFolder,
@@ -508,34 +508,6 @@
   function menuItemEls(): HTMLButtonElement[] {
     if (!menuEl) return [];
     return [...menuEl.querySelectorAll<HTMLButtonElement>('[role="menuitem"]')];
-  }
-
-  function focusAdjacentToMenuOpener(
-    popup: HTMLElement,
-    opener: HTMLElement | null,
-    backwards: boolean,
-  ) {
-    const candidates = enumerateFocusables<HTMLElement>(document).filter(
-      (candidate) =>
-        candidate.tabIndex >= 0 &&
-        !popup.contains(candidate) &&
-        candidate.getClientRects().length > 0,
-    );
-    if (candidates.length === 0) return;
-
-    const openerIndex = opener ? candidates.indexOf(opener) : -1;
-    let target = openerIndex >= 0
-      ? candidates[openerIndex + (backwards ? -1 : 1)]
-      : undefined;
-    if (!target && opener?.isConnected) {
-      const direction = backwards
-        ? Node.DOCUMENT_POSITION_PRECEDING
-        : Node.DOCUMENT_POSITION_FOLLOWING;
-      const ordered = backwards ? [...candidates].reverse() : candidates;
-      target = ordered.find((candidate) => opener.compareDocumentPosition(candidate) & direction);
-    }
-    target ??= candidates[backwards ? candidates.length - 1 : 0];
-    window.setTimeout(() => target?.focus(), 0);
   }
 
   function handleMenuKeydown(e: KeyboardEvent) {

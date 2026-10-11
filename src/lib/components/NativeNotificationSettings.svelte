@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { formatClockMinutes, parseClockMinutes } from "../format";
   import { onMount } from "svelte";
   import { isTauri } from "../platform";
   import { hostPlatform } from "../stores/platformStore";
@@ -37,14 +38,12 @@
   const muteField = $derived(taskID ? "muted_task_ids" : scope.kind === "workspace" ? "muted_workspace_ids" : "muted_repository_ids");
   const muted = $derived(!!draft?.[muteField].includes(taskID ?? (scope.kind !== "global" ? scope.id : "")));
   const muteCount = $derived(draft ? draft.muted_workspace_ids.length + draft.muted_repository_ids.length + draft.muted_task_ids.length : 0);
-  const clock = (n: number) => `${String(Math.floor(n / 60)).padStart(2, "0")}:${String(n % 60).padStart(2, "0")}`;
-  const minute = (s: string) => { if (!/^([01][0-9]|2[0-3]):[0-5][0-9]$/.test(s)) throw new Error("Choose valid local quiet hours."); const [h, m] = s.split(":").map(Number); return h * 60 + m; };
   async function refresh() {
     if (busy || pending) return; busy = true; error = "";
     try {
       const settings = await getNotificationSettings(); if (disposed) return;
       saved = settings; draft = notificationDraft(settings); quiet = settings.quiet_start !== null;
-      if (settings.quiet_start !== null && settings.quiet_end !== null) { start = clock(settings.quiet_start); end = clock(settings.quiet_end); }
+      if (settings.quiet_start !== null && settings.quiet_end !== null) { start = formatClockMinutes(settings.quiet_start); end = formatClockMinutes(settings.quiet_end); }
       if (isTauri()) { const status = await nativeNotificationStatus(); if (!disposed) native = status; }
     } catch (cause) { if (!disposed) error = explainError(cause); } finally { if (!disposed) busy = false; }
   }
@@ -60,7 +59,7 @@
     busy = true; error = "";
     try {
       if (!pending) {
-        const next = { ...draft, quiet_start: quiet ? minute(start) : null, quiet_end: quiet ? minute(end) : null };
+        const next = { ...draft, quiet_start: quiet ? parseClockMinutes(start) : null, quiet_end: quiet ? parseClockMinutes(end) : null };
         if (quiet && next.quiet_start === next.quiet_end) throw new Error("Quiet-hour start and end must differ.");
         if (next.enabled && isTauri() && (!native || !["authorized", "provisional"].includes(native.authorization))) {
           const status = await nativeNotificationStatus(true); if (disposed) return; native = status;
