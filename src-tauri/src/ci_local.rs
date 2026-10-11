@@ -593,7 +593,12 @@ pub fn plan_ci_with_affected(repo_root: &Path, seeds: &[String]) -> CiPlan {
         );
     }
     let repo_str = repo_root.to_string_lossy();
-    let affected = crate::codeintel::affected_tests(&repo_str, seeds, None, None);
+    let affected = crate::codeintel::affected_tests(
+        &repo_str,
+        seeds,
+        None,
+        crate::codeintel::WalkBounds::default(),
+    );
     plan_ci_from_affected(repo_root, seeds, &affected)
 }
 

@@ -754,7 +754,14 @@ pub fn impact(
     target: &str,
     token_budget: Option<u32>,
 ) -> CodeintelResponse<CodeintelEdge> {
-    impact_at_rung(repo_path, target, token_budget, None, None)
+    impact_at_rung(
+        repo_path,
+        target,
+        token_budget,
+        None,
+        WalkBounds::default(),
+        None,
+    )
 }
 
 /// Impact narrowed to a named resolution rung.
@@ -763,6 +770,7 @@ pub fn impact_at_rung(
     target: &str,
     token_budget: Option<u32>,
     min_rung: Option<&str>,
+    bounds: WalkBounds,
     cancel: Option<Cancel>,
 ) -> CodeintelResponse<CodeintelEdge> {
     at_rung_query(
@@ -772,6 +780,7 @@ pub fn impact_at_rung(
             query: target,
             token_budget,
             min_rung,
+            bounds,
             cancel,
             failure: "Impact computation failed",
         },
@@ -785,7 +794,14 @@ pub fn dependencies(
     file_path: &str,
     token_budget: Option<u32>,
 ) -> CodeintelResponse<CodeintelEdge> {
-    dependencies_at_rung(repo_path, file_path, token_budget, None, None)
+    dependencies_at_rung(
+        repo_path,
+        file_path,
+        token_budget,
+        None,
+        WalkBounds::default(),
+        None,
+    )
 }
 
 /// Dependencies narrowed to a named resolution rung.
@@ -794,6 +810,7 @@ pub fn dependencies_at_rung(
     file_path: &str,
     token_budget: Option<u32>,
     min_rung: Option<&str>,
+    bounds: WalkBounds,
     cancel: Option<Cancel>,
 ) -> CodeintelResponse<CodeintelEdge> {
     at_rung_query(
@@ -803,6 +820,7 @@ pub fn dependencies_at_rung(
             query: file_path,
             token_budget,
             min_rung,
+            bounds,
             cancel,
             failure: "Dependencies lookup failed",
         },
@@ -819,6 +837,7 @@ struct AtRungQuery<'a> {
     query: &'a str,
     token_budget: Option<u32>,
     min_rung: Option<&'a str>,
+    bounds: WalkBounds,
     cancel: Option<Cancel>,
     failure: &'a str,
 }
@@ -842,6 +861,10 @@ fn at_rung_query<E: std::fmt::Display>(
         Ok(r) => r,
         Err(e) => return CodeintelResponse::unavailable(e),
     };
+    let (min_confidence, max_depth) = match q.bounds.resolve() {
+        Ok(b) => b,
+        Err(e) => return CodeintelResponse::unavailable(e),
+    };
     let store = match open_repo_map(q.repo_path) {
         Ok(s) => s,
         Err(e) => return CodeintelResponse::unavailable(e),
@@ -853,8 +876,8 @@ fn at_rung_query<E: std::fmt::Display>(
     let req = Request {
         query: q.query.to_string(),
         token_budget: q.token_budget.unwrap_or(DEFAULT_CODEINTEL_BUDGET),
-        min_confidence: 0.0,
-        max_depth: 10,
+        min_confidence,
+        max_depth,
     };
 
     match run(&engine, req, rung) {
@@ -894,7 +917,15 @@ pub fn trace_between(
     to: &str,
     token_budget: Option<u32>,
 ) -> CodeintelResponse<CodeintelEdge> {
-    trace_between_at_rung(repo_path, from, to, token_budget, None, None)
+    trace_between_at_rung(
+        repo_path,
+        from,
+        to,
+        token_budget,
+        None,
+        WalkBounds::default(),
+        None,
+    )
 }
 
 /// Trace narrowed to a named resolution rung.
@@ -904,6 +935,7 @@ pub fn trace_between_at_rung(
     to: &str,
     token_budget: Option<u32>,
     min_rung: Option<&str>,
+    bounds: WalkBounds,
     cancel: Option<Cancel>,
 ) -> CodeintelResponse<CodeintelEdge> {
     if let Err(e) = require_argument("from", from).and_then(|()| require_argument("to", to)) {
@@ -911,6 +943,10 @@ pub fn trace_between_at_rung(
     }
     let rung = match parse_min_rung(min_rung) {
         Ok(r) => r,
+        Err(e) => return CodeintelResponse::unavailable(e),
+    };
+    let (min_confidence, max_depth) = match bounds.resolve() {
+        Ok(b) => b,
         Err(e) => return CodeintelResponse::unavailable(e),
     };
     let store = match open_repo_map(repo_path) {
@@ -924,8 +960,8 @@ pub fn trace_between_at_rung(
     let req = Request {
         query: (from.to_string(), to.to_string()),
         token_budget: token_budget.unwrap_or(DEFAULT_CODEINTEL_BUDGET),
-        min_confidence: 0.0,
-        max_depth: 10,
+        min_confidence,
+        max_depth,
     };
 
     match engine.trace_between(req) {
@@ -949,16 +985,58 @@ pub struct CodeintelNeighbors {
     pub callees: CodeintelResponse<CodeintelEdge>,
 }
 
+/// Deepest walk the MCP surface advertises for `depth`.
+pub const MAX_WALK_DEPTH: usize = 64;
+
+/// Walk depth used when the caller names none (the engine's long-standing cap).
+const DEFAULT_WALK_DEPTH: usize = 10;
+
+/// How far and how confidently a graph walk may reach.
+///
+/// `None` keeps the long-standing defaults (depth 10, confidence 0.0), which is
+/// what the app commands pass. A value outside its range (`min_confidence` in
+/// `[0, 1]`, `max_depth` in `1..=`[`MAX_WALK_DEPTH`]) is refused rather than
+/// clamped, so a caller never reads a wider answer as the narrow one it asked
+/// for. The one owner of that range check for every query that walks edges.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct WalkBounds {
+    pub max_depth: Option<usize>,
+    pub min_confidence: Option<f32>,
+}
+
+impl WalkBounds {
+    /// The `(min_confidence, max_depth)` the engine takes, or why they are invalid.
+    fn resolve(self) -> Result<(f32, usize), String> {
+        let min_confidence = self.min_confidence.unwrap_or(0.0);
+        if !(0.0..=1.0).contains(&min_confidence) {
+            return Err(format!(
+                "min_confidence must be within [0, 1], got {min_confidence}"
+            ));
+        }
+        let max_depth = self.max_depth.unwrap_or(DEFAULT_WALK_DEPTH);
+        if !(1..=MAX_WALK_DEPTH).contains(&max_depth) {
+            return Err(format!(
+                "depth must be within 1..={MAX_WALK_DEPTH}, got {max_depth}"
+            ));
+        }
+        Ok((min_confidence, max_depth))
+    }
+}
+
 /// Callers and callees for one or more targets (chunked at [`MAX_NEIGHBOR_TARGETS`]).
+///
+/// `bounds` limits the walk; see [`WalkBounds`].
 pub fn neighbors(
     repo_path: &str,
     targets: &[String],
     token_budget: Option<u32>,
     min_rung: Option<&str>,
+    bounds: WalkBounds,
 ) -> Result<Vec<CodeintelNeighbors>, String> {
     if targets.is_empty() {
         return Err("neighbors requires at least one target".into());
     }
+    let (min_confidence, max_depth) = bounds.resolve()?;
     let rung = parse_min_rung(min_rung)?;
     let store = open_repo_map(repo_path)?;
     let engine = StoreQueryEngine::new(&store);
@@ -966,7 +1044,7 @@ pub fn neighbors(
     let mut out = Vec::new();
     for chunk in targets.chunks(MAX_NEIGHBOR_TARGETS) {
         let report = engine
-            .neighbors_at_rung(chunk, budget, 0.0, 10, rung)
+            .neighbors_at_rung(chunk, budget, min_confidence, max_depth, rung)
             .map_err(|e| format!("neighbors failed: {e}"))?;
         for entry in report {
             out.push(CodeintelNeighbors {
@@ -977,6 +1055,60 @@ pub fn neighbors(
         }
     }
     Ok(out)
+}
+
+/// Wraps [`neighbors`] in the answer envelope every other query carries.
+///
+/// The bare `Vec` is what the app command and the frontend consume, but it
+/// serialises to a JSON array: it cannot satisfy an object `outputSchema` and
+/// has nowhere to say "truncated", "walk stopped at depth" or "freshness not
+/// checked". Each target's own callers/callees keep their envelopes; this one
+/// summarises them — `truncated` and `walk_incomplete` are raised when any
+/// facet raised them, `source_freshness` is the weakest of them, and
+/// `available` is false (with the first reason) when any facet could not
+/// answer, so a refusal never renders as "no callers". A failed walk becomes
+/// an unavailable envelope, as it does for every sibling query.
+pub fn neighbors_envelope(
+    result: Result<Vec<CodeintelNeighbors>, String>,
+) -> CodeintelResponse<CodeintelNeighbors> {
+    let items = match result {
+        Ok(items) => items,
+        Err(reason) => return CodeintelResponse::unavailable(reason),
+    };
+    let reason = items
+        .iter()
+        .flat_map(|entry| [&entry.callers, &entry.callees])
+        .find(|facet| !facet.available)
+        .map(|facet| {
+            facet
+                .reason
+                .clone()
+                .unwrap_or_else(|| "a facet of this answer was unavailable".to_string())
+        });
+    let truncated = items
+        .iter()
+        .any(|entry| entry.callers.truncated || entry.callees.truncated);
+    let walk_incomplete = fold_qualification_reason(
+        items.iter().flat_map(|entry| {
+            [&entry.callers, &entry.callees]
+                .into_iter()
+                .filter_map(|facet| facet.walk_incomplete.clone())
+        }),
+        QUALIFICATION_MAX_CHARS,
+    );
+    let source_freshness = items
+        .iter()
+        .flat_map(|entry| [&entry.callers, &entry.callees])
+        .map(|facet| facet.source_freshness.clone())
+        .reduce(merge_source_freshness)
+        .unwrap_or_else(CodeintelResponse::<CodeintelNeighbors>::unverified_freshness);
+    let count = items.len() as u32;
+    let mut out = CodeintelResponse::ok(items, count, count, truncated);
+    out.available = reason.is_none();
+    out.reason = reason;
+    out.walk_incomplete = walk_incomplete;
+    out.source_freshness = source_freshness;
+    out
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1164,7 +1296,7 @@ pub fn affected_tests(
     repo_path: &str,
     targets: &[String],
     token_budget: Option<u32>,
-    max_depth: Option<usize>,
+    bounds: WalkBounds,
 ) -> CodeintelAffectedTests {
     if targets.is_empty() {
         return CodeintelAffectedTests {
@@ -1182,6 +1314,10 @@ pub fn affected_tests(
             fail_closed_reason: Some("no seeds provided".into()),
         };
     }
+    let (min_confidence, max_depth) = match bounds.resolve() {
+        Ok(b) => b,
+        Err(e) => return affected_tests_unavailable(targets, e),
+    };
     let repo = match resolve_repo(repo_path) {
         Ok(r) => r,
         Err(e) => {
@@ -1250,14 +1386,35 @@ pub fn affected_tests(
         &store,
         targets,
         token_budget.unwrap_or(DEFAULT_CODEINTEL_BUDGET),
-        max_depth.unwrap_or(10),
+        min_confidence,
+        max_depth,
     )
+}
+
+/// A refused affected-tests query: nothing was selected, so the caller must
+/// fall back to the full suite and is told why.
+fn affected_tests_unavailable(targets: &[String], reason: String) -> CodeintelAffectedTests {
+    CodeintelAffectedTests {
+        available: false,
+        reason: Some(reason.clone()),
+        targets: targets.to_vec(),
+        tests: CodeintelResponse::unavailable(reason.clone()),
+        blast_radius: CodeintelBlastRadius {
+            seeds: Vec::new(),
+            unmatched_targets: targets.to_vec(),
+            layers: CodeintelResponse::unavailable(reason.clone()),
+            total_impacted: 0,
+        },
+        fail_closed: true,
+        fail_closed_reason: Some(reason),
+    }
 }
 
 fn affected_tests_from_store(
     store: &Store,
     targets: &[String],
     budget: u32,
+    min_confidence: f32,
     depth: usize,
 ) -> CodeintelAffectedTests {
     let engine = StoreQueryEngine::new(store);
@@ -1272,7 +1429,7 @@ fn affected_tests_from_store(
         // One caller budget across all batches, including the remainder.
         let chunk_budget =
             budget / chunk_count + u32::from(index < (budget % chunk_count) as usize);
-        match engine.affected_tests(chunk, chunk_budget, 0.0, depth) {
+        match engine.affected_tests(chunk, chunk_budget, min_confidence, depth) {
             Ok(report) => {
                 unmatched.extend(report.blast_radius.unmatched_targets);
                 seeds.extend(report.blast_radius.seeds);
@@ -1782,7 +1939,25 @@ pub fn explore(
     query: &str,
     token_budget: Option<u32>,
     limit: Option<u32>,
+    bounds: WalkBounds,
 ) -> CodeintelExplore {
+    let (min_confidence, max_depth) = match bounds.resolve() {
+        Ok(b) => b,
+        Err(e) => {
+            return CodeintelExplore {
+                available: false,
+                reason: Some(e.clone()),
+                definitions: CodeintelResponse::unavailable(e.clone()),
+                blast_radius: CodeintelBlastRadius {
+                    seeds: Vec::new(),
+                    unmatched_targets: vec![query.to_string()],
+                    layers: CodeintelResponse::unavailable(e),
+                    total_impacted: 0,
+                },
+                limit: 0,
+            }
+        }
+    };
     if let Err(e) = require_argument("query", query) {
         return CodeintelExplore {
             available: false,
@@ -1817,7 +1992,7 @@ pub fn explore(
     let engine = StoreQueryEngine::new(&store);
     let budget = token_budget.unwrap_or(DEFAULT_CODEINTEL_BUDGET);
     let limit = limit.unwrap_or(20) as usize;
-    match engine.explore(query, limit, budget, 0.0, 10) {
+    match engine.explore(query, limit, budget, min_confidence, max_depth) {
         Ok(report) => {
             let definitions = from_engine(report.definitions, |d| CodeintelExploreDefinition {
                 symbol_name: d.symbol_name,
@@ -1942,7 +2117,7 @@ pub fn preview(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::procguard::LockedSpawn;
 
@@ -2282,7 +2457,7 @@ mod tests {
     ///     the map.
     ///   * only `src/caller.rs` exists on disk, so one search hit can read its
     ///     source span and the other cannot.
-    fn repo_with_one_generation() -> tempfile::TempDir {
+    pub(crate) fn repo_with_one_generation() -> tempfile::TempDir {
         let dir = git_repo();
         let root = dir.path().to_string_lossy().into_owned();
         std::fs::create_dir_all(dir.path().join("src")).expect("mkdir src");
@@ -2401,6 +2576,40 @@ mod tests {
         dir
     }
 
+    /// Depth and confidence reach the affected-tests walk: the test file is two
+    /// hops from `probe_island` over a 0.9 and a 0.3 edge.
+    #[test]
+    fn affected_tests_walk_honours_depth_and_min_confidence() {
+        let repo = repo_with_one_generation();
+        let conn = rusqlite::Connection::open(map_path(repo.path())).unwrap();
+        conn.execute(
+            "UPDATE paths SET path = 'tests/probe_test.rs' WHERE id = 1",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO edge_rows
+               (edge_id, source_file_id, target_file_id,
+                source_symbol, target_symbol, edge_kind, confidence,
+                valid_from, valid_to)
+             VALUES (1, 2, 3, 'probe_callee', 'probe_island', 'Calls', 0.3, 1, NULL)",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+        let store = Store::open_read_only(map_path(repo.path())).unwrap();
+        let targets = vec!["probe_island".to_owned()];
+        let found = |min_confidence: f32, depth: usize| {
+            affected_tests_from_store(&store, &targets, 2000, min_confidence, depth)
+                .tests
+                .items
+                .len()
+        };
+        assert_eq!(found(0.0, 1), 0, "one hop does not reach the test file");
+        assert_eq!(found(0.0, 2), 1, "two hops do");
+        assert_eq!(found(0.5, 2), 0, "the 0.3 edge is below min_confidence");
+    }
+
     /* ── Finding 1: a refusal must not render as an answer ────────────────── */
 
     #[test]
@@ -2421,7 +2630,7 @@ mod tests {
         assert!(raw.tests.truncated);
         assert_eq!(raw.tests.total, 1);
         assert!(raw.blast_radius.layers.truncated);
-        let report = affected_tests_from_store(&store, &targets, 0, 10);
+        let report = affected_tests_from_store(&store, &targets, 0, 0.0, 10);
         assert_eq!(report.tests.total, 1);
         assert_eq!(report.tests.shown, 0);
         assert!(report.tests.truncated);
@@ -2434,7 +2643,7 @@ mod tests {
         assert!(report.fail_closed_reason.is_some());
 
         let empty = Store::open_in_memory().unwrap();
-        let refused = affected_tests_from_store(&empty, &targets, 2000, 10);
+        let refused = affected_tests_from_store(&empty, &targets, 2000, 0.0, 10);
         assert!(!refused.tests.available);
         assert!(!refused.blast_radius.layers.available);
         assert!(refused.fail_closed);
@@ -2451,7 +2660,7 @@ mod tests {
         .unwrap();
         drop(conn);
         let store = Store::open_read_only(map_path(repo.path())).unwrap();
-        let report = affected_tests_from_store(&store, &["probe_callee".into()], 2000, 0);
+        let report = affected_tests_from_store(&store, &["probe_callee".into()], 2000, 0.0, 0);
         assert!(report.tests.available);
         assert!(report.tests.items.is_empty());
         assert!(report.blast_radius.layers.items.is_empty());
@@ -2481,7 +2690,7 @@ mod tests {
         drop(conn);
         let store = Store::open_read_only(map_path(repo.path())).unwrap();
         let targets = vec!["probe_callee".to_owned(); MAX_NEIGHBOR_TARGETS + 1];
-        let report = affected_tests_from_store(&store, &targets, 100, 10);
+        let report = affected_tests_from_store(&store, &targets, 100, 0.0, 10);
         let engine = StoreQueryEngine::new(&store);
         let mut expected_shown = 0;
         let mut tokens = 0;
@@ -3258,7 +3467,12 @@ mod tests {
             .status("")
             .expect_err("corrupt status evidence must fail");
         assert!(error.to_string().contains("Invalid column type"), "{error}");
-        let selected = affected_tests(root, &["probe_callee".to_string()], None, None);
+        let selected = affected_tests(
+            root,
+            &["probe_callee".to_string()],
+            None,
+            WalkBounds::default(),
+        );
         assert!(
             selected.fail_closed,
             "status read failed but selection was authorized: {selected:?}"
@@ -3464,7 +3678,12 @@ mod tests {
             .expect("enqueue pending");
         drop(store);
 
-        let report = affected_tests(&root, &["src/caller.rs".into()], None, None);
+        let report = affected_tests(
+            &root,
+            &["src/caller.rs".into()],
+            None,
+            WalkBounds::default(),
+        );
         assert!(
             report.fail_closed,
             "a stale map must not produce a trusted affected-tests list"

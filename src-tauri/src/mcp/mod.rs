@@ -2552,50 +2552,6 @@ mod tests {
             "gitpulse_provenance",
             "relays git-notes provenance records, which carry per-commit free-form fields",
         ),
-        (
-            "devmap_status",
-            "relays the DevMap CLI envelope; DevMap owns its schema",
-        ),
-        (
-            "devmap_search",
-            "relays the DevMap CLI envelope; DevMap owns its schema",
-        ),
-        (
-            "devmap_dependencies",
-            "relays the DevMap CLI envelope; DevMap owns its schema",
-        ),
-        (
-            "devmap_impact",
-            "relays the DevMap CLI envelope; DevMap owns its schema",
-        ),
-        (
-            "devmap_trace",
-            "relays the DevMap CLI envelope; DevMap owns its schema",
-        ),
-        (
-            "devmap_neighbors",
-            "relays the DevMap CLI envelope; DevMap owns its schema",
-        ),
-        (
-            "devmap_dead_symbols",
-            "relays the DevMap CLI envelope; DevMap owns its schema",
-        ),
-        (
-            "devmap_clones",
-            "relays the DevMap CLI envelope; DevMap owns its schema",
-        ),
-        (
-            "devmap_preview",
-            "relays the DevMap CLI envelope; DevMap owns its schema",
-        ),
-        (
-            "devmap_explore",
-            "relays the DevMap CLI envelope; DevMap owns its schema",
-        ),
-        (
-            "devmap_affected_tests",
-            "relays the DevMap CLI envelope; DevMap owns its schema",
-        ),
     ];
 
     fn is_object_only_exempt(name: &str) -> bool {
@@ -2687,6 +2643,12 @@ mod tests {
 
         let missing = "/no/such/gitpulse-output-schema-repo".to_string();
 
+        // One repository with an indexed generation, so the DevMap tools answer
+        // with data rather than only their unavailable envelopes.
+        let indexed_dir = crate::codeintel::tests::repo_with_one_generation();
+        let indexed = indexed_dir.path().to_string_lossy().into_owned();
+        crate::test_support::trust_repo(indexed_dir.path());
+
         let mut validated = std::collections::BTreeSet::new();
         let mut errors: std::collections::BTreeMap<String, Vec<String>> = Default::default();
         let mut check =
@@ -2724,13 +2686,18 @@ mod tests {
                 );
                 validated.insert(name.to_string());
             };
-        for repo in [&healthy, &broken, &untrusted, &ledgered, &missing] {
+        for repo in [&healthy, &broken, &untrusted, &ledgered, &missing, &indexed] {
             for tool in tools() {
                 let name = tool["name"].as_str().expect("name");
-                if tool["annotations"]["readOnlyHint"] != true || is_object_only_exempt(name) {
+                // Exempt tools are still run and held to the object schema they
+                // declare; only a tool that never succeeds escapes (below).
+                if tool["annotations"]["readOnlyHint"] != true {
                     continue;
                 }
                 let mut arguments = json!({ "repo_path": repo });
+                if tool["inputSchema"]["properties"]["targets"].is_object() {
+                    arguments["targets"] = json!(["probe_caller"]);
+                }
                 for extra in [
                     "query",
                     "target",
@@ -2741,6 +2708,8 @@ mod tests {
                     "task_id",
                     "symptom",
                     "since",
+                    "file",
+                    "content",
                 ] {
                     if tool["inputSchema"]["properties"][extra].is_object() {
                         arguments[extra] = json!("probe");
@@ -2842,6 +2811,15 @@ mod tests {
                 validated.contains(name),
                 "{name} was never validated against its outputSchema (every call errored): {:?}",
                 errors.get(name)
+            );
+        }
+        // The DevMap tools are exempt from a typed schema, not from a payload:
+        // each must have produced a checked object on at least one repository.
+        for name in devmap_parity::TOOL_NAMES {
+            assert!(
+                validated.contains(*name),
+                "{name} was never validated against its declared outputSchema: {:?}",
+                errors.get(*name)
             );
         }
         // The allow-list cannot go stale: an exempt tool must still declare
