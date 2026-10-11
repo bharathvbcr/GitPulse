@@ -23,8 +23,16 @@ use crate::engine::git_cli::{sandbox_join_entry, validate_repo};
 /// megabyte CHANGELOG cannot freeze the UI or the backend.
 ///
 /// Rendering is linear in MarkDev's own code, but pulldown-cmark itself is
-/// super-linear on some adversarial inputs (alternating `*a_` quadruples
-/// when it doubles): at this cap that is about a second, off-thread.
+/// super-linear on some adversarial inputs: alternating `*a_` triples take
+/// about four times as long each time the input doubles. Re-measured
+/// 2026-10-10 (release build, Apple silicon): 25 ms at 32 KiB, 96 ms at
+/// 64 KiB, 360 ms at this cap, off-thread. A debug build is about thirty times
+/// slower. The cap stays: lowering it would truncate real notes to defend
+/// against one input shape, and no cheap pre-scan separates that shape from
+/// snake_case-heavy prose without refusing legitimate files. Nesting is not a
+/// cost: quotes, lists, brackets, tables and raw HTML at the cap all render in
+/// under 15 ms without deep recursion
+/// (`hostile_input_at_the_cap_renders_without_exhausting_the_stack`).
 pub const MAX_RENDER_BYTES: usize = 128 * 1024;
 
 /// Most picture bytes one render embeds. The viewer re-renders as a note is
@@ -330,6 +338,47 @@ mod tests {
         assert!(
             rendered.contains("referrerpolicy=\"no-referrer\""),
             "{rendered}"
+        );
+    }
+
+    /// Hostile shapes at the byte cap each render, on a small stack, and
+    /// the super-linear one (`*a_`) stays bounded at a quarter of the cap, so
+    /// a change that makes it worse than the documented growth shows up here.
+    #[test]
+    fn hostile_input_at_the_cap_renders_without_exhausting_the_stack() {
+        let cases: Vec<(&str, String)> = vec![
+            ("deep quotes", "> ".repeat(MAX_RENDER_BYTES / 2)),
+            ("bare quote markers", ">".repeat(MAX_RENDER_BYTES)),
+            (
+                "deep lists",
+                (0..2000)
+                    .map(|i| format!("{}- a\n", "  ".repeat(i % 60)))
+                    .collect(),
+            ),
+            ("open brackets", "[".repeat(MAX_RENDER_BYTES)),
+            ("unclosed links", "[a](".repeat(MAX_RENDER_BYTES / 4)),
+            ("nested html", "<div>".repeat(MAX_RENDER_BYTES / 5)),
+            (
+                "many footnote refs",
+                (0..8000).map(|i| format!("[^{i}] ")).collect(),
+            ),
+        ];
+        for (name, source) in cases {
+            let (rendered, _) = std::thread::Builder::new()
+                .stack_size(2 * 1024 * 1024)
+                .spawn(move || (render(&source, None), ()))
+                .unwrap()
+                .join()
+                .unwrap_or_else(|_| panic!("{name} overflowed or panicked"));
+            assert!(rendered.is_ok(), "{name}: {:?}", rendered.err());
+        }
+        let emphasis = "*a_".repeat(MAX_RENDER_BYTES / 3 / 4);
+        let started = std::time::Instant::now();
+        render(&emphasis, None).unwrap();
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "{:?} for a quarter-cap emphasis storm",
+            started.elapsed()
         );
     }
 
