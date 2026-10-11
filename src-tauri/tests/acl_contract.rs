@@ -41,6 +41,11 @@
 #[path = "../src/test_support/env.rs"]
 mod hermetic_env;
 
+// The same reading of `generate_handler!` that `build.rs` turns into the app
+// ACL manifest.
+#[path = "../build_support/app_commands.rs"]
+mod app_commands;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -105,6 +110,9 @@ fn granted_permissions() -> Vec<String> {
 fn split_identifier(id: &str) -> (String, String) {
     match id.rsplit_once(':') {
         Some((ns, perm)) => (ns.to_string(), perm.to_string()),
+        // The app's own command permissions (`allow-cmd-…`) live in the app
+        // manifest, whose key is not a plugin name.
+        None if id.starts_with("allow-") => ("__app-acl__".to_string(), id.to_string()),
         // A bare id names a plugin's default permission set.
         None => (id.to_string(), "default".to_string()),
     }
@@ -448,4 +456,198 @@ fn a_scope_only_permission_grants_no_command() {
             .is_some_and(|s| !s.is_empty()),
         "allow-default-urls must still carry the URL scope openExternal relies on"
     );
+}
+
+
+// ---------------------------------------------------------------------------
+// The app's own commands.
+//
+// Tauri enforces capabilities on app commands only when the build declares an
+// app manifest (`build.rs`). Declared, every registered command is denied to
+// every window until a capability names its `allow-<command>` permission, so
+// the three sets below must agree exactly: what is registered, what the
+// frontend can call, and what each window is granted.
+// ---------------------------------------------------------------------------
+
+fn registered_commands() -> Vec<String> {
+    let lib = fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("src/lib.rs"))
+        .expect("src/lib.rs");
+    app_commands::handler_commands(&lib)
+}
+
+fn permission_for(command: &str) -> String {
+    format!("allow-{}", command.replace('_', "-"))
+}
+
+/// App command permissions one capability file grants, as command names.
+fn app_commands_granted_by(file: &str) -> BTreeSet<String> {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("capabilities")
+        .join(file);
+    let json = read_json(&path);
+    let by_permission: BTreeMap<String, String> = registered_commands()
+        .into_iter()
+        .map(|c| (permission_for(&c), c))
+        .collect();
+    let mut out = BTreeSet::new();
+    for perm in json["permissions"].as_array().expect("permissions array") {
+        let Some(id) = perm.as_str().filter(|id| !id.contains(':')) else {
+            continue;
+        };
+        let command = by_permission
+            .get(id)
+            .unwrap_or_else(|| panic!("{file} grants {id:?}, which names no registered command"));
+        assert!(out.insert(command.clone()), "{file} grants {id:?} twice");
+    }
+    out
+}
+
+/// Quoted `cmd_*` literals in code lines of the given files: what a file can
+/// pass to `invoke`, constants included. Comment lines are skipped.
+fn command_literals(files: &[PathBuf]) -> BTreeSet<String> {
+    let mut out = BTreeSet::new();
+    for file in files {
+        let source = fs::read_to_string(file).unwrap_or_default();
+        for line in source.lines() {
+            let trimmed = line.trim_start();
+            if trimmed.starts_with("//") || trimmed.starts_with('*') || trimmed.starts_with("/*") {
+                continue;
+            }
+            for quote in ['"', '\''] {
+                let mut parts = line.split(quote);
+                parts.next();
+                for literal in parts.step_by(2) {
+                    if literal.starts_with("cmd_")
+                        && literal.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                    {
+                        out.insert(literal.to_string());
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+#[test]
+fn the_app_manifest_defines_a_permission_for_every_registered_command() {
+    let manifest = read_json(&manifest_path());
+    let app = manifest
+        .get("__app-acl__")
+        .expect("no app manifest was compiled: build.rs must declare AppManifest::commands");
+    let registered = registered_commands();
+    assert!(registered.len() > 200, "parsed only {} handlers", registered.len());
+    for command in &registered {
+        let permission = permission_for(command);
+        assert!(
+            app["permissions"].get(&permission).is_some(),
+            "no {permission} in the app manifest for registered command {command}"
+        );
+    }
+}
+
+/// Every command the shipped frontend can call is granted to the main window,
+/// and nothing it never calls is. A registered command no source names stays
+/// denied everywhere.
+#[test]
+fn the_main_window_is_granted_exactly_the_commands_the_frontend_calls() {
+    let registered: BTreeSet<String> = registered_commands().into_iter().collect();
+    let called: BTreeSet<String> = command_literals(&frontend_sources())
+        .intersection(&registered)
+        .cloned()
+        .collect();
+    let granted = app_commands_granted_by("default.json");
+    assert!(called.len() > 200, "the scan found only {} commands", called.len());
+    let missing: Vec<_> = called.difference(&granted).collect();
+    assert!(
+        missing.is_empty(),
+        "the frontend calls commands the main window is not granted, so they fail at runtime \
+         with \"not allowed by ACL\": {missing:?}"
+    );
+    let surplus: Vec<_> = granted.difference(&called).collect();
+    assert!(
+        surplus.is_empty(),
+        "the main window is granted commands nothing in the frontend calls: {surplus:?}"
+    );
+}
+
+/// The files the status popover actually loads: `src/status.ts` and the value
+/// imports reachable from it (type-only imports are erased at build time).
+fn status_popover_sources() -> Vec<PathBuf> {
+    let root = repo_root().join("src");
+    let mut seen: BTreeSet<PathBuf> = BTreeSet::new();
+    let mut queue = vec![root.join("status.ts")];
+    while let Some(file) = queue.pop() {
+        if !seen.insert(file.clone()) {
+            continue;
+        }
+        let source = fs::read_to_string(&file).unwrap_or_default();
+        for statement in source.split("import ").skip(1) {
+            let head = statement.split(';').next().unwrap_or("");
+            if head.trim_start().starts_with("type ") {
+                continue;
+            }
+            let Some(spec) = head
+                .split(['"', '\''])
+                .nth(1)
+                .filter(|s| s.starts_with('.'))
+            else {
+                continue;
+            };
+            let base = file.parent().expect("parent").join(spec);
+            for candidate in [
+                base.clone(),
+                PathBuf::from(format!("{}.ts", base.display())),
+                PathBuf::from(format!("{}.svelte", base.display())),
+                base.join("index.ts"),
+            ] {
+                if candidate.is_file() {
+                    queue.push(candidate);
+                    break;
+                }
+            }
+        }
+    }
+    let files: Vec<PathBuf> = seen
+        .into_iter()
+        .filter(|p| p.extension().is_some_and(|e| e == "ts" || e == "svelte"))
+        .collect();
+    assert!(files.len() > 5, "the status import closure found {files:?}");
+    files
+}
+
+#[test]
+fn the_status_popover_is_granted_only_the_commands_it_calls() {
+    let registered: BTreeSet<String> = registered_commands().into_iter().collect();
+    let called: BTreeSet<String> = command_literals(&status_popover_sources())
+        .intersection(&registered)
+        .cloned()
+        .collect();
+    let granted = app_commands_granted_by("status-popover.json");
+    assert_eq!(
+        called,
+        ["cmd_get_status_state", "cmd_resize_status", "cmd_status_action"]
+            .iter()
+            .map(|c| c.to_string())
+            .collect(),
+        "the popover's call sites changed; review what it may now call"
+    );
+    assert_eq!(granted, called, "the popover's grants must equal its call sites");
+    assert!(
+        granted.len() < registered.len() / 10,
+        "the popover must not hold a broad grant"
+    );
+}
+
+/// Neither window is granted a command the other window's job needs, and no
+/// command is reachable from a window with no capability at all.
+#[test]
+fn no_capability_grants_a_command_that_is_not_registered_twice_or_unscoped() {
+    for file in ["default.json", "status-popover.json"] {
+        let json = read_json(&Path::new(env!("CARGO_MANIFEST_DIR")).join("capabilities").join(file));
+        assert!(
+            json["windows"].as_array().is_some_and(|w| w.len() == 1),
+            "{file} must name exactly one window, never a wildcard"
+        );
+    }
 }
