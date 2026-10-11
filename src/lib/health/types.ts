@@ -73,6 +73,14 @@ export interface ScanLimitNotice {
   inventory_only?: boolean;
 }
 
+/** How many audit targets were found versus audited, and which were not. */
+export interface AuditCoverage {
+  found: number;
+  audited: number;
+  /** `family:path` for each found target that was not audited. */
+  unaudited: string[];
+}
+
 export interface DepsHealthReport {
   node_version?: string | null;
   npm_version?: string | null;
@@ -97,6 +105,8 @@ export interface DepsHealthReport {
   scanners_ran?: string[];
   /** True only when every discovered supported audit target completed. */
   audit_complete?: boolean;
+  /** Targets found versus audited. Absent on reports from older builds. */
+  audit_coverage?: AuditCoverage;
   manifests: NpmManifest[];
   ecosystems: EcosystemHint[];
   issues: HealthIssue[];
@@ -321,6 +331,24 @@ function parseNpmManifest(value: unknown): NpmManifest {
   };
 }
 
+function parseAuditCoverage(value: unknown): AuditCoverage | undefined {
+  if (value === undefined) return undefined;
+  if (
+    !isRecord(value) ||
+    typeof value.found !== "number" ||
+    typeof value.audited !== "number" ||
+    !Number.isFinite(value.found) ||
+    !Number.isFinite(value.audited)
+  ) {
+    throw new Error("health: audit_coverage was corrupt");
+  }
+  return {
+    found: value.found,
+    audited: value.audited,
+    unaudited: stringArray(value.unaudited, "audit_coverage.unaudited"),
+  };
+}
+
 function parseAudit(value: unknown): AuditSummary {
   if (!isRecord(value) || typeof value.total !== "number" || !Number.isFinite(value.total)) {
     throw new Error("health: audit.total was not a number");
@@ -369,6 +397,7 @@ export function parseDepsHealthReport(value: unknown): DepsHealthReport {
     const manifests = stringArray(item.manifests, "ecosystem manifests");
     ecosystems.push({ family: item.family, manifests, note: item.note });
   }
+  const auditCoverage = parseAuditCoverage(value.audit_coverage);
   const notices = value.limit_notices;
   if (notices !== undefined && !Array.isArray(notices)) {
     throw new Error("health: limit_notices was not a list");
@@ -387,6 +416,7 @@ export function parseDepsHealthReport(value: unknown): DepsHealthReport {
     bundler_audit_present: typeof value.bundler_audit_present === "boolean" ? value.bundler_audit_present : undefined,
     scanners_ran: value.scanners_ran === undefined ? undefined : stringArray(value.scanners_ran, "scanners_ran"),
     audit_complete: typeof value.audit_complete === "boolean" ? value.audit_complete : undefined,
+    audit_coverage: auditCoverage,
     manifests: value.manifests.map(parseNpmManifest),
     ecosystems,
     issues: value.issues as HealthIssue[],

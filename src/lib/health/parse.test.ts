@@ -25,6 +25,29 @@ describe("parseDepsHealthReport", () => {
     ).toThrow(/omitted manifests/);
   });
 
+  it("carries the audit census through, and refuses a corrupt one", () => {
+    const base = {
+      npm_cli_present: true,
+      cargo_audit_present: true,
+      manifests: [],
+      ecosystems: [],
+      issues: [],
+      vulnerabilities: [],
+      outdated: [],
+      audit: { total: 0 },
+      truncated: false,
+    };
+    const parsed = parseDepsHealthReport({
+      ...base,
+      audit_coverage: { found: 2, audited: 1, unaudited: ["cargo:Cargo.lock"] },
+    });
+    expect(parsed.audit_coverage).toEqual({ found: 2, audited: 1, unaudited: ["cargo:Cargo.lock"] });
+    expect(parseDepsHealthReport(base).audit_coverage).toBeUndefined();
+    expect(() => parseDepsHealthReport({ ...base, audit_coverage: { found: "2" } })).toThrow(
+      /audit_coverage was corrupt/,
+    );
+  });
+
   it("defaults a missing lifecycle_scripts list to empty instead of crashing render", () => {
     const parsed = parseDepsHealthReport({
       npm_cli_present: true,

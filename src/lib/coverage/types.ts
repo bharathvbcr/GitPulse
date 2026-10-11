@@ -25,6 +25,12 @@ export interface CoverageArtifact {
   skipped: boolean;
   skip_reason?: string | null;
   totals: CoverageTotals;
+  /** Files dropped because the source changed after the report was written. Absent on older reports. */
+  stale_files?: number;
+  /** Reported files that match no repository file, left out of every total. Absent on older reports. */
+  unresolved_files?: number;
+  /** Hit lines past the end of their source file, dropped. Absent on older reports. */
+  lines_past_eof?: number;
 }
 
 export interface FileCoverageSummary {

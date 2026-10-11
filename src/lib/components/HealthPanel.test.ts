@@ -127,6 +127,10 @@ describe("HealthPanel rendering", () => {
     // second local formatter.
     expect(source).toContain("report?.audit_complete === true");
     expect(source).toContain("(report?.scanners_ran ?? []).length > 0");
+    // The target census is worded by its one owner and shown in the
+    // vulnerabilities section.
+    expect(source).toContain("formatAuditCoverage(report?.audit_coverage)");
+    expect(source).toContain('data-testid="audit-coverage"');
     // The panel must not re-derive the counts sentence beside the owner.
     expect(source).not.toContain("formatAuditCounts(");
   });
