@@ -11,14 +11,14 @@ const source = readFileSync(
 );
 
 describe("TerminalPanel source contracts & safety hygiene", () => {
-  it("invokes cmd_terminal_run with repoPath and args", () => {
-    expect(source).toContain('invoke<TerminalRunResponse>("cmd_terminal_run"');
-    expect(source).toContain("repoPath,");
-    expect(source).toContain("args: tokenized.argv,");
-    expect(source).toContain("timeoutSecs,");
+  // Rendered in harness/terminal.html: a Console command runs once,
+  // tokenized, against this repository; one that does not tokenize is
+  // refused before anything runs; a tab chord in the Console opens nothing;
+  // an incomplete output states the backend's reason, or "reason unavailable"
+  // without one, never an invented cap; Clear empties the output.
+  it("hands Console launch requests to the Console", () => {
     expect(source).toContain("consoleLaunchRequests");
   });
-
   it("delegates every PTY session endpoint to TerminalSession", () => {
     // The strip owns which sessions exist, never how one talks to its shell.
     // Asserted as an absence so a session endpoint cannot creep back into the
@@ -34,11 +34,6 @@ describe("TerminalPanel source contracts & safety hygiene", () => {
     }
   });
 
-  it("tokenizes commands and checks for safety before execution in Console mode", () => {
-    expect(source).toContain("tokenizeCommand(textToRun)");
-    expect(source).toContain("validationError = tokenized.error");
-  });
-
   it("journals executed terminal actions into harnessStore", () => {
     expect(source).toContain("harnessStore.recordAction({");
   });
@@ -50,8 +45,7 @@ describe("TerminalPanel source contracts & safety hygiene", () => {
     expect(journalCalls).toHaveLength(2);
   });
 
-  it("provides copy and clear output affordances in Console mode", () => {
-    expect(source).toContain("clearOutput");
+  it("offers a copy of each Console run", () => {
     expect(source).toContain("copyOutput");
   });
 });
@@ -110,21 +104,6 @@ describe("TerminalPanel session ownership", () => {
     expect(source).not.toContain("liveCleanupTarget");
   });
 
-  it("keys each session on its tab id so a close cannot recycle a live shell", () => {
-    // An unkeyed each would reuse the component of a closed tab for its
-    // neighbour, attaching a live PTY to the wrong tab instead of ending it.
-    expect(source).toContain("{#each tabState.tabs as tab (tab.id)}");
-  });
-
-  it("keeps sessions mounted while the Console tab is showing", () => {
-    // Unmounting disposes the xterm and kills the shell; the mode switch
-    // hides the strip instead, the same rule TerminalDock applies to the
-    // whole dock. An {:else} against the console branch would kill them.
-    const sessionIdx = source.indexOf("<TerminalSession");
-    expect(sessionIdx).toBeGreaterThan(-1);
-    expect(source).toContain('class:hidden={mode !== "shell"}');
-    expect(source.indexOf('{#if mode === "console"}')).toBeGreaterThan(sessionIdx);
-  });
 });
 
 describe("TerminalPanel rendering", () => {
@@ -137,38 +116,22 @@ describe("TerminalPanel rendering", () => {
 });
 
 describe("TerminalPanel tab strip", () => {
-  it("offers a new tab per launcher instead of restarting the one session", () => {
-    // The old pills called selectLauncher, which killed the running shell to
-    // start the chosen CLI in its place — switching cost you your session.
+  // Rendered in harness/terminal.html: the new-tab chord opens a second tab;
+  // a new shell tab starts in the directory of the shell beside it; session
+  // search filters and activates; the strip scrolls and compresses when
+  // crowded and scrolls a new tab into view; the global limit disables New
+  // and names itself, and raising it frees a place at once; close kills only
+  // its own session; the Console switch preserves sessions; the four chrome
+  // popovers sit above the grid and the launcher menu overlays it without
+  // shifting it. What stays is what the fixture does not reach.
+  it("never restarts the one session to change launcher", () => {
     expect(source).not.toContain("selectLauncher");
-    expect(source).toContain("{#each filteredLaunchers as launcher, index (launcher.kind)}");
-    // A shell opens beside the active one, in its directory — still a new tab.
-    expect(source).toContain("onclick={() => void openBeside(nextLauncher)}");
-    expect(source).toMatch(/async function openBeside[\s\S]*?if \(!newTab\(launcher\)\) return false;/);
-    expect(source).toContain("openLauncherMenu");
   });
-
-  it("keeps a searchable session switcher and a scrolling tab strip", () => {
-    expect(source).toContain('aria-label="Find terminal session"');
-    expect(source).toContain("filterTerminalTabs");
-    expect(source).toContain("data-terminal-tab-scroller");
-    expect(source).toContain("overflow-x-auto overflow-y-hidden");
-    expect(source).toContain("bindHorizontalWheel(scroller)");
-    expect(source).toContain("scrollChildIntoHorizontalView");
-    expect(source).toContain("crowdedTabStrip");
-  });
-
-  it("disables opening past the ceiling and says why", () => {
-    expect(source).toContain("disabled={!repoPath || !canCreate}");
-    expect(source).toContain("${$terminalSessionLimit} terminal sessions are open");
-    // The user's live limit, so raising it in Settings opens a waiting task
-    // terminal at once instead of when a session next closes. Live sessions
-    // only: the strip's own bound is the hard ceiling, and says so apart.
-    expect(source).toContain("const canCreate = $derived(!stripFull && $terminalSessions.length < $terminalSessionLimit)");
+  it("says the strip itself is full apart from the session limit", () => {
+    // The fixture's session limit is reached long before the strip's bound.
     expect(source).toContain("const stripFull = $derived(!canOpenTab(tabState, MAX_STRIP_TABS))");
     expect(source).toContain("already holds {MAX_STRIP_TABS} tabs");
   });
-
   it("consumes a queued request only once its tab holds a session slot", () => {
     // Consumed when the tab opened, a request lost the race for the last
     // slots and was never retried. It stays queued until admitted, and a
@@ -196,15 +159,6 @@ describe("TerminalPanel tab strip", () => {
     expect(source).toContain("onChord={handleChord}");
   });
 
-  it("ignores chords while the Console tab is showing", () => {
-    // Console has no tabs; claiming ⌃⇧W there would swallow a keystroke that
-    // belongs to the command input.
-    const body = source.slice(source.indexOf("function handleChord"));
-    expect(body.indexOf('if (mode !== "shell") return false;')).toBeLessThan(
-      body.indexOf("terminalTabChord(event)"),
-    );
-  });
-
   it("drops the session handle when its tab closes", () => {
     // Leaving it in the record keeps a disposed component reachable and lets
     // the reveal effect call into it.
@@ -228,24 +182,6 @@ describe("TerminalPanel tab strip", () => {
   });
 });
 
-/**
- * Regression: the amber strip asserted a cause. `[Output exceeded cap]` was
- * printed for every prefix — including a stream the engine never finished
- * reading, whose byte count was often zero. The backend now says which, and
- * the panel renders that instead of guessing.
- */
-describe("TerminalPanel truncation disclosure", () => {
-  it("renders the backend's reason rather than naming a cap", () => {
-    expect(source).toContain("entry.result.truncation_reason");
-    expect(source).not.toContain("Output exceeded cap");
-  });
-
-  it("still discloses the prefix when the reason is missing", () => {
-    // A prefix with no explanation is still a prefix; silence would let it
-    // read as the whole output.
-    expect(source).toContain('"reason unavailable"');
-  });
-});
 
 describe("TerminalPanel agent-session record", () => {
   const claim = source.slice(
@@ -261,62 +197,5 @@ describe("TerminalPanel agent-session record", () => {
     expect(claim).not.toMatch(/claimed\.launcher === "(claude|codex|grok|agy)"/);
     expect(claim).toContain("claimed.prompt !== undefined");
     expect(source).toMatch(/import \{[^}]*\bisPromptLauncher\b[^}]*\} from "\.\.\/terminal\/launchRequests"/);
-  });
-});
-
-describe("TerminalPanel chrome popovers", () => {
-  it("keeps shortcuts, sessions, find, and tab options in the column instead of overlaying the grid", () => {
-    // On macOS `bg-surface` is translucent. An absolutely positioned bar at a
-    // guessed header+tabs offset paints over xterm, so the prompt, the
-    // session badge, and the shortcut legend occupy the same pixels.
-    // Find already takes a row in the session; these four must too.
-    const ruleStart = source.indexOf(".terminal-popover {");
-    expect(ruleStart).toBeGreaterThan(-1);
-    const rule = source.slice(ruleStart, source.indexOf("}", ruleStart) + 1);
-    expect(rule).toContain("flex-shrink: 0");
-    expect(rule).not.toMatch(/position:\s*absolute/);
-    expect(rule).not.toMatch(/inset:/);
-    expect(source).not.toContain("rounded-lg bg-surface shadow-lg");
-    const panesIdx = source.indexOf('class="terminal-panes');
-    expect(panesIdx).toBeGreaterThan(-1);
-    const marks = [...source.matchAll(/class="terminal-popover/g)];
-    expect(marks).toHaveLength(4);
-    for (const mark of marks) {
-      expect(mark.index).toBeLessThan(panesIdx);
-    }
-    const harness = readFileSync(
-      join(dirname(fileURLToPath(import.meta.url)), "../../../harness/terminal.html"),
-      "utf8",
-    );
-    expect(harness).toContain('check("shortcuts sit above the grid instead of overlapping it"');
-    expect(harness).toContain('check("tab options sit above the grid instead of overlapping it"');
-    expect(harness).toContain('check("session list sits above the grid instead of overlapping it"');
-    expect(harness).toContain('check("session search sits above the grid instead of overlapping it"');
-  });
-
-  it("opens the session-type picker as a compact overlay instead of a chrome row", () => {
-    // A full-width in-flow type list shoved the PTY down by its own height.
-    // This picker is a menu, not a toolbar, so it uses the shared portaled
-    // popover — `gp-menu` carries the float blur, so it can sit over xterm.
-    expect(source).toMatch(/use:portal=\{"body"\}\s*\n\s*use:popover=\{launcherMenuDismissal\}/);
-    expect(source).toContain("element: launcherTriggerEl");
-    expect(source).toContain("[data-terminal-launcher], [data-terminal-launcher-popup]");
-    expect(source).toContain("LAYERS.MENU");
-    expect(source).toContain('data-terminal-launcher-popup');
-    expect(source).toContain('aria-label="New session type menu"');
-    expect(source).toContain('aria-haspopup="listbox"');
-    expect(source).not.toContain("clampMenuPosition");
-    const menuBlock = source.slice(
-      source.indexOf('id="terminal-launcher-menu"'),
-      source.indexOf('aria-label="New session type menu"'),
-    );
-    expect(menuBlock).toContain("gp-menu gp-pop");
-    expect(menuBlock).not.toContain("terminal-popover");
-    const harness = readFileSync(
-      join(dirname(fileURLToPath(import.meta.url)), "../../../harness/terminal.html"),
-      "utf8",
-    );
-    expect(harness).toContain('check("launcher menu does not shift the session grid"');
-    expect(harness).toContain('check("launcher menu is a compact overlay"');
   });
 });
