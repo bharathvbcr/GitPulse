@@ -764,6 +764,54 @@ pub fn invalidate_cache() {
 }
 
 /// Atomic write: sibling temp, `sync_all`, rename.
+/// Executable locations `next` points at that `current` did not: a tool
+/// binary or a source checkout GitPulse would build and run code from.
+///
+/// An empty string is a clear, not a new location. A load failure upstream
+/// passes the default config here, which makes every set path count as new:
+/// when the prior state cannot be read, the user is asked rather than assumed.
+pub fn new_executable_paths(current: &ToolConfig, next: &ToolConfig) -> Vec<String> {
+    let mut out = Vec::new();
+    for (tool, before, after) in [
+        ("devmap", &current.devmap, &next.devmap),
+        ("manvi", &current.manvi, &next.manvi),
+    ] {
+        for (label, old, new) in [
+            ("binary", &before.binary, &after.binary),
+            ("source root", &before.source_root, &after.source_root),
+        ] {
+            if let Some(new) = new.as_deref().filter(|p| !p.trim().is_empty()) {
+                if old.as_deref() != Some(new) {
+                    out.push(format!("{tool} {label}: {new}"));
+                }
+            }
+        }
+    }
+    out
+}
+
+/// [`save`] for a request that came from the webview. Pointing a tool at a
+/// new binary or source root makes GitPulse run that code, so each new
+/// location is confirmed by `confirm` (the OS dialog in production) before
+/// anything is written; a refusal writes nothing.
+pub fn save_confirmed(
+    config: &ToolConfig,
+    confirm: &dyn Fn(&str, &str) -> bool,
+) -> Result<PathBuf, String> {
+    let current = load().unwrap_or_default();
+    let changes = new_executable_paths(&current, config);
+    if !changes.is_empty() {
+        let message = format!(
+            "GitPulse will run programs from these locations:\n\n{}\n\nOnly continue if you chose them.",
+            changes.join("\n")
+        );
+        if !confirm("Change which programs GitPulse runs?", &message) {
+            return Err("Tool locations were not changed: the change was not confirmed".into());
+        }
+    }
+    save(config)
+}
+
 pub fn save(config: &ToolConfig) -> Result<PathBuf, String> {
     let path = config_path()?;
     if let Some(parent) = path.parent() {
@@ -1195,6 +1243,38 @@ mod tests {
     fn write_raw(path: &Path, json: &str) {
         fs::write(path, json).unwrap();
         invalidate_cache();
+    }
+
+    /// A webview can call the save command directly, so a new binary path or
+    /// source root is only written after the native confirmation says yes.
+    #[test]
+    fn saving_a_new_binary_or_source_root_needs_confirmation() {
+        with_temp_config(|_| {
+            let mut next = ToolConfig::default();
+            next.devmap.binary = Some("/tmp/evil/devmap".into());
+            next.manvi.source_root = Some("/tmp/evil/manvi".into());
+
+            let asked = std::cell::RefCell::new(String::new());
+            let refused = save_confirmed(&next, &|_, body| {
+                *asked.borrow_mut() = body.to_string();
+                false
+            })
+            .expect_err("a declined confirmation must refuse");
+            assert!(refused.contains("not confirmed"), "{refused}");
+            assert!(asked.borrow().contains("/tmp/evil/devmap"), "{}", asked.borrow());
+            assert!(asked.borrow().contains("/tmp/evil/manvi"), "{}", asked.borrow());
+            assert_eq!(load().unwrap().devmap.binary, None);
+
+            save_confirmed(&next, &|_, _| true).expect("confirmed");
+            assert_eq!(load().unwrap().devmap.binary.as_deref(), Some("/tmp/evil/devmap"));
+            // Resaving the same paths, or changing something else, asks nothing.
+            next.onboarding = OnboardingState::default();
+            save_confirmed(&next, &|_, _| panic!("unchanged paths must not prompt"))
+                .expect("unchanged");
+            // Clearing a path is not a new location.
+            next.devmap.binary = Some(String::new());
+            save_confirmed(&next, &|_, _| panic!("clearing must not prompt")).expect("clear");
+        });
     }
 
     #[test]

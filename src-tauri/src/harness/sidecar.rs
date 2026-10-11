@@ -1074,10 +1074,51 @@ pub(crate) struct ModelSelection {
     pub model: String,
 }
 
+/// Ambient variables the harness child may inherit.
+///
+/// Manvi runs a model-driven tool loop in a repository the user may not trust,
+/// so it starts from an empty environment and receives only what it needs to
+/// locate its tools, talk to the network and find the user's git and ssh
+/// setup. Credentials (`GITHUB_TOKEN`, `AWS_*`, provider API keys) and
+/// repository-redirecting `GIT_*` variables are absent by construction rather
+/// than by a denylist that has to know every name. `MANVI_*` settings pass
+/// unless they look like a secret. Names compare case-insensitively because
+/// Windows environment names are.
+fn sidecar_ambient_env(
+    vars: impl Iterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
+) -> Vec<(std::ffi::OsString, std::ffi::OsString)> {
+    const EXACT: &[&str] = &[
+        "PATH", "HOME", "USER", "LOGNAME", "SHELL", "TMPDIR", "TMP", "TEMP", "LANG", "LANGUAGE",
+        "TZ", "TERM", "SSH_AUTH_SOCK", "SSH_ASKPASS", "GIT_ASKPASS", "GIT_SSH", "GIT_SSH_COMMAND",
+        "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "ALL_PROXY", "SSL_CERT_FILE", "SSL_CERT_DIR",
+        "DISPLAY", "WAYLAND_DISPLAY", "DBUS_SESSION_BUS_ADDRESS", "SYSTEMROOT", "SYSTEMDRIVE",
+        "WINDIR", "COMSPEC", "PATHEXT", "USERPROFILE", "USERNAME", "APPDATA", "LOCALAPPDATA",
+        "PROGRAMDATA", "PROGRAMFILES", "PROGRAMFILES(X86)", "PROGRAMW6432", "HOMEDRIVE",
+        "HOMEPATH", "COMPUTERNAME", "NUMBER_OF_PROCESSORS", "PROCESSOR_ARCHITECTURE",
+    ];
+    const SECRET_SUFFIXES: &[&str] = &["_KEY", "_TOKEN", "_SECRET", "_PASSWORD", "_PASSPHRASE"];
+    vars.filter(|(name, _)| {
+        let Some(name) = name.to_str() else {
+            return false;
+        };
+        let upper = name.to_ascii_uppercase();
+        EXACT.contains(&upper.as_str())
+            || upper.starts_with("LC_")
+            || upper.starts_with("XDG_")
+            || (upper.starts_with("MANVI_")
+                && !SECRET_SUFFIXES.iter().any(|suffix| upper.ends_with(suffix)))
+    })
+    .collect()
+}
+
 /// The `manvi serve` invocation, built separately so its environment can be
 /// asserted without starting a sidecar.
 fn sidecar_command(binary: &str, dir: &Path, selection: Option<&ModelSelection>) -> Command {
     let mut command = Command::new(binary);
+    command.env_clear();
+    for (name, value) in sidecar_ambient_env(std::env::vars_os()) {
+        command.env(name, value);
+    }
     command
         .args(["serve", "--posture", "host"])
         .current_dir(dir)
@@ -2439,6 +2480,64 @@ done
         let mut unverified = sidecar_command("manvi", dir.path(), None);
         attach_workbench(&mut unverified, dir.path(), &profile, None);
         assert_eq!(env(&unverified, "MANVI_STORE_BINARY"), None);
+    }
+
+    /// The harness runs a model-driven tool loop in a repository the user may
+    /// not trust, so it gets an allowlisted environment: ambient credentials
+    /// (`GITHUB_TOKEN`, `AWS_*`, provider API keys) never reach it. The canary
+    /// is a variable cargo guarantees is in this process's environment.
+    #[cfg(unix)]
+    #[test]
+    fn sidecar_child_environment_is_an_allowlist_not_the_ambient_one() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::TempDir::new().unwrap();
+        let script = dir.path().join("dump-env");
+        std::fs::write(&script, "#!/bin/sh\nenv\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(
+            std::env::var_os("CARGO_MANIFEST_DIR").is_some(),
+            "the canary must be ambient for this test to mean anything"
+        );
+        let out = sidecar_command(script.to_str().unwrap(), dir.path(), None)
+            .output()
+            .expect("run the env dump");
+        let text = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            !text.contains("CARGO_MANIFEST_DIR="),
+            "ambient variables must not reach the sidecar:\n{text}"
+        );
+        assert!(text.contains("PATH="), "PATH must still be set:\n{text}");
+        assert!(text.contains("MANVI_STATE_DIR="), "host settings survive:\n{text}");
+    }
+
+    #[test]
+    fn sidecar_env_allowlist_keeps_config_and_drops_credentials() {
+        let ambient = [
+            ("HOME", "/h"),
+            ("LC_ALL", "C"),
+            ("XDG_CONFIG_HOME", "/x"),
+            ("SSH_AUTH_SOCK", "/s"),
+            ("HTTPS_PROXY", "http://p"),
+            ("MANVI_LOG", "debug"),
+            ("MANVI_LLM_ANTHROPIC_API_KEY", "k"),
+            ("GITHUB_TOKEN", "t"),
+            ("AWS_SECRET_ACCESS_KEY", "a"),
+            ("OPENAI_API_KEY", "o"),
+            ("ANTHROPIC_API_KEY", "c"),
+            ("GIT_DIR", "/elsewhere"),
+        ];
+        let kept: Vec<String> = sidecar_ambient_env(
+            ambient
+                .iter()
+                .map(|(k, v)| (std::ffi::OsString::from(k), std::ffi::OsString::from(v))),
+        )
+        .into_iter()
+        .map(|(k, _)| k.to_string_lossy().into_owned())
+        .collect();
+        assert_eq!(
+            kept,
+            ["HOME", "LC_ALL", "XDG_CONFIG_HOME", "SSH_AUTH_SOCK", "HTTPS_PROXY", "MANVI_LOG"]
+        );
     }
 
     #[test]
