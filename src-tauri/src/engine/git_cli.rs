@@ -4657,11 +4657,19 @@ mod tests {
         for thread in threads {
             thread.join().unwrap();
         }
+        // The cap is a rate, so it is measured against the window that actually
+        // ran: coverage_relaxed stretches the 500 ms window tenfold under
+        // instrumentation, and a bound fixed for 500 ms then fails on refills
+        // the gate was right to grant. Windows up to a second keep the bound the
+        // fixed version had (a second of refill plus 4 of slack); an uncapped
+        // gate admits hundreds in the same window.
+        let window = started.elapsed().as_secs_f64();
         let n = admitted.load(Ordering::Relaxed);
+        let cap = 8 + (4.0 * window.max(1.0)).ceil() as u32 + 4;
         assert!(n >= 8, "burst was not issued: {n}");
         assert!(
-            n <= 8 + 4 + 4,
-            "concurrent storm admitted {n}; cap is burst 8 plus 4/s"
+            n <= cap,
+            "concurrent storm admitted {n} in {window:.2}s; cap is burst 8 plus 4/s = {cap}"
         );
     }
 
