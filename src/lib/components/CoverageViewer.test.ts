@@ -59,13 +59,14 @@ describe("CoverageViewer report copy contract", () => {
       source.indexOf("async function generateAiReport"),
     );
     expect(body).toContain("if (await copyText(");
-    expect(body).toContain("reportCopied = true;");
+    expect(body).toContain("reportFlash.flash();");
     expect(source).toContain('{reportCopied ? "Coverage report copied" : "Copy coverage report"}');
   });
 
   it("cleans up report-copy feedback on reset and unmount", () => {
-    expect(source).toContain("window.clearTimeout(reportCopyTimer);");
-    expect(source.match(/window\.clearTimeout\(reportCopyTimer\)/g)?.length).toBeGreaterThanOrEqual(2);
+    // The countdown itself is createCopyFlash's (desktop/clipboard.test.ts).
+    expect(source).toContain("reportFlash.reset();");
+    expect(source).toContain("reportFlash.dispose();");
   });
 });
 describe("CoverageViewer MANVI integration contracts", () => {
@@ -185,7 +186,8 @@ describe("CoverageViewer MANVI integration contracts", () => {
     // Unmount teardown cancels every guard and clears the copy timer.
     expect(source).toContain("generationInflight?.cancel();");
     expect(source).toContain("opsInflight?.cancel();");
-    expect(source).toContain("window.clearTimeout(aiCopyTimer);");
+    expect(source).toContain("aiFlash.reset();");
+    expect(source).toContain("aiFlash.dispose();");
   });
 
   it("keeps the generate button usable without a discovered model server", () => {
@@ -385,7 +387,8 @@ describe("CoverageViewer failure diagnostics and copy contracts", () => {
   it("cleans up all copy feedback timers on reset and unmount", () => {
     expect(source).toContain("window.clearTimeout(copiedScriptTimer);");
     expect(source).toContain("window.clearTimeout(copiedAllTimer);");
-    expect(source).toContain("window.clearTimeout(scanErrorCopyTimer);");
+    expect(source).toContain("scanErrorFlash.reset();");
+    expect(source).toContain("scanErrorFlash.dispose();");
     expect(source).toContain("window.clearTimeout(copiedStepTimer);");
   });
 });

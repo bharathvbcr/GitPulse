@@ -56,13 +56,13 @@
     harnessStore,
     type AiGeneration,
   } from "../stores/harnessStore";
-  import { createCopyFlash } from "../desktop/clipboard";
+  import { copyText, createCopyFlash } from "../desktop/clipboard";
   import { coverageGap, formatHealthReport, formatDeadCodeStatus, observedTotal } from "../health/report";
   import {
     githubAlertsCache,
     loadGithubAlerts,
   } from "../health/githubAlerts";
-  import { buildRunnablePlanSteps } from "../terminal/tokenize";
+  import { buildRunnablePlanSteps, type RunnablePlanStep } from "../terminal/tokenize";
   import { PROMPT_LAUNCHERS, terminalLaunchRequests, type PromptLauncher } from "../terminal/launchRequests";
   import { PROVIDER_LABELS } from "../workbench/taskHandoff";
   import { HEALTH_AGENT_ACTIONS, healthAgentPrompt, type HealthAgentAction } from "../health/agentPrompts";
@@ -150,16 +150,7 @@
   let planError = $state<string | null>(null);
   let planCopied = $state(false);
 
-  interface RunnableStep {
-    id: string;
-    number: number | null;
-    text: string;
-    command: string | null;
-    argv: string[] | null;
-    error?: string;
-  }
-
-  let planSteps = $derived.by<RunnableStep[]>(() => {
+  let planSteps = $derived.by<RunnablePlanStep[]>(() => {
     if (!plan?.text) return [];
     return buildRunnablePlanSteps(plan.text);
   });
@@ -660,7 +651,7 @@
     }
   }
 
-  async function runStep(step: RunnableStep, guard: AsyncGuard): Promise<boolean> {
+  async function runStep(step: RunnablePlanStep, guard: AsyncGuard): Promise<boolean> {
     const repoPath = $repoStore.currentPath;
     if (!step.argv || step.argv.length === 0 || !repoPath) return false;
     const actionLabel = step.command ?? step.text;
@@ -791,15 +782,11 @@
   async function copyHealthAgentPrompt() {
     const text = agentPrompt;
     if (!text) return;
-    const ok = await agentCopyFlash.copy(text);
-    if (agentPrompt !== text) {
-      // The prompt changed while the copy was in flight: that copy is not of
-      // what is on screen, so do not claim it.
-      agentCopyFlash.dispose();
-      agentCopied = false;
-      return;
-    }
-    if (!ok) {
+    const ok = await copyText(text);
+    if (agentPrompt !== text) return;
+    if (ok) {
+      agentCopyFlash.flash();
+    } else {
       agentError = "Could not copy. Open Preview prompt and copy it from there.";
       agentPreviewOpen = true;
     }

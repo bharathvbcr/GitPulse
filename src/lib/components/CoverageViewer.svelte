@@ -74,9 +74,9 @@
   } from "../stores/harnessStore";
   import { askConfirm } from "../stores/modalStore";
   import { openExternal as openExternalUrl } from "../desktop/openExternal";
-  import { copyText } from "../desktop/clipboard";
+  import { copyText, createCopyFlash } from "../desktop/clipboard";
   import { interfaceStore } from "../stores/interfaceStore";
-  import { buildRunnablePlanSteps, tokenizeCommand } from "../terminal/tokenize";
+  import { buildRunnablePlanSteps, tokenizeCommand, type RunnablePlanStep } from "../terminal/tokenize";
   import {
     formatRunDetail,
     formatRunSummary,
@@ -159,7 +159,7 @@
     jumpMissed(event.key === "ArrowDown" ? 1 : -1);
   }
   let reportCopied = $state(false);
-  let reportCopyTimer: number | null = null;
+  const reportFlash = createCopyFlash((value) => (reportCopied = value));
 
   function beginScan(): AsyncGuard {
     scanInflight?.cancel();
@@ -290,27 +290,13 @@
       // A copy can settle after a repo switch. The clipboard write already
       // happened, but stale success feedback must not leak into the new repo.
       if ($repoStore.currentPath !== repo || report !== current) return;
-      reportCopied = true;
-      if (reportCopyTimer !== null) window.clearTimeout(reportCopyTimer);
-      reportCopyTimer = window.setTimeout(() => {
-        reportCopyTimer = null;
-        reportCopied = false;
-      }, 1500);
+      reportFlash.flash();
     }
   }
 
   // ---------------------------------------------------------------------------
   // MANVI: local-model analysis of the coverage report
   // ---------------------------------------------------------------------------
-
-  interface RunnableStep {
-    id: string;
-    number: number | null;
-    text: string;
-    command: string | null;
-    argv: string[] | null;
-    error?: string;
-  }
 
   /**
    * `no_data` is the outcome that used to be reported as `passed`: the command
@@ -382,13 +368,13 @@
       .map((status) => ({ command: status.label, limitation: status.recovery!.limitation })),
   );
   let runningMissing = $state(false);
-  let aiCopyTimer: number | null = null;
+  const aiFlash = createCopyFlash((value) => (generationCopied = value));
   let copiedScriptKey = $state<string | null>(null);
   let copiedScriptTimer: number | null = null;
   let copiedAllFailed = $state(false);
   let copiedAllTimer: number | null = null;
   let scanErrorCopied = $state(false);
-  let scanErrorCopyTimer: number | null = null;
+  const scanErrorFlash = createCopyFlash((value) => (scanErrorCopied = value));
   let copiedStepId = $state<string | null>(null);
   let copiedStepTimer: number | null = null;
   let issueSubmitting = $state(false);
@@ -489,7 +475,7 @@
       })),
   );
 
-  let aiSteps = $derived.by<RunnableStep[]>(() => {
+  let aiSteps = $derived.by<RunnablePlanStep[]>(() => {
     if (!aiGeneration?.text) return [];
     return buildRunnablePlanSteps(aiGeneration.text);
   });
@@ -510,16 +496,8 @@
     generating = false;
     aiGeneration = null;
     aiError = null;
-    reportCopied = false;
-    if (reportCopyTimer !== null) {
-      window.clearTimeout(reportCopyTimer);
-      reportCopyTimer = null;
-    }
-    generationCopied = false;
-    if (aiCopyTimer !== null) {
-      window.clearTimeout(aiCopyTimer);
-      aiCopyTimer = null;
-    }
+    reportFlash.reset();
+    aiFlash.reset();
     copiedScriptKey = null;
     if (copiedScriptTimer !== null) {
       window.clearTimeout(copiedScriptTimer);
@@ -530,11 +508,7 @@
       window.clearTimeout(copiedAllTimer);
       copiedAllTimer = null;
     }
-    scanErrorCopied = false;
-    if (scanErrorCopyTimer !== null) {
-      window.clearTimeout(scanErrorCopyTimer);
-      scanErrorCopyTimer = null;
-    }
+    scanErrorFlash.reset();
     copiedStepId = null;
     if (copiedStepTimer !== null) {
       window.clearTimeout(copiedStepTimer);
@@ -659,11 +633,7 @@
 
   async function copyGeneration() {
     if (!aiGeneration?.text) return;
-    if (await copyText(aiGeneration.text)) {
-      generationCopied = true;
-      if (aiCopyTimer !== null) window.clearTimeout(aiCopyTimer);
-      aiCopyTimer = window.setTimeout(() => (generationCopied = false), 1500);
-    }
+    await aiFlash.copy(aiGeneration.text);
   }
 
   async function copyFailedScript(key: string, status: ScriptStatus) {
@@ -709,17 +679,10 @@
       repoPath: $repoStore.currentPath,
       scanError,
     });
-    if (await copyText(text)) {
-      scanErrorCopied = true;
-      if (scanErrorCopyTimer !== null) window.clearTimeout(scanErrorCopyTimer);
-      scanErrorCopyTimer = window.setTimeout(() => {
-        scanErrorCopyTimer = null;
-        scanErrorCopied = false;
-      }, 1500);
-    }
+    await scanErrorFlash.copy(text);
   }
 
-  async function copyStepOutput(step: RunnableStep, res: { detail?: string }) {
+  async function copyStepOutput(step: RunnablePlanStep, res: { detail?: string }) {
     let text = `$ ${step.command ?? step.text}\n`;
     if (res.detail) text += `${res.detail}\n`;
     if (await copyText(text.trim())) {
@@ -742,7 +705,7 @@
    * The `finally` clears it — only while the row is still this invocation's,
    * never a newer run's, and never a row in a repository switched to since.
    */
-  async function runStep(step: RunnableStep, guard: AsyncGuard): Promise<boolean> {
+  async function runStep(step: RunnablePlanStep, guard: AsyncGuard): Promise<boolean> {
     const repoPath = $repoStore.currentPath;
     if (!step.argv || step.argv.length === 0 || !repoPath || issueSubmitting) return false;
     const runId = ++nextRunId;
@@ -756,7 +719,7 @@
   }
 
   async function runStepOnce(
-    step: RunnableStep,
+    step: RunnablePlanStep,
     argv: string[],
     repoPath: string,
     guard: AsyncGuard,
@@ -1244,11 +1207,11 @@
       scanInflight?.cancel();
       generationInflight?.cancel();
       opsInflight?.cancel();
-      if (reportCopyTimer !== null) window.clearTimeout(reportCopyTimer);
-      if (aiCopyTimer !== null) window.clearTimeout(aiCopyTimer);
+      reportFlash.dispose();
+      aiFlash.dispose();
       if (copiedScriptTimer !== null) window.clearTimeout(copiedScriptTimer);
       if (copiedAllTimer !== null) window.clearTimeout(copiedAllTimer);
-      if (scanErrorCopyTimer !== null) window.clearTimeout(scanErrorCopyTimer);
+      scanErrorFlash.dispose();
       if (copiedStepTimer !== null) window.clearTimeout(copiedStepTimer);
     };
   });

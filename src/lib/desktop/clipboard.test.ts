@@ -74,6 +74,16 @@ describe("createCopyFlash", () => {
     expect(seen).toEqual([true, true, false]);
   });
 
+  it("flash lights without copying, and reset puts it out and cancels the countdown", () => {
+    vi.useFakeTimers();
+    const seen: boolean[] = [];
+    const flash = createCopyFlash((v) => seen.push(v), 1000);
+    flash.flash();
+    flash.reset();
+    vi.advanceTimersByTime(5000);
+    expect(seen).toEqual([true, false]);
+  });
+
   it("leaves the indicator alone on failure and cancels on dispose", async () => {
     vi.useFakeTimers();
     const seen: boolean[] = [];
