@@ -16,11 +16,12 @@ import { harnessStore } from "../src/lib/stores/harnessStore";
 import { interfaceStore } from "../src/lib/stores/interfaceStore";
 import { diagnostics } from "../src/lib/diagnostics/diagnostics";
 import { coverageMetric } from "../src/lib/metrics/repoMetrics";
+import { promptState, completePrompt } from "../src/lib/stores/modalStore";
 
 const REPO = "/fixture/GitPulse";
 
 export async function runCoverageChecks(ctx) {
-  const { wait, until, button, byText, region, card, runs, aiCalls, knobs, setMode, setRunDelay, scans, check } = ctx;
+  const { wait, until, button, byText, region, card, runs, aiCalls, ipcLog, knobs, setMode, setRunDelay, scans, check } = ctx;
 
   // `check` from the page takes a boolean evaluated at the call site, so a
   // throwing probe would be attributed to nothing. This evaluates here and
@@ -606,6 +607,59 @@ export async function runCoverageChecks(ctx) {
       () => flat(strip()).includes("scan capped: 4000 of 12873 covered files") && !flat(strip()).includes("5 of 5"), () => flat(strip()));
     await enter([family("javascript", "JavaScript", { suggested_commands: ["npm run cov-a"] })], { truncated: true, limit_notices: [] });
     ok("with no published counts the chip says only that the scan was capped", () => /scan capped(?!:)/.test(flat(strip())) && !flat(strip()).includes("scan capped:"));
+
+    // ---- Commands the panel will not run, and what it says about the rest ----
+    const bad = family("javascript", "JavaScript", { suggested_commands: ['npm run "unclosed'], duration_hint: "Takes a few minutes." });
+    await enter([bad]);
+    ok("a family's duration hint is the title of its run button", () => byText("Run JavaScript coverage").title === "Takes a few minutes.");
+    ok("the batch button names what it needs and how long it can take",
+      () => { const title = region().querySelector('button[title^="Generate each missing language"]')?.title ?? ""; return title.includes("cargo-llvm-cov") && title.includes("several minutes"); });
+    journaled = generatorJournal().length;
+    byText("Run JavaScript coverage").click();
+    await settle();
+    ok("a command that cannot be tokenized never reaches IPC, and is named, journaled and reported as failed",
+      () => runs.length === 0 && rowText('npm run "unclosed').includes("failed") && generatorJournal().length === journaled + 1
+        && generatorJournal().at(-1).ok === false && get(diagnostics).some(entry => entry.source === "coverage" && entry.message.includes("Invalid coverage command")),
+      () => [runs.length, rowText('npm run "unclosed')]);
+    await enter([go]);
+    knobs.runHandler = scripted({});
+    scanBase = scans();
+    [...card("go").querySelectorAll("button")].find(node => node.title === "Run with MANVI: go -C a test ./...").click();
+    await settle();
+    ok("running one command by its chip runs only that command, then rescans", () => argvs().join("|") === "go -C a test ./..." && scans() > scanBase, () => [argvs(), scans() - scanBase]);
+
+    // ---- Filing a coverage issue -----------------------------------------------
+    resetKnobs();
+    setMode("measured");
+    await switchTo("Other"); await switchTo("GitPulse");
+    await until(() => header().includes("62.5%") && idle());
+    const issueButton = () => button("Create a guarded GitHub issue from this coverage snapshot");
+    const created = () => ipcLog.filter(entry => entry.cmd === "cmd_github_create_issue");
+    issueButton().click(); await wait();
+    ok("filing an issue asks first, and promises no local path",
+      () => get(promptState)?.options.title === "Create coverage issue" && get(promptState).options.message.includes("The draft excludes the local checkout path and command output."));
+    completePrompt(false); await wait();
+    ok("declining files nothing", () => created().length === 0);
+    issueButton().click(); await wait(); completePrompt(true);
+    await until(() => region().textContent.includes("Coverage issue created"));
+    ok("confirming files a redacted snapshot, with no label requirement, for this repository",
+      () => created().length === 1 && created()[0].args.repoPath === REPO && !created()[0].args.body.includes(REPO)
+        && created()[0].args.title.startsWith("test(coverage): address 62.5%") && created()[0].args.labels.length === 0, () => created());
+    ok("the created issue can be opened from the panel", () => !!byText("Open issue"));
+    issueButton().click(); await wait();
+    await switchTo("Other");
+    completePrompt(true); await wait(); await wait();
+    ok("an answer that arrives after a repository switch files nothing", () => created().length === 1);
+    await switchTo("GitPulse");
+    await until(() => header().includes("62.5%") && idle());
+    knobs.runHandler = scripted({});
+    setRunDelay(300);
+    await enter([quick]);
+    byText("Run JavaScript coverage").click(); await tick(); await wait();
+    ok("a coverage command in flight disables filing an issue", () => issueButton().disabled);
+    await settle();
+    setRunDelay(0);
+    ok("and it is available again once the run settles", () => !issueButton().disabled);
   } finally {
     // Leaves the page for the checks that follow in coverage.html.
   }

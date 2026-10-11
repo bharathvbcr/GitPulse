@@ -98,6 +98,7 @@
             const content = Array.from({ length: 100 }, (_, i) => `export const line${i + 1} = ${i + 1};`).join("\n");
             return mode === "slow-detail" ? new Promise(resolve => setTimeout(() => resolve(content), 250)) : content;
           }
+          case "cmd_github_create_issue": return { output: "https://example.invalid/issues/7" };
           case "cmd_terminal_spawn": {
             if (mode === "spawn-error" && args.program) { mode = "empty"; throw new Error("Fixture agent executable unavailable"); }
             const id = `coverage-${++sequence}`;
