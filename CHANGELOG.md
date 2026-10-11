@@ -11,6 +11,19 @@ before that tag is pushed.
 
 ## [Unreleased]
 
+### Fixed
+
+- The local-model client now tries every address `localhost` resolves to (an
+  IPv4-only Ollama was refused when `::1` came first), treats a chunked reply
+  cut off before its last chunk as an error, and reports non-text reply
+  content instead of an unexplained empty one. Suggested branch names pass the
+  app's ref-name validation, and the branch-name prompt reads a capped diff
+  that names untracked files.
+- The staged patch reaches Lappi as git's exact bytes rather than a lossy
+  UTF-8 decode.
+- A Markdown link to `other.md#section` opens that section, and a footnote
+  whose label matches a heading no longer shares its id.
+
 ### Added
 
 - An agent's `done` that is held in review for lack of a passing verification
