@@ -465,6 +465,33 @@ export function attemptHolding<T extends { state: string; expires_at: number; cw
 }
 
 /**
+ * Whether anyone holds the checkout, as far as it could be read.
+ *
+ * `unknown` is the read that has not answered yet or failed. It must be
+ * treated as held: calling it "nobody holds this" let a second agent launch
+ * into a checkout that already had one. `reads` is the list of holding runs
+ * as read, or null while it is not known.
+ */
+export type CheckoutHolder<T> =
+  | { kind: "free" }
+  | { kind: "held"; run: T }
+  | { kind: "unknown"; reason: string };
+
+export function checkoutHolder<T extends { state: string; expires_at: number; cwd: string; git_dir?: string }>(
+  reads: readonly T[] | null,
+  readError: string | null,
+  target: CheckoutTarget,
+  options: PathIdentityOptions,
+  now: number = Date.now(),
+): CheckoutHolder<T> {
+  if (reads === null) {
+    return { kind: "unknown", reason: readError ? `reading the checkout's agents failed (${readError})` : "still reading the checkout's agents" };
+  }
+  const run = attemptHolding(reads, target, options, now);
+  return run ? { kind: "held", run } : { kind: "free" };
+}
+
+/**
  * A checkout as `attemptHolding` asks about it: the chosen path, and its Git
  * directory once the host has said (`checkoutIdentity`); null or absent while
  * unknown, when the comparison falls back to the directory itself.

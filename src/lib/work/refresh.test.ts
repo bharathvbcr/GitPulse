@@ -94,4 +94,22 @@ describe("Overview refresh lifecycle", () => {
     expect(view.collisions).toHaveBeenCalledWith(null, expect.stringContaining("invalid response"));
     expect(view.finished).toHaveBeenCalledWith(null);
   });
+
+  it("a switched-away repository's hung load does not hold up the new repository (ft-3b404cb4)", async () => {
+    vi.useFakeTimers();
+    // A native call that ignores its signal and never answers.
+    const load = vi.fn((repo: string) => repo === "/old" ? new Promise<typeof projection>(() => undefined) : Promise.resolve(projection));
+    const worker = createWorkRefresh({ load, collisions: async () => risk });
+    const stale = observer(); const next = observer();
+    worker.request("/old", stale); await tick();
+    worker.request("/new", next); await tick();
+    // No timer advanced: the 20 s deadline of the old call is irrelevant.
+    expect(load.mock.calls.map(call => call[0])).toEqual(["/old", "/new"]);
+    expect(next.projection).toHaveBeenCalledOnce();
+    expect(next.finished).toHaveBeenCalledWith(null);
+    expect(stale.projection).not.toHaveBeenCalled();
+    expect(stale.finished).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(WORK_TIMEOUT_MS);
+    expect(vi.getTimerCount()).toBe(0);
+  });
 });

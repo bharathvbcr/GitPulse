@@ -240,3 +240,89 @@ describe("the frontend has one IPC entry point", () => {
     expect(/fn not_retryable\(/.test(source), "not_retryable exists").toBe(true);
   });
 });
+
+describe("invoke wait bound (ft-3b404cb4)", () => {
+  const hang = () => new Promise<never>(() => undefined);
+
+  it("a call that never answers rejects with a DeadlineError at its deadline", async () => {
+    vi.useFakeTimers();
+    try {
+      const invoke = withDeferralRetry(hang as never);
+      const outcome = invoke("cmd_x", { a: 1 }, { deadlineMs: 5_000 }).catch((e: unknown) => e);
+      await vi.advanceTimersByTimeAsync(5_001);
+      expect(await outcome).toMatchObject({ name: "DeadlineError", ms: 5_000 });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("forwards neither deadlineMs nor signal to the backend, and keeps real options", async () => {
+    const raw = vi.fn(async () => "ok");
+    const invoke = withDeferralRetry(raw as never);
+    await invoke("cmd_x", { a: 1 }, { deadlineMs: 1_000, signal: new AbortController().signal });
+    await invoke("cmd_x", undefined, { deadlineMs: 1_000 });
+    await invoke("cmd_y", { b: 2 }, { deadlineMs: 1_000, headers: { h: "v" } });
+    expect(raw.mock.calls).toEqual([
+      ["cmd_x", { a: 1 }],
+      ["cmd_x"],
+      ["cmd_y", { b: 2 }, { headers: { h: "v" } }],
+    ]);
+  });
+
+  it("an aborted signal ends the wait at once and an already-aborted one never sends", async () => {
+    const raw = vi.fn(hang);
+    const invoke = withDeferralRetry(raw as never);
+    const controller = new AbortController();
+    const outcome = invoke("cmd_x", undefined, { signal: controller.signal }).catch((e: unknown) => e);
+    controller.abort();
+    expect(await outcome).toMatchObject({ name: "AbortError" });
+    const gone = new AbortController();
+    gone.abort();
+    await expect(invoke("cmd_z", undefined, { signal: gone.signal })).rejects.toMatchObject({ name: "AbortError" });
+    expect(raw).toHaveBeenCalledTimes(1);
+  });
+
+  it("the deadline covers the deferral backoff, not just one attempt", async () => {
+    vi.useFakeTimers();
+    try {
+      const raw = vi.fn(async () => { throw DEFERRAL; });
+      const invoke = withDeferralRetry(raw as never, { random: () => 0, whenShown: () => Promise.resolve() });
+      const outcome = invoke("cmd_x", { a: 1 }, { deadlineMs: 4_000 }).catch((e: unknown) => e);
+      await vi.advanceTimersByTimeAsync(4_001);
+      expect(await outcome).toMatchObject({ name: "DeadlineError" });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("bounds the GitHub commands by default so a panel gets a message, not a spinner", async () => {
+    vi.useFakeTimers();
+    try {
+      const invoke = withDeferralRetry(hang as never);
+      const context = invoke("cmd_github_context", { repoPath: "/r" }).catch((e: unknown) => e);
+      const runs = invoke("cmd_github_runs", { repoPath: "/r" }).catch((e: unknown) => e);
+      await vi.advanceTimersByTimeAsync(10 * 60_000);
+      expect(await context).toMatchObject({ name: "DeadlineError" });
+      expect(await runs).toMatchObject({ name: "DeadlineError" });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("leaves other commands unbounded, and Infinity opts a bounded one out", async () => {
+    vi.useFakeTimers();
+    try {
+      const answers: Array<(v: string) => void> = [];
+      const raw = vi.fn(() => new Promise<string>((resolve) => { answers.push(resolve); }));
+      const invoke = withDeferralRetry(raw as never);
+      const long = invoke<string>("cmd_long_job", { a: 1 });
+      const optedOut = invoke<string>("cmd_github_context", { repoPath: "/r" }, { deadlineMs: Infinity });
+      await vi.advanceTimersByTimeAsync(60 * 60_000);
+      answers.forEach((answer) => answer("done"));
+      await expect(long).resolves.toBe("done");
+      await expect(optedOut).resolves.toBe("done");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});

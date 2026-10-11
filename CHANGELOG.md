@@ -16,6 +16,19 @@ before that tag is pushed.
 - Task board: a refresh after any write keeps the pages a reader loaded (columns and navigator) instead of snapping back to page one; moving a card to the bottom of a paged column reads the column to its end first, so the card is not hidden after reload; overlapping catalog reads no longer land out of order.
 - Archive and Attention inbox keep their pages and selection across a window blur; closing a tab through any of the three close routes now forgets every per-tab record and the harness journal cache.
 - One shared `workbench-changed` subscription: each write refreshes each surface once (a repeated sequence and the watcher's echo of an in-process write are dropped), the inbox re-reads only when enhancement status really changes, and a failed listener is reported on every surface.
+- Backend calls can now be bounded: `invoke` takes a deadline and an abort
+  signal, a timeout is a distinct `DeadlineError`, and the GitHub context, runs
+  and workflows reads time out with a message instead of a spinner that never
+  ends. The five separate timeout helpers are replaced by one. A switched-away
+  repository's Overview load no longer holds up the new one.
+- A failed read no longer looks like an empty or successful one: issue import
+  refuses while the task list is unread, a failed diff shows its own error with
+  a retry (and no longer disables Review changes or keeps the previous file's
+  diff), quick commit picks end on the last pick, Launch at login shows
+  "unknown" instead of Off, branch stats no longer revert a newer branch list,
+  an unreadable checkout-holder list forces a worktree, sticky error toasts
+  outlive other toasts, a failed notification read can be dismissed, and a typed
+  answer withdraws the session alert.
 
 ### Added
 

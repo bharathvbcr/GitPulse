@@ -91,15 +91,16 @@ function createToastStore() {
     update((toasts) => {
       const next = [...toasts, item];
       if (next.length > MAX_TOASTS) {
-        const oldest = next[0];
-        if (oldest) {
-          const t = timers.get(oldest.id);
-          if (t) {
-            clearTimeout(t);
-            timers.delete(oldest.id);
-          }
+        // An error is sticky and the reader has not dismissed it: it is the
+        // last thing evicted, only when nothing else is left to drop.
+        const evicted = next.find((t) => t.kind !== "error") ?? next[0];
+        const t = timers.get(evicted.id);
+        if (t) {
+          clearTimeout(t);
+          timers.delete(evicted.id);
         }
-        return next.slice(next.length - MAX_TOASTS);
+        paused.delete(evicted.id);
+        return next.filter((candidate) => candidate !== evicted);
       }
       return next;
     });

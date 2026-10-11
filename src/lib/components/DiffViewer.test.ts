@@ -551,7 +551,7 @@ describe("DiffViewer keeps its frame when there is nothing to show", () => {
   it("keeps the file list beside an empty diff", () => {
     // `{#if lines.length === 0}` used to replace the rail as well as the
     // rows, so a clean merge left no way to reach another file.
-    expect(source).toContain("const showEmpty = $derived(!pending && lines.length === 0)");
+    expect(source).toContain("const showEmpty = $derived(!pending && !diffError && lines.length === 0)");
     const frame = source.indexOf("{#if railOpen && hasRail}");
     const empty = source.indexOf("{:else if showEmpty}");
     expect(frame).toBeGreaterThan(-1);

@@ -96,7 +96,7 @@
     type PermissionMode,
   } from "../terminal/agentDefaults";
   import { agentDefaults, loadAgentDefaults } from "../stores/agentDefaultsStore";
-  import { terminalAttendance } from "../stores/sessionAlertsStore";
+  import { reportAttentionAnswered, terminalAttendance } from "../stores/sessionAlertsStore";
   import { sessionActivity } from "../terminal/sessionActivity";
   import type { TerminalSpawned } from "../terminal/runResult";
   import { isImeComposition } from "../keyboard/imeGuard";
@@ -463,8 +463,10 @@
         else console.debug("[gitpulse-terminal]", line);
       }
       // The reader answering whatever the agent last asked; xterm's own
-      // replies (focus, cursor reports) are told apart inside.
-      if (nativeSessionId) sessionActivity.input(nativeSessionId, data);
+      // replies (focus, cursor reports) are told apart inside. When something
+      // stood, the notifier is told too, or it would replay the question and
+      // leave its banner up.
+      if (nativeSessionId && sessionActivity.input(nativeSessionId, data)) reportAttentionAnswered(nativeSessionId);
       lifecycle?.write(data);
     });
     created.onBinary((data) => { lifecycle?.write(data, true); });

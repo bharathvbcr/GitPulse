@@ -345,6 +345,13 @@ export interface RepoSession {
    * announces.
    */
   selectedDiffPending: boolean;
+  /**
+   * Why the selected diff could not be read, or null. Per selection and kept
+   * apart from `error` (the repository snapshot's): a failed diff read must
+   * not blank the status, disable Review changes, or leave the previous
+   * file's diff on screen under the new file's name.
+   */
+  selectedDiffError: string | null;
   activeTab: ViewTab;
   /**
    * The section last open in each sectioned view, keyed by view id.
@@ -470,6 +477,15 @@ export interface RepoState {
    * announces.
    */
   selectedDiffPending: boolean;
+  /**
+   * Why the selected diff could not be read, or null. Per selection and kept
+   * apart from `error` (the repository snapshot's): a failed diff read must
+   * not blank the status, disable Review changes, or leave the previous
+   * file's diff on screen under the new file's name.
+   */
+  selectedDiffError: string | null;
+  /** What the selection is: a worktree file, a commit (optionally one of its files), or a range. */
+  selectionKind: SelectionKind;
   activeTab: ViewTab;
   /** Section last open in each sectioned view; see the session field. */
   viewSections: Record<string, string>;
@@ -626,6 +642,8 @@ function emptyProjected(): RepoState {
     selectedDiffTruncated: false,
     selectedDiffTruncationReason: null,
     selectedDiffPending: false,
+    selectedDiffError: null,
+    selectionKind: "file",
     activeTab: "work",
     viewSections: {},
     terminalOpen: false,
@@ -678,6 +696,7 @@ function createSession(
     selectedDiffTruncated: extras.selectedDiffTruncated ?? false,
     selectedDiffTruncationReason: extras.selectedDiffTruncationReason ?? null,
     selectedDiffPending: extras.selectedDiffPending ?? false,
+    selectedDiffError: extras.selectedDiffError ?? null,
     activeTab: extras.activeTab ?? "work",
     viewSections: { ...(extras.viewSections ?? {}) },
     terminalOpen: extras.terminalOpen ?? false,
@@ -818,6 +837,8 @@ function projectRest(
     selectedDiffTruncated: active?.selectedDiffTruncated ?? false,
     selectedDiffTruncationReason: active?.selectedDiffTruncationReason ?? null,
     selectedDiffPending: active?.selectedDiffPending ?? false,
+    selectedDiffError: active?.selectedDiffError ?? null,
+    selectionKind: active?.selectionKind ?? "file",
     activeTab: active?.activeTab ?? "work",
     viewSections: active?.viewSections ?? {},
     terminalOpen: active?.terminalOpen ?? false,
@@ -1010,7 +1031,29 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
       session.selectedIgnoreWhitespace === target.ignoreWhitespace &&
       session.selectedDiff !== null;
     if (unchanged) return;
-    applyToSession(session.id, session.generation, { selectedDiffPending: true });
+    applyToSession(session.id, session.generation, { selectedDiffPending: true, selectedDiffError: null });
+  };
+
+  /**
+   * A diff read that failed: the selection the reader asked for, no diff, and
+   * the reason, on the selection itself. The previous file's diff is cleared
+   * rather than left under the new file's name, and the repository snapshot's
+   * `error` is untouched (it means "status unavailable", which this is not).
+   */
+  const failDiffFetch = (
+    session: RepoSession,
+    generation: number,
+    err: unknown,
+    selection: Partial<RepoSession> | ((current: RepoSession) => Partial<RepoSession>),
+  ): void => {
+    applyToSession(session.id, generation, (current) => ({
+      ...(typeof selection === "function" ? selection(current) : selection),
+      selectedDiff: null,
+      selectedDiffTruncated: false,
+      selectedDiffTruncationReason: null,
+      selectedDiffError: formatError(err),
+      selectedDiffPending: false,
+    }));
   };
 
   /**
@@ -2012,7 +2055,16 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
       statsInflight.delete(id);
       return;
     }
-    let branches = start.branches;
+    // Stats are collected here and merged into the LIVE branch list at each
+    // publish. Writing back a copy of the list as it stood when the drain
+    // began reverted a refresh that landed meanwhile: a deleted branch came
+    // back and a new one vanished.
+    const collected = new Map<string, { tip: string; stats: Partial<BranchInfo> }>();
+    const withCollectedStats = (list: BranchInfo[]): BranchInfo[] =>
+      list.map((branch) => {
+        const hit = collected.get(branchStatsKey(branch.name, branch.is_remote, branch.remote_name));
+        return hit && hit.tip === branch.tip_commit_id ? { ...branch, ...hit.stats } : branch;
+      });
     let dirty = false;
     // `pending` keeps the in-flight marker lit across intermediate publishes;
     // `failed` lands only on the final settle so a mid-drain hiccup that a
@@ -2031,11 +2083,11 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
         return;
       }
       if (dirty) {
-        applyToSession(id, generation, {
-          branches,
+        applyToSession(id, generation, (current) => ({
+          branches: withCollectedStats(current.branches),
           statsPending: pending,
           statsFailed: failed,
-        });
+        }));
         dirty = false;
         return;
       }
@@ -2066,23 +2118,23 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
           ]),
         );
         let batchTouched = false;
-        branches = branches.map((branch) => {
-          const update = updates.get(
-            branchStatsKey(branch.name, branch.is_remote, branch.remote_name),
-          );
-          if (!update || update.tip_commit_id !== branch.tip_commit_id)
-            return branch;
-          batchTouched = true;
-          return {
-            ...branch,
-            additions: update.additions,
-            deletions: update.deletions,
-            files_changed: update.files_changed,
-            commits_ahead_of_base: update.commits_ahead_of_base,
-            commits_behind_base: update.commits_behind_base,
-            compared_to: report.compared_to,
-          };
-        });
+        for (const [key, update] of updates) {
+          collected.set(key, {
+            tip: update.tip_commit_id,
+            stats: {
+              additions: update.additions,
+              deletions: update.deletions,
+              files_changed: update.files_changed,
+              commits_ahead_of_base: update.commits_ahead_of_base,
+              commits_behind_base: update.commits_behind_base,
+              compared_to: report.compared_to,
+            },
+          });
+        }
+        for (const branch of session.branches) {
+          const update = updates.get(branchStatsKey(branch.name, branch.is_remote, branch.remote_name));
+          if (update && update.tip_commit_id === branch.tip_commit_id) batchTouched = true;
+        }
         if (batchTouched) dirty = true;
         const drained = !report.capped;
         if (dirty && (drained || (batch + 1) % STATS_PUBLISH_EVERY === 0)) {
@@ -3101,6 +3153,7 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
         selectedDiff: null,
         selectedDiffTruncated: false,
         selectedDiffTruncationReason: null,
+        selectedDiffError: null,
         selectedDiffPending: Boolean(file),
         selectedIsStaged: side,
         selectionKind: "file",
@@ -3142,6 +3195,7 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
           selectedIsStaged: isStaged,
           selectedIgnoreWhitespace: ignoreWhitespace,
           selectedDiffPending: false,
+          selectedDiffError: null,
           selectionKind: "file",
           ...(navigationEpoch === openEpoch ? {
             activeTab: "history" as const,
@@ -3150,13 +3204,17 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
         }));
       } catch (err: unknown) {
         if (!selectionGeneration.isCurrent(token)) return;
-        // The flag clears on failure too: a fetch that errored is not still
-        // running, and leaving a spinner up would report a dead read as a
-        // slow one.
-        applyToSession(session.id, generation, {
-          error: formatError(err),
-          selectedDiffPending: false,
-        });
+        // A fetch that errored is not still running: the flag clears with it.
+        failDiffFetch(session, generation, err, (current) => ({
+          selectedFilePath: filePath,
+          selectedCommitId: null,
+          selectedIsStaged: isStaged,
+          selectionKind: "file",
+          ...(navigationEpoch === openEpoch ? {
+            activeTab: "history" as const,
+            viewSections: { ...current.viewSections, history: "diff" },
+          } : {}),
+        }));
       }
     },
     selectFilePath: (filePath: string | null) => {
@@ -3219,16 +3277,17 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
           selectedDiffTruncationReason: diff.truncation_reason ?? null,
           selectedIsStaged: false,
           selectedDiffPending: false,
+          selectedDiffError: null,
           selectionKind: "commit",
         });
       } catch (err: unknown) {
         if (!selectionGeneration.isCurrent(token)) return;
-        // The flag clears on failure too: a fetch that errored is not still
-        // running, and leaving a spinner up would report a dead read as a
-        // slow one.
-        applyToSession(session.id, generation, {
-          error: formatError(err),
-          selectedDiffPending: false,
+        // A fetch that errored is not still running: the flag clears with it.
+        failDiffFetch(session, generation, err, {
+          selectedCommitId: commitId,
+          selectedFilePath: null,
+          selectedIsStaged: false,
+          selectionKind: "commit",
         });
       }
     },
@@ -3261,19 +3320,22 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
           selectedDiffTruncationReason: fileDiff.truncation_reason ?? null,
           selectedIsStaged: false,
           selectedDiffPending: false,
+          selectedDiffError: null,
           selectionKind: "commit",
           activeTab: "history",
           viewSections: { ...current.viewSections, history: "diff" },
         }));
       } catch (err: unknown) {
         if (!selectionGeneration.isCurrent(token)) return;
-        // The flag clears on failure too: a fetch that errored is not still
-        // running, and leaving a spinner up would report a dead read as a
-        // slow one.
-        applyToSession(session.id, generation, {
-          error: formatError(err),
-          selectedDiffPending: false,
-        });
+        // A fetch that errored is not still running: the flag clears with it.
+        failDiffFetch(session, generation, err, (current) => ({
+          selectedCommitId: commitId,
+          selectedFilePath: filePath,
+          selectedIsStaged: false,
+          selectionKind: "commit",
+          activeTab: "history" as const,
+          viewSections: { ...current.viewSections, history: "diff" },
+        }));
       }
     },
     selectRangeDiff: async (from: string, to: string) => {
@@ -3302,19 +3364,22 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
           selectedDiffTruncationReason: diff.truncation_reason ?? null,
           selectedIsStaged: false,
           selectedDiffPending: false,
+          selectedDiffError: null,
           selectionKind: "range",
           activeTab: "history",
           viewSections: { ...current.viewSections, history: "diff" },
         }));
       } catch (err: unknown) {
         if (!selectionGeneration.isCurrent(token)) return;
-        // The flag clears on failure too: a fetch that errored is not still
-        // running, and leaving a spinner up would report a dead read as a
-        // slow one.
-        applyToSession(session.id, generation, {
-          error: formatError(err),
-          selectedDiffPending: false,
-        });
+        // A fetch that errored is not still running: the flag clears with it.
+        failDiffFetch(session, generation, err, (current) => ({
+          selectedFilePath: `${from}...${to}`,
+          selectedCommitId: null,
+          selectedIsStaged: false,
+          selectionKind: "range",
+          activeTab: "history" as const,
+          viewSections: { ...current.viewSections, history: "diff" },
+        }));
       }
     },
     stageFile: async (filePath: string) =>
@@ -3832,6 +3897,7 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
         selectedDiff: null,
         selectedDiffTruncated: false,
         selectedDiffTruncationReason: null,
+        selectedDiffError: null,
         selectedIsStaged: false,
         selectionKind: "commit",
         activeTab: "history",

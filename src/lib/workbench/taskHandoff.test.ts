@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it } from "vitest";
 import type { RunPreparation } from "./client";
 import {
+  checkoutHolder,
   MAX_CHECKOUT_LENGTH,
   checkoutBesideCommonDir,
   checkoutCandidates,
@@ -560,5 +561,21 @@ describe("a preparation whose outcome is unknown", () => {
     expect(pendingPreparationFor("t1")).toBeNull();
     expect(pendingPreparationFor("overflow")).not.toBeNull();
     expect(pendingPreparationFor(`t${MAX_PENDING_PREPARATIONS - 1}`)).not.toBeNull();
+  });
+});
+
+describe("checkoutHolder (ft-038e6ba5): unknown is held, never free", () => {
+  const opts = { caseInsensitive: false } as never;
+  const run = { state: "prepared", expires_at: Date.now() + 60_000, cwd: "/work/repo" };
+
+  it("a holder read that is pending or failed is unknown, with a reason", () => {
+    expect(checkoutHolder(null, null, { path: "/work/repo" }, opts)).toMatchObject({ kind: "unknown", reason: expect.stringContaining("still reading") });
+    expect(checkoutHolder(null, "gh: boom", { path: "/work/repo" }, opts)).toMatchObject({ kind: "unknown", reason: expect.stringContaining("gh: boom") });
+  });
+
+  it("a read that came back names the holder, or is free", () => {
+    expect(checkoutHolder([run], null, { path: "/work/repo" }, opts)).toEqual({ kind: "held", run });
+    expect(checkoutHolder([run], null, { path: "/work/other" }, opts)).toEqual({ kind: "free" });
+    expect(checkoutHolder([], null, { path: "/work/repo" }, opts)).toEqual({ kind: "free" });
   });
 });

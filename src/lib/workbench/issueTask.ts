@@ -318,7 +318,7 @@ export function linkedIssueNumber(card: Pick<TaskCard, "title" | "labels">): num
 
 /** Find existing task matching issue number. */
 export function findTaskForIssue(
-  tasks: readonly TaskCard[],
+  tasks: readonly TaskCard[] | null,
   issueNumber: number,
 ): TaskCard | undefined {
   if (!Array.isArray(tasks) || issueNumber <= 0) return undefined;
@@ -403,19 +403,29 @@ export async function createTaskFromIssue(
   return saved;
 }
 
+/** Why an import was refused before it wrote anything. */
+export const TASK_CATALOG_UNREAD_MESSAGE =
+  "The existing task list has not been read (it is still loading or failed to load), so issues cannot be checked against it. Reload the tasks and retry.";
+
 /**
  * Batch create workbench tasks from multiple GitHub issues, skipping any
  * issues that already have a corresponding task.
+ *
+ * `existingTasks` is the catalog as it was actually read: `null` means it was
+ * not (still loading, or the read failed), and the import refuses. An empty
+ * array is a real, empty catalog. Treating an unread catalog as empty made
+ * "Add all issues" re-create every task that already existed.
  */
 export async function batchCreateTasksFromIssues(
   issues: readonly IssueInfo[],
   repoPath: string,
-  existingTasks: readonly TaskCard[] = [],
+  existingTasks: readonly TaskCard[] | null,
   options: IssueTaskOptions = {},
 ): Promise<BatchCreateResult> {
   if (!repoPath || !repoPath.trim()) {
     throw new Error("Cannot batch create tasks: repository path is missing.");
   }
+  if (existingTasks === null) throw new Error(TASK_CATALOG_UNREAD_MESSAGE);
 
   const result: BatchCreateResult = {
     created: [],

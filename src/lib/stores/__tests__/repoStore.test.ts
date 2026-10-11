@@ -2460,7 +2460,9 @@ describe("repoStore diff selection", () => {
     await store.openRepo("/r/commit-file-err");
 
     await store.selectCommitFileDiff("cX", "src/b.ts");
-    expect(get(store).error).toMatch(/bad object/);
+    // The diff's own error: the repository status error stays untouched (ft-038e6ba5).
+    expect(get(store).selectedDiffError).toMatch(/bad object/);
+    expect(get(store).error).toBeNull();
   });
 
   it("applies rapid same-tab selections in click order, not resolve order", async () => {
@@ -4289,7 +4291,7 @@ describe("uncommitted previews", () => {
     await store.openRepo("/r");
     await store.selectCommitDiff("old");
     await store.previewUncommitted();
-    expect(get(store)).toMatchObject({ error: "file disappeared", selectedDiff: null, selectedCommitId: null, selectedDiffPending: false, selectedFilePath: "README.md" });
+    expect(get(store)).toMatchObject({ error: null, selectedDiffError: "file disappeared", selectedDiff: null, selectedCommitId: null, selectedDiffPending: false, selectedFilePath: "README.md" });
   });
 
   it("resolves another worktree and fetches its files, never the previous repository's", async () => {

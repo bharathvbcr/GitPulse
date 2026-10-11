@@ -1,3 +1,4 @@
+import { bounded } from "./taskActions";
 import { WorkbenchError, explainError, type Page, type TaskCard, type TaskStatus } from "./client";
 
 /** Upper bound for one user-confirmed delete pass. The rest stay selected. */
@@ -163,22 +164,9 @@ export async function runBoundedSerial<T>(
   return { done, failed, skipped };
 }
 
-export async function withTimeout<T>(work: Promise<T>, ms: number, message = "Delete timed out. Retry to confirm its result."): Promise<T> {
-  const cap = Number.isFinite(ms) && ms > 0 ? Math.min(ms, 120_000) : DELETE_ATTEMPT_TIMEOUT_MS;
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  try {
-    return await Promise.race([
-      work,
-      new Promise<never>((_, reject) => {
-        timer = setTimeout(
-          () => reject(new WorkbenchError("transport_error", message)),
-          cap,
-        );
-      }),
-    ]);
-  } finally {
-    if (timer !== undefined) clearTimeout(timer);
-  }
+/** A pass's per-attempt bound: the caller's, within reason; anything unusable falls back to the default. */
+function deleteTimeout(ms: number | undefined): number {
+  return ms !== undefined && Number.isFinite(ms) && ms > 0 ? Math.min(ms, 120_000) : DELETE_ATTEMPT_TIMEOUT_MS;
 }
 
 export async function deleteTasks(
@@ -237,7 +225,7 @@ async function writeEach(
       return attempt ? { task, attempt } : null;
     })
     .filter((row): row is { task: DeletableTask; attempt: DeleteAttempt } => row !== null);
-  const exec = (attempt: DeleteAttempt) => withTimeout(run(attempt), options.timeout ?? DELETE_ATTEMPT_TIMEOUT_MS, options.timeoutMessage);
+  const exec = (attempt: DeleteAttempt) => bounded(run(attempt), deleteTimeout(options.timeout), options.timeoutMessage ?? "Delete timed out. Retry to confirm its result.");
 
   const serial = await runBoundedSerial(attempts, async (row) => {
     try {
