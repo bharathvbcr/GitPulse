@@ -1440,6 +1440,33 @@ if (params.has("check")) {
     check("due dates round-trip through the task editor",
       tasks.some(task => task.id === "task-2" && task.due_at === dueExpected)
       && dueTrigger().textContent.includes("2026"));
+    {
+      // The calendar opens on the month the task is due in, not the month the
+      // reader last browsed; Escape closes the picker, not the sheet; Clear
+      // removes the date and has nothing to do once there is none.
+      const duePopup = () => document.querySelector('[data-testid="task-due-popup"]');
+      const month = () => duePopup()?.querySelector('[data-testid="task-due-month"]')?.textContent.trim();
+      const september = new Date(2026, 8, 1).toLocaleDateString(undefined, { month: "long", year: "numeric" });
+      dueTrigger().click(); await settle(80);
+      const openedOn = month();
+      duePopup()?.querySelector('[aria-label="Next month"]')?.click(); await settle(30);
+      const browsedTo = month();
+      document.body.dispatchEvent(new PointerEvent("pointerdown", { bubbles: true })); await settle(60);
+      dueTrigger().click(); await settle(80);
+      check("the due calendar opens on the due month, and forgets the browsing once closed",
+        openedOn === september && browsedTo !== september && month() === september);
+      duePopup()?.querySelector('[data-testid="task-due-phrase"]')?.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true }));
+      await settle(60);
+      check("Escape in the due picker closes it and leaves the sheet open", !duePopup() && Boolean(editor()));
+      dueTrigger().click(); await settle(80);
+      duePopup()?.querySelector('[data-testid="task-due-clear"]')?.click(); await settle(60);
+      const clearAfter = duePopup()?.querySelector('[data-testid="task-due-clear"]');
+      document.body.dispatchEvent(new PointerEvent("pointerdown", { bubbles: true })); await settle(60);
+      await click("Save task"); await settle(100);
+      check("Clear removes the due date, saves as none, and has nothing to clear after",
+        dueTrigger().textContent.includes("No due date") && tasks.find(task => task.id === "task-2")?.due_at === null
+        && (!clearAfter || clearAfter.disabled));
+    }
     editor().querySelector('[data-sheet-tab="agent"]').click(); await settle();
     await change(field("Owner"),"ada"); await click("Save task"); await settle(100);
     check("saving keeps the reader on the pane they were editing", editor().querySelector('[data-sheet-tab="agent"]').getAttribute("aria-selected")==="true");
