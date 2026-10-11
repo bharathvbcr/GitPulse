@@ -93,7 +93,9 @@ before that tag is pushed.
   repository has opted in (and while the setting cannot be read), and it asks
   before anything is sent. Every `gh` call it makes now passes the command gate
   and is recorded in the ledger like each other `gh` mutation, and runs through
-  the one `gh` runner the GitHub actions use.
+  the one `gh` runner the GitHub actions use. The main window is granted the
+  three `cmd_verify_status_*` commands the sheet calls (without the grant the
+  app ACL refused them at runtime).
 - An agent's `done` that is held in review for lack of a passing verification
   now starts that verification itself (one per task and head, at most two at a
   time, off the MCP response path) and moves the card to done when Manvi's
