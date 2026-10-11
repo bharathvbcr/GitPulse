@@ -44,6 +44,7 @@
   import {
     createTaskFromIssue,
     batchCreateTasksFromIssues,
+    TASK_CATALOG_UNREAD_MESSAGE,
     findTaskForIssue,
     listAllRepositoryTasks,
   } from "../workbench/issueTask";
@@ -107,7 +108,9 @@
   let releaseMessage = $state("");
   let releaseConfirmed = $state(false);
 
-  let repoTasks = $state<TaskCard[]>([]);
+  /** The task catalog as read; `null` while loading or after a failed read — never "empty". */
+  let repoTasks = $state<TaskCard[] | null>(null);
+  let repoTasksError = $state<string | null>(null);
   let taskAddingNumber = $state<number | null>(null);
   let batchAdding = $state(false);
 
@@ -116,7 +119,9 @@
       ? github.issues.filter((issue) => !findTaskForIssue(repoTasks, issue.number))
       : [],
   );
-  let unimportedCount = $derived(unimportedIssues.length);
+  // Unknown, not zero: with no catalog every issue would look new.
+  let unimportedCount = $derived(repoTasks === null ? 0 : unimportedIssues.length);
+  let importPaused = $derived(repoTasks === null && !!github?.issues?.length);
 
   let tagPlan = $state<TagCleanupPlan | null>(null);
   let selectedTags = $state<string[]>([]);
@@ -463,7 +468,8 @@
 
   async function loadRepoTasks(repoPath: string = $repoStore.currentPath ?? "") {
     if (!repoPath) {
-      repoTasks = [];
+      repoTasks = null;
+      repoTasksError = null;
       return;
     }
     const currentGen = ++repoTasksGeneration;
@@ -473,9 +479,15 @@
       const tasks = await listAllRepositoryTasks(registered.id);
       if ($repoStore.currentPath === repoPath && currentGen === repoTasksGeneration) {
         repoTasks = tasks;
+        repoTasksError = null;
       }
-    } catch {
-      // Non-fatal: if task catalog cannot be reached, repoTasks remains empty
+    } catch (err) {
+      // Unknown, not empty: importing against a catalog that was not read
+      // would re-create every task that already exists.
+      if ($repoStore.currentPath === repoPath && currentGen === repoTasksGeneration) {
+        repoTasks = null;
+        repoTasksError = formatError(err);
+      }
     }
   }
 
@@ -486,12 +498,16 @@
       return;
     }
     if (taskAddingNumber !== null || batchAdding || busy !== null) return;
+    if (repoTasks === null) {
+      notice = TASK_CATALOG_UNREAD_MESSAGE;
+      return;
+    }
     taskAddingNumber = issue.number;
     notice = null;
     try {
       const saved = await createTaskFromIssue(issue, repoPath);
       if ($repoStore.currentPath === repoPath) {
-        repoTasks = [saved, ...repoTasks.filter((t) => t.id !== saved.id)];
+        repoTasks = [saved, ...(repoTasks ?? []).filter((t) => t.id !== saved.id)];
         toastStore.success(`Created task for issue #${issue.number}`);
         notice = `Task [#${issue.number}] created. Available on the Tasks board for agent handoff.`;
       }
@@ -508,6 +524,10 @@
     const repoPath = $repoStore.currentPath;
     if (!repoPath || !github?.issues?.length) return;
     if (batchAdding || taskAddingNumber !== null || busy !== null) return;
+    if (repoTasks === null) {
+      notice = TASK_CATALOG_UNREAD_MESSAGE;
+      return;
+    }
 
     if (unimportedIssues.length === 0) {
       notice = "All open issues are already in tasks.";
@@ -527,7 +547,7 @@
     try {
       const result = await batchCreateTasksFromIssues(unimportedIssues, repoPath, repoTasks);
       if ($repoStore.currentPath === repoPath) {
-        repoTasks = [...result.created, ...repoTasks];
+        repoTasks = [...result.created, ...(repoTasks ?? [])];
         if (result.created.length > 0) {
           toastStore.success(
             `Created ${result.created.length} task${result.created.length === 1 ? "" : "s"} from GitHub issues`,
@@ -692,7 +712,8 @@
     selectedBranches = [];
     review = null;
     github = null;
-    repoTasks = [];
+    repoTasks = null;
+    repoTasksError = null;
     notice = null;
     pollError = null;
     const tag = releaseTagSuggestion(repoTags.map((tag) => tag.name));
@@ -912,6 +933,17 @@
         <div class="mb-3 flex items-center justify-between">
           <div><h3 class="font-semibold">Issue monitor</h3><p class="text-textMuted">Refreshes open GitHub issues every minute while this view is visible.</p></div>
           <div class="flex items-center gap-2">
+            {#if importPaused}
+              <button
+                type="button"
+                class="gp-btn text-xs py-1 px-2.5"
+                onclick={() => loadRepoTasks()}
+                title={repoTasksError ?? "Reading the existing task list"}
+              >
+                <RefreshCw size={12} />
+                <span>Retry task list</span>
+              </button>
+            {/if}
             {#if unimportedCount > 0}
               <button
                 type="button"
@@ -932,6 +964,9 @@
             <button class="gp-icon-btn" title="Refresh issues" onclick={() => loadIssues()} disabled={busy !== null}><RefreshCw size={13} class={busy === "issues" ? "animate-spin" : ""} /></button>
           </div>
         </div>
+        {#if importPaused && repoTasksError}
+          <div class="mb-2 flex items-center gap-2 text-amber-400" role="status"><AlertTriangle size={14} /> Task import paused: could not read the existing task list ({repoTasksError}), so issues are not checked against it.</div>
+        {/if}
         {#if github?.error}
           <div class="text-amber-400">{github.error}</div>
         {:else if github?.issues_error}
@@ -971,7 +1006,7 @@
                       type="button"
                       class="inline-flex items-center gap-1 px-2 py-0.5 rounded text-[11px] font-medium bg-surface hover:bg-surfaceHover border border-border text-textSecondary hover:text-textPrimary transition-colors disabled:opacity-50 cursor-pointer"
                       onclick={() => addIssueToTask(issue)}
-                      disabled={taskAddingNumber === issue.number || batchAdding || busy !== null}
+                      disabled={taskAddingNumber === issue.number || batchAdding || busy !== null || repoTasks === null}
                       title={`Create task from issue #${issue.number} for agents to work on`}
                     >
                       {#if taskAddingNumber === issue.number}
