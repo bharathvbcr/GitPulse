@@ -13,6 +13,8 @@ before that tag is pushed.
 
 ### Fixed
 
+- AI replies: an orphan `</think>` (templates that open the tag in the prompt) now drops the reasoning before it and keeps the answer after it, and a reply that ends inside its reasoning reports "the model's reply ended inside its reasoning; no answer was produced" instead of a generic empty reply.
+- Secrets scan: a refused envelope version no longer replaces a valid probed one (the refusal is reported as `kingfisher_version_rejected`), and a finding without a line carries no line (`null`) rather than line 0.
 - Task board: a refresh after any write keeps the pages a reader loaded (columns and navigator) instead of snapping back to page one; moving a card to the bottom of a paged column reads the column to its end first, so the card is not hidden after reload; overlapping catalog reads no longer land out of order.
 - Archive and Attention inbox keep their pages and selection across a window blur; closing a tab through any of the three close routes now forgets every per-tab record and the harness journal cache.
 - One shared `workbench-changed` subscription: each write refreshes each surface once (a repeated sequence and the watcher's echo of an in-process write are dropped), the inbox re-reads only when enhancement status really changes, and a failed listener is reported on every surface.

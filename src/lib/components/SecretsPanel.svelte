@@ -214,6 +214,11 @@
           {/if}
           {#if scannedAgo}· scanned {scannedAgo}{/if}
           {#if report.kingfisher_version}· Kingfisher {report.kingfisher_version}{/if}
+          {#if report.kingfisher_version_rejected}<span
+              class="text-amber-300"
+              title="The scan output named a version that was refused as unsafe to display.">
+              · scan-reported version refused</span
+            >{/if}
         </span>
       {/if}
     </div>
@@ -392,7 +397,7 @@
                     >
                   </td>
                   <td class="px-3 py-1.5 font-mono text-textPrimary break-all">
-                    <span title={finding.path}>{finding.path}</span>{#if finding.line > 0}<span
+                    <span title={finding.path}>{finding.path}</span>{#if finding.line !== null}<span
                         class="text-textMuted">:{finding.line}</span
                       >{/if}
                     {#if sameValue > 1}

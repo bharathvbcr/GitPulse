@@ -234,6 +234,7 @@ pub(crate) fn assemble(
         diagnostic: None,
         kingfisher_present: true,
         kingfisher_version: envelope.version,
+        kingfisher_version_rejected: envelope.version_rejected,
         nested_repos_scanned: facts.nested_repos_scanned,
         completeness: if envelope.failed {
             ScanCompleteness::Partial

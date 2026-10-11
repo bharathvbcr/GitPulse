@@ -546,7 +546,11 @@ fn run(
                 "Reply parsed locally rather than by the harness ({}).",
                 detail
             ));
-            let stripped = prompt::strip_think_tags(&completion.content);
+            let visible = prompt::split_think(&completion.content);
+            if visible.ended_in_reasoning {
+                warnings.push(REPLY_ENDED_IN_REASONING.into());
+            }
+            let stripped = visible.text;
             let truncated = completion.finish_reason == "length"
                 || (max_output > 0 && completion.completion_tokens >= max_output);
             (stripped, completion.reasoning.clone(), truncated)
@@ -706,6 +710,25 @@ fn complete(selection: &AiSelection, turn: &Turn, max_output: i64) -> Result<Com
             .and_then(Value::as_i64)
             .unwrap_or(0),
     })
+}
+
+/// Warning (and empty-reply reason) for a reply that opened `<think>` and
+/// never produced an answer before it ended.
+const REPLY_ENDED_IN_REASONING: &str =
+    "The model's reply ended inside its reasoning; no answer was produced.";
+
+/// Why a generation's text is empty: the distinct reasoning-only cause when the
+/// reply recorded it, otherwise `generic`.
+fn empty_reply_reason(generation: &AiGeneration, generic: &str) -> String {
+    if generation
+        .warnings
+        .iter()
+        .any(|w| w == REPLY_ENDED_IN_REASONING)
+    {
+        REPLY_ENDED_IN_REASONING.to_string()
+    } else {
+        generic.to_string()
+    }
 }
 
 /// The reply text of a chat message's `content`, and a note when it was not a
@@ -1131,7 +1154,10 @@ pub fn explain_commit(
     })?;
     generation.text = prompt::strip_think_tags(&generation.text);
     if generation.text.is_empty() {
-        return Err("The model returned an empty explanation.".into());
+        return Err(empty_reply_reason(
+            &generation,
+            "The model returned an empty explanation.",
+        ));
     }
     if let Some(reason) = &diff_truncation_reason {
         // An explanation written from a prefix must not read as one written
@@ -1171,7 +1197,10 @@ pub fn suggest_branch_name(
     })?;
     generation.text = prompt::clean_branch_name(&generation.text);
     if generation.text.is_empty() {
-        return Err("The model returned no usable branch name.".into());
+        return Err(empty_reply_reason(
+            &generation,
+            "The model returned no usable branch name.",
+        ));
     }
     Ok(generation)
 }
@@ -1245,6 +1274,7 @@ fn run_advisory_with_empty_retry(
     mut generate: impl FnMut(bool) -> Result<AiGeneration, String>,
 ) -> Result<AiGeneration, String> {
     let mut prior_warnings = Vec::new();
+    let mut ended_in_reasoning = false;
     for retry in [false, true] {
         let mut generation = generate(retry)?;
         generation.text = prompt::strip_think_tags(&generation.text)
@@ -1260,7 +1290,16 @@ fn run_advisory_with_empty_retry(
             generation.warnings = prior_warnings;
             return Ok(generation);
         }
+        ended_in_reasoning |= generation
+            .warnings
+            .iter()
+            .any(|w| w == REPLY_ENDED_IN_REASONING);
         prior_warnings.append(&mut generation.warnings);
+    }
+    if ended_in_reasoning {
+        return Err(format!(
+            "{REPLY_ENDED_IN_REASONING} GitPulse retried once for the {answer_name}."
+        ));
     }
     Err(format!(
         "The model returned an empty {answer_name} twice; GitPulse stopped after one bounded retry."
@@ -1802,6 +1841,66 @@ mod tests {
         let explained = explain_commit(&root, &head, Some(selection)).expect("explain succeeds");
         assert!(explained.text.contains("seeds the repository"));
         assert!(requests.recv_timeout(TEST_WAIT).is_ok(), "no request sent");
+    }
+
+    #[test]
+    fn a_reply_that_ends_inside_its_reasoning_names_that_reason() {
+        let _serial = PROBE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _clear = ClearFakeProbe;
+        let _no_harness = NoHarness::install();
+
+        let repo = repo_with_staged_change();
+        let root = repo.path().to_string_lossy().to_string();
+        let head = String::from_utf8(
+            std::process::Command::new("git")
+                .args(["rev-parse", "HEAD"])
+                .current_dir(repo.path())
+                .output_locked()
+                .expect("rev-parse runs")
+                .stdout,
+        )
+        .expect("utf8 oid")
+        .trim()
+        .to_string();
+        let (base_url, _requests) = fake_model_server("<think>weighing the options");
+        let (selection, _hits) = probing_selection(base_url);
+        let err = explain_commit(&root, &head, Some(selection)).expect_err("no answer exists");
+        assert_eq!(err, REPLY_ENDED_IN_REASONING);
+
+        // The same cause survives the advisory retry's own empty-reply error.
+        let err = run_advisory_with_empty_retry("coverage analysis", |_| {
+            let mut generation = empty_generation();
+            generation.warnings.push(REPLY_ENDED_IN_REASONING.into());
+            Ok(generation)
+        })
+        .expect_err("both attempts are reasoning only");
+        assert!(err.starts_with(REPLY_ENDED_IN_REASONING), "{err}");
+        // A plainly empty reply keeps the generic reason.
+        let err = run_advisory_with_empty_retry("coverage analysis", |_| Ok(empty_generation()))
+            .expect_err("both attempts are empty");
+        assert!(err.contains("empty coverage analysis twice"), "{err}");
+    }
+
+    fn empty_generation() -> AiGeneration {
+        AiGeneration {
+            text: String::new(),
+            reasoning: String::new(),
+            model: "test-model".into(),
+            base_url: "http://127.0.0.1:1/v1".into(),
+            context_window: 8_192,
+            context_source: "test".into(),
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            truncated: false,
+            diff_truncated: false,
+            diff_used_bytes: 0,
+            diff_total_bytes: 0,
+            budget: BudgetReport::default(),
+            warnings: Vec::new(),
+            elapsed_ms: 1,
+        }
     }
 
     /// Generous: it bounds a hang, it does not measure speed.
