@@ -46,6 +46,7 @@
   import { boardKey as viewBoardKey, boardPrefs, effectiveSwimlane, wipState, type SavedTaskView, type TaskViewSnapshot } from "../ui/taskBoardViews";
   import TaskSavedViews from "./TaskSavedViews.svelte";
   import TaskSuggestPanel from "./TaskSuggestPanel.svelte";
+  import WavePanel from "./WavePanel.svelte";
   import { consumeTaskOpen, taskOpenRequest } from "../workbench/taskOpen";
   import { parseQuickAddDue, quickAddDraft, type QuickAddMode, type QuickAddResult } from "../workbench/taskQuickAdd";
   import { removeFromColumns, restoreSummary, restoreTasks } from "../workbench/taskDelete";
@@ -2209,6 +2210,7 @@
         onPriority={(value) => { suggestPriority = value; void askSuggest(); }}
         onOpen={(id) => void openTask(id)} onRefresh={() => void askSuggest()} onClose={() => { showSuggest = false; }}
       />
+      <WavePanel repositoryId={scope.kind === "repository" ? scope.id : null} />
     {/if}
     {#if initialized && (showFilters || filtering || showSearchHelp)}
       <div class="query-bar" data-testid="task-query-bar">

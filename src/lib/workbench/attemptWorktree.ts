@@ -31,7 +31,8 @@ import { formatError } from "../ui/formatError";
 import { plural } from "../format";
 import { isAttemptWorktree } from "./taskSessions";
 import { runHoldsCheckout } from "./taskHandoff";
-import type { TaskRun } from "./client";
+import { listAllLiveRuns, type TaskRun } from "./client";
+import { liveRunIn } from "./liveRun";
 
 type AttemptRef = Pick<TaskRun, "id" | "cwd" | "state" | "expires_at">;
 
@@ -153,6 +154,43 @@ export async function mergeAttemptWorktree(run: AttemptRef): Promise<WorktreeAct
   if (!merged.branch_deleted) parts.push(`The branch ${merged.merged_branch} was kept.`);
   if (merged.hook_error) parts.push(`The post-merge hook failed: ${merged.hook_error}`);
   return { message: parts.join(" ") };
+}
+
+/** What an unattended merge did: the commit it merged and the line the board shows. */
+export interface VerifiedMerge { head: string; message: string }
+
+/**
+ * Merges an attempt's branch for a caller that already holds the person's
+ * consent (a wave they started) and an evidence-gated verdict, so it asks
+ * nothing — and therefore checks everything the dialog's reader would have
+ * looked at. It refuses, and merges nothing, when the worktree's head is not
+ * `expectedHead` (the commit the verdict was reached for), when the worktree
+ * has uncommitted files (teardown would lose them, and no verdict saw them),
+ * when the main checkout is dirty or unreadable (a person's or another
+ * session's work), or when a live attempt is working in the main checkout.
+ * It never pushes: the host command it calls only merges and tears down.
+ */
+export async function mergeVerifiedAttempt(run: AttemptRef, expectedHead: string): Promise<VerifiedMerge> {
+  if (!expectedHead) throw new Error("No verified head was named, so nothing is merged.");
+  const root = await mainCheckoutOf(run.cwd);
+  const { main, own } = await listingFor(root, run.cwd);
+  if (!own.branch) throw new Error("This worktree is not on a branch, so there is nothing to merge.");
+  if (own.head !== expectedHead) throw new Error(`The worktree moved to ${own.head.slice(0, 8)} after ${expectedHead.slice(0, 8)} was verified, so it is not merged.`);
+  if (own.dirty_files !== 0) throw new Error(own.dirty_files === null ? "The worktree's uncommitted changes could not be counted, so it is not merged." : `The worktree has ${plural(own.dirty_files, "uncommitted file")} no verdict covered, so it is not merged.`);
+  const target = main?.branch ?? null;
+  if (!main || !target) throw new Error("The main checkout is not on a branch, so there is nothing to merge into.");
+  if (main.dirty_files !== 0) throw new Error(main.dirty_files === null ? `The main checkout ${root} could not be checked for uncommitted work, so nothing is merged into it.` : `The main checkout ${root} has ${plural(main.dirty_files, "uncommitted file")}, which are not this wave's to merge over.`);
+  const live = await listAllLiveRuns();
+  if (!live.complete) throw new Error("Live attempts could not all be read, so the main checkout cannot be shown free of other sessions.");
+  if (liveRunIn(root, live.runs)) throw new Error(`Another attempt is working in the main checkout ${root}, so nothing is merged into it.`);
+  if (!(await repoStore.trustRepo(run.cwd))) throw new Error("The repository is not trusted, so it is not merged.");
+  const result = await invoke<Guarded<MergeTeardownResult>>("cmd_worktree_merge_teardown", { repoPath: root, worktreePath: run.cwd, targetBranch: target, squash: false });
+  await closeStranded(run.cwd);
+  const merged = result.output;
+  const parts = [`Merged ${plural(merged.commits_merged, "commit")} from ${merged.merged_branch} into ${merged.target_branch}.`];
+  if (!merged.worktree_removed) parts.push("The worktree was not removed.");
+  if (merged.hook_error) parts.push(`The post-merge hook failed: ${merged.hook_error}`);
+  return { head: expectedHead, message: parts.join(" ") };
 }
 
 /**
