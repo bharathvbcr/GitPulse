@@ -48,7 +48,7 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::engine::git_cli::{git_bytes_capped, git_text, validate_repo};
+use crate::engine::git_cli::{git_bytes_capped, git_text_capped, validate_repo};
 use crate::engine::GitReader;
 use crate::harness::protocol::{
     PrepareResult, ProbeResult, SettleResult, OP_CAPABILITY_PROBE, OP_CHAT_PREPARE, OP_CHAT_SETTLE,
@@ -553,6 +553,9 @@ fn run(
         }
     };
 
+    if let Some(note) = &completion.content_note {
+        warnings.push(note.clone());
+    }
     if truncated {
         warnings.push("The model stopped at the output cap, so the reply is incomplete.".into());
     }
@@ -623,6 +626,9 @@ fn settle(turn: &Turn, completion: &Completion, max_output: i64) -> Result<Settl
 
 struct Completion {
     content: String,
+    /// Why `content` is empty or partial when the server did not send a plain
+    /// string, so an empty reply is never reported without its cause.
+    content_note: Option<String>,
     reasoning: String,
     finish_reason: String,
     prompt_tokens: i64,
@@ -674,12 +680,10 @@ fn complete(selection: &AiSelection, turn: &Turn, max_output: i64) -> Result<Com
         })?;
     let message = choice.get("message").unwrap_or(&Value::Null);
 
+    let (content, content_note) = reply_text(message.get("content"));
     Ok(Completion {
-        content: message
-            .get("content")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_string(),
+        content,
+        content_note,
         reasoning: message
             .get("reasoning_content")
             .or_else(|| message.get("reasoning"))
@@ -702,6 +706,47 @@ fn complete(selection: &AiSelection, turn: &Turn, max_output: i64) -> Result<Com
             .and_then(Value::as_i64)
             .unwrap_or(0),
     })
+}
+
+/// The reply text of a chat message's `content`, and a note when it was not a
+/// plain string. OpenAI-style servers may send an array of typed parts, and
+/// send `null` when the turn is tool calls or reasoning only; reading either as
+/// `""` made an unusable reply look like an empty one with no explanation.
+fn reply_text(content: Option<&Value>) -> (String, Option<String>) {
+    match content {
+        Some(Value::String(text)) => (text.clone(), None),
+        None | Some(Value::Null) => (
+            String::new(),
+            Some("The server sent no text content (null) for this reply.".into()),
+        ),
+        Some(Value::Array(parts)) => {
+            let mut text = String::new();
+            let mut skipped = 0usize;
+            for part in parts {
+                match part.get("text").and_then(Value::as_str) {
+                    Some(piece) => text.push_str(piece),
+                    None => skipped += 1,
+                }
+            }
+            let note = (skipped > 0).then(|| {
+                format!("The server sent {skipped} non-text content part(s), which were not used.")
+            });
+            (text, note)
+        }
+        Some(other) => {
+            let kind = match other {
+                Value::Bool(_) => "a boolean",
+                Value::Number(_) => "a number",
+                _ => "an object",
+            };
+            (
+                String::new(),
+                Some(format!(
+                    "The server sent {kind} as the reply content, not text."
+                )),
+            )
+        }
+    }
 }
 
 fn truncate(s: &str, max: usize) -> String {
@@ -779,15 +824,30 @@ fn choose_commit_engine(
     CommitEngine::Patch
 }
 
-/// The working-tree diff against HEAD, staged or not.
+/// How much of each part of the working tree is read to name a branch.
+///
+/// The prompt is budgeted to a fraction of this, so reading more only costs
+/// memory and time on a tree with a multi-megabyte pending change.
+const BRANCH_DIFF_CAP: usize = 256 * 1024;
+
+/// The work in progress as one diff: staged, unstaged, and a header per
+/// untracked file (new files are most of what a fresh branch is about, and
+/// `git diff` never mentions them). Every read is capped.
 fn working_diff(repo_path: &str) -> Result<String, String> {
     let repo = validate_repo(repo_path)?;
-    let staged = git_text(
-        &repo,
-        &["diff", "--cached", "--no-color", "--no-ext-diff", "-U3"],
-    )?;
-    let unstaged = git_text(&repo, &["diff", "--no-color", "--no-ext-diff", "-U3"])?;
-    Ok(format!("{}{}", staged, unstaged))
+    let diff = |args: &[&str]| git_text_capped(&repo, args, BRANCH_DIFF_CAP).map(|(text, _)| text);
+    let staged = diff(&["diff", "--cached", "--no-color", "--no-ext-diff", "-U3"])?;
+    let unstaged = diff(&["diff", "--no-color", "--no-ext-diff", "-U3"])?;
+    let untracked = diff(&["ls-files", "--others", "--exclude-standard", "-z"])?;
+    let mut out = format!("{staged}{unstaged}");
+    // A cut listing may end mid-path; drop the partial tail entry.
+    let complete = untracked.rsplit_once('\0').map_or("", |(done, _)| done);
+    for path in complete.split('\0').filter(|path| !path.is_empty()) {
+        out.push_str(&format!(
+            "diff --git a/{path} b/{path}\nnew file mode 100644\n"
+        ));
+    }
+    Ok(out)
 }
 
 /// Writes a commit message for the staged changes.
@@ -1655,6 +1715,54 @@ mod tests {
             "no warning that a line was dropped: {:?}",
             generation.warnings
         );
+    }
+
+    #[test]
+    fn working_diff_names_untracked_files_and_caps_every_read() {
+        let repo = repo_with_staged_change();
+        std::fs::write(repo.path().join("brand_new.rs"), "fn main() {}\n").unwrap();
+        std::fs::write(
+            repo.path().join("tracked-now.txt"),
+            "x".repeat(2 * BRANCH_DIFF_CAP),
+        )
+        .unwrap();
+        std::process::Command::new("git")
+            .args(["add", "tracked-now.txt"])
+            .current_dir(repo.path())
+            .output_locked()
+            .expect("git add");
+
+        let diff = working_diff(&repo.path().to_string_lossy()).expect("working diff");
+
+        assert!(
+            diff.contains("diff --git a/brand_new.rs b/brand_new.rs"),
+            "{diff}"
+        );
+        assert!(
+            diff.len() < BRANCH_DIFF_CAP + 4096,
+            "an oversized pending change was read whole: {} bytes",
+            diff.len()
+        );
+    }
+
+    #[test]
+    fn a_non_text_reply_content_says_why_it_is_empty() {
+        let (text, note) = reply_text(Some(&serde_json::json!("hi")));
+        assert_eq!((text.as_str(), note), ("hi", None));
+        let (text, note) = reply_text(Some(&serde_json::Value::Null));
+        assert!(text.is_empty() && note.unwrap().contains("null"));
+        let (text, note) = reply_text(None);
+        assert!(text.is_empty() && note.is_some());
+        let parts = serde_json::json!([
+            {"type": "text", "text": "feat: "},
+            {"type": "image_url", "image_url": {}},
+            {"type": "text", "text": "x"},
+        ]);
+        let (text, note) = reply_text(Some(&parts));
+        assert_eq!(text, "feat: x");
+        assert!(note.unwrap().contains("1 non-text"));
+        let (text, note) = reply_text(Some(&serde_json::json!(7)));
+        assert!(text.is_empty() && note.unwrap().contains("number"));
     }
 
     #[test]
