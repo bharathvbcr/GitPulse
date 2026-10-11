@@ -117,6 +117,19 @@ time: the `x86_64-pc-windows-msvc` target fails to cross-check here because
 written with `cfg` inversion — a `not(unix)` arm compiled on macOS — rather than
 trusted to a build nobody ran.
 
+### Native PTY, Linux and macOS hardware runs
+
+| Surface | State | Evidence |
+| --- | --- | --- |
+| A real shell command round-tripping through the PTY (input in, output event out, exit event) | **Works on macOS**; runs on Linux in CI | `terminal::tests::a_real_shell_command_round_trips_through_the_pty` (`#[cfg(unix)]`, so it is part of the `ci.yml` Rust suite on the Linux and macOS legs). It passed locally on macOS; its first Linux run is the next `ci.yml` run. |
+| Linux Wayland session | **Unverified** | Manual hardware run; no known defect |
+| Linux physical global shortcuts | **Unverified** | Manual hardware run; no known defect |
+| Linux x86_64 packaging and signing | **Unverified** | Manual hardware run; no known defect |
+| macOS sleep/wake and display changes | **Unverified** | Manual hardware run; no known defect |
+
+An unverified row is not a claim that it works. Record the result here as
+works, broken or unverified when someone runs it.
+
 ## Live product docs (not archived)
 
 Architecture, Features, Terminal, Tasks and workspaces, Module integration,

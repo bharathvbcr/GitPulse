@@ -3429,6 +3429,68 @@ mod tests {
         assert_eq!(detach_all(&state), 0);
     }
 
+    /// The native smoke test the browser harness cannot be: it executes a real
+    /// command. Bytes typed into the session go through a real `openpty` pair to
+    /// a real `/bin/sh`, and what the shell prints comes back out of the master
+    /// as a `terminal-output` event, followed by `terminal-exit`. Every other
+    /// test here asserts argv or a side-effect file, so a PTY that opened and
+    /// spawned but never delivered output would pass them all.
+    #[cfg(unix)]
+    #[test]
+    fn a_real_shell_command_round_trips_through_the_pty() {
+        use tauri::Listener;
+        let dir = tempfile::tempdir().unwrap();
+        init_test_repo(dir.path());
+        let app = tauri::test::mock_builder().build(crate::context()).unwrap();
+        let state = TerminalSessions::default();
+        let output = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let sink = output.clone();
+        app.listen("terminal-output", move |event| {
+            let payload: serde_json::Value = serde_json::from_str(event.payload()).unwrap();
+            let bytes = BASE64_STANDARD
+                .decode(payload["data_b64"].as_str().unwrap())
+                .unwrap();
+            sink.lock().unwrap().extend_from_slice(&bytes);
+        });
+        let exited = Arc::new(AtomicBool::new(false));
+        let exit_flag = exited.clone();
+        app.listen("terminal-exit", move |_| {
+            exit_flag.store(true, Ordering::SeqCst)
+        });
+
+        let spawned = spawn_session_inner(
+            app.handle(),
+            &state,
+            dir.path().to_str().unwrap(),
+            None,
+            24,
+            80,
+            Some("/bin/sh".into()),
+            Some(vec![
+                "-c".into(),
+                "read word; printf 'round-trip:%s:%s\\n' \"$word\" $((6 * 7))".into(),
+            ]),
+            None,
+            None,
+        )
+        .unwrap();
+        // The arithmetic is evaluated by the shell, so the expected text cannot
+        // be the tty merely echoing the typed input back.
+        write_to_session(&state, &spawned.id, "ping\n").unwrap();
+        assert!(
+            wait_until(Duration::from_secs(15), || {
+                String::from_utf8_lossy(&output.lock().unwrap()).contains("round-trip:ping:42")
+            }),
+            "shell output never came back through the PTY: {:?}",
+            String::from_utf8_lossy(&output.lock().unwrap())
+        );
+        assert!(
+            wait_until(Duration::from_secs(15), || exited.load(Ordering::SeqCst)),
+            "terminal-exit was never emitted after the shell finished"
+        );
+        let _ = kill_session(&state, &spawned.id);
+    }
+
     #[cfg(unix)]
     fn alive(pid: i32) -> bool {
         // SAFETY: signal 0 only probes.
