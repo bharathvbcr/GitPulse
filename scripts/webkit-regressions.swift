@@ -1,4 +1,5 @@
 import AppKit
+import ObjectiveC
 import WebKit
 
 // Use the system WKWebView, with an ephemeral profile and the same fixture
@@ -39,6 +40,21 @@ window.contentView = webview
 // app (or a concurrent run) can refuse it or take it back mid-run, leaving
 // `document.hasFocus()` false. A fixture whose waits depend on the product's
 // focus-gated polls has to say it is in front itself (see tasksChecks.js).
+// WebKit reports `document.hidden` whenever the window is occluded, and a
+// locked screen, a sleeping display or another app's window all occlude it.
+// A hidden page gets no animation frames and heavily throttled timers, so
+// every fixture that waits on a transition or a poll timed out for reasons
+// that had nothing to do with the product (the locked session that ran the
+// whole suite unattended failed 11 of 27 pages, none of them in Chrome).
+// Turn the occlusion detection off for this test view only; it is a WebKit
+// SPI, so a build without it is reported rather than silently run hidden.
+let occlusionSetter = NSSelectorFromString("_setWindowOcclusionDetectionEnabled:")
+if let method = class_getInstanceMethod(WKWebView.self, occlusionSetter) {
+    typealias SetEnabled = @convention(c) (AnyObject, Selector, Bool) -> Void
+    unsafeBitCast(method_getImplementation(method), to: SetEnabled.self)(webview, occlusionSetter, false)
+} else {
+    fputs("WebKit lacks _setWindowOcclusionDetectionEnabled:; an occluded window will make pages hidden\n", stderr)
+}
 window.makeKeyAndOrderFront(nil)
 if #available(macOS 14.0, *) { app.activate() }
 webview.load(URLRequest(url: url))

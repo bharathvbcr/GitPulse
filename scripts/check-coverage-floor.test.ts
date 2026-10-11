@@ -155,6 +155,31 @@ describe("coverage floor contract", () => {
     expect(parsed.totals.branches).toEqual({ found: 2, hit: 1 });
   });
 
+  it("accepts a BRF that differs from the BRDA record count, as branch-mode llvm-cov emits", () => {
+    // Real output of `cargo llvm-cov --branch` (nightly-2026-10-05): 11 of 193
+    // records carry a BRF that is not the number of BRDA lines, in both
+    // directions (devmap/live.rs: BRF 107 with 108 BRDA; terminal/mod.rs: BRF
+    // 532 with 516). The producer counts branch regions per instantiation and
+    // writes BRDA per source position, so neither side is the corrupt one.
+    const more = [
+      "TN:",
+      "SF:src-tauri/src/example.rs",
+      "DA:1,1",
+      "BRF:1",
+      "BRH:1",
+      "BRDA:1,0,0,1",
+      "BRDA:1,0,1,0",
+      "LF:1",
+      "LH:1",
+      "end_of_record",
+    ].join("\n");
+    const fewer = more.replace("BRF:1\nBRH:1", "BRF:3\nBRH:2");
+    expect(parseLcov(more).totals.branches).toEqual({ found: 1, hit: 1 });
+    expect(parseLcov(fewer).totals.branches).toEqual({ found: 3, hit: 2 });
+    // The summary must still be internally possible.
+    expect(() => parseLcov(more.replace("BRH:1", "BRH:2"))).toThrow(/BRH cannot exceed BRF/);
+  });
+
   it("still rejects an execution count that is not a number at all", () => {
     // Relaxing the range must not relax the shape.
     for (const bad of ["abc", "-5", "1.5", ""]) {
