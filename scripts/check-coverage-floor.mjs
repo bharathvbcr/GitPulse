@@ -173,13 +173,11 @@ function finishRecord(record, reportName, sourceFiles) {
     }
     const branchFound = record.branchFound;
     const branchHit = record.branchHit;
-    if (branchFound !== record.branches.length) {
-      throw new Error(
-        `${location}: BRF ${branchFound} does not match ${record.branches.length} BRDA records`,
-      );
-    }
-    // Same reasoning as LH above: the summary is authoritative, the per-branch
-    // records are detail a producer may compute differently.
+    // Neither BRF nor BRH is cross-checked against the BRDA records. Same
+    // reasoning as LH above: the summary is authoritative, the per-branch
+    // records are detail a producer may compute differently — `cargo llvm-cov
+    // --branch` wrote BRF 107 beside 108 BRDA lines and BRF 532 beside 516, in
+    // 11 of 193 records of one report.
     if (branchHit > branchFound) {
       throw new Error(`${location}: BRH cannot exceed BRF`);
     }
