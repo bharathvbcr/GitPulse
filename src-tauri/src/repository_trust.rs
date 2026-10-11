@@ -793,6 +793,7 @@ fn lock_directory(_root: &Path) -> Result<Option<File>, String> {
 }
 
 /// The lock file's name. A leading dot keeps it out of migration and listing.
+#[cfg(unix)]
 const STORE_LOCK: &str = ".store.lock";
 
 /// Renames `source` to `dest` and never replaces an existing `dest`: the
@@ -2035,6 +2036,75 @@ mod tests {
             "the child ran in a directory that was never admitted"
         );
         assert_ne!(ran_in, elsewhere.canonicalize().unwrap());
+    }
+
+    /// The Windows counterpart of the substitution test above. Windows cannot
+    /// re-anchor the child, so the guarantee is that the substitution is
+    /// impossible: while the admission guard lives, the pinned chain omits
+    /// `FILE_SHARE_DELETE`, so neither the admitted directory nor any ancestor
+    /// can be renamed or removed to leave a different object under the name.
+    /// Dropping the guard releases them, which proves the guard is what held.
+    #[cfg(windows)]
+    #[test]
+    fn a_substituted_directory_cannot_replace_an_admitted_one_while_the_guard_is_held() {
+        let base = tempfile::tempdir().unwrap();
+        let base = base.path().canonicalize().unwrap();
+        let admitted_path = base.join("outer").join("admitted");
+        let elsewhere = base.join("elsewhere");
+        fs::create_dir_all(&admitted_path).unwrap();
+        fs::create_dir(&elsewhere).unwrap();
+
+        let mut cmd = std::process::Command::new("cmd");
+        cmd.current_dir(&admitted_path);
+        let admission = check_command(&mut cmd).expect("a plain directory is admitted");
+
+        let moved = base.join("moved");
+        assert!(
+            fs::rename(&admitted_path, &moved).is_err(),
+            "the admitted directory was renamed out from under its guard"
+        );
+        assert!(
+            fs::rename(base.join("outer"), base.join("outer-moved")).is_err(),
+            "an ancestor of the admitted directory was renamed under its guard"
+        );
+        assert!(
+            fs::remove_dir(&admitted_path).is_err(),
+            "the admitted directory was removed under its guard"
+        );
+        assert!(admitted_path.is_dir(), "the admitted directory is intact");
+
+        drop(admission);
+        fs::rename(&admitted_path, &moved)
+            .expect("once the guard is dropped the directory is free to move");
+    }
+
+    /// A reparse point is the Windows symlink: the pin refuses one outright
+    /// rather than following it, and admission canonicalizes first so a
+    /// junction in the caller's spelling is an ordinary route to the real
+    /// directory, not an attack and not a way to run somewhere else.
+    #[cfg(windows)]
+    #[test]
+    fn a_junction_is_refused_by_the_pin_and_resolved_before_admission() {
+        let base = tempfile::tempdir().unwrap();
+        let base = base.path().canonicalize().unwrap();
+        let real = base.join("real");
+        fs::create_dir_all(real.join("inner")).unwrap();
+        let alias = base.join("alias");
+        let status = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(&alias)
+            .arg(&real)
+            .status_locked()
+            .expect("run mklink");
+        assert!(status.success(), "mklink /J failed");
+
+        let refused = crate::fs_entry::pin_directory(&alias)
+            .expect_err("a reparse point must not be pinned as a real directory");
+        assert_eq!(refused.kind(), std::io::ErrorKind::InvalidInput);
+
+        let mut cmd = std::process::Command::new("cmd");
+        cmd.current_dir(alias.join("inner"));
+        let _admission = check_command(&mut cmd).expect("a junctioned ancestor is not an attack");
     }
 
     /// The fast path is taken on exactly one condition, so that condition is

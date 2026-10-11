@@ -3533,6 +3533,7 @@ mod tests {
         spawned
     }
 
+    #[cfg(unix)]
     fn read_pid(file: &std::path::Path) -> i32 {
         let deadline = Instant::now() + Duration::from_secs(5);
         while Instant::now() < deadline {

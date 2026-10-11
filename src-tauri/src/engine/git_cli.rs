@@ -8739,6 +8739,7 @@ mod tests {
 #[cfg(test)]
 mod admission_scope_tests {
     use super::*;
+    #[cfg(unix)]
     use crate::procguard::LockedSpawn;
 
     fn leak(gate: SpawnGate) -> &'static SpawnGate {
@@ -8760,6 +8761,7 @@ mod admission_scope_tests {
     /// time too, and thirty-two real process spawns do not fit in three
     /// seconds on a busy machine. The window's own expiry is pinned by
     /// `a_credit_expires_with_its_window`, against explicit instants.
+    #[cfg(unix)]
     fn hold_credit_open(repo: &Path) {
         let mut credits = post_action_credits().lock().unwrap();
         credits.get_mut(repo).expect("a credit was granted").until =

@@ -290,6 +290,7 @@ mod tests {
     #[cfg(unix)]
     use super::{InputFeed, OutputDrains};
     use crate::engine::git_cli::SpawnPermit;
+    #[cfg(unix)]
     use crate::procguard::LockedSpawn;
     use std::io;
     use std::sync::Arc;

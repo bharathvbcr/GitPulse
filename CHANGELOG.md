@@ -13,6 +13,12 @@ before that tag is pushed.
 
 ### Added
 
+- A weekly `deep-checks.yml` workflow runs the lane-solver deep fuzz and the
+  Go-backed repository-hygiene test, and a native PTY test now round-trips a
+  real shell command on the macOS and Linux CI legs.
+- Windows trust-gate tests: an admitted directory (and its ancestors) cannot be
+  renamed or removed while the admission guard is held, and a junction is
+  refused by the pin but resolved before admission.
 - An agent's `done` that is held in review for lack of a passing verification
   now starts that verification itself (one per task and head, at most two at a
   time, off the MCP response path) and moves the card to done when Manvi's

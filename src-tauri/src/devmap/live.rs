@@ -706,6 +706,7 @@ impl IfEmpty for String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use crate::procguard::LockedSpawn;
     use serde_json::json;
 
