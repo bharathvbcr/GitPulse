@@ -14,6 +14,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
+#[cfg(unix)]
 use std::time::Duration;
 use tempfile::TempDir;
 
@@ -649,6 +650,7 @@ mod diskio_guard {
         }
     }
 
+    #[cfg(unix)]
     fn run_child(budget: &str) -> std::process::Output {
         use crate::procguard::LockedSpawn;
         let (mut command, _guard) =

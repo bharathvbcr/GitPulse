@@ -1800,6 +1800,7 @@ fn notify_send(path: &std::path::Path, payload: &str) -> Result<(), String> {
 }
 
 /// Whether the socket's one-line answer accepted the report.
+#[cfg(unix)]
 fn acknowledged(reply: &[u8]) -> Result<(), String> {
     match serde_json::from_slice::<Value>(reply)
         .ok()
@@ -3274,6 +3275,7 @@ done
         )
     }
 
+    #[cfg(unix)]
     fn edit_call(cwd: &str, file_path: &str) -> HookInput {
         HookInput {
             hook_event_name: PRE_TOOL_USE.to_string(),
@@ -4210,6 +4212,7 @@ done
         assert_eq!(notice.detail.as_deref(), Some("rate_limit"));
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_refused_or_garbled_answer_is_not_reported_as_delivered() {
         assert_eq!(acknowledged(b"{\"ok\":true}\n"), Ok(()));

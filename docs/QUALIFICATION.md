@@ -111,11 +111,41 @@ turns that into a desktop banner. The unread marker on the tab is the signal.
   CI before (a `file:` URL's `pathname` is `/D:/…` on Windows) but it is a lint,
   not a run.
 
+### Windows status (2026-10)
+
+| Surface | State | Evidence |
+| --- | --- | --- |
+| `cargo clippy --all-targets -- -D warnings` for `x86_64-pc-windows-msvc` | **Clean** in a metadata-only cross-check from macOS; unix-only items are `cfg(unix)`-gated rather than allowed | Recipe below. A check only: nothing links and no test runs. |
+| Repository trust gate, Windows arm (`admit_directory_windows`, `pin_dir_chain`) | **Tests written, never run** | `repository_trust::tests::a_substituted_directory_cannot_replace_an_admitted_one_while_the_guard_is_held` (rename, ancestor rename and removal refused while the guard lives, allowed after) and `a_junction_is_refused_by_the_pin_and_resolved_before_admission`. They compile under the Windows target; the first Windows CI run is their first execution. |
+| The 31 Rust lib test failures on the Windows leg (`ref_cache` x10, `terminal_launch` x9, worktree, `git_writer` OS error 123, insights) and 3 Vitest failures (vendor-crates, vite-watch, markdownInsertion) | **Broken, undiagnosed** | Needs a Windows run log; the board card carries only the summary. Not fixed from source reading alone. |
+| Managed Codex/Claude runs, terminal handoffs, Secrets `\\?\` paths, git separator/case handling | **Unverified** | See the list above; needs a Windows machine |
+| Repository hygiene removal | **Refused**, with the reason shown in the Cleaner panel | `storage/hygiene/global.rs` reports `supported: cfg!(unix)`; the backend refuses `Cleanup is unavailable on this platform` |
+
+Windows clippy recipe from macOS (the C dependencies' build scripts are given
+fake `cc`/`ar`/`rc` that only create the files the build script expects, so
+`cargo clippy` type-checks without linking): set `CC_x86_64_pc_windows_msvc`,
+`AR_x86_64_pc_windows_msvc` and `RC` to such scripts and run
+`cargo clippy --all-targets --target x86_64-pc-windows-msvc -- -D warnings`
+in `src-tauri`. Without them the build stops in `libsqlite3-sys`, as below.
+
 A Windows regression cannot be caught from a macOS checkout even at compile
 time: the `x86_64-pc-windows-msvc` target fails to cross-check here because
 `libsqlite3-sys` needs a Windows toolchain. Platform-specific code is therefore
 written with `cfg` inversion — a `not(unix)` arm compiled on macOS — rather than
 trusted to a build nobody ran.
+
+### Native PTY, Linux and macOS hardware runs
+
+| Surface | State | Evidence |
+| --- | --- | --- |
+| A real shell command round-tripping through the PTY (input in, output event out, exit event) | **Works on macOS**; runs on Linux in CI | `terminal::tests::a_real_shell_command_round_trips_through_the_pty` (`#[cfg(unix)]`, so it is part of the `ci.yml` Rust suite on the Linux and macOS legs). It passed locally on macOS; its first Linux run is the next `ci.yml` run. |
+| Linux Wayland session | **Unverified** | Manual hardware run; no known defect |
+| Linux physical global shortcuts | **Unverified** | Manual hardware run; no known defect |
+| Linux x86_64 packaging and signing | **Unverified** | Manual hardware run; no known defect |
+| macOS sleep/wake and display changes | **Unverified** | Manual hardware run; no known defect |
+
+An unverified row is not a claim that it works. Record the result here as
+works, broken or unverified when someone runs it.
 
 ## Live product docs (not archived)
 

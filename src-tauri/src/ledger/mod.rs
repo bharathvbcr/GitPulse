@@ -2848,6 +2848,7 @@ pub(crate) mod tests_support {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use crate::procguard::LockedSpawn;
 
     thread_local! {

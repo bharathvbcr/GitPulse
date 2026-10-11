@@ -8,6 +8,7 @@
 //! fallback (§1): no agent means [`Outcome::Unavailable`], and the caller keeps
 //! its own path.
 
+#[cfg(unix)]
 use std::io::{self, BufRead};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -348,6 +349,7 @@ fn connect_reason(error: &io::Error) -> UnavailableReason {
     }
 }
 
+#[cfg(unix)]
 fn exchange_reason(error: &io::Error) -> UnavailableReason {
     match error.kind() {
         io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock => UnavailableReason::Deadline,
@@ -363,6 +365,7 @@ fn exchange_reason(error: &io::Error) -> UnavailableReason {
 /// seen: a connection closed before one is `closed_without_reply` even when
 /// some bytes arrived (`docs/caller-contract.md` §1), never a short reply that
 /// then fails to parse.
+#[cfg(unix)]
 fn read_reply_line<R: BufRead>(reader: R, cap: usize) -> Result<Vec<u8>, UnavailableReason> {
     let mut buf = Vec::new();
     let mut limited = reader.take(cap as u64 + 1);
@@ -561,6 +564,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_close_before_the_newline_is_closed_without_reply_even_with_bytes() {
         let partial: &[u8] = br#"{"status":"ok""#;

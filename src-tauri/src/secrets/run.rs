@@ -125,6 +125,7 @@ pub fn resolve_kingfisher() -> Option<PathBuf> {
 /// [`resolve_kingfisher`] under an injected environment, for reproducing a
 /// GUI launch in tests.
 #[cfg(test)]
+#[cfg(unix)]
 pub(super) fn resolve_kingfisher_with(
     path_var: Option<&OsStr>,
     home: Option<&OsStr>,

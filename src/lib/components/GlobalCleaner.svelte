@@ -98,7 +98,7 @@
   {#if draft && cleaner}
     {#if cleaner.background_error}<p role="alert" class="text-amber-300">Background setup failed; schedule disabled. {cleaner.background_error}</p>{/if}
     <fieldset disabled={busy} class="space-y-4 border-0 p-0 m-0 min-w-0">
-    {#if !cleaner.supported}<p class="text-amber-300">Cleanup is unavailable on this platform. Inventory and policy guidance remain available.</p>{/if}
+    {#if !cleaner.supported}<p class="text-amber-300">Cleanup is unavailable on this platform: removal relies on Unix descriptor-relative deletion that has no Windows implementation, so nothing is deleted here. Inventory and policy guidance remain available.</p>{/if}
     <div class="grid gap-3 md:grid-cols-2">
       <label class="space-y-1">Project roots · one absolute directory per line<textarea aria-label="Project roots" class="block w-full rounded border border-border bg-surface p-2 font-mono" rows="3" bind:value={rootsText} oninput={edited} disabled={busy}></textarea></label>
       <label class="space-y-1">Excluded directories · one absolute directory per line<textarea aria-label="Excluded directories" class="block w-full rounded border border-border bg-surface p-2 font-mono" rows="3" bind:value={exclusionsText} oninput={edited} disabled={busy}></textarea></label>

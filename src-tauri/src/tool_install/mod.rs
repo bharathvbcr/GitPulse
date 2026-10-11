@@ -2085,6 +2085,7 @@ pub fn select_rung_for_test(rungs: &[RungStatus]) -> Option<InstallRung> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
     use crate::procguard::LockedSpawn;
     #[test]
     fn audit_schema_numbers_cannot_wrap_into_supported_versions() {
