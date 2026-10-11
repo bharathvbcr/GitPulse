@@ -475,6 +475,137 @@ export async function runCoverageChecks(ctx) {
       () => ["Timed out after 2.0s", "stderr:\nwarn line", "stdout:\npartial log", "(output clipped)"].every(part => copied.at(-1).includes(part)), () => copied.at(-1));
     ok("the row shows the one-line summary while the copy holds the whole detail",
       () => !rowText("npm run cov-a").includes("partial log"));
+
+    // ---- Scan lifecycle: cache, one scan per action, external adoption -------
+    resetKnobs();
+    setMode("measured");
+    await switchTo("GitPulse");
+    button("Rescan coverage artifacts").click();
+    await until(() => header().includes("62.5%") && idle());
+    knobs.scanDelay = 600;
+    await switchTo("Other");
+    await switchTo("GitPulse");
+    ok("a revisit shows the cached report while the fresh scan is still running",
+      () => header().includes("62.5%") && button("Rescan coverage artifacts").disabled && !region().textContent.includes("Scanning coverage…"));
+    await until(() => idle());
+    await repoStore.openRepo("/fixture/Fresh"); await wait();
+    ok("a repository with no cached report shows the scan placeholder, not stale numbers",
+      () => region().textContent.includes("Scanning coverage…") && !header().includes("62.5%"));
+    await until(() => idle());
+    knobs.scanDelay = 0;
+    await switchTo("GitPulse");
+    await until(() => header().includes("62.5%") && idle());
+
+    let scanBase = scans();
+    let measuredBase = coverageMetric.snapshot(REPO).measuredAt;
+    button("Rescan coverage artifacts").click();
+    await settle();
+    await new Promise(resolve => setTimeout(resolve, 400));
+    ok("one rescan is exactly one scan, which it does not adopt and repeat", () => scans() - scanBase === 1, () => scans() - scanBase);
+    ok("the rescan goes through the shared coverage metric", () => coverageMetric.snapshot(REPO).measuredAt > measuredBase);
+    const tsFile = { path: "src/example.ts", language: "TypeScript", color_hex: "#3178c6", lines_found: 10, lines_hit: 5, percentage: 50 };
+    setMode("custom");
+    knobs.customReport = () => ({
+      ...empty([family("javascript", "JavaScript", { found: true })]),
+      files: [tsFile], artifacts: [{ path: "coverage/lcov.info", format: "lcov", family: "javascript", skipped: false, totals: { lines_found: 10, lines_hit: 5, percentage: 50 } }],
+      languages: [], overall: { lines_found: 10, lines_hit: 5, percentage: 50 },
+    });
+    scanBase = scans();
+    await coverageMetric.refresh(REPO, { force: true });
+    await until(() => header().includes("50.0%"));
+    await new Promise(resolve => setTimeout(resolve, 400));
+    ok("a measurement the panel did not ask for is adopted once", () => scans() - scanBase === 1 && header().includes("50.0%"), () => scans() - scanBase);
+    setMode("measured");
+    button("Rescan coverage artifacts").click();
+    await until(() => header().includes("62.5%") && idle());
+
+    // ---- Selection -----------------------------------------------------------
+    // The open file's path in the pane header (file rows share the title attribute).
+    const paneTitle = () => region().querySelector("span.min-w-0.flex-1.truncate.text-textPrimary:not(.font-mono)")?.title ?? null;
+    repoStore.selectFilePath("LIB/RUST.RS"); await tick();
+    button("Rescan coverage artifacts").click(); await settle();
+    ok("a selection that differs only in case survives a rescan",
+      () => paneTitle() === "LIB/RUST.RS" && get(repoStore).selectedFilePath === "LIB/RUST.RS", () => [paneTitle(), get(repoStore).selectedFilePath]);
+    repoStore.selectFilePath("nope/missing.ts"); await tick();
+    button("Rescan coverage artifacts").click(); await settle();
+    ok("a selection no longer in the report falls to the first file and is echoed to the session",
+      () => paneTitle() === "src/example.ts" && get(repoStore).selectedFilePath === "src/example.ts", () => [paneTitle(), get(repoStore).selectedFilePath]);
+    button("lib/rust.rs, 25.0%, 3 missed lines").click(); await tick();
+    await switchTo("Other"); await switchTo("GitPulse");
+    await until(() => header().includes("62.5%") && idle());
+    ok("the persisted selection is seeded on remount, not wiped by the first scan", () => paneTitle() === "lib/rust.rs", paneTitle);
+
+    // ---- File details: no stale gutters, truncation, missing source ----------
+    button("src/example.ts, 70.0%, 3 missed lines").click(); await until(() => !!document.querySelector("[data-coverage-line]"));
+    knobs.contentHandler = () => new Promise(resolve => setTimeout(() => resolve("export const x = 1;\n"), 500));
+    button("lib/rust.rs, 25.0%, 3 missed lines").click(); await tick(); await wait();
+    ok("while another file's details load, the report stays and no previous gutters linger",
+      () => header().includes("62.5%") && !document.querySelector("[data-coverage-line]") && region().textContent.includes("Loading lib/rust.rs…"));
+    await until(() => !!document.querySelector("[data-coverage-line]"));
+    knobs.contentHandler = null;
+
+    const detail = over => args => ({ path: args.filePath, language: "TypeScript", color_hex: "#3178c6", lines: [{ line_no: 1, hits: 1 }, { line_no: 2, hits: 0 }],
+      totals: { lines_found: 10, lines_hit: 7, percentage: 70 }, truncated: false, lines_truncated: false, ...over });
+    knobs.detailHandler = detail({ truncated: true });
+    button("src/full.ts, 100.0%, 0 missed lines").click();
+    await until(() => region().textContent.includes("missing gutters here mean unknown, not uncovered"));
+    ok("a capped scan's missing gutters are disclosed as unknown, without naming a cause",
+      () => region().textContent.includes("The scan did not read every artifact") && !region().textContent.includes("hit a cap"));
+    knobs.detailHandler = detail({ lines_truncated: true });
+    button("src/example.ts, 70.0%, 3 missed lines").click();
+    await until(() => region().textContent.includes("Gutter view capped for display; totals still reflect the full file."));
+    knobs.detailHandler = null;
+    button("src/full.ts, 100.0%, 0 missed lines").click();
+    await until(() => !region().textContent.includes("Gutter view capped"));
+    ok("the capped-view notices go away with the file they qualified", () => !region().textContent.includes("did not read every artifact"));
+
+    const diagBefore = get(diagnostics).length;
+    knobs.contentHandler = () => { throw new Error("File not found: lib/rust.rs"); };
+    button("lib/rust.rs, 25.0%, 3 missed lines").click();
+    await until(() => region().textContent.includes("No source available"));
+    await wait();
+    ok("a source file that is simply absent says so without a diagnostics warning", () => get(diagnostics).length === diagBefore && region().textContent.includes("File not found: lib/rust.rs"));
+    knobs.contentHandler = () => { throw new Error("disk on fire"); };
+    button("src/example.ts, 70.0%, 3 missed lines").click();
+    await until(() => region().textContent.includes("disk on fire"));
+    ok("any other source failure is reported to the diagnostics ring",
+      () => get(diagnostics).some(entry => entry.source === "coverage" && entry.message.includes("disk on fire")));
+    knobs.contentHandler = null;
+
+    // ---- A failed rescan ------------------------------------------------------
+    setMode("failed");
+    button("Rescan coverage artifacts").click();
+    await until(() => region().textContent.includes("Rescan failed: Fixture scan failed") && idle());
+    ok("a failed rescan keeps the previous results and offers a retry", () => header().includes("62.5%") && !!byText("Retry scan"));
+    button("Copy scan error").click(); await wait();
+    ok("the scan error is copyable, and the copy is acknowledged", () => copied.at(-1).includes("Fixture scan failed") && !!byText("Copied"), () => copied.at(-1));
+    setMode("measured");
+    byText("Retry scan").click();
+    await until(() => !region().textContent.includes("Rescan failed") && idle());
+
+    // ---- Honesty about what was measured --------------------------------------
+    setMode("ojas");
+    button("Rescan coverage artifacts").click();
+    await until(() => !!card("python") && idle());
+    ok("a scan that measured nothing is 'No coverage data', never a red 0.0%", () => header().includes("No coverage data") && !header().includes("0.0%"), header);
+    ok("a family with no planned command still states why, and offers no Run button",
+      () => flat(card("python")).includes("No Python tests found") && !card("python").querySelector("button"));
+    ok("a family with a planned command carries its chip in the wide pane",
+      () => [...card("go").querySelectorAll("button")].some(node => node.title === "Run with MANVI: go -C go test ./... -coverprofile=coverage.out"));
+    setMode("ojas-mixed");
+    button("Rescan coverage artifacts").click();
+    await until(() => document.querySelectorAll("[data-coverage-family]").length === 3 && idle());
+    const inStrip = name => document.querySelector(`[data-coverage-family="${name}"]`);
+    ok("in the strip the same family states why and offers no Run button",
+      () => flat(inStrip("python")).includes("No Python tests found") && !inStrip("python").querySelector("button"));
+    ok("in the strip the planned command is the same chip",
+      () => [...inStrip("go").querySelectorAll("button")].some(node => node.title === "Run with MANVI: go -C go test ./... -coverprofile=coverage.out"));
+    const notices = [{ resource: "covered files", kept: 4000, total: 12873, inventory_only: false }, { resource: "manifests", kept: 5, total: 5, inventory_only: false }];
+    await enter([family("javascript", "JavaScript", { suggested_commands: ["npm run cov-a"] })], { truncated: true, limit_notices: notices });
+    ok("the capped chip names exact counts, and only for caps that dropped rows",
+      () => flat(strip()).includes("scan capped: 4000 of 12873 covered files") && !flat(strip()).includes("5 of 5"), () => flat(strip()));
+    await enter([family("javascript", "JavaScript", { suggested_commands: ["npm run cov-a"] })], { truncated: true, limit_notices: [] });
+    ok("with no published counts the chip says only that the scan was capped", () => /scan capped(?!:)/.test(flat(strip())) && !flat(strip()).includes("scan capped:"));
   } finally {
     // Leaves the page for the checks that follow in coverage.html.
   }
