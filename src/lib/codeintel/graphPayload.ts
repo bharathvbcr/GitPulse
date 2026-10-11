@@ -320,10 +320,17 @@ function communityLabel(name: string, nodes: LaidOutNode[]): string {
     ?? (name === "_" ? "Ungrouped" : name.replace(/^community[-_]/, "Group "));
 }
 
+/**
+ * The content space a graph is laid out in. Fixed, so the layout depends on
+ * the payload alone and a viewport resize never recomputes it.
+ */
+export const CODE_GRAPH_LAYOUT_WIDTH = 800;
+export const CODE_GRAPH_LAYOUT_HEIGHT = 560;
+
 export function buildCodeGraphModel(
   payload: unknown,
-  width = 800,
-  height = 560,
+  width = CODE_GRAPH_LAYOUT_WIDTH,
+  height = CODE_GRAPH_LAYOUT_HEIGHT,
 ): CodeGraphModel {
   const data = asRecord(payload) ?? {};
   const nodeRows: unknown[] = Array.isArray(data.nodes) ? data.nodes : [];

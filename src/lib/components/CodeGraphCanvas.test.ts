@@ -49,3 +49,37 @@ describe("CodeGraphCanvas", () => {
     expect(source).toContain("onOpenNode(path, selectedNode.id)");
   });
 });
+
+describe("CodeGraphCanvas interaction cost and recovery", () => {
+  it("lays out in a fixed content space, so a resize never re-lays out", () => {
+    expect(source).toContain("buildCodeGraphModel(payload, CODE_GRAPH_LAYOUT_WIDTH, CODE_GRAPH_LAYOUT_HEIGHT)");
+    expect(source).not.toMatch(/buildCodeGraphModel\(payload,\s*width,\s*height\)/);
+  });
+
+  it("hit-tests hover at most once per frame, from the newest pointer position", () => {
+    expect(source).toContain("const hoverScheduler = createFrameScheduler()");
+    // Every hitTestCodeGraph on the move path sits inside the scheduled job.
+    const move = source.slice(source.indexOf("function onPointerMove"), source.indexOf("function onPointerUp"));
+    expect(move).toContain("hoverScheduler.schedule(");
+    expect(move.indexOf("hitTestCodeGraph")).toBeGreaterThan(move.indexOf("hoverScheduler.schedule("));
+    expect(move).not.toContain("getBoundingClientRect()\n    return");
+    expect(source).toContain("hoverScheduler.cancel()");
+  });
+
+  it("drops the cached context on loss and repaints on restore", () => {
+    expect(source).toContain('canvas?.addEventListener("contextlost", onContextLost)');
+    expect(source).toContain('canvas?.addEventListener("contextrestored", onContextRestored)');
+    expect(source).toContain('canvas?.removeEventListener("contextlost", onContextLost)');
+    expect(source).toMatch(/function onContextLost\(event: Event\) \{\s*event\.preventDefault\(\);\s*gpuCtx = null;\s*schedulePaint\(\);/);
+    expect(source).toMatch(/function onContextRestored\(\) \{\s*gpuCtx = null;\s*schedulePaint\(\);/);
+  });
+});
+
+describe("buildCodeGraphModel layout space", () => {
+  it("defaults to the fixed content space the canvas passes", async () => {
+    const graph = await import("../codeintel/graphPayload");
+    const payload = { nodes: [{ id: "a", name: "a" }, { id: "b", name: "b" }, { id: "c", name: "c" }], links: [{ source: "a", target: "b" }] };
+    const fixed = graph.buildCodeGraphModel(payload, graph.CODE_GRAPH_LAYOUT_WIDTH, graph.CODE_GRAPH_LAYOUT_HEIGHT);
+    expect(graph.buildCodeGraphModel(payload).nodes.map((n) => [n.x, n.y])).toEqual(fixed.nodes.map((n) => [n.x, n.y]));
+  });
+});

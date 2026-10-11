@@ -13,6 +13,11 @@ before that tag is pushed.
 
 ### Added
 
+- A minimal in-repo string catalogue and translator (`src/lib/i18n`), piloted on the setup wizard chrome. No new dependency; a test fails when a catalogue key is looked up nowhere.
+- Setup wizard is a real modal: Tab stays inside, Escape closes it, focus returns to the opener. Install is disabled until the selected tool's ladder has loaded, and a late reply for the previous tool is dropped.
+- Board: moving a card with Left/Right keeps focus on it and announces the new column; the drop target is measured once per frame while dragging.
+- Code graph: layout no longer reruns on resize, hover hit testing runs once per frame, and a lost canvas context repaints on restore.
+
 - An agent's `done` that is held in review for lack of a passing verification
   now starts that verification itself (one per task and head, at most two at a
   time, off the MCP response path) and moves the card to done when Manvi's
