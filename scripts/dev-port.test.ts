@@ -381,6 +381,7 @@ describe("resolveDevPort", () => {
 
   it("reclaims this app's leftover Vite instead of hopping ports", async () => {
     const killed: number[] = [];
+    const needles: (string | null)[] = [];
     const result = await resolveDevPort({
       preferred: 5173,
       env: {},
@@ -394,12 +395,15 @@ describe("resolveDevPort", () => {
         isFree: async () => false,
         killVerified: async (pid: number, needle: string | null) => {
           killed.push(pid);
-          if (needle != null) expect(needle).toContain("vite");
+          needles.push(needle);
         },
         waitUntilFree: async () => true,
       }),
     });
     expect(killed).toEqual([4242]);
+    // The kill is verified against the process's own identity; a dropped needle
+    // would let it signal whatever now holds the pid.
+    expect(needles).toEqual([expect.stringContaining("vite")]);
     expect(result.source).toBe("cleaned");
     expect(result.port).toBe(5173);
     expect(formatResolveMessage(result)).toMatch(/Reclaimed port 5173/);
@@ -423,9 +427,8 @@ describe("resolveDevPort", () => {
           return 1_000; // one second old: someone else's live dev server
         },
         isFree: async () => false,
-        killVerified: async (pid: number, needle: string | null) => {
+        killVerified: async (pid: number) => {
           killed.push(pid);
-          if (needle != null) expect(needle).toContain("vite");
         },
         findFreePort: async () => 5174,
       }),
@@ -438,6 +441,7 @@ describe("resolveDevPort", () => {
 
   it("reclaims even a young Vite when GITPULSE_RECLAIM=1", async () => {
     const killed: number[] = [];
+    const needles: (string | null)[] = [];
     let elapsedCalls = 0;
     const result = await resolveDevPort({
       preferred: 5173,
@@ -455,13 +459,14 @@ describe("resolveDevPort", () => {
         isFree: async () => false,
         killVerified: async (pid: number, needle: string | null) => {
           killed.push(pid);
-          if (needle != null) expect(needle).toContain("vite");
+          needles.push(needle);
         },
         waitUntilFree: async () => true,
       }),
     });
     expect(elapsedCalls).toBe(0); // opt-in skips the age probe entirely
     expect(killed).toEqual([4242]);
+    expect(needles).toEqual([expect.stringContaining("vite")]);
     expect(result.source).toBe("cleaned");
   });
 

@@ -185,17 +185,24 @@ describe("the command gate judges the command that actually runs", () => {
     for (const [command, executor] of Object.entries(executors)) {
       const body = fnBody(PRODUCTION_COMMANDS, command);
       expect(body, `${command} must exist`).not.toBeNull();
-      const built = body!.indexOf("let argv_owned =");
+      // The builder's result is whatever name the handler binds it to; what
+      // matters is that the gate and the executor receive that one binding.
+      const binding = /let (\w+) =\s*(?:crate::firebase::apphosting::)?\w+_argv\(/.exec(body!);
+      expect(binding, `${command} must build its argv through one builder`).not.toBeNull();
+      const argv = binding![1];
+      const built = binding!.index;
       const gated = body!.indexOf("guard(&repo_path, &refs)?");
       const spawned = body!.indexOf(executor);
-      expect(built, `${command} must build its argv through one builder`).toBeGreaterThan(-1);
       expect(gated, `${command} must hand that argv to the write gate`).toBeGreaterThan(-1);
       expect(spawned, `${command} must call ${executor}`).toBeGreaterThan(-1);
       expect(built, `${command} must build argv before gating it`).toBeLessThan(gated);
       expect(gated, `${command} must gate before it spawns`).toBeLessThan(spawned);
-      // The executor receives the same value that was gated, not a rebuild.
-      expect(body).toContain("&argv_owned");
-      expect(body).toContain("argv_owned.iter().map(String::as_str)");
+      // The gate judges the builder's value and the executor receives that same
+      // value, not a rebuild.
+      expect(body, `${command} must derive the judged refs from the built argv`).toMatch(
+        new RegExp(`let refs[^=]*=\\s*${argv}\\.iter\\(\\)\\.map\\(String::as_str\\)`),
+      );
+      expect(body!.slice(spawned), `${command} must run ${executor} on the built argv`).toContain(`&${argv}`);
     }
   });
 

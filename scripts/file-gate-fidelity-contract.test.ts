@@ -29,16 +29,19 @@ const WRITER = readFileSync(
 );
 
 describe("conflict file authorization", () => {
-  it("derives the operation from the checked native source instead of always declaring modify", () => {
+  // The operation itself (create / modify / delete / stage-deletion) is derived
+  // from the checked source in `conflict_session::save_with_gate` and driven
+  // through a real repository by `file_authorization_distinguishes_creation_modification_and_deletion`
+  // (tests/conflict_save_integration.rs); the folding of the file verdict into
+  // the result is `conflict_save_surfaces_the_file_verdict_not_only_the_last_command`.
+  // What only the source can show is that the Tauri command forwards that
+  // derived operation to the gate rather than declaring one of its own.
+  it("forwards the derived operation to the file gate instead of declaring one", () => {
     const body = fnBody(production(COMMANDS), "cmd_save_conflict");
     expect(body).not.toBeNull();
-    expect(body).not.toContain('guard_file(&repo_path, &request.file_path, "modify")');
-    expect(body).toContain("guard_file(&repo_path, file, op)");
-    expect(body).toContain("save_conflict_folded(");
-    const folded = fnBody(production(COMMANDS), "save_conflict_folded");
-    expect(folded).not.toBeNull();
-    expect(folded).toContain("conflict_session::save_with_gate");
-    expect(folded).toContain("judge_file(file, op)?");
+    const call = /guard_file\(\s*&repo_path\s*,\s*(\w+)\s*,\s*([^)]+?)\)/s.exec(body!);
+    expect(call, "cmd_save_conflict no longer reaches guard_file").not.toBeNull();
+    expect(call![2].trim(), "a quoted operation here would gate every conflict save as one fixed act").not.toMatch(/^"/);
   });
 });
 
@@ -126,21 +129,27 @@ describe("the file gate is told the operation that actually runs", () => {
     expect(destructive, "discard_changes' subcommands not parsed").toContain("clean");
   });
 
-  it.each(
-    fileGateSites().map((site) => [site.command, site] as const),
-  )("%s does not gate a possible delete as a mere modify", (_name, site) => {
-    const subcommands = site.delegates.flatMap((delegate) => writerSubcommands(delegate));
-    const destructive = subcommands.filter((subcommand) =>
-      DESTRUCTIVE_SUBCOMMANDS.includes(subcommand),
-    );
-    if (destructive.length === 0) return;
-    // The writer can remove the path, so the op cannot be a hardcoded weaker
-    // literal — it has to be derived from what will actually happen.
-    expect(
-      site.op,
-      `${site.command} delegates to a writer running \`git ${destructive.join(", ")}\` ` +
-        `but declares a fixed op ${site.op}; a delete gated as a modify is judged ` +
-        `and recorded as something it is not`,
-    ).not.toMatch(/^"(modify|write|create)"$/);
+  const destructiveSites = sites.filter((site) =>
+    site.delegates
+      .flatMap((delegate) => writerSubcommands(delegate))
+      .some((subcommand) => DESTRUCTIVE_SUBCOMMANDS.includes(subcommand)),
+  );
+
+  it("has command sites whose writer can delete, so the rule below is not vacuous", () => {
+    expect(destructiveSites.map((site) => site.command)).toContain("cmd_discard_changes");
   });
+
+  it.each(destructiveSites.map((site) => [site.command, site] as const))(
+    "%s does not gate a possible delete as a mere modify",
+    (_name, site) => {
+      // The writer can remove the path, so the op cannot be a hardcoded weaker
+      // literal; it has to be derived from what will actually happen.
+      expect(
+        site.op,
+        `${site.command} delegates to a writer that can run git ${DESTRUCTIVE_SUBCOMMANDS.join("/")} ` +
+          `but declares a fixed op ${site.op}; a delete gated as a modify is judged ` +
+          `and recorded as something it is not`,
+      ).not.toMatch(/^"(modify|write|create)"$/);
+    },
+  );
 });

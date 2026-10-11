@@ -17,6 +17,7 @@
     bandColor,
     blameRowTint,
     buildAgeTicks,
+    areBlameLinesEqual,
     buildBlameTimeline,
     columnHeight,
     describePeriod,
@@ -95,25 +96,6 @@
   const detailScope = paneDetails.register("blame");
   let requestCount = 0;
   let loadedSubject: string | null = null;
-
-  function areBlameLinesEqual(a: BlameLine[], b: BlameLine[]): boolean {
-    if (a === b) return true;
-    if (a.length !== b.length) return false;
-    for (let i = 0; i < a.length; i++) {
-      const la = a[i];
-      const lb = b[i];
-      if (
-        la.line_no !== lb.line_no ||
-        la.commit_id !== lb.commit_id ||
-        la.timestamp !== lb.timestamp ||
-        la.author_name !== lb.author_name ||
-        la.content !== lb.content
-      ) {
-        return false;
-      }
-    }
-    return true;
-  }
 
   async function loadBlameFor(repo: string, path: string, revision: string | null = null) {
     if (!repo || !path) return;
