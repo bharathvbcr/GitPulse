@@ -794,6 +794,8 @@ pub(crate) fn read_checked_state_file(
 }
 
 fn open(db_path: &Path) -> Result<Connection, LedgerError> {
+    #[cfg(test)]
+    tests::LEDGER_WRITE_OPENS.with(|opens| opens.set(opens.get() + 1));
     let dir = db_path.parent().ok_or_else(|| {
         LedgerError::new(
             "state_path_invalid",
@@ -846,6 +848,57 @@ fn open(db_path: &Path) -> Result<Connection, LedgerError> {
     checked_state_directory(dir, Some(repo), false)?;
     validate_ledger_files(db_path, repo)?;
     Ok(conn)
+}
+
+/// Opens an existing ledger read-only, or `Ok(None)` when there is none.
+///
+/// The read half of [`open`], for a process that must not create, secure or
+/// migrate the database: no directory or file is created, nothing is
+/// chmodded, and a read-only connection cannot run the WAL pragmas or the
+/// schema DDL. The same no-symlink, inside-the-repository validation runs
+/// before and after the open, by metadata only — never by opening and closing
+/// a descriptor, which would drop this process's SQLite locks (see [`open`]).
+fn open_readonly(db_path: &Path) -> Result<Option<Connection>, LedgerError> {
+    let dir = db_path.parent().ok_or_else(|| {
+        LedgerError::new(
+            "state_path_invalid",
+            format!("ledger path has no parent: {}", db_path.display()),
+        )
+    })?;
+    let repo = dir.parent().ok_or_else(|| {
+        LedgerError::new(
+            "state_path_invalid",
+            format!(
+                "ledger state directory has no repository: {}",
+                dir.display()
+            ),
+        )
+    })?;
+    if checked_state_file_metadata(db_path, Some(repo))?.is_none() {
+        return Ok(None);
+    }
+    validate_ledger_files(db_path, repo)?;
+    let conn = Connection::open_with_flags(
+        db_path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(|e| LedgerError::new("open_failed", format!("{}: {e}", db_path.display())))?;
+    checked_state_directory(dir, Some(repo), false)?;
+    validate_ledger_files(db_path, repo)?;
+    Ok(Some(conn))
+}
+
+/// Whether a read-only connection's database has `table`. A creator that died
+/// between creating the file and its schema leaves a database with none, and
+/// a read-only reader cannot add them; such a ledger holds no rows.
+fn has_table(conn: &Connection, table: &str) -> Result<bool, LedgerError> {
+    conn.query_row(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+        params![table],
+        |row| row.get::<_, i64>(0),
+    )
+    .map(|count| count > 0)
+    .map_err(|e| LedgerError::new("query_failed", e.to_string()))
 }
 
 #[cfg(unix)]
@@ -1024,49 +1077,20 @@ fn with_access<T>(
     match access {
         Access::Writable => with_conn(repo_path, f),
         Access::ReadOnly => {
-            let conn = open_readonly(&ledger_path(repo_path))?;
+            let conn = open_readonly_initialised(&ledger_path(repo_path))?;
             f(&conn)
         }
     }
 }
 
-/// Opens an existing ledger without any ability to write. The directory and
-/// file are validated exactly as [`open`] validates them, and a database with
-/// no schema yet is reported rather than read as empty.
-fn open_readonly(db_path: &Path) -> Result<Connection, LedgerError> {
-    let dir = db_path.parent().ok_or_else(|| {
-        LedgerError::new(
-            "state_path_invalid",
-            format!("ledger path has no parent: {}", db_path.display()),
-        )
-    })?;
-    let repo = dir.parent().ok_or_else(|| {
-        LedgerError::new(
-            "state_path_invalid",
-            format!(
-                "ledger state directory has no repository: {}",
-                dir.display()
-            ),
-        )
-    })?;
-    checked_state_directory(dir, Some(repo), false)?;
-    validate_ledger_files(db_path, repo)?;
-    let conn = Connection::open_with_flags(
-        db_path,
-        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    )
-    .map_err(|e| LedgerError::new("open_failed", format!("{}: {e}", db_path.display())))?;
-    validate_ledger_files(db_path, repo)?;
-    let has_events: bool = conn
-        .query_row(
-            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'events')",
-            [],
-            |row| row.get(0),
-        )
-        .map_err(|e| LedgerError::new("query_failed", e.to_string()))?;
-    if !has_events {
-        return Err(LedgerError::new(
-            "not_initialised",
+/// [`open_readonly`] for a reader that needs a ledger to read: a missing
+/// file or a database with no schema yet is reported, never read as empty.
+fn open_readonly_initialised(db_path: &Path) -> Result<Connection, LedgerError> {
+    let not_initialised = |message: &str| LedgerError::new("not_initialised", message);
+    let conn = open_readonly(db_path)?
+        .ok_or_else(|| not_initialised("no ledger in this repository yet; nothing has been recorded"))?;
+    if !has_table(&conn, "events")? {
+        return Err(not_initialised(
             "the ledger file has no schema yet; nothing has been recorded",
         ));
     }
@@ -1487,6 +1511,43 @@ fn latest_binding(
 ) -> Result<Option<Option<String>>, LedgerError> {
     #[cfg(test)]
     tests::LEDGER_READS.with(|reads| reads.set(reads.get() + 1));
+    with_conn(repo_path, |conn| {
+        query_latest_binding(conn, repo_path, worktree, stored_worktree)
+    })
+}
+
+/// [`latest_binding`] over a read-only connection that is opened, queried and
+/// dropped, never cached.
+///
+/// For the agent hook, a fresh process on every Bash call and every edit: the
+/// creating path cost it a directory and file chmod, WAL and synchronous
+/// pragmas and the whole schema DDL on each call, against a ledger the app is
+/// writing. `Ok(None)` when there is no ledger, or one that never received its
+/// schema — neither can hold a binding.
+pub(crate) fn latest_binding_readonly(
+    repo_path: &str,
+    worktree: &str,
+    stored_worktree: &str,
+) -> Result<Option<Option<String>>, LedgerError> {
+    #[cfg(test)]
+    tests::LEDGER_READS.with(|reads| reads.set(reads.get() + 1));
+    let Some(conn) = open_readonly(&ledger_path(repo_path))? else {
+        return Ok(None);
+    };
+    if !has_table(&conn, "events")? {
+        return Ok(None);
+    }
+    query_latest_binding(&conn, repo_path, worktree, stored_worktree)
+}
+
+/// The one binding query behind [`latest_binding`] and
+/// [`latest_binding_readonly`].
+fn query_latest_binding(
+    conn: &Connection,
+    repo_path: &str,
+    worktree: &str,
+    stored_worktree: &str,
+) -> Result<Option<Option<String>>, LedgerError> {
     let canonical_repo_path = canonical_repo(repo_path);
     let stored_repo_path = redact::text(&canonical_repo_path);
     // `NOT IN` cannot seek, and in the normal case — no foreign row — `LIMIT 1`
@@ -1499,30 +1560,28 @@ fn latest_binding(
     } else {
         (&stored_repo_path, &canonical_repo_path)
     };
-    with_conn(repo_path, |conn| {
-        let foreign = conn
-            .query_row(FOREIGN_ROW_SQL, params![lo, hi], |row| row.get::<_, i64>(0))
-            .optional()
-            .map_err(|e| LedgerError::new("query_failed", e.to_string()))?;
-        if foreign.is_some() {
-            return Err(LedgerError::new(
-                "repository_mismatch",
-                "the ledger contains an event attributed to a different repository",
-            ));
-        }
-        conn.query_row(
-            "SELECT action, task_id FROM events
-             WHERE action IN ('worktree.bind', 'worktree.unbind')
-               AND worktree_path IN (?1, ?2)
-             ORDER BY ts_utc DESC, ulid DESC
-             LIMIT 1",
-            params![worktree, stored_worktree],
-            |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
-        )
+    let foreign = conn
+        .query_row(FOREIGN_ROW_SQL, params![lo, hi], |row| row.get::<_, i64>(0))
         .optional()
-        .map_err(|e| LedgerError::new("query_failed", e.to_string()))
-        .map(|found| found.map(|(action, task_id)| task_id.filter(|_| action == bindings::BIND)))
-    })
+        .map_err(|e| LedgerError::new("query_failed", e.to_string()))?;
+    if foreign.is_some() {
+        return Err(LedgerError::new(
+            "repository_mismatch",
+            "the ledger contains an event attributed to a different repository",
+        ));
+    }
+    conn.query_row(
+        "SELECT action, task_id FROM events
+         WHERE action IN ('worktree.bind', 'worktree.unbind')
+           AND worktree_path IN (?1, ?2)
+         ORDER BY ts_utc DESC, ulid DESC
+         LIMIT 1",
+        params![worktree, stored_worktree],
+        |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+    )
+    .optional()
+    .map_err(|e| LedgerError::new("query_failed", e.to_string()))
+    .map(|found| found.map(|(action, task_id)| task_id.filter(|_| action == bindings::BIND)))
 }
 
 /// A binding's `(ts_utc, ulid)` precedence key and the task it names, if any.
@@ -2054,6 +2113,77 @@ pub fn prune_events(
     })
 }
 
+/// The first sibling ledger holding rows [`consolidate_worktree_ledgers`] has
+/// not imported into `anchor`, found without importing them.
+///
+/// The read-only twin of consolidation's steady-state check, for a lookup
+/// that must fail closed on unmigrated history rather than run the migration:
+/// a legacy sibling may hold the binding event that decides the answer.
+/// Sources persist after import, so existence proves nothing; a source is
+/// consolidated when it is empty or the anchor's marker for it has reached its
+/// newest row — exactly where a completed import leaves the marker. A source
+/// that shrank below its marker was replaced, and consolidation re-reads it,
+/// so it counts as unimported until then.
+pub(crate) fn unconsolidated_legacy_ledger(
+    anchor: &str,
+    members: &[PathBuf],
+) -> Result<Option<PathBuf>, LedgerError> {
+    let anchor_path = std::fs::canonicalize(anchor).map_err(|error| {
+        LedgerError::new(
+            "legacy_anchor_invalid",
+            format!("could not resolve family ledger anchor: {error}"),
+        )
+    })?;
+    let mut anchor_conn: Option<Option<Connection>> = None;
+    for source in members {
+        if source == &anchor_path {
+            continue;
+        }
+        let source_db = ledger_path(&source.to_string_lossy());
+        let Some(source_conn) = open_readonly(&source_db)? else {
+            continue;
+        };
+        let source_max: i64 = if has_table(&source_conn, "events")? {
+            source_conn
+                .query_row("SELECT COALESCE(MAX(id), 0) FROM events", [], |row| {
+                    row.get(0)
+                })
+                .map_err(|error| {
+                    LedgerError::new(
+                        "legacy_read_failed",
+                        format!("could not read {}: {error}", source_db.display()),
+                    )
+                })?
+        } else {
+            0
+        };
+        if source_max == 0 {
+            continue;
+        }
+        if anchor_conn.is_none() {
+            anchor_conn = Some(open_readonly(&ledger_path(anchor))?);
+        }
+        let marker = match anchor_conn.as_ref().and_then(Option::as_ref) {
+            Some(conn) if has_table(conn, "ledger_family_imports")? => {
+                let key = family_source_key(&anchor_path, &source.to_string_lossy())?;
+                conn.query_row(
+                    "SELECT source_cursor FROM ledger_family_imports WHERE source_key = ?1",
+                    params![key],
+                    |row| row.get::<_, i64>(0),
+                )
+                .optional()
+                .map_err(|error| LedgerError::new("legacy_marker_failed", error.to_string()))?
+                .unwrap_or(0)
+            }
+            _ => 0,
+        };
+        if marker != source_max {
+            return Ok(Some(source.clone()));
+        }
+    }
+    Ok(None)
+}
+
 /// The highest cursor in this repo's ledger, or 0 when it is empty.
 ///
 /// Phase 3's reflog catch-up starts here: everything git recorded after this
@@ -2095,7 +2225,7 @@ pub fn status_readonly(repo_path: &str) -> LedgerStatus {
             "not_initialised".to_string(),
         )
     } else {
-        match open_readonly(&path) {
+        match open_readonly_initialised(&path) {
             Ok(_) => (true, String::new(), String::new()),
             Err(e) => (false, e.message, e.code.to_string()),
         }
@@ -2852,6 +2982,11 @@ pub(crate) mod tests_support {
         super::registry().lock().unwrap().clear();
         super::dropped_registry().lock().unwrap().clear();
     }
+
+    /// Read-write ledger opens this thread has made so far.
+    pub fn write_opens() -> usize {
+        super::tests::LEDGER_WRITE_OPENS.with(std::cell::Cell::get)
+    }
 }
 
 #[cfg(test)]
@@ -2872,6 +3007,9 @@ mod tests {
         /// Ledger queries this thread has issued through [`read_after`] or
         /// [`latest_binding`]; a test reads it to count what a lookup costs.
         pub(super) static LEDGER_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+        /// Read-write opens ([`open`]) this thread has made: each one is the
+        /// chmod pass, the WAL pragmas and the schema DDL.
+        pub(super) static LEDGER_WRITE_OPENS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     }
 
     /// The env var that turns [`shm_lock_probe_child`] from a no-op into the
