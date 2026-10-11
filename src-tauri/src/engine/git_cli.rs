@@ -4829,23 +4829,76 @@ mod tests {
         );
         assert!(result.is_err(), "capture erased stderr completeness");
     }
+    const RETRYING_ALIAS: &str =
+        "alias.retry=!echo attempt >> attempts; sleep 0.08; echo 'cannot lock ref' >&2; exit 1";
+
+    /// Where the total budget runs out between two lock retries decides which
+    /// seam reports it: the top of the loop returns an error, a child killed
+    /// in flight returns its prefix tagged [`Incomplete::Deadline`]. Which one
+    /// happens depends on the backoff (pid-derived) and on scheduling, so a
+    /// capped caller must accept either, and a caller that needs the whole
+    /// stream must get an error from both.
     #[cfg(unix)]
     #[test]
     fn audit_lock_retries_share_one_total_deadline() {
         let dir = crate::test_support::git_repo();
         let started = Instant::now();
-        let error = git_run_capped(Some(dir.path()), &[
-            "-c", "alias.retry=!echo attempt >> attempts; sleep 0.08; echo 'cannot lock ref' >&2; exit 1", "retry"
-        ], Duration::from_millis(150), None, 1024).unwrap_err();
+        let capped = git_run_capped(
+            Some(dir.path()),
+            &["-c", RETRYING_ALIAS, "retry"],
+            Duration::from_millis(150),
+            None,
+            1024,
+        );
+        let whole = git_timeout(
+            Some(dir.path()),
+            &["-c", RETRYING_ALIAS, "retry"],
+            Duration::from_millis(150),
+            None,
+        );
+        // Two sequential runs of one 150 ms budget each.
         assert!(
-            started.elapsed() < crate::test_support::coverage_relaxed(Duration::from_millis(500)),
+            started.elapsed() < crate::test_support::coverage_relaxed(Duration::from_millis(1000)),
             "retries renewed the timeout: {:?}",
             started.elapsed()
         );
+        match capped {
+            Err(error) => assert!(error.contains("timed out"), "{error}"),
+            Ok((_, Some(Incomplete::Deadline { message, .. }))) => {
+                assert!(message.contains("timed out"), "{message}")
+            }
+            other => panic!("a deadline must never look like success: {other:?}"),
+        }
+        let error = whole.expect_err("a caller that needs the whole stream cannot accept a prefix");
         assert!(
             error.contains("timed out"),
             "deadline expiry must be explicit: {error}"
         );
+    }
+
+    /// The in-flight half, deterministically: no lock error, so the budget can
+    /// only run out inside the child.
+    #[cfg(unix)]
+    #[test]
+    fn audit_a_deadline_in_flight_is_a_tagged_prefix_for_capped_callers() {
+        let dir = crate::test_support::git_repo();
+        let args = ["-c", "alias.slow=!sleep 5", "slow"];
+        let capped = git_run_capped(
+            Some(dir.path()),
+            &args,
+            Duration::from_millis(100),
+            None,
+            1024,
+        )
+        .expect("a killed child is a tagged prefix, not an error");
+        assert!(
+            matches!(capped.1, Some(Incomplete::Deadline { .. })),
+            "{:?}",
+            capped.1
+        );
+        let error = git_timeout(Some(dir.path()), &args, Duration::from_millis(100), None)
+            .expect_err("whole-stream callers fail a deadline");
+        assert!(error.contains("timed out"), "{error}");
     }
 
     #[cfg(unix)]
