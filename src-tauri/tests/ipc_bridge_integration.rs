@@ -19,10 +19,6 @@ use tauri::{ipc::CallbackFn, WebviewWindowBuilder};
 
 /// A mock app exposing the commands under test, wired the way lib.rs wires
 /// them so dispatch and (de)serialization are the real implementations.
-fn webview() -> tauri::WebviewWindow<tauri::test::MockRuntime> {
-    webview_labeled("main")
-}
-
 fn webview_labeled(label: &str) -> tauri::WebviewWindow<tauri::test::MockRuntime> {
     let app = mock_builder()
         // A hand-picked subset rather than lib.rs's full registry. Sharing the
@@ -203,8 +199,8 @@ fn hygiene_execution_requires_a_backend_plan_and_cancel_is_idempotent() {
 
 #[test]
 fn a_missing_argument_is_refused_by_the_bridge_rather_than_reaching_the_command() {
-    let error = invoke("cmd_stash_list", json!({}))
-        .expect_err("a missing argument must not dispatch");
+    let error =
+        invoke("cmd_stash_list", json!({})).expect_err("a missing argument must not dispatch");
     assert!(
         error.to_string().contains("repoPath") || error.to_string().contains("repo_path"),
         "the failure should name the missing argument: {error}"

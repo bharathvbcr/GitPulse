@@ -325,8 +325,11 @@ mod tests {
     #[test]
     fn remote_pictures_are_withheld_until_the_reader_clicks() {
         let rendered = html("![shot](https://example.com/s.png)\n\n![p](//cdn.example/p.png)");
-        assert!(!rendered.contains("src=\"https://example.com"), "{rendered}");
-        assert!(!rendered.contains("src=\"//cdn.example"), "{rendered}");
+        assert!(
+            !rendered.contains(" src=\"https://example.com"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains(" src=\"//cdn.example"), "{rendered}");
         assert!(rendered.contains("src=\"#\""), "{rendered}");
         assert!(
             rendered.contains("data-withheld-src=\"https://example.com/s.png\""),

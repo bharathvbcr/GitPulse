@@ -116,7 +116,9 @@ fn execution_risk(target: &Path) -> Option<String> {
         .extension()
         .map(|e| e.to_string_lossy().to_ascii_lowercase());
     if let Some(extension) = extension.filter(|e| LAUNCHER_EXTENSIONS.contains(&e.as_str())) {
-        return Some(format!("a .{extension} file or bundle that the OS can launch"));
+        return Some(format!(
+            "a .{extension} file or bundle that the OS can launch"
+        ));
     }
     #[cfg(unix)]
     {
@@ -146,7 +148,9 @@ fn prepare_open(
             "{relative} is {risk}. Opening it can run code from this repository.\n\nOpen it anyway?"
         );
         if !confirm("Open a file that can run code?", &message) {
-            return Err(format!("Not opened: {relative} can run code and was not confirmed"));
+            return Err(format!(
+                "Not opened: {relative} can run code and was not confirmed"
+            ));
         }
     }
     Ok(target)
@@ -377,8 +381,10 @@ mod tests {
             ("x.terminal", 0o644),
         ]);
         let root = repo.path().to_string_lossy().into_owned();
-        prepare_open(&root, "docs/readme.md", &|_, _| panic!("a document must not prompt"))
-            .expect("plain document");
+        prepare_open(&root, "docs/readme.md", &|_, _| {
+            panic!("a document must not prompt")
+        })
+        .expect("plain document");
         for risky in ["run.command", "README", "x.fileloc", "x.terminal"] {
             let asked = std::cell::Cell::new(false);
             let refused = prepare_open(&root, risky, &|_, _| {

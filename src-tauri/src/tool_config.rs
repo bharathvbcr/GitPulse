@@ -1261,12 +1261,23 @@ mod tests {
             })
             .expect_err("a declined confirmation must refuse");
             assert!(refused.contains("not confirmed"), "{refused}");
-            assert!(asked.borrow().contains("/tmp/evil/devmap"), "{}", asked.borrow());
-            assert!(asked.borrow().contains("/tmp/evil/manvi"), "{}", asked.borrow());
+            assert!(
+                asked.borrow().contains("/tmp/evil/devmap"),
+                "{}",
+                asked.borrow()
+            );
+            assert!(
+                asked.borrow().contains("/tmp/evil/manvi"),
+                "{}",
+                asked.borrow()
+            );
             assert_eq!(load().unwrap().devmap.binary, None);
 
             save_confirmed(&next, &|_, _| true).expect("confirmed");
-            assert_eq!(load().unwrap().devmap.binary.as_deref(), Some("/tmp/evil/devmap"));
+            assert_eq!(
+                load().unwrap().devmap.binary.as_deref(),
+                Some("/tmp/evil/devmap")
+            );
             // Resaving the same paths, or changing something else, asks nothing.
             next.onboarding = OnboardingState::default();
             save_confirmed(&next, &|_, _| panic!("unchanged paths must not prompt"))

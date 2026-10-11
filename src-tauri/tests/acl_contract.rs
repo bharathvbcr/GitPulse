@@ -458,7 +458,6 @@ fn a_scope_only_permission_grants_no_command() {
     );
 }
 
-
 // ---------------------------------------------------------------------------
 // The app's own commands.
 //
@@ -518,7 +517,9 @@ fn command_literals(files: &[PathBuf]) -> BTreeSet<String> {
                 parts.next();
                 for literal in parts.step_by(2) {
                     if literal.starts_with("cmd_")
-                        && literal.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                        && literal
+                            .chars()
+                            .all(|c| c.is_ascii_alphanumeric() || c == '_')
                     {
                         out.insert(literal.to_string());
                     }
@@ -536,7 +537,11 @@ fn the_app_manifest_defines_a_permission_for_every_registered_command() {
         .get("__app-acl__")
         .expect("no app manifest was compiled: build.rs must declare AppManifest::commands");
     let registered = registered_commands();
-    assert!(registered.len() > 200, "parsed only {} handlers", registered.len());
+    assert!(
+        registered.len() > 200,
+        "parsed only {} handlers",
+        registered.len()
+    );
     for command in &registered {
         let permission = permission_for(command);
         assert!(
@@ -557,7 +562,11 @@ fn the_main_window_is_granted_exactly_the_commands_the_frontend_calls() {
         .cloned()
         .collect();
     let granted = app_commands_granted_by("default.json");
-    assert!(called.len() > 200, "the scan found only {} commands", called.len());
+    assert!(
+        called.len() > 200,
+        "the scan found only {} commands",
+        called.len()
+    );
     let missing: Vec<_> = called.difference(&granted).collect();
     assert!(
         missing.is_empty(),
@@ -626,13 +635,20 @@ fn the_status_popover_is_granted_only_the_commands_it_calls() {
     let granted = app_commands_granted_by("status-popover.json");
     assert_eq!(
         called,
-        ["cmd_get_status_state", "cmd_resize_status", "cmd_status_action"]
-            .iter()
-            .map(|c| c.to_string())
-            .collect(),
+        [
+            "cmd_get_status_state",
+            "cmd_resize_status",
+            "cmd_status_action"
+        ]
+        .iter()
+        .map(|c| c.to_string())
+        .collect(),
         "the popover's call sites changed; review what it may now call"
     );
-    assert_eq!(granted, called, "the popover's grants must equal its call sites");
+    assert_eq!(
+        granted, called,
+        "the popover's grants must equal its call sites"
+    );
     assert!(
         granted.len() < registered.len() / 10,
         "the popover must not hold a broad grant"
@@ -644,7 +660,11 @@ fn the_status_popover_is_granted_only_the_commands_it_calls() {
 #[test]
 fn no_capability_grants_a_command_that_is_not_registered_twice_or_unscoped() {
     for file in ["default.json", "status-popover.json"] {
-        let json = read_json(&Path::new(env!("CARGO_MANIFEST_DIR")).join("capabilities").join(file));
+        let json = read_json(
+            &Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("capabilities")
+                .join(file),
+        );
         assert!(
             json["windows"].as_array().is_some_and(|w| w.len() == 1),
             "{file} must name exactly one window, never a wildcard"

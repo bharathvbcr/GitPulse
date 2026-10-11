@@ -1088,13 +1088,50 @@ fn sidecar_ambient_env(
     vars: impl Iterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
 ) -> Vec<(std::ffi::OsString, std::ffi::OsString)> {
     const EXACT: &[&str] = &[
-        "PATH", "HOME", "USER", "LOGNAME", "SHELL", "TMPDIR", "TMP", "TEMP", "LANG", "LANGUAGE",
-        "TZ", "TERM", "SSH_AUTH_SOCK", "SSH_ASKPASS", "GIT_ASKPASS", "GIT_SSH", "GIT_SSH_COMMAND",
-        "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "ALL_PROXY", "SSL_CERT_FILE", "SSL_CERT_DIR",
-        "DISPLAY", "WAYLAND_DISPLAY", "DBUS_SESSION_BUS_ADDRESS", "SYSTEMROOT", "SYSTEMDRIVE",
-        "WINDIR", "COMSPEC", "PATHEXT", "USERPROFILE", "USERNAME", "APPDATA", "LOCALAPPDATA",
-        "PROGRAMDATA", "PROGRAMFILES", "PROGRAMFILES(X86)", "PROGRAMW6432", "HOMEDRIVE",
-        "HOMEPATH", "COMPUTERNAME", "NUMBER_OF_PROCESSORS", "PROCESSOR_ARCHITECTURE",
+        "PATH",
+        "HOME",
+        "USER",
+        "LOGNAME",
+        "SHELL",
+        "TMPDIR",
+        "TMP",
+        "TEMP",
+        "LANG",
+        "LANGUAGE",
+        "TZ",
+        "TERM",
+        "SSH_AUTH_SOCK",
+        "SSH_ASKPASS",
+        "GIT_ASKPASS",
+        "GIT_SSH",
+        "GIT_SSH_COMMAND",
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "NO_PROXY",
+        "ALL_PROXY",
+        "SSL_CERT_FILE",
+        "SSL_CERT_DIR",
+        "DISPLAY",
+        "WAYLAND_DISPLAY",
+        "DBUS_SESSION_BUS_ADDRESS",
+        "SYSTEMROOT",
+        "SYSTEMDRIVE",
+        "WINDIR",
+        "COMSPEC",
+        "PATHEXT",
+        "USERPROFILE",
+        "USERNAME",
+        "APPDATA",
+        "LOCALAPPDATA",
+        "PROGRAMDATA",
+        "PROGRAMFILES",
+        "PROGRAMFILES(X86)",
+        "PROGRAMW6432",
+        "HOMEDRIVE",
+        "HOMEPATH",
+        "COMPUTERNAME",
+        "NUMBER_OF_PROCESSORS",
+        "PROCESSOR_ARCHITECTURE",
     ];
     const SECRET_SUFFIXES: &[&str] = &["_KEY", "_TOKEN", "_SECRET", "_PASSWORD", "_PASSPHRASE"];
     vars.filter(|(name, _)| {
@@ -2498,8 +2535,9 @@ done
             std::env::var_os("CARGO_MANIFEST_DIR").is_some(),
             "the canary must be ambient for this test to mean anything"
         );
+        use crate::procguard::LockedSpawn;
         let out = sidecar_command(script.to_str().unwrap(), dir.path(), None)
-            .output()
+            .output_locked()
             .expect("run the env dump");
         let text = String::from_utf8_lossy(&out.stdout);
         assert!(
@@ -2507,7 +2545,10 @@ done
             "ambient variables must not reach the sidecar:\n{text}"
         );
         assert!(text.contains("PATH="), "PATH must still be set:\n{text}");
-        assert!(text.contains("MANVI_STATE_DIR="), "host settings survive:\n{text}");
+        assert!(
+            text.contains("MANVI_STATE_DIR="),
+            "host settings survive:\n{text}"
+        );
     }
 
     #[test]
@@ -2536,7 +2577,14 @@ done
         .collect();
         assert_eq!(
             kept,
-            ["HOME", "LC_ALL", "XDG_CONFIG_HOME", "SSH_AUTH_SOCK", "HTTPS_PROXY", "MANVI_LOG"]
+            [
+                "HOME",
+                "LC_ALL",
+                "XDG_CONFIG_HOME",
+                "SSH_AUTH_SOCK",
+                "HTTPS_PROXY",
+                "MANVI_LOG"
+            ]
         );
     }
 
@@ -2586,9 +2634,12 @@ done
             "MANVI_LLM_LOCAL_BASE_URL",
             "MANVI_LLM_LOCAL_MODEL",
         ] {
+            // On a cleared environment `env_remove` deletes the entry instead
+            // of recording a removal, so "not set" is `None`; what must never
+            // appear is a value (ambient or otherwise).
             assert!(
-                matches!(cleared.get(std::ffi::OsStr::new(key)), Some(None)),
-                "{key} must be removed when no selection is given: {cleared:?}"
+                !matches!(cleared.get(std::ffi::OsStr::new(key)), Some(Some(_))),
+                "{key} must not be set when no selection is given: {cleared:?}"
             );
         }
     }

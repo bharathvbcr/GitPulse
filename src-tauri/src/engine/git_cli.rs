@@ -33,7 +33,10 @@ pub use hooks::{
 };
 
 mod preflight;
-pub use preflight::{git_preflight, GitPreflight, GitPreflightStatus, MIN_GIT_VERSION};
+pub use preflight::{
+    git_preflight, require_git_for_clone, GitPreflight, GitPreflightStatus, MIN_CLONE_GIT_VERSION,
+    MIN_GIT_VERSION, MIN_SUBMODULE_GIT_VERSION,
+};
 
 /// Shared grace window for pipe EOF after child exit. Unix closes unfinished
 /// descriptors; Windows cancels workers and retains their resource slots until
@@ -5909,16 +5912,17 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn git_launch_preserves_relative_path_resolution_and_unset_path_defaults() {
-        // Relative PATH entries have child-cwd semantics; let the OS retain
-        // those semantics rather than silently bypassing a user-selected git.
+    fn git_launch_drops_relative_path_entries_and_unset_path_defaults() {
+        // A relative PATH entry has child-cwd semantics, and the child's cwd
+        // is the repository: it is dropped rather than honoured, so git is
+        // resolved from the absolute entries and never from inside the repo.
         let cmd = git_command_with_env(
             None,
             &["status"],
             Some(std::ffi::OsStr::new("relative:/usr/bin")),
             None,
         );
-        assert_eq!(cmd.get_program(), "git");
+        assert!(Path::new(cmd.get_program()).is_absolute());
         let cmd = git_command_with_env(None, &["status"], None, None);
         assert!(Path::new(cmd.get_program()).is_absolute());
     }

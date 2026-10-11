@@ -1428,7 +1428,10 @@ mod tests {
         .expect_err("declined");
         assert!(refused.contains("not confirmed"), "{refused}");
         assert!(shown.borrow().contains(&inspect(&path).unwrap().path));
-        assert!(require(repo.path()).is_err(), "a declined grant records nothing");
+        assert!(
+            require(repo.path()).is_err(),
+            "a declined grant records nothing"
+        );
 
         grant_confirmed(&path, &identity, &|_, _| true).expect("confirmed");
         require(repo.path()).expect("granted after confirmation");
