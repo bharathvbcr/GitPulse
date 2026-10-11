@@ -2,10 +2,11 @@
   import { onMount, untrack } from "svelte";
   import NativeNotificationSettings from "./NativeNotificationSettings.svelte";
   import { createListenerTracker } from "../dom/listenerTracker";
-  import { bindForegroundChanges, readBackgroundDocument } from "../runtime/foreground";
+  import { readBackgroundDocument } from "../runtime/foreground";
+  import { createLiveLoader } from "../workbench/liveLoader";
   import { formatRelativeTime } from "../format";
   import { buriedUnread, notificationPile, pileToggleLabel } from "../ui/notificationPile";
-  import { automaticUpdates, explainError, sameAutomaticUpdate, subscribeWorkbenchChanges, getAttention, listAttention, type Attention, type AttentionFilter, type AutomaticUpdate, type Page, type Scope } from "../workbench/client";
+  import { automaticUpdates, explainError, sameAutomaticUpdate, getAttention, listAttention, type Attention, type AttentionFilter, type AutomaticUpdate, type Page, type Scope } from "../workbench/client";
 
   let { scope, active = true, onopen }: { scope: Scope; active?: boolean; onopen: (taskID: string) => Promise<void> } = $props();
   let filter = $state<AttentionFilter>("active"), result = $state<Page<Attention> | null>(null);
@@ -13,25 +14,22 @@
   let visible = $state(!readBackgroundDocument());
   let expanded = $state(false);
   let pileKey = "";
-  let generation = 0, disposed = false, loading = false, again = false;
-  let refreshTimer: ReturnType<typeof setTimeout> | undefined;
-  async function load(cursor?: string) {
-    if (!active || !visible || disposed) return;
-    if (loading) { again = true; return; }
-    const epoch = generation; loading = true;
-    try {
+  const loader = createLiveLoader<string>({
+    canRun: () => active && visible,
+    read: async (cursor, isCurrent) => {
       const next = await listAttention(scope, filter, cursor);
-      if (epoch === generation && !disposed) { result = next; error = ""; }
-    } catch (cause) { if (epoch === generation && !disposed) error = explainError(cause); }
-    finally { loading = false; if (again) { again = false; void load(); } }
-  }
-  function schedule() {
-    if (!active || !visible || disposed) return;
-    clearTimeout(refreshTimer); refreshTimer = setTimeout(() => { void load(); }, 200);
-  }
+      if (isCurrent()) { result = next; error = ""; }
+    },
+    onError: (cause) => { error = explainError(cause); },
+  });
+  const load = loader.load;
+  const schedule = loader.schedule;
   onMount(() => {
     const listeners = createListenerTracker();
-    listeners.track(subscribeWorkbenchChanges({ changed: schedule, unavailable: (message) => { if (!disposed) notice = `Live updates unavailable: ${message}. Use Refresh inbox.`; } }));
+    listeners.track(loader.connect({
+      onVisibility: (next) => { visible = next; },
+      onUnavailable: (message) => { notice = `Live updates unavailable: ${message}. Use Refresh inbox.`; },
+    }));
     // The load effect reads once on mount; the status poll then republishes
     // every 2 s, and only a change in what it says re-reads the inbox.
     let lastAutomatic: AutomaticUpdate | null = null;
@@ -40,13 +38,8 @@
       lastAutomatic = update;
       if (changed) schedule();
     });
-    const onForeground = () => {
-      visible = !readBackgroundDocument();
-      if (visible) schedule();
-    };
     listeners.track(automatic);
-    listeners.track(bindForegroundChanges(document, typeof window === "undefined" ? null : window, onForeground));
-    return () => { disposed = true; generation++; clearTimeout(refreshTimer); listeners.dispose(); };
+    return () => { loader.dispose(); listeners.dispose(); };
   });
   $effect(() => {
     const key = scope.kind === "global" ? `global:${filter}` : `${scope.kind}:${scope.id}:${filter}`;
@@ -56,7 +49,7 @@
     // Not `visible`: a blur pauses loads and a return refreshes in place
     // (`onForeground`), instead of emptying the list under the reader.
     scope; filter; active;
-    generation++; result = null; clearTimeout(refreshTimer);
+    loader.reset(); result = null;
     untrack(() => { void load(); });
   });
   const items = $derived(result?.items ?? []);
