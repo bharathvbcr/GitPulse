@@ -531,8 +531,19 @@ impl CoverageScanner {
         let mut truncated = detected.listing_partial;
         let mut limit_notices: Vec<CoverageScanLimit> = Vec::new();
         let candidates = {
-            let mut c = collect_candidates(&families, &detected.cargo_dirs, &detected.go_mod_dirs);
-            if extend_directory_candidates(&repo, &families, &detected.cargo_dirs, &mut c) {
+            let mut c = collect_candidates(
+                &families,
+                &detected.cargo_dirs,
+                &detected.go_mod_dirs,
+                &detected.jvm_dirs,
+            );
+            if extend_directory_candidates(
+                &repo,
+                &families,
+                &detected.cargo_dirs,
+                &detected.jvm_dirs,
+                &mut c,
+            ) {
                 // A probed directory dropped an artifact-shaped entry beyond
                 // the MAX_DIR_ENTRIES window; readdir order is arbitrary, so
                 // real artifacts may have been left unseen.
@@ -2721,6 +2732,9 @@ struct FamilyScan {
     families: BTreeMap<String, CoverageFamilyStatus>,
     cargo_dirs: Vec<String>,
     go_mod_dirs: Vec<String>,
+    /// Non-root directories holding a Maven or Gradle build file: the modules
+    /// whose own `target/site/jacoco` or `build/reports/jacoco` is probed.
+    jvm_dirs: Vec<String>,
     go_work_at_root: bool,
     package_swift_dirs: Vec<String>,
     has_python_tests: bool,
@@ -2752,6 +2766,7 @@ fn detect_families(repo: &Path) -> Result<FamilyScan, String> {
     let mut families: BTreeMap<String, CoverageFamilyStatus> = BTreeMap::new();
     let mut cargo_dirs: Vec<String> = Vec::new();
     let mut go_mod_dirs: Vec<String> = Vec::new();
+    let mut jvm_dirs: Vec<String> = Vec::new();
     let mut go_work_at_root = false;
     let mut package_swift_dirs: Vec<String> = Vec::new();
     let mut has_python_tests = false;
@@ -2780,6 +2795,17 @@ fn detect_families(repo: &Path) -> Result<FamilyScan, String> {
             let dir = rel_parent_dir(&rel);
             if !go_mod_dirs.contains(&dir) {
                 go_mod_dirs.push(dir);
+            }
+        } else if matches!(name, "pom.xml" | "build.gradle" | "build.gradle.kts") {
+            let dir = rel_parent_dir(&rel);
+            if !dir.is_empty() && !coverage_third_party_dir(&dir) && !jvm_dirs.contains(&dir) {
+                if jvm_dirs.len() >= MAX_JVM_MODULES {
+                    // Modules past the bound are never probed; say so rather
+                    // than present the modules read as the whole build.
+                    listing_partial = true;
+                } else {
+                    jvm_dirs.push(dir);
+                }
             }
         } else if name == "go.work" && rel_parent_dir(&rel).is_empty() {
             go_work_at_root = true;
@@ -2849,11 +2875,13 @@ fn detect_families(repo: &Path) -> Result<FamilyScan, String> {
     }
     cargo_dirs.sort();
     go_mod_dirs.sort();
+    jvm_dirs.sort();
     package_swift_dirs.sort();
     Ok(FamilyScan {
         families,
         cargo_dirs,
         go_mod_dirs,
+        jvm_dirs,
         go_work_at_root,
         package_swift_dirs,
         has_python_tests,
@@ -2867,6 +2895,7 @@ fn collect_candidates(
     families: &BTreeMap<String, CoverageFamilyStatus>,
     cargo_dirs: &[String],
     go_mod_dirs: &[String],
+    jvm_dirs: &[String],
 ) -> Vec<Candidate> {
     let mut out = Vec::new();
     // One candidate per artifact PATH: several families can list the same
@@ -2915,7 +2944,49 @@ fn collect_candidates(
             }
         }
     }
+    // Multi-module Maven/Gradle builds write each module's report under that
+    // module, never at the root; the root specs above miss all of them.
+    if families.contains_key("jvm") {
+        for dir in jvm_dirs {
+            for (tail, format) in nested_jvm_specs() {
+                let rel = format!("{dir}/{tail}");
+                if seen.insert(rel.clone()) {
+                    out.push(Candidate {
+                        rel,
+                        format: *format,
+                        family: "jvm".to_string(),
+                    });
+                }
+            }
+        }
+    }
     out
+}
+
+/// Cap on Maven/Gradle module directories probed for their own reports. A
+/// monorepo with hundreds of build files must not turn a scan into hundreds of
+/// stats; hitting it marks the scan capped.
+const MAX_JVM_MODULES: usize = 128;
+
+/// Report locations relative to a non-root Maven or Gradle module directory.
+fn nested_jvm_specs() -> &'static [(&'static str, CoverageFormat)] {
+    &[
+        ("target/site/jacoco/jacoco.xml", CoverageFormat::Jacoco),
+        (
+            "build/reports/jacoco/test/jacocoTestReport.xml",
+            CoverageFormat::Jacoco,
+        ),
+        ("build/reports/jacoco/jacoco.xml", CoverageFormat::Jacoco),
+    ]
+}
+
+/// Report directories probed relative to a non-root Maven or Gradle module.
+fn nested_jvm_dirs() -> &'static [&'static str] {
+    &[
+        "target/site/jacoco",
+        "build/reports/jacoco",
+        "build/reports/jacoco/test",
+    ]
 }
 
 /// Artifact locations relative to a non-root Go module directory.
@@ -2965,6 +3036,7 @@ fn extend_directory_candidates(
     repo: &Path,
     families: &BTreeMap<String, CoverageFamilyStatus>,
     cargo_dirs: &[String],
+    jvm_dirs: &[String],
     out: &mut Vec<Candidate>,
 ) -> bool {
     let mut seen: BTreeSet<String> = out.iter().map(|c| c.rel.clone()).collect();
@@ -3017,6 +3089,13 @@ fn extend_directory_candidates(
         }
         for tail in nested_rust_dirs() {
             scan_dir(&format!("{dir}/{tail}"), "rust", &mut seen, out);
+        }
+    }
+    if families.contains_key("jvm") {
+        for dir in jvm_dirs {
+            for tail in nested_jvm_dirs() {
+                scan_dir(&format!("{dir}/{tail}"), "jvm", &mut seen, out);
+            }
         }
     }
     was_truncated
@@ -4620,7 +4699,7 @@ mod tests {
                 duration_hint: String::new(),
             },
         );
-        let cands = collect_candidates(&families, &[], &[]);
+        let cands = collect_candidates(&families, &[], &[], &[]);
         assert!(cands.iter().any(|c| c.rel == "lcov.info"));
         assert!(!cands.iter().any(|c| c.format == CoverageFormat::Jacoco));
         assert!(!cands.iter().any(|c| c.format == CoverageFormat::GoCover));
@@ -4645,7 +4724,7 @@ mod tests {
                 duration_hint: String::new(),
             },
         );
-        let cands = collect_candidates(&families, &[], &[]);
+        let cands = collect_candidates(&families, &[], &[], &[]);
         assert!(cands.iter().any(|c| c.rel == "coverage.xml"));
         assert!(!cands.iter().any(|c| c.format == CoverageFormat::GoCover));
         assert!(!cands.iter().any(|c| c.format == CoverageFormat::Jacoco));
