@@ -288,3 +288,66 @@ describe("trapFocus action", () => {
     expect(currentTarget()).toBe(outside);
   });
 });
+
+describe("focusAdjacentToMenuOpener", () => {
+  class Stop {
+    tabIndex = 0;
+    isConnected = true;
+    focused = false;
+    constructor(public name: string, public order: number, public visible = true) {}
+    getAttribute(): string | null { return null; }
+    hasAttribute(): boolean { return false; }
+    getClientRects(): unknown[] { return this.visible ? [{}] : []; }
+    focus(): void { this.focused = true; }
+    contains(other: unknown): boolean { return other === this; }
+    compareDocumentPosition(other: Stop): number { return other.order > this.order ? 4 : 2; }
+  }
+  const rootOf = (stops: Stop[]) => ({
+    querySelectorAll: () => stops as unknown as ArrayLike<HTMLElement>,
+  });
+  const run = async (
+    stops: Stop[], popup: Stop, opener: Stop | null, backwards: boolean,
+  ) => {
+    const { focusAdjacentToMenuOpener } = await import("./focusTrap");
+    focusAdjacentToMenuOpener(
+      popup as unknown as HTMLElement,
+      opener as unknown as HTMLElement | null,
+      backwards,
+      rootOf(stops),
+    );
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  };
+
+  it("focuses the stop after the opener, skipping the popup and hidden stops", async () => {
+    const a = new Stop("a", 1);
+    const opener = new Stop("opener", 2);
+    const inPopup = new Stop("popup", 3);
+    const hidden = new Stop("hidden", 4, false);
+    const b = new Stop("b", 5);
+    await run([a, opener, inPopup, hidden, b], inPopup, opener, false);
+    expect([a.focused, b.focused]).toEqual([false, true]);
+  });
+
+  it("goes backwards with shift, and wraps to the ends without an opener", async () => {
+    const a = new Stop("a", 1);
+    const opener = new Stop("opener", 2);
+    const b = new Stop("b", 3);
+    const popup = new Stop("popup", 9);
+    await run([a, opener, b], popup, opener, true);
+    expect(a.focused).toBe(true);
+    const c = new Stop("c", 1);
+    const d = new Stop("d", 2);
+    await run([c, d], popup, null, true);
+    expect(d.focused).toBe(true);
+  });
+
+  it("falls back to document order when the opener is not a tab stop", async () => {
+    const a = new Stop("a", 1);
+    const b = new Stop("b", 5);
+    const opener = new Stop("opener", 3);
+    opener.tabIndex = -1;
+    const popup = new Stop("popup", 9);
+    await run([a, opener, b], popup, opener, false);
+    expect(b.focused).toBe(true);
+  });
+});

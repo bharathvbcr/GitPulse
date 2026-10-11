@@ -56,7 +56,7 @@
     harnessStore,
     type AiGeneration,
   } from "../stores/harnessStore";
-  import { copyText } from "../desktop/clipboard";
+  import { createCopyFlash } from "../desktop/clipboard";
   import { coverageGap, formatHealthReport, formatDeadCodeStatus, observedTotal } from "../health/report";
   import {
     githubAlertsCache,
@@ -625,17 +625,13 @@
     return `${text}\n${stamps.join("\n")}`;
   }
 
-  let copyTimer: number | null = null;
-  let planCopyTimer: number | null = null;
+  const copyFlash = createCopyFlash((value) => (copied = value));
+  const planCopyFlash = createCopyFlash((value) => (planCopied = value));
 
   async function copyReport() {
     const text = renderedReport();
     if (!text) return;
-    if (await copyText(text)) {
-      copied = true;
-      if (copyTimer !== null) window.clearTimeout(copyTimer);
-      copyTimer = window.setTimeout(() => (copied = false), 1500);
-    }
+    await copyFlash.copy(text);
   }
 
   /**
@@ -744,11 +740,7 @@
 
   async function copyPlan() {
     if (!plan?.text) return;
-    if (await copyText(plan.text)) {
-      planCopied = true;
-      if (planCopyTimer !== null) window.clearTimeout(planCopyTimer);
-      planCopyTimer = window.setTimeout(() => (planCopied = false), 1500);
-    }
+    await planCopyFlash.copy(plan.text);
   }
 
   let agentLauncher = $state<PromptLauncher>("claude");
@@ -758,7 +750,7 @@
   let agentCopied = $state(false);
   let agentError = $state<string | null>(null);
   let agentNotice = $state<string | null>(null);
-  let agentCopyTimer: number | null = null;
+  const agentCopyFlash = createCopyFlash((value) => (agentCopied = value));
   /**
    * The one pending launch, cancelled with the repository it was started for.
    * A prompt built for the previous checkout must never open in the next.
@@ -816,13 +808,15 @@
   async function copyHealthAgentPrompt() {
     const text = agentPrompt;
     if (!text) return;
-    const ok = await copyText(text);
-    if (agentPrompt !== text) return;
-    if (ok) {
-      agentCopied = true;
-      if (agentCopyTimer !== null) window.clearTimeout(agentCopyTimer);
-      agentCopyTimer = window.setTimeout(() => (agentCopied = false), 1500);
-    } else {
+    const ok = await agentCopyFlash.copy(text);
+    if (agentPrompt !== text) {
+      // The prompt changed while the copy was in flight: that copy is not of
+      // what is on screen, so do not claim it.
+      agentCopyFlash.dispose();
+      agentCopied = false;
+      return;
+    }
+    if (!ok) {
       agentError = "Could not copy. Open Preview prompt and copy it from there.";
       agentPreviewOpen = true;
     }
@@ -837,9 +831,9 @@
       fixInflight?.cancel();
       stepsInflight?.cancel();
       cancelHealthAgentLaunch();
-      if (copyTimer !== null) window.clearTimeout(copyTimer);
-      if (planCopyTimer !== null) window.clearTimeout(planCopyTimer);
-      if (agentCopyTimer !== null) window.clearTimeout(agentCopyTimer);
+      copyFlash.dispose();
+      planCopyFlash.dispose();
+      agentCopyFlash.dispose();
     };
   });
 

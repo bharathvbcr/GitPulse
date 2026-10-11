@@ -369,7 +369,8 @@ describe("BranchList menu keyboard accessibility", () => {
     expect(tabBranch).toContain("focusAdjacentToMenuOpener(");
     expect(tabBranch).toContain("e.shiftKey");
     expect(tabBranch).not.toContain("restoreFocus");
-    expect(source).toContain("candidate.tabIndex >= 0");
+    expect(source).toMatch(/focusAdjacentToMenuOpener[^}]*\} from "[./]+\/ui\/focusTrap"/);
+    expect(source).not.toContain("function focusAdjacentToMenuOpener");
   });
 
   it("declares popup semantics on the kebab trigger", () => {

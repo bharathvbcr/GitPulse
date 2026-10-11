@@ -33,7 +33,7 @@ describe("StoragePanel source contracts & async hygiene", () => {
   });
 
   it("cleans up timers on unmount", () => {
-    expect(source).toContain("if (copyTimer !== null) window.clearTimeout(copyTimer);");
+    expect(source).toContain("copyFlash.dispose();"); // the timer itself is covered in desktop/clipboard.test.ts
   });
 
   it("never renders a retained report as a current measurement", () => {

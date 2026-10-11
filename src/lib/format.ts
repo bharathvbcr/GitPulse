@@ -38,3 +38,15 @@ export function shortHash(hash: string | null | undefined, len = 7): string {
 export function plural(count: number, singular: string, pluralForm = `${singular}s`): string {
   return `${count} ${count === 1 ? singular : pluralForm}`;
 }
+
+/** Minutes since local midnight as `HH:MM`, the value of an `<input type="time">`. */
+export function formatClockMinutes(minutes: number): string {
+  return `${String(Math.floor(minutes / 60)).padStart(2, "0")}:${String(minutes % 60).padStart(2, "0")}`;
+}
+
+/** Inverse of `formatClockMinutes`; throws on anything but a valid 24-hour `HH:MM`. */
+export function parseClockMinutes(clock: string): number {
+  if (!/^([01][0-9]|2[0-3]):[0-5][0-9]$/.test(clock)) throw new Error("Choose valid local quiet hours.");
+  const [h, m] = clock.split(":").map(Number);
+  return h * 60 + m;
+}
