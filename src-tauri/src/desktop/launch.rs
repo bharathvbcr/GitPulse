@@ -94,6 +94,11 @@ pub fn establish() -> Launch {
             // taking its mailbox with it.
             let launch = unless_already_running();
             if let Launch::Proceed = launch {
+                // Agent hooks' command verdicts, answered here instead of by a
+                // `manvi serve` each hook would start.
+                primary.attach_gate(std::sync::Arc::new(|cwd, command| {
+                    crate::hooks::serve_gate(cwd, command)
+                }));
                 let _ = PRIMARY.set(primary);
             }
             launch

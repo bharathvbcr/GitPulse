@@ -55,6 +55,9 @@ const MAX_FRAME: usize = 128 * 1024;
 const MAX_PATHS: usize = 16;
 /// `PATH_MAX` on macOS.
 const MAX_PATH_BYTES: usize = 1024;
+/// The longest command line a hook may ask the app to judge. A longer one is
+/// judged by the hook's own path, which has no frame to fit in.
+const MAX_GATE_COMMAND_BYTES: usize = 48 * 1024;
 /// Native notification identifiers are well under this; see
 /// `alerts::native_session_key` and `workbench::notifications::owned`, which
 /// validate them properly on the owner's side.
@@ -62,6 +65,10 @@ const MAX_NATIVE_ID: usize = 256;
 /// Connections answered at once. A connection past this is closed unanswered
 /// and its sender retries until its own deadline.
 const MAX_HANDLERS: usize = 8;
+/// Hook verdicts in flight at once, counted on top of [`MAX_HANDLERS`] so a
+/// burst of agent hooks can never use up the handlers a relaunch needs. One
+/// past this is answered "busy" and its hook judges the command itself.
+const MAX_GATE_HANDLERS: usize = 16;
 /// Requests held for an owner whose window is not up yet.
 const MAX_QUEUED: usize = 32;
 /// How long the owner gives one connection end to end. Longer than the
@@ -90,6 +97,16 @@ pub enum Request {
     /// A banner was clicked, or its Snooze pressed, and macOS delivered the
     /// response to the launch rather than to the owner.
     Notification { id: String, snooze: bool },
+    /// An agent hook asking for a verdict on a command it is about to let run.
+    /// Answered on the connection, by whatever [`Primary::attach_gate`] put
+    /// there, rather than handed to the window: see [`GateSink`].
+    GateCommand {
+        /// Echoed in the answer, so a reply that belongs to another request is
+        /// refused by the hook rather than believed.
+        id: String,
+        cwd: String,
+        command: String,
+    },
 }
 
 impl Request {
@@ -121,6 +138,22 @@ impl Request {
                 }
                 Ok(())
             }
+            Request::GateCommand { id, cwd, command } => {
+                if id.is_empty() || id.len() > MAX_NATIVE_ID || id.chars().any(char::is_control) {
+                    return Err("gate request id is empty, too long or not printable".into());
+                }
+                if cwd.is_empty()
+                    || cwd.len() > MAX_PATH_BYTES
+                    || cwd.contains('\0')
+                    || !Path::new(cwd).is_absolute()
+                {
+                    return Err("gate cwd must be an absolute path".into());
+                }
+                if command.is_empty() || command.len() > MAX_GATE_COMMAND_BYTES {
+                    return Err("gate command is empty or too long".into());
+                }
+                Ok(())
+            }
         }
     }
 }
@@ -145,6 +178,32 @@ struct Ack {
     accepted: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     reason: Option<String>,
+    /// The request's `id` and the verdict, for the one request that has an
+    /// answer beyond "accepted".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    reply: Option<serde_json::Value>,
+}
+
+impl Ack {
+    fn accepted() -> Self {
+        Self {
+            accepted: true,
+            reason: None,
+            id: None,
+            reply: None,
+        }
+    }
+
+    fn refused(reason: String) -> Self {
+        Self {
+            accepted: false,
+            reason: Some(reason),
+            id: None,
+            reply: None,
+        }
+    }
 }
 
 /// Where the lock and the mailbox live for a profile directory.
@@ -381,12 +440,28 @@ pub struct Secondary {
 
 impl Secondary {
     fn connect(socket: &Path) -> Result<Self, Reach> {
+        Self::connect_within(socket, HELLO_TIMEOUT)
+    }
+
+    /// [`Self::connect`] with a greeting deadline of the caller's choosing. A
+    /// peer that is not this user is not an owner: the profile directory is
+    /// private, so one that answers there is an impostor or a misconfiguration,
+    /// and either way nothing may be handed to it.
+    fn connect_within(socket: &Path, hello: Duration) -> Result<Self, Reach> {
         let unreachable = |error: String| Reach::Unreachable(error);
         let stream = UnixStream::connect(socket)
             .map_err(|error| unreachable(format!("connect: {error}")))?;
+        // SAFETY: `getuid` reads this process's real user id and cannot fail.
+        let own_uid = unsafe { libc::getuid() };
+        let peer = crate::local_socket::peer_uid(&stream);
+        if !peer_allowed(peer, own_uid) {
+            return Err(unreachable(format!(
+                "the owner is uid {peer:?}, not this user"
+            )));
+        }
         stream
-            .set_read_timeout(Some(HELLO_TIMEOUT))
-            .and_then(|()| stream.set_write_timeout(Some(HELLO_TIMEOUT)))
+            .set_read_timeout(Some(hello))
+            .and_then(|()| stream.set_write_timeout(Some(hello)))
             .map_err(|error| unreachable(format!("timeouts: {error}")))?;
         let mut reader = BufReader::new(
             stream
@@ -423,11 +498,31 @@ impl Secondary {
     /// Hands the owner `request`. The connection was opened by [`claim`] and is
     /// held while the caller works out what to send, which the owner allows
     /// for up to [`HANDLER_TIMEOUT`].
-    pub fn forward(mut self, request: &Request) -> Result<(), String> {
+    pub fn forward(self, request: &Request) -> Result<(), String> {
+        self.exchange(request, HANDLER_TIMEOUT).map(|_| ())
+    }
+
+    /// Asks the owner for a verdict on a command: the answer is the owner's
+    /// reply to [`Request::GateCommand`], returned only when the owner echoed
+    /// this request's id. Anything else — a refusal, a missing or foreign id, a
+    /// missing reply — is an error, and the caller judges the command itself.
+    pub fn gate(self, request: &Request, within: Duration) -> Result<serde_json::Value, String> {
+        let Request::GateCommand { id, .. } = request else {
+            return Err("not a gate request".into());
+        };
+        let ack = self.exchange(request, within)?;
+        if ack.id.as_deref() != Some(id.as_str()) {
+            return Err("the answer names another request".into());
+        }
+        ack.reply
+            .ok_or_else(|| "the answer carries no verdict".into())
+    }
+
+    fn exchange(mut self, request: &Request, within: Duration) -> Result<Ack, String> {
         request.validate()?;
         self.stream
-            .set_read_timeout(Some(HANDLER_TIMEOUT))
-            .and_then(|()| self.stream.set_write_timeout(Some(HANDLER_TIMEOUT)))
+            .set_read_timeout(Some(within))
+            .and_then(|()| self.stream.set_write_timeout(Some(within)))
             .map_err(|error| format!("timeouts: {error}"))?;
         let envelope = Envelope {
             v: PROTOCOL,
@@ -444,12 +539,26 @@ impl Secondary {
         let line = read_frame(&mut self.reader)?.ok_or("the owner closed without an answer")?;
         let ack: Ack = serde_json::from_str(&line).map_err(|error| format!("answer: {error}"))?;
         if ack.accepted {
-            Ok(())
+            Ok(ack)
         } else {
             Err(ack.reason.unwrap_or_else(|| "refused".into()))
         }
     }
 }
+
+/// How a hook reaches the running app: `dir` is the profile directory its
+/// owner claimed. `None` when there is no owner to ask — the ordinary case when
+/// GitPulse is closed, which is why this never claims anything.
+pub fn reach_owner(dir: &Path, hello: Duration) -> Option<Secondary> {
+    let paths = Paths::in_dir(&dir.canonicalize().ok()?);
+    if !paths.socket_fits() {
+        return None;
+    }
+    Secondary::connect_within(&paths.socket, hello).ok()
+}
+
+/// Judges one command for a hook: `(cwd, command)` to the verdict's JSON.
+pub type GateSink = Arc<dyn Fn(&str, &str) -> Result<serde_json::Value, String> + Send + Sync>;
 
 type Sink = Arc<dyn Fn(Request) + Send + Sync>;
 
@@ -462,8 +571,23 @@ struct Inbox {
 struct Shared {
     closing: AtomicBool,
     active: AtomicUsize,
+    gating: AtomicUsize,
+    gate: Mutex<Option<GateSink>>,
     inbox: Mutex<Inbox>,
     own_uid: u32,
+}
+
+impl Shared {
+    fn new(own_uid: u32) -> Self {
+        Self {
+            closing: AtomicBool::new(false),
+            active: AtomicUsize::new(0),
+            gating: AtomicUsize::new(0),
+            gate: Mutex::new(None),
+            inbox: Mutex::new(Inbox::default()),
+            own_uid,
+        }
+    }
 }
 
 /// The profile's owner. Holds the lock for as long as it lives.
@@ -483,14 +607,11 @@ impl Primary {
             .set_len(0)
             .and_then(|()| write!(lock, "{}", std::process::id()))
             .and_then(|()| lock.flush());
-        let shared = Arc::new(Shared {
-            closing: AtomicBool::new(false),
-            active: AtomicUsize::new(0),
-            inbox: Mutex::new(Inbox::default()),
+        let shared = Arc::new(Shared::new(
             // SAFETY: `getuid` reads this process's real user id and cannot
             // fail — the same id the hook bridge compares peers against.
-            own_uid: unsafe { libc::getuid() },
-        });
+            unsafe { libc::getuid() },
+        ));
         let mut primary = Self {
             _lock: lock,
             paths,
@@ -544,6 +665,17 @@ impl Primary {
         }
     }
 
+    /// Where hooks' command verdicts are answered from now on. Until this is
+    /// called a [`Request::GateCommand`] is refused, and its hook judges the
+    /// command itself.
+    pub fn attach_gate(&self, sink: GateSink) {
+        *self
+            .shared
+            .gate
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(sink);
+    }
+
     /// Stops answering and takes the mailbox down, keeping the lock. A launch
     /// from here on waits for the lock instead, which the kernel releases when
     /// this process is gone — so a relaunch during a slow quit becomes the next
@@ -593,7 +725,7 @@ fn accept_loop(listener: UnixListener, shared: Arc<Shared>) {
                 continue;
             }
         };
-        if shared.active.fetch_add(1, Ordering::AcqRel) >= MAX_HANDLERS {
+        if shared.active.fetch_add(1, Ordering::AcqRel) >= MAX_HANDLERS + MAX_GATE_HANDLERS {
             shared.active.fetch_sub(1, Ordering::AcqRel);
             continue;
         }
@@ -655,7 +787,7 @@ fn answer(stream: &mut UnixStream, shared: &Shared) -> Result<(), String> {
     let Some(line) = read_frame(&mut reader)? else {
         return Ok(());
     };
-    let verdict = serde_json::from_str::<Envelope>(&line)
+    let request = serde_json::from_str::<Envelope>(&line)
         .map_err(|error| format!("malformed request: {error}"))
         .and_then(|envelope| {
             if envelope.v != PROTOCOL {
@@ -663,17 +795,21 @@ fn answer(stream: &mut UnixStream, shared: &Shared) -> Result<(), String> {
             }
             envelope.request.validate()?;
             Ok(envelope.request)
-        })
-        .and_then(|request| admit(shared, request));
+        });
+    let request = match request {
+        Ok(request) => request,
+        Err(reason) => {
+            write_frame(stream, &Ack::refused(reason.clone()))?;
+            return Err(reason);
+        }
+    };
+    if let Request::GateCommand { id, cwd, command } = &request {
+        return answer_gate(stream, shared, id, cwd, command);
+    }
+    let verdict = admit(shared, request);
     let ack = match &verdict {
-        Ok(_) => Ack {
-            accepted: true,
-            reason: None,
-        },
-        Err(reason) => Ack {
-            accepted: false,
-            reason: Some(reason.clone()),
-        },
+        Ok(_) => Ack::accepted(),
+        Err(reason) => Ack::refused(reason.clone()),
     };
     write_frame(stream, &ack)?;
     match verdict {
@@ -683,6 +819,64 @@ fn answer(stream: &mut UnixStream, shared: &Shared) -> Result<(), String> {
         }
         Ok(None) => Ok(()),
         Err(reason) => Err(reason),
+    }
+}
+
+/// Answers a hook's [`Request::GateCommand`] on its connection. The sink's
+/// error is a refusal, not a verdict: the hook reads it as "judge this
+/// yourself", which is the path that has always decided.
+fn answer_gate(
+    stream: &mut UnixStream,
+    shared: &Shared,
+    id: &str,
+    cwd: &str,
+    command: &str,
+) -> Result<(), String> {
+    let slot = GateSlot::take(shared);
+    // Cloned out so the lock is not held while the verdict is worked out.
+    let sink = shared
+        .gate
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .clone();
+    let outcome = if shared.closing.load(Ordering::Acquire) {
+        Err("GitPulse is quitting".to_string())
+    } else if slot.is_none() {
+        Err("the gate is busy".to_string())
+    } else {
+        match sink {
+            Some(sink) => sink(cwd, command),
+            None => Err("the gate is not attached".to_string()),
+        }
+    };
+    let ack = match outcome {
+        Ok(reply) => Ack {
+            accepted: true,
+            reason: None,
+            id: Some(id.to_string()),
+            reply: Some(reply),
+        },
+        Err(reason) => Ack::refused(reason),
+    };
+    write_frame(stream, &ack)
+}
+
+/// One of the [`MAX_GATE_HANDLERS`] verdicts in flight, released on drop.
+struct GateSlot<'a>(&'a Shared);
+
+impl<'a> GateSlot<'a> {
+    fn take(shared: &'a Shared) -> Option<Self> {
+        if shared.gating.fetch_add(1, Ordering::AcqRel) >= MAX_GATE_HANDLERS {
+            shared.gating.fetch_sub(1, Ordering::AcqRel);
+            return None;
+        }
+        Some(Self(shared))
+    }
+}
+
+impl Drop for GateSlot<'_> {
+    fn drop(&mut self) {
+        self.0.gating.fetch_sub(1, Ordering::AcqRel);
     }
 }
 

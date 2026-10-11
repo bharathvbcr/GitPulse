@@ -890,12 +890,7 @@ fn a_killed_owner_frees_the_profile_even_if_its_child_lives_on() {
 
 #[test]
 fn a_panicking_mailbox_handler_releases_its_slot() {
-    let shared = Arc::new(Shared {
-        closing: AtomicBool::new(false),
-        active: AtomicUsize::new(0),
-        inbox: Mutex::new(Inbox::default()),
-        own_uid: 0,
-    });
+    let shared = Arc::new(Shared::new(0));
     // More panics than there are slots: without release-on-drop the mailbox
     // would be full after MAX_HANDLERS of them and refuse every later launch.
     for _ in 0..MAX_HANDLERS * 2 {
@@ -909,4 +904,157 @@ fn a_panicking_mailbox_handler_releases_its_slot() {
         assert!(panicked.is_err());
     }
     assert_eq!(shared.active.load(Ordering::Acquire), 0);
+}
+
+// ---------------------------------------------------------------------------
+// Hook verdicts over the mailbox
+// ---------------------------------------------------------------------------
+
+fn gate_request(id: &str) -> Request {
+    Request::GateCommand {
+        id: id.into(),
+        cwd: "/".into(),
+        command: "ls".into(),
+    }
+}
+
+#[test]
+fn a_gate_request_is_bounded_before_anything_acts_on_it() {
+    assert_eq!(gate_request("g-1").validate(), Ok(()));
+    let refused = [
+        Request::GateCommand {
+            id: String::new(),
+            cwd: "/".into(),
+            command: "ls".into(),
+        },
+        Request::GateCommand {
+            id: "g\n1".into(),
+            cwd: "/".into(),
+            command: "ls".into(),
+        },
+        Request::GateCommand {
+            id: "g".into(),
+            cwd: "relative".into(),
+            command: "ls".into(),
+        },
+        Request::GateCommand {
+            id: "g".into(),
+            cwd: "/a\0b".into(),
+            command: "ls".into(),
+        },
+        Request::GateCommand {
+            id: "g".into(),
+            cwd: "/".into(),
+            command: String::new(),
+        },
+        Request::GateCommand {
+            id: "g".into(),
+            cwd: "/".into(),
+            command: "x".repeat(MAX_GATE_COMMAND_BYTES + 1),
+        },
+    ];
+    for request in refused {
+        assert!(request.validate().is_err(), "{request:?}");
+    }
+}
+
+#[test]
+fn a_gate_request_is_refused_until_a_gate_is_attached() {
+    let dir = profile();
+    let owner = primary(dir.path());
+    let socket = Paths::in_dir(&dir.path().canonicalize().unwrap()).socket;
+    let secondary = Secondary::connect(&socket).ok().expect("reach the owner");
+    let refused = secondary.gate(&gate_request("g-1"), Duration::from_secs(5));
+    assert!(refused.is_err(), "answered with no gate attached");
+    drop(owner);
+}
+
+#[test]
+fn a_gate_answer_carries_the_sinks_verdict_and_the_requests_id() {
+    let dir = profile();
+    let owner = primary(dir.path());
+    owner.attach_gate(Arc::new(|cwd, command| {
+        Ok(serde_json::json!({"cwd": cwd, "command": command}))
+    }));
+    let socket = Paths::in_dir(&dir.path().canonicalize().unwrap()).socket;
+    let reply = Secondary::connect(&socket)
+        .ok()
+        .expect("reach the owner")
+        .gate(&gate_request("g-7"), Duration::from_secs(5))
+        .expect("answered");
+    assert_eq!(reply, serde_json::json!({"cwd": "/", "command": "ls"}));
+
+    // A sink that errors is a refusal, never a reply.
+    owner.attach_gate(Arc::new(|_, _| Err("no verdict".into())));
+    let refused = Secondary::connect(&socket)
+        .ok()
+        .expect("reach the owner")
+        .gate(&gate_request("g-8"), Duration::from_secs(5));
+    assert_eq!(refused, Err("no verdict".to_string()));
+}
+
+#[test]
+fn a_burst_of_hooks_is_bounded_and_never_starves_a_relaunch() {
+    let dir = profile();
+    let owner = primary(dir.path());
+    let release = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+    let entered = Arc::new(AtomicUsize::new(0));
+    {
+        let release = release.clone();
+        let entered = entered.clone();
+        owner.attach_gate(Arc::new(move |_, _| {
+            entered.fetch_add(1, Ordering::AcqRel);
+            let (open, wake) = &*release;
+            let mut open = open.lock().unwrap();
+            while !*open {
+                open = wake.wait(open).unwrap();
+            }
+            Ok(serde_json::json!({"ok": true}))
+        }));
+    }
+    let socket = Paths::in_dir(&dir.path().canonicalize().unwrap()).socket;
+    let held: Vec<_> = (0..MAX_GATE_HANDLERS)
+        .map(|n| {
+            let socket = socket.clone();
+            std::thread::spawn(move || {
+                Secondary::connect(&socket)
+                    .ok()
+                    .expect("reach the owner")
+                    .gate(&gate_request(&format!("g-{n}")), Duration::from_secs(30))
+            })
+        })
+        .collect();
+    let started = Instant::now();
+    while entered.load(Ordering::Acquire) < MAX_GATE_HANDLERS {
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "gates never filled"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+
+    // One past the cap is told it is busy, at once.
+    let over = Secondary::connect(&socket)
+        .ok()
+        .expect("reach the owner")
+        .gate(&gate_request("g-over"), Duration::from_secs(5));
+    assert_eq!(over, Err("the gate is busy".to_string()));
+    // And a relaunch is still taken while every gate slot is held.
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let sink = seen.clone();
+    owner.attach(move |request| sink.lock().unwrap().push(request));
+    Secondary::connect(&socket)
+        .ok()
+        .expect("reach the owner")
+        .forward(&Request::Reveal)
+        .expect("a relaunch was starved by hook traffic");
+
+    {
+        let (open, wake) = &*release;
+        *open.lock().unwrap() = true;
+        wake.notify_all();
+    }
+    for worker in held {
+        assert!(worker.join().unwrap().is_ok());
+    }
 }

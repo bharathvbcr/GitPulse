@@ -23,6 +23,7 @@ pub use policy::{
 pub use protocol::{
     HelloResult, PrepareResult, ProbeResult, ScanModel, ScanResult, ScanServer, SettleResult,
 };
+pub(crate) use sidecar::Lane;
 pub use sidecar::{HarnessError, DEFAULT_CALL_TIMEOUT};
 
 /// What the UI shows about the harness.
@@ -150,22 +151,29 @@ pub(crate) fn guard_command_allowing(
 /// id or the harness's `host-scope` placeholder (always the placeholder from a
 /// `manvi` older than the scope allowlist fix), so its task id is no evidence of
 /// a binding.
-pub(crate) fn check_command_in_scope(repo_path: &str, command: &str) -> ScopedVerdict {
+///
+/// `lane` is the sidecar that answers: the hook process's own one-shot child
+/// ([`Lane::Shared`]) or the app's long-lived hook child ([`Lane::Hook`], via
+/// `hooks::serve_gate`). It is the one body both run, so they cannot disagree
+/// about what a scope is.
+pub(crate) fn check_command_in_scope(lane: Lane, repo_path: &str, command: &str) -> ScopedVerdict {
+    let ask =
+        |scope: Option<&HostScope>| policy::check_command_on(lane, repo_path, command, scope, &[]);
     match hook_scope(repo_path) {
         HookScope::Declared(scope) => ScopedVerdict {
             bound: true,
             unscoped: None,
-            verdict: check_command(repo_path, command, Some(&scope)),
+            verdict: ask(Some(&scope)),
         },
         HookScope::Unbound => ScopedVerdict {
             bound: false,
             unscoped: None,
-            verdict: check_command(repo_path, command, None),
+            verdict: ask(None),
         },
         HookScope::Untrusted => ScopedVerdict {
             bound: false,
             unscoped: Some(UNSCOPED_UNTRUSTED),
-            verdict: check_command(repo_path, command, None),
+            verdict: ask(None),
         },
         HookScope::Unresolved(failure) => ScopedVerdict {
             bound: true,
@@ -755,7 +763,7 @@ done
         // The hook learns the binding from here, never from the verdict's
         // task id, which may be the harness's `host-scope` placeholder.
         assert!(
-            check_command_in_scope(repo, "ls").bound,
+            check_command_in_scope(Lane::Shared, repo, "ls").bound,
             "a bound checkout must report that it is bound"
         );
         std::fs::remove_file(&requests).ok();
@@ -957,7 +965,7 @@ done
         );
         assert!(!verdict.gate_failed(), "a refusal, not a gate outage");
         // And the agent hook, which judges through the same owner, refuses too.
-        let judged = check_command_in_scope(&worktree, "echo x > src/planned.rs");
+        let judged = check_command_in_scope(Lane::Shared, &worktree, "echo x > src/planned.rs");
         assert!(judged.verdict.blocks() && judged.bound, "{judged:?}");
     }
 
@@ -1016,7 +1024,8 @@ done
 
         // The agent hook path: no binding to read, so judged unscoped rather
         // than refused for want of one.
-        let ScopedVerdict { verdict, bound, .. } = check_command_in_scope(&worktree, "ls");
+        let ScopedVerdict { verdict, bound, .. } =
+            check_command_in_scope(Lane::Shared, &worktree, "ls");
         assert!(!bound, "a missing checkout declares no scope");
         assert_ne!(verdict.rule, TASK_SCOPE_UNAVAILABLE, "{verdict:?}");
     }

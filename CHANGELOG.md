@@ -13,6 +13,14 @@ before that tag is pushed.
 
 ### Added
 
+- The agent hook's command gate asks the running app over the single-instance
+  mailbox instead of starting a `manvi serve` per Bash call: about 31 ms to
+  about 10 ms median per call (release hook, loaded machine; see
+  `docs/PERFORMANCE.md`). The app judges on its own hook-lane sidecar,
+  isolated from the shared one; with no app, a slow or malformed answer, the
+  hook judges the command itself as before, and never allows what that path
+  would refuse. The mailbox's peer check now covers the connecting side too.
+
 - An agent's `done` that is held in review for lack of a passing verification
   now starts that verification itself (one per task and head, at most two at a
   time, off the MCP response path) and moves the card to done when Manvi's
