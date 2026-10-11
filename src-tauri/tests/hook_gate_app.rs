@@ -108,9 +108,9 @@ fn hooks_ask_the_app_and_fall_back_to_their_own_manvi() {
     )
     .unwrap();
     std::fs::set_permissions(&manvi, std::fs::Permissions::from_mode(0o755)).unwrap();
-    // SAFETY: the only test in this binary, so nothing else reads or writes
-    // the environment concurrently.
-    unsafe { std::env::set_var("GITPULSE_MANVI_BIN", &manvi) };
+    // The env owner serializes the write and restores it on drop.
+    let serial = hermetic_env::env_serial();
+    let _env = hermetic_env::bind_env(&serial).set("GITPULSE_MANVI_BIN", &manvi);
 
     let repo = scratch.path().join("repo");
     std::fs::create_dir_all(&repo).unwrap();

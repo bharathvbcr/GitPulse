@@ -384,7 +384,8 @@ mod tests {
         let started = std::time::Instant::now();
         render(&emphasis, None).unwrap();
         assert!(
-            started.elapsed() < std::time::Duration::from_secs(10),
+            started.elapsed()
+                < crate::test_support::coverage_relaxed(std::time::Duration::from_secs(10)),
             "{:?} for a quarter-cap emphasis storm",
             started.elapsed()
         );

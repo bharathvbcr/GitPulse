@@ -96,8 +96,9 @@ fn command_gate_cost_with_and_without_the_app() {
     let manvi = PathBuf::from(
         std::env::var_os("GITPULSE_BENCH_MANVI").expect("GITPULSE_BENCH_MANVI names the manvi"),
     );
-    // SAFETY: the only test in this binary; nothing else touches the environment.
-    unsafe { std::env::set_var("GITPULSE_MANVI_BIN", &manvi) };
+    // The env owner serializes the write and restores it on drop.
+    let serial = hermetic_env::env_serial();
+    let _env = hermetic_env::bind_env(&serial).set("GITPULSE_MANVI_BIN", &manvi);
     let rounds = env_usize("GITPULSE_BENCH_ROUNDS", 7);
     let calls = env_usize("GITPULSE_BENCH_CALLS", 30);
 
