@@ -214,6 +214,11 @@ fn server_document(name: &str) -> Result<Value, ReadError> {
             "name": super::SERVER_NAME,
             "version": super::server_version(),
             "storeSchemaVersion": crate::codeintel::SUPPORTED_STORE_SCHEMA,
+            // The two dc-store schemas this build embeds, so a cross-app check
+            // can ask an installed binary rather than trust the source it
+            // might not have been built from (scripts/check-schema-parity.mjs).
+            "dcStoreSchemaVersion": dc_store::SCHEMA_VERSION,
+            "workbenchSchemaVersion": dc_store::workbench::WORKBENCH_SCHEMA,
             "protocolVersion": super::PROTOCOL_VERSION,
             "legacyVersions": super::LEGACY_VERSIONS,
             // Derived from the tool annotations, so it cannot claim "read-only"
@@ -551,6 +556,11 @@ mod tests {
         assert_eq!(
             parsed["storeSchemaVersion"],
             crate::codeintel::SUPPORTED_STORE_SCHEMA
+        );
+        assert_eq!(parsed["dcStoreSchemaVersion"], dc_store::SCHEMA_VERSION);
+        assert_eq!(
+            parsed["workbenchSchemaVersion"],
+            dc_store::workbench::WORKBENCH_SCHEMA
         );
     }
 

@@ -169,11 +169,32 @@ function isRecord(value) {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+/** @param {unknown} value @returns {number | null} */
+function schemaNumber(value) {
+  return typeof value === "number" && Number.isSafeInteger(value) && value > 0 ? value : null;
+}
+
+/**
+ * The schema identity a server's manifest declares.
+ *
+ * @typedef {{ storeSchema: number | null, dcStoreSchema: number | null, workbenchSchema: number | null, error: string | null }} ManifestIdentity
+ */
+
+/** @param {string} error @returns {ManifestIdentity} */
+function unidentified(error) {
+  return { storeSchema: null, dcStoreSchema: null, workbenchSchema: null, error };
+}
+
 /**
  * A missing reply is distinct from a reply whose schema identity is unavailable.
+ *
+ * `storeSchemaVersion` is required. The dc-store and workbench numbers came
+ * later: a binary built before them reports `null` for both, which a caller
+ * must treat as "this binary did not say", never as a match.
+ *
  * @param {string} stdout
  * @param {number} id
- * @returns {{ storeSchema: number | null, error: string | null } | null}
+ * @returns {ManifestIdentity | null}
  */
 export function parseServerManifest(stdout, id) {
   for (const line of stdout.split(/\r?\n/)) {
@@ -183,23 +204,29 @@ export function parseServerManifest(stdout, id) {
     if (!isRecord(message) || message.id !== id) continue;
     if (!isRecord(message.result) || !Array.isArray(message.result.contents)
         || message.result.contents.length !== 1) {
-      return { storeSchema: null, error: "server did not return its manifest resource" };
+      return unidentified("server did not return its manifest resource");
     }
     const content = message.result.contents[0];
     if (!isRecord(content) || content.uri !== MANIFEST_URI
         || content.mimeType !== "application/json" || typeof content.text !== "string") {
-      return { storeSchema: null, error: "server manifest is missing or truncated" };
+      return unidentified("server manifest is missing or truncated");
     }
     /** @type {unknown} */
     let manifest;
     try { manifest = JSON.parse(content.text); } catch {
-      return { storeSchema: null, error: "server manifest is invalid JSON" };
+      return unidentified("server manifest is invalid JSON");
     }
-    const schema = isRecord(manifest) ? manifest.storeSchemaVersion : null;
-    if (typeof schema !== "number" || !Number.isSafeInteger(schema) || schema <= 0) {
-      return { storeSchema: null, error: "server manifest has no valid storeSchemaVersion" };
+    if (!isRecord(manifest)) return unidentified("server manifest is not an object");
+    const storeSchema = schemaNumber(manifest.storeSchemaVersion);
+    if (storeSchema === null) {
+      return unidentified("server manifest has no valid storeSchemaVersion");
     }
-    return { storeSchema: schema, error: null };
+    return {
+      storeSchema,
+      dcStoreSchema: schemaNumber(manifest.dcStoreSchemaVersion),
+      workbenchSchema: schemaNumber(manifest.workbenchSchemaVersion),
+      error: null,
+    };
   }
   return null;
 }
@@ -213,7 +240,7 @@ export function parseServerManifest(stdout, id) {
  *
  * @param {string} binPath
  * @param {number} timeoutMs
- * @returns {Promise<{ version: string | null, storeSchema: number | null, error: string | null }>}
+ * @returns {Promise<{ version: string | null } & ManifestIdentity>}
  */
 export function probeServer(binPath, timeoutMs = DEFAULT_TIMEOUT_MS) {
   return new Promise((resolve) => {
@@ -222,7 +249,7 @@ export function probeServer(binPath, timeoutMs = DEFAULT_TIMEOUT_MS) {
     try {
       child = spawn(binPath, [], { stdio: ["pipe", "pipe", "pipe"] });
     } catch (err) {
-      resolve({ version: null, storeSchema: null, error: /** @type {Error} */ (err).message });
+      resolve({ version: null, storeSchema: null, dcStoreSchema: null, workbenchSchema: null, error: /** @type {Error} */ (err).message });
       return;
     }
     let stdout = "";
@@ -231,7 +258,7 @@ export function probeServer(binPath, timeoutMs = DEFAULT_TIMEOUT_MS) {
     let version = null;
     let requestedManifest = false;
     let settled = false;
-    const finish = (/** @type {{ version: string | null, storeSchema: number | null, error: string | null }} */ outcome) => {
+    const finish = (/** @type {{ version: string | null } & ManifestIdentity} */ outcome) => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
@@ -239,18 +266,18 @@ export function probeServer(binPath, timeoutMs = DEFAULT_TIMEOUT_MS) {
       resolve(outcome);
     };
     const timer = setTimeout(
-      () => finish({ version, storeSchema: null, error: `no complete identity response within ${timeoutMs}ms` }),
+      () => finish({ version, storeSchema: null, dcStoreSchema: null, workbenchSchema: null, error: `no complete identity response within ${timeoutMs}ms` }),
       timeoutMs,
     );
 
-    child.on("error", (err) => finish({ version, storeSchema: null, error: err.message }));
+    child.on("error", (err) => finish({ version, storeSchema: null, dcStoreSchema: null, workbenchSchema: null, error: err.message }));
     child.stderr.resume();
     child.stdout.setEncoding("utf8");
     child.stdout.on("data", (chunk) => {
       if (settled) return;
       receivedBytes += Buffer.byteLength(chunk, "utf8");
       if (receivedBytes > MAX_RESPONSE_BYTES) {
-        finish({ version, storeSchema: null, error: `identity response exceeded ${MAX_RESPONSE_BYTES} bytes` });
+        finish({ version, storeSchema: null, dcStoreSchema: null, workbenchSchema: null, error: `identity response exceeded ${MAX_RESPONSE_BYTES} bytes` });
         return;
       }
       stdout += chunk;
@@ -264,7 +291,7 @@ export function probeServer(binPath, timeoutMs = DEFAULT_TIMEOUT_MS) {
       if (manifest !== null) finish({ version, ...manifest });
     });
     child.on("close", () => {
-      finish({ version, storeSchema: null, error: version === null
+      finish({ version, storeSchema: null, dcStoreSchema: null, workbenchSchema: null, error: version === null
         ? "server exited without a usable initialize response"
         : "server exited without its manifest schema identity" });
     });
@@ -724,7 +751,7 @@ export async function main(argv = process.argv.slice(2)) {
     const expected = opts.expect ?? expectedVersion();
     const expectedSchema = readVendoredSchema();
     const binPath = opts.bin ?? resolveOnPath(SERVER_BIN);
-    const probe = binPath === null ? { version: null, storeSchema: null, error: null } : await probeServer(binPath, opts.timeoutMs);
+    const probe = binPath === null ? { version: null, storeSchema: null, dcStoreSchema: null, workbenchSchema: null, error: null } : await probeServer(binPath, opts.timeoutMs);
     const { status, violations } = classify({ binPath, ...probe, expected, expectedSchema });
 
     // Derived from the shipped manifest, so a hook added there is checked

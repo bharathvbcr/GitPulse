@@ -144,6 +144,9 @@ all three together, built from the same dc-store schema, before any of them open
 it. Reinstall the `gitpulse-mcp` and `gitpulse-hook` binaries too
 (`bun run mcp:install`); a binary built against an older schema refuses the
 migrated profile. The release notes in the CHANGELOG record each schema change.
+After updating, `bun run check:schema-parity` asks each installed reader which
+schemas it reads, including the app's bundled server, and names any that were
+left behind.
 
 ## Build from source
 
