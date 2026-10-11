@@ -1210,7 +1210,8 @@ fn test_rebase_failed_step_restores_original_branch() {
 #[test]
 fn test_coverage_scan_of_rust_lcov_in_opened_repo() {
     let repo = TestRepo::init();
-    repo.write("src/lib.rs", "pub fn x() {}\n");
+    // Two lines on disk: the scanner drops hits past the end of the file.
+    repo.write("src/lib.rs", "pub fn x() {}\npub fn y() {}\n");
     repo.write(
         "lcov.info",
         "SF:src/lib.rs\nDA:1,1\nDA:2,0\nend_of_record\n",
