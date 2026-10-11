@@ -668,7 +668,10 @@ impl Sidecar {
             .unwrap_or_default();
         match tail.last() {
             Some(last) if !last.is_empty() => {
-                format!(" (last diagnostic: {})", truncate(last, 200))
+                format!(
+                    " (last diagnostic: {})",
+                    crate::engine::budget::truncate_chars_ellipsis(last, 200)
+                )
             }
             _ => String::new(),
         }
@@ -715,20 +718,13 @@ fn classify_line(raw: &str, expected_id: &str) -> LineOutcome {
                     "sidecar answered {} with an undecodable response ({}): {}",
                     expected_id,
                     e,
-                    truncate(raw, 200)
+                    crate::engine::budget::truncate_chars_ellipsis(raw, 200)
                 ))
             } else {
                 LineOutcome::Ignore
             }
         }
     }
-}
-
-fn truncate(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
-        return s.to_string();
-    }
-    s.chars().take(max).collect::<String>() + "…"
 }
 
 #[cfg(unix)]

@@ -1108,19 +1108,91 @@ const ALERT_DISPLAY_LIMIT: usize = 50;
 /// `available: false` and an explicit reason, so the UI can distinguish "no
 /// open alerts" from "could not check".
 pub fn load_dependabot_alerts(repo_path: &str) -> DependabotReport {
+    load_alert_outcome(repo_path, list_dependabot_alerts).into()
+}
+
+/// What fetching one alert family produced, before it takes the wire shape of
+/// [`DependabotReport`] or [`CodeScanningReport`] (the two share every field
+/// but the alert row type, and the IPC type contract pins each by name).
+struct AlertOutcome<T> {
+    available: bool,
+    cli_present: bool,
+    is_github_remote: bool,
+    slug: String,
+    alerts: Vec<T>,
+    truncated: bool,
+    error: Option<String>,
+    unavailable_reason: Option<GithubUnavailableReason>,
+}
+
+impl<T> AlertOutcome<T> {
+    /// A fetch that never ran to an answer (the worker died or was
+    /// cancelled): unavailable with `error`, never an empty success.
+    fn transport_failure(error: String) -> Self {
+        Self {
+            available: false,
+            cli_present: false,
+            is_github_remote: false,
+            slug: String::new(),
+            alerts: Vec::new(),
+            truncated: false,
+            error: Some(error),
+            unavailable_reason: Some(GithubUnavailableReason::Transport),
+        }
+    }
+}
+
+macro_rules! report_from_outcome {
+    ($report:ident, $alert:ty) => {
+        impl From<AlertOutcome<$alert>> for $report {
+            fn from(o: AlertOutcome<$alert>) -> Self {
+                Self {
+                    available: o.available,
+                    cli_present: o.cli_present,
+                    is_github_remote: o.is_github_remote,
+                    slug: o.slug,
+                    alerts: o.alerts,
+                    truncated: o.truncated,
+                    error: o.error,
+                    unavailable_reason: o.unavailable_reason,
+                }
+            }
+        }
+
+        impl $report {
+            /// The report for a fetch that never ran to an answer.
+            pub fn transport_failure(error: String) -> Self {
+                AlertOutcome::transport_failure(error).into()
+            }
+        }
+    };
+}
+report_from_outcome!(DependabotReport, DependabotAlertInfo);
+report_from_outcome!(CodeScanningReport, CodeScanningAlertInfo);
+
+/// Probes `gh`, finds the GitHub remote, and fetches one alert family.
+///
+/// The single owner of the fail-closed contract both alert loaders share:
+/// every condition that prevents the fetch (no GitHub remote, no `gh` CLI, API
+/// error) comes back as an [`AlertOutcome`] with `available: false` and an
+/// explicit reason, never as an empty success.
+fn load_alert_outcome<T>(
+    repo_path: &str,
+    list: impl FnOnce(&GitHubRepoRef) -> Result<(Vec<T>, bool), String>,
+) -> AlertOutcome<T> {
     let gh = probe_gh_cli();
     let cli_present = gh_cli_reported_present(&gh);
     let remote = match discover_github_remote(repo_path) {
         Ok(Some(r)) => r,
-        // Not an error: a local-only repository simply has no Dependabot data.
-        Ok(None) => return unavailable_dependabot(cli_present, false, String::new(), None),
-        Err(e) => return unavailable_dependabot(cli_present, false, String::new(), Some(e)),
+        // Not an error: a local-only repository simply has no alert data.
+        Ok(None) => return unavailable_alert_outcome(cli_present, false, String::new(), None),
+        Err(e) => return unavailable_alert_outcome(cli_present, false, String::new(), Some(e)),
     };
     if let Some(reason) = gh_unavailable_reason(&gh) {
-        return unavailable_dependabot(cli_present, true, remote.slug(), Some(reason));
+        return unavailable_alert_outcome(cli_present, true, remote.slug(), Some(reason));
     }
-    match list_dependabot_alerts(&remote) {
-        Ok((alerts, truncated)) => DependabotReport {
+    match list(&remote) {
+        Ok((alerts, truncated)) => AlertOutcome {
             available: true,
             cli_present: true,
             is_github_remote: true,
@@ -1130,22 +1202,22 @@ pub fn load_dependabot_alerts(repo_path: &str) -> DependabotReport {
             error: None,
             unavailable_reason: None,
         },
-        Err(e) => unavailable_dependabot(true, true, remote.slug(), Some(e)),
+        Err(e) => unavailable_alert_outcome(true, true, remote.slug(), Some(e)),
     }
 }
 
-fn unavailable_dependabot(
+fn unavailable_alert_outcome<T>(
     cli_present: bool,
     is_github_remote: bool,
     slug: String,
     error: Option<String>,
-) -> DependabotReport {
+) -> AlertOutcome<T> {
     let unavailable_reason = Some(classify_github_unavailable(
         is_github_remote,
         cli_present,
         error.as_deref(),
     ));
-    DependabotReport {
+    AlertOutcome {
         available: false,
         cli_present,
         is_github_remote,
@@ -1535,52 +1607,7 @@ fn alert_from_json(row: &Value) -> DependabotAlertInfo {
 /// an explicit reason. A 403 ("Advanced Security is not enabled") or missing
 /// `security_events` scope must never look like "no open alerts".
 pub fn load_code_scanning_alerts(repo_path: &str) -> CodeScanningReport {
-    let gh = probe_gh_cli();
-    let cli_present = gh_cli_reported_present(&gh);
-    let remote = match discover_github_remote(repo_path) {
-        Ok(Some(r)) => r,
-        Ok(None) => return unavailable_code_scanning(cli_present, false, String::new(), None),
-        Err(e) => return unavailable_code_scanning(cli_present, false, String::new(), Some(e)),
-    };
-    if let Some(reason) = gh_unavailable_reason(&gh) {
-        return unavailable_code_scanning(cli_present, true, remote.slug(), Some(reason));
-    }
-    match list_code_scanning_alerts(&remote) {
-        Ok((alerts, truncated)) => CodeScanningReport {
-            available: true,
-            cli_present: true,
-            is_github_remote: true,
-            slug: remote.slug(),
-            alerts,
-            truncated,
-            error: None,
-            unavailable_reason: None,
-        },
-        Err(e) => unavailable_code_scanning(true, true, remote.slug(), Some(e)),
-    }
-}
-
-fn unavailable_code_scanning(
-    cli_present: bool,
-    is_github_remote: bool,
-    slug: String,
-    error: Option<String>,
-) -> CodeScanningReport {
-    let unavailable_reason = Some(classify_github_unavailable(
-        is_github_remote,
-        cli_present,
-        error.as_deref(),
-    ));
-    CodeScanningReport {
-        available: false,
-        cli_present,
-        is_github_remote,
-        slug,
-        alerts: Vec::new(),
-        truncated: false,
-        error,
-        unavailable_reason,
-    }
+    load_alert_outcome(repo_path, list_code_scanning_alerts).into()
 }
 
 fn list_code_scanning_alerts(

@@ -263,14 +263,6 @@ struct GetInput {
     request_id: Option<String>,
 }
 
-fn valid_id(id: &str) -> bool {
-    !id.is_empty()
-        && id.len() <= 128
-        && id
-            .bytes()
-            .all(|c| c.is_ascii_alphanumeric() || c == b'_' || c == b'-')
-}
-
 fn invalid(message: &str) -> WorkbenchError {
     WorkbenchError::new("invalid_input", message)
 }
@@ -287,7 +279,7 @@ fn object_input<T: for<'de> Deserialize<'de>>(input: &str) -> Result<T, Workbenc
 /// Params for Manvi's `work.verify.task`, validated before any process I/O.
 pub(crate) fn start_params(input: &str) -> Result<Value, WorkbenchError> {
     let parsed: StartInput = object_input(input)?;
-    if !valid_id(&parsed.id) || !valid_id(&parsed.request_id) {
+    if !super::is_record_id(&parsed.id) || !super::is_record_id(&parsed.request_id) {
         return Err(invalid(
             "Verification requires valid task and request identities.",
         ));
@@ -323,7 +315,12 @@ pub(crate) fn start_params(input: &str) -> Result<Value, WorkbenchError> {
 /// Params for Manvi's `work.verify.get`.
 pub(crate) fn get_params(input: &str) -> Result<Value, WorkbenchError> {
     let parsed: GetInput = object_input(input)?;
-    if !valid_id(&parsed.id) || parsed.request_id.as_deref().is_some_and(|r| !valid_id(r)) {
+    if !super::is_record_id(&parsed.id)
+        || parsed
+            .request_id
+            .as_deref()
+            .is_some_and(|r| !super::is_record_id(r))
+    {
         return Err(invalid(
             "Verification requires valid task and request identities.",
         ));

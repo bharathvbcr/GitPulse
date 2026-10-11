@@ -37,12 +37,7 @@ pub(super) fn parse(input: &str) -> Result<Launch, WorkbenchError> {
     }
     let launch: Launch = serde_json::from_str(input)
         .map_err(|e| WorkbenchError::new("invalid_input", e.to_string()))?;
-    if launch.id.is_empty()
-        || launch.id.len() > 128
-        || !launch
-            .id
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+    if !super::is_record_id(&launch.id)
         || launch.expected_revision != terminal_launch::PREPARED_REVISION
         || launch.rows == 0
         || launch.rows > 1000

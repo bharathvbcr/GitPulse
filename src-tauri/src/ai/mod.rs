@@ -667,7 +667,7 @@ fn complete(selection: &AiSelection, turn: &Turn, max_output: i64) -> Result<Com
             selection.base_url,
             response.status,
             selection.model,
-            truncate(response.body.trim(), 300)
+            crate::engine::budget::truncate_chars_ellipsis(response.body.trim(), 300)
         ));
     }
 
@@ -679,7 +679,7 @@ fn complete(selection: &AiSelection, turn: &Turn, max_output: i64) -> Result<Com
         .ok_or_else(|| {
             format!(
                 "model server returned no choices: {}",
-                truncate(&response.body, 300)
+                crate::engine::budget::truncate_chars_ellipsis(&response.body, 300)
             )
         })?;
     let message = choice.get("message").unwrap_or(&Value::Null);
@@ -770,13 +770,6 @@ fn reply_text(content: Option<&Value>) -> (String, Option<String>) {
             )
         }
     }
-}
-
-fn truncate(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
-        return s.to_string();
-    }
-    s.chars().take(max).collect::<String>() + "…"
 }
 
 /// How much of a staged patch is read for classification.

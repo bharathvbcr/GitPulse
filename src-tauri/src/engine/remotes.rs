@@ -357,7 +357,7 @@ where
     Ok((verdict, output))
 }
 
-fn list_names(repo: &Path) -> Result<Vec<String>, String> {
+pub(crate) fn list_names(repo: &Path) -> Result<Vec<String>, String> {
     let raw = git_text(repo, &["remote"])?;
     Ok(raw
         .lines()

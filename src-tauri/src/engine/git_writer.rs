@@ -2509,16 +2509,6 @@ fn current_branch_name(repo: &Path) -> Result<String, String> {
     crate::engine::git_reader::head_branch(repo)?.ok_or_else(|| PUSH_DETACHED.to_string())
 }
 
-fn configured_remotes(repo: &Path) -> Result<Vec<String>, String> {
-    let text = git_text(repo, &["remote"])?;
-    Ok(text
-        .lines()
-        .map(str::trim)
-        .filter(|name| !name.is_empty())
-        .map(str::to_string)
-        .collect())
-}
-
 /// Remote to publish an unpublished branch to when the caller did not name one.
 ///
 /// Priority: `checkout.defaultRemote` when it names a configured remote,
@@ -2526,7 +2516,7 @@ fn configured_remotes(repo: &Path) -> Result<Vec<String>, String> {
 /// Never invents `origin` — `git push -u origin …` against a missing remote is
 /// the same class of raw fatal this path exists to replace.
 fn unpublished_push_remote(repo: &Path) -> Result<String, String> {
-    let remotes = configured_remotes(repo)?;
+    let remotes = crate::engine::remotes::list_names(repo)?;
     if remotes.is_empty() {
         return Err(PUSH_NO_REMOTES.into());
     }

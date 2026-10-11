@@ -544,17 +544,7 @@ fn replay_reflog(
             if entry.action.is_empty() {
                 "move".to_string()
             } else {
-                entry
-                    .action
-                    .chars()
-                    .map(|c| {
-                        if c.is_ascii_alphanumeric() {
-                            c.to_ascii_lowercase()
-                        } else {
-                            '_'
-                        }
-                    })
-                    .collect::<String>()
+                ledger::action_segment(&entry.action)
             }
         );
         let detail = serde_json::json!({

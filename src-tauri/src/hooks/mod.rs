@@ -40,7 +40,7 @@ use serde_json::{json, Value};
 use crate::engine::agent_session_slug;
 use crate::engine::git_cli::find_git_root;
 use crate::harness::{self, PolicyStatus, ScopedVerdict};
-use crate::insights::{self, CollisionRisk, InsightsSnapshot};
+use crate::insights::{self, same_path, CollisionRisk, InsightsSnapshot};
 
 /// Wall-clock ceiling for the work behind one hook invocation.
 ///
@@ -675,7 +675,7 @@ pub fn collision_facts(
         .map(|item| {
             item.worktrees
                 .iter()
-                .filter(|party| !same_path(Path::new(&party.path), here))
+                .filter(|party| !same_path(&party.path, here))
                 .map(|party| CollisionOther {
                     worktree: party.path.clone(),
                     branch: party.branch.clone().unwrap_or_default(),
@@ -1362,7 +1362,7 @@ pub fn session_brief(snapshot: &InsightsSnapshot, here: &str, source: &str) -> S
         .worktrees
         .items
         .iter()
-        .find(|w| same_path(Path::new(&w.path), Path::new(here)));
+        .find(|w| same_path(&w.path, here));
     match mine {
         Some(w) => out.push_str(&format!(
             "branch here: {}{}\n",
@@ -1428,7 +1428,7 @@ pub fn session_brief(snapshot: &InsightsSnapshot, here: &str, source: &str) -> S
             .items
             .iter()
             .filter(|w| w.dirty_files.unwrap_or(0) > 0)
-            .filter(|w| !same_path(Path::new(&w.path), Path::new(here)))
+            .filter(|w| !same_path(&w.path, here))
         {
             out.push_str(&format!(
                 "  - {} [{}] {} dirty{}\n",
@@ -1904,15 +1904,6 @@ fn repo_relative(root: &Path, file: &Path) -> Option<String> {
     }
 }
 
-/// Path equality that survives symlinks, falling back to a literal comparison
-/// when either side cannot be canonicalised (a pruned worktree, say).
-fn same_path(a: &Path, b: &Path) -> bool {
-    match (a.canonicalize(), b.canonicalize()) {
-        (Ok(x), Ok(y)) => x == y,
-        _ => a == b,
-    }
-}
-
 /// The brief's live-session line: how many running agents this repository
 /// and this worktree hold, per kind, with every kind that could not be
 /// observed named as unknown rather than left out of the sum.
@@ -1933,7 +1924,7 @@ fn live_sessions_lines(live: &crate::insights::LiveSessionFacet, here: &str) -> 
     let here_count = live
         .worktrees
         .iter()
-        .filter(|w| same_path(Path::new(&w.path), Path::new(here)))
+        .filter(|w| same_path(&w.path, here))
         .map(|w| w.sessions.len())
         .sum::<usize>();
     format!(
