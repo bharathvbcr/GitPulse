@@ -176,7 +176,7 @@ export function sources(env = process.env, from = REPO) {
  * @param {string} from
  * @returns {string}
  */
-function findSibling(name, from = REPO) {
+export function findSibling(name, from = REPO) {
   let dir = from;
   for (let i = 0; i < 8; i++) {
     const candidate = path.join(dir, name);

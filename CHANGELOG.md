@@ -13,6 +13,7 @@ before that tag is pushed.
 
 ### Fixed
 
+- `bun run gusset:check` runs from a linked worktree under `.claude/worktrees/<name>`. It used to exit 2 there, because `go/go.mod`'s `../../DevCouncil` and `../../gusset` replaces point inside `.claude/`. It now finds the checkouts the way `vendor-crates.mjs` does (`GITPULSE_DEVCOUNCIL_ROOT` / `GITPULSE_GUSSET_ROOT`, then ancestors, then the canonical checkout's siblings) and, only when they are not where go.mod points, hands them to go through a temporary `go.work` whose replaces take precedence.
 - `gitpulse-mcp` `devmap_neighbors` no longer fails every call with "data must be object": it answers the `CodeintelResponse` envelope (`source_freshness`, `available`/`reason`, `total`/`shown`/`truncated`, `walk_incomplete`). `depth` and `min_confidence` were advertised but hardcoded to 10 and 0.0 in `devmap_neighbors`, `devmap_impact`, `devmap_trace`, `devmap_explore` and `devmap_affected_tests`; they now reach the walk through one `WalkBounds` and an out-of-range value is refused, not clamped. `devmap_dependencies` reads one file's direct edges, so it drops the no-op `depth` and gains `min_confidence`. `devmap_trace` declares the `min_rung` it reads. All eleven DevMap tools now declare typed `outputSchema`s, and the contract tests run each of them and require every declared argument to be read and every read argument to be declared.
 
 ### Changed
