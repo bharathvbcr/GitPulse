@@ -79,40 +79,16 @@ pub(crate) fn resolve(repo_path: &str) -> Result<LocalRepository, WorkbenchError
 
 /// The registered record for a repository, if the board has one. Never writes.
 pub(crate) fn find(store: &Store, identity: &str) -> Result<Option<Value>, WorkbenchError> {
-    let mut cursor: Option<String> = None;
-    for _ in 0..50 {
-        let mut input = json!({"limit":200});
-        if let Some(cursor) = &cursor {
-            input["cursor"] = json!(cursor);
-        }
-        let page = query(store, "repositories.list", &input.to_string())?;
-        let records = page["items"]
-            .as_array()
-            .ok_or_else(|| WorkbenchError::new("protocol_error", "Invalid repository page."))?;
-        if let Some(repository) = records
-            .iter()
-            .find(|r| r["identity_key"].as_str() == Some(identity))
-        {
-            return Ok(Some(repository.clone()));
-        }
-        if page["has_more"] != true {
-            return Ok(None);
-        }
-        let next = page["next_cursor"]
-            .as_str()
-            .ok_or_else(|| WorkbenchError::new("protocol_error", "Missing repository cursor."))?;
-        if cursor.as_deref() == Some(next) {
-            return Err(WorkbenchError::new(
-                "protocol_error",
-                "Repository cursor did not advance.",
-            ));
-        }
-        cursor = Some(next.into());
+    // One request through the store's UNIQUE index on the identity.
+    match query(
+        store,
+        "repositories.get",
+        &json!({"identity_key": identity}).to_string(),
+    ) {
+        Ok(found) => Ok(Some(found["item"].clone())),
+        Err(error) if error.code == "not_found" => Ok(None),
+        Err(error) => Err(error),
     }
-    Err(WorkbenchError::new(
-        "registry_limit",
-        "Repository registration requires an indexed identity lookup beyond 10,000 repositories.",
-    ))
 }
 
 /// Find or register a repository. The board's own registration goes through
@@ -1816,36 +1792,17 @@ fn board_repository(store: &Store, repo_path: &str) -> Result<Value, WorkbenchEr
 /// store has never had it. `items.get` hides deleted items, `items.history`
 /// does not.
 fn last_revision(store: &Store, id: &str) -> Result<Option<Value>, WorkbenchError> {
-    let mut after = 0_i64;
-    let mut last = None;
-    for _ in 0..50 {
-        let input = json!({"id": id, "limit": 200, "after_revision": after});
-        let page = match query(store, "items.history", &input.to_string()) {
-            Ok(page) => page,
-            Err(error) if error.code == "not_found" => return Ok(None),
-            Err(error) => return Err(error),
-        };
-        let revisions = page["items"]
-            .as_array()
-            .ok_or_else(|| WorkbenchError::new("protocol_error", "Invalid task history page."))?;
-        if let Some(revision) = revisions.last() {
-            last = Some(revision.clone());
-        }
-        if page["has_more"] != true {
-            return Ok(last);
-        }
-        let next = page["next_cursor"]
-            .as_i64()
-            .filter(|next| *next > after)
-            .ok_or_else(|| {
-                WorkbenchError::new("protocol_error", "Task history cursor did not advance.")
-            })?;
-        after = next;
-    }
-    Err(WorkbenchError::new(
-        "registry_limit",
-        "The task's history is longer than 10,000 revisions; delete it on the board.",
-    ))
+    // Newest first, one row: no walk from revision 0 through every body.
+    let input = json!({"id": id, "limit": 1, "newest_first": true});
+    let page = match query(store, "items.history", &input.to_string()) {
+        Ok(page) => page,
+        Err(error) if error.code == "not_found" => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let revisions = page["items"]
+        .as_array()
+        .ok_or_else(|| WorkbenchError::new("protocol_error", "Invalid task history page."))?;
+    Ok(revisions.first().cloned())
 }
 
 /// A deleted board task that was linked to `repository_id`, as last recorded.

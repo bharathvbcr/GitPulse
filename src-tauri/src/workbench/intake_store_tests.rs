@@ -275,3 +275,52 @@ fn a_placement_with_no_scan_is_not_held_to_one() {
         Outcome::Created
     );
 }
+
+/// Registers `count` synthetic repositories straight into the table, so a
+/// registry larger than any page walk the host once made exists without a
+/// minute of writes.
+fn bulk_repositories(store: &Store, count: i64) {
+    store
+        .connection()
+        .execute(
+            "WITH RECURSIVE n(i) AS (SELECT 0 UNION ALL SELECT i+1 FROM n WHERE i+1<?1)
+             INSERT INTO work_repositories(id,revision,body)
+             SELECT 'bulk-'||i,1,json_object('id','bulk-'||i,'revision',1,'name','Bulk '||i,'identity_key','local:/bulk-'||i||'/.git','remote_url',NULL,'updated_at',1) FROM n",
+            [count],
+        )
+        .unwrap();
+}
+
+#[test]
+fn a_repository_is_found_by_identity_in_a_registry_past_the_old_page_walk() {
+    let (_dir, path) = profile();
+    let store = Store::open(&path).unwrap();
+    let repo = git_repo();
+    let first = registered(&store, &repo);
+    bulk_repositories(&store, 10_050);
+    let found = find(&store, "local:/bulk-10049/.git").unwrap().expect("registered");
+    assert_eq!(found["id"], "bulk-10049");
+    assert!(find(&store, "local:/never-registered/.git").unwrap().is_none());
+    // A real registration against a registry this size still finds before it creates.
+    assert_eq!(registered(&store, &repo)["id"], first["id"], "one record, not two");
+}
+
+#[test]
+fn the_last_revision_of_a_task_with_a_very_long_history_is_one_read() {
+    let (_dir, path) = profile();
+    let store = Store::open(&path).unwrap();
+    let repo = git_repo();
+    let id = filed(&store, &repo, "gp-long-history", "Card with a long history");
+    store
+        .connection()
+        .execute(
+            "WITH RECURSIVE n(i) AS (SELECT 1000 UNION ALL SELECT i+1 FROM n WHERE i<11000)
+             INSERT INTO work_revisions(entity_type,entity_id,revision,body)
+             SELECT 'item',?1,i,json_object('id',?1,'revision',i,'title','revision '||i) FROM n",
+            [&id],
+        )
+        .unwrap();
+    let last = last_revision(&store, &id).unwrap().expect("history");
+    assert_eq!(last["revision"], 11_000);
+    assert!(last_revision(&store, "never-filed").unwrap().is_none());
+}

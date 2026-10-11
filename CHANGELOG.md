@@ -11,6 +11,17 @@ before that tag is pushed.
 
 ## [Unreleased]
 
+### Changed
+
+- Workbench store at scale (dc-store re-vendored from DevCouncil `28a44abe`):
+  finding a repository by identity and reading a task's last revision are one
+  store request each (they paged 23 and 25 times at 5,000 repositories and
+  5,000 revisions, and failed past 10,000), a request receipt no longer copies
+  the record body, `events.list` and `items.history` bound their per-page count
+  (`total_exact` says when `total` is a floor), and a newly created profile is
+  `auto_vacuum=INCREMENTAL` so `store.compact` gives pages back. A profile that
+  already exists keeps its size until a full `VACUUM`.
+
 ### Added
 
 - An agent's `done` that is held in review for lack of a passing verification
