@@ -988,8 +988,56 @@ pub(crate) fn probe_one(pid: i32) -> Option<ProcFacts> {
 /// process may still clean up.
 ///
 /// Security: this signals only a process the current user already owns and
-/// could `kill` from a shell, on an explicit click; it widens no access.
-pub fn terminate_orphan(pid: i32, start_us: u64) -> Result<String, String> {
+/// could `kill` from a shell. The Terminate button is DOM, so any script that
+/// reaches the IPC bridge could call the command behind it; `confirm` is the
+/// native dialog ([`crate::desktop::confirm::native`]) that page script cannot
+/// answer, so nothing is signalled without the person's own Yes. The process
+/// is re-checked after the dialog closes, since it can take any amount of
+/// time to answer.
+pub fn terminate_orphan(
+    pid: i32,
+    start_us: u64,
+    confirm: &dyn Fn(&str, &str) -> bool,
+) -> Result<String, String> {
+    terminate_confirmed(
+        || still_orphaned(pid, start_us),
+        confirm,
+        || signal_term(pid),
+    )
+}
+
+/// The decision behind [`terminate_orphan`], separated from the OS so it is
+/// tested with closures: check, ask, check again, then signal — and on any
+/// refusal or decline, signal nothing.
+fn terminate_confirmed(
+    check: impl Fn() -> Result<Orphan, String>,
+    confirm: &dyn Fn(&str, &str) -> bool,
+    signal: impl FnOnce() -> Result<(), String>,
+) -> Result<String, String> {
+    let seen = check()?;
+    let body = format!(
+        "Send SIGTERM to {} (pid {})?\n\nIt has run {} min with no parent in {}.",
+        seen.name,
+        seen.pid,
+        seen.age_s / 60,
+        seen.checkout
+    );
+    if !confirm("Terminate orphaned process", &body) {
+        return Err("termination was not confirmed; nothing was signalled".into());
+    }
+    let orphan = check()?;
+    signal()?;
+    Ok(format!(
+        "Sent SIGTERM to {} ({}), which had run {} min in {}",
+        orphan.name,
+        orphan.pid,
+        orphan.age_s / 60,
+        orphan.checkout
+    ))
+}
+
+/// Everything that made `pid` an orphan, checked again on the live process.
+fn still_orphaned(pid: i32, start_us: u64) -> Result<Orphan, String> {
     if pid <= 1 || start_us == 0 || i32::try_from(std::process::id()).ok() == Some(pid) {
         return Err("that process is not one GitPulse will terminate".into());
     }
@@ -1017,15 +1065,8 @@ pub fn terminate_orphan(pid: i32, start_us: u64) -> Result<String, String> {
     if f.ppid != 1 {
         return Err("the process has a parent again; it is no longer orphaned".into());
     }
-    let orphan = orphan_of(&f, now_us(), &|pid| os::cwd(pid))
-        .ok_or("the process no longer looks orphaned; nothing was signalled")?;
-    signal_term(pid)?;
-    Ok(format!(
-        "Sent SIGTERM to {} ({pid}), which had run {} min in {}",
-        orphan.name,
-        orphan.age_s / 60,
-        orphan.checkout
-    ))
+    orphan_of(&f, now_us(), &|pid| os::cwd(pid))
+        .ok_or_else(|| "the process no longer looks orphaned; nothing was signalled".into())
 }
 
 #[cfg(unix)]
@@ -1886,6 +1927,106 @@ pub(crate) mod tests {
     use std::sync::Mutex;
 
     pub(crate) const ME: u32 = 501;
+
+    fn spinning_orphan() -> Orphan {
+        Orphan {
+            pid: 4242,
+            start_us: 7,
+            name: "node".into(),
+            exec: None,
+            cwd: "/r/app".into(),
+            checkout: "/r/app".into(),
+            age_s: 1_800,
+            cpu_ratio: 0.9,
+            footprint: Reading::default(),
+        }
+    }
+
+    /// The Terminate button is DOM; the native Yes is the boundary. A
+    /// declined dialog signals nothing, and the dialog names the process.
+    #[test]
+    fn a_declined_confirmation_signals_nothing() {
+        let shown = std::cell::RefCell::new(String::new());
+        let signalled = std::cell::Cell::new(false);
+        let refused = terminate_confirmed(
+            || Ok(spinning_orphan()),
+            &|_, body| {
+                *shown.borrow_mut() = body.to_owned();
+                false
+            },
+            || {
+                signalled.set(true);
+                Ok(())
+            },
+        )
+        .expect_err("declined");
+        assert!(refused.contains("not confirmed"), "{refused}");
+        assert!(!signalled.get(), "a declined dialog sent a signal");
+        assert!(
+            shown.borrow().contains("4242") && shown.borrow().contains("node"),
+            "{}",
+            shown.borrow()
+        );
+    }
+
+    /// The dialog can stay open for minutes; a process that stopped being an
+    /// orphan meanwhile is refused after the Yes, not signalled on it.
+    #[test]
+    fn a_process_that_changed_while_the_dialog_was_open_is_not_signalled() {
+        let checks = std::cell::Cell::new(0u32);
+        let signalled = std::cell::Cell::new(false);
+        let refused = terminate_confirmed(
+            || {
+                checks.set(checks.get() + 1);
+                if checks.get() == 1 {
+                    Ok(spinning_orphan())
+                } else {
+                    Err("the process has a parent again; it is no longer orphaned".into())
+                }
+            },
+            &|_, _| true,
+            || {
+                signalled.set(true);
+                Ok(())
+            },
+        )
+        .expect_err("changed");
+        assert!(refused.contains("parent again"), "{refused}");
+        assert_eq!(checks.get(), 2, "re-checked after the dialog");
+        assert!(!signalled.get());
+    }
+
+    #[test]
+    fn a_confirmed_orphan_is_signalled_once() {
+        let signals = std::cell::Cell::new(0u32);
+        let sent = terminate_confirmed(
+            || Ok(spinning_orphan()),
+            &|_, _| true,
+            || {
+                signals.set(signals.get() + 1);
+                Ok(())
+            },
+        )
+        .expect("confirmed");
+        assert_eq!(signals.get(), 1);
+        assert!(sent.contains("4242") && sent.contains("30 min"), "{sent}");
+    }
+
+    /// A refusal before the dialog never shows it.
+    #[test]
+    fn a_process_that_is_not_an_orphan_never_reaches_the_dialog() {
+        let asked = std::cell::Cell::new(false);
+        let refused = terminate_orphan(1, 7, &|_, _| {
+            asked.set(true);
+            true
+        })
+        .expect_err("pid 1");
+        assert!(
+            refused.contains("not one GitPulse will terminate"),
+            "{refused}"
+        );
+        assert!(!asked.get());
+    }
 
     /// Set on a re-executed test binary to make it a fixture process instead
     /// of a test run: `sleep=<s>[,alloc_mib=<n>][,pidfile=<path>]`.

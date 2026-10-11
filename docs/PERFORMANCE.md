@@ -280,6 +280,31 @@ tree (`c2fc9679`) four Rust guards fail (4,474 passed, 4 failed) and the
 commands" check (`cmd_host_load_status`). Tracked on the board as
 gp-host-load-governor-integration.
 
+**Fixed 2026-10-11 (ft-ae39d654).** The four host-load commands are granted.
+Terminate goes behind the native confirm; see `docs/LOAD_GOVERNOR.md` → Orphans.
+The soak declares `mod common;`, the snapshot loop uses `coverage_relaxed`, and
+the sampler runs under `supervisor::spawn_service_with(Policy::RESTART)`. A new
+test failed on the raw thread (1 tick) and passes on the supervised one. The
+`uncommitted` harness mocks `cmd_host_load_status` from the typed
+`harness/hostLoadFixture.ts`.
+
+`ci:local` on that tree came back 13/17, but none of the four failures touch
+the change:
+- Vitest failed two tests that read gitignored local state, present since
+  2026-10-09: `.agents/skills/*` and `docs/PROMO.md`. CI never has those files.
+- The Rust step failed two live scanner tests (`deps_live_scan`) on network
+  timeouts: a TLS handshake to proxy.golang.org, and npm audit at 90 s. They
+  still failed alone. Their offline skip does not recognise those shapes.
+- The Rust step also failed one hook test under load (`over_the_app`). It
+  passed alone, 5/5.
+- Coverage floor followed from the Rust step.
+- WebKit failed five harnesses. `scroll-cue` stalls at module load ("did not
+  finish within 60 seconds", 25 requests), alone and identically at the
+  pre-change HEAD in a detached worktree.
+
+The four previously failing guard crates, the `uncommitted` harness
+(128/128), clippy, fmt, svelte-check and Chrome `browser:all` are green.
+
 Not covered by `ci:local` at all: see the README's `ci:local` row (no `bun
 audit`, `cargo deny`, Go jobs, scheduled workflows, or Linux/Windows builds).
 

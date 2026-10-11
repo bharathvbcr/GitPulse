@@ -9,8 +9,9 @@
    * itself runs whether or not anyone is looking.
    *
    * The one action here is Terminate on a foreign orphan, and it takes two
-   * clicks. The backend checks again, on the live process, that it is still
-   * the same orphan before it signals anything.
+   * clicks and then a Yes in a system dialog this page cannot answer. The
+   * backend checks again, on the live process, before and after that dialog,
+   * that it is still the same orphan before it signals anything.
    */
   import { onDestroy, onMount } from "svelte";
   import { keyedList } from "../../ui/eachKeys";
@@ -258,8 +259,8 @@
         </HealthTable>
         <p class="text-textMuted">
           Each has no parent left, works in a git checkout, belongs to no agent session or GitPulse launch, and has
-          kept a CPU busy for most of its life. GitPulse only lists them; Terminate sends SIGTERM after checking again
-          that it is still the same process.
+          kept a CPU busy for most of its life. GitPulse only lists them; Terminate asks you to confirm in a system
+          dialog, then sends SIGTERM after checking again that it is still the same process.
         </p>
       {/if}
       {#if outcome}

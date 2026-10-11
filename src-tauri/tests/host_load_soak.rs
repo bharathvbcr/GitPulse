@@ -16,6 +16,8 @@
 //! would not apply to it either way; the hidden-window condition is the
 //! installed app's, and is checked there.
 
+mod common;
+
 use gitpulse_lib::sysload::{start, SamplerOptions};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};

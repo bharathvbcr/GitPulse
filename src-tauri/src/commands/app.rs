@@ -254,13 +254,17 @@ pub async fn cmd_host_load_status() -> Result<crate::sysload::HostLoadStatus, St
 }
 
 /// Sends SIGTERM to a foreign orphan Health listed, after the person clicked
-/// Terminate on it. Every condition is re-checked on the live process first
-/// (`sysload::terminate_orphan`); anything changed refuses. `start_us` is
-/// microseconds since the epoch, well inside a JavaScript number's exact
-/// range.
+/// Terminate on it and then answered Yes in a native dialog the webview cannot
+/// click. Every condition is re-checked on the live process before and after
+/// that dialog (`sysload::terminate_orphan`); anything changed refuses.
+/// `start_us` is microseconds since the epoch, well inside a JavaScript
+/// number's exact range.
 #[tauri::command(async)]
 pub async fn cmd_host_load_terminate_orphan(pid: i32, start_us: u64) -> Result<String, String> {
-    off_thread(move || crate::sysload::terminate_orphan(pid, start_us)).await
+    off_thread(move || {
+        crate::sysload::terminate_orphan(pid, start_us, &crate::desktop::confirm::native)
+    })
+    .await
 }
 
 /// The host-load kill switch, as stored.

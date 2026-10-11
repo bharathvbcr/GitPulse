@@ -1136,7 +1136,9 @@ mod tests {
         };
         let (mut whole, mut torn) = (0u32, 0u32);
         let started = std::time::Instant::now();
-        while started.elapsed() < std::time::Duration::from_millis(400) {
+        while started.elapsed()
+            < crate::test_support::coverage_relaxed(std::time::Duration::from_millis(400))
+        {
             match read(&path) {
                 Ok(s) => {
                     let n = s.tick.ticks;

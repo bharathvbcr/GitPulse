@@ -304,8 +304,20 @@ GitPulse launches that outlive their run are card 4's, not listed here. Health
 lists each orphan with **Terminate**, which takes two clicks. The backend then
 re-checks everything on the live process: same pid and start time, still this
 user's, still parented by launchd, still no launch id or session, still
-spinning in a checkout. It sends SIGTERM only if all of that holds. Anything
-changed refuses and signals nothing.
+spinning in a checkout. It then asks in a native Yes/No dialog that names the
+process (`desktop::confirm::native`), checks everything again once the dialog
+closes, and sends SIGTERM only if all of that still holds. A No, a dialog the
+host cannot draw, or anything changed refuses and signals nothing.
+
+Security impact: `cmd_host_load_terminate_orphan` is granted to the main
+window, so any script that reaches the IPC bridge can ask for it. The two
+clicks are DOM and are not the boundary; the native dialog is, as for the
+other grants that widen what GitPulse will do (repository trust, tool paths).
+The signal is SIGTERM to a process this user already owns and could `kill`
+from a shell; no access is widened beyond that. The other three host-load
+grants (`cmd_host_load_status`, `cmd_host_load_settings`,
+`cmd_host_load_settings_save`) read the sensor and toggle the sampler's kill
+switch.
 
 ## Health and the status bar
 

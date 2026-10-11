@@ -186,10 +186,15 @@ pub fn start(options: SamplerOptions) -> Result<StopHandle, String> {
         stop: AtomicBool::new(false),
     });
     let worker = shared.clone();
-    let thread = std::thread::Builder::new()
-        .name("host-load-sampler".into())
-        .spawn(move || run(&worker, options))
-        .map_err(|e| format!("could not start the host-load sampler: {e}"))?;
+    // Restarted after a panic: the body rebuilds its sensor, scanner and
+    // writer election from `options`, and a sampler that keeps panicking
+    // stops visibly (Diagnostics) instead of leaving the last pulse standing.
+    let thread = crate::supervisor::spawn_service_with(
+        SUBSYSTEM,
+        crate::supervisor::Policy::RESTART,
+        move || run(&worker, &options),
+    )
+    .map_err(|e| format!("could not start the host-load sampler: {e}"))?;
     Ok(StopHandle {
         shared,
         thread: Some(thread),
@@ -304,7 +309,10 @@ fn fill(
     snap.orphans = u32::try_from(view.orphans.len()).unwrap_or(u32::MAX);
 }
 
-fn run(shared: &Shared, options: SamplerOptions) {
+/// The supervised thread's name and its Diagnostics subsystem.
+const SUBSYSTEM: &str = "host-load-sampler";
+
+fn run(shared: &Shared, options: &SamplerOptions) {
     let mut problems = Vec::new();
     if let Err(why) = super::probe::set_user_initiated_qos() {
         problems.push(format!("QoS: {why}"));
@@ -382,6 +390,9 @@ fn run(shared: &Shared, options: SamplerOptions) {
         if let Some(on_tick) = &options.on_tick {
             on_tick(pulse);
         }
+        // A restarted sampler is healthy again once a tick completes; the
+        // supervisor clears its record only when the body returns.
+        crate::supervisor::note_recovered(SUBSYSTEM);
 
         // The next slot on the fixed grid. Waking later than one whole
         // cadence past it means slots went by with no tick: those are missed.
@@ -507,6 +518,35 @@ mod tests {
         first.stop();
         let pulses = ticks.lock().unwrap();
         assert!(pulses.iter().all(|p| p.role == Role::Writer));
+    }
+
+    /// Real: a tick that panics does not end the sampler. A raw thread died
+    /// with its first panic and the pulse simply stopped, so the status bar
+    /// kept showing the last reading as though it were current.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn real_sampler_keeps_publishing_after_a_tick_panics() {
+        let dir = tempfile::tempdir().unwrap();
+        let ticks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = ticks.clone();
+        let mut options = SamplerOptions::new(dir.path().to_path_buf());
+        options.cadence = Duration::from_millis(50);
+        options.on_tick = Some(Box::new(move |_| {
+            if seen.fetch_add(1, Ordering::SeqCst) == 0 {
+                panic!("injected sampler panic");
+            }
+        }));
+        let sampler = start(options).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while ticks.load(Ordering::SeqCst) < 4 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let after = ticks.load(Ordering::SeqCst);
+        sampler.stop();
+        assert!(
+            after >= 4,
+            "the sampler stopped ticking after its first tick panicked ({after} ticks)"
+        );
     }
 
     /// Real: the kill switch off still publishes — enabled false and no
