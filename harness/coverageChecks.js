@@ -683,8 +683,10 @@ export async function runCoverageChecks(ctx) {
     knobs.runHandler = scripted({});
     setRunDelay(300);
     await enter([quick]);
-    byText("Run JavaScript coverage").click(); await tick(); await wait();
-    ok("a coverage command in flight disables filing an issue", () => issueButton().disabled);
+    // The chip runs one script without the batch flag, so only the script's own
+    // running state can be what disables the issue button.
+    [...card("javascript").querySelectorAll("button")].find(node => node.title === "Run with MANVI: npm run cov-a").click(); await tick(); await wait();
+    ok("a coverage command in flight disables filing an issue", () => issueButton().disabled && !byText("Running…"));
     await settle();
     setRunDelay(0);
     ok("and it is available again once the run settles", () => !issueButton().disabled);
