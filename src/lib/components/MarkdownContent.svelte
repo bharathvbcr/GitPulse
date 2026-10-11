@@ -11,6 +11,7 @@
   import { openExternal } from "../desktop/openExternal";
   import { copyText } from "../desktop/clipboard";
   import { repoStore } from "../stores/repoStore";
+  import { openFileAtAnchor } from "../files/pendingAnchor";
   import {
     findFragmentTarget,
     handleMarkdownClick,
@@ -55,7 +56,7 @@
       notice = "Switch to this note's repository to open its files.";
       return;
     }
-    repoStore.selectFilePath(path);
+    openFileAtAnchor((target) => repoStore.selectFilePath(target), note.repoPath, path, fragment);
     repoStore.setActiveTab("code");
   }
 

@@ -27,6 +27,7 @@
     type RenderedMarkdown,
   } from "../../files/markdevRender";
   import { findFragmentTarget, type MarkdownNote } from "../../files/markdownLinks";
+  import { takeAnchor } from "../../files/pendingAnchor";
   import { docsBacklinks, type DocBacklink } from "../../docs/client";
   import CodeViewer from "./CodeViewer.svelte";
   import MarkDevLogo from "./MarkDevLogo.svelte";
@@ -167,6 +168,14 @@
       repoStore.setError(formatError(err));
     }
   }
+
+  // A link from another note lands on its section once this file's page exists.
+  $effect(() => {
+    void rendered;
+    if (!previewContainerEl || !note || shownFile !== filePath || !rendered.html) return;
+    const fragment = takeAnchor(note.repoPath, note.path);
+    if (fragment) findFragmentTarget(previewContainerEl, fragment)?.scrollIntoView({ block: "start" });
+  });
 
   function scrollToHeading(id: string) {
     if (!previewContainerEl) return;
