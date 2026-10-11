@@ -1,5 +1,6 @@
 import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
+import { readCommandsSource } from "./commands-source";
 
 /**
  * The command gate must judge the command that actually runs.
@@ -24,10 +25,7 @@ import { describe, expect, it } from "vitest";
  * their own mirror tests instead, and are listed below rather than silently
  * skipped: a skip nobody can see is how this rots into decoration.
  */
-const COMMANDS = readFileSync(
-  new URL("../src-tauri/src/commands/mod.rs", import.meta.url),
-  "utf8",
-);
+const COMMANDS = readCommandsSource();
 const WRITER = readFileSync(
   new URL("../src-tauri/src/engine/git_writer.rs", import.meta.url),
   "utf8",
@@ -73,6 +71,9 @@ const DERIVED_ARGV = Object.freeze({
   cmd_write_file_content: "writes through the sandbox, gated by path not command",
   cmd_discard_changes: "gated by path not command; covered by file-gate-fidelity-contract",
   cmd_save_conflict: "conflict_session::mutation builds argv once for judging and execution; native conflict gate regressions cover hash-object, update-index and denial",
+  cmd_move_path: "GitWriter::move_path hands the gate its MovePlan (the git mv argv, or the untracked delete and write) before executing it, so the judged lines are the lines that run",
+  cmd_docs_rename: "docs::rename_doc hands the gate the same MovePlan GitWriter::move_path does, through guard_move, before it touches the filesystem",
+  cmd_delete_path: "GitWriter::delete_path hands the gate every planned git rm / git clean argv before the first runs",
 });
 
 function production(source: string): string {

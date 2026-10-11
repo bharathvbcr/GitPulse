@@ -1,0 +1,750 @@
+use super::*;
+use crate::procguard::LockedSpawn;
+
+/// `git init` + one commit, plus an untracked file on disk.
+fn repo_with_tracked_and_untracked() -> tempfile::TempDir {
+    let dir = tempfile::TempDir::new().unwrap();
+    let run = |args: &[&str]| {
+        std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir.path())
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@e")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@e")
+            .output_locked()
+            .expect("git runs");
+    };
+    run(&["init", "-b", "main"]);
+    std::fs::write(dir.path().join("README.md"), "# t\n").unwrap();
+    run(&["add", "."]);
+    run(&["commit", "-m", "seed"]);
+    std::fs::write(dir.path().join("fresh.txt"), "new\n").unwrap();
+    crate::test_support::trust_repo(dir.path());
+    dir
+}
+
+/// The gate must never answer for a root it was never given.
+///
+/// Pre-fix the caller's string went straight to the sidecar as `root`, so
+/// the verdict described whatever the harness made of a path this process
+/// had not resolved. The needle is the resolution failure itself: a
+/// sidecar that is absent, slow, or unhappy writes its own detail and
+/// never this one, so the assertion cannot pass by the harness being down.
+#[test]
+fn a_policy_check_will_not_judge_a_root_that_is_not_a_repository() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let verdict = policy_verdict_for(&dir.path().to_string_lossy(), "git status");
+
+    assert!(!verdict.checked, "a root that never resolved was judged");
+    assert_eq!(verdict.status, crate::harness::PolicyStatus::Unchecked);
+    assert!(
+        verdict.detail.contains("Not a Git repository"),
+        "the refusal must say why the gate did not run: {:?}",
+        verdict.detail
+    );
+    assert_eq!(
+        verdict.target, "git status",
+        "the judged target is the command, not the root"
+    );
+}
+
+/// Root shapes that must not reach a second process at all. Each is
+/// refused for a different reason, and each must still say which.
+#[test]
+fn a_policy_check_refuses_every_root_shape_that_cannot_name_a_checkout() {
+    for root in [
+        "",
+        "relative/path",
+        "/no/such/directory/anywhere",
+        "/tmp/\u{7}bell",
+    ] {
+        let verdict = policy_verdict_for(root, "git status");
+        assert!(!verdict.checked, "{root:?} was forwarded to the harness");
+        assert!(
+            !verdict.detail.is_empty(),
+            "{root:?} was refused without saying why"
+        );
+    }
+}
+
+/// No-narrowing: resolving the root must not cost a real checkout its
+/// verdict. Asserted on the refusal text rather than on `checked`, because
+/// whether the sidecar answers here depends on the machine.
+#[test]
+fn a_policy_check_still_forwards_a_real_checkout() {
+    let dir = repo_with_tracked_and_untracked();
+    let verdict = policy_verdict_for(&dir.path().to_string_lossy(), "git status");
+    assert!(
+        !verdict.detail.contains("Not a Git repository"),
+        "a real checkout was refused by the resolution step: {:?}",
+        verdict.detail
+    );
+}
+
+#[test]
+fn discard_declares_delete_for_the_file_it_will_delete() {
+    // `discard_changes` runs `restore` AND `clean -f`. For an untracked
+    // path the clean is what acts, and it removes the file — so declaring
+    // "modify" asked the policy sidecar to judge, and the ledger to
+    // record, a gentler operation than the one that ran.
+    let dir = repo_with_tracked_and_untracked();
+    let root = dir.path().to_string_lossy().to_string();
+
+    assert_eq!(discard_file_op(&root, "README.md"), "modify");
+    assert_eq!(discard_file_op(&root, "fresh.txt"), "delete");
+}
+
+#[test]
+fn last_fetch_at_reads_fetch_head_mtime_or_none() {
+    let dir = repo_with_tracked_and_untracked();
+    let repo = validate_repo(dir.path().to_str().unwrap()).unwrap();
+    assert_eq!(last_fetch_at_ms(&repo).unwrap(), None);
+    let fetch_head = crate::engine::git_cli::resolve_git_common_dir(&repo)
+        .unwrap()
+        .join("FETCH_HEAD");
+    std::fs::write(&fetch_head, "deadbeef\t\tbranch 'main' of somewhere\n").unwrap();
+    let stamp = last_fetch_at_ms(&repo).unwrap().expect("FETCH_HEAD mtime");
+    assert!(stamp > 0);
+}
+
+#[test]
+fn discard_fails_closed_when_the_index_cannot_be_read() {
+    // A probe that could not run must not produce the gentler claim.
+    assert_eq!(
+        discard_file_op("/definitely/not/a/repository", "any.txt"),
+        "delete"
+    );
+}
+
+fn verdict(status: crate::harness::PolicyStatus) -> crate::harness::PolicyVerdict {
+    crate::harness::PolicyVerdict {
+        status,
+        checked: true,
+        target: "git x".into(),
+        rule: String::new(),
+        severity: String::new(),
+        reason: String::new(),
+        demoted: String::new(),
+        task_id: String::new(),
+        grant_id: String::new(),
+        granted_by: String::new(),
+        widened: String::new(),
+        degraded: Vec::new(),
+        detail: String::new(),
+        detail_code: String::new(),
+    }
+}
+
+#[test]
+fn strictest_verdict_ranks_blocked_over_clean_passes() {
+    use crate::harness::PolicyStatus::*;
+    let allowed = strictest_verdict(verdict(Allowed), verdict(Allowed));
+    assert_eq!(allowed.status, Allowed);
+    let warned = strictest_verdict(verdict(Allowed), verdict(Warned));
+    assert_eq!(warned.status, Warned);
+    let demoted = strictest_verdict(verdict(Demoted), verdict(Unchecked));
+    assert_eq!(demoted.status, Demoted);
+    let blocked = strictest_verdict(verdict(Allowed), verdict(Blocked));
+    assert_eq!(blocked.status, Blocked);
+}
+
+#[test]
+fn verdict_fold_keeps_the_strictest_in_any_order() {
+    use crate::harness::PolicyStatus::*;
+    for order in [
+        [Warned, Allowed, Allowed],
+        [Allowed, Warned, Allowed],
+        [Allowed, Allowed, Warned],
+    ] {
+        let fold = VerdictFold::default();
+        assert!(VerdictFold::default().finish().is_none());
+        for status in order {
+            fold.record(verdict(status));
+        }
+        assert_eq!(fold.finish().unwrap().status, Warned, "{order:?}");
+    }
+}
+
+fn git_in(dir: &std::path::Path, args: &[&str]) -> bool {
+    use crate::procguard::LockedSpawn;
+    std::process::Command::new("git")
+        .args(args)
+        .current_dir(dir)
+        .env("GIT_AUTHOR_NAME", "Test")
+        .env("GIT_AUTHOR_EMAIL", "t@example.com")
+        .env("GIT_COMMITTER_NAME", "Test")
+        .env("GIT_COMMITTER_EMAIL", "t@example.com")
+        .output_locked()
+        .unwrap()
+        .status
+        .success()
+}
+
+#[test]
+fn conflict_save_surfaces_the_file_verdict_not_only_the_last_command() {
+    use crate::harness::PolicyStatus::*;
+    let dir = tempfile::tempdir().unwrap();
+    let p = dir.path();
+    assert!(git_in(p, &["init", "-b", "main"]));
+    assert!(git_in(p, &["config", "commit.gpgsign", "false"]));
+    std::fs::write(p.join("file"), "base\n").unwrap();
+    assert!(git_in(p, &["add", "."]) && git_in(p, &["commit", "-m", "base"]));
+    assert!(git_in(p, &["checkout", "-b", "incoming"]));
+    std::fs::write(p.join("file"), "theirs\n").unwrap();
+    assert!(git_in(p, &["commit", "-am", "theirs"]));
+    assert!(git_in(p, &["checkout", "main"]));
+    std::fs::write(p.join("file"), "ours\n").unwrap();
+    assert!(git_in(p, &["commit", "-am", "ours"]));
+    assert!(!git_in(p, &["merge", "incoming"]), "must conflict");
+
+    let repo = p.to_str().unwrap();
+    // The hermetic test store, never the developer's real trust record.
+    let view = crate::repository_trust::inspect(repo).unwrap();
+    crate::repository_trust::grant(repo, &view.identity, true).unwrap();
+    let snapshot = conflict_session::snapshot(repo, "file").unwrap();
+    let request = ConflictSaveRequest {
+        file_path: "file".into(),
+        revision: snapshot.revision,
+        choice: crate::diff::conflict_session::ConflictFileChoice::Ours,
+    };
+    // The file check warns; every command check afterwards allows. The
+    // old handler discarded the file verdict and kept only the last
+    // command's, so this reached the UI as a clean allow.
+    let saved = save_conflict_folded(
+        repo,
+        &request,
+        |_, _| Ok(verdict(Warned)),
+        |_| Ok(verdict(Allowed)),
+    )
+    .unwrap();
+    assert_eq!(saved.policy.status, Warned);
+}
+
+/// Lockstep test for commit_amend_argv against GitWriter::commit_inner's
+/// branching: empty-message amend is --amend --no-edit, everything else
+/// is -m <msg> with an optional trailing --amend.
+#[test]
+fn commit_amend_argv_mirrors_commit_inner() {
+    assert_eq!(
+        commit_amend_argv("feat: thing", false),
+        vec!["git", "commit", "-m", "feat: thing"]
+    );
+    assert_eq!(
+        commit_amend_argv("feat: thing", true),
+        vec!["git", "commit", "-m", "feat: thing", "--amend"]
+    );
+    // The Squash/Fixup path amends with no message at all.
+    assert_eq!(
+        commit_amend_argv("", true),
+        vec!["git", "commit", "--amend", "--no-edit"]
+    );
+}
+
+#[test]
+fn quick_commit_gates_add_all_then_commit_minus_m() {
+    assert_eq!(GitWriter::QUICK_COMMIT_ADD_ARGV, &["add", "--all"]);
+    let add_argv: Vec<&str> = std::iter::once("git")
+        .chain(GitWriter::QUICK_COMMIT_ADD_ARGV.iter().copied())
+        .collect();
+    assert_eq!(add_argv, vec!["git", "add", "--all"]);
+    assert_eq!(
+        commit_amend_argv("feat: all", false),
+        vec!["git", "commit", "-m", "feat: all"]
+    );
+}
+
+#[test]
+fn reworded_message_keeps_body_rewrites_subject() {
+    assert_eq!(reworded_message("old\n\nbody", "new"), "new\n\nbody");
+    assert_eq!(reworded_message("subject only", "new"), "new");
+}
+
+/// Lockstep contract with GitReader::page_count_limit: the probe row this
+/// fetch-limit appends must survive the reader's clamp, including at
+/// exactly MAX_HISTORY_COMMITS, or has_more dies at the ceiling.
+#[test]
+fn graph_fetch_limit_yields_the_probe_row_even_at_the_ceiling() {
+    let max = GitReader::MAX_HISTORY_COMMITS;
+    assert_eq!(
+        graph_fetch_limit(max),
+        max + 1,
+        "probe row must exist at exactly the ceiling"
+    );
+    assert_eq!(graph_fetch_limit(max + 10), max + 1);
+    assert_eq!(graph_fetch_limit(0), 2);
+}
+
+fn init_repo_with_branch_commits() -> (tempfile::TempDir, String, String, String) {
+    let dir = tempfile::TempDir::new().unwrap();
+    let git = |args: &[&str]| {
+        let output = std::process::Command::new("git")
+            .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+            .args(args)
+            .current_dir(dir.path())
+            .output_locked()
+            .expect("spawn git");
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap().trim().to_string()
+    };
+    git(&["init", "-q", "-b", "main"]);
+    std::fs::write(dir.path().join("base.txt"), "base\n").unwrap();
+    git(&["add", "--", "base.txt"]);
+    git(&["commit", "-m", "base"]);
+    let base = git(&["rev-parse", "HEAD"]);
+    std::fs::write(dir.path().join("a.txt"), "a\n").unwrap();
+    git(&["add", "--", "a.txt"]);
+    git(&["commit", "-m", "A"]);
+    let c_a = git(&["rev-parse", "HEAD"]);
+    std::fs::write(dir.path().join("b.txt"), "b\n").unwrap();
+    git(&["add", "--", "b.txt"]);
+    git(&["commit", "-m", "B"]);
+    let c_b = git(&["rev-parse", "HEAD"]);
+    crate::test_support::trust_repo(dir.path());
+    (dir, base, c_a, c_b)
+}
+
+/// Bare git runner for tests that only need a side effect (no output).
+fn run_git(cwd: &std::path::Path, args: &[&str]) {
+    let output = std::process::Command::new("git")
+        .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+        .args(args)
+        .current_dir(cwd)
+        .output_locked()
+        .expect("spawn git");
+    assert!(
+        output.status.success(),
+        "git {args:?} failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// The planned sequence for pick+squash on a branch mirrors
+/// execute_rebase_sequence exactly: detach onto the base, replay the
+/// steps (squash picks -n and amends --no-edit), then move the branch
+/// and check it back out. The rollback pair is gated proactively.
+#[test]
+fn rebase_planned_commands_mirror_the_writer_sequence_on_a_branch() {
+    let (dir, base, c_a, c_b) = init_repo_with_branch_commits();
+    let path = dir.path().to_str().unwrap();
+    let steps = vec![
+        RebaseStep {
+            commit_id: c_a.clone(),
+            action: crate::engine::git_writer::RebaseActionKind::Pick,
+        },
+        RebaseStep {
+            commit_id: c_b.clone(),
+            action: crate::engine::git_writer::RebaseActionKind::Squash,
+        },
+    ];
+    let planned = rebase_planned_commands(path, &base, &steps).unwrap();
+    assert_eq!(
+        planned,
+        vec![
+            vec!["git", "checkout", "--detach", &base],
+            vec!["git", "cherry-pick", &c_a],
+            vec!["git", "cherry-pick", "-n", &c_b],
+            vec!["git", "commit", "--amend", "--no-edit"],
+            vec!["git", "cherry-pick", "--abort"],
+            vec!["git", "checkout", "-f", "main"],
+            vec!["git", "branch", "-f", "main", "HEAD"],
+            vec!["git", "checkout", "main"],
+        ]
+    );
+}
+
+/// Detached sessions have no branch to fast-forward: the restore target
+/// is the detached HEAD oid and there is no branch -f / checkout tail.
+#[test]
+fn rebase_planned_commands_detached_session_restores_to_head_oid() {
+    let (dir, base, c_a, c_b) = init_repo_with_branch_commits();
+    let path = dir.path().to_str().unwrap();
+    let head = {
+        let output = std::process::Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(dir.path())
+            .output_locked()
+            .unwrap();
+        String::from_utf8(output.stdout).unwrap().trim().to_string()
+    };
+    let detached = std::process::Command::new("git")
+        .args(["checkout", "-q", "--detach"])
+        .current_dir(dir.path())
+        .output_locked()
+        .unwrap();
+    assert!(
+        detached.status.success(),
+        "detaching failed: {}",
+        String::from_utf8_lossy(&detached.stderr)
+    );
+    let planned = rebase_planned_commands(
+        path,
+        &base,
+        &[
+            RebaseStep {
+                commit_id: c_a.clone(),
+                action: crate::engine::git_writer::RebaseActionKind::Pick,
+            },
+            RebaseStep {
+                commit_id: c_b.clone(),
+                action: crate::engine::git_writer::RebaseActionKind::Fixup,
+            },
+        ],
+    )
+    .unwrap();
+    assert_eq!(
+        planned,
+        vec![
+            vec!["git", "checkout", "--detach", &base],
+            vec!["git", "cherry-pick", &c_a],
+            vec!["git", "cherry-pick", "-n", &c_b],
+            vec!["git", "commit", "--amend", "--no-edit"],
+            vec!["git", "cherry-pick", "--abort"],
+            vec!["git", "checkout", "-f", &head],
+        ]
+    );
+}
+
+/// A reword step composes its amend message from the original body plus
+/// the new subject, so the gate judges the real `-m` payload.
+#[test]
+fn rebase_planned_commands_reword_composes_the_real_message() {
+    let (dir, base, _c_a, _c_b) = init_repo_with_branch_commits();
+    // Rewrite HEAD's message so it has a body worth preserving.
+    let output = std::process::Command::new("git")
+        .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+        .args(["commit", "--amend", "-m", "A\n\nbody of A"])
+        .current_dir(dir.path())
+        .output_locked()
+        .unwrap();
+    assert!(output.status.success());
+    let c_a = {
+        let output = std::process::Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(dir.path())
+            .output_locked()
+            .unwrap();
+        String::from_utf8(output.stdout).unwrap().trim().to_string()
+    };
+    let planned = rebase_planned_commands(
+        dir.path().to_str().unwrap(),
+        &base,
+        &[RebaseStep {
+            commit_id: c_a.clone(),
+            action: crate::engine::git_writer::RebaseActionKind::Reword("renamed subject".into()),
+        }],
+    )
+    .unwrap();
+    assert_eq!(planned[2][0], "git");
+    assert_eq!(planned[2][1], "commit");
+    assert_eq!(planned[2][2], "-m");
+    assert!(
+        planned[2][3].starts_with("renamed subject\n\nbody of A"),
+        "reword must keep the original body, got {:?}",
+        planned[2][3]
+    );
+    assert_eq!(planned[2][4], "--amend");
+}
+
+#[test]
+fn rebase_planned_commands_refuses_empty_steps_and_invalid_oids() {
+    let (dir, base, _c_a, _c_b) = init_repo_with_branch_commits();
+    let path = dir.path().to_str().unwrap();
+    let err = rebase_planned_commands(path, &base, &[]).unwrap_err();
+    assert!(err.contains("empty"));
+    let err = rebase_planned_commands(
+        path,
+        &base,
+        &[RebaseStep {
+            commit_id: "; rm -rf /".into(),
+            action: crate::engine::git_writer::RebaseActionKind::Pick,
+        }],
+    )
+    .unwrap_err();
+    assert!(err.contains("Invalid revision"), "{err}");
+}
+
+/// The restack upstream resolver finds the fork point (here: where feature
+/// branched from main) and refuses invalid refs before anything is judged.
+/// The full rebase line is assembled in [`cmd_restack`] from this frozen
+/// value under one lock span, so planner and executor cannot drift.
+#[test]
+fn restack_upstream_resolution_resolves_fork_point() {
+    let (dir, base, _c_a, _c_b) = init_repo_with_branch_commits();
+    run_git(dir.path(), &["branch", "feature", &base]);
+    let canon = validate_repo(dir.path().to_str().unwrap()).unwrap();
+    let upstream = GitWriter::prepare_restack(&canon, "feature", "main", None).unwrap();
+    assert_eq!(upstream, base, "upstream must resolve to the fork base");
+    // Invalid refs are refused before anything is rendered or judged.
+    assert!(GitWriter::prepare_restack(&canon, "-evil", "main", None).is_err());
+}
+
+/// A cascade names the fork point it read the stack at. It is honoured
+/// when it really is an ancestor, and refused — never silently replaced
+/// by the computed one — when the stack has moved since it was read.
+#[test]
+fn restack_honours_a_caller_supplied_fork_point_and_refuses_a_stale_one() {
+    let (dir, base, c_a, _c_b) = init_repo_with_branch_commits();
+    run_git(dir.path(), &["branch", "feature", &base]);
+    let canon = validate_repo(dir.path().to_str().unwrap()).unwrap();
+
+    // `base` is genuinely an ancestor of `feature`, so it is taken as-is.
+    let honoured =
+        GitWriter::prepare_restack(&canon, "feature", "main", Some(base.as_str())).unwrap();
+    assert_eq!(honoured, base);
+
+    // `c_a` sits on the other branch, so it is not an ancestor of
+    // `feature`: the plan the caller built no longer describes this
+    // repository and the restack must not proceed on a widened range.
+    let err = GitWriter::prepare_restack(&canon, "feature", "main", Some(c_a.as_str()))
+        .expect_err("a non-ancestor fork point must be refused");
+    assert!(err.contains("no longer the stack on disk"), "{err}");
+
+    // Anything that is not an object id is refused before it reaches argv.
+    assert!(GitWriter::prepare_restack(&canon, "feature", "main", Some("--exec=boom")).is_err());
+}
+
+#[test]
+fn unborn_head_errors_are_notices_not_faults() {
+    assert!(is_unborn_head_error(
+        "fatal: ambiguous argument 'HEAD': unknown revision or path not in the working tree."
+    ));
+    assert!(is_unborn_head_error("fatal: Needed a single revision"));
+    assert!(is_unborn_head_error(
+        "fatal: ambiguous argument 'HEAD': unknown revision or path not in the working tree.\nUse '--' to separate paths from revisions"
+    ));
+    assert!(!is_unborn_head_error("fatal: bad object HEAD"));
+    assert!(!is_unborn_head_error("fatal: not a git repository"));
+}
+
+/// Every read failing used to leave every part absent, and the summary
+/// then said "Worktree clean" about a worktree nothing had looked at.
+#[test]
+fn a_worktree_summary_whose_reads_failed_is_an_error_not_clean() {
+    let repo = crate::test_support::git_repo();
+    crate::test_support::git_in(repo.path(), &["commit", "--allow-empty", "-m", "seed"]);
+    let path = repo.path().to_str().unwrap();
+    let read = super::worktree_ai_summary(path, path, Some("main")).expect("summary");
+    assert!(read.contains("HEAD±: clean"), "{read}");
+    let failed = crate::engine::git_cli::with_forced_spawn_failure(|| {
+        super::worktree_ai_summary(path, path, Some("main"))
+    });
+    let error = failed.expect_err("no read answered, so there is no summary");
+    assert!(
+        error.contains("forced by test"),
+        "the cause is named: {error}"
+    );
+}
+
+/// The Work view asks for up to 32 task titles per refresh. Each title
+/// was its own command, and each command authenticated the repository
+/// with `git worktree list`, so one refresh started a git process per
+/// title.
+#[test]
+fn many_task_scopes_authenticate_the_repository_once() {
+    let dir = crate::test_support::git_repo();
+    let repo = dir.path().canonicalize().expect("canonical repository");
+    let path = repo.to_str().expect("utf8");
+    let db = crate::tasks::store_path(path);
+    std::fs::create_dir_all(db.parent().unwrap()).unwrap();
+    let store = dc_store::Store::open(&db).unwrap();
+    for id in ["T1", "T2", "T3"] {
+        store
+            .connection()
+            .execute(
+                &format!(
+                    "INSERT INTO tasks (id, title, description, planned_files_json, status)
+                     VALUES ('{id}', 'title of {id}', '', '[]', 'in_progress')"
+                ),
+                [],
+            )
+            .unwrap();
+    }
+    let listings = || {
+        crate::engine::git_cli::spawn_log::spawns_in(&repo)
+            .iter()
+            .filter(|argv| argv.iter().any(|arg| arg == "worktree"))
+            .count()
+    };
+    let ids: Vec<String> = ["T1", "T2", "T3", "T2", "MISSING"]
+        .iter()
+        .map(|id| id.to_string())
+        .collect();
+
+    let before = listings();
+    let scopes = super::task_scopes(path, &ids).expect("scopes");
+    assert_eq!(listings() - before, 1, "one authentication for the set");
+    let titles: Vec<&str> = scopes.iter().map(|scope| scope.title.as_str()).collect();
+    assert_eq!(titles, ["title of T1", "title of T2", "title of T3"]);
+
+    let before = listings();
+    assert!(super::task_scopes(path, &[]).expect("empty").is_empty());
+    assert_eq!(listings(), before, "nothing asked, nothing spawned");
+
+    let too_many: Vec<String> = (0..=crate::tasks::MAX_SCOPE_IDS)
+        .map(|n| format!("T{n}"))
+        .collect();
+    let error = super::task_scopes(path, &too_many).expect_err("over the limit");
+    assert!(error.contains("the limit is 64"), "{error}");
+}
+
+#[test]
+fn an_empty_repository_graph_is_a_notice_not_a_fault() {
+    let repo = crate::test_support::git_repo();
+    let payload = tauri::async_runtime::block_on(cmd_get_commit_graph(
+        repo.path().to_string_lossy().into_owned(),
+        100,
+        None,
+        None,
+        None,
+        None,
+    ))
+    .expect("empty repository graph must load");
+    assert!(payload.rows.is_empty(), "no commits to draw");
+    assert!(payload.head_id.is_none());
+    assert!(
+        payload
+            .warnings
+            .iter()
+            .all(|w| !w.to_ascii_lowercase().contains("head unavailable")),
+        "unborn HEAD must not be a diagnostics fault: {:?}",
+        payload.warnings
+    );
+    assert!(
+        payload.notices.iter().any(|n| n.contains("no commits yet")),
+        "unborn HEAD must be disclosed as a notice: {:?}",
+        payload.notices
+    );
+}
+
+/// The payload carries assembly warnings through a serde round trip when
+/// present, and a payload from before the field existed still deserializes
+/// to an empty vec instead of failing (the `#[serde(default)]` contract).
+#[test]
+fn commit_graph_payload_round_trips_warnings() {
+    let warning = "HEAD unavailable (bad object HEAD); commit graph may lack the HEAD marker";
+    let notice = "36 commit(s) reachable only from refs outside branches, remotes and tags \
+                  are not drawn.";
+    let payload = CommitGraphPayload {
+        rows: Vec::new(),
+        head_id: None,
+        refs: Vec::new(),
+        has_more: false,
+        warnings: vec![warning.to_string()],
+        notices: vec![notice.to_string()],
+        mainline_id: Some("abc".to_string()),
+        mainline_name: Some("main".to_string()),
+    };
+    let json = serde_json::to_string(&payload).unwrap();
+    assert!(
+        json.contains(&format!(r#""warnings":["{warning}"]"#)),
+        "warnings must serialize verbatim, got {json}"
+    );
+    let back: CommitGraphPayload = serde_json::from_str(&json).unwrap();
+    assert_eq!(back.warnings, vec![warning]);
+    // Two lists on the wire, not one: a client that folded them back
+    // together would refile every disclosure as a fault again.
+    assert_eq!(back.notices, vec![notice]);
+
+    // `folds` was shipped (and never read) by earlier builds; a payload
+    // carrying it must still deserialize.
+    let legacy = r#"{"rows":[],"folds":[],"head_id":null,"refs":[],"has_more":false}"#;
+    let back: CommitGraphPayload = serde_json::from_str(legacy).unwrap();
+    assert!(back.warnings.is_empty(), "absent field defaults to empty");
+    assert!(back.notices.is_empty(), "absent field defaults to empty");
+    assert!(back.mainline_id.is_none() && back.mainline_name.is_none());
+}
+
+fn decoration(name: &str, kind: RefKind, commit_id: &str, is_head: bool) -> RefDecoration {
+    RefDecoration {
+        remote: None,
+        name: name.to_string(),
+        kind,
+        commit_id: commit_id.to_string(),
+        is_head,
+    }
+}
+
+/// The default branch supplies every tip carrying its name, local first,
+/// all labelled with the local name; HEAD is the fallback anchor.
+#[test]
+fn mainline_hint_takes_the_default_branch_local_then_remotes() {
+    let refs = vec![
+        decoration("feature", RefKind::Local, "f1", true),
+        decoration("main", RefKind::Local, "m1", false),
+        decoration("origin/main", RefKind::Remote, "o1", false),
+        decoration("upstream/main", RefKind::Remote, "u1", false),
+        decoration("origin/feature", RefKind::Remote, "f1", false),
+        decoration("v1", RefKind::Tag, "m1", false),
+    ];
+    let resolved = resolve_mainline_hint(&refs, Some("main"), Some("f1"));
+    assert_eq!(
+        resolved.hint,
+        MainlineHint {
+            branch_tips: vec!["m1".into(), "o1".into(), "u1".into()],
+            fallback_tip: Some("f1".into()),
+        }
+    );
+    assert_eq!(resolved.name_for("m1", &refs).as_deref(), Some("main"));
+    assert_eq!(
+        resolved.name_for("o1", &refs).as_deref(),
+        Some("main"),
+        "a remote copy of a local branch is still labelled by the branch"
+    );
+    assert_eq!(
+        resolved.name_for("f1", &refs).as_deref(),
+        Some("feature"),
+        "the HEAD fallback is labelled with the checked-out branch"
+    );
+    assert_eq!(resolved.name_for("nowhere", &refs), None);
+}
+
+/// Without a resolved default branch the conventional names are probed
+/// in order; a remote-only branch is labelled by its remote ref.
+#[test]
+fn mainline_hint_falls_back_to_conventional_names_and_remote_only_labels() {
+    let refs = vec![
+        decoration("origin/master", RefKind::Remote, "r1", false),
+        decoration("develop", RefKind::Local, "d1", false),
+    ];
+    let resolved = resolve_mainline_hint(&refs, None, None);
+    assert_eq!(resolved.hint.branch_tips, vec!["r1".to_string()]);
+    assert_eq!(resolved.hint.fallback_tip, None);
+    assert_eq!(
+        resolved.name_for("r1", &refs).as_deref(),
+        Some("origin/master")
+    );
+
+    // A default branch that has no refs at all must NOT fall through to
+    // another name: pinning `develop` when the repository's default is
+    // `release` would straighten the wrong branch.
+    let resolved = resolve_mainline_hint(&refs, Some("release"), Some("h"));
+    assert_eq!(resolved.hint.branch_tips, vec!["r1".to_string()]);
+    assert_eq!(
+        resolve_mainline_hint(&[], Some("release"), Some("h")).hint,
+        MainlineHint {
+            branch_tips: Vec::new(),
+            fallback_tip: Some("h".into()),
+        }
+    );
+}
+
+/// A detached HEAD is labelled `HEAD`; blank ids never become tips.
+#[test]
+fn mainline_hint_detached_head_and_blank_ids() {
+    let refs = vec![decoration("HEAD", RefKind::Head, "h1", true)];
+    let resolved = resolve_mainline_hint(&refs, Some(""), Some("h1"));
+    assert!(resolved.hint.branch_tips.is_empty());
+    assert_eq!(resolved.hint.fallback_tip.as_deref(), Some("h1"));
+    assert_eq!(resolved.name_for("h1", &refs).as_deref(), Some("HEAD"));
+    assert_eq!(
+        resolve_mainline_hint(&refs, None, Some("  "))
+            .hint
+            .fallback_tip,
+        None
+    );
+}

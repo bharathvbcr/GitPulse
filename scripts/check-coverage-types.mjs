@@ -129,14 +129,14 @@ export const CONTRACTS = Object.freeze([
   { label: "local-scan", rustPath: rust("harness", "protocol.rs"), tsPath: ts("ai", "scan.ts"), structs: ["ScanModel", "ScanServer", "ScanResult"] },
   { label: "tasks", rustPath: rust("tasks", "mod.rs"), tsPath: ts("tasks", "types.ts"), structs: ["TaskScope", "TaskLease", "TaskEvidence", "TaskGap", "TaskRun", "TaskView"] },
   { label: "ops", rustPath: rust("ops.rs"), tsPath: ts("ops", "model.ts"), structs: ["BranchCleanupCandidate", "BranchCleanupPlan", "CommitReviewReport", "TagCleanupPlan", "TagCleanupEntry"] },
-  { label: "release", rustPath: rust("commands", "mod.rs"), tsPath: ts("ops", "model.ts"), structs: ["ReleasePublishResult"] },
+  { label: "release", rustPath: rust("commands", "refs.rs"), tsPath: ts("ops", "model.ts"), structs: ["ReleasePublishResult"] },
   // The envelope on every gated command: `policy` travels with `output` so the
   // UI can tell an approved action from one that ran with no gate available.
   // Renaming either field would have broken 33 commands at once, silently.
-  { label: "guarded", rustPath: rust("commands", "mod.rs"), tsPath: ts("stores", "harnessStore.ts"), structs: ["Guarded"] },
+  { label: "guarded", rustPath: rust("commands", "policy.rs"), tsPath: ts("stores", "harnessStore.ts"), structs: ["Guarded"] },
   { label: "branches", rustPath: rust("engine", "git_reader.rs"), tsPath: ts("branches", "types.ts"), structs: ["BranchInfo", "TagInfo", "TagList"] },
   { label: "commits", rustPath: rust("engine", "git_reader.rs"), tsPath: ts("stores", "graphStore.ts"), structs: ["CommitDetails", "CommitFileChange"] },
-  { label: "graph", rustPath: rust("commands", "mod.rs"), tsPath: ts("stores", "graphStore.ts"), structs: ["CommitGraphPayload"] },
+  { label: "graph", rustPath: rust("commands", "commit_graph.rs"), tsPath: ts("stores", "graphStore.ts"), structs: ["CommitGraphPayload"] },
   { label: "refs", rustPath: rust("graph", "refs.rs"), tsPath: ts("stores", "graphStore.ts"), structs: ["RefDecoration"] },
   { label: "stack", rustPath: rust("stack", "stack_tree.rs"), tsPath: ts("stack", "types.ts"), structs: ["StackHierarchyPayload", "StackedBranchNode", "BranchAncestryChain"] },
   { label: "status", rustPath: rust("engine", "git_reader.rs"), tsPath: ts("stores", "repoStore.ts"), structs: ["FileStatus", "BranchStatsReport", "DiffPayload"] },
@@ -204,7 +204,7 @@ export const CONTRACTS = Object.freeze([
   // lost, so a field that silently read as undefined would report zero — the
   // exact "a check that did not run looks like one that passed" shape this
   // subsystem exists to avoid.
-  { label: "session-alerts", rustPath: rust("commands", "mod.rs"), tsPath: ts("stores", "sessionAlertsStore.ts"), structs: ["SessionAlertsView"] },
+  { label: "session-alerts", rustPath: rust("commands", "app.rs"), tsPath: ts("stores", "sessionAlertsStore.ts"), structs: ["SessionAlertsView"] },
   { label: "session-alert-status", rustPath: rust("alerts", "mod.rs"), tsPath: ts("stores", "sessionAlertsStore.ts"), structs: ["SessionAlertStatus"] },
   // What an agent stood asking for while no page listened. A renamed field
   // here would replay every waiting agent as asking nothing.
@@ -216,7 +216,7 @@ export const CONTRACTS = Object.freeze([
   // build can expand. `modes` and `launchers` are what the chooser renders, so
   // a renamed field would empty the chooser rather than fail — leaving a panel
   // that offers nothing while reporting nothing wrong.
-  { label: "agent-defaults", rustPath: rust("commands", "mod.rs"), tsPath: ts("stores", "agentDefaultsStore.ts"), structs: ["AgentDefaultsView"] },
+  { label: "agent-defaults", rustPath: rust("commands", "app.rs"), tsPath: ts("stores", "agentDefaultsStore.ts"), structs: ["AgentDefaultsView"] },
   { label: "agent-models", rustPath: rust("workbench", "agent_models.rs"), tsPath: ts("terminal", "agentModelCatalog.ts"), structs: ["AgentModelOption", "AgentModelCatalog"] },
   // Per-repository DevCouncil setup, and the inventory behind it. These land
   // on every repository the user opens, so a rename that made `exclude` or

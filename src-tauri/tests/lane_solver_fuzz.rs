@@ -863,7 +863,7 @@ fn dangling_parent_edges_stay_stubs_across_seeds() {
 /// Solving B after A on a reused solver must match solving B alone: solve()
 /// resets `active_columns`, `column_colors`, and the color cursor before each
 /// run (lane_solver.rs solve()), and production creates one solver per call
-/// anyway (commands/mod.rs). This guards against state leaks if either
+/// anyway (commands/commit_graph.rs). This guards against state leaks if either
 /// changes.
 #[test]
 fn solver_state_does_not_leak_between_solves() {
