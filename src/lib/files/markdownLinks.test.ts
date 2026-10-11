@@ -5,6 +5,7 @@ import { describe, expect, it, vi } from "vitest";
 import {
   findFragmentTarget,
   handleMarkdownClick,
+  handleMarkdownKeydown,
   MARKDOWN_ID_PREFIX,
   resolveMarkdownLink,
   type MarkdownClickContext,
@@ -147,12 +148,34 @@ describe("handleMarkdownClick", () => {
     expect(click.preventDefault).toHaveBeenCalled();
     expect(attrs.src).toBe("https://tracker.example/p.png?u=1");
     expect("data-withheld-src" in attrs).toBe(false);
+    expect((attrs as Record<string, string>).referrerpolicy).toBe("no-referrer");
 
-    for (const bad of ["javascript:alert(1)", "data:text/html,x", "file:///etc/passwd", ""]) {
+    // Scheme-relative would resolve against the app's own scheme: read as https.
+    const relative = { src: "#", "data-withheld-src": "//cdn.example/p.png" };
+    handleMarkdownClick(event(element(relative, ["img[data-withheld-src]"])), context());
+    expect(relative.src).toBe("https://cdn.example/p.png");
+
+    for (const bad of ["javascript:alert(1)", "data:text/html,x", "file:///etc/passwd", "", "http://plain.example/p.png", "https://", "///x"]) {
       const held = { src: "#", "data-withheld-src": bad };
       handleMarkdownClick(event(element(held, ["img[data-withheld-src]"])), context());
       expect(held.src, bad).toBe("#");
     }
+  });
+
+  it("loads a withheld picture from the keyboard with Enter or Space, and ignores other keys", () => {
+    for (const key of ["Enter", " "]) {
+      const attrs = { src: "#", "data-withheld-src": "https://cdn.example/p.png", role: "button", tabindex: "0" };
+      const press = { key, target: element(attrs, ["img[data-withheld-src]"]), preventDefault: vi.fn() };
+      handleMarkdownKeydown(press as unknown as KeyboardEvent);
+      expect(press.preventDefault, key).toHaveBeenCalled();
+      expect(attrs.src, key).toBe("https://cdn.example/p.png");
+      expect("tabindex" in attrs, key).toBe(false);
+    }
+    const attrs = { src: "#", "data-withheld-src": "https://cdn.example/p.png" };
+    const press = { key: "a", target: element(attrs, ["img[data-withheld-src]"]), preventDefault: vi.fn() };
+    handleMarkdownKeydown(press as unknown as KeyboardEvent);
+    expect(press.preventDefault).not.toHaveBeenCalled();
+    expect(attrs.src).toBe("#");
   });
 
   it("never lets the webview follow a link, whatever the link is", () => {

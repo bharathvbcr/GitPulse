@@ -137,10 +137,34 @@ const WITHHELD_IMAGE = "img[data-withheld-src]";
  * a click is the reader asking for this one. Only network addresses load.
  */
 function loadWithheldImage(image: Element): void {
-  const address = image.getAttribute("data-withheld-src") ?? "";
-  if (!/^(https?:)?\/\//i.test(address.trim())) return;
-  image.setAttribute("src", address.trim());
+  const address = withheldAddress(image.getAttribute("data-withheld-src") ?? "");
+  if (!address) return;
+  image.setAttribute("referrerpolicy", "no-referrer");
+  image.setAttribute("src", address);
   image.removeAttribute("data-withheld-src");
+  image.removeAttribute("role");
+  image.removeAttribute("tabindex");
+}
+
+/**
+ * The address a withheld picture may load from, or null. Only https reaches
+ * the network. A scheme-relative address would resolve against the app's own
+ * scheme, so it is read as https; plain http is not loaded, as the renderer
+ * never lets an http picture through either.
+ */
+function withheldAddress(raw: string): string | null {
+  const trimmed = raw.trim();
+  const address = trimmed.startsWith("//") ? `https:${trimmed}` : trimmed;
+  return /^https:\/\/[^/]/i.test(address) ? address : null;
+}
+
+/** Enter or Space on a withheld picture loads it, as a click does. */
+export function handleMarkdownKeydown(event: KeyboardEvent): void {
+  if (event.key !== "Enter" && event.key !== " ") return;
+  const withheld = closest(event.target, WITHHELD_IMAGE);
+  if (!withheld) return;
+  event.preventDefault();
+  loadWithheldImage(withheld);
 }
 
 /**
@@ -275,8 +299,19 @@ export function prepareRenderedMarkdown(html: string, note: MarkdownNote | null,
     frame.append(button, block);
   }
   for (const picture of root.querySelectorAll("img")) {
-    const src = picture.getAttribute("src") ?? "";
-    if (/^(?:data:image\/|https:)/i.test(src)) continue;
+    const held = picture.getAttribute("data-withheld-src");
+    const heldAddress = held === null ? null : withheldAddress(held);
+    if (heldAddress) {
+      // A remote picture the renderer withheld stays in place as a control:
+      // the reader loads it by clicking it (or Enter/Space).
+      picture.classList.add("gp-md-withheld-picture");
+      picture.setAttribute("role", "button");
+      picture.setAttribute("tabindex", "0");
+      picture.setAttribute("title", `Remote picture not loaded: ${heldAddress}. Click to load it.`);
+      continue;
+    }
+    const src = held ?? picture.getAttribute("src") ?? "";
+    if (held === null && /^(?:data:image\/|https:)/i.test(src)) continue;
     // The renderer leaves a picture it did not embed with its source path.
     // In the webview that path resolves against the APP's origin — a broken
     // icon at best, one of GitPulse's own assets at worst — so it is replaced

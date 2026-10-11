@@ -1751,6 +1751,15 @@ html.light .gp-markdown {
   font-size: 0.9em;
   cursor: pointer;
 }
+.gp-markdown .gp-md-withheld-picture {
+  display: inline-block;
+  min-width: 4em;
+  min-height: 1.5em;
+  border: 1px dashed rgb(var(--c-border));
+  border-radius: 5px;
+  color: rgb(var(--c-text-muted));
+  cursor: pointer;
+}
 .gp-markdown .gp-md-missing-picture {
   display: inline-block;
   padding: 0.1em 0.5em;

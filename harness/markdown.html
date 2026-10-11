@@ -132,12 +132,17 @@
       check("no link can run script", () => [...page().querySelectorAll("a")].every(a => !/^\s*javascript:/i.test(a.getAttribute("href"))));
 
       // --- pictures ------------------------------------------------------
-      check("a remote picture loads without a referrer", () => {
-        const img = page().querySelector("img");
-        return img?.getAttribute("src").startsWith("https://") && img.getAttribute("referrerpolicy") === "no-referrer";
-      });
+      const remote = page().querySelector("img[data-withheld-src]");
+      check("a remote picture is withheld until the reader asks for it", () =>
+        remote?.getAttribute("src") === "#" && remote.getAttribute("data-withheld-src").startsWith("https://") &&
+        remote.getAttribute("role") === "button" && remote.getAttribute("tabindex") === "0" && /Click to load/.test(remote.title));
+      clickable(remote); await settle();
+      check("a clicked remote picture loads over https without a referrer", () =>
+        remote.getAttribute("src").startsWith("https://") && !remote.hasAttribute("data-withheld-src") &&
+        remote.getAttribute("referrerpolicy") === "no-referrer");
       check("a picture that was not embedded never resolves against the app", () =>
-        [...page().querySelectorAll("img")].every(img => /^(data:image\/|https:)/.test(img.getAttribute("src"))) &&
+        [...page().querySelectorAll("img")].every(img => /^(data:image\/|https:)/.test(img.getAttribute("src")) ||
+          (img.getAttribute("src") === "#" && img.hasAttribute("data-withheld-src"))) &&
         page().querySelector(".gp-md-missing-picture")?.textContent === "Missing local picture");
 
       // --- links -------------------------------------------------------
