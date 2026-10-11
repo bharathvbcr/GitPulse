@@ -13,7 +13,7 @@ before that tag is pushed.
 
 ### Fixed
 
-- `gitpulse-mcp` `devmap_neighbors` no longer fails every call with "data must be object": it answers the `CodeintelResponse` envelope (`source_freshness`, `available`/`reason`, `total`/`shown`/`truncated`, `walk_incomplete`) under a typed `outputSchema`, honours its advertised `depth` and `min_confidence` (it silently walked to depth 10 with confidence 0), and `devmap_trace` now declares the `min_rung` it reads. The output-schema contract test now runs and validates every DevMap tool instead of skipping the exempt ones.
+- `gitpulse-mcp` `devmap_neighbors` no longer fails every call with "data must be object": it answers the `CodeintelResponse` envelope (`source_freshness`, `available`/`reason`, `total`/`shown`/`truncated`, `walk_incomplete`). `depth` and `min_confidence` were advertised but hardcoded to 10 and 0.0 in `devmap_neighbors`, `devmap_impact`, `devmap_trace`, `devmap_explore` and `devmap_affected_tests`; they now reach the walk through one `WalkBounds` and an out-of-range value is refused, not clamped. `devmap_dependencies` reads one file's direct edges, so it drops the no-op `depth` and gains `min_confidence`. `devmap_trace` declares the `min_rung` it reads. All eleven DevMap tools now declare typed `outputSchema`s, and the contract tests run each of them and require every declared argument to be read and every read argument to be declared.
 
 ### Changed
 

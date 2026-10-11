@@ -1,6 +1,7 @@
 //! Code intelligence, DevMap, workspace, DevCouncil, insights and fleet commands.
 
 use super::*;
+use crate::codeintel::WalkBounds;
 
 // --- code intelligence (devmap in-process) ----------------------------
 
@@ -47,8 +48,14 @@ pub async fn cmd_codeintel_impact(
 ) -> Result<crate::codeintel::CodeintelResponse<crate::codeintel::CodeintelEdge>, String> {
     off_thread(move || {
         let cancel = crate::codeintel::begin_cancellable_query(cancel_token.as_deref());
-        let result =
-            crate::codeintel::impact_at_rung(&repo_path, &target, token_budget, None, Some(cancel));
+        let result = crate::codeintel::impact_at_rung(
+            &repo_path,
+            &target,
+            token_budget,
+            None,
+            WalkBounds::default(),
+            Some(cancel),
+        );
         crate::codeintel::finish_cancellable_query(cancel_token.as_deref());
         Ok(result)
     })
@@ -104,6 +111,7 @@ pub async fn cmd_codeintel_dependencies(
             &file_path,
             token_budget,
             min_rung.as_deref(),
+            WalkBounds::default(),
             None,
         ))
     })
@@ -126,6 +134,7 @@ pub async fn cmd_codeintel_trace(
             &to,
             token_budget,
             min_rung.as_deref(),
+            WalkBounds::default(),
             None,
         ))
     })
@@ -146,8 +155,7 @@ pub async fn cmd_codeintel_neighbors(
             &targets,
             token_budget,
             min_rung.as_deref(),
-            None,
-            None,
+            WalkBounds::default(),
         )
     })
     .await
@@ -167,6 +175,7 @@ pub async fn cmd_codeintel_explore(
             &query,
             token_budget,
             limit,
+            WalkBounds::default(),
         ))
     })
     .await
@@ -185,7 +194,10 @@ pub async fn cmd_codeintel_affected_tests(
             &repo_path,
             &targets,
             token_budget,
-            max_depth,
+            WalkBounds {
+                max_depth,
+                min_confidence: None,
+            },
         ))
     })
     .await
@@ -260,6 +272,7 @@ pub async fn cmd_codeintel_impact_at_rung(
             &target,
             token_budget,
             min_rung.as_deref(),
+            WalkBounds::default(),
             Some(cancel),
         );
         crate::codeintel::finish_cancellable_query(cancel_token.as_deref());

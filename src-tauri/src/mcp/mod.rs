@@ -2552,46 +2552,6 @@ mod tests {
             "gitpulse_provenance",
             "relays git-notes provenance records, which carry per-commit free-form fields",
         ),
-        (
-            "devmap_status",
-            "in-process `crate::codeintel` answer; GitPulse owns the shape, typed schema still to write",
-        ),
-        (
-            "devmap_search",
-            "in-process `crate::codeintel` answer; GitPulse owns the shape, typed schema still to write",
-        ),
-        (
-            "devmap_dependencies",
-            "in-process `crate::codeintel` answer; GitPulse owns the shape, typed schema still to write",
-        ),
-        (
-            "devmap_impact",
-            "in-process `crate::codeintel` answer; GitPulse owns the shape, typed schema still to write",
-        ),
-        (
-            "devmap_trace",
-            "in-process `crate::codeintel` answer; GitPulse owns the shape, typed schema still to write",
-        ),
-        (
-            "devmap_dead_symbols",
-            "in-process `crate::codeintel` answer; GitPulse owns the shape, typed schema still to write",
-        ),
-        (
-            "devmap_clones",
-            "in-process `crate::codeintel` answer; GitPulse owns the shape, typed schema still to write",
-        ),
-        (
-            "devmap_preview",
-            "in-process `crate::codeintel` answer; GitPulse owns the shape, typed schema still to write",
-        ),
-        (
-            "devmap_explore",
-            "in-process `crate::codeintel` answer; GitPulse owns the shape, typed schema still to write",
-        ),
-        (
-            "devmap_affected_tests",
-            "in-process `crate::codeintel` answer; GitPulse owns the shape, typed schema still to write",
-        ),
     ];
 
     fn is_object_only_exempt(name: &str) -> bool {
