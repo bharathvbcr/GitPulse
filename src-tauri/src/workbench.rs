@@ -5,7 +5,7 @@
 use dc_store::Store;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use tauri::{Emitter, State};
@@ -238,6 +238,15 @@ impl WorkbenchState {
         }
         Ok(())
     }
+    /// The profile this host owns, for naming it in a record, without creating
+    /// anything on disk.
+    fn profile_label(&self) -> PathBuf {
+        self.0
+            .path
+            .clone()
+            .or_else(|| intake::default_profile_path().ok())
+            .unwrap_or_default()
+    }
     fn profile_path(&self) -> Result<PathBuf, WorkbenchError> {
         let path = match &self.0.path {
             Some(path) => path.clone(),
@@ -295,7 +304,7 @@ impl WorkbenchState {
             // first read (a read never upgrades). A handle is cached only
             // after that succeeds, so a failure is reported by every request
             // until it is fixed rather than leaving reads against an old schema.
-            upgrade_owned_profile(&store)?;
+            upgrade_owned_profile(&store, &path)?;
             *guard = Some(store);
         }
         body(
@@ -530,7 +539,9 @@ impl WorkbenchState {
             worker.shutdown();
             return Err(error);
         }
-        worker.call(method, params).map_err(worker_error)
+        worker
+            .call(method, params)
+            .map_err(|error| worker_error(&self.profile_label(), error))
     }
 
     /// What the profile worker's harness declared at handshake.
@@ -561,7 +572,7 @@ impl WorkbenchState {
         worker
             .handshake()
             .map(|(_, hello)| hello)
-            .map_err(worker_error)
+            .map_err(|error| worker_error(&self.profile_label(), error))
     }
 
     /// Resolves (building if needed) the profile worker for a model selection.
@@ -588,8 +599,9 @@ impl WorkbenchState {
                         log::warn!(target: "workbench", "profile worker retire could not acquire the active request; prior generation may remain unresolved");
                     }
                 }
-                let connection = crate::harness::sidecar::ProfileConnection::new(path, selection)
-                    .map_err(worker_error)?;
+                let connection =
+                    crate::harness::sidecar::ProfileConnection::new(path.clone(), selection)
+                        .map_err(|error| worker_error(&path, error))?;
                 *guard = Some((fingerprint, Arc::new(connection)));
             }
             Arc::clone(&guard.as_ref().expect("worker slot just ensured").1)
@@ -769,17 +781,22 @@ fn generation_input(method: &str, input: &str) -> Result<HostControl, WorkbenchE
     })
 }
 
-/// The Diagnostics name of the profile upgrade.
-const PROFILE_UPGRADE_SUBSYSTEM: &str = "workbench profile upgrade";
+/// The Diagnostics name of one profile's upgrade. Per profile, because the
+/// record is process-global: a profile that opened cleanly must not clear the
+/// failure of another that did not.
+fn profile_upgrade_subsystem(profile: &Path) -> String {
+    format!("workbench profile upgrade ({})", profile.display())
+}
 
 /// Brings the profile this host owns to the current schema, and says so
 /// loudly when it cannot: the error goes to the caller, the log and the
 /// Diagnostics list, never into a silent fallback to a profile of the wrong
 /// shape.
-fn upgrade_owned_profile(store: &Store) -> Result<(), WorkbenchError> {
+fn upgrade_owned_profile(store: &Store, profile: &Path) -> Result<(), WorkbenchError> {
+    let subsystem = profile_upgrade_subsystem(profile);
     match store.upgrade_workbench_profile() {
         Ok(report) => {
-            crate::supervisor::note_recovered(PROFILE_UPGRADE_SUBSYSTEM);
+            crate::supervisor::note_recovered(&subsystem);
             if let Some(backup) = report.backup {
                 log::info!(target: "workbench", "profile upgraded from schema {} to {}; backup at {backup}", report.from, report.to);
             }
@@ -788,7 +805,7 @@ fn upgrade_owned_profile(store: &Store) -> Result<(), WorkbenchError> {
         Err(error) => {
             let reason = format!("{}: {}", error.code, error.message);
             log::error!(target: "workbench", "profile upgrade failed: {reason}");
-            crate::supervisor::note_degraded(PROFILE_UPGRADE_SUBSYSTEM, &reason);
+            crate::supervisor::note_degraded(&subsystem, &reason);
             Err(error.into())
         }
     }
@@ -798,11 +815,11 @@ fn upgrade_owned_profile(store: &Store) -> Result<(), WorkbenchError> {
 /// not been upgraded: the host owns that step, so the way out is to let it.
 const SCHEMA_UPGRADE_REQUIRED: &str = "The task profile is on an older schema and Manvi's worker does not upgrade a shared profile. GitPulse upgrades it, after a backup, the first time it opens the profile: restart GitPulse, and see Diagnostics if it reports the upgrade failed.";
 
-fn worker_error(error: crate::harness::HarnessError) -> WorkbenchError {
+fn worker_error(profile: &Path, error: crate::harness::HarnessError) -> WorkbenchError {
     match error {
         crate::harness::HarnessError::Refused(error) if error.code == "schema_upgrade_required" => {
             crate::supervisor::note_degraded(
-                PROFILE_UPGRADE_SUBSYSTEM,
+                &profile_upgrade_subsystem(profile),
                 &format!("the profile worker refused: {}", error.message),
             );
             WorkbenchError::new(
@@ -1035,15 +1052,27 @@ mod tests {
     #[test]
     fn worker_error_preserves_timeout_unavailable_and_protocol_codes() {
         assert_eq!(
-            worker_error(crate::harness::HarnessError::Timeout("slow".into())).code,
+            worker_error(
+                std::path::Path::new("/p"),
+                crate::harness::HarnessError::Timeout("slow".into())
+            )
+            .code,
             "timeout"
         );
         assert_eq!(
-            worker_error(crate::harness::HarnessError::Unavailable("down".into())).code,
+            worker_error(
+                std::path::Path::new("/p"),
+                crate::harness::HarnessError::Unavailable("down".into())
+            )
+            .code,
             "unavailable"
         );
         assert_eq!(
-            worker_error(crate::harness::HarnessError::Protocol("bad".into())).code,
+            worker_error(
+                std::path::Path::new("/p"),
+                crate::harness::HarnessError::Protocol("bad".into())
+            )
+            .code,
             "protocol_error"
         );
     }

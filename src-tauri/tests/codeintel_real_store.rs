@@ -18,6 +18,13 @@ fn have_real_store(repo: &str) -> bool {
     codeintel::devmap_db_path(repo).exists()
 }
 
+/// The store's own refusal of a schema it does not read, in either direction.
+fn is_schema_mismatch(reason: Option<&str>) -> bool {
+    reason.is_some_and(|reason| {
+        reason.contains("is not supported by this binary") || reason.contains("this build reads")
+    })
+}
+
 #[test]
 fn answers_impact_from_the_real_map_in_process() {
     // A candidate schema can be tested against an isolated source checkout
@@ -41,6 +48,26 @@ fn answers_impact_from_the_real_map_in_process() {
 
     common::trust_repo(std::path::Path::new(repo));
     let status = codeintel::status(repo);
+    // A map one schema behind this binary is an environment fact, not a
+    // regression: the store refuses it by design and only `devmap build` (which
+    // rewrites a checkout this test does not own) can fix it. Say so as loudly
+    // as the missing-map skip does and return, instead of failing the suite on
+    // a stale index. A GITPULSE_CODEINTEL_TEST_REPO named by the caller is held
+    // to the stricter rule: they asked for this map to be exercised.
+    if !status.available && is_schema_mismatch(status.reason.as_deref()) {
+        assert!(
+            selected_repo.is_none(),
+            "GITPULSE_CODEINTEL_TEST_REPO has a map this binary cannot read: {:?}",
+            status.reason
+        );
+        eprintln!(
+            "NOT COVERED: the real-map impact check did not run. {repo}'s map is on another \
+             schema than this binary reads ({:?}). Rebuild it with `devmap build` there, or \
+             set GITPULSE_CODEINTEL_TEST_REPO to a repository with a current map.",
+            status.reason
+        );
+        return;
+    }
     assert!(
         status.available,
         "the map is on disk but unreadable: {:?}",

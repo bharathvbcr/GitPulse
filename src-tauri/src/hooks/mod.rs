@@ -4667,7 +4667,10 @@ done
             let profile = profile();
             let started = std::time::Instant::now();
             assert!(judged_by_app_in(profile.path().to_path_buf(), &repo, "ls").is_none());
-            assert!(started.elapsed() < Duration::from_millis(300));
+            assert!(
+                started.elapsed()
+                    < crate::test_support::coverage_relaxed(Duration::from_millis(300))
+            );
         }
     }
 }

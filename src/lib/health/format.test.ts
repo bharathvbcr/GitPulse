@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   dependabotBadgeClass,
   formatAuditCounts,
+  formatAuditCoverage,
   issueClass,
   normalizeSeverity,
   severityClass,
@@ -256,5 +257,33 @@ describe("health tone presentation", () => {
     expect(issueClass(" ERROR ")).toContain("rose");
     expect(issueClass("Warning")).toContain("amber");
     expect(issueClass("info")).toBe(issueClass("anything else"));
+  });
+});
+
+describe("formatAuditCoverage", () => {
+  it("says nothing when no census was sent or nothing was found to audit", () => {
+    expect(formatAuditCoverage(undefined)).toBeNull();
+    expect(formatAuditCoverage({ found: 0, audited: 0, unaudited: [] })).toBeNull();
+  });
+
+  it("prints both numbers, and names what was not audited", () => {
+    expect(formatAuditCoverage({ found: 3, audited: 3, unaudited: [] })).toBe("3 of 3 audited");
+    expect(
+      formatAuditCoverage({ found: 3, audited: 1, unaudited: ["cargo:Cargo.lock", "go:go.mod"] }),
+    ).toBe("1 of 3 audited; not audited: cargo:Cargo.lock, go:go.mod");
+  });
+
+  it("never reads a shortfall as complete when the names are missing", () => {
+    expect(formatAuditCoverage({ found: 2, audited: 1, unaudited: [] })).toBe(
+      "1 of 2 audited; not audited: unknown",
+    );
+  });
+
+  it("bounds the list and strips control characters from target paths", () => {
+    const unaudited = Array.from({ length: 8 }, (_, i) => `npm:pkg${i}\nINJECTED/package-lock.json`);
+    const line = formatAuditCoverage({ found: 9, audited: 1, unaudited }) ?? "";
+    expect(line).not.toContain("\n");
+    expect(line).toContain("1 of 9 audited");
+    expect(line).toContain("and 3 more");
   });
 });

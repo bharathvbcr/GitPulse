@@ -162,6 +162,7 @@
         cargo_audit_present: true, cargo_deny_present: false, cargo_crev_present: false, pip_audit_present: false, govulncheck_present: false,
         composer_present: false, bundler_audit_present: false,
         scanners_ran: ["npm", "cargo"], audit_complete: false,
+          audit_coverage: { found: 2, audited: 1, unaudited: ["cargo:Cargo.lock"] },
         manifests: [{
           path: "package.json", name: "gitpulse", version: "0.0.5", private: true,
           license: "MIT", engines_node: ">=22", package_manager: "npm",
@@ -336,7 +337,7 @@
         cmd_get_knowledge_report: () => ({ authors: [], files: [] }),
         cmd_get_dora_report: () => null,
         cmd_scan_deps_health: () => q.has("health-evidence") ? {
-          ...healthReport(), audit_complete: true, issues: [], vulnerabilities: [], outdated: [],
+          ...healthReport(), audit_complete: true, audit_coverage: { found: 2, audited: 2, unaudited: [] }, issues: [], vulnerabilities: [], outdated: [],
           audit: { info: 0, low: 0, moderate: 0, high: 0, critical: 0, unknown: 0, total: 0 },
           limit_notices: [{ resource: "cargo ecosystem artifacts", kept: 24, total: 783, inventory_only: true }],
         } : healthReport(),

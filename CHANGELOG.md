@@ -13,6 +13,13 @@ before that tag is pushed.
 
 ### Fixed
 
+- Multi-module Maven and Gradle builds: each module's own JaCoCo report
+  (`<module>/target/site/jacoco/jacoco.xml`, `<module>/build/reports/jacoco/...`)
+  is found and resolved against that module's sources; modules past 128 mark the
+  scan capped. The Health view, its vulnerabilities facet and the text report
+  show the audit census ("N of M audited; not audited: ..."), and the coverage
+  report names the stale, unresolved and past-end-of-file data an artifact
+  dropped from its totals.
 - AI replies: an orphan `</think>` (templates that open the tag in the prompt) now drops the reasoning before it and keeps the answer after it, and a reply that ends inside its reasoning reports "the model's reply ended inside its reasoning; no answer was produced" instead of a generic empty reply.
 - Secrets scan: a refused envelope version no longer replaces a valid probed one (the refusal is reported as `kingfisher_version_rejected`), and a finding without a line carries no line (`null`) rather than line 0.
 - Task board: a refresh after any write keeps the pages a reader loaded (columns and navigator) instead of snapping back to page one; moving a card to the bottom of a paged column reads the column to its end first, so the card is not hidden after reload; overlapping catalog reads no longer land out of order.

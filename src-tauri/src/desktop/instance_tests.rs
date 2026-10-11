@@ -1027,7 +1027,7 @@ fn a_burst_of_hooks_is_bounded_and_never_starves_a_relaunch() {
     let started = Instant::now();
     while entered.load(Ordering::Acquire) < MAX_GATE_HANDLERS {
         assert!(
-            started.elapsed() < Duration::from_secs(10),
+            started.elapsed() < crate::test_support::coverage_relaxed(Duration::from_secs(10)),
             "gates never filled"
         );
         std::thread::sleep(Duration::from_millis(5));

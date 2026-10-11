@@ -108,6 +108,24 @@ function representativeReport(): CoverageReport {
   };
 }
 
+describe("formatCoverageReport — data the scanner refused to count", () => {
+  it("names stale, unresolved and past-EOF drops on the artifact line", () => {
+    const report = representativeReport();
+    report.artifacts[0] = {
+      ...report.artifacts[0],
+      stale_files: 1,
+      unresolved_files: 2,
+      lines_past_eof: 1,
+    };
+    const text = formatCoverageReport(report, "/repos/acme");
+    expect(text).toContain(
+      "- target/lcov.info (lcov) — dropped from totals: 1 stale file, 2 unresolved files, 1 line past end of file",
+    );
+    // An artifact that dropped nothing carries no clause.
+    expect(text).toContain("- target/old-lcov.info (lcov) — skipped: parse failed\n");
+  });
+});
+
 describe("formatCoverageAgentPrompt", () => {
   it("includes scanner-owned paths, detected languages, and the canonical snapshot", () => {
     const report = representativeReport();

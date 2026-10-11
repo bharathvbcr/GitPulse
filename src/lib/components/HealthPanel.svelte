@@ -73,6 +73,7 @@
 
   import {
     dependabotBadgeClass as badgeClassFor,
+    formatAuditCoverage,
     issueClass,
     severityClass,
     toneChipClass,
@@ -198,6 +199,7 @@
 
   /** A clean result is valid only after every discovered supported target ran. */
   let auditComplete = $derived(report?.audit_complete === true);
+  let auditCensus = $derived(formatAuditCoverage(report?.audit_coverage));
   let auditsRan = $derived((report?.scanners_ran ?? []).length > 0);
 
   /** Open Dependabot alerts, for the header badge. */
@@ -1420,6 +1422,9 @@
             >Direct</button>
           </div>
         {/snippet}
+        {#if auditCensus}
+          <p class="text-textMuted {HEALTH_PROSE_WIDTH}" data-testid="audit-coverage">{auditCensus}.</p>
+        {/if}
         {#if !report.npm_cli_present && report.manifests.length > 0}
           <p class="text-textMuted {HEALTH_PROSE_WIDTH}">Install npm on PATH to run <span class="font-mono">npm audit</span> against this lockfile. GitPulse does not apply <span class="font-mono">npm audit fix</span>.</p>
         {:else if visibleVulns.length === 0}
