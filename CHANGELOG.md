@@ -74,8 +74,32 @@ before that tag is pushed.
   applies only what you select, at the revision you reviewed: a task that
   changed since is refused and re-read. Nothing Manvi proposes is applied
   automatically, and a sidecar that is down is an error, never an empty scan.
+
 ### Fixed
 
+- Checks that could not run no longer read as clean. A task whose scope JSON is
+  unreadable is a broken scope (not "nothing forbidden"); govulncheck killed
+  mid-stream or silent, a cargo-audit document with no vulnerabilities list or a
+  mismatched count, and any scanner that exits 0 with no output are issues and
+  are not counted as run; RustSec CVSS vectors are scored (critical/low) and a
+  missing score is `unknown`, not `high`. Every multi-command git action folds
+  all of its verdicts, conflict save's file verdict included. A log-lock timeout
+  drops one line instead of silencing the sink. `tools.json` is written under a
+  writer and file lock, atomically, reloads when edited by hand, and a failed
+  save of an installed tool's path is reported. Preview debounce claims its slot
+  atomically and evicts expired ones.
+- The dependency audit's "complete" now compares audited against found targets
+  (`audit_coverage`): a nested `package-lock.json` is audited on its own,
+  workspace members use their root's lockfile, `uv.lock`/`poetry.lock`/
+  `pyproject.toml`-only Python and ecosystems with no scanner are reported as
+  not audited, empty cargo-crev output is not a run, and `engines.node` ranges
+  compare full versions (`>=18 < 20`, `< 20`, `>18.5.0`).
+- Coverage maps JaCoCo and Cobertura hits onto Maven/Gradle sources and applies
+  Cobertura `<source>` roots, resolves a nested report against its own module,
+  refuses single-component suffix matches, leaves unmatched paths out of the
+  totals (counted per artifact as `unresolved_files`), drops hits from files
+  edited after the report was written and lines past end of file, and reads
+  SimpleCov (`.resultset.json`, JSON formatter) for Ruby.
 - **Store reliability.** The ledger no longer caches a failed open for the
   process lifetime, holds one lock per repository instead of one for every
   repository across its IO, reopens a database whose `.devcouncil/` was deleted,

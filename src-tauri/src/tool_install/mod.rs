@@ -1185,12 +1185,15 @@ fn finish_ok(
 ) -> InstallOutcome {
     tool_capability::invalidate(tool);
     let status = resolve_status(tool);
-    if let Some(ref path) = status.path {
-        let _ = tool_config::set_binary(tool, path);
-    }
+    // A path that could not be saved resolves again only until the next
+    // launch, so the install is not reported as done.
+    let persist_error = status
+        .path
+        .as_deref()
+        .and_then(|path| tool_config::set_binary(tool, path).err());
     InstallOutcome {
         tool,
-        ok: status.installed,
+        ok: status.installed && persist_error.is_none(),
         binary: status.path.clone(),
         lookup: Some(status.lookup.clone()),
         version: status.version.clone(),
@@ -1201,7 +1204,12 @@ fn finish_ok(
         stderr,
         timed_out: false,
         cancelled: false,
-        reason: if status.installed {
+        reason: if let Some(error) = persist_error {
+            Some(format!(
+                "{} installed but its path could not be saved: {error}",
+                tool.as_str()
+            ))
+        } else if status.installed {
             None
         } else {
             Some(format!(
@@ -1219,9 +1227,18 @@ fn install_prebuilt_rung(tool: ExternalTool) -> InstallOutcome {
         "downloading prebuilt release…",
         Some(InstallRung::PrebuiltRelease),
     );
-    match release::install_prebuilt(tool) {
+    let installed = release::install_prebuilt(tool).and_then(|path| {
+        tool_config::set_binary(tool, &path.display().to_string())
+            .map(|()| path)
+            .map_err(|e| {
+                format!(
+                    "{} installed but its path could not be saved: {e}",
+                    tool.as_str()
+                )
+            })
+    });
+    match installed {
         Ok(path) => {
-            let _ = tool_config::set_binary(tool, &path.display().to_string());
             tool_capability::invalidate(tool);
             finish_ok(
                 tool,
@@ -1973,15 +1990,22 @@ pub fn clone_source(tool: ExternalTool, parent_dir: &str) -> CloneSourceOutcome 
         Ok(cloned) => {
             let dest = PathBuf::from(&cloned);
             match install_target(tool, &dest) {
-                Ok(_) => {
-                    let _ = tool_config::set_source_root(tool, &cloned);
-                    CloneSourceOutcome {
+                Ok(_) => match tool_config::set_source_root(tool, &cloned) {
+                    Ok(()) => CloneSourceOutcome {
                         tool,
                         ok: true,
                         path: Some(cloned),
                         reason: None,
-                    }
-                }
+                    },
+                    Err(error) => CloneSourceOutcome {
+                        tool,
+                        ok: false,
+                        path: Some(cloned),
+                        reason: Some(format!(
+                            "cloned but the source root could not be saved: {error}"
+                        )),
+                    },
+                },
                 Err(reason) => CloneSourceOutcome {
                     tool,
                     ok: false,

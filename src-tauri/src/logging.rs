@@ -120,6 +120,12 @@ struct SinkState {
     /// Bytes written to the live generation, for the rotation bound.
     bytes: u64,
     degraded: Option<String>,
+    /// Opening, writing or rotating failed in a way retrying would not fix, so
+    /// the disk mirror stays off. Contention on the generation lock is not
+    /// this: it drops the one line that met it (`dropped`) and nothing more.
+    retired: bool,
+    /// Lines dropped because the generation lock stayed busy past its wait.
+    dropped: u64,
 }
 
 /// Append-only mirror of the ring, on disk.
@@ -176,6 +182,8 @@ impl FileSink {
                 file: None,
                 bytes: 0,
                 degraded: None,
+                retired: false,
+                dropped: 0,
             }),
             release_error: Mutex::new(None),
         };
@@ -208,7 +216,7 @@ impl FileSink {
         // about bytes on disk, not about remembering a particular call path.
         let line = safe_log_line(line);
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-        if state.file.is_none() && state.degraded.is_some() {
+        if state.retired {
             return;
         }
         // All cooperating processes lock the same stable sidecar, not the
@@ -216,8 +224,10 @@ impl FileSink {
         let _generation = match self.generation_lock() {
             Ok(lock) => lock,
             Err(error) => {
-                state.degraded = Some(error);
-                state.file = None;
+                // One busy lock costs this line, not the sink: the next write
+                // retries, and the report says how many were lost.
+                state.dropped = state.dropped.saturating_add(1);
+                state.degraded = Some(format!("{error}; {} log line(s) dropped", state.dropped));
                 return;
             }
         };
@@ -231,6 +241,7 @@ impl FileSink {
             }
             Err(error) => {
                 state.degraded = Some(error);
+                state.retired = true;
                 return;
             }
         }
@@ -287,6 +298,7 @@ impl FileSink {
             Err(e) => {
                 state.degraded = Some(format!("write failed: {e}"));
                 state.file = None;
+                state.retired = true;
             }
         }
     }
@@ -309,7 +321,10 @@ impl FileSink {
                 state.bytes = bytes;
                 Self::write_locked(state, &session_marker(&stem_of(&self.current), "rotated"));
             }
-            Err(e) => state.degraded = Some(e),
+            Err(e) => {
+                state.degraded = Some(e);
+                state.retired = true;
+            }
         }
     }
 
@@ -1768,13 +1783,20 @@ mod tests {
         );
         assert!(tail.degraded.unwrap().contains("lock unavailable"));
         drop(held);
-        sink.write_line("disabled writes are not retried");
+        // Reason this changed: it asserted the sink stayed off for the rest of
+        // the process after one lock timeout. A busy lock drops the line that
+        // met it and the next write goes through; the loss stays reported.
+        sink.write_line("writes resume once the lock is free");
         let tail = sink.tail(10);
-        assert!(tail.degraded.is_some());
+        assert!(tail.degraded.unwrap().contains("1 log line(s) dropped"));
         assert!(!tail
             .lines
             .iter()
-            .any(|line| line.contains("disabled writes")));
+            .any(|line| line.contains("cannot acquire generation lock")));
+        assert!(tail
+            .lines
+            .iter()
+            .any(|line| line.contains("writes resume once the lock is free")));
     }
 
     #[test]

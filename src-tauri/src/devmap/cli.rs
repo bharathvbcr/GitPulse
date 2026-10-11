@@ -10,7 +10,6 @@ use crate::engine::git_cli::{self, validate_repo, BoundedRun};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
-use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Mutex, OnceLock};
@@ -41,14 +40,10 @@ const PREVIEW_SKIP_DEBOUNCED: &str =
 /// carry coverage gaps. 8 MiB is a hard ceiling, not a typical size.
 pub const STDOUT_CAP: usize = 8 * 1024 * 1024;
 
-#[derive(Debug, Clone)]
-struct PreviewDebounceEntry {
-    until: Instant,
-    content_fingerprint: u64,
-}
+type DebounceKey = (String, String);
 
-fn preview_debounces() -> &'static Mutex<HashMap<(String, String), PreviewDebounceEntry>> {
-    static MAP: OnceLock<Mutex<HashMap<(String, String), PreviewDebounceEntry>>> = OnceLock::new();
+fn preview_debounces() -> &'static Mutex<HashMap<DebounceKey, Instant>> {
+    static MAP: OnceLock<Mutex<HashMap<DebounceKey, Instant>>> = OnceLock::new();
     MAP.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
@@ -59,10 +54,24 @@ pub(crate) fn clear_preview_debounces() {
     }
 }
 
-fn content_fingerprint(content: &str) -> u64 {
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    content.hash(&mut hasher);
-    hasher.finish()
+/// Claims the debounce slot for `key`, or says it is still held.
+///
+/// Check and insert happen under the one `&mut` borrow of the map, so two
+/// callers racing on the same file cannot both be admitted. Expired slots are
+/// evicted on every call: a window lasts [`PREVIEW_DEBOUNCE`], so the map
+/// holds at most the files touched within one window rather than every file
+/// ever previewed.
+fn admit_preview_slot(
+    map: &mut HashMap<DebounceKey, Instant>,
+    key: DebounceKey,
+    now: Instant,
+) -> bool {
+    map.retain(|_, until| *until > now);
+    if map.contains_key(&key) {
+        return false;
+    }
+    map.insert(key, now + PREVIEW_DEBOUNCE);
+    true
 }
 
 /// Whether `devmap preview` should run for this relative path.
@@ -974,18 +983,6 @@ pub fn preview(repo_path: &str, file_path: &str, content: &str) -> PreviewFileRe
         }
     };
     let repo_key = repo.to_string_lossy().into_owned();
-    let fingerprint = content_fingerprint(content);
-    let now = Instant::now();
-    if let Ok(map) = preview_debounces().lock() {
-        if let Some(entry) = map.get(&(repo_key.clone(), file_path.to_string())) {
-            if entry.until > now {
-                // Content changes inside the window still coalesce: a fixture
-                // rewrite storm must not spawn one child per FS event.
-                let _ = fingerprint == entry.content_fingerprint;
-                return skipped_preview_file(file_path, PREVIEW_SKIP_DEBOUNCED);
-            }
-        }
-    }
     // Refuse while a build holds the writer lock — preview reads the store.
     {
         let guards = build_guards()
@@ -1013,16 +1010,22 @@ pub fn preview(repo_path: &str, file_path: &str, content: &str) -> PreviewFileRe
             }
         }
     };
-    // Admit the debounce slot before spawn so concurrent callers for the same
-    // file see SkipDebounced rather than racing a second child.
-    if let Ok(mut map) = preview_debounces().lock() {
-        map.insert(
+    // Claim the debounce slot before spawn so concurrent callers for the same
+    // file see SkipDebounced rather than racing a second child. Content
+    // changes inside the window coalesce too: a fixture rewrite storm must not
+    // spawn one child per FS event.
+    let admitted = {
+        let mut map = preview_debounces()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        admit_preview_slot(
+            &mut map,
             (repo_key.clone(), file_path.to_string()),
-            PreviewDebounceEntry {
-                until: Instant::now() + PREVIEW_DEBOUNCE,
-                content_fingerprint: fingerprint,
-            },
-        );
+            Instant::now(),
+        )
+    };
+    if !admitted {
+        return skipped_preview_file(file_path, PREVIEW_SKIP_DEBOUNCED);
     }
     let run = match run_devmap(
         &binary,
@@ -1809,6 +1812,34 @@ exit 2
             debounced >= 30,
             "most of the burst should hit debounce, got {debounced}"
         );
+    }
+
+    #[test]
+    fn racing_callers_claim_one_debounce_slot_and_expired_slots_are_evicted() {
+        let map = Mutex::new(HashMap::new());
+        let key = ("/repo".to_string(), "src/lib.rs".to_string());
+        let now = Instant::now();
+        let admitted = std::sync::atomic::AtomicUsize::new(0);
+        std::thread::scope(|scope| {
+            for _ in 0..32 {
+                scope.spawn(|| {
+                    let mut guard = map.lock().unwrap();
+                    if admit_preview_slot(&mut guard, key.clone(), now) {
+                        admitted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    }
+                });
+            }
+        });
+        assert_eq!(admitted.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        let mut map = map.into_inner().unwrap();
+        for i in 0..100 {
+            admit_preview_slot(&mut map, ("/repo".into(), format!("f{i}.rs")), now);
+        }
+        assert_eq!(map.len(), 101);
+        let later = now + PREVIEW_DEBOUNCE + Duration::from_millis(1);
+        assert!(admit_preview_slot(&mut map, key, later));
+        assert_eq!(map.len(), 1, "expired slots must be evicted");
     }
 
     #[test]

@@ -162,24 +162,36 @@ fn empty_view(path: String, available: bool, error: String) -> TaskView {
     }
 }
 
-fn parse_paths(json: &str) -> Vec<String> {
+/// Reads one scope column, or says which part of it cannot be read.
+///
+/// A column that cannot be read is an error, never an empty list: an empty
+/// `forbidden_changes` means "nothing is forbidden" and an empty
+/// `allowed_commands` drops the task's allowlist, so reading damage as empty
+/// would widen what the gate permits. Callers surface the error as a broken
+/// scope (see `harness::scope_for`).
+fn parse_paths(column: &str, json: &str) -> Result<Vec<String>, String> {
     // planned_files_json is an array of objects carrying `path`; the other
-    // columns are arrays of plain strings. Accept both rather than assuming,
-    // because a shape this code guessed wrong would silently yield an empty
-    // scope — and an empty scope authorises nothing, so every write would be
-    // refused with no hint why.
-    let Ok(value) = serde_json::from_str::<serde_json::Value>(json) else {
-        return Vec::new();
-    };
-    let Some(items) = value.as_array() else {
-        return Vec::new();
-    };
+    // columns are arrays of plain strings. Accept both.
+    let value = serde_json::from_str::<serde_json::Value>(json)
+        .map_err(|e| format!("task scope column {column} is not valid JSON: {e}"))?;
+    let items = value
+        .as_array()
+        .ok_or_else(|| format!("task scope column {column} is not a JSON array"))?;
     items
         .iter()
-        .filter_map(|item| match item {
-            serde_json::Value::String(s) => Some(s.clone()),
-            serde_json::Value::Object(o) => o.get("path")?.as_str().map(str::to_string),
-            _ => None,
+        .enumerate()
+        .map(|(i, item)| match item {
+            serde_json::Value::String(s) => Ok(s.clone()),
+            serde_json::Value::Object(o) => o
+                .get("path")
+                .and_then(|p| p.as_str())
+                .map(str::to_string)
+                .ok_or_else(|| {
+                    format!("task scope column {column} entry {i} has no string `path`")
+                }),
+            _ => Err(format!(
+                "task scope column {column} entry {i} is neither a string nor an object"
+            )),
         })
         .collect()
 }
@@ -383,10 +395,13 @@ fn scope_in(store: &dc_store::Store, task_id: &str) -> Result<Option<TaskScope>,
         id: task.id,
         title: task.title,
         status: task.status,
-        planned_files: parse_paths(&task.planned_files_json),
-        agent_appended_files: parse_paths(&task.agent_appended_planned_files_json),
-        forbidden_changes: parse_paths(&task.forbidden_changes_json),
-        allowed_commands: parse_paths(&task.allowed_commands_json),
+        planned_files: parse_paths("planned_files_json", &task.planned_files_json)?,
+        agent_appended_files: parse_paths(
+            "agent_appended_planned_files_json",
+            &task.agent_appended_planned_files_json,
+        )?,
+        forbidden_changes: parse_paths("forbidden_changes_json", &task.forbidden_changes_json)?,
+        allowed_commands: parse_paths("allowed_commands_json", &task.allowed_commands_json)?,
     }))
 }
 
@@ -656,21 +671,57 @@ mod tests {
         // Objects carrying `path` (planned_files_json) and plain strings
         // (forbidden_changes_json) both occur in the real schema.
         assert_eq!(
-            parse_paths(r#"[{"path":"a.rs"},{"path":"b.rs"}]"#),
+            parse_paths("c", r#"[{"path":"a.rs"},{"path":"b.rs"}]"#).unwrap(),
             ["a.rs", "b.rs"]
         );
-        assert_eq!(parse_paths(r#"["a.rs","b.rs"]"#), ["a.rs", "b.rs"]);
-        assert_eq!(parse_paths("[]"), Vec::<String>::new());
+        assert_eq!(
+            parse_paths("c", r#"["a.rs","b.rs"]"#).unwrap(),
+            ["a.rs", "b.rs"]
+        );
+        assert_eq!(parse_paths("c", "[]").unwrap(), Vec::<String>::new());
     }
 
     #[test]
-    fn unreadable_scope_json_yields_no_paths_rather_than_a_guess() {
-        // An empty scope authorises nothing, so this fails closed. The
-        // alternative — inventing a path list — would authorise writes nobody
-        // planned.
-        assert_eq!(parse_paths("not json"), Vec::<String>::new());
-        assert_eq!(parse_paths(r#"{"path":"a.rs"}"#), Vec::<String>::new());
-        assert_eq!(parse_paths(r#"[1,2,3]"#), Vec::<String>::new());
+    fn unreadable_scope_json_is_an_error_not_an_empty_list() {
+        // Reason this test changed: it used to assert these parse to an empty
+        // list "because an empty scope authorises nothing". That holds for
+        // planned_files but is backwards for forbidden_changes ("nothing
+        // forbidden") and allowed_commands (allowlist dropped), so every
+        // unreadable column must be reported and the gate must treat the scope
+        // as broken.
+        for bad in [
+            "not json",
+            r#"["secrets/**""#,
+            r#"{"path":"a.rs"}"#,
+            "[1,2,3]",
+            r#"["ok",{"nopath":1}]"#,
+            "",
+        ] {
+            let err = parse_paths("forbidden_changes_json", bad).unwrap_err();
+            assert!(err.contains("forbidden_changes_json"), "{bad}: {err}");
+        }
+    }
+
+    #[test]
+    fn a_task_with_a_damaged_scope_column_has_no_readable_scope() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().to_str().unwrap();
+        let db = store_path(repo);
+        std::fs::create_dir_all(db.parent().unwrap()).unwrap();
+        let store = dc_store::Store::open(&db).unwrap();
+        store
+            .connection()
+            .execute(
+                "INSERT INTO tasks (id, title, description, planned_files_json,
+                     forbidden_changes_json, allowed_commands_json, status)
+                 VALUES ('TASK-2', 'Damaged', '', '[]', '[\"secrets/**\"', '[]', 'in_progress')",
+                [],
+            )
+            .unwrap();
+        let err = scope(repo, "TASK-2").unwrap_err();
+        assert!(err.contains("forbidden_changes_json"), "{err}");
+        let err = scopes(repo, &["TASK-2".to_string()]).unwrap_err();
+        assert!(err.contains("forbidden_changes_json"), "{err}");
     }
 
     #[test]

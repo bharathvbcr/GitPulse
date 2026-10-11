@@ -302,6 +302,11 @@ pub(crate) fn parse_cargo_crev_jsonl(text: &str) -> Result<CrevScan, String> {
             }
         }
     }
+    if scan.verified + scan.local + scan.unreviewed == 0 && scan.negative.is_empty() {
+        // A verify run lists every crate it judged; whitespace or nothing at
+        // all is a run that produced no answer, not zero findings.
+        return Err("cargo crev printed no crate rows".into());
+    }
     Ok(scan)
 }
 

@@ -882,18 +882,14 @@ pub async fn cmd_checkout_branch(
                 "--".into(),
             ],
         ];
-        let mut representative: Option<crate::harness::PolicyVerdict> = None;
+        let fold = VerdictFold::default();
         for argv in &attempts {
             let refs: Vec<&str> = argv.iter().map(String::as_str).collect();
-            let verdict = guard(&repo_path, &refs)?;
-            representative = Some(match representative {
-                Some(prev) => strictest_verdict(prev, verdict),
-                None => verdict,
-            });
+            fold.record(guard(&repo_path, &refs)?);
         }
         GitWriter::checkout_branch(&repo_path, &branch_name)?;
         Ok(Guarded {
-            policy: representative.expect("at least one attempt is always gated"),
+            policy: fold.finish().expect("at least one attempt is always gated"),
             output: (),
         })
     })
@@ -973,24 +969,19 @@ pub async fn cmd_deadbranch_clean(
     create_backup: bool,
 ) -> Result<Guarded<crate::engine::deadbranch::DeadbranchCleanResult>, String> {
     off_thread(move || {
-        let policy = std::cell::RefCell::new(None);
+        let fold = VerdictFold::default();
         let result = crate::engine::deadbranch::clean_branches_with_gate(
             &repo_path,
             &branches,
             force,
             create_backup,
             |argv| {
-                let verdict = guard(&repo_path, argv)?;
-                let mut slot = policy.borrow_mut();
-                *slot = Some(match slot.take() {
-                    Some(prev) => strictest_verdict(prev, verdict),
-                    None => verdict,
-                });
+                fold.record(guard(&repo_path, argv)?);
                 Ok(())
             },
         )?;
         Ok(Guarded {
-            policy: policy.into_inner().unwrap_or_else(no_git_verdict),
+            policy: fold.finish().unwrap_or_else(no_git_verdict),
             output: result,
         })
     })
@@ -1011,23 +1002,18 @@ pub async fn cmd_deadbranch_restore(
     branches: Option<Vec<String>>,
 ) -> Result<Guarded<crate::engine::deadbranch::DeadbranchRestoreResult>, String> {
     off_thread(move || {
-        let policy = std::cell::RefCell::new(None);
+        let fold = VerdictFold::default();
         let result = crate::engine::deadbranch::restore_backup_with_gate(
             &repo_path,
             &backup_path,
             branches,
             |argv| {
-                let verdict = guard(&repo_path, argv)?;
-                let mut slot = policy.borrow_mut();
-                *slot = Some(match slot.take() {
-                    Some(prev) => strictest_verdict(prev, verdict),
-                    None => verdict,
-                });
+                fold.record(guard(&repo_path, argv)?);
                 Ok(())
             },
         )?;
         Ok(Guarded {
-            policy: policy.into_inner().unwrap_or_else(no_git_verdict),
+            policy: fold.finish().unwrap_or_else(no_git_verdict),
             output: result,
         })
     })
@@ -1107,18 +1093,14 @@ pub async fn cmd_set_git_identity(
 ) -> Result<Guarded<GitIdentity>, String> {
     off_thread(move || {
         GitWriter::validate_identity(&name, &email)?;
-        let mut policy: Option<crate::harness::PolicyVerdict> = None;
+        let fold = VerdictFold::default();
         for argv in GitWriter::identity_argv(scope, name.trim(), email.trim()) {
             let refs: Vec<&str> = argv.iter().map(String::as_str).collect();
-            let verdict = guard(&repo_path, &refs)?;
-            policy = Some(match policy.take() {
-                Some(previous) => strictest_verdict(previous, verdict),
-                None => verdict,
-            });
+            fold.record(guard(&repo_path, &refs)?);
         }
         let output = GitWriter::set_identity(&repo_path, &name, &email, scope)?;
         Ok(Guarded {
-            policy: policy.unwrap_or_else(no_git_verdict),
+            policy: fold.finish().unwrap_or_else(no_git_verdict),
             output,
         })
     })
@@ -1139,22 +1121,43 @@ pub async fn cmd_save_conflict(
     request: ConflictSaveRequest,
 ) -> Result<Guarded<ConflictSaveOutcome>, String> {
     off_thread(move || {
-        // Authorize the literal target and the exact object/index commands.
-        // The native transaction builds argv once for judging and execution.
-        let mut policy = None;
-        let output = conflict_session::save_with_gate(
+        save_conflict_folded(
             &repo_path,
             &request,
-            |file, op| crate::harness::guard_file(&repo_path, file, op).map(|_| ()),
-            |argv| {
-                policy = Some(guard(&repo_path, argv)?);
-                Ok(())
-            },
-        )?;
-        let policy = policy.ok_or("Conflict transaction did not produce a command verdict")?;
-        Ok(Guarded { policy, output })
+            |file, op| crate::harness::guard_file(&repo_path, file, op),
+            |argv| guard(&repo_path, argv),
+        )
     })
     .await
+}
+
+/// Saves a conflict resolution with every judged line, the target file's
+/// included, folded into one verdict. Authorizes the literal target and the
+/// exact object/index commands; the native transaction builds argv once for
+/// judging and execution.
+fn save_conflict_folded(
+    repo_path: &str,
+    request: &ConflictSaveRequest,
+    judge_file: impl Fn(&str, &str) -> Result<crate::harness::PolicyVerdict, String>,
+    judge_command: impl Fn(&[&str]) -> Result<crate::harness::PolicyVerdict, String>,
+) -> Result<Guarded<ConflictSaveOutcome>, String> {
+    let fold = VerdictFold::default();
+    let output = conflict_session::save_with_gate(
+        repo_path,
+        request,
+        |file, op| {
+            fold.record(judge_file(file, op)?);
+            Ok(())
+        },
+        |argv| {
+            fold.record(judge_command(argv)?);
+            Ok(())
+        },
+    )?;
+    let policy = fold
+        .finish()
+        .ok_or("Conflict transaction did not produce a verdict")?;
+    Ok(Guarded { policy, output })
 }
 
 #[tauri::command(async)]
@@ -1208,14 +1211,10 @@ pub async fn cmd_rebase_interactive(
         // a refusal on ANY of them refuses the whole rebase before the
         // first mutation.
         let planned = rebase_planned_commands(&repo_path, &onto_commit, &steps)?;
-        let mut representative: Option<crate::harness::PolicyVerdict> = None;
+        let fold = VerdictFold::default();
         for argv in &planned {
             let refs: Vec<&str> = argv.iter().map(String::as_str).collect();
-            let verdict = guard(&repo_path, &refs)?;
-            representative = Some(match representative {
-                Some(prev) => strictest_verdict(prev, verdict),
-                None => verdict,
-            });
+            fold.record(guard(&repo_path, &refs)?);
         }
         GitWriter::execute_rebase_sequence(&repo_path, &onto_commit, &steps)?;
         Ok(Guarded {
@@ -1224,7 +1223,9 @@ pub async fn cmd_rebase_interactive(
             // attached — it errors out above). A single "last" verdict would
             // surface the trailing `git checkout`, hiding an earlier warning
             // or demotion on the mutating cherry-picks.
-            policy: representative.expect("at least one planned command is always gated"),
+            policy: fold
+                .finish()
+                .expect("at least one planned command is always gated"),
             output: (),
         })
     })
@@ -1643,23 +1644,19 @@ pub async fn cmd_merge_branch(
     mode: Option<MergeMode>,
 ) -> Result<Guarded<String>, String> {
     off_thread(move || {
-        let mut policy: Option<crate::harness::PolicyVerdict> = None;
+        let fold = VerdictFold::default();
         let output = GitWriter::merge_branch(
             &repo_path,
             &branch_name,
             mode.unwrap_or_default(),
             &mut |args| {
                 let argv: Vec<&str> = std::iter::once("git").chain(args.iter().copied()).collect();
-                let verdict = guard(&repo_path, &argv)?;
-                policy = Some(match policy.take() {
-                    Some(previous) => strictest_verdict(previous, verdict),
-                    None => verdict,
-                });
+                fold.record(guard(&repo_path, &argv)?);
                 Ok(())
             },
         )?;
         Ok(Guarded {
-            policy: policy.unwrap_or_else(no_git_verdict),
+            policy: fold.finish().unwrap_or_else(no_git_verdict),
             output,
         })
     })
@@ -2965,6 +2962,28 @@ fn strictest_verdict(
     }
 }
 
+/// Accumulates the verdicts of every command and file check one handler judges
+/// and yields the strictest, so a warning on an early line is not overwritten
+/// by a later clean pass. Interior mutability because the gate closures the
+/// engines take are `Fn`, and two closures (command and file) feed one fold.
+#[derive(Default)]
+struct VerdictFold(std::cell::RefCell<Option<crate::harness::PolicyVerdict>>);
+
+impl VerdictFold {
+    fn record(&self, verdict: crate::harness::PolicyVerdict) {
+        let mut slot = self.0.borrow_mut();
+        *slot = Some(match slot.take() {
+            Some(previous) => strictest_verdict(previous, verdict),
+            None => verdict,
+        });
+    }
+
+    /// Judges nothing yet: `None`, never a fabricated allow.
+    fn finish(self) -> Option<crate::harness::PolicyVerdict> {
+        self.0.into_inner()
+    }
+}
+
 /// The amend argv [`crate::engine::git_writer::GitWriter::commit_inner`] runs
 /// for `(message, amend)`. Kept in lockstep with that private fn by test
 /// (`commit_amend_argv_mirrors_commit_inner`); if the writer ever changes flag
@@ -3453,6 +3472,78 @@ mod tests {
         assert_eq!(demoted.status, Demoted);
         let blocked = strictest_verdict(verdict(Allowed), verdict(Blocked));
         assert_eq!(blocked.status, Blocked);
+    }
+
+    #[test]
+    fn verdict_fold_keeps_the_strictest_in_any_order() {
+        use crate::harness::PolicyStatus::*;
+        for order in [
+            [Warned, Allowed, Allowed],
+            [Allowed, Warned, Allowed],
+            [Allowed, Allowed, Warned],
+        ] {
+            let fold = VerdictFold::default();
+            assert!(VerdictFold::default().finish().is_none());
+            for status in order {
+                fold.record(verdict(status));
+            }
+            assert_eq!(fold.finish().unwrap().status, Warned, "{order:?}");
+        }
+    }
+
+    fn git_in(dir: &std::path::Path, args: &[&str]) -> bool {
+        use crate::procguard::LockedSpawn;
+        std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .env("GIT_AUTHOR_NAME", "Test")
+            .env("GIT_AUTHOR_EMAIL", "t@example.com")
+            .env("GIT_COMMITTER_NAME", "Test")
+            .env("GIT_COMMITTER_EMAIL", "t@example.com")
+            .output_locked()
+            .unwrap()
+            .status
+            .success()
+    }
+
+    #[test]
+    fn conflict_save_surfaces_the_file_verdict_not_only_the_last_command() {
+        use crate::harness::PolicyStatus::*;
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path();
+        assert!(git_in(p, &["init", "-b", "main"]));
+        assert!(git_in(p, &["config", "commit.gpgsign", "false"]));
+        std::fs::write(p.join("file"), "base\n").unwrap();
+        assert!(git_in(p, &["add", "."]) && git_in(p, &["commit", "-m", "base"]));
+        assert!(git_in(p, &["checkout", "-b", "incoming"]));
+        std::fs::write(p.join("file"), "theirs\n").unwrap();
+        assert!(git_in(p, &["commit", "-am", "theirs"]));
+        assert!(git_in(p, &["checkout", "main"]));
+        std::fs::write(p.join("file"), "ours\n").unwrap();
+        assert!(git_in(p, &["commit", "-am", "ours"]));
+        assert!(!git_in(p, &["merge", "incoming"]), "must conflict");
+
+        let repo = p.to_str().unwrap();
+        // The hermetic test store, never the developer's real trust record.
+        let view = crate::repository_trust::inspect(repo).unwrap();
+        crate::repository_trust::grant(repo, &view.identity, true).unwrap();
+        let snapshot = conflict_session::snapshot(repo, "file").unwrap();
+        let request = ConflictSaveRequest {
+            file_path: "file".into(),
+            revision: snapshot.revision,
+            choice: crate::diff::conflict_session::ConflictFileChoice::Ours,
+        };
+        // The file check warns; every command check afterwards allows. The
+        // old handler discarded the file verdict and kept only the last
+        // command's, so this reached the UI as a clean allow.
+        let saved = save_conflict_folded(
+            repo,
+            &request,
+            |_, _| Ok(verdict(Warned)),
+            |_| Ok(verdict(Allowed)),
+        )
+        .unwrap();
+        assert_eq!(saved.policy.status, Warned);
     }
 
     /// Lockstep test for commit_amend_argv against GitWriter::commit_inner's
@@ -5109,19 +5200,15 @@ pub async fn cmd_delete_path(
     path: String,
 ) -> Result<Guarded<crate::engine::git_writer::DeleteOutcome>, String> {
     off_thread(move || {
-        let mut policy: Option<crate::harness::PolicyVerdict> = None;
+        let fold = VerdictFold::default();
         let output = GitWriter::delete_path(&repo_path, &path, |plan| {
             for argv in plan {
                 let refs: Vec<&str> = argv.iter().map(String::as_str).collect();
-                let verdict = guard(&repo_path, &refs)?;
-                policy = Some(match policy.take() {
-                    Some(previous) => strictest_verdict(previous, verdict),
-                    None => verdict,
-                });
+                fold.record(guard(&repo_path, &refs)?);
             }
             Ok(())
         })?;
-        let policy = policy.ok_or("Delete did not produce a verdict")?;
+        let policy = fold.finish().ok_or("Delete did not produce a verdict")?;
         Ok(Guarded { policy, output })
     })
     .await
