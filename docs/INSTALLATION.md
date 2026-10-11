@@ -137,6 +137,14 @@ The check reads public tags using `git ls-remote`, at most once a day for the
 periodic path. It does not download or install a binary. A failed check reports
 that it could not check, rather than claiming the app is up to date.
 
+**Upgrading a profile that has opened a newer task store.** The DevCouncil task
+store (dc-store) migrates one way: schema 11 cannot be read back by a host built
+against schema 10. GitPulse, Manvi and DevCouncil share that profile, so update
+all three together, built from the same dc-store schema, before any of them opens
+it. Reinstall the `gitpulse-mcp` and `gitpulse-hook` binaries too
+(`bun run mcp:install`); a binary built against an older schema refuses the
+migrated profile. The release notes in the CHANGELOG record each schema change.
+
 ## Build from source
 
 Follow [Contributing](../CONTRIBUTING.md) for platform toolchains and verification.

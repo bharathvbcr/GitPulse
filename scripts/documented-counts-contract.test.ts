@@ -1,4 +1,4 @@
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import { existsSync, readFileSync, readdirSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
@@ -263,6 +263,28 @@ describe("documented counts match the code", () => {
 
 describe("promotional drafts state the real counts too", () => {
   /**
+   * `skipIf` below is honest only for a file git ignores. A draft that is
+   * tracked (or merely not ignored) and missing is a deleted or renamed
+   * document, and skipping it would look exactly like a clean run, so that case
+   * fails instead.
+   */
+  for (const draft of LOCAL_DRAFTS) {
+    it(`${draft} may be absent only while git ignores it`, () => {
+      if (existsSync(fileURLToPath(docUrl(draft)))) return;
+      const root = fileURLToPath(new URL("..", import.meta.url));
+      const ignored = spawnSync("git", ["check-ignore", "-q", "--", draft], {
+        cwd: root,
+        timeout: 5_000,
+      });
+      expect(ignored.error, "git check-ignore could not run").toBeUndefined();
+      expect(
+        ignored.status,
+        `${draft} is missing and not ignored: restore it or drop it from LOCAL_DRAFTS`,
+      ).toBe(0);
+    });
+  }
+
+  /**
    * These live only on the author's machine, so there is nothing to check on a
    * clean clone or in CI. `skipIf` reports that honestly — the reporter prints
    * the draft's name as skipped — where reading it unconditionally crashed the
@@ -280,6 +302,89 @@ describe("promotional drafts state the real counts too", () => {
   }
 });
 
+
+describe("documentation does not cite files that will not exist", () => {
+  const root = fileURLToPath(new URL("..", import.meta.url));
+  const tracked = execFileSync("git", ["ls-files", "-z", "--", "*.md"], {
+    cwd: root,
+    encoding: "utf8",
+    timeout: 5_000,
+  })
+    .split("\0")
+    // Dated ledgers and the changelog record what was true when written, and
+    // are not claims about the present tree.
+    .filter((doc) => doc && !doc.startsWith("docs/archive/") && doc !== "CHANGELOG.md");
+
+  /** A `/tmp/<name>.log`-style path cited as evidence: cleaned by the OS, never committed. */
+  const TMP_EVIDENCE = /\/tmp\/[\w.-]+\.(?:log|json|jsonl|txt)\b/g;
+
+  it("scans the tracked Markdown it claims to", () => {
+    expect(tracked).toContain("README.md");
+    expect(tracked).toContain("docs/PERFORMANCE.md");
+  });
+
+  it("recognises a /tmp evidence citation", () => {
+    expect("see `/tmp/gitpulse-ci.log` for the run".match(TMP_EVIDENCE)).toHaveLength(1);
+    expect("HOME=/private/tmp/gpe-perf and /tmp/".match(TMP_EVIDENCE)).toBeNull();
+  });
+
+  it("cites no /tmp log as evidence", () => {
+    const offenders = tracked.flatMap((doc) =>
+      [...read(doc).matchAll(TMP_EVIDENCE)].map((m) => `${doc}: ${m[0]}`),
+    );
+    expect(
+      offenders,
+      "summarise the numbers inline or commit the evidence; /tmp is cleaned",
+    ).toEqual([]);
+  });
+});
+
+describe("the MCP server's documented surface matches its code", () => {
+  const SKILL = "plugins/gitpulse/skills/gitpulse-insights/SKILL.md";
+  const MANIFESTS = [
+    ".claude-plugin/marketplace.json",
+    "plugins/gitpulse/plugin.json",
+    "plugins/gitpulse/.codex-plugin/plugin.json",
+    "plugins/gitpulse/.cursor-plugin/plugin.json",
+    "plugins/gitpulse/.claude-plugin/plugin.json",
+  ] as const;
+  const WRITE_TOOLS = [
+    "gitpulse_add_task",
+    "gitpulse_import_tasks",
+    "gitpulse_complete_task",
+    "gitpulse_merge_tasks",
+    "gitpulse_delete_task",
+  ] as const;
+
+  it("states the real number of devmap_* tools", () => {
+    const names = [...read("src-tauri/src/mcp/devmap_parity.rs")
+      .match(/TOOL_NAMES: &\[&str\] = &\[([^\]]*)\]/)![1]
+      .matchAll(/"(devmap_\w+)"/g)];
+    expect(names.length).toBeGreaterThan(0);
+    const claim = /\((\d+) tools:/.exec(read(SKILL));
+    expect(claim, `${SKILL} must state how many devmap_* tools it maps`).toBeTruthy();
+    expect(Number(claim![1]), `${SKILL} says ${claim![1]}; the code lists ${names.length}`).toBe(
+      names.length,
+    );
+  });
+
+  it("names only write tools the server defines, and calls the five its only writers", () => {
+    const skill = read(SKILL);
+    const server = read("src-tauri/src/mcp/mod.rs");
+    for (const name of WRITE_TOOLS) {
+      expect(skill, `${SKILL} omits ${name}`).toContain(name);
+      expect(server, `${name} is not defined by the MCP server`).toContain(`"${name}"`);
+    }
+  });
+
+  it("does not describe the server as read-only in any plugin manifest", () => {
+    for (const manifest of MANIFESTS) {
+      expect(read(manifest), `${manifest} calls a server with write tools read-only`).not.toMatch(
+        /read-only/i,
+      );
+    }
+  });
+});
 
 describe("the contract-test table in CONTRIBUTING stays honest", () => {
   // A table listing the safety net is itself a claim that can drift: a test

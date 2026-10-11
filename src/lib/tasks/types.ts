@@ -83,7 +83,7 @@ export interface TaskGap {
   stderr_path: string | null;
 }
 
-export interface TaskRun {
+export interface DevCouncilRun {
   id: string;
   task_id: string;
   sandbox: string;
@@ -106,7 +106,7 @@ export interface TaskView {
   evidence_truncated: boolean;
   gaps: TaskGap[];
   gaps_truncated: boolean;
-  runs: TaskRun[];
+  runs: DevCouncilRun[];
   runs_truncated: boolean;
   /**
    * Empty when the store could be read; otherwise why it could not.

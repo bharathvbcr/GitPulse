@@ -99,8 +99,9 @@ pub fn run() {
     } else {
         log::warn!(target: "setup", "{}", limits.describe());
     }
-    // Quitting the app, logging out, or a `kill` from a terminal all arrive as
-    // a signal whose default action ends this process and leaves whatever git
+    // Logging out, a `kill` from a terminal or a supervisor's stop arrives as a
+    // signal (Cmd-Q does not: it ends the event loop and reaches the same
+    // teardown through `RunEvent::Exit`, below), and a signal's default action ends this process and leaves whatever git
     // commands the UI had in flight running against the user's repository.
     let signals = procguard::install_signal_handlers();
     if signals.is_armed() {

@@ -1,7 +1,8 @@
 #!/usr/bin/env node
 /**
- * Run every gate CI runs, on this machine, without letting one failure hide
- * the rest.
+ * Run the local gates (`--list` prints them) on this machine, without letting
+ * one failure hide the rest. It is not all of CI: `bun audit`, `cargo deny`, the
+ * Go jobs and the scheduled workflows run only there.
  *
  * `ci:local` used to be a single `&&` chain. That is the one shape
  * `.github/workflows/ci.yml` deliberately refuses: every step there carries
@@ -294,7 +295,7 @@ export function summarize(outcomes) {
 function usage() {
   return formatUsage({
     name: "ci-local",
-    summary: "Run every gate CI runs, locally, without one failure hiding the rest.",
+    summary: "Run the local gates (a subset of CI), without one failure hiding the rest.",
     flags: [
       { flag: "--list", description: "Print the gates and exit" },
       { flag: "--help, -h", description: "Show this message" },
