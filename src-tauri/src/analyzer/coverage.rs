@@ -4087,8 +4087,7 @@ fn resolve_reported(repo: &Path, reported: &str) -> Option<String> {
                 prefixes.extend(JVM_SOURCE_PREFIXES);
             }
             for prefix in prefixes {
-                let candidate =
-                    join_rel(&join_rel(base, prefix).trim_matches('/').to_string(), &tail);
+                let candidate = join_rel(join_rel(base, prefix).trim_matches('/'), &tail);
                 if is_safe_rel(&candidate)
                     && !skip_source(&candidate)
                     && path_exists_cached(repo, &candidate)

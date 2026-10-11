@@ -3492,6 +3492,7 @@ mod tests {
     }
 
     fn git_in(dir: &std::path::Path, args: &[&str]) -> bool {
+        use crate::procguard::LockedSpawn;
         std::process::Command::new("git")
             .args(args)
             .current_dir(dir)
@@ -3499,7 +3500,7 @@ mod tests {
             .env("GIT_AUTHOR_EMAIL", "t@example.com")
             .env("GIT_COMMITTER_NAME", "Test")
             .env("GIT_COMMITTER_EMAIL", "t@example.com")
-            .output()
+            .output_locked()
             .unwrap()
             .status
             .success()
@@ -3508,7 +3509,6 @@ mod tests {
     #[test]
     fn conflict_save_surfaces_the_file_verdict_not_only_the_last_command() {
         use crate::harness::PolicyStatus::*;
-        crate::engine::git_cli::run_process_with_unlimited_spawn_rate();
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path();
         assert!(git_in(p, &["init", "-b", "main"]));
