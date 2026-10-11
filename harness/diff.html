@@ -1,0 +1,256 @@
+<!doctype html>
+<html lang="en" class="dark">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Diff viewer checks</title>
+<style>body{margin:0}#preview{display:flex;height:520px;width:900px}#result{position:fixed;bottom:8px;right:8px;max-height:30vh;overflow:auto;font:11px monospace;background:#141a29;color:#e9edf8;z-index:100;white-space:pre}</style></head>
+<body><div id="preview"></div><pre id="result"></pre>
+<script type="module">
+/**
+ * The diff viewer, rendered.
+ *
+ * What the pane does with a diff is what these checks settle, in a real page
+ * against fixture IPC: what a backend-truncated diff lets the reader stage,
+ * which patch each staging action sends, how find reads a row, what the change
+ * stepper does, how split pairs a change, how wrapping treats a long line, and
+ * what the pane says while it reads and when there is nothing to show. Nothing
+ * here executes git.
+ */
+import "../src/app.css";
+import { createChecks } from "./checks.ts";
+const crashes=[], unexpected=[], calls=[];
+window.addEventListener("error",event=>crashes.push(event.message));
+window.addEventListener("unhandledrejection",event=>crashes.push(String(event.reason)));
+const root="/workspace/alpha", other="/workspace/beta";
+const status=(path,is_staged=false,status_code="M")=>({path,is_staged,status_code,is_conflicted:false,additions:1,deletions:1});
+let files=[status("src/shared.ts",true),status("src/shared.ts"),status("notes.md",false,"??")];
+let stashEntries=[], stashTruncated=false, stashPreviewPending=null;
+const stashWrites=[], indexWrites=[];
+const worktrees=[root,other].map((path,i)=>({path,name:path.split("/").pop(),branch:i?"feature":"main",head:"a".repeat(40),is_main:i===0,is_bare:false,is_detached:false,is_locked:false,is_prunable:false,dirty_files:3}));
+const patch=(path,text)=>`diff --git a/${path} b/${path}\n--- a/${path}\n+++ b/${path}\n@@ -1 +1 @@\n-previous value\n+${text}\n`;
+const fixtures={
+ cmd_resolve_repo:a=>({path:a.repoPath,name:a.repoPath.split("/").pop(),is_bare:false}),
+ // Commands the diff and AI surfaces call that this harness does not exercise.
+ // Each answers the way a build without the feature does: a fixed HEAD, no
+ // code index, no on-device model. Refusing them as unconfigured failed the
+ // whole suite on commands it never meant to test.
+ cmd_get_head_id:()=>"0000000000000000000000000000000000000001",
+ cmd_codeintel_symbols_for_file:a=>({available:false,head_matches:false,file_path:a.filePath,requested_head_sha:a.headSha,items:[],reason:"no code index in this fixture"}),
+ cmd_apple_intelligence_status:()=>({compiled:false,state:"unsupported_os",reason:"not_compiled",detail:"Not built into this fixture."}),
+ cmd_get_status:()=>files,cmd_list_branches:()=>[],cmd_list_tags:()=>({tags:[],truncated:false}),
+ cmd_repo_operation:()=>null,cmd_stash_list: () => ({ entries: stashEntries, truncated: stashTruncated }),cmd_watch_repo:()=>null,cmd_unwatch_repo:()=>null,
+ cmd_list_remotes:()=>({remotes:[],truncated:false}),cmd_list_submodules:()=>({submodules:[],truncated:false}),
+ cmd_stash_show:()=>stashPreviewPending??({text:patch("stash-file.txt","stashed modification"),truncated:true,truncation_reason:"Fixture byte limit"}),
+ // `pull.rebase` unset: the backend's Option<String> None, so pull merges.
+ cmd_pull_rebase_config:()=>null,
+ cmd_stash_save:a=>{stashWrites.push(a);return {policy:null,output:"Saved stash"};},
+ cmd_stash_action:a=>{stashWrites.push(a);return {policy:null,output:"Applied stash"};},
+ cmd_change_index:a=>{indexWrites.push(a);return {policy:null,output:a.filePaths.length};},
+ cmd_get_commit_graph:()=>({nodes:[],edges:[],total_commits:0,truncated:false}),cmd_set_recent_menu:()=>null,
+ cmd_branch_stats:()=>({updates:[],capped:false,compute_failures:0,compared_to:"main"}),cmd_workspace_sync:()=>({repos:[]}),
+ cmd_devcouncil_init:()=>({repo:"/workspace/alpha",state_dir:"/workspace/alpha/.devmap",exclude:{status:"already_ignored",source:"harness"},workspace_registry:null,workspace_reason:null,skipped_untrusted:[],skipped_unavailable:[],devmap_available:false}),
+ cmd_devmap_maybe_refresh:()=>({decision:"skip_unavailable",facts:{available:false,is_fresh:false,schema_ok:false,already_building:false},reason:null}),
+ cmd_get_file_diff:a=>{calls.push(a);return {text:patch(a.filePath,`${a.repoPath} ${a.isStaged?"staged":"unstaged"} modification`),truncated:false};},
+ cmd_get_commit_diff:()=>({text:patch("old.ts","old commit content"),truncated:false}),
+ cmd_get_commit_files:()=>[{path:"old.ts",status_code:"M",additions:1,deletions:1}],
+ cmd_get_language_stats:()=>({stats:[],truncated:false}),
+ cmd_last_fetch_at:()=>null,cmd_note_tab_activated:()=>null,
+ cmd_get_file_content:()=>"fixture content",
+ // CodeintelResponse::unavailable still carries a freshness object; without one
+ // parseCodeintelResponse throws and DiffViewer reports "impact request failed"
+ // instead of the reason below.
+ cmd_codeintel_impact_at_rung:()=>({source_freshness:{fresh:null,reason:"this query did not verify whole-tree freshness; ask status for a live check"},available:false,reason:"Not indexed in fixture",items:[],shown:0,total:0,truncated:false}),
+ cmd_codeintel_impact_layered_many:()=>[],cmd_codeintel_cancel:()=>null,
+ cmd_devmap_preview_many:()=>[],
+ cmd_task_view:()=>({available:false,store_path:"",leases:[],error:""}),cmd_list_worktrees:()=>worktrees,
+ // Repository scope, to match cmd_collision_risk below: a fixture that reads
+ // both worktrees is one whose approval reaches both. "checkout" here would
+ // raise the extend-trust banner over every panel in this harness.
+ cmd_repository_trust:()=>({path:"/workspace/alpha",git_dir:"/workspace/alpha/.git",common_dir:"/workspace/alpha/.git",identity:"fixture-identity",scope:"repository",worktrees:2}),
+ cmd_worktree_task:()=>null,cmd_ledger_tail:()=>[],cmd_grants_view:()=>({available:false,path:"",grants:[],error:""}),
+ cmd_github_context:()=>({available:false,cli_present:false,owner:"",repo:"",pull_requests:[],workflow_runs:[],issues:[],releases:[],warnings:[],error:null}),
+ cmd_collision_risk:()=>({ok:true,error:"",overlapping_files:0,worktrees_involved:0,scanned_worktrees:2,unscanned_worktrees:0,failed_worktrees:0,truncated:false,items:[],shared_worktree_files:0,shared_worktrees:[],sessions_ok:true,sessions_error:""}),
+ cmd_fleet_snapshot:()=>({repos:[],requested:2,scanned:0,anchor_epoch:0,truncated:true,duration_ms:0}),
+};
+// What the diff read answers, per check. `answer` replaces the default reply.
+const FILE="src/app.ts";
+const line=(n)=>` context line ${n}`;
+const longHunk=()=>[
+ "diff --git a/src/app.ts b/src/app.ts","--- a/src/app.ts","+++ b/src/app.ts",
+ "@@ -1,160 +1,160 @@",
+ line(1),"-old two","+new two",
+ ...Array.from({length:150},(_,i)=>line(i+4)),
+ "-old far","+new far",
+ line(160),
+ ""
+].join("\n");
+const twoHunks=()=>[
+ "diff --git a/src/app.ts b/src/app.ts","--- a/src/app.ts","+++ b/src/app.ts",
+ "@@ -1,3 +1,3 @@",line(1),"-old two","+new two",line(3),
+ "@@ -40,3 +40,3 @@",line(40),"-old forty","+new forty",line(42),
+ ""
+].join("\n");
+let answer={text:twoHunks(),truncated:false}, delayMs=0;
+const stagingCalls=[];
+fixtures.cmd_get_file_diff=async a=>{calls.push(a);if(delayMs)await new Promise(r=>setTimeout(r,delayMs));return answer;};
+fixtures.cmd_stage_selective_patch=a=>{stagingCalls.push({kind:"stage",...a});return {policy:null,output:""};};
+fixtures.cmd_unstage_selective_patch=a=>{stagingCalls.push({kind:"unstage",...a});return {policy:null,output:""};};
+files=[status(FILE),status("src/other.ts")];
+window.__TAURI_INTERNALS__={invoke:async(cmd,args)=>{if(cmd.startsWith("plugin:event|"))return 1;if(fixtures[cmd])return fixtures[cmd](args);unexpected.push(cmd);throw Error(`Unconfigured command: ${cmd}`);},transformCallback:cb=>cb};
+const {mount,unmount,tick}=await import("svelte");
+const {get}=await import("svelte/store");
+const {repoStore}=await import("../src/lib/stores/repoStore.ts");
+const {interfaceStore}=await import("../src/lib/stores/interfaceStore.ts");
+const DiffViewer=(await import("../src/lib/components/DiffViewer.svelte")).default;
+const {results,check,stopped}=createChecks();
+const preview=document.getElementById("preview");
+const wait=(ms=60)=>new Promise(r=>setTimeout(r,ms));
+const until=async(test,label)=>{const end=Date.now()+8000;while(!test()&&Date.now()<end)await wait();if(!test())throw new Error("Timed out: "+label);};
+const text=()=>preview.textContent;
+const buttons=(label)=>[...preview.querySelectorAll("button")].filter(b=>(b.textContent.trim().startsWith(label))||b.getAttribute("aria-label")===label||b.title===label);
+const button=(label)=>buttons(label)[0];
+const scroller=()=>{
+ // The pane that scrolls the rows: the nearest scrolling ancestor of a drawn row.
+ let node=[...preview.querySelectorAll(".gp-diff-text")].find(el=>el.textContent.includes("context line 4"));
+ while(node&&node!==preview){const o=getComputedStyle(node).overflowY;if((o==="auto"||o==="scroll")&&node.scrollHeight>node.clientHeight+50)return node;node=node.parentElement;}
+ return null;
+};
+let view;
+/** Opens FILE as the reader would, with the diff read answering `next`. */
+async function open(next,{staged=false}={}){
+ if(view){await unmount(view);preview.replaceChildren();}
+ answer=next;
+ await repoStore.openRepo(root);
+ view=mount(DiffViewer,{target:preview});
+ // Another file first: re-selecting the one already open is not a new read.
+ await repoStore.selectFileDiff("src/other.ts",false);
+ await repoStore.selectFileDiff(FILE,staged);
+ await until(()=>text().includes("new two")||text().includes("Nothing")||text().includes("no changes")||text().length>0&&!text().includes("Reading the diff"),"diff drawn");
+ await wait(120);
+}
+const key=(target,init)=>target.dispatchEvent(new KeyboardEvent("keydown",{bubbles:true,cancelable:true,...init}));
+const hunkButtons=(label)=>[...preview.querySelectorAll("button")].filter(b=>b.textContent.trim()===label);
+/** The changed lines a staging call marks to be applied, in patch order. */
+const selectedIn=call=>call.filePatch.hunks.flatMap(h=>h.lines).filter(l=>l.is_selected).map(l=>l.content);
+const lineBoxes=()=>[...preview.querySelectorAll('button[aria-label="Select line for patch staging"]')];
+(async()=>{try{
+ await repoStore.openRepo(other);
+ // --- reading ----------------------------------------------------------
+ delayMs=500;
+ await open({text:twoHunks(),truncated:false});
+ // open() waits for rows; reopen with the read in flight to see the wait.
+ await unmount(view);preview.replaceChildren();
+ view=mount(DiffViewer,{target:preview});
+ const pending=repoStore.selectFileDiff("src/other.ts",false);
+ await until(()=>preview.querySelector('[aria-busy="true"]')||text().includes("Reading the diff"),"busy state");
+ check("while the diff is read the pane says so, as a live status and a busy region",()=>{
+  const status=[...preview.querySelectorAll('[role="status"]')].find(el=>el.textContent.includes("Reading the diff"));
+  return Boolean(status)&&Boolean(preview.querySelector('[aria-busy="true"]'));
+ });
+ await pending;await until(()=>text().includes("new two"),"rows after read");
+ check("and the rows arrive once it is read, with the busy mark gone",()=>!preview.querySelector('[aria-busy="true"]')&&text().includes("old forty"));
+ delayMs=0;
+ // --- identity and rows ---------------------------------------------------
+ check("the pane is titled from the diff's own file",()=>text().includes("app.ts"));
+ check("a changed line is drawn as the removed and the added text",()=>text().includes("old two")&&text().includes("new two"));
+ // --- staging -------------------------------------------------------------
+ await open({text:twoHunks(),truncated:false});
+ check("an unstaged working-tree file offers Stage Hunk for each hunk and no Unstage Hunk",()=>hunkButtons("Stage Hunk").length===2&&hunkButtons("Unstage Hunk").length===0);
+ hunkButtons("Stage Hunk")[1].click();await until(()=>stagingCalls.length===1,"hunk stage");
+ check("Stage Hunk marks exactly that hunk's changed lines as the ones to stage",()=>stagingCalls[0].kind==="stage"&&selectedIn(stagingCalls[0]).join()==="old forty,new forty");
+ stagingCalls.length=0;
+ await wait(400);
+ await until(()=>lineBoxes().length>0,"line boxes");
+ lineBoxes()[0].click();await tick();await wait();
+ check("selecting a line shows the selection bar with only Stage Selected",()=>text().includes("1 line selected")&&buttons("Stage Selected").length===1&&buttons("Unstage Selected").length===0);
+ buttons("Stage Selected")[0].click();await until(()=>stagingCalls.length===1,"selection stage");
+ check("Stage Selected marks only the selected line as the one to stage",()=>stagingCalls[0].kind==="stage"&&selectedIn(stagingCalls[0]).join()==="old two");
+ stagingCalls.length=0;
+ await open({text:twoHunks(),truncated:false},{staged:true});
+ check("a staged file offers Unstage Hunk and never Stage Hunk",()=>hunkButtons("Unstage Hunk").length===2&&hunkButtons("Stage Hunk").length===0);
+ lineBoxes()[0].click();await tick();await wait();
+ check("and its selection bar offers Unstage Selected only",()=>buttons("Unstage Selected").length===1&&buttons("Stage Selected").length===0);
+ // --- truncation ----------------------------------------------------------
+ await open({text:twoHunks(),truncated:true,truncation_reason:"the fixture byte cap"});
+ check("a backend-truncated diff says why, in the backend's words, and that staging is off",()=>text().includes("the fixture byte cap")&&/Staging is disabled/i.test(text()));
+ check("and every Stage Hunk is disabled",()=>hunkButtons("Stage Hunk").length===2&&hunkButtons("Stage Hunk").every(b=>b.disabled));
+ hunkButtons("Stage Hunk")[0].click();await wait(120);
+ check("a click on a disabled Stage Hunk stages nothing",()=>stagingCalls.length===0);
+ lineBoxes()[0].click();await tick();await wait();
+ check("a line selected from a truncated diff cannot be staged either",()=>buttons("Stage Selected").length===1&&buttons("Stage Selected")[0].disabled);
+ await open({text:twoHunks(),truncated:true});
+ check("a truncation with no stated cause still discloses the prefix",()=>text().includes("is incomplete"));
+ // --- find ----------------------------------------------------------------
+ await open({text:twoHunks(),truncated:false});
+ const findBox=()=>preview.querySelector('input[aria-label="Find in this diff"]');
+ check("the find bar is closed until asked for",()=>!findBox());
+ key(preview.querySelector("*"),{key:"f",metaKey:true,ctrlKey:true});await tick();await wait();
+ check("Command-F opens the find bar with the cursor in it",()=>Boolean(findBox())&&document.activeElement===findBox());
+ findBox().value="new two";findBox().dispatchEvent(new Event("input",{bubbles:true}));await tick();await wait();
+ check("a query for text a row shows finds it once",()=>/1 of 1/.test(text()));
+ findBox().value="+new";findBox().dispatchEvent(new Event("input",{bubbles:true}));await tick();await wait();
+ check("a query for the marker column and text finds nothing, because the marker is not what the row shows",()=>/no matches/.test(text()));
+ key(findBox(),{key:"Escape"});await tick();await wait();
+ check("Escape closes the find bar",()=>!findBox());
+ // --- stepping between changes -------------------------------------------
+ await open({text:longHunk(),truncated:false});
+ const pane=scroller();
+ // Start just below the first block, so only the second can be next.
+ pane.scrollTop=300;await wait(150);
+ const from=pane.scrollTop;
+ button("Next change").click();await wait(250);
+ const atSecond=pane.scrollTop;
+ check("Next change goes to the block of change 150 lines on, not to a nearer line",()=>from>0&&atSecond>from+1500);
+ button("Previous change").click();await wait(250);
+ check("Previous change comes back to the first block, above where the reader was",()=>pane.scrollTop<from);
+ // --- a refresh does not take the reader's place away --------------------
+ await open({text:longHunk(),truncated:false});
+ const placed=scroller();
+ placed.scrollTop=300;await wait(150);
+ const placedAt=placed.scrollTop;
+ lineBoxes()[0]?.click();await tick();await wait();
+ const pickedBefore=text().includes("1 line selected");
+ await repoStore.refresh(root);await wait(400);
+ check("a status refresh that changes nothing keeps the scroll position and the selected line",()=>pickedBefore&&Math.abs(scroller().scrollTop-placedAt)<=1&&text().includes("1 line selected"));
+ answer={text:longHunk().replace("+new two","+brand new two"),truncated:false};
+ await repoStore.selectFileDiff(FILE,false);await until(()=>text().includes("brand new two"),"changed diff read");await wait(200);
+ check("when the diff text itself changes the selection is dropped, because its indices no longer mean those lines",()=>!text().includes("line selected"));
+ check("and the reader keeps their place in the file while it does",()=>Math.abs(scroller().scrollTop-placedAt)<=1);
+ // --- layout --------------------------------------------------------------
+ await open({text:twoHunks(),truncated:false});
+ const rowOf=(a,b)=>{const leaf=[...preview.querySelectorAll("div")].filter(el=>el.textContent.includes(a)&&el.textContent.includes(b)).sort((x,y)=>x.textContent.length-y.textContent.length)[0];return leaf;};
+ const unifiedRow=rowOf("old two","new two");
+ check("unified draws the removed and the added line as two rows",()=>!unifiedRow||unifiedRow.getBoundingClientRect().height>60);
+ button("Split").click();await tick();await wait(150);
+ check("split puts a replaced line beside its replacement in one row",()=>{const row=rowOf("old two","new two");return Boolean(row)&&row.getBoundingClientRect().height<=60;});
+ check("Split reads as the pressed layout",()=>button("Split").getAttribute("aria-pressed")==="true"&&button("Unified").getAttribute("aria-pressed")==="false");
+ button("Unified").click();await tick();await wait(100);
+ // --- wrapping ------------------------------------------------------------
+ const wide="+"+"x".repeat(3000);
+ await open({text:["diff --git a/src/app.ts b/src/app.ts","--- a/src/app.ts","+++ b/src/app.ts","@@ -1,1 +1,2 @@",line(1),wide,""].join("\n"),truncated:false});
+ const wrapButton=()=>preview.querySelector('[aria-label="Toggle word wrap"]');
+ const sideways=()=>[...preview.querySelectorAll("*")].some(el=>el.scrollWidth>el.clientWidth+200&&getComputedStyle(el).overflowX!=="visible");
+ if(wrapButton().getAttribute("aria-pressed")==="true"){wrapButton().click();await tick();await wait(120);}
+ check("a long line scrolls sideways when wrapping is off",()=>sideways());
+ wrapButton().click();await tick();await wait(200);
+ check("and wraps within the pane, with no sideways scroll, when it is on",()=>!sideways());
+ // --- nothing to show -----------------------------------------------------
+ await open({text:"",truncated:false});
+ check("an empty diff draws no rows and says there is nothing to show",()=>!text().includes("new two")&&!preview.querySelector('[aria-busy="true"]')&&text().trim().length>0);
+ // --- names ---------------------------------------------------------------
+ await open({text:twoHunks(),truncated:false});
+ check("every button in the pane has an accessible name",()=>{
+  const unnamed=[...preview.querySelectorAll("button")].filter(b=>!(b.textContent.trim()||b.getAttribute("aria-label")||b.getAttribute("title")));
+  return unnamed.length===0;
+ });
+ check("the whitespace checkbox is named even where its label is hidden",()=>Boolean(preview.querySelector('input[type="checkbox"][aria-label="Ignore whitespace-only changes"]')));
+ const before=calls.length;
+ preview.querySelector('input[aria-label="Ignore whitespace-only changes"]').click();await until(()=>calls.length>before,"whitespace refetch");
+ check("ticking it reads the diff again ignoring whitespace",()=>calls.at(-1).ignoreWhitespace===true);
+ check("No unexpected commands",()=>unexpected.length===0);
+ check("No runtime errors",()=>crashes.length===0);
+}catch(error){stopped(error);}
+ const result={results,crashes,unexpected};window.__gpResult=result;
+ document.documentElement.dataset.gpResult=encodeURIComponent(JSON.stringify(result));
+ document.getElementById("result").textContent=results.map(r=>(r.pass?"ok   ":"FAIL ")+r.name).join("\n");
+ const report=new URLSearchParams(location.search).get("report");if(report)await fetch(report,{method:"POST",body:document.documentElement.outerHTML});
+})();
+</script></body></html>

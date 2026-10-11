@@ -68,6 +68,8 @@ let tasks = [
 let corruptDelete = false, loseDelete = false;
 const deleted = new Set(), deleteWrites = [], restoreWrites = [], mergeWrites = [];
 let mergeFailSource = "";
+// Reads of one workspace's membership, and a switch that makes them fail.
+let workspaceGets = 0, failWorkspaceGet = false;
 let failList = false, corruptSave = false, loseSave = false, holdSave = false, releaseSave, holdSearch = false, heldSearch = [], holdGet = false, releaseGet;
 const receipts = new Map(), proposals = new Map(), enhancementWrites = [], enhancementReads = [];
 const verdicts = new Map(), verdictReads = [];
@@ -206,7 +208,10 @@ mockIPCWithEvents(async (cmd, args) => {
     // `ORDER BY position,id`, as the store lists them. Array order would make
     // a reorder look persisted whether or not its position was written.
     case "workspaces.list": return JSON.stringify(page([...workspaces].sort((a, b) => a.position - b.position || (a.id < b.id ? -1 : 1))));
-    case "workspaces.get": return JSON.stringify({ok: true, item: workspaces.find(space => space.id === input.id) ?? workspace});
+    case "workspaces.get":
+      workspaceGets++;
+      if (failWorkspaceGet) throw {code: "store_error", message: "Fixture workspace membership offline"};
+      return JSON.stringify({ok: true, item: workspaces.find(space => space.id === input.id) ?? workspace});
     case "workspaces.put": {
       workspaceWrites.push(structuredClone(input));
       const index = workspaces.findIndex(space => space.id === input.id);
@@ -2850,6 +2855,109 @@ if (params.has("check")) {
       interfaceStore.setTaskSwimlane("none");
       await click("Clear filters"); await settle(200);
     } catch (error) { check(`the board view checks ran to the end (${error.message} at ${guardStep}; error=${root.querySelector(".banner.error")?.textContent ?? ""})`, false); }
+
+    // ---- Claims the board's source-text tests used to make from the markup ---
+    try {
+      guardStep = "claims: chrome";
+      const scopes = root.querySelector('nav[aria-label="Task scopes"]');
+      button("All", scopes).click(); await settle(400);
+      if (button("Board")) { button("Board").click(); await settle(200); }
+      const drawn = root.textContent;
+      const banned = ["GLOBAL BOARD", "WORKSPACE BOARD", "REPOSITORY BOARD", "Drop a Git repository", "Drop a task here", "Activity inbox", "Add repositories to start creating linked tasks"];
+      check(`the board chrome carries none of the generic marketing labels (${banned.filter(label => drawn.includes(label)).join(", ")})`, banned.every(label => !drawn.includes(label)));
+      check("the header offers New task and an Inbox", Boolean(button("New task")) && Boolean(root.querySelector('[aria-label="Inbox"]')));
+      const urgent = card("task-2")?.querySelector('[aria-label$=" priority"]');
+      check("a card names its priority for a screen reader, not by colour alone", /^High priority$/.test(urgent?.getAttribute("aria-label") ?? ""));
+
+      guardStep = "claims: quick add dims";
+      const quickRow = () => root.querySelector('[data-testid="task-quick-add-row"]');
+      check("the quick-add row is live while no task sheet is open", !editor() && !quickRow().classList.contains("dimmed") && !quickRow().querySelector("input").disabled);
+      card("task-3").dispatchEvent(new MouseEvent("click", { bubbles: true })); await wait(editor);
+      check("the quick-add row is dimmed and disabled while a task sheet is open", quickRow().classList.contains("dimmed") && quickRow().querySelector("input").disabled);
+      confirmAnswer = true; await click("Close task details"); await wait(() => !editor());
+      check("closing the sheet brings the quick-add row back", !quickRow().classList.contains("dimmed") && !quickRow().querySelector("input").disabled);
+
+      guardStep = "claims: priority order locks moves";
+      const readyIds = () => [...root.querySelectorAll('[data-task-column="ready"] [data-task-card]')].map(el => el.dataset.cardId);
+      button("Priority first").click(); await settle(200);
+      const lockedFrom = readyIds(), lockedWrites = writes.length;
+      const lockedCard = root.querySelector('[data-task-column="ready"] [data-task-card]');
+      lockedCard.focus(); lockedCard.dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowDown", altKey: true, bubbles: true, cancelable: true })); await settle(300);
+      check("under Priority first a card is not moved within its column, and the board says why",
+        writes.length === lockedWrites && readyIds().join() === lockedFrom.join() && /Switch to Board order/.test(root.querySelector('[role="status"][aria-live="polite"].sr-only')?.textContent ?? ""));
+      button("Board order").click(); await settle(200);
+      const freeFirst = root.querySelector('[data-task-column="ready"] [data-task-card]');
+      freeFirst.focus(); freeFirst.dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowDown", altKey: true, bubbles: true, cancelable: true }));
+      await wait(() => writes.length > lockedWrites);
+      check("back in Board order the same key moves the card with a write", writes.length === lockedWrites + 1);
+
+      guardStep = "claims: drop onto a column";
+      // Every drag above is cancelled; this one is released over another
+      // column, which is the only path that writes a status from a drag.
+      {
+        const pointer = (target, type, x, y) => target.dispatchEvent(new PointerEvent(type, {
+          bubbles: true, cancelable: true, composed: true, pointerId: 1, pointerType: "mouse", isPrimary: true,
+          button: 0, buttons: type === "pointerup" ? 0 : 1, clientX: x, clientY: y,
+        }));
+        const draggedId = readyIds()[0];
+        const dragged = card(draggedId), from = tasks.find(task => task.id === draggedId);
+        const grabBox = dragged.getBoundingClientRect();
+        const target = root.querySelector('[data-task-column="backlog"]').getBoundingClientRect();
+        const dest = { x: target.left + target.width / 2, y: target.top + Math.min(target.height - 4, 60) };
+        const dropWrites = writes.length;
+        pointer(dragged, "pointerdown", grabBox.left + 10, grabBox.top + 10);
+        pointer(dragged, "pointermove", dest.x, dest.y); await settle(80);
+        pointer(dragged, "pointermove", dest.x, dest.y + 1); await settle(80);
+        pointer(document.body, "pointerup", dest.x, dest.y + 1);
+        await wait(() => tasks.find(task => task.id === draggedId).status === "backlog");
+        await settle(300);
+        check("releasing a dragged card over another column writes that status, once", writes.length === dropWrites + 1 && writes.at(-1).id === draggedId && writes.at(-1).status === "backlog");
+        check("and the card is drawn in that column", Boolean(root.querySelector(`[data-task-column="backlog"] [data-card-id="${draggedId}"]`)));
+        tasks = tasks.map(task => task.id === draggedId ? { ...task, status: from.status, position: from.position } : task);
+      }
+
+      guardStep = "claims: editor subtasks and shortcuts";
+      {
+        card("task-3").dispatchEvent(new MouseEvent("click", { bubbles: true })); await wait(editor);
+        const part = testid => editor().querySelector(`[data-testid="${testid}"]`);
+        const typed = async text => { await change(part("task-subtask-add-input"), text); };
+        check("Add stays disabled until a subtask is typed", part("task-subtask-add-button").disabled === true);
+        await typed("Write the tests");
+        check("and is enabled once one is", part("task-subtask-add-button").disabled === false);
+        part("task-subtask-add-button").click(); await settle();
+        check("Add lists the subtask, puts it in the criteria and clears the box",
+          part("task-subtask-item-0")?.textContent.includes("Write the tests") && part("task-criteria").value === "Write the tests" && part("task-subtask-add-input").value === "");
+        await typed("Ship it");
+        part("task-subtask-add-input").dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true, cancelable: true })); await settle();
+        check("Enter in the box adds one too", part("task-subtask-item-1")?.textContent.includes("Ship it") && part("task-criteria").value === "Write the tests\nShip it");
+        part("task-subtask-remove-0").click(); await settle();
+        check("Remove drops that subtask and keeps the other", part("task-subtask-item-0")?.textContent.includes("Ship it") && !part("task-subtask-item-1") && part("task-criteria").value === "Ship it");
+        await change(field("Description"), "Plan:\n- [ ] Alpha step\n- [ ] Beta step");
+        part("task-extract-subtasks").click(); await settle();
+        check("Extract subtasks moves the checklist out of the description into the criteria, keeping what was there",
+          part("task-criteria").value === "Ship it\nAlpha step\nBeta step" && !field("Description").value.includes("Alpha step") && /Extracted 2 subtasks/.test(editor().textContent));
+        // Cmd+S from inside the repository popover, which is portaled out of the sheet.
+        await openRepoPicker();
+        const savesBefore = writes.length;
+        repoPopup().dispatchEvent(new KeyboardEvent("keydown", { key: "s", metaKey: true, ctrlKey: true, bubbles: true, cancelable: true }));
+        await wait(() => writes.length > savesBefore); await settle(200);
+        check("Command-S saves from inside the repository popover, with the criteria as stored lines",
+          JSON.stringify(writes.at(-1).acceptance_criteria) === JSON.stringify(["Ship it", "Alpha step", "Beta step"]));
+        await closeRepoPicker();
+        await click("Close task details"); await wait(() => !editor());
+      }
+
+      guardStep = "claims: membership retry";
+      failWorkspaceGet = true;
+      workspaceTab("Developer tools").click(); await wait(() => root.querySelector(".banner.error"));
+      check("a failed workspace membership read is reported with a Retry", /membership offline/.test(root.querySelector(".banner.error").textContent) && Boolean(button("Retry", root.querySelector(".banner.error"))));
+      failWorkspaceGet = false;
+      const getsBeforeRetry = workspaceGets;
+      button("Retry", root.querySelector(".banner.error")).click();
+      await wait(() => !root.querySelector(".banner.error"));
+      check("Retry reads the workspace membership again, not just the board", workspaceGets > getsBeforeRetry);
+      button("All", scopes).click(); await settle(400);
+    } catch (error) { check(`the board claim checks ran to the end (${error.message} at ${guardStep})`, false); }
 
     // ---- A repository's board reaches the global board -------------------
     try {
