@@ -2318,7 +2318,7 @@ some-future-field whatever
         }
         let elapsed = started.elapsed();
         assert!(
-            elapsed < std::time::Duration::from_secs(5),
+            elapsed < crate::test_support::coverage_relaxed(std::time::Duration::from_secs(5)),
             "hostile paths took {elapsed:?}"
         );
     }
