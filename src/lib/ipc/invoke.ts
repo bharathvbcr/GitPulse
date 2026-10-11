@@ -35,8 +35,11 @@ import { activity, observeSettled } from "../diagnostics/activity";
  * delay is jittered upward (`jitteredRetryDelayMs`), so the calls one storm
  * declined do not all come back on the same millisecond into the same empty
  * budget. And a retry waits while the window is hidden: nobody can see its
- * answer, and the spawn budget it would spend is shared with every agent
- * session on the machine.
+ * answer, and the spawn budget it would spend is shared with every other
+ * GitPulse process of this user — the agent servers (`gitpulse-mcp`), the
+ * hooks and `gitpulsed` draw from the same per-user record
+ * (`engine/git_cli/shared_budget.rs`). Agent sessions themselves do not: the
+ * `git` an agent runs on its own never passes through this budget.
  */
 type Raw = <T>(cmd: string, args?: InvokeArgs, options?: InvokeOptions) => Promise<T>;
 

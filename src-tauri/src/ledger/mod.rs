@@ -1087,8 +1087,9 @@ fn with_access<T>(
 /// file or a database with no schema yet is reported, never read as empty.
 fn open_readonly_initialised(db_path: &Path) -> Result<Connection, LedgerError> {
     let not_initialised = |message: &str| LedgerError::new("not_initialised", message);
-    let conn = open_readonly(db_path)?
-        .ok_or_else(|| not_initialised("no ledger in this repository yet; nothing has been recorded"))?;
+    let conn = open_readonly(db_path)?.ok_or_else(|| {
+        not_initialised("no ledger in this repository yet; nothing has been recorded")
+    })?;
     if !has_table(&conn, "events")? {
         return Err(not_initialised(
             "the ledger file has no schema yet; nothing has been recorded",

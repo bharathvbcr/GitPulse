@@ -419,7 +419,7 @@ fn build_tools() -> Vec<Value> {
         tool(
             "gitpulse_insights",
             "Repository insights",
-            "One-shot snapshot of worktrees, agent sessions (agents.live: running Claude Code sessions per worktree path; kinds it cannot observe, such as Codex, are reported unknown), uncommitted changes, overlapping dirty files, ledger, and code-graph availability. Facets fail independently so a missed scan never looks clean.",
+            "One-shot snapshot of worktrees, agent sessions (agents.live: running Claude Code and Codex sessions per worktree path, found by executable in the process table; a kind that could not be observed is reported unknown, never zero), uncommitted changes, overlapping dirty files, ledger, and code-graph availability. Facets fail independently so a missed scan never looks clean.",
             json!({ "repo_path": repo_prop() }),
             &["repo_path"],
             json!({

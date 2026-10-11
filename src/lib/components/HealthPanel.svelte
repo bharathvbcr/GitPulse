@@ -87,6 +87,7 @@
   import { keyedList } from "../ui/eachKeys";
   import HealthSection from "./health/HealthSection.svelte";
   import HealthTable from "./health/HealthTable.svelte";
+  import HostLoadSection from "./health/HostLoadSection.svelte";
   import HealthSummaryCard from "./health/HealthSummaryCard.svelte";
   import GithubAlertsSection from "./health/GithubAlertsSection.svelte";
   import AlertLinkButton from "./health/AlertLinkButton.svelte";
@@ -1650,6 +1651,13 @@
             No dead-code result for this repository yet.
           </p>
         {/if}
+      </HealthSection>
+
+      <!-- Machine-wide, not this repository's: the same readings under every
+           repository's Health. Last, because it is context for the findings
+           above rather than one of them. -->
+      <HealthSection id="host-load">
+        <HostLoadSection />
       </HealthSection>
     {:else}
       <div class="text-textMuted">Open a repository to scan dependency health.</div>
