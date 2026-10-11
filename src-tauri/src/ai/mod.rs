@@ -48,7 +48,7 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::engine::git_cli::{git_text, git_text_capped, validate_repo};
+use crate::engine::git_cli::{git_bytes_capped, git_text, validate_repo};
 use crate::engine::GitReader;
 use crate::harness::protocol::{
     PrepareResult, ProbeResult, SettleResult, OP_CAPABILITY_PROBE, OP_CHAT_PREPARE, OP_CHAT_SETTLE,
@@ -717,15 +717,19 @@ fn truncate(s: &str, max: usize) -> String {
 /// multi-megabyte diff from being treated as a complete description of the change.
 const COMMIT_PATCH_CAP: usize = 2 * 1024 * 1024;
 
-/// The staged patch, and whether the read stopped early.
-fn read_staged_patch(repo_path: &str) -> Result<(String, bool), String> {
+/// The staged patch as git printed it, and whether the read stopped early.
+///
+/// Bytes, not text: Lappi's caller contract sends the context as bytes, so the
+/// exact output must survive to the request. Text consumers decode it with
+/// [`String::from_utf8_lossy`] at their own boundary.
+fn read_staged_patch(repo_path: &str) -> Result<(Vec<u8>, bool), String> {
     let repo = validate_repo(repo_path)?;
-    let (text, incomplete) = git_text_capped(
+    let (bytes, incomplete) = git_bytes_capped(
         &repo,
         &["diff", "--cached", "--no-color", "--no-ext-diff", "-U3"],
         COMMIT_PATCH_CAP,
     )?;
-    Ok((text, incomplete.is_some()))
+    Ok((bytes, incomplete.is_some()))
 }
 
 /// Which writer phrases the subject. The patch has already been classified.
@@ -798,7 +802,8 @@ pub fn generate_commit_message(
     selection: Option<AiSelection>,
 ) -> Result<AiGeneration, String> {
     let started = Instant::now();
-    let (diff, patch_truncated) = read_staged_patch(repo_path)?;
+    let (patch, patch_truncated) = read_staged_patch(repo_path)?;
+    let diff = String::from_utf8_lossy(&patch).into_owned();
     if diff.trim().is_empty() {
         if patch_truncated {
             return Err(
@@ -864,7 +869,7 @@ pub fn generate_commit_message(
     // setting on: Lappi may pre-select that missing type and nothing else.
     // Bounded by `lappi::ASK_DEADLINE`; this function already runs off the UI
     // thread. With both Lappi settings off it reads only the cached config.
-    crate::lappi::consult_on_commit_type(repo_path, diff.as_bytes(), &mut draft);
+    crate::lappi::consult_on_commit_type(repo_path, &patch, &mut draft);
 
     let explicit = usable_selection(selection);
     let (discovered, on_device) = if explicit.is_some() {
@@ -1330,6 +1335,22 @@ mod tests {
         (format!("http://127.0.0.1:{port}/v1"), rx)
     }
 
+    /// Runs `body` with `tools.json` bound to an empty file in a temp directory,
+    /// so a commit-message test reads defaults (both Lappi switches off) and
+    /// can never take the user's "Record Lappi caller data" setting into a
+    /// held-out caller-record store, whatever the process environment says.
+    fn with_isolated_tools_config<T>(body: impl FnOnce() -> T) -> T {
+        let serial = crate::test_support::env::env_serial();
+        let dir = tempfile::TempDir::new().expect("config dir");
+        let _env = crate::test_support::env::bind_env(&serial)
+            .set(
+                crate::tool_config::TOOL_CONFIG_ENV,
+                dir.path().join("tools.json"),
+            )
+            .invalidating(crate::tool_config::invalidate_cache);
+        body()
+    }
+
     /// A repository with one staged change, which is what the commit-message
     /// feature requires before it will say anything at all.
     fn repo_with_staged_change() -> tempfile::TempDir {
@@ -1386,8 +1407,10 @@ mod tests {
         let (base_url, requests) = fake_model_server("feat: add a readme");
         let (selection, _hits) = probing_selection(base_url);
 
-        let generation = generate_commit_message(&repo.path().to_string_lossy(), Some(selection))
-            .expect("generation succeeds without a harness");
+        let generation = with_isolated_tools_config(|| {
+            generate_commit_message(&repo.path().to_string_lossy(), Some(selection))
+        })
+        .expect("generation succeeds without a harness");
 
         assert_eq!(generation.text, "feat: add a readme");
         assert_eq!(generation.prompt_tokens, 11);
@@ -1414,6 +1437,61 @@ mod tests {
             "classified brief not sent: {sent}"
         );
         assert!(sent.contains("test-model"), "model not sent: {sent}");
+    }
+
+    /// The Lappi caller contract sends the staged patch as bytes. A lossy UTF-8
+    /// decode on the way in would put U+FFFD where git printed 0xff while
+    /// `context_len` still matched what was sent.
+    #[test]
+    fn the_staged_patch_is_git_s_exact_bytes_even_when_not_utf8() {
+        let repo = repo_with_staged_change();
+        std::fs::write(repo.path().join("latin1.txt"), b"caf\xe9 \xff\xfe\n").unwrap();
+        std::process::Command::new("git")
+            .args(["add", "latin1.txt"])
+            .current_dir(repo.path())
+            .output_locked()
+            .expect("git add");
+
+        let (patch, truncated) =
+            read_staged_patch(&repo.path().to_string_lossy()).expect("staged patch");
+        let expected = std::process::Command::new("git")
+            .args(["diff", "--cached", "--no-color", "--no-ext-diff", "-U3"])
+            .current_dir(repo.path())
+            .output_locked()
+            .expect("git diff")
+            .stdout;
+
+        assert!(!truncated);
+        assert!(expected.windows(2).any(|pair| pair == b"\xff\xfe"));
+        assert_eq!(patch, expected, "the patch was re-encoded on the way in");
+    }
+
+    /// Gap check for the held-out caller-record store: the tests in this module
+    /// resolve both `tools.json` and the caller-record directory under the
+    /// per-process hermetic root, never under the developer's real home, and a
+    /// bound config directory wins over both.
+    #[test]
+    fn ai_tests_resolve_config_and_caller_records_under_the_hermetic_root() {
+        let serial = crate::test_support::env::env_serial();
+        let root = crate::test_support::env::hermetic::root();
+        let config = crate::tool_config::config_path().expect("config path");
+        let records = crate::lappi::record::Store::default_dir().expect("store dir");
+        assert!(config.starts_with(&root), "{config:?} escapes {root:?}");
+        assert!(records.starts_with(&root), "{records:?} escapes {root:?}");
+        if let Some(real) = crate::test_support::env::hermetic::real_home() {
+            assert!(!config.starts_with(&real) && !records.starts_with(&real));
+        }
+
+        let dir = tempfile::TempDir::new().expect("config dir");
+        let bound = dir.path().join("tools.json");
+        let _env = crate::test_support::env::bind_env(&serial)
+            .set(crate::tool_config::TOOL_CONFIG_ENV, &bound)
+            .invalidating(crate::tool_config::invalidate_cache);
+        assert_eq!(crate::tool_config::config_path(), Ok(bound));
+        assert_eq!(
+            crate::tool_config::lappi_settings(),
+            crate::tool_config::LappiSettings::default()
+        );
     }
 
     #[test]
@@ -1508,13 +1586,15 @@ mod tests {
         let _no_harness = NoHarness::install();
 
         let repo = repo_with_staged_change();
-        let generation = generate_commit_message(
-            &repo.path().to_string_lossy(),
-            Some(AiSelection {
-                base_url: "http://127.0.0.1:1/v1".into(),
-                model: "unused".into(),
-            }),
-        )
+        let generation = with_isolated_tools_config(|| {
+            generate_commit_message(
+                &repo.path().to_string_lossy(),
+                Some(AiSelection {
+                    base_url: "http://127.0.0.1:1/v1".into(),
+                    model: "unused".into(),
+                }),
+            )
+        })
         .expect("a staged change still has a message");
 
         assert_eq!(generation.text, "docs: add readme");
@@ -1544,8 +1624,10 @@ mod tests {
             "feat: add a readme\n\nFixes #404\n\nCo-authored-by: Mallory <m@example.com>\n",
         );
         let (selection, _hits) = probing_selection(base_url);
-        let generation = generate_commit_message(&repo.path().to_string_lossy(), Some(selection))
-            .expect("generation succeeds");
+        let generation = with_isolated_tools_config(|| {
+            generate_commit_message(&repo.path().to_string_lossy(), Some(selection))
+        })
+        .expect("generation succeeds");
 
         assert!(
             generation.text.starts_with("feat: add a readme"),

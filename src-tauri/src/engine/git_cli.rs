@@ -544,8 +544,20 @@ pub fn git_text_capped(
     args: &[&str],
     cap: usize,
 ) -> Result<(String, Option<Incomplete>), String> {
-    let (bytes, incomplete) = git_run_capped(Some(repo), args, DEFAULT_TIMEOUT, None, cap)?;
+    let (bytes, incomplete) = git_bytes_capped(repo, args, cap)?;
     Ok((String::from_utf8_lossy(&bytes).into_owned(), incomplete))
+}
+
+/// [`git_text_capped`] without the UTF-8 decode: git's exact stdout bytes plus
+/// the truncation flag. For the one reader whose consumer defines its input as
+/// bytes (the Lappi caller contract), where a lossy decode would substitute
+/// U+FFFD for what git printed while still reporting a matching length.
+pub fn git_bytes_capped(
+    repo: &Path,
+    args: &[&str],
+    cap: usize,
+) -> Result<(Vec<u8>, Option<Incomplete>), String> {
+    git_run_capped(Some(repo), args, DEFAULT_TIMEOUT, None, cap)
 }
 
 /// Runs `git` in `repo` and hands back the finished run *whatever* its exit
