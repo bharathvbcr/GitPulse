@@ -207,12 +207,12 @@ under Agent supervision.
 | --- | --- | --- |
 | Background recovery | **Connected**: `runs.reconcile` → `run_unresolved`, `enhancements.recover` → `enhancement_interrupted` | — |
 | Agent approval, managed lane | **Connected**: the table above | — |
-| Agent approval, terminal lane | Session banners only (`src-tauri/src/alerts/`); no inbox notice, because terminal handoffs have no structured callback producer (ARCHITECTURE.md) | ft-723b56f2 (hook scope fence and supervision phase 2) |
-| Agent output review | Blocked: the review gate is designed, not built ([AGENT_OUTPUT_REVIEW.md](AGENT_OUTPUT_REVIEW.md)) | ft-723b56f2 |
+| Agent approval, terminal lane | **Blocked, and not by ft-723b56f2** (done). Session banners only (`src-tauri/src/alerts/`). A hook report (Notification, permission prompt) arrives with no provider thread, turn or protocol request id and no channel to answer it, while a `decision_permission` notice is a pending `decisions.create` that the inspector answers and the store delivers back to the provider. A notice raised from a hook report would be one nobody could act on. Wiring it needs a terminal-lane response path (the PTY, not the hook) designed first | A terminal-lane approval design; no card names it. Tracked on ft-971055ea |
+| Agent output review | **Connected by design, through the run's exit notice.** A review is a host `change_review` / `merge_unreviewed` decision created and decided in one step on the person's action (`workbench/review.rs`), and dc-store deliberately raises no notice for it (`attention.rs:50-53`: the person is already looking at the range, and the run's own `run_exited` / `run_exit_failed` / `run_unresolved` notice points at the ended attempt). `change_review_is_created_only_for_an_ended_run_with_a_thirty_day_cap` pins that a review adds no notice | — (changing it means a new notice kind in dc-store and in every consumer's closed kind set) |
 | GitHub changes | Blocked: no sync workflow writes to the store | ft-75540dc2 (two-way GitHub issue sync with a durable outbox) |
 | Workspace results | Blocked: no cross-repository execution queue exists | ft-75540dc2 (cross-repository execution queue) |
-| CI | Blocked: GitPulse reads workflow runs on demand (`load_workflow_runs_report`). It records no store event, and a notice must name a task, which a CI run does not | No card names it. It needs a dc-store event and a task binding; the store work belongs with ft-a986603ee (dc-store follow-ups) |
-| Reminders | Blocked: tasks carry `due_at`, but nothing records an event when it passes. The store has no clock-driven producer | No card names it. It needs a dc-store scheduled event, so it belongs with ft-a986603ee |
+| CI | Blocked: GitPulse reads workflow runs on demand (`load_workflow_runs_report`). It records no store event, and a notice must name a task, which a CI run does not | Needs a dc-store event and a task binding. Owned by ft-971055ea (store-event producers: CI results and reminders) |
+| Reminders | Blocked: tasks carry `due_at`, but nothing records an event when it passes. The store has no clock-driven producer | Needs a dc-store scheduled event. Owned by ft-971055ea (store-event producers) |
 
 ## Windows and Linux
 
