@@ -1053,21 +1053,10 @@ fn safe_log_line(value: &str) -> String {
     bound_utf8(&single_line, MAX_LOG_ENTRY_BYTES)
 }
 
-/// Largest index `<= max` in `value` that sits on a UTF-8 character boundary.
-///
-/// Every byte budget in this module has to pass through here before it
-/// reaches a slice. A raw `&str[..n]` panics whenever `n` lands inside a
-/// multi-byte character, and this module *is* the panic hook's formatter: a
-/// panic raised here re-enters the hook and aborts the process instead of
-/// logging anything.
-fn floor_char_boundary(value: &str, max: usize) -> usize {
-    let mut cut = max.min(value.len());
-    while cut > 0 && !value.is_char_boundary(cut) {
-        cut -= 1;
-    }
-    cut
-}
-
+// Every byte budget in `bound_utf8` goes through `str::floor_char_boundary`
+// before it reaches a slice: a raw `&str[..n]` panics whenever `n` lands inside
+// a multi-byte character, and this module *is* the panic hook's formatter, so a
+// panic raised here re-enters the hook and aborts the process.
 fn bound_utf8(value: &str, max_bytes: usize) -> String {
     if value.len() <= max_bytes {
         return value.to_string();
@@ -1076,12 +1065,12 @@ fn bound_utf8(value: &str, max_bytes: usize) -> String {
         // The marker is not ASCII — it carries two U+2026 ellipses — so the
         // budget must be floored onto a boundary here too. Slicing it raw
         // panicked for every budget of 2, 3, 26 or 27 bytes.
-        return LOG_TRUNCATION_MARKER[..floor_char_boundary(LOG_TRUNCATION_MARKER, max_bytes)]
+        return LOG_TRUNCATION_MARKER[..LOG_TRUNCATION_MARKER.floor_char_boundary(max_bytes)]
             .to_string();
     }
 
     let body = max_bytes - LOG_TRUNCATION_MARKER.len();
-    let head_end = floor_char_boundary(value, body * 35 / 100);
+    let head_end = value.floor_char_boundary(body * 35 / 100);
     let tail_budget = body - head_end;
     let mut tail_start = value.len().saturating_sub(tail_budget);
     while tail_start < value.len() && !value.is_char_boundary(tail_start) {
