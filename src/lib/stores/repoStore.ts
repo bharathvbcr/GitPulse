@@ -145,6 +145,7 @@ import {
 } from "../repos/watcherRefresh";
 import { decideCadence, readEventLoopDelay } from "../runtime/loadCadence";
 import { debounce, type Debounced } from "../async/debounce";
+import { createSessionBook } from "../repos/sessionBook";
 import { beginGeneration } from "../async/guard";
 import { createCommitDraftStore } from "./commitDraftStore";
 import { flushOnPageHide } from "../async/deferredWrite";
@@ -975,7 +976,10 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
   let pollInflight = false;
   /** Monotonic poll ordering; a superseded tick's result is discarded. */
   let pollSequenceSource = 0;
-  const pollRuns = new Map<string, number>();
+  // Per-tab and per-path records the poll, hydrate, stats and mutation paths
+  // keep. One owner, so every close route forgets all of them (`sessionBook.ts`).
+  const sessionBook = createSessionBook((a, b) => sameRepo(a, b, options));
+  const { familyUnknown, snapshotRuns, pollRuns, statsInflight, mutationEchoUntil } = sessionBook;
 
   // Monotonic token source for diff-selection requests. Session `generation`
   // only moves on tab activation, so it cannot order two rapid selections of
@@ -1769,6 +1773,22 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
     await serialWatch(id, () => unwatchNative(path));
   }
 
+  /**
+   * The one routine every tab-close route ends in (closeTab, closeOtherTabs,
+   * closeTabsToTheRight): forgets the tab's per-id and per-path records
+   * (`sessionBook.ts`), drops its graph and stops its watch, and lets the
+   * harness store drop the repository's ledger cache once no other tab shows
+   * it. Call it after the tab is out of `internal.sessions`.
+   */
+  async function releaseSession(id: string, path: string | null): Promise<void> {
+    sessionBook.forget(id, path);
+    if (path === null) return;
+    const stillOpen = Object.values(internal.sessions).some((other) => sameRepo(other.path, path, options));
+    if (!stillOpen) harnessStore.forgetRepository(path);
+    graph.evict(path);
+    await unwatch(path);
+  }
+
   async function resolvePath(path: string): Promise<ResolvedRepo> {
     return invokeFn<ResolvedRepo>("cmd_resolve_repo", { repoPath: path });
   }
@@ -1787,24 +1807,6 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
       commonDir: resolved.common_dir ?? null,
     };
   }
-
-  /**
-   * Tab ids whose family is unknown because no resolve has succeeded for them
-   * yet (restored untrusted, or unreachable at restore). A resolve that
-   * answered "no common directory" is an answer and is not listed. `hydrate`
-   * asks again for these, once per hydrate: without it a family split at
-   * restore stayed split until the app restarted.
-   */
-  const familyUnknown = new Set<string>();
-
-  /**
-   * Ordering token for snapshot fetches. `activateTab` starts a hydrate at
-   * generation N; `refresh()` and watcher events start more at the SAME N
-   * (refresh never bumps). Generation alone cannot order those, so the older
-   * response could resolve last and overwrite fresher data. Only the
-   * latest-started fetch may apply.
-   */
-  const snapshotRuns = new Map<string, number>();
 
   /**
    * Folds live churn (branch stats merged after previous drains) into a fresh
@@ -1976,7 +1978,6 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
   // fetch per session at a time: capped reports re-invoke inside the same
   // in-flight slot until drained, and a refresh racing one lets it finish —
   // the tip guard keeps stale merges out, and the next refresh fetches again.
-  const statsInflight = new Set<string>();
 
   function branchStatsKey(
     name: string,
@@ -2111,13 +2112,6 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
   // same timer instead of queueing overlapping refreshes.
   const watcherRefreshTimers = new Map<string, Debounced<[]>>();
 
-  /**
-   * Per-repo deadline until which watcher events count as echoes of our own
-   * just-landed mutation rather than external changes; see
-   * WATCHER_ECHO_SUPPRESS_MS.
-   */
-  const mutationEchoUntil = new Map<string, number>();
-
   function scheduleWatcherRefresh(key: string, run: () => void) {
     let timer = watcherRefreshTimers.get(key);
     if (!timer) {
@@ -2215,6 +2209,8 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
      * Resolves to whether trust was granted and the tab loaded.
      */
     trustTab: (id: string) => grantTrust(id),
+    /** Per-tab and per-path records held beyond the sessions themselves; zero once every tab is closed. */
+    retainedSessionRecords: (): number => sessionBook.size(),
     /**
      * Why `openRepo(rawPath)` would be refused before anything is resolved,
      * or null. Only refusals that waiting cannot fix are knowable here: an
@@ -2587,13 +2583,9 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
       commitEdit(result.closedPath ? [result.closedPath] : []);
       replaceWorkspace(result.workspace);
       const { [id]: _removed, ...rest } = internal.sessions;
-      familyUnknown.delete(id);
       internal = { ...internal, sessions: rest };
       stopStatusPoll();
-      if (session) {
-        graph.evict(session.path);
-        await unwatch(session.path);
-      }
+      await releaseSession(id, session?.path ?? null);
       const next = activeSession();
       if (next) {
         // Activation-by-close: bump the neighbor so the App-owned graph
@@ -2620,10 +2612,7 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
       replaceWorkspace(closeOtherTabs(internal.workspace, id));
       internal = { ...internal, sessions: { [id]: keep } };
       stopStatusPoll();
-      for (const tab of removed) {
-        graph.evict(tab.path);
-        await unwatch(tab.path);
-      }
+      for (const tab of removed) await releaseSession(tab.id, tab.path);
       if (internal.workspace.activeId === id) {
         putSession(bumped(keep));
       }
@@ -2647,10 +2636,7 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
       }
       internal = { ...internal, sessions };
       stopStatusPoll();
-      for (const tab of removed) {
-        graph.evict(tab.path);
-        await unwatch(tab.path);
-      }
+      for (const tab of removed) await releaseSession(tab.id, tab.path);
       const revealed = activeSession();
       // When the active tab was among those removed, tabModel reassigns
       // activeId to the clicked tab — bump it so the App-owned graph effect

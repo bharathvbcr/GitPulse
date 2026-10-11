@@ -1,4 +1,7 @@
+import { listen } from "@tauri-apps/api/event";
+import { isTauri } from "../platform";
 import { invoke } from "../ipc/invoke";
+import { createWorkbenchChanges, type WorkbenchSubscriber } from "./changes";
 import { bindForegroundChanges, readBackgroundDocument } from "../runtime/foreground";
 import { decideCadence, readEventLoopDelay } from "../runtime/loadCadence";
 import { selectionWire, type ModelSelection } from "./taskModel";
@@ -8,6 +11,17 @@ import type { ModelChoice as LaunchModelChoice } from "../terminal/agentDefaults
 import { PERMISSION_MODES, STATUSES, asAgentProvider, supportsManaged, type AgentProvider, type ManagedProvider, type PermissionMode, type RunKind, type TaskStatus } from "./vocabulary";
 
 export type { ModelSelection };
+export type { WorkbenchChange, WorkbenchSubscriber } from "./changes";
+
+const workbenchChanges = createWorkbenchChanges({ listen, explain: (cause) => explainError(cause) });
+/**
+ * Follow the host's `workbench-changed` events through the one shared
+ * subscription (`changes.ts`): each write reaches a subscriber once. Outside
+ * the desktop host there is no event, and nothing is subscribed.
+ */
+export function subscribeWorkbenchChanges(subscriber: WorkbenchSubscriber): () => void {
+  return isTauri() ? workbenchChanges.subscribe(subscriber) : () => {};
+}
 
 export { STATUSES, STATUS_LABELS, asTaskStatus, PERMISSION_MODES, AGENT_PROVIDERS, asAgentProvider } from "./vocabulary";
 export type { TaskStatus, PermissionMode, RunKind, AgentProvider } from "./vocabulary";
@@ -663,8 +677,10 @@ export async function relinkRepository(repo: Repository, path: string, requestId
   const saved = repository(raw.repository);
   return saved.id === repo.id && saved.revision === repo.revision + 1 ? saved : invalid();
 }
-export async function listRepositories(cursor?: string): Promise<Page<Repository>> { return page(await request("repositories.list", { limit: 200, ...(cursor ? { cursor } : {}) }), repository); }
-export async function listWorkspaces(cursor?: string): Promise<Page<WorkspaceCard>> { return page(await request("workspaces.list", { limit: 200, include_archived: true, ...(cursor ? { cursor } : {}) }), workspaceCard); }
+/** Rows per `repositories.list` / `workspaces.list` page: the store's maximum. */
+export const NAVIGATOR_PAGE_SIZE = 200;
+export async function listRepositories(cursor?: string): Promise<Page<Repository>> { return page(await request("repositories.list", { limit: NAVIGATOR_PAGE_SIZE, ...(cursor ? { cursor } : {}) }), repository); }
+export async function listWorkspaces(cursor?: string): Promise<Page<WorkspaceCard>> { return page(await request("workspaces.list", { limit: NAVIGATOR_PAGE_SIZE, include_archived: true, ...(cursor ? { cursor } : {}) }), workspaceCard); }
 export async function getWorkspace(id: string): Promise<Workspace> { return record(await request("workspaces.get", { id }), workspace); }
 export async function getTask(id: string): Promise<Task> { return record(await request("items.get", { id }), task); }
 export async function getTaskBrief(id: string, expectedRevision: number): Promise<TaskBrief> {
@@ -893,7 +909,16 @@ export async function automaticQueueCount(): Promise<number> {
     return { id: text(raw.id), not_before_ms: integer(raw.not_before_ms) };
   }).total;
 }
-type AutomaticUpdate = { status: AutomaticStatus | null; error: string };
+export type AutomaticUpdate = { status: AutomaticStatus | null; error: string };
+/**
+ * Whether two published updates say the same thing to a reader: the state,
+ * which task and proposal it is on, and the error. The status poll republishes
+ * every 2 s while enhancement is busy; a countdown or a reworded reason is not
+ * a change a list of attention should be re-read for.
+ */
+export function sameAutomaticUpdate(a: AutomaticUpdate, b: AutomaticUpdate): boolean {
+  return a.error === b.error && a.status?.state === b.status?.state && a.status?.task_id === b.status?.task_id && a.status?.proposal_id === b.status?.proposal_id;
+}
 let automaticUpdate: AutomaticUpdate = { status: null, error: "" };
 const automaticListeners = new Set<(value: AutomaticUpdate) => void>();
 const AUTOMATIC_REFRESH_MS = 2_000;

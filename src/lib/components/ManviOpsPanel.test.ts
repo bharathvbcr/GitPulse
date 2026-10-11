@@ -180,7 +180,7 @@ describe("ManviOpsPanel issue monitor task integration", () => {
   });
 
   it("subscribes to live workbench-changed events with debounced refresh and teardown", () => {
-    expect(source).toContain('listen("workbench-changed", scheduleRefreshRepoTasks)');
+    expect(source).toContain("changed: scheduleRefreshRepoTasks");
     expect(source).toContain("createListenerTracker()");
     expect(source).toContain("listeners.dispose();");
     expect(source).toContain("function scheduleRefreshRepoTasks()");

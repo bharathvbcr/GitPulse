@@ -61,6 +61,6 @@ describe("background work shares one foreground rule", () => {
     const tasks = ops.slice(ops.indexOf("function scheduleRefreshRepoTasks()"), ops.indexOf("async function loadRepoTasks"));
     expect(tasks.match(/readBackgroundDocument\(\)/g)?.length).toBeGreaterThanOrEqual(2);
     expect(ops).toContain("bindForegroundChanges");
-    expect(ops).toContain('listen("workbench-changed", scheduleRefreshRepoTasks)');
+    expect(ops).toContain("changed: scheduleRefreshRepoTasks");
   });
 });

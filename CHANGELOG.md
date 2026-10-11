@@ -11,6 +11,12 @@ before that tag is pushed.
 
 ## [Unreleased]
 
+### Fixed
+
+- Task board: a refresh after any write keeps the pages a reader loaded (columns and navigator) instead of snapping back to page one; moving a card to the bottom of a paged column reads the column to its end first, so the card is not hidden after reload; overlapping catalog reads no longer land out of order.
+- Archive and Attention inbox keep their pages and selection across a window blur; closing a tab through any of the three close routes now forgets every per-tab record and the harness journal cache.
+- One shared `workbench-changed` subscription: each write refreshes each surface once (a repeated sequence and the watcher's echo of an in-process write are dropped), the inbox re-reads only when enhancement status really changes, and a failed listener is reported on every surface.
+
 ### Added
 
 - An agent's `done` that is held in review for lack of a passing verification

@@ -205,7 +205,8 @@ describe("the dock reads only what the store actually has", () => {
     expect(source, "the raw search box still reaches the store").not.toMatch(/listTasks\([^)]*\bquery\b/);
     // Reloaded on the words, not on every filter keystroke; the pending-delete
     // count is not confused with rows a filter hid.
-    expect(source).toContain("scope; storeQuery; view; active; visible;");
+    expect(source).toContain("scope; storeQuery; view; active;");
+    expect(source).not.toContain("scope; storeQuery; view; active; visible;");
     expect(source).toContain("hiddenHere = $derived((result?.items.length ?? 0) - live.length)");
     expect(source).toContain('data-testid="task-archive-query-problems"');
   });
@@ -264,7 +265,7 @@ describe("the archive is separate from the Done column", () => {
     // The filter is the contract; the page size is the board's to choose.
     // Columns read no search text: words are ranked over loaded cards, and a
     // search reads its own candidate set (`taskSearchPlan.ts`).
-    expect(board).toMatch(/listTasks\(target, status, "", undefined, \w+, BOARD\)/);
+    expect(board).toMatch(/listTasks\(target, status, "", cursor, \w+, BOARD\)/);
     expect(board).toMatch(/listTasks\(scope, status, "", cursor, \w+, BOARD\)/);
     // A search reads one status-less candidate set, under the same filter.
     expect(board).toMatch(/listTasks\(current\.scope, null, "", undefined, CANDIDATE_PAGE, BOARD\)/);
@@ -315,7 +316,7 @@ describe("the dock stays current after a write", () => {
   // also tells the dock directly at each point where it knows a write
   // committed. Either path alone leaves a restored task sitting in the list.
   it("listens for the live event and accepts a direct nudge", () => {
-    expect(source).toContain('listen("workbench-changed", schedule)');
+    expect(source).toContain("changed: schedule");
     expect(source).toContain("refreshToken");
     expect(board).toContain("refreshToken={archiveToken}");
   });

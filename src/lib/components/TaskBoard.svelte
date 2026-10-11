@@ -3,9 +3,8 @@
   import { liquidSelection } from "../ui/transitions";
   import { onMount, untrack } from "svelte";
   import { invoke } from "../ipc/invoke";
-  import { listen } from "@tauri-apps/api/event";
   import { AlertTriangle, Archive, Bot, ChevronDown, ChevronUp, Clipboard, EyeOff, FolderSync, Import, Inbox, LayoutGrid, List, Merge, Plus, RefreshCw, Search, Sparkles, SquarePen, Trash2, Undo2, X } from "@lucide/svelte";
-  import { isMacOS, isTauri } from "../platform";
+  import { isMacOS } from "../platform";
   import { createListenerTracker } from "../dom/listenerTracker";
   import { createAdaptiveTimer } from "../runtime/adaptiveTimer";
   import { bindForegroundChanges, readBackgroundDocument } from "../runtime/foreground";
@@ -16,10 +15,11 @@
   import { portal } from "../dom/portal";
   import { LAYERS } from "../ui/layers";
   import { popover, restoreFocusTo } from "../ui/popover";
+  import { readToEnd, reloadPaged } from "../workbench/boardPaging";
   import { cardFace, dragExceeded, grabPoint, type GrabPoint, insertIndexFromY, insertionNeighbors, insertionPosition, neighborStatus, parseColumnStatus, shouldCommitMove } from "../workbench/boardDrag";
   import {
     explainError, getTask, getTaskBrief, getWorkspace, listAttention, listRepositories, listTasks, listWorkspaces, newID, putTask, registerRepository, restoreDeletedTask, suggestTasks,
-    STATUSES, STATUS_LABELS, TASK_PAGE_SIZE, taskDraft, taskWrite,
+    NAVIGATOR_PAGE_SIZE, STATUSES, subscribeWorkbenchChanges, STATUS_LABELS, TASK_PAGE_SIZE, taskDraft, taskWrite,
     type Page, type Repository, type Scope, type Task, type TaskCard, type TaskDraft, type TaskListFilter, type TaskStatus, type TaskSuggestions, type Workspace, type WorkspaceCard,
   } from "../workbench/client";
   import { addableOpenTabs, attachRepositories, openAddActionLabel, openMembershipCandidates, pickerSelectionIds } from "../workbench/openMembership";
@@ -109,7 +109,7 @@
   let verdicts = $state<ReadonlyMap<string, Verdict>>(new Map());
   let verdictError = $state("");
   let search = $state(""); let initialized = $state(false); let loading = $state(false);
-  let error = $state(""); let catalogError = $state(""); let announce = $state("");
+  let error = $state(""); let catalogError = $state(""); let liveNotice = $state(""); let announce = $state("");
   let taskTabs = $state<TaskTabState>(emptyTaskTabs());
   let session = $state<{ tabId: string; pane: string; value: Task | null; status?: TaskStatus; seed?: Partial<TaskDraft> } | null>(null);
   let workspaceEditor = $state<{ value: Workspace | null } | null>(null);
@@ -135,7 +135,7 @@
   /** The scope the loaded columns were read for, whatever the search was. */
   let loadedScope = $state("");
   let unreadError = $state("");
-  let unreadRevision = 0, initializationRevision = 0, openingRevision = 0;
+  let unreadRevision = 0, initializationRevision = 0, openingRevision = 0, catalogRevision = 0;
   // ---- Search (`taskQuery.ts`, `taskRank.ts`, `taskSearchPlan.ts`) --------
   /**
    * The search box read once, by the parser the archive and the navigator
@@ -516,9 +516,19 @@
     repo: scope.kind === "repository" ? [] : repositories.map((repo) => repo.name),
   }));
 
+  /**
+   * The navigator's lists, re-read as far as they were paged in. Only the
+   * newest read lands: two overlapping ones (a write's refresh and a
+   * workspace move's) would otherwise leave whichever finished last, which
+   * may be the older answer.
+   */
   async function catalog() {
-    const [repos, groups] = await Promise.all([listRepositories(), listWorkspaces()]);
-    if (disposed) return;
+    const ticket = ++catalogRevision;
+    const [repos, groups] = await Promise.all([
+      reloadPaged((cursor) => listRepositories(cursor), repositories.length, NAVIGATOR_PAGE_SIZE),
+      reloadPaged((cursor) => listWorkspaces(cursor), workspaces.length, NAVIGATOR_PAGE_SIZE),
+    ]);
+    if (disposed || ticket !== catalogRevision) return;
     repositories = repos.items; repositoryTotal = repos.total; repositoryCursor = repos.next_cursor;
     workspaces = groups.items; workspaceTotal = groups.total; workspaceCursor = groups.next_cursor;
     catalogError = "";
@@ -546,8 +556,13 @@
         selected = new Set([...selected].filter((id) => loadedHas(id, pages)));
         return;
       }
+      // Columns are re-read as far as they were paged in (`boardPaging.ts`),
+      // so a refresh after any write keeps "Load more" where the reader left
+      // it. Another scope's columns, or a search's candidates bucketed into
+      // columns, say nothing about this scope's pages.
+      const kept = candidates === null && loadedScope === JSON.stringify(target);
       const [pages, archive] = await Promise.all([
-        Promise.all(STATUSES.map(async (status) => [status, await listTasks(target, status, "", undefined, TASK_PAGE_SIZE, BOARD)] as const)),
+        Promise.all(STATUSES.map(async (status) => [status, await reloadPaged((cursor) => listTasks(target, status, "", cursor, TASK_PAGE_SIZE, BOARD), kept ? columns[status]?.items.length ?? 0 : 0, TASK_PAGE_SIZE)] as const)),
         archived,
       ]);
       if (generation !== revision || disposed || key !== boardKey) return;
@@ -679,7 +694,7 @@
   onMount(() => {
     const listeners = createListenerTracker();
     const changed = () => { scheduleRefresh(); void boardAgents.refresh(); };
-    if (isTauri()) void listen("workbench-changed", changed).then((stop) => listeners.track(stop)).catch((cause) => { if (!disposed) error = `Live updates unavailable: ${explainError(cause)}`; });
+    listeners.track(subscribeWorkbenchChanges({ changed, unavailable: (message) => { if (!disposed) liveNotice = `Live updates unavailable: ${message}. Use Refresh.`; } }));
     const stopClock = createAdaptiveTimer(() => { now = Math.floor(Date.now() / 1000); }, 30_000);
     const onForeground = () => {
       boardAgents.wake();
@@ -1085,6 +1100,32 @@
     } catch (cause) { if (generation === revision && !disposed) error = explainError(cause); }
     finally { if (generation === revision && !disposed) loading = false; }
   }
+  /** Whether a column has cards beyond the loaded ones, so the end of what is loaded is not its end. */
+  function tailUnknown(status: TaskStatus): boolean {
+    return Boolean(columns[status]?.next_cursor) || (searching && candidates !== null && !candidatesComplete(candidates));
+  }
+  /**
+   * Read a column to its true end, so a card sent to the bottom is positioned
+   * after the last card and not after page one. False, with the reason on the
+   * banner, when the end could not be reached: the move is then refused
+   * rather than written where it would disappear on the next read.
+   */
+  async function loadColumnRest(status: TaskStatus): Promise<boolean> {
+    if (!tailUnknown(status)) return true;
+    const refusal = `${STATUS_LABELS[status]} has more tasks than are loaded, so the card was not moved to its end. ${searching ? "Load more tasks, or clear the search," : "Retry,"} then move it again.`;
+    const page = columns[status];
+    if (searching || !page || loadedKey !== boardKey) { error = refusal; return false; }
+    const generation = revision, key = boardKey;
+    loading = true; error = "";
+    try {
+      const all = await readToEnd((cursor) => listTasks(scope, status, "", cursor, TASK_PAGE_SIZE, BOARD), page);
+      if (generation !== revision || disposed || key !== boardKey) return false;
+      if (!all) { error = refusal; return false; }
+      columns = { ...columns, [status]: all };
+      return true;
+    } catch (cause) { if (generation === revision && !disposed) error = explainError(cause); return false; }
+    finally { if (generation === revision && !disposed) loading = false; }
+  }
   async function pageColumn(status: TaskStatus, cursor?: string) {
     if (searching || loading || moving || loadedKey !== boardKey) return;
     const generation = revision, key = boardKey;
@@ -1178,14 +1219,28 @@
   async function dropCard(card: TaskCard, over: TaskStatus | null, insertIndex: number) {
     const fromIndex = (displayColumns[card.status]?.items ?? []).findIndex((item) => item.id === card.id);
     if (!shouldCommitMove(card.status, over, { moving, fromIndex, insertIndex })) return;
-    const items = displayColumns[over]?.items ?? [];
-    const { before, after } = insertionNeighbors(items, card.id, insertIndex);
-    const position = insertionPosition(before,after);
+    let items = displayColumns[over]?.items ?? [];
+    let { before, after } = insertionNeighbors(items, card.id, insertIndex);
+    let position = insertionPosition(before, after, undefined, tailUnknown(over));
+    if (position === null) {
+      // The slot is the bottom of a column with more behind it: read the rest
+      // first, then the bottom is the real one.
+      if (!(await loadColumnRest(over))) return;
+      items = displayColumns[over]?.items ?? [];
+      ({ before, after } = insertionNeighbors(items, card.id, items.length));
+      position = insertionPosition(before, after);
+    }
     if (after !== null && (position >= after || before !== null && position <= before)) {
       const plan = reorderPlan(items,card,insertIndex);
       if (columns[over]?.next_cursor || (candidates && !candidatesComplete(candidates)) || plan.cards.length > MAX_TASK_SELECTION) { error = `This column needs re-spacing. Load its remaining tasks first; up to ${MAX_TASK_SELECTION} tasks can be reordered together. Priority and title sorting remain available.`; return; }
       await applyUpdate(new TaskBatch(plan.cards,{kind:"reorder",status:over,positions:plan.positions}));
     } else await moveCard(card, over, position);
+  }
+  /** The keyboard's move to the neighbouring column: to its bottom, which is only known once the column is read to its end. */
+  async function moveToEnd(card: TaskCard, status: TaskStatus) {
+    if (moving || !(await loadColumnRest(status))) return;
+    const last = (columns[status]?.items ?? []).at(-1);
+    await moveCard(card, status, insertionPosition(last?.position ?? null, null));
   }
   function onCardClick(e: MouseEvent, card: TaskCard) {
     // A card is not `disabled` while a task opens: a disabled button loses
@@ -1293,8 +1348,7 @@
     e.preventDefault();
     const next = neighborStatus(card.status, e.key === "ArrowRight" ? 1 : -1);
     if (!next) return;
-    const last = (columns[next]?.items ?? []).at(-1);
-    void moveCard(card, next, insertionPosition(last?.position ?? null, null));
+    void moveToEnd(card, next);
   }
   /**
    * The card a vertical key lands on: the next or previous card in the same
@@ -2366,6 +2420,7 @@
     {#if relinkPending}<div class="banner error" role="alert" data-testid="repository-relink-uncertain"><span>{relinkPending.message}</span><button type="button" class="gp-btn" disabled={relinking} onclick={() => void retryRelink()}>Retry relink</button></div>{/if}
     {#if catalogError}<div class="banner error" role="alert">{catalogError}<button type="button" class="gp-btn" onclick={() => initialized ? refresh() : initialize()}>Retry</button></div>{/if}
     {#if issueProgress}<div class="banner" data-testid="task-issue-progress"><span>Filing issue {issueProgress.index} of {issueProgress.total}: {issueProgress.title}</span>{#if issueProgress.total > 1}<button type="button" class="gp-btn" disabled={issueStop} onclick={() => { issueStop = true; }}>{issueStop ? "Stopping…" : "Stop"}</button>{/if}</div>{/if}
+    {#if liveNotice}<div class="banner" role="status" data-testid="task-live-unavailable">{liveNotice}</div>{/if}
     {#if error}<div class="banner error" role="alert">{error}</div>{/if}
     <!-- Cards carry no agent marks while this stands: an old reading would
          claim agents nobody checked. -->

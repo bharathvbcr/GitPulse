@@ -52,6 +52,17 @@ describe("insertionPosition", () => {
     expect(insertionPosition(null, 400, now)).toBe(200);
   });
 
+  it("refuses to guess the bottom of a column that has more cards than are loaded", () => {
+    // before + 1 would sort after page one, and the card would vanish on reload.
+    expect(insertionPosition(400, null, 9_000, true)).toBeNull();
+    expect(insertionPosition(null, null, 9_000, true)).toBeNull();
+    // A slot with a card after it is decided by its neighbors whatever lies beyond.
+    expect(insertionPosition(400, 800, 9_000, true)).toBe(600);
+    expect(insertionPosition(null, 400, 9_000, true)).toBe(200);
+    // A complete column still appends.
+    expect(insertionPosition(400, null, 9_000, false)).toBe(401);
+  });
+
   it("reads neighbors from the remaining cards at an insert index", () => {
     const items = [
       { id: "a", position: 100 },

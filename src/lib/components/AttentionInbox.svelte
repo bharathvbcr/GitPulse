@@ -1,13 +1,11 @@
 <script lang="ts">
   import { onMount, untrack } from "svelte";
   import NativeNotificationSettings from "./NativeNotificationSettings.svelte";
-  import { listen } from "@tauri-apps/api/event";
-  import { isTauri } from "../platform";
   import { createListenerTracker } from "../dom/listenerTracker";
   import { bindForegroundChanges, readBackgroundDocument } from "../runtime/foreground";
   import { formatRelativeTime } from "../format";
   import { buriedUnread, notificationPile, pileToggleLabel } from "../ui/notificationPile";
-  import { automaticUpdates, explainError, getAttention, listAttention, type Attention, type AttentionFilter, type Page, type Scope } from "../workbench/client";
+  import { automaticUpdates, explainError, sameAutomaticUpdate, subscribeWorkbenchChanges, getAttention, listAttention, type Attention, type AttentionFilter, type AutomaticUpdate, type Page, type Scope } from "../workbench/client";
 
   let { scope, active = true, onopen }: { scope: Scope; active?: boolean; onopen: (taskID: string) => Promise<void> } = $props();
   let filter = $state<AttentionFilter>("active"), result = $state<Page<Attention> | null>(null);
@@ -33,8 +31,15 @@
   }
   onMount(() => {
     const listeners = createListenerTracker();
-    if (isTauri()) void listen("workbench-changed", schedule).then((stop) => listeners.track(stop)).catch((cause) => { if (!disposed) notice = `Live updates unavailable: ${explainError(cause)}. Use Refresh inbox.`; });
-    const automatic = automaticUpdates.subscribe(schedule);
+    listeners.track(subscribeWorkbenchChanges({ changed: schedule, unavailable: (message) => { if (!disposed) notice = `Live updates unavailable: ${message}. Use Refresh inbox.`; } }));
+    // The load effect reads once on mount; the status poll then republishes
+    // every 2 s, and only a change in what it says re-reads the inbox.
+    let lastAutomatic: AutomaticUpdate | null = null;
+    const automatic = automaticUpdates.subscribe((update) => {
+      const changed = lastAutomatic !== null && !sameAutomaticUpdate(lastAutomatic, update);
+      lastAutomatic = update;
+      if (changed) schedule();
+    });
     const onForeground = () => {
       visible = !readBackgroundDocument();
       if (visible) schedule();
@@ -48,7 +53,9 @@
     if (key !== pileKey) { pileKey = key; expanded = false; }
   });
   $effect(() => {
-    scope; filter; active; visible;
+    // Not `visible`: a blur pauses loads and a return refreshes in place
+    // (`onForeground`), instead of emptying the list under the reader.
+    scope; filter; active;
     generation++; result = null; clearTimeout(refreshTimer);
     untrack(() => { void load(); });
   });

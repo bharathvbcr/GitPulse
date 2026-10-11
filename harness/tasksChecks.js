@@ -1,5 +1,6 @@
 import "../src/app.css";
 import { mount, tick } from "svelte";
+import { emit } from "@tauri-apps/api/event";
 import { get } from "svelte/store";
 import { promptState } from "../src/lib/stores/modalStore";
 import { mockIPCWithEvents } from "./tauriMocks";
@@ -16,6 +17,8 @@ import { describeForeground, holdForeground } from "./foreground";
 
 const params = new URLSearchParams(location.search);
 const results = [], crashes = [], writes = [], unknown = [];
+// Every workbench method the host was asked for, in order: what the board costs while nothing changes.
+const ipcMethods = [];
 // Attempts holding a checkout and their requests, for the board's agent
 // marks. Empty until the checks for those marks fill them.
 let boardRuns = [], boardDecisions = [], boardRunsFail = false;
@@ -164,6 +167,7 @@ mockIPCWithEvents(async (cmd, args) => {
   }
   if (cmd !== "cmd_workbench_request") { unknown.push(cmd); throw Error(`Unconfigured command: ${cmd}`); }
   const input = JSON.parse(args.input);
+  ipcMethods.push(args.method);
   switch (args.method) {
     case "repositories.list": return JSON.stringify(page(repos));
     case "repositories.get": return JSON.stringify({ok:true, item: repos.find(repo => repo.id === input.id)});
@@ -1612,6 +1616,15 @@ if (params.has("check")) {
     // confirm dialog rather than writing straight through.
     archiveRows()[0].querySelector('input[type="checkbox"]').click(); await settle();
     archiveRows()[1].querySelector('input[type="checkbox"]').click(); await settle();
+    // ft-30d0d11d: Cmd-Tab away and back. A blur pauses loads; it must not
+    // reset the page or the selection the reader built over several pages.
+    {
+      const checked = () => archiveRows().filter(row => row.querySelector('input[type="checkbox"]').checked).map(row => row.getAttribute("data-card-id"));
+      const chosen = checked(), rowsBefore = archiveRows().length;
+      window.dispatchEvent(new Event("blur")); await settle(400);
+      check("a window blur and return keep the archive's selection and loaded pages",
+        chosen.length === 2 && checked().join() === chosen.join() && archiveRows().length === rowsBefore);
+    }
     // The defect this panel was reported for, measured rather than asserted
     // about the stylesheet. With the rows loaded, the Restore/Delete bar used
     // to render ~107px below the panel's own fold at scroll top: ticking a
@@ -2619,6 +2632,68 @@ if (params.has("check")) {
       tasks = tasks.filter(task => !task.title.startsWith("Paged review"));
       await refreshBoard(); await settle(200);
     } catch (error) { check(`the paging checks ran to the end (${error.message} at ${guardStep})`, false); }
+
+    // ---- ft-1259cd60 / ft-608b881a: what a refresh keeps, where a move lands, one event once -----
+    try {
+      guardStep = "board paging";
+      for (let i = 0; i < 65; i++) tasks.push(makeTask(`task-${500 + i}`, `Wave4 review ${String(i + 1).padStart(2, "0")}`, "repo-0", "review"));
+      boardRuns = []; boardDecisions = [];
+      root.querySelector('button[aria-label="Refresh"]').click(); await settle(300);
+      const review = () => root.querySelector('[data-task-column="review"]');
+      const reviewCards = () => review().querySelectorAll("[data-task-card]").length;
+      await wait(() => button("Load more Review tasks", review()));
+      button("Load more Review tasks", review()).click();
+      await wait(() => reviewCards() === 60);
+      const refreshes = () => ipcMethods.filter(method => method === "repositories.list").length;
+      let reads = refreshes();
+      await emit("workbench-changed", { sequence: 100 });
+      await wait(() => refreshes() > reads); await settle(500);
+      check("a workbench change after Load more keeps the 60 cards that were loaded", reviewCards() === 60 && Boolean(button("Load more Review tasks", review())));
+      // One write is announced twice by the host (the command, then the
+      // data_version poll). It must cost one refresh, not two.
+      reads = refreshes();
+      await emit("workbench-changed", { sequence: 101 });
+      await settle(450);
+      await emit("workbench-changed", { sequence: null, source: "external" });
+      await settle(900);
+      check("one write and its external echo refresh the board once", refreshes() - reads === 1);
+      reads = refreshes();
+      await emit("workbench-changed", { sequence: null, source: "external" });
+      await wait(() => refreshes() > reads);
+      check("a change from outside the app still refreshes the board", refreshes() - reads === 1);
+      // A reader typing: the board keeps its cards, marked busy, while the load is pending.
+      const searchBox = root.querySelector('[aria-label="Search tasks"]');
+      const columns = () => root.querySelector('[data-testid="task-columns"]');
+      const typed = [], counts = [];
+      for (const text of ["Wa", "Wav", "Wave", "Wave4"]) {
+        searchBox.focus(); await change(searchBox, text);
+        typed.push(root.querySelectorAll("[data-task-card]").length > 0 && Boolean(columns()));
+        counts.push(`${text}:${root.querySelectorAll("[data-task-card]").length}/${columns()?.getAttribute("aria-busy")}`);
+      }
+      check(`typing in search never empties the board while its load is pending (${counts.join(" ")})`, typed.every(Boolean));
+      await settle(600);
+      await click("Clear task search"); await settle(500);
+      // Keyboard move to the bottom of a column with more behind it.
+      guardStep = "move to the end of a paged column";
+      await wait(() => button("Load more Review tasks", review()));
+      const lastReview = () => Math.max(...tasks.filter(task => task.status === "review" && task.id !== "task-1").map(task => task.position));
+      const inProgressOf1 = tasks.find(task => task.id === "task-1").status;
+      card("task-1").focus(); card("task-1").dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowRight", bubbles: true, cancelable: true }));
+      await wait(() => tasks.find(task => task.id === "task-1").status === "review");
+      await settle(400);
+      check("a card moved to the bottom of a paged column sorts after every card in it, so it is still there on reload",
+        inProgressOf1 !== "review" && tasks.find(task => task.id === "task-1").position > lastReview());
+      check("and it is on screen", Boolean(review().querySelector('[data-card-id="task-1"]')));
+      // Nothing changing costs nothing: no polls on a visible, idle board.
+      guardStep = "idle board";
+      await settle(1200);
+      const idleFrom = ipcMethods.length;
+      await new Promise(resolve => setTimeout(resolve, 10_000));
+      check(`a visible board with no writes makes no IPC in 10 s${ipcMethods.length === idleFrom ? "" : ` (${ipcMethods.slice(idleFrom).join(",")})`}`, ipcMethods.length === idleFrom);
+      // Leave the fixture as the next checks expect it.
+      tasks = tasks.filter(task => !task.title.startsWith("Wave4 review")).map(task => task.id === "task-1" ? { ...task, status: "in_progress", position: 1 } : task);
+      root.querySelector('button[aria-label="Refresh"]').click(); await settle(300);
+    } catch (error) { check(`the board refresh checks ran to the end (${error.message} at ${guardStep})`, false); }
 
     // ---- Work-in-progress limits, lanes and saved views, per board --------
     try {

@@ -46,9 +46,7 @@
    * window so short that the panel's own chrome overflows the cap.
    */
   import { onMount, untrack } from "svelte";
-  import { listen } from "@tauri-apps/api/event";
   import { Archive, ExternalLink } from "@lucide/svelte";
-  import { isTauri } from "../platform";
   import { createListenerTracker } from "../dom/listenerTracker";
   import { createAdaptiveTimer } from "../runtime/adaptiveTimer";
   import { bindForegroundChanges, readBackgroundDocument } from "../runtime/foreground";
@@ -60,7 +58,7 @@
   import { words as lexiconWords } from "../workbench/taskLexicon";
   import { ARCHIVE_RULE, archiveStamp, archiveSummary, refreshPages, restoreAction, type ArchiveView } from "../workbench/taskArchive";
   import {
-    STATUS_LABELS, explainError, listTasks,
+    STATUS_LABELS, explainError, listTasks, subscribeWorkbenchChanges,
     type Page, type Scope, type TaskCard,
   } from "../workbench/client";
 
@@ -184,11 +182,10 @@
 
   onMount(() => {
     const listeners = createListenerTracker();
-    if (isTauri()) {
-      void listen("workbench-changed", schedule)
-        .then((stop) => listeners.track(stop))
-        .catch((cause) => { if (!disposed) notice = `Live updates unavailable: ${explainError(cause)}. Use Refresh.`; });
-    }
+    listeners.track(subscribeWorkbenchChanges({
+      changed: schedule,
+      unavailable: (message) => { if (!disposed) notice = `Live updates unavailable: ${message}. Use Refresh.`; },
+    }));
     const onForeground = () => {
       visible = !readBackgroundDocument();
       if (visible) schedule();
@@ -201,8 +198,11 @@
 
   // Scope, search and view each change what the list is, so the page starts
   // over. A completed write only changes rows within it: refreshed in place.
+  // The window's focus is not among them: a blur (Cmd-Tab) pauses loads, and
+  // coming back refreshes in place (`onForeground`), so a selection made over
+  // several pages survives a look at another app.
   $effect(() => {
-    scope; storeQuery; view; active; visible;
+    scope; storeQuery; view; active;
     generation++; result = null; pages = 0; selected = new Set(); clearTimeout(refreshTimer);
     untrack(() => { void load("first"); });
   });

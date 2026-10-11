@@ -3,7 +3,6 @@
   import { createVisibleInterval } from "../dom/visibleInterval";
   import { bindForegroundChanges, readBackgroundDocument } from "../runtime/foreground";
   import { invoke } from "../ipc/invoke";
-  import { listen } from "@tauri-apps/api/event";
   import { isTauri } from "../platform";
   import { createListenerTracker } from "../dom/listenerTracker";
   import { openExternal as openExternalUrl } from "../desktop/openExternal";
@@ -40,7 +39,7 @@
     type TagCleanupPlan,
     type IssueInfo,
   } from "../ops/model";
-  import { registerRepository, type TaskCard } from "../workbench/client";
+  import { registerRepository, subscribeWorkbenchChanges, type TaskCard } from "../workbench/client";
   import {
     createTaskFromIssue,
     batchCreateTasksFromIssues,
@@ -646,14 +645,14 @@
 
     const listeners = createListenerTracker();
     if (isTauri()) {
-      void listen("workbench-changed", scheduleRefreshRepoTasks)
-        .then((stop) => {
-          listeners.track(stop);
-          tasksFollowChanges = true;
-        })
-        .catch(() => {
-          // Live updates unavailable in non-Tauri preview mode
-        });
+      // Following changes is a promise to stop polling tasks, so it is made
+      // only while the subscription stands; a failed one says so and the
+      // issue poll keeps the tasks fresh.
+      tasksFollowChanges = true;
+      listeners.track(subscribeWorkbenchChanges({
+        changed: scheduleRefreshRepoTasks,
+        unavailable: (message) => { tasksFollowChanges = false; notice = `Live updates unavailable: ${message}. Tasks refresh with the issue poll.`; },
+      }));
     }
     const onForeground = () => {
       if (readBackgroundDocument()) {
