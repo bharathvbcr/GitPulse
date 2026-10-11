@@ -14,8 +14,10 @@ const source = readFileSync(
  * (`node scripts/browser-regressions.mjs --harness diff`) mounts the real
  * DiffViewer against fixture IPC and checks the busy state, staging (which
  * hunk or line each action sends, and what a truncated diff refuses), find,
- * change stepping, split pairing, wrapping, the empty state, accessible names
- * and that a refresh keeps the reader's place. `harness/uncommitted.html`
+ * change stepping, split pairing, wrapping and wrapped-row sizing, the empty
+ * state, accessible names, that a refresh keeps the reader's place, each row's
+ * language and the header icon, the gutter's width and pinning, the minimap, a
+ * late impact answer being dropped, image blobs, and the preference seeding. `harness/uncommitted.html`
  * checks the file rail beside it. Only what a rendered page cannot see stays
  * here: invariants about cost.
  */
