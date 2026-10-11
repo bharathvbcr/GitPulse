@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onMount, tick, untrack } from "svelte";
-  import { createVisibleInterval } from "../dom/visibleInterval";
+  import { createAdaptiveTimer } from "../runtime/adaptiveTimer";
   import { bindForegroundChanges, readBackgroundDocument } from "../runtime/foreground";
   import { invoke } from "../ipc/invoke";
   import { isTauri } from "../platform";
@@ -657,7 +657,7 @@
     // window is on screen AND this pane is the one showing. The visibility
     // half belongs to the timer now — it used to keep firing behind other
     // windows and merely decline the work, which still woke the renderer.
-    const stopInterval = createVisibleInterval(() => {
+    const stopInterval = createAdaptiveTimer(() => {
       if (pane === "ops" && $repoStore.currentPath) {
         void loadIssues(undefined, { background: true });
       }

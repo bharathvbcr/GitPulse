@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import type { IntervalHost } from "../dom/visibleInterval";
+import type { AdaptiveHost } from "../runtime/adaptiveTimer";
 import { runPhase, runTimelineRow } from "../github/runLifecycle";
 import type { WorkflowRunInfo } from "../github/types";
 import { createLivePoll } from "./livePoll";
@@ -404,13 +404,13 @@ describe("the live loop under sustained churn", () => {
     let nextHandle = 1;
     let clock = 0;
     let hidden = false;
-    const host: IntervalHost = {
-      setInterval: (handler) => {
+    const host: AdaptiveHost = {
+      setTimeout: (handler) => {
         const handle = nextHandle++;
         timers.set(handle, handler);
         return handle;
       },
-      clearInterval: (handle) => void timers.delete(handle as number),
+      clearTimeout: (handle) => void timers.delete(handle as number),
       addEventListener: (_t, listener) => listeners.add(listener),
       removeEventListener: (_t, listener) => listeners.delete(listener),
       isHidden: () => hidden,
@@ -454,7 +454,7 @@ describe("the live loop under sustained churn", () => {
         live.reset();
         pollsThisSession = 0;
       }
-      for (const handler of [...timers.values()]) handler();
+      { const due = [...timers.values()]; timers.clear(); for (const handler of due) handler(); }
       // Two turns: the poll awaits once internally before settling.
       await Promise.resolve();
       await Promise.resolve();
@@ -483,13 +483,13 @@ describe("the live loop under sustained churn", () => {
     // battery drain nobody attributes to this panel.
     const timers = new Map<number, () => void>();
     let nextHandle = 1;
-    const host: IntervalHost = {
-      setInterval: (handler) => {
+    const host: AdaptiveHost = {
+      setTimeout: (handler) => {
         const handle = nextHandle++;
         timers.set(handle, handler);
         return handle;
       },
-      clearInterval: (handle) => void timers.delete(handle as number),
+      clearTimeout: (handle) => void timers.delete(handle as number),
       addEventListener: () => {},
       removeEventListener: () => {},
       isHidden: () => false,
@@ -506,7 +506,7 @@ describe("the live loop under sustained churn", () => {
     });
     for (let i = 0; i < 10_000; i += 1) {
       live.sync(false);
-      for (const handler of [...timers.values()]) handler();
+      { const due = [...timers.values()]; timers.clear(); for (const handler of due) handler(); }
       await Promise.resolve();
     }
     expect(polls).toBe(0);

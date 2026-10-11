@@ -90,7 +90,7 @@ import {
   type AutoFetchPrefs,
   type AutoFetchSetting,
 } from "../repos/autoFetch";
-import { createVisibleInterval } from "../dom/visibleInterval";
+import { createAdaptiveTimer } from "../runtime/adaptiveTimer";
 import { hasUnstagedChanges } from "../files/fileStatus";
 import { indexSelectionPaths } from "../repos/bulkOps";
 import {
@@ -2862,7 +2862,7 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
         onError: (path, error) =>
           diagnostics.warn("autoFetch", `auto-fetch of ${path} failed: ${formatError(error)}`),
       });
-      return createVisibleInterval(() => void scheduler.tick(), AUTO_FETCH_TICK_MS);
+      return createAdaptiveTimer(() => void scheduler.tick(), AUTO_FETCH_TICK_MS);
     },
     push: async (remote?: string, branch?: string, force: boolean = false) =>
       runMutating(
