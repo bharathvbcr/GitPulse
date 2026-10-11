@@ -31,6 +31,19 @@ pub(super) fn task(key: &str, title: &str) -> ExternalTask {
     }
 }
 
+/// Builds the workbench tables, and migrates them, before concurrent handles
+/// arrive. They are made by a profile's first request, in steps; a second
+/// handle that arrives while that is under way meets a schema that is not yet
+/// current and is refused (`schema_upgrade_required`), because a reader never
+/// upgrades. That is a creation race in dc-store (reported separately), not
+/// what the racing tests here are about, so they start from a built profile.
+pub(super) fn build_schema(path: &Path) {
+    Store::open(path)
+        .unwrap()
+        .workbench_request("repositories.list", "{}")
+        .unwrap();
+}
+
 pub(super) fn items(store: &Store, repository: &Value) -> Vec<Value> {
     let page = query(
         store,
@@ -354,15 +367,7 @@ fn concurrent_writers_never_duplicate_or_lose_a_task() {
     let (_dir, path) = profile();
     let repo = git_repo();
     let repo_path = repo.path().to_str().unwrap().to_string();
-    // The profile's tables are built, and migrated, by its first request. A
-    // second handle arriving while that is under way meets a schema that is
-    // not yet current and is refused (`schema_upgrade_required`), because a
-    // reader never upgrades; that is dc-store's creation race and not what
-    // this test is about, so the profile exists before the writers start.
-    Store::open(&path)
-        .unwrap()
-        .workbench_request("repositories.list", "{}")
-        .unwrap();
+    build_schema(&path);
     let threads = 16;
     let keys = 25;
     let handles: Vec<_> = (0..threads)
@@ -481,7 +486,7 @@ fn importing_an_empty_or_missing_folder_registers_nothing() {
 #[test]
 fn racing_first_registrations_converge_on_one_record() {
     let (_dir, path) = profile();
-    Store::open(&path).unwrap();
+    build_schema(&path);
     for _round in 0..12 {
         let repo = git_repo();
         let repo_path = repo.path().to_str().unwrap().to_string();
