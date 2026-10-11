@@ -191,15 +191,16 @@ describe("the agent handoff has one implementation", () => {
     expect(sheet).toContain("Resume or cancel it from this task's Agents tab.");
   });
 
-  it("never lets bypass survive the attempt it was authorized for", () => {
-    expect(form).toContain('if (settings.permission === "bypass") settings = { ...settings, permission: defaultHandoff().permission };');
-    expect(form).toContain("acknowledged = false;");
-    // Remembering belongs to the owner, which downgrades bypass before it
-    // stores anything — even before `sanitizeHandoff` refuses to restore it.
+  it("never lets the owner remember bypass, whatever the form sends it", () => {
+    // Rendered in harness/task-runs.html: "Bypass requires acknowledgment on
+    // this attempt", "Bypass never survives the attempt it was authorized
+    // for" (the form resets to the default and drops the acknowledgment), and
+    // "The remembered handoff never carries bypass into storage"
+    // (sanitizeHandoff). What only the source shows: the form does not store
+    // the handoff itself, and the owner downgrades before it stores.
     expect(form).not.toContain("setTaskHandoff");
     expect(owner).toContain('deps.remember(settings.permission === "bypass" ? { ...settings, permission: defaultHandoff().permission } : settings);');
   });
-
   it("shows the run before the form once one is live", () => {
     // "Live" has to mean the same thing here as it does to the store, which
     // releases a prepared attempt the moment it expires. While this filter
@@ -218,24 +219,16 @@ describe("the agent handoff has one implementation", () => {
     expect(panel).toContain("#task-agent-launch[hidden]{display:none}");
   });
 
-  it("keeps polling scoped to runs that can still change", () => {
-    // Exactly the runs that hold a checkout, by the one helper the board and
-    // the row use. A hand copy here left out `unresolved` — which the store
-    // still holds and its owner can still finish — so the pane stopped
-    // polling and showed "Unresolved" after the attempt had ended.
+  it("keeps polling scoped to runs that still hold a checkout, by the shared helper", () => {
+    // Rendered in harness/task-runs.html: "Hidden task inspector stops run
+    // polling", "Visible inspector refreshes immediately after resume", and
+    // "The pane goes on polling for it, and sees it end without a manual
+    // refresh" (an agent older than a page of history). What the fixture
+    // never serves is an `unresolved` attempt, which a hand-copied state
+    // list here once dropped; the helper is what keeps it polled.
     expect(panel).toContain("live: allRuns.some((run) => runHoldsCheckout(run, clock)),");
     expect(panel).not.toMatch(/live: allRuns\.some\(\(run\) => \[/);
-    // The working agents are read apart from the history page, so an old one
-    // can be on the live list alone. Polling read only the history page, and
-    // stopped while that agent was still running.
-    expect(panel).toContain("live: allRuns.some((run) =>");
-    expect(panel).not.toContain("live: runs.some(");
-    expect(panel).toContain("readBackgroundDocument");
-    expect(panel).toContain("nextTaskRunPollDelay");
-    expect(panel).toContain("if (!active)");
-    expect(panel).toContain("runs.length >= MAX_LOADED_RUNS");
   });
-
   it("answers 'keep polling' and 'still live' from one instant", () => {
     // These two decisions used to read different clocks — the poll loop called
     // `Date.now()` inline while the liveness filter had no clock at all — so
