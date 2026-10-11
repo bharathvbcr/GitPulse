@@ -1015,9 +1015,17 @@ mod tests {
     fn every_managed_callback_kind_produces_a_bannerable_notice() {
         let root = tempfile::tempdir().unwrap();
         let host = profile_host(root.path());
+        // The store refuses a relative directory, and `/checkout` has no drive
+        // letter, so on Windows it is not absolute.
+        let checkout = if cfg!(windows) {
+            r"C:\checkout"
+        } else {
+            "/checkout"
+        };
+        let checkout_git = format!("{checkout}/.git");
         call(&host,"repositories.put",json!({"id":"m","request_id":"m","expected_revision":0,"name":"m","identity_key":"local:/checkout/.git"})).unwrap();
         call(&host,"items.put",json!({"id":"t","request_id":"t","expected_revision":0,"title":"private","repository_ids":["m"],"primary_repository_id":"m"})).unwrap();
-        call(&host,"runs.prepare",json!({"id":"run","request_id":"prepare","expected_revision":0,"kind":"managed","task_id":"t","source_revision":1,"repository_id":"m","repository_revision":1,"provider":"codex","permission_mode":"ask","cwd":"/checkout","git_dir":"/checkout/.git","git_common_dir":"/checkout/.git","head_oid":"0123456789abcdef0123456789abcdef01234567","head_ref":"refs/heads/main","max_active_runs":1})).unwrap();
+        call(&host,"runs.prepare",json!({"id":"run","request_id":"prepare","expected_revision":0,"kind":"managed","task_id":"t","source_revision":1,"repository_id":"m","repository_revision":1,"provider":"codex","permission_mode":"ask","cwd":checkout,"git_dir":checkout_git,"git_common_dir":checkout_git,"head_oid":"0123456789abcdef0123456789abcdef01234567","head_ref":"refs/heads/main","max_active_runs":1})).unwrap();
         call(&host,"runs.claim",json!({"id":"run","request_id":"claim","expected_revision":1,"owner_id":"owner","session_id":"session","kind":"managed"})).unwrap();
         let pid = std::process::id();
         let birth = super::super::process_birth::read(pid).unwrap();

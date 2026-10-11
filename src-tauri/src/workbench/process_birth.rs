@@ -127,7 +127,10 @@ fn stat_is_zombie(stat: &str) -> bool {
 #[cfg(target_os = "linux")]
 fn observe(pid: u32) -> Result<Option<Birth>, String> {
     use std::io::Read;
-    if pid == 0 {
+    // Not `pid == 0` alone: a PID past `pid_t` can never have been issued, and
+    // `/proc` answering "no such file" for it would read as "exited" (the macOS
+    // arm refuses it the same way).
+    if pid == 0 || i32::try_from(pid).is_err() {
         return Err("Invalid process ID".into());
     }
     let bounded = |path: &str, limit| -> Result<Option<String>, String> {

@@ -922,10 +922,14 @@ mod tests {
     fn control_paths_match_git_rev_parse() {
         use crate::test_support::git_in;
         let main = crate::test_support::git_repo();
-        let root = main.path().canonicalize().unwrap();
+        // Plain, not `canonicalize`: `linked` is handed to git as an argument,
+        // and git cannot create a worktree at a `\\?\` path.
+        let plain =
+            |path: &std::path::Path| crate::engine::git_cli::canonicalize_plain(path).unwrap();
+        let root = plain(main.path());
         git_in(&root, &["commit", "--allow-empty", "-q", "-m", "base"]);
         let holder = tempfile::tempdir().unwrap();
-        let linked = holder.path().canonicalize().unwrap().join("linked");
+        let linked = plain(holder.path()).join("linked");
         git_in(
             &root,
             &[
@@ -938,7 +942,7 @@ mod tests {
             ],
         );
         let bare_dir = tempfile::tempdir().unwrap();
-        let bare = bare_dir.path().canonicalize().unwrap();
+        let bare = plain(bare_dir.path());
         git_in(&bare, &["init", "--bare", "-q"]);
 
         // Probe files mostly do not exist, so compare through their parent.

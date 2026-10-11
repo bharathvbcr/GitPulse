@@ -1,5 +1,5 @@
 import { readFileSync, readdirSync } from "node:fs";
-import { join, relative } from "node:path";
+import { join, relative, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 
@@ -28,7 +28,7 @@ const OWNER = "lib/components/MarkdownContent.svelte";
 
 describe("rendered Markdown reaches the document through MarkdownContent only", () => {
   const renderers = svelteFiles(SRC)
-    .map((path) => ({ path: relative(SRC, path), text: readFileSync(path, "utf8") }))
+    .map((path) => ({ path: relative(SRC, path).split(sep).join("/"), text: readFileSync(path, "utf8") }))
     .filter((file) => file.text.includes("renderMarkDevMarkdown"));
 
   it("finds the renderers it guards", () => {

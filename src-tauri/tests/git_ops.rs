@@ -1628,17 +1628,26 @@ fn reset_preview_names_what_a_rewind_leaves_behind() {
 /// parent's path is the old name.
 #[test]
 fn blame_at_revision_steps_to_the_parent_across_a_rename() {
+    // The quotes make git C-quote the name in its porcelain output, which the
+    // parser must undo. `"` is not a legal Windows filename (`git mv` fails
+    // with "Invalid argument"), so there the rename target is a plain name
+    // with a space, and the quoted-name parse is exercised off Windows only.
+    let new_name = if cfg!(windows) {
+        "new q.txt"
+    } else {
+        "new \"q\".txt"
+    };
     let repo = TestRepo::init();
     repo.write("old name.txt", "one\ntwo\n");
     repo.commit_all("c1");
-    run_git(repo.dir.path(), &["mv", "old name.txt", "new \"q\".txt"]);
-    repo.write("new \"q\".txt", "one\nTWO\n");
+    run_git(repo.dir.path(), &["mv", "old name.txt", new_name]);
+    repo.write(new_name, "one\nTWO\n");
     repo.commit_all("c2");
     // The working tree moves on; a revision blame must not see it.
-    repo.write("new \"q\".txt", "one\nTWO\nthree\n");
+    repo.write(new_name, "one\nTWO\nthree\n");
 
     let at_head =
-        GitReader::get_file_blame(&repo.path_str(), "new \"q\".txt", Some("HEAD")).expect("blame");
+        GitReader::get_file_blame(&repo.path_str(), new_name, Some("HEAD")).expect("blame");
     assert_eq!(at_head.len(), 2, "HEAD has two lines, the worktree three");
     assert_eq!(at_head[1].content, "TWO");
     let parent = at_head[1].previous_commit.clone().expect("c2 has a parent");
@@ -1659,7 +1668,7 @@ fn blame_at_revision_steps_to_the_parent_across_a_rename() {
 
     // The working-tree form is unchanged by the new argument.
     assert_eq!(
-        GitReader::get_file_blame(&repo.path_str(), "new \"q\".txt", None)
+        GitReader::get_file_blame(&repo.path_str(), new_name, None)
             .expect("worktree")
             .len(),
         3

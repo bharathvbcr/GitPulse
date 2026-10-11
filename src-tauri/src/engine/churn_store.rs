@@ -656,7 +656,9 @@ mod tests {
     /// covers: a rotated file (attributes), a rename (rename config).
     fn fixture() -> (tempfile::TempDir, PathBuf) {
         let dir = tempfile::tempdir().unwrap();
-        let repo = dir.path().canonicalize().unwrap();
+        // Not `canonicalize`: its `\\?\` spelling is not one git resolves
+        // `core.attributesFile` and the other paths below through.
+        let repo = git_cli::canonicalize_plain(dir.path()).unwrap();
         git_in(&repo, &["init", "-q", "-b", "main"]);
         git_in(&repo, &["config", "user.email", "t@example.invalid"]);
         git_in(&repo, &["config", "user.name", "t"]);
@@ -823,7 +825,7 @@ mod tests {
         std::fs::remove_file(repo.join(".git/shallow")).unwrap();
         measured("shallow removed", false);
 
-        let global = repo.join(".git/global-attributes");
+        let global = repo.join(".git").join("global-attributes");
         std::fs::write(&global, "").unwrap();
         git_in(
             &repo,

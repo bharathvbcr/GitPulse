@@ -1984,7 +1984,13 @@ mod tests {
             .request("runs.prepare_managed", &managed.to_string())
             .unwrap_err();
         assert_eq!(refused.code, "unsupported_operation");
-        assert!(refused.message.contains("pkg/web"), "{}", refused.message);
+        // The folder is named in the platform's own separator.
+        let inside = Path::new("pkg").join("web");
+        assert!(
+            refused.message.contains(&*inside.to_string_lossy()),
+            "{}",
+            refused.message
+        );
 
         let lane_run = state
             .request(

@@ -1617,7 +1617,10 @@ mod tests {
         assert_eq!(separator, args.len() - 2, "{args:?}");
         assert!(args.iter().position(|a| a == "--add-dir").unwrap() < separator);
         assert!(args.iter().position(|a| a == "--settings").unwrap() < separator);
-        assert!(args[separator + 1].contains(&*brief.path.to_string_lossy()));
+        // The prompt carries the path as a JSON string, so a Windows path's
+        // backslashes are doubled there.
+        let quoted = serde_json::to_string(&*brief.path.to_string_lossy()).unwrap();
+        assert!(args[separator + 1].contains(&quoted), "{args:?}");
 
         // An id Claude would refuse is left out, never reshaped into one.
         for id in ["run", "6F1C2A7E0D4B4C1E9A553B0E8F2D9C11", "../../run", ""] {
