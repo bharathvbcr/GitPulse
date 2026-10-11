@@ -1285,13 +1285,29 @@ fn simplified_windows_path(path: &str) -> Option<String> {
 /// On every other platform this is `canonicalize`, unchanged.
 pub(crate) fn canonicalize_plain(path: &Path) -> std::io::Result<PathBuf> {
     let canonical = path.canonicalize()?;
+    Ok(match canonical.to_str() {
+        Some(text) => PathBuf::from(plain_path_text(text)),
+        None => canonical,
+    })
+}
+
+/// `path` in the spelling git takes as a command-line argument.
+///
+/// [`canonicalize_plain`] for a path that is already in hand as text: the
+/// repository admission and trust identity spell every checkout `\\?\C:\...`
+/// (the sandbox containment checks depend on that), and git refuses that form
+/// as an argument -- `git worktree add '\\?\C:\...\wt'` dies with `could not
+/// create leading directories ... Invalid argument`. A path with no ordinary
+/// spelling (beyond the legacy limit, a device path) is returned unchanged.
+///
+/// The same string reaches the command gate and the spawn, so both judge one
+/// spelling. Identity off Windows, where a backslash is a filename character.
+pub(crate) fn plain_path_text(path: &str) -> String {
     #[cfg(windows)]
-    {
-        if let Some(simplified) = canonical.to_str().and_then(simplified_windows_path) {
-            return Ok(PathBuf::from(simplified));
-        }
+    if let Some(simplified) = simplified_windows_path(path) {
+        return simplified;
     }
-    Ok(canonical)
+    path.to_owned()
 }
 
 /// Assembles the `capture_command` child with injectable `PATH`/home lookups,
@@ -4829,6 +4845,7 @@ mod tests {
         );
         assert!(result.is_err(), "capture erased stderr completeness");
     }
+    #[cfg(unix)]
     const RETRYING_ALIAS: &str =
         "alias.retry=!echo attempt >> attempts; sleep 0.08; echo 'cannot lock ref' >&2; exit 1";
 
@@ -6853,6 +6870,38 @@ mod tests {
             dir.path().canonicalize().unwrap(),
             "the ordinary spelling must denote the same directory"
         );
+    }
+
+    /// The text form of [`canonicalize_plain`], for the paths the command gate
+    /// and `git worktree add` receive already spelled: a canonicalized checkout
+    /// joined with a lane directory.
+    #[cfg(windows)]
+    #[test]
+    fn plain_path_text_drops_the_verbatim_prefix_git_cannot_use() {
+        assert_eq!(
+            plain_path_text(r"\\?\C:\Users\runneradmin\repo\.gitpulse\worktrees\lane"),
+            r"C:\Users\runneradmin\repo\.gitpulse\worktrees\lane"
+        );
+        assert_eq!(
+            plain_path_text(r"\\?\UNC\server\share\repo"),
+            r"\\server\share\repo"
+        );
+        // No ordinary spelling exists: unchanged rather than invented.
+        assert_eq!(
+            plain_path_text(r"\\?\Volume{0123}\repo"),
+            r"\\?\Volume{0123}\repo"
+        );
+        assert_eq!(plain_path_text(r"C:\already\plain"), r"C:\already\plain");
+    }
+
+    /// Off Windows a backslash is a filename character and `\\?\` means
+    /// nothing, so every spelling is left exactly as given.
+    #[cfg(not(windows))]
+    #[test]
+    fn plain_path_text_is_the_identity_off_windows() {
+        for path in [r"\\?\C:\repo\wt", "/tmp/repo/wt", r"/tmp/odd\name", ""] {
+            assert_eq!(plain_path_text(path), path);
+        }
     }
 
     /// Off Windows there is nothing to strip, and a backslash is an ordinary

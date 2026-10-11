@@ -2,7 +2,7 @@
   import type { LanguageInfo } from "../../files/types";
   import type { CommitGraphPayload } from "../../stores/graphStore";
   import { onMount, untrack } from "svelte";
-  import { createVisibleInterval } from "../../dom/visibleInterval";
+  import { createAdaptiveTimer } from "../../runtime/adaptiveTimer";
   import { currentRepoPath, repoStore } from "../../stores/repoStore";
   import { currentHeadTip } from "../../stores/headTip";
   import { invoke } from "../../ipc/invoke";
@@ -63,7 +63,7 @@
     // them. The status poll already refuses to work on a hidden window; this
     // ticker used to keep firing behind other windows, invalidating derived
     // state across the pane every five seconds for a label nobody could see.
-    const stopTicking = createVisibleInterval(() => (tick += 1), 5000);
+    const stopTicking = createAdaptiveTimer(() => (tick += 1), 5000);
     return () => {
       stopTicking();
       commitGuard?.cancel();

@@ -13,6 +13,7 @@ before that tag is pushed.
 
 ### Fixed
 
+- Windows: `git worktree add` and `remove` are given an ordinary `C:\...` path rather than the canonical `\\?\C:\...` one git rejects, so a managed attempt's worktree can be created, reused and reclaimed; a task brief that is a directory or a link is refused as "not a regular file" instead of an access error or a followed link; the vendoring manifest records `/`-separated origin paths on every platform. Linux: closing an idle shell hangs up its jobs under bash, and a process ID past `pid_t` is reported unknown rather than gone.
 - Multi-module Maven and Gradle builds: each module's own JaCoCo report
   (`<module>/target/site/jacoco/jacoco.xml`, `<module>/build/reports/jacoco/...`)
   is found and resolved against that module's sources; modules past 128 mark the

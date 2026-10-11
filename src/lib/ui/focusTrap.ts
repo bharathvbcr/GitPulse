@@ -169,3 +169,41 @@ export function trapFocus(node: HTMLElement, options: TrapFocusOptions = {}) {
     },
   };
 }
+
+// Node.DOCUMENT_POSITION_PRECEDING / _FOLLOWING, spelled out so the helper
+// runs in plain Node where the `Node` global is absent.
+const POSITION_PRECEDING = 2;
+const POSITION_FOLLOWING = 4;
+
+/**
+ * Where a popup menu hands focus when Tab closes it: the tab stop next to the
+ * control that opened it, outside the popup, in document order. Falls back to
+ * the first/last stop when the opener is gone or not itself a tab stop.
+ * Focus moves on a zero-delay timeout so it lands after the popup unmounts.
+ */
+export function focusAdjacentToMenuOpener(
+  popup: HTMLElement,
+  opener: HTMLElement | null,
+  backwards: boolean,
+  root: { querySelectorAll(selectors: string): ArrayLike<HTMLElement> } = document,
+): void {
+  const candidates = enumerateFocusables<HTMLElement>(root).filter(
+    (candidate) =>
+      candidate.tabIndex >= 0 &&
+      !popup.contains(candidate) &&
+      candidate.getClientRects().length > 0,
+  );
+  if (candidates.length === 0) return;
+
+  const openerIndex = opener ? candidates.indexOf(opener) : -1;
+  let target = openerIndex >= 0
+    ? candidates[openerIndex + (backwards ? -1 : 1)]
+    : undefined;
+  if (!target && opener?.isConnected) {
+    const direction = backwards ? POSITION_PRECEDING : POSITION_FOLLOWING;
+    const ordered = backwards ? [...candidates].reverse() : candidates;
+    target = ordered.find((candidate) => opener.compareDocumentPosition(candidate) & direction);
+  }
+  target ??= candidates[backwards ? candidates.length - 1 : 0];
+  globalThis.setTimeout(() => target?.focus(), 0);
+}

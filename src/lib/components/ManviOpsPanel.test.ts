@@ -198,6 +198,6 @@ describe("ManviOpsPanel issue monitor task integration", () => {
     // change listener already reloads them on each change.
     expect(source).toContain("if (!opts.background || !tasksFollowChanges) void loadRepoTasks(repo);");
     expect(source).toContain("tasksFollowChanges = true;");
-    expect(source).toContain("createVisibleInterval(() => {");
+    expect(source).toContain("createAdaptiveTimer(() => {");
   });
 });

@@ -316,7 +316,10 @@ describe("the dock stays current after a write", () => {
   // also tells the dock directly at each point where it knows a write
   // committed. Either path alone leaves a restored task sitting in the list.
   it("listens for the live event and accepts a direct nudge", () => {
-    expect(source).toContain("changed: schedule");
+    // The subscription lives in the shared loader, which both coalesces the
+    // event and refreshes on return to the window.
+    expect(source).toContain("loader.connect(");
+    expect(readFileSync(new URL("../workbench/liveLoader.ts", import.meta.url), "utf8")).toContain("changed: schedule");
     expect(source).toContain("refreshToken");
     expect(board).toContain("refreshToken={archiveToken}");
   });

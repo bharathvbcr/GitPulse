@@ -227,7 +227,7 @@
 
 <script lang="ts">
   import { onDestroy, untrack } from "svelte";
-  import { createVisibleInterval } from "../dom/visibleInterval";
+  import { createAdaptiveTimer } from "../runtime/adaptiveTimer";
   import { harnessStore, verdictLabel, type AiSelection } from "../stores/harnessStore";
   import { currentRepoPath, repoStore } from "../stores/repoStore";
   import { copyText } from "../desktop/clipboard";
@@ -312,10 +312,10 @@
     {
       // Visibility-aware for the same reason the status poll is: this timer
       // re-reads grants every ten seconds, and a hidden window has no grants
-      // display to keep current. `createVisibleInterval` starts, stops and
+      // display to keep current. `createAdaptiveTimer` starts, stops and
       // catches up on its own, so the scheduler seam stays a plain
       // setInterval/clearInterval pair for tests.
-      setInterval: (callback, delayMs) => createVisibleInterval(callback, delayMs),
+      setInterval: (callback, delayMs) => createAdaptiveTimer(callback, delayMs),
       clearInterval: (handle) => (handle as () => void)(),
     },
   );

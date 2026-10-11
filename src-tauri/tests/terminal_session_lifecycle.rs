@@ -154,6 +154,10 @@ fn a_shell_that_exits_is_over_even_while_a_background_job_holds_the_terminal() {
 /// Closing an idle interactive shell must hang it up, not SIGKILL it: only a
 /// shell that receives SIGHUP passes it on to its jobs. Killing it outright
 /// orphans every job it started, and the orphan then holds the terminal.
+///
+/// Bash by name, not `/bin/sh`: re-sending the hangup to its jobs is the
+/// shell's doing, bash does it, and `/bin/sh` is dash on Debian and Ubuntu.
+/// The job outlived the close on ubuntu-latest, where `/bin/sh` is dash.
 #[test]
 fn closing_an_idle_shell_hangs_up_its_jobs_and_finishes_promptly() {
     let h = harness();
@@ -166,7 +170,7 @@ fn closing_an_idle_shell_hangs_up_its_jobs_and_finishes_promptly() {
         dir.path().to_str().unwrap(),
         24,
         80,
-        Some("/bin/sh".into()),
+        Some("/bin/bash".into()),
         Some(vec!["-i".into()]),
         None,
     )

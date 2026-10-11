@@ -139,7 +139,7 @@ export const CONTRACTS = Object.freeze([
   { label: "graph", rustPath: rust("commands", "commit_graph.rs"), tsPath: ts("stores", "graphStore.ts"), structs: ["CommitGraphPayload"] },
   { label: "refs", rustPath: rust("graph", "refs.rs"), tsPath: ts("stores", "graphStore.ts"), structs: ["RefDecoration"] },
   { label: "stack", rustPath: rust("stack", "stack_tree.rs"), tsPath: ts("stack", "types.ts"), structs: ["StackHierarchyPayload", "StackedBranchNode", "BranchAncestryChain"] },
-  { label: "status", rustPath: rust("engine", "git_reader.rs"), tsPath: ts("stores", "repoStore.ts"), structs: ["FileStatus", "BranchStatsReport", "DiffPayload"] },
+  { label: "status", rustPath: rust("engine", "git_reader.rs"), tsPath: ts("repos", "storeTypes.ts"), structs: ["FileStatus", "BranchStatsReport", "DiffPayload"] },
   { label: "file-content", rustPath: rust("engine", "git_reader.rs"), tsPath: ts("files", "types.ts"), structs: ["BlameLine", "FileBlob"] },
   { label: "markdown-render", rustPath: rust("markdown", "mod.rs"), tsPath: ts("files", "markdevRender.ts"), structs: ["RenderedMarkdown", "MarkdownHeading", "FrontmatterField"] },
   { label: "language-detect", rustPath: rust("analyzer", "language.rs"), tsPath: ts("files", "types.ts"), structs: ["LanguageInfo"] },
@@ -165,7 +165,7 @@ export const CONTRACTS = Object.freeze([
   { label: "fleet", rustPath: rust("insights", "mod.rs"), tsPath: ts("fleet", "types.ts"), structs: ["FleetRepoFacet", "FleetSnapshot", "FleetCommitStats"] },
   { label: "fleet-metrics", rustPath: rust("ledger", "mod.rs"), tsPath: ts("fleet", "types.ts"), structs: ["FleetMetrics", "FleetMetricsInput", "FleetLanguageStat"] },
   { label: "languages", rustPath: rust("engine", "git_reader.rs"), tsPath: ts("language", "barStats.ts"), structs: ["LanguageStatsReport", "RepoLanguageStat"] },
-  { label: "repo", rustPath: rust("engine", "git_cli.rs"), tsPath: ts("stores", "repoStore.ts"), structs: ["ResolvedRepo"] },
+  { label: "repo", rustPath: rust("engine", "git_cli.rs"), tsPath: ts("repos", "storeTypes.ts"), structs: ["ResolvedRepo"] },
   // On-device drafting availability. The tagged `state` union is what keeps an
   // ineligible Mac, a switched-off setting and a bridge-less build apart, so a
   // drift here would collapse three different answers into one message.

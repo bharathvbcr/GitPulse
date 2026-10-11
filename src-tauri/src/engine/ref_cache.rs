@@ -492,7 +492,7 @@ mod tests {
 
     fn fixture(ref_format: Option<&str>) -> Option<Fixture> {
         let holder = tempfile::tempdir().unwrap();
-        let base = holder.path().canonicalize().unwrap();
+        let base = crate::engine::git_cli::canonicalize_plain(holder.path()).unwrap();
         let main = base.join("main");
         std::fs::create_dir(&main).unwrap();
         let mut init = vec!["init", "-q", "-b", "main"];

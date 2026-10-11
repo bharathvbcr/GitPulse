@@ -7,7 +7,7 @@
 //! removes them through the same validated, harness-gated paths as every other
 //! write.
 
-use crate::engine::git_cli::{git_text, resolve_git_common_dir, validate_repo};
+use crate::engine::git_cli::{git_text, plain_path_text, resolve_git_common_dir, validate_repo};
 use crate::engine::git_writer::validate_oid_or_revision;
 use crate::engine::git_writer::validate_ref_name;
 use crate::engine::git_writer::{GitWriter, MergeMode, SquashFailure};
@@ -1170,6 +1170,10 @@ pub fn add_worktree(
         validate_oid_or_revision(start)?;
     }
 
+    // The spelling the gate judged ([`add_worktree_argv`]): a verbatim
+    // `\\?\` path from a canonicalized checkout is not one git can create.
+    let target_path = plain_path_text(target_path);
+    let target_path = target_path.as_str();
     let mut args: Vec<&str> = vec!["worktree", "add"];
     if let Some(branch) = new_branch {
         args.push("-b");
@@ -1507,6 +1511,10 @@ fn remove_worktree_locked(repo: &Path, target_path: &str, force: bool) -> Result
     // can execute even though the parent is the process's current directory.
     let target = validate_repo(target_path)?;
     let target_path = target.to_str().ok_or("Worktree path is not UTF-8")?;
+    // `validate_repo` canonicalizes, which on Windows is the `\\?\` form git
+    // does not take as an argument.
+    let target_path = plain_path_text(target_path);
+    let target_path = target_path.as_str();
     let mut args: Vec<&str> = vec!["worktree", "remove"];
     if force {
         args.push("--force");
@@ -1581,7 +1589,7 @@ pub fn add_worktree_argv(
     } else if detach {
         argv.push("--detach".into());
     }
-    argv.push(target_path.into());
+    argv.push(plain_path_text(target_path));
     if let Some(start) = start_point {
         argv.push(start.into());
     }
@@ -1593,7 +1601,7 @@ pub fn remove_worktree_argv(target_path: &str, force: bool) -> Vec<String> {
     if force {
         argv.push("--force".into());
     }
-    argv.push(target_path.into());
+    argv.push(plain_path_text(target_path));
     argv
 }
 
@@ -1633,6 +1641,15 @@ mod tests {
     use super::*;
     use crate::procguard::LockedSpawn;
     use std::path::PathBuf;
+
+    /// `path.canonicalize()` in the spelling git reports its worktrees in. The
+    /// spawn log is keyed by the directory a child ran in, and git lists a
+    /// worktree as `C:/...`, never `\\?\C:\...`, so a verbatim key matches
+    /// nothing on Windows and a "spawned zero" assertion passes or fails for
+    /// the wrong reason. Plain `canonicalize` off Windows.
+    fn plain(path: impl AsRef<Path>) -> PathBuf {
+        crate::engine::git_cli::canonicalize_plain(path.as_ref()).unwrap()
+    }
 
     /// The fixtures below are written in `--porcelain`'s newline layout for
     /// readability; the parser reads the `-z` layout, whose NUL is that
@@ -1686,6 +1703,46 @@ mod tests {
                 .contains("b1"),
             "the branch of the newline-path worktree was lost"
         );
+    }
+
+    /// The command gate and the writer take the same spelling, and it is one
+    /// git accepts: a canonicalized checkout is `\\?\C:\...` on Windows, which
+    /// `git worktree add` and `remove` refuse as an argument.
+    #[cfg(windows)]
+    #[test]
+    fn worktree_argv_never_carries_a_verbatim_path() {
+        let verbatim = r"\\?\C:\repo\.gitpulse\worktrees\lane";
+        let plain = r"C:\repo\.gitpulse\worktrees\lane";
+        assert_eq!(
+            add_worktree_argv(verbatim, Some("b"), None, false),
+            ["git", "worktree", "add", "-b", "b", plain]
+        );
+        assert_eq!(
+            remove_worktree_argv(verbatim, true),
+            ["git", "worktree", "remove", "--force", plain]
+        );
+    }
+
+    /// A target that is already in canonical form still creates and removes a
+    /// worktree: the case every managed attempt is in, since its checkout came
+    /// from `validate_repo`.
+    #[test]
+    fn a_canonicalized_target_creates_and_removes_a_worktree() {
+        let main = tempfile::TempDir::new().unwrap();
+        git_in(main.path(), &["init", "-b", "main"]);
+        git_in(
+            main.path(),
+            &["commit", "--allow-empty", "-q", "-m", "init"],
+        );
+        crate::test_support::trust_repo(main.path());
+        let holder = tempfile::TempDir::new().unwrap();
+        let target = holder.path().canonicalize().unwrap().join("lane");
+        let target_text = target.to_str().unwrap();
+        let repo = main.path().to_str().unwrap();
+        add_worktree(repo, target_text, Some("lane"), None, false).expect("add");
+        assert!(target.join(".git").exists(), "{target:?} was not created");
+        remove_worktree(repo, target_text, false).expect("remove");
+        assert!(!target.exists(), "{target:?} was not removed");
     }
 
     #[test]
@@ -1960,7 +2017,7 @@ some-future-field whatever
                     ],
                 );
                 crate::test_support::trust_repo(&path);
-                path.canonicalize().unwrap()
+                plain(path)
             })
             .collect();
         (main, parent, paths)
@@ -2004,7 +2061,7 @@ some-future-field whatever
             branch: Some("main".into()),
             ..ParsedWorktree::default()
         };
-        let repo = main.path().canonicalize().unwrap();
+        let repo = plain(main.path());
         let scan = crate::engine::git_cli::with_forced_spawn_failure_of("diff", || {
             scan_worktree(&repo, &entry, ScanDepth::Full, &Base::none())
         });
@@ -2960,7 +3017,7 @@ some-future-field whatever
     #[test]
     fn a_full_listing_looks_up_main_once_whatever_the_worktree_count() {
         let (main, _parent, linked) = repo_with_worktrees(5);
-        let root = main.path().canonicalize().unwrap();
+        let root = plain(main.path());
         let listed = list_worktrees(root.to_str().unwrap()).expect("list");
         assert_eq!(listed.len(), 6);
         let mut cwds = linked.clone();
@@ -3002,7 +3059,7 @@ some-future-field whatever
     #[test]
     fn a_batch_that_cannot_answer_falls_back_to_each_worktrees_own_walk() {
         let (main, _parent, linked) = repo_with_worktrees(3);
-        let root = main.path().canonicalize().unwrap();
+        let root = plain(main.path());
         // Two commits on one agent branch, so the counts are not all zero.
         for n in 0..2 {
             std::fs::write(linked[1].join(format!("w{n}.txt")), "x").unwrap();
@@ -3042,7 +3099,7 @@ some-future-field whatever
         git_in(dir.path(), &["init", "-q", "-b", "master"]);
         git_in(dir.path(), &["commit", "-q", "--allow-empty", "-m", "base"]);
         git_in(dir.path(), &["branch", "main/feature"]);
-        let root = dir.path().canonicalize().unwrap();
+        let root = plain(dir.path());
         assert_eq!(main_ref(&root), MainRef::Found("master"));
         git_in(dir.path(), &["branch", "-q", "-m", "master", "trunk"]);
         assert_eq!(main_ref(&root), MainRef::Absent);
@@ -3053,7 +3110,7 @@ some-future-field whatever
     #[test]
     fn a_failed_main_lookup_is_named_on_the_worktrees_it_left_unmeasured() {
         let (main, _parent, _linked) = repo_with_worktrees(2);
-        let root = main.path().canonicalize().unwrap();
+        let root = plain(main.path());
         let listed = crate::engine::git_cli::with_forced_spawn_failure_of("for-each-ref", || {
             list_worktrees(root.to_str().unwrap())
         })
@@ -3070,7 +3127,7 @@ some-future-field whatever
     #[test]
     fn each_scan_depth_spawns_only_what_it_measures() {
         let (main, _parent, linked) = repo_with_worktrees(3);
-        let root = main.path().canonicalize().unwrap();
+        let root = plain(main.path());
         let mut cwds = linked.clone();
         cwds.push(root.clone());
 
@@ -3099,7 +3156,7 @@ some-future-field whatever
         scan_dirty(&mut target);
         assert_eq!(target.dirty_files, Some(1));
         assert_eq!(target.scan_note, None);
-        let others = [main.path().canonicalize().unwrap(), linked[0].clone()];
+        let others = [plain(main.path()), linked[0].clone()];
         assert_eq!(spawned_with(&others, "status"), 0);
     }
 
@@ -3184,7 +3241,7 @@ some-future-field whatever
     #[test]
     fn concurrent_listings_share_one_scan_at_the_deepest_depth() {
         let (main, _parent, linked) = repo_with_worktrees(3);
-        let root = main.path().canonicalize().unwrap();
+        let root = plain(main.path());
         let before = listings_in(&root);
         let leader = lead(&root, ScanDepth::Dirty, Duration::from_secs(2));
         wait_until("gathering", || gathering(&root));
@@ -3224,7 +3281,7 @@ some-future-field whatever
     #[test]
     fn a_listing_already_reading_is_never_handed_to_a_later_caller() {
         let (main, _parent, linked) = repo_with_worktrees(1);
-        let root = main.path().canonicalize().unwrap();
+        let root = plain(main.path());
         let before = listings_in(&root);
         let (computed_tx, computed_rx) = std::sync::mpsc::channel::<()>();
         let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
@@ -3272,7 +3329,7 @@ some-future-field whatever
     fn listings_share_only_within_one_admission_class_and_depth_listing_never_waits() {
         use crate::engine::git_cli::{with_admission, Admission};
         let (main, _parent, _linked) = repo_with_worktrees(1);
-        let root = main.path().canonicalize().unwrap();
+        let root = plain(main.path());
         let before = listings_in(&root);
         let leader = lead(&root, ScanDepth::Dirty, Duration::from_millis(500));
         wait_until("gathering", || gathering(&root));
@@ -3303,7 +3360,7 @@ some-future-field whatever
     #[test]
     fn a_failed_shared_listing_fails_every_caller_and_frees_the_lane() {
         let (main, _parent, _linked) = repo_with_worktrees(0);
-        let root = main.path().canonicalize().unwrap();
+        let root = plain(main.path());
         let leader = lead(&root, ScanDepth::Dirty, Duration::from_millis(300));
         wait_until("gathering", || gathering(&root));
         let path = root.to_str().unwrap().to_string();

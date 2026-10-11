@@ -743,13 +743,6 @@ export async function completeEnhancement(input: {
 }): Promise<Enhancement> {
   return record(await request("enhancements.complete", input), enhancement);
 }
-/** Start generation for a pending enhancement; optional model selects the sidecar env. */
-export async function generateEnhancement(
-  input: { id: string; request_id: string; expected_revision: number },
-  selection?: ModelSelection | null,
-): Promise<Enhancement> {
-  return changeEnhancement("enhancements.generate", { ...input, ...selectionWire(selection) });
-}
 export async function enhancementConfiguration(selection?: ModelSelection | null): Promise<EnhancementConfiguration> {
   const raw = object(await request("enhancements.configuration", selectionWire(selection)));
   if (raw.ok !== true) return invalid();

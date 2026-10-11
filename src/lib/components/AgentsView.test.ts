@@ -81,6 +81,6 @@ describe("AgentsView", () => {
     // ft-0ff882a6: a raw one-second setInterval kept waking the renderer
     // while the window was hidden.
     expect(source).not.toMatch(/\bsetInterval\(/);
-    expect(source).toContain("const stopClock = createVisibleInterval(() => {");
+    expect(source).toContain("const stopClock = createAdaptiveTimer(() => {");
   });
 });

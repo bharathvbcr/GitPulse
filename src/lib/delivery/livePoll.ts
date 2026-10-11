@@ -1,7 +1,7 @@
 /**
  * The loop that turns [`decidePoll`] into an actual timer.
  *
- * Built on `createVisibleInterval` rather than a bare `setInterval`, and
+ * Built on `createAdaptiveTimer` rather than a bare `setInterval`, and
  * shaped the way the work-tree status poll already is: a fixed cadence with a
  * gate that skips ticks. The novel part is that the interval itself only
  * exists while something is in flight — a repository nobody is deploying runs
@@ -11,7 +11,7 @@
  * Both panels drive this rather than owning a loop each. Two copies of a
  * retry-and-give-up loop is two places for the give-up to be forgotten.
  */
-import { createVisibleInterval, type IntervalHost } from "../dom/visibleInterval";
+import { createAdaptiveTimer, type AdaptiveHost } from "../runtime/adaptiveTimer";
 import {
   afterPoll,
   closedPollSession,
@@ -55,7 +55,7 @@ export function createLivePoll(options: {
   onState: (state: LiveState) => void;
   limits?: PollLimits;
   /** Injected for tests; the browser host by default. */
-  host?: IntervalHost | null;
+  host?: AdaptiveHost | null;
   now?: () => number;
 }): LivePoll {
   const limits = resolveLimits(options.limits);
@@ -92,7 +92,7 @@ export function createLivePoll(options: {
 
   function startTimer(): void {
     if (stopInterval !== null || disposed) return;
-    stopInterval = createVisibleInterval(tick, limits.baseIntervalMs, options.host);
+    stopInterval = createAdaptiveTimer(tick, limits.baseIntervalMs, options.host);
   }
 
   function tick(): void {
