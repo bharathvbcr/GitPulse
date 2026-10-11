@@ -381,6 +381,24 @@ fn announce(repo_path: &str, cursor: i64) {
     }
 }
 
+/// One segment of an event action name: lowercase ASCII letters and digits,
+/// every other character folded to `_`.
+///
+/// The single owner of what an action segment may contain, shared by command
+/// lines ([`action_for_argv`]) and the reflog replay, so a verb from either
+/// source is spelled the same way in the ledger.
+pub(crate) fn action_segment(raw: &str) -> String {
+    raw.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() {
+                c.to_ascii_lowercase()
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
 /// Derives an event action name from a command line.
 ///
 /// `git commit` becomes `git.commit`; anything else becomes `command.run`, so a
@@ -389,16 +407,7 @@ fn announce(repo_path: &str, cursor: i64) {
 pub fn action_for_argv(argv: &[&str]) -> String {
     match (argv.first(), argv.get(1)) {
         (Some(&"git"), Some(sub)) => {
-            let clean: String = sub
-                .chars()
-                .map(|c| {
-                    if c.is_ascii_alphanumeric() {
-                        c.to_ascii_lowercase()
-                    } else {
-                        '_'
-                    }
-                })
-                .collect();
+            let clean = action_segment(sub);
             if clean.is_empty() || !clean.starts_with(|c: char| c.is_ascii_lowercase()) {
                 "command.run".to_string()
             } else {
@@ -2847,6 +2856,14 @@ pub(crate) mod tests_support {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn action_segments_fold_to_lowercase_ascii_tokens() {
+        assert_eq!(action_segment("Cherry-Pick"), "cherry_pick");
+        assert_eq!(action_segment("é!"), "__");
+        assert_eq!(action_for_argv(&["git", "Cherry-Pick"]), "git.cherry_pick");
+        assert_eq!(action_for_argv(&["git", "9lives"]), "command.run");
+    }
+
     use super::*;
     #[cfg(unix)]
     use crate::procguard::LockedSpawn;

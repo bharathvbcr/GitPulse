@@ -1576,16 +1576,6 @@ fn to_changed(file: &FileStatus) -> ChangedFile {
     }
 }
 
-/// Resolves the worktree an insights read is about, and proves it belongs to
-/// `repo_path`.
-///
-/// Without this, `worktree_path` was taken on trust: a path naming a totally
-/// unrelated repository came back stamped with `repo_path`'s identity, so the
-/// answer described one repository while claiming to describe another. The
-/// ledger route has always authenticated this pair; these read tools now use
-/// the same gate. The returned path is the canonical one git registered, so
-/// later comparisons against the worktree listing are not defeated by
-/// symlinks or a trailing slash.
 /// Do two path strings name the same directory?
 ///
 /// A literal comparison is not enough on macOS, where every temporary directory
@@ -1598,8 +1588,9 @@ fn to_changed(file: &FileStatus) -> ChangedFile {
 /// Canonicalization is attempted on both sides and the literal comparison is
 /// the fallback, because a worktree that was removed between the listing and
 /// this call cannot be canonicalized and must still compare equal to itself.
-fn same_path(left: &str, right: &str) -> bool {
-    if Path::new(left) == Path::new(right) {
+pub(crate) fn same_path(left: impl AsRef<Path>, right: impl AsRef<Path>) -> bool {
+    let (left, right) = (left.as_ref(), right.as_ref());
+    if left == right {
         return true;
     }
     match (std::fs::canonicalize(left), std::fs::canonicalize(right)) {
@@ -1608,6 +1599,16 @@ fn same_path(left: &str, right: &str) -> bool {
     }
 }
 
+/// Resolves the worktree an insights read is about, and proves it belongs to
+/// `repo_path`.
+///
+/// Without this, `worktree_path` was taken on trust: a path naming a totally
+/// unrelated repository came back stamped with `repo_path`'s identity, so the
+/// answer described one repository while claiming to describe another. The
+/// ledger route has always authenticated this pair; these read tools now use
+/// the same gate. The returned path is the canonical one git registered, so
+/// later comparisons against the worktree listing are not defeated by
+/// symlinks or a trailing slash.
 fn resolve_target(repo_path: &str, worktree_path: Option<&str>) -> Result<String, String> {
     let Some(requested) = worktree_path else {
         // No worktree named: the repository itself is the target, and there is
@@ -2125,6 +2126,25 @@ mod tests {
     use std::fs;
 
     use crate::test_support::git_in;
+
+    #[test]
+    fn same_path_takes_strings_and_paths_and_sees_through_symlinks() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real");
+        fs::create_dir(&real).unwrap();
+        assert!(same_path(real.to_str().unwrap(), &real));
+        assert!(!same_path(&real, dir.path()));
+        // A removed directory cannot be canonicalised and compares literally.
+        let gone = dir.path().join("gone");
+        assert!(same_path(&gone, &gone));
+        assert!(!same_path(&gone, &real));
+        #[cfg(unix)]
+        {
+            let link = dir.path().join("link");
+            std::os::unix::fs::symlink(&real, &link).unwrap();
+            assert!(same_path(&link, &real));
+        }
+    }
 
     fn init_repo() -> tempfile::TempDir {
         let dir = tempfile::TempDir::new().unwrap();

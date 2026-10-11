@@ -1,5 +1,6 @@
 import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
+import { readCommandsSource } from "./commands-source";
 
 /**
  * The file gate must be told the operation that will actually happen.
@@ -21,10 +22,7 @@ import { describe, expect, it } from "vitest";
  * The rule below is derived from the writers, not from a list of known-bad
  * commands, so a newly destructive writer is caught the day it lands.
  */
-const COMMANDS = readFileSync(
-  new URL("../src-tauri/src/commands/mod.rs", import.meta.url),
-  "utf8",
-);
+const COMMANDS = readCommandsSource();
 const WRITER = readFileSync(
   new URL("../src-tauri/src/engine/git_writer.rs", import.meta.url),
   "utf8",

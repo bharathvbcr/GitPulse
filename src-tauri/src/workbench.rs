@@ -47,6 +47,27 @@ type WorkerFingerprint = Option<(String, String)>;
 #[cfg(test)]
 type OpenFiles = fn(&std::path::Path) -> Result<(), String>;
 
+/// Longest identifier the host accepts from the renderer.
+pub(crate) const MAX_RECORD_ID_BYTES: usize = 128;
+
+/// Whether `id` is a plain record identifier: non-empty, at most `max_len`
+/// bytes, ASCII letters, digits, `_` and `-` only.
+///
+/// The single owner of the identifier shape every workbench request validates
+/// before it reaches a query or a path.
+pub(crate) fn is_record_id_within(id: &str, max_len: usize) -> bool {
+    !id.is_empty()
+        && id.len() <= max_len
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+}
+
+/// [`is_record_id_within`] at the standard [`MAX_RECORD_ID_BYTES`].
+pub(crate) fn is_record_id(id: &str) -> bool {
+    is_record_id_within(id, MAX_RECORD_ID_BYTES)
+}
+
 #[derive(Debug, Serialize)]
 pub struct WorkbenchError {
     pub code: String,
@@ -753,15 +774,8 @@ fn generation_input(method: &str, input: &str) -> Result<HostControl, WorkbenchE
         });
     }
     let parsed: GenerationInput = serde_json::from_str(input).map_err(invalid)?;
-    let valid_id = |id: &str| {
-        !id.is_empty()
-            && id.len() <= 128
-            && id
-                .bytes()
-                .all(|c| c.is_ascii_alphanumeric() || c == b'_' || c == b'-')
-    };
-    if !valid_id(&parsed.id)
-        || !valid_id(&parsed.request_id)
+    if !is_record_id(&parsed.id)
+        || !is_record_id(&parsed.request_id)
         || parsed.expected_revision == 0
         || parsed.expected_revision > 9_007_199_254_740_991
     {
@@ -967,6 +981,20 @@ mod profile_owner_tests;
 #[cfg(test)]
 mod tests {
     use super::{generation_input, worker_error, Inner, WorkbenchState, MAX_IN_FLIGHT};
+
+    #[test]
+    fn record_ids_are_plain_tokens_within_their_length_cap() {
+        use super::{is_record_id, is_record_id_within, MAX_RECORD_ID_BYTES};
+        assert!(is_record_id("run_1-A"));
+        assert!(is_record_id(&"a".repeat(MAX_RECORD_ID_BYTES)));
+        assert!(!is_record_id(&"a".repeat(MAX_RECORD_ID_BYTES + 1)));
+        assert!(!is_record_id(""));
+        assert!(!is_record_id("a/b"));
+        assert!(!is_record_id("a b"));
+        assert!(!is_record_id("é"));
+        assert!(is_record_id_within("abc", 3));
+        assert!(!is_record_id_within("abcd", 3));
+    }
     use crate::procguard::LockedSpawn;
     use serde_json::json;
     use std::sync::Arc;

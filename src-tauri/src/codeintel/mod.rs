@@ -765,32 +765,18 @@ pub fn impact_at_rung(
     min_rung: Option<&str>,
     cancel: Option<Cancel>,
 ) -> CodeintelResponse<CodeintelEdge> {
-    if let Err(e) = require_argument("target", target) {
-        return CodeintelResponse::unavailable(e);
-    }
-    let rung = match parse_min_rung(min_rung) {
-        Ok(r) => r,
-        Err(e) => return CodeintelResponse::unavailable(e),
-    };
-    let store = match open_repo_map(repo_path) {
-        Ok(s) => s,
-        Err(e) => return CodeintelResponse::unavailable(e),
-    };
-    let mut engine = StoreQueryEngine::new(&store);
-    if let Some(cancel) = cancel {
-        engine = engine.with_cancel(cancel);
-    }
-    let req = Request {
-        query: target.to_string(),
-        token_budget: token_budget.unwrap_or(DEFAULT_CODEINTEL_BUDGET),
-        min_confidence: 0.0,
-        max_depth: 10,
-    };
-
-    match engine.impact_at_rung(req, rung) {
-        Ok(res) => from_engine(res, map_edge),
-        Err(e) => CodeintelResponse::unavailable(format!("Impact computation failed: {e}")),
-    }
+    at_rung_query(
+        AtRungQuery {
+            repo_path,
+            label: "target",
+            query: target,
+            token_budget,
+            min_rung,
+            cancel,
+            failure: "Impact computation failed",
+        },
+        |engine, req, rung| engine.impact_at_rung(req, rung),
+    )
 }
 
 /// Finds dependencies for a file.
@@ -810,31 +796,70 @@ pub fn dependencies_at_rung(
     min_rung: Option<&str>,
     cancel: Option<Cancel>,
 ) -> CodeintelResponse<CodeintelEdge> {
-    if let Err(e) = require_argument("file_path", file_path) {
+    at_rung_query(
+        AtRungQuery {
+            repo_path,
+            label: "file_path",
+            query: file_path,
+            token_budget,
+            min_rung,
+            cancel,
+            failure: "Dependencies lookup failed",
+        },
+        |engine, req, rung| engine.dependencies_at_rung(req, rung),
+    )
+}
+
+/// The arguments one rung-narrowed edge query shares: what is asked, of which
+/// repository, how it may be cut off, and how a failure is worded.
+struct AtRungQuery<'a> {
+    repo_path: &'a str,
+    /// Argument name quoted when `query` is blank.
+    label: &'a str,
+    query: &'a str,
+    token_budget: Option<u32>,
+    min_rung: Option<&'a str>,
+    cancel: Option<Cancel>,
+    failure: &'a str,
+}
+
+/// Validates, opens the store, and runs one rung-narrowed edge query.
+///
+/// The single owner of the blank-argument, rung-parse, store-open, cancel and
+/// request-shape steps for [`impact_at_rung`] and [`dependencies_at_rung`].
+fn at_rung_query<E: std::fmt::Display>(
+    q: AtRungQuery<'_>,
+    run: impl FnOnce(
+        &StoreQueryEngine<'_>,
+        Request<String>,
+        Option<Rung>,
+    ) -> Result<Response<ResolvedEdge>, E>,
+) -> CodeintelResponse<CodeintelEdge> {
+    if let Err(e) = require_argument(q.label, q.query) {
         return CodeintelResponse::unavailable(e);
     }
-    let rung = match parse_min_rung(min_rung) {
+    let rung = match parse_min_rung(q.min_rung) {
         Ok(r) => r,
         Err(e) => return CodeintelResponse::unavailable(e),
     };
-    let store = match open_repo_map(repo_path) {
+    let store = match open_repo_map(q.repo_path) {
         Ok(s) => s,
         Err(e) => return CodeintelResponse::unavailable(e),
     };
     let mut engine = StoreQueryEngine::new(&store);
-    if let Some(cancel) = cancel {
+    if let Some(cancel) = q.cancel {
         engine = engine.with_cancel(cancel);
     }
     let req = Request {
-        query: file_path.to_string(),
-        token_budget: token_budget.unwrap_or(DEFAULT_CODEINTEL_BUDGET),
+        query: q.query.to_string(),
+        token_budget: q.token_budget.unwrap_or(DEFAULT_CODEINTEL_BUDGET),
         min_confidence: 0.0,
         max_depth: 10,
     };
 
-    match engine.dependencies_at_rung(req, rung) {
+    match run(&engine, req, rung) {
         Ok(res) => from_engine(res, map_edge),
-        Err(e) => CodeintelResponse::unavailable(format!("Dependencies lookup failed: {e}")),
+        Err(e) => CodeintelResponse::unavailable(format!("{}: {e}", q.failure)),
     }
 }
 

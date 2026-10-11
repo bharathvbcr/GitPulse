@@ -33,14 +33,6 @@ fn object_input<T: for<'de> Deserialize<'de>>(input: &str) -> Result<T, Workbenc
     serde_json::from_str(input).map_err(|e| invalid(e.to_string()))
 }
 
-fn valid_ref(id: &str) -> bool {
-    !id.is_empty()
-        && id.len() <= 128
-        && id
-            .bytes()
-            .all(|c| c.is_ascii_alphanumeric() || c == b'_' || c == b'-')
-}
-
 // ---------------------------------------------------------------------------
 // Scans: params for Manvi's work.scan.* ops
 // ---------------------------------------------------------------------------
@@ -114,7 +106,7 @@ struct ScanRef {
 /// Params for `work.scan.get` and `work.scan.cancel`.
 pub(crate) fn scan_ref_params(input: &str) -> Result<Value, WorkbenchError> {
     let parsed: ScanRef = object_input(input)?;
-    if !valid_ref(&parsed.scan_id) {
+    if !crate::workbench::is_record_id(&parsed.scan_id) {
         return Err(invalid("A scan is named by its scan id."));
     }
     Ok(json!({ "scan_id": parsed.scan_id }))
@@ -300,7 +292,10 @@ struct ApplyInput {
 /// retry of the same accept names the same tasks.
 pub(crate) fn apply_refinement(store: &Store, input: &str) -> Result<Value, WorkbenchError> {
     let parsed: ApplyInput = object_input(input)?;
-    if !valid_ref(&parsed.id) || parsed.expected_revision < 1 || parsed.expected_task_revision < 1 {
+    if !crate::workbench::is_record_id(&parsed.id)
+        || parsed.expected_revision < 1
+        || parsed.expected_task_revision < 1
+    {
         return Err(invalid(
             "Applying needs a proposal id and the revisions reviewed.",
         ));

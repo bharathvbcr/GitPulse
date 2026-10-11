@@ -15,6 +15,7 @@ use crate::engine::git_cli::{
     capture_command, git_text_partial, is_sandbox_symlink_escape, sandbox_join,
     sandbox_join_canonical, validate_repo,
 };
+use crate::fs_entry::BoundedRead;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::Path;
@@ -398,37 +399,33 @@ fn limits_tag(limits: &ScanLimits) -> u64 {
 /// canonical target must stay inside the repository. That prevents a FIFO from
 /// blocking and prevents a symlink candidate from fingerprinting outside data.
 fn content_probe(repo: &Path, path: &Path, max_bytes: u64) -> u64 {
-    use std::io::Read;
     let Ok(canon) = path.canonicalize() else {
         return 0;
     };
     if !canon.starts_with(repo) {
         return 0;
     }
-    let Ok(meta) = std::fs::metadata(&canon) else {
+    let Ok(bytes) = read_capped(&canon, max_bytes) else {
         return 0;
     };
-    if !meta.is_file() || meta.len() > max_bytes {
-        return 0;
-    }
-    let Ok(mut file) = std::fs::File::open(canon) else {
-        return 0;
-    };
-    let mut buf = [0u8; 64 * 1024];
     let mut hash: u64 = 0x8422_2325_cbf2_9ce4;
-    loop {
-        let Ok(read) = file.read(&mut buf) else {
-            return 0;
-        };
-        if read == 0 {
-            break;
-        }
-        for byte in &buf[..read] {
-            hash ^= *byte as u64;
-            hash = hash.wrapping_mul(0x100_0000_01b3);
-        }
+    for byte in &bytes {
+        hash ^= *byte as u64;
+        hash = hash.wrapping_mul(0x100_0000_01b3);
     }
     hash
+}
+
+/// The bytes of a regular file of at most `cap` bytes.
+///
+/// The one bounded-read path for every file the coverage scan takes from the
+/// repository. The cap holds for the bytes actually read — not only for the
+/// size `metadata` reported before the read, which a file that grows between
+/// the check and the read defeats — and the open is non-blocking and never
+/// follows a symlink, so a FIFO or a swapped-in link cannot park or redirect
+/// the scan. Every caller passes an already canonical in-repository path.
+fn read_capped(path: &Path, cap: u64) -> Result<Vec<u8>, BoundedRead> {
+    crate::fs_entry::read_bounded_nofollow(path, usize::try_from(cap).unwrap_or(usize::MAX))
 }
 
 /// ASCII-case-insensitive map lookup fallback for `file_coverage`.
@@ -1187,16 +1184,11 @@ fn read_go_work_modules(repo: &Path) -> Option<(Vec<String>, bool)> {
         Ok(path) => path,
         Err(_) => return Some((Vec::new(), true)),
     };
-    let meta = match std::fs::metadata(&path) {
-        Ok(meta) => meta,
-        Err(_) => return Some((Vec::new(), true)),
-    };
-    if !meta.is_file() || meta.len() > MAX_GO_WORK_BYTES {
+    let Some(text) = read_capped(&path, MAX_GO_WORK_BYTES)
+        .ok()
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+    else {
         return Some((Vec::new(), true));
-    }
-    let text = match std::fs::read_to_string(&path) {
-        Ok(text) => text,
-        Err(_) => return Some((Vec::new(), true)),
     };
     Some(parse_go_work_use(&text))
 }
@@ -1317,12 +1309,8 @@ fn manifest_is_file(repo: &Path, rel: &str) -> bool {
 
 fn read_root_package_json(repo: &Path) -> Option<serde_json::Value> {
     let path = sandbox_join_canonical(repo, "package.json").ok()?;
-    let meta = std::fs::metadata(&path).ok()?;
-    if !meta.is_file() || meta.len() > MAX_PACKAGE_JSON_BYTES {
-        return None;
-    }
-    let text = std::fs::read_to_string(&path).ok()?;
-    serde_json::from_str(&text).ok()
+    let bytes = read_capped(&path, MAX_PACKAGE_JSON_BYTES).ok()?;
+    serde_json::from_slice(&bytes).ok()
 }
 
 fn package_has_dep(pkg: &serde_json::Value, name: &str) -> bool {
@@ -1567,26 +1555,13 @@ fn resolve_manifest_rel(base: &str, rel: &str) -> Option<String> {
 }
 
 fn read_cargo_manifest_shape(repo: &Path, dir: &str) -> Option<CargoManifestShape> {
-    use std::io::Read as _;
     let rel = if dir.is_empty() {
         "Cargo.toml".to_string()
     } else {
         format!("{dir}/Cargo.toml")
     };
     let path = sandbox_join_canonical(repo, &rel).ok()?;
-    // Regular files only: opening a FIFO would block the scan.
-    if !std::fs::metadata(&path).ok()?.is_file() {
-        return None;
-    }
-    let mut text = String::new();
-    std::fs::File::open(&path)
-        .ok()?
-        .take(MAX_CARGO_MANIFEST_BYTES + 1)
-        .read_to_string(&mut text)
-        .ok()?;
-    if text.len() as u64 > MAX_CARGO_MANIFEST_BYTES {
-        return None;
-    }
+    let text = String::from_utf8(read_capped(&path, MAX_CARGO_MANIFEST_BYTES).ok()?).ok()?;
     Some(parse_cargo_manifest_shape(&text))
 }
 
@@ -3156,33 +3131,11 @@ fn read_artifact(repo: &Path, rel: &str, max_bytes: u64) -> ArtifactRead {
             reason: "artifact path escaped the repository".into(),
         };
     }
-    let meta = match std::fs::metadata(&canon) {
-        Ok(m) => m,
-        Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => {
-            return ArtifactRead::Skipped {
-                reason: "permission denied".into(),
-            };
-        }
-        Err(_) => return ArtifactRead::Missing,
-    };
-    // Regular files only. FIFOs, sockets, and device nodes pass size checks
-    // (len() is 0 for a FIFO) and would block `fs::read` forever on open
-    // with no writer, pinning a scan thread.
-    if !meta.is_file() {
-        return ArtifactRead::Skipped {
-            reason: "not a regular file".into(),
-        };
-    }
-    if meta.len() > max_bytes {
-        return ArtifactRead::Skipped {
-            reason: format!("artifact exceeds {} byte limit ({})", max_bytes, meta.len()),
-        };
-    }
-    // Residual TOCTOU: the path can be swapped (e.g. re-pointed at a symlink
-    // outside the repo) between canonicalize and read, same as the documented
-    // write-path residual in git_cli.rs. Read-only exposure; attacker already
-    // needs local repo-write access.
-    match std::fs::read(&canon) {
+    // Regular files only, at or below the byte limit. FIFOs, sockets, and
+    // device nodes pass size checks (len() is 0 for a FIFO) and would block a
+    // plain read forever with no writer, pinning a scan thread; the bounded
+    // reader never blocks on them and holds the cap on the bytes it reads.
+    match read_capped(&canon, max_bytes) {
         Ok(bytes) => {
             if bytes.contains(&0) {
                 ArtifactRead::Skipped {
@@ -3192,10 +3145,18 @@ fn read_artifact(repo: &Path, rel: &str, max_bytes: u64) -> ArtifactRead {
                 ArtifactRead::Text(String::from_utf8_lossy(&bytes).into_owned())
             }
         }
-        Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => ArtifactRead::Skipped {
-            reason: "permission denied".into(),
+        Err(BoundedRead::NotRegular) => ArtifactRead::Skipped {
+            reason: "not a regular file".into(),
         },
-        Err(_) => ArtifactRead::Missing,
+        Err(BoundedRead::TooLarge | BoundedRead::Grew) => ArtifactRead::Skipped {
+            reason: format!("artifact exceeds {max_bytes} byte limit"),
+        },
+        Err(BoundedRead::Io(err)) if err.kind() == std::io::ErrorKind::PermissionDenied => {
+            ArtifactRead::Skipped {
+                reason: "permission denied".into(),
+            }
+        }
+        Err(BoundedRead::Io(_)) => ArtifactRead::Missing,
     }
 }
 
@@ -4225,14 +4186,12 @@ fn drop_stale_and_out_of_range(
                 continue;
             }
         }
-        if meta.len() <= MAX_EOF_CHECK_BYTES {
-            if let Ok(bytes) = std::fs::read(&source) {
-                let newlines = bytes.iter().filter(|b| **b == b'\n').count();
-                let last_line = newlines + usize::from(bytes.last().is_some_and(|b| *b != b'\n'));
-                let before = lines.len();
-                lines.retain(|ln, _| *ln <= last_line);
-                past_eof += before - lines.len();
-            }
+        if let Ok(bytes) = read_capped(&source, MAX_EOF_CHECK_BYTES) {
+            let newlines = bytes.iter().filter(|b| **b == b'\n').count();
+            let last_line = newlines + usize::from(bytes.last().is_some_and(|b| *b != b'\n'));
+            let before = lines.len();
+            lines.retain(|ln, _| *ln <= last_line);
+            past_eof += before - lines.len();
         }
         if !lines.is_empty() {
             kept.insert(path, lines);
@@ -4248,6 +4207,66 @@ mod tests {
     use crate::procguard::LockedSpawn;
     use std::process::Command;
     use tempfile::TempDir;
+
+    /// Every bounded read of repository content goes through `read_capped`, so
+    /// the cap must hold for the bytes read, exactly at and one past the limit.
+    #[test]
+    fn read_capped_holds_the_cap_on_the_bytes_it_reads() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("f");
+        std::fs::write(&path, b"abcd").unwrap();
+        assert_eq!(read_capped(&path, 4).unwrap(), b"abcd");
+        assert!(matches!(read_capped(&path, 3), Err(BoundedRead::TooLarge)));
+        assert!(matches!(
+            read_capped(dir.path(), 100),
+            Err(BoundedRead::NotRegular)
+        ));
+    }
+
+    #[test]
+    fn oversized_files_are_refused_by_every_bounded_repository_read() {
+        let dir = TempDir::new().unwrap();
+        let repo = dir.path().canonicalize().unwrap();
+        std::fs::write(
+            repo.join("go.work"),
+            "x".repeat(MAX_GO_WORK_BYTES as usize + 1),
+        )
+        .unwrap();
+        assert_eq!(read_go_work_modules(&repo), Some((Vec::new(), true)));
+        std::fs::write(
+            repo.join("package.json"),
+            format!(
+                "{{\"pad\":\"{}\"}}",
+                "x".repeat(MAX_PACKAGE_JSON_BYTES as usize)
+            ),
+        )
+        .unwrap();
+        assert!(read_root_package_json(&repo).is_none());
+        std::fs::write(repo.join("lcov.info"), "x".repeat(64)).unwrap();
+        assert_ne!(content_probe(&repo, &repo.join("lcov.info"), 64), 0);
+        assert_eq!(content_probe(&repo, &repo.join("lcov.info"), 63), 0);
+        match read_artifact(&repo, "lcov.info", 63) {
+            ArtifactRead::Skipped { reason } => {
+                assert!(reason.contains("63 byte limit"), "{reason}")
+            }
+            _ => panic!("an artifact past the cap must be skipped"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_fifo_artifact_is_skipped_not_waited_on() {
+        let dir = TempDir::new().unwrap();
+        let repo = dir.path().canonicalize().unwrap();
+        let fifo = repo.join("lcov.info");
+        let c = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        match read_artifact(&repo, "lcov.info", 1024) {
+            ArtifactRead::Skipped { reason } => assert_eq!(reason, "not a regular file"),
+            _ => panic!("a FIFO must be skipped"),
+        }
+        assert_eq!(content_probe(&repo, &fifo, 1024), 0);
+    }
 
     /// Regression (audit M4): every per-file detail request re-parsed every
     /// artifact on disk. A second identical scan must be served from the

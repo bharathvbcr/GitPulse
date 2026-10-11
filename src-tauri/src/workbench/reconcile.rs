@@ -356,13 +356,7 @@ pub(super) fn release(state: &WorkbenchState, input: &str) -> Result<Value, Work
     }
     let request: Release = serde_json::from_str(input)
         .map_err(|e| WorkbenchError::new("invalid_input", e.to_string()))?;
-    if request.id.is_empty()
-        || request.id.len() > 128
-        || !request
-            .id
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
-    {
+    if !super::is_record_id(&request.id) {
         return Err(WorkbenchError::new(
             "invalid_input",
             "Select a saved attempt.",

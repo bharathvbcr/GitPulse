@@ -11,12 +11,11 @@ struct Identity {
     id: String,
 }
 
+/// Managed-run identities are shorter than the general record identifier.
+const MAX_MANAGED_ID_BYTES: usize = 100;
+
 fn valid_id(value: &str) -> bool {
-    !value.is_empty()
-        && value.len() <= 100
-        && value
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+    super::is_record_id_within(value, MAX_MANAGED_ID_BYTES)
 }
 
 fn parse(input: &str) -> Result<String, WorkbenchError> {

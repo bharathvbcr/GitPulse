@@ -350,7 +350,7 @@ fn a_guarded_command_returns_the_policy_verdict_beside_its_output() {
     // unchecked verdict allowed to proceed — but it must not arrive looking
     // like a check that ran and passed, or the UI would report a guarded
     // mutation that nothing guarded.
-    // Observed here: "demoted", which the verdict ranking in commands/mod.rs
+    // Observed here: "demoted", which the verdict ranking in commands/policy.rs
     // places strictly above "allowed" (Blocked > Warned > Demoted > Unchecked
     // > Allowed). Asserting the negative rather than the exact value keeps this
     // from breaking if a sidecar is present in some environment.
