@@ -90,12 +90,12 @@
   import HealthSummaryCard from "./health/HealthSummaryCard.svelte";
   import GithubAlertsSection from "./health/GithubAlertsSection.svelte";
   import AlertLinkButton from "./health/AlertLinkButton.svelte";
+  import { runManviAction } from "../terminal/manviAction";
   import { formatError } from "../ui/formatError";
   import {
     formatRunDetail,
     formatRunSummary,
     runPassed,
-    type TerminalRunResult,
   } from "../terminal/runResult";
   import { reportPanelError } from "../diagnostics/report";
   import { getCodeintelStatus, getDeadSymbols } from "../codeintel/client";
@@ -664,26 +664,17 @@
     const repoPath = $repoStore.currentPath;
     if (!step.argv || step.argv.length === 0 || !repoPath) return false;
     const actionLabel = step.command ?? step.text;
-    let actionRecorded = false;
     stepResults[step.id] = { running: true };
 
     try {
-      const res = await invoke<TerminalRunResult>("cmd_manvi_run_action", {
+      const res = await runManviAction({
         repoPath,
-        args: step.argv,
+        argv: step.argv,
         actionKind: "health",
-        // Long enough for a cold install/build; the backend clamps to [1s, 30min].
-        timeoutSecs: 600,
+        journalKind: "remediation-step",
+        label: actionLabel,
       });
       const passed = runPassed(res);
-      harnessStore.recordAction({
-        repoPath,
-        kind: "remediation-step",
-        label: actionLabel,
-        ok: passed,
-        verdict: res.policy ?? null,
-      });
-      actionRecorded = true;
       if (!guard.isLive()) return false;
 
       stepResults[step.id] = {
@@ -699,14 +690,6 @@
 
       return passed;
     } catch (err) {
-      if (!actionRecorded) {
-        harnessStore.recordAction({
-          repoPath,
-          kind: "remediation-step",
-          label: actionLabel,
-          ok: false,
-        });
-      }
       if (!guard.isLive()) return false;
       const msg = formatError(err);
       stepResults[step.id] = {

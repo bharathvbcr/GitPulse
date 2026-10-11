@@ -17,11 +17,11 @@ describe("HealthPanel source contracts & interactive remediation", () => {
     // panel used to spell the whole wire shape out anonymously at the invoke
     // call, which is why a backend field rename could reach it as `undefined`
     // with nothing to catch it.
-    expect(source).toContain("invoke<TerminalRunResult>");
+    expect(source).toContain("runManviAction({");
     expect(source).not.toContain("invoke<{");
-    expect(source).toContain('"cmd_manvi_run_action"');
+    expect(source).not.toContain('"cmd_manvi_run_action"');
     expect(source).toContain('actionKind: "health"');
-    expect(source).toContain("args: step.argv,");
+    expect(source).toContain("argv: step.argv,");
   });
 
   it("keeps both output streams, and marks a clipped tail as clipped", () => {
@@ -38,27 +38,19 @@ describe("HealthPanel source contracts & interactive remediation", () => {
     expect(source).toContain("buildRunnablePlanSteps(plan.text)");
   });
 
-  it("journals step execution into harnessStore", () => {
-    expect(source).toContain("harnessStore.recordAction({");
-    expect(source).toContain('kind: "remediation-step",');
-  });
-
-  it("journals a settled step before any stale-UI return", () => {
+  it("journals step execution through the shared runner, before any stale-UI return", () => {
+    // runManviAction journals the outcome or the failure before it returns or
+    // rethrows (terminal/manviAction.test.ts), so the panel awaits it ahead of
+    // its first liveness check and files nothing of its own.
+    expect(source).toContain('journalKind: "remediation-step",');
     const body = source.slice(
       source.indexOf("async function runStep"),
       source.indexOf("async function runAllSteps"),
     );
-    const settled = body.indexOf("await invoke<TerminalRunResult>");
-    const successJournal = body.indexOf("harnessStore.recordAction", settled);
-    const successGuard = body.indexOf("if (!guard.isLive()) return false;", settled);
-    expect(successJournal).toBeGreaterThan(settled);
-    expect(successJournal).toBeLessThan(successGuard);
-
-    const caught = body.indexOf("} catch", successGuard);
-    const failureJournal = body.indexOf("harnessStore.recordAction", caught);
-    const failureGuard = body.indexOf("if (!guard.isLive()) return false;", caught);
-    expect(failureJournal).toBeGreaterThan(caught);
-    expect(failureJournal).toBeLessThan(failureGuard);
+    const settled = body.indexOf("await runManviAction(");
+    expect(settled).toBeGreaterThan(-1);
+    expect(settled).toBeLessThan(body.indexOf("if (!guard.isLive()) return false;"));
+    expect(body).not.toContain("harnessStore.recordAction");
   });
 
   it("provides single-step and sequential run-all execution", () => {

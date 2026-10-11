@@ -23,7 +23,7 @@
 <script lang="ts">
   import { untrack } from "svelte";
   import { currentRepoPath, repoStore } from "../stores/repoStore";
-  import { invoke } from "../ipc/invoke";
+  import { runManviAction } from "../terminal/manviAction";
   import {
     Percent,
     RefreshCw,
@@ -761,25 +761,16 @@
     runId: number,
   ): Promise<boolean> {
     let passed = false;
-    let commandCompleted = false;
     const actionLabel = step.command ?? step.text;
     try {
-      const res = await invoke<TerminalRunResult>("cmd_manvi_run_action", {
+      const res = await runManviAction({
         repoPath,
-        args: step.argv,
+        argv: step.argv,
         actionKind: "coverage",
-        // Long enough for a cold install/build/test cycle; the backend clamps to [1s, 30min].
-        timeoutSecs: 900,
-      });
-      commandCompleted = true;
-      passed = runPassed(res);
-      harnessStore.recordAction({
-        repoPath,
-        kind: "coverage-step",
+        journalKind: "coverage-step",
         label: actionLabel,
-        ok: passed,
-        verdict: res.policy ?? null,
       });
+      passed = runPassed(res);
       if (!guard.isLive()) return false;
 
       const detail = formatRunDetail(res);
@@ -801,14 +792,6 @@
       }
     } catch (err: unknown) {
       passed = false;
-      if (!commandCompleted) {
-        harnessStore.recordAction({
-          repoPath,
-          kind: "coverage-step",
-          label: actionLabel,
-          ok: false,
-        });
-      }
       if (!guard.isLive()) return false;
       const detail = reportPanelError("coverage", err);
       stepResults[step.id] = {
@@ -947,30 +930,13 @@
     repoPath: string,
     actionLabel: string,
   ): Promise<TerminalRunResult> {
-    try {
-      const res = await invoke<TerminalRunResult>("cmd_manvi_run_action", {
-        repoPath,
-        args: argv,
-        actionKind: "coverage_generator",
-        timeoutSecs: 900,
-      });
-      harnessStore.recordAction({
-        repoPath,
-        kind: "coverage-script",
-        label: actionLabel,
-        ok: runPassed(res),
-        verdict: res.policy ?? null,
-      });
-      return res;
-    } catch (err: unknown) {
-      harnessStore.recordAction({
-        repoPath,
-        kind: "coverage-script",
-        label: actionLabel,
-        ok: false,
-      });
-      throw err;
-    }
+    return runManviAction({
+      repoPath,
+      argv,
+      actionKind: "coverage_generator",
+      journalKind: "coverage-script",
+      label: actionLabel,
+    });
   }
 
   async function runCoverageScript(
