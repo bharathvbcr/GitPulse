@@ -426,7 +426,7 @@ fn the_identity_flag_cannot_be_reached_by_a_hook_payload() {
         "identity output parses as hook JSON, so a host could read it as a decision"
     );
     assert!(
-        answer.elapsed < Duration::from_secs(10),
+        answer.elapsed < hermetic_env::coverage_relaxed(Duration::from_secs(10)),
         "identity waited on stdin it does not read"
     );
 }

@@ -190,7 +190,10 @@ fn symlink_loop_does_not_hang_or_explode() {
         !report.scan.truncated,
         "loop link is skipped, not descended"
     );
-    assert!(elapsed < Duration::from_secs(10), "no pathological walk");
+    assert!(
+        elapsed < common::env::coverage_relaxed(Duration::from_secs(10)),
+        "no pathological walk"
+    );
     // Exactly one 'loop' entry worth of link-size, not exponential growth.
     let expected_floor = 500u64;
     assert!(

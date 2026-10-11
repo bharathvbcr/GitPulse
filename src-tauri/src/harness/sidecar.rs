@@ -2387,7 +2387,7 @@ done"#;
             "gave up before the injected deadline: {elapsed:?}"
         );
         assert!(
-            elapsed < Duration::from_secs(4),
+            elapsed < crate::test_support::coverage_relaxed(Duration::from_secs(4)),
             "the stall was not bounded: {elapsed:?}"
         );
 
@@ -3330,7 +3330,7 @@ while IFS= read -r line; do handle "$line" & done
         let decision = verdict.expect("the fresh second connection must answer the verdict");
         assert_eq!(decision.action, "allow");
         assert!(
-            elapsed < Duration::from_secs(10),
+            elapsed < crate::test_support::coverage_relaxed(Duration::from_secs(10)),
             "retry exceeded any sane bound: {elapsed:?}"
         );
 

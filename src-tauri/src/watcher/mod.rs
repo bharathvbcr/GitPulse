@@ -3970,7 +3970,7 @@ mod tests {
         }
         let elapsed = started.elapsed();
         assert!(
-            elapsed < Duration::from_millis(750),
+            elapsed < crate::test_support::coverage_relaxed(Duration::from_millis(750)),
             "10k linked-worktree internal-root classifications took {elapsed:?} (alias walk regression)"
         );
 

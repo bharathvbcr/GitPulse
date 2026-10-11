@@ -696,7 +696,7 @@ mod tests {
             "entries were dropped during collision disambiguation"
         );
         assert!(
-            elapsed < std::time::Duration::from_secs(30),
+            elapsed < crate::test_support::coverage_relaxed(std::time::Duration::from_secs(30)),
             "took {elapsed:?}"
         );
     }

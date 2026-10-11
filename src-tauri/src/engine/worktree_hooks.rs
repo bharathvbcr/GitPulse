@@ -587,7 +587,7 @@ mod tests {
         let err = result.expect_err("a hook past its deadline must fail");
         assert!(err.contains("did not complete"), "{err}");
         assert!(
-            elapsed < std::time::Duration::from_secs(10),
+            elapsed < crate::test_support::coverage_relaxed(std::time::Duration::from_secs(10)),
             "the hook ran {elapsed:?} against a 1s deadline"
         );
     }

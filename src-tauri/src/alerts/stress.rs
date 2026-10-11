@@ -212,7 +212,7 @@ fn the_scanner_keeps_up_with_a_terminal_writing_as_fast_as_it_can() {
     let elapsed = started.elapsed();
     assert_eq!(signals, 0, "ordinary terminal output raised a notification");
     assert!(
-        elapsed < Duration::from_secs(20),
+        elapsed < crate::test_support::coverage_relaxed(Duration::from_secs(20)),
         "scanning {} MiB took {elapsed:?}",
         rounds * chunk.len() / (1024 * 1024)
     );

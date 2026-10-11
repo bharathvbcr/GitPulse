@@ -126,6 +126,70 @@ fn integration_tests_resolve_state_under_the_per_process_root() {
     );
 }
 
+/// Lines (1-based, with their text) where an elapsed time is compared against a
+/// `Duration::from_*` that is not wrapped in `coverage_relaxed`.
+///
+/// A limit is the text after the `<` up to the first `,`, `;`, `{` or `=>`, which ends the
+/// comparison inside `assert!(elapsed < Duration::from_secs(5), "..")`. It is
+/// read across lines because rustfmt breaks a long assertion so the `Duration`
+/// sits on the line after `elapsed <`; a per-line check missed every one of
+/// those. Only a comparison counts: a benchmark that reports `{elapsed:?}` has
+/// no `<` after `elapsed` and is not flagged. Comment lines are skipped.
+fn bare_wall_clock_limits(text: &str) -> Vec<(usize, String)> {
+    let lines: Vec<&str> = text.lines().collect();
+    let mut found = Vec::new();
+    for (index, line) in lines.iter().enumerate() {
+        let code = line.trim_start();
+        if code.starts_with("//") {
+            continue;
+        }
+        let Some(limit_start) = elapsed_comparison_end(code) else {
+            continue;
+        };
+        let mut limit = String::from(&code[limit_start..]);
+        for next in lines.iter().skip(index + 1).take(2) {
+            if limit_end(&limit).is_some() {
+                break;
+            }
+            limit.push(' ');
+            limit.push_str(next.trim());
+        }
+        let limit = &limit[..limit_end(&limit).unwrap_or(limit.len())];
+        if limit.contains("Duration::from_") && !limit.contains("coverage_relaxed") {
+            found.push((index + 1, code.to_string()));
+        }
+    }
+    found
+}
+
+/// Where a limit's text ends: the `,` that precedes an assertion message, the
+/// `;` of a statement, the `{` of an `if`/`while` body, or a match arm's `=>`.
+fn limit_end(text: &str) -> Option<usize> {
+    text.find([',', ';', '{'])
+        .into_iter()
+        .chain(text.find("=>"))
+        .min()
+}
+
+/// Byte offset just past the `<` of an `elapsed < ..` / `.elapsed() < ..` /
+/// `x.elapsed < ..` comparison on this line, if there is one.
+fn elapsed_comparison_end(code: &str) -> Option<usize> {
+    let mut from = 0;
+    while let Some(found) = code[from..].find("elapsed") {
+        let after = from + found + "elapsed".len();
+        let rest = code[after..].trim_start_matches("()").trim_start();
+        // `<` and `<=` compare; `<<` is a shift and never follows `elapsed`
+        // in a limit.
+        if let Some(tail) = rest.strip_prefix('<') {
+            if !tail.starts_with('<') {
+                return Some(code.len() - tail.len());
+            }
+        }
+        from = after;
+    }
+    None
+}
+
 /// A wall-clock limit asserted as a bare `Duration::from_millis(400)` is a limit
 /// nobody scaled for an instrumented or loaded runner, and when it includes a
 /// process spawn it fails on contention rather than on a bug. Every such
@@ -146,17 +210,8 @@ fn no_wall_clock_assertion_bypasses_the_scaling_helper() {
             continue;
         }
         let text = std::fs::read_to_string(&path).unwrap();
-        for (index, line) in text.lines().enumerate() {
-            let code = line.trim_start();
-            if code.starts_with("//") {
-                continue;
-            }
-            if code.contains(".elapsed() <")
-                && code.contains("Duration::from_")
-                && !code.contains("coverage_relaxed")
-            {
-                offenders.push(format!("{}:{}: {}", path.display(), index + 1, code));
-            }
+        for (line, code) in bare_wall_clock_limits(&text) {
+            offenders.push(format!("{}:{}: {}", path.display(), line, code));
         }
     }
     assert!(
@@ -164,4 +219,68 @@ fn no_wall_clock_assertion_bypasses_the_scaling_helper() {
         "wall-clock limits must be written `coverage_relaxed(Duration::from_..)`:\n{}",
         offenders.join("\n")
     );
+}
+
+/// The guard above is only worth having if it sees the shapes the suite really
+/// contains, so its matcher is pinned on them directly.
+#[test]
+fn the_wall_clock_matcher_sees_single_line_and_wrapped_limits_only() {
+    let flagged = |source: &str| bare_wall_clock_limits(source).len();
+    // Single line, field or binding, either spelling of the elapsed time.
+    assert_eq!(
+        flagged("assert!(elapsed < Duration::from_secs(10), \"x\");"),
+        1
+    );
+    assert_eq!(
+        flagged("assert!(t.elapsed() < Duration::from_millis(5));"),
+        1
+    );
+    assert_eq!(
+        flagged("assert!(answer.elapsed < Duration::from_secs(10));"),
+        1
+    );
+    // The rustfmt-wrapped form: the limit is on the next line.
+    assert_eq!(
+        flagged("assert!(\n    elapsed < std::time::Duration::from_secs(5),\n    \"slow\"\n);"),
+        1
+    );
+    assert_eq!(
+        flagged("assert!(\n    elapsed <\n        Duration::from_secs(5),\n    \"slow\"\n);"),
+        1
+    );
+    assert_eq!(flagged("assert!(elapsed <= Duration::from_secs(5));"), 1);
+    // Routed through the helper, in either layout.
+    assert_eq!(
+        flagged("assert!(elapsed < coverage_relaxed(Duration::from_secs(5)));"),
+        0
+    );
+    assert_eq!(
+        flagged(
+            "assert!(\n    elapsed < coverage_relaxed(Duration::from_secs(5)),\n    \"slow\"\n);"
+        ),
+        0
+    );
+    // Not assertions: a deadline loop and a match guard compare against a variable.
+    assert_eq!(
+        flagged("while t.elapsed() < timeout {\n    let d = Duration::from_secs(1);\n}"),
+        0
+    );
+    assert_eq!(
+        flagged(
+            "Ok(None) if started.elapsed() < timeout => {\n    sleep(Duration::from_millis(5));\n}"
+        ),
+        0
+    );
+    // Not limits: a reported time, a non-Duration bound, a Duration in the message,
+    // and a comment.
+    assert_eq!(flagged("println!(\"took {elapsed:?}\");"), 0);
+    assert_eq!(
+        flagged("assert!(elapsed < budget, \"over {:?}\", Duration::from_secs(1));"),
+        0
+    );
+    assert_eq!(
+        flagged("let elapsed = started.elapsed();\nlet wait = Duration::from_secs(5);"),
+        0
+    );
+    assert_eq!(flagged("// assert!(elapsed < Duration::from_secs(5));"), 0);
 }
