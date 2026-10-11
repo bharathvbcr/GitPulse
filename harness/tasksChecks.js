@@ -1983,7 +1983,10 @@ if (params.has("check")) {
 
     // ---- Filing a task as a GitHub issue ----------------------------------
     {
-      const issuePrompt = () => [...document.querySelectorAll('[role="dialog"]')].filter(node => node.getAttribute("aria-label") === "Create GitHub issue").at(-1);
+      // Only the prompt the store still holds is open. A dismissed dialog lingers in the DOM for its fade-out, and WebKit runs that fade
+      // longer than Chrome does, so a bare DOM lookup finds the previous task's dialog and answers it.
+      const livePrompt = title => get(promptState)?.options.title === title ? [...document.querySelectorAll('[role="dialog"]')].filter(node => node.getAttribute("aria-label") === title).at(-1) : undefined;
+      const issuePrompt = () => livePrompt("Create GitHub issue");
       // By its stem: a selection's row reads "Create 2 GitHub issues…".
       const issueRow = () => menu() && [...menu().querySelectorAll("button")].find(el => /^Create (\d+ )?GitHub issues?…/.test(el.textContent.trim()));
       const labelsOf = id => tasks.find(task => task.id === id).labels;
@@ -2032,7 +2035,7 @@ if (params.has("check")) {
         if (root.querySelector('[aria-label="Selected task actions"]')) await click("Clear task selection");
         for (const id of ids) { card(id).dispatchEvent(new MouseEvent("click",{bubbles:true,ctrlKey:true})); await settle(); }
       };
-      const batchPrompt = () => [...document.querySelectorAll('[role="dialog"]')].filter(node => node.getAttribute("aria-label") === "Create GitHub issues").at(-1);
+      const batchPrompt = () => livePrompt("Create GitHub issues");
       await multiSelect(["task-23", "task-24", "task-20"]);
       await openMenu("task-23");
       check(`a selection offers one run and counts the linked task it will skip (${issueRow()?.textContent.trim()})`,

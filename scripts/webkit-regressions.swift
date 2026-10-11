@@ -22,7 +22,15 @@ guard let deadline = requestedDeadline, deadline.isFinite, deadline >= 1, deadli
 }
 
 let app = NSApplication.shared
-app.setActivationPolicy(.accessory)
+// `.regular`, not `.accessory`: for an accessory app WebKit stops treating the
+// view as one a person is using about 30 s into a run and aligns every timer to
+// a one-second tick, so each `settle()` in a long harness costs a second and
+// `tasks` ran out its deadline near check 263 with nothing hung. Measured per
+// ten seconds of the run: overrun of a 30 ms timer 2-10 ms before 30 s,
+// 830-980 ms after, under `.accessory` (with `beginActivity` held, and with the
+// occlusion SPI below, so neither is the cause); under `.regular` 2-4 ms for
+// the whole run. The cost is a Dock icon while a page runs.
+app.setActivationPolicy(.regular)
 let config = WKWebViewConfiguration()
 // The app under test may lose focus while the agent reports progress. Keep
 // fixture timers running; otherwise a hidden webview can suspend mid-assertion.
