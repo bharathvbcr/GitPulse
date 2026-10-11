@@ -94,16 +94,13 @@ describe("TerminalSession PTY contracts", () => {
     expect(source).toContain('resize: (sessionId, rows, cols) => invoke("cmd_terminal_resize"');
   });
 
-  it("applies the theme palette reactively from themeStore", () => {
-    expect(source).toContain('import { themeStore } from "../stores/themeStore";');
+  // Rendered in harness/terminal.html: "terminal palette follows the
+  // completed theme transition", "theme switch preserves sessions".
+  it("gives a terminal created between theme emissions the current palette", () => {
     const effectIdx = source.indexOf("$themeStore;");
     expect(effectIdx).toBeGreaterThan(-1);
-    expect(source.indexOf("term.options.theme = termTheme()", effectIdx)).toBeGreaterThan(effectIdx);
-    // Construction-time palette stays too: a term created between emissions
-    // still gets the current CSS-variable palette immediately.
     expect(source.slice(0, effectIdx)).toContain("theme: termTheme()");
   });
-
   it("reserves one fixed-height status row instead of swapping py-2/py-1.5 strips", () => {
     expect(source).not.toContain("py-2 border-t");
     expect(source).not.toContain("py-1.5 border-t");
@@ -167,70 +164,27 @@ describe("TerminalSession PTY contracts", () => {
     }
   });
 
-  it("lets the strip claim tab chords before xterm writes them to the shell", () => {
-    // Without this the chord is typed into the shell, because the terminal is
-    // exactly where it will always be typed.
-    const handlerIdx = source.indexOf("created.attachCustomKeyEventHandler(");
-    expect(handlerIdx).toBeGreaterThan(-1);
-    const body = source.slice(handlerIdx, source.indexOf("term = created;"));
-    expect(body).toContain('event.type !== "keydown"');
-    expect(body).toContain("return !onChord(event);");
-  });
-
-  it("acknowledges output credit when the emulator cannot finish painting", () => {
-    // The ack used to live inside term?.write's callback and return early
-    // once `disposed` was set, so a close during a flood never released the
-    // bytes Rust had already reserved.
-    const outputIdx = source.indexOf("output(b64, sessionId, reserved)");
-    expect(outputIdx).toBeGreaterThan(-1);
-    const body = source.slice(outputIdx, source.indexOf("exit(event)", outputIdx));
-    expect(body).toContain("planTerminalOutput(");
-    // A frame that cannot be measured is lost output, never a reason to end
-    // the process: the host sheds instead of waiting on its credit.
-    expect(body).toContain('decision.action === "lost"');
-    expect(body).toContain("lifecycle?.fail(decision.failure, true)");
-    expect(body).not.toContain("lifecycle?.stop(");
-    expect(body).not.toContain("credit.accept(");
-    expect(body).not.toContain("if (disposed) return");
-    expect(body).not.toContain("term?.write(");
-    const cleanupIdx = source.indexOf("disposed = true;");
-    expect(source.indexOf("credit.releaseAll()", cleanupIdx)).toBeGreaterThan(cleanupIdx);
-    expect(source.indexOf("credit.releaseAll()", cleanupIdx)).toBeLessThan(source.indexOf("term?.dispose()", cleanupIdx));
-  });
-
-  it("coalesces output acknowledgements and flushes them synchronously on teardown", () => {
-    // One `cmd_terminal_ack` per 4 KiB chunk was one IPC call per read.
-    const helper = source.slice(source.indexOf("function acknowledgeOutput("), source.indexOf("function paintOutput("));
-    expect(helper).toContain("acks.add(sessionId, bytes)");
-    expect(helper).not.toContain('invoke("cmd_terminal_ack"');
-    expect(source).toContain("createAckCoalescer(");
+  // Rendered in harness/terminal.html: "painted output is acknowledged to
+  // the PTY", "a corrupt chunk acknowledges its reserved length", "a live
+  // oversized chunk stays on the status row". What the fixture cannot reach
+  // is teardown in the middle of a flood: credit released, then the owed
+  // acknowledgements flushed while the lifecycle can still report.
+  it("releases reserved credit and flushes owed acknowledgements on teardown, in that order", () => {
     const cleanupIdx = source.indexOf("disposed = true;");
     const released = source.indexOf("credit.releaseAll()", cleanupIdx);
     const flushed = source.indexOf("acks.flush();", cleanupIdx);
+    expect(released).toBeGreaterThan(cleanupIdx);
+    expect(released).toBeLessThan(source.indexOf("term?.dispose()", cleanupIdx));
     expect(flushed, "teardown sends what is owed").toBeGreaterThan(released);
     expect(flushed, "while the lifecycle can still report a failure").toBeLessThan(
       source.indexOf("lifecycle?.dispose()", cleanupIdx),
     );
   });
-
-  it("owns Backspace on the helper textarea before xterm can reinsert the line", () => {
-    const mountIdx = source.indexOf("onMount(() => {");
-    const openIdx = source.indexOf("t?.open(host)", mountIdx);
-    const guardIdx = source.indexOf("addEventListener(type, onEraseCapture, true)", mountIdx);
-    expect(guardIdx).toBeGreaterThan(mountIdx);
-    expect(guardIdx).toBeLessThan(openIdx);
-    expect(source).toContain("xterm-helper-textarea");
-    expect(source).toContain("eraseGuard.decide");
-    expect(source).toContain("applyHelperTextareaHardening");
-    expect(source).toContain("decision.clearTextarea");
-    expect(source).toContain("decision.cancelDefault");
-    expect(source).toContain("webkit229ChordEvent");
-    expect(source).toContain("applicationCursorKeysMode");
-    const capture = source.slice(source.indexOf("const onEraseCapture"), source.indexOf("if (host) {"));
-    expect(capture.indexOf("webkit229ChordEvent")).toBeLessThan(capture.indexOf("eraseGuard.decide"));
-    const cleanup = source.indexOf("removeEventListener(type, onEraseCapture, true)", openIdx);
-    expect(cleanup).toBeGreaterThan(openIdx);
-  });
+  // Backspace, held Backspace, an ordinary letter, the helper textarea's
+  // writing-tool refusal and the keyCode 229 resend are rendered in
+  // harness/terminal.html; tab chords are claimed before xterm writes them
+  // ("close chord kills only its session", "a held close chord does not
+  // repeat", which reads the shell's writes).
 });
 
 /**
@@ -314,14 +268,9 @@ describe("TerminalSession linkification", () => {
     expect(source).toContain("activePath !== repoPath");
   });
 
-  it("records the reveal before the selection that triggers the viewer", () => {
-    // The viewer reads the request as it mounts, so recording it afterwards
-    // is a race the click loses on a fast file read.
-    const body = source.slice(source.indexOf("async function activateLink"));
-    expect(body.indexOf("requestReveal(action.path, action.line, action.column)"))
-      .toBeLessThan(body.indexOf("repoStore.selectFilePath(action.path)"));
-  });
-
+  // A file link's reveal reaching the viewer is rendered: "the viewer lands on
+  // the line the reference named", "the viewer reports the revealed line as
+  // selected".
   it("maps buffer columns from cell widths rather than string offsets", () => {
     // A double-width glyph is one string index and two cells; reading the
     // offset as the column drags every later link range to the left.
