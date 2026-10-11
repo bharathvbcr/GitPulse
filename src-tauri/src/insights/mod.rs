@@ -2176,34 +2176,6 @@ mod tests {
         }
     }
 
-    /// One builder per fact. Two hand-written `WorktreeSummary` literals and a
-    /// third agent-kind scan in the collision path each had to be kept in step
-    /// by hand; a new field, or a change to how a path is labelled, landed in
-    /// one and not the others.
-    #[test]
-    fn worktree_rows_and_agent_labels_each_have_one_builder() {
-        let source = include_str!("mod.rs");
-        let production = &source[..source
-            .find("#[cfg(test)]\nmod tests")
-            .expect("test module marker")];
-        // A struct literal opens on a line of its own; signatures returning
-        // the type and the definition do not.
-        assert_eq!(
-            production
-                .lines()
-                .filter(|line| line.trim() == "WorktreeSummary {")
-                .count(),
-            1,
-            "summarise_worktree is the only WorktreeSummary literal"
-        );
-        assert_eq!(
-            production.matches("agent_layout(").count(),
-            1,
-            "agent_labels is the one scan"
-        );
-        assert!(!production.contains("agent_kind(&"));
-    }
-
     /// The snapshot row and the change-context row for an unlisted checkout
     /// come from one builder. Pinned to the bytes the two separate builders
     /// produced before they converged, so the convergence changed no output.

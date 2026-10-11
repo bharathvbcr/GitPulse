@@ -187,6 +187,25 @@ fn wait_until(within: Duration, mut done: impl FnMut() -> bool) -> bool {
     done()
 }
 
+/// The counter's value once it has not moved for `hold`, or `None` if it was
+/// still moving when `within` ran out.
+fn settled_count(counter: &AtomicUsize, hold: Duration, within: Duration) -> Option<usize> {
+    let deadline = Instant::now() + within;
+    let mut last = counter.load(Ordering::SeqCst);
+    let mut since = Instant::now();
+    while Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+        let now = counter.load(Ordering::SeqCst);
+        if now != last {
+            last = now;
+            since = Instant::now();
+        } else if since.elapsed() >= hold {
+            return Some(last);
+        }
+    }
+    None
+}
+
 /// The reported defect. Before the fix the stall killed the shell with
 /// "renderer did not acknowledge output" and this exit arrived.
 #[test]
@@ -252,14 +271,27 @@ fn detaching_leaves_the_process_running_and_attach_takes_it_back() {
         "{listed:?}"
     );
     // Nothing is delivered and nothing waits: the flood keeps running.
-    std::thread::sleep(Duration::from_millis(300));
-    let quiet = view.received.load(Ordering::SeqCst);
-    std::thread::sleep(Duration::from_secs(1));
-    assert_eq!(
-        view.received.load(Ordering::SeqCst),
-        quiet,
-        "a detached session is not delivered"
-    );
+    // Delivery that was already in flight lands, then stops: wait for the
+    // count to hold still across consecutive polls rather than for a fixed
+    // time. A session still delivered after detach either never settles
+    // (and fails here) or moves inside the window below; it cannot pass by
+    // luck of timing.
+    let quiet = settled_count(
+        &view.received,
+        Duration::from_millis(200),
+        Duration::from_secs(5),
+    )
+    .expect("a detached session kept delivering output");
+    // Then hold the line over a bounded window, stopping at the first byte.
+    let window = Instant::now() + Duration::from_secs(1);
+    while Instant::now() < window {
+        assert_eq!(
+            view.received.load(Ordering::SeqCst),
+            quiet,
+            "a detached session is not delivered"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
     assert!(alive(pid));
     assert!(view.exits.try_recv().is_err());
 

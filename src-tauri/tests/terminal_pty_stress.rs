@@ -161,14 +161,47 @@ fn output_flood_is_backpressured_then_drains_without_loss() {
     let dir = repo();
     let spawned = spawn_session(app.handle(), &state, dir.path().to_str().unwrap(), 24, 80,
         Some("/bin/sh".into()), Some(vec!["-c".into(), "i=0; while [ $i -lt 32768 ]; do printf 0123456789abcdef0123456789abcdef; i=$((i+1)); done".into()]), None).unwrap();
-    std::thread::sleep(Duration::from_millis(250));
+    // Receive without acknowledging until the stream goes quiet. Quiet after
+    // the producer demonstrably ran is the observable "blocked on flow
+    // control"; a producer that ignored backpressure would instead deliver
+    // every byte, which the cap below turns into a failure.
+    const PRODUCED: usize = 1024 * 1024;
+    let mut held: Vec<Vec<u8>> = Vec::new();
+    let mut unacknowledged = 0usize;
+    while unacknowledged < PRODUCED {
+        match receive.recv_timeout(Duration::from_millis(400)) {
+            Ok(payload) => {
+                let (_id, bytes) = take_output(&payload);
+                unacknowledged += bytes.len();
+                held.push(bytes);
+            }
+            Err(_) => break,
+        }
+    }
+    assert!(
+        unacknowledged > 0,
+        "positive control: the producer ran and delivered before it was held"
+    );
+    assert!(
+        unacknowledged < PRODUCED,
+        "producer must wait for render acknowledgements (delivered {unacknowledged} unacknowledged bytes)"
+    );
     assert!(
         exit_receive.try_recv().is_err(),
-        "producer must wait for render acknowledgements"
+        "a producer held by flow control must not have exited"
     );
+
+    // Now repay what was held, in order, and drain the rest without loss.
     let mut total = 0usize;
+    for bytes in held {
+        for (offset, byte) in bytes.iter().enumerate() {
+            assert_eq!(*byte, b"0123456789abcdef"[(total + offset) % 16]);
+        }
+        total += bytes.len();
+        acknowledge_output(&state, &spawned.id, bytes.len()).unwrap();
+    }
     let deadline = Instant::now() + Duration::from_secs(15);
-    while total < 1024 * 1024 && Instant::now() < deadline {
+    while total < PRODUCED && Instant::now() < deadline {
         let (_id, bytes) = take_output(&receive.recv_timeout(Duration::from_secs(3)).unwrap());
         for (offset, byte) in bytes.iter().enumerate() {
             assert_eq!(*byte, b"0123456789abcdef"[(total + offset) % 16]);
@@ -176,7 +209,7 @@ fn output_flood_is_backpressured_then_drains_without_loss() {
         total += bytes.len();
         acknowledge_output(&state, &spawned.id, bytes.len()).unwrap();
     }
-    assert_eq!(total, 1024 * 1024);
+    assert_eq!(total, PRODUCED);
     exit_receive.recv_timeout(Duration::from_secs(5)).unwrap();
 }
 

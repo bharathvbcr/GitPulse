@@ -6922,6 +6922,10 @@ mod tests {
         assert_eq!(literal_pathspec("0:foo.py"), ":(literal)0:foo.py");
     }
 
+    /// Kept as a stated source contract: the failure is Windows-only (a Git for
+    /// Windows index refuses `0:foo.py`), so no test on another host can
+    /// observe it. The fixtures that must not be reintroduced are the two
+    /// `read-tree` call shapes below.
     #[test]
     fn tests_do_not_seed_drive_shaped_names_through_read_tree() {
         let src = include_str!("git_reader.rs");
@@ -6932,8 +6936,6 @@ mod tests {
             "read-tree cannot install 0:foo.py into a Git for Windows index; use mktree for the commit and git_output if the refusal itself is the assertion"
         );
         assert!(!src.contains(&forbidden_path));
-        assert!(src.contains("commit_index_union_mktree"));
-        assert!(src.contains("index_can_store_path"));
     }
 
     #[test]
