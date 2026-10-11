@@ -363,6 +363,31 @@
         await churn();
         check(`WorkView: "Show more" persists across unrelated publishes (${expanded} -> ${rows()})`, () => rows() === expanded);
 
+        // ---- WorkView: a filter that hides every row says so, in its own words.
+        const filterField = () => app.querySelector('input[aria-label="Filter work rows"]');
+        filterField().value = "zzz-matches-nothing"; filterField().dispatchEvent(new Event("input", { bubbles: true }));
+        await until(() => app.textContent.includes("No row matches this filter"));
+        check("WorkView: a filter matching nothing says so, never \"Nothing in flight\", and counts what it hid",
+          () => rows() === 0 && !app.textContent.includes("Nothing in flight") && app.textContent.includes(`0 of ${worktrees.length}`));
+        buttons().find((b) => b.textContent.trim() === "Clear filter")?.click();
+        await until(() => rows() > 0);
+        check("WorkView: Clear filter brings the rows back and empties the field", () => rows() > 0 && filterField().value === "");
+        const dirtyFacet = () => buttons().find((b) => b.textContent.trim() === "Uncommitted changes");
+        const pressedBefore = dirtyFacet()?.getAttribute("aria-pressed");
+        dirtyFacet()?.click(); await settle(5);
+        check("WorkView: the Uncommitted changes facet is a pressed toggle that narrows the rows",
+          () => pressedBefore === "false" && dirtyFacet()?.getAttribute("aria-pressed") === "true" && app.textContent.includes(`of ${worktrees.length}`));
+        dirtyFacet()?.click(); await settle(5);
+        check("WorkView: names the repository the reader is standing in", () => Boolean(app.querySelector('section[aria-label="Current repository"]')));
+        // A collision scan that failed is not a scan that found nothing.
+        const collisionFixture = fixtures.cmd_collision_risk;
+        fixtures.cmd_collision_risk = () => { throw new Error("fixture: collision scan unavailable"); };
+        await show(WorkView);
+        await until(() => app.textContent.includes("Could not check overlapping files"));
+        check("WorkView: a failed collision scan says it could not check, never that there is no overlap",
+          () => app.textContent.includes("fixture: collision scan unavailable") && app.textContent.includes("Absence of a list is not"));
+        fixtures.cmd_collision_risk = collisionFixture;
+
         check(`no crash (${crashes.join(" | ") || "none"})`, () => crashes.length === 0);
         check(`no unconfigured native command (${[...new Set(unexpected)].join(", ") || "none"})`, () => unexpected.length === 0);
       }
