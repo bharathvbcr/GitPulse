@@ -242,26 +242,33 @@ Closed since (2026-10-07):
 
 ## Current gate status
 
-`bun run ci:local` on branch `hx/w8-docs` (commit `787f8dd5`, 2026-10-11, one
-checkout, one Mac, other agents running): **not green, 13 of 17 gates passed.**
+`bun run ci:local` on branch `hx/w8-final` (commit `3299c074`, 2026-10-11, one
+checkout, one Mac, other agents running): **green, 17 of 17 gates passed, none
+skipped.**
 
-- Passed: IPC and type contracts, release version, Svelte and TypeScript check,
-  frontend unit tests with coverage (9,769 passed, one skipped, 712 files),
-  headless Chrome browser regressions, the WKWebView regressions, Vite build,
-  `cargo fmt`, clippy.
-- Failed, Rust tests: 3,202 passed and one failed,
-  `engine::git_cli::tests::spawn_rate_cap_bounds_a_concurrent_storm`
-  (`git_cli.rs:4662`), a timing-sensitive concurrency test run while sibling
-  agents loaded the host. Not rerun in isolation, so whether it is load-only is
-  inferred, not established. Because `cargo llvm-cov` exited non-zero it wrote no
-  `lcov.info`.
-- Failed, coverage floor: exit 2 (`Rust report cannot be read`), a consequence of
-  the missing LCOV, so the floors were **not evaluated**. Previously recorded
-  passes of the floors are in
-  [AGENTIC_WORKSPACES_PLAN.md](AGENTIC_WORKSPACES_PLAN.md).
-- Failed, environment: `check:vendor-schema` (vendored schema 27, installed
-  `devmap` CLI expects 26) and `gusset:check` (no DevCouncil and gusset checkout
-  next to this worktree). Neither is a code result.
+- Frontend unit tests with coverage: 9,769 passed, one skipped. Lines 96.59%
+  (floor 90%), branches 89.93% (floor 85%).
+- Rust tests with coverage (`cargo llvm-cov … --no-fail-fast --test-threads=1`):
+  4,408 passed, 0 failed, 33 ignored. Lines 87.97% (floor 80%). The LCOV carries
+  no branch data, so Rust branches are reported as not gated.
+- Headless Chrome and WKWebView regressions, Svelte/TypeScript check, Vite
+  build, `cargo fmt`, clippy, IPC/type/release/workflow contracts, the vendored
+  crate check and the gusset engine check (parity, match-any, panic firewall)
+  passed.
+- Two conditions of that run, stated so it is not over-read. `check:vendor-schema`
+  compares against the `devmap` on `PATH`; the run put a `devmap` built from
+  DevCouncil `9add99c2` first, because the installed `~/.local/bin/devmap`
+  (0.2.4, store schema 26) predates the vendored schema 27 and fails the gate.
+  The gusset gate ran the nested-worktree resolution that landed as `18d0f87c`
+  during the run.
+- The previous run of the same gate (`787f8dd5`) failed
+  `spawn_rate_cap_bounds_a_concurrent_storm`: under coverage its window is
+  stretched to 5 s while its cap assumed 500 ms. Fixed in `b8fa95e5` by
+  bounding the count by the measured window; reproduced and verified with
+  `CARGO_LLVM_COV=1`, and a gate with its rate cap removed still fails.
+
+Not covered by `ci:local` at all: see the README's `ci:local` row (no `bun
+audit`, `cargo deny`, Go jobs, scheduled workflows, or Linux/Windows builds).
 
 ## Earlier validation and remaining gates
 

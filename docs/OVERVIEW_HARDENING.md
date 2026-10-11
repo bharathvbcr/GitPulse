@@ -69,7 +69,7 @@ No commit, release, application installation, or signing change is included.
 Earlier full-suite failures in concurrent ConflictEditor/graph edits cleared
 in the later full-suite snapshot. Their edits were preserved.
 
-Not run at the time of this record (a later full `ci:local` run is in [PERFORMANCE.md](PERFORMANCE.md#current-gate-status): not green, 13 of 17 gates, 2026-10-11): the complete `ci:local` Rust lint/coverage pipeline, an installed-app
+Not run at the time of this record (a later full `ci:local` run is in [PERFORMANCE.md](PERFORMANCE.md#current-gate-status): green, 17 of 17 gates, 2026-10-11): the complete `ci:local` Rust lint/coverage pipeline, an installed-app
 webview smoke test, release/signing checks. This change targets the frontend;
 native verification was limited to the collision contract it consumes.
 
