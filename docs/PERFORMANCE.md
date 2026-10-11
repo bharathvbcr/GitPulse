@@ -500,3 +500,83 @@ editing, and their broad read/write callers were covered by the native suites.
 Current cumulative scope: selected performance source, tests, harness and this
 report add 2,381 lines and remove 213, excluding shared App/command wiring and
 architecture documentation. This performance work adds no dependencies.
+
+## 2026-10-10: command-gate over the app mailbox (ft-cb0d70b8, Fable D9)
+
+Every `gitpulse-hook command-gate` used to start its own `manvi serve`. While
+the app is running, the hook now asks it over the single-instance mailbox
+(`instance.sock` in the profile directory) and the app judges the command on a
+long-lived sidecar of its own.
+
+**Shape.** `Request::GateCommand { id, cwd, command }` is answered on its own
+connection by the sink `launch::establish` attaches (`hooks::serve_gate`),
+which runs the same `hooks::judge_command` the hook runs for itself, on the
+app's hook lane (`harness::sidecar::Lane::Hook`). The hook (`judged_by_app`)
+gives the app `GATE_APP_DEADLINE` (750 ms, inside the 5 s budget and the host's
+hook timeout) and otherwise judges the command itself, exactly as before.
+
+**Isolation from ft-6b72c703.** The hook lane is a separate `Slot`, so a
+transport fault, timeout or respawn backoff on hook verdicts drops only the hook
+lane's child, and a slow `work.runs.managed.prepare` on the profile sidecar or a
+slow gated commit on the shared one cannot stall or tear down hook verdicts. The
+lane makes one attempt (no retry-and-reset): the hook's own path is its retry.
+Hook verdicts are capped at 16 in flight (`MAX_GATE_HANDLERS`), on top of the 8
+relaunch handlers, so hook traffic cannot starve a relaunch; the 17th is told
+"busy" at once and its hook judges the command itself.
+
+**Measured** (`src-tauri/tests/hook_gate_bench.rs`, release `gitpulse-hook`,
+real `manvi`, interleaved and rotated per round, 7 rounds x 30 calls per case,
+min and median of the per-round medians, load average 22 to 27, so not a quiet
+machine):
+
+| case | min median | median median |
+| --- | --- | --- |
+| `start` (process alone, empty command) | 9.14 ms | 10.18 ms |
+| `bare/own` (no repository, hook's own `manvi serve`) | 30.70 ms | 32.23 ms |
+| `bare/app` | 9.61 ms | 11.02 ms |
+| `repo/own` (repository, no ledger) | 30.51 ms | 32.16 ms |
+| `repo/app` | 9.69 ms | 11.16 ms |
+| `ledger/own` | 30.08 ms | 32.60 ms |
+| `ledger/app` | 9.85 ms | 11.10 ms |
+
+Per call the sidecar start is about 21 ms of the 31 ms; with the app the gate is
+within 0.5 to 1 ms of the bare process start, under the 15 ms target (A19) even
+at this load. Not established: the benchmark runs each hook under a fresh
+`HOME`, so its repositories are untrusted there and the binding lookup and
+`git worktree list` are skipped on both sides; the `ledger/*` rows therefore do
+not exercise a live ledger, and the card's "38 MB live ledger" figure is not
+re-measured. In the app path those costs move into the app process (off the
+hook's critical path but not removed); the conditional follow-on of replacing
+`git worktree list` with a registry read is not needed to reach 15 ms and was not
+taken.
+
+## Security impact: who may speak on the mailbox
+
+The mailbox already accepted `Open`, `Reveal` and `Notification` from any
+process of the same user. `GateCommand` adds a caller path to the command gate,
+and it can only ask for a verdict:
+
+- It returns what `check_command_in_scope` would return in the hook's own
+  process: the app re-derives the git root, trust and bound scope itself from
+  `cwd` and `command`; the caller supplies no scope, allowlist or root, so a
+  peer cannot ask for the unscoped answer of a bound checkout.
+- It never changes a repository, a binding or the ledger, and it records
+  nothing.
+- A verdict that is not a real one (harness missing, busy, faulted, scope
+  unresolved to an unmappable reason) is an error on the app side, never a
+  reply, and the hook then reports exactly what it reports with no app.
+- The hook refuses an answer whose id is not its request's, that lacks a verdict,
+  that does not decode, or that says `checked: false` / `Unchecked`. Any refusal,
+  timeout or absence falls back to the per-call path; nothing falls open.
+- Peers must be the same uid on both ends (`peer_uid`, which now also guards the
+  connecting side), in a 0700 profile directory, with the socket 0600.
+- Residual risk, stated plainly: a same-uid process that binds the mailbox path
+  in place of the app could lie with a well-formed allow. That process can
+  already replace `manvi`, the trust store or the hook binary, so the socket
+  does not widen what same-user code can do; it is not defended against.
+
+Differential evidence: `hooks::tests::over_the_app` compares the app's answer
+with the hook's own for 8 commands across a bound, an unbound and a
+repository-free directory (a mutation making the app answer `bound: false`
+fails it), and feeds the hook seven kinds of wrong answer plus a control
+(`a_peer_that_answers_wrongly_is_not_believed`).

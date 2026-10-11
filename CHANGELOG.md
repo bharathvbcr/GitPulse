@@ -37,6 +37,13 @@ before that tag is pushed.
 - Setup wizard is a real modal: Tab stays inside, Escape closes it, focus returns to the opener. Install is disabled until the selected tool's ladder has loaded, and a late reply for the previous tool is dropped.
 - Board: moving a card with Left/Right keeps focus on it and announces the new column; the drop target is measured once per frame while dragging.
 - Code graph: layout no longer reruns on resize, hover hit testing runs once per frame, and a lost canvas context repaints on restore.
+- The agent hook's command gate asks the running app over the single-instance
+  mailbox instead of starting a `manvi serve` per Bash call: about 31 ms to
+  about 10 ms median per call (release hook, loaded machine; see
+  `docs/PERFORMANCE.md`). The app judges on its own hook-lane sidecar,
+  isolated from the shared one; with no app, a slow or malformed answer, the
+  hook judges the command itself as before, and never allows what that path
+  would refuse. The mailbox's peer check now covers the connecting side too.
 
 - An agent's `done` that is held in review for lack of a passing verification
   now starts that verification itself (one per task and head, at most two at a

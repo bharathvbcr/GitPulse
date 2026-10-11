@@ -1275,6 +1275,38 @@ fn slot() -> &'static Mutex<Slot> {
     })
 }
 
+/// The sidecar that answers the agent hook's command gate, over the app's
+/// mailbox (`hooks::serve_gate`).
+///
+/// Its own slot, not [`slot`]. The shared sidecar also hosts GitPulse's own
+/// gated actions, and a transport fault there drops the child and starts the
+/// respawn backoff for everything on it. A hook asks once per Bash call an
+/// agent makes, so sharing would let a burst of hook verdicts (or one slow
+/// verdict) tear down the child a commit is waiting on, and the reverse. Here a
+/// fault costs only the hook lane its own child.
+fn hook_slot() -> &'static Mutex<Slot> {
+    static SLOT: OnceLock<Mutex<Slot>> = OnceLock::new();
+    SLOT.get_or_init(|| {
+        Mutex::new(Slot {
+            sidecar: None,
+            last_error: None,
+            backoff_until: None,
+            profile: None,
+            selection: None,
+            closed: false,
+        })
+    })
+}
+
+/// Which process-wide sidecar a policy verdict is asked of.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Lane {
+    /// GitPulse's own gated actions, and a hook process's one-shot sidecar.
+    Shared,
+    /// The long-lived child that serves agent hooks; see [`hook_slot`].
+    Hook,
+}
+
 /// Recovers the slot guard from a poisoned lock, discarding what the panicking
 /// holder left behind.
 ///
@@ -1702,6 +1734,36 @@ pub fn call_policy<T: serde::de::DeserializeOwned>(
     }
 }
 
+/// [`call_policy`] on `lane`.
+///
+/// The hook lane makes one attempt and reports its fault: the caller is a hook
+/// that holds a per-call path of its own to fall back on, so a retry here would
+/// only spend the hook's deadline twice. A fault still drops this lane's child
+/// (see [`record_fault`]), so the next request starts a fresh one.
+pub(crate) fn call_policy_on<T: serde::de::DeserializeOwned>(
+    lane: Lane,
+    op: &str,
+    params: impl Serialize,
+    timeout: Duration,
+) -> Result<T, HarnessError> {
+    match lane {
+        Lane::Shared => call_policy(op, params, timeout),
+        // No `test_serial` here, unlike `call_policy`: this lane is reached from
+        // the app's mailbox threads, and a test that holds the serial across a
+        // hook-over-the-socket round trip would wait on its own handler. The
+        // tests that drive it hold the serial for the whole round trip.
+        Lane::Hook => {
+            let params = serde_json::to_value(params).map_err(|e| {
+                HarnessError::Protocol(format!("could not encode {} params: {}", op, e))
+            })?;
+            let raw = call_in_slot(hook_slot(), op, Some(params), Budget::Fixed(timeout), None)?;
+            serde_json::from_value(raw).map_err(|e| {
+                HarnessError::Protocol(format!("could not decode {} result: {}", op, e))
+            })
+        }
+    }
+}
+
 /// What the sidecar answered at handshake, without provoking a spawn beyond
 /// the first.
 ///
@@ -1743,6 +1805,13 @@ pub fn reset() {
     guard.drop_sidecar();
     guard.last_error = None;
     guard.backoff_until = None;
+    drop(guard);
+    let mut hook = hook_slot()
+        .lock()
+        .unwrap_or_else(|poisoned| recover_slot_for(hook_slot(), poisoned));
+    hook.drop_sidecar();
+    hook.last_error = None;
+    hook.backoff_until = None;
 }
 
 /// True when this build knows how to ask for `op` and the running sidecar
@@ -1767,8 +1836,14 @@ pub fn serves(hello: &HelloResult, op: &str) -> bool {
 /// applies.
 pub(crate) fn shutdown() {
     let deadline = Instant::now() + Duration::from_millis(1200);
+    for owner in [slot(), hook_slot()] {
+        drop_on_exit(owner, deadline);
+    }
+}
+
+fn drop_on_exit(owner: &Mutex<Slot>, deadline: Instant) {
     loop {
-        match slot().try_lock() {
+        match owner.try_lock() {
             Ok(mut guard) => {
                 guard.drop_sidecar();
                 return;
