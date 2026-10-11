@@ -1,4 +1,3 @@
-import { gitHeaderSides, stripSidePrefix } from "./gitPaths";
 
 export type DiffChunkKind = "Equal" | "Added" | "Removed";
 
@@ -378,65 +377,6 @@ export function isImagePath(path: string | null | undefined): boolean {
 export function annotateUnifiedDiff(raw: string): AnnotatedDiffLine[] {
   const parsed = parseUnifiedDiff(raw);
   return annotateRange(parsed, 0, parsed.length);
-}
-
-/** True when the line is a per-file section opener: `diff --git a/X b/Y`. */
-function isFileHeader(line: string): boolean {
-  return line.startsWith("diff --git ");
-}
-
-function sectionMentionsPath(section: string[], path: string): boolean {
-  const header = section.find(isFileHeader);
-  if (!header) return false;
-  const sides = gitHeaderSides(header);
-  const headerMatch =
-    !!sides &&
-    (sides[0] === path ||
-      sides[1] === path ||
-      stripSidePrefix(sides[0]) === path ||
-      stripSidePrefix(sides[1]) === path);
-  if (headerMatch) return true;
-  // Timestamps ride after a tab: "+++ b/src/main.rs<TAB>2024-01-01 ...".
-  const marked = (marker: string): boolean =>
-    section.some((line) => {
-      if (!line.startsWith(marker)) return false;
-      const rest = line.slice(marker.length);
-      return rest === path || rest.startsWith(`${path}\t`);
-    });
-  // Rename/copy targets run to end of line: no timestamp suffix.
-  const exact = (marker: string): boolean =>
-    section.some((line) => line === `${marker}${path}`);
-  return (
-    marked("--- a/") || marked("+++ b/") || exact("rename to ") || exact("copy to ")
-  );
-}
-
-/**
- * Reduces a multi-file diff (as produced by `cmd_get_commit_diff`) to the
- * patch of a single file, keeping each file's metadata block attached to its
- * hunks. The backend command takes no path filter, so commit-file selection
- * filters here; sections are matched by their `diff --git` header sides plus
- * +++/--- fallbacks so renames resolve too. Returns "" when the path is not
- * part of the diff.
- */
-export function filterFilePatch(raw: string, path: string): string {
-  if (!raw || !path) return "";
-  const lines = raw.split("\n");
-  const sections: string[][] = [];
-  let preamble: string[] | null = null;
-  for (const line of lines) {
-    if (isFileHeader(line)) {
-      sections.push([line]);
-    } else if (sections.length > 0) {
-      sections[sections.length - 1].push(line);
-    } else {
-      (preamble ??= []).push(line);
-    }
-  }
-  return sections
-    .filter((section) => sectionMentionsPath(section, path))
-    .map((section) => section.join("\n"))
-    .join("\n");
 }
 
 /** Empty-state copy for the diff pane, distinguishing clean merges. */

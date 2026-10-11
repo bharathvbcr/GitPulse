@@ -64,11 +64,6 @@ export const EMPTY_SPLIT_MODEL: SplitModel = {
   lineToRow: new Int32Array(0),
 };
 
-/** True for the row kinds that carry file content rather than chrome. */
-function isCodeLine(line: AnnotatedDiffLine | undefined): boolean {
-  return !!line && (line.type === "add" || line.type === "del" || line.type === "ctx");
-}
-
 /**
  * Builds the side-by-side rows for one parsed diff.
  *
@@ -252,12 +247,4 @@ export function nextChangeRow(tones: Uint8Array, from: number, delta: 1 | -1): n
     if (isBlockStart(i)) return i;
   }
   return null;
-}
-
-/** Whether a line list holds anything a reader would call content. */
-export function hasContentLines(lines: readonly AnnotatedDiffLine[]): boolean {
-  for (const line of lines) {
-    if (isCodeLine(line)) return true;
-  }
-  return false;
 }

@@ -1,6 +1,5 @@
 import { describe, expect, it } from "vitest";
 import {
-  groupHunksBySymbol,
   hunkSymbolLabels,
   symbolForHunk,
   type HunkLineRange,
@@ -42,30 +41,6 @@ describe("symbolForHunk", () => {
 
   it("joins on the new side when the old side is empty", () => {
     expect(symbolForHunk(hunk("a", 0, 0, 12, 1), symbols)).toBe("inner");
-  });
-});
-
-describe("groupHunksBySymbol", () => {
-  it("merges adjacent hunks under the same symbol", () => {
-    const groups = groupHunksBySymbol(
-      [hunk("1", 11, 1), hunk("2", 15, 1), hunk("3", 55, 1)],
-      symbols,
-    );
-    expect(groups).toEqual([
-      { symbol_name: "inner", hunk_keys: ["1", "2"] },
-      { symbol_name: "other", hunk_keys: ["3"] },
-    ]);
-  });
-
-  it("does not merge empty-symbol hunks together", () => {
-    const groups = groupHunksBySymbol(
-      [hunk("1", 100, 1), hunk("2", 200, 1)],
-      symbols,
-    );
-    expect(groups).toEqual([
-      { symbol_name: "", hunk_keys: ["1"] },
-      { symbol_name: "", hunk_keys: ["2"] },
-    ]);
   });
 });
 
