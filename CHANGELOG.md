@@ -11,87 +11,41 @@ before that tag is pushed.
 
 ## [Unreleased]
 
+## [1.4.0] - 2026-10-11
+
+Agents that start in the background with a pane showing every one at work,
+stacked worktree tabs, a model choice per agent, one agent guidance in every
+handoff, and board tools that delete and merge tasks and make agents group work
+before filing — plus stale-branch cleanup with backups, a secret scan that never
+reads a partial scan as clean, worktree cache sync and named local routes,
+symbol-level collision notes, Markdown rendered by MarkDev, terminals that
+report what they are running, coloured tabs, timers that stop in the
+background, Bun for installs and scripts, and git spawns admitted by class so
+a refresh storm can no longer starve the actions you asked for, with branch
+churn kept across restarts. Two live agents sharing one worktree now show up
+in collision risk; the task board gains Undo, bulk changes and full keyboard
+operation; workspaces can be reordered, imported from tab groups and relinked
+to a moved checkout; and the code graph opens the maps devmap 0.2.4 writes.
+Tasks gain checklists, links, search filters, swimlanes, saved views and
+work-in-progress limits; the code view searches file contents and renames,
+moves and deletes files; pull requests can be reviewed and merged. A terminal
+agent now ends only by its own exit, a Close or Quit — never because its view
+stalled or went away — every way to quit on macOS reaches the confirmation,
+and a second launch on macOS hands its request to the running GitPulse.
+
+Since the first 1.4.0 build: the app enforces an ACL on its own commands, and
+trusting a repository or pointing GitPulse at a new tool binary asks in a native
+dialog the page cannot answer. The board runs tasks in waves, takes Manvi's
+proposals and next-task suggestions, and can post a task's verification
+verdict to GitHub. Task writes are safer to repeat, and a failed read no longer
+looks like an empty one. The Rust tests run hermetically. The host-load
+sampler is supervised and its commands are granted. `bun run
+check:schema-parity` asks every installed reader which DevCouncil schemas it
+reads.
+
 ### Added
 
 - `bun run check:schema-parity` compares what DevCouncil's checkout writes (devmap store, dc-store and workbench schemas) with what every reader reports. The readers are the vendored crates, `devmap` and `dcstore` on PATH, the `gitpulse-mcp` on PATH, the `gitpulse-mcp` bundled in GitPulse.app, and the DevCouncil commits Manvi and Jarvis pin. Pins are judged by the constants at the pinned commit. It also compares GitPulse's copy of Manvi's serve contract with Manvi's. The `gitpulse://server/manifest` resource now declares `dcStoreSchemaVersion` and `workbenchSchemaVersion` beside `storeSchemaVersion`, so an installed binary can be asked rather than inferred from source. On its first run it found the installed app reading store schema 26 against DevCouncil's 27.
-
-### Fixed
-
-- Host load in the installed app: the status bar and Health → Host load called four commands the main window was never granted, so every call failed "not allowed by ACL". `cmd_host_load_status`, `cmd_host_load_settings`, `cmd_host_load_settings_save` and `cmd_host_load_terminate_orphan` are now granted. Terminate now also needs a Yes in a native dialog that page script cannot answer, and the process is re-checked after the dialog closes as well as before it. See `docs/LOAD_GOVERNOR.md` → Orphans for the security impact.
-- The host-load sampler runs under the supervisor (`Policy::RESTART`). A tick that panics no longer ends the thread and leaves the last pulse standing as though it were current. A sampler that keeps panicking stops visibly in Diagnostics. A sampler stopped during a restart backoff waits out that backoff (1 s, doubling to 60 s) before it joins.
-
-- `bun run gusset:check` runs from a linked worktree under `.claude/worktrees/<name>`. It used to exit 2 there, because `go/go.mod`'s `../../DevCouncil` and `../../gusset` replaces point inside `.claude/`. It now finds the checkouts the way `vendor-crates.mjs` does (`GITPULSE_DEVCOUNCIL_ROOT` / `GITPULSE_GUSSET_ROOT`, then ancestors, then the canonical checkout's siblings) and, only when they are not where go.mod points, hands them to go through a temporary `go.work` whose replaces take precedence.
-- `gitpulse-mcp` `devmap_neighbors` no longer fails every call with "data must be object": it answers the `CodeintelResponse` envelope (`source_freshness`, `available`/`reason`, `total`/`shown`/`truncated`, `walk_incomplete`). `depth` and `min_confidence` were advertised but hardcoded to 10 and 0.0 in `devmap_neighbors`, `devmap_impact`, `devmap_trace`, `devmap_explore` and `devmap_affected_tests`; they now reach the walk through one `WalkBounds` and an out-of-range value is refused, not clamped. `devmap_dependencies` reads one file's direct edges, so it drops the no-op `depth` and gains `min_confidence`. `devmap_trace` declares the `min_rung` it reads. All eleven DevMap tools now declare typed `outputSchema`s, and the contract tests run each of them and require every declared argument to be read and every read argument to be declared.
-
-### Changed
-
-- Re-vendored DevCouncil at `8229de20` (wave 6): the `devmap-*`, `dc-store`, `dc-redact`, `dc-glob` and `dc-proc` crates, and the shared contracts (`lease.schema.md`, `verdict.schema.json`, `CHECKSUMS`). `devmap-query` now links `dc-glob` (already vendored; `Cargo.lock` gains the edge); `dc-evidence` and `dc-sparse-encode` (and its git-pinned `tessl`) are not part of GitPulse's closure. A map built by the new devmap is store schema 27, and the devmap-store now refuses any store that carries a trigger. Re-vendored again at `9add99c2` (`a6b5e815`): `devmap-extract`'s Swift scope self-lookup recursion fix only.
-- A task whose planned file declares an `allowed_change` outside `create`, `modify`, `delete`, `read_only` is now an unreadable scope (the Go decoder refuses the whole task), reported through the same broken-scope path as damaged JSON instead of being read as a plain path. GitPulse writes no such value anywhere.
-- A failed `devmap ... --json` run (doctor, status, preview, integrate, build, live refresh, the index sweep and the map pane) now reports DevMap's own `{"error": ...}` envelope from stdout. Under `--json` stderr is empty for exactly the failures that have a reason, so the reason used to be replaced by "exited N".
-
-### Fixed
-
-- Windows: `git worktree add` and `remove` are given an ordinary `C:\...` path rather than the canonical `\\?\C:\...` one git rejects, so a managed attempt's worktree can be created, reused and reclaimed; a task brief that is a directory or a link is refused as "not a regular file" instead of an access error or a followed link; the vendoring manifest records `/`-separated origin paths on every platform. Linux: closing an idle shell hangs up its jobs under bash, and a process ID past `pid_t` is reported unknown rather than gone.
-- Multi-module Maven and Gradle builds: each module's own JaCoCo report
-  (`<module>/target/site/jacoco/jacoco.xml`, `<module>/build/reports/jacoco/...`)
-  is found and resolved against that module's sources; modules past 128 mark the
-  scan capped. The Health view, its vulnerabilities facet and the text report
-  show the audit census ("N of M audited; not audited: ..."), and the coverage
-  report names the stale, unresolved and past-end-of-file data an artifact
-  dropped from its totals.
-- AI replies: an orphan `</think>` (templates that open the tag in the prompt) now drops the reasoning before it and keeps the answer after it, and a reply that ends inside its reasoning reports "the model's reply ended inside its reasoning; no answer was produced" instead of a generic empty reply.
-- Secrets scan: a refused envelope version no longer replaces a valid probed one (the refusal is reported as `kingfisher_version_rejected`), and a finding without a line carries no line (`null`) rather than line 0.
-- Task board: a refresh after any write keeps the pages a reader loaded (columns and navigator) instead of snapping back to page one; moving a card to the bottom of a paged column reads the column to its end first, so the card is not hidden after reload; overlapping catalog reads no longer land out of order.
-- Archive and Attention inbox keep their pages and selection across a window blur; closing a tab through any of the three close routes now forgets every per-tab record and the harness journal cache.
-- One shared `workbench-changed` subscription: each write refreshes each surface once (a repeated sequence and the watcher's echo of an in-process write are dropped), the inbox re-reads only when enhancement status really changes, and a failed listener is reported on every surface.
-- Backend calls can now be bounded: `invoke` takes a deadline and an abort
-  signal, a timeout is a distinct `DeadlineError`, and the GitHub context, runs
-  and workflows reads time out with a message instead of a spinner that never
-  ends. The five separate timeout helpers are replaced by one. A switched-away
-  repository's Overview load no longer holds up the new one.
-- A failed read no longer looks like an empty or successful one: issue import
-  refuses while the task list is unread, a failed diff shows its own error with
-  a retry (and no longer disables Review changes or keeps the previous file's
-  diff), quick commit picks end on the last pick, Launch at login shows
-  "unknown" instead of Off, branch stats no longer revert a newer branch list,
-  an unreadable checkout-holder list forces a worktree, sticky error toasts
-  outlive other toasts, a failed notification read can be dismissed, and a typed
-  answer withdraws the session alert.
-- The local-model client now tries every address `localhost` resolves to (an
-  IPv4-only Ollama was refused when `::1` came first), treats a chunked reply
-  cut off before its last chunk as an error, and reports non-text reply
-  content instead of an unexplained empty one. Suggested branch names pass the
-  app's ref-name validation, and the branch-name prompt reads a capped diff
-  that names untracked files.
-- The staged patch reaches Lappi as git's exact bytes rather than a lossy
-  UTF-8 decode.
-- A Markdown link to `other.md#section` opens that section, and a footnote
-  whose label matches a heading no longer shares its id.
-### Security
-
-- The app now enforces an ACL on its own commands. The main window is granted
-  only the commands the frontend calls and the status popover only its three;
-  six registered commands nothing calls are denied everywhere. Webviews can no
-  longer navigate off the app origin.
-- Trusting a repository, and pointing devmap or manvi at a new binary or source
-  root, ask for a native confirmation drawn by the OS, not just the in-app
-  modal. Open-in-default-app requires a trusted repository and confirms
-  executables, `.app`, `.command`, `.terminal` and `.fileloc` before running.
-- Remote images in repository Markdown no longer load on render; click one to
-  load it.
-- Child processes drop relative `PATH` entries (`.`, `bin`,
-  `./node_modules/.bin`), which resolved inside the repository being opened.
-  A setup that relied on one must use an absolute path. The Manvi sidecar now
-  starts from an allowlisted environment, so provider API keys and tokens set in
-  the launching shell no longer reach it.
-- Remote tool installs build one pinned commit (`cargo install --rev`,
-  `go install @<sha>`) from a fixed working directory; curl is confined to
-  https for the request and every redirect; prebuilt installs need a version and
-  SHA-256 pinned in the app and refuse a downgrade (none are pinned yet, so
-  that rung reports itself unavailable). Clone refuses Git older than 2.45.1,
-  and submodule recursion Git older than 2.50.1, with the reason shown.
-
-### Added
 
 - Run the board in waves: from a repository board, "Run in waves" launches the top N suggested tasks (default 3, at most 5) in their own worktrees, waits for each run, runs `work.verify.task`, and merges only tasks whose verdict is `passed` at the head the worktree is still at, one at a time with a re-verify after each, then launches the next N. Tasks whose file scopes overlap, or are unknown, never launch together. Degraded, failed and could-not-run verdicts, refused launches and merge conflicts hold that task and are shown; nothing is pushed. A wave is kept on its cards (a `wave:` label and one log line) and resumes after a restart without relaunching a claimed run; Stop ends launching and merging.
 - A minimal in-repo string catalogue and translator (`src/lib/i18n`), piloted on the setup wizard chrome. No new dependency; a test fails when a catalogue key is looked up nowhere.
@@ -145,478 +99,6 @@ before that tag is pushed.
   applies only what you select, at the revision you reviewed: a task that
   changed since is refused and re-read. Nothing Manvi proposes is applied
   automatically, and a sidecar that is down is an error, never an empty scan.
-
-### Changed
-
-- Workbench store at scale (dc-store re-vendored from DevCouncil `40b6bbbf`):
-  finding a repository by identity and reading a task's last revision are one
-  store request each (they paged 23 and 25 times at 5,000 repositories and
-  5,000 revisions, and failed past 10,000), a request receipt no longer copies
-  the record body, `events.list` and `items.history` bound their per-page count
-  (`total_exact` says when `total` is a floor), and a newly created profile is
-  `auto_vacuum=INCREMENTAL` so `store.compact` gives pages back. A profile that
-  already exists keeps its size until a full `VACUUM`. The workbench profile is now schema 13 (short receipts: a schema 12 host refuses it with `schema_unsupported`); the upgrade runs on the first write, after the backup, as for earlier schemas.
-
-### Fixed
-
-- Checks that could not run no longer read as clean. A task whose scope JSON is
-  unreadable is a broken scope (not "nothing forbidden"); govulncheck killed
-  mid-stream or silent, a cargo-audit document with no vulnerabilities list or a
-  mismatched count, and any scanner that exits 0 with no output are issues and
-  are not counted as run; RustSec CVSS vectors are scored (critical/low) and a
-  missing score is `unknown`, not `high`. Every multi-command git action folds
-  all of its verdicts, conflict save's file verdict included. A log-lock timeout
-  drops one line instead of silencing the sink. `tools.json` is written under a
-  writer and file lock, atomically, reloads when edited by hand, and a failed
-  save of an installed tool's path is reported. Preview debounce claims its slot
-  atomically and evicts expired ones.
-- The dependency audit's "complete" now compares audited against found targets
-  (`audit_coverage`): a nested `package-lock.json` is audited on its own,
-  workspace members use their root's lockfile, `uv.lock`/`poetry.lock`/
-  `pyproject.toml`-only Python and ecosystems with no scanner are reported as
-  not audited, empty cargo-crev output is not a run, and `engines.node` ranges
-  compare full versions (`>=18 < 20`, `< 20`, `>18.5.0`).
-- Coverage maps JaCoCo and Cobertura hits onto Maven/Gradle sources and applies
-  Cobertura `<source>` roots, resolves a nested report against its own module,
-  refuses single-component suffix matches, leaves unmatched paths out of the
-  totals (counted per artifact as `unresolved_files`), drops hits from files
-  edited after the report was written and lines past end of file, and reads
-  SimpleCov (`.resultset.json`, JSON formatter) for Ruby.
-- **Store reliability.** The ledger no longer caches a failed open for the
-  process lifetime, holds one lock per repository instead of one for every
-  repository across its IO, reopens a database whose `.devcouncil/` was deleted,
-  takes an IMMEDIATE transaction for every multi-statement write (fleet metrics,
-  languages and history are one), and validates action names against the event
-  schema. `gitpulse_status`, `gitpulse_ledger_events` and the ledger resource
-  open the ledger read-only (no DDL, no chmod, no legacy consolidation); the
-  resource pages like the tool, returns `next_cursor`, and `truncated` is exact.
-  URL userinfo that is a bare token, or a password containing `/` or `@`, is
-  redacted. Reflog catch-up dedups with one indexed query against redacted
-  identities and stops when it cannot read what is recorded. The instance
-  mailbox releases a handler's slot even when the handler panics.
-  Security impact: redaction only removes more; binding resolution still
-  enforces a legacy sibling binding, now through a read-only connection.
-- **Profile durability.** Repository-trust grant, revoke and migration take one
-  directory lock and move records with a no-replace link, closing a window in
-  which a migration could undo a revoke (no access widened). The churn cache
-  deletes its database only when it is not a database or is corrupt, not on a
-  transient busy error. Startup re-registers a hygiene or launch-at-login
-  LaunchAgent that still starts a moved or replaced app (never a translocated
-  path). DevCouncil's dc-store now upgrades the workbench profile only on a
-  write and after an online backup; this lands here when that change is
-  re-vendored.
-- **Task MCP retries.** `gitpulse_complete_task`, `gitpulse_delete_task` and
-  `gitpulse_merge_tasks` recognise their own earlier work before comparing
-  `expected_revision`, so an identical retry is `unchanged` and an interrupted
-  delete or merge (including one started from the board) finishes. A task with
-  more than 25 related open tasks can be filed: `reviewed_related` takes up to
-  500 ids and a refusal names 25 at a time. A server timeout says the work may
-  still finish and a write's outcome is unknown.
-### Fixed
-
-- Destructive git actions are bound to the state they checked. A release tag is
-  created on the commit the release checks were made against, not on whatever
-  HEAD is by then; a local CI note is written only if HEAD and the tree are the
-  ones the run started on; merge-and-teardown holds one lock from its checks
-  through the removal and re-reads the worktree and the branch tip before
-  `worktree remove --force` and `branch -D`. A git read that produced no answer
-  (the current branch, `origin/HEAD`) is an error, never "detached" or "not the
-  default branch", so a rebase or restack can no longer finish with HEAD
-  detached and a force delete can no longer remove the default branch after an
-  unreadable `origin/HEAD`. A failed `rebase --abort` during a restack is
-  reported instead of "rolled back". With a tag named like the branch, the
-  current branch is still found.
-- Git's output format and environment no longer depend on the developer's
-  settings. Every git child gets `log.showSignature`, colour and diff-prefix
-  settings pinned, patch-printing commands skip `diff.external`, and the
-  environment is decided once for both the git builder and the `gh`/tool
-  builder: `LC_ALL=C`, no credential prompt, no optional locks, and
-  `GIT_LITERAL_PATHSPECS` (and its glob/icase siblings), `GIT_SSH`,
-  `GIT_PROXY_COMMAND`, `GIT_TRACE*`, `GIT_DIFF_OPTS`, `GIT_SHALLOW_FILE` and
-  `GIT_ATTR_SOURCE` stripped. A signed commit under `log.showSignature=true` no
-  longer produces a "No signature" graph id, `color.ui=always` no longer puts
-  escapes in the diff viewer, and the identity GitPulse shows follows git's
-  order (environment before config).
-- A cancelled or timed-out git command is asked to stop before it is killed:
-  SIGTERM to its process group, then SIGKILL after the 500 ms grace, so git
-  removes its own `.git/index.lock` and the next commit does not fail on it.
-  Reads that were cut short no longer pass for complete ones: a notes listing
-  killed at its deadline is an error rather than "nothing is verified", a blame
-  cut at its byte cap marks the ownership report truncated, and a failed or
-  malformed submodule or remote read is an error rather than "none". The shared
-  spawn-rate budget's file IO no longer runs under the gate mutex, so a user
-  action does not queue behind a background re-poll. SHA-256 repositories
-  resolve revisions for provenance.
-- Git parsers read unusual but legal repositories correctly. Worktree paths
-  with a newline or a trailing space round-trip through one `-z` parser used by
-  every caller; a tag named like the branch no longer hides the graph's HEAD
-  chip; a remote named `team/fork` owns its branches (one longest-prefix owner
-  in `remotes.rs`) instead of `team`; a branch named `release/HEAD` is listed
-  while a remote's own `HEAD` pointer still is not; a `--depth 1` boundary
-  commit is drawn as a stub rather than the root of the history; and a path
-  git printed as non-UTF-8 carries a warning instead of silently naming a file
-  that does not exist.
-- Long histories and wide graphs say what they leave out. A graph wider than
-  the 4,096 px canvas shows how many lanes are not drawn; a filter that joins
-  more than 32 ancestors onto a commit reports how many parent links the cap
-  dropped instead of cutting them silently; and a window longer than 5,000
-  commits is read and kept as chunks, so "load more" no longer re-reads and
-  re-parses every earlier commit (one 100k-commit answer exceeded the cache's
-  per-entry cap and was never kept). Git still skips past earlier commits for a
-  new chunk, and lane solving still covers the whole window.
-- Tasks board: **Suggest next** asks Manvi (`work.tasks.suggest`, through the
-  host method `tasks.suggest`) which open tasks to start, ranked by priority,
-  severity, due date, idle age, what each unblocks and its last verification,
-  with a one-line reason per task, a priority filter, and a plain statement when
-  blocked, duplicate, in-progress or unread tasks were left out or the board read
-  was capped. It is deterministic and makes no model call. The serve contract
-  mirror and the profile worker allowlist gain the op.
-- Tasks board Filters: a severity filter (saved views keep it) and a Priority
-  first order for the columns, a view that never writes a position. A card's
-  priority pip now has an accessible name.
-
-### Changed
-
-- **The task profile's schema moves only when the desktop app moves it.**
-  The app upgrades an older profile once, after dc-store's own backup
-  (`<profile>.pre-schema-<n>.bak`) and before the first read, and a failed
-  upgrade is returned to the caller, logged and listed in Diagnostics. The MCP
-  server's handles refuse upgrades (`schema_upgrade_required`), so an older or
-  newer server never migrates a profile the app and Manvi share. Manvi's own
-  `schema_upgrade_required` is shown as what to do. Task views and scopes open
-  the repository store read-only and judge leases without sweeping them: a
-  lapsed lease is no longer rewritten by looking at it, and a lease whose
-  expiry cannot be read is listed with that text (`expiry_error`) instead of
-  failing the list.
-- **Task writes are safer to repeat.** `gitpulse_complete_task` and
-  `gitpulse_delete_task` take an optional `request_id`, which the store keys its
-  receipts by, so a call whose answer was lost can be sent again. A delete the
-  caller allowed with `even_if_running` carries that to the store, which now
-  refuses a delete under a live run inside its own transaction. `gitpulse_add_task`
-  files a new task only against the board it scanned for related work: the write
-  names the scan's sequence, and a board that changed in between is scanned
-  again once, then reported as `board_changed`.
-- The profile is compacted once a day: the host runs dc-store's `store.compact`
-  (expired receipts, events and revisions, a bounded number per pass) from its
-  existing background loop, off the UI thread, never beside itself, never
-  creating a profile. The last attempt is stamped beside the profile, so a
-  restart does not start another window and a failure is logged and retried next
-  window. The log line carries deleted, eligible and truncated per table.
-- Accepting a refinement's splits runs the board's related-task check on each
-  split title. A split that looks like open work holds the whole accept, and the
-  sheet offers "They are separate: apply anyway". DevCouncil is re-vendored at
-  `c0bc26d5` and the serve contract refreshed from Manvi's `work.store.compact`.
-- DevCouncil is re-vendored at `acb5e3b9`: dc-store workbench schema 12 (refinement
-  proposals, an `acceptance_criteria` lock) and `dc-glob`. A profile that
-  Manvi's dc-store has taken to 12 is refused by a GitPulse built at 11, so the
-  installer now requires a `dcstore` that reports schema 12. Suggest
-  refinements now accepts through the proposal Manvi stored (parts chosen
-  against the proposal and task revisions reviewed; each accepted split is a new
-  inbox task with an id the host makes), and the Map panel says when a
-  workspace's link scan could not read part of it.
-- The profile worker's per-call timeout now comes from Manvi's `hello`
-  (`op_limits`: the lane and server-side deadline of each op) plus a 5 s margin,
-  clamped to 15 minutes, instead of a hard-coded table. Against an older Manvi
-  that advertises nothing the built-in table still applies, and a log line says
-  so. The vendored `contracts/serve.ops.schema.json` is refreshed for it and for
-  the repository roots Manvi's `devmap.*`, refine and scan ops now require
-  (`E_BAD_ROOT` otherwise); GitPulse sends none of those ops today.
-- **The update check announces releases, not tags.** `git ls-remote --tags`
-  only says a tag exists, and the release workflow runs for many minutes after
-  a tag is pushed and may never publish, so a `vX.Y.Z` pushed early (or a
-  mistaken `v9.0.0`) was announced to every user. A tag newer than the running
-  build is now announced only once its release is published, confirmed by one
-  bounded `HEAD` of the release's checksum asset (a draft's assets are not
-  public); at most five tags are probed, a check that cannot be made fails the
-  check rather than guessing, and a tag with no release is not announced.
-- **`gitpulse-mcp` answers an unknown protocol version with the newest it
-  supports.** A client asking for a revision the binary does not list (such as
-  `2025-06-18`) used to be answered with the oldest, `2024-11-05`, under which
-  `outputSchema` and `structuredContent` may be ignored. The lifecycle
-  specification says the answer SHOULD be the latest the server supports.
-- The MCP output-schema contract test now validates every advertised tool,
-  the task-board writers included, and fails a tool whose calls all errored
-  instead of skipping it. The thirteen tools that declare only
-  `{"type":"object"}` are named in an explicit allow-list with a reason each,
-  and the list cannot go stale.
-- **The Rust tests run in a hermetic environment.** Every test process now
-  starts in a per-process temporary home with its own git configuration, so a
-  developer's `core.hooksPath`, `init.defaultBranch`, `~/.claude` sessions,
-  repository-trust store and `tools.json` can no longer decide whether the suite
-  passes (and fixture repositories are no longer granted trust in the real
-  store). There is one environment lock instead of six, enforced by the type
-  `bind_env` takes; raw `set_var` is refused outside
-  `src/test_support/env.rs`; every wall-clock limit goes through
-  `coverage_relaxed` (Rust) or `wallClockBudget` (TypeScript). The Rust suite now
-  also runs on 8 threads in a separate workflow (`test-parallel.yml`); the serial
-  gate in `ci.yml` is unchanged.
-- **A runaway test process is stopped.** Test processes sample the operating
-  system's own write counter and abort with a message when one averages more
-  than 40 MiB/s over 30 s or writes more than 8 GiB, a guard added after a
-  `gitpulse_lib` test binary was reported writing 549.8 GiB in 90 minutes.
-  `node scripts/test-disk-writes.mjs` attributes bytes to single tests and fails
-  any over a budget.
-- The coverage floors are less generous. `graphStore.ts` and `repoMetrics.ts`
-  count again, each remaining exclusion names an owner and a review date (a
-  passed date fails `scripts/coverage-exclusions-contract.test.ts`), and the
-  function floor has a margin of over one point instead of 0.05. The coverage
-  workflow now reports Rust branch coverage (nightly `--branch`); it is reported,
-  not gated, until a floor has been measured.
-- **The task-scope fence covers argument-writing commands.** With DevCouncil
-  `ec26e906` in the harness (Manvi `hx/wave2` or later), `rm`, `truncate`,
-  `touch`, `dd of=`, `perl -i`, `install`, `ln`, `rsync` and `patch FILE` against
-  a plan that excludes the file are refused as `scope.unplanned`, and a write
-  whose target is not in the command (`git apply`, `xargs`, `find -exec`) is
-  refused as `command.substitution` while a scope is bound. GitPulse still
-  runs no parser of its own: the hook forwards every command verbatim with the
-  bound scope, and a test proves each one arrives. The real-harness fence test
-  now asserts the refusals against a Manvi built from `hx/wave2`. Escaped
-  descendants and second-profile agents stay documented as outside what a hook
-  can judge.
-- **`gitpulse-hook` correctness.** The hook now takes down any `git` or harness
-  child a check abandoned at its deadline before it exits (a stalled `git
-  status` used to outlive it and could hold `.git/index.lock`); one 8 s
-  deadline starts when the process does and every wait is cut to what is left,
-  so a late stdin no longer adds up to the host's 10 s timeout and drops the
-  decision; the collision verdict is computed for the file being edited rather
-  than the first overlapping file; a file touched in another worktree on
-  different symbols (or with a stale index) informs the agent through
-  additional context instead of asking, which a launched agent turned into a
-  refused edit; a Cursor deny or ask is shown as a warning instead of looking
-  like a clean pass; and the `MultiEdit` tool the guard judges is now in the
-  plugin's matcher, with a test that keeps the two lists equal. Security
-  impact: the guard now also covers `MultiEdit` and no longer leaves orphans;
-  the disjoint-symbol case stops asking, which narrows nothing that was
-  blocking a real conflict (shared-symbol and file-level overlaps still ask).
-- **A released app's safety hooks and MCP server now resolve, and a hook that
-  cannot launch no longer fails open.** The plugin's manifests name bare
-  `gitpulse-hook` / `gitpulse-mcp`, which only a developer's `mcp:install`
-  puts on PATH, and a host runs the tool call anyway when a hook cannot start.
-  Settings now resolves both binaries beside the app, says `not reachable`
-  when `gitpulse-hook` is missing and when either is not on PATH, and copies
-  `.mcp.json` and a new `hooks.json` built from the resolved absolute paths.
-  In the copied hooks the collision guard and command gate refuse the call
-  (exit status 2, reason on stderr) when the binary is missing, and session
-  start tells the agent the hooks are off. Security impact: this narrows what
-  proceeds without a gate (a missing gate now blocks instead of passing); it
-  grants nothing. The plugin's own static `hooks/hooks.json` keeps its
-  portable bare names.
-- **Repository hooks need your approval.** `.gitpulse/hooks.json` and
-  `hooks.toml` come from the working tree, so a pulled branch or a compromised
-  agent could write shell commands that GitPulse then ran on every agent
-  launch, worktree add and merge. They now run only after you approve the
-  exact file text (the Worktrees panel shows it); any edit asks again. Each
-  command goes through the command gate and the ledger before it runs, "Run
-  repository hooks" is its own option and off by default (split from "Share
-  build caches"), a file that does not parse is an error instead of falling
-  back to the other format, and TOML commands containing commas are no longer
-  cut apart. Unapproved hooks are skipped with a notice, never run. Security
-  impact: this narrows what repository content can execute; nothing widens.
-
-- CI now fails when a vendored crate is edited in this repository, through the
-  new `bun run check:vendor-edits` (`vendor-crates.mjs --check --allow-drift`),
-  which `ci:local` runs too. Upstream drift is still printed but never fails a
-  gate: DevCouncil commits land independently, so bare `vendor:check` stays the
-  check to run right after `bun run vendor`.
-- An agent's `gitpulse_complete_task(done)` no longer takes its own word. The
-  task lands in `done` only when Manvi's `work.verify.task` stored a settled
-  `passed` verdict for the head its worktree is at now; with no record, a
-  `failed` or `degraded` one, one still running, one for an older head or
-  another task or repository, or an evidence store that cannot be read, it
-  lands in `review` with the reason in the task's history
-  (`held_for_review: true` in the reply). A passed verdict is attached to the
-  history ahead of the agent's summary. A person moving a card is unaffected.
-  Security impact: this narrows what an agent can do (it can no longer
-  self-certify done); nothing widens, and the check fails closed.
-- The profile worker may now call `work.verify.task` and `work.verify.get`
-  (host methods `verifications.start` and `verifications.get`), which only name
-  the work to judge; no command or criteria travel in the request.
-- **Less background work while you type and while the window idles.** A
-  commit-message keystroke or status poll no longer re-runs code-impact
-  queries, re-lists every file in the tree, re-walks a file's history,
-  refetches provenance or markdown backlinks, or rescans dead branches
-  (which also reset the cleanup selection); those refresh when the
-  repository, selection, staged paths or HEAD change. Dragging the terminal
-  dock writes preferences once on release instead of every frame, an
-  unrelated preference change no longer resets the graph's tile cache or
-  native zoom, and the Agents clock stops while the window is hidden.
-- **Fewer spawns and faster ledger reads.** The ledger's foreign-repository
-  check uses index seeks instead of scanning every event on each gated
-  action and agent hook; dead-branch scans and cleans read the worktree list
-  once rather than once per branch; the update check, persisted log and MCP
-  info no longer block the interface thread or a shared runtime worker.
-- **Ranked task search on one shared parser.** The Tasks board, the archive dock
-  and the navigator's find box keep one search language (`taskQuery.ts`), which
-  now also reads `"phrases"`, `OR` between words, and comma lists for any of
-  several values (`label:ui,ci`), and reports a stray `OR` or an unknown
-  `todo:fix` instead of dropping it. A search or Filters choice reads one
-  candidate set for the board (200 at a time, **Load more tasks** up to 2,000)
-  plus one full-text read for the most selective word, so filters reach every
-  task rather than the loaded column pages and descriptions still match. Words
-  are ranked locally — word forms, related software terms, parts of words and
-  close spellings, weighted by field and rarity — with **Relevance** or **Board
-  order**; dragging and keyboard reordering are off under Relevance. A line
-  under the search says what was read and never lets a partial answer read as
-  complete, cards say why they matched when it is not obvious, and the search
-  box completes filter names and values. Lexical ranking, not embeddings.
-
-### Fixed
-
-- **Panels no longer reset or re-ask when the repository store publishes
-  something they do not read.** An armed "click again to remove" on a
-  worktree stayed armed through a status poll, the GitHub spinner clears when
-  its answer lands even if the store published mid-fetch, "Show more" on the
-  Overview keeps its rows, and the line-count, storage and language metrics
-  keep one subscription instead of resubscribing (and recording a pulse
-  history point) per publish. Effects now key on `repoStore.currentPath`, a
-  store that notifies only when the active repository changes, or on values
-  compared by value; the hand-kept `prev*` guards they replaced are gone, and
-  a contract test fails if an `$effect` reads `$repoStore` again. The branch
-  list and pull-request list each hold their own freshness token, so one
-  list's success no longer clears the other's error. `harness/repo-churn.html`
-  drives fifteen panels through unrelated publishes in Chrome and WebKit.
-- Quitting (Cmd-Q, the Dock, a logout) and a `SIGTERM`/`SIGHUP` now run one
-  teardown: launch forwarding stops first, every terminal is closed under a
-  deadline, the sidecar is asked to finish, then procguard's children are
-  swept. Before, a normal quit never swept `git fetch`/`ci_local` children and
-  a signal never closed the terminals, so runs stayed "running".
-- Closing a terminal hangs up every process group in its session (`cmd &`,
-  `nohup`, a dev server, a stopped editor), not only the foreground group, and
-  gives them 2.5 s to clean up (an agent's SessionEnd) before killing the rest.
-  A tab with a background or stopped job is no longer treated as idle when its
-  view goes away, and closing it asks.
-- A worktree is not removed or merged away while any process, including an
-  agent typed into a plain dock tab, has its working directory inside it, even
-  with no workbench profile. An exited-but-unreaped child no longer counts as
-  running, and the sidecar reaps its child when its stdout ends.
-- One panic no longer disables a subsystem until restart: the hygiene cleaner,
-  the terminal session map, the task board's store and worker, the watcher and
-  the recent-repositories list recover from a poisoned lock. A panic in the
-  cleaner's clock thread is recorded as a degraded subsystem (listed in
-  Diagnostics) and the thread keeps running. Concurrent model probes, agent
-  model listings and MCP completions share one run, and no longer hold a cache
-  lock across a CLI or git call; a failed model listing is remembered for 5 s.
-- `gitpulsed` holds a per-profile lock and refuses a second copy (exit 3,
-  naming the owner); the ledger stamps a writer generation and refuses a
-  writer older than its stamp; Diagnostics flags a running daemon from another
-  version.
-- Terminal sessions: sessions above a lowered limit are all adopted after a
-  reload; the quit guard counts host sessions no tab shows and agents typed
-  into shell tabs; `spawn` no longer waits on git and the ledger; one rejected
-  input write no longer ends the tab's input, and a cut-off bracketed paste is
-  closed; failed output emits no longer leak flow credit; a session whose
-  process outlives its terminal is listed as ending, with Stop.
-- GitHub calls on any host but github.com no longer fail: `gh pr/issue/run/
-  release` have no `--hostname` flag, so the host now travels inside
-  `--repo HOST/OWNER/REPO` from one builder (`gh_repo_flags`). `ssh.github.com`
-  remotes normalise to github.com. A 403 whose message says "API rate limit
-  exceeded" or "secondary rate limit" is classified rate-limited, with the wait
-  when GitHub gave one; a scope-only 403 stays forbidden. A fork pull request
-  whose head branch shares a name with a local branch no longer attaches to
-  that row or shows freshness for `origin/<name>`.
-- Insights finds agent sessions under every Claude config directory
-  (`CLAUDE_CONFIG_DIR`, `GITPULSE_CLAUDE_CONFIG_DIRS`, `~/.claude`, the XDG
-  directory and `~/.claude-*`) and reports not-ok when that list could not be
-  completed. Storage cleanup is no longer blocked machine-wide by an unrelated
-  `uv`/`npm`/`cargo` process (the path-scoped open-file scan remains), discovery
-  no longer walks repository source trees (an ~80k-entry root completes), a
-  symlinked cache root is an error rather than 0 bytes, and a partial removal
-  says entries were already removed. The fleet commit walk is bounded by its
-  window, so only a window that hit the cap reads as truncated; change totals
-  cover every file.
-- The watcher ignores read-only access events (Linux self-refresh loops),
-  treats a backend rescan/overflow and a full event queue as one full refresh,
-  no longer lets continuous noise hold a real change back, ignores a sibling
-  worktree's `git add` and the main checkout's HEAD/index, and keeps a
-  truncated ignore list instead of re-listing every 30 s. The status poll now
-  tells the live index and document vault about nested edits the
-  non-recursive worktree watch cannot see.
-- Performance: DORA lead time is one `git name-rev` instead of up to 30
-  `describe` processes, bounded by a 60 s deadline, and a failed read is
-  reported rather than published as an empty answer. Stage/unstage of a
-  selection is one git process. `gh --version` and an agent CLI's
-  `--version`/`--help` are probed once per binary (path, size, mtime). Alert
-  ranking asks GitHub for the worst severities when the first page is full.
-
-- The agentic workspaces plan no longer describes the flat graph export as
-  "generation 1". It records the real path, `.devcouncil/graph/code_graph.json`,
-  and how fresh each repository's export was on 2026-10-09.
-- A new test holds what GitPulse sends Manvi to Manvi's published serve
-  contract (`contracts/serve.ops.schema.json`): a field on the Rust host scope
-  or policy params the contract does not declare, or a profile-worker op the
-  harness does not serve, now fails the build instead of being dropped silently
-  at runtime. That is how a task's allowed commands once stopped being honoured.
-- The module-integration guide no longer shows board edits going through Manvi;
-  they run in-process on the vendored store.
-- **Freshness badges no longer spend a third of launch's git budget.** The
-  branch list and the Remote pane asked for provenance freshness from effects
-  that re-ran on every repository-store emission — a status poll, a diff
-  selection, a loading flag — and the branch list also reset the shared store
-  each time, dropping whatever was in flight: one launch ran 108 `git notes`
-  listings, two per freshness request, in its first 32 s. The effects now ask
-  only when the
-  repository, its branches or its pull requests change; an identical request
-  still out is joined; the two lists' answers no longer discard each other.
-  Each notes ref is listed once until it moves, rather than twice per batch,
-  and every branch or remote-tracking tip in a batch is measured by one
-  `for-each-ref` instead of one `rev-list` per row.
-- **Code-index retries no longer return in lockstep.** A deferred index check
-  or initialization, and a busy index writer's retry, now wait the shared
-  jittered backoff, so tabs refused by one spawn storm come back spread out.
-- **Dead-branch backups belong to one repository and never overwrite each
-  other.** Backups were filed by folder name and second, so two repositories
-  called `app` shared a directory and two cleans in one second wrote the same
-  file. Each repository now has its own directory, keyed by its git common
-  directory and shared by its worktrees, and every backup claims a new file
-  name. Backups written by 1.4.0 are still listed and restorable, but only by
-  the repository their header names.
-- **Restoring a backup can no longer run a git option.** Restore reads only
-  this repository's own backup files, up to 4 MiB. Each line must be
-  `git branch <name> <full commit id>` and is run as
-  `git branch -- <name> <commit>`. A line such as `git branch foo -D` used to
-  delete `foo` and report it restored.
-- **Restore reports what happened to each branch.** A branch counts as
-  restored only when it exists at the backed-up commit afterwards. Git's exit
-  status alone no longer decides.
-- **The ledger records a branch deletion after it happens, with its outcome.**
-  A dead-branch clean journaled every branch as deleted while writing the
-  backup, before the policy check and before any delete. A refused or failed
-  clean still recorded deletions. Each row is now written after its delete,
-  as `ok` or `failed`, with the command that ran.
-- **A dead-branch clean no longer spawns git several times per branch while
-  holding the repository lock.** It lists worktrees once, reuses the default
-  branch the branch listing already resolved, and runs `merge-tree` only for
-  the selected branches (none with force). A 50-branch clean went from 457 git
-  processes to 109.
-- Branch freshness badges in the sidebar were requested and then discarded:
-  the reset that clears them on a repository switch ran after every load,
-  voiding it, and wiped the GitHub panel's PR badges with it. It now runs only
-  when the repository changes.
-
-
-## [1.4.0] - 2026-10-09
-
-Agents that start in the background with a pane showing every one at work,
-stacked worktree tabs, a model choice per agent, one agent guidance in every
-handoff, and board tools that delete and merge tasks and make agents group work
-before filing — plus stale-branch cleanup with backups, a secret scan that never
-reads a partial scan as clean, worktree cache sync and named local routes,
-symbol-level collision notes, Markdown rendered by MarkDev, terminals that
-report what they are running, coloured tabs, timers that stop in the
-background, Bun for installs and scripts, and git spawns admitted by class so
-a refresh storm can no longer starve the actions you asked for, with branch
-churn kept across restarts. Two live agents sharing one worktree now show up
-in collision risk; the task board gains Undo, bulk changes and full keyboard
-operation; workspaces can be reordered, imported from tab groups and relinked
-to a moved checkout; and the code graph opens the maps devmap 0.2.4 writes.
-Tasks gain checklists, links, search filters, swimlanes, saved views and
-work-in-progress limits; the code view searches file contents and renames,
-moves and deletes files; pull requests can be reviewed and merged. A terminal
-agent now ends only by its own exit, a Close or Quit — never because its view
-stalled or went away — every way to quit on macOS reaches the confirmation,
-and a second launch on macOS hands its request to the running GitPulse.
-
-### Added
 
 - **Task search filters and repository search.** The Tasks search box takes
   `is:bug`, `priority:high`, `status:open`, `repo:name`, `owner:`, `label:`,
@@ -829,6 +311,202 @@ and a second launch on macOS hands its request to the running GitPulse.
 
 ### Changed
 
+- Re-vendored DevCouncil at `8229de20` (wave 6): the `devmap-*`, `dc-store`, `dc-redact`, `dc-glob` and `dc-proc` crates, and the shared contracts (`lease.schema.md`, `verdict.schema.json`, `CHECKSUMS`). `devmap-query` now links `dc-glob` (already vendored; `Cargo.lock` gains the edge); `dc-evidence` and `dc-sparse-encode` (and its git-pinned `tessl`) are not part of GitPulse's closure. A map built by the new devmap is store schema 27, and the devmap-store now refuses any store that carries a trigger. Re-vendored again at `9add99c2` (`a6b5e815`): `devmap-extract`'s Swift scope self-lookup recursion fix only.
+- A task whose planned file declares an `allowed_change` outside `create`, `modify`, `delete`, `read_only` is now an unreadable scope (the Go decoder refuses the whole task), reported through the same broken-scope path as damaged JSON instead of being read as a plain path. GitPulse writes no such value anywhere.
+- A failed `devmap ... --json` run (doctor, status, preview, integrate, build, live refresh, the index sweep and the map pane) now reports DevMap's own `{"error": ...}` envelope from stdout. Under `--json` stderr is empty for exactly the failures that have a reason, so the reason used to be replaced by "exited N".
+
+- Workbench store at scale (dc-store re-vendored from DevCouncil `40b6bbbf`):
+  finding a repository by identity and reading a task's last revision are one
+  store request each (they paged 23 and 25 times at 5,000 repositories and
+  5,000 revisions, and failed past 10,000), a request receipt no longer copies
+  the record body, `events.list` and `items.history` bound their per-page count
+  (`total_exact` says when `total` is a floor), and a newly created profile is
+  `auto_vacuum=INCREMENTAL` so `store.compact` gives pages back. A profile that
+  already exists keeps its size until a full `VACUUM`. The workbench profile is now schema 13 (short receipts: a schema 12 host refuses it with `schema_unsupported`); the upgrade runs on the first write, after the backup, as for earlier schemas.
+
+- **The task profile's schema moves only when the desktop app moves it.**
+  The app upgrades an older profile once, after dc-store's own backup
+  (`<profile>.pre-schema-<n>.bak`) and before the first read, and a failed
+  upgrade is returned to the caller, logged and listed in Diagnostics. The MCP
+  server's handles refuse upgrades (`schema_upgrade_required`), so an older or
+  newer server never migrates a profile the app and Manvi share. Manvi's own
+  `schema_upgrade_required` is shown as what to do. Task views and scopes open
+  the repository store read-only and judge leases without sweeping them: a
+  lapsed lease is no longer rewritten by looking at it, and a lease whose
+  expiry cannot be read is listed with that text (`expiry_error`) instead of
+  failing the list.
+- **Task writes are safer to repeat.** `gitpulse_complete_task` and
+  `gitpulse_delete_task` take an optional `request_id`, which the store keys its
+  receipts by, so a call whose answer was lost can be sent again. A delete the
+  caller allowed with `even_if_running` carries that to the store, which now
+  refuses a delete under a live run inside its own transaction. `gitpulse_add_task`
+  files a new task only against the board it scanned for related work: the write
+  names the scan's sequence, and a board that changed in between is scanned
+  again once, then reported as `board_changed`.
+- The profile is compacted once a day: the host runs dc-store's `store.compact`
+  (expired receipts, events and revisions, a bounded number per pass) from its
+  existing background loop, off the UI thread, never beside itself, never
+  creating a profile. The last attempt is stamped beside the profile, so a
+  restart does not start another window and a failure is logged and retried next
+  window. The log line carries deleted, eligible and truncated per table.
+- Accepting a refinement's splits runs the board's related-task check on each
+  split title. A split that looks like open work holds the whole accept, and the
+  sheet offers "They are separate: apply anyway". DevCouncil is re-vendored at
+  `c0bc26d5` and the serve contract refreshed from Manvi's `work.store.compact`.
+- DevCouncil is re-vendored at `acb5e3b9`: dc-store workbench schema 12 (refinement
+  proposals, an `acceptance_criteria` lock) and `dc-glob`. A profile that
+  Manvi's dc-store has taken to 12 is refused by a GitPulse built at 11, so the
+  installer now requires a `dcstore` that reports schema 12. Suggest
+  refinements now accepts through the proposal Manvi stored (parts chosen
+  against the proposal and task revisions reviewed; each accepted split is a new
+  inbox task with an id the host makes), and the Map panel says when a
+  workspace's link scan could not read part of it.
+- The profile worker's per-call timeout now comes from Manvi's `hello`
+  (`op_limits`: the lane and server-side deadline of each op) plus a 5 s margin,
+  clamped to 15 minutes, instead of a hard-coded table. Against an older Manvi
+  that advertises nothing the built-in table still applies, and a log line says
+  so. The vendored `contracts/serve.ops.schema.json` is refreshed for it and for
+  the repository roots Manvi's `devmap.*`, refine and scan ops now require
+  (`E_BAD_ROOT` otherwise); GitPulse sends none of those ops today.
+- **The update check announces releases, not tags.** `git ls-remote --tags`
+  only says a tag exists, and the release workflow runs for many minutes after
+  a tag is pushed and may never publish, so a `vX.Y.Z` pushed early (or a
+  mistaken `v9.0.0`) was announced to every user. A tag newer than the running
+  build is now announced only once its release is published, confirmed by one
+  bounded `HEAD` of the release's checksum asset (a draft's assets are not
+  public); at most five tags are probed, a check that cannot be made fails the
+  check rather than guessing, and a tag with no release is not announced.
+- **`gitpulse-mcp` answers an unknown protocol version with the newest it
+  supports.** A client asking for a revision the binary does not list (such as
+  `2025-06-18`) used to be answered with the oldest, `2024-11-05`, under which
+  `outputSchema` and `structuredContent` may be ignored. The lifecycle
+  specification says the answer SHOULD be the latest the server supports.
+- The MCP output-schema contract test now validates every advertised tool,
+  the task-board writers included, and fails a tool whose calls all errored
+  instead of skipping it. The thirteen tools that declare only
+  `{"type":"object"}` are named in an explicit allow-list with a reason each,
+  and the list cannot go stale.
+- **The Rust tests run in a hermetic environment.** Every test process now
+  starts in a per-process temporary home with its own git configuration, so a
+  developer's `core.hooksPath`, `init.defaultBranch`, `~/.claude` sessions,
+  repository-trust store and `tools.json` can no longer decide whether the suite
+  passes (and fixture repositories are no longer granted trust in the real
+  store). There is one environment lock instead of six, enforced by the type
+  `bind_env` takes; raw `set_var` is refused outside
+  `src/test_support/env.rs`; every wall-clock limit goes through
+  `coverage_relaxed` (Rust) or `wallClockBudget` (TypeScript). The Rust suite now
+  also runs on 8 threads in a separate workflow (`test-parallel.yml`); the serial
+  gate in `ci.yml` is unchanged.
+- **A runaway test process is stopped.** Test processes sample the operating
+  system's own write counter and abort with a message when one averages more
+  than 40 MiB/s over 30 s or writes more than 8 GiB, a guard added after a
+  `gitpulse_lib` test binary was reported writing 549.8 GiB in 90 minutes.
+  `node scripts/test-disk-writes.mjs` attributes bytes to single tests and fails
+  any over a budget.
+- The coverage floors are less generous. `graphStore.ts` and `repoMetrics.ts`
+  count again, each remaining exclusion names an owner and a review date (a
+  passed date fails `scripts/coverage-exclusions-contract.test.ts`), and the
+  function floor has a margin of over one point instead of 0.05. The coverage
+  workflow now reports Rust branch coverage (nightly `--branch`); it is reported,
+  not gated, until a floor has been measured.
+- **The task-scope fence covers argument-writing commands.** With DevCouncil
+  `ec26e906` in the harness (Manvi `hx/wave2` or later), `rm`, `truncate`,
+  `touch`, `dd of=`, `perl -i`, `install`, `ln`, `rsync` and `patch FILE` against
+  a plan that excludes the file are refused as `scope.unplanned`, and a write
+  whose target is not in the command (`git apply`, `xargs`, `find -exec`) is
+  refused as `command.substitution` while a scope is bound. GitPulse still
+  runs no parser of its own: the hook forwards every command verbatim with the
+  bound scope, and a test proves each one arrives. The real-harness fence test
+  now asserts the refusals against a Manvi built from `hx/wave2`. Escaped
+  descendants and second-profile agents stay documented as outside what a hook
+  can judge.
+- **`gitpulse-hook` correctness.** The hook now takes down any `git` or harness
+  child a check abandoned at its deadline before it exits (a stalled `git
+  status` used to outlive it and could hold `.git/index.lock`); one 8 s
+  deadline starts when the process does and every wait is cut to what is left,
+  so a late stdin no longer adds up to the host's 10 s timeout and drops the
+  decision; the collision verdict is computed for the file being edited rather
+  than the first overlapping file; a file touched in another worktree on
+  different symbols (or with a stale index) informs the agent through
+  additional context instead of asking, which a launched agent turned into a
+  refused edit; a Cursor deny or ask is shown as a warning instead of looking
+  like a clean pass; and the `MultiEdit` tool the guard judges is now in the
+  plugin's matcher, with a test that keeps the two lists equal. Security
+  impact: the guard now also covers `MultiEdit` and no longer leaves orphans;
+  the disjoint-symbol case stops asking, which narrows nothing that was
+  blocking a real conflict (shared-symbol and file-level overlaps still ask).
+- **A released app's safety hooks and MCP server now resolve, and a hook that
+  cannot launch no longer fails open.** The plugin's manifests name bare
+  `gitpulse-hook` / `gitpulse-mcp`, which only a developer's `mcp:install`
+  puts on PATH, and a host runs the tool call anyway when a hook cannot start.
+  Settings now resolves both binaries beside the app, says `not reachable`
+  when `gitpulse-hook` is missing and when either is not on PATH, and copies
+  `.mcp.json` and a new `hooks.json` built from the resolved absolute paths.
+  In the copied hooks the collision guard and command gate refuse the call
+  (exit status 2, reason on stderr) when the binary is missing, and session
+  start tells the agent the hooks are off. Security impact: this narrows what
+  proceeds without a gate (a missing gate now blocks instead of passing); it
+  grants nothing. The plugin's own static `hooks/hooks.json` keeps its
+  portable bare names.
+- **Repository hooks need your approval.** `.gitpulse/hooks.json` and
+  `hooks.toml` come from the working tree, so a pulled branch or a compromised
+  agent could write shell commands that GitPulse then ran on every agent
+  launch, worktree add and merge. They now run only after you approve the
+  exact file text (the Worktrees panel shows it); any edit asks again. Each
+  command goes through the command gate and the ledger before it runs, "Run
+  repository hooks" is its own option and off by default (split from "Share
+  build caches"), a file that does not parse is an error instead of falling
+  back to the other format, and TOML commands containing commas are no longer
+  cut apart. Unapproved hooks are skipped with a notice, never run. Security
+  impact: this narrows what repository content can execute; nothing widens.
+
+- CI now fails when a vendored crate is edited in this repository, through the
+  new `bun run check:vendor-edits` (`vendor-crates.mjs --check --allow-drift`),
+  which `ci:local` runs too. Upstream drift is still printed but never fails a
+  gate: DevCouncil commits land independently, so bare `vendor:check` stays the
+  check to run right after `bun run vendor`.
+- An agent's `gitpulse_complete_task(done)` no longer takes its own word. The
+  task lands in `done` only when Manvi's `work.verify.task` stored a settled
+  `passed` verdict for the head its worktree is at now; with no record, a
+  `failed` or `degraded` one, one still running, one for an older head or
+  another task or repository, or an evidence store that cannot be read, it
+  lands in `review` with the reason in the task's history
+  (`held_for_review: true` in the reply). A passed verdict is attached to the
+  history ahead of the agent's summary. A person moving a card is unaffected.
+  Security impact: this narrows what an agent can do (it can no longer
+  self-certify done); nothing widens, and the check fails closed.
+- The profile worker may now call `work.verify.task` and `work.verify.get`
+  (host methods `verifications.start` and `verifications.get`), which only name
+  the work to judge; no command or criteria travel in the request.
+- **Less background work while you type and while the window idles.** A
+  commit-message keystroke or status poll no longer re-runs code-impact
+  queries, re-lists every file in the tree, re-walks a file's history,
+  refetches provenance or markdown backlinks, or rescans dead branches
+  (which also reset the cleanup selection); those refresh when the
+  repository, selection, staged paths or HEAD change. Dragging the terminal
+  dock writes preferences once on release instead of every frame, an
+  unrelated preference change no longer resets the graph's tile cache or
+  native zoom, and the Agents clock stops while the window is hidden.
+- **Fewer spawns and faster ledger reads.** The ledger's foreign-repository
+  check uses index seeks instead of scanning every event on each gated
+  action and agent hook; dead-branch scans and cleans read the worktree list
+  once rather than once per branch; the update check, persisted log and MCP
+  info no longer block the interface thread or a shared runtime worker.
+- **Ranked task search on one shared parser.** The Tasks board, the archive dock
+  and the navigator's find box keep one search language (`taskQuery.ts`), which
+  now also reads `"phrases"`, `OR` between words, and comma lists for any of
+  several values (`label:ui,ci`), and reports a stray `OR` or an unknown
+  `todo:fix` instead of dropping it. A search or Filters choice reads one
+  candidate set for the board (200 at a time, **Load more tasks** up to 2,000)
+  plus one full-text read for the most selective word, so filters reach every
+  task rather than the loaded column pages and descriptions still match. Words
+  are ranked locally — word forms, related software terms, parts of words and
+  close spellings, weighted by field and rarity — with **Relevance** or **Board
+  order**; dragging and keyboard reordering are off under Relevance. A line
+  under the search says what was read and never lets a partial answer read as
+  complete, cards say why they matched when it is not obvious, and the search
+  box completes filter names and values. Lexical ranking, not embeddings.
+
 - **More than 24 repositories can be open at once.** Opening a twenty-fifth
   used to be refused with "Too many open repositories (max 24)", because every
   tab held one of 24 native file watches. Tabs and watches are now separate:
@@ -973,6 +651,295 @@ and a second launch on macOS hands its request to the running GitPulse.
   before failing instead of stopping at the first.
 
 ### Fixed
+
+- Host load in the installed app: the status bar and Health → Host load called four commands the main window was never granted, so every call failed "not allowed by ACL". `cmd_host_load_status`, `cmd_host_load_settings`, `cmd_host_load_settings_save` and `cmd_host_load_terminate_orphan` are now granted. Terminate now also needs a Yes in a native dialog that page script cannot answer, and the process is re-checked after the dialog closes as well as before it. See `docs/LOAD_GOVERNOR.md` → Orphans for the security impact.
+- The host-load sampler runs under the supervisor (`Policy::RESTART`). A tick that panics no longer ends the thread and leaves the last pulse standing as though it were current. A sampler that keeps panicking stops visibly in Diagnostics. A sampler stopped during a restart backoff waits out that backoff (1 s, doubling to 60 s) before it joins.
+
+- `bun run gusset:check` runs from a linked worktree under `.claude/worktrees/<name>`. It used to exit 2 there, because `go/go.mod`'s `../../DevCouncil` and `../../gusset` replaces point inside `.claude/`. It now finds the checkouts the way `vendor-crates.mjs` does (`GITPULSE_DEVCOUNCIL_ROOT` / `GITPULSE_GUSSET_ROOT`, then ancestors, then the canonical checkout's siblings) and, only when they are not where go.mod points, hands them to go through a temporary `go.work` whose replaces take precedence.
+- `gitpulse-mcp` `devmap_neighbors` no longer fails every call with "data must be object": it answers the `CodeintelResponse` envelope (`source_freshness`, `available`/`reason`, `total`/`shown`/`truncated`, `walk_incomplete`). `depth` and `min_confidence` were advertised but hardcoded to 10 and 0.0 in `devmap_neighbors`, `devmap_impact`, `devmap_trace`, `devmap_explore` and `devmap_affected_tests`; they now reach the walk through one `WalkBounds` and an out-of-range value is refused, not clamped. `devmap_dependencies` reads one file's direct edges, so it drops the no-op `depth` and gains `min_confidence`. `devmap_trace` declares the `min_rung` it reads. All eleven DevMap tools now declare typed `outputSchema`s, and the contract tests run each of them and require every declared argument to be read and every read argument to be declared.
+
+- Windows: `git worktree add` and `remove` are given an ordinary `C:\...` path rather than the canonical `\\?\C:\...` one git rejects, so a managed attempt's worktree can be created, reused and reclaimed; a task brief that is a directory or a link is refused as "not a regular file" instead of an access error or a followed link; the vendoring manifest records `/`-separated origin paths on every platform. Linux: closing an idle shell hangs up its jobs under bash, and a process ID past `pid_t` is reported unknown rather than gone.
+- Multi-module Maven and Gradle builds: each module's own JaCoCo report
+  (`<module>/target/site/jacoco/jacoco.xml`, `<module>/build/reports/jacoco/...`)
+  is found and resolved against that module's sources; modules past 128 mark the
+  scan capped. The Health view, its vulnerabilities facet and the text report
+  show the audit census ("N of M audited; not audited: ..."), and the coverage
+  report names the stale, unresolved and past-end-of-file data an artifact
+  dropped from its totals.
+- AI replies: an orphan `</think>` (templates that open the tag in the prompt) now drops the reasoning before it and keeps the answer after it, and a reply that ends inside its reasoning reports "the model's reply ended inside its reasoning; no answer was produced" instead of a generic empty reply.
+- Secrets scan: a refused envelope version no longer replaces a valid probed one (the refusal is reported as `kingfisher_version_rejected`), and a finding without a line carries no line (`null`) rather than line 0.
+- Task board: a refresh after any write keeps the pages a reader loaded (columns and navigator) instead of snapping back to page one; moving a card to the bottom of a paged column reads the column to its end first, so the card is not hidden after reload; overlapping catalog reads no longer land out of order.
+- Archive and Attention inbox keep their pages and selection across a window blur; closing a tab through any of the three close routes now forgets every per-tab record and the harness journal cache.
+- One shared `workbench-changed` subscription: each write refreshes each surface once (a repeated sequence and the watcher's echo of an in-process write are dropped), the inbox re-reads only when enhancement status really changes, and a failed listener is reported on every surface.
+- Backend calls can now be bounded: `invoke` takes a deadline and an abort
+  signal, a timeout is a distinct `DeadlineError`, and the GitHub context, runs
+  and workflows reads time out with a message instead of a spinner that never
+  ends. The five separate timeout helpers are replaced by one. A switched-away
+  repository's Overview load no longer holds up the new one.
+- A failed read no longer looks like an empty or successful one: issue import
+  refuses while the task list is unread, a failed diff shows its own error with
+  a retry (and no longer disables Review changes or keeps the previous file's
+  diff), quick commit picks end on the last pick, Launch at login shows
+  "unknown" instead of Off, branch stats no longer revert a newer branch list,
+  an unreadable checkout-holder list forces a worktree, sticky error toasts
+  outlive other toasts, a failed notification read can be dismissed, and a typed
+  answer withdraws the session alert.
+- The local-model client now tries every address `localhost` resolves to (an
+  IPv4-only Ollama was refused when `::1` came first), treats a chunked reply
+  cut off before its last chunk as an error, and reports non-text reply
+  content instead of an unexplained empty one. Suggested branch names pass the
+  app's ref-name validation, and the branch-name prompt reads a capped diff
+  that names untracked files.
+- The staged patch reaches Lappi as git's exact bytes rather than a lossy
+  UTF-8 decode.
+- A Markdown link to `other.md#section` opens that section, and a footnote
+  whose label matches a heading no longer shares its id.
+
+- Checks that could not run no longer read as clean. A task whose scope JSON is
+  unreadable is a broken scope (not "nothing forbidden"); govulncheck killed
+  mid-stream or silent, a cargo-audit document with no vulnerabilities list or a
+  mismatched count, and any scanner that exits 0 with no output are issues and
+  are not counted as run; RustSec CVSS vectors are scored (critical/low) and a
+  missing score is `unknown`, not `high`. Every multi-command git action folds
+  all of its verdicts, conflict save's file verdict included. A log-lock timeout
+  drops one line instead of silencing the sink. `tools.json` is written under a
+  writer and file lock, atomically, reloads when edited by hand, and a failed
+  save of an installed tool's path is reported. Preview debounce claims its slot
+  atomically and evicts expired ones.
+- The dependency audit's "complete" now compares audited against found targets
+  (`audit_coverage`): a nested `package-lock.json` is audited on its own,
+  workspace members use their root's lockfile, `uv.lock`/`poetry.lock`/
+  `pyproject.toml`-only Python and ecosystems with no scanner are reported as
+  not audited, empty cargo-crev output is not a run, and `engines.node` ranges
+  compare full versions (`>=18 < 20`, `< 20`, `>18.5.0`).
+- Coverage maps JaCoCo and Cobertura hits onto Maven/Gradle sources and applies
+  Cobertura `<source>` roots, resolves a nested report against its own module,
+  refuses single-component suffix matches, leaves unmatched paths out of the
+  totals (counted per artifact as `unresolved_files`), drops hits from files
+  edited after the report was written and lines past end of file, and reads
+  SimpleCov (`.resultset.json`, JSON formatter) for Ruby.
+- **Store reliability.** The ledger no longer caches a failed open for the
+  process lifetime, holds one lock per repository instead of one for every
+  repository across its IO, reopens a database whose `.devcouncil/` was deleted,
+  takes an IMMEDIATE transaction for every multi-statement write (fleet metrics,
+  languages and history are one), and validates action names against the event
+  schema. `gitpulse_status`, `gitpulse_ledger_events` and the ledger resource
+  open the ledger read-only (no DDL, no chmod, no legacy consolidation); the
+  resource pages like the tool, returns `next_cursor`, and `truncated` is exact.
+  URL userinfo that is a bare token, or a password containing `/` or `@`, is
+  redacted. Reflog catch-up dedups with one indexed query against redacted
+  identities and stops when it cannot read what is recorded. The instance
+  mailbox releases a handler's slot even when the handler panics.
+  Security impact: redaction only removes more; binding resolution still
+  enforces a legacy sibling binding, now through a read-only connection.
+- **Profile durability.** Repository-trust grant, revoke and migration take one
+  directory lock and move records with a no-replace link, closing a window in
+  which a migration could undo a revoke (no access widened). The churn cache
+  deletes its database only when it is not a database or is corrupt, not on a
+  transient busy error. Startup re-registers a hygiene or launch-at-login
+  LaunchAgent that still starts a moved or replaced app (never a translocated
+  path). DevCouncil's dc-store now upgrades the workbench profile only on a
+  write and after an online backup; this lands here when that change is
+  re-vendored.
+- **Task MCP retries.** `gitpulse_complete_task`, `gitpulse_delete_task` and
+  `gitpulse_merge_tasks` recognise their own earlier work before comparing
+  `expected_revision`, so an identical retry is `unchanged` and an interrupted
+  delete or merge (including one started from the board) finishes. A task with
+  more than 25 related open tasks can be filed: `reviewed_related` takes up to
+  500 ids and a refusal names 25 at a time. A server timeout says the work may
+  still finish and a write's outcome is unknown.
+
+- Destructive git actions are bound to the state they checked. A release tag is
+  created on the commit the release checks were made against, not on whatever
+  HEAD is by then; a local CI note is written only if HEAD and the tree are the
+  ones the run started on; merge-and-teardown holds one lock from its checks
+  through the removal and re-reads the worktree and the branch tip before
+  `worktree remove --force` and `branch -D`. A git read that produced no answer
+  (the current branch, `origin/HEAD`) is an error, never "detached" or "not the
+  default branch", so a rebase or restack can no longer finish with HEAD
+  detached and a force delete can no longer remove the default branch after an
+  unreadable `origin/HEAD`. A failed `rebase --abort` during a restack is
+  reported instead of "rolled back". With a tag named like the branch, the
+  current branch is still found.
+- Git's output format and environment no longer depend on the developer's
+  settings. Every git child gets `log.showSignature`, colour and diff-prefix
+  settings pinned, patch-printing commands skip `diff.external`, and the
+  environment is decided once for both the git builder and the `gh`/tool
+  builder: `LC_ALL=C`, no credential prompt, no optional locks, and
+  `GIT_LITERAL_PATHSPECS` (and its glob/icase siblings), `GIT_SSH`,
+  `GIT_PROXY_COMMAND`, `GIT_TRACE*`, `GIT_DIFF_OPTS`, `GIT_SHALLOW_FILE` and
+  `GIT_ATTR_SOURCE` stripped. A signed commit under `log.showSignature=true` no
+  longer produces a "No signature" graph id, `color.ui=always` no longer puts
+  escapes in the diff viewer, and the identity GitPulse shows follows git's
+  order (environment before config).
+- A cancelled or timed-out git command is asked to stop before it is killed:
+  SIGTERM to its process group, then SIGKILL after the 500 ms grace, so git
+  removes its own `.git/index.lock` and the next commit does not fail on it.
+  Reads that were cut short no longer pass for complete ones: a notes listing
+  killed at its deadline is an error rather than "nothing is verified", a blame
+  cut at its byte cap marks the ownership report truncated, and a failed or
+  malformed submodule or remote read is an error rather than "none". The shared
+  spawn-rate budget's file IO no longer runs under the gate mutex, so a user
+  action does not queue behind a background re-poll. SHA-256 repositories
+  resolve revisions for provenance.
+- Git parsers read unusual but legal repositories correctly. Worktree paths
+  with a newline or a trailing space round-trip through one `-z` parser used by
+  every caller; a tag named like the branch no longer hides the graph's HEAD
+  chip; a remote named `team/fork` owns its branches (one longest-prefix owner
+  in `remotes.rs`) instead of `team`; a branch named `release/HEAD` is listed
+  while a remote's own `HEAD` pointer still is not; a `--depth 1` boundary
+  commit is drawn as a stub rather than the root of the history; and a path
+  git printed as non-UTF-8 carries a warning instead of silently naming a file
+  that does not exist.
+- Long histories and wide graphs say what they leave out. A graph wider than
+  the 4,096 px canvas shows how many lanes are not drawn; a filter that joins
+  more than 32 ancestors onto a commit reports how many parent links the cap
+  dropped instead of cutting them silently; and a window longer than 5,000
+  commits is read and kept as chunks, so "load more" no longer re-reads and
+  re-parses every earlier commit (one 100k-commit answer exceeded the cache's
+  per-entry cap and was never kept). Git still skips past earlier commits for a
+  new chunk, and lane solving still covers the whole window.
+- Tasks board: **Suggest next** asks Manvi (`work.tasks.suggest`, through the
+  host method `tasks.suggest`) which open tasks to start, ranked by priority,
+  severity, due date, idle age, what each unblocks and its last verification,
+  with a one-line reason per task, a priority filter, and a plain statement when
+  blocked, duplicate, in-progress or unread tasks were left out or the board read
+  was capped. It is deterministic and makes no model call. The serve contract
+  mirror and the profile worker allowlist gain the op.
+- Tasks board Filters: a severity filter (saved views keep it) and a Priority
+  first order for the columns, a view that never writes a position. A card's
+  priority pip now has an accessible name.
+
+- **Panels no longer reset or re-ask when the repository store publishes
+  something they do not read.** An armed "click again to remove" on a
+  worktree stayed armed through a status poll, the GitHub spinner clears when
+  its answer lands even if the store published mid-fetch, "Show more" on the
+  Overview keeps its rows, and the line-count, storage and language metrics
+  keep one subscription instead of resubscribing (and recording a pulse
+  history point) per publish. Effects now key on `repoStore.currentPath`, a
+  store that notifies only when the active repository changes, or on values
+  compared by value; the hand-kept `prev*` guards they replaced are gone, and
+  a contract test fails if an `$effect` reads `$repoStore` again. The branch
+  list and pull-request list each hold their own freshness token, so one
+  list's success no longer clears the other's error. `harness/repo-churn.html`
+  drives fifteen panels through unrelated publishes in Chrome and WebKit.
+- Quitting (Cmd-Q, the Dock, a logout) and a `SIGTERM`/`SIGHUP` now run one
+  teardown: launch forwarding stops first, every terminal is closed under a
+  deadline, the sidecar is asked to finish, then procguard's children are
+  swept. Before, a normal quit never swept `git fetch`/`ci_local` children and
+  a signal never closed the terminals, so runs stayed "running".
+- Closing a terminal hangs up every process group in its session (`cmd &`,
+  `nohup`, a dev server, a stopped editor), not only the foreground group, and
+  gives them 2.5 s to clean up (an agent's SessionEnd) before killing the rest.
+  A tab with a background or stopped job is no longer treated as idle when its
+  view goes away, and closing it asks.
+- A worktree is not removed or merged away while any process, including an
+  agent typed into a plain dock tab, has its working directory inside it, even
+  with no workbench profile. An exited-but-unreaped child no longer counts as
+  running, and the sidecar reaps its child when its stdout ends.
+- One panic no longer disables a subsystem until restart: the hygiene cleaner,
+  the terminal session map, the task board's store and worker, the watcher and
+  the recent-repositories list recover from a poisoned lock. A panic in the
+  cleaner's clock thread is recorded as a degraded subsystem (listed in
+  Diagnostics) and the thread keeps running. Concurrent model probes, agent
+  model listings and MCP completions share one run, and no longer hold a cache
+  lock across a CLI or git call; a failed model listing is remembered for 5 s.
+- `gitpulsed` holds a per-profile lock and refuses a second copy (exit 3,
+  naming the owner); the ledger stamps a writer generation and refuses a
+  writer older than its stamp; Diagnostics flags a running daemon from another
+  version.
+- Terminal sessions: sessions above a lowered limit are all adopted after a
+  reload; the quit guard counts host sessions no tab shows and agents typed
+  into shell tabs; `spawn` no longer waits on git and the ledger; one rejected
+  input write no longer ends the tab's input, and a cut-off bracketed paste is
+  closed; failed output emits no longer leak flow credit; a session whose
+  process outlives its terminal is listed as ending, with Stop.
+- GitHub calls on any host but github.com no longer fail: `gh pr/issue/run/
+  release` have no `--hostname` flag, so the host now travels inside
+  `--repo HOST/OWNER/REPO` from one builder (`gh_repo_flags`). `ssh.github.com`
+  remotes normalise to github.com. A 403 whose message says "API rate limit
+  exceeded" or "secondary rate limit" is classified rate-limited, with the wait
+  when GitHub gave one; a scope-only 403 stays forbidden. A fork pull request
+  whose head branch shares a name with a local branch no longer attaches to
+  that row or shows freshness for `origin/<name>`.
+- Insights finds agent sessions under every Claude config directory
+  (`CLAUDE_CONFIG_DIR`, `GITPULSE_CLAUDE_CONFIG_DIRS`, `~/.claude`, the XDG
+  directory and `~/.claude-*`) and reports not-ok when that list could not be
+  completed. Storage cleanup is no longer blocked machine-wide by an unrelated
+  `uv`/`npm`/`cargo` process (the path-scoped open-file scan remains), discovery
+  no longer walks repository source trees (an ~80k-entry root completes), a
+  symlinked cache root is an error rather than 0 bytes, and a partial removal
+  says entries were already removed. The fleet commit walk is bounded by its
+  window, so only a window that hit the cap reads as truncated; change totals
+  cover every file.
+- The watcher ignores read-only access events (Linux self-refresh loops),
+  treats a backend rescan/overflow and a full event queue as one full refresh,
+  no longer lets continuous noise hold a real change back, ignores a sibling
+  worktree's `git add` and the main checkout's HEAD/index, and keeps a
+  truncated ignore list instead of re-listing every 30 s. The status poll now
+  tells the live index and document vault about nested edits the
+  non-recursive worktree watch cannot see.
+- Performance: DORA lead time is one `git name-rev` instead of up to 30
+  `describe` processes, bounded by a 60 s deadline, and a failed read is
+  reported rather than published as an empty answer. Stage/unstage of a
+  selection is one git process. `gh --version` and an agent CLI's
+  `--version`/`--help` are probed once per binary (path, size, mtime). Alert
+  ranking asks GitHub for the worst severities when the first page is full.
+
+- The agentic workspaces plan no longer describes the flat graph export as
+  "generation 1". It records the real path, `.devcouncil/graph/code_graph.json`,
+  and how fresh each repository's export was on 2026-10-09.
+- A new test holds what GitPulse sends Manvi to Manvi's published serve
+  contract (`contracts/serve.ops.schema.json`): a field on the Rust host scope
+  or policy params the contract does not declare, or a profile-worker op the
+  harness does not serve, now fails the build instead of being dropped silently
+  at runtime. That is how a task's allowed commands once stopped being honoured.
+- The module-integration guide no longer shows board edits going through Manvi;
+  they run in-process on the vendored store.
+- **Freshness badges no longer spend a third of launch's git budget.** The
+  branch list and the Remote pane asked for provenance freshness from effects
+  that re-ran on every repository-store emission — a status poll, a diff
+  selection, a loading flag — and the branch list also reset the shared store
+  each time, dropping whatever was in flight: one launch ran 108 `git notes`
+  listings, two per freshness request, in its first 32 s. The effects now ask
+  only when the
+  repository, its branches or its pull requests change; an identical request
+  still out is joined; the two lists' answers no longer discard each other.
+  Each notes ref is listed once until it moves, rather than twice per batch,
+  and every branch or remote-tracking tip in a batch is measured by one
+  `for-each-ref` instead of one `rev-list` per row.
+- **Code-index retries no longer return in lockstep.** A deferred index check
+  or initialization, and a busy index writer's retry, now wait the shared
+  jittered backoff, so tabs refused by one spawn storm come back spread out.
+- **Dead-branch backups belong to one repository and never overwrite each
+  other.** Backups were filed by folder name and second, so two repositories
+  called `app` shared a directory and two cleans in one second wrote the same
+  file. Each repository now has its own directory, keyed by its git common
+  directory and shared by its worktrees, and every backup claims a new file
+  name. Backups written by 1.4.0 are still listed and restorable, but only by
+  the repository their header names.
+- **Restoring a backup can no longer run a git option.** Restore reads only
+  this repository's own backup files, up to 4 MiB. Each line must be
+  `git branch <name> <full commit id>` and is run as
+  `git branch -- <name> <commit>`. A line such as `git branch foo -D` used to
+  delete `foo` and report it restored.
+- **Restore reports what happened to each branch.** A branch counts as
+  restored only when it exists at the backed-up commit afterwards. Git's exit
+  status alone no longer decides.
+- **The ledger records a branch deletion after it happens, with its outcome.**
+  A dead-branch clean journaled every branch as deleted while writing the
+  backup, before the policy check and before any delete. A refused or failed
+  clean still recorded deletions. Each row is now written after its delete,
+  as `ok` or `failed`, with the command that ran.
+- **A dead-branch clean no longer spawns git several times per branch while
+  holding the repository lock.** It lists worktrees once, reuses the default
+  branch the branch listing already resolved, and runs `merge-tree` only for
+  the selected branches (none with force). A 50-branch clean went from 457 git
+  processes to 109.
+- Branch freshness badges in the sidebar were requested and then discarded:
+  the reset that clears them on a repository switch ran after every load,
+  voiding it, and wiped the GitHub panel's PR badges with it. It now runs only
+  when the repository changes.
 
 - **A terminal agent is no longer ended by anything but its own exit, a Close, or Quit.** The PTY reader killed a session whose window did not acknowledge 256 KiB of output within 30 s — a hidden, minimized or busy window, which macOS throttles — and a failed output event killed it too. It now skips output for that view (one notice, the screen redrawn when the view catches up; a view that lagged once is waited 2 s, not 30) and the process keeps running. A terminal tab that unmounted for any reason other than Close — its repository tab closed, its pane crashed, the dock re-hosting — killed its process; it is now detached and its slot handed to **Sessions**, where it can be shown again or stopped. Only a plain shell known to be idle at its prompt ends with its view. Quitting asks first when agents are running. Every session end is logged with its cause.
 - **One GitPulse per profile on macOS.** LaunchServices keeps one instance per
@@ -1373,6 +1340,30 @@ and a second launch on macOS hands its request to the running GitPulse.
   failed as "deferred under load". Tests that measure contention now lift
   the rate cap for their own process only; the concurrency limit still
   applies. A guard fails if any shipped source calls that switch.
+
+### Security
+
+- The app now enforces an ACL on its own commands. The main window is granted
+  only the commands the frontend calls and the status popover only its three;
+  six registered commands nothing calls are denied everywhere. Webviews can no
+  longer navigate off the app origin.
+- Trusting a repository, and pointing devmap or manvi at a new binary or source
+  root, ask for a native confirmation drawn by the OS, not just the in-app
+  modal. Open-in-default-app requires a trusted repository and confirms
+  executables, `.app`, `.command`, `.terminal` and `.fileloc` before running.
+- Remote images in repository Markdown no longer load on render; click one to
+  load it.
+- Child processes drop relative `PATH` entries (`.`, `bin`,
+  `./node_modules/.bin`), which resolved inside the repository being opened.
+  A setup that relied on one must use an absolute path. The Manvi sidecar now
+  starts from an allowlisted environment, so provider API keys and tokens set in
+  the launching shell no longer reach it.
+- Remote tool installs build one pinned commit (`cargo install --rev`,
+  `go install @<sha>`) from a fixed working directory; curl is confined to
+  https for the request and every redirect; prebuilt installs need a version and
+  SHA-256 pinned in the app and refuse a downgrade (none are pinned yet, so
+  that rung reports itself unavailable). Clone refuses Git older than 2.45.1,
+  and submodule recursion Git older than 2.50.1, with the reason shown.
 
 ### Documentation
 
