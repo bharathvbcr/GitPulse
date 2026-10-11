@@ -48,6 +48,7 @@ import { formatError } from "../ui/formatError";
 import { PROVIDER_LABELS } from "./vocabulary";
 import { defaultHandoff, type HandoffSettings } from "./taskHandoff";
 import { bounded, TASK_ACTION_TIMEOUT_MS } from "./taskActions";
+import { fallbackOnDeadline, withDeadline } from "../async/deadline";
 
 /**
  * The longest one host step of an attempt's start is waited for: the root
@@ -55,22 +56,6 @@ import { bounded, TASK_ACTION_TIMEOUT_MS } from "./taskActions";
  * never answered held the launch, and the sheet that made it, for good.
  */
 export const ATTEMPT_HOST_STEP_MS = TASK_ACTION_TIMEOUT_MS;
-
-/**
- * `work`'s answer, or `fallback` once `ms` pass without one. A rejection in
- * time is the caller's; one after the bound is absorbed, since nothing is
- * listening for it any more.
- */
-async function answerWithin<T>(work: Promise<T>, fallback: T, ms: number = ATTEMPT_HOST_STEP_MS): Promise<T> {
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  let late = false;
-  work.catch(() => undefined);
-  try {
-    return await Promise.race([work, new Promise<T>((resolve) => { timer = setTimeout(() => { late = true; resolve(fallback); }, ms); })]);
-  } finally {
-    if (!late) clearTimeout(timer);
-  }
-}
 
 /**
  * `opened`: on screen now. `started`: its checkout is open and the terminal
@@ -116,7 +101,7 @@ export async function startTaskTerminal(run: RunRef): Promise<AttemptStart> {
   queueAttempt(run, place);
   // Queued already, so an open still in progress at the bound is "waiting
   // for the checkout" — true, and the request starts when the tab opens.
-  const opened = await answerWithin(repoStore.openRepo(place.root, backgroundOpen()), false);
+  const opened = await withDeadline(repoStore.openRepo(place.root, backgroundOpen()), ATTEMPT_HOST_STEP_MS).catch(fallbackOnDeadline(false));
   return afterOpen(run, place.root, opened, "started");
 }
 
@@ -200,7 +185,7 @@ interface Placement {
 async function hostFor(place: Placement): Promise<Placement> {
   if (tabFor(place.root) || get(repoStore).currentPath === null) return place;
   // Only a better host for the terminal: without an answer, the checkout's own tab.
-  const family = await answerWithin(repoStore.familyOf(place.root), null);
+  const family = await withDeadline(repoStore.familyOf(place.root), ATTEMPT_HOST_STEP_MS).catch(fallbackOnDeadline(null));
   if (!family) return place;
   const host = hostTabFor({ repoPath: place.root, family }, openTabs(), { caseInsensitive: isCaseInsensitiveFs() });
   return host ? { ...place, family, host: host.path } : place;

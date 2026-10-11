@@ -8,6 +8,7 @@ import {
   isDeferredUnderLoad,
   jitteredRetryDelayMs,
 } from "../async/deferral";
+import { withDeadline } from "../async/deadline";
 import { whenDocumentShown } from "../runtime/foreground";
 import { activity, observeSettled } from "../diagnostics/activity";
 
@@ -38,8 +39,38 @@ import { activity, observeSettled } from "../diagnostics/activity";
  * session on the machine.
  */
 type Raw = <T>(cmd: string, args?: InvokeArgs, options?: InvokeOptions) => Promise<T>;
+
+/**
+ * How long one caller waits, and what ends the wait early. Carried in the
+ * options argument beside Tauri's own (`headers`), stripped before the call
+ * is forwarded, so the backend never sees them and a call that carries only
+ * these is still retried and joined like any other.
+ *
+ * The deadline covers the whole call as this caller sees it, deferral
+ * backoff included. It stops the wait, not the native operation, so a write
+ * that times out may still have landed: report it as unknown, not as failed.
+ */
+export type IpcBound = {
+  /** Rejects with a `DeadlineError` after this many ms; `Infinity` waits unbounded. */
+  deadlineMs?: number;
+  /** Rejects with the signal's reason at once, and never sends the call if already aborted. */
+  signal?: AbortSignal;
+};
+export type IpcOptions = InvokeOptions & IpcBound;
 /** Exactly what the caller passed after `cmd`, forwarded with the same arity. */
-type Rest = [args?: InvokeArgs, options?: InvokeOptions];
+type Rest = [args?: InvokeArgs, options?: IpcOptions];
+
+/**
+ * Commands that shell out to `gh` over the network and so can hang on a dead
+ * connection, bounded by default so a panel shows a message instead of a
+ * spinner for good. `cmd_github_context` runs four `gh` round trips (see
+ * WorkspaceView), hence the longer bound. A caller's `deadlineMs` overrides.
+ */
+export const COMMAND_DEADLINES_MS: Readonly<Record<string, number>> = {
+  cmd_github_context: 60_000,
+  cmd_github_runs: 30_000,
+  cmd_github_workflows: 30_000,
+};
 
 export type DeferralRetryOptions = {
   /** Stand-in for `setTimeout`-based sleeping, for tests. */
@@ -146,7 +177,7 @@ export function withDeferralRetry(raw: Raw, options: DeferralRetryOptions = {}) 
   // `.catch`, and is checked for plain data only if it is actually deferred.
   // The exported `invoke` sits one microtask above `tauriInvoke`, for the
   // stall-attribution note below.
-  return function invoke<T>(cmd: string, ...rest: Rest): Promise<T> {
+  function dispatch<T>(cmd: string, rest: Rest): Promise<T> {
     // A call carrying options (request headers, for raw-body commands) is
     // treated like one with non-plain arguments: neither retried nor joined.
     // So is a byte buffer; both are known without serializing anything.
@@ -179,7 +210,25 @@ export function withDeferralRetry(raw: Raw, options: DeferralRetryOptions = {}) 
       retrying.set(settledKey, chain);
       return chain;
     });
+  }
+
+  return function invoke<T>(cmd: string, ...given: Rest): Promise<T> {
+    const [args, options] = given;
+    if (options === undefined) return bound(cmd, given, COMMAND_DEADLINES_MS[cmd], undefined);
+    const { deadlineMs, signal, ...tauriOptions } = options;
+    const rest: Rest = Object.keys(tauriOptions).length > 0 ? [args, tauriOptions] : args === undefined ? [] : [args];
+    return bound(cmd, rest, deadlineMs ?? COMMAND_DEADLINES_MS[cmd], signal);
   };
+
+  /** `dispatch` under the caller's wait bound; a call with neither adds nothing. */
+  function bound<T>(cmd: string, rest: Rest, deadlineMs: number | undefined, signal: AbortSignal | undefined): Promise<T> {
+    const limited = deadlineMs !== undefined && Number.isFinite(deadlineMs);
+    if (!limited && !signal) return dispatch<T>(cmd, rest);
+    return withDeadline(() => dispatch<T>(cmd, rest), limited ? deadlineMs : Infinity, {
+      signal,
+      message: `${cmd} timed out after ${Math.round((deadlineMs ?? 0) / 1000)} s without an answer`,
+    });
+  }
 }
 
 // Each answer is noted for UI stall attribution (diagnostics/activity.ts).

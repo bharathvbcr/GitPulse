@@ -61,27 +61,13 @@ export function formatDevmapLogs(
   ].join("\n");
 }
 
-async function readLog<T>(request: Promise<T>): Promise<T> {
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  try {
-    return await Promise.race([
-      request,
-      new Promise<never>((_resolve, reject) => {
-        timer = setTimeout(() => reject(new Error("log read timed out after 5 seconds")), DEVMAP_LOG_READ_TIMEOUT_MS);
-      }),
-    ]);
-  } finally {
-    if (timer !== undefined) clearTimeout(timer);
-  }
-}
-
 export async function copyDevmapLogs(
   context: DevmapDiagnosticContext,
   isCurrent: () => boolean,
 ): Promise<"copied" | "failed" | "stale"> {
   const [memory, durable] = await Promise.allSettled([
-    readLog(invoke<string[]>("cmd_diagnostic_log_tail", { maxLines: LOG_LINES })),
-    readLog(invoke<PersistedLog>("cmd_diagnostic_persisted_log", { maxLines: LOG_LINES })),
+    invoke<string[]>("cmd_diagnostic_log_tail", { maxLines: LOG_LINES }, { deadlineMs: DEVMAP_LOG_READ_TIMEOUT_MS }),
+    invoke<PersistedLog>("cmd_diagnostic_persisted_log", { maxLines: LOG_LINES }, { deadlineMs: DEVMAP_LOG_READ_TIMEOUT_MS }),
   ]);
   // A repository switch or destroyed panel must not copy the previous repo.
   if (!isCurrent()) return "stale";
