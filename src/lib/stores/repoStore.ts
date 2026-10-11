@@ -4,6 +4,8 @@ import { invoke } from "../ipc/invoke";
 import { formatError } from "../ui/formatError";
 import { diagnostics } from "../diagnostics/diagnostics";
 import { askConfirm } from "./modalStore";
+import { confirmTerminalLoss } from "../repos/terminalLoss";
+import { createDiffSelection } from "../repos/diffSelection";
 // One-way: the terminal registry knows nothing about repositories, so this
 // cannot form a cycle. `sessionFocus` takes the store by injection for the
 // same reason.
@@ -144,7 +146,6 @@ import {
 import { decideCadence, readEventLoopDelay } from "../runtime/loadCadence";
 import { debounce, type Debounced } from "../async/debounce";
 import { createSessionBook } from "../repos/sessionBook";
-import { beginGeneration } from "../async/guard";
 import { createCommitDraftStore } from "./commitDraftStore";
 import { flushOnPageHide } from "../async/deferredWrite";
 import type { FilePatch } from "../diff/patchBuilder";
@@ -262,56 +263,6 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
       sessionsByRepo(get(terminalSessions).filter((record) => !!record.checkout), options).get(repoPath) ?? 0,
   };
 
-  /**
-   * True when these tabs may be closed: either nothing is running in any of
-   * them, or the user said to end it anyway.
-   *
-   * Takes a LIST because "Close Other Tabs" and "Close Tabs to the Right"
-   * discard several repositories at once and never route through `closeTab`.
-   * Guarding only the single close would leave the two paths that can lose
-   * the most work unguarded.
-   *
-   * Fails OPEN on a broken counter. A registry that threw would otherwise
-   * make every repository tab unclosable, which is a worse failure than a
-   * missing warning — the count is a courtesy, not a safety interlock.
-   */
-  async function confirmTerminalLoss(paths: readonly string[]): Promise<boolean> {
-    let running = 0;
-    let repos = 0;
-    let hosted = 0;
-    try {
-      for (const path of paths) {
-        const count = terminals.countFor(path);
-        if (!Number.isFinite(count) || count <= 0) continue;
-        running += count;
-        repos += 1;
-        const elsewhere = terminals.hostedFor?.(path) ?? 0;
-        if (Number.isFinite(elsewhere) && elsewhere > 0) hosted += Math.min(elsewhere, count);
-      }
-    } catch {
-      return true;
-    }
-    if (running <= 0) return true;
-    const shells = running === 1 ? "the shell" : `all ${running} shells`;
-    const subject = repos === 1 ? "this repository tab" : `these ${repos} repository tabs`;
-    const elsewhere = hosted === 0 ? ""
-      : hosted === running
-        ? `${hosted === 1 ? "It is an agent" : "They are agents"} working in another checkout of this repository, hosted here; ${hosted === 1 ? "it keeps" : "they keep"} running. `
-        : `${hosted} of them ${hosted === 1 ? "is an agent" : "are agents"} working in another checkout of this repository, hosted here; ${hosted === 1 ? "it keeps" : "they keep"} running. `;
-    return askConfirm({
-      title: running === 1 ? "End the terminal session?" : `End ${running} terminal sessions?`,
-      message:
-        `${paths.length === 1 ? `${paths[0]}\n\n` : ""}` +
-        `Closing ${subject} closes ${shells} in ${repos === 1 ? "it" : "them"} and their scrollback. ` +
-        elsewhere +
-        "A shell waiting at its prompt ends. Anything still running — a build, a test run, an agent — keeps running, " +
-        "listed under Sessions in the terminal dock, where it can be shown again or stopped.\n\n" +
-        "Hiding the terminal instead (⌃`) keeps the scrollback too.",
-      confirmLabel: running === 1 ? "Close and End Session" : "Close and End Sessions",
-      destructive: true,
-    });
-  }
-
   /** Rows `publish` can reuse; see `ProjectionCache`. */
   const projection = createProjectionCache();
   let internal: InternalState = {
@@ -346,59 +297,14 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
   const sessionBook = createSessionBook((a, b) => sameRepo(a, b, options));
   const { familyUnknown, snapshotRuns, pollRuns, statsInflight, mutationEchoUntil } = sessionBook;
 
-  // Monotonic token source for diff-selection requests. Session `generation`
-  // only moves on tab activation, so it cannot order two rapid selections of
-  // the same tab; this does.
-  const selectionGeneration = beginGeneration();
-
-  /**
-   * Marks a diff fetch as in flight, but only when the target actually moves.
-   *
-   * The `select*Diff` calls are also how the app refetches the diff already
-   * on screen after a mutation or a watcher event. Raising the flag for those
-   * would blink a skeleton over content that is about to be replaced by
-   * nearly the same content, several times a minute.
-   */
-  const beginDiffFetch = (
-    session: RepoSession,
-    target: {
-      filePath: string | null;
-      commitId: string | null;
-      isStaged: boolean;
-      ignoreWhitespace: boolean;
-    },
-  ): void => {
-    const unchanged =
-      session.selectedFilePath === target.filePath &&
-      session.selectedCommitId === target.commitId &&
-      session.selectedIsStaged === target.isStaged &&
-      session.selectedIgnoreWhitespace === target.ignoreWhitespace &&
-      session.selectedDiff !== null;
-    if (unchanged) return;
-    applyToSession(session.id, session.generation, { selectedDiffPending: true, selectedDiffError: null });
-  };
-
-  /**
-   * A diff read that failed: the selection the reader asked for, no diff, and
-   * the reason, on the selection itself. The previous file's diff is cleared
-   * rather than left under the new file's name, and the repository snapshot's
-   * `error` is untouched (it means "status unavailable", which this is not).
-   */
-  const failDiffFetch = (
-    session: RepoSession,
-    generation: number,
-    err: unknown,
-    selection: Partial<RepoSession> | ((current: RepoSession) => Partial<RepoSession>),
-  ): void => {
-    applyToSession(session.id, generation, (current) => ({
-      ...(typeof selection === "function" ? selection(current) : selection),
-      selectedDiff: null,
-      selectedDiffTruncated: false,
-      selectedDiffTruncationReason: null,
-      selectedDiffError: formatError(err),
-      selectedDiffPending: false,
-    }));
-  };
+  // Diff selection: file, commit, commit file and range share one fetch path
+  // (`repos/diffSelection.ts`), which also owns the token that orders them.
+  const diffSelection = createDiffSelection({
+    invoke: invokeFn,
+    activeSession: () => activeSession(),
+    applyToSession: (id, generation, patch) => applyToSession(id, generation, patch),
+    openEpoch: () => openEpoch,
+  });
 
   /**
    * How many poll ticks between re-asserting the active repository's watch.
@@ -1973,7 +1879,7 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
       // in it. Ask first, and only when there is something to lose — a
       // confirmation on every close would train the user to dismiss it, which
       // is how the one that mattered gets dismissed too.
-      if (session && !(await confirmTerminalLoss([session.path]))) return;
+      if (session && !(await confirmTerminalLoss(terminals, [session.path]))) return;
       const result = closeTab(internal.workspace, id);
       if (result.reason === "missing") return;
       commitEdit(result.closedPath ? [result.closedPath] : []);
@@ -2003,7 +1909,7 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
       const keep = internal.sessions[id];
       if (!keep) return;
       const removed = internal.workspace.tabs.filter((tab) => tab.id !== id);
-      if (!(await confirmTerminalLoss(removed.map((tab) => tab.path)))) return;
+      if (!(await confirmTerminalLoss(terminals, removed.map((tab) => tab.path)))) return;
       commitEdit(removed.map((tab) => tab.path));
       replaceWorkspace(closeOtherTabs(internal.workspace, id));
       internal = { ...internal, sessions: { [id]: keep } };
@@ -2022,7 +1928,7 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
       const index = internal.workspace.tabs.findIndex((tab) => tab.id === id);
       if (index < 0) return;
       const removed = internal.workspace.tabs.slice(index + 1);
-      if (!(await confirmTerminalLoss(removed.map((tab) => tab.path)))) return;
+      if (!(await confirmTerminalLoss(terminals, removed.map((tab) => tab.path)))) return;
       commitEdit(removed.map((tab) => tab.path));
       replaceWorkspace(closeTabsToTheRight(internal.workspace, id));
       const remaining = new Set(internal.workspace.tabs.map((tab) => tab.id));
@@ -2159,7 +2065,7 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
     closeGroup: async (groupName: string) => {
       const groupTabs = internal.workspace.tabs.filter((t) => t.group === groupName);
       if (groupTabs.length === 0) return;
-      if (!(await confirmTerminalLoss(groupTabs.map((t) => t.path)))) return;
+      if (!(await confirmTerminalLoss(terminals, groupTabs.map((t) => t.path)))) return;
       const { workspace, closedPaths } = closeWorkspaceGroup(internal.workspace, groupName);
       commitEdit(groupTabs.map((tab) => tab.path));
       replaceWorkspace(workspace);
@@ -2490,7 +2396,7 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
       const side = isStaged === false && file && hasUnstagedChanges(file) ? false : file?.is_staged ?? false;
       openEpoch += 1;
       // Invalidate late commit/range reads even when this worktree became clean.
-      selectionGeneration.next();
+      diffSelection.supersede();
       applyToSession(session.id, session.generation, {
         selectedFilePath: file?.path ?? null,
         selectedCommitId: null,
@@ -2507,60 +2413,17 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
       interfaceStore.setFleetOpen(false);
       if (file) await store.selectFileDiff(file.path, side);
     },
-    selectFileDiff: async (filePath: string, isStaged: boolean = false) => {
-      const session = activeSession();
-      if (!session) return;
-      const generation = session.generation;
-      const navigationEpoch = openEpoch;
-      // The whitespace preference lives on the session, not on call sites:
-      // every refetch of this diff must carry whatever the user last chose.
-      const ignoreWhitespace = session.selectedIgnoreWhitespace;
-      const token = selectionGeneration.next();
-      beginDiffFetch(session, {
+    selectFileDiff: (filePath: string, isStaged: boolean = false) =>
+      diffSelection.select({
+        command: "cmd_get_file_diff",
+        args: { filePath, isStaged },
         filePath,
         commitId: null,
         isStaged,
-        ignoreWhitespace,
-      });
-      try {
-        const diff = await invokeFn<DiffPayload>("cmd_get_file_diff", {
-          repoPath: session.path,
-          filePath,
-          isStaged,
-          ignoreWhitespace,
-        });
-        if (!selectionGeneration.isCurrent(token)) return;
-        applyToSession(session.id, generation, (current) => ({
-          selectedFilePath: filePath,
-          selectedCommitId: null,
-          selectedDiff: diff.text,
-          selectedDiffTruncated: diff.truncated,
-          selectedDiffTruncationReason: diff.truncation_reason ?? null,
-          selectedIsStaged: isStaged,
-          selectedIgnoreWhitespace: ignoreWhitespace,
-          selectedDiffPending: false,
-          selectedDiffError: null,
-          selectionKind: "file",
-          ...(navigationEpoch === openEpoch ? {
-            activeTab: "history" as const,
-            viewSections: { ...current.viewSections, history: "diff" },
-          } : {}),
-        }));
-      } catch (err: unknown) {
-        if (!selectionGeneration.isCurrent(token)) return;
-        // A fetch that errored is not still running: the flag clears with it.
-        failDiffFetch(session, generation, err, (current) => ({
-          selectedFilePath: filePath,
-          selectedCommitId: null,
-          selectedIsStaged: isStaged,
-          selectionKind: "file",
-          ...(navigationEpoch === openEpoch ? {
-            activeTab: "history" as const,
-            viewSections: { ...current.viewSections, history: "diff" },
-          } : {}),
-        }));
-      }
-    },
+        kind: "file",
+        history: "unlessNavigated",
+        worktree: true,
+      }),
     selectFilePath: (filePath: string | null) => {
       const session = activeSession();
       if (!session) return;
@@ -2596,136 +2459,39 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
       if (selectionKind !== "file" || !filePath) return;
       void store.selectFileDiff(filePath, isStaged);
     },
-    selectCommitDiff: async (commitId: string) => {
-      const session = activeSession();
-      if (!session) return;
-      const generation = session.generation;
-      const token = selectionGeneration.next();
-      beginDiffFetch(session, {
+    selectCommitDiff: (commitId: string) =>
+      diffSelection.select({
+        command: "cmd_get_commit_diff",
+        args: { commitId },
         filePath: null,
         commitId,
         isStaged: false,
-        ignoreWhitespace: session.selectedIgnoreWhitespace,
-      });
-      try {
-        const diff = await invokeFn<DiffPayload>("cmd_get_commit_diff", {
-          repoPath: session.path,
-          commitId,
-        });
-        if (!selectionGeneration.isCurrent(token)) return;
-        applyToSession(session.id, generation, {
-          selectedCommitId: commitId,
-          selectedFilePath: null,
-          selectedDiff: diff.text,
-          selectedDiffTruncated: diff.truncated,
-          selectedDiffTruncationReason: diff.truncation_reason ?? null,
-          selectedIsStaged: false,
-          selectedDiffPending: false,
-          selectedDiffError: null,
-          selectionKind: "commit",
-        });
-      } catch (err: unknown) {
-        if (!selectionGeneration.isCurrent(token)) return;
-        // A fetch that errored is not still running: the flag clears with it.
-        failDiffFetch(session, generation, err, {
-          selectedCommitId: commitId,
-          selectedFilePath: null,
-          selectedIsStaged: false,
-          selectionKind: "commit",
-        });
-      }
-    },
+        kind: "commit",
+        history: "never",
+      }),
     /**
      * Opens one file of a commit while keeping the commit as the selection owner.
      */
-    selectCommitFileDiff: async (commitId: string, filePath: string) => {
-      const session = activeSession();
-      if (!session) return;
-      const generation = session.generation;
-      const token = selectionGeneration.next();
-      beginDiffFetch(session, {
+    selectCommitFileDiff: (commitId: string, filePath: string) =>
+      diffSelection.select({
+        command: "cmd_get_commit_file_diff",
+        args: { commitId, filePath },
         filePath,
         commitId,
         isStaged: false,
-        ignoreWhitespace: session.selectedIgnoreWhitespace,
-      });
-      try {
-        const fileDiff = await invokeFn<DiffPayload>("cmd_get_commit_file_diff", {
-          repoPath: session.path,
-          commitId,
-          filePath,
-        });
-        if (!selectionGeneration.isCurrent(token)) return;
-        applyToSession(session.id, generation, (current) => ({
-          selectedCommitId: commitId,
-          selectedFilePath: filePath,
-          selectedDiff: fileDiff.text,
-          selectedDiffTruncated: fileDiff.truncated,
-          selectedDiffTruncationReason: fileDiff.truncation_reason ?? null,
-          selectedIsStaged: false,
-          selectedDiffPending: false,
-          selectedDiffError: null,
-          selectionKind: "commit",
-          activeTab: "history",
-          viewSections: { ...current.viewSections, history: "diff" },
-        }));
-      } catch (err: unknown) {
-        if (!selectionGeneration.isCurrent(token)) return;
-        // A fetch that errored is not still running: the flag clears with it.
-        failDiffFetch(session, generation, err, (current) => ({
-          selectedCommitId: commitId,
-          selectedFilePath: filePath,
-          selectedIsStaged: false,
-          selectionKind: "commit",
-          activeTab: "history" as const,
-          viewSections: { ...current.viewSections, history: "diff" },
-        }));
-      }
-    },
-    selectRangeDiff: async (from: string, to: string) => {
-      const session = activeSession();
-      if (!session) return;
-      const generation = session.generation;
-      const token = selectionGeneration.next();
-      beginDiffFetch(session, {
+        kind: "commit",
+        history: "always",
+      }),
+    selectRangeDiff: (from: string, to: string) =>
+      diffSelection.select({
+        command: "cmd_get_range_diff",
+        args: { from, to },
         filePath: `${from}...${to}`,
         commitId: null,
         isStaged: false,
-        ignoreWhitespace: session.selectedIgnoreWhitespace,
-      });
-      try {
-        const diff = await invokeFn<DiffPayload>("cmd_get_range_diff", {
-          repoPath: session.path,
-          from,
-          to,
-        });
-        if (!selectionGeneration.isCurrent(token)) return;
-        applyToSession(session.id, generation, (current) => ({
-          selectedFilePath: `${from}...${to}`,
-          selectedCommitId: null,
-          selectedDiff: diff.text,
-          selectedDiffTruncated: diff.truncated,
-          selectedDiffTruncationReason: diff.truncation_reason ?? null,
-          selectedIsStaged: false,
-          selectedDiffPending: false,
-          selectedDiffError: null,
-          selectionKind: "range",
-          activeTab: "history",
-          viewSections: { ...current.viewSections, history: "diff" },
-        }));
-      } catch (err: unknown) {
-        if (!selectionGeneration.isCurrent(token)) return;
-        // A fetch that errored is not still running: the flag clears with it.
-        failDiffFetch(session, generation, err, (current) => ({
-          selectedFilePath: `${from}...${to}`,
-          selectedCommitId: null,
-          selectedIsStaged: false,
-          selectionKind: "range",
-          activeTab: "history" as const,
-          viewSections: { ...current.viewSections, history: "diff" },
-        }));
-      }
-    },
+        kind: "range",
+        history: "always",
+      }),
     stageFile: async (filePath: string) =>
       runMutating("stage", filePath, (path) =>
         invokeFn("cmd_stage_file", { repoPath: path, filePath }),
