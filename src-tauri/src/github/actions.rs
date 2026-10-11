@@ -252,7 +252,7 @@ fn validate_run_id(run_id: u64) -> Result<(), String> {
 /// `args` is a full argv line starting with the program name; everything
 /// after it is passed to gh verbatim. Non-zero exits surface gh's stderr,
 /// tail-capped so a chatty failure cannot flood a report.
-fn run_gh_in(repo_path: &str, args: &[String]) -> Result<String, String> {
+pub(crate) fn run_gh_in(repo_path: &str, args: &[String]) -> Result<String, String> {
     debug_assert!(
         args.first().map(String::as_str) == Some("gh"),
         "argv builders must include the program name"

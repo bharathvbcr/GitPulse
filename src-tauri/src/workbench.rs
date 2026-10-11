@@ -29,6 +29,7 @@ mod terminal_launch;
 mod terminal_run;
 pub(crate) mod verification_driver;
 pub(crate) mod verification_gate;
+pub(crate) mod verify_status;
 
 const MAX_IN_FLIGHT: usize = 8;
 const MAX_INPUT: usize = 1024 * 1024;

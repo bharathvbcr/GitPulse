@@ -549,6 +549,38 @@ where
     )
 }
 
+/// Which repositories have turned on posting a verification result to GitHub
+/// as a commit status, keyed by the canonical common Git directory like
+/// [`ReviewGateSettings`]. Off for every repository until the person turns it
+/// on, and a block this cannot read is read as off: posting is the side that
+/// writes to someone else's service, so an unreadable setting never enables it.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct VerifyStatusSettings {
+    #[serde(default)]
+    pub repositories: std::collections::BTreeSet<String>,
+}
+
+impl VerifyStatusSettings {
+    pub fn is_default(&self) -> bool {
+        self.repositories.is_empty()
+    }
+}
+
+fn lenient_verify_status<'de, D>(deserializer: D) -> Result<VerifyStatusSettings, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = serde_json::Value::deserialize(deserializer)?;
+    Ok(serde_json::from_value(raw).unwrap_or_else(|error| {
+        log::warn!(
+            target: "tool_config",
+            "ignoring unreadable verify_status block, posting stays off everywhere: {error}"
+        );
+        VerifyStatusSettings::default()
+    }))
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ToolConfig {
     pub version: u32,
@@ -595,6 +627,13 @@ pub struct ToolConfig {
         skip_serializing_if = "ReviewGateSettings::is_default"
     )]
     pub review_gate: ReviewGateSettings,
+    /// Repositories that post verification results to GitHub. Off by default.
+    #[serde(
+        default,
+        deserialize_with = "lenient_verify_status",
+        skip_serializing_if = "VerifyStatusSettings::is_default"
+    )]
+    pub verify_status: VerifyStatusSettings,
     /// Top-level keys this build does not know, written back as they were
     /// read. Without this, saving any setting here would delete what a newer
     /// build stored, so moving between versions would quietly cost settings.
@@ -614,6 +653,7 @@ impl Default for ToolConfig {
             agent_launch: StoredAgentLaunch::default(),
             lappi: LappiSettings::default(),
             review_gate: ReviewGateSettings::default(),
+            verify_status: VerifyStatusSettings::default(),
             unknown: serde_json::Map::new(),
         }
     }
@@ -1265,6 +1305,26 @@ pub fn set_review_gate(common_dir: Option<&str>, enabled: Option<bool>) -> Resul
     })
 }
 
+/// Whether the repository whose canonical common Git directory is `common_dir`
+/// has opted in to posting verification results to GitHub.
+pub fn verify_status_enabled(common_dir: &str) -> Result<bool, String> {
+    Ok(load()?.verify_status.repositories.contains(common_dir))
+}
+
+/// Opts one repository in or out of posting verification results.
+pub fn set_verify_status(common_dir: &str, enabled: bool) -> Result<(), String> {
+    let mut cfg = load()?;
+    if enabled {
+        cfg.verify_status
+            .repositories
+            .insert(common_dir.to_string());
+    } else {
+        cfg.verify_status.repositories.remove(common_dir);
+    }
+    save(&cfg)?;
+    Ok(())
+}
+
 pub fn set_lappi_settings(next: LappiSettings) -> Result<(), String> {
     update(|cfg| {
         cfg.lappi = next;
@@ -1372,6 +1432,26 @@ mod tests {
             // Clearing a path is not a new location.
             next.devmap.binary = Some(String::new());
             save_confirmed(&next, &|_, _| panic!("clearing must not prompt")).expect("clear");
+        });
+    }
+
+    #[test]
+    fn verify_status_posting_is_off_until_a_repository_opts_in_and_an_unreadable_block_is_off() {
+        with_temp_config(|path| {
+            assert!(!verify_status_enabled("/a/.git").unwrap());
+            set_verify_status("/a/.git", true).unwrap();
+            assert!(verify_status_enabled("/a/.git").unwrap());
+            assert!(!verify_status_enabled("/b/.git").unwrap(), "per repository");
+            set_verify_status("/a/.git", false).unwrap();
+            assert!(!verify_status_enabled("/a/.git").unwrap());
+            write_raw(
+                path,
+                r#"{"version":1,"verify_status":{"repositories":"not a list"}}"#,
+            );
+            assert!(
+                !verify_status_enabled("/a/.git").unwrap(),
+                "a block that cannot be read never enables posting"
+            );
         });
     }
 

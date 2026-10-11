@@ -68,7 +68,7 @@ fn the_app_upgrades_an_older_profile_once_and_reports_when_it_cannot() {
     std::fs::remove_dir(&blocker).unwrap();
     let listed = host.board_request("items.list", "{}").unwrap();
     assert!(listed["items"].is_array(), "{listed}");
-    assert_eq!(version(&path), 12);
+    assert_eq!(version(&path), 13);
     assert!(backup.exists(), "the pre-upgrade copy is kept");
     assert!(degraded_now().is_none(), "recovered, so no longer listed");
 

@@ -87,3 +87,16 @@ describe("decoding the host's answer", () => {
     expect(v.record?.degraded).toEqual([]);
   });
 });
+
+describe("the task sheet's Post verify result action", () => {
+  it("is offered, and disabled until the repository's opt-in has been read as on", () => {
+    const out = render(TaskVerification, { props: { taskId: "t", revision: 1, repositoryPath: "/repo" } }).body;
+    expect(out).toMatch(/<button[^>]*data-testid="task-verify-post"[^>]*disabled/);
+    expect(out).toContain("Post verify result");
+    expect(out).toContain('data-testid="task-verify-post-note"');
+  });
+  it("stays disabled with no repository open", () => {
+    const out = render(TaskVerification, { props: { taskId: "t", revision: 1 } }).body;
+    expect(out).toMatch(/<button[^>]*data-testid="task-verify-post"[^>]*disabled/);
+  });
+});

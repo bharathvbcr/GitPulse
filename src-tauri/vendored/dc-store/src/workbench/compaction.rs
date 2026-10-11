@@ -112,14 +112,27 @@ pub(super) fn compact(input: &Input<'_>, now: i64) -> Result<String> {
         params![keep_revisions, limit],
     )? as i64;
 
+    // Deleting rows frees pages inside the file; only an auto_vacuum=INCREMENTAL
+    // database can hand them back, and then no more than `limit` of them per pass.
+    let mode: i64 = conn.query_row("PRAGMA auto_vacuum", [], |r| r.get(0))?;
+    let free_before: i64 = conn.query_row("PRAGMA freelist_count", [], |r| r.get(0))?;
+    if mode == 2 && free_before > 0 {
+        // The pragma frees one page per step; draining its rows runs it out.
+        let mut vacuum = conn.prepare(&format!("PRAGMA incremental_vacuum({limit})"))?;
+        let mut rows = vacuum.query([])?;
+        while rows.next()?.is_some() {}
+    }
+    let free_after: i64 = conn.query_row("PRAGMA freelist_count", [], |r| r.get(0))?;
+
     Ok(conn.query_row(
         "SELECT json_object('ok',json('true'),
             'item',json_object('id','compaction','revision',1,
               'receipts',json_object('deleted',?1,'eligible',?2,'truncated',json(CASE WHEN ?2>?1 THEN 'true' ELSE 'false' END)),
               'events',json_object('deleted',?3,'eligible',?4,'truncated',json(CASE WHEN ?4>?3 THEN 'true' ELSE 'false' END)),
-              'revisions',json_object('deleted',?5,'eligible',?6,'truncated',json(CASE WHEN ?6>?5 THEN 'true' ELSE 'false' END))),
+              'revisions',json_object('deleted',?5,'eligible',?6,'truncated',json(CASE WHEN ?6>?5 THEN 'true' ELSE 'false' END)),
+              'vacuum',json_object('incremental',json(CASE WHEN ?7=2 THEN 'true' ELSE 'false' END),'free_pages_before',?8,'free_pages_after',?9)),
             'sequence',(SELECT coalesce(max(sequence),0) FROM work_events))",
-        params![receipts, receipts_eligible, events, events_eligible, revisions, revisions_eligible],
+        params![receipts, receipts_eligible, events, events_eligible, revisions, revisions_eligible, mode, free_before, free_after],
         |r| r.get(0),
     )?)
 }

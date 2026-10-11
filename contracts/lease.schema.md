@@ -190,3 +190,17 @@ one revisioned update (`applied_task_revision`), a stale task revision is
 `revision_conflict`, a changed field the proposal was drafted from is
 `field_conflict`, and a conflict consumes nothing. The accepted proposal lists
 `created_item_ids`.
+
+---
+
+## Workbench profile schema 13: short request receipts
+
+Schema 13 changes no table. A request's receipt (`work_requests.response`) now
+keeps only the event `sequence` (marked `"replay":"event"`), and a retry
+rebuilds the response from the event it names. A schema 12 host replays a stored
+receipt verbatim, so it would answer a retry with a body-less response; it is
+therefore a hard fence like 12: a build that knows only schema 12 refuses a 13
+profile with `schema_unsupported`. Receipts stored in full by schema 12 keep
+replaying as written. Upgrade every host that shares a profile together; the
+upgrade runs only on a write, after the `VACUUM INTO` backup
+(`<profile>.pre-schema-12.bak`).
