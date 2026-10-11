@@ -5349,6 +5349,39 @@ pub async fn cmd_lappi_settings_save(
     .await
 }
 
+/// Whether this repository posts verification results to GitHub. Off until
+/// turned on; an unreadable setting is an error, never a yes.
+#[tauri::command(async)]
+pub async fn cmd_verify_status_enabled(repo_path: String) -> Result<bool, String> {
+    off_thread(move || crate::workbench::verify_status::enabled_for(&repo_path)).await
+}
+
+#[tauri::command(async)]
+pub async fn cmd_verify_status_save(repo_path: String, enabled: bool) -> Result<(), String> {
+    off_thread(move || crate::workbench::verify_status::set_enabled(&repo_path, enabled)).await
+}
+
+/// Posts a task's verification verdict to GitHub as a commit status (and
+/// optionally a PR comment) through `gh`. Only a person's explicit action
+/// reaches this: it is a desktop command, and no MCP tool calls it. Refused
+/// unless the repository opted in; `dry_run` returns what would be sent.
+#[tauri::command(async)]
+pub async fn cmd_verify_status_post(
+    repo_path: String,
+    task_id: String,
+    comment: bool,
+    dry_run: bool,
+    workbench: State<'_, crate::workbench::WorkbenchState>,
+) -> Result<crate::workbench::verify_status::PostedVerifyStatus, String> {
+    let workbench = workbench.inner().clone();
+    off_thread(move || {
+        crate::workbench::verify_status::post_via_app(
+            &workbench, &repo_path, &task_id, comment, dry_run,
+        )
+    })
+    .await
+}
+
 /// One agent attempt's review, for its task panel (`docs/AGENT_OUTPUT_REVIEW.md`).
 #[tauri::command(async)]
 pub async fn cmd_attempt_review(

@@ -300,11 +300,13 @@ describe("annotated but unregistered commands", () => {
     // cmd_review_gate_save) joined them, 266 with cmd_exit_request_answer,
     // 267 with cmd_terminal_detach, 269 with cmd_degraded_subsystems and
     // cmd_daemon_status, and 271 with the worktree-hook approval commands
-    // (cmd_preview_worktree_hooks, cmd_approve_worktree_hooks);
+    // (cmd_preview_worktree_hooks, cmd_approve_worktree_hooks), and 274 with
+    // the verify-status commands (cmd_verify_status_enabled,
+    // cmd_verify_status_save, cmd_verify_status_post);
     // `bun run check:ipc`
     // prints all three numbers, so a bump made without re-running it will not
     // agree.
-    expect(found.size).toBe(271);
+    expect(found.size).toBe(274);
     expect(found.has("cmd_repository_trust")).toBe(true);
     expect(found.has("cmd_grant_repository_trust")).toBe(true);
     expect(found.has("cmd_revoke_repository_trust")).toBe(true);

@@ -24,6 +24,16 @@ before that tag is pushed.
 
 ### Added
 
+- Post a task's verification verdict to GitHub as the `devcouncil/verify` commit
+  status for the verified commit, and optionally as a pull-request comment,
+  through your own `gh` login (`gh api`; GitPulse never reads the token). Off
+  for every repository until you turn it on, and only from a desktop command:
+  no MCP tool posts. A verdict that was not recorded, could not run, did not
+  settle, or covered a worktree with uncommitted changes posts `error`, never
+  `success`; a verdict that cannot be tied to the commit posts nothing. Posts
+  carry counts and criterion numbers only, never command output, environment,
+  diff text or criterion text. A dry run shows what would be sent. There is no
+  button on the task board yet.
 - An agent's `done` that is held in review for lack of a passing verification
   now starts that verification itself (one per task and head, at most two at a
   time, off the MCP response path) and moves the card to done when Manvi's

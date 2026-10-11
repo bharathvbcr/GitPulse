@@ -298,11 +298,19 @@ fn a_repository_is_found_by_identity_in_a_registry_past_the_old_page_walk() {
     let repo = git_repo();
     let first = registered(&store, &repo);
     bulk_repositories(&store, 10_050);
-    let found = find(&store, "local:/bulk-10049/.git").unwrap().expect("registered");
+    let found = find(&store, "local:/bulk-10049/.git")
+        .unwrap()
+        .expect("registered");
     assert_eq!(found["id"], "bulk-10049");
-    assert!(find(&store, "local:/never-registered/.git").unwrap().is_none());
+    assert!(find(&store, "local:/never-registered/.git")
+        .unwrap()
+        .is_none());
     // A real registration against a registry this size still finds before it creates.
-    assert_eq!(registered(&store, &repo)["id"], first["id"], "one record, not two");
+    assert_eq!(
+        registered(&store, &repo)["id"],
+        first["id"],
+        "one record, not two"
+    );
 }
 
 #[test]
