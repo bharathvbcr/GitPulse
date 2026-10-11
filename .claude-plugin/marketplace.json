@@ -1,6 +1,6 @@
 {
   "name": "gitpulse",
-  "description": "GitPulse control-plane plugins: read-only repository, worktree, collision, ledger, and code-intelligence tools for agents.",
+  "description": "GitPulse control-plane plugins: repository, worktree, collision, ledger, and code-intelligence tools for agents, plus task-board writes. It never writes git.",
   "owner": {
     "name": "GitPulse Team",
     "url": "https://gitpulse.vbcr.dev"

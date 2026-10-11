@@ -1,5 +1,11 @@
 # Performance diagnostics
 
+> **Evidence names.** Log and evidence file names quoted in this document (`*.log`,
+> `*.json`) name local run artifacts that were never committed and are not
+> retained; the figures quoted beside them are the record. They are not paths a
+> reader can open. `scripts/documented-counts-contract.test.ts` rejects any new
+> `/tmp/...` evidence path.
+
 Open **Diagnostics** from the header bug icon or command palette and copy its
 report after reproducing a slow action. Keep the time, repository size, open
 view, and action with the report; they help correlate UI observations with
@@ -190,7 +196,7 @@ its existing large-chunk advisory. The project's Chromium diagnostics harness
 passed 24 checks; it does not establish native WKWebView frame pacing.
 The updated arm64 release executable also built via
 `npm run tauri -- build --no-bundle --no-sign --ci`
-(`/tmp/gitpulse-followup-native-build.log`). It has not been packaged, signed,
+(`gitpulse-followup-native-build.log`). It has not been packaged, signed,
 installed, or used for a native rendering comparison.
 
 The full frontend coverage reruns are not a green whole-tree gate: the latest
@@ -202,15 +208,15 @@ as completion, and a timed-out exit observation resolved as success. Both have
 regressions and fixes; no test timeout was increased. Further integrated
 verification is required after the remaining audit changes and shared edits settle.
 After the broad suites finished, all 50 tests in those three failing files
-passed with one frontend worker (`/tmp/gitpulse-failed-cases-serial.log`). This
+passed with one frontend worker (`gitpulse-failed-cases-serial.log`). This
 is an isolated pass, not a replacement for the failing full coverage run.
 
-Local evidence: `/tmp/gitpulse-docs-timing-before.log`,
-`/tmp/gitpulse-docs-timing-after.log`, `/tmp/gitpulse-docs-verified.log`,
-`/tmp/gitpulse-priority-runner-tests.log`, `/tmp/gitpulse-followup-native-all.log`,
-`/tmp/gitpulse-background-browser.log`, `/tmp/gitpulse-background-clippy.log`,
-`/tmp/gitpulse-followup-coverage-final.log` and
-`/tmp/gitpulse-exit-observation-baseline.log`.
+Local evidence: `gitpulse-docs-timing-before.log`,
+`gitpulse-docs-timing-after.log`, `gitpulse-docs-verified.log`,
+`gitpulse-priority-runner-tests.log`, `gitpulse-followup-native-all.log`,
+`gitpulse-background-browser.log`, `gitpulse-background-clippy.log`,
+`gitpulse-followup-coverage-final.log` and
+`gitpulse-exit-observation-baseline.log`.
 
 Still open in the overall audit: measured native macOS rendering/idle-power
 behavior with the updated build (stutter attribution and still-running
@@ -485,11 +491,11 @@ index memory or the lifetime of snapshots retained by active readers. The
 reasons each is kept are in the 2026-10-08 section above.
 
 
-Evidence from this workstation is retained in `/tmp/gitpulse-spawn-benchmark.log`,
-`/tmp/gitpulse-macos-audit-sample.txt`, `/tmp/gitpulse-audit-native-tests.log`,
-`/tmp/gitpulse-audit-runner-final.log`, `/tmp/gitpulse-audit-lib-final.log`, `/tmp/gitpulse-audit-real-repo.log`,
-`/tmp/gitpulse-audit-pulse-real.log`, `/tmp/gitpulse-audit-deep-fuzz.log`, and
-`/tmp/gitpulse-audit-coverage.log`. These are local run artifacts, not a CI claim.
+Evidence from this workstation is retained in `gitpulse-spawn-benchmark.log`,
+`gitpulse-macos-audit-sample.txt`, `gitpulse-audit-native-tests.log`,
+`gitpulse-audit-runner-final.log`, `gitpulse-audit-lib-final.log`, `gitpulse-audit-real-repo.log`,
+`gitpulse-audit-pulse-real.log`, `gitpulse-audit-deep-fuzz.log`, and
+`gitpulse-audit-coverage.log`. These are local run artifacts, not a CI claim.
 
 GitNexus review of the complete dirty checkout reported 63 changed files,
 192 symbols and 38 affected execution flows at CRITICAL risk. That includes

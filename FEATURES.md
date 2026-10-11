@@ -261,7 +261,7 @@ flowchart TD
 ### 4.5 Storage
 - **Git Internals Audit**: Breaks down disk usage across packfiles, loose objects, reflogs, Git LFS assets, and submodules.
 - **Build & Cache Auditor**: Identifies unignored build directories (`target/`, `node_modules/`, `.venv/`, `dist/`).
-- **Repo Hygiene & Build Cleaner**: Configurable cleanup policies for stale build output across Rust, Node, Go, Python, and JVM projects, with preview dry-runs and safe restoration.
+- **Repo Hygiene & Build Cleaner**: Configurable cleanup policies for stale build output across Rust, Node, Go, Python, and JVM projects, with preview dry-runs. Cleaning deletes: nothing is restored afterwards, so read the preview first.
 
 ---
 

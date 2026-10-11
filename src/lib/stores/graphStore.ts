@@ -52,7 +52,7 @@ export interface SkippedFileStat {
 }
 
 /** Wire shape of `cmd_get_commit_diff` (snake_case over IPC). */
-export interface DiffPayload {
+export interface GraphDiffPayload {
   content: string;
   truncated: boolean;
   included_files: number;
@@ -84,7 +84,7 @@ function coerceSkippedFiles(value: unknown): SkippedFileStat[] {
   return files;
 }
 
-function emptyDiffPayload(): DiffPayload {
+function emptyDiffPayload(): GraphDiffPayload {
   return {
     content: "",
     truncated: false,
@@ -97,13 +97,13 @@ function emptyDiffPayload(): DiffPayload {
 }
 
 /**
- * Defensively turns whatever crossed `invoke()` into a `DiffPayload`. The
+ * Defensively turns whatever crossed `invoke()` into a `GraphDiffPayload`. The
  * backend is transitioning from a bare diff string to this object, and other
  * stores still hold `string | null`-typed diff state, so every wrong shape
  * degrades to a safe default instead of throwing downstream: a legacy string
  * becomes an untruncated payload; null, arrays and other junk become empty.
  */
-export function normalizeDiffPayload(raw: unknown): DiffPayload {
+export function normalizeDiffPayload(raw: unknown): GraphDiffPayload {
   if (typeof raw === "string") {
     return { ...emptyDiffPayload(), content: raw };
   }

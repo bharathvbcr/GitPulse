@@ -1,5 +1,11 @@
 # Native activity notifications
 
+> **Evidence names.** Log and evidence file names quoted in this document (`*.log`,
+> `*.json`) name local run artifacts that were never committed and are not
+> retained; the figures quoted beside them are the record. They are not paths a
+> reader can open. `scripts/documented-counts-contract.test.ts` rejects any new
+> `/tmp/...` evidence path.
+
 Manvi schema seven now owns notification settings and delivery records alongside
 the durable activity inbox introduced in schema six. GitPulse implements the
 macOS adapter, preference controls and recovered review view. Source compilation,
@@ -35,8 +41,8 @@ source changes or checksum changes.
 Verified on the macOS host: the resolved-feature and lockfile comparison,
 `cargo fmt --manifest-path src-tauri/Cargo.toml --all -- --check` and
 `cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets --locked --offline -- -D warnings`
-passed. The Clippy log is `/tmp/gitpulse-native-bindings-clippy.log`; the feature
-comparison is `/tmp/gitpulse-native-bindings-feature-diff.json`. That declaration-only
+passed. The Clippy log is `gitpulse-native-bindings-clippy.log`; the feature
+comparison is `gitpulse-native-bindings-feature-diff.json`. That declaration-only
 checkpoint did not repeat the full test run; the adapter verification below does.
 No installed
 notification delivery or Windows/Linux runtime validation was performed.
@@ -144,7 +150,7 @@ delivery as unavailable. They verify sound/quiet-hour persistence, workspace,
 repository and task mutes, current and stale activation recovery, unchanged
 task/proposal state on closing, clearing saved mutes and rendered layout. Activation records are
 seeded through the real store; no OS submission is implied. Evidence:
-`/tmp/gitpulse-native-notifications-browser-evidence.json`.
+`gitpulse-native-notifications-browser-evidence.json`.
 
 Snooze and withdrawal (2026-10-07) add three native tests against the real
 store. `the_banner_snooze_is_the_inbox_snooze_and_never_opens_or_rebanners`

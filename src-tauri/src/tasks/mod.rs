@@ -115,7 +115,7 @@ pub struct TaskGap {
 
 /// One verification run from `dc-store`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct TaskRun {
+pub struct DevCouncilRun {
     pub id: String,
     pub task_id: String,
     pub sandbox: String,
@@ -138,7 +138,7 @@ pub struct TaskView {
     pub evidence_truncated: bool,
     pub gaps: Vec<TaskGap>,
     pub gaps_truncated: bool,
-    pub runs: Vec<TaskRun>,
+    pub runs: Vec<DevCouncilRun>,
     pub runs_truncated: bool,
     /// Empty when the store could be read; otherwise why it could not.
     ///
@@ -337,7 +337,7 @@ fn read_view(
     let (run_rows, runs_truncated) = store.runs_list(task_id).map_err(|e| format!("runs: {e}"))?;
     let runs = run_rows
         .into_iter()
-        .map(|row| TaskRun {
+        .map(|row| DevCouncilRun {
             id: row.id,
             task_id: row.task_id,
             sandbox: row.sandbox,

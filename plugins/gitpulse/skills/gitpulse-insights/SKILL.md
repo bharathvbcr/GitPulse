@@ -33,6 +33,8 @@ It surfaces GitPulse-owned facts and selected **DevCouncil** modules (in-process
 | `gitpulse_ledger_events` | Policy verdicts and recorded mutations |
 | `gitpulse_task_view` | DevCouncil tasks and leases, when a store exists |
 | `gitpulse_codeintel_*` | Symbol search, impact, dependencies, trace, dead symbols |
+| `devmap_*` (11 tools: `status`, `search`, `dependencies`, `impact`, `trace`, `neighbors`, `dead_symbols`, `clones`, `preview`, `explore`, `affected_tests`) | The same code graph under DevMap's own tool names, for parity with the standalone `devmap mcp` server; pass `repo_path` on every call |
+| `gitpulse_add_task`, `gitpulse_import_tasks`, `gitpulse_complete_task`, `gitpulse_merge_tasks`, `gitpulse_delete_task` | The only write tools: they change the task board, never git (see the gitpulse-tasks skill) |
 | `gitpulse_provenance` | Verification freshness for a commit |
 
 ## Honesty rules this server already enforces
@@ -41,6 +43,6 @@ It surfaces GitPulse-owned facts and selected **DevCouncil** modules (in-process
 - A missing code graph is `available: false` with a reason, not an empty hit list.
 - Agent worktrees are recognised from `/.<agent>/worktrees/` layout, never from a branch name.
 - `agents.ok: false` is "the worktree listing failed", not "no agents"; `agents.truncated: true` means the counts came from a capped sample, so `agents.sessions` is a floor and a kind whose worktrees all fall past the cap is absent from `agents.kinds` rather than undercounted.
-- An agent worktree is a *checkout*, not a running process: this server reports the sessions a repository has on disk, and cannot tell one still running from one abandoned mid-change.
+- An agent worktree is a *checkout*, not a running process: `agents.kinds` counts the sessions a repository has on disk and cannot tell a running one from one abandoned mid-change. `agents.live` can: it lists the running Claude Code sessions per worktree with their status. A kind that keeps no readable registry (Codex) is reported with `ok: false` and an error, so a zero there means "could not count", not "none".
 
 Pass `repo_path` as an absolute filesystem path on every call. The protocol is MCP `2026-07-28`: include `_meta.io.modelcontextprotocol/protocolVersion` and `clientCapabilities` on each request. Legacy `initialize` still works for older clients.

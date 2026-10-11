@@ -194,7 +194,7 @@ bun run tauri dev
 | `bun run test:webkit:all` | The same regressions under WKWebView (macOS only) |
 | `bun run build` | Build the frontend bundle |
 | `bun run tauri build` | Build native bundles for the host |
-| `bun run ci:local` | Every gate CI runs, both renderers, coverage, and the native gates |
+| `bun run ci:local` | The gates in `scripts/ci-local.mjs`: contracts, both renderers, format, clippy, Rust and frontend tests, coverage floors and the gusset check. It does not run `bun audit`, `cargo deny` (`bun-audit.yml`), the Go `vet` and `-race` jobs, the scheduled deep and parallel-test workflows, or the Linux and Windows builds, which only CI runs |
 
 The browser regressions run twice in CI — under Chrome on Linux and under
 WKWebView on macOS — because the two engines disagree often enough to matter: a
