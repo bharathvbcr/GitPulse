@@ -128,10 +128,12 @@ fn render_with(text: &str, files: Option<(&Path, &Path)>) -> Result<Fragment, HT
             asset_base,
             vault_root,
             file_access,
-            // Remote pictures load — the app's CSP admits https images — and
-            // go without a referrer. Remote audio and video stay blocked by
-            // the CSP's default-src.
-            remote_media: true,
+            // Repository Markdown is untrusted and the app's CSP admits https
+            // images, so a loaded remote picture is a beacon the reader never
+            // asked for. They render as `src="#"` with the address in
+            // `data-withheld-src`; the viewer loads one on click
+            // (`markdownLinks.ts`).
+            remote_media: false,
             max_embedded_bytes: Some(MAX_EMBEDDED_IMAGE_BYTES),
             ..Default::default()
         },
@@ -329,14 +331,20 @@ mod tests {
     }
 
     #[test]
-    fn remote_pictures_load_without_a_referrer() {
-        let rendered = html("![shot](https://example.com/s.png)");
+    fn remote_pictures_are_withheld_until_the_reader_clicks() {
+        let rendered = html("![shot](https://example.com/s.png)\n\n![p](//cdn.example/p.png)");
         assert!(
-            rendered.contains("src=\"https://example.com/s.png\""),
+            !rendered.contains(" src=\"https://example.com"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains(" src=\"//cdn.example"), "{rendered}");
+        assert!(rendered.contains("src=\"#\""), "{rendered}");
+        assert!(
+            rendered.contains("data-withheld-src=\"https://example.com/s.png\""),
             "{rendered}"
         );
         assert!(
-            rendered.contains("referrerpolicy=\"no-referrer\""),
+            rendered.contains("data-withheld-src=\"//cdn.example/p.png\""),
             "{rendered}"
         );
     }

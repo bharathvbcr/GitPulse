@@ -27,7 +27,15 @@ pub const PUBLIC_DEVMAP_REPO: &str = "https://github.com/bharathvbcr/DevCouncil"
 pub const PUBLIC_MANVI_REPO: &str = "https://github.com/bharathvbcr/Manvi";
 pub const PUBLIC_DEVMAP_GIT: &str = "https://github.com/bharathvbcr/DevCouncil.git";
 pub const PUBLIC_MANVI_GIT: &str = "https://github.com/bharathvbcr/Manvi.git";
-pub const MANVI_GO_INSTALL: &str = "github.com/bharathvbcr/Manvi/manvi/cmd/manvi@latest";
+/// Commits the remote installs build, as 40-hex SHAs rather than tags or
+/// `latest`: a tag can be moved and `@latest` follows whatever was pushed
+/// last, while a SHA names one tree. Both are the newest published release
+/// (DevCouncil v0.2.3, Manvi v0.0.5); bump them together with the version
+/// GitPulse is qualified against, never to "whatever is newest".
+pub const PUBLIC_DEVMAP_REV: &str = "97741aec2a7150e7288733542200e4d26e939daa";
+pub const MANVI_GO_REV: &str = "2b804415503017a8f56910c285c85be61d37ff22";
+pub const MANVI_GO_INSTALL: &str =
+    "github.com/bharathvbcr/Manvi/manvi/cmd/manvi@2b804415503017a8f56910c285c85be61d37ff22";
 
 /// Wall-clock budget for `cargo install` / `go install`.
 pub const INSTALL_DEADLINE: Duration = Duration::from_secs(20 * 60);
@@ -505,16 +513,33 @@ fn documented_command(tool: ExternalTool, target: Option<&Path>) -> String {
     }
 }
 
-fn remote_install_command(tool: ExternalTool) -> String {
+/// Arguments after the program for the pinned remote install. One owner for
+/// both the command that runs and the one shown to the user.
+fn remote_install_args(tool: ExternalTool) -> Vec<&'static str> {
     match tool {
-        ExternalTool::Devmap => {
-            format!("cargo install --git {PUBLIC_DEVMAP_GIT} --locked --force devmap-cli")
-        }
-        ExternalTool::Manvi => format!("go install {MANVI_GO_INSTALL}"),
+        ExternalTool::Devmap => vec![
+            "install",
+            "--git",
+            PUBLIC_DEVMAP_GIT,
+            "--rev",
+            PUBLIC_DEVMAP_REV,
+            "--locked",
+            "--force",
+            "devmap-cli",
+        ],
+        ExternalTool::Manvi => vec!["install", MANVI_GO_INSTALL],
     }
 }
 
-fn probe_version(path: &str, tool: ExternalTool) -> Option<String> {
+fn remote_install_command(tool: ExternalTool) -> String {
+    let program = match tool {
+        ExternalTool::Devmap => "cargo",
+        ExternalTool::Manvi => "go",
+    };
+    format!("{program} {}", remote_install_args(tool).join(" "))
+}
+
+pub(crate) fn probe_version(path: &str, tool: ExternalTool) -> Option<String> {
     let mut cmd = Command::new(path);
     match tool {
         ExternalTool::Devmap => {
@@ -1313,14 +1338,7 @@ fn install_toolchain_remote(tool: ExternalTool) -> InstallOutcome {
                 }
             };
             let mut cmd = Command::new(&cargo);
-            cmd.args([
-                "install",
-                "--git",
-                PUBLIC_DEVMAP_GIT,
-                "--locked",
-                "--force",
-                "devmap-cli",
-            ]);
+            cmd.args(remote_install_args(ExternalTool::Devmap));
             cmd
         }
         ExternalTool::Manvi => {
@@ -1346,13 +1364,40 @@ fn install_toolchain_remote(tool: ExternalTool) -> InstallOutcome {
                 }
             };
             let mut cmd = Command::new(&go);
-            cmd.args(["install", MANVI_GO_INSTALL]);
+            cmd.args(remote_install_args(ExternalTool::Manvi));
             cmd
         }
     };
+    // A fixed, empty directory of our own: `cargo` reads `.cargo/config.toml`
+    // from every ancestor of its cwd and `go` reads `go.work`/`go.mod`, so
+    // inheriting whatever directory GitPulse was launched from would let a
+    // file there redirect the install to another source or toolchain.
+    match release::install_work_dir() {
+        Ok(dir) => {
+            cmd.current_dir(dir);
+        }
+        Err(reason) => {
+            return InstallOutcome {
+                tool,
+                ok: false,
+                binary: None,
+                lookup: None,
+                version: None,
+                source_used: None,
+                command,
+                exit_code: None,
+                stdout: String::new(),
+                stderr: String::new(),
+                timed_out: false,
+                cancelled: false,
+                reason: Some(reason),
+                rung: Some(InstallRung::ToolchainRemote),
+            };
+        }
+    }
     let label = match tool {
-        ExternalTool::Devmap => "cargo install --git",
-        ExternalTool::Manvi => "go install @latest",
+        ExternalTool::Devmap => "cargo install --git --rev",
+        ExternalTool::Manvi => "go install @<commit>",
     };
     match run_cancellable_install(&mut cmd, label, tool, Some(InstallRung::ToolchainRemote)) {
         InstallRun::Cancelled { stdout, stderr } => InstallOutcome {
@@ -2183,10 +2228,30 @@ mod tests {
         assert!(cmd.contains("devmap-cli"));
         let cmd = remote_install_command(ExternalTool::Manvi);
         assert!(cmd.contains(MANVI_GO_INSTALL));
+        assert!(!MANVI_GO_INSTALL.ends_with("@latest"));
+    }
+
+    /// Remote installs name one commit: no `latest`, no branch, no tag that
+    /// can move.
+    #[test]
+    fn remote_installs_are_pinned_to_a_full_commit() {
+        for rev in [PUBLIC_DEVMAP_REV, MANVI_GO_REV] {
+            assert_eq!(rev.len(), 40, "{rev}");
+            assert!(
+                rev.chars().all(|c| matches!(c, '0'..='9' | 'a'..='f')),
+                "{rev}"
+            );
+        }
+        let devmap = remote_install_args(ExternalTool::Devmap);
+        let at = devmap.iter().position(|a| *a == "--rev").expect("--rev");
+        assert_eq!(devmap[at + 1], PUBLIC_DEVMAP_REV);
+        assert!(devmap.contains(&"--locked"));
+        let manvi = remote_install_args(ExternalTool::Manvi);
         assert_eq!(
-            MANVI_GO_INSTALL,
-            "github.com/bharathvbcr/Manvi/manvi/cmd/manvi@latest"
+            manvi.last().copied(),
+            Some(format!("github.com/bharathvbcr/Manvi/manvi/cmd/manvi@{MANVI_GO_REV}").as_str())
         );
+        assert!(remote_install_command(ExternalTool::Manvi).contains(MANVI_GO_REV));
     }
 
     #[test]

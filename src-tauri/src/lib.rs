@@ -122,6 +122,7 @@ pub fn run() {
     #[cfg(target_os = "macos")]
     let builder = builder.on_web_content_process_terminate(desktop::webcrash::on_terminated);
     builder
+        .plugin(desktop::navigation_guard())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_autostart::init(
             tauri_plugin_autostart::MacosLauncher::LaunchAgent,

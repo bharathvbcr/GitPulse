@@ -15,6 +15,7 @@
   import {
     findFragmentTarget,
     handleMarkdownClick,
+    handleMarkdownKeydown,
     prepareRenderedMarkdown,
     type MarkdownNote,
   } from "../files/markdownLinks";
@@ -80,9 +81,11 @@
     if (!el) return;
     el.addEventListener("click", onActivate);
     el.addEventListener("auxclick", onActivate);
+    el.addEventListener("keydown", handleMarkdownKeydown);
     return () => {
       el.removeEventListener("click", onActivate);
       el.removeEventListener("auxclick", onActivate);
+      el.removeEventListener("keydown", handleMarkdownKeydown);
     };
   });
 </script>

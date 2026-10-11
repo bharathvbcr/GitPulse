@@ -19,7 +19,7 @@ use tauri::{ipc::CallbackFn, WebviewWindowBuilder};
 
 /// A mock app exposing the commands under test, wired the way lib.rs wires
 /// them so dispatch and (de)serialization are the real implementations.
-fn webview() -> tauri::WebviewWindow<tauri::test::MockRuntime> {
+fn webview_labeled(label: &str) -> tauri::WebviewWindow<tauri::test::MockRuntime> {
     let app = mock_builder()
         // A hand-picked subset rather than lib.rs's full registry. Sharing the
         // real list was tried and does not work: exposing it as
@@ -66,13 +66,21 @@ fn webview() -> tauri::WebviewWindow<tauri::test::MockRuntime> {
         // ones — and the bundle metadata is embedded once, not twice.
         .build(gitpulse_lib::context())
         .expect("mock app builds");
-    WebviewWindowBuilder::new(&app, "main", Default::default())
+    WebviewWindowBuilder::new(&app, label, Default::default())
         .build()
         .expect("mock webview builds")
 }
 
 fn invoke(cmd: &str, body: serde_json::Value) -> Result<serde_json::Value, serde_json::Value> {
-    let view = webview();
+    invoke_from("main", cmd, body)
+}
+
+fn invoke_from(
+    label: &str,
+    cmd: &str,
+    body: serde_json::Value,
+) -> Result<serde_json::Value, serde_json::Value> {
+    let view = webview_labeled(label);
     let response = get_ipc_response(
         &view,
         InvokeRequest {
@@ -104,29 +112,44 @@ fn invoke(cmd: &str, body: serde_json::Value) -> Result<serde_json::Value, serde
 
 #[test]
 fn a_command_reachable_from_the_frontend_round_trips_through_the_bridge() {
-    // camelCase argument names are what the frontend actually sends.
+    // camelCase argument names are what the frontend actually sends. The app
+    // ACL only lets a window call what the frontend uses, so the sample must
+    // be one it does: `cmd_stash_list` is.
+    let repo = repo_with_change();
     let result = invoke(
+        "cmd_stash_list",
+        json!({ "repoPath": repo.path().to_string_lossy() }),
+    )
+    .expect("a successful response");
+    // The envelope's field names are what the TypeScript side reads.
+    assert!(result["entries"].is_array(), "got: {result}");
+    assert_eq!(result["truncated"], json!(false), "got: {result}");
+}
+
+/// The app manifest makes capabilities binding for the app's own commands: a
+/// command that is registered but that no capability names is refused before
+/// it runs. `cmd_compute_word_diff` is such a command (nothing in the
+/// frontend calls it).
+#[test]
+fn a_registered_command_no_capability_grants_is_refused_by_the_acl() {
+    let error = invoke(
         "cmd_compute_word_diff",
         json!({ "oldLine": "the quick brown fox", "newLine": "the slow brown fox" }),
     )
-    .expect("a successful response");
+    .expect_err("an ungranted command must not run");
+    assert!(error.to_string().contains("not allowed"), "{error}");
+}
 
-    // The reply must carry the field names the TypeScript side reads.
-    assert!(result.get("original_segments").is_some(), "got: {result}");
-    assert!(result.get("modified_segments").is_some(), "got: {result}");
-    let original = result["original_segments"].as_array().expect("an array");
-    assert!(!original.is_empty());
-    // Segment shape is part of the contract too, not just the envelope.
-    assert!(
-        original[0].get("kind").is_some(),
-        "segment: {}",
-        original[0]
-    );
-    assert!(
-        original[0].get("text").is_some(),
-        "segment: {}",
-        original[0]
-    );
+/// The status popover loads only its own page, but it is a local window with
+/// the IPC bridge; its capability grants three commands and nothing else.
+#[test]
+fn the_status_popover_cannot_call_commands_it_does_not_use() {
+    let repo = repo_with_change();
+    let body = json!({ "repoPath": repo.path().to_string_lossy() });
+    assert!(invoke_from("main", "cmd_stash_list", body.clone()).is_ok());
+    let error = invoke_from("status-popover", "cmd_stash_list", body)
+        .expect_err("the popover is not granted cmd_stash_list");
+    assert!(error.to_string().contains("not allowed"), "{error}");
 }
 
 #[test]
@@ -176,10 +199,10 @@ fn hygiene_execution_requires_a_backend_plan_and_cancel_is_idempotent() {
 
 #[test]
 fn a_missing_argument_is_refused_by_the_bridge_rather_than_reaching_the_command() {
-    let error = invoke("cmd_compute_word_diff", json!({ "oldLine": "only one" }))
-        .expect_err("a missing argument must not dispatch");
+    let error =
+        invoke("cmd_stash_list", json!({})).expect_err("a missing argument must not dispatch");
     assert!(
-        error.to_string().contains("newLine") || error.to_string().contains("new_line"),
+        error.to_string().contains("repoPath") || error.to_string().contains("repo_path"),
         "the failure should name the missing argument: {error}"
     );
 }

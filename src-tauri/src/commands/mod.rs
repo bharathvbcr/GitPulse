@@ -2400,7 +2400,14 @@ pub async fn cmd_grant_repository_trust(
     repo_path: String,
     expected_identity: String,
 ) -> Result<(), String> {
-    off_thread(move || crate::repository_trust::grant(&repo_path, &expected_identity, true)).await
+    off_thread(move || {
+        crate::repository_trust::grant_confirmed(
+            &repo_path,
+            &expected_identity,
+            &crate::desktop::confirm::native,
+        )
+    })
+    .await
 }
 
 #[tauri::command(async)]
@@ -5276,7 +5283,7 @@ pub async fn cmd_tool_config_save(
     config: crate::tool_config::ToolConfig,
 ) -> Result<crate::tool_config::ToolConfigView, String> {
     off_thread(move || {
-        crate::tool_config::save(&config)?;
+        crate::tool_config::save_confirmed(&config, &crate::desktop::confirm::native)?;
         crate::tool_config::view()
     })
     .await

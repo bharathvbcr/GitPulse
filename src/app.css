@@ -1740,6 +1740,26 @@ html.light .gp-markdown {
   height: auto;
   vertical-align: middle;
 }
+/* A remote picture the renderer withheld until the reader clicks it. */
+.gp-markdown img[data-withheld-src] {
+  min-width: 8em;
+  min-height: 2.4em;
+  padding: 0.3em 0.6em;
+  border: 1px dashed rgb(var(--c-border));
+  border-radius: 5px;
+  color: rgb(var(--c-text-muted));
+  font-size: 0.9em;
+  cursor: pointer;
+}
+.gp-markdown .gp-md-withheld-picture {
+  display: inline-block;
+  min-width: 4em;
+  min-height: 1.5em;
+  border: 1px dashed rgb(var(--c-border));
+  border-radius: 5px;
+  color: rgb(var(--c-text-muted));
+  cursor: pointer;
+}
 .gp-markdown .gp-md-missing-picture {
   display: inline-block;
   padding: 0.1em 0.5em;
