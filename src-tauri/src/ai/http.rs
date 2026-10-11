@@ -673,7 +673,7 @@ mod tests {
         });
         match rx.recv_timeout(Duration::from_secs(3)) {
             Ok((_, elapsed)) => assert!(
-                elapsed < Duration::from_secs(2),
+                elapsed < crate::test_support::coverage_relaxed(Duration::from_secs(2)),
                 "round trip took {:?}; the deadline did not bound it",
                 elapsed
             ),

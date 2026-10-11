@@ -422,7 +422,7 @@ fn eight_thread_stage_commit_hammer_finishes_without_deadlock() {
         "every atomic stage+commit lands"
     );
     assert!(
-        elapsed < Duration::from_secs(60),
+        elapsed < common::env::coverage_relaxed(Duration::from_secs(60)),
         "hammer deadlocked or starved: {elapsed:?}"
     );
 

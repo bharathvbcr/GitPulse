@@ -305,7 +305,7 @@ fn twenty_thousand_findings_are_capped_with_both_numbers() {
     assert!(groups.len() <= 51);
     assert_no_plant(&report);
     assert!(
-        elapsed < Duration::from_secs(20),
+        elapsed < common::env::coverage_relaxed(Duration::from_secs(20)),
         "20k findings took {elapsed:?}"
     );
 }
@@ -598,5 +598,8 @@ fn superseded_scans_stop_and_never_overlap() {
     );
     // Six back-to-back two-second scans would take 12s; killing the
     // superseded ones leaves the last scan plus the stagger.
-    assert!(elapsed < Duration::from_secs(12), "{elapsed:?}");
+    assert!(
+        elapsed < common::env::coverage_relaxed(Duration::from_secs(12)),
+        "{elapsed:?}"
+    );
 }

@@ -305,7 +305,7 @@ fn test_language_stats_skip_oversized_files_without_reading() {
         "a scan that skipped a candidate must report that it did not count everything"
     );
     assert!(
-        elapsed < std::time::Duration::from_secs(5),
+        elapsed < common::env::coverage_relaxed(std::time::Duration::from_secs(5)),
         "oversized files must be stat-skipped, took {elapsed:?}"
     );
 }

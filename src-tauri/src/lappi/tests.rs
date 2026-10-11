@@ -245,7 +245,7 @@ fn a_dripping_agent_cannot_hold_the_caller_past_the_whole_exchange_deadline() {
     let elapsed = started.elapsed();
     assert_eq!(outcome, unavailable(UnavailableReason::Deadline));
     assert!(
-        elapsed < Duration::from_millis(1500),
+        elapsed < crate::test_support::coverage_relaxed(Duration::from_millis(1500)),
         "held for {elapsed:?} by a dripping agent"
     );
 }

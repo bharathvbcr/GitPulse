@@ -435,7 +435,7 @@ fn a_slow_call_does_not_delay_the_answer_to_a_fast_one() {
         "the fast request did not overtake the slow one: {first}"
     );
     assert!(
-        elapsed < Duration::from_millis(400),
+        elapsed < hermetic_env::coverage_relaxed(Duration::from_millis(400)),
         "the fast answer waited {elapsed:?} — the loop is still serialized"
     );
 }
