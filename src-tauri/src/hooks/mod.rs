@@ -1112,6 +1112,9 @@ pub fn serve_gate(cwd: &str, command: &str) -> Result<Value, String> {
 /// the app wedged pays this once and then does what it always did. It is long
 /// enough for the app's hook-lane sidecar to start cold, which the first
 /// verdict after the app launches pays.
+///
+/// Only the macOS app answers a hook's gate request (`judged_by_app`).
+#[cfg(target_os = "macos")]
 const GATE_APP_DEADLINE: Duration = Duration::from_millis(750);
 
 #[cfg(target_os = "macos")]

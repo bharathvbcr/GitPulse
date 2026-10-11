@@ -4571,9 +4571,18 @@ mod tests {
     #[test]
     fn pull_with_rebase_replays_local_commits_without_a_merge() {
         let (local, _origin) = diverged_clone();
+        // Unset in the repository, so whatever answers comes from outside it:
+        // Git for Windows' installer writes `pull.rebase=false` to the system
+        // config, which a fresh clone there inherits.
+        let inherited = git_text(
+            local.path(),
+            &["config", "--system", "--get", "pull.rebase"],
+        )
+        .ok()
+        .map(|value| value.trim().to_owned());
         assert_eq!(
             GitWriter::pull_rebase_config(&repo_path(&local)).unwrap(),
-            None
+            inherited
         );
         GitWriter::pull(&repo_path(&local), None, None, Some(true)).unwrap();
         assert_eq!(parents_of_head(&local), 1, "rebased, not merged");
@@ -4594,9 +4603,12 @@ mod tests {
         write_commit(&dir, "other.txt", "base\n", "other");
         std::fs::write(dir.path().join("tracked.txt"), "stash me\n").unwrap();
         std::fs::write(dir.path().join("other.txt"), "keep me\n").unwrap();
-        std::fs::write(dir.path().join("*"), "literal star\n").unwrap();
+        // A file whose name is a glob. `*` is not a legal Windows filename
+        // (creating it is OS error 123), but a character class is.
+        let glob = if cfg!(windows) { "[tk]" } else { "*" };
+        std::fs::write(dir.path().join(glob), "literal glob\n").unwrap();
         let options = StashSaveOptions {
-            paths: vec!["tracked.txt".into(), "*".into(), "tracked.txt".into()],
+            paths: vec!["tracked.txt".into(), glob.into(), "tracked.txt".into()],
             ..StashSaveOptions::default()
         };
         assert_eq!(
@@ -4610,7 +4622,7 @@ mod tests {
                 "part",
                 "--",
                 ":(literal)tracked.txt",
-                ":(literal)*"
+                format!(":(literal){glob}").as_str()
             ]
         );
         GitWriter::stash_save_with(&repo_path(&dir), Some("part"), options).unwrap();
@@ -4623,8 +4635,8 @@ mod tests {
             "keep me\n"
         );
         assert!(
-            !dir.path().join("*").exists(),
-            "the literal `*` file was stashed"
+            !dir.path().join(glob).exists(),
+            "the literal `{glob}` file was stashed"
         );
 
         let escape = StashSaveOptions {

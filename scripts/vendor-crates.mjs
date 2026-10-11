@@ -145,8 +145,8 @@ export function sources(env = process.env, from = REPO) {
         "devmap-resolve",
         "devmap-store",
       ],
-      crateDir: (/** @type {string} */ name) => path.join("rust", name),
-      contracts: path.join("backend", "contracts"),
+      crateDir: (/** @type {string} */ name) => path.posix.join("rust", name),
+      contracts: path.posix.join("backend", "contracts"),
     },
     {
       // MarkDev's module crates: the parse model, the HTML renderer the
@@ -157,7 +157,7 @@ export function sources(env = process.env, from = REPO) {
       root: env.GITPULSE_MARKDEV_ROOT ?? findSibling("MarkDev", from),
       workspace: "core",
       crates: ["markdev-md", "markdev-highlight", "markdev-html", "markdev-vault"],
-      crateDir: (/** @type {string} */ name) => path.join("core", "crates", name),
+      crateDir: (/** @type {string} */ name) => path.posix.join("core", "crates", name),
     },
   ];
 }

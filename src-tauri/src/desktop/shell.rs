@@ -194,6 +194,7 @@ pub fn cmd_reveal_repository(app: AppHandle, repo: String) -> Result<(), String>
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use crate::procguard::LockedSpawn;
     use std::fs;
 
@@ -330,6 +331,7 @@ mod tests {
         assert!(resolved.exists(), "{resolved:?}");
     }
 
+    #[cfg(unix)]
     fn trusted_repo_with(files: &[(&str, u32)]) -> tempfile::TempDir {
         use std::os::unix::fs::PermissionsExt;
         let dir = repo_with(&[]);

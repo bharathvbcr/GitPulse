@@ -2882,9 +2882,15 @@ mod tests {
         while let Ok(item) = watcher.receiver.try_recv() {
             events += 1;
             if let Ok(event) = item {
+                // Below `target/`, not `target` itself: Windows reports the
+                // directory entry as modified (its last-write time) for every
+                // file created inside it, which is no nested write reaching the
+                // watch. That event is shown below to carry no signal.
                 let names_target = event.paths.iter().any(|path| {
-                    path.components()
-                        .any(|component| component.as_os_str() == "target")
+                    path != &target
+                        && path
+                            .components()
+                            .any(|component| component.as_os_str() == "target")
                 });
                 if names_target {
                     target_events += 1;
@@ -2914,6 +2920,18 @@ mod tests {
         assert!(
             sentinel_events >= 1,
             "the watch must still deliver a file at the worktree root, else the zero above is a dead stream"
+        );
+        // What the platform may deliver for `target/` itself changes nothing.
+        let directory_touched = notify::Event::new(notify::EventKind::Any).add_path(target);
+        assert!(
+            !event_has_signal(
+                &directory_touched,
+                &internal_roots_for(dir.path()),
+                dir.path(),
+                None,
+                &IgnoreRules::builtin()
+            ),
+            "a modified `target` directory entry must not count as signal"
         );
     }
 

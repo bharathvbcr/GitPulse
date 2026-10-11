@@ -613,9 +613,12 @@ pub(crate) fn preserve_metadata(source: &std::fs::File, target: &std::fs::File) 
 /// Why [`read_bounded_nofollow`] refused a file.
 #[derive(Debug)]
 pub(crate) enum BoundedRead {
-    /// Opening or reading failed; a symlink in the final component lands here.
+    /// Opening or reading failed; on Unix a symlink in the final component
+    /// lands here.
     Io(io::Error),
-    /// A directory, FIFO, socket or device — never opened for a blocking read.
+    /// A directory, FIFO, socket or device — never opened for a blocking read
+    /// — or, on Windows, a link (a symlink or junction), which is opened itself
+    /// and never followed.
     NotRegular,
     /// Larger than the cap when opened.
     TooLarge,
@@ -637,9 +640,25 @@ pub(crate) fn read_bounded_nofollow(path: &Path, cap: usize) -> Result<Vec<u8>, 
         use std::os::unix::fs::OpenOptionsExt;
         options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
     }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        // OPEN_REPARSE_POINT opens a link itself instead of its target, and
+        // BACKUP_SEMANTICS lets a directory be opened at all (without it the
+        // open fails with access denied, which would hide "not a regular
+        // file" behind an I/O error). Both are classified from the handle.
+        options.custom_flags(0x0020_0000 | 0x0200_0000);
+    }
     let file = options.open(path).map_err(BoundedRead::Io)?;
     let meta = file.metadata().map_err(BoundedRead::Io)?;
-    if !meta.is_file() {
+    #[cfg(windows)]
+    let is_link = {
+        use std::os::windows::fs::MetadataExt;
+        meta.file_attributes() & 0x400 != 0
+    };
+    #[cfg(not(windows))]
+    let is_link = false;
+    if is_link || !meta.is_file() {
         return Err(BoundedRead::NotRegular);
     }
     if meta.len() > cap as u64 {
