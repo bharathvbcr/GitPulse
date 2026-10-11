@@ -976,7 +976,6 @@ fn enrich_cargo(
             &[("CARGO_TERM_COLOR", "never")],
         ) {
             Ok(out) => {
-                ran = true;
                 let text = out.stdout_text();
                 if text.trim().is_empty() && !out.success {
                     push_issue(
@@ -994,6 +993,7 @@ fn enrich_cargo(
                 }
                 match parse_cargo_audit_json(&text) {
                     Ok((mut vulns, warnings)) => {
+                        ran = true;
                         report.vulnerabilities.append(&mut vulns);
                         for mut warning in warnings {
                             warning.path = Some(rel.clone());
@@ -1016,7 +1016,6 @@ fn enrich_cargo(
                 }
             }
             Err(e) => {
-                ran = true;
                 push_issue(
                     &mut report.issues,
                     "warning",
@@ -1675,7 +1674,6 @@ fn enrich_python(
             AUDIT_TIMEOUT,
             &[("NO_COLOR", "1"), ("PIP_AUDIT_PROGRESS_SPINNER", "off")],
         );
-        ran = true;
         let Some(text) = scanner_stdout(
             out,
             &mut report.issues,
@@ -1686,7 +1684,10 @@ fn enrich_python(
             continue;
         };
         match parse_pip_audit_json(&text) {
-            Ok(mut vulns) => report.vulnerabilities.append(&mut vulns),
+            Ok(mut vulns) => {
+                ran = true;
+                report.vulnerabilities.append(&mut vulns);
+            }
             Err(e) => push_issue(
                 &mut report.issues,
                 "warning",
@@ -1749,7 +1750,26 @@ fn enrich_go(
                 ("GOTOOLCHAIN", "local"),
             ],
         );
-        ran = true;
+        // `-json` exits 0 whether or not it finds anything; a non-zero exit
+        // (killed, build failure, timeout) leaves a stream that may stop on a
+        // message boundary and still parse, so it is never trusted.
+        if let Ok(o) = &out {
+            if !o.success {
+                let err = o.stderr_text();
+                push_issue(
+                    &mut report.issues,
+                    "warning",
+                    "govulncheck_failed",
+                    if err.is_empty() {
+                        format!("govulncheck exited {}", o.status_code)
+                    } else {
+                        err
+                    },
+                    Some(rel.clone()),
+                );
+                continue;
+            }
+        }
         let Some(text) = scanner_stdout(
             out,
             &mut report.issues,
@@ -1760,7 +1780,10 @@ fn enrich_go(
             continue;
         };
         match parse_govulncheck_stream(&text) {
-            Ok(mut vulns) => report.vulnerabilities.append(&mut vulns),
+            Ok(mut vulns) => {
+                ran = true;
+                report.vulnerabilities.append(&mut vulns);
+            }
             Err(e) => push_issue(
                 &mut report.issues,
                 "warning",
@@ -1825,7 +1848,6 @@ fn enrich_php(
                 ("COMPOSER_DISABLE_NETWORK", "0"),
             ],
         );
-        ran = true;
         let Some(text) = scanner_stdout(
             out,
             &mut report.issues,
@@ -1836,7 +1858,10 @@ fn enrich_php(
             continue;
         };
         match parse_composer_audit_json(&text) {
-            Ok(mut vulns) => report.vulnerabilities.append(&mut vulns),
+            Ok(mut vulns) => {
+                ran = true;
+                report.vulnerabilities.append(&mut vulns);
+            }
             Err(e) => push_issue(
                 &mut report.issues,
                 "warning",
@@ -1896,7 +1921,6 @@ fn enrich_ruby(
             AUDIT_TIMEOUT,
             &[("NO_COLOR", "1")],
         );
-        ran = true;
         let Some(text) = scanner_stdout(
             out,
             &mut report.issues,
@@ -1907,7 +1931,10 @@ fn enrich_ruby(
             continue;
         };
         match parse_bundler_audit_json(&text) {
-            Ok(mut vulns) => report.vulnerabilities.append(&mut vulns),
+            Ok(mut vulns) => {
+                ran = true;
+                report.vulnerabilities.append(&mut vulns);
+            }
             Err(e) => push_issue(
                 &mut report.issues,
                 "warning",
@@ -2035,9 +2062,9 @@ pub(crate) fn parse_bundler_audit_json(text: &str) -> Result<Vec<Vulnerability>,
 ///
 /// A check that could not run must never look like a check that ran clean:
 /// a non-zero exit with no parsable output is recorded as an issue naming the
-/// tool's stderr (or exit status when stderr is mute). Only a successful run
-/// with empty output counts as zero findings — scanners like pip-audit always
-/// emit at least `[]`, so emptiness there would itself be suspicious.
+/// tool's stderr (or exit status when stderr is mute). Empty output is never
+/// zero findings, even on exit 0: these scanners always emit at least `[]` or
+/// a config message, so emptiness is itself a failed run.
 fn scanner_stdout(
     out: Result<crate::engine::git_cli::CapturedOutput, String>,
     issues: &mut Vec<HealthIssue>,
@@ -2049,14 +2076,16 @@ fn scanner_stdout(
         Ok(o) => {
             let text = o.stdout_text();
             if text.trim().is_empty() {
-                if o.success {
-                    return None;
-                }
                 let err = o.stderr_text();
-                let message = if err.is_empty() {
-                    format!("{program} exited {} with no output", o.status_code)
-                } else {
+                let message = if !err.is_empty() {
                     err
+                } else if o.success {
+                    // Every wired scanner emits a document (at least `[]` or a
+                    // config message) even for a clean tree, so silence is a
+                    // run that produced nothing, not zero findings.
+                    format!("{program} exited 0 but printed nothing to parse")
+                } else {
+                    format!("{program} exited {} with no output", o.status_code)
                 };
                 push_issue(issues, "warning", code, message, label);
                 return None;
@@ -3138,11 +3167,31 @@ pub(crate) fn parse_cargo_audit_json(
 ) -> Result<(Vec<Vulnerability>, Vec<HealthIssue>), String> {
     let value: Value =
         serde_json::from_str(text.trim()).map_err(|e| format!("cargo audit JSON: {e}"))?;
+    // A document without a vulnerabilities list (`{"error": ...}`, a schema
+    // change) is a run that reported nothing, not a clean tree.
     let list = value
         .pointer("/vulnerabilities/list")
         .and_then(|v| v.as_array())
         .cloned()
-        .unwrap_or_default();
+        .ok_or_else(|| {
+            let detail = value
+                .get("error")
+                .and_then(|e| e.as_str())
+                .map(|e| format!(": {e}"))
+                .unwrap_or_default();
+            format!("cargo audit JSON has no vulnerabilities list{detail}")
+        })?;
+    if let Some(count) = value
+        .pointer("/vulnerabilities/count")
+        .and_then(|c| c.as_u64())
+    {
+        if count != list.len() as u64 {
+            return Err(format!(
+                "cargo audit JSON reports {count} vulnerabilities but lists {}",
+                list.len()
+            ));
+        }
+    }
     let mut out = Vec::new();
     for item in list {
         let advisory = item.get("advisory").unwrap_or(&item);
@@ -3177,7 +3226,7 @@ pub(crate) fn parse_cargo_audit_json(
             .get("cvss")
             .and_then(|v| v.as_str())
             .map(cvss_to_severity)
-            .unwrap_or_else(|| "high".into());
+            .unwrap_or_else(|| SEVERITY_UNKNOWN.into());
         out.push(Vulnerability {
             name: pkg,
             severity,
@@ -3248,8 +3297,16 @@ pub(crate) fn parse_cargo_audit_json(
     Ok((out, warnings))
 }
 
+/// Maps a CVSS score (`"7.5"`) or a CVSS v3 vector string
+/// (`"CVSS:3.1/AV:N/..."`, what RustSec publishes) to a severity bucket.
+///
+/// Anything that cannot be scored — a v4 vector, a malformed vector, a zero
+/// score — is [`SEVERITY_UNKNOWN`], never a guessed rating.
 fn cvss_to_severity(score: &str) -> String {
-    let n: f64 = score.parse().unwrap_or(0.0);
+    let n = match score.trim().parse::<f64>() {
+        Ok(n) => n,
+        Err(_) => cvss3_base_score(score).unwrap_or(0.0),
+    };
     if n >= 9.0 {
         "critical".into()
     } else if n >= 7.0 {
@@ -3259,9 +3316,97 @@ fn cvss_to_severity(score: &str) -> String {
     } else if n > 0.0 {
         "low".into()
     } else {
-        "high".into()
+        SEVERITY_UNKNOWN.into()
     }
 }
+
+/// CVSS v3.0/v3.1 base score from a vector string (FIRST specification,
+/// section 7.1), or `None` when the vector is not a complete v3 base vector.
+fn cvss3_base_score(vector: &str) -> Option<f64> {
+    let mut parts = vector.trim().split('/');
+    let head = parts.next()?;
+    if head != "CVSS:3.0" && head != "CVSS:3.1" {
+        return None;
+    }
+    let (mut av, mut ac, mut pr, mut ui, mut scope, mut c, mut i, mut a) =
+        (None, None, None, None, None, None, None, None);
+    for metric in parts {
+        let (key, value) = metric.split_once(':')?;
+        let slot = match key {
+            "AV" => &mut av,
+            "AC" => &mut ac,
+            "PR" => &mut pr,
+            "UI" => &mut ui,
+            "S" => &mut scope,
+            "C" => &mut c,
+            "I" => &mut i,
+            "A" => &mut a,
+            // Temporal and environmental metrics do not move the base score.
+            _ => continue,
+        };
+        *slot = Some(value);
+    }
+    let changed = match scope? {
+        "U" => false,
+        "C" => true,
+        _ => return None,
+    };
+    let av = match av? {
+        "N" => 0.85,
+        "A" => 0.62,
+        "L" => 0.55,
+        "P" => 0.2,
+        _ => return None,
+    };
+    let ac = match ac? {
+        "L" => 0.77,
+        "H" => 0.44,
+        _ => return None,
+    };
+    let pr = match (pr?, changed) {
+        ("N", _) => 0.85,
+        ("L", false) => 0.62,
+        ("L", true) => 0.68,
+        ("H", false) => 0.27,
+        ("H", true) => 0.5,
+        _ => return None,
+    };
+    let ui = match ui? {
+        "N" => 0.85,
+        "R" => 0.62,
+        _ => return None,
+    };
+    let cia = |v: Option<&str>| match v? {
+        "H" => Some(0.56),
+        "L" => Some(0.22),
+        "N" => Some(0.0),
+        _ => None,
+    };
+    let iss: f64 = 1.0 - (1.0 - cia(c)?) * (1.0 - cia(i)?) * (1.0 - cia(a)?);
+    let impact = if changed {
+        7.52 * (iss - 0.029) - 3.25 * (iss - 0.02).powi(15)
+    } else {
+        6.42 * iss
+    };
+    if impact <= 0.0 {
+        return Some(0.0);
+    }
+    let exploitability = 8.22 * av * ac * pr * ui;
+    let raw: f64 = if changed {
+        1.08 * (impact + exploitability)
+    } else {
+        impact + exploitability
+    };
+    // Roundup per the specification's integer formulation, immune to float
+    // noise such as 4.000000000000001.
+    let scaled = (raw.min(10.0) * 100_000.0).round() as i64;
+    Some(if scaled % 10_000 == 0 {
+        scaled as f64 / 100_000.0
+    } else {
+        ((scaled / 10_000) + 1) as f64 / 10.0
+    })
+}
+
 /// Parses `pip-audit --format json` output.
 ///
 /// Two root shapes exist in the wild: current releases (verified against
@@ -3370,7 +3515,7 @@ pub(crate) fn parse_pip_audit_json(text: &str) -> Result<Vec<Vulnerability>, Str
 pub(crate) fn parse_govulncheck_stream(text: &str) -> Result<Vec<Vulnerability>, String> {
     let trimmed = text.trim();
     if trimmed.is_empty() {
-        return Ok(Vec::new());
+        return Err("govulncheck output was empty".into());
     }
     struct ModuleFinding {
         name: String,
@@ -3381,18 +3526,19 @@ pub(crate) fn parse_govulncheck_stream(text: &str) -> Result<Vec<Vulnerability>,
     let mut osv_urls: BTreeMap<String, String> = BTreeMap::new();
     let mut seen: BTreeMap<(String, String), ModuleFinding> = BTreeMap::new();
     let mut parsed_any = false;
+    let mut saw_config = false;
 
     let deserializer = serde_json::Deserializer::from_str(trimmed);
     for item in deserializer.into_iter::<Value>() {
-        // A corrupt trailing segment (truncated run, interleaved writer)
-        // skips rather than poisoning everything before it.
-        let Ok(value) = item else {
-            continue;
-        };
+        // A corrupt segment means findings after it were never read; an
+        // incomplete stream must not report the findings before it as the
+        // whole answer.
+        let value = item.map_err(|e| format!("govulncheck stream is truncated or corrupt: {e}"))?;
         if !value.is_object() {
             continue;
         }
         parsed_any = true;
+        saw_config |= value.get("config").is_some();
         if let Some(osv) = value.get("osv") {
             let id = json_str(osv, "id");
             if id.is_empty() {
@@ -3456,6 +3602,11 @@ pub(crate) fn parse_govulncheck_stream(text: &str) -> Result<Vec<Vulnerability>,
 
     if !parsed_any {
         return Err("govulncheck output contained no JSON messages".into());
+    }
+    if !saw_config {
+        // govulncheck -json opens every stream with a config message; without
+        // it this is not a complete run's output.
+        return Err("govulncheck stream has no config message".into());
     }
     let mut out = Vec::new();
     for ((id, _module), mf) in seen {
@@ -4544,11 +4695,14 @@ mod tests {
 {"finding":{"osv":"GO-2022-0969","fixed_version":"","trace":[{"module":"stdlib","version":"go1.24.0"}]}}
 {"finding":{"osv":"GO-2021-0111","fixed_version":"v0.3.7","trace":[{"module":"golang.org/x/text","version":"v0.3.5","package":"golang.org/x/text/language"}]}}
 {"finding":{"osv":"GO-2021-0111","fixed_version":"v0.3.7","trace":[{"module":"golang.org/x/text","version":"v0.3.5","package":"golang.org/x/text/language","function":"Parse"},{"module":"tmp","function":"main"}]}}
-not-json-at-all
 "#;
 
     #[test]
     fn parse_govulncheck_keeps_module_level_and_dedupes() {
+        // A trailing garbage line used to ride along in this fixture and be
+        // skipped; corrupt segments are now an error (see
+        // govulncheck_killed_midstream_is_not_clean).
+        assert!(parse_govulncheck_stream(&format!("{GOVULN_STREAM}not-json-at-all\n")).is_err());
         let vulns = parse_govulncheck_stream(GOVULN_STREAM).expect("parse");
         assert_eq!(vulns.len(), 2, "one row per (osv, module): {vulns:?}");
         let xtext = vulns
@@ -4575,8 +4729,8 @@ not-json-at-all
 
     #[test]
     fn parse_govulncheck_empty_and_all_garbage() {
-        assert!(parse_govulncheck_stream("").unwrap().is_empty());
-        assert!(parse_govulncheck_stream("   \n \n").unwrap().is_empty());
+        assert!(parse_govulncheck_stream("").is_err());
+        assert!(parse_govulncheck_stream("   \n \n").is_err());
         assert!(parse_govulncheck_stream("garbage\nmore garbage").is_err());
     }
 
@@ -4584,11 +4738,11 @@ not-json-at-all
     fn parse_govulncheck_survives_truncated_stream_mid_line() {
         let truncated =
             "{\"config\":{\"protocol_version\":\"v1.0.0\"}}\n{\"finding\":{\"osv\":\"GO-202";
-        let vulns = parse_govulncheck_stream(truncated).unwrap();
-        assert!(
-            vulns.is_empty(),
-            "partial finding line is skipped: {vulns:?}"
-        );
+        // Reason this changed: it used to assert the partial line is skipped
+        // and the stream reads as zero findings, which reports a killed run
+        // as clean. A truncated stream is now an error.
+        let err = parse_govulncheck_stream(truncated).unwrap_err();
+        assert!(err.contains("truncated or corrupt"), "{err}");
     }
 
     /// Captured verbatim (abbreviated) from govulncheck v1.7.0 against a
@@ -6401,5 +6555,142 @@ not-json-at-all
             handle.join().expect("scan thread panicked");
         }
         assert_eq!(ok.load(Ordering::SeqCst), rounds);
+    }
+}
+
+#[cfg(test)]
+mod fail_closed_tests {
+    use super::*;
+    use crate::engine::git_cli::CapturedOutput;
+
+    fn captured(status: i32, success: bool, stdout: &str, stderr: &str) -> CapturedOutput {
+        CapturedOutput {
+            stdout: stdout.as_bytes().to_vec(),
+            stderr: stderr.as_bytes().to_vec(),
+            success,
+            status_code: status,
+        }
+    }
+
+    /// The scanner_stdout -> parse_govulncheck_stream path enrich_go runs.
+    /// Returns whether the run was reported (an issue or a parse error).
+    fn go_reported(out: CapturedOutput) -> bool {
+        let mut issues = Vec::new();
+        match scanner_stdout(
+            Ok(out),
+            &mut issues,
+            "govulncheck_failed",
+            "govulncheck",
+            None,
+        ) {
+            None => !issues.is_empty(),
+            Some(text) => parse_govulncheck_stream(&text).is_err() || !issues.is_empty(),
+        }
+    }
+
+    #[test]
+    fn govulncheck_killed_midstream_is_not_clean() {
+        let out = captured(
+            137,
+            false,
+            "{\"config\":{\"protocol_version\":\"v1.0.0\"}}\n{\"finding\":{\"osv\":\"GO-202",
+            "signal: killed",
+        );
+        assert!(go_reported(out));
+    }
+
+    #[test]
+    fn govulncheck_exit_zero_empty_stdout_is_not_clean() {
+        assert!(go_reported(captured(0, true, "", "")));
+    }
+
+    #[test]
+    fn govulncheck_stream_without_config_is_not_a_complete_run() {
+        let err = parse_govulncheck_stream(r#"{"osv":{"id":"GO-1"}}"#).unwrap_err();
+        assert!(err.contains("config"), "{err}");
+        assert!(
+            parse_govulncheck_stream(r#"{"config":{"protocol_version":"v1.0.0"}}"#)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn scanner_stdout_flags_silent_success_for_every_scanner() {
+        for program in ["pip-audit", "composer", "bundler-audit"] {
+            let mut issues = Vec::new();
+            let text = scanner_stdout(
+                Ok(captured(0, true, "  \n", "")),
+                &mut issues,
+                "x_failed",
+                program,
+                None,
+            );
+            assert!(text.is_none());
+            assert_eq!(issues.len(), 1, "{program}: {issues:?}");
+        }
+    }
+
+    #[test]
+    fn cargo_audit_without_vulnerabilities_section_is_not_clean() {
+        let err =
+            parse_cargo_audit_json(r#"{"error":"couldn't fetch advisory database"}"#).unwrap_err();
+        assert!(err.contains("couldn't fetch"), "{err}");
+        assert!(parse_cargo_audit_json(r#"{"vulnerabilities":{"found":false}}"#).is_err());
+    }
+
+    #[test]
+    fn cargo_audit_count_must_match_the_list() {
+        let doc = r#"{"vulnerabilities":{"found":true,"count":2,"list":[
+            {"advisory":{"id":"RUSTSEC-1","package":"a"},"versions":{"patched":[]}}]}}"#;
+        let err = parse_cargo_audit_json(doc).unwrap_err();
+        assert!(err.contains("2") && err.contains("1"), "{err}");
+        let ok = r#"{"vulnerabilities":{"found":false,"count":0,"list":[]}}"#;
+        assert!(parse_cargo_audit_json(ok).unwrap().0.is_empty());
+    }
+
+    #[test]
+    fn cvss_vectors_map_to_their_real_severity() {
+        assert_eq!(
+            cvss_to_severity("CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"),
+            "critical"
+        );
+        assert_eq!(
+            cvss_to_severity("CVSS:3.1/AV:P/AC:H/PR:H/UI:R/S:U/C:L/I:N/A:N"),
+            "low"
+        );
+        // 6.1: the classic reflected-XSS vector.
+        assert_eq!(
+            cvss_to_severity("CVSS:3.1/AV:N/AC:L/PR:N/UI:R/S:C/C:L/I:L/A:N"),
+            "moderate"
+        );
+        assert_eq!(
+            cvss_to_severity("CVSS:3.0/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:N/A:N"),
+            "high"
+        );
+        assert_eq!(cvss_to_severity("7.5"), "high");
+    }
+
+    #[test]
+    fn unscorable_cvss_is_unknown_not_high() {
+        for bad in [
+            "",
+            "garbage",
+            "CVSS:4.0/AV:N/AC:L/AT:N/PR:N/UI:N/VC:H/VI:H/VA:H/SC:N/SI:N/SA:N",
+            "CVSS:3.1/AV:N",
+            "0.0",
+        ] {
+            assert_eq!(cvss_to_severity(bad), SEVERITY_UNKNOWN, "{bad}");
+        }
+    }
+
+    #[test]
+    fn cargo_audit_missing_cvss_is_unknown() {
+        let doc = r#"{"vulnerabilities":{"count":1,"list":[
+            {"advisory":{"id":"RUSTSEC-1","package":"a"},"versions":{"patched":[]}}]}}"#;
+        assert_eq!(
+            parse_cargo_audit_json(doc).unwrap().0[0].severity,
+            SEVERITY_UNKNOWN
+        );
     }
 }
