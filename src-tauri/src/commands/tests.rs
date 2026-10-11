@@ -621,6 +621,74 @@ fn an_empty_repository_graph_is_a_notice_not_a_fault() {
     );
 }
 
+/// A repository that has commits but whose HEAD branch ref is unreadable is a
+/// fault, not a repository fact: git words it exactly like an unborn branch
+/// ("ambiguous argument 'HEAD'"), so the text alone cannot be the evidence.
+#[test]
+fn an_unreadable_head_in_a_repository_with_commits_is_a_warning_not_no_commits() {
+    let repo = crate::test_support::git_repo();
+    crate::test_support::git_in(repo.path(), &["commit", "--allow-empty", "-m", "seed"]);
+    let branch = std::fs::read_to_string(repo.path().join(".git/HEAD")).expect("HEAD");
+    let branch_ref = branch.trim().strip_prefix("ref: ").expect("symbolic HEAD");
+    std::fs::write(
+        repo.path().join(".git").join(branch_ref),
+        "not an object id\n",
+    )
+    .expect("corrupt the branch ref");
+    let payload = tauri::async_runtime::block_on(cmd_get_commit_graph(
+        repo.path().to_string_lossy().into_owned(),
+        100,
+        None,
+        None,
+        None,
+        None,
+    ))
+    .expect("a degraded HEAD must not fail the load");
+    assert!(
+        payload
+            .notices
+            .iter()
+            .all(|n| !n.contains("no commits yet")),
+        "a broken HEAD must not be stated as an empty repository: {:?}",
+        payload.notices
+    );
+    assert!(
+        payload
+            .warnings
+            .iter()
+            .any(|w| w.contains("HEAD unavailable")),
+        "the unreadable HEAD is a diagnosable fault: {:?}",
+        payload.warnings
+    );
+}
+
+/// An orphan checkout in a repository that already has commits really is
+/// unborn: the notice is true there, and must stay a notice.
+#[test]
+fn an_orphan_branch_in_a_repository_with_commits_is_still_unborn() {
+    let repo = crate::test_support::git_repo();
+    crate::test_support::git_in(repo.path(), &["commit", "--allow-empty", "-m", "seed"]);
+    crate::test_support::git_in(repo.path(), &["checkout", "--orphan", "fresh"]);
+    let payload = tauri::async_runtime::block_on(cmd_get_commit_graph(
+        repo.path().to_string_lossy().into_owned(),
+        100,
+        None,
+        None,
+        None,
+        None,
+    ))
+    .expect("orphan graph must load");
+    assert!(
+        payload.notices.iter().any(|n| n.contains("no commits yet")),
+        "{:?}",
+        payload.notices
+    );
+    assert!(payload
+        .warnings
+        .iter()
+        .all(|w| !w.contains("HEAD unavailable")));
+}
+
 /// The payload carries assembly warnings through a serde round trip when
 /// present, and a payload from before the field existed still deserializes
 /// to an empty vec instead of failing (the `#[serde(default)]` contract).

@@ -1,6 +1,7 @@
 //! Commit graph assembly: the payload, mainline anchoring, lane solving, stack hierarchy.
 
 use super::*;
+use std::path::Path;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CommitGraphPayload {
@@ -69,6 +70,36 @@ pub(super) fn is_unborn_head_error(err: &str) -> bool {
     lower.contains("ambiguous argument 'head'")
         || lower.contains("needed a single revision")
         || (lower.contains("unknown revision") && lower.contains("head"))
+}
+
+/// Whether a failed HEAD probe means the checked-out branch has no commits.
+///
+/// Git words an unborn branch and a branch whose ref file is unreadable
+/// identically (`ambiguous argument 'HEAD'`), so the error text only says
+/// "HEAD did not resolve". The branch is unborn when HEAD names a ref that is
+/// absent; if that ref is present and still did not resolve, it is damaged,
+/// and calling it "no commits yet" would present a fault as a repository fact.
+/// Any probe that cannot answer counts as "not unborn": the caller then
+/// records the original error as a warning.
+pub(super) fn head_is_unborn(repo: &Path, err: &str) -> bool {
+    if !is_unborn_head_error(err) {
+        return false;
+    }
+    let Ok(target) = crate::engine::git_cli::git_text(repo, &["symbolic-ref", "-q", "HEAD"]) else {
+        return false;
+    };
+    let Ok(located) =
+        crate::engine::git_cli::git_text(repo, &["rev-parse", "--git-path", target.trim()])
+    else {
+        return false;
+    };
+    let located = Path::new(located.trim());
+    let located = if located.is_absolute() {
+        located.to_path_buf()
+    } else {
+        repo.join(located)
+    };
+    !located.exists()
 }
 
 pub(super) const UNBORN_HEAD_NOTICE: &str =
@@ -360,7 +391,7 @@ pub async fn cmd_get_commit_graph(
         let head_id = match head {
             Ok(Ok(id)) => Some(id),
             Ok(Err(err)) => {
-                if is_unborn_head_error(&err) {
+                if head_is_unborn(Path::new(&repo_path), &err) {
                     notes.notices.push(UNBORN_HEAD_NOTICE.into());
                 } else {
                     notes.warnings.push(format!(

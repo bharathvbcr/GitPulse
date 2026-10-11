@@ -2365,7 +2365,11 @@ mod tests {
         assert!(!snap.changes.ok);
         assert!(!snap.collisions.ok);
         assert_eq!(snap.collisions.overlapping_files, 0);
-        assert!(!snap.collisions.items.is_empty() || snap.collisions.items.is_empty());
+        assert!(
+            snap.collisions.items.is_empty(),
+            "a collision scan that failed must not invent overlaps: {:?}",
+            snap.collisions.items
+        );
         // Zero overlapping files plus ok:false is "we did not look", not clean.
         assert!(!snap.worktrees.ok && snap.collisions.overlapping_files == 0);
     }
