@@ -24,7 +24,7 @@ import { formatAuditCoverage, dependabotBadgeClass } from "../src/lib/health/for
 const REPO = "/fixture/GitPulse";
 
 export async function runHealthChecks(ctx) {
-  const { check, root, section, has, flat, wait, until, button, header, agentBar, rescan, ipcLog, aiCalls, runs, knobs, tick, healthReport, remount, setMode, setGithub } = ctx;
+  const { check, root, section, has, flat, wait, until, button, header, agentBar, rescan, ipcLog, aiCalls, runs, knobs, tick, healthReport, remount, detach, attach, setMode, setGithub } = ctx;
 
   const copied = [];
   const setClipboard = writeText => Object.defineProperty(navigator, "clipboard", { configurable: true, value: { writeText } });
@@ -38,7 +38,7 @@ export async function runHealthChecks(ctx) {
   const scanCalls = path => ipcLog.filter(entry => entry.cmd === "cmd_scan_deps_health" && entry.args.repoPath === path).length;
   // What the app does on a repository switch: its views are keyed on the open
   // repository, so the old panel is destroyed and a new one mounted.
-  const switchTo = async path => { await repoStore.openRepo(path); await remount(); await wait(); await wait(); };
+  const switchTo = async path => { await detach(); await repoStore.openRepo(path); await attach(); await wait(); await wait(); };
   const settled = () => !button("Scan local").disabled && !button("Check GitHub alerts").disabled;
   const settle = async () => { await until(settled); await wait(120); };
   const aiResult = text => ({
@@ -52,6 +52,7 @@ export async function runHealthChecks(ctx) {
     runs.length = 0;
     aiCalls.length = 0;
   };
+  const noScans = () => ipcLog.filter(entry => ["cmd_scan_coverage", "cmd_scan_secrets", "cmd_storage_scan"].includes(entry.cmd)).length === 0;
   const runButton = () => agentBar().querySelector('button[aria-label^="Run "]');
 
   try {
@@ -146,6 +147,11 @@ export async function runHealthChecks(ctx) {
     await switchTo("/fixture/Other");
     check("a repository switch aborts the pending launch", () => get(terminalLaunchRequests) === null && !has(root, "Opening agent terminal…"));
     await switchTo(REPO);
+    // A host that keeps the panel mounted: the panel itself aborts on a switch.
+    runButton().click(); await tick();
+    await repoStore.openRepo("/fixture/Other"); await wait();
+    check("an unkeyed panel aborts the pending launch itself on a repository switch", () => get(terminalLaunchRequests) === null && !has(root, "Opening agent terminal…"));
+    await switchTo(REPO);
     runButton().click(); await tick();
     check("the channel is free for the next launch after an aborted one", () => get(terminalLaunchRequests) !== null);
     terminalLaunchRequests.take(REPO).complete(); await wait();
@@ -205,6 +211,125 @@ export async function runHealthChecks(ctx) {
     button("Check GitHub alerts").click();
     await until(() => !!section("dependabot")?.querySelector("table"));
     await settle();
+
+    // ---- Scan lifecycle: one scan per visit, cache, no foreign data -------------
+    const visits = scanCalls("/fixture/Visit");
+    await switchTo("/fixture/Visit");
+    await wait(400);
+    check("opening a repository scans it exactly once", () => scanCalls("/fixture/Visit") === visits + 1, () => scanCalls("/fixture/Visit") - visits);
+    knobs.scanDelay = 700;
+    await switchTo("/fixture/Other");
+    await switchTo(REPO);
+    check("a revisit shows the cached report while the fresh scan runs", () => !!section("summary") && button("Scan local").disabled);
+    await settle();
+    await switchTo("/fixture/Fresh");
+    check("a repository with nothing cached shows none of the previous repository's findings", () =>
+      !section("summary") && !section("vulnerabilities") && !has(root, "unused_0"));
+    await settle();
+    check("and shows its own report once its scan lands", () => !!section("summary"));
+    // The same switch without a remount, for a host that keeps the panel mounted:
+    // the panel clears the previous repository's data itself.
+    knobs.scanDelay = 700;
+    await repoStore.openRepo("/fixture/Fresh3"); await wait(100);
+    check("an unkeyed panel clears the previous repository's data while the new one scans", () =>
+      !section("summary") && !has(root, "unused_0"));
+    await settle();
+    knobs.scanDelay = 0;
+    await switchTo(REPO);
+    await settle();
+    knobs.scanDelay = 700;
+    button("Scan local").click(); await tick(); await wait();
+    check("a rescan keeps the report on screen while it runs", () => !!section("summary") && button("Scan local").disabled);
+    await settle();
+    knobs.scanDelay = 0;
+
+    // ---- Failure separation -----------------------------------------------------
+    knobs.openFail = true;
+    button("Open the advisory for pkg-1").click();
+    await until(() => has(root, "Fixture opener refused"));
+    check("a link that fails to open is reported without replacing the report", () => !!section("summary") && !!section("vulnerabilities"));
+    knobs.openFail = false;
+    button("Scan local").click();
+    await settle();
+    check("a new scan clears the stale action error", () => !has(root, "Fixture opener refused"));
+    check("Dependabot severities of any casing tint the header badge by the shared normalizer", () => {
+      const badge = [...header().querySelectorAll("span")].find(node => node.textContent.includes("Dependabot"));
+      return !!badge && badge.className.includes(dependabotBadgeClass([{ severity: "high" }]));
+    });
+    knobs.severity = "Critical";
+    button("Check GitHub alerts").click(); await settle();
+    check("a mixed-case critical alert tints like critical", () => {
+      const badge = [...header().querySelectorAll("span")].find(node => node.textContent.includes("Dependabot"));
+      return !!badge && badge.className.includes(dependabotBadgeClass([{ severity: "critical" }]));
+    });
+    knobs.severity = "MODERATE";
+    button("Check GitHub alerts").click(); await settle();
+    check("a moderate alert tints differently from a high one", () => {
+      const badge = [...header().querySelectorAll("span")].find(node => node.textContent.includes("Dependabot"));
+      return !!badge && badge.className.includes(dependabotBadgeClass([{ severity: "moderate" }])) && dependabotBadgeClass([{ severity: "moderate" }]) !== dependabotBadgeClass([{ severity: "high" }]);
+    });
+    knobs.severity = "HIGH";
+    button("Check GitHub alerts").click(); await settle();
+    setMode("malformed");
+    button("Scan local").click(); await settle();
+    check("a payload the parser refuses is reported, and the panel is usable again", () => has(root, "omitted scanner presence") && !button("Scan local").disabled);
+    await rescan("findings");
+
+    // ---- Dead code: each answer is told apart -----------------------------------
+    const deadAnswer = over => () => ({ source_freshness: { fresh: true, generation_id: 12 }, available: true, reason: null, items: [], total: 0, shown: 0, truncated: false, rungs: { deterministic: 0, high: 0, speculative: 0, filtered_out: 0 }, ...over });
+    knobs.dead = deadAnswer({ available: false, reason: "index is stale" });
+    await rescan("findings");
+    check("a dead-code check that could not run is not read as finding nothing", () =>
+      has(section("dead-code"), "Dead-code check could not run: index is stale") && has(section("dead-code"), "not the same as finding no unreferenced symbols"));
+    knobs.dead = deadAnswer({});
+    await rescan("findings");
+    check("an answered, empty graph says there are no candidates", () => has(section("dead-code"), "No dead-code candidates in the indexed graph."));
+    knobs.dead = deadAnswer({ truncated: true, total: 5 });
+    await rescan("findings");
+    check("an empty answer from a truncated query is not an all-clear", () => has(section("dead-code"), "stopped at its token budget before returning anything; this is not an all-clear."));
+    knobs.dead = null;
+    await rescan("findings");
+    check("the dead-code heading counts the observed total with the truncation marker", () =>
+      has(section("dead-code").querySelector("h3"), formatSectionCount({ shown: 2, total: 14, atLeast: true })));
+    check("exempt rows carry their reason and the others the shared status wording", () => {
+      const cells = [...section("dead-code").querySelectorAll("tbody tr td:last-child")].map(flat);
+      return cells.includes(formatDeadCodeStatus({ is_exempt: true, exemption_reason: "public API" }))
+        && cells.includes(formatDeadCodeStatus({ is_exempt: false, exemption_reason: null }));
+    });
+
+    // ---- Counts: observed totals, never the surviving rows ------------------------
+    await rescan("huge");
+    const heading = id => flat(section(id).querySelector("h3"));
+    check("the vulnerability heading carries the observed total and what it shows", () =>
+      heading("vulnerabilities").includes(formatSectionCount({ shown: 400, total: 1200 })));
+    root.querySelector('[aria-label="Vulnerability scope"] button:nth-child(2)').click(); await tick();
+    check("a capped scan's direct count is a floor, never a total", () =>
+      heading("vulnerabilities").includes(formatSectionCount({ shown: 134, total: 134, atLeast: true, qualifier: "direct" })), () => heading("vulnerabilities"));
+    root.querySelector('[aria-label="Vulnerability scope"] button:nth-child(1)').click(); await tick();
+    check("the outdated heading counts the observed total", () => heading("outdated").includes(formatSectionCount({ shown: 400, total: 1200 })));
+    await rescan("hostile");
+    button("Copy report").click(); await until(() => copied.at(-1)?.includes("Repository: "));
+    check("the copied report carries an incomplete dead-code walk", () => copied.at(-1).includes("170746 of 331397"));
+    await rescan("findings");
+    check("the outdated section is headed as npm-only", () => has(section("outdated").querySelector("h3"), "Outdated npm packages"));
+    check("the target census is worded by its owner in the vulnerabilities section", () =>
+      flat(section("vulnerabilities").querySelector('[data-testid="audit-coverage"]')) === `${formatAuditCoverage({ found: 2, audited: 1, unaudited: ["cargo:Cargo.lock"] })}.`);
+    check("an ecosystem is a definition list that says how many artifacts it is not showing", () => {
+      const entries = [...section("packages").querySelectorAll("dl dd ul li")].map(flat);
+      return flat(section("packages").querySelector("dl dt")) === "cargo" && entries.length === 5 && entries[4] === "+32 more" && entries.every(entry => !entry.includes(","));
+    });
+    const failing = () => {
+      const report = healthReport();
+      return { ...report, scanners_ran: ["npm"], audit_complete: false, vulnerabilities: [], audit: { info: 0, low: 0, moderate: 0, high: 0, critical: 0, unknown: 0, total: 0 },
+        issues: [{ severity: "error", code: "audit_failed", message: "npm audit exited 1", path: "package.json" }] };
+    };
+    knobs.deps = failing;
+    await rescan("findings");
+    check("a scanner that ran and failed is named, not only one that is missing", () =>
+      has(section("vulnerabilities"), `Local audit incomplete (${coverageGap(failing())}); no all-clear is available.`) && coverageGap(failing()).includes("failed: npm audit"));
+    knobs.deps = null;
+    await rescan("findings");
+    check("Health never scans coverage, secrets or storage itself", noScans);
   } finally {
     if (originalClipboard) Object.defineProperty(navigator, "clipboard", originalClipboard);
     reset();

@@ -205,7 +205,9 @@
       let panel = mount(HealthPanel, { target: root });
       // The app keys its views on the open repository, so a switch there is an
       // unmount and a fresh mount, with only the module caches surviving.
-      const remount = async () => { await unmount(panel); panel = mount(HealthPanel, { target: root }); await tick(); };
+      const detach = async () => { await unmount(panel); };
+      const attach = async () => { panel = mount(HealthPanel, { target: root }); await tick(); };
+      const remount = async () => { await detach(); await attach(); };
 
       // `textContent` keeps the newlines and indentation Svelte emits between
       // markup lines, so a probe for a phrase the template wraps reads as
@@ -527,7 +529,7 @@
           const { runHealthChecks } = await import("./healthChecks.js");
           await runHealthChecks({
             check, root, section, has, flat, wait, until, button, scroller, header, agentBar, rescan,
-            ipcLog, aiCalls, runs, knobs, tick, healthReport, remount,
+            ipcLog, aiCalls, runs, knobs, tick, healthReport, remount, detach, attach,
             setMode: next => { mode = next; }, setGithub: next => { githubMode = next; },
           });
           check("no unhandled runtime errors", () => errors.length === 0);
