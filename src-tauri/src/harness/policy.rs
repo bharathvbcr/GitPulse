@@ -410,7 +410,9 @@ pub fn render_command(argv: &[&str]) -> String {
         .join(" ")
 }
 
-fn shell_quote(arg: &str) -> String {
+/// `arg` as one POSIX shell word: bare when every character is safe, else
+/// single-quoted with an embedded `'` written `'\''`.
+pub fn shell_quote(arg: &str) -> String {
     let safe = !arg.is_empty()
         && arg.chars().all(|c| {
             c.is_ascii_alphanumeric()
