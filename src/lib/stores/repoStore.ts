@@ -1634,6 +1634,7 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
         );
         if (aliases.length > 0) {
           const aliasIds = new Set(aliases.map((tab) => tab.id));
+          const aliasPaths = new Map(aliases.map((tab) => [tab.id, tab.path]));
           for (const alias of aliases) {
             if (internal.sessions[alias.id]) {
               carriedSession = internal.sessions[alias.id];
@@ -1662,7 +1663,9 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
           const sessions = { ...internal.sessions };
           for (const id of aliasIds) {
             delete sessions[id];
-            familyUnknown.delete(id);
+            // An alias spelling is not a closed repository: its journal key
+            // resolves to the surviving tab, so only the tab's own records go.
+            sessionBook.forget(id, aliasPaths.get(id) ?? null);
           }
           internal = { ...internal, sessions };
         }
@@ -2076,9 +2079,11 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
       }
       internal = { ...internal, sessions };
       stopStatusPoll();
-      for (const path of closedPaths) {
-        graph.evict(path);
-        await unwatch(path);
+      // The fourth close route: it must end in the same release as the other
+      // three, or its tabs' records and journals outlive them.
+      const closedSet = new Set(closedPaths);
+      for (const tab of groupTabs) {
+        if (closedSet.has(tab.path)) await releaseSession(tab.id, tab.path);
       }
       const revealed = activeSession();
       if (revealed) {
