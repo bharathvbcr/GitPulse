@@ -10,5 +10,5 @@ pub use conventional::{ConventionalCommit, ConventionalCommitParser};
 pub use coverage::{CoverageReport, CoverageScanner, FileCoverage};
 pub use deps::{DepsHealthReport, DepsScanner};
 pub use filter::CommitFilter;
-pub use language::{LanguageDetector, LanguageInfo};
+pub use language::{LanguageDetector, LanguageInfo, LinguistAttrs};
 pub use loc_counter::{CommentSyntax, DiffChurn, LineCounts, LocCounter, StringSyntax};

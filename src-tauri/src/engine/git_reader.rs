@@ -311,6 +311,19 @@ pub struct RepoLanguageStat {
 /// report says so instead of presenting a capped sample as complete coverage.
 pub const LANG_STATS_DEADLINE: Duration = Duration::from_secs(10);
 
+/// Candidates one language scan reads at most; see
+/// [`LanguageDetector::prioritize_for_stats`].
+const LANG_STATS_MAX_FILES: usize = 10_000;
+
+/// Largest file the language scan reads whole.
+const LANG_MAX_FILE_BYTES: u64 = 1_048_576;
+
+/// Threads one language scan reads with, the caller's own included. File
+/// reads spawn no child, so this pool is the whole of the scan's parallelism
+/// and is bounded here rather than borrowed from rayon's global pool, which
+/// the insights and dead-branch scans share.
+const LANG_SCAN_WORKERS: usize = 4;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LanguageStatsReport {
     pub stats: Vec<RepoLanguageStat>,
@@ -1743,97 +1756,103 @@ impl GitReader {
         })
     }
 
+    /// Language statistics for the working tree, bounded by
+    /// [`LANG_STATS_DEADLINE`].
+    ///
+    /// Callers asking about one repository while its scan runs share that
+    /// scan: the metric strip, the fleet view and a watcher-driven refresh
+    /// routinely ask at once, and each used to start its own read of the
+    /// whole tree. The key carries the admission class so a reactive caller
+    /// never inherits a refusal that only a background leader could get.
     pub fn get_repo_language_stats(repo_path: &str) -> Result<LanguageStatsReport, String> {
-        Self::get_repo_language_stats_bounded(repo_path, Some(LANG_STATS_DEADLINE))
+        type Flights = crate::singleflight::SingleFlight<
+            (std::path::PathBuf, git_cli::Admission),
+            Result<LanguageStatsReport, String>,
+        >;
+        static FLIGHTS: OnceLock<Flights> = OnceLock::new();
+        let repo = validate_repo(repo_path)?;
+        let key = (
+            repo.canonicalize().unwrap_or(repo),
+            git_cli::current_admission(),
+        );
+        FLIGHTS.get_or_init(Flights::default).run(key, || {
+            Self::get_repo_language_stats_bounded(repo_path, Some(LANG_STATS_DEADLINE))
+        })
     }
 
     /// Like [`Self::get_repo_language_stats`] with an explicit budget;
     /// `None` means unbounded (tests).
+    ///
+    /// Each file's result is remembered against its identity (see
+    /// [`lang_cache`]), so a rescan reads only the files that changed since
+    /// the last one; the rest cost one `lstat` each. What does need reading is
+    /// read by up to [`LANG_SCAN_WORKERS`] threads.
     pub fn get_repo_language_stats_bounded(
         repo_path: &str,
         deadline: Option<Duration>,
     ) -> Result<LanguageStatsReport, String> {
         let started = Instant::now();
-        let expired = || match deadline {
-            Some(d) => started.elapsed() >= d,
-            None => false,
-        };
         let repo = validate_repo(repo_path)?;
-        let stdout = git_text(
-            &repo,
-            &[
-                "ls-files",
-                "-z",
-                "--cached",
-                "--others",
-                "--exclude-standard",
-            ],
-        )?;
-
-        let mut candidates = Vec::new();
-        // Git can list one conflicted path in multiple index stages. Preserve
-        // its exact filename bytes for disk access; normalization is only for
-        // language classification, never for opening the file.
-        for rel_path in parse_ls_files_entries(&stdout) {
-            if rel_path.is_empty() || LanguageDetector::is_ignored_source_path(&rel_path) {
-                continue;
-            }
-            let lang_info = LanguageDetector::detect_from_path(&rel_path);
-            if !LanguageDetector::should_count_for_stats(&rel_path, &lang_info) {
-                continue;
-            }
-            candidates.push((rel_path, lang_info));
-        }
+        #[cfg(test)]
+        lang_probe::note_scan(&repo);
+        let candidates = language_candidates(&repo)?;
         let candidate_files = candidates.len();
-        let selected = LanguageDetector::prioritize_for_stats(candidates, 10_000);
-        let selected_len = selected.len();
+        let selected = LanguageDetector::prioritize_for_stats(candidates, LANG_STATS_MAX_FILES);
+
+        let cache_key = repo.canonicalize().unwrap_or_else(|_| repo.clone());
+        let mut previous = lang_cache::take(&cache_key);
+        let outcomes = scan_language_files(&repo, &selected, &previous, started, deadline);
 
         let mut lang_counts: HashMap<&'static str, (usize, usize, &'static str, &'static str)> =
             HashMap::new();
         let mut total_lines = 0usize;
         let mut scanned_files = 0usize;
         let mut deadline_hit = false;
-        let mut incomplete = selected_len < candidate_files;
+        let mut incomplete = selected.len() < candidate_files;
+        let mut remembered = lang_cache::RepoMap::with_capacity(selected.len());
 
-        for (rel_path, path_info) in selected {
-            if expired() {
-                deadline_hit = true;
-                break;
-            }
-            // Resolve through symlinks so a tracked file that is really a link
-            // pointing outside the repo is refused instead of read.
-            let full_path = match git_cli::sandbox_join_canonical(&repo, &rel_path) {
-                Ok(path) => path,
-                Err(_) => {
-                    incomplete = true;
-                    record_lang(&mut lang_counts, path_info, 0);
+        for ((rel_path, path_info), outcome) in selected.into_iter().zip(outcomes) {
+            let tally = match outcome {
+                None => {
+                    deadline_hit = true;
                     continue;
                 }
-            };
-            let bytes = match read_working_tree_file(&full_path, 1_048_576) {
-                Ok(bytes) => bytes,
-                Err(_) => {
+                Some(ScanOutcome::Remembered(tally)) => {
+                    if let Some(entry) = previous.remove(&rel_path) {
+                        remembered.insert(rel_path, entry);
+                    }
+                    tally
+                }
+                Some(ScanOutcome::Read { tally, remember }) => {
+                    previous.remove(&rel_path);
+                    if let Some(entry) = remember {
+                        remembered.insert(rel_path, entry);
+                    }
+                    tally
+                }
+                Some(ScanOutcome::Unreadable) => {
+                    previous.remove(&rel_path);
                     incomplete = true;
                     record_lang(&mut lang_counts, path_info, 0);
                     continue;
                 }
             };
             scanned_files += 1;
-            if LanguageDetector::looks_binary(&bytes) && !path_info.is_programming() {
-                continue;
+            if let FileTally::Counted { lang, code_lines } = tally {
+                record_lang(&mut lang_counts, lang, code_lines);
+                total_lines += code_lines;
             }
-            let lang_info = LanguageDetector::detect_from_bytes(&rel_path, &bytes);
-            if !LanguageDetector::should_count_for_stats(&rel_path, &lang_info) {
-                continue;
-            }
-            let content = String::from_utf8_lossy(&bytes);
-            // Language-aware: block comments, docstrings and string literals
-            // all change what counts as code, and this sum IS the repository's
-            // headline LOC number.
-            let loc = LocCounter::count_for_language(&content, lang_info.name);
-            record_lang(&mut lang_counts, lang_info, loc.code_lines);
-            total_lines += loc.code_lines;
         }
+        // A finished pass saw every selected file, so what it did not see is
+        // gone (deleted, ignored, past the cap) and is not kept. A pass the
+        // deadline cut short keeps what it never reached, which is what lets
+        // the next pass get further instead of starting over.
+        if deadline_hit {
+            for (rel_path, entry) in previous {
+                remembered.entry(rel_path).or_insert(entry);
+            }
+        }
+        lang_cache::put(cache_key, remembered);
 
         let mut stats: Vec<RepoLanguageStat> = lang_counts
             .into_iter()
@@ -4674,6 +4693,568 @@ fn record_lang(
     entry.1 += 1;
 }
 
+/// The files a language scan counts: tracked and untracked-not-ignored, minus
+/// vendored, generated and non-text kinds.
+///
+/// Vendored and generated are decided by the path's `linguist-vendored` and
+/// `linguist-generated` attributes where the repository sets them, and by the
+/// built-in directory and file-name rules where it does not, as Linguist does.
+/// Git can list one conflicted path in several index stages; the listing is
+/// deduplicated, and each path keeps its exact bytes for disk access, since
+/// normalization is only for classification.
+fn language_candidates(repo: &Path) -> Result<Vec<(String, LanguageInfo)>, String> {
+    let stdout = git_text(
+        repo,
+        &[
+            "ls-files",
+            "-z",
+            "--cached",
+            "--others",
+            "--exclude-standard",
+        ],
+    )?;
+    let paths = parse_ls_files_entries(&stdout);
+    let attrs = linguist_attributes(repo, &paths)?;
+    let mut candidates = Vec::with_capacity(paths.len());
+    for rel_path in paths {
+        let path_attrs = attrs.get(&rel_path).copied().unwrap_or_default();
+        let lang_info = LanguageDetector::detect_from_path(&rel_path);
+        if LanguageDetector::should_count_for_stats_with(&rel_path, &lang_info, path_attrs) {
+            candidates.push((rel_path, lang_info));
+        }
+    }
+    Ok(candidates)
+}
+
+/// Every path's Linguist attributes from one `git check-attr --stdin` run;
+/// paths with neither attribute specified are left out.
+///
+/// A failure here fails the scan rather than counting without the
+/// attributes: a total that silently includes trees the repository marked as
+/// vendored is a wrong number presented as a right one.
+fn linguist_attributes(
+    repo: &Path,
+    paths: &[String],
+) -> Result<HashMap<String, crate::analyzer::LinguistAttrs>, String> {
+    let mut attrs: HashMap<String, crate::analyzer::LinguistAttrs> = HashMap::new();
+    if paths.is_empty() {
+        return Ok(attrs);
+    }
+    let mut input = Vec::with_capacity(paths.iter().map(|p| p.len() + 1).sum());
+    for path in paths {
+        input.extend_from_slice(path.as_bytes());
+        input.push(0);
+    }
+    let output = git_cli::git_with_stdin(
+        repo,
+        &[
+            "check-attr",
+            "-z",
+            "--stdin",
+            "linguist-vendored",
+            "linguist-generated",
+        ],
+        &input,
+    )?;
+    // `-z` output is `<path> NUL <attribute> NUL <value> NUL`, per attribute.
+    let mut fields = output.split(|&b| b == 0);
+    while let (Some(path), Some(attribute), Some(value)) =
+        (fields.next(), fields.next(), fields.next())
+    {
+        let Some(value) =
+            crate::analyzer::LinguistAttrs::parse_value(&String::from_utf8_lossy(value))
+        else {
+            continue;
+        };
+        let entry = attrs
+            .entry(String::from_utf8_lossy(path).into_owned())
+            .or_default();
+        match attribute {
+            b"linguist-vendored" => entry.vendored = Some(value),
+            b"linguist-generated" => entry.generated = Some(value),
+            _ => {}
+        }
+    }
+    Ok(attrs)
+}
+
+/// What one scanned file adds to the language report.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FileTally {
+    /// Read, and not counted: binary, or classified out of the statistics.
+    Skipped,
+    Counted {
+        lang: LanguageInfo,
+        code_lines: usize,
+    },
+}
+
+/// One candidate's fate in a scan.
+enum ScanOutcome {
+    /// Unchanged since the last scan; its remembered tally, unread.
+    Remembered(FileTally),
+    /// Read now. `remember` is set when the file has been still long enough
+    /// that a later change must change its identity.
+    Read {
+        tally: FileTally,
+        remember: Option<lang_cache::Entry>,
+    },
+    /// Could not be read safely: escapes the repository, vanished, is not a
+    /// regular file, or is text past the size cap. The report is incomplete.
+    Unreadable,
+}
+
+/// A file's identity for the language cache: what a write must change.
+///
+/// The ctime is what makes this hold against tools that restore an mtime
+/// (`cp -p`, `rsync -t`, `touch -r`): no user-level call can set it, and any
+/// write, chmod or rename moves it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ScanIdentity {
+    len: u64,
+    inode: u64,
+    modified: Option<SystemTime>,
+    changed: Option<SystemTime>,
+}
+
+impl ScanIdentity {
+    fn of(meta: &std::fs::Metadata) -> Self {
+        #[cfg(unix)]
+        let (inode, changed) = {
+            use std::os::unix::fs::MetadataExt;
+            let changed = u64::try_from(meta.ctime())
+                .ok()
+                .and_then(|secs| u32::try_from(meta.ctime_nsec()).ok().map(|ns| (secs, ns)))
+                .map(|(secs, ns)| UNIX_EPOCH + Duration::new(secs, ns));
+            (meta.ino(), changed)
+        };
+        // Windows exposes no inode or change time through `std`; size and
+        // mtime still move on every ordinary write.
+        #[cfg(not(unix))]
+        let (inode, changed) = (0, None);
+        Self {
+            len: meta.len(),
+            inode,
+            modified: meta.modified().ok(),
+            changed,
+        }
+    }
+
+    /// The later of the mtime and the ctime; `None` when the mtime is
+    /// unknown, which never lets the file be remembered.
+    fn newest(&self) -> Option<SystemTime> {
+        let modified = self.modified?;
+        Some(
+            self.changed
+                .map_or(modified, |changed| changed.max(modified)),
+        )
+    }
+}
+
+/// Resolves each directory a scan reads from once, through
+/// [`sandbox_join_canonical`], instead of re-resolving every component of
+/// every file's path: one `lstat` + `realpath` per directory per scan, not
+/// per file. A file is then opened as `<resolved dir>/<name>` with
+/// `O_NOFOLLOW`, so the only component left unresolved cannot be a link.
+struct ScanSandbox<'a> {
+    repo: &'a Path,
+    dirs: Mutex<HashMap<String, Option<std::sync::Arc<Path>>>>,
+}
+
+impl<'a> ScanSandbox<'a> {
+    fn new(repo: &'a Path) -> Self {
+        Self {
+            repo,
+            dirs: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// `rel_dir` resolved inside the repository, or `None` when it escapes
+    /// it through a link or cannot be resolved. `""` is the root.
+    fn dir(&self, rel_dir: &str) -> Option<std::sync::Arc<Path>> {
+        if let Some(known) = self
+            .dirs
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(rel_dir)
+        {
+            return known.clone();
+        }
+        // Resolved outside the lock: two workers may both resolve one
+        // directory, and they reach the same answer.
+        let resolved = if rel_dir.is_empty() {
+            self.repo.canonicalize().ok()
+        } else {
+            sandbox_join_canonical(self.repo, rel_dir).ok()
+        }
+        .map(std::sync::Arc::<Path>::from);
+        self.dirs
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(rel_dir.to_string(), resolved.clone());
+        resolved
+    }
+}
+
+/// Scans `selected` on up to [`LANG_SCAN_WORKERS`] threads. The result is in
+/// `selected`'s order; `None` marks a file the deadline stopped the scan
+/// before reaching.
+fn scan_language_files(
+    repo: &Path,
+    selected: &[(String, LanguageInfo)],
+    previous: &lang_cache::RepoMap,
+    started: Instant,
+    deadline: Option<Duration>,
+) -> Vec<Option<ScanOutcome>> {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let sandbox = ScanSandbox::new(repo);
+    let next = AtomicUsize::new(0);
+    let work = || {
+        let mut done = Vec::new();
+        while !deadline.is_some_and(|limit| started.elapsed() >= limit) {
+            let index = next.fetch_add(1, Ordering::Relaxed);
+            let Some((rel_path, path_info)) = selected.get(index) else {
+                break;
+            };
+            done.push((index, scan_one(&sandbox, rel_path, *path_info, previous)));
+        }
+        done
+    };
+    let workers = std::thread::available_parallelism()
+        .map_or(1, std::num::NonZeroUsize::get)
+        .min(LANG_SCAN_WORKERS)
+        .min(selected.len());
+    let batches: Vec<Vec<(usize, ScanOutcome)>> = std::thread::scope(|scope| {
+        // The caller is one of the workers. A helper the host refuses to
+        // start only means fewer of them: the shared counter hands its share
+        // to the threads that did start.
+        let helpers: Vec<_> = (1..workers)
+            .filter_map(|_| {
+                std::thread::Builder::new()
+                    .name("gitpulse-lang-scan".into())
+                    .spawn_scoped(scope, work)
+                    .ok()
+            })
+            .collect();
+        let mut batches = vec![work()];
+        for helper in helpers {
+            batches.push(
+                helper
+                    .join()
+                    .unwrap_or_else(|panic| std::panic::resume_unwind(panic)),
+            );
+        }
+        batches
+    });
+    let mut outcomes: Vec<Option<ScanOutcome>> = std::iter::repeat_with(|| None)
+        .take(selected.len())
+        .collect();
+    for (index, outcome) in batches.into_iter().flatten() {
+        outcomes[index] = Some(outcome);
+    }
+    outcomes
+}
+
+/// One candidate: answered from `previous` when its identity is unchanged,
+/// read otherwise.
+fn scan_one(
+    sandbox: &ScanSandbox<'_>,
+    rel_path: &str,
+    path_info: LanguageInfo,
+    previous: &lang_cache::RepoMap,
+) -> ScanOutcome {
+    // Lexical validation (absolute, `..`, NUL) is owned by sandbox_join.
+    if sandbox_join(sandbox.repo, rel_path).is_err() {
+        return ScanOutcome::Unreadable;
+    }
+    let (rel_dir, name) = rel_path.rsplit_once('/').unwrap_or(("", rel_path));
+    let Some(dir) = sandbox.dir(rel_dir) else {
+        return ScanOutcome::Unreadable;
+    };
+    let path = dir.join(name);
+    let Ok(meta) = std::fs::symlink_metadata(&path) else {
+        return ScanOutcome::Unreadable;
+    };
+    if meta.file_type().is_symlink() {
+        // A link resolves whole, and one that leaves the repository is
+        // refused. It is never remembered: its target can change while the
+        // link itself does not.
+        let Ok(target) = sandbox_join_canonical(sandbox.repo, rel_path) else {
+            return ScanOutcome::Unreadable;
+        };
+        let Ok(target_meta) = std::fs::symlink_metadata(&target) else {
+            return ScanOutcome::Unreadable;
+        };
+        if !target_meta.is_file() {
+            return ScanOutcome::Unreadable;
+        }
+        #[cfg(test)]
+        lang_probe::note_read(sandbox.repo);
+        return match tally_file(&target, target_meta.len(), rel_path, path_info) {
+            Some(tally) => ScanOutcome::Read {
+                tally,
+                remember: None,
+            },
+            None => ScanOutcome::Unreadable,
+        };
+    }
+    // Checked before opening: a FIFO, socket or device is never opened.
+    if !meta.is_file() {
+        return ScanOutcome::Unreadable;
+    }
+    let identity = ScanIdentity::of(&meta);
+    if let Some(entry) = previous.get(rel_path) {
+        if entry.identity == identity && entry.path_info == path_info {
+            return ScanOutcome::Remembered(entry.tally);
+        }
+    }
+    #[cfg(test)]
+    lang_probe::note_read(sandbox.repo);
+    match tally_file(&path, meta.len(), rel_path, path_info) {
+        Some(tally) => ScanOutcome::Read {
+            tally,
+            remember: lang_cache::settled(&identity).then_some(lang_cache::Entry {
+                identity,
+                path_info,
+                tally,
+            }),
+        },
+        None => ScanOutcome::Unreadable,
+    }
+}
+
+/// Reads and classifies one regular file `len` bytes long. `None` when it
+/// cannot be read, or is text past [`LANG_MAX_FILE_BYTES`] and so cannot be
+/// counted.
+///
+/// A file past the cap is read only as far as [`LanguageDetector::looks_binary`]
+/// looks: a binary one is skipped exactly as a whole read would skip it.
+fn tally_file(path: &Path, len: u64, rel_path: &str, path_info: LanguageInfo) -> Option<FileTally> {
+    let oversized = len > LANG_MAX_FILE_BYTES;
+    let limit = if oversized {
+        LanguageDetector::BINARY_PROBE_BYTES as u64
+    } else {
+        LANG_MAX_FILE_BYTES + 1
+    };
+    let bytes = read_file_prefix(path, limit, len).ok()?;
+    if LanguageDetector::looks_binary(&bytes) && !path_info.is_programming() {
+        return Some(FileTally::Skipped);
+    }
+    // Grown past the cap since it was measured, or past it all along.
+    if oversized || bytes.len() as u64 > LANG_MAX_FILE_BYTES {
+        return None;
+    }
+    let lang_info = LanguageDetector::detect_from_bytes(rel_path, &bytes);
+    // The path rules already admitted this file; only its kind, which the
+    // bytes can change (a PNG named `.txt`), is left to decide.
+    if !LanguageDetector::is_countable_kind(&lang_info) {
+        return Some(FileTally::Skipped);
+    }
+    let content = String::from_utf8_lossy(&bytes);
+    // Language-aware: block comments, docstrings and string literals all
+    // change what counts as code, and this sum IS the repository's headline
+    // LOC number.
+    let loc = LocCounter::count_for_language(&content, lang_info.name);
+    Some(FileTally::Counted {
+        lang: lang_info,
+        code_lines: loc.code_lines,
+    })
+}
+
+/// Up to `limit` bytes of the regular file at `path`, which measured `len`
+/// bytes. Opened without following a final link and without blocking (a FIFO
+/// swapped in after the caller's `lstat` cannot hang the read), and refused
+/// unless the open handle is a regular file. The buffer is sized from `len`
+/// so an unchanged file takes one read and one end-of-file read: `open`,
+/// `fstat`, two `read`s and `close`.
+fn read_file_prefix(path: &Path, limit: u64, len: u64) -> std::io::Result<Vec<u8>> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW);
+    }
+    let mut file = options.open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(std::io::Error::other("not a regular file"));
+    }
+    let limit = usize::try_from(limit).unwrap_or(usize::MAX);
+    let first = usize::try_from(len.saturating_add(1))
+        .unwrap_or(usize::MAX)
+        .clamp(1, limit.max(1));
+    let mut bytes = vec![0u8; first];
+    let mut filled = 0;
+    loop {
+        if filled == bytes.len() {
+            if bytes.len() >= limit {
+                break;
+            }
+            bytes.resize(bytes.len().saturating_mul(2).min(limit), 0);
+        }
+        match file.read(&mut bytes[filled..]) {
+            Ok(0) => break,
+            Ok(n) => filled += n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+    bytes.truncate(filled);
+    Ok(bytes)
+}
+
+/// Per-file results of the language scan, so a rescan reads only what
+/// changed.
+///
+/// Keyed by path and checked against [`ScanIdentity`] rather than keyed by
+/// blob id: an identity answers for tracked, modified and untracked files
+/// alike from one `lstat`, where a blob id needs git to vouch, per scan, that
+/// the working-tree file still matches the index, and a content-keyed entry
+/// poisoned by a write racing the read would be served to every worktree.
+///
+/// Bounded twice over: a repository's map holds at most the files one scan
+/// can select (it is pruned to them after every complete pass, and refused
+/// whole if it ever outgrows twice that), and at most `MAX_REPOS`
+/// repositories are remembered, the least recently scanned going first.
+/// Nothing here is a source of truth: a miss is always recomputed from the
+/// file.
+mod lang_cache {
+    use super::{
+        FileTally, HashMap, LanguageInfo, Mutex, OnceLock, PoisonError, ScanIdentity,
+        LANG_STATS_MAX_FILES,
+    };
+    use std::path::PathBuf;
+    use std::time::{Duration, SystemTime};
+
+    pub(super) const MAX_REPOS: usize = 8;
+    const MAX_FILES_PER_REPO: usize = 2 * LANG_STATS_MAX_FILES;
+    /// A file changed this recently is not remembered: a second write inside
+    /// one timestamp tick (a second on HFS+, two on FAT) would leave its
+    /// identity unchanged. Git applies the same "racily clean" rule to its
+    /// own index.
+    pub(super) const RACY_WINDOW: Duration = Duration::from_secs(2);
+
+    #[derive(Clone, Debug)]
+    pub(super) struct Entry {
+        pub identity: ScanIdentity,
+        /// The path-based classification the tally was computed under.
+        pub path_info: LanguageInfo,
+        pub tally: FileTally,
+    }
+
+    pub(super) type RepoMap = HashMap<String, Entry>;
+
+    #[derive(Default)]
+    struct Store {
+        /// Least recently scanned first.
+        order: Vec<PathBuf>,
+        repos: HashMap<PathBuf, RepoMap>,
+    }
+
+    fn store() -> &'static Mutex<Store> {
+        static STORE: OnceLock<Mutex<Store>> = OnceLock::new();
+        STORE.get_or_init(|| Mutex::new(Store::default()))
+    }
+
+    /// Whether `identity` is old enough that a later write must change it.
+    pub(super) fn settled(identity: &ScanIdentity) -> bool {
+        identity.newest().is_some_and(|newest| {
+            SystemTime::now()
+                .duration_since(newest)
+                .is_ok_and(|age| age >= RACY_WINDOW)
+        })
+    }
+
+    /// Takes `repo`'s map out of the store so the scan holds no lock while it
+    /// reads files. A concurrent scan of the same repository starts empty.
+    pub(super) fn take(repo: &PathBuf) -> RepoMap {
+        let mut store = store().lock().unwrap_or_else(PoisonError::into_inner);
+        store.order.retain(|key| key != repo);
+        store.repos.remove(repo).unwrap_or_default()
+    }
+
+    pub(super) fn put(repo: PathBuf, map: RepoMap) {
+        if map.is_empty() || map.len() > MAX_FILES_PER_REPO {
+            return;
+        }
+        let mut store = store().lock().unwrap_or_else(PoisonError::into_inner);
+        store.order.retain(|key| *key != repo);
+        store.order.push(repo.clone());
+        store.repos.insert(repo, map);
+        while store.order.len() > MAX_REPOS {
+            let oldest = store.order.remove(0);
+            store.repos.remove(&oldest);
+        }
+    }
+
+    /// Forgets one repository, as a restart would.
+    #[cfg(test)]
+    pub(super) fn forget(repo: &std::path::Path) {
+        let key = repo.canonicalize().unwrap_or_else(|_| repo.to_path_buf());
+        take(&key);
+    }
+
+    #[cfg(test)]
+    pub(super) fn tracked_repos() -> usize {
+        store()
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .repos
+            .len()
+    }
+}
+
+/// What the language scan did, per repository, for the tests that count it.
+/// Keyed by repository rather than by thread because the scan reads on worker
+/// threads and the test harness runs tests side by side in one process.
+#[cfg(test)]
+mod lang_probe {
+    use super::{HashMap, Mutex, Path, PoisonError};
+    use std::path::PathBuf;
+
+    #[derive(Default)]
+    struct Counts {
+        scans: usize,
+        reads: usize,
+    }
+
+    static COUNTS: Mutex<Option<HashMap<PathBuf, Counts>>> = Mutex::new(None);
+
+    fn key(repo: &Path) -> PathBuf {
+        repo.canonicalize().unwrap_or_else(|_| repo.to_path_buf())
+    }
+
+    fn with(repo: &Path, f: impl FnOnce(&mut Counts)) {
+        let mut guard = COUNTS.lock().unwrap_or_else(PoisonError::into_inner);
+        f(guard
+            .get_or_insert_with(HashMap::new)
+            .entry(key(repo))
+            .or_default());
+    }
+
+    pub(super) fn note_scan(repo: &Path) {
+        with(repo, |c| c.scans += 1);
+    }
+
+    pub(super) fn note_read(repo: &Path) {
+        with(repo, |c| c.reads += 1);
+    }
+
+    /// Scans started on `repo` so far.
+    pub(super) fn scans_of(repo: &Path) -> usize {
+        let mut n = 0;
+        with(repo, |c| n = c.scans);
+        n
+    }
+
+    /// Files the scan has opened and read in `repo` so far.
+    pub(super) fn reads_of(repo: &Path) -> usize {
+        let mut n = 0;
+        with(repo, |c| n = c.reads);
+        n
+    }
+}
+
 fn mime_from_path(path: &str) -> String {
     match Path::new(path)
         .extension()
@@ -4809,6 +5390,378 @@ mod tests {
         assert!(report.truncated, "a scan that read nothing is truncated");
     }
 
+    /// Longer than the window inside which a just-changed file is not
+    /// remembered, so a fixture written before it is eligible for the cache.
+    const SETTLE: Duration = Duration::from_millis(2_200);
+
+    fn run_git_in(dir: &std::path::Path, args: &[&str]) {
+        let output = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .output_locked()
+            .expect("git");
+        assert!(output.status.success(), "git {args:?}: {output:?}");
+    }
+
+    /// A repository of `files` source files in nested directories, a few
+    /// untracked, binary and markdown ones among them.
+    fn churn_repo(dir: &std::path::Path, files: usize) {
+        init_stats_repo(dir);
+        for i in 0..files {
+            let (name, body) = match i % 5 {
+                0 => (
+                    format!("f{i}.py"),
+                    format!("# c\ndef f{i}():\n    return {i}\n"),
+                ),
+                1 => (format!("f{i}.md"), format!("# title {i}\n\ntext\n")),
+                2 => (format!("f{i}.bin"), "\u{0}\u{1}\u{2}".repeat(10)),
+                _ => (
+                    format!("f{i}.rs"),
+                    format!("/* b */\nfn f{i}() {{\n    let x = {i};\n}}\n"),
+                ),
+            };
+            let path = churn_path(dir, &name, i);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, body).unwrap();
+        }
+        run_git_in(dir, &["add", "."]);
+        // Untracked, and so counted by the scan's `--others`.
+        std::fs::write(dir.join("untracked.rs"), "fn u() {}\n").unwrap();
+    }
+
+    fn churn_path(dir: &std::path::Path, name: &str, i: usize) -> std::path::PathBuf {
+        dir.join(format!("pkg{}", i % 40))
+            .join(format!("mod{}", i % 7))
+            .join(name)
+    }
+
+    fn churn_rs(dir: &std::path::Path, i: usize) -> std::path::PathBuf {
+        assert!(i % 5 >= 3, "index {i} is not a .rs file in the fixture");
+        churn_path(dir, &format!("f{i}.rs"), i)
+    }
+
+    /// A rescan reads only the files that changed: none for an unchanged
+    /// tree, exactly the edited one after a one-file edit. The old scan read
+    /// every candidate on every call.
+    #[test]
+    fn language_stats_rescan_reads_only_what_changed() {
+        let dir = tempfile::TempDir::new().unwrap();
+        churn_repo(dir.path(), 3000);
+        std::thread::sleep(SETTLE);
+        let root = dir.path();
+        let repo = root.to_str().unwrap();
+
+        let before = lang_probe::reads_of(root);
+        let first = GitReader::get_repo_language_stats_bounded(repo, None).unwrap();
+        assert_eq!(
+            lang_probe::reads_of(root) - before,
+            first.candidate_files,
+            "a cold scan reads every candidate"
+        );
+        assert!(!first.truncated);
+
+        let before = lang_probe::reads_of(root);
+        let second = GitReader::get_repo_language_stats_bounded(repo, None).unwrap();
+        assert_eq!(
+            lang_probe::reads_of(root) - before,
+            0,
+            "an unchanged tree must not be read again"
+        );
+        assert_eq!(
+            serde_json::to_string(&first).unwrap(),
+            serde_json::to_string(&second).unwrap()
+        );
+
+        std::fs::write(churn_rs(root, 3), "fn changed() {}\nfn again() {}\n").unwrap();
+        std::thread::sleep(SETTLE);
+        let before = lang_probe::reads_of(root);
+        let third = GitReader::get_repo_language_stats_bounded(repo, None).unwrap();
+        assert_eq!(
+            lang_probe::reads_of(root) - before,
+            1,
+            "a one-file edit reads that file and nothing else"
+        );
+        assert_ne!(
+            serde_json::to_string(&second).unwrap(),
+            serde_json::to_string(&third).unwrap(),
+            "the edit is reflected"
+        );
+    }
+
+    /// Callers arriving while a scan runs share it instead of each starting
+    /// their own read of the whole tree.
+    #[test]
+    fn concurrent_language_stats_calls_share_one_scan() {
+        let dir = tempfile::TempDir::new().unwrap();
+        churn_repo(dir.path(), 3000);
+        let root = dir.path().to_path_buf();
+        let started = lang_probe::scans_of(&root);
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let (barrier, root) = (barrier.clone(), root.clone());
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    GitReader::get_repo_language_stats(root.to_str().unwrap()).unwrap()
+                })
+            })
+            .collect();
+        let reports: Vec<String> = handles
+            .into_iter()
+            .map(|h| serde_json::to_string(&h.join().unwrap()).unwrap())
+            .collect();
+        let scans = lang_probe::scans_of(&root) - started;
+        assert!(reports.windows(2).all(|pair| pair[0] == pair[1]));
+        assert!(scans <= 2, "8 simultaneous callers started {scans} scans");
+    }
+
+    /// Vendored trees count for nothing, whether a directory name or a
+    /// `.gitattributes` rule says so; `linguist-generated` is honoured; and an
+    /// explicit `-linguist-vendored` brings a tree back.
+    #[test]
+    fn vendored_trees_and_linguist_attributes_contribute_no_lines() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+        init_stats_repo(root); // app.rs: 1 line
+        let files = [
+            ("vendored/dep/src/lib.rs", "fn v() {}\n".repeat(50)),
+            ("third_party/zlib/inflate.c", "int x;\n".repeat(50)),
+            (
+                "src-tauri/framework/tao/src/lib.rs",
+                "fn t() {}\n".repeat(50),
+            ),
+            ("deps/big/lib.rs", "fn d() {}\n".repeat(50)),
+            ("src/schema.rs", "fn g() {}\n".repeat(50)),
+            ("vendor/ours/keep.rs", "fn k() {}\nfn k2() {}\n".to_string()),
+            ("crates/framework/src/lib.rs", "fn f() {}\n".to_string()),
+        ];
+        for (path, body) in &files {
+            let path = root.join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, body).unwrap();
+        }
+        std::fs::write(
+            root.join(".gitattributes"),
+            "src-tauri/framework/** linguist-vendored\n\
+             deps/** linguist-vendored\n\
+             src/schema.rs linguist-generated\n\
+             vendor/ours/** -linguist-vendored\n",
+        )
+        .unwrap();
+        run_git_in(root, &["add", "."]);
+        let report =
+            GitReader::get_repo_language_stats_bounded(root.to_str().unwrap(), None).unwrap();
+        let rust: usize = report
+            .stats
+            .iter()
+            .filter(|s| s.language == "Rust")
+            .map(|s| s.code_lines)
+            .sum();
+        assert_eq!(
+            rust,
+            1 + 2 + 1,
+            "app.rs, vendor/ours/keep.rs, crates/framework"
+        );
+        assert!(
+            report.stats.iter().all(|s| s.language != "C"),
+            "third_party/ is vendored: {:?}",
+            report.stats
+        );
+        assert!(!report.truncated);
+    }
+
+    /// The scan with nothing remembered: what every call used to be.
+    fn fresh_language_stats(repo: &std::path::Path) -> String {
+        lang_cache::forget(repo);
+        let report = GitReader::get_repo_language_stats_bounded(repo.to_str().unwrap(), None)
+            .expect("fresh");
+        serde_json::to_string(&report).unwrap()
+    }
+
+    fn warm_language_stats(repo: &std::path::Path) -> String {
+        let report =
+            GitReader::get_repo_language_stats_bounded(repo.to_str().unwrap(), None).expect("warm");
+        serde_json::to_string(&report).unwrap()
+    }
+
+    /// The remembered answer must be the fresh answer after every kind of
+    /// churn: edits that change size, deletions, additions of tracked and
+    /// untracked files, a source file turned binary, a regular file replaced
+    /// by a symlink out of the repository, a rename, and a same-size rewrite
+    /// that puts the old mtime back.
+    #[test]
+    fn language_stats_rescan_equals_a_fresh_scan_under_churn() {
+        let dir = tempfile::TempDir::new().unwrap();
+        churn_repo(dir.path(), 400);
+        let root = dir.path();
+        std::thread::sleep(SETTLE);
+        assert_eq!(warm_language_stats(root), fresh_language_stats(root));
+        assert_eq!(warm_language_stats(root), fresh_language_stats(root));
+
+        let step = |label: &str, mutate: &dyn Fn()| {
+            warm_language_stats(root);
+            mutate();
+            std::thread::sleep(SETTLE);
+            assert_eq!(
+                warm_language_stats(root),
+                fresh_language_stats(root),
+                "{label}"
+            );
+            // And the next warm pass off the rebuilt cache agrees too.
+            assert_eq!(
+                warm_language_stats(root),
+                fresh_language_stats(root),
+                "{label} (again)"
+            );
+        };
+        step("grow a file", &|| {
+            std::fs::write(churn_rs(root, 3), "fn a() {}\nfn b() {}\nfn c() {}\n").unwrap();
+        });
+        step("shrink a file", &|| {
+            std::fs::write(churn_rs(root, 8), "").unwrap()
+        });
+        step("delete a file", &|| {
+            std::fs::remove_file(churn_rs(root, 13)).unwrap()
+        });
+        step("add untracked files", &|| {
+            std::fs::write(root.join("new1.rs"), "fn n1() {}\n").unwrap();
+            std::fs::write(root.join("new2.py"), "x = 1\ny = 2\n").unwrap();
+        });
+        step("turn a source file binary", &|| {
+            std::fs::write(churn_rs(root, 18), vec![0u8; 64]).unwrap();
+        });
+        let outside = tempfile::TempDir::new().unwrap();
+        std::fs::write(outside.path().join("o.rs"), "fn outside() {}\n".repeat(50)).unwrap();
+        #[cfg(unix)]
+        step("replace a file with an outside symlink", &|| {
+            let target = churn_rs(root, 23);
+            std::fs::remove_file(&target).unwrap();
+            std::os::unix::fs::symlink(outside.path().join("o.rs"), &target).unwrap();
+        });
+        step("rename a file", &|| {
+            std::fs::rename(churn_rs(root, 28), root.join("renamed.rs")).unwrap();
+        });
+        step("same-size rewrite with the old mtime put back", &|| {
+            let path = churn_rs(root, 33);
+            let old = std::fs::metadata(&path).unwrap().modified().unwrap();
+            let body = std::fs::read_to_string(&path).unwrap();
+            // A comment line becomes a code line, in the same number of bytes.
+            let same_size = body.replacen("/* b */", "fn b();", 1);
+            assert_ne!(same_size, body);
+            assert_eq!(same_size.len(), body.len());
+            std::fs::write(&path, same_size).unwrap();
+            std::fs::File::options()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_modified(old)
+                .unwrap();
+        });
+    }
+
+    /// A file written inside the racy window is never remembered, so a second
+    /// write in the same clock tick cannot be served stale.
+    #[test]
+    fn language_stats_do_not_remember_a_file_written_just_now() {
+        let dir = tempfile::TempDir::new().unwrap();
+        init_stats_repo(dir.path());
+        let root = dir.path();
+        let repo = root.to_str().unwrap();
+        let file = root.join("app.rs");
+        let (mut last_lines, mut reads) = (0, 0);
+        for round in 1..=3usize {
+            std::fs::write(&file, "fn x() {}\n".repeat(round)).unwrap();
+            let before = lang_probe::reads_of(root);
+            let report = GitReader::get_repo_language_stats_bounded(repo, None).unwrap();
+            reads += lang_probe::reads_of(root) - before;
+            last_lines = report.stats[0].code_lines;
+        }
+        assert_eq!(last_lines, 3, "the newest write is what is counted");
+        assert_eq!(reads, 3, "a just-written file is read on every pass");
+    }
+
+    /// The remembered repositories are bounded and the oldest goes first.
+    #[test]
+    fn language_stats_cache_remembers_a_bounded_number_of_repositories() {
+        let meta = std::fs::metadata(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let entry = || {
+            let mut map = HashMap::new();
+            map.insert(
+                "a.rs".to_string(),
+                lang_cache::Entry {
+                    identity: ScanIdentity::of(&meta),
+                    path_info: LanguageDetector::detect_from_path("a.rs"),
+                    tally: FileTally::Skipped,
+                },
+            );
+            map
+        };
+        let keys: Vec<std::path::PathBuf> = (0..lang_cache::MAX_REPOS + 4)
+            .map(|i| std::path::PathBuf::from(format!("/bounded-cache-probe/{i}")))
+            .collect();
+        for key in &keys {
+            lang_cache::put(key.clone(), entry());
+        }
+        assert!(lang_cache::tracked_repos() <= lang_cache::MAX_REPOS);
+        assert!(
+            lang_cache::take(&keys[0]).is_empty(),
+            "the least recently scanned repository is forgotten first"
+        );
+    }
+
+    /// Directories are resolved once per scan rather than per file, and that
+    /// must not open a way out: a tracked file whose directory has been
+    /// replaced by a link out of the repository is refused, not read.
+    #[cfg(unix)]
+    #[test]
+    fn language_stats_refuse_a_directory_linked_out_of_the_repository() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+        init_stats_repo(root);
+        std::fs::create_dir(root.join("pkg")).unwrap();
+        std::fs::write(root.join("pkg/inner.py"), "x = 1\n").unwrap();
+        run_git_in(root, &["add", "."]);
+        let outside = tempfile::TempDir::new().unwrap();
+        std::fs::write(outside.path().join("inner.py"), "y = 2\n".repeat(40)).unwrap();
+        std::fs::remove_dir_all(root.join("pkg")).unwrap();
+        std::os::unix::fs::symlink(outside.path(), root.join("pkg")).unwrap();
+        let report =
+            GitReader::get_repo_language_stats_bounded(root.to_str().unwrap(), None).unwrap();
+        assert!(
+            report
+                .stats
+                .iter()
+                .filter(|s| s.language == "Python")
+                .all(|s| s.code_lines == 0),
+            "{report:?}"
+        );
+        assert!(report.truncated, "a refused candidate is a hole");
+    }
+
+    /// A file over the read cap whose first bytes are binary is not source:
+    /// a full read would have skipped it on the same 8 KiB sniff, so it is
+    /// skipped, not reported as a hole in the scan. This repository's
+    /// `src-tauri/icons/icon.icns` (1.3 MB, an extension no table names) made
+    /// every scan of it report `truncated`. Oversized text is still a hole.
+    #[test]
+    fn an_oversized_binary_is_skipped_but_oversized_text_truncates() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+        init_stats_repo(root);
+        let mut icon = b"icns\0\0\0\x01".to_vec();
+        icon.resize(1_300_000, 7);
+        std::fs::write(root.join("icon.icns"), icon).unwrap();
+        run_git_in(root, &["add", "."]);
+        let repo = root.to_str().unwrap();
+        let report = GitReader::get_repo_language_stats_bounded(repo, None).unwrap();
+        assert!(!report.truncated, "{report:?}");
+        assert_eq!(report.scanned_files, report.candidate_files);
+
+        std::fs::write(root.join("huge.txt"), "line\n".repeat(300_000)).unwrap();
+        let report = GitReader::get_repo_language_stats_bounded(repo, None).unwrap();
+        assert!(report.truncated, "uncounted text is a hole: {report:?}");
+    }
+
     #[test]
     fn language_stats_report_is_complete_on_a_small_repo() {
         let dir = tempfile::TempDir::new().unwrap();
@@ -4823,6 +5776,76 @@ mod tests {
         assert_eq!(report.candidate_files, 1);
         assert_eq!(report.stats.len(), 1);
         assert_eq!(report.stats[0].language, "Rust");
+    }
+
+    /// `PROFILE_REPO=<repo> cargo test --lib language_stats_profile -- --ignored --nocapture`
+    #[test]
+    #[ignore = "benchmark: prints timings over PROFILE_REPO"]
+    fn language_stats_profile() {
+        // A relative PROFILE_REPO is taken from the checkout root, not from
+        // the `src-tauri` directory cargo runs the test in.
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join(std::env::var("PROFILE_REPO").expect("PROFILE_REPO"))
+            .canonicalize()
+            .expect("PROFILE_REPO exists");
+        let root = root.to_str().expect("UTF-8 path").to_string();
+        crate::test_support::trust_repo(Path::new(&root));
+        let (mut cold, mut warm) = (u128::MAX, u128::MAX);
+        let (mut cold_max, mut warm_max) = (0, 0);
+        for round in 0..5 {
+            // Cold: nothing remembered, as after a restart.
+            lang_cache::forget(Path::new(&root));
+            let reads = lang_probe::reads_of(Path::new(&root));
+            let t = Instant::now();
+            let a = GitReader::get_repo_language_stats(&root).expect("cold");
+            let ms = t.elapsed().as_millis();
+            (cold, cold_max) = (cold.min(ms), cold_max.max(ms));
+            let cold_reads = lang_probe::reads_of(Path::new(&root)) - reads;
+            let reads = lang_probe::reads_of(Path::new(&root));
+            let t = Instant::now();
+            let b = GitReader::get_repo_language_stats(&root).expect("warm");
+            let ms = t.elapsed().as_millis();
+            (warm, warm_max) = (warm.min(ms), warm_max.max(ms));
+            let warm_reads = lang_probe::reads_of(Path::new(&root)) - reads;
+            eprintln!(
+                "round {round}: truncated {}/{} scanned {}/{} candidates {} reads {cold_reads}/{warm_reads}",
+                a.truncated, b.truncated, a.scanned_files, b.scanned_files, a.candidate_files
+            );
+            assert!(!a.truncated && !b.truncated, "{a:?}");
+            assert_eq!(a.scanned_files, a.candidate_files);
+        }
+        eprintln!(
+            "language stats over {root}: cold min {cold} ms (max {cold_max}), warm min {warm} ms (max {warm_max})"
+        );
+    }
+
+    /// No file under this repository's `src-tauri/vendored/` or
+    /// `src-tauri/framework/` is a candidate: the first by its directory
+    /// name, the second by `.gitattributes`.
+    #[test]
+    fn this_repository_counts_no_vendored_or_framework_file() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("checkout root")
+            .canonicalize()
+            .unwrap();
+        crate::test_support::trust_repo(&root);
+        let candidates = language_candidates(&root).expect("candidates");
+        assert!(
+            candidates
+                .iter()
+                .any(|(path, _)| path.starts_with("src-tauri/src/")),
+            "the listing is this repository's"
+        );
+        let leaked: Vec<&String> = candidates
+            .iter()
+            .map(|(path, _)| path)
+            .filter(|path| {
+                path.starts_with("src-tauri/vendored/") || path.starts_with("src-tauri/framework/")
+            })
+            .collect();
+        assert!(leaked.is_empty(), "{} leaked: {leaked:?}", leaked.len());
     }
 
     #[test]
