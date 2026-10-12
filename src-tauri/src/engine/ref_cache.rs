@@ -399,6 +399,22 @@ fn note_hit() {
     HITS.with(|cell| cell.set(cell.get() + 1));
 }
 
+/// Runs `f` with no racy window, so every stamp it reads is stored. For tests
+/// outside this module that count spawns: a fixture repository's config was
+/// written moments ago, which the window would otherwise treat as unsettled.
+#[cfg(test)]
+pub(crate) fn without_racy_window<T>(f: impl FnOnce() -> T) -> T {
+    RACY_OVERRIDE.with(|cell| cell.set(Some(Duration::ZERO)));
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            RACY_OVERRIDE.with(|cell| cell.set(None));
+        }
+    }
+    let _reset = Reset;
+    f()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -445,15 +461,7 @@ mod tests {
 
     /// from the window.
     fn eager<T>(f: impl FnOnce() -> T) -> T {
-        RACY_OVERRIDE.with(|cell| cell.set(Some(Duration::ZERO)));
-        struct Reset;
-        impl Drop for Reset {
-            fn drop(&mut self) {
-                RACY_OVERRIDE.with(|cell| cell.set(None));
-            }
-        }
-        let _reset = Reset;
-        f()
+        without_racy_window(f)
     }
 
     fn hits() -> u64 {
