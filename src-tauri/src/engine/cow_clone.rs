@@ -2,7 +2,8 @@
 //!
 //! AI coding agents parallelize across linked worktrees, but duplicating
 //! multi-gigabyte dependency trees (`node_modules`) burns disk space and
-//! stalls launches on repeated installations. This module clones them:
+//! stalls launches on repeated installations, and a fresh Cargo `target/`
+//! recompiles every dependency. This module clones them:
 //! - macOS: APFS `copyfile(3)` with `COPYFILE_CLONE | COPYFILE_RECURSIVE`.
 //! - Linux: `ioctl(FICLONE)` on files across directory hierarchy (btrfs, XFS).
 //! - Windows / Fallback: Bounded recursive copy when CoW is unsupported.
@@ -13,6 +14,13 @@
 //! tree and reports the failure. A half-copied `node_modules` used to be
 //! reported as success, and because its directory then existed, never
 //! repaired.
+//!
+//! Cargo's `target/` is cloned only by a real clone (never byte-copied: a
+//! byte copy of a build directory costs the disk the clone was meant to
+//! save), only while no anchor build holds its `.cargo-lock`, and with the
+//! anchor's absolute paths in recorded build-script output rewritten to the
+//! clone's. Registry and git crates' fingerprints carry no workspace path,
+//! so the worktree reuses their compiled artifacts; path crates rebuild.
 
 use serde::{Deserialize, Serialize};
 #[cfg(target_os = "macos")]
@@ -43,12 +51,33 @@ impl CowCaps {
     };
 }
 
-/// Cache directories cloned by default: dependency trees that hold no
-/// absolute path of the checkout they were installed in, so a copy works in
-/// another worktree. Rust `target/`, `build/`, `dist/` and `vendor/` are not
-/// among them: build outputs record absolute paths (a copied `target/` is
-/// rebuilt anyway), and `vendor/` is often tracked.
-pub const STANDARD_CACHE_DIRS: &[&str] = &["node_modules", ".turbo"];
+/// Cache directories cloned by default, each only where the worktree's git
+/// ignore rules cover it. `node_modules` and `.turbo` hold no absolute path
+/// of the checkout they were made in. Cargo's `target/` reuses compiled
+/// registry and git dependencies (their fingerprints name no workspace
+/// path); the paths it does record — build-script output — are rewritten
+/// for the clone, and it is cloned only by a real clone (see
+/// [`CARGO_TARGET_DIR`]). `build/` and `dist/` are not caches: a stale
+/// `dist/` would be embedded by the next bundling build. `vendor/` is often
+/// tracked.
+pub const STANDARD_CACHE_DIRS: &[&str] = &["node_modules", ".turbo", CARGO_TARGET_DIR];
+
+/// Cargo's build directory. Cloned only when every file can be cloned (APFS
+/// `clonefile`, or FICLONE on each file), never byte-copied; skipped, with
+/// the reason reported, while an anchor build holds a `.cargo-lock` in it.
+pub const CARGO_TARGET_DIR: &str = "target";
+
+/// Profile directories (`target/debug`, `target/release`, ...) whose
+/// `.cargo-lock` a target clone takes. Far above any real target directory.
+const MAX_TARGET_PROFILES: usize = 256;
+
+/// Largest recorded build-script output rewritten for a target clone. Real
+/// ones are a few kilobytes of `cargo:` lines.
+const MAX_BUILD_OUTPUT: u64 = 16 * 1024 * 1024;
+
+/// Build scripts' directories under one profile's `build/` the rewrite
+/// visits; past it the target clone fails rather than leave some unrewritten.
+const MAX_BUILD_SCRIPTS: usize = 100_000;
 
 /// Python virtual environments. `python -m venv` writes its own absolute path
 /// into `bin/activate`, `pyvenv.cfg` and every script's shebang, so a copy
@@ -113,17 +142,31 @@ struct Tally {
     is_cow: bool,
 }
 
+/// Work done on a finished staging tree before it is renamed into place.
+type Finish<'a> = &'a dyn Fn(&Path) -> Result<(), String>;
+
+/// What one copy demands beyond its bounds.
+#[derive(Clone, Copy, Default)]
+struct CopyRules<'a> {
+    /// Every file must be cloned; a tree this filesystem can only byte-copy
+    /// is not copied at all.
+    require_clone: bool,
+    /// Runs on the finished staging tree; an error discards the copy.
+    finish: Option<Finish<'a>>,
+}
+
 /// Clones a directory tree from `src` to `dst`, prioritizing Copy-on-Write,
 /// under the default bounds.
 pub fn reflink_copy_dir(src: &Path, dst: &Path) -> Result<ReflinkResult, String> {
-    reflink_copy_dir_bounded(src, dst, CowCaps::DEFAULT)
+    reflink_copy_dir_bounded(src, dst, CowCaps::DEFAULT, CopyRules::default())
 }
 
-/// [`reflink_copy_dir`] under `caps`.
+/// [`reflink_copy_dir`] under `caps` and `rules`.
 fn reflink_copy_dir_bounded(
     src: &Path,
     dst: &Path,
     caps: CowCaps,
+    rules: CopyRules<'_>,
 ) -> Result<ReflinkResult, String> {
     // Refused, not respelled: a lossy spelling names a different file, and
     // the clone and its cleanup would act on that one.
@@ -142,7 +185,10 @@ fn reflink_copy_dir_bounded(
 
     let start = Instant::now();
     let staging = staging_path(dst)?;
-    let copied = clone_tree(src, &staging, caps).and_then(|tally| {
+    let copied = clone_tree(src, &staging, caps, rules.require_clone).and_then(|tally| {
+        if let Some(finish) = rules.finish {
+            finish(&staging)?;
+        }
         fs::rename(&staging, dst)
             .map(|()| tally)
             .map_err(|e| format!("Could not move the finished copy into '{dst_text}': {e}"))
@@ -198,20 +244,71 @@ fn discard_staging(staging: &Path, error: String) -> String {
     }
 }
 
-/// Copies `src` into `staging`, which must not exist yet.
-fn clone_tree(src: &Path, staging: &Path, caps: CowCaps) -> Result<Tally, String> {
+/// Why a tree that must be cloned was not copied.
+const NOT_CLONED: &str = "this filesystem could not clone it, and a build directory is never byte-copied, so it was skipped";
+
+#[cfg(test)]
+thread_local! {
+    static FORCE_BYTE_COPY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether a test has ruled out every clone primitive on this thread, so the
+/// byte-copy path runs on a filesystem that could clone.
+#[cfg(test)]
+fn byte_copy_forced() -> bool {
+    FORCE_BYTE_COPY.with(std::cell::Cell::get)
+}
+
+#[cfg(not(test))]
+fn byte_copy_forced() -> bool {
+    false
+}
+
+/// Runs `body` as if this filesystem could not clone (Windows, ext4, a
+/// cross-device FICLONE).
+#[cfg(test)]
+pub(crate) fn with_forced_byte_copy<T>(body: impl FnOnce() -> T) -> T {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            FORCE_BYTE_COPY.with(|cell| cell.set(self.0));
+        }
+    }
+    let _restore = Restore(FORCE_BYTE_COPY.with(|cell| cell.replace(true)));
+    body()
+}
+
+/// Copies `src` into `staging`, which must not exist yet. With
+/// `require_clone`, a tree that cannot be cloned is not copied.
+fn clone_tree(
+    src: &Path,
+    staging: &Path,
+    caps: CowCaps,
+    require_clone: bool,
+) -> Result<Tally, String> {
     #[cfg(target_os = "macos")]
-    {
+    if !byte_copy_forced() {
         let src_c = CString::new(utf8_path(src, "Source")?)
             .map_err(|e| format!("Invalid source path: {e}"))?;
         let dst_c = CString::new(utf8_path(staging, "Destination")?)
             .map_err(|e| format!("Invalid destination path: {e}"))?;
-        let flags = COPYFILE_ALL | COPYFILE_RECURSIVE | COPYFILE_CLONE;
-        // SAFETY: `src_c` and `dst_c` are NUL-terminated strings that outlive
-        // the call; `copyfile(3)` only reads them. A null `state` is the
-        // documented way to run without a copyfile_state_t. The call touches
-        // no Rust-owned memory besides those two buffers.
-        let ret = unsafe { copyfile(src_c.as_ptr(), dst_c.as_ptr(), std::ptr::null_mut(), flags) };
+        let ret = if require_clone {
+            // `copyfile(3)`'s `COPYFILE_CLONE` quietly copies data where it
+            // cannot clone, and its `COPYFILE_CLONE_FORCE` refuses
+            // directories. `clonefile(2)` clones a whole hierarchy in one
+            // call, or fails (ENOTSUP off APFS, EXDEV across volumes).
+            // SAFETY: `src_c` and `dst_c` are NUL-terminated strings that
+            // outlive the call; `clonefile(2)` only reads them and touches no
+            // other Rust-owned memory.
+            unsafe { libc::clonefile(src_c.as_ptr(), dst_c.as_ptr(), 0) }
+        } else {
+            let flags = COPYFILE_ALL | COPYFILE_RECURSIVE | COPYFILE_CLONE;
+            // SAFETY: `src_c` and `dst_c` are NUL-terminated strings that
+            // outlive the call; `copyfile(3)` only reads them. A null `state`
+            // is the documented way to run without a copyfile_state_t. The
+            // call touches no Rust-owned memory besides those two buffers.
+            unsafe { copyfile(src_c.as_ptr(), dst_c.as_ptr(), std::ptr::null_mut(), flags) }
+        };
         if ret == 0 {
             let (files, bytes) = count_dir_stats(staging, 0, caps, &mut 0)?;
             return Ok(Tally {
@@ -230,16 +327,41 @@ fn clone_tree(src: &Path, staging: &Path, caps: CowCaps) -> Result<Tally, String
                 ));
             }
         }
+        if require_clone {
+            return Err(NOT_CLONED.to_string());
+        }
     }
 
-    fallback_reflink_copy(src, staging, caps)
+    fallback_reflink_copy(src, staging, caps, require_clone)
+}
+
+/// One file cloned rather than copied, where this platform can.
+fn try_clone_file(src: &Path, dst: &Path) -> bool {
+    if byte_copy_forced() {
+        return false;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        try_linux_ficlone(src, dst).unwrap_or(false)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (src, dst);
+        false
+    }
 }
 
 /// Recursive copier that attempts file-level FICLONE on Linux, or `fs::copy`
 /// elsewhere. Every entry is copied or the copy fails: an unreadable
 /// directory or file, a failed write, an entry that is none of file,
-/// directory or link, or a bound reached is an error naming it.
-fn fallback_reflink_copy(src: &Path, dst: &Path, caps: CowCaps) -> Result<Tally, String> {
+/// directory or link, or a bound reached is an error naming it. With
+/// `require_clone`, a file that could not be cloned ends the copy.
+fn fallback_reflink_copy(
+    src: &Path,
+    dst: &Path,
+    caps: CowCaps,
+    require_clone: bool,
+) -> Result<Tally, String> {
     fs::create_dir(dst).map_err(|e| format!("Failed to create destination dir: {e}"))?;
 
     let mut tally = Tally {
@@ -283,13 +405,10 @@ fn fallback_reflink_copy(src: &Path, dst: &Path, caps: CowCaps) -> Result<Tally,
                     .map_err(|e| format!("Cannot create '{}': {e}", target_path.display()))?;
                 stack.push((entry_path, target_path, depth + 1));
             } else if kind.is_file() {
-                #[cfg(target_os = "linux")]
-                let cloned = try_linux_ficlone(&entry_path, &target_path).unwrap_or(false);
-                #[cfg(not(target_os = "linux"))]
-                let cloned = false;
-
-                if cloned {
+                if try_clone_file(&entry_path, &target_path) {
                     tally.is_cow = true;
+                } else if require_clone {
+                    return Err(NOT_CLONED.to_string());
                 } else {
                     fs::copy(&entry_path, &target_path)
                         .map_err(|e| format!("Could not copy '{}': {e}", entry_path.display()))?;
@@ -400,6 +519,138 @@ fn count_dir_stats(
     Ok((files, bytes))
 }
 
+/// Takes, without waiting, every `<target>/<profile>/.cargo-lock` the anchor
+/// has — the lock cargo holds for a whole build of that profile — so no
+/// anchor build writes the tree while it is cloned. Released when the files
+/// drop. A profile with no lock file has no build to wait for.
+fn hold_cargo_build_locks(target: &Path) -> Result<Vec<fs::File>, String> {
+    let profiles =
+        fs::read_dir(target).map_err(|e| format!("Cannot read '{}': {e}", target.display()))?;
+    let mut held = Vec::new();
+    for (index, profile) in profiles.enumerate() {
+        if index >= MAX_TARGET_PROFILES {
+            return Err(format!(
+                "'{}' holds more than {MAX_TARGET_PROFILES} entries, so its build locks were not all checked",
+                target.display()
+            ));
+        }
+        let profile = profile.map_err(|e| format!("Cannot list '{}': {e}", target.display()))?;
+        let lock_path = profile.path().join(".cargo-lock");
+        let file = match fs::File::open(&lock_path) {
+            Ok(file) => file,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            // A profile entry that is a file, not a directory.
+            Err(_) if !profile.path().is_dir() => continue,
+            Err(e) => return Err(format!("Cannot open '{}': {e}", lock_path.display())),
+        };
+        match file.try_lock() {
+            Ok(()) => held.push(file),
+            Err(fs::TryLockError::WouldBlock) => {
+                return Err(format!(
+                    "anchor build in progress ('{}' is locked)",
+                    lock_path.display()
+                ))
+            }
+            Err(fs::TryLockError::Error(e)) => {
+                return Err(format!("Cannot lock '{}': {e}", lock_path.display()))
+            }
+        }
+    }
+    Ok(held)
+}
+
+/// Points a cloned target directory's recorded build-script output at the
+/// clone. Cargo never reruns a registry crate's build script, so its
+/// `output` (`cargo:rustc-link-search=native=<out dir>`) and `root-output`
+/// keep naming the anchor's out directories — and the worktree silently
+/// links against the anchor's target until a `cargo clean` there.
+///
+/// Visits `<target>/<profile>/build/<script>/{output,root-output}`; replaces
+/// `from` (the anchor's target directory) with `to` wherever it is a whole
+/// path prefix. A file that cannot be read as UTF-8, or is oversized, fails
+/// the clone.
+fn rewrite_build_outputs(staging: &Path, from: &str, to: &str) -> Result<(), String> {
+    let profiles =
+        fs::read_dir(staging).map_err(|e| format!("Cannot read '{}': {e}", staging.display()))?;
+    for (index, profile) in profiles.enumerate() {
+        if index >= MAX_TARGET_PROFILES {
+            return Err(format!(
+                "the target directory holds more than {MAX_TARGET_PROFILES} entries"
+            ));
+        }
+        let profile = profile.map_err(|e| format!("Cannot list '{}': {e}", staging.display()))?;
+        let build = profile.path().join("build");
+        if !build.is_dir() {
+            continue;
+        }
+        let scripts =
+            fs::read_dir(&build).map_err(|e| format!("Cannot read '{}': {e}", build.display()))?;
+        for (index, script) in scripts.enumerate() {
+            if index >= MAX_BUILD_SCRIPTS {
+                return Err(format!(
+                    "'{}' holds more than {MAX_BUILD_SCRIPTS} entries",
+                    build.display()
+                ));
+            }
+            let script = script.map_err(|e| format!("Cannot list '{}': {e}", build.display()))?;
+            for name in ["output", "root-output"] {
+                rewrite_one_output(&script.path().join(name), from, to)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn rewrite_one_output(path: &Path, from: &str, to: &str) -> Result<(), String> {
+    let meta = match path.symlink_metadata() {
+        Ok(meta) => meta,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(format!("Cannot read '{}': {e}", path.display())),
+    };
+    if !meta.is_file() {
+        return Err(format!("'{}' is not a file", path.display()));
+    }
+    if meta.len() > MAX_BUILD_OUTPUT {
+        return Err(format!(
+            "'{}' is larger than {MAX_BUILD_OUTPUT} bytes",
+            path.display()
+        ));
+    }
+    let bytes = fs::read(path).map_err(|e| format!("Cannot read '{}': {e}", path.display()))?;
+    let text = String::from_utf8(bytes).map_err(|_| {
+        format!(
+            "'{}' is not UTF-8, so its paths cannot be rewritten",
+            path.display()
+        )
+    })?;
+    let rewritten = replace_path_prefix(&text, from, to);
+    if rewritten != text {
+        fs::write(path, rewritten)
+            .map_err(|e| format!("Cannot rewrite '{}': {e}", path.display()))?;
+    }
+    Ok(())
+}
+
+/// `text` with every occurrence of the path `from` that is a whole path or a
+/// path prefix (followed by a separator, a line end or the end) replaced by
+/// `to`. `/a/target2` is not inside `/a/target`.
+fn replace_path_prefix(text: &str, from: &str, to: &str) -> String {
+    if from.is_empty() {
+        return text.to_string();
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(at) = rest.find(from) {
+        let after = &rest[at + from.len()..];
+        let whole = after.is_empty() || after.starts_with(['/', '\\', '\n', '\r']);
+        out.push_str(&rest[..at]);
+        out.push_str(if whole { to } else { from });
+        rest = after;
+    }
+    out.push_str(rest);
+    out
+}
+
 /// Whether the worktree's own ignore rules cover `dir_name/`. Exit 0 is
 /// "ignored", 1 is "not ignored"; anything else — including a spawn deferred
 /// under load — is no answer, and the caller copies nothing on no answer.
@@ -469,7 +720,17 @@ pub fn reflink_ignored_caches(
                 continue;
             }
         }
-        match reflink_copy_dir_bounded(&anchor_dir, &worktree_dir, selection.caps) {
+        let copied = if *dir_name == CARGO_TARGET_DIR {
+            clone_cargo_target(&anchor_dir, &worktree_dir, selection.caps)
+        } else {
+            reflink_copy_dir_bounded(
+                &anchor_dir,
+                &worktree_dir,
+                selection.caps,
+                CopyRules::default(),
+            )
+        };
+        match copied {
             Ok(res) => results.push(res),
             Err(err) => failures.push(format!("{dir_name}: {err}")),
         }
@@ -488,10 +749,45 @@ pub fn reflink_ignored_caches(
         format!(" (copied: {})", names.join(", "))
     };
     Err(format!(
-        "{} of the build caches could not be copied: {}{copied}",
+        "{} of the build caches were not copied: {}{copied}",
         failures.len(),
         failures.join("; ")
     ))
+}
+
+/// Clones the anchor's Cargo target directory: a real directory, under its
+/// build locks, by clone only, with recorded build-script paths rewritten
+/// to the destination before the copy is renamed into place.
+fn clone_cargo_target(
+    anchor_dir: &Path,
+    worktree_dir: &Path,
+    caps: CowCaps,
+) -> Result<ReflinkResult, String> {
+    let from = utf8_path(anchor_dir, "Source")?;
+    let to = utf8_path(worktree_dir, "Destination")?;
+    let is_link = anchor_dir
+        .symlink_metadata()
+        .map_err(|e| format!("Cannot read '{from}': {e}"))?
+        .file_type()
+        .is_symlink();
+    if is_link {
+        return Err(
+            "skipped: the anchor's target is a link to a shared build directory, which a clone would not follow"
+                .to_string(),
+        );
+    }
+    let _held =
+        hold_cargo_build_locks(anchor_dir).map_err(|reason| format!("skipped: {reason}"))?;
+    let rewrite = |staging: &Path| rewrite_build_outputs(staging, from, to);
+    reflink_copy_dir_bounded(
+        anchor_dir,
+        worktree_dir,
+        caps,
+        CopyRules {
+            require_clone: true,
+            finish: Some(&rewrite),
+        },
+    )
 }
 
 #[cfg(test)]
@@ -587,7 +883,7 @@ mod tests {
             max_depth: 12,
             ..CowCaps::DEFAULT
         };
-        let refused = reflink_copy_dir_bounded(&src, &dst, shallow);
+        let refused = reflink_copy_dir_bounded(&src, &dst, shallow, CopyRules::default());
         let error = refused.expect_err("a tree past the depth bound was reported copied");
         assert!(error.contains("12 directories deep"), "{error}");
         assert_eq!(
@@ -608,12 +904,12 @@ mod tests {
             max_depth: 12,
             ..CowCaps::DEFAULT
         };
-        let error = fallback_reflink_copy(&src, &dst, shallow)
+        let error = fallback_reflink_copy(&src, &dst, shallow, false)
             .map(|tally| tally.files)
             .expect_err("past the bound");
         assert!(error.contains("12 directories deep"), "{error}");
         let whole = temp.path().join("whole");
-        let tally = fallback_reflink_copy(&src, &whole, CowCaps::DEFAULT).expect("copied");
+        let tally = fallback_reflink_copy(&src, &whole, CowCaps::DEFAULT, false).expect("copied");
         assert_eq!(tally.files, 1);
     }
 
@@ -632,12 +928,13 @@ mod tests {
             ..CowCaps::DEFAULT
         };
         let dst = temp.path().join("dst");
-        let error = reflink_copy_dir_bounded(&src, &dst, few).expect_err("past the cap");
+        let error = reflink_copy_dir_bounded(&src, &dst, few, CopyRules::default())
+            .expect_err("past the cap");
         assert!(error.contains("more than 4 entries"), "{error}");
         assert_eq!(entries(temp.path()), ["src"]);
 
         let walk = temp.path().join("walk");
-        let error = fallback_reflink_copy(&src, &walk, few)
+        let error = fallback_reflink_copy(&src, &walk, few, false)
             .map(|tally| tally.files)
             .expect_err("past the cap");
         assert!(error.contains("more than 4 entries"), "{error}");
@@ -646,7 +943,8 @@ mod tests {
             max_entries: 6,
             ..CowCaps::DEFAULT
         };
-        let result = reflink_copy_dir_bounded(&src, &dst, roomy).expect("within the cap");
+        let result = reflink_copy_dir_bounded(&src, &dst, roomy, CopyRules::default())
+            .expect("within the cap");
         assert_eq!(result.files_cloned, 5);
     }
 
@@ -833,5 +1131,210 @@ mod tests {
         assert!(target.join("node_modules/pkg/index.js").is_file());
         assert!(!target.join(".venv").exists());
         assert!(!target.join("vendor").exists());
+    }
+
+    /// An anchor whose ignored `target/` holds one build script's recorded
+    /// output, written the way cargo writes it: absolute paths into the
+    /// anchor's own target directory. Returns the anchor (canonical), the
+    /// worktree, and the script's directory relative to `target/`.
+    fn anchor_with_cargo_target() -> (
+        tempfile::TempDir,
+        tempfile::TempDir,
+        PathBuf,
+        PathBuf,
+        PathBuf,
+    ) {
+        let (main, parent, worktree) = anchor_and_worktree(&["target", "node_modules"]);
+        let anchor = main.path().canonicalize().unwrap();
+        let script = PathBuf::from("debug/build/ring-0f3a9c");
+        let out = anchor.join("target").join(&script).join("out");
+        fs::create_dir_all(&out).unwrap();
+        fs::write(out.join("libring_core.a"), "archive").unwrap();
+        let out_text = out.to_str().unwrap();
+        fs::write(
+            anchor.join("target").join(&script).join("output"),
+            format!(
+                "cargo:rustc-link-lib=static=ring_core\ncargo:rustc-link-search=native={out_text}\n"
+            ),
+        )
+        .unwrap();
+        fs::write(
+            anchor.join("target").join(&script).join("root-output"),
+            out_text,
+        )
+        .unwrap();
+        fs::create_dir_all(anchor.join("target/debug/deps")).unwrap();
+        fs::write(anchor.join("target/debug/deps/libserde-1a2b.rlib"), "rlib").unwrap();
+        fs::create_dir_all(anchor.join("node_modules/pkg")).unwrap();
+        fs::write(anchor.join("node_modules/pkg/index.js"), "i").unwrap();
+        (main, parent, anchor, worktree, script)
+    }
+
+    /// A cloned `target/` reuses the anchor's compiled dependencies, but
+    /// cargo never reruns a registry build script, so the paths it recorded
+    /// must name the clone's own out directories — not the anchor's, which
+    /// a `cargo clean` there would pull out from under the worktree.
+    #[test]
+    fn a_cloned_cargo_target_records_its_own_paths_not_the_anchors() {
+        let (_main, _parent, anchor, worktree, script) = anchor_with_cargo_target();
+        let copied =
+            reflink_ignored_caches(&anchor, &worktree, &CacheSelection::default()).expect("synced");
+        assert!(
+            copied
+                .iter()
+                .any(|r| Path::new(&r.destination).file_name() == Some("target".as_ref())),
+            "{copied:?}"
+        );
+        assert!(worktree
+            .join("target/debug/deps/libserde-1a2b.rlib")
+            .is_file());
+        let anchor_target = anchor.join("target");
+        let worktree_target = worktree.join("target");
+        for name in ["output", "root-output"] {
+            let cloned = fs::read_to_string(worktree_target.join(&script).join(name)).unwrap();
+            assert_eq!(
+                cloned.matches(anchor_target.to_str().unwrap()).count(),
+                0,
+                "{name} still names the anchor: {cloned}"
+            );
+            assert!(
+                cloned.contains(worktree_target.join(&script).join("out").to_str().unwrap()),
+                "{name}: {cloned}"
+            );
+            let original = fs::read_to_string(anchor_target.join(&script).join(name)).unwrap();
+            assert!(
+                original.contains(anchor_target.to_str().unwrap()),
+                "the anchor's own was rewritten"
+            );
+        }
+    }
+
+    /// A build in progress in the anchor holds `target/debug/.cargo-lock`.
+    /// The sync neither waits for it nor clones a half-written tree: target
+    /// is skipped and the reason reported, and the other caches still land.
+    #[test]
+    fn a_cargo_target_mid_build_is_skipped_with_the_reason_and_without_waiting() {
+        let (_main, _parent, anchor, worktree, _script) = anchor_with_cargo_target();
+        let lock_path = anchor.join("target/debug/.cargo-lock");
+        fs::write(&lock_path, "").unwrap();
+        let held = File::open(&lock_path).unwrap();
+        held.lock().unwrap();
+        let started = Instant::now();
+        let synced = reflink_ignored_caches(&anchor, &worktree, &CacheSelection::default());
+        let waited = started.elapsed();
+        held.unlock().unwrap();
+        let error = synced.expect_err("a skipped target/ must be reported");
+        assert!(error.contains("target"), "{error}");
+        assert!(error.contains("anchor build in progress"), "{error}");
+        assert!(
+            waited < std::time::Duration::from_secs(10),
+            "waited {waited:?}"
+        );
+        assert!(!worktree.join("target").exists());
+        assert!(worktree.join("node_modules/pkg/index.js").is_file());
+
+        // Released, the next sync clones it.
+        reflink_ignored_caches(&anchor, &worktree, &CacheSelection::default()).expect("synced");
+        assert!(worktree
+            .join("target/debug/deps/libserde-1a2b.rlib")
+            .is_file());
+    }
+
+    /// A recorded build output that is not UTF-8 cannot be rewritten
+    /// byte-exactly, so the target/ clone fails whole and nothing is left.
+    #[test]
+    fn an_unrewritable_build_output_fails_the_target_clone_whole() {
+        let (_main, _parent, anchor, worktree, script) = anchor_with_cargo_target();
+        fs::write(
+            anchor.join("target").join(&script).join("output"),
+            b"cargo:x=\xff\n",
+        )
+        .unwrap();
+        let error = reflink_ignored_caches(&anchor, &worktree, &CacheSelection::default())
+            .expect_err("an output that could not be rewritten was cloned");
+        assert!(error.contains("target"), "{error}");
+        assert!(!worktree.join("target").exists());
+        assert!(worktree.join("node_modules/pkg/index.js").is_file());
+        assert_eq!(
+            entries(&worktree)
+                .iter()
+                .filter(|name| name.contains("gitpulse-partial"))
+                .count(),
+            0,
+            "a staging tree was left"
+        );
+    }
+
+    /// Where nothing can be cloned (Windows, ext4, a cross-device FICLONE),
+    /// target/ is skipped with the reason rather than byte-copied, and the
+    /// other caches keep their byte-copy fallback.
+    #[test]
+    fn a_cargo_target_that_could_only_be_byte_copied_is_skipped_with_the_reason() {
+        let (_main, _parent, anchor, worktree, _script) = anchor_with_cargo_target();
+        let synced = with_forced_byte_copy(|| {
+            reflink_ignored_caches(&anchor, &worktree, &CacheSelection::default())
+        });
+        let error = synced.expect_err("a skipped target/ must be reported");
+        assert!(error.contains("target: "), "{error}");
+        assert!(error.contains("never byte-copied"), "{error}");
+        assert!(error.contains("copied: node_modules"), "{error}");
+        assert!(!worktree.join("target").exists());
+        assert!(worktree.join("node_modules/pkg/index.js").is_file());
+        assert_eq!(
+            entries(&worktree)
+                .iter()
+                .filter(|name| name.contains("gitpulse-partial"))
+                .count(),
+            0,
+            "a staging tree was left"
+        );
+    }
+
+    /// A target directory that is a link (a shared `CARGO_TARGET_DIR`) is not
+    /// cloned: the clone would be the link, and the worktree would build in
+    /// the anchor's directory.
+    #[cfg(unix)]
+    #[test]
+    fn a_linked_cargo_target_is_skipped_with_the_reason() {
+        let (main, _parent, worktree) = anchor_and_worktree(&["target"]);
+        let anchor = main.path().canonicalize().unwrap();
+        let shared = tempdir().unwrap();
+        fs::create_dir_all(shared.path().join("debug")).unwrap();
+        std::os::unix::fs::symlink(shared.path(), anchor.join("target")).unwrap();
+        let error = reflink_ignored_caches(&anchor, &worktree, &CacheSelection::default())
+            .expect_err("a skipped target/ must be reported");
+        assert!(error.contains("target: skipped"), "{error}");
+        assert!(worktree.join("target").symlink_metadata().is_err());
+    }
+
+    #[test]
+    fn only_whole_path_prefixes_are_rewritten() {
+        let from = "/w/a/target";
+        let to = "/w/b/target";
+        assert_eq!(
+            replace_path_prefix(
+                "x=/w/a/target/debug/out\ny=/w/a/target2/z\nroot=/w/a/target\n/w/a/target",
+                from,
+                to
+            ),
+            "x=/w/b/target/debug/out\ny=/w/a/target2/z\nroot=/w/b/target\n/w/b/target"
+        );
+        assert_eq!(
+            replace_path_prefix("nothing here", from, to),
+            "nothing here"
+        );
+    }
+
+    /// target/ passes the same ignore check as every other cache.
+    #[test]
+    fn a_cargo_target_git_does_not_ignore_is_not_cloned() {
+        let (main, _parent, worktree) = anchor_and_worktree(&["node_modules"]);
+        let anchor = main.path().canonicalize().unwrap();
+        fs::create_dir_all(anchor.join("target/debug/deps")).unwrap();
+        fs::write(anchor.join("target/debug/deps/liba.rlib"), "rlib").unwrap();
+        let copied =
+            reflink_ignored_caches(&anchor, &worktree, &CacheSelection::default()).expect("synced");
+        assert!(copied.is_empty(), "{copied:?}");
+        assert!(!worktree.join("target").exists());
     }
 }
