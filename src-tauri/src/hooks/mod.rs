@@ -42,6 +42,8 @@ use crate::engine::git_cli::find_git_root;
 use crate::harness::{self, PolicyStatus, ScopedVerdict};
 use crate::insights::{self, same_path, CollisionRisk, InsightsSnapshot};
 
+pub mod signal_guard;
+
 /// Wall-clock ceiling for the work behind one hook invocation.
 ///
 /// A PreToolUse hook runs on *every* matching tool call, so the cost of this
@@ -1043,8 +1045,18 @@ fn gate_decision(judged: &ScopedVerdict, what: Judged) -> HookOutput {
 }
 
 /// Gathers, then decides. The impure half of command-gate.
+///
+/// A command that signals processes is first measured by [`signal_guard`],
+/// which refuses one whose reach includes an agent session or GitPulse; a
+/// refusal there is final, and anything else is combined with the harness's
+/// answer.
 pub fn run_command_gate(input: &HookInput) -> HookOutput {
-    command_gate_with(input, |job| within_budget(BUDGET, job))
+    let guard = signal_guard::run(input);
+    if signal_guard::refuses(&guard) {
+        return guard;
+    }
+    let gate = command_gate_with(input, |job| within_budget(BUDGET, job));
+    signal_guard::combine(guard, gate)
 }
 
 /// Judges one command line the way the hook does, on `lane`'s sidecar.
