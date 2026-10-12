@@ -334,6 +334,14 @@ fn no_production_code_signals_a_process_outside_the_guarded_primitive() {
             "the Windows tree kill, which refuses pid <= 4 and this process first",
         ),
     ];
+    // Files that must name the pattern killers to judge them, and run none.
+    // Only the tool names are excused there: a `libc::kill` or `killpg` in
+    // one is still an offender.
+    const NAMES_THE_KILLERS: &[(&str, &str)] = &[(
+        "src/hooks/signal_guard.rs",
+        "parses agents' pkill/killall/kill command lines to refuse them; spawns nothing",
+    )];
+    const TOOL_NAMES: &[&str] = &["pkill", "killall", "taskkill"];
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
     let mut files = Vec::new();
     collect_rs(&root, &mut files);
@@ -364,7 +372,12 @@ fn no_production_code_signals_a_process_outside_the_guarded_primitive() {
                 continue;
             }
             let probe = code.contains("libc::kill(") && code.contains(", 0)");
-            if !probe && SENDERS.iter().any(|sender| code.contains(sender)) {
+            let names_only = NAMES_THE_KILLERS.iter().any(|(named, _)| *named == rel);
+            let sends = SENDERS
+                .iter()
+                .filter(|sender| !(names_only && TOOL_NAMES.contains(sender)))
+                .any(|sender| code.contains(sender));
+            if !probe && sends {
                 offenders.entry(rel.clone()).or_default().push(*line_no);
             }
         }
@@ -380,6 +393,22 @@ fn no_production_code_signals_a_process_outside_the_guarded_primitive() {
             root.parent().expect("manifest dir").join(allowed).is_file(),
             "ALLOWED names {allowed}, which is not a file any more"
         );
+    }
+    for (named, _) in NAMES_THE_KILLERS {
+        let path = root.parent().expect("manifest dir").join(named);
+        assert!(
+            path.is_file(),
+            "NAMES_THE_KILLERS names {named}, which is not a file any more"
+        );
+        // The excuse covers naming the tools, never running one.
+        let text = std::fs::read_to_string(&path).expect("read source");
+        for (line_no, line) in strip_test_items(&text) {
+            let code = line.trim_start();
+            assert!(
+                !(code.contains("Command::new") || code.contains("process::Command")),
+                "{named}:{line_no} spawns a process, which its exemption does not cover"
+            );
+        }
     }
     assert!(scanned > 10_000, "read only {scanned} production lines");
 }
