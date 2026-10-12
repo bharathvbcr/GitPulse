@@ -1,4 +1,4 @@
-import { PRIORITY_LABELS } from "./boardDrag";
+import { priorityLabel } from "./taskPriority";
 import { STATUS_LABELS, type TaskDraft, type TaskStatus } from "./client";
 import { displayTitle } from "./taskDelete";
 import { formatLogsSection } from "./taskLogs";
@@ -375,7 +375,7 @@ export function formatDraftAgentCopy(draft: DraftAgentCopy): string | null {
   const labels = (draft.labels ?? []).map((item) => item.trim()).filter(Boolean);
   const repos = (draft.repositoryNames ?? []).map((item) => item.trim()).filter(Boolean);
   const status = draft.status && STATUS_LABELS[draft.status] ? STATUS_LABELS[draft.status] : "Unspecified";
-  const priority = PRIORITY_LABELS[(draft.priority ?? 1) as 0 | 1 | 2 | 3] ?? "Unknown";
+  const priority = priorityLabel(draft.priority);
   const lines = [
     AGENT_COPY_COMPLETION,
     "",

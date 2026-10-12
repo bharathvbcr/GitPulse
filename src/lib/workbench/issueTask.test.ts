@@ -89,30 +89,59 @@ describe("inferTaskKind", () => {
 });
 
 describe("inferTaskPriority and severity", () => {
-  it("maps critical/urgent labels to priority 3 and critical severity", () => {
-    expect(inferTaskPriority(["p0"])).toBe(3);
-    expect(inferTaskPriority(["critical"])).toBe(3);
-    expect(inferTaskPriority(["priority:urgent"])).toBe(3);
+  it("maps critical/urgent labels to priority 0 (Urgent) and critical severity", () => {
+    expect(inferTaskPriority(["p0"])).toBe(0);
+    expect(inferTaskPriority(["critical"])).toBe(0);
+    expect(inferTaskPriority(["blocker"])).toBe(0);
+    expect(inferTaskPriority(["urgent"])).toBe(0);
+    expect(inferTaskPriority(["priority:urgent"])).toBe(0);
     expect(inferTaskSeverity(["critical"])).toBe("critical");
     expect(inferTaskSeverity(["sev1"])).toBe("critical");
   });
 
-  it("maps high priority labels to priority 2 and high severity", () => {
-    expect(inferTaskPriority(["p1"])).toBe(2);
-    expect(inferTaskPriority(["priority:high"])).toBe(2);
-    expect(inferTaskPriority(["important"])).toBe(2);
+  it("maps high priority labels to priority 1 and high severity", () => {
+    expect(inferTaskPriority(["p1"])).toBe(1);
+    expect(inferTaskPriority(["high"])).toBe(1);
+    expect(inferTaskPriority(["priority:high"])).toBe(1);
+    expect(inferTaskPriority(["important"])).toBe(1);
     expect(inferTaskSeverity(["sev2"])).toBe("high");
   });
 
-  it("maps low priority labels to priority 0", () => {
-    expect(inferTaskPriority(["p3"])).toBe(0);
-    expect(inferTaskPriority(["minor"])).toBe(0);
-    expect(inferTaskPriority(["trivial"])).toBe(0);
+  it("maps medium labels to priority 2 and low labels to priority 3 (Low)", () => {
+    expect(inferTaskPriority(["p2"])).toBe(2);
+    expect(inferTaskPriority(["medium"])).toBe(2);
+    expect(inferTaskPriority(["p3"])).toBe(3);
+    expect(inferTaskPriority(["low"])).toBe(3);
+    expect(inferTaskPriority(["minor"])).toBe(3);
+    expect(inferTaskPriority(["trivial"])).toBe(3);
   });
 
-  it("defaults to priority 1 and null severity", () => {
-    expect(inferTaskPriority([])).toBe(1);
-    expect(inferTaskPriority(["random"])).toBe(1);
+  it("reads tracker spellings: case, spaces, and priority namespaces", () => {
+    expect(inferTaskPriority(["P1"])).toBe(1);
+    expect(inferTaskPriority(["Priority: High"])).toBe(1);
+    expect(inferTaskPriority(["prio/critical"])).toBe(0);
+    expect(inferTaskPriority(["severity:critical"])).toBe(0);
+    expect(inferTaskPriority(["p0: outage"])).toBe(0);
+    expect(inferTaskPriority(["priority/low"])).toBe(3);
+  });
+
+  it("does not read a word out of an unrelated label", () => {
+    expect(inferTaskPriority(["area:low"])).toBe(2);
+    expect(inferTaskPriority(["highlight", "below", "p10", "priority:"])).toBe(2);
+  });
+
+  it("lets the most urgent of several labels win, in any order", () => {
+    expect(inferTaskPriority(["low", "high"])).toBe(1);
+    expect(inferTaskPriority(["high", "low"])).toBe(1);
+    expect(inferTaskPriority(["p3", "bug", "critical", "p1"])).toBe(0);
+    expect(inferTaskPriority(["minor", "medium"])).toBe(2);
+  });
+
+  it("defaults to priority 2 (Normal) and null severity", () => {
+    expect(inferTaskPriority([])).toBe(2);
+    expect(inferTaskPriority(["random"])).toBe(2);
+    expect(inferTaskPriority([42, null, {}])).toBe(2);
+    expect(inferTaskPriority(undefined as unknown as string[])).toBe(2);
     expect(inferTaskSeverity([])).toBeNull();
   });
 });
@@ -277,7 +306,7 @@ describe("issueToTaskDraft", () => {
     expect(draft.title).toBe("[#42] Race condition in watcher sync loop");
     expect(draft.kind).toBe("bug");
     expect(draft.status).toBe("inbox");
-    expect(draft.priority).toBe(2);
+    expect(draft.priority).toBe(1);
     expect(draft.primary_repository_id).toBe("repo-123");
     expect(draft.repository_ids).toEqual(["repo-123"]);
     expect(draft.labels).toContain("github-issue");

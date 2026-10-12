@@ -1,6 +1,7 @@
 <script lang="ts">
   import { onDestroy, onMount, untrack } from "svelte";
   import { bounded } from "../workbench/taskActions";
+  import { DEFAULT_PRIORITY, PRIORITY_LABELS } from "../workbench/taskPriority";
   import { Clipboard, X } from "@lucide/svelte";
   import { copyText } from "../desktop/clipboard";
   import TaskAgentPanel from "./TaskAgentPanel.svelte";
@@ -52,7 +53,7 @@
   let current = $state(initial.value);
   let draft = $state<TaskDraft>((() => {
     const base = initial.value ? taskDraft(initial.value) : {
-      title: "", description: "", kind: "feature", status: initial.initialStatus, priority: 2, severity: null,
+      title: "", description: "", kind: "feature", status: initial.initialStatus, priority: DEFAULT_PRIORITY, severity: null,
       owner: null, due_at: null, labels: [], acceptance_criteria: [], repository_ids: initial.primary ? [initial.primary] : [],
       primary_repository_id: initial.primary, home_workspace_id: initial.home, position: Date.now(), locked_fields: [] as EnhancementField[],
       logs: "", ...freshTaskFields(),
@@ -760,7 +761,7 @@
                 <fieldset disabled={enhancementBusy}>
                   <div class="pair">
                     <label>Status<select class="gp-select" bind:value={draft.status}>{#each STATUSES as status}<option value={status}>{STATUS_LABELS[status]}</option>{/each}</select></label>
-                    <label>Priority<select class="gp-select" bind:value={draft.priority}><option value={0}>Urgent</option><option value={1}>High</option><option value={2}>Normal</option><option value={3}>Low</option></select></label>
+                    <label>Priority<select class="gp-select" bind:value={draft.priority}>{#each PRIORITY_LABELS as name, level}<option value={level}>{name}</option>{/each}</select></label>
                   </div>
                   <div class="pair">
                     <label>Type

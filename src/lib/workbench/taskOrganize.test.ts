@@ -12,6 +12,7 @@ import {
   enhanceableFields,
   facetActive,
   hiddenTaskDetails,
+  normalizePriority,
   parseDueInput,
   partitionLanes,
   priorityLabel,
@@ -36,6 +37,15 @@ const task: Task = {
   acceptance_criteria: ["Reproduce", " "],
   locked_fields: ["title"],
 };
+
+describe("normalizePriority", () => {
+  it("accepts numbers 0-3 and their numeric strings, and 'all' for the rest", () => {
+    expect([0, 1, 2, 3, "0", "3"].map(normalizePriority)).toEqual([0, 1, 2, 3, 0, 3]);
+    for (const bad of [true, false, 1.5, -1, 4, "4", "", "all", "high", " 1", Number.NaN, null, undefined, [1]]) {
+      expect(normalizePriority(bad)).toBe("all");
+    }
+  });
+});
 
 describe("facets", () => {
   it("starts inactive and becomes active on any constraint", () => {

@@ -32,6 +32,7 @@
  * reader never saves a task that quietly lost half of what they typed.
  */
 
+import { DEFAULT_PRIORITY, parsePriority } from "./taskPriority";
 import { freshTaskFields, type EnhancementField, type TaskDraft, type TaskStatus } from "./client";
 
 /** Longest quick-add line accepted. Past this the input is refused, not truncated. */
@@ -116,13 +117,6 @@ const MARKERS: Record<string, QuickAddTokenKind> = Object.assign(Object.create(n
   "@": "owner",
   "~": "kind",
   "^": "repository",
-});
-
-const PRIORITY_WORDS: Record<string, number> = Object.assign(Object.create(null), {
-  "0": 0, urgent: 0, p0: 0,
-  "1": 1, high: 1, p1: 1,
-  "2": 2, normal: 2, medium: 2, p2: 2,
-  "3": 3, low: 3, p3: 3,
 });
 
 const WEEKDAYS: Record<string, number> = Object.assign(Object.create(null), {
@@ -439,8 +433,8 @@ export function parseQuickAdd(input: unknown, options: QuickAddOptions = {}): Qu
     switch (markerKind) {
       case "priority": {
         const word = body.toLowerCase();
-        const value = Object.hasOwn(PRIORITY_WORDS, word) ? PRIORITY_WORDS[word] : undefined;
-        if (value === undefined) {
+        const value = parsePriority(word);
+        if (value === null) {
           warnings.push({
             code: "bad_priority",
             message: `"!${body}" is not a priority. Use !0-!3 or !urgent, !high, !normal, !low.`,
@@ -546,7 +540,7 @@ export function quickAddDraft(
     description: parsed.description,
     kind: parsed.kind || defaults.kind,
     status: defaults.status,
-    priority: parsed.priority ?? 2,
+    priority: parsed.priority ?? DEFAULT_PRIORITY,
     severity: null,
     owner: parsed.owner,
     due_at: parsed.dueAt,

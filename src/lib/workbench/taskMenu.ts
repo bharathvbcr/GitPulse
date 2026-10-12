@@ -1,4 +1,4 @@
-import { PRIORITY_LABELS } from "./boardDrag";
+import { PRIORITY_LABELS } from "./taskPriority";
 import { ALREADY_ARCHIVED, archiveState } from "./taskArchive";
 import { STATUSES, STATUS_LABELS, type TaskCard, type TaskStatus } from "./client";
 import { displayTitle, isRevision, isTaskId } from "./taskDelete";

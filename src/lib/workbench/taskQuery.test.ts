@@ -150,6 +150,12 @@ describe("cardMatchesQuery", () => {
     expect(matches("priority:urgent", { priority: 0 })).toBe(true);
   });
 
+  it("reads medium as Normal, as the Markdown import does", () => {
+    expect(matches("priority:medium", { priority: 2 })).toBe(true);
+    expect(matches("priority:medium", { priority: 1 })).toBe(false);
+    expect(parseTaskQuery("priority:medium").problems).toEqual([]);
+  });
+
   it("matches status, and open as anything not done", () => {
     expect(matches("status:ready")).toBe(true);
     expect(matches("status:done")).toBe(false);

@@ -3,8 +3,6 @@ import { STATUSES, type TaskCard, type TaskStatus } from "./client";
 /** Pointer movement (px²) before a press becomes a card drag. */
 export const TASK_DRAG_THRESHOLD_PX = 6;
 
-export const PRIORITY_LABELS = ["Urgent", "High", "Normal", "Low"] as const;
-
 export function dragExceeded(dx: number, dy: number, threshold = TASK_DRAG_THRESHOLD_PX): boolean {
   return dx * dx + dy * dy >= threshold * threshold;
 }
