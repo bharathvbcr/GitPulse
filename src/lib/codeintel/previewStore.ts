@@ -247,8 +247,3 @@ export const previewMarkers = derived(
   previewStore,
   ($s): Map<string, PreviewMarker> => markersByPath($s.files),
 );
-
-/** Snapshot helper for non-Svelte callers / tests. */
-export function getPreviewMarkers(): Map<string, PreviewMarker> {
-  return get(previewMarkers);
-}

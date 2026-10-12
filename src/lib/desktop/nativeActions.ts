@@ -37,16 +37,6 @@ export const FLEET_ACTION_ID = "fleet";
  */
 export const AGENTS_ACTION_ID = "agents";
 
-/**
- * The native id for the terminal dock.
- *
- * Outside the `tab-` namespace for the same reason as Fleet: `viewTabForMenuId`
- * claims everything in there, and the terminal is no longer a view. It is a
- * dock beneath whichever view is on screen, so routing it through `setTab`
- * would ask the app to navigate somewhere that does not exist.
- */
-export const TERMINAL_DOCK_ACTION_ID = "terminal-dock";
-
 export interface NativeMenuHandlers {
   canDispatch?: (event: NativeEvent) => boolean;
   activateRepo: (path: string) => void;

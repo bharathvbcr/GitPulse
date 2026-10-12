@@ -213,6 +213,8 @@ struct CycleReport {
     /// a floor, and what was not reached is the next cycle's. Carried as its
     /// own field so a partial pass is not only a substring of `error`.
     truncated: bool,
+    /// Ledger events the retention policy deleted at the end of this cycle.
+    pruned: i64,
     /// The ledger's own status. A cycle that recorded nothing because the
     /// ledger could not be opened must never read like one that recorded
     /// nothing because nothing happened.
@@ -250,6 +252,7 @@ fn guarded_cycle(
                 skipped_lines: 0,
                 reflog_entries: 0,
                 truncated: false,
+                pruned: 0,
                 // Unknown, so not claimed: the panic may have hit the ledger.
                 recording: false,
                 error: format!("catch-up panicked: {what}"),
@@ -283,6 +286,7 @@ fn run_cycle(repo: &str, cycle: u64) -> CycleReport {
                 skipped_lines: 0,
                 reflog_entries: 0,
                 truncated: false,
+                pruned: 0,
                 recording: false,
                 error: reason,
                 elapsed_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
@@ -303,6 +307,7 @@ fn run_cycle(repo: &str, cycle: u64) -> CycleReport {
         skipped_lines: caught.skipped_lines,
         reflog_entries: caught.reflog_entries,
         truncated: caught.truncated,
+        pruned: caught.pruned,
         recording: status.recording,
         error: if caught.error.is_empty() {
             status.error
@@ -453,6 +458,7 @@ mod tests {
                         skipped_lines: 0,
                         reflog_entries: 0,
                         truncated: false,
+                        pruned: 0,
                         recording: true,
                         error: String::new(),
                         elapsed_ms: 0,
