@@ -108,7 +108,7 @@ otherwise it is `unavailable`, never a guessed `normal`.
 
 A fixed-size record of 664 bytes in the per-user config directory
 (`~/Library/Application Support/GitPulse/host-load.v1`), beside
-`spawn-budget.v1`. It sits in the config directory rather than `TMPDIR` because
+`spawn-budget.v2`. It sits in the config directory rather than `TMPDIR` because
 agent hosts give their children a private `TMPDIR`. It opens through the same
 refusals as the spawn budget (`fs_entry::open_private_record`): it must not be
 a symlink (`O_NOFOLLOW`), must be a regular file, owned by this user, mode
