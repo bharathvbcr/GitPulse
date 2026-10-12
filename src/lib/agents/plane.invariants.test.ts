@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import type { WorktreeSummary } from "../insights/types";
 import { applyAgentFilter, liveAgentCount, projectAgentPlane, type PlaneProbe, type PlaneTask, type PlaneTerminal } from "./plane";
 import { listing, PATHS, snapshot } from "./__tests__/fixtures";
+import { mulberry32 } from "../__tests__/prng";
 
 /**
  * Attribution rules under generated workspaces: several repositories, each
@@ -9,16 +10,6 @@ import { listing, PATHS, snapshot } from "./__tests__/fixtures";
  * directories (inside a checkout, below one, beside one, nowhere) and task
  * attempts whose runs may or may not have a terminal here.
  */
-
-function mulberry32(seed: number): () => number {
-  let a = seed >>> 0;
-  return () => {
-    a = (a + 0x6d2b79f5) | 0;
-    let t = Math.imul(a ^ (a >>> 15), a | 1);
-    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
-    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
-  };
-}
 
 const STATUSES = ["starting", "running", "exited"];
 const ATTENTIONS = [null, "needs-you", "error", "signalled", "finished"] as const;
