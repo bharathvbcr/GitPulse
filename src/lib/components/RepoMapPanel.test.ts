@@ -113,6 +113,18 @@ describe("RepoMapPanel bounds process output before the status strip", () => {
     ).toEqual([]);
   });
 
+  it("says the index is too slow while automatic indexing is paused, over a loaded map too", () => {
+    // A timed-out build pauses the live index for at least ten minutes. Read
+    // as "queued" — or, over a map that did load, as nothing at all — the
+    // strip hid the one fact that explains why the map stopped updating.
+    expect(source).toContain('case "paused":');
+    expect(source).toContain('snapshot?.phase === "paused"');
+    expect(source).toContain('data-testid="map-index-paused"');
+    expect(source).toContain("Index too slow");
+    const template = source.slice(source.lastIndexOf("</script>"));
+    expect(template).toMatch(/\{:else if indexPaused\}/);
+  });
+
   it("interpolates the failed-build reason through the clip too", () => {
     // devmap's stderr on a failed build is a log, not a sentence.
     expect(source).toContain("The automatic index failed: ${boundStrip(snapshot.reason)}");

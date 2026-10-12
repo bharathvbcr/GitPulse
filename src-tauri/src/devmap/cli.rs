@@ -611,32 +611,94 @@ fn build_outcome_from_run(binary: &ResolvedDevmap, run: BoundedRun) -> BuildOutc
 /// with an unusual ignore setup must not silently lose its code intelligence
 /// over a cosmetic concern. It is logged rather than swallowed, and
 /// initialization surfaces the same refusal in the UI for the active tab.
-fn spawn_build(repo_path: &str, args: &[&str]) -> Result<BuildOutcome, String> {
+fn spawn_build(repo_path: &str, args: &'static [&'static str]) -> Result<BuildOutcome, String> {
+    prepare_args(repo_path, args)?.run_then(|outcome| outcome)
+}
+
+const MANIFEST_BUILD_ARGS: &[&str] = &["build", "--manifest", "--json"];
+const INCREMENTAL_BUILD_ARGS: &[&str] = &["build", "--json"];
+
+/// A build whose writer slot is already claimed and whose child has not run.
+///
+/// Everything that must be settled before a caller can answer happens in
+/// [`prepare`]: the repository is validated, the per-repository
+/// [`BuildGuard`] is held and the binary is resolved. A caller that hands the
+/// run to another thread therefore cannot race a second build in between —
+/// [`is_build_in_flight`] is already true when `prepare` returns.
+pub struct PreparedBuild {
+    repo: PathBuf,
+    binary: ResolvedDevmap,
+    args: &'static [&'static str],
+    guard: BuildGuard,
+}
+
+/// Claim the writer slot for a build of `repo_path` without running it.
+///
+/// `manifest` selects `devmap build --manifest --json` (see [`build`]) over the
+/// incremental `devmap build --json` (see [`refresh`]).
+pub fn prepare(repo_path: &str, manifest: bool) -> Result<PreparedBuild, String> {
+    prepare_args(
+        repo_path,
+        if manifest {
+            MANIFEST_BUILD_ARGS
+        } else {
+            INCREMENTAL_BUILD_ARGS
+        },
+    )
+}
+
+fn prepare_args(repo_path: &str, args: &'static [&'static str]) -> Result<PreparedBuild, String> {
     let repo = validate_repo(repo_path)?;
-    let _guard = BuildGuard::try_acquire(&repo)?;
+    let guard = BuildGuard::try_acquire(&repo)?;
     let binary = resolve_binary()?;
-    if let super::init::ExcludeOutcome::Refused { reason } =
-        super::init::ensure_state_dir_excluded(&repo)
-    {
-        log::warn!(
-            target: "devmap",
-            "{}: building an index whose state directory git will show as untracked — {reason}",
-            repo.display()
-        );
-    }
-    match run_devmap(&binary, &repo, args, None, BUILD_DEADLINE) {
-        Ok(run) => Ok(build_outcome_from_run(&binary, run)),
-        Err(e) if timed_out(&e) => Ok(BuildOutcome {
-            ok: false,
-            binary: binary.path,
-            lookup: binary.lookup,
-            exit_code: None,
-            stdout: String::new(),
-            stderr: e,
-            timed_out: true,
-            report: None,
-        }),
-        Err(e) => Err(e),
+    Ok(PreparedBuild {
+        repo,
+        binary,
+        args,
+        guard,
+    })
+}
+
+impl PreparedBuild {
+    /// Run the child, then hand its outcome to `settle` while the writer slot
+    /// is still held.
+    ///
+    /// Settling first is what lets a caller record what the build meant before
+    /// anyone can observe the repository as idle: between the child exiting and
+    /// the guard dropping, [`is_build_in_flight`] still answers true.
+    pub fn run_then<R>(self, settle: impl FnOnce(Result<BuildOutcome, String>) -> R) -> R {
+        let PreparedBuild {
+            repo,
+            binary,
+            args,
+            guard,
+        } = self;
+        if let super::init::ExcludeOutcome::Refused { reason } =
+            super::init::ensure_state_dir_excluded(&repo)
+        {
+            log::warn!(
+                target: "devmap",
+                "{}: building an index whose state directory git will show as untracked — {reason}",
+                repo.display()
+            );
+        }
+        let outcome = match run_devmap(&binary, &repo, args, None, BUILD_DEADLINE) {
+            Ok(run) => Ok(build_outcome_from_run(&binary, run)),
+            Err(e) if timed_out(&e) => Ok(BuildOutcome {
+                ok: false,
+                binary: binary.path,
+                lookup: binary.lookup,
+                exit_code: None,
+                stdout: String::new(),
+                stderr: e,
+                timed_out: true,
+                report: None,
+            }),
+            Err(e) => Err(e),
+        };
+        let settled = settle(outcome);
+        drop(guard);
+        settled
     }
 }
 
@@ -645,12 +707,12 @@ fn spawn_build(repo_path: &str, args: &[&str]) -> Result<BuildOutcome, String> {
 /// The manifest flag is what writes the consumer artifacts `repo_map.json` and
 /// `code_graph.json`; a plain build updates the database only.
 pub fn build(repo_path: &str) -> Result<BuildOutcome, String> {
-    spawn_build(repo_path, &["build", "--manifest", "--json"])
+    spawn_build(repo_path, MANIFEST_BUILD_ARGS)
 }
 
 /// Incremental rebuild (`devmap build --json` without `--full`).
 pub fn refresh(repo_path: &str) -> Result<BuildOutcome, String> {
-    spawn_build(repo_path, &["build", "--json"])
+    spawn_build(repo_path, INCREMENTAL_BUILD_ARGS)
 }
 
 /// Installation health `devmap doctor --json` already measures and GitPulse
@@ -2000,6 +2062,9 @@ exit 2
             "source freshness unverified: this generation has no repository root",
         ] {
             let _ = fs::remove_file(repo.path().join("argv.log"));
+            // Each reason is its own case. The rest the previous iteration's
+            // build earned belongs to the governor's tests in live.rs.
+            crate::devmap::clear_live_echo_cooldown(canonical.to_str().unwrap());
             devmap.set_status(available_status(&format!(
                 r#"{{"is_fresh":false,"schema_outdated":false,"degraded_reason":{reason:?}}}"#
             )));
@@ -2030,6 +2095,9 @@ exit 2
             r#"{"is_fresh":false,"schema_outdated":false,"message":"stored extraction payload is obsolete; rebuild with the current analyzer"}"#,
         ] {
             let _ = fs::remove_file(repo.path().join("argv.log"));
+            // Each payload is its own case. The rest the previous iteration's
+            // build earned belongs to the governor's tests in live.rs.
+            crate::devmap::clear_live_echo_cooldown(canonical.to_str().unwrap());
             devmap.set_status(available_status(payload));
             let outcome = crate::devmap::maybe_refresh(canonical.to_str().unwrap(), true);
             assert_eq!(
