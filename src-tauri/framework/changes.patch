@@ -1472,3 +1472,55 @@
 +        cf::CFRelease(runloop.0);
 +    }
 +}
+--- a/tao/src/platform_impl/macos/mod.rs
++++ b/tao/src/platform_impl/macos/mod.rs
+@@ -2,6 +2,14 @@
+ // Copyright 2021-2023 Tauri Programme within The Commons Conservancy
+ // SPDX-License-Identifier: Apache-2.0
+ 
++// Same Apple-binding churn as wry's `wkwebview` tree: newer `objc2-app-kit`
++// marks safe what this revision wraps in `unsafe`, and deprecates constants it
++// still names. `dead_code` joins them because this module carries upstream's
++// full macOS surface — the badge setters, `util::yes`, and the window state
++// this consumer never reads are tao's API, not leftovers to delete. All three
++// retire when a published tao adopts the current bindings.
++#![allow(deprecated, unused_unsafe, dead_code)]
++
+ mod app;
+ mod app_delegate;
+ mod app_state;
+--- a/tao/src/platform_impl/macos/monitor.rs
++++ b/tao/src/platform_impl/macos/monitor.rs
+@@ -20,7 +20,7 @@
+ };
+ use objc2::{msg_send, rc::Retained};
+ use objc2_app_kit::NSScreen;
+-use objc2_foundation::{ns_string, MainThreadMarker, NSString, NSUInteger};
++use objc2_foundation::{ns_string, MainThreadMarker, NSUInteger};
+ 
+ #[derive(Clone)]
+ pub struct VideoMode {
+--- a/tao/src/platform_impl/macos/util/async.rs
++++ b/tao/src/platform_impl/macos/util/async.rs
+@@ -8,7 +8,7 @@
+ };
+ 
+ use core_graphics::base::CGFloat;
+-use dispatch2::{DispatchQueue, DispatchQueueAttr};
++use dispatch2::DispatchQueue;
+ use objc2::{rc::autoreleasepool, Message};
+ use objc2_app_kit::{NSScreen, NSView, NSWindow, NSWindowStyleMask};
+ use objc2_foundation::{MainThreadMarker, NSPoint, NSSize, NSString};
+--- a/tao/src/platform/macos.rs
++++ b/tao/src/platform/macos.rs
+@@ -3,6 +3,10 @@
+ // SPDX-License-Identifier: Apache-2.0
+ 
+ #![cfg(target_os = "macos")]
++// `NSApplication::unhide` is safe in the current `objc2-app-kit`; the
++// `MainThreadMarker::new_unchecked` calls beside it still are not. See the note
++// in `platform_impl/macos/mod.rs`.
++#![allow(unused_unsafe)]
+ 
+ use std::os::raw::c_void;
+ 
