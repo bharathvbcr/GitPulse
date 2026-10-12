@@ -1,0 +1,114 @@
+name: Benchmarks
+
+# Runs the benches in src-tauri/benches in smoke mode (3 samples per row) on
+# each runner class, uploads their JSON reports, and fails when a work counter
+# changes or a row's min-of-N time regresses past the ratio documented in
+# docs/PERFORMANCE.md ("Benchmark harness"), against the committed baseline for
+# that runner class (src-tauri/benches/baselines/<runner>.json).
+#
+# Scheduled and manual only, never on a pull request: a wall-clock comparison on
+# a shared runner is a trend, not a gate for a change that did not touch the
+# measured code, and a flaky required check is worse than none. A separate
+# workflow so a red result here is its own check, as deep-checks.yml is.
+#
+# Seeding a baseline: a runner class with no committed baseline FAILS this job
+# (bench-compare exits 2, "NO BASELINE") rather than passing with nothing
+# compared. Run this workflow by hand once, download the `bench-<runner>`
+# artifact, and write the baseline from it:
+#   node scripts/bench-compare.mjs --results <unzipped dir> \
+#        --write-baseline src-tauri/benches/baselines/<runner>.json
+on:
+  schedule:
+    # Nightly, off the hour and off the other scheduled runs (03:17, 04:41).
+    - cron: "37 5 * * *"
+  # Run by hand on a branch, so a fix is verified before its PR exists.
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# Fail closed: this job only checks out, builds and measures.
+permissions:
+  contents: read
+
+jobs:
+  benches:
+    name: Benches, smoke (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    env:
+      # The baseline is keyed on this: times are only compared within a class.
+      GITPULSE_BENCH_RUNNER_CLASS: ${{ matrix.os }}
+      GITPULSE_BENCH_JSON_DIR: ${{ github.workspace }}/bench-results
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v7
+
+      - name: Install System Dependencies (Linux)
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev build-essential curl wget file libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev pkg-config
+
+      - name: Setup Rust Toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Key the Rust cache to this runner image
+        shell: bash
+        run: echo "RUST_CACHE_PREFIX=${ImageOS:-unknown}-${ImageVersion:-unknown}-gp3" >> "$GITHUB_ENV"
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+          prefix-key: ${{ env.RUST_CACHE_PREFIX }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: 22
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+
+      - name: Install Frontend Dependencies
+        run: bun install --frozen-lockfile
+
+      # The library links tauri's generated context, which embeds the built
+      # frontend.
+      - name: Frontend Vite Build
+        run: bun run build
+
+      # Every bench runs even if one fails (the loop collects the failures), so
+      # a bench that never ran cannot read like one that passed: the compare
+      # step below refuses a baselined bench with no report.
+      - name: Run benches (smoke)
+        shell: bash
+        run: |
+          set -uo pipefail
+          mkdir -p "$GITPULSE_BENCH_JSON_DIR"
+          failed=0
+          for bench in $BENCHES; do
+            echo "::group::cargo bench --bench $bench"
+            cargo bench --manifest-path src-tauri/Cargo.toml --locked --bench "$bench" -- --smoke || failed=1
+            echo "::endgroup::"
+          done
+          exit "$failed"
+        env:
+          BENCHES: graph_diff watcher repo_read command_timings mcp_protocol
+
+      - name: Upload bench reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-${{ matrix.os }}
+          path: bench-results/*.json
+          if-no-files-found: error
+
+      - name: Compare against the committed baseline
+        run: node scripts/bench-compare.mjs --results bench-results --baseline "src-tauri/benches/baselines/${{ matrix.os }}.json"

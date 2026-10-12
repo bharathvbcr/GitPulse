@@ -1,3 +1,6 @@
+/// The door `benches/watcher.rs` measures the event classifier through.
+#[doc(hidden)]
+pub mod bench_seam;
 pub mod debouncer;
 #[cfg(test)]
 mod registration_timing;

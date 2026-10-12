@@ -1,15 +1,37 @@
 //! Where the MCP surface spends its time.
 //!
-//! Run with `cargo bench --bench mcp_protocol`. Deliberately not a Criterion
-//! benchmark: Criterion would be a new dependency, and the questions here are
-//! coarse — "is the protocol layer free relative to the work it wraps, and did
-//! a fix that was supposed to be cheap stay cheap" — which do not need
-//! statistical machinery. What they do need is honesty about spread, so every
-//! row reports p50 and p95 rather than a single mean that hides a stall.
+//! Run with `cargo bench --manifest-path src-tauri/Cargo.toml --bench mcp_protocol`
+//! (add `-- --smoke` for 3 samples per row, `-- --json out.json` for the
+//! machine-readable report). Deliberately not a Criterion benchmark: Criterion
+//! would be a new dependency, and the questions here are coarse — "is the
+//! protocol layer free relative to the work it wraps, and did a fix that was
+//! supposed to be cheap stay cheap". It runs on the shared harness in
+//! `benches/common`: interleaved rounds, min/p50/p95 per row, work counters
+//! and the host-load snapshot with every run.
 //!
 //! `test = false` in Cargo.toml keeps this out of `cargo test`: a wall-clock
 //! measurement asserted as a test fails on a loaded machine, and a check that
 //! fails for reasons unrelated to the code is worse than no check.
+//!
+//! # What the repository rows measure
+//!
+//! * They run on a **generated fixture repository** with linked worktrees,
+//!   built once under the hermetic temp `HOME`, so two machines and two days
+//!   measure the same bytes. `GITPULSE_BENCH_REPO=<path>` points them at a
+//!   real checkout instead, explicitly; the run then says so in its report.
+//! * `main` lifts the production spawn rate first
+//!   (`run_process_with_unlimited_spawn_rate`, the switch the stress tests
+//!   use). Without it the 220 git-spawning samples spent the production gate's
+//!   192-spawn burst and then refilled at 8/s, so the rows timed the rate
+//!   limiter or a deferred, degraded snapshot rather than the work.
+//! * **Every sampled response is checked.** A tool result with `isError`, or
+//!   any object in its payload with `"ok": false` (a facet that did not run),
+//!   aborts the run naming the tool and the facet path. A degraded answer is
+//!   never timed as if it were the work. Facets that report unavailability
+//!   without an `ok` flag (`codeintel.available`, `ledger.error`,
+//!   `agents.live`) are printed, not gated: on a fixture with no code-graph
+//!   store they are expected, and `agents.live` reads the host's real process
+//!   table whatever `HOME` is.
 //!
 //! The two rows that exist because a measurement found a defect:
 //!
@@ -22,22 +44,16 @@
 //!   spec asks for, so the row exists to keep the cost visible rather than to
 //!   argue with it.
 
-use std::time::{Duration, Instant};
+mod common;
 
+use common::fixture::{build_repo, count_git_processes, Spec};
+use common::{interleave, Case, Report, Sample};
 use gitpulse_lib::mcp::{self, Era, JsonRpcRequest};
 use serde_json::{json, Value};
 
-/// Samples per row after warmup.
-const SAMPLES: usize = 200;
-const WARMUP: usize = 20;
-
-struct Row {
-    name: &'static str,
-    p50: Duration,
-    p95: Duration,
-    worst: Duration,
-    bytes: usize,
-}
+/// Rounds for the cheap protocol rows and for the git-spawning rows.
+const PROTOCOL_ROUNDS: usize = 200;
+const WORK_ROUNDS: usize = 30;
 
 fn modern_meta() -> Value {
     json!({
@@ -57,115 +73,93 @@ fn request(method: &str, mut params: Value) -> JsonRpcRequest {
     }
 }
 
-/// Time `body` `SAMPLES` times and summarise. `body` returns the serialized
-/// response so the row can report payload size next to latency — a fast call
-/// that emits a megabyte is not a cheap call on a stdio transport.
-fn measure(name: &'static str, mut body: impl FnMut() -> usize) -> Row {
-    for _ in 0..WARMUP {
-        std::hint::black_box(body());
-    }
-    let mut timings = Vec::with_capacity(SAMPLES);
-    let mut bytes = 0;
-    for _ in 0..SAMPLES {
-        let started = Instant::now();
-        bytes = std::hint::black_box(body());
-        timings.push(started.elapsed());
-    }
-    timings.sort_unstable();
-    Row {
-        name,
-        p50: timings[SAMPLES / 2],
-        p95: timings[SAMPLES * 95 / 100],
-        worst: *timings.last().expect("samples"),
+/// One request through `accept` + `run`, returning the response as a value and
+/// the byte length it serializes to on the transport.
+fn call(method: &str, params: &Value) -> (Value, usize) {
+    let mut era = Era::Unknown;
+    let response =
+        mcp::process_request(request(method, params.clone()), &mut era).expect("answered");
+    let text = serde_json::to_string(&response).expect("serializes");
+    let bytes = text.len();
+    (
+        serde_json::from_str(&text).expect("a response is JSON"),
         bytes,
-    }
+    )
 }
 
-/// One request through `accept` + `run`, serialized as the transport would.
-fn round_trip(method: &'static str, params: Value) -> impl FnMut() -> usize {
-    move || {
-        let mut era = Era::Unknown;
-        let response =
-            mcp::process_request(request(method, params.clone()), &mut era).expect("answered");
-        serde_json::to_string(&response).expect("serializes").len()
+/// A `tools/call` that must be the work, not a refusal: aborts naming the tool
+/// and the failing facet otherwise.
+fn checked_tool_call(tool: &str, repo: &str) -> Sample {
+    let params = json!({ "name": tool, "arguments": { "repo_path": repo } });
+    let (response, bytes) = call("tools/call", &params);
+    let result = &response["result"];
+    if !response["error"].is_null() || result.is_null() {
+        panic!("{tool}: JSON-RPC error instead of a result: {}", response["error"]);
     }
-}
-
-fn render(rows: &[Row]) {
-    let width = rows.iter().map(|r| r.name.len()).max().unwrap_or(0).max(9);
-    println!(
-        "\n{:<width$}  {:>10}  {:>10}  {:>10}  {:>12}",
-        "operation", "p50", "p95", "worst", "bytes"
-    );
-    println!("{}", "-".repeat(width + 50));
-    for row in rows {
-        println!(
-            "{:<width$}  {:>10}  {:>10}  {:>10}  {:>12}",
-            row.name,
-            format!("{:.1?}", row.p50),
-            format!("{:.1?}", row.p95),
-            format!("{:.1?}", row.worst),
-            row.bytes,
+    if result["isError"] == true {
+        panic!(
+            "{tool}: the response is isError, so this run would time a refusal, not the work: {}",
+            result["content"][0]["text"]
         );
     }
+    let payload = &result["structuredContent"];
+    let passed = common::require_no_failed_facets(tool, payload);
+    Sample::default()
+        .counter("facets_ok", passed)
+        .metric("bytes", bytes as f64)
+}
+
+fn protocol_case(name: &'static str, method: &'static str, params: Value) -> Case<'static> {
+    Case::new(name, move || {
+        let (response, bytes) = call(method, &params);
+        std::hint::black_box(&response);
+        Sample::default().metric("bytes", bytes as f64)
+    })
 }
 
 fn main() {
-    // Every repository-scoped row runs against this crate's own checkout, which
-    // is a real repository with real worktrees — a synthetic empty repo would
-    // measure the error path rather than the work.
-    let repo = std::env::var("GITPULSE_BENCH_REPO").unwrap_or_else(|_| {
-        std::env::current_dir()
-            .ok()
-            .and_then(|d| d.parent().map(|p| p.to_string_lossy().into_owned()))
-            .unwrap_or_else(|| ".".into())
-    });
-    println!("gitpulse-mcp protocol benchmark");
-    println!("  protocol : {}", mcp::PROTOCOL_VERSION);
-    println!("  repo     : {repo}");
-    println!("  samples  : {SAMPLES} (after {WARMUP} warmup)");
+    // First statement: the production spawn gate (192-spawn burst, then 8/s)
+    // would otherwise be what the git-spawning rows time.
+    gitpulse_lib::engine::git_cli::run_process_with_unlimited_spawn_rate();
 
-    let mut rows = Vec::new();
+    let mut report = Report::new("mcp_protocol");
+    let protocol_rounds = report.opts.samples(PROTOCOL_ROUNDS);
+    let work_rounds = report.opts.samples(WORK_ROUNDS);
+
+    // ---- The repository the work rows run on.
+    let temp = tempfile::tempdir().expect("temp dir");
+    let explicit = std::env::var("GITPULSE_BENCH_REPO").ok();
+    let spec = Spec {
+        files: 400,
+        dirs: 20,
+        extra_commits: 30,
+        touch: 4,
+        linked_worktrees: 3,
+    };
+    let (repo, _fixture) = match &explicit {
+        Some(path) => {
+            common::fixture::trust_repo(std::path::Path::new(path));
+            report.note(format!(
+                "repository rows run on GITPULSE_BENCH_REPO={path} (explicit; not comparable across machines)"
+            ));
+            (path.clone(), None)
+        }
+        None => {
+            let built = build_repo(temp.path(), &spec);
+            report.note(format!(
+                "repository rows run on a generated fixture: {} files in {} dirs, {} commits, {} linked worktrees, hermetic HOME",
+                spec.files,
+                spec.dirs,
+                spec.extra_commits + 1,
+                spec.linked_worktrees
+            ));
+            (built.path().to_string(), Some(built))
+        }
+    };
+    report.note(format!("protocol: {}", mcp::PROTOCOL_VERSION));
 
     // ---- Protocol layer: no filesystem, no git. This is the overhead the
     // capability work added, and it has to stay invisible next to a git spawn.
-    rows.push(measure(
-        "server/discover",
-        round_trip("server/discover", json!({})),
-    ));
-    rows.push(measure("tools/list", round_trip("tools/list", json!({}))));
-    rows.push(measure(
-        "resources/list",
-        round_trip("resources/list", json!({})),
-    ));
-    rows.push(measure(
-        "resources/templates/list",
-        round_trip("resources/templates/list", json!({})),
-    ));
-    rows.push(measure(
-        "prompts/list",
-        round_trip("prompts/list", json!({})),
-    ));
-    rows.push(measure(
-        "resources/read server/manifest",
-        round_trip(
-            "resources/read",
-            json!({ "uri": "gitpulse://server/manifest" }),
-        ),
-    ));
-    rows.push(measure(
-        "completion/complete",
-        round_trip(
-            "completion/complete",
-            json!({
-                "ref": { "type": "ref/prompt", "name": "gitpulse_preflight" },
-                "argument": { "name": "repo_path", "value": "" }
-            }),
-        ),
-    ));
-
-    // ---- Argument validation, the per-call tax the spec's "validate all tool
-    // inputs" adds. Measured against the largest schema in the catalog.
     let trace = mcp::tools()
         .into_iter()
         .find(|t| t["name"] == "gitpulse_codeintel_trace")
@@ -173,81 +167,100 @@ fn main() {
     let schema = trace["inputSchema"].clone();
     let good = json!({ "repo_path": "/tmp/x", "from": "a", "to": "b", "budget": 2000 });
     let bad = json!({ "repo_path": "", "from": 7, "to": "b", "budget": -1, "nope": 1 });
-    rows.push(measure("validate (accepting)", || {
-        std::hint::black_box(mcp::validate::validate(&good, &schema)).len()
-    }));
-    rows.push(measure("validate (rejecting)", || {
-        std::hint::black_box(mcp::validate::validate(&bad, &schema)).len()
-    }));
-
-    // ---- A rejected call must be cheap: this is the path a confused model
-    // retries in a loop, and it must never cost what the real call costs.
-    rows.push(measure(
-        "tools/call rejected argument",
-        round_trip(
+    let cheap = vec![
+        protocol_case("server/discover", "server/discover", json!({})),
+        protocol_case("tools/list", "tools/list", json!({})),
+        protocol_case("resources/list", "resources/list", json!({})),
+        protocol_case(
+            "resources/templates/list",
+            "resources/templates/list",
+            json!({}),
+        ),
+        protocol_case("prompts/list", "prompts/list", json!({})),
+        protocol_case(
+            "resources/read server/manifest",
+            "resources/read",
+            json!({ "uri": "gitpulse://server/manifest" }),
+        ),
+        protocol_case(
+            "completion/complete",
+            "completion/complete",
+            json!({
+                "ref": { "type": "ref/prompt", "name": "gitpulse_preflight" },
+                "argument": { "name": "repo_path", "value": "" }
+            }),
+        ),
+        // Argument validation, the per-call tax the spec's "validate all tool
+        // inputs" adds, against the largest schema in the catalog.
+        Case::new("validate (accepting)", || {
+            Sample::default().counter(
+                "violations",
+                std::hint::black_box(mcp::validate::validate(&good, &schema)).len() as u64,
+            )
+        }),
+        Case::new("validate (rejecting)", || {
+            Sample::default().counter(
+                "violations",
+                std::hint::black_box(mcp::validate::validate(&bad, &schema)).len() as u64,
+            )
+        }),
+        // A rejected call must be cheap: this is the path a confused model
+        // retries in a loop, and it must never cost what the real call costs.
+        protocol_case(
+            "tools/call rejected argument",
             "tools/call",
             json!({
                 "name": "gitpulse_active_changes",
                 "arguments": { "repo_path": "/tmp", "limit": "500" }
             }),
         ),
-    ));
+    ];
+    let warmup = report.opts.warmup(20);
+    let mut rows = interleave(cheap, protocol_rounds, warmup);
 
     // ---- Real work. These dominate; the rows above exist to show by how much.
-    rows.push(measure(
-        "codeintel status",
-        round_trip(
-            "tools/call",
-            json!({
-                "name": "gitpulse_status", "arguments": { "repo_path": repo.clone() }
-            }),
-        ),
-    ));
-    rows.push(measure(
-        "tools/call collision_risk",
-        round_trip(
-            "tools/call",
-            json!({
-                "name": "gitpulse_collision_risk", "arguments": { "repo_path": repo.clone() }
-            }),
-        ),
-    ));
-    rows.push(measure(
-        "tools/call insights",
-        round_trip(
-            "tools/call",
-            json!({
-                "name": "gitpulse_insights", "arguments": { "repo_path": repo.clone() }
-            }),
-        ),
-    ));
+    let work = vec![
+        Case::new("codeintel status", || {
+            checked_tool_call("gitpulse_status", &repo)
+        }),
+        Case::new("tools/call collision_risk", || {
+            checked_tool_call("gitpulse_collision_risk", &repo)
+        }),
+        Case::new("tools/call insights", || {
+            checked_tool_call("gitpulse_insights", &repo)
+        }),
+    ];
+    rows.extend(interleave(work, work_rounds, report.opts.warmup(3)));
 
-    render(&rows);
+    // The spawn gate is lifted, so its report is not the evidence; git's own
+    // trace2 is. One insights call, counted in its own untimed pass.
+    let (_, processes) = count_git_processes(|| checked_tool_call("gitpulse_insights", &repo));
+    if let Some(row) = rows.iter_mut().find(|r| r.name == "tools/call insights") {
+        row.counters.insert("git_processes", processes);
+    }
+    report.note(format!(
+        "one insights call starts {processes} git processes (git trace2, counted in a separate untimed pass)"
+    ));
 
     // A protocol-only call has to be negligible against a call that touches
     // git. Reporting the ratio is the point: an absolute number means nothing
     // without knowing what it is being hidden behind.
-    let protocol = rows
-        .iter()
-        .find(|r| r.name == "tools/list")
-        .map(|r| r.p50)
-        .unwrap_or_default();
-    let work = rows
-        .iter()
-        .find(|r| r.name == "tools/call insights")
-        .map(|r| r.p50)
-        .unwrap_or_default();
-    if !protocol.is_zero() && !work.is_zero() {
-        println!(
-            "\ntools/list is {:.0}x cheaper than one insights call ({:.1?} vs {:.1?})",
-            work.as_secs_f64() / protocol.as_secs_f64(),
-            protocol,
-            work
-        );
+    let min_of = |name: &str| rows.iter().find(|r| r.name == name).map(|r| r.min());
+    if let (Some(protocol), Some(work)) = (min_of("tools/list"), min_of("tools/call insights")) {
+        if !protocol.is_zero() && !work.is_zero() {
+            report.note(format!(
+                "tools/list is {:.0}x cheaper than one insights call (min {:.1?} vs {:.1?})",
+                work.as_secs_f64() / protocol.as_secs_f64(),
+                protocol,
+                work
+            ));
+        }
     }
-    println!(
-        "\nNote: tools/call emits its payload twice — pretty-printed into content[0].text\n\
-         and raw into structuredContent — which the spec asks for so pre-structuredContent\n\
-         clients still read something. The `bytes` column counts both."
+    report.note(
+        "tools/call emits its payload twice (pretty-printed content[0].text and raw \
+         structuredContent) as the spec asks; the `bytes` metric counts both"
+            .to_string(),
     );
+    report.extend(rows);
+    report.finish();
 }
