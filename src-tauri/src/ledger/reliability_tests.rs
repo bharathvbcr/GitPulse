@@ -347,3 +347,97 @@ fn pruning_keeps_the_newest_events_and_every_binding() {
         .collect();
     assert_eq!(left, ["worktree.bind", "git.push"]);
 }
+
+/// Inserts `count` events stamped `ts` with one statement, so a policy sized
+/// in thousands of rows is not tested by thousands of appends.
+fn insert_events(repo: &str, count: i64, ts: &str, tag: &str) {
+    with_conn(repo, |conn| {
+        conn.execute(
+            "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < ?1)
+             INSERT INTO events (ulid, ts_utc, repo_path, actor_kind, action, outcome)
+             SELECT ?3 || i, ?2, 'r', 'system', 'git.commit', 'ok' FROM n",
+            params![count, ts, tag],
+        )
+        .map_err(|e| LedgerError::new("t", e.to_string()))
+    })
+    .unwrap();
+}
+
+/// Catch-up with the transcript root pointed at an empty directory, so the
+/// pass touches nothing of the machine's real history.
+fn hermetic_catch_up(repo: &str) -> crate::ingest::CatchUp {
+    let root = tempfile::tempdir().unwrap();
+    let serial = crate::test_support::env::env_serial();
+    let _env =
+        crate::test_support::env::bind_env(&serial).set("GITPULSE_TRANSCRIPT_ROOT", root.path());
+    crate::ingest::catch_up_into_bounded(repo, repo, None)
+}
+
+/// `prune_events` had no caller, so the events table only ever grew. Catch-up
+/// is the pass every host runs; it applies the retention policy.
+#[test]
+fn catch_up_prunes_events_past_the_retention_policy() {
+    let (_dir, repo) = repo_dir();
+    insert_events(
+        &repo,
+        RETAIN_NEWEST_EVENTS + 50,
+        "2001-01-01T00:00:00.000Z",
+        "old",
+    );
+    let report = hermetic_catch_up(&repo);
+    assert_eq!(report.pruned, 50, "{}", report.error);
+    assert_eq!(event_count(&repo), RETAIN_NEWEST_EVENTS);
+}
+
+/// The window is the contract: a row younger than the retention age survives
+/// even when it is not among the newest rows.
+#[test]
+fn catch_up_never_prunes_inside_the_retention_window() {
+    let (_dir, repo) = repo_dir();
+    let recent = ids::iso8601_utc(ids::now_millis());
+    insert_events(&repo, RETAIN_NEWEST_EVENTS + 50, &recent, "new");
+    let report = hermetic_catch_up(&repo);
+    assert_eq!(report.pruned, 0, "{}", report.error);
+    assert_eq!(event_count(&repo), RETAIN_NEWEST_EVENTS + 50);
+}
+
+/// A prune that fails is reported on the pass, not folded into "nothing to
+/// prune".
+#[test]
+fn a_failing_prune_is_surfaced_on_the_catch_up_report() {
+    let (_dir, repo) = repo_dir();
+    insert_events(
+        &repo,
+        RETAIN_NEWEST_EVENTS + 5,
+        "2001-01-01T00:00:00.000Z",
+        "old",
+    );
+    with_conn(&repo, |conn| {
+        conn.execute_batch(
+            "CREATE TRIGGER no_delete BEFORE DELETE ON events
+             BEGIN SELECT RAISE(ABORT, 'delete refused'); END;",
+        )
+        .map_err(|e| LedgerError::new("t", e.to_string()))
+    })
+    .unwrap();
+    let report = hermetic_catch_up(&repo);
+    assert!(
+        report.error.contains("ledger retention failed"),
+        "error was {:?}",
+        report.error
+    );
+    assert_eq!(report.pruned, 0);
+    assert_eq!(event_count(&repo), RETAIN_NEWEST_EVENTS + 5);
+}
+
+#[test]
+fn a_pass_past_its_deadline_starts_no_batch() {
+    let (_dir, repo) = repo_dir();
+    insert_events(&repo, 20, "2001-01-01T00:00:00.000Z", "old");
+    let expired = std::time::Instant::now() - Duration::from_secs(1);
+    let report = prune_with_policy(&repo, 1, 5, Some(expired));
+    assert_eq!((report.deleted, report.error.as_str()), (0, ""));
+    assert_eq!(event_count(&repo), 20);
+    let report = prune_with_policy(&repo, 1, 5, None);
+    assert_eq!(report.deleted, 15);
+}

@@ -2084,9 +2084,9 @@ const PRUNE_BATCH: i64 = 5_000;
 /// worktree's task scope is enforced from, however old). One bounded batch per
 /// call; returns how many were deleted, so a caller loops until it is 0.
 ///
-/// The ledger is an audit record, so nothing runs this on its own: it is the
-/// retention policy a host or operator invokes deliberately. Keeping the
-/// newest rows means the highest cursor survives, so ids are never reused.
+/// Catch-up ([`prune_expired`]) runs it on the default policy; a host may
+/// still call it with its own. Keeping the newest rows means the highest
+/// cursor survives, so ids are never reused.
 pub fn prune_events(
     repo_path: &str,
     older_than_days: u32,
@@ -2112,6 +2112,50 @@ pub fn prune_events(
         tx.commit().map_err(failed)?;
         Ok(deleted)
     })
+}
+
+/// Batches one maintenance pass may run, so a ledger that fell far behind is
+/// brought back over several passes instead of one long write-lock hold.
+pub const PRUNE_MAX_BATCHES: usize = 20;
+
+/// What one [`prune_expired`] pass did. `error` is empty when it ran clean;
+/// a pass that could not prune must not read the same as one with nothing to
+/// prune.
+#[derive(Debug, Clone, Default)]
+pub struct PruneReport {
+    pub deleted: usize,
+    pub error: String,
+}
+
+/// The default retention policy ([`RETAIN_EVENT_DAYS`], [`RETAIN_NEWEST_EVENTS`])
+/// applied in bounded batches: at most [`PRUNE_MAX_BATCHES`] of [`PRUNE_BATCH`]
+/// rows, and no batch starts once `deadline` has passed.
+pub fn prune_expired(repo_path: &str, deadline: Option<std::time::Instant>) -> PruneReport {
+    prune_with_policy(repo_path, RETAIN_EVENT_DAYS, RETAIN_NEWEST_EVENTS, deadline)
+}
+
+fn prune_with_policy(
+    repo_path: &str,
+    older_than_days: u32,
+    keep_newest: i64,
+    deadline: Option<std::time::Instant>,
+) -> PruneReport {
+    let mut report = PruneReport::default();
+    for _ in 0..PRUNE_MAX_BATCHES {
+        if deadline.is_some_and(|d| std::time::Instant::now() >= d) {
+            break;
+        }
+        match prune_events(repo_path, older_than_days, keep_newest) {
+            Ok(0) => break,
+            Ok(n) => report.deleted += n,
+            Err(error) => {
+                log::error!(target: "ledger", "event retention failed for {repo_path}: {error}");
+                report.error = format!("ledger retention failed: {error}");
+                break;
+            }
+        }
+    }
+    report
 }
 
 /// The first sibling ledger holding rows [`consolidate_worktree_ledgers`] has
