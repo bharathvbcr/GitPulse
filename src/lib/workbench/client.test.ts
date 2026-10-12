@@ -73,6 +73,20 @@ describe("task suggestions", () => {
     expect(taskSuggestions(reply).suggestions[0]).toMatchObject({ id: "t1", rank: 1, priority: 0, reason: "urgent priority" });
     expect(taskSuggestions(reply).board.complete).toBe(true);
   });
+  it("reads a task with no signals from both Manvi builds: [] and the old null", () => {
+    for (const signals of [[], null]) {
+      const got = taskSuggestions({ ...reply, suggestions: [{ ...reply.suggestions[0], score: 0, signals }] });
+      expect(got.suggestions[0].signals).toEqual([]);
+    }
+  });
+  it("reads the unread count when Manvi sends it and takes 0 from a build that does not", () => {
+    expect(taskSuggestions(reply).excluded.unread).toBe(0);
+    expect(taskSuggestions({ ...reply, excluded: { ...reply.excluded, unread: 7 } }).excluded.unread).toBe(7);
+    for (const unread of [-1, "3", null, 1.5]) expect(() => taskSuggestions({ ...reply, excluded: { ...reply.excluded, unread } })).toThrow("invalid response");
+  });
+  it("still refuses signals that are neither an array nor null", () => {
+    for (const signals of ["x", {}, 3, undefined]) expect(() => taskSuggestions({ ...reply, suggestions: [{ ...reply.suggestions[0], signals }] })).toThrow("invalid response");
+  });
   it("refuses a malformed or failed answer instead of showing part of it", () => {
     const bad: unknown[] = [
       { ...reply, ok: false }, { ...reply, suggestions: null }, { ...reply, board: { ...reply.board, complete: "yes" } },

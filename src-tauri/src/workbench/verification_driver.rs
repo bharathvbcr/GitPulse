@@ -588,7 +588,7 @@ pub(crate) struct HostBackend(pub WorkbenchState);
 
 impl Backend for HostBackend {
     fn start(&self, params: Value) -> Result<Value, WorkbenchError> {
-        self.0.worker_call("work.verify.task", params, None)
+        self.0.worker_call_current("work.verify.task", params)
     }
     fn head_of(&self, worktree: &str) -> Result<String, String> {
         gate::current_head(worktree)

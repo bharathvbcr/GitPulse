@@ -68,7 +68,7 @@ pub(super) fn launch(state: &WorkbenchState, input: &str) -> Result<Value, Workb
     launch_with(
         state,
         input,
-        |op, params| state.worker_call(op, params, None),
+        |op, params| state.worker_call_current(op, params),
         process_birth::read,
     )
 }
@@ -238,7 +238,7 @@ pub(super) fn stop(state: &WorkbenchState, input: &str) -> Result<Value, Workben
             "This managed attempt has no active process to stop.",
         ));
     }
-    state.worker_call("work.runs.managed.stop", json!({"id":id}), None)
+    state.worker_call_current("work.runs.managed.stop", json!({"id":id}))
 }
 
 #[cfg(test)]

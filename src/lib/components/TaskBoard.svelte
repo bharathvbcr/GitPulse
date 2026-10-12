@@ -47,6 +47,7 @@
   import { boardKey as viewBoardKey, boardPrefs, effectiveSwimlane, wipState, type SavedTaskView, type TaskViewSnapshot } from "../ui/taskBoardViews";
   import TaskSavedViews from "./TaskSavedViews.svelte";
   import TaskSuggestPanel from "./TaskSuggestPanel.svelte";
+  import { createSuggestWatch, suggestSignature } from "../workbench/suggestFreshness";
   import WavePanel from "./WavePanel.svelte";
   import { consumeTaskOpen, taskOpenRequest } from "../workbench/taskOpen";
   import { parseQuickAddDue, quickAddDraft, type QuickAddMode, type QuickAddResult } from "../workbench/taskQuickAdd";
@@ -187,7 +188,13 @@
   // not withdrawn by a scope change: it is still the reader's to undo.
   $effect(() => { JSON.stringify(scope); untrack(() => offerUndo(null)); });
   // A suggestion ranks one board's tasks: another scope drops it, and an open panel asks again.
-  $effect(() => { JSON.stringify(scope); untrack(() => { suggestTicket++; suggestion = null; suggestError = ""; suggestLoading = false; if (showSuggest) void askSuggest(); }); });
+  $effect(() => { JSON.stringify(scope); untrack(() => { suggestWatch.reset(); suggestTicket++; suggestion = null; suggestError = ""; suggestLoading = false; if (showSuggest) void askSuggest(); }); });
+  // A task whose priority or status changed, or that came or went, is ranked
+  // from its old fields until Manvi is asked again: one debounced re-ask per
+  // burst of changes while the panel is open. A closed panel asks on reopening.
+  const suggestWatch = createSuggestWatch(() => { if (showSuggest && !disposed) void askSuggest(); }, 400);
+  const suggestSig = $derived(suggestSignature(columns));
+  $effect(() => { const key = loadedKey === boardKey ? boardKey : null, signature = suggestSig; untrack(() => suggestWatch.observe(key, signature)); });
   let opening = $state(false); let moving = $state(false); let deleting = $state(false);
   /**
    * A held card, before and during its drag. Owned by one pointer: every
@@ -715,7 +722,7 @@
     listeners.track(stopClock);
     listeners.track(bindForegroundChanges(document, typeof window === "undefined" ? null : window, onForeground));
     return () => {
-      disposed = true; revision++; unreadRevision++; initializationRevision++; openingRevision++; pendingUpdate?.stop(); clearTimeout(refreshTimer); clearTimeout(undoTimer); clearTimeout(skipClickTimer); dropFrame.cancel(); listeners.dispose();
+      disposed = true; suggestWatch.reset(); revision++; unreadRevision++; initializationRevision++; openingRevision++; pendingUpdate?.stop(); clearTimeout(refreshTimer); clearTimeout(undoTimer); clearTimeout(skipClickTimer); dropFrame.cancel(); listeners.dispose();
       // Leaving the board ends the undo window rather than dropping it: the
       // reader saw these tasks go, so they go.
       if (pendingDelete && !pendingDelete.running) void commitPendingDelete();
@@ -1062,7 +1069,8 @@
   }
   function toggleSuggest() {
     showSuggest = !showSuggest;
-    if (showSuggest && !suggestion && !suggestLoading) void askSuggest();
+    // Always ask on opening: a kept answer ranks tasks as they were when it was asked.
+    if (showSuggest && !suggestLoading) void askSuggest();
   }
   async function openTask(id: string) {
     if (session?.tabId === id && session.value) return;
