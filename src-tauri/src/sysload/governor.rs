@@ -651,8 +651,7 @@ impl GovernorPulse {
 /// Stop, kill, cancel, save, commit, release and reconcile are deliberately
 /// not here, so no pressure can refuse them; `tests::the_never_gated_verbs_have_no_site`
 /// holds that, and `tests/governor_sites.rs` holds the call sites to this list.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Site {
     /// Before a launch's checkout probes (`git rev-parse` and friends).
     CheckoutProbe,
