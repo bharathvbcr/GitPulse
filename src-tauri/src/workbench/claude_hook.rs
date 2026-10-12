@@ -18,9 +18,14 @@
 //!   other", so an injected `hooks` key adds to the user's hooks.
 //! * "If you define the same handler in more than one settings file, it runs
 //!   once. A plugin's or skill's copy of the same handler stays separate."
-//!   So a plugin that is also enabled runs the hook a second time, and the
-//!   duplicate cannot be left to Claude Code. [`decide`] therefore skips the
-//!   injection when the configuration the launch will use enables the plugin.
+//!   So a session whose configuration also enables the plugin runs the hook
+//!   twice. That configuration cannot be known here: a shell wrapper may set
+//!   `CLAUDE_CONFIG_DIR` after GitPulse hands over the command line, and a
+//!   guess that the plugin is enabled leaves the session ungated — the very
+//!   case this exists for. So the hook always goes on, and the hook itself
+//!   makes the second run harmless: every check is a read, both copies reach
+//!   the same decision, and an identical warning for one call is said once
+//!   (`hooks::advisory_once`).
 //!
 //! The hook entries are not written out a second time here: they are the
 //! plugin manifest's own `PreToolUse` entries with the bare `gitpulse-hook`
@@ -29,7 +34,6 @@
 //! mistyped path in settings leaves the gate silently disabled, which is why
 //! a missing binary is reported rather than injected.
 
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use serde_json::{json, Map, Value};
@@ -49,9 +53,6 @@ const HOOK_NAME: &str = "gitpulse-hook";
 pub(crate) enum HookInjection {
     /// Put the hook on this launch, run from this binary.
     Inject(PathBuf),
-    /// The configuration this launch uses already enables the plugin, which
-    /// runs the hook; injecting it too would run it twice.
-    PluginEnabled,
     /// The provider takes no hooks.
     NotApplicable,
     /// The binary could not be found. The launch goes ahead without the hook
@@ -66,97 +67,6 @@ impl HookInjection {
             Self::Inject(path) => Some(path),
             _ => None,
         }
-    }
-}
-
-/// Whether `settings` (a parsed `settings.json`) enables a GitPulse plugin.
-/// `Some(false)` is an explicit disable, which a higher-precedence scope
-/// uses to switch off what a lower one enabled.
-fn plugin_flag(settings: &Value) -> Option<bool> {
-    let enabled = settings.get("enabledPlugins")?.as_object()?;
-    let mut found = None;
-    for (name, value) in enabled {
-        if name.split('@').next() == Some("gitpulse") && name.contains('@') {
-            match value.as_bool() {
-                Some(true) => return Some(true),
-                Some(false) => found = Some(false),
-                None => {}
-            }
-        }
-    }
-    found
-}
-
-fn read_settings(path: &Path) -> Option<Value> {
-    let text = std::fs::read_to_string(path).ok()?;
-    serde_json::from_str(&text).ok()
-}
-
-/// Whether the plugin is enabled for a launch.
-///
-/// Reads the scopes Claude Code merges for a session — user (`config_dir`),
-/// project and project-local (`project_dir/.claude`) — in increasing
-/// precedence, so a project that disables what the user enabled is honoured.
-/// `sources` is the user's `--setting-sources` narrowing: a scope it leaves
-/// out is not loaded by the launch, so it cannot enable anything.
-///
-/// A file that is absent, unreadable or not JSON enables nothing. The cost of
-/// that reading is a hook that runs twice, never a gate that does not run.
-fn plugin_enabled(
-    config_dir: Option<&Path>,
-    project_dir: Option<&Path>,
-    sources: Option<&str>,
-) -> bool {
-    let loads = |scope: &str| {
-        sources.is_none_or(|list| list.split(',').any(|source| source.trim() == scope))
-    };
-    let mut enabled = false;
-    let mut scopes: Vec<(&str, Option<PathBuf>)> = vec![
-        ("user", config_dir.map(|dir| dir.join("settings.json"))),
-        (
-            "project",
-            project_dir.map(|dir| dir.join(".claude").join("settings.json")),
-        ),
-        (
-            "local",
-            project_dir.map(|dir| dir.join(".claude").join("settings.local.json")),
-        ),
-    ];
-    for (scope, path) in scopes.drain(..) {
-        if !loads(scope) {
-            continue;
-        }
-        if let Some(flag) = path
-            .as_deref()
-            .and_then(read_settings)
-            .as_ref()
-            .and_then(plugin_flag)
-        {
-            enabled = flag;
-        }
-    }
-    enabled
-}
-
-/// The configuration directory a Claude Code launch will use:
-/// `CLAUDE_CONFIG_DIR` from the launch's own environment, else the app's,
-/// else `~/.claude`. A relative value is Claude Code's to resolve against its
-/// working directory, so it is resolved against `cwd` here; with no `cwd` it
-/// cannot be placed and the answer is `None`.
-pub(crate) fn effective_config_dir(
-    launch_env: Option<&HashMap<String, String>>,
-    process_dir: Option<PathBuf>,
-    cwd: Option<&Path>,
-) -> Option<PathBuf> {
-    let explicit = launch_env
-        .and_then(|env| env.get("CLAUDE_CONFIG_DIR"))
-        .filter(|dir| !dir.is_empty())
-        .map(PathBuf::from);
-    let dir = explicit.or(process_dir)?;
-    if dir.is_absolute() {
-        Some(dir)
-    } else {
-        cwd.map(|cwd| cwd.join(dir))
     }
 }
 
@@ -208,48 +118,28 @@ pub(crate) fn resolve_binary(
     }
 }
 
-/// The pure decision: what a launch with this configuration does.
-pub(crate) fn decide(
-    config_dir: Option<&Path>,
-    project_dir: Option<&Path>,
-    sources: Option<&str>,
-    binary: Result<PathBuf, String>,
-) -> HookInjection {
-    if plugin_enabled(config_dir, project_dir, sources) {
-        return HookInjection::PluginEnabled;
-    }
+/// The pure decision: inject the binary that was found, or say why not.
+pub(crate) fn decide(binary: Result<PathBuf, String>) -> HookInjection {
     match binary {
         Ok(path) => HookInjection::Inject(path),
         Err(reason) => HookInjection::BinaryMissing(reason),
     }
 }
 
-/// What `provider`'s launch in `cwd` does about the hook, read from the
-/// environment. Only Claude Code takes hooks.
+/// What `provider`'s launch does about the hook. Only Claude Code takes
+/// hooks.
 ///
 /// A missing binary is logged here, once per launch, because nothing else
 /// will say so: the launch proceeds and the agent runs ungated.
-pub(crate) fn for_launch(
-    provider: &str,
-    launch_env: Option<&HashMap<String, String>>,
-    cwd: Option<&Path>,
-    sources: Option<&str>,
-) -> HookInjection {
+pub(crate) fn for_launch(provider: &str) -> HookInjection {
     if provider != "claude" {
         return HookInjection::NotApplicable;
     }
-    let process_dir = super::conversation::claude_home();
-    let config_dir = effective_config_dir(launch_env, process_dir, cwd);
     let explicit = std::env::var_os("GITPULSE_HOOK_PATH")
         .filter(|path| !path.is_empty())
         .map(PathBuf::from);
     let exe = std::env::current_exe().ok();
-    let decision = decide(
-        config_dir.as_deref(),
-        cwd,
-        sources,
-        resolve_binary(explicit.as_deref(), exe.as_deref()),
-    );
+    let decision = decide(resolve_binary(explicit.as_deref(), exe.as_deref()));
     if let HookInjection::BinaryMissing(reason) = &decision {
         log::warn!(
             target: "workbench",
@@ -354,158 +244,36 @@ mod tests {
         std::fs::write(path, text).unwrap();
     }
 
-    const ENABLED: &str = r#"{"enabledPlugins":{"gitpulse@gitpulse":true}}"#;
-
     fn hook() -> Result<PathBuf, String> {
         Ok(PathBuf::from(
             "/Applications/GitPulse.app/Contents/MacOS/gitpulse-hook",
         ))
     }
 
+    /// The incident case: the seat a wrapper picks may not enable the
+    /// plugin even when every configuration GitPulse can see does. So the
+    /// launch entry point reads no configuration at all: given the binary, a
+    /// claude launch is injected.
     #[test]
-    fn a_config_dir_without_the_plugin_gets_the_hook() {
-        let dir = temp("without");
-        write(
-            &dir,
-            "settings.json",
-            r#"{"enabledPlugins":{"other@x":true}}"#,
-        );
-        assert_eq!(
-            decide(Some(&dir), None, None, hook()),
-            HookInjection::Inject(hook().unwrap())
-        );
-    }
-
-    #[test]
-    fn a_config_dir_with_the_plugin_enabled_is_not_injected_twice() {
-        let dir = temp("with");
-        write(&dir, "settings.json", ENABLED);
-        assert_eq!(
-            decide(Some(&dir), None, None, hook()),
-            HookInjection::PluginEnabled
-        );
-    }
-
-    #[test]
-    fn a_plugin_listed_but_disabled_is_injected() {
-        let dir = temp("disabled");
-        write(
-            &dir,
-            "settings.json",
-            r#"{"enabledPlugins":{"gitpulse@gitpulse":false}}"#,
-        );
-        assert!(matches!(
-            decide(Some(&dir), None, None, hook()),
-            HookInjection::Inject(_)
-        ));
-    }
-
-    #[test]
-    fn the_plugin_under_any_marketplace_name_counts() {
-        let dir = temp("marketplace");
-        write(
-            &dir,
-            "settings.json",
-            r#"{"enabledPlugins":{"gitpulse@elsewhere":true}}"#,
-        );
-        assert_eq!(
-            decide(Some(&dir), None, None, hook()),
-            HookInjection::PluginEnabled
-        );
-    }
-
-    #[test]
-    fn a_similarly_named_plugin_does_not_count() {
-        let dir = temp("lookalike");
-        write(
-            &dir,
-            "settings.json",
-            r#"{"enabledPlugins":{"gitpulse-extras@x":true,"gitpulse":true}}"#,
-        );
-        assert!(matches!(
-            decide(Some(&dir), None, None, hook()),
-            HookInjection::Inject(_)
-        ));
-    }
-
-    #[test]
-    fn a_missing_nonexistent_or_malformed_settings_file_is_injected() {
-        let missing = temp("no-file");
-        assert!(matches!(
-            decide(Some(&missing), None, None, hook()),
-            HookInjection::Inject(_)
-        ));
-        let nonexistent = missing.join("never-created");
-        assert!(matches!(
-            decide(Some(&nonexistent), None, None, hook()),
-            HookInjection::Inject(_)
-        ));
-        assert!(matches!(
-            decide(None, None, None, hook()),
-            HookInjection::Inject(_)
-        ));
-        let malformed = temp("malformed");
-        write(&malformed, "settings.json", "{ not json");
-        assert!(matches!(
-            decide(Some(&malformed), None, None, hook()),
-            HookInjection::Inject(_)
-        ));
-        let wrong_shape = temp("wrong-shape");
-        write(
-            &wrong_shape,
-            "settings.json",
-            r#"{"enabledPlugins":["gitpulse@gitpulse"]}"#,
-        );
-        assert!(matches!(
-            decide(Some(&wrong_shape), None, None, hook()),
-            HookInjection::Inject(_)
-        ));
-    }
-
-    #[test]
-    fn a_project_scope_can_enable_or_disable_what_the_user_set() {
-        let user = temp("scope-user");
-        let project = temp("scope-project");
-        write(&project, ".claude/settings.json", ENABLED);
-        assert_eq!(
-            decide(Some(&user), Some(&project), None, hook()),
-            HookInjection::PluginEnabled
-        );
-        write(&user, "settings.json", ENABLED);
-        write(
-            &project,
-            ".claude/settings.local.json",
-            r#"{"enabledPlugins":{"gitpulse@gitpulse":false}}"#,
-        );
-        assert!(matches!(
-            decide(Some(&user), Some(&project), None, hook()),
-            HookInjection::Inject(_)
-        ));
-    }
-
-    #[test]
-    fn a_scope_the_setting_sources_leave_out_is_not_read() {
-        let user = temp("sources-user");
-        write(&user, "settings.json", ENABLED);
-        assert!(matches!(
-            decide(Some(&user), None, Some("project,local"), hook()),
-            HookInjection::Inject(_)
-        ));
-        assert_eq!(
-            decide(Some(&user), None, Some("user, project"), hook()),
-            HookInjection::PluginEnabled
-        );
+    fn every_claude_launch_is_injected_when_the_binary_is_there() {
+        let dir = temp("launch");
+        let binary = dir.join("gitpulse-hook");
+        write(&dir, "gitpulse-hook", "#!/bin/sh\n");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        // Only `for_launch` reads this variable.
+        std::env::set_var("GITPULSE_HOOK_PATH", &binary);
+        let decision = for_launch("claude");
+        std::env::remove_var("GITPULSE_HOOK_PATH");
+        assert_eq!(decision, HookInjection::Inject(binary));
     }
 
     #[test]
     fn a_missing_binary_is_reported_not_injected() {
-        let dir = temp("no-binary");
-        let decision = decide(
-            Some(&dir),
-            None,
-            None,
-            Err("gitpulse-hook is not at /x".into()),
-        );
+        let decision = decide(Err("gitpulse-hook is not at /x".into()));
         assert_eq!(
             decision,
             HookInjection::BinaryMissing("gitpulse-hook is not at /x".into())
@@ -513,41 +281,31 @@ mod tests {
         assert!(decision.binary().is_none());
     }
 
+    /// Lockstep with the hook: the subcommands injected here are exactly the
+    /// ones the hook deduplicates advisories for. One injected but not
+    /// deduplicated would print every warning twice; one deduplicated but not
+    /// injected is dead.
     #[test]
-    fn an_enabled_plugin_wins_over_a_missing_binary() {
-        let dir = temp("plugin-no-binary");
-        write(&dir, "settings.json", ENABLED);
-        assert_eq!(
-            decide(Some(&dir), None, None, Err("missing".into())),
-            HookInjection::PluginEnabled
-        );
-    }
-
-    #[test]
-    fn the_config_dir_comes_from_the_launch_env_then_the_process_then_home() {
-        let env: HashMap<String, String> =
-            [("CLAUDE_CONFIG_DIR".to_owned(), "/seat".to_owned())].into();
-        let home = Some(PathBuf::from("/home/.claude"));
-        assert_eq!(
-            effective_config_dir(Some(&env), home.clone(), None),
-            Some(PathBuf::from("/seat"))
-        );
-        assert_eq!(effective_config_dir(None, home.clone(), None), home);
-        let empty: HashMap<String, String> =
-            [("CLAUDE_CONFIG_DIR".to_owned(), String::new())].into();
-        assert_eq!(effective_config_dir(Some(&empty), home.clone(), None), home);
-        assert_eq!(effective_config_dir(None, None, None), None);
-    }
-
-    #[test]
-    fn a_relative_config_dir_is_placed_by_the_working_directory_or_not_at_all() {
-        let env: HashMap<String, String> =
-            [("CLAUDE_CONFIG_DIR".to_owned(), "seat".to_owned())].into();
-        assert_eq!(
-            effective_config_dir(Some(&env), None, Some(Path::new("/work/repo"))),
-            Some(PathBuf::from("/work/repo/seat"))
-        );
-        assert_eq!(effective_config_dir(Some(&env), None, None), None);
+    fn the_injected_subcommands_are_the_ones_the_hook_deduplicates() {
+        let hooks = settings_hooks(&hook().unwrap()).unwrap();
+        let mut injected: Vec<String> = hooks
+            .as_object()
+            .unwrap()
+            .values()
+            .flat_map(|groups| groups.as_array().unwrap().clone())
+            .flat_map(|group| group["hooks"].as_array().unwrap().clone())
+            .map(|hook| {
+                let command = hook["command"].as_str().unwrap().to_owned();
+                command.rsplit(' ').next().unwrap().to_owned()
+            })
+            .collect();
+        injected.sort();
+        let mut deduped: Vec<String> = crate::hooks::INJECTED_SUBCOMMANDS
+            .iter()
+            .map(|s| (*s).to_owned())
+            .collect();
+        deduped.sort();
+        assert_eq!(injected, deduped);
     }
 
     #[test]
@@ -641,9 +399,6 @@ mod tests {
 
     #[test]
     fn other_providers_are_never_injected() {
-        assert_eq!(
-            for_launch("codex", None, None, None),
-            HookInjection::NotApplicable
-        );
+        assert_eq!(for_launch("codex"), HookInjection::NotApplicable);
     }
 }

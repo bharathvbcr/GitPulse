@@ -37,15 +37,10 @@ pub async fn cmd_terminal_spawn(
     // land in front of them: policy, launch flags, then the caller's prompt.
     let defaults = crate::tool_config::agent_defaults();
     let sources = defaults.claude_setting_sources_arg();
-    // Before the flags: the hook goes on the launch only where the
-    // configuration it will use does not already run it from the plugin.
+    // Before the flags: the hook goes on every claude launch, plugin or not
+    // (`workbench::claude_hook`).
     let hook = match program.as_deref() {
-        Some(provider) => crate::workbench::claude_hook::for_launch(
-            provider.trim(),
-            env.as_ref(),
-            Some(std::path::Path::new(&repo_path)),
-            sources.as_deref(),
-        ),
+        Some(provider) => crate::workbench::claude_hook::for_launch(provider.trim()),
         None => crate::workbench::claude_hook::HookInjection::NotApplicable,
     };
     let args = crate::workbench::terminal_command::apply_permission_mode(

@@ -114,6 +114,14 @@ fn decide() {
     let argument = std::env::args().nth(2);
     match hooks::dispatch(&subcommand, argument.as_deref(), &input) {
         Ok(output) => {
+            // GitPulse injects the PreToolUse gates into every session it
+            // launches, so a session that also enables the plugin runs them
+            // twice. Decisions are left alone; an identical warning is said once.
+            let output = if hooks::INJECTED_SUBCOMMANDS.contains(&subcommand.as_str()) {
+                hooks::advisory_once::dedupe(&subcommand, &input, output)
+            } else {
+                output
+            };
             if let Some(json) = output.render_for_host(input.is_cursor) {
                 emit(format!("{json}\n"));
             }
