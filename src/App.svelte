@@ -17,6 +17,7 @@
   import { filterStore } from "./lib/stores/filterStore";
   import { interfaceStore } from "./lib/stores/interfaceStore";
   import { toastStore } from "./lib/stores/toastStore";
+  import { watchIncidents } from "./lib/terminal/incidentWatch";
   import { preflightProblem } from "./lib/repos/gitPreflight";
   import { harnessStore } from "./lib/stores/harnessStore";
   import { applyPlatformClass, isMacOS, isTauri } from "./lib/platform";
@@ -764,6 +765,13 @@
       },
       [...$repoStore.recentRepos],
       shellHandlers,
+    );
+
+    // Sessions ended together by one external signal: say what ended them and
+    // offer to resume their Claude conversations.
+    void watchIncidents(listen).then(
+      (unlisten) => track(unlisten),
+      (error) => diagnostics.warn("boot:terminal-incident", error),
     );
 
     // Build progress. A cold index of a large repository is several minutes of

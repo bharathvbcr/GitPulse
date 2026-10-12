@@ -89,6 +89,7 @@
   import { ptyBus } from "../terminal/ptyBus.tauri";
   import { launcherLabel, type LauncherKind, type ResumeLaunch } from "../terminal/tabs";
   import { agentPromptArgs } from "../terminal/launchRequests";
+  import { hostedClaude, resumers, withSessionId } from "../terminal/hostedClaude";
   import {
     effectiveMode,
     PERMISSION_LABELS,
@@ -573,6 +574,39 @@
     return effectiveMode(view.defaults, launcher, view.launchers);
   }
 
+  /**
+   * The Claude Code conversation this tab's process runs, when it is one
+   * GitPulse can name: a fresh launch carries a `--session-id` GitPulse chose,
+   * a resumed one the id it resumes. Null for a shell, a task attempt (whose
+   * id the backend assigns) and a `--continue` launch.
+   */
+  let hostedId: string | null = null;
+  /** Set to relaunch the conversation a signal ended; consumed by the next spawn. */
+  let resumeOverride: string | null = null;
+  /** The conversation a signal ended in this tab, which Resume relaunches. */
+  let resumeOffer = $state<string | null>(null);
+  /** The dead PTY the offer was registered under for an incident's "Resume N". */
+  let offerTerminal: string | null = null;
+
+  function withdrawOffer() {
+    if (offerTerminal) resumers.unregister(offerTerminal);
+    offerTerminal = null;
+    resumeOffer = null;
+  }
+
+  /**
+   * Relaunches the conversation a signal ended, in this tab: the same
+   * directory and permission mode (this tab's own, read once at mount), by
+   * the same `--resume <id>` launch a resumed attempt uses.
+   */
+  async function resumeEnded() {
+    const id = resumeOffer;
+    if (!id || disposed) return;
+    withdrawOffer();
+    resumeOverride = id;
+    await lifecycle?.restart();
+  }
+
   /** The session this tab is still to take over, until its first start. */
   let attachPending: string | null = untrack(() => attachSessionId ?? null);
 
@@ -591,6 +625,21 @@
           // `null` on the wire and the backend's u16 refuses the spawn.
           const { rows, cols } = spawnGridSize(fitAddon?.proposeDimensions(), hasRenderedBox(container));
           const cfg = launcherConfig(launcher);
+          // A conversation GitPulse can name is one it can resume. Every
+          // fresh Claude launch is given an id, a task attempt excepted: its
+          // run id is already its session id, assigned by the backend.
+          const resumeId = resumeOverride;
+          resumeOverride = null;
+          hostedId = null;
+          if (launcher === "claude" && !taskRunId) {
+            const hosted = withSessionId(resumeId ? ["--resume", resumeId] : cfg.args);
+            cfg.args = hosted.args;
+            hostedId = hosted.sessionId;
+            if (hostedId) hostedClaude.begin({
+              sessionId: hostedId, repoPath: workPath, startDir: startDir ?? null,
+              mode: permissionMode, startedAt: Date.now(),
+            });
+          }
           // Once: a later restart of this tab starts a fresh process the
           // ordinary way, because the session it took over has ended.
           if (attachPending) {
@@ -638,6 +687,7 @@
       hooks: {
         state(status, message) {
           spawning = status === "starting";
+          if (spawning) withdrawOffer();
           exited = status === "exited";
           error = status === "error" ? message ?? "Terminal failed" : null;
           onStatus(status);
@@ -652,6 +702,7 @@
           // left behind it pushes the live one out of the bounded report.
           if (nativeSessionId && nativeSessionId !== spawned.id) { terminalAttendance.forget(nativeSessionId); sessionActivity.forget(nativeSessionId); }
           nativeSessionId = spawned.id;
+          if (hostedId) hostedClaude.bind(hostedId, spawned.id);
           terminalAttendance.report(nativeSessionId, onscreen);
           startedIn = spawned.cwd;
           // A session taken over after a reload was already recorded as
@@ -690,6 +741,17 @@
           }
         },
         exit(event) {
+          // A signal that was not this app's own close (which never reaches
+          // here) is an external kill: the conversation is intact on disk and
+          // this tab offers to pick it back up.
+          if (hostedId) {
+            hostedClaude.ended(hostedId, event.signal || null);
+            if (event.signal) {
+              resumeOffer = hostedId;
+              offerTerminal = event.id;
+              resumers.register(event.id, resumeEnded);
+            }
+          }
           const why = event.error || event.signal || (event.exit_code === null ? "exited" : `exit ${event.exit_code}`);
           term?.writeln(`\r\n\u001b[2m[session closed — ${why}]\u001b[0m`);
         },
@@ -1099,6 +1161,9 @@
       for (const timer of armTimers) clearTimeout(timer);
       armTimers.clear();
       disposed = true;
+      // Closing the tab is the reader's own end of it, not an incident.
+      withdrawOffer();
+      if (hostedId) hostedClaude.forget(hostedId);
       for (const owed of credit.releaseAll()) acknowledgeOutput(owed.sessionId, owed.bytes);
       // Before `lifecycle` goes: nothing owed waits for a frame this view
       // will not see, and a failure is still reported against the session.
@@ -1271,12 +1336,17 @@
           <RotateCw size={12} /> {taskRunId ? "Reconnect attempt" : "Retry"}
         </button>
       {:else if exited}
-        <span class="text-textMuted flex-1 text-[11px]">This session ended.</span>
+        <span class="text-textMuted flex-1 text-[11px]">{resumeOffer ? "This session was ended by a signal." : "This session ended."}</span>
         {#if linkedRunId}
           <!-- The task details are where a new attempt starts, so the way
                there is here rather than only named in a tooltip. -->
           <button type="button" class="gp-btn py-1! text-[11px]!" data-testid="terminal-open-task" onclick={() => void openOwnTask()}>
             Open task
+          </button>
+        {/if}
+        {#if resumeOffer}
+          <button type="button" class="gp-btn py-1! text-[11px]!" data-testid="terminal-resume-claude" onclick={() => void resumeEnded()} title="Relaunch this Claude Code conversation with --resume, in the same directory and permission mode">
+            <RotateCw size={12} /> Resume
           </button>
         {/if}
         <button type="button" class="gp-btn py-1! text-[11px]!" onclick={restart} disabled={!!taskRunId} title={taskRunId ? "Launch a new attempt from the task details." : "Restart this terminal"}>
