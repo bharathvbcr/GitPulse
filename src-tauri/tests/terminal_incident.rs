@@ -24,8 +24,17 @@ fn repo() -> tempfile::TempDir {
     dir
 }
 
+/// Open descriptors a session could leak: PTYs, pipes and sockets. Regular
+/// files are left out: the ledger's SQLite connection (database, -wal, -shm)
+/// is opened once per process on the spawn-record thread, which can land
+/// after the baseline under load and read as three leaked descriptors.
 fn open_fds() -> usize {
-    std::fs::read_dir("/dev/fd").map_or(0, Iterator::count)
+    std::fs::read_dir("/dev/fd").map_or(0, |entries| {
+        entries
+            .flatten()
+            .filter(|entry| !std::fs::metadata(entry.path()).is_ok_and(|meta| meta.is_file()))
+            .count()
+    })
 }
 
 fn read_pid(path: &std::path::Path) -> i32 {
