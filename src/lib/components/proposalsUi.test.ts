@@ -93,6 +93,17 @@ describe("TaskRefine renders", () => {
   it("unsaved edits disable asking", () => {
     expect(render(TaskRefine, { props: { task, repositoryPath: "/r", disabled: true, onApplied: () => {} } }).body).toMatch(/data-testid="task-refine-ask"[^>]*disabled/);
   });
+  it("ticking a part is not an edit of the task: its input and change events stay inside the refine section", () => {
+    // TaskEditor marks the sheet dirty on any input or change that bubbles to
+    // its form, and passes `dirty` as `disabled`. A part checkbox whose change
+    // reached the form disabled Apply the moment it was ticked, so a split could
+    // never be applied from the sheet.
+    const editorForm = /<form id="task-editor-form-[\s\S]*?\n\s*>/.exec(readFileSync(join(here, "TaskEditor.svelte"), "utf8"))?.[0] ?? "";
+    expect(editorForm).toMatch(/onchange=\{\(\) => \{ dirty = true; \}\}/);
+    const root = /^<section class="refine".*$/m.exec(readFileSync(join(here, "TaskRefine.svelte"), "utf8"))?.[0] ?? "";
+    expect(root).toMatch(/oninput=\{\(event\) => event\.stopPropagation\(\)\}/);
+    expect(root).toMatch(/onchange=\{\(event\) => event\.stopPropagation\(\)\}/);
+  });
 });
 
 describe("glass that floats over content is blurred", () => {

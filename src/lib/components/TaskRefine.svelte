@@ -113,7 +113,9 @@
 
 </script>
 
-<section class="refine" aria-label="Refine this task" data-testid="task-refine">
+<!-- The part checkboxes choose what to apply; they are not the task's fields. TaskEditor marks
+     its sheet dirty on any input or change reaching its form, and dirty disables Apply. -->
+<section class="refine" aria-label="Refine this task" data-testid="task-refine" oninput={(event) => event.stopPropagation()} onchange={(event) => event.stopPropagation()}>
   <div class="bar">
     <button type="button" class="gp-btn" data-testid="task-refine-ask" disabled={!task || asking || disabled} onclick={ask}>
       <Sparkles size={14} aria-hidden="true" /> {asking ? "Asking Manvi…" : "Suggest refinements"}
