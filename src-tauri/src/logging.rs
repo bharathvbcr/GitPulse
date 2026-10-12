@@ -120,12 +120,68 @@ struct SinkState {
     /// Bytes written to the live generation, for the rotation bound.
     bytes: u64,
     degraded: Option<String>,
-    /// Opening, writing or rotating failed in a way retrying would not fix, so
-    /// the disk mirror stays off. Contention on the generation lock is not
-    /// this: it drops the one line that met it (`dropped`) and nothing more.
+    /// The disk mirror is off for good: rotation failed (the existing record
+    /// is preserved, never truncated through a possibly substituted link), or
+    /// opening/writing failed [`MAX_CONSECUTIVE_FAILURES`] times running.
+    /// Contention on the generation lock is not this: it drops the one line
+    /// that met it (`dropped`) and nothing more.
     retired: bool,
-    /// Lines dropped because the generation lock stayed busy past its wait.
+    /// Lines dropped because the generation lock stayed busy, or the disk
+    /// refused the write, or the sink was backing off from a refusal.
     dropped: u64,
+    /// Opens or writes that failed since the last one that succeeded.
+    failures: u32,
+    /// While set and in the future, lines are dropped without touching the
+    /// disk: a full or failing disk is not hammered once per log line.
+    retry_at: Option<std::time::Instant>,
+    /// What the last failure was, so lines dropped while backing off still
+    /// report why.
+    cause: String,
+    /// Next writes that fail as if the disk refused them.
+    #[cfg(test)]
+    inject_write_errors: u32,
+}
+
+/// Consecutive open/write failures after which the sink is retired. A
+/// transient ENOSPC or EIO clears within the backoff ladder; one that outlasts
+/// it (about two minutes at [`WRITE_BACKOFF_CAP`]) is a persistent condition.
+const MAX_CONSECUTIVE_FAILURES: u32 = 8;
+const WRITE_BACKOFF_BASE: std::time::Duration = std::time::Duration::from_millis(250);
+const WRITE_BACKOFF_CAP: std::time::Duration = std::time::Duration::from_secs(30);
+
+impl SinkState {
+    /// Records that this line could not reach the disk. The line is dropped
+    /// and counted; the next attempt waits out an exponential backoff, and
+    /// only a run of [`MAX_CONSECUTIVE_FAILURES`] retires the sink.
+    fn note_failure(&mut self, cause: String) {
+        self.file = None;
+        self.dropped = self.dropped.saturating_add(1);
+        self.failures = self.failures.saturating_add(1);
+        self.cause = cause;
+        if self.failures >= MAX_CONSECUTIVE_FAILURES {
+            self.retired = true;
+            self.retry_at = None;
+            self.degraded = Some(format!(
+                "{}; disk log disabled after {} consecutive failures; {} log line(s) dropped",
+                self.cause, self.failures, self.dropped
+            ));
+            return;
+        }
+        let shift = (self.failures - 1).min(16);
+        let wait = WRITE_BACKOFF_BASE
+            .saturating_mul(1u32 << shift)
+            .min(WRITE_BACKOFF_CAP);
+        self.retry_at = Some(std::time::Instant::now() + wait);
+        self.degraded = Some(format!(
+            "{}; {} log line(s) dropped",
+            self.cause, self.dropped
+        ));
+    }
+
+    fn note_success(&mut self) {
+        self.failures = 0;
+        self.retry_at = None;
+    }
 }
 
 /// Append-only mirror of the ring, on disk.
@@ -184,6 +240,11 @@ impl FileSink {
                 degraded: None,
                 retired: false,
                 dropped: 0,
+                failures: 0,
+                retry_at: None,
+                cause: String::new(),
+                #[cfg(test)]
+                inject_write_errors: 0,
             }),
             release_error: Mutex::new(None),
         };
@@ -215,13 +276,32 @@ impl FileSink {
         // production callers arrive through RingLogger, but the invariant is
         // about bytes on disk, not about remembering a particular call path.
         let line = safe_log_line(line);
-        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-        if state.retired {
-            return;
+        {
+            let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+            if state.retired {
+                return;
+            }
+            if state
+                .retry_at
+                .is_some_and(|t| std::time::Instant::now() < t)
+            {
+                state.dropped = state.dropped.saturating_add(1);
+                state.degraded = Some(format!(
+                    "{}; {} log line(s) dropped",
+                    state.cause, state.dropped
+                ));
+                return;
+            }
         }
         // All cooperating processes lock the same stable sidecar, not the
-        // file being renamed. The guard explicitly releases the OS lock.
-        let _generation = match self.generation_lock() {
+        // file being renamed. The guard explicitly releases the OS lock. It is
+        // taken before the state mutex and without it: the wait can spin for
+        // up to `GENERATION_LOCK_WAIT`, and no other writer or reader should
+        // queue on the state mutex behind that. `tail` takes them in the same
+        // order.
+        let generation = self.generation_lock();
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        let _generation = match generation {
             Ok(lock) => lock,
             Err(error) => {
                 // One busy lock costs this line, not the sink: the next write
@@ -231,6 +311,9 @@ impl FileSink {
                 return;
             }
         };
+        if state.retired {
+            return;
+        }
         // Another logger may have appended or rotated since our last entry.
         // Reopen under the lock so neither byte counts nor inodes go stale.
         state.file = None;
@@ -240,8 +323,7 @@ impl FileSink {
                 state.bytes = bytes;
             }
             Err(error) => {
-                state.degraded = Some(error);
-                state.retired = true;
+                state.note_failure(error);
                 return;
             }
         }
@@ -291,15 +373,29 @@ impl FileSink {
         let Some(file) = state.file.as_mut() else {
             return;
         };
-        match writeln!(file, "{line}") {
+        #[cfg(test)]
+        let injected = std::mem::take(&mut state.inject_write_errors)
+            .checked_sub(1)
+            .map(|left| {
+                state.inject_write_errors = left;
+                std::io::Error::other("injected: no space left on device")
+            });
+        #[cfg(not(test))]
+        let injected: Option<std::io::Error> = None;
+        let written = match injected {
+            Some(error) => Err(error),
+            None => writeln!(file, "{line}"),
+        };
+        match written {
             // `File` is unbuffered, so a successful write is already on the
             // way to disk; there is no flush left to miss on the way out.
-            Ok(()) => state.bytes += line.len() as u64 + 1,
-            Err(e) => {
-                state.degraded = Some(format!("write failed: {e}"));
-                state.file = None;
-                state.retired = true;
+            Ok(()) => {
+                state.bytes += line.len() as u64 + 1;
+                state.note_success();
             }
+            // A full or failing disk is usually transient: this line is
+            // dropped and counted, not the sink.
+            Err(e) => state.note_failure(format!("write failed: {e}")),
         }
     }
 
@@ -335,8 +431,9 @@ impl FileSink {
         // Keep the sink lock across both reads. Otherwise a writer can rotate
         // `current` into `previous` between them and make a whole generation
         // disappear from an apparently complete response.
+        let generation = self.generation_lock();
         let state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-        let _generation = match self.generation_lock() {
+        let _generation = match generation {
             Ok(lock) => lock,
             Err(error) => {
                 return PersistedLog {
@@ -1828,6 +1925,106 @@ mod tests {
             .lines
             .iter()
             .any(|line| line.contains("accepted after transient contention")));
+    }
+
+    fn lines_of(sink: &FileSink) -> Vec<String> {
+        sink.tail(50).lines
+    }
+
+    #[test]
+    fn a_transient_write_error_drops_the_line_and_the_sink_recovers() {
+        let dir = tempfile::tempdir().unwrap();
+        let sink = FileSink::open_in(dir.path(), "gitpulse");
+        sink.state.lock().unwrap().inject_write_errors = 1;
+        sink.write_line("lost to a full disk");
+        {
+            let state = sink.state.lock().unwrap();
+            assert!(!state.retired, "one write error must not retire the sink");
+            assert!(state.retry_at.is_some(), "the next attempt backs off");
+        }
+        // Inside the backoff the disk is not touched at all.
+        sink.write_line("dropped while backing off");
+        let degraded = sink.tail(10).degraded.unwrap();
+        assert!(degraded.contains("write failed"), "{degraded}");
+        assert!(degraded.contains("2 log line(s) dropped"), "{degraded}");
+        // Time passes.
+        sink.state.lock().unwrap().retry_at = None;
+        sink.write_line("lands after recovery");
+        let lines = lines_of(&sink);
+        assert!(lines.iter().any(|l| l.contains("lands after recovery")));
+        assert!(!lines.iter().any(|l| l.contains("lost to a full disk")));
+        assert!(!lines
+            .iter()
+            .any(|l| l.contains("dropped while backing off")));
+        let state = sink.state.lock().unwrap();
+        assert_eq!((state.failures, state.retry_at.is_none()), (0, true));
+    }
+
+    #[test]
+    fn a_persistent_write_failure_retires_the_sink_after_bounded_attempts() {
+        let dir = tempfile::tempdir().unwrap();
+        let sink = FileSink::open_in(dir.path(), "gitpulse");
+        for attempt in 1..=MAX_CONSECUTIVE_FAILURES {
+            {
+                let mut state = sink.state.lock().unwrap();
+                assert!(!state.retired, "retired early, before attempt {attempt}");
+                state.inject_write_errors = 1;
+                state.retry_at = None;
+            }
+            sink.write_line("refused");
+        }
+        let state = sink.state.lock().unwrap();
+        assert!(state.retired);
+        assert!(state
+            .degraded
+            .as_deref()
+            .unwrap()
+            .contains("disk log disabled after"));
+    }
+
+    #[test]
+    fn the_backoff_grows_and_is_capped() {
+        let mut state = SinkState {
+            file: None,
+            bytes: 0,
+            degraded: None,
+            retired: false,
+            dropped: 0,
+            failures: 0,
+            retry_at: None,
+            cause: String::new(),
+            inject_write_errors: 0,
+        };
+        let mut waits = Vec::new();
+        for _ in 1..MAX_CONSECUTIVE_FAILURES {
+            let before = std::time::Instant::now();
+            state.note_failure("EIO".into());
+            waits.push(state.retry_at.unwrap() - before);
+        }
+        assert!(waits.windows(2).all(|w| w[1] >= w[0]), "{waits:?}");
+        assert!(waits
+            .iter()
+            .all(|w| *w <= WRITE_BACKOFF_CAP + std::time::Duration::from_secs(1)));
+        assert!(waits[0] >= WRITE_BACKOFF_BASE);
+    }
+
+    #[test]
+    fn waiting_for_the_generation_lock_does_not_hold_the_state_mutex() {
+        let dir = tempfile::tempdir().unwrap();
+        let sink = Arc::new(FileSink::open_in(dir.path(), "gitpulse"));
+        let held = sink.generation_lock().unwrap();
+        let writer = {
+            let sink = Arc::clone(&sink);
+            std::thread::spawn(move || sink.write_line("spins on the lock"))
+        };
+        // Let the writer reach its spin on the held lock.
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert!(
+            sink.state.try_lock().is_ok(),
+            "the state mutex was held across the lock spin"
+        );
+        drop(held);
+        writer.join().unwrap();
     }
 
     #[test]
