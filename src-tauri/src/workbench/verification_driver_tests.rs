@@ -484,3 +484,79 @@ fn a_manual_verify_after_the_claimed_worktree_was_torn_down_judges_the_repositor
         canon(repo.path().to_str().unwrap())
     );
 }
+
+/// A linked worktree with one commit of its own, claimed done and held in review.
+fn claimed_attempt(
+    store: &Store,
+    repo: &tempfile::TempDir,
+    id: &str,
+    parent: &tempfile::TempDir,
+) -> String {
+    let linked = parent.path().join("attempt");
+    let linked_str = linked.to_str().unwrap().to_owned();
+    crate::test_support::git_in(
+        repo.path(),
+        &["worktree", "add", "-q", "-b", "attempt", &linked_str],
+    );
+    crate::test_support::git_in(
+        &linked,
+        &["commit", "-q", "--allow-empty", "-m", "the attempt's work"],
+    );
+    let claimed = complete_task(store, &linked_str, id, "done", None, Some("done"), None).unwrap();
+    assert_eq!(claimed["status"], "review", "{claimed}");
+    linked_str
+}
+
+#[test]
+fn a_manual_verify_of_a_claim_whose_worktree_was_removed_unmerged_is_refused() {
+    let (_d, store, repo, id) = setup();
+    let parent = tempfile::tempdir().unwrap();
+    let linked = claimed_attempt(&store, &repo, &id, &parent);
+    // Abandoned: the worktree is deleted and its commit never reached the checkout.
+    crate::test_support::git_in(repo.path(), &["worktree", "remove", "--force", &linked]);
+    let fake = Fake::new();
+    let error =
+        run_now(&store, &fake, &id).expect_err("the checkout does not hold the claimed work");
+    assert_eq!(error.code, "repository_unavailable", "{}", error.message);
+    assert!(error.message.contains("not merged"), "{}", error.message);
+    assert!(
+        fake.starts.borrow().is_empty(),
+        "no verification may judge the checkout in its place"
+    );
+}
+
+#[test]
+fn a_manual_verify_of_a_claim_merged_and_torn_down_judges_the_checkout_that_holds_it() {
+    let (_d, store, repo, id) = setup();
+    let parent = tempfile::tempdir().unwrap();
+    let linked = claimed_attempt(&store, &repo, &id, &parent);
+    crate::test_support::git_in(
+        repo.path(),
+        &["merge", "-q", "--no-ff", "-m", "merge", "attempt"],
+    );
+    crate::test_support::git_in(repo.path(), &["worktree", "remove", "--force", &linked]);
+    let fake = Fake::new();
+    run_now(&store, &fake, &id).expect("the merged work is judged where it landed");
+    let sent = fake.starts.borrow();
+    assert_eq!(
+        std::fs::canonicalize(sent[0]["worktree"].as_str().unwrap()).unwrap(),
+        std::fs::canonicalize(repo.path()).unwrap()
+    );
+}
+
+#[test]
+fn a_manual_verify_of_a_squash_merged_claim_is_refused_rather_than_guessed() {
+    let (_d, store, repo, id) = setup();
+    let parent = tempfile::tempdir().unwrap();
+    let linked = claimed_attempt(&store, &repo, &id, &parent);
+    // A squash lands the content under another commit: nothing proves the claim's commit landed.
+    crate::test_support::git_in(repo.path(), &["merge", "-q", "--squash", "attempt"]);
+    crate::test_support::git_in(
+        repo.path(),
+        &["commit", "-q", "--allow-empty", "-m", "squashed"],
+    );
+    crate::test_support::git_in(repo.path(), &["worktree", "remove", "--force", &linked]);
+    let fake = Fake::new();
+    assert!(run_now(&store, &fake, &id).is_err());
+    assert!(fake.starts.borrow().is_empty());
+}
