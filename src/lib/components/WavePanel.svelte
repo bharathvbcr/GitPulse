@@ -34,7 +34,7 @@
     merging: "Merging", merged: "Merged", held: "Held for review", stopped: "Stopped",
   };
   const STATES: Record<WaveRecord["state"], string> = {
-    running: "Running", done: "Finished", cancelled: "Stopped", halted: "Halted after a failed re-verify", failed: "Stopped: its state could not be kept", refused: "Not started",
+    running: "Running", done: "Finished", cancelled: "Stopped", halted: "Halted after a failed re-verify", failed: "Stopped: its state could not be kept", refused: "Refused to launch from a partial ranking",
   };
 
   function watch(next: WaveRunner) {

@@ -59,10 +59,17 @@ describe("WavePanel", () => {
   it("shows why a wave refused to start from a partial board, and offers the unchecked-ranking opt-in", () => {
     wave.record = running([], { state: "refused", batch: 0, note: "Nothing was launched: 385 open tasks' links were not read, so a blocker may be among what was not read." });
     const body = html("repo-1");
-    expect(body).toContain("Not started");
+    expect(body).toContain("Refused to launch from a partial ranking");
     expect(body).toMatch(/385 open tasks(&#39;|') links were not read/);
     expect(body).toContain('data-testid="wave-accept-unchecked"');
     expect(body).not.toMatch(/data-testid="wave-accept-unchecked"[^>]*checked/);
+  });
+
+  it("does not call a wave that refused its second batch one that never started", () => {
+    wave.record = running([member("merged")], { state: "refused", batch: 1, batchesLeft: 1, note: "Nothing was launched: the board was only partly read." });
+    const body = html("repo-1");
+    expect(body).not.toContain("Not started");
+    expect(body).toContain("Refused to launch from a partial ranking: batch 1");
   });
 
   it("is mounted on the board beside Suggest next, scoped to the repository board only", () => {

@@ -33,3 +33,14 @@ describe("what a wave reads from a suggest answer", () => {
     expect(read.candidates.map((c) => c.id)).toEqual(["b"]);
   });
 });
+
+describe("an answer missing the coverage fields", () => {
+  it("is refused by the decoder, never read as a complete board", () => {
+    const full = { ok: true, generated_at: 1, candidates: 0, suggestions: [], blocked: [],
+      excluded: { in_progress: 0, review: 0, duplicate: 0, blocked: 0, unread: 0, filtered: 0 },
+      board: { scanned: 1, complete: true, unhydrated: 0 }, verification: { checked: 1, unchecked: 0, failed: 0 } };
+    for (const drop of [{ board: undefined }, { board: { scanned: 1, unhydrated: 0 } }, { board: { scanned: 1, complete: true } }, { verification: undefined }, { verification: { checked: 1, failed: 0 } }]) {
+      expect(() => taskSuggestions({ ...full, ...drop }), JSON.stringify(drop)).toThrow();
+    }
+  });
+});

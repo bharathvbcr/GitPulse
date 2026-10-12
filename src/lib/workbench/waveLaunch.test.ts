@@ -342,6 +342,26 @@ describe("stop reaches every wait", () => {
     expect(phases(done)).toEqual({ a: "merged", b: "stopped" });
   });
 
+  it("interrupts a run read, a scope read and a head read that never answer", async () => {
+    for (const hang of ["getRun", "scopes", "headOf"] as const) {
+      vi.useFakeTimers();
+      try {
+        const w = world({ candidates: [[task("a")]] });
+        if (hang === "getRun") w.deps.getRun = (_id: string, signal: AbortSignal) => untilAborted(signal);
+        if (hang === "scopes") w.deps.scopes = (_ids: readonly string[], signal: AbortSignal) => untilAborted(signal);
+        if (hang === "headOf") w.deps.headOf = (_cwd: string, signal: AbortSignal) => untilAborted(signal);
+        const runner = await startWave({ repositoryId: "r", n: 1, waves: 1, acceptUnchecked: true }, w.deps);
+        await vi.advanceTimersByTimeAsync(1_000);
+        let settled = false;
+        void runner.cancel().then(() => { settled = true; });
+        await vi.advanceTimersByTimeAsync(1_000);
+        expect(settled, hang).toBe(true);
+        expect(runner.record().state, hang).toBe("cancelled");
+        expect(w.merged, hang).toEqual([]);
+      } finally { vi.useRealTimers(); }
+    }
+  });
+
   it("a second stop while the first is settling is harmless", async () => {
     const w = world({ candidates: [[task("a")]] });
     w.deps.verify = (_id, signal) => untilAborted(signal);
@@ -360,6 +380,41 @@ describe("stop reaches every wait", () => {
 });
 
 describe("a partial board", () => {
+  it("keeps the person's allowance of an unchecked ranking across a restart", async () => {
+    const w = world({ coverage: { unchecked: 2 }, candidates: [[task("a")], [task("b")]], scopes: { a: ["a"], b: ["b"] } });
+    let crashed = false;
+    const first = { ...w.deps, persist: async (record: WaveRecord) => { await w.deps.persist(record); if (record.members.some((m) => m.phase === "running") && !crashed) { crashed = true; throw new Error("process died"); } } };
+    await (await startWave({ repositoryId: "r", n: 1, waves: 2, acceptUnchecked: true }, first)).finished;
+    const saved = w.persisted.findLast((r) => r.state === "running")!;
+    expect(saved.acceptUnchecked).toBe(true);
+    // The restart reads the record back from the card, so the allowance must survive the codec too.
+    const done = await (await resumeWave(structuredClone(saved), w.deps)).finished;
+    expect(done.state).toBe("done");
+    expect(w.launched).toEqual(["a", "b"]);
+  });
+
+  it("a resumed wave the person never allowed still refuses an unchecked ranking", async () => {
+    const w = world({ candidates: [[task("a")], [task("b")]], scopes: { a: ["a"], b: ["b"] } });
+    let crashed = false;
+    const first = { ...w.deps, persist: async (record: WaveRecord) => { await w.deps.persist(record); if (record.members.some((m) => m.phase === "running") && !crashed) { crashed = true; throw new Error("process died"); } } };
+    await (await startWave({ repositoryId: "r", n: 1, waves: 2 }, first)).finished;
+    const saved = w.persisted.findLast((r) => r.state === "running")!;
+    const read = w.deps.suggest;
+    w.deps.suggest = async (signal) => ({ ...(await read(signal)), unchecked: 3 });
+    const done = await (await resumeWave(saved, w.deps)).finished;
+    expect(done.state).toBe("refused");
+    expect(w.launched).toEqual(["a"]);
+  });
+
+  it("a stop pressed before the first suggest read returns launches nothing", async () => {
+    const w = world();
+    w.deps.suggest = (signal) => untilAborted(signal);
+    const runner = await startWave({ repositoryId: "r", n: 3, waves: 1, acceptUnchecked: true }, w.deps);
+    await runner.cancel();
+    expect(runner.record().state).toBe("cancelled");
+    expect(w.launched).toEqual([]);
+  });
+
   it("refuses to launch from a ranking whose links were not read, and records why", async () => {
     const w = world({ coverage: { unread: "385 open tasks' links were not read, so a blocker may be among what was not read." } });
     const done = await (await startWave({ repositoryId: "r", n: 3, waves: 1, acceptUnchecked: true }, w.deps)).finished;

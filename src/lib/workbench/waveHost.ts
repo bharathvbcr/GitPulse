@@ -5,6 +5,7 @@
  */
 
 import { get } from "svelte/store";
+import { withDeadline } from "../async/deadline";
 import { invoke } from "../ipc/invoke";
 import { identityKey, isCaseInsensitiveFs } from "../repos/paths";
 import { interfaceStore } from "../stores/interfaceStore";
@@ -61,6 +62,11 @@ async function checkoutFor(repositoryId: string): Promise<string> {
   return path;
 }
 
+/** Ends the wait, not the read, when the wave is stopped; reads that normally answer at once carry no deadline of their own. */
+function stoppable<T>(work: Promise<T>, signal: AbortSignal): Promise<T> {
+  return withDeadline(work, Infinity, { signal });
+}
+
 function sleep(ms: number, signal: AbortSignal): Promise<void> {
   return new Promise((resolve) => {
     if (signal.aborted) return resolve();
@@ -79,8 +85,8 @@ export async function waveDeps(repositoryId: string, persist: WaveDeps["persist"
     sleep,
     persist,
     suggest: async (signal) => readSuggestion(await bounded(suggestTasks({ limit: MAX_SUGGESTIONS, repository_id: repositoryId }), undefined, undefined, signal)),
-    scopes: async (ids) => {
-      const found = await loadTaskScopes(invoke, checkout, ids);
+    scopes: async (ids, signal) => {
+      const found = await stoppable(loadTaskScopes(invoke, checkout, ids), signal);
       return new Map(Object.values(found).map((scope) => [scope.id, [...scope.planned_files, ...scope.agent_appended_files]]));
     },
     launch: async (taskId, ids, signal) => {
@@ -98,8 +104,8 @@ export async function waveDeps(repositoryId: string, persist: WaveDeps["persist"
       if (!started.ok) throw new Error(started.error);
       return readRun(started.run);
     },
-    getRun: async (runId) => {
-      try { return readRun(await getTaskRun(runId)); }
+    getRun: async (runId, signal) => {
+      try { return readRun(await stoppable(getTaskRun(runId), signal)); }
       catch (cause) { if (cause instanceof WorkbenchError && cause.code === "not_found") return null; throw cause; }
     },
     verify: async (taskId, signal) => {
@@ -112,10 +118,10 @@ export async function waveDeps(repositoryId: string, persist: WaveDeps["persist"
         if (signal.aborted) throw new Error("The wave was stopped while waiting for verification.");
       }
     },
-    headOf: async (cwd) => {
+    headOf: async (cwd, signal) => {
       const opts = { caseInsensitive: isCaseInsensitiveFs() };
       const key = identityKey(cwd, opts);
-      const own = (await invoke<WorktreeInfo[]>("cmd_list_worktrees", { repoPath: checkout })).find((entry) => identityKey(entry.path, opts) === key);
+      const own = (await stoppable(invoke<WorktreeInfo[]>("cmd_list_worktrees", { repoPath: checkout }), signal)).find((entry) => identityKey(entry.path, opts) === key);
       if (!own) throw new Error(`${cwd} is no longer a worktree of the repository.`);
       return own.head;
     },

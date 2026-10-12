@@ -27,7 +27,7 @@ export interface WaveTaskApi {
 }
 
 const PHASES: readonly MemberPhase[] = ["launching", "running", "verifying", "ready", "merging", "merged", "held", "stopped"];
-const STATES: readonly WaveState[] = ["running", "done", "cancelled", "halted", "failed"];
+const STATES: readonly WaveState[] = ["running", "done", "cancelled", "halted", "failed", "refused"];
 const MAX_TEXT = 4096;
 
 export const waveLabel = (id: string) => `${WAVE_LABEL_PREFIX}${id}`;
@@ -70,7 +70,10 @@ export function decodeWave(logs: string | undefined): WaveRecord | null {
   const members = r.members.map(decodeMember);
   const attempted = r.attempted.map((entry) => str(entry, 128));
   if (members.some((m) => m === null) || attempted.some((a) => a === null)) return null;
-  return { v: 1, id, repositoryId, n, batchesLeft, batch, state, members: members as WaveMember[], attempted: attempted as string[], note, seq };
+  if (r.acceptUnchecked !== undefined && typeof r.acceptUnchecked !== "boolean") return null;
+  const decoded: WaveRecord = { v: 1, id, repositoryId, n, batchesLeft, batch, state, members: members as WaveMember[], attempted: attempted as string[], note, seq };
+  if (r.acceptUnchecked !== undefined) decoded.acceptUnchecked = r.acceptUnchecked;
+  return decoded;
 }
 
 function withLine(logs: string | undefined, line: string): string {
