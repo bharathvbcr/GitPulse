@@ -1388,8 +1388,9 @@ pub fn add_worktree(
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WorktreeCreated {
     pub path: String,
-    /// Copying build caches from the main checkout failed as a whole.
-    /// Individual cache directories that fail are logged and skipped there.
+    /// Some build cache could not be copied from the main checkout, or could
+    /// not be checked: each one named, with what was copied. A cache that
+    /// failed is absent from the worktree, never half there.
     pub cache_error: Option<String>,
     /// A `post_create` hook failed, timed out, or was refused.
     pub hook_error: Option<String>,
@@ -1420,7 +1421,12 @@ pub fn add_worktree_extended(
     };
     if cow_caches {
         let repo = validate_repo(repo_path)?;
-        created.cache_error = reflink_ignored_caches(&repo, Path::new(target_path)).err();
+        created.cache_error = reflink_ignored_caches(
+            &repo,
+            Path::new(target_path),
+            &crate::engine::cow_clone::CacheSelection::default(),
+        )
+        .err();
     }
     if run_hooks {
         let repo = validate_repo(repo_path)?;

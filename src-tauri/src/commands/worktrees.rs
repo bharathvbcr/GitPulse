@@ -241,7 +241,8 @@ pub(crate) fn merge_teardown_guarded(
     })
 }
 
-/// Reflink-copies standard ignored build caches from anchor to target worktree.
+/// Reflink-copies the repository's ignored dependency caches into one of its
+/// worktrees. A cache that could not be copied whole fails the call.
 #[tauri::command(async)]
 pub async fn cmd_worktree_cow_sync(
     repo_path: String,
@@ -249,8 +250,16 @@ pub async fn cmd_worktree_cow_sync(
 ) -> Result<Vec<crate::engine::cow_clone::ReflinkResult>, String> {
     off_thread(move || {
         let repo = crate::engine::validate_repo(&repo_path)?;
-        let target = std::path::Path::new(&target_path);
-        crate::engine::cow_clone::reflink_ignored_caches(&repo, target)
+        // The target comes from the webview. Only a checkout git lists as a
+        // worktree of this repository receives caches — one `git worktree
+        // list`, no scan of any worktree. Any other existing directory used to
+        // be filled with the anchor's caches and links.
+        let family = crate::engine::worktree::resolve_worktree_family(&repo_path, &target_path)?;
+        crate::engine::cow_clone::reflink_ignored_caches(
+            &repo,
+            &family.worktree,
+            &crate::engine::cow_clone::CacheSelection::default(),
+        )
     })
     .await
 }

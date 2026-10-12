@@ -953,3 +953,59 @@ fn worktree_listing_profile() {
         );
     }
 }
+
+/// A main checkout whose shared `info/exclude` ignores `node_modules/`, which
+/// holds one package, and one linked worktree.
+fn checkout_with_an_ignored_cache() -> (tempfile::TempDir, tempfile::TempDir, std::path::PathBuf) {
+    let (main, parent, linked) = crate::test_support::repo_with_worktrees(1);
+    std::fs::create_dir_all(main.path().join(".git/info")).unwrap();
+    std::fs::write(main.path().join(".git/info/exclude"), "node_modules/\n").unwrap();
+    std::fs::create_dir_all(main.path().join("node_modules/pkg")).unwrap();
+    std::fs::write(main.path().join("node_modules/pkg/index.js"), "x").unwrap();
+    (main, parent, linked.into_iter().next().unwrap())
+}
+
+/// The target of a cache sync is whatever path the webview sent. Anything
+/// that is not a worktree of the repository is refused before a byte is
+/// copied: an unrelated directory, another repository, a directory inside a
+/// worktree.
+#[test]
+fn a_cache_sync_into_anything_but_a_worktree_of_the_repository_is_refused() {
+    let (main, _parent, linked) = checkout_with_an_ignored_cache();
+    let repo = main.path().to_string_lossy().into_owned();
+    let elsewhere = tempfile::TempDir::new().unwrap();
+    let other_repository = crate::test_support::git_repo();
+    let inside = linked.join("sub");
+    std::fs::create_dir_all(&inside).unwrap();
+    for target in [elsewhere.path(), other_repository.path(), inside.as_path()] {
+        let before = std::fs::read_dir(target).unwrap().count();
+        let refused = tauri::async_runtime::block_on(cmd_worktree_cow_sync(
+            repo.clone(),
+            target.to_string_lossy().into_owned(),
+        ));
+        assert!(refused.is_err(), "{}: {refused:?}", target.display());
+        assert_eq!(
+            std::fs::read_dir(target).unwrap().count(),
+            before,
+            "{} gained entries",
+            target.display()
+        );
+    }
+}
+
+/// A linked worktree of the repository still receives the caches, and the
+/// membership check reads the worktree list without scanning any worktree.
+#[test]
+fn a_cache_sync_into_a_linked_worktree_copies_and_scans_nothing() {
+    let (main, _parent, linked) = checkout_with_an_ignored_cache();
+    let dirs = every_checkout(main.path(), std::slice::from_ref(&linked));
+    let status_before = spawns_naming(&dirs, "status");
+    let copied = tauri::async_runtime::block_on(cmd_worktree_cow_sync(
+        main.path().to_string_lossy().into_owned(),
+        linked.to_string_lossy().into_owned(),
+    ))
+    .expect("synced");
+    assert_eq!(copied.len(), 1, "{copied:?}");
+    assert!(linked.join("node_modules/pkg/index.js").is_file());
+    assert_eq!(spawns_naming(&dirs, "status"), status_before);
+}
