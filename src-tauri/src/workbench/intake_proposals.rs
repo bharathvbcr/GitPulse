@@ -227,11 +227,7 @@ pub(crate) fn file_proposal(store: &Store, input: &str) -> Result<Value, Workben
             let unreviewed: Vec<Value> = related
                 .tasks
                 .into_iter()
-                .filter(|t| {
-                    !reviewed
-                        .iter()
-                        .any(|r| t["item_id"].as_str() == Some(r.trim()))
-                })
+                .filter(|t| !is_reviewed(t, &reviewed))
                 .take(MAX_RELATED)
                 .collect();
             Ok(json!({
@@ -257,6 +253,25 @@ fn existing(store: &Store, repo_path: &str, key: &str) -> Result<(String, Value)
 // ---------------------------------------------------------------------------
 // Applying a refinement
 // ---------------------------------------------------------------------------
+
+/// The acceptance criteria of a task row.
+fn criteria_of(task: &Value) -> Vec<&str> {
+    task["acceptance_criteria"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .collect()
+}
+
+/// Whether the proposal offers a criterion the task lacks, compared trimmed.
+fn adds_criteria(task: &Value, proposed: &Value) -> bool {
+    let have: Vec<&str> = criteria_of(task).into_iter().map(str::trim).collect();
+    criteria_of(proposed)
+        .into_iter()
+        .map(str::trim)
+        .any(|c| !c.is_empty() && !have.contains(&c))
+}
 
 /// The parts of a refinement proposal (dc-store schema 12) a person selects
 /// among.
@@ -316,6 +331,7 @@ pub(crate) fn apply_refinement(store: &Store, input: &str) -> Result<Value, Work
             "Select distinct parts among acceptance_criteria, split_into and duplicate_of.",
         ));
     }
+    check_reviewed_len(&parsed.reviewed_related)?;
     let repository = board_repository(store, &parsed.repo_path)?;
     let repository_id = repository["id"].as_str().unwrap_or_default().to_owned();
     let proposal = query(
@@ -337,14 +353,29 @@ pub(crate) fn apply_refinement(store: &Store, input: &str) -> Result<Value, Work
         return Err(invalid("That proposal is not a refinement."));
     }
     let proposed = &proposal["proposed"];
-    let selected = |part: &str| parsed.fields.iter().any(|f| f == part);
+    // The store appends the criteria it is given and compares them exactly, so
+    // a criterion that differs from one the task has only in whitespace would
+    // be added as a second copy. Criteria that add nothing, compared trimmed,
+    // are left out of the accept.
+    let fields: Vec<String> = parsed
+        .fields
+        .iter()
+        .filter(|f| f.as_str() != "acceptance_criteria" || adds_criteria(&task, proposed))
+        .cloned()
+        .collect();
+    if fields.is_empty() {
+        return Err(invalid(
+            "Every proposed acceptance criterion is already on the task, so there is nothing to apply.",
+        ));
+    }
+    let selected = |part: &str| fields.iter().any(|f| f == part);
     let mut accept = json!({
         "id": parsed.id,
         "request_id": item_id(&repository_id, &format!("refine-accept:{}:{}", parsed.id, parsed.expected_revision))
             .replacen(ITEM_PREFIX, "rfa-", 1),
         "expected_revision": parsed.expected_revision,
         "expected_task_revision": parsed.expected_task_revision,
-        "fields": parsed.fields,
+        "fields": fields,
     });
     if selected("split_into") {
         let count = proposed["split_into"].as_array().map_or(0, Vec::len);
@@ -361,13 +392,6 @@ pub(crate) fn apply_refinement(store: &Store, input: &str) -> Result<Value, Work
             .into_iter()
             .flatten()
             .any(|l| l["kind"] == "duplicate_of" && l["item_id"] == target)
-    };
-    let criteria_added = if selected("acceptance_criteria") {
-        proposed["acceptance_criteria"]
-            .as_array()
-            .map_or(0, Vec::len)
-    } else {
-        0
     };
     let links_added = if selected("duplicate_of") {
         proposed["duplicate_of"]
@@ -403,12 +427,7 @@ pub(crate) fn apply_refinement(store: &Store, input: &str) -> Result<Value, Work
             let unreviewed: Vec<Value> = related
                 .tasks
                 .into_iter()
-                .filter(|t| {
-                    !parsed
-                        .reviewed_related
-                        .iter()
-                        .any(|r| t["item_id"].as_str() == Some(r.trim()))
-                })
+                .filter(|t| !is_reviewed(t, &parsed.reviewed_related))
                 .take(MAX_RELATED)
                 .collect();
             if !unreviewed.is_empty() {
@@ -424,8 +443,13 @@ pub(crate) fn apply_refinement(store: &Store, input: &str) -> Result<Value, Work
             }));
         }
     }
+    let criteria_before = criteria_of(&task).len();
     let saved = query(store, "enhancements.accept", &accept.to_string())?;
     let accepted = &saved["item"];
+    // What the task gained, read back, not what the proposal held.
+    let criteria_added = get_item(store, task_id)?
+        .map_or(0, |after| criteria_of(&after).len())
+        .saturating_sub(criteria_before);
     Ok(json!({
         "ok": true,
         "outcome": "applied",

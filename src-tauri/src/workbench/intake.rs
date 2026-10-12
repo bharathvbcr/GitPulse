@@ -832,6 +832,28 @@ pub(crate) const MAX_RELATED: usize = 25;
 /// back everything it has read so far; a cap equal to the page size would make
 /// the 26th related task impossible to file.
 pub(crate) const MAX_REVIEWED_RELATED: usize = 500;
+
+/// Whether the caller has named `related` among the open tasks it reviewed.
+/// The one test every path that honours `reviewed_related` applies (the board
+/// intake, `proposals.file`, `proposals.apply`), so they cannot disagree about
+/// what a reviewed task is.
+pub(crate) fn is_reviewed(related: &Value, reviewed: &[String]) -> bool {
+    related["item_id"]
+        .as_str()
+        .is_some_and(|id| reviewed.iter().any(|r| r.trim() == id))
+}
+
+/// Refuse a reviewed set no single call is meant to carry, before it is
+/// searched once per related task.
+pub(crate) fn check_reviewed_len(reviewed: &[String]) -> Result<(), WorkbenchError> {
+    if reviewed.len() > MAX_REVIEWED_RELATED {
+        return Err(WorkbenchError::new(
+            "invalid_input",
+            format!("reviewed_related names at most {MAX_REVIEWED_RELATED} tasks."),
+        ));
+    }
+    Ok(())
+}
 /// Bound on the open tasks read to look for related ones.
 const MAX_SCANNED_TASKS: usize = 2000;
 
@@ -1047,6 +1069,7 @@ fn add_task_once(
     reviewed_related: &[String],
     between: &mut dyn FnMut(),
 ) -> Result<Value, WorkbenchError> {
+    check_reviewed_len(reviewed_related)?;
     let local = resolve_for_agent(repo_path)?;
     // Validate before registering, so a bad request leaves no trace.
     task.item_fields(&local.name)
@@ -1082,11 +1105,7 @@ fn add_task_once(
             let unreviewed: Vec<&Value> = related
                 .tasks
                 .iter()
-                .filter(|t| {
-                    !reviewed_related
-                        .iter()
-                        .any(|r| t["item_id"].as_str() == Some(r.trim()))
-                })
+                .filter(|t| !is_reviewed(t, reviewed_related))
                 .collect();
             if !unreviewed.is_empty() {
                 let listed: Vec<String> = unreviewed
