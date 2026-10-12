@@ -353,14 +353,20 @@ pub(crate) fn apply_refinement(store: &Store, input: &str) -> Result<Value, Work
         return Err(invalid("That proposal is not a refinement."));
     }
     let proposed = &proposal["proposed"];
-    // The store appends the criteria it is given and compares them exactly, so
-    // a criterion that differs from one the task has only in whitespace would
-    // be added as a second copy. Criteria that add nothing, compared trimmed,
-    // are left out of the accept.
+    // The store refuses a proposed criterion equal to one of the task's, but
+    // compares exactly and appends what it holds, so one that differs only in
+    // whitespace would be added as a second copy. Criteria that add nothing,
+    // compared trimmed, are left out of the accept. They are compared with the
+    // task as the proposal saw it (`source`), not as it is now: the store only
+    // accepts criteria onto that same list, and a retry of an apply whose reply
+    // was lost must send the same request to be replayed, not refused as a
+    // reused request_id because its own first write added the criteria.
     let fields: Vec<String> = parsed
         .fields
         .iter()
-        .filter(|f| f.as_str() != "acceptance_criteria" || adds_criteria(&task, proposed))
+        .filter(|f| {
+            f.as_str() != "acceptance_criteria" || adds_criteria(&proposal["source"], proposed)
+        })
         .cloned()
         .collect();
     if fields.is_empty() {
@@ -443,13 +449,17 @@ pub(crate) fn apply_refinement(store: &Store, input: &str) -> Result<Value, Work
             }));
         }
     }
-    let criteria_before = criteria_of(&task).len();
+    // The store appends every criterion the proposal holds when the part is
+    // accepted, and criteria that add nothing were dropped above. Counted from
+    // the request rather than read back, so a replayed accept reports the same
+    // receipt and a failed re-read cannot turn a done write into an error.
+    let criteria_added = if selected("acceptance_criteria") {
+        criteria_of(proposed).len()
+    } else {
+        0
+    };
     let saved = query(store, "enhancements.accept", &accept.to_string())?;
     let accepted = &saved["item"];
-    // What the task gained, read back, not what the proposal held.
-    let criteria_added = get_item(store, task_id)?
-        .map_or(0, |after| criteria_of(&after).len())
-        .saturating_sub(criteria_before);
     Ok(json!({
         "ok": true,
         "outcome": "applied",

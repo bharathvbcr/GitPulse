@@ -342,6 +342,37 @@ fn a_criterion_the_task_already_has_is_not_added_again_for_differing_whitespace(
     );
 }
 
+/// An apply whose reply was lost is retried as the same request, and the store
+/// replays the receipt. Which parts are sent must not depend on the task as it
+/// is after the first write, or the retry is a different request under a used
+/// request_id (or "nothing to apply") and is refused although the apply
+/// succeeded.
+#[test]
+fn a_retried_apply_replays_rather_than_being_refused_by_its_own_first_write() {
+    for fields in [
+        json!(["acceptance_criteria"]),
+        json!(["acceptance_criteria", "duplicate_of"]),
+    ] {
+        let (_d, store, repo) = setup();
+        let (id, revision) = reviewed(&store, &repo);
+        let proposal = stored_criteria(&store, &id, revision, json!(["A fresh criterion"]));
+        let input = apply_input(&repo, &proposal, revision, fields.clone());
+        let first = apply_refinement(&store, &input).unwrap_or_else(|e| panic!("{fields}: {e:?}"));
+        assert_eq!(first["outcome"], "applied", "{first}");
+        assert_eq!(first["criteria_added"], 1, "{first}");
+        let again = apply_refinement(&store, &input)
+            .unwrap_or_else(|e| panic!("{fields}: the retry was refused: {e:?}"));
+        assert_eq!(again["outcome"], "applied", "{again}");
+        assert_eq!(again["revision"], first["revision"], "{again}");
+        assert_eq!(again["criteria_added"], first["criteria_added"], "{again}");
+        assert_eq!(
+            get_item(&store, &id).unwrap().unwrap()["acceptance_criteria"],
+            json!(["Existing criterion", "A fresh criterion"]),
+            "{fields}: applied once"
+        );
+    }
+}
+
 #[test]
 fn criteria_added_is_what_the_task_actually_gained() {
     let (_d, store, repo) = setup();
