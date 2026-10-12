@@ -21,6 +21,8 @@ const incident = (id: string, at_ms: number, over: Partial<TerminalIncident> = {
   ...over,
 });
 
+const rustEmits = (rust: string) => rust.includes('emit("terminal-incident"');
+
 describe("terminal incidents", () => {
   it("merges newest first, one row per id, bounded", () => {
     let list: TerminalIncident[] = [];
@@ -43,7 +45,11 @@ describe("terminal incidents", () => {
     const read = (p: string) => readFileSync(join(here, p), "utf8");
     expect(read("sections.ts")).toContain('id: "terminal-incidents"');
     expect(read("terminalIncidents.ts")).toContain('"cmd_terminal_incidents"');
-    expect(read("terminalIncidents.ts")).toContain('"terminal-incident"');
+    // One owner for the event name: the Health view subscribes through the
+    // shared constant, which names the event the backend emits.
+    expect(read("terminalIncidents.ts")).toMatch(/listen<unknown>\(INCIDENT_EVENT,/);
+    expect(read("../terminal/incident.ts")).toContain('INCIDENT_EVENT = "terminal-incident"');
+    expect(rustEmits(read("../../../src-tauri/src/terminal/incident.rs"))).toBe(true);
     expect(read("../components/HealthPanel.svelte")).toContain("<TerminalIncidentsSection />");
     const rust = read("../../../src-tauri/src/terminal/incident.rs");
     for (const field of ["id", "signal", "at_ms", "session_ids", "sender", "sender_note"]) {
