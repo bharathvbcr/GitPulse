@@ -14,15 +14,15 @@
   import { untrack } from "svelte";
   import { get } from "svelte/store";
   import { Sparkles } from "@lucide/svelte";
-  import { explainError, getTask, newID, WorkbenchError, type RefinePart, type Task } from "../workbench/client";
-  import { applyRefine, dismissRefine, refineDiff, requestRefine, type ApplyHeld, type RefineResult } from "../workbench/proposals";
+  import { explainError, getRefinement, getTask, newID, WorkbenchError, type RefinePart, type Task } from "../workbench/client";
+  import { applyConflict, applyRefine, confirmReviewed, dismissRefine, refineDiff, requestRefine, selectableParts, type ApplyHeld, type RefineResult } from "../workbench/proposals";
   import { effectiveSelection } from "../workbench/taskModel";
   import { harnessStore } from "../stores/harnessStore";
 
   let { task, repositoryPath, disabled = false, onApplied, initial = null }: {
     task: Task | null;
     repositoryPath: string;
-    /** The sheet has unsaved edits or is saving: applying would discard them. */
+    /** The sheet has unsaved edits or is busy: asking or applying would discard them. */
     disabled?: boolean;
     /** The task as it is now on the board, after an apply or after a stale proposal was refused. */
     onApplied: (task: Task) => void;
@@ -35,18 +35,24 @@
   let applying = $state(false);
   let error = $state("");
   let message = $state("");
-  /** The parts to accept. Criteria start chosen; splits create tasks and duplicates link one, so they start unchosen. */
+  /** The parts to accept. Criteria start chosen when one is new; a part the task has locked never does. */
   const defaultParts = (next: RefineResult | null): Set<RefinePart> =>
-    new Set(next && next.criteria.some((c) => !task?.acceptance_criteria.some((have) => have.trim() === c.text.trim())) ? ["acceptance_criteria"] : []);
+    new Set(task && next ? selectableParts(task, next).initial : []);
   let picked = $state<Set<RefinePart>>(untrack(() => defaultParts(initial)));
   /** Kept across a failed ask so a retry replays the same request instead of calling the model again. */
   let attempt = newID();
 
   /** Splits the host held because they look like open work; applying again names these tasks as separate. */
   let held = $state<ApplyHeld | null>(null);
+  /** Every related task the person has confirmed as separate for this proposal, across refusals. */
+  let reviewed = $state<string[]>([]);
 
   const diff = $derived(task && result ? refineDiff(task, result) : null);
-  const nothingPicked = $derived(picked.size === 0);
+  const locked = $derived<readonly RefinePart[]>(task && result ? selectableParts(task, result).locked : []);
+  /** Only what is chosen and still allowed: a lock that arrived after the choice drops it. */
+  const chosen = $derived([...picked].filter((part) => !locked.includes(part)));
+  const nothingPicked = $derived(chosen.length === 0);
+  const blocked = $derived(applying || disabled || nothingPicked || Boolean(diff?.stale));
 
   async function ask() {
     if (!task || asking || disabled) return;
@@ -54,7 +60,7 @@
     try {
       const next = await requestRefine(repositoryPath, task, effectiveSelection(get(harnessStore)), attempt);
       attempt = newID();
-      result = next; picked = defaultParts(next); held = null;
+      result = next; picked = defaultParts(next); held = null; reviewed = [];
     } catch (cause) {
       result = null;
       error = explainError(cause);
@@ -62,6 +68,7 @@
   }
 
   function toggle(part: RefinePart) {
+    if (locked.includes(part)) return;
     const next = new Set(picked);
     if (!next.delete(part)) next.add(part);
     picked = next; held = null;
@@ -74,23 +81,30 @@
     if (dropped) try { await dismissRefine(dropped); } catch { /* nothing was applied either way */ }
   }
 
-  async function apply(reviewedRelated: readonly string[] = []) {
-    if (!result || applying || nothingPicked || diff?.stale) return;
+  async function apply(confirm: readonly { item_id: string }[] = []) {
+    // The sheet's unsaved edits are replaced by the task an apply returns, so a dirty or busy sheet cannot apply.
+    if (!result || blocked) return;
     applying = true; error = ""; message = "";
-    const reviewed = result;
+    const reviewedProposal = result;
+    const sent = confirmReviewed(reviewed, confirm);
     try {
-      const receipt = await applyRefine(repositoryPath, reviewed, [...picked], reviewedRelated);
-      if (receipt.outcome === "related_tasks_exist") { held = receipt; return; }
-      held = null;
-      onApplied(await getTask(reviewed.task_id));
+      const receipt = await applyRefine(repositoryPath, reviewedProposal, chosen, sent);
+      if (receipt.outcome === "related_tasks_exist") { held = receipt; reviewed = sent; return; }
+      held = null; reviewed = [];
+      // Applied, whatever follows: the write is done and a retry would be refused as a reused request.
       message = `Applied: ${receipt.criteriaAdded} criteria added, ${receipt.linksAdded} links added, ${receipt.createdTaskIds.length} tasks created in the inbox.`;
       result = null;
+      try { onApplied(await getTask(reviewedProposal.task_id)); }
+      catch (reread) { message += ` The task could not be re-read (${explainError(reread)}); reload it to see the result.`; }
     } catch (cause) {
       if (cause instanceof WorkbenchError && cause.code === "revision_conflict") {
-        // Refused, nothing written. Show the task as it is now and ask again against it.
-        result = null; held = null;
-        error = "The task changed after this suggestion was made, so nothing was applied. It has been re-read; ask again to refine the current version.";
-        try { onApplied(await getTask(reviewed.task_id)); } catch (reread) { error += ` (It could not be re-read: ${explainError(reread)}.)`; }
+        // Refused, nothing written. Say which side moved, show the task as it is now, and ask again against it.
+        result = null; held = null; reviewed = [];
+        const [freshTask, stored] = await Promise.allSettled([getTask(reviewedProposal.task_id), getRefinement(reviewedProposal.enhancement_id)]);
+        const current = freshTask.status === "fulfilled" ? freshTask.value : null;
+        error = applyConflict(reviewedProposal, current, stored.status === "fulfilled" ? stored.value : null).message;
+        if (current) onApplied(current);
+        else error += ` (The task could not be re-read: ${freshTask.status === "rejected" ? explainError(freshTask.reason) : "no reply"}.)`;
       } else {
         error = explainError(cause);
       }
@@ -130,7 +144,7 @@
 
       {#if diff.criteria.length > 0}
         <h4>Acceptance criteria</h4>
-        <label class="part"><input type="checkbox" data-testid="task-refine-part-acceptance_criteria" checked={picked.has("acceptance_criteria")} onchange={() => toggle("acceptance_criteria")} /> Add these to the task</label>
+        <label class="part"><input type="checkbox" data-testid="task-refine-part-acceptance_criteria" checked={chosen.includes("acceptance_criteria")} disabled={locked.includes("acceptance_criteria")} onchange={() => toggle("acceptance_criteria")} /> Add these to the task{#if locked.includes("acceptance_criteria")} <em>(locked on this task)</em>{/if}</label>
         <ul class="rows">
           {#each diff.criteria as row}
             <li class:present={row.state === "present"}>
@@ -143,7 +157,7 @@
 
       {#if diff.duplicates.length > 0}
         <h4>Possible duplicates</h4>
-        <label class="part"><input type="checkbox" data-testid="task-refine-part-duplicate_of" checked={picked.has("duplicate_of")} onchange={() => toggle("duplicate_of")} /> Link these as the original</label>
+        <label class="part"><input type="checkbox" data-testid="task-refine-part-duplicate_of" checked={chosen.includes("duplicate_of")} disabled={locked.includes("duplicate_of")} onchange={() => toggle("duplicate_of")} /> Link these as the original</label>
         <ul class="rows">
           {#each diff.duplicates as row}
             <li class:present={row.state === "present"}>
@@ -155,7 +169,7 @@
 
       {#if diff.splits.length > 0}
         <h4>Split into</h4>
-        <label class="part"><input type="checkbox" data-testid="task-refine-part-split_into" checked={picked.has("split_into")} onchange={() => toggle("split_into")} /> Create these as new inbox tasks</label>
+        <label class="part"><input type="checkbox" data-testid="task-refine-part-split_into" checked={chosen.includes("split_into")} disabled={locked.includes("split_into")} onchange={() => toggle("split_into")} /> Create these as new inbox tasks</label>
         <ul class="rows">
           {#each diff.splits as part, index}
             <li data-testid="task-refine-split-{index}">
@@ -167,14 +181,14 @@
       {/if}
 
       {#if diff.criteria.length + diff.duplicates.length + diff.splits.length > 0}
-        <button type="button" class="gp-btn primary" data-testid="task-refine-apply" disabled={applying || nothingPicked || diff.stale} onclick={() => apply()}>
+        <button type="button" class="gp-btn primary" data-testid="task-refine-apply" disabled={blocked} onclick={() => apply()}>
           {applying ? "Applying…" : "Apply selected"}
         </button>
         {#if held}
           <div class="held" role="alert" data-testid="task-refine-related">
             <p>Nothing was applied. Similar open work exists for {held.splits.length === 1 ? "a proposed split" : "some proposed splits"}:</p>
             <ul>{#each held.splits as split}<li><strong>{split.title}</strong>: {split.related.map((r) => r.title).join("; ")}</li>{/each}</ul>
-            <button type="button" class="gp-btn" data-testid="task-refine-apply-anyway" disabled={applying} onclick={() => apply([...new Set(held!.splits.flatMap((split) => split.related.map((r) => r.item_id)))])}>They are separate: apply anyway</button>
+            <button type="button" class="gp-btn" data-testid="task-refine-apply-anyway" disabled={blocked} onclick={() => apply(held!.splits.flatMap((split) => split.related))}>They are separate: apply anyway</button>
           </div>
         {/if}
       {/if}

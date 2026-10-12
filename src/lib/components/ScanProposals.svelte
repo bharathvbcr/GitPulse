@@ -16,9 +16,9 @@
   import { onDestroy, untrack } from "svelte";
   import { ScanSearch, X } from "@lucide/svelte";
   import { explainError } from "../workbench/client";
-  import { DEFAULT_PRIORITY, PRIORITY_LABELS } from "../workbench/taskPriority";
+  import { PRIORITY_LABELS } from "../workbench/taskPriority";
   import {
-    cancelScan, categoryLabel, coverageNotes, dismissedFingerprints, dismissFingerprint, draftOf, fileScanProposal,
+    cancelScan, categoryLabel, confirmReviewed, coverageNotes, dismissedFingerprints, dismissFingerprint, draftOf, fileScanProposal,
     getScan, scanFinished, scanIsPartial, startScan,
     type FileDraft, type FileOutcome, type ScanProposal, type ScanView,
   } from "../workbench/proposals";
@@ -38,8 +38,14 @@
   let starting = $state(false);
   let dismissed = $state<Set<string>>(untrack(() => (repositoryPath ? dismissedFingerprints(repositoryPath) : new Set())));
   let showDismissed = $state(false);
-  let editing = $state<string | null>(null);
-  let draft = $state<FileDraft>({ title: "", description: "", kind: "feature", priority: DEFAULT_PRIORITY, labels: [] });
+  /**
+   * The edit in progress for each proposal, by fingerprint: a proposal is being
+   * edited exactly while it has a draft. One draft per proposal, so editing B
+   * never changes what "file anyway" files for A.
+   */
+  let drafts = $state<Record<string, FileDraft>>({});
+  /** The related tasks the person has confirmed as separate, per proposal, across refusals. */
+  let reviewed = $state<Record<string, string[]>>({});
   /** Outcome of each proposal's filing attempt, by fingerprint. */
   let outcomes = $state<Record<string, FileOutcome | { outcome: "error"; message: string }>>({});
   /** Fingerprints being filed right now: a second click while one is in flight does nothing. */
@@ -63,7 +69,7 @@
     shownFor = path;
     epoch += 1;
     clearTimeout(timer);
-    view = null; error = ""; outcomes = {}; editing = null;
+    view = null; error = ""; outcomes = {}; drafts = {}; reviewed = {};
     dismissed = path ? dismissedFingerprints(path) : new Set();
   });
   onDestroy(() => { epoch += 1; clearTimeout(timer); });
@@ -111,20 +117,25 @@
 
   function dismiss(proposal: ScanProposal) {
     dismissed = dismissFingerprint(repositoryPath, proposal.fingerprint);
-    if (editing === proposal.fingerprint) editing = null;
+    delete drafts[proposal.fingerprint];
   }
   function edit(proposal: ScanProposal) {
-    editing = proposal.fingerprint;
-    draft = draftOf(proposal);
+    drafts[proposal.fingerprint] ??= draftOf(proposal);
   }
-  async function file(proposal: ScanProposal, body: FileDraft, reviewed: readonly string[] = []) {
+  /** `confirm`: the related tasks the person was just shown and says are separate. */
+  async function file(proposal: ScanProposal, body: FileDraft, confirm: readonly { item_id: string }[] = []) {
     const fp = proposal.fingerprint;
     if (filing.has(fp)) return;
     filing.add(fp); busy = new Set(filing);
     const mine = epoch;
+    const sent = confirmReviewed(reviewed[fp] ?? [], confirm);
     try {
-      const outcome = await fileScanProposal(repositoryPath, proposal, body, reviewed);
-      if (mine === epoch) { outcomes[fp] = outcome; if (outcome.outcome !== "related_tasks_exist") editing = null; }
+      const outcome = await fileScanProposal(repositoryPath, proposal, body, sent);
+      if (mine === epoch) {
+        outcomes[fp] = outcome;
+        if (outcome.outcome === "related_tasks_exist") reviewed[fp] = sent;
+        else { delete drafts[fp]; delete reviewed[fp]; }
+      }
     } catch (cause) {
       if (mine === epoch) outcomes[fp] = { outcome: "error", message: explainError(cause) };
     } finally { filing.delete(fp); if (mine === epoch) busy = new Set(filing); }
@@ -142,7 +153,7 @@
 {/if}
 
 {#if open}
-  <aside class="drawer gp-glass bg-surface" aria-label="Gap scan proposals" data-testid="proposals-drawer">
+  <aside class="drawer bg-surface shadow-float" aria-label="Gap scan proposals" data-testid="proposals-drawer">
     <header>
       <h2>Gap scan</h2>
       <span class="actions">
@@ -186,6 +197,7 @@
         {#each visible as proposal (proposal.fingerprint)}
           {@const outcome = outcomeOf(proposal.fingerprint)}
           {@const done = filedOutcome(proposal.fingerprint)}
+          {@const mine = drafts[proposal.fingerprint]}
           <li class="proposal" class:dismissed={dismissed.has(proposal.fingerprint)} data-testid="proposal-{proposal.fingerprint}">
             <div class="head">
               <span class="chip">{categoryLabel(proposal.category)}</span>
@@ -212,7 +224,7 @@
                 <p>Not filed. The board already has open work that looks similar:</p>
                 <ul>{#each outcome.related as task}<li>{task.title} <span class="status">({task.status})</span></li>{/each}</ul>
                 <button type="button" class="gp-btn" data-testid="proposal-file-anyway" disabled={busy.has(proposal.fingerprint)}
-                  onclick={() => file(proposal, editing === proposal.fingerprint ? draft : draftOf(proposal), outcome.related.map((t) => t.item_id))}>
+                  onclick={() => file(proposal, drafts[proposal.fingerprint] ?? draftOf(proposal), outcome.related)}>
                   It is separate: file anyway
                 </button>
               </div>
@@ -220,18 +232,18 @@
               <p class="error" role="alert" data-testid="proposal-error">Not filed: {outcome.message}</p>
             {/if}
 
-            {#if editing === proposal.fingerprint}
-              <div class="editor">
-                <label>Title <input class="gp-field" bind:value={draft.title} maxlength="300" /></label>
-                <label>Description <textarea class="gp-field" rows="5" bind:value={draft.description}></textarea></label>
+            {#if mine}
+              <div class="editor" data-testid="proposal-editor">
+                <label>Title <input class="gp-field" data-testid="proposal-edit-title" bind:value={mine.title} maxlength="300" /></label>
+                <label>Description <textarea class="gp-field" rows="5" bind:value={mine.description}></textarea></label>
                 <label>Priority
-                  <select class="gp-field" bind:value={draft.priority}>
+                  <select class="gp-field" bind:value={mine.priority}>
                     {#each PRIORITY_LABELS as name, level}<option value={level}>{name}</option>{/each}
                   </select>
                 </label>
                 <span class="actions">
-                  <button type="button" class="gp-btn primary" data-testid="proposal-file-edited" disabled={busy.has(proposal.fingerprint) || !draft.title.trim()} onclick={() => file(proposal, draft)}>File edited task</button>
-                  <button type="button" class="gp-btn" onclick={() => { editing = null; }}>Cancel</button>
+                  <button type="button" class="gp-btn primary" data-testid="proposal-file-edited" disabled={busy.has(proposal.fingerprint) || !mine.title.trim()} onclick={() => file(proposal, mine)}>File edited task</button>
+                  <button type="button" class="gp-btn" onclick={() => { delete drafts[proposal.fingerprint]; }}>Cancel</button>
                 </span>
               </div>
             {:else if proposal.status !== "attached" && !done}
@@ -261,7 +273,7 @@
 <style>
   .dock-trigger{position:absolute;right:14px;bottom:14px;z-index:20;display:inline-flex;align-items:center;gap:6px}
   .count{min-width:16px;padding:0 5px;border-radius:8px;background:rgb(var(--c-accent));color:rgb(var(--c-bg));font-size:10px;text-align:center}
-  .drawer{position:absolute;top:0;right:0;bottom:0;z-index:30;width:min(30rem,100%);box-sizing:border-box;padding:12px 14px;overflow:auto;border-left:1px solid rgb(var(--c-border) / 0.65);display:flex;flex-direction:column;gap:8px;color:rgb(var(--c-text))}
+  .drawer{position:absolute;top:0;right:0;bottom:0;z-index:30;width:min(30rem,100%);box-sizing:border-box;padding:12px 14px;overflow:auto;border-left:1px solid rgb(var(--c-border) / 0.65);display:flex;flex-direction:column;gap:8px;color:rgb(var(--c-text));background-color:rgb(var(--c-surface) / 0.94)}
   header{display:flex;align-items:center;justify-content:space-between;gap:8px}
   h2{margin:0;font-size:14px;font-weight:650}
   .actions{display:flex;gap:6px;align-items:center;flex-wrap:wrap}
