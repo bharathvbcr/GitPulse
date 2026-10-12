@@ -77,6 +77,20 @@ let mergeFailSource = "";
 let workspaceGets = 0, failWorkspaceGet = false;
 let failList = false, corruptSave = false, loseSave = false, holdSave = false, releaseSave, holdSearch = false, heldSearch = [], holdGet = false, releaseGet;
 const receipts = new Map(), proposals = new Map(), enhancementWrites = [], enhancementReads = [];
+// Manvi's refinements and gap scans, and the host's two writes that accept
+// them (`proposals.apply`, `proposals.file`). `reviewProtocol` holds what the
+// host was sent and what it answered, so the checks can read the protocol.
+const refinements = new Map(), proposalCalls = [];
+let refineCriteria = ["Exports CSV with a header row"], refineSplits = [{title: "Index the export", description: "part"}];
+// How many open tasks look related to whatever is filed or split. The host
+// names the first 25 that the caller has not reviewed, as intake.rs does.
+let relatedCount = 0, failGetTaskId = "";
+const MAX_RELATED = 25;
+const relatedTasks = () => Array.from({length: relatedCount}, (_, i) => ({item_id: `ft-rel-${String(i).padStart(3, "0")}`, title: `Related task ${i}`, status: "todo"}));
+const unreviewedRelated = input => relatedTasks().filter(related => !(input.reviewed_related ?? []).includes(related.item_id)).slice(0, MAX_RELATED);
+const SCAN_FPS = ["0123456789abcdef", "fedcba9876543210"];
+const scanProposal = (fingerprint, n) => ({fingerprint, category: "dead_symbols", status: "new", title: `Remove unused helper ${n}`, description: `Helper ${n} has no callers.`, kind: "maintenance", priority: 2, labels: ["manvi-scan"], signals: [{source: "devmap dead_symbols", result: "confidence 0.9"}]});
+const filedFingerprints = new Map();
 const verdicts = new Map(), verdictReads = [];
 let verifyOptIn = false;
 const verifyPosts = [];
@@ -257,8 +271,56 @@ mockIPCWithEvents(async (cmd, args) => {
       if (input.newest) items = items.reverse();
       return JSON.stringify(page(items, Number(input.cursor ?? 0), input.limit ?? 200));
     }
-    case "enhancements.get": enhancementReads.push(input.id); return JSON.stringify({ok:true,item:proposals.get(input.id)});
+    case "enhancements.get": enhancementReads.push(input.id); return JSON.stringify({ok:true,item:proposals.get(input.id) ?? refinements.get(input.id)});
+    case "enhancements.refine": {
+      proposalCalls.push({method: args.method, ...structuredClone(input)});
+      const source = tasks.find(task => task.id === input.id);
+      const id = `enh-refine-${refinements.size + 1}`;
+      refinements.set(id, {id, revision: 2, updated_at: 1, kind: "refine", state: "ready", task_id: source.id, source_revision: source.revision, fields: ["acceptance_criteria", "split_into", "duplicate_of"],
+        provider: "local", model: "quick-fixture", automatic: false, created_at: 1, expires_at: 2, accepted_fields: [], created_item_ids: [],
+        proposed: {acceptance_criteria: refineCriteria.map(text => text), split_into: structuredClone(refineSplits), duplicate_of: []}});
+      return JSON.stringify({ok: true, applied: false, enhancement_id: id, task_id: source.id, request_id: input.request_id, source_revision: source.revision, provider: "local", model: "quick-fixture",
+        proposal: {acceptance_criteria: refineCriteria.map(text => ({text, cites: []})), split_into: refineSplits.map(split => ({...split, cites: []})), duplicate_of: [], rationale: "Fixture refinement."},
+        dropped: [], grounding: {status: "grounded", index_fresh: true, symbols: []}, limits: {}});
+    }
+    case "proposals.apply": {
+      proposalCalls.push({method: args.method, ...structuredClone(input)});
+      const stored = refinements.get(input.id), index = tasks.findIndex(task => task.id === stored?.task_id);
+      // The store's one code for both sides: the proposal's own revision, then the task's.
+      if (!stored || stored.revision !== input.expected_revision || stored.state !== "ready") throw {code: "revision_conflict", message: `expected revision ${input.expected_revision}; current revision is ${stored?.revision ?? 0}`};
+      if (tasks[index].revision !== input.expected_task_revision) throw {code: "revision_conflict", message: "the task changed before refinement acceptance"};
+      const lockedFields = tasks[index].locked_fields ?? [];
+      if (input.fields.some(field => lockedFields.includes(field))) throw {code: "field_locked", message: "a selected task field is locked"};
+      if (input.fields.includes("split_into")) {
+        const held = unreviewedRelated(input);
+        if (held.length) return JSON.stringify({ok: false, outcome: "related_tasks_exist", splits: [{index: 0, title: stored.proposed.split_into[0].title, related: held}], scan_complete: true});
+      }
+      const criteria = input.fields.includes("acceptance_criteria") ? stored.proposed.acceptance_criteria.map(text => text.trim()).filter((text, at, all) => text && all.indexOf(text) === at && !tasks[index].acceptance_criteria.includes(text)) : [];
+      tasks[index] = {...tasks[index], acceptance_criteria: [...tasks[index].acceptance_criteria, ...criteria], revision: tasks[index].revision + 1};
+      refinements.set(stored.id, {...stored, revision: stored.revision + 1, state: "accepted", accepted_fields: input.fields});
+      return JSON.stringify({ok: true, outcome: "applied", item_id: stored.task_id, enhancement_id: stored.id, revision: tasks[index].revision, criteria_added: criteria.length, links_added: 0, created_item_ids: input.fields.includes("split_into") ? ["ft-split-1"] : []});
+    }
+    case "proposals.file": {
+      proposalCalls.push({method: args.method, ...structuredClone(input)});
+      const fingerprint = input.origin.fingerprint;
+      if (filedFingerprints.has(fingerprint)) return JSON.stringify({ok: true, outcome: "already_filed", item_id: filedFingerprints.get(fingerprint), title: input.title});
+      const held = unreviewedRelated(input);
+      if (held.length) return JSON.stringify({ok: false, outcome: "related_tasks_exist", related: held, compared: 40, scan_complete: true});
+      filedFingerprints.set(fingerprint, `ft-filed-${fingerprint}`);
+      return JSON.stringify({ok: true, outcome: "filed", item_id: `ft-filed-${fingerprint}`, title: input.title});
+    }
+    case "scans.start": case "scans.get": case "scans.cancel": {
+      proposalCalls.push({method: args.method, ...structuredClone(input)});
+      return JSON.stringify({scan_id: "scan-fixture", state: "done", repo_root: "/fixture/GitPulse", max_proposals: 25, started_at: 1, finished_at: 2, complete: true, board_complete: true,
+        new_count: 2, attached_count: 0, over_cap: 0, coverage: [{category: "dead_symbols", status: "ok"}], proposals: SCAN_FPS.map((fingerprint, n) => scanProposal(fingerprint, n + 1))});
+    }
     case "enhancements.create": case "enhancements.generate": case "enhancements.complete": case "enhancements.accept": case "enhancements.undo": case "enhancements.dismiss": {
+      if (args.method === "enhancements.dismiss" && refinements.has(input.id)) {
+        const stored = refinements.get(input.id);
+        if (stored.revision !== input.expected_revision) throw {code: "revision_conflict", message: "Suggestion changed"};
+        refinements.set(stored.id, {...stored, revision: stored.revision + 1, state: "dismissed"});
+        return JSON.stringify({ok: true, item: refinements.get(input.id)});
+      }
       enhancementWrites.push({method:args.method,...structuredClone(input)});
       if(receipts.has(input.request_id)) return receipts.get(input.request_id);
       let proposal = proposals.get(input.id);
@@ -283,7 +345,7 @@ mockIPCWithEvents(async (cmd, args) => {
             proposal.rationale=input.rationale ?? "";
           }
         }
-        if(args.method === "enhancements.dismiss") { proposal.state="cancelled"; proposal.failure="Cancelled by user"; }
+        if(args.method === "enhancements.dismiss") { proposal.state = proposal.state === "running" ? "cancel_requested" : "dismissed"; }
         if(args.method === "enhancements.accept" || args.method === "enhancements.undo") {
           const index = tasks.findIndex(task=>task.id===proposal.task_id), current=tasks[index];
           if(current.revision !== input.expected_task_revision) throw {code:"revision_conflict",message:"Task changed"};
@@ -320,7 +382,7 @@ mockIPCWithEvents(async (cmd, args) => {
       if (holdSearch && input.query === "older") return new Promise(resolve => heldSearch.push(() => resolve(result)));
       return result;
     }
-    case "items.get": { const found = tasks.find(task => task.id === input.id); const result = JSON.stringify({ok: true, item: found ? { logs: "", ...found } : found}); if (holdGet) return new Promise(resolve => { releaseGet = () => resolve(result); }); return result; }
+    case "items.get": { if (failGetTaskId === input.id) throw {code: "transport_error", message: "Lost task read"}; const found = tasks.find(task => task.id === input.id); const result = JSON.stringify({ok: true, item: found ? { logs: "", ...found } : found}); if (holdGet) return new Promise(resolve => { releaseGet = () => resolve(result); }); return result; }
     case "items.brief.get": {
       const task = tasks.find(item => item.id === input.id);
       if (!task || deleted.has(task.id)) throw {code:"not_found", message:"Fixture has no such task"};
@@ -3282,6 +3344,145 @@ if (params.has("check")) {
       await click("Global fixture"); await wait(() => !root.querySelector('[data-testid="task-board-all"]'));
       check("the global board does not offer a link to itself", !root.querySelector('[data-testid="task-board-all"]'));
     } catch (error) { check(`the global navigation checks ran to the end (${error.message} at ${guardStep})`, false); }
+
+    // ---- Proposals: Manvi's refinement of a task, and the gap scan ---------
+    // Both only propose; what a person accepts is written by the host's
+    // `proposals.apply` and `proposals.file`, whose related-task protection
+    // pages 25 at a time. The fixture answers as the host does (see the
+    // `proposals.*` routes), so these checks read the protocol, not a stub.
+    let proposalStep = "start";
+    try {
+      await click("GitPulse fixture"); await wait(() => card("task-1"));
+      const rq = id => editor()?.querySelector(`[data-testid="${id}"]`);
+      const applyCalls = () => proposalCalls.filter(call => call.method === "proposals.apply");
+      const taskNow = id => tasks.find(item => item.id === id);
+      const ask = async () => { rq("task-refine-ask").click(); await wait(() => rq("task-refine-result")); };
+      const closeSheet = async () => { if (editor()) { await click("Close task details"); await wait(() => !editor()); } };
+      const rowsOf = () => [...rq("task-refine-result").querySelectorAll("ins")].map(el => el.textContent.trim());
+
+      // -- Apply replaces the sheet's draft, so it waits for the edits to be saved.
+      proposalStep = "dirty apply";
+      refineCriteria = ["Exports CSV with a header row", "  Exports CSV with a header row  ", "   "];
+      card("task-1").click(); await wait(editor);
+      await ask();
+      check("whitespace variants and blank criteria are one criterion in the proposal's diff", rowsOf().length === 1 && rowsOf()[0] === "+ Exports CSV with a header row");
+      await change(field("Title"), "Typed but not saved");
+      check("Apply selected is disabled while the sheet has unsaved edits", rq("task-refine-apply").disabled && Boolean(rq("task-refine-ask").disabled));
+      const applyBefore = applyCalls().length;
+      rq("task-refine-apply").click(); await settle(100);
+      check("a click on a disabled Apply writes nothing and the typed title is still there", applyCalls().length === applyBefore && field("Title").value === "Typed but not saved");
+      await click("Reload saved"); await wait(() => !rq("task-refine-apply").disabled);
+      check("once the edits are discarded Apply is available again", !rq("task-refine-apply").disabled);
+
+      // -- More than 25 related tasks: the review accumulates, so 'anyway' succeeds.
+      proposalStep = "apply anyway";
+      relatedCount = 60;
+      rq("task-refine-part-split_into").click(); await settle();
+      await wait(() => !rq("task-refine-apply").disabled);
+      const callsBefore = applyCalls().length;
+      proposalStep = `apply anyway (apply disabled=${rq("task-refine-apply").disabled}, hint=${Boolean(editor().querySelector(".refine .hint"))}, stale=${Boolean(rq("task-refine-stale"))}, applying=${rq("task-refine-apply").textContent.trim()}, split ticked=${rq("task-refine-part-split_into").checked}, criteria ticked=${rq("task-refine-part-acceptance_criteria")?.checked})`;
+      rq("task-refine-apply").click(); await wait(() => rq("task-refine-apply-anyway"));
+      for (let round = 0; round < 6 && rq("task-refine-apply-anyway"); round++) { rq("task-refine-apply-anyway").click(); await settle(100); }
+      await wait(() => rq("task-refine-message"));
+      const sentSizes = applyCalls().slice(callsBefore).map(call => call.reviewed_related.length);
+      check("Apply anyway with 60 related tasks accumulates the reviewed set and succeeds", JSON.stringify(sentSizes) === "[0,25,50,60]" && /^Applied/.test(rq("task-refine-message").textContent) && !rq("task-refine-error"));
+      check("the applied criterion was added once, trimmed", JSON.stringify(taskNow("task-1").acceptance_criteria.filter(text => text.includes("CSV"))) === '["Exports CSV with a header row"]');
+      relatedCount = 0;
+
+      // -- An apply that succeeded is reported as applied even when the re-read fails.
+      proposalStep = "reread";
+      refineCriteria = ["Rejects files over the size cap"]; refineSplits = [];
+      await ask();
+      failGetTaskId = "task-1";
+      rq("task-refine-apply").click(); await wait(() => rq("task-refine-message"));
+      failGetTaskId = "";
+      check("an apply whose re-read fails is reported as applied, not as an error", /^Applied/.test(rq("task-refine-message").textContent) && /could not be re-read/.test(rq("task-refine-message").textContent) && !rq("task-refine-error"));
+      check("that apply wrote exactly once", applyCalls().length === callsBefore + sentSizes.length + 1);
+      await closeSheet();
+
+      // -- A refusal names the side that moved.
+      proposalStep = "conflicts";
+      refineCriteria = ["Documents the export format"];
+      card("task-1").click(); await wait(editor);
+      await ask();
+      const proposalId = [...refinements.keys()].at(-1);
+      refinements.set(proposalId, {...refinements.get(proposalId), revision: 3, state: "dismissed"});
+      rq("task-refine-apply").click(); await wait(() => rq("task-refine-error"));
+      check("a proposal dismissed elsewhere says so, not that the task changed", /dismissed elsewhere/.test(rq("task-refine-error").textContent) && !/The task changed/.test(rq("task-refine-error").textContent));
+      await ask();
+      const moved = taskNow("task-1");
+      tasks = tasks.map(item => item.id === "task-1" ? {...item, revision: item.revision + 1} : item);
+      rq("task-refine-apply").click(); await wait(() => rq("task-refine-error"));
+      check("a task edited elsewhere says the task changed", /The task changed/.test(rq("task-refine-error").textContent) && taskNow("task-1").revision === moved.revision + 1);
+      await closeSheet();
+
+      // -- A locked part is never pre-ticked, and cannot be applied.
+      proposalStep = "locked";
+      tasks = tasks.map(item => item.id === "task-3" ? {...item, locked_fields: ["acceptance_criteria"]} : item);
+      refineCriteria = ["A criterion on a locked list"];
+      card("task-3").click(); await wait(editor);
+      await ask();
+      check("a locked acceptance_criteria part is disabled and not pre-ticked", rq("task-refine-part-acceptance_criteria").disabled && !rq("task-refine-part-acceptance_criteria").checked);
+      check("with every part locked or unchosen there is nothing to apply", rq("task-refine-apply").disabled);
+      tasks = tasks.map(item => item.id === "task-3" ? {...item, locked_fields: []} : item);
+      await closeSheet();
+
+      // -- A pending suggestion past its expiry no longer blocks Ask.
+      proposalStep = "expired pending";
+      const nowSeconds = Math.floor(Date.now() / 1000);
+      const pendingFor = (id, expiresAt) => ({id, revision: 1, updated_at: 1, task_id: "task-3", source_revision: taskNow("task-3").revision, source: structuredClone(taskNow("task-3")), fields: ["title", "description"],
+        state: "pending", provider: "local", model: "quick-fixture", automatic: false, created_at: nowSeconds - 120, expires_at: expiresAt});
+      const askState = async id => { proposals.set(id.id, id); card("task-3").click(); await wait(editor); await settle(300); const disabled = Boolean(enhanceButton()?.disabled); proposals.delete(id.id); await closeSheet(); return disabled; };
+      check("Ask is available on a task with no suggestion in flight", (await askState({...pendingFor("none-1", 0), state: "dismissed"})) === false);
+      check("a pending suggestion that has not expired still blocks Ask", (await askState(pendingFor("live-1", nowSeconds + 600))) === true);
+      check("an expired pending suggestion does not block Ask", (await askState(pendingFor("expired-1", nowSeconds - 60))) === false);
+
+      // -- The gap scan: drawer, drafts and the reviewed set.
+      proposalStep = "scan";
+      const trigger = () => root.querySelector('[data-testid="proposals-open"]');
+      trigger().click(); await wait(() => root.querySelector('[data-testid="proposals-drawer"]'));
+      root.querySelector('[data-testid="proposals-scan"]').click(); await wait(() => root.querySelector(`[data-testid="proposal-${SCAN_FPS[0]}"]`));
+      check("a scan lists its proposals through scans.start", proposalCalls.some(call => call.method === "scans.start") && SCAN_FPS.every(fp => root.querySelector(`[data-testid="proposal-${fp}"]`)));
+
+      const drawer = root.querySelector('[data-testid="proposals-drawer"]');
+      const alphaOf = color => { const m = /\/\s*([\d.]+)(%?)\s*\)$/.exec(color) ?? /rgba\([^)]*,\s*([\d.]+)\s*\)$/.exec(color); return m ? (m[2] === "%" ? parseFloat(m[1]) / 100 : parseFloat(m[1])) : 1; };
+      const hadMacos = document.documentElement.classList.contains("macos"), hadLight = document.documentElement.classList.contains("light");
+      document.documentElement.classList.add("macos");
+      const surfaces = [];
+      for (const theme of ["dark", "light"]) {
+        document.documentElement.classList.toggle("light", theme === "light"); document.documentElement.classList.toggle("dark", theme === "dark");
+        await settle(50);
+        const css = getComputedStyle(drawer);
+        surfaces.push({theme, alpha: alphaOf(css.backgroundColor), blur: `${css.backdropFilter} ${css.webkitBackdropFilter}`.includes("blur")});
+      }
+      document.documentElement.classList.toggle("macos", hadMacos); document.documentElement.classList.toggle("light", hadLight); document.documentElement.classList.toggle("dark", !hadLight);
+      check(`the proposals drawer is opaque or blurred over the board in light and dark on macOS (${JSON.stringify(surfaces)})`, surfaces.length === 2 && surfaces.every(surface => surface.alpha >= 0.9 || surface.blur));
+      const probe = drawer.getBoundingClientRect();
+      check("the drawer is the topmost surface over the busy board", drawer.contains(document.elementFromPoint(probe.left + probe.width / 2, probe.top + probe.height / 2)));
+
+      const panel = fp => root.querySelector(`[data-testid="proposal-${fp}"]`);
+      const inPanel = (fp, id) => panel(fp)?.querySelector(`[data-testid="${id}"]`);
+      const fileCalls = fp => proposalCalls.filter(call => call.method === "proposals.file" && call.origin.fingerprint === fp);
+      relatedCount = 60;
+      const [first, second] = SCAN_FPS;
+      inPanel(first, "proposal-edit").click(); await settle();
+      await change(inPanel(first, "proposal-edit-title"), "A, edited by hand");
+      inPanel(first, "proposal-file-edited").click(); await wait(() => inPanel(first, "proposal-file-anyway"));
+      inPanel(second, "proposal-edit").click(); await settle();
+      await change(inPanel(second, "proposal-edit-title"), "B, edited by hand");
+      check("each proposal keeps its own edit while another is being edited", inPanel(first, "proposal-edit-title")?.value === "A, edited by hand" && inPanel(second, "proposal-edit-title")?.value === "B, edited by hand");
+      for (let round = 0; round < 6 && inPanel(first, "proposal-file-anyway"); round++) { inPanel(first, "proposal-file-anyway").click(); await settle(100); }
+      await wait(() => inPanel(first, "proposal-filed"));
+      const sent = fileCalls(first);
+      check("File anyway files the proposal's own edited text, not another proposal's", sent.length >= 2 && sent.every(call => call.title === "A, edited by hand") && fileCalls(second).length === 0);
+      check("File anyway with 60 related tasks accumulates the reviewed set and succeeds", JSON.stringify(sent.map(call => call.reviewed_related.length)) === "[0,25,50,60]" && /Filed in the inbox/.test(inPanel(first, "proposal-filed").textContent));
+      check("the other proposal's edit survived the first one being filed", inPanel(second, "proposal-edit-title")?.value === "B, edited by hand");
+      relatedCount = 0;
+      inPanel(second, "proposal-file-edited").click(); await wait(() => inPanel(second, "proposal-filed"));
+      check("an edited proposal files as edited once the related tasks are out of the way", fileCalls(second).at(-1).title === "B, edited by hand" && fileCalls(second).length === 1);
+      root.querySelector('button[aria-label="Close proposals"]').click(); await settle();
+    } catch (error) { check(`the proposals checks ran to the end (${error.message} at ${proposalStep}; refine error: ${editor()?.querySelector('[data-testid="task-refine-error"]')?.textContent ?? "none"}; refine message: ${editor()?.querySelector('[data-testid="task-refine-message"]')?.textContent ?? "none"}; apply calls: ${JSON.stringify(proposalCalls.filter(call => call.method === "proposals.apply").map(call => call.reviewed_related.length))})`, false); if (editor()) { await click("Close task details").catch(() => {}); } }
+    relatedCount = 0; failGetTaskId = "";
 
     check(`no runtime errors or unconfigured fixture requests occurred${crashes.length || unknown.length ? ` (${[...crashes, ...unknown].join("; ")})` : ""}`, crashes.length === 0 && unknown.length === 0);
   } catch(error) { results.push({name:error.message, stack:error.stack, pass:false}); }
