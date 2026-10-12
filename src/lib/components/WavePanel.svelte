@@ -1,5 +1,6 @@
 <script lang="ts">
   import { onDestroy, onMount } from "svelte";
+  import { createAdaptiveTimer } from "../runtime/adaptiveTimer";
   import { explainError } from "../workbench/client";
   import { beginWave, currentWave, resumeActiveWave } from "../workbench/waveHost";
   import { DEFAULT_WAVES, DEFAULT_WAVE_SIZE, MAX_WAVES, MAX_WAVE_SIZE, clampWaveSize, clampWaves, type MemberPhase, type WaveRecord, type WaveRunner } from "../workbench/waveLaunch";
@@ -20,7 +21,7 @@
   let error = $state("");
   let partial = $state(false);
   let busy = $state(false);
-  let timer: ReturnType<typeof setInterval> | null = null;
+  let stopPoll: (() => void) | null = null;
   let disposed = false;
 
   const running = $derived(record?.state === "running");
@@ -34,11 +35,12 @@
 
   function watch(next: WaveRunner) {
     runner = next; record = next.record();
-    if (timer) clearInterval(timer);
-    timer = setInterval(() => {
+    stopPoll?.();
+    // Stops while the window is hidden and catches up when it returns.
+    stopPoll = createAdaptiveTimer(() => {
       if (!runner || disposed) return;
       record = runner.record();
-      if (record.state !== "running" && timer) { clearInterval(timer); timer = null; }
+      if (record.state !== "running") { stopPoll?.(); stopPoll = null; }
     }, 1000);
     void next.finished.then((done) => { if (!disposed && runner === next) record = done; });
   }
@@ -52,7 +54,7 @@
       if (found.runner) watch(found.runner);
     } catch (cause) { if (!disposed) error = `A wave left running could not be resumed: ${explainError(cause)}`; }
   });
-  onDestroy(() => { disposed = true; if (timer) clearInterval(timer); });
+  onDestroy(() => { disposed = true; stopPoll?.(); });
 
   async function start() {
     if (!repositoryId || busy || running) return;

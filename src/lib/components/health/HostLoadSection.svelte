@@ -32,6 +32,7 @@
     sensorStateLabel,
   } from "../../health/hostLoad";
   import { explainError } from "../../workbench/client";
+  import { createAdaptiveTimer } from "../../runtime/adaptiveTimer";
 
   const REFRESH_MS = 4_000;
   const SESSION_COLUMNS = Object.freeze([
@@ -65,7 +66,7 @@
   let confirming = $state<number | null>(null);
   let terminating = $state(false);
   let outcome = $state("");
-  let timer: ReturnType<typeof setInterval> | null = null;
+  let stopRefresh: (() => void) | null = null;
 
   const status = $derived($hostLoadStatus);
   const snap = $derived(status?.snapshot ?? null);
@@ -83,10 +84,11 @@
 
   onMount(() => {
     void refresh();
-    timer = setInterval(() => void refresh(), REFRESH_MS);
+    // Stops while the window is hidden and refreshes once when it returns.
+    stopRefresh = createAdaptiveTimer(() => void refresh(), REFRESH_MS);
   });
   onDestroy(() => {
-    if (timer) clearInterval(timer);
+    stopRefresh?.();
   });
 
   async function terminate(orphan: Orphan) {
