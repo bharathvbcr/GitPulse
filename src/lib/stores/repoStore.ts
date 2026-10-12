@@ -1436,7 +1436,7 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
       return !!active && sameRepo(active.path, path, options);
     },
     isHidden: readHiddenDocument,
-    refresh: (path) => void store.refresh(path),
+    refresh: (path) => store.refresh(path),
   });
   let unbindRefreshVisibility: (() => void) | null = null;
   function bindRefreshVisibility(): void {

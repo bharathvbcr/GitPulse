@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   BACKGROUND_REFRESH_MIN_MS,
   BACKGROUND_REFRESH_SPACING_MS,
+  INFLIGHT_MAX_MS,
   WATCHER_REFRESH_DEBOUNCE_MS,
   createWatcherRefreshPolicy,
   type WatcherRefreshPolicy,
@@ -12,8 +13,9 @@ function harness(initial: { active?: string; hidden?: boolean } = {}) {
   let now = 1_000_000;
   let nextHandle = 1;
   const timers = new Map<number, { at: number; run: () => void }>();
-  const state = { active: initial.active ?? "A", hidden: initial.hidden ?? false };
+  const state = { active: initial.active ?? "A", hidden: initial.hidden ?? false, hold: false };
   const refreshes: Array<{ key: string; at: number }> = [];
+  const releases: Array<() => void> = [];
   const policy: WatcherRefreshPolicy = createWatcherRefreshPolicy({
     now: () => now,
     setTimer: (run, delayMs) => {
@@ -27,8 +29,21 @@ function harness(initial: { active?: string; hidden?: boolean } = {}) {
     },
     isActive: (key) => key === state.active,
     isHidden: () => state.hidden,
-    refresh: (key) => refreshes.push({ key, at: now }),
+    refresh: (key) => {
+      refreshes.push({ key, at: now });
+      if (!state.hold) return;
+      return new Promise<void>((resolve) => {
+        releases.push(resolve);
+      });
+    },
   });
+  /** Completes every refresh started while `state.hold` was set. */
+  const settle = async () => {
+    for (const release of releases.splice(0)) release();
+    // Let the policy's own continuation run.
+    await Promise.resolve();
+    await Promise.resolve();
+  };
   /** Advances the clock, firing due timers in time order. */
   const advance = (ms: number) => {
     const end = now + ms;
@@ -45,8 +60,107 @@ function harness(initial: { active?: string; hidden?: boolean } = {}) {
     now = end;
   };
   const count = (key: string) => refreshes.filter((r) => r.key === key).length;
-  return { policy, state, refreshes, advance, count, timers, at: () => now };
+  return { policy, state, refreshes, advance, count, timers, settle, at: () => now };
 }
+
+describe("watcher refresh policy: a refresh already in flight", () => {
+  it("never starts a second refresh of a key while one is running", async () => {
+    const h = harness();
+    h.state.hold = true;
+    h.policy.onChange("A");
+    h.advance(WATCHER_REFRESH_DEBOUNCE_MS);
+    expect(h.count("A")).toBe(1);
+    // A storm keeps settling every couple of seconds while the snapshot is
+    // still being read (a large repository under a busy spawn budget).
+    for (let i = 0; i < 20; i += 1) {
+      h.policy.onChange("A");
+      h.advance(2_000);
+    }
+    expect(h.count("A")).toBe(1);
+    expect(h.policy.owed()).toEqual(["A"]);
+  });
+
+  it("owes exactly one trailing refresh for everything that arrived meanwhile", async () => {
+    const h = harness();
+    h.state.hold = true;
+    h.policy.onChange("A");
+    h.advance(WATCHER_REFRESH_DEBOUNCE_MS);
+    for (let i = 0; i < 5; i += 1) {
+      h.policy.onChange("A");
+      h.advance(2_000);
+    }
+    h.state.hold = false;
+    await h.settle();
+    h.advance(WATCHER_REFRESH_DEBOUNCE_MS);
+    expect(h.count("A")).toBe(2);
+    h.advance(60_000);
+    expect(h.count("A")).toBe(2);
+    expect(h.policy.owed()).toEqual([]);
+  });
+
+  it("owes nothing when no event arrived while it ran", async () => {
+    const h = harness();
+    h.state.hold = true;
+    h.policy.onChange("A");
+    h.advance(WATCHER_REFRESH_DEBOUNCE_MS);
+    h.state.hold = false;
+    await h.settle();
+    h.advance(60_000);
+    expect(h.count("A")).toBe(1);
+    expect(h.policy.owed()).toEqual([]);
+  });
+
+  it("a refresh that rejects still releases the key", async () => {
+    let now = 0;
+    const timers: Array<() => void> = [];
+    let calls = 0;
+    const policy = createWatcherRefreshPolicy({
+      now: () => now,
+      setTimer: (run) => timers.push(run),
+      clearTimer: () => {},
+      isActive: () => true,
+      isHidden: () => false,
+      refresh: () => {
+        calls += 1;
+        return Promise.reject(new Error("boom"));
+      },
+    });
+    policy.onChange("A");
+    now += WATCHER_REFRESH_DEBOUNCE_MS;
+    timers.shift()?.();
+    await Promise.resolve();
+    await Promise.resolve();
+    policy.onChange("A");
+    now += WATCHER_REFRESH_DEBOUNCE_MS;
+    timers.shift()?.();
+    expect(calls).toBe(2);
+  });
+
+  it("a refresh that never settles stops holding the key after the bound", () => {
+    const h = harness();
+    h.state.hold = true;
+    h.policy.onChange("A");
+    h.advance(WATCHER_REFRESH_DEBOUNCE_MS);
+    h.advance(INFLIGHT_MAX_MS);
+    h.policy.onChange("A");
+    h.advance(WATCHER_REFRESH_DEBOUNCE_MS);
+    expect(h.count("A")).toBe(2);
+  });
+
+  it("forgetting the key while it runs drops the trailing refresh", async () => {
+    const h = harness();
+    h.state.hold = true;
+    h.policy.onChange("A");
+    h.advance(WATCHER_REFRESH_DEBOUNCE_MS);
+    h.policy.onChange("A");
+    h.advance(2_000);
+    h.policy.forget("A");
+    h.state.hold = false;
+    await h.settle();
+    h.advance(60_000);
+    expect(h.count("A")).toBe(1);
+  });
+});
 
 describe("watcher refresh policy: the active tab", () => {
   it("keeps the storm debounce: a burst is one trailing refresh", () => {
