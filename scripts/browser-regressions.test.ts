@@ -57,6 +57,30 @@ describe("failure reporting a CI reader can see", () => {
   });
 });
 
+describe("the watchdog only ever signals the Chrome it launched", () => {
+  const profile = "/tmp/gitpulse-browser-abc123";
+  const own = (pid: number) => ({ pgid: pid, command: `Chrome --user-data-dir=${profile} about:blank` });
+  it("names Chrome's group when the pid is still its group leader", async () => {
+    const { chromeVictim } = await import("./browser-regressions.mjs");
+    expect(chromeVictim(4242, profile, "darwin", 7, own)).toBe(-4242);
+    expect(chromeVictim(4242, profile, "win32", 7, own)).toBe(4242);
+  });
+  it("refuses every id that would reach more than Chrome", async () => {
+    const { chromeVictim } = await import("./browser-regressions.mjs");
+    // process.kill(-0) is kill(0): the watchdog's own group. -1 is everything.
+    for (const id of [0, -0, 1, -1, -2, NaN, Infinity, 1.5, 7]) {
+      expect(chromeVictim(id, profile, "darwin", 7, own), `pid ${id}`).toBeNull();
+    }
+  });
+  it("refuses a recycled pid: gone, not a group leader, or not this run's Chrome", async () => {
+    const { chromeVictim } = await import("./browser-regressions.mjs");
+    expect(chromeVictim(4242, profile, "darwin", 7, () => null)).toBeNull();
+    expect(chromeVictim(4242, profile, "darwin", 7, () => ({ pgid: 900, command: `Chrome --user-data-dir=${profile}` }))).toBeNull();
+    expect(chromeVictim(4242, profile, "darwin", 7, () => ({ pgid: 4242, command: "/usr/bin/vim notes.txt" }))).toBeNull();
+    expect(chromeVictim(4242, "", "darwin", 7, own)).toBeNull();
+  });
+});
+
 describe("a browser cannot outlive its runner", () => {
   const chrome = chromeBinary();
   // Reported as skipped where there is no Chrome, never as passed.

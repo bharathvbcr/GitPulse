@@ -11,6 +11,17 @@ before that tag is pushed.
 
 ## [Unreleased]
 
+### Fixed
+
+- Every signal GitPulse sends now goes through one guarded primitive,
+  `procguard::signal`. It refuses pid 0, 1 and negative ids, the app's own
+  process, group and session, a group GitPulse did not create, and a pid whose
+  start time moved, and it logs who sent each signal and why. Terminal close,
+  the Health orphan Terminate and every spawned-child teardown use it; a test
+  fails the build if production code signals a process any other way. The
+  browser-regression watchdog and `dev-port` reclaim likewise refuse a pid they
+  have not verified.
+
 ## [1.4.0] - 2026-10-11
 
 Agents that start in the background with a pane showing every one at work,

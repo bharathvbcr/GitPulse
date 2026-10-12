@@ -244,7 +244,13 @@ pub(crate) fn announced_pid(child: &mut std::process::Child) -> u32 {
 /// process being gone therefore go through [`wait_gone`].
 #[cfg(all(test, unix))]
 pub(crate) fn process_alive(pid: u32) -> bool {
-    unsafe { libc::kill(pid as i32, 0) == 0 }
+    // `pid as i32` would turn u32::MAX into -1, which `kill` reads as "every
+    // process"; a pid that does not fit a `pid_t` names nothing.
+    let Ok(pid) = i32::try_from(pid) else {
+        return false;
+    };
+    // SAFETY: signal 0 delivers nothing; it only probes for existence.
+    unsafe { libc::kill(pid, 0) == 0 }
 }
 
 /// Waits for a pid to leave the process table, so an assertion never depends on

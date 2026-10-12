@@ -26,12 +26,26 @@ const HOOK: &str = env!("CARGO_BIN_EXE_gitpulse-hook");
 /// `BUDGET` waits (5 s each) would end at the host's 10 s timeout.
 const STDIN_DELAY: Duration = Duration::from_millis(4800);
 
-fn alive(pid: &str) -> bool {
-    Command::new("kill")
-        .args(["-0", pid])
-        .stderr(Stdio::null())
-        .status_locked()
-        .is_ok_and(|s| s.success())
+/// The pid a fixture recorded, as a number `kill` can only aim at one process:
+/// 0, 1 and negatives address groups, init or everything, and an unparsable
+/// line names nothing.
+fn recorded_pid(text: &str) -> Option<i32> {
+    text.trim().parse::<i32>().ok().filter(|pid| *pid > 1)
+}
+
+fn alive(pid: i32) -> bool {
+    // SAFETY: signal 0 only probes for existence and permission.
+    unsafe { libc::kill(pid, 0) == 0 }
+}
+
+/// Whether `pid` is still the fixture's `sleep 60`. The pid was recorded
+/// seconds ago by a process that has since exited, so a live process under that
+/// number may be a stranger's; only the fixture's own command line is ours.
+fn is_the_fixture_sleep(pid: i32) -> bool {
+    Command::new("ps")
+        .args(["-o", "command=", "-p", &pid.to_string()])
+        .output_locked()
+        .is_ok_and(|out| String::from_utf8_lossy(&out.stdout).trim() == "sleep 60")
 }
 
 #[test]
@@ -103,10 +117,11 @@ fn a_stalled_child_is_reaped_and_the_total_stays_under_the_host_timeout() {
     std::thread::sleep(Duration::from_millis(500));
 
     let recorded = std::fs::read_to_string(&pids).unwrap_or_default();
-    let pid_list: Vec<&str> = recorded.lines().filter(|l| !l.is_empty()).collect();
-    let survivors: Vec<&str> = pid_list.iter().copied().filter(|pid| alive(pid)).collect();
-    for pid in &survivors {
-        let _ = Command::new("kill").args(["-9", pid]).status_locked();
+    let pid_list: Vec<i32> = recorded.lines().filter_map(recorded_pid).collect();
+    let survivors: Vec<i32> = pid_list.iter().copied().filter(|pid| alive(*pid)).collect();
+    for pid in survivors.iter().filter(|pid| is_the_fixture_sleep(**pid)) {
+        // SAFETY: a pid above 1 whose command line is the fixture's own.
+        unsafe { libc::kill(*pid, libc::SIGKILL) };
     }
     assert!(
         !pid_list.is_empty(),
