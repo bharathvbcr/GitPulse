@@ -428,6 +428,38 @@ describe("liveIndex controller", () => {
     index.reset();
   });
 
+  it("another repository waits, without asking, while a background build is collected", async () => {
+    // The queue slot used to serialize builds by holding the IPC call. With
+    // the build off the IPC path, a second repository asking during it was
+    // refused by the backend's one-build slot after paying for a status
+    // probe, then spent its busy budget against a writer that was not its own.
+    const answers: Record<string, LiveRefreshOutcome[]> = {
+      "/a": [
+        outcome("started"),
+        ...Array.from({ length: 12 }, () => outcome("skip_building")),
+        outcome("refresh", { cooldown_remaining_ms: 30_000 }),
+      ],
+      "/b": [outcome("refresh", { cooldown_remaining_ms: 30_000 })],
+    };
+    const maybeRefresh = vi.fn(async (repo: string, _changed: boolean) => answers[repo]?.shift() ?? outcome("skip_fresh"));
+    const index = createLiveIndex({ debounceMs: 0, maybeRefresh });
+    index.onRepoChanged("/a");
+    await vi.advanceTimersByTimeAsync(0);
+    expect(index.get("/a").phase).toBe("running");
+    index.onRepoChanged("/b");
+    const callsFor = (repo: string) => maybeRefresh.mock.calls.filter(([r]) => r === repo);
+    await vi.advanceTimersByTimeAsync(90_000);
+    expect(callsFor("/b")).toHaveLength(0);
+    expect(index.get("/b").phase).toBe("scheduled");
+    await vi.advanceTimersByTimeAsync(5 * 60_000);
+    expect(index.get("/a").phase).toBe("ready");
+    // Once, after the build it waited behind, and still owed its edit.
+    expect(callsFor("/b")).toEqual([["/b", true]]);
+    expect(index.get("/b").phase).toBe("ready");
+    expect(vi.getTimerCount()).toBe(0);
+    index.reset();
+  });
+
   it("gives up collecting a background build that outlives its deadline", async () => {
     const maybeRefresh = vi.fn(async (_repo: string, _changed: boolean) => outcome("skip_building"))
       .mockResolvedValueOnce(outcome("started"));
@@ -468,6 +500,8 @@ describe("liveIndex controller", () => {
     for (let i = 0; i < 9 * 60; i++) {
       index.onRepoChanged("/repo");
       await vi.advanceTimersByTimeAsync(1_000);
+      // Still too slow, not "queued", for as long as the pause lasts.
+      expect(index.get("/repo").phase).toBe("paused");
     }
     expect(maybeRefresh).toHaveBeenCalledTimes(1);
     await vi.advanceTimersByTimeAsync(2 * 60_000);

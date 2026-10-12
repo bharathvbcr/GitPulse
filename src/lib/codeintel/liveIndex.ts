@@ -259,6 +259,18 @@ export function createLiveIndex(opts?: {
   }
 
   async function run(repoPath: string, isCurrent: () => boolean) {
+    // One automatic build at a time. While another repository's background
+    // build is being collected, this one waits here — no IPC, so no status
+    // probe and no busy budget spent on a writer that is not its own — as it
+    // used to wait behind the IPC call that held the queue slot for the build.
+    // Bounded: collection ends by `LIVE_INDEX_BUILD_WAIT_MS`.
+    if (awaiting.size > 0 && !awaiting.has(repoPath)) {
+      if (queue.enqueue(repoPath, { delayMs: LIVE_INDEX_COLLECT_MAX_MS })) {
+        const prev = get(snapshots)[repoPath];
+        if (prev?.phase !== "paused") patch(repoPath, { phase: "scheduled" });
+      }
+      return;
+    }
     const repoChanged = dirty.has(repoPath);
     // Consumed by this ask. An edit that lands while it is in flight marks the
     // repository again, so it is owed its own build rather than being erased
@@ -471,7 +483,7 @@ export function createLiveIndex(opts?: {
           let next = map;
           for (const key of scheduled) {
             const prev = snapshotFor(next, key);
-            if (prev.phase === "running" || prev.phase === "scheduled") continue;
+            if (prev.phase === "running" || prev.phase === "scheduled" || prev.phase === "paused") continue;
             if (next === map) next = { ...map };
             next[key] = { ...prev, phase: "scheduled" };
           }
@@ -504,7 +516,9 @@ export function createLiveIndex(opts?: {
       }
       snapshots.update((map) => {
         const prev = snapshotFor(map, repoPath);
-        if (prev.phase === "running" || prev.phase === "scheduled") return map;
+        // A pause is still a pause after the next edit: reading "queued" for
+        // ten minutes is what the too-slow sentence exists to prevent.
+        if (prev.phase === "running" || prev.phase === "scheduled" || prev.phase === "paused") return map;
         return { ...map, [repoPath]: { ...prev, phase: "scheduled" } };
       });
     },
