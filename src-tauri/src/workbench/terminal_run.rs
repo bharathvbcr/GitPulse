@@ -1,12 +1,13 @@
 use super::{
-    announce, process_birth, query, receipts, terminal_command, terminal_launch, WorkbenchError,
-    WorkbenchState,
+    announce, claude_hook, process_birth, query, receipts, terminal_command, terminal_launch,
+    WorkbenchError, WorkbenchState,
 };
 use crate::terminal::{
     self, SessionObserver, TerminalExitPayload, TerminalSessions, TerminalSpawned,
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
+use std::path::Path;
 use std::sync::{
     atomic::{AtomicU64, Ordering},
     Arc, Mutex,
@@ -116,10 +117,18 @@ pub(super) fn spawn<R: tauri::Runtime>(
             .map_err(|message| WorkbenchError::new("protocol_error", message))?,
         None => defaults.model_for(&source.provider).cloned(),
     };
+    // Decided once, here, so the build is checked for the flags it is given.
+    let hook = claude_hook::for_launch(
+        &source.provider,
+        None,
+        Some(Path::new(&source.cwd)),
+        sources.as_deref(),
+    );
     let options = terminal_command::LaunchOptions {
         notify: crate::tool_config::session_alerts().configure_agents,
         setting_sources: sources.as_deref(),
         model: recorded.as_ref(),
+        hook: hook.binary(),
     };
     terminal_command::check(
         &program,
