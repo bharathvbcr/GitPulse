@@ -269,3 +269,48 @@ describe("a refused apply says which side moved", () => {
     expect(conflict.message).toMatch(/nothing was applied/i);
   });
 });
+
+describe("adversarial: the apply path's reviewed set across several held splits", () => {
+  // A host that behaves as intake.rs does for `proposals.apply`: each split
+  // names the first 25 of its related tasks the caller has not reviewed, and
+  // the accept goes through only when no split names any.
+  const hostWith = (perSplit: { item_id: string }[][]) => {
+    native.mockReset();
+    native.mockImplementation(async (_cmd, args) => {
+      const sent = JSON.parse(String((args as { input: string }).input)) as { reviewed_related: string[] };
+      const splits = perSplit.map((related, index) => ({ index, title: `S${index}`,
+        related: related.filter((r) => !sent.reviewed_related.includes(r.item_id)).slice(0, 25).map((r) => ({ ...r, title: r.item_id, status: "todo" })) }))
+        .filter((split) => split.related.length > 0);
+      return JSON.stringify(splits.length ? { ok: false, outcome: "related_tasks_exist", scan_complete: true, splits }
+        : { ok: true, outcome: "applied", revision: 5, criteria_added: 0, links_added: 0, created_item_ids: perSplit.map((_, n) => `ft-s${n}`) });
+    });
+  };
+  const ids = (prefix: string, n: number) => Array.from({ length: n }, (_, i) => ({ item_id: `${prefix}-${i}` }));
+  const confirmUntilApplied = async () => {
+    const result = { ...refineResult(refine()), enhancement_revision: 2 };
+    let reviewed: string[] = [];
+    let outcome = await applyRefine("/r", result, ["split_into"], reviewed);
+    let rounds = 0;
+    while (outcome.outcome === "related_tasks_exist") {
+      if (++rounds > 10) throw new Error("the review does not converge");
+      // Exactly what TaskRefine's "apply anyway" passes: every split's related rows.
+      reviewed = confirmReviewed(reviewed, outcome.splits.flatMap((split) => split.related));
+      outcome = await applyRefine("/r", result, ["split_into"], reviewed);
+    }
+    return { rounds, reviewed: reviewed.length, outcome: outcome.outcome };
+  };
+  it("two splits with 30 disjoint related tasks each converge in two confirmations", async () => {
+    hostWith([ids("a", 30), ids("b", 30)]);
+    expect(await confirmUntilApplied()).toEqual({ rounds: 2, reviewed: 60, outcome: "applied" });
+  });
+  it("splits that share their related tasks are confirmed once, not once per split", async () => {
+    const shared = ids("s", 60);
+    hostWith([shared, shared, shared]);
+    expect(await confirmUntilApplied()).toEqual({ rounds: 3, reviewed: 60, outcome: "applied" });
+  });
+  it("a page whose rows repeat an id already confirmed never grows the set past the distinct ids", async () => {
+    const reviewed = confirmReviewed(confirmReviewed([], ids("x", 25)), [...ids("x", 25), ...ids("y", 5)]);
+    expect(reviewed).toHaveLength(30);
+    expect(new Set(reviewed).size).toBe(30);
+  });
+});

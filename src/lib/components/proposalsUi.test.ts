@@ -134,6 +134,26 @@ describe("glass that floats over content is blurred", () => {
       expect([...FLOAT_TIER, ...IN_FLOW].includes(name), `${file} uses gp-glass: add it to FLOAT_TIER (and give it shadow-float) or IN_FLOW (it must not overlay content)`).toBe(true);
     }
   });
+  it("adversarial: a gp-glass element positioned out of the flow carries the float tier, in whichever group its file is", () => {
+    // The file-level lists miss an overlay added to an in-flow file. Positioned
+    // by a Tailwind utility, by one of its own classes in the file's style, or
+    // portaled out of its parent: any of those lays it over other content.
+    const root = join(here, "../../..");
+    const files = execFileSync("rg", ["-l", "--no-config", "gp-glass", "src", "-g", "*.svelte"], { cwd: root, encoding: "utf8" }).split("\n").filter(Boolean);
+    const offenders: string[] = [];
+    for (const file of files) {
+      const source = readFileSync(join(root, file), "utf8");
+      const css = source.split("<style>")[1] ?? "";
+      for (const tag of source.matchAll(/<[a-z][^>]*\bclass="([^"]*\bgp-glass\b[^"]*)"[^>]*>/g)) {
+        const classes = tag[1]!.split(/\s+/).filter(Boolean);
+        const positioned = classes.some((c) => c === "absolute" || c === "fixed")
+          || /use:portal/.test(tag[0])
+          || classes.some((c) => /^[a-z][\w-]*$/.test(c) && new RegExp(`(^|[\\s,}])\\.${c}\\s*\\{[^}]*position:\\s*(absolute|fixed)`).test(css));
+        if (positioned && !classes.some((c) => c === "shadow-float" || c === "shadow-pop")) offenders.push(`${file}: ${tag[1]}`);
+      }
+    }
+    expect(offenders).toEqual([]);
+  });
   it.each(FLOAT_TIER)("%s: each gp-glass element also carries the float tier", (file) => {
     const tags = [...read(file).matchAll(/class="([^"]*\bgp-glass\b[^"]*)"/g)].map((m) => m[1]!);
     expect(tags.length).toBeGreaterThan(0);

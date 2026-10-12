@@ -385,6 +385,12 @@ describe("liveEnhancement", () => {
       expect(liveEnhancement(summary({ state, expires_at: 200 }), 10_000), state).toBe(true);
     }
   });
+  it("adversarial: a pending proposal whose expiry is not a usable number stays live (fail closed)", () => {
+    // `now >= NaN` is false: a malformed expiry must never read as expired and unblock a second Ask.
+    expect(liveEnhancement(summary({ state: "pending", expires_at: Number.NaN }), 10_000)).toBe(true);
+    // A host clock behind the store's by a second: the boundary is the store's own (`expires_at>now`).
+    expect(liveEnhancement(summary({ state: "pending", expires_at: 200 }), 199.999)).toBe(true);
+  });
   it("settled and absent proposals are never live", () => {
     for (const state of ["ready", "failed", "cancelled", "interrupted", "dismissed", "accepted", "undone"] as const) {
       expect(liveEnhancement(summary({ state, expires_at: 10_000 }), 100), state).toBe(false);
