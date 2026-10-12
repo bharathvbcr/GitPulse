@@ -23,8 +23,12 @@ export interface TerminalIncident {
 
 export const INCIDENT_EVENT = "terminal-incident";
 
-/** Most session ids one incident may list. A longer list is truncated, not trusted. */
-export const MAX_INCIDENT_SESSIONS = 256;
+/**
+ * Most session ids one incident may list: the backend's own cap
+ * (`MAX_MEMBERS` in src-tauri/src/terminal/incident.rs), so every id it sends
+ * is kept. A longer list is truncated, not trusted.
+ */
+export const MAX_INCIDENT_SESSIONS = 512;
 
 /** Incident ids remembered so a repeated event is not offered twice. */
 const MAX_SEEN_INCIDENTS = 64;

@@ -1,3 +1,4 @@
+import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 import { createHostedClaudeStore, createResumers } from "./hostedClaude";
 import {
@@ -86,6 +87,15 @@ describe("parseIncident", () => {
     const parsed = parseIncident({ ...incident(), session_ids: [1, null, "", ...many] });
     expect(parsed?.session_ids).toHaveLength(MAX_INCIDENT_SESSIONS);
     expect(parsed?.session_ids[0]).toBe("term-0");
+  });
+
+  it("keeps every session id the backend may send", () => {
+    // Lockstep with the recorder: a smaller cap here silently drops sessions
+    // the backend listed, and Resume N never offers them.
+    const source = readFileSync(new URL("../../../src-tauri/src/terminal/incident.rs", import.meta.url), "utf8");
+    const backend = /pub const MAX_MEMBERS: usize = (\d+);/.exec(source);
+    expect(backend, "MAX_MEMBERS not found in incident.rs").not.toBeNull();
+    expect(MAX_INCIDENT_SESSIONS).toBe(Number(backend?.[1]));
   });
 });
 

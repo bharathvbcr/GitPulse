@@ -15,6 +15,7 @@ use base64::Engine;
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
 mod flow;
 pub(crate) mod foreground;
+pub mod incident;
 #[cfg(unix)]
 mod input;
 use flow::{OutputFlow, Route};
@@ -193,6 +194,8 @@ pub struct TerminalSessions {
     /// Milliseconds a reader waits on an unacknowledged window before it
     /// sheds (`DEFAULT_OUTPUT_STALL`). Live, so a test can shorten it.
     output_stall_ms: Arc<AtomicU64>,
+    /// Mass external-signal deaths, recorded once each (see [`incident`]).
+    incidents: Arc<incident::Recorder>,
 }
 
 impl Default for TerminalSessions {
@@ -202,6 +205,7 @@ impl Default for TerminalSessions {
             active_sessions: Arc::default(),
             limit: Arc::new(AtomicUsize::new(DEFAULT_PTY_SESSIONS)),
             output_stall_ms: Arc::new(AtomicU64::new(DEFAULT_OUTPUT_STALL.as_millis() as u64)),
+            incidents: Arc::default(),
         }
     }
 }
@@ -215,6 +219,11 @@ impl TerminalSessions {
         self.sessions
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Recorded mass-death incidents, newest first and bounded.
+    pub fn incidents(&self) -> Vec<incident::TerminalIncidentPayload> {
+        self.incidents.recent()
     }
 
     /// How many sessions may be open at once right now.
@@ -1477,6 +1486,9 @@ fn spawn_session_inner<R: tauri::Runtime>(
     let thread_child = child.clone();
     let thread_master = master.clone();
     let thread_observer = observer.clone();
+    let incident_log = state.incidents.clone();
+    let incident_program = shell.clone();
+    let incident_cwd = start.to_string_lossy().into_owned();
     if start_error.is_some() {
         dead.store(true, Ordering::Release);
         output_flow.stop();
@@ -1629,6 +1641,8 @@ fn spawn_session_inner<R: tauri::Runtime>(
                 }
             }
 
+            // Read before the store below: set means GitPulse ended it.
+            let ended_by_gitpulse = dead_flag.load(Ordering::SeqCst);
             dead_flag.store(true, Ordering::SeqCst);
             output_flow.stop();
             watcher.ended();
@@ -1665,6 +1679,14 @@ fn spawn_session_inner<R: tauri::Runtime>(
                     if let Some(observer) = &thread_observer {
                         observer.finished(&payload);
                     }
+                    incident::report_exit(
+                        &incident_log,
+                        &app_handle,
+                        ended_by_gitpulse,
+                        &payload,
+                        &incident_program,
+                        &incident_cwd,
+                    );
                     drop(reservation.take());
                     sessions_map
                         .lock()

@@ -484,6 +484,7 @@ pub fn run() {
             cmd_terminal_export,
             cmd_terminal_resize,
             cmd_terminal_kill,
+            cmd_terminal_incidents,
             cmd_terminal_context,
             cmd_terminal_sessions,
             cmd_terminal_attach,

@@ -168,6 +168,14 @@ pub async fn cmd_terminal_kill(
     off_thread(move || crate::terminal::kill_session(&state, &session_id)).await
 }
 
+/// Mass external-signal deaths recorded this run, newest first and bounded.
+#[tauri::command(async)]
+pub async fn cmd_terminal_incidents(
+    state: State<'_, crate::terminal::TerminalSessions>,
+) -> Result<Vec<crate::terminal::incident::TerminalIncidentPayload>, String> {
+    Ok(state.incidents())
+}
+
 /// Exports user-selected terminal output through the native save dialog.
 #[tauri::command(async)]
 pub async fn cmd_terminal_export(data: String) -> Result<bool, String> {
