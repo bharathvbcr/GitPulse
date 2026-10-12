@@ -286,8 +286,9 @@ fn read_registry_pointer(path: &Path) -> Result<Option<PathBuf>, ()> {
 /// tree from turning one listing call into hundreds of subprocess spawns.
 const MAX_DIRTY_SCANS: usize = 32;
 
-/// Worktrees one listing scans at a time. Each scan is three to five git
-/// children; an unbounded parallel walk put all 32 scans' children in the
+/// Worktrees one listing scans at a time. A full scan is one to three git
+/// children (status; a diff when status found changes; a `rev-list` when the
+/// batched divergence could not be read); an unbounded parallel walk put all 32 scans' children in the
 /// spawn gate's queue at once, ahead of everything else the app was asking.
 const DIRTY_SCAN_FAN_OUT: usize = 4;
 
@@ -712,7 +713,8 @@ pub enum ScanDepth {
     Listing,
     /// Adds the dirty-file count (`git status`) for each scanned worktree.
     Dirty,
-    /// Adds diff stats, divergence from main/master, and portless routes.
+    /// Adds diff stats (a `git diff` only where status found changes),
+    /// divergence from main/master, and portless routes.
     Full,
 }
 
@@ -1235,6 +1237,14 @@ struct WorktreeScan {
     note: Option<String>,
 }
 
+/// Whether a listed `HEAD` names a commit: git lists an unborn branch's head
+/// as all zeros, and an entry it gave no head for is empty.
+fn head_is_born(head: &str) -> bool {
+    head.len() >= 40
+        && head.bytes().all(|b| b.is_ascii_hexdigit())
+        && head.bytes().any(|b| b != b'0')
+}
+
 fn scan_worktree(
     repo: &Path,
     entry: &ParsedWorktree,
@@ -1282,7 +1292,15 @@ fn scan_worktree(
     });
     let mut scan = WorktreeScan {
         dirty,
-        diff_stat: measure_diff_stat(dir),
+        diff_stat: if dirty == Some(0) && head_is_born(&entry.head) {
+            // `git status` just found HEAD, the index and the files in
+            // agreement, which is exactly an empty `git diff HEAD`; asking
+            // again cost a second child per worktree, and most worktrees in
+            // a listing are clean. An unborn or unknown HEAD is measured.
+            Some(WorktreeDiffStat::default())
+        } else {
+            measure_diff_stat(dir)
+        },
         divergence,
         routes: detect_worktree_routes(&entry.path, branch),
         note: None,
@@ -1370,8 +1388,9 @@ pub fn add_worktree(
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WorktreeCreated {
     pub path: String,
-    /// Copying build caches from the main checkout failed as a whole.
-    /// Individual cache directories that fail are logged and skipped there.
+    /// Some build cache could not be copied from the main checkout, or could
+    /// not be checked: each one named, with what was copied. A cache that
+    /// failed is absent from the worktree, never half there.
     pub cache_error: Option<String>,
     /// A `post_create` hook failed, timed out, or was refused.
     pub hook_error: Option<String>,
@@ -1402,7 +1421,12 @@ pub fn add_worktree_extended(
     };
     if cow_caches {
         let repo = validate_repo(repo_path)?;
-        created.cache_error = reflink_ignored_caches(&repo, Path::new(target_path)).err();
+        created.cache_error = reflink_ignored_caches(
+            &repo,
+            Path::new(target_path),
+            &crate::engine::cow_clone::CacheSelection::default(),
+        )
+        .err();
     }
     if run_hooks {
         let repo = validate_repo(repo_path)?;
@@ -2164,34 +2188,123 @@ some-future-field whatever
         assert!(list_worktrees(dir.path().to_str().unwrap()).is_err());
     }
 
-    /// A main checkout with `linked` worktrees under one parent directory.
-    fn repo_with_worktrees(linked: usize) -> (tempfile::TempDir, tempfile::TempDir, Vec<PathBuf>) {
-        let main = tempfile::TempDir::new().unwrap();
-        git_in(main.path(), &["init", "-b", "main"]);
-        std::fs::write(main.path().join("seed.txt"), "seed").unwrap();
-        git_in(main.path(), &["add", "."]);
-        git_in(main.path(), &["commit", "-m", "init"]);
-        let parent = tempfile::TempDir::new().unwrap();
-        let paths = (0..linked)
-            .map(|i| {
-                let path = parent.path().join(format!("wt-{i:02}"));
-                let branch = format!("agent/{i:02}");
-                git_in(
-                    main.path(),
-                    &[
-                        "worktree",
-                        "add",
-                        "-q",
-                        "-b",
-                        &branch,
-                        path.to_str().unwrap(),
-                    ],
-                );
-                crate::test_support::trust_repo(&path);
-                plain(path)
-            })
-            .collect();
-        (main, parent, paths)
+    use crate::test_support::repo_with_worktrees;
+
+    /// `diff` children a listing started in `dir`.
+    fn diff_spawns_in(dir: &Path) -> usize {
+        crate::engine::git_cli::spawn_log::spawns_in(dir)
+            .iter()
+            .filter(|argv| argv.iter().any(|arg| arg == "diff"))
+            .count()
+    }
+
+    /// A full scan of a worktree whose `git status` came back empty does not
+    /// start a second child to be told the diff against HEAD is empty, and a
+    /// worktree with changes is still measured.
+    #[test]
+    fn a_full_scan_diffs_only_the_worktrees_status_found_changed() {
+        let (main, _parent, linked) = repo_with_worktrees(2);
+        std::fs::write(linked[1].join("seed.txt"), "seed\nand\nmore\n").unwrap();
+        let listed = list_worktrees(main.path().to_str().unwrap()).expect("list");
+        let of = |dir: &Path| {
+            listed
+                .iter()
+                .find(|w| Path::new(&w.path) == dir)
+                .expect("listed")
+                .clone()
+        };
+        let clean = of(&linked[0]);
+        assert_eq!(clean.dirty_files, Some(0));
+        assert_eq!(clean.diff_stat, Some(WorktreeDiffStat::default()));
+        assert_eq!(clean.scan_note, None);
+        assert_eq!(diff_spawns_in(&linked[0]), 0, "a clean worktree was diffed");
+
+        let changed = of(&linked[1]);
+        assert_eq!(changed.dirty_files, Some(1));
+        assert_eq!(
+            diff_spawns_in(&linked[1]),
+            1,
+            "a changed worktree is diffed once"
+        );
+        let stat = changed.diff_stat.expect("measured");
+        assert_eq!((stat.files_changed, stat.insertions), (1, 3), "{stat:?}");
+    }
+
+    /// The skipped diff is only ever the empty one: whenever status reports
+    /// nothing, the listing's answer equals an unconditional `git diff HEAD`,
+    /// across the states that change one without the other's knowledge.
+    #[test]
+    fn a_clean_status_and_a_measured_diff_always_agree() {
+        let (main, _parent, linked) = repo_with_worktrees(1);
+        let dir = linked[0].clone();
+        type Step = (&'static str, Box<dyn Fn()>);
+        let steps: Vec<Step> = vec![
+            ("untouched", Box::new(|| {})),
+            ("mtime moved, content not", {
+                let dir = dir.clone();
+                Box::new(move || {
+                    let file = std::fs::File::options()
+                        .write(true)
+                        .open(dir.join("seed.txt"))
+                        .unwrap();
+                    file.set_modified(std::time::SystemTime::now() - Duration::from_secs(120))
+                        .unwrap();
+                })
+            }),
+            ("only an untracked file", {
+                let dir = dir.clone();
+                Box::new(move || std::fs::write(dir.join("loose.txt"), "x").unwrap())
+            }),
+            ("a staged change", {
+                let dir = dir.clone();
+                Box::new(move || {
+                    std::fs::remove_file(dir.join("loose.txt")).unwrap();
+                    std::fs::write(dir.join("seed.txt"), "staged").unwrap();
+                    git_in(&dir, &["add", "seed.txt"]);
+                })
+            }),
+            ("that change committed", {
+                let dir = dir.clone();
+                Box::new(move || git_in(&dir, &["commit", "-q", "-m", "next"]))
+            }),
+            ("reset back past it", {
+                let dir = dir.clone();
+                Box::new(move || git_in(&dir, &["reset", "-q", "--hard", "HEAD~1"]))
+            }),
+        ];
+        let mut clean_states = 0;
+        for (label, step) in steps {
+            step();
+            let listed = list_worktrees(main.path().to_str().unwrap()).expect("list");
+            let wt = listed
+                .iter()
+                .find(|w| Path::new(&w.path) == dir)
+                .expect("listed");
+            assert_eq!(wt.scan_note, None, "{label}");
+            if wt.dirty_files == Some(0) {
+                clean_states += 1;
+            }
+            assert_eq!(wt.diff_stat, measure_diff_stat(&dir), "{label}");
+        }
+        assert!(clean_states >= 3, "the fixture never reached a clean state");
+    }
+
+    /// An unborn HEAD has nothing to diff against, so a clean status there
+    /// is not taken as an empty diff; it is measured, as before.
+    #[test]
+    fn an_unborn_head_is_never_assumed_clean() {
+        let (main, _parent, _linked) = repo_with_worktrees(0);
+        let repo = plain(main.path());
+        let entry = ParsedWorktree {
+            path: repo.to_str().unwrap().to_string(),
+            head: "0".repeat(40),
+            branch: Some("main".into()),
+            ..ParsedWorktree::default()
+        };
+        let before = diff_spawns_in(&repo);
+        let scan = scan_worktree(&repo, &entry, ScanDepth::Full, &Base::none());
+        assert_eq!(scan.dirty, Some(0));
+        assert_eq!(diff_spawns_in(&repo), before + 1);
     }
 
     /// Every absent count says why, and a scanned one says nothing.
@@ -2271,6 +2384,11 @@ some-future-field whatever
     fn worktree_scans_keep_the_callers_admission_class() {
         use crate::engine::git_cli::{spawn_log, with_admission, Admission};
         let (main, _parent, linked) = repo_with_worktrees(6);
+        // Changed, so each scan starts both its children (status and diff):
+        // a clean worktree's diff is not asked for.
+        for dir in &linked {
+            std::fs::write(dir.join("seed.txt"), "changed").unwrap();
+        }
         let listed = with_admission(Admission::Background, || {
             list_worktrees(main.path().to_str().unwrap()).expect("list")
         });

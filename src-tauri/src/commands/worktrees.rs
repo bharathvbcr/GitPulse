@@ -6,17 +6,21 @@ use super::*;
 // Linked worktrees: how agents parallelize, so they are first-class here.
 // ---------------------------------------------------------------------------
 
-/// `depth` is what the caller reads: the Work view reads dirty counts only,
-/// and asking it for the full scan cost diff stats, divergence and routes for
-/// every worktree on every refresh. Absent means `full`, the panel's answer.
+/// `depth` is what the caller reads, and absent means `listing`: one
+/// `git worktree list`, every count "not scanned". Each level past it costs
+/// git children per worktree — `dirty` one `git status` each, `full` adds a
+/// diff of every changed worktree, divergence from main and routes — so a
+/// caller asks for what it renders. The default used to be `full`, and a
+/// caller that read only heads or dirty counts paid for all of it: 18
+/// worktrees were 37 children per listing through an 8-a-second spawn budget.
 #[tauri::command(async)]
 pub async fn cmd_list_worktrees(
     repo_path: String,
     depth: Option<crate::engine::worktree::ScanDepth>,
 ) -> Result<Vec<WorktreeInfo>, String> {
-    // Spawns one `git status` per worktree (capped), so it belongs on the
-    // blocking pool like every other reader.
-    let depth = depth.unwrap_or(crate::engine::worktree::ScanDepth::Full);
+    // Past `listing` it spawns git per worktree (capped), so it belongs on
+    // the blocking pool like every other reader.
+    let depth = depth.unwrap_or(crate::engine::worktree::ScanDepth::Listing);
     off_thread(move || crate::engine::worktree::list_worktrees_scanned(&repo_path, depth)).await
 }
 
@@ -237,7 +241,8 @@ pub(crate) fn merge_teardown_guarded(
     })
 }
 
-/// Reflink-copies standard ignored build caches from anchor to target worktree.
+/// Reflink-copies the repository's ignored dependency caches into one of its
+/// worktrees. A cache that could not be copied whole fails the call.
 #[tauri::command(async)]
 pub async fn cmd_worktree_cow_sync(
     repo_path: String,
@@ -245,8 +250,16 @@ pub async fn cmd_worktree_cow_sync(
 ) -> Result<Vec<crate::engine::cow_clone::ReflinkResult>, String> {
     off_thread(move || {
         let repo = crate::engine::validate_repo(&repo_path)?;
-        let target = std::path::Path::new(&target_path);
-        crate::engine::cow_clone::reflink_ignored_caches(&repo, target)
+        // The target comes from the webview. Only a checkout git lists as a
+        // worktree of this repository receives caches — one `git worktree
+        // list`, no scan of any worktree. Any other existing directory used to
+        // be filled with the anchor's caches and links.
+        let family = crate::engine::worktree::resolve_worktree_family(&repo_path, &target_path)?;
+        crate::engine::cow_clone::reflink_ignored_caches(
+            &repo,
+            &family.worktree,
+            &crate::engine::cow_clone::CacheSelection::default(),
+        )
     })
     .await
 }

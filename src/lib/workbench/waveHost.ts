@@ -99,7 +99,8 @@ export async function waveDeps(repositoryId: string, persist: WaveDeps["persist"
     headOf: async (cwd) => {
       const opts = { caseInsensitive: isCaseInsensitiveFs() };
       const key = identityKey(cwd, opts);
-      const own = (await invoke<WorktreeInfo[]>("cmd_list_worktrees", { repoPath: checkout })).find((entry) => identityKey(entry.path, opts) === key);
+      // The head is all this reads, and the listing alone carries it.
+      const own = (await invoke<WorktreeInfo[]>("cmd_list_worktrees", { repoPath: checkout, depth: "listing" })).find((entry) => identityKey(entry.path, opts) === key);
       if (!own) throw new Error(`${cwd} is no longer a worktree of the repository.`);
       return own.head;
     },

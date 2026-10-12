@@ -90,7 +90,7 @@ export function mergeTargetLabel(cwd: string): string | null {
 /** The main checkout's entry and the attempt's own, from one listing. */
 async function listingFor(root: string, cwd: string): Promise<{ main: WorktreeInfo | null; own: WorktreeInfo }> {
   const opts = options();
-  const list = await invoke<WorktreeInfo[]>("cmd_list_worktrees", { repoPath: root });
+  const list = await invoke<WorktreeInfo[]>("cmd_list_worktrees", { repoPath: root, depth: "dirty" });
   const key = identityKey(cwd, opts);
   const own = list.find((entry) => identityKey(entry.path, opts) === key);
   if (!own) throw new Error(`${cwd} is no longer a worktree of ${root}. It may already have been merged or removed.`);

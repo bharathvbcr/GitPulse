@@ -200,6 +200,41 @@ pub(crate) fn trust_repo(dir: &Path) {
     crate::repository_trust::grant(path, &preview.identity, false).expect("approve fixture");
 }
 
+/// A main checkout (one commit of `seed.txt` on `main`) with `linked`
+/// worktrees, `wt-00`.. on branches `agent/00`.., under one parent directory.
+/// Each linked path is trusted and returned in the spelling git lists it in
+/// (plain canonical form), which is also the key the spawn log files its
+/// children under.
+#[cfg(test)]
+pub(crate) fn repo_with_worktrees(linked: usize) -> (TempDir, TempDir, Vec<PathBuf>) {
+    let main = TempDir::new().unwrap();
+    git_in(main.path(), &["init", "-b", "main"]);
+    fs::write(main.path().join("seed.txt"), "seed").unwrap();
+    git_in(main.path(), &["add", "."]);
+    git_in(main.path(), &["commit", "-m", "init"]);
+    let parent = TempDir::new().unwrap();
+    let paths = (0..linked)
+        .map(|i| {
+            let path = parent.path().join(format!("wt-{i:02}"));
+            let branch = format!("agent/{i:02}");
+            git_in(
+                main.path(),
+                &[
+                    "worktree",
+                    "add",
+                    "-q",
+                    "-b",
+                    &branch,
+                    path.to_str().unwrap(),
+                ],
+            );
+            trust_repo(&path);
+            crate::engine::git_cli::canonicalize_plain(&path).unwrap()
+        })
+        .collect();
+    (main, parent, paths)
+}
+
 /// A fresh repository on `main`, for suites that only need somewhere to scan.
 ///
 /// Identical bodies stood in `analyzer::coverage` and `analyzer::deps`; the

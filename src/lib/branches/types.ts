@@ -297,7 +297,7 @@ export interface WorktreeHooksPreview {
  */
 export interface WorktreeCreated {
   path: string;
-  /** Copying build caches from the main checkout failed as a whole. */
+  /** Some build cache could not be copied (or checked); each is named, and none is left half-copied. */
   cache_error: string | null;
   /** A `post_create` hook failed, timed out, or was refused. */
   hook_error: string | null;
