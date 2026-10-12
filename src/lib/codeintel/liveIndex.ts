@@ -12,6 +12,16 @@
  * upgrade without waiting for focus. Identical `setScope` applies for keys
  * already offered must not re-enqueue: every apply used to restart the 1 Hz
  * status+build loop after a finished run.
+ *
+ * Duty cycle. The backend sets a per-repository wait after every live build
+ * (`max(30 s, 2 x build)`, longer after a timeout) and answers a watcher tick
+ * inside it with `skip_cooldown`. This half holds the repository's next ask
+ * until that wait ends, so every edit inside it — watcher, status poll, or any
+ * future source routed through `onRepoChanged` — joins one held ask rather than
+ * becoming an IPC call of its own, and the last edit of a storm is still owed
+ * one build. Watcher edits to a tab that is not focused are held until it is.
+ * The backend no longer holds the IPC call for the build: it answers
+ * `started`, and this half collects the outcome by asking again.
  */
 
 import { get, writable } from "svelte/store";
@@ -57,7 +67,35 @@ export function busyRetryDelayMs(attempt: number): number {
   return Math.min(1_000 * 2 ** Math.min(step - 1, 30), LIVE_INDEX_BUSY_RETRY_MAX_MS);
 }
 
-export type LiveIndexPhase = "idle" | "scheduled" | "running" | "ready" | "skipped" | "failed";
+/**
+ * How long a build the backend started in the background is collected:
+ * its 15-minute `BUILD_DEADLINE` plus a minute. Past that the child has been
+ * killed and its outcome stored, so a repository still answering
+ * `skip_building` is a different writer's, not ours.
+ */
+export const LIVE_INDEX_BUILD_WAIT_MS = 16 * 60_000;
+
+/** Longest wait between two asks for a background build's outcome. */
+export const LIVE_INDEX_COLLECT_MAX_MS = 10_000;
+
+/**
+ * Consecutive `skip_cooldown` answers a held watcher edit is re-asked through
+ * before the next edit has to ask again. Each re-ask lands when the backend's
+ * own wait ends, so more than one is reached only if a new wait was set in
+ * between.
+ */
+export const LIVE_INDEX_COOLDOWN_REASKS = 3;
+
+/** Wait before collection ask `attempt` (1-based): 1 s, doubling, capped. */
+function collectDelayMs(attempt: number): number {
+  return Math.min(1_000 * 2 ** Math.min(Math.max(attempt, 1) - 1, 30), LIVE_INDEX_COLLECT_MAX_MS);
+}
+
+/**
+ * `paused`: the last automatic build ran past its deadline and the backend
+ * paused automatic indexing; `reason` is the sentence the Map strip shows.
+ */
+export type LiveIndexPhase = "idle" | "scheduled" | "running" | "ready" | "skipped" | "failed" | "paused";
 
 export interface LiveIndexSnapshot {
   phase: LiveIndexPhase;
@@ -133,6 +171,21 @@ export function createLiveIndex(opts?: {
   const offered = new Set<string>();
   /** Focused key at the last `setScope`, so a re-apply is not a focus change. */
   let lastFocused: string | null = null;
+  /**
+   * Active key at the last `setScope`, visible or not: the one tab whose
+   * watcher edits are live. Hiding the window does not make the others live.
+   */
+  let lastActive: string | null = opts?.scope?.activeKey ?? null;
+  /** Retained keys at the last `setScope`; `null` until a scope is applied. */
+  let retainedScope: Set<string> | null = opts?.scope ? new Set(opts.scope.retainedKeys) : null;
+  /** Epoch ms until which the backend answers a watcher tick without a build. */
+  const restUntil = new Map<string, number>();
+  /** Background builds being collected: when they started, asks spent. */
+  const awaiting = new Map<string, { since: number; asks: number }>();
+  /** Consecutive `skip_cooldown` re-asks of a held watcher edit. */
+  const cooldownAsks = new Map<string, number>();
+  /** Unfocused tabs with a watcher edit held until they are focused. */
+  const held = new Set<string>();
   let revision = 0;
   const queue = createPacedQueue({
     debounceMs,
@@ -161,6 +214,41 @@ export function createLiveIndex(opts?: {
   function forgetRetries(repoPath: string) {
     busyRetries.delete(repoPath);
     deferrals.delete(repoPath);
+    cooldownAsks.delete(repoPath);
+  }
+
+  /** Everything a closed or evicted repository was owed. */
+  function forget(repoPath: string) {
+    forgetRetries(repoPath);
+    dirty.delete(repoPath);
+    held.delete(repoPath);
+    awaiting.delete(repoPath);
+    restUntil.delete(repoPath);
+  }
+
+  function noteRest(repoPath: string, waitMs: number | null | undefined) {
+    if (typeof waitMs === "number" && Number.isFinite(waitMs) && waitMs > 0) {
+      restUntil.set(repoPath, Date.now() + waitMs);
+    }
+  }
+
+  function restRemainingMs(repoPath: string): number {
+    const until = restUntil.get(repoPath);
+    if (until === undefined) return 0;
+    const left = until - Date.now();
+    if (left > 0) return left;
+    restUntil.delete(repoPath);
+    return 0;
+  }
+
+  /**
+   * Ask about a watcher edit no sooner than the backend will act on it. Every
+   * edit inside the wait joins this one held ask: `enqueue` never pulls a held
+   * entry forward.
+   */
+  function enqueueEdit(repoPath: string): boolean {
+    const waitMs = restRemainingMs(repoPath);
+    return queue.enqueue(repoPath, waitMs > 0 ? { delayMs: waitMs } : undefined);
   }
 
   function patch(repoPath: string, next: Partial<LiveIndexSnapshot>) {
@@ -171,27 +259,92 @@ export function createLiveIndex(opts?: {
   }
 
   async function run(repoPath: string, isCurrent: () => boolean) {
-    patch(repoPath, { phase: "running", refreshing: true, reason: null, stage: null });
+    // One automatic build at a time. While another repository's background
+    // build is being collected, this one waits here — no IPC, so no status
+    // probe and no busy budget spent on a writer that is not its own — as it
+    // used to wait behind the IPC call that held the queue slot for the build.
+    // Bounded: collection ends by `LIVE_INDEX_BUILD_WAIT_MS`.
+    if (awaiting.size > 0 && !awaiting.has(repoPath)) {
+      if (queue.enqueue(repoPath, { delayMs: LIVE_INDEX_COLLECT_MAX_MS })) {
+        const prev = get(snapshots)[repoPath];
+        if (prev?.phase !== "paused") patch(repoPath, { phase: "scheduled" });
+      }
+      return;
+    }
     const repoChanged = dirty.has(repoPath);
+    // Consumed by this ask. An edit that lands while it is in flight marks the
+    // repository again, so it is owed its own build rather than being erased
+    // by this ask's settlement.
+    dirty.delete(repoPath);
+    const collecting = awaiting.get(repoPath);
+    // A collection ask keeps the stage the kernel last reported.
+    patch(repoPath, collecting
+      ? { phase: "running", refreshing: true }
+      : { phase: "running", refreshing: true, reason: null, stage: null });
     const outcome = await maybeRefresh(repoPath, repoChanged);
     if (!isCurrent()) return;
+    /** This ask's edit is still owed: put it back for the retry. */
+    const stillOwed = () => {
+      if (repoChanged) dirty.add(repoPath);
+    };
+    if (outcome.decision === "started") {
+      // The build took every edit up to now. It runs off the IPC path; ask
+      // again for its outcome.
+      forgetRetries(repoPath);
+      const collectingNow = queue.enqueue(repoPath, { delayMs: collectDelayMs(1) });
+      if (collectingNow) awaiting.set(repoPath, { since: Date.now(), asks: 1 });
+      patch(repoPath, {
+        phase: collectingNow ? "running" : "failed",
+        decision: outcome.decision,
+        reason: collectingNow ? null : "The index build started, but the refresh queue is full. Refresh the map again.",
+        refreshing: collectingNow,
+        updatedAt: Date.now(),
+      });
+      return;
+    }
+    if (outcome.decision === "skip_building" && collecting) {
+      // Our own build, still running. Bounded by the build's deadline, not by
+      // the busy budget, which is sized for somebody else's writer.
+      stillOwed();
+      const asks = collecting.asks + 1;
+      const within = Date.now() - collecting.since < LIVE_INDEX_BUILD_WAIT_MS;
+      if (within && queue.enqueue(repoPath, { delayMs: collectDelayMs(asks) })) {
+        awaiting.set(repoPath, { since: collecting.since, asks });
+        patch(repoPath, { phase: "running", refreshing: true, updatedAt: Date.now() });
+        return;
+      }
+      awaiting.delete(repoPath);
+      patch(repoPath, {
+        phase: "failed",
+        decision: outcome.decision,
+        reason: within
+          ? "The index build is running, but the refresh queue is full. Refresh the map again."
+          : "The background index build never reported back. Refresh the map again.",
+        refreshing: false,
+        updatedAt: Date.now(),
+        stage: null,
+      });
+      return;
+    }
+    awaiting.delete(repoPath);
     if (outcome.decision === "skip_deferred") {
       // The backend's spawn gate declined to start the probe under load —
       // nothing was examined. Settling it as "skipped" is what left every tab
       // restored at launch unhealed for the session, so ask again, later.
-      // `dirty` is kept: the retry still owes the watcher its rebuild. Every
+      // The edit is kept: the retry still owes the watcher its rebuild. Every
       // tab restored at launch is deferred by the same storm, so the waits
       // are spread rather than returning to the gate on one millisecond.
       const attempt = (deferrals.get(repoPath) ?? 0) + 1;
       const delayMs = jitteredRetryDelayMs(attempt, random);
       const retrying = attempt <= MAX_DEFERRED_RETRIES && queue.enqueue(repoPath, { delayMs });
-      if (retrying) deferrals.set(repoPath, attempt);
-      else {
+      if (retrying) {
+        deferrals.set(repoPath, attempt);
+        stillOwed();
+      } else {
         // Bounded: a watcher tick or focusing the tab is a new request.
         // `offered` is left alone, so re-applying the same scope cannot
         // restart the chain (see `setScope`).
         forgetRetries(repoPath);
-        dirty.delete(repoPath);
       }
       patch(repoPath, {
         phase: retrying ? "scheduled" : "failed",
@@ -209,11 +362,10 @@ export function createLiveIndex(opts?: {
       const retries = busyRetries.get(repoPath) ?? 0;
       const retrying = retries < LIVE_INDEX_BUSY_RETRIES &&
         queue.enqueue(repoPath, { delayMs: jitteredDelayMs(busyRetryDelayMs(retries + 1), random) });
-      if (retrying) busyRetries.set(repoPath, retries + 1);
-      else {
-        forgetRetries(repoPath);
-        dirty.delete(repoPath);
-      }
+      if (retrying) {
+        busyRetries.set(repoPath, retries + 1);
+        stillOwed();
+      } else forgetRetries(repoPath);
       patch(repoPath, {
         phase: retrying ? "scheduled" : "failed",
         decision: outcome.decision,
@@ -226,13 +378,23 @@ export function createLiveIndex(opts?: {
       return;
     }
     if (outcome.decision === "skip_cooldown") {
-      // Watcher echo backoff: keep the strip on "scheduled" so a storm does
-      // not look like a hard failure. The next repo-changed tick re-enters
-      // maybe_refresh; do not busy-spin like skip_building.
-      forgetRetries(repoPath);
-      dirty.delete(repoPath);
+      // The backend is waiting out the last build. A watcher edit inside the
+      // wait is owed exactly one ask when it ends — not a busy spin, and not
+      // nothing, which is what lost the last edit of every storm. An
+      // activation is not owed a build.
+      noteRest(repoPath, outcome.cooldown_remaining_ms);
+      const waitMs = restRemainingMs(repoPath);
+      const asks = (cooldownAsks.get(repoPath) ?? 0) + 1;
+      busyRetries.delete(repoPath);
+      deferrals.delete(repoPath);
+      const reasking = repoChanged && waitMs > 0 && asks <= LIVE_INDEX_COOLDOWN_REASKS &&
+        queue.enqueue(repoPath, { delayMs: waitMs });
+      if (reasking) {
+        cooldownAsks.set(repoPath, asks);
+        stillOwed();
+      } else cooldownAsks.delete(repoPath);
       patch(repoPath, {
-        phase: "scheduled",
+        phase: outcome.index_too_slow === true ? "paused" : "scheduled",
         decision: outcome.decision,
         reason: outcome.reason,
         refreshing: false,
@@ -242,7 +404,10 @@ export function createLiveIndex(opts?: {
       return;
     }
     forgetRetries(repoPath);
-    dirty.delete(repoPath);
+    if (outcome.decision === "refresh") noteRest(repoPath, outcome.cooldown_remaining_ms);
+    // Edits that arrived while a background build ran are not in it: they
+    // are owed one build, held until the rest that build just set has ended.
+    if (collecting && repoChanged && enqueueEdit(repoPath)) dirty.add(repoPath);
     const failed =
       outcome.decision === "refresh" && outcome.build?.ok !== true;
     // A build spawned because `repo_map.json` was missing rewrites the
@@ -255,7 +420,9 @@ export function createLiveIndex(opts?: {
       outcome.build?.ok === true &&
       (!isUnchangedEcho(outcome.build) || outcome.artifacts_restored === true);
     patch(repoPath, {
-      phase: queue.isPending(repoPath) ? "scheduled" : failed
+      phase: outcome.index_too_slow === true
+        ? "paused"
+        : queue.isPending(repoPath) ? "scheduled" : failed
         ? "failed"
         : outcome.decision === "refresh" ? "ready" : "skipped",
       decision: outcome.decision,
@@ -285,6 +452,11 @@ export function createLiveIndex(opts?: {
         if (prev?.phase === "failed" && prev.decision === "skip_deferred") offered.delete(focused);
       }
       lastFocused = focused;
+      lastActive = scope.activeKey;
+      retainedScope = open;
+      for (const key of [...held, ...awaiting.keys(), ...restUntil.keys()]) {
+        if (!open.has(key)) forget(key);
+      }
       snapshots.update((map) => {
         const closed = Object.keys(map).filter((key) => !open.has(key));
         if (!closed.length) return map;
@@ -292,11 +464,13 @@ export function createLiveIndex(opts?: {
         for (const key of closed) {
           delete next[key];
           retained.delete(key);
-          forgetRetries(key);
-          dirty.delete(key);
+          forget(key);
         }
         return next;
       });
+      // A tab focused with a watcher edit held for it: that edit's build is
+      // owed now, still no sooner than the backend's wait allows.
+      if (focused !== null && held.delete(focused) && !enqueueEdit(focused)) dirty.delete(focused);
       const scheduled: string[] = [];
       for (const key of scope.retainedKeys) {
         if (!key || offered.has(key)) continue;
@@ -309,7 +483,7 @@ export function createLiveIndex(opts?: {
           let next = map;
           for (const key of scheduled) {
             const prev = snapshotFor(next, key);
-            if (prev.phase === "running" || prev.phase === "scheduled") continue;
+            if (prev.phase === "running" || prev.phase === "scheduled" || prev.phase === "paused") continue;
             if (next === map) next = { ...map };
             next[key] = { ...prev, phase: "scheduled" };
           }
@@ -318,7 +492,12 @@ export function createLiveIndex(opts?: {
       }
     },
     onRepoChanged(repoPath: string) {
-      if (!queue.enqueue(repoPath)) return;
+      if (!repoPath || (retainedScope !== null && !retainedScope.has(repoPath))) return;
+      // Only the focused tab is live. Another tab's edit is held, once, until
+      // that tab is focused; the status poll and the watcher both land here,
+      // so neither can rebuild a repository nobody is looking at.
+      if (lastActive !== null && repoPath !== lastActive) held.add(repoPath);
+      else if (!enqueueEdit(repoPath)) return;
       dirty.add(repoPath);
       retained.delete(repoPath);
       retained.add(repoPath);
@@ -328,8 +507,7 @@ export function createLiveIndex(opts?: {
         if (retained.size <= 65) break;
         if (queue.has(key)) continue;
         retained.delete(key);
-        forgetRetries(key);
-        dirty.delete(key);
+        forget(key);
         snapshots.update((map) => {
           const next = { ...map };
           delete next[key];
@@ -338,7 +516,9 @@ export function createLiveIndex(opts?: {
       }
       snapshots.update((map) => {
         const prev = snapshotFor(map, repoPath);
-        if (prev.phase === "running" || prev.phase === "scheduled") return map;
+        // A pause is still a pause after the next edit: reading "queued" for
+        // ten minutes is what the too-slow sentence exists to prevent.
+        if (prev.phase === "running" || prev.phase === "scheduled" || prev.phase === "paused") return map;
         return { ...map, [repoPath]: { ...prev, phase: "scheduled" } };
       });
     },
@@ -367,7 +547,12 @@ export function createLiveIndex(opts?: {
       deferrals.clear();
       dirty.clear();
       offered.clear();
+      held.clear();
+      awaiting.clear();
+      restUntil.clear();
+      cooldownAsks.clear();
       lastFocused = null;
+      lastActive = null;
       snapshots.set({});
     },
   };

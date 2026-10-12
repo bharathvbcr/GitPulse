@@ -926,7 +926,13 @@ export type LiveRefreshDecision =
    * The backend's spawn gate declined to start the probe or build under load.
    * Nothing was examined; ask again after a backoff, never settle on it.
    */
-  | "skip_deferred";
+  | "skip_deferred"
+  /**
+   * A build was started on a background thread and the call did not wait for
+   * it. The next ask for the repository collects its outcome (a `refresh`
+   * carrying the build); until then every ask answers `skip_building`.
+   */
+  | "started";
 
 export interface LiveRefreshFactsDto {
   available: boolean;
@@ -950,8 +956,19 @@ export interface LiveRefreshOutcome {
   facts: LiveRefreshFactsDto;
   build?: DevmapBuildOutcome | null;
   reason?: string | null;
-  /** Remaining echo/failure backoff when `decision` is `skip_cooldown`. */
+  /**
+   * How long the backend now waits before the next automatic build: the
+   * remaining wait when `decision` is `skip_cooldown`, and the rest a finished
+   * build just set when it is `refresh`. A watcher tick inside it is answered
+   * without a build, so the next ask is held until it ends.
+   */
   cooldown_remaining_ms?: number | null;
+  /**
+   * The last automatic build ran past its deadline and automatic indexing is
+   * paused (at least 10 min). Set on that build's outcome and on every
+   * `skip_cooldown` answered during the pause.
+   */
+  index_too_slow?: boolean;
   /**
    * The build wrote consumer artifacts that were missing beforehand. Such a
    * build reports the *store* `unchanged` whenever the database was already

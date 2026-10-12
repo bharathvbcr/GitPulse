@@ -53,6 +53,9 @@ pub struct CatchUp {
     /// this is set.
     #[serde(default)]
     pub truncated: bool,
+    /// Ledger events the retention policy deleted at the end of this pass.
+    #[serde(default)]
+    pub pruned: i64,
     /// Empty when the pass completed; otherwise what stopped it.
     pub error: String,
 }
@@ -596,8 +599,30 @@ pub fn catch_up_into_bounded(
     worktree_path: &str,
     budget: Option<std::time::Duration>,
 ) -> CatchUp {
-    let started = std::time::Instant::now();
-    let deadline = budget.map(|d| started + d);
+    let deadline = budget.map(|d| std::time::Instant::now() + d);
+    let mut total = replay_into(ledger_repo, worktree_path, deadline);
+    // Retention rides the pass every host already runs (the app on open, the
+    // daemon on its interval), so the events table is bounded without a
+    // second scheduler. A pass the deadline cut short spends no more time.
+    if !total.truncated {
+        let pruned = ledger::prune_expired(ledger_repo, deadline);
+        total.pruned = i64::try_from(pruned.deleted).unwrap_or(i64::MAX);
+        if !pruned.error.is_empty() {
+            total.error = if total.error.is_empty() {
+                pruned.error
+            } else {
+                format!("{}; {}", total.error, pruned.error)
+            };
+        }
+    }
+    total
+}
+
+fn replay_into(
+    ledger_repo: &str,
+    worktree_path: &str,
+    deadline: Option<std::time::Instant>,
+) -> CatchUp {
     let expired = || deadline.is_some_and(|d| std::time::Instant::now() >= d);
 
     let mut total = ingest_reflog_into(ledger_repo, worktree_path, 200);

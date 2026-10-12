@@ -40,10 +40,6 @@ export function setStackExpanded(key: string, open: boolean): void {
   });
 }
 
-export function toggleStackExpanded(key: string, current: ReadonlySet<string>): void {
-  setStackExpanded(key, !current.has(key));
-}
-
 const lastUsed = new Map<string, string>();
 
 /**

@@ -313,6 +313,10 @@ pub async fn cmd_devmap_refresh(repo_path: String) -> Result<crate::devmap::Buil
 /// `repo_changed` should be true when this follows a `repo-changed` event —
 /// that folds the working-tree dirty signal into effective freshness so a
 /// store with an empty pending queue still rebuilds after a settled write.
+///
+/// Never waits on a build: an authorized build runs on its own thread and
+/// this answers `started`; the next call for the repository collects the
+/// outcome. The blocking-pool thread is held only for the status probe.
 #[tauri::command(async)]
 pub async fn cmd_devmap_maybe_refresh(
     repo_path: String,
@@ -320,7 +324,7 @@ pub async fn cmd_devmap_maybe_refresh(
 ) -> Result<crate::devmap::LiveRefreshOutcome, String> {
     off_thread(move || {
         crate::engine::git_cli::with_background_processes(|| {
-            Ok(crate::devmap::maybe_refresh(
+            Ok(crate::devmap::live::start_refresh(
                 &repo_path,
                 repo_changed.unwrap_or(true),
             ))

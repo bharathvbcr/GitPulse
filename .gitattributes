@@ -28,3 +28,11 @@
 *.msi binary
 *.deb binary
 *.AppImage binary
+
+# Copies of other projects' code, not this one's. GitHub's language bar and
+# GitPulse's own language statistics both skip `linguist-vendored` paths;
+# without this the ported Tauri stack under `framework/` counted as GitPulse's
+# Rust. `framework` is marked here rather than added to a built-in list of
+# directory names, because a project's own crate may be called that.
+src-tauri/framework/** linguist-vendored
+src-tauri/vendored/** linguist-vendored

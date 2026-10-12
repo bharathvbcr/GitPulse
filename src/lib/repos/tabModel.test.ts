@@ -29,6 +29,7 @@ import {
   expandAllGroups,
   type WorkspaceTabs,
 } from "./tabModel";
+import { mulberry32Uint32 } from "../__tests__/prng";
 
 const opts = { caseInsensitive: true };
 
@@ -362,7 +363,7 @@ describe("tab and group colors", () => {
 describe("adversarial stress", () => {
   it("keeps invariants across 5_000 random open/close/reorder/pin/group operations", () => {
     let ws = emptyWorkspace();
-    const rng = mulberry32(0x51f1e7);
+    const rng = mulberry32Uint32(0x51f1e7);
     for (let i = 0; i < 5_000; i += 1) {
       const roll = rng() % 16;
       if (roll === 0 || ws.tabs.length === 0) {
@@ -413,12 +414,3 @@ describe("adversarial stress", () => {
   });
 });
 
-function mulberry32(seed: number): () => number {
-  let t = seed >>> 0;
-  return () => {
-    t += 0x6d2b79f5;
-    let r = Math.imul(t ^ (t >>> 15), 1 | t);
-    r ^= r + Math.imul(r ^ (r >>> 7), 61 | r);
-    return ((r ^ (r >>> 14)) >>> 0) % 0x100000000;
-  };
-}
