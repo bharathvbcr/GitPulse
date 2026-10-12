@@ -58,7 +58,7 @@
 //! [`super::build`], which acquire [`super::cli::BuildGuard`] for the duration
 //! of the child.
 
-use super::cli::{self, is_build_in_flight, BuildOutcome, CliStatus};
+use super::cli::{self, BuildOutcome, CliStatus};
 use crate::engine::git_cli::is_deferred_under_load;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -77,7 +77,7 @@ pub struct LiveRefreshFacts {
     /// `!schema_outdated` — an outdated schema needs a tooling upgrade, not
     /// an incremental rebuild against the wrong shape.
     pub schema_ok: bool,
-    /// [`is_build_in_flight`] already true for this repo.
+    /// [`super::cli::is_build_in_flight`] already true for this repo.
     pub already_building: bool,
     /// The CLI's own `rebuild_required`: a full `devmap build` fixes this
     /// store. The kernel sets it for payload-obsolete and *migratable*
@@ -717,7 +717,16 @@ pub(crate) fn live_refresh(
             live_wait(repo_path, now).map(|(remaining, _)| duration_ms(remaining));
         return finished;
     }
-    let already_building = is_build_in_flight(repo_path);
+    // Held from the first question to the last answer: the probe and the build
+    // are one operation per repository, so a concurrent caller is turned away
+    // here rather than running a status child of its own and then, if it
+    // probed before the first build finished, a second build. A path that does
+    // not validate claims nothing; the probe below reports why.
+    let (permit, already_building) = match cli::claim_build(repo_path) {
+        Ok(permit) => (Some(permit), false),
+        Err(cli::ClaimRefusal::Busy(_)) => (None, true),
+        Err(cli::ClaimRefusal::Invalid(_)) => (None, false),
+    };
     if already_building {
         // Busy retries must not launch status children against the active
         // writer. No status was examined, so do not claim available/fresh/ok.
@@ -786,7 +795,7 @@ pub(crate) fn live_refresh(
         available,
         is_fresh,
         schema_ok,
-        already_building,
+        already_building: false,
         rebuild_required: schema_rebuild_authorized(cli.status.as_ref()),
         artifacts_missing,
         daemon_pending: None,
@@ -880,7 +889,11 @@ pub(crate) fn live_refresh(
         artifacts_missing,
         started: now,
     };
-    let prepared = match cli::prepare(repo_path, rebuild == LiveRebuildKind::Manifest) {
+    let manifest = rebuild == LiveRebuildKind::Manifest;
+    let prepared = match permit.map_or_else(
+        || cli::prepare(repo_path, manifest),
+        |permit| permit.prepare(manifest),
+    ) {
         Ok(prepared) => prepared,
         Err(error) => return settle.record(Err(error), Duration::ZERO),
     };
@@ -1935,7 +1948,7 @@ exit 2
             asked.elapsed()
         );
         assert!(
-            is_build_in_flight(&path),
+            cli::is_build_in_flight(&path),
             "the writer slot is held on return"
         );
 
