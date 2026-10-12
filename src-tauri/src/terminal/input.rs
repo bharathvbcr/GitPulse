@@ -87,7 +87,9 @@ fn write_with_timeout(
         match writer.try_lock() {
             Ok(writer) => break writer,
             Err(TryLockError::WouldBlock) => std::thread::sleep(Duration::from_millis(5)),
-            Err(TryLockError::Poisoned(_)) => return Err("Terminal writer lock failed".into()),
+            // An unbuffered descriptor: a panic under the lock leaves nothing
+            // half-written to refuse the session for.
+            Err(TryLockError::Poisoned(poisoned)) => break poisoned.into_inner(),
         }
     };
     let mut written = 0;
@@ -188,6 +190,33 @@ mod tests {
     use std::sync::atomic::AtomicBool;
     use std::sync::Mutex;
     use std::time::{Duration, Instant};
+
+    /// The defect: a poisoned writer lock answered "Terminal writer lock
+    /// failed" for the rest of the session, so one panic under it made a live
+    /// agent permanently untypeable. The writer is an unbuffered descriptor:
+    /// nothing a panic interrupts leaves it half-updated.
+    #[test]
+    fn a_poisoned_writer_lock_does_not_make_the_terminal_untypeable() {
+        let (mut reader, writer) = UnixStream::pair().unwrap();
+        let writer: Mutex<Box<dyn Write + Send>> = Mutex::new(Box::new(writer));
+        let _ = std::thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    let _held = writer.lock().unwrap();
+                    panic!("injected panic under the writer lock");
+                })
+                .join()
+        });
+        assert!(
+            writer.is_poisoned(),
+            "positive control: the lock is poisoned"
+        );
+        let dead = AtomicBool::new(false);
+        write_with_timeout(&writer, &dead, b"typed", Duration::from_secs(1)).unwrap();
+        let mut got = [0; 5];
+        reader.read_exact(&mut got).unwrap();
+        assert_eq!(&got, b"typed");
+    }
 
     #[test]
     fn output_wait_is_bounded_and_hangup_preserves_buffered_bytes() {
