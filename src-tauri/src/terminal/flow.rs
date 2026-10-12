@@ -64,14 +64,20 @@ pub(super) struct OutputFlow {
     changed: Condvar,
 }
 impl OutputFlow {
+    /// The counters, as a panic under the lock left them. Every update is a
+    /// whole-number adjustment, so there is no half-updated state to refuse:
+    /// and the reader treats a failed `reserve` as a dead view and kills the
+    /// process, so refusing a poisoned lock ended sessions that were fine.
+    fn lock(&self) -> std::sync::MutexGuard<'_, State> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
     pub(super) fn reserve(&self, bytes: usize, timeout: Duration) -> Result<Route, String> {
         if bytes > OUTPUT_WINDOW {
             return Err("Terminal output chunk exceeds window".into());
         }
-        let mut state = self
-            .state
-            .lock()
-            .map_err(|_| "Terminal output lock failed")?;
+        let mut state = self.lock();
         let timeout = if state.lagged {
             timeout.min(RELAPSE_STALL)
         } else {
@@ -96,7 +102,7 @@ impl OutputFlow {
             state = self
                 .changed
                 .wait_timeout(state, remaining)
-                .map_err(|_| "Terminal output wait failed")?
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .0;
         }
         if state.stopped {
@@ -111,10 +117,7 @@ impl OutputFlow {
     /// The renderer that held this session is gone. Wakes a reader waiting
     /// on its credit, which then holds rather than stalls.
     pub(super) fn detach(&self) {
-        let mut state = self
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut state = self.lock();
         state.detached = true;
         state.shedding = false;
         state.lagged = false;
@@ -125,10 +128,7 @@ impl OutputFlow {
     /// A view takes the session over. Returns whether it had been detached;
     /// only then is there anything to take over.
     pub(super) fn attach(&self) -> bool {
-        let mut state = self
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut state = self.lock();
         let was = state.detached && !state.stopped;
         if was {
             state.detached = false;
@@ -141,10 +141,7 @@ impl OutputFlow {
         was
     }
     pub(super) fn is_detached(&self) -> bool {
-        self.state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .detached
+        self.lock().detached
     }
     /// A chunk of `bytes`, already reserved, could not be handed to the event
     /// loop. Whether any view got it is unknown (an emit goes to every webview
@@ -155,10 +152,7 @@ impl OutputFlow {
     /// acknowledgements bring the window down, as after any stall. Returns
     /// whether this began the shedding.
     pub(super) fn shed(&self, bytes: usize) -> bool {
-        let mut state = self
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut state = self.lock();
         if state.stopped || state.detached {
             return false;
         }
@@ -175,16 +169,10 @@ impl OutputFlow {
     }
     #[cfg(test)]
     pub(super) fn is_shedding(&self) -> bool {
-        self.state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .shedding
+        self.lock().shedding
     }
     pub(super) fn acknowledge(&self, bytes: usize) -> Result<(), String> {
-        let mut state = self
-            .state
-            .lock()
-            .map_err(|_| "Terminal output lock failed")?;
+        let mut state = self.lock();
         if bytes == 0 || bytes > state.pending + state.uncertain {
             return Err("Invalid terminal output acknowledgement".into());
         }
@@ -195,10 +183,7 @@ impl OutputFlow {
         Ok(())
     }
     pub(super) fn stop(&self) {
-        let mut state = self
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut state = self.lock();
         state.stopped = true;
         self.changed.notify_all();
     }
@@ -209,6 +194,32 @@ mod tests {
     use super::{OutputFlow, Route, OUTPUT_WINDOW};
     use std::sync::Arc;
     use std::time::Duration;
+    /// The defect: `reserve` and `acknowledge` refused a poisoned lock, while
+    /// every other method recovered. The reader treats a failed `reserve` as a
+    /// dead view and kills the process, so one panic under this lock (nothing
+    /// here can leave the counters half-updated) ended an agent that was fine.
+    #[test]
+    fn a_poisoned_flow_lock_neither_kills_the_reader_nor_blocks_acknowledgements() {
+        let flow = Arc::new(OutputFlow::default());
+        assert_eq!(flow.reserve(100, Duration::ZERO).unwrap(), Route::Deliver);
+        let poisoner = flow.clone();
+        let _ = std::thread::spawn(move || {
+            let _held = poisoner.state.lock().unwrap();
+            panic!("injected panic under the flow lock");
+        })
+        .join();
+        assert!(
+            flow.state.is_poisoned(),
+            "positive control: the lock is poisoned"
+        );
+        assert_eq!(flow.reserve(100, Duration::ZERO).unwrap(), Route::Deliver);
+        flow.acknowledge(200).unwrap();
+        assert_eq!(
+            flow.state.lock().unwrap_or_else(|p| p.into_inner()).pending,
+            0
+        );
+    }
+
     #[test]
     fn output_window_blocks_until_ack_and_cancel_wakes_it() {
         let flow = Arc::new(OutputFlow::default());

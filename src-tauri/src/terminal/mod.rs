@@ -21,6 +21,7 @@ use flow::{OutputFlow, Route};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::io::{Read, Write};
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -245,6 +246,24 @@ impl TerminalSessions {
     pub fn set_output_stall_timeout(&self, timeout: Duration) {
         let ms = timeout.as_millis().clamp(10, 300_000) as u64;
         self.output_stall_ms.store(ms, Ordering::Release);
+    }
+}
+
+/// Removes a session from the map when its reader thread ends, however it
+/// ends. The normal tail removes the entry itself, before it announces the
+/// exit; this is the road for every other way out, so an entry never outlives
+/// the only thread that could ever finish it.
+struct SessionSlot {
+    sessions: Arc<Mutex<HashMap<String, SessionEntry>>>,
+    id: String,
+}
+
+impl Drop for SessionSlot {
+    fn drop(&mut self) {
+        self.sessions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&self.id);
     }
 }
 
@@ -1489,17 +1508,26 @@ fn spawn_session_inner<R: tauri::Runtime>(
     // the reader thread outlives every borrow it could otherwise take.
     let watcher = SessionWatcher::new(&session_id, &resolved, &repo);
 
+    let slot = SessionSlot {
+        sessions: state.sessions.clone(),
+        id: session_id.clone(),
+    };
     let reader_thread = crate::supervisor::spawn_once(
         format!("pty-read-{session_id}"),
         "terminal reader",
         move || {
+            // Dropped when this thread ends by any road, a panic included.
+            let _slot = slot;
             let mut reservation = Some(reservation);
             let mut failure = None;
             let mut watcher = watcher;
             let mut buf = [0u8; OUTPUT_CHUNK_BYTES];
             // Logged once per run of failures, not once per chunk.
             let mut emit_failing = false;
-            loop {
+            // A panic anywhere in the loop (the scanner, an event listener) is
+            // contained here: the thread must not end with the child alive and
+            // nothing reading its tty, which is a session "running" forever.
+            let pumped = catch_unwind(AssertUnwindSafe(|| loop {
                 match reader.read(&mut buf) {
                     Ok(0) => break,
                     Ok(n) => {
@@ -1627,6 +1655,22 @@ fn spawn_session_inner<R: tauri::Runtime>(
                         break;
                     }
                 }
+            }));
+            if let Err(payload) = pumped {
+                // Not "terminal reader": every reader that ends normally
+                // clears that record, which would erase this one at once.
+                crate::supervisor::note_stopped("terminal reader panic", payload.as_ref());
+                failure.get_or_insert_with(|| {
+                    format!(
+                        "Terminal output reader panicked: {}",
+                        crate::supervisor::payload_text(payload.as_ref())
+                    )
+                });
+                dead_flag.store(true, Ordering::SeqCst);
+                output_flow.stop();
+                if let Err(error) = terminate_pty_child(&thread_child, &thread_master) {
+                    log::warn!(target: "terminal", "could not signal a terminal whose reader panicked: {error}");
+                }
             }
 
             dead_flag.store(true, Ordering::SeqCst);
@@ -1662,8 +1706,17 @@ fn spawn_session_inner<R: tauri::Runtime>(
                     );
                     // Shutdown waits for session removal. Persist the owned
                     // process's outcome before telling shutdown it is cleaned up.
+                    // A panic in the bookkeeping must not keep the exit from
+                    // being announced or the entry from leaving the map.
                     if let Some(observer) = &thread_observer {
-                        observer.finished(&payload);
+                        if let Err(panic) =
+                            catch_unwind(AssertUnwindSafe(|| observer.finished(&payload)))
+                        {
+                            crate::supervisor::note_stopped(
+                                "terminal observer panic",
+                                panic.as_ref(),
+                            );
+                        }
                     }
                     drop(reservation.take());
                     sessions_map
@@ -1905,19 +1958,18 @@ pub fn resize_session(
     rows: u16,
     cols: u16,
 ) -> Result<(), String> {
-    let guard = state.lock_sessions();
-    if let Some(session) = guard.get(session_id) {
-        let size = bounded_pty_size(rows, cols);
-        session
-            .master
-            .lock()
-            .map_err(|e| format!("Terminal size lock error: {e}"))?
-            .resize(size)
-            .map_err(|e| format!("Failed to resize terminal: {e}"))?;
-        Ok(())
-    } else {
-        Err(format!("Terminal session '{session_id}' not found"))
-    }
+    // The map is let go before the master is waited for: one session's busy
+    // master must not stall list, write, kill and attach for all the others.
+    let master = state
+        .lock_sessions()
+        .get(session_id)
+        .map(|session| session.master.clone())
+        .ok_or_else(|| format!("Terminal session '{session_id}' not found"))?;
+    let resized = master
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .resize(bounded_pty_size(rows, cols));
+    resized.map_err(|e| format!("Failed to resize terminal: {e}"))
 }
 
 /// Kills a PTY session.
@@ -3499,6 +3551,185 @@ mod tests {
         kill_session(&state, &spawned.id).unwrap();
         assert!(list_sessions(&state).is_empty());
         assert_eq!(detach_all(&state), 0);
+    }
+
+    /// An observer that panics when told the process ended, standing for any
+    /// bookkeeping the end of a session runs before it lets go of the entry.
+    #[cfg(unix)]
+    struct PanicsOnFinish;
+    #[cfg(unix)]
+    impl SessionObserver for PanicsOnFinish {
+        fn run_id(&self) -> &str {
+            "run-panics"
+        }
+        fn before_spawn(&self, _: &str) -> Result<(), String> {
+            Ok(())
+        }
+        fn started(&self, _: &str, _: Option<u32>) -> Result<(), String> {
+            Ok(())
+        }
+        fn spawn_failed(&self, _: &str, reason: &str) {
+            panic!("spawn failed: {reason}")
+        }
+        fn finished(&self, _: &TerminalExitPayload) {
+            panic!("injected panic in the end-of-session bookkeeping");
+        }
+    }
+
+    /// The defect: a panic in the reader thread's tail left the session in the
+    /// map for good - listed as live and never announced as exited - because
+    /// only the tail removed it. The frontend then showed a terminal with no
+    /// process behind it.
+    #[cfg(unix)]
+    #[test]
+    fn a_panic_ending_a_session_still_removes_it_and_announces_the_exit() {
+        use tauri::Listener;
+        let dir = tempfile::tempdir().unwrap();
+        init_test_repo(dir.path());
+        let app = tauri::test::mock_builder().build(crate::context()).unwrap();
+        let state = TerminalSessions::default();
+        let exited = Arc::new(AtomicBool::new(false));
+        let flag = exited.clone();
+        app.listen("terminal-exit", move |_| flag.store(true, Ordering::SeqCst));
+        spawn_session_inner(
+            app.handle(),
+            &state,
+            dir.path().to_str().unwrap(),
+            None,
+            24,
+            80,
+            Some("/bin/sh".into()),
+            Some(vec!["-c".into(), "exit 0".into()]),
+            None,
+            Some(Arc::new(PanicsOnFinish)),
+        )
+        .unwrap();
+        assert!(
+            wait_until(Duration::from_secs(10), || list_sessions(&state).is_empty()),
+            "a session whose end-of-session bookkeeping panicked stayed in the map"
+        );
+        assert!(
+            wait_until(Duration::from_secs(5), || exited.load(Ordering::SeqCst)),
+            "the view is told the session ended"
+        );
+        assert_eq!(state.active_sessions.load(Ordering::SeqCst), 0);
+    }
+
+    /// The defect: a panic while reading output (the scanner, an event
+    /// listener) ended the reader thread with the child still alive and
+    /// nothing reading its tty. The session stayed "running" forever and its
+    /// output backed up until the program blocked. The reader now contains the
+    /// panic, stops the child, and takes the normal exit path.
+    #[cfg(unix)]
+    #[test]
+    fn a_panic_while_reading_output_ends_the_session_instead_of_orphaning_it() {
+        use tauri::Listener;
+        let dir = tempfile::tempdir().unwrap();
+        init_test_repo(dir.path());
+        let app = tauri::test::mock_builder().build(crate::context()).unwrap();
+        let state = TerminalSessions::default();
+        app.listen("terminal-output", |_| {
+            panic!("injected panic while delivering output");
+        });
+        let pid_file = dir.path().join("reader-panic.pid");
+        spawn_session_inner(
+            app.handle(),
+            &state,
+            dir.path().to_str().unwrap(),
+            None,
+            24,
+            80,
+            Some("/bin/sh".into()),
+            Some(vec![
+                "-c".into(),
+                format!("echo $$ > '{}'; echo hello; sleep 300", pid_file.display()),
+            ]),
+            None,
+            None,
+        )
+        .unwrap();
+        let pid = read_pid(&pid_file);
+        // The listener's panic poisons the event bus, so the exit event
+        // itself cannot be announced here; what must hold is that the process
+        // does not outlive its reader.
+        assert!(
+            wait_until(Duration::from_secs(15), || list_sessions(&state).is_empty()),
+            "the reader panicked and the session was left running"
+        );
+        assert!(
+            wait_until(Duration::from_secs(5), || unsafe { libc::kill(pid, 0) }
+                != 0),
+            "the child of a reader that panicked was left running"
+        );
+    }
+
+    /// The defect: `resize_session` held the whole session map while it waited
+    /// for one session's master lock, so one busy master stalled list, write,
+    /// kill and attach for every other session.
+    #[cfg(unix)]
+    #[test]
+    fn a_resize_waiting_on_one_master_does_not_hold_the_session_map() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = TerminalSessions::default();
+        let spawned = spawn_script(&state, dir.path(), "sleep 300".into());
+        let master = state
+            .lock_sessions()
+            .get(&spawned.id)
+            .unwrap()
+            .master
+            .clone();
+        let held = master.lock().unwrap();
+        let resizer = {
+            let state = state.clone();
+            let id = spawned.id.clone();
+            thread::spawn(move || resize_session(&state, &id, 30, 100))
+        };
+        thread::sleep(Duration::from_millis(200));
+        let (send, receive) = std::sync::mpsc::channel();
+        let lister = state.clone();
+        thread::spawn(move || send.send(list_sessions(&lister).len()));
+        let listed = receive.recv_timeout(Duration::from_secs(2));
+        drop(held);
+        resizer.join().unwrap().unwrap();
+        assert_eq!(
+            listed.expect("list_sessions was stuck behind another session's resize"),
+            1
+        );
+        kill_session(&state, &spawned.id).unwrap();
+    }
+
+    /// The defect: a poisoned master lock made every later resize fail with
+    /// "Terminal size lock error", so the PTY kept its old size for good.
+    #[cfg(unix)]
+    #[test]
+    fn a_poisoned_master_lock_does_not_stop_resizing() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = TerminalSessions::default();
+        let spawned = spawn_script(&state, dir.path(), "sleep 300".into());
+        let master = state
+            .lock_sessions()
+            .get(&spawned.id)
+            .unwrap()
+            .master
+            .clone();
+        let poisoner = master.clone();
+        let _ = thread::spawn(move || {
+            let _held = poisoner.lock().unwrap();
+            panic!("injected panic under the master lock");
+        })
+        .join();
+        assert!(
+            master.is_poisoned(),
+            "positive control: the lock is poisoned"
+        );
+        resize_session(&state, &spawned.id, 40, 120).unwrap();
+        let size = master
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get_size()
+            .unwrap();
+        assert_eq!((size.rows, size.cols), (40, 120));
+        kill_session(&state, &spawned.id).unwrap();
     }
 
     /// The native smoke test the browser harness cannot be: it executes a real
