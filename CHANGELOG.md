@@ -11,6 +11,10 @@ before that tag is pushed.
 
 ## [Unreleased]
 
+### Added
+
+- Host load governor, cards 1b and 1c: one verdict (`sysload::governor`) from the host-load sensor now decides what GitPulse does under memory pressure. Agent launches are refused at severe pressure (kernel level critical, or a thrashing memory compressor) before their checkout probes, capacity check and PTY open, with a typed `host_pressure` refusal that names the resource and value; the user's own shell is never gated, and stop, kill, cancel, save, commit, release and reconcile are never gated. GitPulse's own work is shed through the spawn gate's existing classes with the existing "deferred under load" marker: background work at `warn`, background and reactive work at critical or thrash, never a user action, resuming when the pressure clears. A stale-old or dead sensor admits with a warning and a `host_load.sensor_unavailable` ledger event and sheds nothing; Health shows it as ungoverned. Overrides are human only: **Admit anyway** (Health, and beside Retry on a refused launch) asks in a native dialog, then admits for two minutes. After 30 minutes of continuous refusal a toast offers one click to stop refusing; the refusal never lifts on its own. New setting `host_load.govern_launches`, new command `cmd_host_load_admit_anyway` (granted to the main window; 279 handlers). See `docs/LOAD_GOVERNOR.md`.
+
 ## [1.4.0] - 2026-10-11
 
 Agents that start in the background with a pane showing every one at work,

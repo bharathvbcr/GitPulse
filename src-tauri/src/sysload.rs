@@ -12,13 +12,15 @@
 //!
 //! # What this module owns, and what it does not
 //!
-//! It **measures and publishes**. It never refuses work, never sheds it, never
-//! kills a process for its footprint and never starts or restarts memguard.
-//! Admission (card 1b), shedding (1c), leases (1d), the hook (3) and the
-//! tree-sum supervisor (4) consume what it publishes; `docs/LOAD_GOVERNOR.md`
-//! has the ownership table. The one action reachable from here is a
-//! user-clicked Terminate of a foreign orphan, re-checked at click time
-//! ([`terminate_orphan`]).
+//! The sensor **measures and publishes**. It never kills a process for its
+//! footprint and never starts or restarts memguard. What to do about a
+//! reading is decided in one place, `governor`: its verdict refuses agent
+//! launches (card 1b, [`admit`]) and sheds GitPulse's own background and
+//! reactive work through the spawn gate's existing classes (1c, [`shed`]).
+//! Leases (1d), the hook (3) and the tree-sum supervisor (4) consume the same
+//! verdict; `docs/LOAD_GOVERNOR.md` has the ownership table. The one action
+//! reachable from here on a process is a user-clicked Terminate of a foreign
+//! orphan, re-checked at click time ([`terminate_orphan`]).
 //!
 //! # Where it runs
 //!
@@ -35,12 +37,21 @@
 //! been verified on a real Linux host. Windows reports unavailable. See
 //! [`Platform`].
 
+mod governor;
 mod probe;
 pub(crate) mod procscan;
 mod sampler;
 mod sensor;
 mod snapshot;
 
+#[cfg(test)]
+pub(crate) use governor::inject as inject_governor;
+pub use governor::{
+    admit, admit_anyway, admit_on, decide, grant_override, report as governor_report, shed,
+    Admitted, Binding, Governor, GovernorPulse, GovernorReport, GovernorVerdict,
+    Input as GovernorInput, Observation, Reason, Refused, Shed, Site, Tier, ENTER_SAMPLES,
+    EXIT_SAMPLES, OVERRIDE_WINDOW, REFUSAL_CODE, REFUSAL_NOTICE_AFTER,
+};
 pub use procscan::{
     terminate_orphan, AgentKind, AgentSession, ForeignProcess, LaunchedTree, MemguardHealth,
     Orphan, ProcView, ScanContext, Scanner as ProcessScanner, SessionCount,

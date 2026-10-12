@@ -500,6 +500,12 @@ where
 pub struct HostLoadSettings {
     #[serde(default = "host_load_enabled_default")]
     pub enabled: bool,
+    /// Whether severe memory pressure (critical, or a thrashing compressor)
+    /// refuses agent launches. On by default; the governor still sheds
+    /// GitPulse's own background and reactive work when it is off. This is
+    /// what the "refusing launches for 30 minutes" notice flips.
+    #[serde(default = "host_load_enabled_default")]
+    pub govern_launches: bool,
 }
 
 fn host_load_enabled_default() -> bool {
@@ -508,7 +514,10 @@ fn host_load_enabled_default() -> bool {
 
 impl Default for HostLoadSettings {
     fn default() -> Self {
-        Self { enabled: true }
+        Self {
+            enabled: true,
+            govern_launches: true,
+        }
     }
 }
 
@@ -1576,7 +1585,11 @@ mod tests {
     fn the_host_load_switch_is_on_by_default_and_survives_a_malformed_block() {
         with_temp_config(|path| {
             assert!(host_load_settings().enabled, "on by default");
-            set_host_load_settings(HostLoadSettings { enabled: false }).unwrap();
+            set_host_load_settings(HostLoadSettings {
+                enabled: false,
+                ..HostLoadSettings::default()
+            })
+            .unwrap();
             invalidate_cache();
             assert!(!host_load_settings().enabled);
             let stored: serde_json::Value =
