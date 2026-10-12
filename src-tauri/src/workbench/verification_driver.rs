@@ -533,7 +533,8 @@ fn describe(
 }
 
 /// A card's manual Verify: the card's worktree is the one its newest claim
-/// named, or the repository's checkout when it has none. Each press is its own
+/// named while it still exists, else the repository's checkout (none claimed,
+/// or merged and torn down). Each press is its own
 /// request, so it can re-run a verdict the automatic one already reached.
 pub(crate) fn run_now(
     store: &Store,
@@ -543,8 +544,14 @@ pub(crate) fn run_now(
     let card = intake::get_item(store, id)?
         .ok_or_else(|| WorkbenchError::new("not_found", "The task does not exist."))?;
     let identity = repository_identity(store, &card)?;
-    let worktree = match target_of(&card) {
-        Some(target) => target.worktree,
+    // A claim's worktree is gone once its work was merged and torn down; the
+    // work now lives in the repository's own checkout, so that is what a
+    // re-verify must judge, not a path that no longer exists.
+    let held = target_of(&card)
+        .map(|target| target.worktree)
+        .filter(|path| Path::new(path).is_dir());
+    let worktree = match held {
+        Some(path) => path,
         None => identity
             .strip_prefix("local:")
             .and_then(|git_dir| git_dir.strip_suffix("/.git").or(Some(git_dir)))

@@ -6,7 +6,7 @@ use super::gate_tests::{head_of, record, store_record};
 use super::tests::{filed, live, person_edits, profile};
 use super::{complete_task, resolve};
 use crate::workbench::verification_driver::{
-    decide, status, status_batch, target_of, Backend, Driver, Facts, Report, Step, Target,
+    decide, run_now, status, status_batch, target_of, Backend, Driver, Facts, Report, Step, Target,
     MAX_ACTIVE,
 };
 use crate::workbench::verification_gate::{self as gate, Record};
@@ -451,5 +451,36 @@ fn a_batched_read_is_bounded() {
     assert_eq!(
         status_batch(&store, &Fake::new(), &ids).unwrap_err().code,
         "invalid_input"
+    );
+}
+
+#[test]
+fn a_manual_verify_after_the_claimed_worktree_was_torn_down_judges_the_repository_checkout() {
+    let (_d, store, repo, id) = setup();
+    let parent = tempfile::tempdir().unwrap();
+    let linked = parent.path().join("attempt");
+    let linked_str = linked.to_str().unwrap();
+    crate::test_support::git_in(
+        repo.path(),
+        &["worktree", "add", "-q", "-b", "attempt", linked_str],
+    );
+    let claimed = complete_task(&store, linked_str, &id, "done", None, Some("done"), None).unwrap();
+    assert_eq!(claimed["status"], "review", "{claimed}");
+    let fake = Fake::new();
+    let canon = |p: &str| std::fs::canonicalize(p).unwrap();
+    // While the worktree exists it is the one judged.
+    run_now(&store, &fake, &id).unwrap();
+    assert_eq!(
+        canon(fake.starts.borrow()[0]["worktree"].as_str().unwrap()),
+        canon(linked_str)
+    );
+    // Merge-and-teardown removes it; the re-verify must follow the work to the checkout.
+    crate::test_support::git_in(repo.path(), &["worktree", "remove", "--force", linked_str]);
+    assert!(!linked.exists());
+    run_now(&store, &fake, &id).expect("the re-verify falls back to the repository checkout");
+    let sent = fake.starts.borrow();
+    assert_eq!(
+        canon(sent[1]["worktree"].as_str().unwrap()),
+        canon(repo.path().to_str().unwrap())
     );
 }
