@@ -1,10 +1,13 @@
 import { describe, expect, it } from "vitest";
-import type { HostLoadPulse, MemguardHealth } from "../stores/hostLoadStore";
+import type { GovernorReport, HostLoadPulse, MemguardHealth } from "../stores/hostLoadStore";
 import {
+  admissionLine,
   bytes,
   describeReading,
   formatAge,
+  governorLine,
   memguardLine,
+  refusalNotice,
   sensorStateLabel,
   statusChip,
   valueOf,
@@ -18,7 +21,37 @@ const pulse = (over: Partial<HostLoadPulse> = {}): HostLoadPulse => ({
   enabled: true,
   compressor_thrash: false,
   role: "writer",
+  governor: {
+    admit: true,
+    shed_background: false,
+    shed_reactive: false,
+    binding: null,
+    refusing_for_s: null,
+    notice: false,
+    overridden: false,
+    largest_foreign: null,
+  },
   ...over,
+});
+
+const report = (over: Partial<GovernorReport["verdict"]> = {}, rest: Partial<GovernorReport> = {}): GovernorReport => ({
+  verdict: {
+    admit: true,
+    shed: { background: false, reactive: false },
+    reason: "healthy",
+    tier: "clear",
+    binding: null,
+    sensor: "fresh",
+    age_ms: 1_000,
+    message: "memory pressure normal (kernel level 1)",
+    warnings: [],
+    ...over,
+  },
+  refusing_for_s: null,
+  notice: false,
+  largest_foreign: null,
+  override_remaining_s: null,
+  ...rest,
 });
 
 describe("host-load wording", () => {
@@ -101,5 +134,77 @@ describe("memguard line", () => {
       "log unreadable",
     );
     expect(memguardLine({ ...healthy, present: false })).toBe("memguard is not running");
+  });
+});
+
+describe("the governor's lines", () => {
+  it("says nothing is shed while the machine is fine", () => {
+    expect(governorLine(report())).toBe("Nothing is shed. Memory pressure normal (kernel level 1).");
+    expect(admissionLine(report())).toBe("Agent launches are admitted.");
+  });
+
+  it("names the classes shed and the reason, with the stale warning", () => {
+    const shedding = report({
+      reason: "elevated",
+      tier: "elevated",
+      shed: { background: true, reactive: false },
+      binding: "memory_pressure",
+      message: "memory pressure warn (kernel level 2): background work is shed, launches are admitted",
+      warnings: ["stale 45s: governing on the last-known level"],
+    });
+    expect(governorLine(shedding)).toBe(
+      "Shedding background work: memory pressure warn (kernel level 2): background work is shed, launches are admitted (stale 45s: governing on the last-known level).",
+    );
+    expect(governorLine(report({ shed: { background: true, reactive: true }, reason: "pressure" }))).toMatch(
+      /^Shedding background and reactive work/,
+    );
+  });
+
+  it("says a dead or stale-old sensor means no extra shedding, rather than looking like governing", () => {
+    const blind = report({
+      reason: "sensor_unavailable",
+      sensor: "dead",
+      message: "the load sensor is not running: memory pressure is unknown, so nothing is shed or refused",
+      warnings: ["the load sensor is not running"],
+    });
+    expect(governorLine(blind)).toMatch(/^Ungoverned: the load sensor is not running/);
+    expect(admissionLine(blind)).toMatch(/^Agent launches are admitted \(the load sensor is not running/);
+    expect(governorLine(report({ reason: "switched_off", message: "host-load measurement is switched off" }))).toBe(
+      "Not governing: host-load measurement is switched off.",
+    );
+  });
+
+  it("reports refusal with its duration, and a person's override", () => {
+    const refusing = report({ admit: false, reason: "pressure", message: "memory pressure critical (kernel level 4): agent launches are refused until it clears" }, { refusing_for_s: 125 });
+    expect(admissionLine(refusing)).toBe(
+      "Agent launches are refused for 2 min: memory pressure critical (kernel level 4): agent launches are refused until it clears.",
+    );
+    expect(admissionLine({ ...refusing, override_remaining_s: 90 })).toBe(
+      "Launches are admitted for 90 s more, on your say-so.",
+    );
+  });
+
+  it("words the 30-minute notice with the binding resource and the largest foreign footprint", () => {
+    const gov = pulse().governor;
+    expect(refusalNotice({ ...gov, binding: "compressor_thrash", refusing_for_s: 2_700, largest_foreign: 3 * 1024 ** 3 })).toBe(
+      "Refusing agent launches for 45 min under a thrashing memory compressor; largest foreign footprint 3.00 GB.",
+    );
+    expect(refusalNotice({ ...gov, binding: "memory_pressure", refusing_for_s: null, largest_foreign: null })).toBe(
+      "Refusing agent launches for 30 min under memory pressure; largest foreign footprint unknown.",
+    );
+  });
+
+  it("adds refused launches and shedding to the status chip, refused first", () => {
+    const gov = pulse().governor;
+    expect(
+      statusChip(pulse({ level: "critical", pressure: "critical", governor: { ...gov, admit: false, shed_background: true, shed_reactive: true } }))?.text,
+    ).toBe("Memory: critical · launches refused");
+    expect(
+      statusChip(pulse({ level: "warn", pressure: "warn", governor: { ...gov, shed_background: true } }))?.text,
+    ).toBe("Memory: warning · shedding");
+    // A person's override stops the chip claiming launches are refused.
+    expect(
+      statusChip(pulse({ level: "critical", pressure: "critical", governor: { ...gov, admit: false, overridden: true, shed_background: true, shed_reactive: true } }))?.text,
+    ).toBe("Memory: critical · shedding");
   });
 });
