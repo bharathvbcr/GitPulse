@@ -343,7 +343,7 @@ mod child {
         let pid = received
             .recv_timeout(Duration::from_secs(10))
             .unwrap_or_else(|_| fail("no content process id"));
-        check(pid > 0, "the page has a content process");
+        check(pid > 1, "the page has a content process");
         let killed = Instant::now();
         // SAFETY: plain kill(2) of WebKit's content process for this webview.
         check(

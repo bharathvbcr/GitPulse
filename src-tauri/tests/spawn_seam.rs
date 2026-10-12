@@ -305,6 +305,85 @@ fn pty_creation_runs_under_the_inheritance_lock() {
     );
 }
 
+/// A signal reaches a process only through `procguard::signal`.
+///
+/// One over-broad `kill` — a pattern, `-1`, group 0, a pid that was recycled —
+/// can end processes the app never started. `procguard::signal` refuses those
+/// ids and logs every delivery, so the absence of any other sender is asserted:
+/// no production line calls `libc::kill` or `libc::killpg` with a real signal
+/// (signal 0, an existence probe, delivers nothing), and none names a
+/// pattern-based killer. The Windows tree kill is the one other sender and
+/// lives in `procguard/mod.rs`, behind its own pid check.
+#[test]
+fn no_production_code_signals_a_process_outside_the_guarded_primitive() {
+    const SENDERS: &[&str] = &[
+        "libc::kill(",
+        "libc::killpg(",
+        "pkill",
+        "killall",
+        "taskkill",
+        "TerminateProcess",
+    ];
+    const ALLOWED: &[(&str, &str)] = &[
+        (
+            "src/procguard/signal.rs",
+            "the primitive: every id is vetted before the one `kill` and `killpg`",
+        ),
+        (
+            "src/procguard/mod.rs",
+            "the Windows tree kill, which refuses pid <= 4 and this process first",
+        ),
+    ];
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut files = Vec::new();
+    collect_rs(&root, &mut files);
+    assert!(files.len() > 50, "only found {} files", files.len());
+    let test_only = test_only_files(&root, &files);
+    assert!(!test_only.is_empty(), "no test-only module files resolved");
+
+    let mut offenders: BTreeMap<String, Vec<usize>> = BTreeMap::new();
+    let mut scanned = 0usize;
+    for file in &files {
+        if test_only.contains(file) {
+            continue;
+        }
+        let rel = file
+            .strip_prefix(env!("CARGO_MANIFEST_DIR"))
+            .unwrap_or(file)
+            .to_string_lossy()
+            .replace('\\', "/");
+        let text = std::fs::read_to_string(file).expect("read source");
+        let production = strip_test_items(&text);
+        scanned += production.len();
+        if ALLOWED.iter().any(|(allowed, _)| *allowed == rel) {
+            continue;
+        }
+        for (line_no, line) in &production {
+            let code = line.trim_start();
+            if code.starts_with("//") {
+                continue;
+            }
+            let probe = code.contains("libc::kill(") && code.contains(", 0)");
+            if !probe && SENDERS.iter().any(|sender| code.contains(sender)) {
+                offenders.entry(rel.clone()).or_default().push(*line_no);
+            }
+        }
+    }
+    assert!(
+        offenders.is_empty(),
+        "these send a signal outside `procguard::signal`, so nothing refuses \
+         pid 0, 1, -1, our own group or a recycled pid, and nothing logs why: \
+         {offenders:?}"
+    );
+    for (allowed, _) in ALLOWED {
+        assert!(
+            root.parent().expect("manifest dir").join(allowed).is_file(),
+            "ALLOWED names {allowed}, which is not a file any more"
+        );
+    }
+    assert!(scanned > 10_000, "read only {scanned} production lines");
+}
+
 fn collect_rs(dir: &Path, out: &mut Vec<PathBuf>) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;

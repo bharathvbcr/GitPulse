@@ -868,6 +868,24 @@ describe("killPid identity check", () => {
     expect(dead).toBe(true);
   }, 10_000);
 
+  it("signals nothing when no command was vetted: a pid alone is not an identity", async () => {
+    if (process.platform === "win32") return;
+    const child = spawn("sleep", ["5"]);
+    await killPid(child.pid!, null);
+    await killPid(child.pid!, "");
+    await killPid(child.pid!);
+    expect(child.exitCode).toBeNull();
+    expect(child.signalCode).toBeNull();
+    expect(await aliveViaPs(child.pid!)).toBe(true);
+    child.kill("SIGKILL");
+  }, 10_000);
+
+  it("refuses to signal this process, its parent, and ids that address more than one process", async () => {
+    for (const pid of [0, 1, -1, -2, process.pid, process.ppid, 1.5, Number.NaN]) {
+      await expect(killPid(pid, "node")).resolves.toBeUndefined();
+    }
+  });
+
   it("refuses to signal when the command no longer matches (pid-reuse guard)", async () => {
     if (process.platform === "win32") return;
     const child = spawn("sleep", ["5"]);

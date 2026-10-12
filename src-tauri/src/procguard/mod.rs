@@ -66,6 +66,9 @@
 //! that it armed nothing rather than returning the same value as a successful
 //! install.
 
+#[cfg(unix)]
+pub mod signal;
+
 use std::collections::BTreeMap;
 use std::io;
 use std::process::{Child, Command, ExitStatus};
@@ -240,7 +243,7 @@ impl Registration {
     pub fn kill_tree(&self, child: &mut Child) {
         let pid = lock(&self.slot.pid);
         if let Some(pid) = *pid {
-            let _ = sys::force_kill(pid);
+            let _ = sys::force_kill(pid, &self.slot.label);
         }
         let _ = child.kill();
     }
@@ -283,7 +286,7 @@ impl Registration {
     pub fn ask_then_stop_and_reap(&self, child: &mut Child) -> io::Result<ExitStatus> {
         let grace = if sys::CAN_ASK_TO_STOP {
             if let Some(pid) = *lock(&self.slot.pid) {
-                let _ = sys::request_stop(pid);
+                let _ = sys::request_stop(pid, &self.slot.label);
             }
             CHILD_GRACE
         } else {
@@ -354,7 +357,7 @@ impl Drop for Registration {
         {
             let mut pid = lock(&self.slot.pid);
             if let Some(pid) = pid.take() {
-                let _ = sys::force_kill(pid);
+                let _ = sys::force_kill(pid, &self.slot.label);
             }
         }
         lock(registry()).remove(&self.key);
@@ -591,7 +594,7 @@ fn sweep(slots: &[Slot], grace: Duration) -> Sweep {
                 None => Ask::Busy,
                 Some(pid) => match *pid {
                     None => Ask::Gone,
-                    Some(pid) => match sys::request_stop(pid) {
+                    Some(pid) => match sys::request_stop(pid, &slot.label) {
                         Ok(true) => Ask::Pending(pid),
                         Ok(false) => Ask::Gone,
                         Err(e) => {
@@ -631,7 +634,7 @@ fn sweep(slots: &[Slot], grace: Duration) -> Sweep {
             }
             continue;
         };
-        match sys::force_kill(pid) {
+        match sys::force_kill(pid, &slot.label) {
             Ok(true) => match asked {
                 // Still there after being asked and given the grace window.
                 Ask::Pending(_) => sweep.force_killed += 1,
@@ -838,29 +841,24 @@ mod sys {
     /// Reading `EPERM` as "someone else's group" would require the pid to have
     /// been recycled, and the registry's rule that a reaped pid is forgotten
     /// under the entry lock is what rules that out.
-    fn signal_group(pid: u32, signo: libc::c_int) -> io::Result<bool> {
+    fn signal_group(pid: u32, signo: libc::c_int, who: &str) -> io::Result<bool> {
         let pgid = i32::try_from(pid).map_err(|_| {
             io::Error::new(
                 io::ErrorKind::InvalidInput,
                 format!("pid {pid} does not fit a pid_t"),
             )
         })?;
-        if unsafe { libc::killpg(pgid, signo) } == 0 {
-            return Ok(true);
-        }
-        let e = io::Error::last_os_error();
-        match e.raw_os_error() {
-            Some(libc::ESRCH) | Some(libc::EPERM) => Ok(false),
-            _ => Err(e),
-        }
+        // The guarded primitive refuses 0, 1, negative ids, our own group and a
+        // leader that is no longer one of ours; see `super::signal`.
+        super::signal::signal_group(pgid, signo, super::signal::Basis::Spawned, who)
     }
 
-    pub(super) fn request_stop(pid: u32) -> io::Result<bool> {
-        signal_group(pid, libc::SIGTERM)
+    pub(super) fn request_stop(pid: u32, who: &str) -> io::Result<bool> {
+        signal_group(pid, libc::SIGTERM, who)
     }
 
-    pub(super) fn force_kill(pid: u32) -> io::Result<bool> {
-        signal_group(pid, libc::SIGKILL)
+    pub(super) fn force_kill(pid: u32, who: &str) -> io::Result<bool> {
+        signal_group(pid, libc::SIGKILL, who)
     }
 
     /// True once this pid has exited, with its zombie left in place.
@@ -903,7 +901,7 @@ mod sys {
     /// pass, whereas guessing "gone" would end the sweep early on a child that
     /// is still running.
     pub(super) fn is_alive(pid: u32) -> bool {
-        signal_group(pid, 0).unwrap_or(true)
+        signal_group(pid, 0, "liveness probe").unwrap_or(true)
     }
 
     /// Runs in signal context: everything it touches must be
@@ -1112,11 +1110,20 @@ mod sys {
     /// No `setpgid` here; the tree is walked at kill time by pid instead.
     pub(super) fn prepare(_cmd: &mut Command) {}
 
-    pub(super) fn request_stop(_pid: u32) -> io::Result<bool> {
+    pub(super) fn request_stop(_pid: u32, _who: &str) -> io::Result<bool> {
         Ok(false)
     }
 
-    pub(super) fn force_kill(pid: u32) -> io::Result<bool> {
+    pub(super) fn force_kill(pid: u32, who: &str) -> io::Result<bool> {
+        // Pid 0 is the idle process and 4 is System; neither is ever a child of
+        // ours, and this process is never its own victim.
+        if pid <= 4 || pid == std::process::id() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("refusing to terminate pid {pid}"),
+            ));
+        }
+        log::info!(target: "procguard", "taskkill /T /F pid {pid} for {who}");
         // `/T` walks the pid tree, `/F` terminates. Spawned directly by argv,
         // never through a shell. A non-zero status is "no such process" as
         // often as it is a real failure, and the two are not distinguishable
@@ -1509,12 +1516,13 @@ mod tests {
         let (mut child, guard) = spawn(&mut cmd, "corpse").expect("spawn");
         let pid = guard.pid().expect("registered");
 
-        assert!(sys::force_kill(pid).expect("first kill"));
+        assert!(sys::force_kill(pid, "test").expect("first kill"));
         // Deliberately not reaped: this is the window under test.
         let deadline = Instant::now() + Duration::from_secs(5);
         let mut seen = 0usize;
         while Instant::now() < deadline {
-            sys::force_kill(pid).expect("a kill aimed at an unreaped corpse reported a failure");
+            sys::force_kill(pid, "test")
+                .expect("a kill aimed at an unreaped corpse reported a failure");
             seen += 1;
             std::thread::sleep(Duration::from_millis(10));
             if seen > 10 {
@@ -1807,6 +1815,152 @@ mod tests {
         assert!(out.status.success());
         assert_eq!(out.stdout, b"out");
         assert_eq!(out.stderr, b"err");
+    }
+
+    /// A process this test owns, in a group of its own that procguard never
+    /// registered: the stand-in for "everyone else's processes". If a signal
+    /// ever leaves the groups under test, this is what it reaches.
+    #[cfg(unix)]
+    struct Bystander(Child);
+
+    #[cfg(unix)]
+    impl Bystander {
+        fn start() -> Bystander {
+            use std::os::unix::process::CommandExt;
+            let mut cmd = Command::new("sleep");
+            cmd.arg("120")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .process_group(0);
+            Bystander(cmd.spawn_locked().expect("bystander"))
+        }
+
+        fn alive(&mut self) -> bool {
+            matches!(self.0.try_wait(), Ok(None))
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for Bystander {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    /// Two hundred process groups, half of them with a descendant that
+    /// outlives its leader's direct kill, torn down by sixteen threads at once.
+    /// Nothing outside them may be signalled: a bystander in a group of its own
+    /// and this test process (which would not survive `killpg(0, ..)`) both
+    /// outlive it, and every group under test is gone.
+    #[cfg(unix)]
+    #[test]
+    fn two_hundred_concurrent_teardowns_signal_nothing_outside_their_groups() {
+        let mut bystander = Bystander::start();
+        let mut started = Vec::new();
+        for index in 0..200 {
+            let mut cmd = Command::new("sh");
+            let script = if index % 2 == 0 {
+                "sleep 60 & echo $!; exec sleep 60"
+            } else {
+                "exec sleep 60"
+            };
+            cmd.arg("-c")
+                .arg(script)
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped());
+            let (mut child, guard) = spawn(&mut cmd, "teardown-stress").expect("spawn");
+            let helper = (index % 2 == 0).then(|| announced_pid(&mut child));
+            started.push((child, guard, helper));
+        }
+        let pending = Mutex::new(started);
+        let helpers = Mutex::new(Vec::new());
+        std::thread::scope(|scope| {
+            for _ in 0..16 {
+                scope.spawn(|| loop {
+                    let Some((mut child, guard, helper)) = lock(&pending).pop() else {
+                        return;
+                    };
+                    if let Some(helper) = helper {
+                        lock(&helpers).push(helper);
+                    }
+                    guard.ask_then_stop_and_reap(&mut child).expect("reap");
+                    // A second teardown of the same entry must find nothing to
+                    // signal: the pid was forgotten when it was reaped.
+                    guard.kill_tree(&mut child);
+                    assert_eq!(guard.pid(), None);
+                });
+            }
+        });
+        for helper in lock(&helpers).iter() {
+            assert!(
+                wait_gone(*helper, Duration::from_secs(10)),
+                "descendant {helper} survived its group's teardown"
+            );
+        }
+        assert!(
+            bystander.alive(),
+            "a signal reached a group nobody asked for"
+        );
+    }
+
+    /// Sixteen threads closing one registration at once: one of them signals,
+    /// the rest find the pid forgotten, and none of them signals the group a
+    /// recycled pid might now lead.
+    #[cfg(unix)]
+    #[test]
+    fn sixteen_racing_closers_of_one_child_signal_it_once_and_only_it() {
+        let mut bystander = Bystander::start();
+        let mut cmd = Command::new("sleep");
+        cmd.arg("60").stdin(Stdio::null()).stdout(Stdio::null());
+        let (child, guard) = spawn(&mut cmd, "closers").expect("spawn");
+        let child = Mutex::new(child);
+        std::thread::scope(|scope| {
+            for _ in 0..16 {
+                scope.spawn(|| {
+                    let mut child = lock(&child);
+                    guard
+                        .stop_and_reap(&mut child, Duration::ZERO)
+                        .expect("every closer sees the child reaped");
+                });
+            }
+        });
+        assert_eq!(guard.pid(), None);
+        assert!(bystander.alive());
+    }
+
+    /// The case no public API can reach, run where it cannot hurt: a helper
+    /// process in a group of its own aims the signal path at its own group and
+    /// at group 0. Before the guard, the helper killed itself and this test saw
+    /// a signal exit; now both are refused and it exits cleanly.
+    #[cfg(unix)]
+    #[test]
+    fn the_signal_path_refuses_its_own_group_even_when_asked_to_kill_it() {
+        use std::os::unix::process::{CommandExt, ExitStatusExt};
+        if std::env::var_os("PROCGUARD_SELF_AIM").is_some() {
+            let me = unsafe { libc::getpgrp() } as u32;
+            for target in [me, 0, 1, u32::MAX] {
+                assert!(sys::force_kill(target, "self-aim").is_err(), "{target}");
+                assert!(sys::request_stop(target, "self-aim").is_err(), "{target}");
+            }
+            return;
+        }
+        let mut cmd = Command::new(std::env::current_exe().expect("test binary"));
+        cmd.args([
+            "--exact",
+            "procguard::tests::the_signal_path_refuses_its_own_group_even_when_asked_to_kill_it",
+            "--nocapture",
+        ])
+        .env("PROCGUARD_SELF_AIM", "1")
+        .stdin(Stdio::null())
+        .process_group(0);
+        let status = cmd.status_locked().expect("helper");
+        assert_eq!(
+            status.signal(),
+            None,
+            "the helper was signalled: {status:?}"
+        );
+        assert!(status.success(), "{status:?}");
     }
 
     /// Windows is the case where nothing can be armed. It must say so, not

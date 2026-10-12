@@ -1490,7 +1490,7 @@ fn spawn_session_inner<R: tauri::Runtime>(
     let incident_program = shell.clone();
     let incident_cwd = start.to_string_lossy().into_owned();
     if start_error.is_some() {
-        dead.store(true, Ordering::Release);
+        dead.store(true, Ordering::SeqCst);
         output_flow.stop();
         if let Err(error) = terminate_pty_child(&child, &master) {
             log::error!(target: "terminal", "could not stop a task session after bookkeeping failure: {error}");
@@ -1703,6 +1703,7 @@ fn spawn_session_inner<R: tauri::Runtime>(
         let mut guard = state.lock_sessions();
         guard.remove(&session_id);
         drop(guard);
+        dead.store(true, Ordering::SeqCst);
         terminate_pty_child(&child, &master)?;
         let exit = child
             .lock()
@@ -1961,8 +1962,12 @@ pub fn kill_session(state: &TerminalSessions, session_id: &str) -> Result<(), St
     };
     if let Some((child, master, flow, dead)) = handles {
         log::info!(target: "terminal", "terminal close requested");
-        terminate_pty_child(&child, &master)?;
+        // Marked before the first signal, not after: the reader that sees the
+        // child die reads this flag to tell a close GitPulse asked for from an
+        // external death, and a reader finishing between the signal and the
+        // store would count our own hangup as someone else's kill.
         dead.store(true, Ordering::SeqCst);
+        terminate_pty_child(&child, &master)?;
         flow.stop();
         let deadline = Instant::now() + Duration::from_secs(2);
         loop {
@@ -2071,12 +2076,16 @@ fn stop_session_jobs(sid: i32, grace: Duration) {
     };
     let signal = |signo: libc::c_int, groups: &BTreeSet<i32>| {
         for group in groups {
-            // SAFETY: the group has a member in the session this call owns
-            // (the leader cannot be reaped while its lock is held), so the id
-            // cannot belong to a stranger.
-            unsafe {
-                libc::killpg(*group, signo);
-            }
+            // The group has a member in the session this call owns (the leader
+            // cannot be reaped while its lock is held). The primitive still
+            // refuses an id that is not an ordinary group, our own group or
+            // session, and a group whose leader is now in another session.
+            let _ = crate::procguard::signal::signal_group(
+                *group,
+                signo,
+                crate::procguard::signal::Basis::Session(sid),
+                "terminal close",
+            );
         }
     };
     let first = match groups() {

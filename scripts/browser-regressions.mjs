@@ -79,6 +79,29 @@ export function chromeLaunch(chrome, profile, url) {
   };
 }
 
+/** The pid to signal to end Chrome's group, or null when it must not be signalled.
+ *
+ * The watchdog fires long after it was told Chrome's pid, so that number may
+ * have been recycled. A `process.kill(-0)` is `kill(0)` (the watchdog's own
+ * group) and `-1` is every process the user owns, so the id is checked, and the
+ * process must still be a group leader whose command line carries this run's
+ * unique profile directory. `readProcess` answers `{ pgid, command }` for a pid
+ * or null when it is gone. Windows has no group to name, so only the id rule and
+ * liveness apply there.
+ * @param {number} chrome @param {string} profile @param {string} platform
+ * @param {number} self @param {(pid: number) => ({ pgid: number, command: string } | null)} readProcess
+ * @returns {number | null}
+ */
+export function chromeVictim(chrome, profile, platform, self, readProcess) {
+  if (!Number.isInteger(chrome) || chrome <= 1 || chrome === self) return null;
+  if (typeof profile !== "string" || profile.length < 2) return null;
+  const info = readProcess(chrome);
+  if (!info) return null;
+  if (platform === "win32") return chrome;
+  if (info.pgid !== chrome || !info.command.includes(profile)) return null;
+  return -chrome;
+}
+
 /** Runs in its own process, polling the runner and the browser. When the
  * runner is gone it ends Chrome's whole process group and removes the profile.
  * It exits as soon as either side is gone, so it never outlives the pair.
@@ -86,10 +109,19 @@ export function chromeLaunch(chrome, profile, url) {
 const WATCHDOG = `
 const runner = Number(process.argv[1]), chrome = Number(process.argv[2]), profile = process.argv[3];
 const alive = pid => { try { process.kill(pid, 0); return true; } catch (e) { return e.code === "EPERM"; } };
+const readProcess = pid => {
+  try {
+    const out = require("node:child_process").execFileSync("ps", ["-o", "pgid=,command=", "-p", String(pid)], { encoding: "utf8" }).trim();
+    const match = /^(\\d+)\\s+(.*)$/s.exec(out);
+    return match ? { pgid: Number(match[1]), command: match[2] } : null;
+  } catch { return null; }
+};
+${chromeVictim.toString()}
 const tick = setInterval(() => {
   if (alive(runner)) { if (!alive(chrome)) process.exit(0); return; }
   clearInterval(tick);
-  try { process.kill(process.platform === "win32" ? chrome : -chrome, "SIGKILL"); } catch {}
+  const victim = chromeVictim(chrome, profile, process.platform, process.pid, readProcess);
+  if (victim !== null) { try { process.kill(victim, "SIGKILL"); } catch {} }
   try { require("node:fs").rmSync(profile, { recursive: true, force: true, maxRetries: 5 }); } catch {}
   process.exit(0);
 }, 200);

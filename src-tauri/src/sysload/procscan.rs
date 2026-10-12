@@ -1002,7 +1002,7 @@ pub fn terminate_orphan(
     terminate_confirmed(
         || still_orphaned(pid, start_us),
         confirm,
-        || signal_term(pid),
+        || signal_term(pid, start_us),
     )
 }
 
@@ -1069,21 +1069,23 @@ fn still_orphaned(pid: i32, start_us: u64) -> Result<Orphan, String> {
         .ok_or_else(|| "the process no longer looks orphaned; nothing was signalled".into())
 }
 
+/// The SIGTERM itself, through the one guarded primitive: it refuses an id that
+/// is not an ordinary pid and re-reads the process's start time at the moment of
+/// the signal, so a pid recycled since [`still_orphaned`] ran is not signalled.
 #[cfg(unix)]
-fn signal_term(pid: i32) -> Result<(), String> {
-    // SAFETY: a plain signal to a pid re-validated just above.
-    if unsafe { libc::kill(pid, libc::SIGTERM) } == 0 {
-        Ok(())
-    } else {
-        Err(format!(
-            "could not signal {pid}: {}",
-            std::io::Error::last_os_error()
-        ))
-    }
+fn signal_term(pid: i32, start_us: u64) -> Result<(), String> {
+    crate::procguard::signal::signal_process(
+        pid,
+        start_us,
+        &|pid| probe_one(pid).map(|facts| facts.start_us),
+        libc::SIGTERM,
+        "Health orphan terminate",
+    )
+    .map_err(|error| format!("could not signal {pid}: {error}"))
 }
 
 #[cfg(not(unix))]
-fn signal_term(_pid: i32) -> Result<(), String> {
+fn signal_term(_pid: i32, _start_us: u64) -> Result<(), String> {
     Err("terminating a process is not supported on this platform".into())
 }
 
@@ -2012,6 +2014,43 @@ pub(crate) mod tests {
         assert!(sent.contains("4242") && sent.contains("30 min"), "{sent}");
     }
 
+    /// The signal re-reads the start time itself: a pid that now belongs to a
+    /// different process than the one the person was shown is never signalled,
+    /// even when the checks before it passed. The stand-in for the reused pid is
+    /// a live process asked about under a start time it does not have.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn the_signal_itself_refuses_a_pid_whose_start_time_moved() {
+        use crate::procguard::LockedSpawn;
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .stdin(std::process::Stdio::null())
+            .spawn_locked()
+            .expect("spawn");
+        let pid = i32::try_from(child.id()).unwrap();
+        let start = (0..100)
+            .find_map(|_| {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+                probe_one(pid).map(|f| f.start_us)
+            })
+            .expect("the fixture is visible to the scan");
+        let refused = signal_term(pid, start + 1).expect_err("a moved start time");
+        assert!(refused.contains("different process"), "{refused}");
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "a pid whose start time moved was signalled"
+        );
+        for id in [0, 1, -1, i32::MIN] {
+            assert!(signal_term(id, start).is_err(), "pid {id}");
+        }
+        signal_term(pid, start).expect("the process the start time names");
+        let status = child.wait().unwrap();
+        assert_eq!(
+            std::os::unix::process::ExitStatusExt::signal(&status),
+            Some(libc::SIGTERM)
+        );
+    }
+
     /// A refusal before the dialog never shows it.
     #[test]
     fn a_process_that_is_not_an_orphan_never_reaches_the_dialog() {
@@ -2100,6 +2139,8 @@ pub(crate) mod tests {
 
     #[cfg(unix)]
     pub(crate) fn kill_fixture(pid: i32) {
+        // 0, 1 and negatives address more than one process.
+        assert!(pid > 1, "refusing to signal pid {pid}");
         // SAFETY: a pid this test started and recorded itself.
         unsafe {
             libc::kill(pid, libc::SIGKILL);
