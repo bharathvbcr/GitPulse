@@ -427,11 +427,11 @@ impl WorkbenchState {
         // the stored record), so a down sidecar cannot block or fake a verdict.
         if method == "verifications.start" {
             let params = verification_gate::start_params(input)?;
-            return self.worker_call("work.verify.task", params, None);
+            return self.worker_call_current("work.verify.task", params);
         }
         if method == "verifications.get" {
             let params = verification_gate::get_params(input)?;
-            return self.worker_call("work.verify.get", params, None);
+            return self.worker_call_current("work.verify.get", params);
         }
         // What the card shows (read from the store, so it works with the
         // sidecar down) and its Verify action. Both use a connection of their
@@ -478,15 +478,15 @@ impl WorkbenchState {
         // error to see, never an empty scan.
         if method == "scans.start" {
             let params = intake::scan_start_params(input)?;
-            return self.worker_call("work.scan.gaps", params, None);
+            return self.worker_call_current("work.scan.gaps", params);
         }
         if method == "scans.get" {
             let params = intake::scan_ref_params(input)?;
-            return self.worker_call("work.scan.get", params, None);
+            return self.worker_call_current("work.scan.get", params);
         }
         if method == "scans.cancel" {
             let params = intake::scan_ref_params(input)?;
-            return self.worker_call("work.scan.cancel", params, None);
+            return self.worker_call_current("work.scan.cancel", params);
         }
         if method == "proposals.file" {
             return self.with_store(|store| intake::file_proposal(store, input));
@@ -510,7 +510,7 @@ impl WorkbenchState {
         // only names the ask. It reads and never writes the board.
         if method == "tasks.suggest" {
             let params = suggest::params(input)?;
-            return self.worker_call("work.tasks.suggest", params, None);
+            return self.worker_call_current("work.tasks.suggest", params);
         }
         if matches!(
             method,
@@ -548,6 +548,8 @@ impl WorkbenchState {
         result
     }
 
+    /// A call that names a model selection (or the default one): the worker is
+    /// rebuilt when the selection's fingerprint differs from the live one.
     fn worker_call(
         &self,
         method: &str,
@@ -555,6 +557,39 @@ impl WorkbenchState {
         selection: Option<crate::harness::sidecar::ModelSelection>,
     ) -> Result<Value, WorkbenchError> {
         let worker = self.worker(selection)?;
+        self.call_worker(worker, method, params)
+    }
+
+    /// A call that has no model of its own (verify, scan, suggest, managed run
+    /// control): it uses whatever worker is live, whatever its fingerprint, and
+    /// builds the default one only when none is. Going through [`Self::worker`]
+    /// with `None` instead would retire a model-selected enhancement worker
+    /// mid-run just to ask a question that does not use the model.
+    fn worker_call_current(&self, method: &str, params: Value) -> Result<Value, WorkbenchError> {
+        let worker = self.current_worker()?;
+        self.call_worker(worker, method, params)
+    }
+
+    fn current_worker(
+        &self,
+    ) -> Result<Arc<crate::harness::sidecar::ProfileConnection>, WorkbenchError> {
+        self.check_open()?;
+        let live = {
+            let guard = crate::supervisor::lock_or_recover(&self.0.worker);
+            guard.as_ref().map(|(_, worker)| Arc::clone(worker))
+        };
+        match live {
+            Some(worker) => Ok(worker),
+            None => self.worker(None),
+        }
+    }
+
+    fn call_worker(
+        &self,
+        worker: Arc<crate::harness::sidecar::ProfileConnection>,
+        method: &str,
+        params: Value,
+    ) -> Result<Value, WorkbenchError> {
         // Initialization is lazy and can overlap shutdown; never spawn after it.
         if let Err(error) = self.check_open() {
             worker.shutdown();
@@ -577,15 +612,7 @@ impl WorkbenchState {
     /// with `None` would retire a perfectly good enhancement worker mid-flight
     /// to learn something it had already told us.
     fn worker_handshake(&self) -> Result<crate::harness::protocol::HelloResult, WorkbenchError> {
-        self.check_open()?;
-        let live = {
-            let guard = crate::supervisor::lock_or_recover(&self.0.worker);
-            guard.as_ref().map(|(_, worker)| Arc::clone(worker))
-        };
-        let worker = match live {
-            Some(worker) => worker,
-            None => self.worker(None)?,
-        };
+        let worker = self.current_worker()?;
         if let Err(error) = self.check_open() {
             worker.shutdown();
             return Err(error);
@@ -1119,7 +1146,7 @@ mod tests {
 while IFS= read -r line; do
   id=$(printf '%s' "$line" | sed -n 's/^{"id":"\([0-9]*\)".*/\1/p')
   case "$line" in
-    *'"op":"hello"'*) result='{"protocol":1,"ops":["hello","work.enhancements.configuration"],"posture":"host"}' ;;
+    *'"op":"hello"'*) result='{"protocol":1,"ops":["hello","work.enhancements.configuration","work.tasks.suggest"],"posture":"host"}' ;;
     *) result="{\"ok\":true,\"provider\":\"local\",\"model\":\"${MANVI_MODEL:-none}\",\"model_source\":\"env\",\"providers\":[\"local\"]}" ;;
   esac
   printf '{"id":"%s","ok":true,"result":%s}\n' "$id" "$result"
@@ -1152,6 +1179,20 @@ done
                 )
                 .unwrap();
             assert_eq!(second["model"], "model-b");
+            // A call with no model of its own must not retire the
+            // model-selected worker: the next enhancement would otherwise find
+            // its worker gone mid-run.
+            let pid_before = host.0.worker.lock().unwrap().as_ref().map(|(_, w)| Arc::as_ptr(w));
+            host.request("tasks.suggest", "{}").unwrap();
+            let guard = host.0.worker.lock().unwrap();
+            let (fingerprint, live) = guard.as_ref().expect("worker still live");
+            assert_eq!(
+                fingerprint.as_ref().map(|(_, model)| model.as_str()),
+                Some("model-b"),
+                "suggest rebuilt the worker to the default selection"
+            );
+            assert_eq!(Some(Arc::as_ptr(live)), pid_before);
+            drop(guard);
             host.shutdown();
         });
         if let Err(panic) = outcome {

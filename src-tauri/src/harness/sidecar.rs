@@ -1513,6 +1513,22 @@ pub fn call(op: &str, params: Option<Value>, timeout: Duration) -> Result<Value,
     call_in_slot(slot(), op, params, Budget::Fixed(timeout), None)
 }
 
+/// What to tell a person when the running Manvi does not advertise `op`: the
+/// feature the op belongs to, so a missing `work.tasks.suggest` does not read
+/// as a task-enhancement problem.
+fn missing_op_message(op: &str) -> String {
+    let feature = match op {
+        "work.tasks.suggest" => "Suggest next",
+        "work.verify.task" | "work.verify.get" => "task verification",
+        "work.scan.gaps" | "work.scan.get" | "work.scan.cancel" => "the repository gap scan",
+        "work.runs.managed.prepare" | "work.runs.managed.activate" | "work.runs.managed.stop" => {
+            "managed runs"
+        }
+        _ => "task enhancements",
+    };
+    format!("This Manvi binary does not advertise {op}. Update Manvi to use {feature}.")
+}
+
 fn call_in_slot(
     owner: &Mutex<Slot>,
     op: &str,
@@ -1542,9 +1558,7 @@ fn call_in_slot(
         if requires_capability && !serves(&sidecar.hello, op) {
             return Err(HarnessError::Refused(WireError {
                 code: "unsupported_operation".into(),
-                message: format!(
-                    "This Manvi binary does not advertise {op}. Update Manvi to use task enhancements."
-                ),
+                message: missing_op_message(op),
                 retryable: false,
             }));
         }
@@ -2784,6 +2798,22 @@ done
         assert!(connection
             .call("work.enhancements.configuration", serde_json::json!({}))
             .is_err());
+    }
+
+    #[test]
+    fn a_missing_op_names_its_own_feature() {
+        for (op, feature) in [
+            ("work.tasks.suggest", "Suggest next"),
+            ("work.verify.task", "task verification"),
+            ("work.scan.gaps", "the repository gap scan"),
+            ("work.runs.managed.prepare", "managed runs"),
+            ("work.enhancements.generate", "task enhancements"),
+        ] {
+            let message = missing_op_message(op);
+            assert!(message.contains(op), "{message}");
+            assert!(message.ends_with(&format!("Update Manvi to use {feature}.")), "{message}");
+        }
+        assert!(!missing_op_message("work.tasks.suggest").contains("enhancements"));
     }
 
     #[test]

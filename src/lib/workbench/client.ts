@@ -1019,8 +1019,15 @@ export interface TaskSuggestions {
   generated_at: number;
   suggestions: TaskSuggestion[];
   blocked: { id: string; title: string; blocked_by: string[] }[];
-  excluded: { in_progress: number; review: number; duplicate: number; blocked: number; filtered: number };
-  /** False when a bound cut the read: the list is then a ranking of what was read. */
+  /**
+   * `blocked` is tasks an open task is known to block. `unread` is tasks left out because their links were
+   * never read; Manvi builds before the unread count existed fold them into `blocked`, so it is 0 there.
+   */
+  excluded: { in_progress: number; review: number; duplicate: number; blocked: number; unread: number; filtered: number };
+  /**
+   * False when a bound cut the read or any open task's links were not read: the list is then a ranking of
+   * what was read. `unhydrated` counts open tasks, in any column, whose links were not read.
+   */
   board: { scanned: number; complete: boolean; unhydrated: number };
   verification: { checked: number; unchecked: number; failed: number };
   candidates: number;
@@ -1030,7 +1037,8 @@ export const MAX_SUGGESTIONS = 20;
 function suggestion(value: unknown): TaskSuggestion {
   const raw = object(value);
   const priority = integer(raw.priority), status = text(raw.status);
-  const signals = raw.signals;
+  // Manvi builds before the fix sent `null` for a task that earned no points; that is no signals, not a bad answer.
+  const signals = raw.signals === null ? [] : raw.signals;
   if (priority > 3 || !(STATUSES as readonly string[]).includes(status) || !Array.isArray(signals) || signals.length > 32) return invalid();
   return {
     rank: integer(raw.rank), id: text(raw.id), title: text(raw.title), status: status as TaskStatus, priority, score: Number.isFinite(raw.score) ? (raw.score as number) : invalid(),
@@ -1050,7 +1058,7 @@ export function taskSuggestions(value: unknown): TaskSuggestions {
     generated_at: integer(raw.generated_at),
     suggestions: raw.suggestions.map(suggestion),
     blocked: raw.blocked.map((entry) => { const item = object(entry); return { id: text(item.id), title: text(item.title), blocked_by: strings(item.blocked_by) }; }),
-    excluded: { in_progress: integer(excluded.in_progress), review: integer(excluded.review), duplicate: integer(excluded.duplicate), blocked: integer(excluded.blocked), filtered: integer(excluded.filtered) },
+    excluded: { in_progress: integer(excluded.in_progress), review: integer(excluded.review), duplicate: integer(excluded.duplicate), blocked: integer(excluded.blocked), unread: excluded.unread === undefined ? 0 : integer(excluded.unread), filtered: integer(excluded.filtered) },
     board: { scanned: integer(board.scanned), complete: boolean(board.complete), unhydrated: integer(board.unhydrated) },
     verification: { checked: integer(verification.checked), unchecked: integer(verification.unchecked), failed: integer(verification.failed) },
     candidates: integer(raw.candidates),
