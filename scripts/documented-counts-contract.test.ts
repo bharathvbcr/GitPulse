@@ -285,16 +285,16 @@ describe("promotional drafts state the real counts too", () => {
   }
 
   /**
-   * These live only on the author's machine, so there is nothing to check on a
-   * clean clone or in CI. `skipIf` reports that honestly — the reporter prints
-   * the draft's name as skipped — where reading it unconditionally crashed the
-   * three tests above, and where quietly dropping it from the corpus would
-   * have looked exactly like a run that found nothing wrong.
+   * These live only on the author's machine, so their result must never decide
+   * the repository's verdict: the same commit passed on a clean clone and
+   * failed on a checkout whose ignored PROMO.md had gone stale. The check is
+   * therefore opt-in (`GITPULSE_CHECK_LOCAL_DRAFTS=1`), and `skipIf` reports it
+   * as skipped otherwise, never as passed. Run it before publishing a draft.
    *
    * A draft that states no counts passes: there is no claim to be wrong.
    */
   for (const draft of LOCAL_DRAFTS) {
-    it.skipIf(!existsSync(fileURLToPath(docUrl(draft))))(`${draft} matches the code`, () => {
+    it.skipIf(process.env.GITPULSE_CHECK_LOCAL_DRAFTS !== "1" || !existsSync(fileURLToPath(docUrl(draft))))(`${draft} matches the code`, () => {
       expectClaims([draft], HANDLER_CLAIM, handlerCount(), "handler", false);
       expectClaims([draft], VIEW_CLAIM, REGISTERED_VIEWS.length, "view", false);
       expectClaims([draft], FIELD_CLAIM, fieldCount(), "field", false);
