@@ -26,7 +26,7 @@
 
 import type { LauncherKind } from "./tabs";
 import { DEFAULT_LIVE_RUNS, MAX_LIVE_RUNS } from "../workbench/vocabulary";
-import { DEFAULT_TERMINAL_SESSIONS, isTerminalSessionLimit } from "./sessionLimit";
+import { isTerminalSessionLimit } from "./sessionLimit";
 
 /**
  * Permission modes, least authority first, so the dangerous end of the range
@@ -105,7 +105,7 @@ export interface AgentDefaults {
   claude_setting_sources?: ClaudeSettingSource[];
   /**
    * How many terminal sessions may be open at once, across every repository.
-   * Absent means {@link DEFAULT_TERMINAL_SESSIONS}; see `sessionLimit.ts`.
+   * Absent means `DEFAULT_TERMINAL_SESSIONS`; see `sessionLimit.ts`.
    */
   max_terminal_sessions?: number;
   /**
@@ -359,9 +359,4 @@ export function isLiveRunLimit(value: unknown): value is number {
 /** The limit a launch will pass: the stored one, or the store's default. */
 export function liveRunLimit(defaults: AgentDefaults): number {
   return isLiveRunLimit(defaults.max_live_runs) ? defaults.max_live_runs : DEFAULT_LIVE_RUNS;
-}
-
-/** The terminal session limit a save will apply: the stored one, or the default. */
-export function terminalSessionLimitOf(defaults: AgentDefaults): number {
-  return isTerminalSessionLimit(defaults.max_terminal_sessions) ? defaults.max_terminal_sessions : DEFAULT_TERMINAL_SESSIONS;
 }
