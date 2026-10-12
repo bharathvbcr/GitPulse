@@ -310,12 +310,7 @@ fn stored_criteria(store: &Store, task: &str, revision: i64, criteria: Value) ->
 fn a_criterion_the_task_already_has_is_not_added_again_for_differing_whitespace() {
     let (_d, store, repo) = setup();
     let (id, revision) = reviewed(&store, &repo);
-    let proposal = stored_criteria(
-        &store,
-        &id,
-        revision,
-        json!(["  Existing criterion\n"]),
-    );
+    let proposal = stored_criteria(&store, &id, revision, json!(["  Existing criterion\n"]));
     // Nothing the proposal offers is new: applying it alone is refused rather
     // than appending the same criterion twice, and the task is untouched.
     let refused = apply_refinement(
