@@ -21,12 +21,13 @@ use crate::{
 use fsevent_sys as fs;
 use fsevent_sys::core_foundation as cf;
 use std::collections::HashMap;
-use std::ffi::CStr;
+use std::ffi::{CStr, OsStr};
 use std::fmt;
 use std::os::raw;
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::ptr;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::thread;
 
 bitflags::bitflags! {
@@ -638,7 +639,10 @@ extern "C" fn callback(
     event_flags: *const fs::FSEventStreamEventFlags, // const FSEventStreamEventFlags eventFlags[]
     event_ids: *const fs::FSEventStreamEventId,      // const FSEventStreamEventId eventIds[]
 ) {
-    unsafe {
+    // A panic unwinding out of an `extern "C"` function aborts the process, and
+    // the user's event handler runs in here. Contain it: the batch is dropped,
+    // the stream keeps delivering later ones.
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
         callback_impl(
             stream_ref,
             info,
@@ -647,6 +651,9 @@ extern "C" fn callback(
             event_flags,
             event_ids,
         )
+    }));
+    if outcome.is_err() {
+        log::error!("FSEvents callback panicked; dropped a batch of {num_events} event(s)");
     }
 }
 
@@ -663,15 +670,13 @@ unsafe fn callback_impl(
     let event_handler = &(*info).event_handler;
 
     for p in 0..num_events {
-        let path = CStr::from_ptr(*event_paths.add(p))
-            .to_str()
-            .expect("Invalid UTF8 string.");
-        let path = PathBuf::from(path);
+        // Paths are bytes, not necessarily UTF-8.
+        let path = PathBuf::from(OsStr::from_bytes(
+            CStr::from_ptr(*event_paths.add(p)).to_bytes(),
+        ));
 
-        let flag = *event_flags.add(p);
-        let flag = StreamFlags::from_bits(flag).unwrap_or_else(|| {
-            panic!("Unable to decode StreamFlags: {}", flag);
-        });
+        // Bits this table does not know (Apple adds them) are ignored.
+        let flag = StreamFlags::from_bits_truncate(*event_flags.add(p));
 
         let mut handle_event = false;
         for (p, r) in &(*info).recursive_info {
@@ -697,7 +702,10 @@ unsafe fn callback_impl(
         for ev in translate_flags(flag, true).into_iter() {
             // TODO: precise
             let ev = ev.add_path(path.clone());
-            let mut event_handler = event_handler.lock().expect("lock not to be poisoned");
+            // A handler that panicked earlier poisoned the lock; keep delivering.
+            let mut event_handler = event_handler
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
             event_handler.handle_event(Ok(ev));
         }
     }
@@ -769,6 +777,93 @@ fn test_fsevent_watcher_drop() {
     }
 
     println!("in test: {} works", file!());
+}
+
+// The FSEvents callback runs in an `extern "C"` frame, where a panic aborts
+// the whole process. These drive `callback` itself with hand-built FSEvents
+// arguments.
+#[cfg(test)]
+mod callback_robustness {
+    use super::*;
+    use std::ffi::CString;
+    use std::sync::mpsc;
+
+    fn fire(info: &StreamContextInfo, paths: &[CString], flags: &[fs::FSEventStreamEventFlags]) {
+        let ptrs: Vec<*const libc::c_char> = paths.iter().map(|p| p.as_ptr()).collect();
+        callback(
+            ptr::null_mut(),
+            info as *const StreamContextInfo as *mut libc::c_void,
+            ptrs.len(),
+            ptrs.as_ptr() as *mut libc::c_void,
+            flags.as_ptr(),
+            ptr::null(),
+        );
+    }
+
+    fn context<F: EventHandler>(handler: F, root: &Path) -> StreamContextInfo {
+        let mut recursive_info = HashMap::new();
+        recursive_info.insert(root.to_path_buf(), true);
+        StreamContextInfo {
+            event_handler: Arc::new(Mutex::new(handler)),
+            recursive_info,
+        }
+    }
+
+    #[test]
+    fn non_utf8_path_and_unknown_flag_bits_are_delivered() {
+        let (tx, rx) = mpsc::channel();
+        let info = context(tx, Path::new("/watched"));
+        let mut raw = b"/watched/bad-".to_vec();
+        raw.extend_from_slice(&[0xff, 0xfe]);
+        let unknown = 0x8000_0000;
+        fire(
+            &info,
+            &[CString::new(raw.clone()).unwrap()],
+            &[fs::kFSEventStreamEventFlagItemCreated | unknown],
+        );
+        let ev = rx.try_recv().expect("event delivered").unwrap();
+        assert!(matches!(ev.kind, EventKind::Create(_)));
+        assert_eq!(ev.paths, vec![PathBuf::from(OsStr::from_bytes(&raw))]);
+    }
+
+    #[test]
+    fn unknown_flag_bits_alone_keep_known_behaviour() {
+        let (tx, rx) = mpsc::channel();
+        let info = context(tx, Path::new("/watched"));
+        fire(
+            &info,
+            &[CString::new("/watched/a").unwrap()],
+            &[fs::kFSEventStreamEventFlagItemRemoved | 0x4000_0000],
+        );
+        let ev = rx.try_recv().expect("event delivered").unwrap();
+        assert!(matches!(ev.kind, EventKind::Remove(_)));
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn panicking_handler_does_not_unwind_out_and_later_batches_still_run() {
+        let calls = Arc::new(Mutex::new(0u32));
+        let seen = calls.clone();
+        let info = context(
+            move |_ev: Result<Event>| {
+                let mut n = seen.lock().unwrap();
+                *n += 1;
+                if *n == 1 {
+                    drop(n);
+                    panic!("handler failure");
+                }
+            },
+            Path::new("/watched"),
+        );
+        let path = [CString::new("/watched/a").unwrap()];
+        let flags = [fs::kFSEventStreamEventFlagItemCreated];
+        fire(&info, &path, &flags);
+        // Reaching here means the panic was contained; the lock was poisoned
+        // by the first call and must be recovered for the second.
+        assert!(info.event_handler.is_poisoned());
+        fire(&info, &path, &flags);
+        assert_eq!(*calls.lock().unwrap(), 2);
+    }
 }
 
 #[test]
