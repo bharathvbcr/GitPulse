@@ -49,11 +49,15 @@
   }
 
   /** Names the repositories a wave and this board belong to; an unread name falls back to its id, never to another repository's. */
+  const asked = new Set<string>();
+  function learnName(id: string) {
+    if (asked.has(id)) return;
+    asked.add(id);
+    void getRepository(id).then((found) => { if (!disposed) names[id] = found.name; }, () => { asked.delete(id); });
+  }
   $effect(() => {
-    for (const id of [repositoryId, record?.repositoryId]) {
-      if (!id || names[id] !== undefined) continue;
-      void getRepository(id).then((found) => { if (!disposed) names[id] = found.name; }, () => {});
-    }
+    if (repositoryId) learnName(repositoryId);
+    if (record) learnName(record.repositoryId);
   });
 
   onMount(async () => {
