@@ -6,17 +6,21 @@ use super::*;
 // Linked worktrees: how agents parallelize, so they are first-class here.
 // ---------------------------------------------------------------------------
 
-/// `depth` is what the caller reads: the Work view reads dirty counts only,
-/// and asking it for the full scan cost diff stats, divergence and routes for
-/// every worktree on every refresh. Absent means `full`, the panel's answer.
+/// `depth` is what the caller reads, and absent means `listing`: one
+/// `git worktree list`, every count "not scanned". Each level past it costs
+/// git children per worktree — `dirty` one `git status` each, `full` adds a
+/// diff of every changed worktree, divergence from main and routes — so a
+/// caller asks for what it renders. The default used to be `full`, and a
+/// caller that read only heads or dirty counts paid for all of it: 18
+/// worktrees were 37 children per listing through an 8-a-second spawn budget.
 #[tauri::command(async)]
 pub async fn cmd_list_worktrees(
     repo_path: String,
     depth: Option<crate::engine::worktree::ScanDepth>,
 ) -> Result<Vec<WorktreeInfo>, String> {
-    // Spawns one `git status` per worktree (capped), so it belongs on the
-    // blocking pool like every other reader.
-    let depth = depth.unwrap_or(crate::engine::worktree::ScanDepth::Full);
+    // Past `listing` it spawns git per worktree (capped), so it belongs on
+    // the blocking pool like every other reader.
+    let depth = depth.unwrap_or(crate::engine::worktree::ScanDepth::Listing);
     off_thread(move || crate::engine::worktree::list_worktrees_scanned(&repo_path, depth)).await
 }
 

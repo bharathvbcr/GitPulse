@@ -816,3 +816,140 @@ fn mainline_hint_detached_head_and_blank_ids() {
         None
     );
 }
+
+/// Children whose argv names `subcommand`, started in any of `dirs`.
+fn spawns_naming(dirs: &[std::path::PathBuf], subcommand: &str) -> usize {
+    dirs.iter()
+        .map(|dir| {
+            crate::engine::git_cli::spawn_log::spawns_in(dir)
+                .iter()
+                .filter(|argv| argv.iter().any(|arg| arg == subcommand))
+                .count()
+        })
+        .sum()
+}
+
+/// The main checkout and every linked worktree of a fixture, in the spelling
+/// git lists them in (which is what the spawn log is keyed by).
+fn every_checkout(
+    main: &std::path::Path,
+    linked: &[std::path::PathBuf],
+) -> Vec<std::path::PathBuf> {
+    let mut dirs = vec![crate::engine::git_cli::canonicalize_plain(main).unwrap()];
+    dirs.extend(linked.iter().cloned());
+    dirs
+}
+
+/// A listing that does not say how deep to measure is the cheap one. The
+/// default used to be the full scan — status, diff, divergence and routes
+/// for every worktree — so a caller that forgot to ask paid for all of it:
+/// 18 worktrees cost 37 git children per listing, through a spawn budget of
+/// 8 a second.
+#[test]
+fn the_default_worktree_listing_spawns_no_measurement() {
+    let (main, _parent, linked) = crate::test_support::repo_with_worktrees(17);
+    let dirs = every_checkout(main.path(), &linked);
+    let before = (
+        spawns_naming(&dirs, "status"),
+        spawns_naming(&dirs, "diff"),
+        spawns_naming(&dirs, "rev-list"),
+    );
+    let listed = tauri::async_runtime::block_on(cmd_list_worktrees(
+        main.path().to_string_lossy().into_owned(),
+        None,
+    ))
+    .expect("listing");
+    assert_eq!(listed.len(), 18);
+    let status = spawns_naming(&dirs, "status") - before.0;
+    let diff = spawns_naming(&dirs, "diff") - before.1;
+    let rev_list = spawns_naming(&dirs, "rev-list") - before.2;
+    assert!(status <= 18, "{status} status children for 18 worktrees");
+    assert_eq!(diff, 0, "the default listing diffed {diff} worktrees");
+    assert_eq!(rev_list, 0, "the default listing measured divergence");
+}
+
+/// The panel that renders diff stats, divergence and routes asks for them,
+/// and every row still carries them.
+#[test]
+fn a_full_worktree_listing_still_measures_every_row() {
+    let (main, _parent, linked) = crate::test_support::repo_with_worktrees(3);
+    std::fs::write(linked[2].join("seed.txt"), "seed\nchanged\n").unwrap();
+    let listed = tauri::async_runtime::block_on(cmd_list_worktrees(
+        main.path().to_string_lossy().into_owned(),
+        Some(crate::engine::worktree::ScanDepth::Full),
+    ))
+    .expect("listing");
+    assert_eq!(listed.len(), 4);
+    for row in &listed {
+        assert_eq!(row.scan_note, None, "{}", row.path);
+        assert!(row.dirty_files.is_some(), "{}", row.path);
+        assert!(row.diff_stat.is_some(), "{}", row.path);
+        assert!(row.main_divergence.is_some(), "{}", row.path);
+    }
+    let changed = listed
+        .iter()
+        .find(|row| std::path::Path::new(&row.path) == linked[2])
+        .expect("listed");
+    assert_eq!(changed.dirty_files, Some(1));
+    assert_eq!(changed.diff_stat.as_ref().map(|s| s.files_changed), Some(1));
+}
+
+/// Timing of the worktree listing at each depth on a real repository, for
+/// the record a change to the scan cites. Ignored: it reads `PROFILE_REPO`.
+///
+/// `PROFILE_REPO=/path/to/repo cargo test --manifest-path src-tauri/Cargo.toml \
+///   worktree_listing_profile -- --ignored --nocapture`
+///
+/// Warm (one unmeasured listing first), minimum of five. A unit-test build
+/// has no spawn-rate budget, so the shipped app additionally waits about
+/// 125 ms for every child past its burst; the child counts printed are what
+/// that cost scales with.
+#[test]
+#[ignore]
+fn worktree_listing_profile() {
+    let named = std::env::var("PROFILE_REPO").expect("PROFILE_REPO names a repository");
+    // Relative to the crate directory, or through a symlink, either is fine.
+    let repo = std::fs::canonicalize(&named)
+        .expect("PROFILE_REPO exists")
+        .to_string_lossy()
+        .into_owned();
+    crate::test_support::trust_repo(std::path::Path::new(&repo));
+    let depths = [
+        ("default", None),
+        ("listing", Some(crate::engine::worktree::ScanDepth::Listing)),
+        ("dirty", Some(crate::engine::worktree::ScanDepth::Dirty)),
+        ("full", Some(crate::engine::worktree::ScanDepth::Full)),
+    ];
+    for (label, depth) in depths {
+        let list = || {
+            tauri::async_runtime::block_on(cmd_list_worktrees(repo.clone(), depth))
+                .expect("listing")
+        };
+        let warm = list();
+        let dirs: Vec<std::path::PathBuf> = warm
+            .iter()
+            .map(|row| std::path::PathBuf::from(&row.path))
+            .collect();
+        let mut best = std::time::Duration::MAX;
+        let mut children = 0;
+        for _ in 0..5 {
+            let before: usize = dirs
+                .iter()
+                .map(|dir| crate::engine::git_cli::spawn_log::spawns_in(dir).len())
+                .sum();
+            let started = std::time::Instant::now();
+            list();
+            best = best.min(started.elapsed());
+            let after: usize = dirs
+                .iter()
+                .map(|dir| crate::engine::git_cli::spawn_log::spawns_in(dir).len())
+                .sum();
+            children = after - before;
+        }
+        eprintln!(
+            "worktree listing {label}: min {} ms of 5 over {} worktrees, {children} git children",
+            best.as_millis(),
+            warm.len()
+        );
+    }
+}

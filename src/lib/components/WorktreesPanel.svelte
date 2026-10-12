@@ -146,7 +146,10 @@
     isLoading = true;
     error = null;
     try {
-      const next = await invoke<WorktreeInfo[]>("cmd_list_worktrees", { repoPath: repo });
+      // The rows render diff stats, divergence from main and dev-server
+      // routes, which only the full scan measures; a listing that does not
+      // ask is the cheap one.
+      const next = await invoke<WorktreeInfo[]>("cmd_list_worktrees", { repoPath: repo, depth: "full" });
       if (!guard.isLive()) return;
       worktrees = next;
       await Promise.all([loadTaskState(repo, next, guard), loadLaneRuns(next, guard)]);
