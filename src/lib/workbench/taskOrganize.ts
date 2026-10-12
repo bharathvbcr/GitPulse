@@ -1,4 +1,5 @@
 import type { EnhancementField, Task, TaskCard, TaskStatus } from "./client";
+import { DEFAULT_PRIORITY, numericPriority } from "./taskPriority";
 export type { BoardLayout } from "../ui/taskView";
 
 export type DueFilter = "all" | "overdue" | "soon" | "none";
@@ -53,8 +54,7 @@ export function dueState(dueAt: number | null | undefined, nowSec: number): DueS
 
 export function normalizePriority(value: unknown): number | "all" {
   if (value === "all" || value === "" || value == null) return "all";
-  const n = typeof value === "number" ? value : Number(value);
-  return n === 0 || n === 1 || n === 2 || n === 3 ? n : "all";
+  return numericPriority(value) ?? "all";
 }
 
 export function cardMatchesFacet(card: TaskCard, facet: TaskFacet, nowSec: number): boolean {
@@ -285,14 +285,10 @@ export function reorderPlan(
  * stable). A view over the cards; it never writes a position.
  */
 export function sortByPriority<T extends Pick<TaskCard, "priority" | "due_at">>(cards: readonly T[]): T[] {
-  const rank = (card: T) => (normalizePriority(card.priority) === "all" ? 2 : (normalizePriority(card.priority) as number));
+  const rank = (card: T) => (numericPriority(card.priority) ?? DEFAULT_PRIORITY);
   const due = (card: T) => (card.due_at != null && Number.isFinite(card.due_at) && card.due_at > 0 ? card.due_at : Number.POSITIVE_INFINITY);
   return cards.map((card, index) => ({ card, index })).sort((a, b) => rank(a.card) - rank(b.card) || (due(a.card) < due(b.card) ? -1 : due(a.card) > due(b.card) ? 1 : 0) || a.index - b.index).map((entry) => entry.card);
 }
 
-/** What a priority is called on a card, a chip and a screen reader. */
-export const PRIORITY_LABELS = ["Urgent", "High", "Normal", "Low"] as const;
-export function priorityLabel(value: unknown): string {
-  const priority = normalizePriority(value);
-  return priority === "all" ? "Normal" : PRIORITY_LABELS[priority];
-}
+// The scale has one owner, `taskPriority.ts`; these stay importable from here.
+export { PRIORITY_LABELS, priorityLabel } from "./taskPriority";

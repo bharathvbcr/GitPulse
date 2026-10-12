@@ -36,6 +36,7 @@
 import type { Repository, TaskCard, TaskStatus } from "./client";
 import { STATUSES, STATUS_LABELS } from "./vocabulary";
 import { dueState } from "./taskOrganize";
+import { PRIORITY_LABELS, parsePriority } from "./taskPriority";
 import { fold, STOPWORDS, words as lexiconWords } from "./taskLexicon";
 
 export type QueryKey = "kind" | "status" | "priority" | "owner" | "label" | "repo" | "due" | "severity" | "title";
@@ -52,7 +53,7 @@ const KEY_ALIASES: Readonly<Record<string, Exclude<QueryKey, "title">>> = {
   severity: "severity", sev: "severity",
 };
 
-const PRIORITY_NAMES = ["urgent", "high", "normal", "low"] as const;
+const PRIORITY_NAMES = PRIORITY_LABELS.map((name) => name.toLowerCase());
 const DUE_VALUES = ["overdue", "soon", "later", "none", "any"] as const;
 type DueValue = (typeof DUE_VALUES)[number];
 /** Words that mean "has no value" for owner, label and severity. */
@@ -138,11 +139,8 @@ function statusValue(value: string): TaskStatus | "open" | null {
 
 /** `urgent`/`p0`/`0` → "0" … `low`/`p3`/`3` → "3". */
 function priorityValue(value: string): string | null {
-  const v = value.toLowerCase();
-  const named = PRIORITY_NAMES.indexOf(v as (typeof PRIORITY_NAMES)[number]);
-  if (named >= 0) return String(named);
-  const match = /^p?([0-3])$/.exec(v);
-  return match ? match[1] : null;
+  const priority = parsePriority(value);
+  return priority === null ? null : String(priority);
 }
 
 /**

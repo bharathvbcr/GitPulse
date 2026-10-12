@@ -16,6 +16,7 @@
   import { onDestroy, untrack } from "svelte";
   import { ScanSearch, X } from "@lucide/svelte";
   import { explainError } from "../workbench/client";
+  import { DEFAULT_PRIORITY, PRIORITY_LABELS } from "../workbench/taskPriority";
   import {
     cancelScan, categoryLabel, coverageNotes, dismissedFingerprints, dismissFingerprint, draftOf, fileScanProposal,
     getScan, scanFinished, scanIsPartial, startScan,
@@ -38,7 +39,7 @@
   let dismissed = $state<Set<string>>(untrack(() => (repositoryPath ? dismissedFingerprints(repositoryPath) : new Set())));
   let showDismissed = $state(false);
   let editing = $state<string | null>(null);
-  let draft = $state<FileDraft>({ title: "", description: "", kind: "feature", priority: 2, labels: [] });
+  let draft = $state<FileDraft>({ title: "", description: "", kind: "feature", priority: DEFAULT_PRIORITY, labels: [] });
   /** Outcome of each proposal's filing attempt, by fingerprint. */
   let outcomes = $state<Record<string, FileOutcome | { outcome: "error"; message: string }>>({});
   /** Fingerprints being filed right now: a second click while one is in flight does nothing. */
@@ -225,7 +226,7 @@
                 <label>Description <textarea class="gp-field" rows="5" bind:value={draft.description}></textarea></label>
                 <label>Priority
                   <select class="gp-field" bind:value={draft.priority}>
-                    <option value={0}>Urgent</option><option value={1}>High</option><option value={2}>Normal</option><option value={3}>Low</option>
+                    {#each PRIORITY_LABELS as name, level}<option value={level}>{name}</option>{/each}
                   </select>
                 </label>
                 <span class="actions">

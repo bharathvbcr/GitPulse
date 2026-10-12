@@ -128,6 +128,13 @@ describe("canAskManvi", () => {
 });
 
 describe("agent copy", () => {
+  it("copies a draft with no priority as Normal, and keeps Urgent as Urgent", () => {
+    const base = { title: "T", description: "d" };
+    expect(formatDraftAgentCopy(base)).toContain("Priority: Normal");
+    expect(formatDraftAgentCopy({ ...base, priority: 0 })).toContain("Priority: Urgent");
+    expect(formatDraftAgentCopy({ ...base, priority: 3 })).toContain("Priority: Low");
+  });
+
   it("labels drafts as unsaved and never invents a revision", () => {
     const copy = formatDraftAgentCopy({
       title: "Keep E42",
