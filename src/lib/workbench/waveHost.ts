@@ -21,7 +21,8 @@ import { startPreparedAttempt } from "./taskTerminal";
 import { getVerification, runVerification } from "./verification";
 import { supportsManaged } from "./vocabulary";
 import { createWavePersister, findActiveWave, type WaveTaskApi } from "./waveStore";
-import { resumeWave, startWave, type RunRead, type WaveDeps, type WaveRunner } from "./waveLaunch";
+import { resumeWave, startWave, type RunRead, type Suggestion, type WaveDeps, type WaveRunner } from "./waveLaunch";
+import type { TaskSuggestions } from "./client";
 
 /** `work.verify.task` can take minutes; a verdict still `running` after this is reported as such, never trusted. */
 const VERIFY_WAIT_MS = 20 * 60_000;
@@ -32,6 +33,20 @@ export const taskApi: WaveTaskApi = {
   saveTask: (id, revision, draft) => putTask(taskWrite(id, revision, draft)),
   listCards: (status, cursor) => listTasks({ kind: "global" }, status, "", cursor, 100),
 };
+
+/** What a wave takes from a suggest answer: the ranking, and why it may not be a ranking of the whole board. */
+export function readSuggestion(answer: TaskSuggestions): Suggestion {
+  const reasons: string[] = [];
+  if (!answer.board.complete) reasons.push(`the board was only partly read (${answer.board.scanned} tasks scanned)`);
+  if (answer.board.unhydrated > 0) reasons.push(`${answer.board.unhydrated} open task${answer.board.unhydrated === 1 ? "'s" : "s'"} links were not read`);
+  if (answer.excluded.unread > 0) reasons.push(`${answer.excluded.unread} task${answer.excluded.unread === 1 ? " was" : "s were"} left out unread`);
+  const blocked = new Set(answer.blocked.map((entry) => entry.id));
+  return {
+    candidates: answer.suggestions.filter((entry) => !blocked.has(entry.id)).map((entry) => ({ id: entry.id, title: entry.title })),
+    unread: reasons.length ? `${reasons.join("; ")}, so a blocker may be among what was not read.` : "",
+    unchecked: answer.verification.unchecked,
+  };
+}
 
 function readRun(run: TaskRun): RunRead {
   return { state: run.state, exitCode: run.exit_code, cwd: run.cwd, reason: run.reason };
@@ -63,22 +78,22 @@ export async function waveDeps(repositoryId: string, persist: WaveDeps["persist"
     id: newID,
     sleep,
     persist,
-    suggest: async () => (await suggestTasks({ limit: MAX_SUGGESTIONS, repository_id: repositoryId })).suggestions.map((entry) => ({ id: entry.id, title: entry.title })),
+    suggest: async (signal) => readSuggestion(await bounded(suggestTasks({ limit: MAX_SUGGESTIONS, repository_id: repositoryId }), undefined, undefined, signal)),
     scopes: async (ids) => {
       const found = await loadTaskScopes(invoke, checkout, ids);
       return new Map(Object.values(found).map((scope) => [scope.id, [...scope.planned_files, ...scope.agent_appended_files]]));
     },
-    launch: async (taskId, ids) => {
+    launch: async (taskId, ids, signal) => {
       // The provider the person last chose when it can be supervised, else Claude; never bypass, which is acknowledged afresh on every launch.
       const saved = get(interfaceStore).taskHandoff;
-      const latest = await bounded(getTask(taskId));
-      const repository = await bounded(getRepository(repositoryId));
+      const latest = await bounded(getTask(taskId), undefined, undefined, signal);
+      const repository = await bounded(getRepository(repositoryId), undefined, undefined, signal);
       const run = await bounded(prepareTaskRun({
         kind: "managed", id: ids.runId, request_id: ids.requestId, task_id: latest.id, source_revision: latest.revision,
         repository_id: repository.id, repository_revision: repository.revision, repo_path: checkout, worktree: true,
         provider: supportsManaged(saved.provider) ? saved.provider : "claude",
         permission_mode: saved.permission === "bypass" ? "ask" : saved.permission, acknowledge_bypass: false,
-      }), WORKTREE_PREPARE_TIMEOUT_MS);
+      }), WORKTREE_PREPARE_TIMEOUT_MS, undefined, signal);
       const started = await startPreparedAttempt(run);
       if (!started.ok) throw new Error(started.error);
       return readRun(started.run);
@@ -87,13 +102,14 @@ export async function waveDeps(repositoryId: string, persist: WaveDeps["persist"
       try { return readRun(await getTaskRun(runId)); }
       catch (cause) { if (cause instanceof WorkbenchError && cause.code === "not_found") return null; throw cause; }
     },
-    verify: async (taskId) => {
-      await runVerification(taskId);
+    verify: async (taskId, signal) => {
+      await bounded(runVerification(taskId), undefined, undefined, signal);
       const until = Date.now() + VERIFY_WAIT_MS;
       for (;;) {
-        const verdict = await getVerification(taskId);
+        const verdict = await bounded(getVerification(taskId), undefined, undefined, signal);
         if (verdict.state !== "running" || Date.now() > until) return { state: verdict.state, stale: verdict.stale, head: verdict.record?.head || null };
-        await sleep(VERIFY_POLL_MS, new AbortController().signal);
+        await sleep(VERIFY_POLL_MS, signal);
+        if (signal.aborted) throw new Error("The wave was stopped while waiting for verification.");
       }
     },
     headOf: async (cwd) => {
@@ -119,7 +135,7 @@ function adopt(runner: WaveRunner): WaveRunner {
   return runner;
 }
 
-export async function beginWave(input: { repositoryId: string; n: number; waves: number }): Promise<WaveRunner> {
+export async function beginWave(input: { repositoryId: string; n: number; waves: number; acceptUnchecked?: boolean }): Promise<WaveRunner> {
   if (current?.record().state === "running") throw new Error("A wave is already running. Stop it before starting another.");
   const found = await findActiveWave(taskApi);
   if (found.record) throw new Error("A wave from before a restart is still marked running on the board. Resume or stop it before starting another.");

@@ -1,21 +1,21 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
   MAX_WAVE_SIZE, clampWaveSize, clampWaves, planBatch, resumeWave, scopesOverlap, startWave,
-  type Candidate, type RunRead, type VerdictRead, type WaveDeps, type WaveRecord,
+  type Candidate, type RunRead, type Suggestion, type VerdictRead, type WaveDeps, type WaveRecord,
 } from "./waveLaunch";
 
 const task = (id: string): Candidate => ({ id, title: `Task ${id}` });
 const passed = (head = "h1"): VerdictRead => ({ state: "passed", stale: false, head });
 
 /** A fake sidecar: runs, verdicts, merges and the persisted record, all in memory. */
-function world(options: { candidates?: Candidate[][]; scopes?: Record<string, string[]>; verdict?: (id: string, call: number) => VerdictRead; mergeError?: (id: string) => string | null; launchError?: (id: string) => string | null; runs?: Map<string, RunRead> } = {}) {
+function world(options: { candidates?: Candidate[][]; scopes?: Record<string, string[]>; verdict?: (id: string, call: number) => VerdictRead; mergeError?: (id: string) => string | null; launchError?: (id: string) => string | null; runs?: Map<string, RunRead>; coverage?: Partial<Pick<Suggestion, "unread" | "unchecked">> } = {}) {
   const batches = options.candidates ?? [[task("a"), task("b"), task("c")]];
   let suggestCalls = 0, tick = 0, ids = 0;
   const runs = options.runs ?? new Map<string, RunRead>();
   const launched: string[] = [], merged: string[] = [], verifies: string[] = [], persisted: WaveRecord[] = [];
   const heads = new Map<string, string>();
   const deps: WaveDeps = {
-    suggest: async () => batches[Math.min(suggestCalls++, batches.length - 1)] ?? [],
+    suggest: async () => ({ candidates: batches[Math.min(suggestCalls++, batches.length - 1)] ?? [], unread: "", unchecked: 0, ...options.coverage }),
     scopes: async (list) => new Map(list.filter((id) => options.scopes?.[id]).map((id) => [id, options.scopes![id]!])),
     launch: async (taskId, { runId }) => {
       const refusal = options.launchError?.(taskId);
@@ -172,7 +172,7 @@ describe("a wave end to end against a fake sidecar", () => {
     const runs = new Map<string, RunRead>();
     const w = world({ candidates: [[task("a")]], runs });
     const original = w.deps.launch;
-    w.deps.launch = async (id, ids) => { await original(id, ids); const bad = { state: "exited", exitCode: 2, cwd: "/wt/a", reason: "" }; runs.set(ids.runId, bad); return bad; };
+    w.deps.launch = async (id, ids, signal) => { await original(id, ids, signal); const bad = { state: "exited", exitCode: 2, cwd: "/wt/a", reason: "" }; runs.set(ids.runId, bad); return bad; };
     const done = await (await startWave({ repositoryId: "r", n: 1, waves: 1 }, w.deps)).finished;
     expect(done.members[0]!.detail).toBe("The run exited with code 2.");
     expect(w.verifies).toEqual([]);
@@ -265,5 +265,132 @@ describe("restart mid-wave", () => {
     expect(done).toEqual(record);
     expect(w.persisted).toEqual([]);
     expect(w.launched).toEqual([]);
+  });
+});
+
+/** Never settles on its own, like a 20-minute verify wait or a worktree preparation; ends only when the signal does. */
+const untilAborted = (signal: AbortSignal) => new Promise<never>((_resolve, reject) => {
+  if (signal.aborted) reject(new Error("aborted"));
+  signal.addEventListener("abort", () => reject(new Error("aborted")), { once: true });
+});
+
+describe("stop reaches every wait", () => {
+  it("interrupts a verify wait at once and leaves the member stopped, not held for a verification that never ran", async () => {
+    vi.useFakeTimers();
+    try {
+      const w = world({ candidates: [[task("a"), task("b")]], scopes: { a: ["a"], b: ["b"] } });
+      w.deps.verify = (_id, signal) => untilAborted(signal);
+      const runner = await startWave({ repositoryId: "r", n: 2, waves: 1 }, w.deps);
+      await vi.advanceTimersByTimeAsync(5_000);
+      expect(runner.record().members.map((m) => m.phase)).toContain("verifying");
+      let settled = false;
+      const stopping = runner.cancel().then(() => { settled = true; });
+      await vi.advanceTimersByTimeAsync(1_000);
+      expect(settled).toBe(true);
+      await stopping;
+      expect(runner.record().state).toBe("cancelled");
+      expect(Object.values(phases(runner.record()))).toEqual(["stopped", "stopped"]);
+      expect(w.merged).toEqual([]);
+    } finally { vi.useRealTimers(); }
+  });
+
+  it("interrupts a launch that is still preparing its worktree", async () => {
+    vi.useFakeTimers();
+    try {
+      const w = world({ candidates: [[task("a")]] });
+      w.deps.launch = (_id, _ids, signal) => untilAborted(signal);
+      const runner = await startWave({ repositoryId: "r", n: 1, waves: 1 }, w.deps);
+      await vi.advanceTimersByTimeAsync(1_000);
+      let settled = false;
+      void runner.cancel().then(() => { settled = true; });
+      await vi.advanceTimersByTimeAsync(1_000);
+      expect(settled).toBe(true);
+      expect(runner.record().state).toBe("cancelled");
+      expect(phases(runner.record())).toEqual({ a: "stopped" });
+    } finally { vi.useRealTimers(); }
+  });
+
+  it("interrupts the suggest read of the next batch", async () => {
+    const w = world({ candidates: [[task("a")], [task("b")]], scopes: { a: ["a"], b: ["b"] } });
+    let calls = 0;
+    const read = w.deps.suggest;
+    w.deps.suggest = (signal) => (++calls === 1 ? read(signal) : untilAborted(signal));
+    const runner = await startWave({ repositoryId: "r", n: 1, waves: 2 }, w.deps);
+    while (calls < 2) await new Promise((resolve) => setTimeout(resolve, 0));
+    await runner.cancel();
+    expect(runner.record().state).toBe("cancelled");
+    expect(w.launched).toEqual(["a"]);
+  });
+
+  it("a stop during a merge lets the merge finish, then does not halt on the interrupted re-verify", async () => {
+    const w = world({ candidates: [[task("a"), task("b")]], scopes: { a: ["a"], b: ["b"] } });
+    let release!: () => void;
+    const merging = new Promise<void>((resolve) => { release = resolve; });
+    let inMerge = false;
+    const merge = w.deps.merge;
+    w.deps.merge = async (target) => { inMerge = true; await merging; return merge(target); };
+    const verify = w.deps.verify;
+    w.deps.verify = (id, signal) => (w.merged.includes(id) ? untilAborted(signal) : verify(id, signal));
+    const runner = await startWave({ repositoryId: "r", n: 2, waves: 1 }, w.deps);
+    while (!inMerge) await new Promise((resolve) => setTimeout(resolve, 0));
+    const stopping = runner.cancel();
+    release();
+    await stopping;
+    const done = runner.record();
+    expect(done.state).toBe("cancelled");
+    expect(w.merged).toEqual(["a"]);
+    expect(phases(done)).toEqual({ a: "merged", b: "stopped" });
+  });
+
+  it("a second stop while the first is settling is harmless", async () => {
+    const w = world({ candidates: [[task("a")]] });
+    w.deps.verify = (_id, signal) => untilAborted(signal);
+    const runner = await startWave({ repositoryId: "r", n: 1, waves: 1 }, w.deps);
+    while (!runner.record().members.some((m) => m.phase === "verifying")) await new Promise((resolve) => setTimeout(resolve, 0));
+    await Promise.all([runner.cancel(), runner.cancel()]);
+    await runner.cancel();
+    expect(runner.record().state).toBe("cancelled");
+  });
+
+  it("still holds a member whose verification throws when nobody stopped the wave", async () => {
+    const w = world({ candidates: [[task("a")]], verdict: () => { throw new Error("sidecar down"); } });
+    const done = await (await startWave({ repositoryId: "r", n: 1, waves: 1 }, w.deps)).finished;
+    expect(phases(done)).toEqual({ a: "held" });
+  });
+});
+
+describe("a partial board", () => {
+  it("refuses to launch from a ranking whose links were not read, and records why", async () => {
+    const w = world({ coverage: { unread: "385 open tasks' links were not read, so a blocker may be among what was not read." } });
+    const done = await (await startWave({ repositoryId: "r", n: 3, waves: 1, acceptUnchecked: true }, w.deps)).finished;
+    expect(done.state).toBe("refused");
+    expect(done.note).toMatch(/Nothing was launched: 385 open tasks' links were not read/);
+    expect(w.launched).toEqual([]);
+    expect(w.persisted.at(-1)?.state).toBe("refused");
+  });
+
+  it("refuses an unchecked ranking unless the person allowed it, and then records the caveat on the wave", async () => {
+    const refused = world({ coverage: { unchecked: 4 } });
+    const no = await (await startWave({ repositoryId: "r", n: 3, waves: 1 }, refused.deps)).finished;
+    expect(no.state).toBe("refused");
+    expect(no.note).toMatch(/4 tasks were not checked/);
+    expect(refused.launched).toEqual([]);
+
+    const allowed = world({ coverage: { unchecked: 1 }, scopes: { a: ["a"], b: ["b"], c: ["c"] } });
+    const yes = await (await startWave({ repositoryId: "r", n: 3, waves: 1, acceptUnchecked: true }, allowed.deps)).finished;
+    expect(yes.state).toBe("done");
+    expect(allowed.launched).toEqual(["a", "b", "c"]);
+    expect(yes.note).toMatch(/Ranked without a verification check on 1 task \(allowed/);
+  });
+
+  it("checks every batch, so a board that turns partial after the first batch stops the next", async () => {
+    const w = world({ candidates: [[task("a")], [task("b")]], scopes: { a: ["a"], b: ["b"] } });
+    let calls = 0;
+    const read = w.deps.suggest;
+    w.deps.suggest = async (signal) => ({ ...(await read(signal)), unread: ++calls > 1 ? "the board was only partly read." : "" });
+    const done = await (await startWave({ repositoryId: "r", n: 1, waves: 2 }, w.deps)).finished;
+    expect(done.state).toBe("refused");
+    expect(w.launched).toEqual(["a"]);
+    expect(phases(done)).toEqual({ a: "merged" });
   });
 });

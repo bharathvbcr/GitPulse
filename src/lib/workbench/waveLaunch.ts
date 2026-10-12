@@ -31,7 +31,7 @@ export const MEMBER_DEADLINE_MS = 6 * 60 * 60_000;
 export const MAX_ATTEMPTED = 200;
 
 export type MemberPhase = "launching" | "running" | "verifying" | "ready" | "merging" | "merged" | "held" | "stopped";
-export type WaveState = "running" | "done" | "cancelled" | "halted" | "failed";
+export type WaveState = "running" | "done" | "cancelled" | "halted" | "failed" | "refused";
 
 export interface WaveMember {
   taskId: string;
@@ -68,20 +68,27 @@ export interface WaveRecord {
 }
 
 export interface Candidate { id: string; title: string }
+/**
+ * Ranked candidates and how much of the board the ranking was read from.
+ * `unread` is why the ranking cannot be trusted to have seen every blocker
+ * (some task's links were never read, or a bound cut the read); `unchecked` is
+ * how many tasks had no verification state consulted, which only reorders.
+ */
+export interface Suggestion { candidates: Candidate[]; unread: string; unchecked: number }
 export interface VerdictRead { state: string; stale: boolean; head: string | null }
 export interface RunRead { state: string; exitCode: number | null; cwd: string; reason: string }
 
 export interface WaveDeps {
   /** Ranked suggestions, most important first (Manvi `work.tasks.suggest`). */
-  suggest(): Promise<Candidate[]>;
+  suggest(signal: AbortSignal): Promise<Suggestion>;
   /** Declared file scopes by task id. A task absent from the map, or with no files, has an unknown scope. */
   scopes(ids: readonly string[]): Promise<ReadonlyMap<string, readonly string[]>>;
   /** Prepares and launches one managed run in its own worktree. Throws on refusal (admission, load, spend cap). */
-  launch(taskId: string, ids: { runId: string; requestId: string }): Promise<RunRead>;
+  launch(taskId: string, ids: { runId: string; requestId: string }, signal: AbortSignal): Promise<RunRead>;
   /** The run, or null when the store has no such run. */
   getRun(runId: string): Promise<RunRead | null>;
-  /** Runs `work.verify.task` for the task and waits for a verdict that is not `running`. */
-  verify(taskId: string): Promise<VerdictRead>;
+  /** Runs `work.verify.task` for the task and waits for a verdict that is not `running`; rejects once `signal` aborts. */
+  verify(taskId: string, signal: AbortSignal): Promise<VerdictRead>;
   /** The commit the run's worktree is at now. */
   headOf(cwd: string): Promise<string>;
   /** Merges the verified head; throws, merging nothing, on a conflict, a dirty or contended checkout, or a moved head. */
@@ -160,17 +167,17 @@ export interface WaveRunner {
 }
 
 /** Starts a new wave and returns at once; `finished` settles when it stops running. */
-export async function startWave(input: { repositoryId: string; n: number; waves: number }, deps: WaveDeps): Promise<WaveRunner> {
+export async function startWave(input: { repositoryId: string; n: number; waves: number; acceptUnchecked?: boolean }, deps: WaveDeps): Promise<WaveRunner> {
   const record: WaveRecord = { v: 1, id: deps.id(), repositoryId: input.repositoryId, n: clampWaveSize(input.n), batchesLeft: clampWaves(input.waves), batch: 0, state: "running", members: [], attempted: [], note: "", seq: 0 };
-  return drive(record, deps, true);
+  return drive(record, deps, true, input.acceptUnchecked === true);
 }
 
 /** Continues a persisted wave after a restart. A wave that is not running is returned as it was. */
 export function resumeWave(record: WaveRecord, deps: WaveDeps): Promise<WaveRunner> {
-  return drive(record, deps, false);
+  return drive(record, deps, false, false);
 }
 
-async function drive(start: WaveRecord, deps: WaveDeps, fresh: boolean): Promise<WaveRunner> {
+async function drive(start: WaveRecord, deps: WaveDeps, fresh: boolean, acceptUnchecked: boolean): Promise<WaveRunner> {
   // A merge interrupted by a restart may or may not have happened; it is never repeated blind.
   let record = fresh ? start : { ...start, members: start.members.map((m) => (m.phase === "merging" ? { ...m, phase: "held" as MemberPhase, detail: "Interrupted while merging; check the branch before merging again." } : m)) };
   const abort = new AbortController();
@@ -185,14 +192,25 @@ async function drive(start: WaveRecord, deps: WaveDeps, fresh: boolean): Promise
   };
 
   const launchBatch = async (): Promise<boolean> => {
-    const ranked = (await deps.suggest()).slice(0, 20);
+    const suggested = await deps.suggest(abort.signal);
+    if (suggested.unread) {
+      // A blocker may be among what was not read; launching from this ranking could start a blocked task.
+      await save({ state: "refused", note: `Nothing was launched: ${suggested.unread}` });
+      return false;
+    }
+    if (suggested.unchecked > 0 && !acceptUnchecked) {
+      await save({ state: "refused", note: `Nothing was launched: ${suggested.unchecked} task${suggested.unchecked === 1 ? " was" : "s were"} not checked for a failed verification, so the ranking may be wrong. Start again and allow an unchecked ranking to launch from it.` });
+      return false;
+    }
+    const caveat = suggested.unchecked > 0 ? `Ranked without a verification check on ${suggested.unchecked} task${suggested.unchecked === 1 ? "" : "s"} (allowed by the person). ` : "";
+    const ranked = suggested.candidates.slice(0, 20);
     const excluded = new Set(record.attempted);
     const open = ranked.filter((c) => !excluded.has(c.id));
     if (open.length === 0) { await save({ state: "done", note: "No further task is ready to start." }); return false; }
     const scopes = await deps.scopes(open.map((c) => c.id));
     const plan = planBatch(open, scopes, record.n, excluded);
     const members = plan.chosen.map((c) => member(c, deps));
-    const note = plan.skipped.length ? `Held back from this batch: ${plan.skipped.map((s) => `${s.title} (${s.reason})`).join("; ")}.` : "";
+    const note = caveat + (plan.skipped.length ? `Held back from this batch: ${plan.skipped.map((s) => `${s.title} (${s.reason})`).join("; ")}.` : "");
     await save({
       batch: record.batch + 1, batchesLeft: record.batchesLeft - 1, members, note,
       attempted: [...record.attempted, ...members.map((m) => m.taskId)].slice(-MAX_ATTEMPTED),
@@ -209,8 +227,11 @@ async function drive(start: WaveRecord, deps: WaveDeps, fresh: boolean): Promise
       // A run recorded before a restart is adopted; only an absent one is prepared (with the same ids).
       let run = await deps.getRun(m.runId);
       if (!run) {
-        try { run = await deps.launch(m.taskId, { runId: m.runId, requestId: m.requestId }); }
-        catch (cause) { await update(m.taskId, { phase: "held", detail: `Not launched: ${message(cause)}` }); return; }
+        try { run = await deps.launch(m.taskId, { runId: m.runId, requestId: m.requestId }, abort.signal); }
+        catch (cause) {
+          // A stop ends the wait, not the run it may have prepared; the member is left to be marked stopped.
+          if (cancelled) return;
+          await update(m.taskId, { phase: "held", detail: `Not launched: ${message(cause)}` }); return; }
       }
       await update(m.taskId, { phase: "running", cwd: run.cwd, detail: "" });
       return;
@@ -233,9 +254,11 @@ async function drive(start: WaveRecord, deps: WaveDeps, fresh: boolean): Promise
     if (m.phase === "verifying") {
       let verdict: VerdictRead, head: string;
       try {
-        verdict = await deps.verify(m.taskId);
+        verdict = await deps.verify(m.taskId, abort.signal);
         head = m.cwd ? await deps.headOf(m.cwd) : "";
-      } catch (cause) { await update(m.taskId, { phase: "held", detail: `Verification could not run: ${message(cause)}` }); return; }
+      } catch (cause) {
+        if (cancelled) return;
+        await update(m.taskId, { phase: "held", detail: `Verification could not run: ${message(cause)}` }); return; }
       if (verdict.state !== "passed") { await update(m.taskId, { phase: "held", detail: `Verification ${verdict.state.replace("_", " ")}; this is not a pass, so it is left for review.` }); return; }
       if (verdict.stale || !verdict.head || !head || verdict.head !== head) {
         await update(m.taskId, { phase: "held", detail: "The passing verdict is not for the commit the worktree is at, so it is left for review." });
@@ -258,7 +281,8 @@ async function drive(start: WaveRecord, deps: WaveDeps, fresh: boolean): Promise
       return true;
     }
     let again: VerdictRead | null = null, why = "";
-    try { again = await deps.verify(next.taskId); } catch (cause) { why = message(cause); }
+    try { again = await deps.verify(next.taskId, abort.signal); } catch (cause) { why = message(cause); }
+    if (cancelled) return true;
     if (!again || again.state !== "passed") {
       await stopTerminal("halted", `Re-verification after merging "${next.title}" ${again ? `was ${again.state.replace("_", " ")}` : `could not run (${why})`}; no further merge was made.`);
     }
@@ -286,6 +310,9 @@ async function drive(start: WaveRecord, deps: WaveDeps, fresh: boolean): Promise
         if (live || record.members.some((m) => m.phase === "ready")) await deps.sleep(deps.pollMs, abort.signal);
       }
     } catch (cause) {
+      if (cancelled && record.state === "running") {
+        try { await stopTerminal("cancelled", "Stopped by the person; no further task was launched or merged."); } catch { /* the record below still says what happened */ }
+      }
       if (record.state === "running") {
         try { await save({ state: "failed", note: `The wave stopped because its state could not be kept or read: ${message(cause)}` }); } catch { record = { ...record, state: "failed", note: `The wave stopped and its state could not be saved: ${message(cause)}` }; }
       }
