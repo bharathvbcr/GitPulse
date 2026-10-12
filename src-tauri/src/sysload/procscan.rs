@@ -1145,6 +1145,86 @@ pub(crate) fn cwd_of(pid: i32) -> Option<PathBuf> {
     os::cwd(pid)
 }
 
+/// One process as something about to signal it would see it: what `pkill`,
+/// `pgrep` and `killall` match against, and whether GitPulse would call it
+/// its own.
+#[derive(Debug, Clone)]
+pub struct TableRow {
+    pub pid: i32,
+    pub ppid: i32,
+    pub uid: u32,
+    /// Microseconds since the Unix epoch; 0 when the OS would not say.
+    pub start_us: u64,
+    /// The process name the OS reports.
+    pub name: String,
+    /// The path it was exec'd with, when readable.
+    pub exec: Option<String>,
+    /// Every argument, `argv[0]` first. `None` when the OS refused it: another
+    /// user's process, or one that exited while the table was being read.
+    pub argv: Option<Vec<String>>,
+    /// The agent CLI this is, by executable.
+    pub agent: Option<AgentKind>,
+    /// Inside a tree GitPulse launched: it, or an ancestor, carries a
+    /// GitPulse launch id.
+    pub hosted: bool,
+}
+
+/// The whole table, with the user it was read as.
+#[derive(Debug, Clone)]
+pub struct Table {
+    pub rows: Vec<TableRow>,
+    pub me_uid: u32,
+}
+
+impl Scanner {
+    /// Reads the whole table once as [`TableRow`]s. The arguments are not part
+    /// of a scan's identities (only memguard's are kept), so `argv_of` supplies
+    /// them, for this user's processes only.
+    pub(crate) fn table(
+        &mut self,
+        mut argv_of: impl FnMut(i32) -> Option<Vec<String>>,
+    ) -> Result<Table, String> {
+        self.source.read(&mut self.facts)?;
+        let me_uid = self.source.me_uid();
+        self.index.clear();
+        for (i, f) in self.facts.iter().enumerate() {
+            self.index.insert(f.pid, i);
+        }
+        self.assign_trees();
+        let rows = self
+            .facts
+            .iter()
+            .enumerate()
+            .map(|(i, f)| TableRow {
+                pid: f.pid,
+                ppid: f.ppid,
+                uid: f.uid,
+                start_us: f.start_us,
+                name: f.ident.name.clone(),
+                exec: f.ident.exec.clone(),
+                argv: if f.uid == me_uid {
+                    argv_of(f.pid)
+                } else {
+                    None
+                },
+                agent: f.ident.kind,
+                hosted: self.tree_of.get(i).copied().flatten().is_some(),
+            })
+            .collect();
+        Ok(Table { rows, me_uid })
+    }
+}
+
+/// The process table with every argument list, for the signal guard. `Err`
+/// when the table could not be read.
+pub(crate) fn signal_table() -> Result<Table, String> {
+    if !os::SUPPORTED {
+        return Err("this platform has no process scan".into());
+    }
+    let mut buf = Vec::new();
+    Scanner::os().table(|pid| os::argv_of(pid, &mut buf))
+}
+
 #[cfg(target_os = "macos")]
 mod os {
     use super::{Identity, LaunchKey, ProcFacts, ProcSource, MAX_SCANNED_PROCESSES};
@@ -1529,6 +1609,15 @@ mod os {
         }
     }
 
+    /// Every argument of `pid`, from `KERN_PROCARGS2`. `buf` is scratch space
+    /// the caller reuses across calls.
+    pub(crate) fn argv_of(pid: i32, buf: &mut Vec<u8>) -> Option<Vec<String>> {
+        if buf.is_empty() {
+            buf.resize(argmax(), 0);
+        }
+        procargs(pid, buf).map(|(_, argv, _)| argv)
+    }
+
     pub(crate) fn probe_one(pid: i32) -> Option<ProcFacts> {
         let me = uid();
         let mut buf = vec![0u8; argmax()];
@@ -1815,6 +1904,17 @@ mod os {
         })
     }
 
+    /// Every argument of `pid`, from `/proc/<pid>/cmdline`.
+    pub(crate) fn argv_of(pid: i32, _buf: &mut Vec<u8>) -> Option<Vec<String>> {
+        let raw = read_bounded(&format!("/proc/{pid}/cmdline"), 1 << 20).ok()?;
+        Some(
+            raw.split(|b| *b == 0)
+                .filter(|s| !s.is_empty())
+                .map(|s| String::from_utf8_lossy(s).into_owned())
+                .collect(),
+        )
+    }
+
     pub(crate) fn probe_one(pid: i32) -> Option<ProcFacts> {
         facts(pid, uid(), clock_ticks(), page_size(), |name, ours, _| {
             Arc::new(read_identity(pid, name, ours))
@@ -1889,6 +1989,10 @@ mod os {
     }
 
     pub(crate) fn cwd(_pid: i32) -> Option<PathBuf> {
+        None
+    }
+
+    pub(crate) fn argv_of(_pid: i32, _buf: &mut Vec<u8>) -> Option<Vec<String>> {
         None
     }
 
@@ -2836,5 +2940,57 @@ pub(crate) mod tests {
         assert_eq!(go_duration_s("0s"), None);
         assert_eq!(go_duration_s("h"), None);
         assert_eq!(go_duration_s("12"), None);
+    }
+
+    /// The signal guard reads the table through the same attribution the
+    /// sampler uses: a hosted agent is hosted, a foreign one is not, a hosted
+    /// child under it is in the tree, and arguments are read only for this
+    /// user's processes.
+    #[test]
+    fn the_signal_table_marks_hosted_agents_and_reads_arguments_for_this_user_only() {
+        let (mut scan, _) = scanner(vec![
+            P {
+                env: &["GITPULSE_SESSION_ID=s-1"],
+                ..p(20, 1, CLAUDE)
+            },
+            p(21, 20, "/bin/sleep"),
+            p(30, 1, CLAUDE),
+            P {
+                uid: 0,
+                ..p(40, 1, "/usr/libexec/logd")
+            },
+        ]);
+        let table = scan
+            .table(|pid| Some(vec![format!("argv-of-{pid}")]))
+            .expect("the fixture table reads");
+        let row = |pid: i32| table.rows.iter().find(|r| r.pid == pid).unwrap();
+        assert_eq!(table.me_uid, ME);
+        assert!(row(20).hosted && row(20).agent == Some(AgentKind::Claude));
+        assert!(
+            row(21).hosted && row(21).agent.is_none(),
+            "a child in the tree"
+        );
+        assert!(!row(30).hosted && row(30).agent == Some(AgentKind::Claude));
+        assert_eq!(
+            row(20).argv.as_deref(),
+            Some(&["argv-of-20".to_string()][..])
+        );
+        assert!(
+            row(40).argv.is_none(),
+            "another user's arguments are not read, and so not claimed"
+        );
+        assert_eq!(row(40).uid, 0);
+    }
+
+    #[test]
+    fn a_table_that_could_not_be_read_is_an_error_never_an_empty_table() {
+        let mut scan = Scanner::new(Box::new(Fixture {
+            facts: Arc::new(Mutex::new(Vec::new())),
+            cwds: HashMap::new(),
+            fds: HashMap::new(),
+            fail: Some("the kernel said no".into()),
+        }));
+        let error = scan.table(|_| None).expect_err("a refused read");
+        assert!(error.contains("the kernel said no"), "{error}");
     }
 }
