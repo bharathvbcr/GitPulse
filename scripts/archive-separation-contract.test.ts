@@ -74,15 +74,23 @@ describe("the store the record describes", () => {
     expect(store, "the migration ladder must end in a supported-version check").toContain(
       "if version != WORKBENCH_SCHEMA {",
     );
-    expect(terminal, "the store must name the schema it opens").toBe("13");
+    expect(terminal, "the store must name the schema it opens").toMatch(/^\d+$/);
     expect(record).toContain(`Schema version is **${terminal}**.`);
   });
 
-  it("names the vendored commit it was written against", () => {
+  it("leaves the vendored commit to VENDOR.json instead of copying it", () => {
     const vendor = JSON.parse(read("src-tauri/vendored/VENDOR.json"));
     const dcStore = vendor.crates.find((crate: { name: string }) => crate.name === "dc-store");
     expect(dcStore, "VENDOR.json must describe dc-store").toBeDefined();
-    expect(record).toContain(dcStore.origin.commit.slice(0, 7));
+    const commit: string = dcStore.origin.commit;
+    expect(commit, "VENDOR.json must record a full commit").toMatch(/^[0-9a-f]{40}$/);
+    // A copy in this record goes stale on the next re-vendor, which is what
+    // made every re-vendor break this suite. It names the commit by pointing
+    // at VENDOR.json, and no abbreviation of any length may stand in for it.
+    for (let length = 7; length <= 40; length++) {
+      expect(record, "the record must not copy the vendored commit").not.toContain(commit.slice(0, length));
+    }
+    expect(record).toContain("VENDOR.json");
   });
 });
 

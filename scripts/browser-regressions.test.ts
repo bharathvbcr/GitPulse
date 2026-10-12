@@ -66,10 +66,8 @@ describe("a browser cannot outlive its runner", () => {
     // A stand-in runner: launches Chrome exactly as a harness run does, then
     // is SIGKILLed, so no `finally`, handler or `exit` hook can run.
     const parent = spawn(process.execPath, ["--input-type=module", "-e", `
-      import { spawn } from "node:child_process";
-      const { chromeLaunch } = await import(${JSON.stringify(pathToFileURL(runner).href)});
-      const launch = chromeLaunch(${JSON.stringify(chrome)}, ${JSON.stringify(profile)}, "about:blank");
-      const child = spawn(launch.file, launch.args, { stdio: launch.stdio });
+      const { startChrome } = await import(${JSON.stringify(pathToFileURL(runner).href)});
+      const child = startChrome(${JSON.stringify(chrome)}, ${JSON.stringify(profile)}, "about:blank");
       console.log(String(child.pid));
       setInterval(() => {}, 1000);
     `], { stdio: ["ignore", "pipe", "inherit"] });
@@ -81,7 +79,7 @@ describe("a browser cannot outlive its runner", () => {
         parent.once("exit", code => reject(new Error(`stand-in runner exited (${code})`)));
       });
       expect(pid).toBeGreaterThan(0);
-      // Chrome is up and waiting on its control pipe before the runner dies.
+      // Chrome is up before the runner dies.
       await new Promise(r => setTimeout(r, 1500));
       expect(alive()).toBe(true);
       parent.kill("SIGKILL");
