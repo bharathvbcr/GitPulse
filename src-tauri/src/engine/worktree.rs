@@ -630,6 +630,70 @@ pub fn refuse_gitpulse_lane_target(target_path: &str) -> Result<(), String> {
 /// must not turn one insights call into an unbounded allocation.
 pub const MAX_CHANGED_PATHS: usize = 256;
 
+/// The one `git status --porcelain -z` read of a worktree, which both the
+/// dirty-file scan and the changed-path scan go through.
+fn read_porcelain(dir: &Path) -> Result<String, String> {
+    #[cfg(test)]
+    status_probes::fire(dir);
+    git_text(dir, &["status", "--porcelain", "-z"])
+}
+
+/// Test seam: runs a closure just before the status read of chosen worktrees,
+/// so a test can make a read slow, or edit a worktree at a known moment,
+/// without timing guesses. Keyed by canonical directory, so parallel tests in
+/// their own temporary repositories never see each other's probes.
+#[cfg(test)]
+pub(crate) mod status_probes {
+    use std::path::{Path, PathBuf};
+    use std::sync::{Arc, Mutex, PoisonError};
+
+    type Probe = Arc<dyn Fn(&Path) + Send + Sync>;
+    static PROBES: Mutex<Vec<(u64, Vec<PathBuf>, Probe)>> = Mutex::new(Vec::new());
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    pub(super) fn fire(dir: &Path) {
+        let canonical = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
+        let hits: Vec<Probe> = PROBES
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .filter(|(_, dirs, _)| dirs.contains(&canonical))
+            .map(|(_, _, probe)| Arc::clone(probe))
+            .collect();
+        for probe in hits {
+            probe(&canonical);
+        }
+    }
+
+    /// Runs `body` with `probe` called before every status read in `dirs`.
+    pub(crate) fn with_probe<T>(
+        dirs: &[PathBuf],
+        probe: impl Fn(&Path) + Send + Sync + 'static,
+        body: impl FnOnce() -> T,
+    ) -> T {
+        struct Remove(u64);
+        impl Drop for Remove {
+            fn drop(&mut self) {
+                PROBES
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .retain(|(id, _, _)| *id != self.0);
+            }
+        }
+        let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dirs = dirs
+            .iter()
+            .map(|d| d.canonicalize().unwrap_or_else(|_| d.clone()))
+            .collect();
+        PROBES
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push((id, dirs, Arc::new(probe)));
+        let _remove = Remove(id);
+        body()
+    }
+}
+
 /// Repo-relative paths with uncommitted changes in this worktree.
 ///
 /// Porcelain only — no numstat — so collision scans stay cheap enough to run
@@ -643,7 +707,7 @@ pub fn changed_paths(worktree_path: &str) -> Result<(Vec<String>, bool), String>
             repo.display()
         ));
     }
-    let stdout = git_text(&repo, &["status", "--porcelain", "-z"])?;
+    let stdout = read_porcelain(&repo)?;
     let mut paths = status_paths(stdout.as_bytes());
     let truncated = paths.len() > MAX_CHANGED_PATHS;
     if truncated {
@@ -1262,7 +1326,7 @@ fn scan_worktree(
     // failure counter is what says whether one was a refusal rather than a
     // real absence (no upstream, no main branch).
     let failures = crate::engine::git_cli::process_failures();
-    let status = match git_text(dir, &["status", "--porcelain", "-z"]) {
+    let status = match read_porcelain(dir) {
         Ok(status) => status,
         Err(reason) => {
             return WorktreeScan {

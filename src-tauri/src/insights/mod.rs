@@ -3807,4 +3807,197 @@ mod tests {
             .all(|w| w.dirty_files.is_some()));
         assert_eq!(measured(&cwds), 0, "snapshot");
     }
+
+    /// A repository with `linked` extra worktrees, all trusted. Returns the
+    /// main checkout, the directory holding the linked ones, and their
+    /// canonical paths.
+    fn repo_with_linked_worktrees(
+        linked: usize,
+    ) -> (
+        tempfile::TempDir,
+        tempfile::TempDir,
+        Vec<std::path::PathBuf>,
+    ) {
+        let main = init_repo();
+        let parent = tempfile::TempDir::new().unwrap();
+        let paths = (0..linked)
+            .map(|i| {
+                let path = parent.path().join(format!("wt-{i:02}"));
+                git_in(
+                    main.path(),
+                    &[
+                        "worktree",
+                        "add",
+                        "-q",
+                        "-b",
+                        &format!("agent/{i:02}"),
+                        path.to_str().unwrap(),
+                    ],
+                );
+                crate::test_support::trust_repo(&path);
+                path.canonicalize().unwrap()
+            })
+            .collect();
+        (main, parent, paths)
+    }
+
+    /// Children that ran `git status` in `dir`, whichever way the path was
+    /// spelled to the spawn.
+    fn status_spawns_in(
+        dir: &std::path::Path,
+    ) -> Vec<(Vec<String>, crate::engine::git_cli::Admission)> {
+        crate::engine::git_cli::spawn_log::classed_spawns_in(dir)
+            .into_iter()
+            .filter(|(argv, _)| argv.iter().any(|arg| arg == "status"))
+            .collect()
+    }
+
+    /// One `git status` per worktree, shared by the worktree rows and the
+    /// collision scan. The collision scan used to re-run the status the
+    /// listing had already read, in every worktree it covered.
+    #[test]
+    fn a_snapshot_reads_each_worktrees_status_once() {
+        let (main, _parent, linked) = repo_with_linked_worktrees(17);
+        let root = main.path().canonicalize().unwrap();
+        // Two worktrees dirty the same file, so the collision scan has a real
+        // overlap to find from the statuses it is given.
+        fs::write(linked[0].join("shared.txt"), "first").unwrap();
+        fs::write(linked[1].join("shared.txt"), "second").unwrap();
+
+        let snap = snapshot(root.to_str().unwrap());
+        assert_eq!(snap.worktrees.count, 18, "{:?}", snap.worktrees);
+        assert!(snap.collisions.ok, "{:?}", snap.collisions);
+        assert_eq!(
+            snap.collisions.overlapping_files, 1,
+            "{:?}",
+            snap.collisions
+        );
+
+        for dir in &linked {
+            assert_eq!(
+                status_spawns_in(dir).len(),
+                1,
+                "{} was read more than once",
+                dir.display()
+            );
+        }
+        // The main checkout is read by the listing and once more by
+        // `get_status`, which needs per-file untracked rows (`-u`) and churn
+        // the listing's count does not: the O(1) beside the N statuses.
+        assert!(
+            status_spawns_in(&root).len() <= 2,
+            "{:?}",
+            status_spawns_in(&root)
+        );
+    }
+
+    /// The collision scan runs on rayon's pool, whose threads start in the
+    /// default class. Under a caller that asked for background work, its
+    /// statuses competed as refresh traffic.
+    #[test]
+    fn the_collision_scan_keeps_the_callers_admission_class() {
+        use crate::engine::git_cli::{with_admission, Admission};
+        let (main, _parent, linked) = repo_with_linked_worktrees(10);
+        let root = main.path().canonicalize().unwrap();
+        let risk = with_admission(Admission::Background, || {
+            collision_risk(root.to_str().unwrap())
+        });
+        assert!(risk.ok, "{risk:?}");
+        assert_eq!(risk.scanned_worktrees, 11, "{risk:?}");
+
+        let mut checked = 0;
+        let mut escaped = Vec::new();
+        for dir in linked.iter().chain(std::iter::once(&root)) {
+            for (argv, class) in status_spawns_in(dir) {
+                checked += 1;
+                if class != Admission::Background {
+                    escaped.push((dir.clone(), argv, class));
+                }
+            }
+        }
+        assert_eq!(checked, 11, "every worktree was read once");
+        assert!(
+            escaped.is_empty(),
+            "{} of {checked} status reads left the caller's class: {escaped:?}",
+            escaped.len()
+        );
+    }
+
+    /// The snapshot reports which operation is parked and nothing else about
+    /// it, so reading the parked state is a look at control files. The full
+    /// report also resolves the branch, describes the incoming commit and
+    /// lists conflicts: three more children per parked worktree, run one
+    /// worktree after another inside the deadline-bounded stage.
+    #[test]
+    fn a_parked_operation_is_named_without_starting_a_process() {
+        let (main, _parent, linked) = repo_with_linked_worktrees(2);
+        let root = main.path().canonicalize().unwrap();
+        let parked = &linked[0];
+        let head = git_text(parked, &["rev-parse", "HEAD"]).unwrap();
+        let git_dir = fs::read_to_string(parked.join(".git")).unwrap();
+        let git_dir = std::path::PathBuf::from(git_dir.trim().trim_start_matches("gitdir: "));
+        fs::write(git_dir.join("MERGE_HEAD"), head).unwrap();
+        let before = crate::engine::git_cli::spawn_log::spawns_in(parked).len();
+
+        let snap = snapshot(root.to_str().unwrap());
+        let row = snap
+            .worktrees
+            .items
+            .iter()
+            .find(|w| same_path(&w.path, parked.to_str().unwrap()))
+            .expect("the parked worktree is listed");
+        assert_eq!(row.operation_kind, "Merge", "{row:?}");
+        assert!(row.operation_ok, "{row:?}");
+        assert_eq!(snap.worktrees.blocked, 1, "{:?}", snap.worktrees);
+
+        let beyond_status: Vec<_> = crate::engine::git_cli::spawn_log::spawns_in(parked)
+            .into_iter()
+            .skip(before)
+            .filter(|argv| !argv.iter().any(|arg| arg == "status"))
+            .collect();
+        assert!(
+            beyond_status.is_empty(),
+            "probing the parked operation started: {beyond_status:?}"
+        );
+    }
+
+    /// The deadline bounds the work, not only the gaps between stages: the
+    /// worktree status reads ran to completion whatever it said, and the
+    /// snapshot returned when they finished.
+    #[test]
+    fn a_snapshot_returns_within_its_deadline_when_every_status_is_slow() {
+        let (main, _parent, linked) = repo_with_linked_worktrees(17);
+        let root = main.path().canonicalize().unwrap();
+        let mut everywhere = linked.clone();
+        everywhere.push(root.clone());
+        let deadline = Duration::from_secs(1);
+
+        let started = Instant::now();
+        let snap = crate::engine::worktree::status_probes::with_probe(
+            &everywhere,
+            |_| std::thread::sleep(Duration::from_millis(500)),
+            || snapshot_within(root.to_str().unwrap(), deadline, MAX_SNAPSHOT_WORKTREES),
+        );
+        let took = started.elapsed();
+
+        assert!(
+            took < deadline + Duration::from_secs(1),
+            "a 1 s deadline returned after {took:?}"
+        );
+        assert!(snap.deadline_expired, "{snap:?}");
+        // The reads that did not happen are unknown, never clean.
+        assert_eq!(snap.worktrees.count, 18, "{:?}", snap.worktrees);
+        assert!(snap.worktrees.dirty_unknown > 0, "{:?}", snap.worktrees);
+        assert!(snap.worktrees.scanned < 18, "{:?}", snap.worktrees);
+        assert!(!snap.collisions.ok, "{:?}", snap.collisions);
+        assert!(snap.collisions.truncated, "{:?}", snap.collisions);
+        assert!(
+            snap.collisions.scanned_worktrees
+                + snap.collisions.failed_worktrees
+                + snap.collisions.unscanned_worktrees
+                >= 18,
+            "{:?}",
+            snap.collisions
+        );
+    }
 }
