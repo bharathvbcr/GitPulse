@@ -1,16 +1,18 @@
 import { describe, expect, it, vi } from "vitest";
+import { MergeTeardownFailure } from "../branches/mergeTeardown";
+import type { MergeTeardownError } from "../branches/types";
 import {
   MAX_WAVE_SIZE, clampWaveSize, clampWaves, planBatch, resumeWave, scopesOverlap, startWave,
-  type Candidate, type RunRead, type Suggestion, type VerdictRead, type WaveDeps, type WaveRecord,
+  type Candidate, type MainState, type RunRead, type Suggestion, type VerdictRead, type WaveDeps, type WaveRecord,
 } from "./waveLaunch";
 
 const task = (id: string): Candidate => ({ id, title: `Task ${id}` });
 const passed = (head = "h1"): VerdictRead => ({ state: "passed", stale: false, head });
 
 /** A fake sidecar: runs, verdicts, merges and the persisted record, all in memory. */
-function world(options: { candidates?: Candidate[][]; scopes?: Record<string, string[]>; verdict?: (id: string, call: number) => VerdictRead; mergeError?: (id: string) => string | null; launchError?: (id: string) => string | null; runs?: Map<string, RunRead>; coverage?: Partial<Pick<Suggestion, "unread" | "unchecked">> } = {}) {
+function world(options: { candidates?: Candidate[][]; scopes?: Record<string, string[]>; verdict?: (id: string, call: number) => VerdictRead; mergeError?: (id: string) => string | null; mergeFailure?: (id: string) => MergeTeardownError | null; mergeSaid?: (id: string) => string | null; main?: () => MainState; launchError?: (id: string) => string | null; runs?: Map<string, RunRead>; coverage?: Partial<Pick<Suggestion, "unread" | "unchecked">> } = {}) {
   const batches = options.candidates ?? [[task("a"), task("b"), task("c")]];
-  let suggestCalls = 0, tick = 0, ids = 0;
+  let suggestCalls = 0, tick = 0, ids = 0, mainReads = 0;
   const runs = options.runs ?? new Map<string, RunRead>();
   const launched: string[] = [], merged: string[] = [], verifies: string[] = [], persisted: WaveRecord[] = [];
   const heads = new Map<string, string>();
@@ -31,16 +33,19 @@ function world(options: { candidates?: Candidate[][]; scopes?: Record<string, st
     merge: async ({ taskId: id, head }) => {
       const error = options.mergeError?.(id);
       if (error) throw new Error(error);
+      const failure = options.mergeFailure?.(id);
+      if (failure) throw new MergeTeardownFailure(failure);
       merged.push(id); heads.set(id, head);
-      return `Merged ${id}`;
+      return options.mergeSaid?.(id) ?? `Merged ${id}`;
     },
+    mainState: async () => { mainReads += 1; return options.main?.() ?? { dirty: 0, operation: null }; },
     persist: async (record) => { persisted.push(structuredClone(record)); },
     now: () => (tick += 1000),
     sleep: async () => { await Promise.resolve(); },
     id: () => `id${(ids += 1)}`,
     pollMs: 1,
   };
-  return { deps, runs, launched, merged, verifies, persisted, heads };
+  return { deps, runs, launched, merged, verifies, persisted, heads, mainReads: () => mainReads };
 }
 
 const phases = (record: WaveRecord) => Object.fromEntries(record.members.map((m) => [m.taskId, m.phase]));
@@ -138,12 +143,94 @@ describe("a wave end to end against a fake sidecar", () => {
     expect(done.members[1]!.detail).toMatch(/could not run: sidecar down/);
   });
 
-  it("shows a merge conflict on that task, never resolves it, and merges the others", async () => {
+  // This used to assert that c merged after b conflicted. A conflicting merge
+  // is rolled back, but c was cut from the same base b conflicted with, and a
+  // wave that carries on past a conflict is a wave that does not stop at the
+  // first thing needing a person ("a conflict stops that task and is shown").
+  it("halts the wave on a merge conflict: that task shows it, the ready ones are held pending it, and no batch follows", async () => {
+    const conflict: MergeTeardownError = { code: "conflict", message: "Merging gitpulse/b into main conflicted in 1 file(s): src/b.ts. It was rolled back; nothing was merged and the worktree and the branch were kept.", paths: ["src/b.ts"], total: 1, rolled_back: true, rollback_error: null };
+    const w = world({ candidates: [[task("a"), task("b"), task("c")], [task("d")]], scopes: { a: ["a"], b: ["b"], c: ["c"], d: ["d"] }, mergeFailure: (id) => (id === "b" ? conflict : null) });
+    const done = await (await startWave({ repositoryId: "r", n: 3, waves: 2 }, w.deps)).finished;
+    expect(done.state).toBe("halted");
+    expect(phases(done)).toEqual({ a: "merged", b: "held", c: "held" });
+    expect(done.members[1]!.detail).toMatch(/Not merged: Merging gitpulse\/b into main conflicted in 1 file\(s\): src\/b\.ts/);
+    expect(done.members[2]!.detail).toBe("not merged: conflict in Task b pending");
+    expect(w.merged).toEqual(["a"]);
+    expect(w.launched).toEqual(["a", "b", "c"]);
+    expect(done.batch).toBe(1);
+    expect(done.note).toMatch(/conflict/);
+  });
+
+  it("holds every member not yet ready, as stopped, when a conflict halts the wave", async () => {
+    const conflict: MergeTeardownError = { code: "conflict", message: "conflicted", paths: ["f"], total: 1, rolled_back: true, rollback_error: null };
+    const w = world({ scopes: { a: ["a"], b: ["b"], c: ["c"] }, mergeFailure: () => conflict, verdict: (id) => { if (id !== "a") throw new Error("sidecar down"); return passed(); } });
+    const done = await (await startWave({ repositoryId: "r", n: 3, waves: 1 }, w.deps)).finished;
+    expect(done.state).toBe("halted");
+    expect(w.merged).toEqual([]);
+    expect(done.members[0]!.phase).toBe("held");
+    for (const m of done.members.slice(1)) expect(["held", "stopped"]).toContain(m.phase);
+  });
+
+  it("treats a parked squash like a conflict: reported as parked in main, and nothing merges after it", async () => {
+    const parked: MergeTeardownError = { code: "squash_parked", message: "The squashed changes are staged but could not be committed", };
+    const w = world({ scopes: { a: ["a"], b: ["b"] }, mergeFailure: (id) => (id === "a" ? parked : null) });
+    const done = await (await startWave({ repositoryId: "r", n: 2, waves: 1 }, w.deps)).finished;
+    expect(done.state).toBe("halted");
+    expect(done.members[1]!.detail).toBe("not merged: squash parked in main (Task a) pending");
+    expect(w.merged).toEqual([]);
+  });
+
+  it("holds only that task on any other refusal, and merges the rest", async () => {
+    for (const refusal of [{ code: "moved", message: "feature moved", branch: "b", expected: "e", actual: "a" }, { code: "refused", message: "nope" }] as MergeTeardownError[]) {
+      const w = world({ scopes: { a: ["a"], b: ["b"], c: ["c"] }, mergeFailure: (id) => (id === "b" ? refusal : null) });
+      const done = await (await startWave({ repositoryId: "r", n: 3, waves: 1 }, w.deps)).finished;
+      expect(phases(done)).toEqual({ a: "merged", b: "held", c: "merged" });
+      expect(w.merged).toEqual(["a", "c"]);
+    }
     const w = world({ scopes: { a: ["a"], b: ["b"], c: ["c"] }, mergeError: (id) => (id === "b" ? "merge conflict in src/b.ts" : null) });
     const done = await (await startWave({ repositoryId: "r", n: 3, waves: 1 }, w.deps)).finished;
     expect(phases(done)).toEqual({ a: "merged", b: "held", c: "merged" });
     expect(done.members[1]!.detail).toMatch(/Not merged: merge conflict in src\/b\.ts/);
-    expect(w.merged).toEqual(["a", "c"]);
+  });
+
+  it("counts a merge whose cleanup is pending as merged, and still re-verifies it", async () => {
+    const said = "Merged 1 commit from gitpulse/a into main; cleanup pending: the worktree could not be removed after 3 attempts.";
+    const w = world({ candidates: [[task("a")]], mergeSaid: () => said });
+    const done = await (await startWave({ repositoryId: "r", n: 1, waves: 1 }, w.deps)).finished;
+    expect(phases(done)).toEqual({ a: "merged" });
+    expect(done.members[0]!.detail).toBe(said);
+    expect(w.verifies.filter((v) => v === "a")).toHaveLength(2);
+  });
+
+  it("launches no batch while the main checkout is dirty or has an operation in progress, and says why", async () => {
+    for (const [main, why] of [
+      [{ dirty: 3, operation: null }, /3 uncommitted files/],
+      [{ dirty: 0, operation: "squash merge" }, /squash merge is in progress/],
+      [{ dirty: null, operation: null }, /could not be counted/],
+    ] as [MainState, RegExp][]) {
+      const w = world({ main: () => main });
+      const done = await (await startWave({ repositoryId: "r", n: 3, waves: 1 }, w.deps)).finished;
+      expect(done.state).toBe("refused");
+      expect(done.note).toMatch(why);
+      expect(w.launched).toEqual([]);
+    }
+    const unreadable = world();
+    unreadable.deps.mainState = async () => { throw new Error("git is busy"); };
+    const done = await (await startWave({ repositoryId: "r", n: 3, waves: 1 }, unreadable.deps)).finished;
+    expect(done.state).toBe("refused");
+    expect(done.note).toMatch(/could not be read \(git is busy\)/);
+    expect(unreadable.launched).toEqual([]);
+  });
+
+  it("refuses each merge while the main checkout is dirty or mid-operation, merging nothing", async () => {
+    let reads = 0;
+    // Clean for the launch of the batch, then dirty for the merges.
+    const w = world({ scopes: { a: ["a"], b: ["b"] }, main: () => ((reads += 1) === 1 ? { dirty: 0, operation: null } : { dirty: 2, operation: null }) });
+    const done = await (await startWave({ repositoryId: "r", n: 2, waves: 1 }, w.deps)).finished;
+    expect(w.merged).toEqual([]);
+    expect(phases(done)).toEqual({ a: "held", b: "held" });
+    expect(done.members[0]!.detail).toMatch(/Not merged: the main checkout has 2 uncommitted files/);
+    expect(w.mainReads()).toBeGreaterThan(1);
   });
 
   it("halts further merges when a re-verify after a merge is not a pass", async () => {

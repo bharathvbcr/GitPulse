@@ -6,15 +6,19 @@ vi.mock("../ipc/invoke", () => ({ invoke: (...args: unknown[]) => invoke(...args
 vi.mock("../stores/modalStore", () => ({ askConfirm: () => { throw new Error("an unattended merge must not ask"); } }));
 const repoState = writable<{ openTabs: unknown[] }>({ openTabs: [] });
 const trustRepo = vi.fn(async (path: string): Promise<string | null> => path);
-vi.mock("../stores/repoStore", () => ({ repoStore: { subscribe: repoState.subscribe, trustRepo: (p: string) => trustRepo(p), closeTab: async () => {}, previewUncommitted: async () => {} } }));
+const closeTab = vi.fn(async (_id: string) => {});
+vi.mock("../stores/repoStore", () => ({ repoStore: { subscribe: repoState.subscribe, trustRepo: (p: string) => trustRepo(p), closeTab: (id: string) => closeTab(id), previewUncommitted: async () => {} } }));
 vi.mock("../stores/interfaceStore", () => ({ interfaceStore: { setGlobalSurface: () => {} } }));
 const live = vi.fn(async (): Promise<{ runs: { cwd: string }[]; complete: boolean }> => ({ runs: [], complete: true }));
 vi.mock("./client", async (original) => ({ ...(await original<typeof import("./client")>()), listAllLiveRuns: () => live() }));
 
 const { mergeVerifiedAttempt } = await import("./attemptWorktree");
+const { MergeTeardownFailure } = await import("../branches/mergeTeardown");
 
 const WT = "/work/repo/.gitpulse/worktrees/fix-e42-wt0attem";
 const run = { id: "wt0attempt", cwd: WT, state: "exited" as const, expires_at: 0 };
+/** `cmd_worktree_merge_teardown`'s output for a merge that landed and cleaned up, unless `over` says otherwise. */
+const teardown = (over: Record<string, unknown> = {}) => ({ merged: true, merged_branch: "gitpulse/fix", target_branch: "main", commits_merged: 1, before_oid: "a", after_oid: "1234567890abcdef", base_oid: null, worktree_removed: true, removal_error: null, branch_deleted: true, branch_error: null, hook_error: null, ...over });
 const entry = (over: Record<string, unknown>) => ({ name: "n", is_bare: false, is_detached: false, is_locked: false, is_prunable: false, diff_stat: null, main_divergence: null, active_routes: [], ...over });
 function setup(own: Record<string, unknown> = {}, main: Record<string, unknown> = {}) {
   invoke.mockImplementation(async (cmd: string) => {
@@ -23,20 +27,21 @@ function setup(own: Record<string, unknown> = {}, main: Record<string, unknown> 
       entry({ path: "/work/repo", head: "mainhead", branch: "main", is_main: true, dirty_files: 0, ...main }),
       entry({ path: WT, head: "1234567890abcdef", branch: "gitpulse/fix", is_main: false, dirty_files: 0, ...own }),
     ];
-    if (cmd === "cmd_worktree_merge_teardown") return { policy: null, output: { merged_branch: "gitpulse/fix", target_branch: "main", commits_merged: 1, worktree_removed: true, branch_deleted: true, hook_error: null } };
+    if (cmd === "cmd_worktree_merge_teardown") return { policy: null, output: teardown() };
     throw new Error(`unexpected ${cmd}`);
   });
 }
 const merged = () => invoke.mock.calls.some((c) => c[0] === "cmd_worktree_merge_teardown");
 
-beforeEach(() => { invoke.mockReset(); trustRepo.mockClear(); trustRepo.mockImplementation(async (p) => p); live.mockReset(); live.mockResolvedValue({ runs: [], complete: true }); repoState.set({ openTabs: [] }); });
+beforeEach(() => { invoke.mockReset(); closeTab.mockClear(); trustRepo.mockClear(); trustRepo.mockImplementation(async (p) => p); live.mockReset(); live.mockResolvedValue({ runs: [], complete: true }); repoState.set({ openTabs: [] }); });
 
 describe("mergeVerifiedAttempt", () => {
   it("merges the verified head without asking, into the main checkout's branch, and never pushes", async () => {
     setup();
     const result = await mergeVerifiedAttempt(run, "1234567890abcdef");
-    expect(result).toEqual({ head: "1234567890abcdef", message: "Merged 1 commit from gitpulse/fix into main." });
-    expect(invoke).toHaveBeenLastCalledWith("cmd_worktree_merge_teardown", { repoPath: "/work/repo", worktreePath: WT, targetBranch: "main", squash: false });
+    expect(result).toEqual({ head: "1234567890abcdef", message: "Merged 1 commit from gitpulse/fix into main. The worktree was removed." });
+    // The head the verdict was reached for is the tip the host holds the merge to.
+    expect(invoke).toHaveBeenLastCalledWith("cmd_worktree_merge_teardown", { repoPath: "/work/repo", worktreePath: WT, targetBranch: "main", squash: false, expectedTip: "1234567890abcdef" });
     expect(invoke.mock.calls.map((c) => String(c[0])).filter((c) => /push|remote/.test(c))).toEqual([]);
   });
 
@@ -80,5 +85,47 @@ describe("mergeVerifiedAttempt", () => {
     const base = invoke.getMockImplementation()!;
     invoke.mockImplementation(async (cmd: string, args: unknown) => { if (cmd === "cmd_worktree_merge_teardown") throw new Error("CONFLICT (content): Merge conflict in src/b.ts"); return base(cmd, args); });
     await expect(mergeVerifiedAttempt(run, "1234567890abcdef")).rejects.toThrow(/Merge conflict in src\/b\.ts/);
+  });
+
+  it("throws the host's typed conflict as a MergeTeardownFailure the wave can tell from other refusals", async () => {
+    setup();
+    const base = invoke.getMockImplementation()!;
+    const typed = { code: "conflict", message: "Merging gitpulse/fix into main conflicted in 1 file(s): src/b.ts.", paths: ["src/b.ts"], total: 1, rolled_back: true, rollback_error: null };
+    invoke.mockImplementation(async (cmd: string, args: unknown) => { if (cmd === "cmd_worktree_merge_teardown") throw typed; return base(cmd, args); });
+    const failure = await mergeVerifiedAttempt(run, "1234567890abcdef").catch((cause: unknown) => cause);
+    expect(failure).toBeInstanceOf(MergeTeardownFailure);
+    expect((failure as InstanceType<typeof MergeTeardownFailure>).failure).toEqual(typed);
+  });
+
+  it("an object that only looks like a typed error is thrown as it came", async () => {
+    setup();
+    const base = invoke.getMockImplementation()!;
+    const lookalike = { code: "conflict", message: "no paths", paths: "src/b.ts" };
+    invoke.mockImplementation(async (cmd: string, args: unknown) => { if (cmd === "cmd_worktree_merge_teardown") throw lookalike; return base(cmd, args); });
+    await expect(mergeVerifiedAttempt(run, "1234567890abcdef")).rejects.toBe(lookalike);
+  });
+
+  it("reports a merge whose worktree could not be removed as merged with the cleanup pending, and keeps the tab", async () => {
+    setup();
+    repoState.set({ openTabs: [{ id: "t", path: WT }] });
+    const base = invoke.getMockImplementation()!;
+    invoke.mockImplementation(async (cmd: string, args: unknown) => cmd === "cmd_worktree_merge_teardown"
+      ? { policy: null, output: teardown({ worktree_removed: false, removal_error: "The worktree could not be removed after 3 attempts: locked", branch_deleted: false, branch_error: "kept" }) }
+      : base(cmd, args));
+    const result = await mergeVerifiedAttempt(run, "1234567890abcdef");
+    expect(result.message).toBe("Merged 1 commit from gitpulse/fix into main; cleanup pending: The worktree could not be removed after 3 attempts: locked.");
+    expect(closeTab).not.toHaveBeenCalled();
+  });
+
+  it("closes the tab of a worktree the teardown removed, and says when only the branch was kept", async () => {
+    setup();
+    repoState.set({ openTabs: [{ id: "t", path: WT }] });
+    const base = invoke.getMockImplementation()!;
+    invoke.mockImplementation(async (cmd: string, args: unknown) => cmd === "cmd_worktree_merge_teardown"
+      ? { policy: null, output: teardown({ branch_deleted: false, branch_error: "branch is not fully merged" }) }
+      : base(cmd, args));
+    const result = await mergeVerifiedAttempt(run, "1234567890abcdef");
+    expect(result.message).toBe("Merged 1 commit from gitpulse/fix into main. The worktree was removed. The branch gitpulse/fix was kept: branch is not fully merged");
+    expect(closeTab).toHaveBeenCalledWith("t");
   });
 });

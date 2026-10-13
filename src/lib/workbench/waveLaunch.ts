@@ -21,6 +21,8 @@
  * - push. The merge dependency merges and tears down; nothing here has a push.
  */
 
+import { MergeTeardownFailure } from "../branches/mergeTeardown";
+
 export const DEFAULT_WAVE_SIZE = 3;
 export const MAX_WAVE_SIZE = 5;
 export const DEFAULT_WAVES = 3;
@@ -79,6 +81,16 @@ export interface Candidate { id: string; title: string }
 export interface Suggestion { candidates: Candidate[]; unread: string; unchecked: number }
 export interface VerdictRead { state: string; stale: boolean; head: string | null }
 export interface RunRead { state: string; exitCode: number | null; cwd: string; reason: string }
+/** `dirty` null: the count could not be read. `operation`: what is parked in the checkout ("merge", "squash merge", ...), or null when nothing is. */
+export interface MainState { dirty: number | null; operation: string | null }
+
+/** Why the main checkout is not free to launch from or merge into, or "" when it is. A state that could not be read is not free. */
+function mainBlocker(state: MainState): string {
+  if (state.operation) return `a ${state.operation} is in progress in the main checkout`;
+  if (state.dirty === null) return "the main checkout's uncommitted changes could not be counted";
+  if (state.dirty > 0) return `the main checkout has ${state.dirty} uncommitted file${state.dirty === 1 ? "" : "s"}`;
+  return "";
+}
 
 export interface WaveDeps {
   /** Ranked suggestions, most important first (Manvi `work.tasks.suggest`). */
@@ -93,8 +105,14 @@ export interface WaveDeps {
   verify(taskId: string, signal: AbortSignal): Promise<VerdictRead>;
   /** The commit the run's worktree is at now. */
   headOf(cwd: string, signal: AbortSignal): Promise<string>;
-  /** Merges the verified head; throws, merging nothing, on a conflict, a dirty or contended checkout, or a moved head. */
+  /**
+   * Merges the verified head; throws, merging nothing, on a conflict, a dirty or contended checkout, or a moved head.
+   * A conflict or a parked squash is thrown as a `MergeTeardownFailure`, which is what halts the wave. A merge that
+   * landed with its cleanup unfinished returns, saying so: it counts as merged.
+   */
   merge(target: { taskId: string; runId: string; cwd: string; head: string }): Promise<string>;
+  /** The main checkout now: its uncommitted file count (null when it could not be counted) and the parked operation, if any. Throws when it cannot be read. */
+  mainState(signal: AbortSignal): Promise<MainState>;
   /** Writes the record durably; a failure stops the wave. */
   persist(record: WaveRecord): Promise<void>;
   now(): number;
@@ -194,6 +212,15 @@ async function drive(start: WaveRecord, deps: WaveDeps, fresh: boolean): Promise
   };
 
   const launchBatch = async (): Promise<boolean> => {
+    // A parked merge or a person's uncommitted work in the main checkout is not
+    // this wave's to build on: the next batch's merges would land over it.
+    let blocker: string;
+    try { blocker = mainBlocker(await deps.mainState(abort.signal)); }
+    catch (cause) { blocker = `the main checkout could not be read (${message(cause)})`; }
+    if (blocker) {
+      await save({ state: "refused", note: `Nothing was launched: ${blocker}.` });
+      return false;
+    }
     const suggested = await deps.suggest(abort.signal);
     if (suggested.unread) {
       // A blocker may be among what was not read; launching from this ranking could start a blocked task.
@@ -274,11 +301,28 @@ async function drive(start: WaveRecord, deps: WaveDeps, fresh: boolean): Promise
   const mergeNext = async (): Promise<boolean> => {
     const next = record.members.find((m) => m.phase === "ready");
     if (!next || !next.cwd || !next.head) return false;
+    let blocker: string;
+    try { blocker = mainBlocker(await deps.mainState(abort.signal)); }
+    catch (cause) { if (cancelled) return true; blocker = `the main checkout could not be read (${message(cause)})`; }
+    if (blocker) {
+      await update(next.taskId, { phase: "held", detail: `Not merged: ${blocker}.` });
+      return true;
+    }
     await update(next.taskId, { phase: "merging" });
     try {
       const said = await deps.merge({ taskId: next.taskId, runId: next.runId, cwd: next.cwd, head: next.head });
       await update(next.taskId, { phase: "merged", detail: said });
     } catch (cause) {
+      const failure = cause instanceof MergeTeardownFailure ? cause.failure : null;
+      if (failure?.code === "conflict" || failure?.code === "squash_parked") {
+        // Nothing after a conflict may merge: the next member's branch was cut
+        // from the same base, and a squash left parked is still in the checkout.
+        const pending = failure.code === "conflict" ? `conflict in ${next.title}` : `squash parked in main (${next.title})`;
+        await update(next.taskId, { phase: "held", detail: `Not merged: ${message(cause)}` });
+        await save({ members: record.members.map((m) => (m.phase === "ready" ? { ...m, phase: "held" as MemberPhase, detail: `not merged: ${pending} pending` } : m)) });
+        await stopTerminal("halted", `Merging "${next.title}" ended in a ${failure.code === "conflict" ? "conflict" : "parked squash"}; no further task was launched or merged.`);
+        return true;
+      }
       await update(next.taskId, { phase: "held", detail: `Not merged: ${message(cause)}` });
       return true;
     }

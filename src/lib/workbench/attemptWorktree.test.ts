@@ -14,6 +14,7 @@ vi.mock("../stores/repoStore", () => ({ repoStore: { subscribe: repoState.subscr
 const setGlobalSurface = vi.fn();
 vi.mock("../stores/interfaceStore", () => ({ interfaceStore: { setGlobalSurface: (s: string) => setGlobalSurface(s) } }));
 
+const { MergeTeardownFailure } = await import("../branches/mergeTeardown");
 const { attemptWorktreeOffer, discardAttemptWorktree, mainCheckoutOf, mergeAttemptWorktree, mergeTargetLabel, reviewAttemptChanges } = await import("./attemptWorktree");
 
 const NOW = 1_800_000_000_000;
@@ -21,6 +22,8 @@ const WT = "/work/repo/.gitpulse/worktrees/fix-e42-wt0attem";
 type RunRef = Pick<import("./client").TaskRun, "id" | "cwd" | "state" | "expires_at">;
 const run = (fields: Partial<RunRef> = {}): RunRef =>
   ({ id: "wt0attempt", cwd: WT, state: "exited", expires_at: NOW / 1000 + 300, ...fields });
+/** `cmd_worktree_merge_teardown`'s output for a merge that landed and cleaned up, unless `over` says otherwise. */
+const teardown = (over: Record<string, unknown> = {}) => ({ merged: true, merged_branch: "gitpulse/fix-e42-wt0attem", target_branch: "main", commits_merged: 1, before_oid: "a", after_oid: "b", base_oid: null, worktree_removed: true, removal_error: null, branch_deleted: true, branch_error: null, hook_error: null, ...over });
 const listing = (dirty: number | null) => [
   { path: "/work/repo", name: "repo", head: "a", branch: "main", is_bare: false, is_detached: false, is_main: true, is_locked: false, is_prunable: false, dirty_files: 0, diff_stat: null, main_divergence: null, active_routes: [] },
   { path: WT, name: "fix", head: "b", branch: "gitpulse/fix-e42-wt0attem", is_bare: false, is_detached: false, is_main: false, is_locked: false, is_prunable: false, dirty_files: dirty, diff_stat: null, main_divergence: null, active_routes: [] },
@@ -77,12 +80,43 @@ describe("merge and discard", () => {
     askConfirm.mockResolvedValueOnce(true);
     invoke.mockImplementationOnce(async () => ({ path: WT, name: "fix", is_bare: false, common_dir: "/work/repo/.git" }))
       .mockImplementationOnce(async () => listing(3))
-      .mockImplementationOnce(async () => ({ policy: null, output: { merged_branch: "gitpulse/fix-e42-wt0attem", target_branch: "main", commits_merged: 2, worktree_removed: true, branch_deleted: true, hook_error: null } }));
+      .mockImplementationOnce(async () => ({ policy: null, output: teardown({ commits_merged: 2 }) }));
     const result = await mergeAttemptWorktree(run());
     expect(askConfirm.mock.calls[0][0]).toMatchObject({ title: "Merge into main?", destructive: true });
     expect(askConfirm.mock.calls[0][0].message).toContain("3 uncommitted files in it will be lost");
-    expect(invoke).toHaveBeenLastCalledWith("cmd_worktree_merge_teardown", { repoPath: "/work/repo", worktreePath: WT, targetBranch: "main", squash: false });
+    // The commit the listing showed is the tip the host holds the merge to.
+    expect(invoke).toHaveBeenLastCalledWith("cmd_worktree_merge_teardown", { repoPath: "/work/repo", worktreePath: WT, targetBranch: "main", squash: false, expectedTip: "b" });
     expect(result?.message).toBe("Merged 2 commits from gitpulse/fix-e42-wt0attem into main. The worktree was removed.");
+  });
+
+  it("says a merge whose cleanup did not finish is merged, with the cleanup pending, and keeps its tab", async () => {
+    askConfirm.mockResolvedValueOnce(true);
+    repoState.set({ openTabs: [{ id: "t", path: WT, familyRoot: "/work/repo", currentBranch: "gitpulse/x" }] });
+    invoke.mockImplementationOnce(async () => listing(0))
+      .mockImplementationOnce(async () => ({ policy: null, output: teardown({ worktree_removed: false, removal_error: "The worktree could not be removed after 3 attempts: locked", branch_deleted: false, branch_error: "kept" }) }));
+    const result = await mergeAttemptWorktree(run());
+    expect(result?.message).toBe("Merged 1 commit from gitpulse/fix-e42-wt0attem into main; cleanup pending: The worktree could not be removed after 3 attempts: locked.");
+    expect(closeTab).not.toHaveBeenCalled();
+  });
+
+  it("closes the tab of a worktree the teardown removed", async () => {
+    askConfirm.mockResolvedValueOnce(true);
+    repoState.set({ openTabs: [{ id: "t", path: WT, familyRoot: "/work/repo", currentBranch: "gitpulse/x" }] });
+    invoke.mockImplementationOnce(async () => listing(0))
+      .mockImplementationOnce(async () => ({ policy: null, output: teardown({}) }));
+    await mergeAttemptWorktree(run());
+    expect(closeTab).toHaveBeenCalledWith("t");
+  });
+
+  it("keeps the host's typed refusal, so a conflict is told from any other failure", async () => {
+    askConfirm.mockResolvedValueOnce(true);
+    const typed = { code: "conflict", message: "Merging a into main conflicted in 1 file(s): f.txt.", paths: ["f.txt"], total: 1, rolled_back: true, rollback_error: null };
+    repoState.set({ openTabs: [{ id: "t", path: WT, familyRoot: "/work/repo", currentBranch: "gitpulse/x" }] });
+    invoke.mockImplementationOnce(async () => listing(0)).mockRejectedValueOnce(typed);
+    const failure = await mergeAttemptWorktree(run()).catch((cause: unknown) => cause);
+    expect(failure).toBeInstanceOf(MergeTeardownFailure);
+    expect((failure as InstanceType<typeof MergeTeardownFailure>).failure).toEqual(typed);
+    expect((failure as InstanceType<typeof MergeTeardownFailure>).message).toBe(typed.message);
   });
 
   it("does nothing when the reader declines", async () => {

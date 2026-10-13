@@ -90,6 +90,7 @@ const UNCHECKED = new Map<string, { reason: string; orphanCommand?: string }>([
   ["InstallOutcome", { reason: "mirrored in src/lib/tools/externalTools.ts — pending CONTRACTS row" }],
   ["LadderAssessment", { reason: "mirrored in src/lib/tools/externalTools.ts — pending CONTRACTS row" }],
   ["LiveRefreshOutcome", { reason: "devmap live refresh; pending CONTRACTS row" }],
+  ["MergeTeardownError", { reason: "internally tagged enum (`code`) the struct checker does not model; mirrored in src/lib/branches/types.ts and read by src/lib/branches/mergeTeardown.ts, pinned by the Rust contract test the_result_and_every_error_serialize_to_the_contract_shape" }],
   ["PreflightReport", { reason: "mirrored in src/lib/tools/externalTools.ts — pending CONTRACTS row" }],
   ["PreviewFileResult", { reason: "devmap preview file envelope; pending CONTRACTS row" }],
   ["PreviewOutcome", { reason: "devmap preview batch; pending CONTRACTS row" }],

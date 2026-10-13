@@ -14,6 +14,22 @@ describe("what a worktree operation left undone", () => {
     expect(notices[1]).toMatch(/created.*post_create hook did not finish.*npm ci exited 1/);
   });
 
+  it("after a merge whose worktree could not be removed, says it is merged and why the cleanup is pending", () => {
+    const notices = worktreeSetupNotices({ worktree_removed: false, removal_error: "locked", branch_deleted: false, branch_error: "kept", hook_error: null }, "merge");
+    expect(notices).toEqual(["Merged, but the worktree was not removed: locked. The merge stands; remove the worktree when it is free."]);
+  });
+
+  it("after a merge that removed the worktree but kept the branch, names the reason", () => {
+    expect(worktreeSetupNotices({ worktree_removed: true, branch_deleted: false, branch_error: "not fully merged" }, "merge")).toEqual([
+      "Merged and the worktree was removed, but the branch was kept: not fully merged",
+    ]);
+    expect(worktreeSetupNotices({ worktree_removed: true, branch_deleted: true }, "merge")).toEqual([]);
+  });
+
+  it("never reports a cleanup the creation path did not do", () => {
+    expect(worktreeSetupNotices({ worktree_removed: false, removal_error: "x" }, "create")).toEqual([]);
+  });
+
   it("after a teardown, says the merge happened and the cleanup did not", () => {
     expect(worktreeSetupNotices({ hook_error: "exit 4" }, "merge")).toEqual([
       "The merge and teardown finished, but the post_merge hook did not: exit 4",

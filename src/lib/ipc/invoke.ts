@@ -127,6 +127,11 @@ export function invalidateSharedReads(): void {
 function messageOf(error: unknown): string {
   if (typeof error === "string") return error;
   if (error instanceof Error) return error.message;
+  // A typed host rejection (`{code, message, ...}`), not "[object Object]".
+  if (error !== null && typeof error === "object") {
+    const { message } = error as { message?: unknown };
+    if (typeof message === "string") return message;
+  }
   return String(error);
 }
 

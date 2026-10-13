@@ -49,6 +49,23 @@ function harness(
   return { invoke, raw, calls, delays, tick, settle, sleeping: () => release.length };
 }
 
+describe("withDeferralRetry and a typed rejection", () => {
+  it("reads a `{code, message}` rejection by its message: a deferral is retried, anything else is thrown as it came", async () => {
+    const typed = { code: "conflict", message: "Merging a into main conflicted", paths: ["f.txt"] };
+    const raw = vi.fn(async (): Promise<string> => { throw typed; });
+    const invoke = withDeferralRetry(raw as never, { sleep: () => Promise.resolve(), random: () => 0, whenShown: () => Promise.resolve() });
+    await expect(invoke("cmd_worktree_merge_teardown", { repoPath: "/r" })).rejects.toBe(typed);
+    expect(raw).toHaveBeenCalledTimes(1);
+
+    const deferred = { code: "refused", message: DEFERRAL };
+    let answers = 0;
+    const flaky = vi.fn(async (): Promise<string> => { if ((answers += 1) === 1) throw deferred; return "answer"; });
+    const retrying = withDeferralRetry(flaky as never, { sleep: () => Promise.resolve(), random: () => 0, whenShown: () => Promise.resolve() });
+    await expect(retrying("cmd_list_branches", { repoPath: "/r" })).resolves.toBe("answer");
+    expect(flaky).toHaveBeenCalledTimes(2);
+  });
+});
+
 describe("withDeferralRetry", () => {
   it("asks again after the backoff, never straight back into the limit", async () => {
     const h = harness([DEFERRAL, "answer"]);

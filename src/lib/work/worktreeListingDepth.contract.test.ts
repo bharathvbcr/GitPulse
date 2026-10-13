@@ -61,8 +61,8 @@ describe("worktree listing depth", () => {
       "lib/work/load.ts": ["dirty"],
       // Branch, head and the dirty counts a merge or removal is judged on.
       "lib/workbench/attemptWorktree.ts": ["dirty"],
-      // The attempt's head only.
-      "lib/workbench/waveHost.ts": ["listing"],
+      // The attempt's head, and the main checkout's dirty count a wave merges and launches on.
+      "lib/workbench/waveHost.ts": ["listing", "dirty"],
     });
   });
 });

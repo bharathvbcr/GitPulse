@@ -51,6 +51,10 @@ const MAX_LISTED_CONFLICTS: usize = 1000;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum OperationKind {
     Merge,
+    /// `git merge --squash` that has staged its changes and not yet committed
+    /// them: git records no `MERGE_HEAD`, only `SQUASH_MSG`. Its only escape
+    /// is `git reset --merge`, because `merge --abort` needs a `MERGE_HEAD`.
+    SquashMerge,
     /// `git rebase` on the merge backend, including every `rebase -i`.
     Rebase,
     /// `git rebase` on the apply backend (`--apply` / older git defaults).
@@ -68,6 +72,7 @@ impl OperationKind {
     pub fn label(self) -> &'static str {
         match self {
             OperationKind::Merge => "merge",
+            OperationKind::SquashMerge => "squash merge",
             OperationKind::Rebase | OperationKind::RebaseApply => "rebase",
             OperationKind::ApplyMailbox => "patch application",
             OperationKind::CherryPick => "cherry-pick",
@@ -79,7 +84,7 @@ impl OperationKind {
     /// The `git` subcommand that owns this operation's recovery verbs.
     fn recovery_subcommand(self) -> &'static str {
         match self {
-            OperationKind::Merge => "merge",
+            OperationKind::Merge | OperationKind::SquashMerge => "merge",
             OperationKind::Rebase | OperationKind::RebaseApply => "rebase",
             OperationKind::ApplyMailbox => "am",
             OperationKind::CherryPick => "cherry-pick",
@@ -163,6 +168,7 @@ const PROBE_ORDER: &[&str] = &[
     "rebase-merge",
     "rebase-apply",
     "MERGE_HEAD",
+    "SQUASH_MSG",
     "CHERRY_PICK_HEAD",
     "REVERT_HEAD",
     "BISECT_LOG",
@@ -175,8 +181,9 @@ const PROBE_ORDER: &[&str] = &[
 const IDX_REBASE_MERGE: usize = 0;
 const IDX_REBASE_APPLY: usize = 1;
 const IDX_MERGE_HEAD: usize = 2;
-const IDX_CHERRY_PICK_HEAD: usize = 3;
-const IDX_REVERT_HEAD: usize = 4;
+const IDX_SQUASH_MSG: usize = 3;
+const IDX_CHERRY_PICK_HEAD: usize = 4;
+const IDX_REVERT_HEAD: usize = 5;
 
 /// Reports the operation `repo`'s worktree is parked in, or `None` when it is
 /// idle.
@@ -279,6 +286,7 @@ fn classify<'a>(
                 }
             }
             "MERGE_HEAD" => OperationKind::Merge,
+            "SQUASH_MSG" => OperationKind::SquashMerge,
             "CHERRY_PICK_HEAD" => OperationKind::CherryPick,
             "REVERT_HEAD" => OperationKind::Revert,
             "BISECT_LOG" => OperationKind::Bisect,
@@ -386,7 +394,7 @@ fn progress(
             }
             (Some(done + 1), Some(total))
         }
-        OperationKind::Merge | OperationKind::Bisect => (None, None),
+        OperationKind::Merge | OperationKind::SquashMerge | OperationKind::Bisect => (None, None),
     }
 }
 
@@ -486,6 +494,15 @@ fn incoming_ref_for(
             .and_then(|raw| describe_oid(repo, raw.trim())),
         OperationKind::Revert => read_control(&paths[IDX_REVERT_HEAD], warnings)
             .and_then(|raw| describe_oid(repo, raw.trim())),
+        // SQUASH_MSG lists the squashed commits, newest first; the first
+        // names what was brought in.
+        OperationKind::SquashMerge => {
+            read_control(&paths[IDX_SQUASH_MSG], warnings).and_then(|raw| {
+                raw.lines()
+                    .find_map(|line| line.strip_prefix("commit "))
+                    .and_then(|oid| describe_oid(repo, oid))
+            })
+        }
         OperationKind::Bisect => None,
     }
 }
@@ -506,19 +523,26 @@ fn describe_oid(repo: &Path, oid: &str) -> Option<String> {
         .or_else(|| Some(oid.chars().take(7).collect()))
 }
 
-/// Unmerged index entries, bounded.
+/// Unmerged index entries, capped at [`MAX_LISTED_CONFLICTS`], with the true
+/// total beside them. A listing that could not be read is an error, never an
+/// empty list. A rename-only conflict has stage entries and no markers, so
+/// the index is read rather than the working tree.
+pub(crate) fn conflicted_paths(repo: &Path) -> Result<(Vec<String>, usize), String> {
+    let raw = git_text(repo, &["diff", "--name-only", "--diff-filter=U", "-z"])?;
+    let all: Vec<&str> = raw.split('\0').filter(|s| !s.is_empty()).collect();
+    let total = all.len();
+    let listed = all
+        .into_iter()
+        .take(MAX_LISTED_CONFLICTS)
+        .map(str::to_string)
+        .collect();
+    Ok((listed, total))
+}
+
+/// [`conflicted_paths`], with a failed listing recorded as a warning.
 fn conflicted_files(repo: &Path, warnings: &mut Vec<String>) -> (Vec<String>, usize) {
-    match git_text(repo, &["diff", "--name-only", "--diff-filter=U", "-z"]) {
-        Ok(raw) => {
-            let all: Vec<&str> = raw.split('\0').filter(|s| !s.is_empty()).collect();
-            let total = all.len();
-            let listed = all
-                .into_iter()
-                .take(MAX_LISTED_CONFLICTS)
-                .map(str::to_string)
-                .collect();
-            (listed, total)
-        }
+    match conflicted_paths(repo) {
+        Ok(found) => found,
         Err(err) => {
             // An unreadable conflict list must not render as "no conflicts",
             // which would offer `continue` on an unresolved tree.
@@ -533,7 +557,7 @@ fn available_actions(kind: OperationKind, conflicted_total: usize) -> Vec<Operat
     match kind {
         // `git merge --continue` refuses while the index has conflicts, and
         // there is no such thing as skipping a merge's single step.
-        OperationKind::Merge => {
+        OperationKind::Merge | OperationKind::SquashMerge => {
             let mut actions = vec![OperationAction::Abort];
             if conflicted_total == 0 {
                 actions.push(OperationAction::Continue);
@@ -567,6 +591,17 @@ pub fn action_argv(kind: OperationKind, action: OperationAction) -> Vec<&'static
     // long-flag form.
     if kind == OperationKind::Bisect {
         return vec!["git", "bisect", "reset"];
+    }
+    // A squash merge records no `MERGE_HEAD`, so `merge --abort` refuses it;
+    // `reset --merge` is what restores the pre-merge tree. Concluding it is a
+    // plain commit, which git takes the message of from `SQUASH_MSG`. It has
+    // no step to skip, so `available_actions` never offers `Skip` and
+    // `run_action_with` refuses it before this is rendered.
+    if kind == OperationKind::SquashMerge {
+        return match action {
+            OperationAction::Continue => vec!["git", "commit", "--no-edit"],
+            OperationAction::Abort | OperationAction::Skip => vec!["git", "reset", "--merge"],
+        };
     }
     let sub = kind.recovery_subcommand();
     match action {
@@ -692,8 +727,80 @@ mod tests {
         assert_eq!(PROBE_ORDER[IDX_REBASE_MERGE], "rebase-merge");
         assert_eq!(PROBE_ORDER[IDX_REBASE_APPLY], "rebase-apply");
         assert_eq!(PROBE_ORDER[IDX_MERGE_HEAD], "MERGE_HEAD");
+        assert_eq!(PROBE_ORDER[IDX_SQUASH_MSG], "SQUASH_MSG");
         assert_eq!(PROBE_ORDER[IDX_CHERRY_PICK_HEAD], "CHERRY_PICK_HEAD");
         assert_eq!(PROBE_ORDER[IDX_REVERT_HEAD], "REVERT_HEAD");
+    }
+
+    #[test]
+    fn a_bare_squash_merge_is_a_parked_operation() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        let git = |args: &[&str]| crate::test_support::git_in(repo, args);
+        git(&["init", "-q", "-b", "main", "."]);
+        git(&["config", "user.email", "t@gitpulse.local"]);
+        git(&["config", "user.name", "Tester"]);
+        std::fs::write(repo.join("a.txt"), "base\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-qm", "base"]);
+        git(&["switch", "-qc", "side"]);
+        std::fs::write(repo.join("b.txt"), "side\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-qm", "side"]);
+        git(&["switch", "-q", "main"]);
+        git(&["merge", "--squash", "side"]);
+        crate::test_support::trust_repo(repo);
+        let parked = detect(repo)
+            .unwrap()
+            .expect("a staged squash read as an idle repository");
+        assert_eq!(parked.kind, OperationKind::SquashMerge);
+        assert_eq!(parked.kind.label(), "squash merge");
+        assert_eq!(
+            parked.available,
+            [OperationAction::Abort, OperationAction::Continue]
+        );
+        assert_eq!(
+            action_argv(OperationKind::SquashMerge, OperationAction::Abort),
+            ["git", "reset", "--merge"]
+        );
+
+        // Continuing is a bare commit, and git writes the squash's own message.
+        let continued = action_argv(OperationKind::SquashMerge, OperationAction::Continue);
+        assert_eq!(continued, ["git", "commit", "--no-edit"]);
+        git(&continued[1..]);
+        assert_eq!(detect(repo).unwrap(), None);
+        assert!(
+            git_text(repo, &["log", "-1", "--format=%B"])
+                .unwrap()
+                .contains("Squashed commit"),
+            "the commit did not take SQUASH_MSG"
+        );
+    }
+
+    #[test]
+    fn a_parked_squash_is_undone_by_reset_merge() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        let git = |args: &[&str]| crate::test_support::git_in(repo, args);
+        git(&["init", "-q", "-b", "main", "."]);
+        git(&["config", "user.email", "t@gitpulse.local"]);
+        git(&["config", "user.name", "Tester"]);
+        std::fs::write(repo.join("a.txt"), "base\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-qm", "base"]);
+        git(&["switch", "-qc", "side"]);
+        std::fs::write(repo.join("b.txt"), "side\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-qm", "side"]);
+        git(&["switch", "-q", "main"]);
+        git(&["merge", "--squash", "side"]);
+        crate::test_support::trust_repo(repo);
+        let abort = action_argv(OperationKind::SquashMerge, OperationAction::Abort);
+        git(&abort[1..]);
+        assert_eq!(detect(repo).unwrap(), None);
+        assert!(git_text(repo, &["status", "--porcelain"])
+            .unwrap()
+            .is_empty());
     }
 
     #[test]

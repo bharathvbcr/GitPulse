@@ -48,7 +48,7 @@
 //! keeps a branch with commits, and a tree something still has open is kept.
 
 use super::WorkbenchError;
-use crate::engine::git_cli::{resolve_git_common_dir, resolve_git_dir};
+use crate::engine::git_cli::{git_text, resolve_git_common_dir, resolve_git_dir};
 use crate::engine::worktree::{gitpulse_lane_container, GITPULSE_LANE_DIR as EXCLUDED};
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
@@ -258,6 +258,43 @@ pub(super) fn provision(
         return Err(refused(format!(
             "The repository's post_create hook failed in the new worktree, so the agent was not started: {hook}.{cleanup}"
         )));
+    }
+    // Where the lane was cut from, for the merge to hold the target to. A
+    // checkout on a detached HEAD, or on a branch name the writers will not
+    // pass to git, has no branch to record; the merge then skips that check
+    // and reports no base, rather than guessing one.
+    match crate::engine::git_reader::head_branch(source) {
+        Ok(Some(base_branch)) => {
+            let recorded = git_text(
+                Path::new(&provisioned.path),
+                &["rev-parse", "--verify", "HEAD"],
+            )
+            .and_then(|oid| {
+                crate::engine::worktree::write_base_record(
+                    Path::new(&provisioned.path),
+                    &base_branch,
+                    oid.trim(),
+                )
+            });
+            if let Err(error) = recorded {
+                let cleanup = discard(&provisioned)
+                    .err()
+                    .map(|e| {
+                        format!(
+                            " The worktree could not be removed and is still at {} on branch {}: {e}",
+                            provisioned.path, provisioned.branch
+                        )
+                    })
+                    .unwrap_or_default();
+                return Err(refused(format!(
+                    "GitPulse could not record which branch the new worktree was cut from, so the agent was not started: {error}.{cleanup}"
+                )));
+            }
+        }
+        Ok(None) => {}
+        Err(error) => {
+            log::warn!(target: "workbench", "agent worktree {} has no recorded base branch: {error}", provisioned.path);
+        }
     }
     // Without the record, a later retry of this same attempt rebuilds the
     // tree instead of trusting it: slower, never wrong.
@@ -531,6 +568,16 @@ mod tests {
         )
         .unwrap();
         assert!(std::path::Path::new(&made.path).is_dir(), "{}", made.path);
+        // The branch and commit the lane was cut from are recorded in its
+        // private Git directory, where the merge reads them.
+        let base = std::fs::read_to_string(
+            crate::engine::git_cli::resolve_git_dir(std::path::Path::new(&made.path))
+                .unwrap()
+                .join(crate::engine::worktree::BASE_RECORD),
+        )
+        .expect("no base record was written");
+        let head = git_text(&root, &["rev-parse", "HEAD"]).unwrap();
+        assert_eq!(base, format!("main\n{}\n", head.trim()));
         let status = git_text(&root, &["status", "--porcelain", "--untracked-files=all"]).unwrap();
         // The command gate's ledger also writes into the repository; only the
         // worktree container is this test's concern. Unexcluded, it reads

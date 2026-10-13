@@ -304,8 +304,13 @@ pub const AUTO_FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_se
 /// caller: before the commit nothing is staged; after it, the squash is.
 #[derive(Debug)]
 pub(crate) enum SquashFailure {
-    /// The merge or the gate refused; the index is as it was.
+    /// The gate or an identity guard refused before git ran; nothing was
+    /// started and the index is as it was.
     Merge(String),
+    /// `git merge --squash` itself failed, so it was started: a conflict
+    /// leaves unmerged entries and `SQUASH_MSG` behind. The caller that owns
+    /// the checkout restores it with [`GitWriter::rollback_failed_merge_locked`].
+    Conflict(String),
     /// The changes are staged but the commit failed (a refusing hook, an
     /// identity problem). The message says how to finish or undo it.
     Commit(String),
@@ -314,7 +319,9 @@ pub(crate) enum SquashFailure {
 impl SquashFailure {
     pub(crate) fn into_message(self) -> String {
         match self {
-            SquashFailure::Merge(message) | SquashFailure::Commit(message) => message,
+            SquashFailure::Merge(message)
+            | SquashFailure::Conflict(message)
+            | SquashFailure::Commit(message) => message,
         }
     }
 }
@@ -895,6 +902,76 @@ Unset the local override with `git config --local --unset-all user.name` and \
         ))
     }
 
+    /// Both identity guards every path that records a commit runs first: an
+    /// identity must be configured, and it must not be the test fixture's.
+    pub(crate) fn require_commit_identity(repo: &Path) -> Result<(), String> {
+        Self::require_identity(repo)?;
+        Self::refuse_fixture_identity(repo, false)
+    }
+
+    /// Restores the checkout at `repo` after a merge this process started
+    /// failed part-way (a conflict, a timeout), so the next merge does not
+    /// find it parked. Driven by what the repository says it is in the middle
+    /// of: `merge --abort` for a merge with a `MERGE_HEAD`, falling back to
+    /// `reset --merge` when that refuses; `reset --merge` for a squash, which
+    /// has none; and `reset --merge` for unmerged entries with no marker at
+    /// all. `reset --merge` keeps unrelated local changes, as `merge --abort`
+    /// does. Returns `Ok` only after re-reading the repository and finding no
+    /// operation and no unmerged entry; a rollback that could not be shown to
+    /// have worked is an `Err` naming what is left. Caller MUST hold the
+    /// repository mutation lock.
+    pub(crate) fn rollback_failed_merge_locked(repo: &Path) -> Result<(), String> {
+        use crate::engine::repo_op::{detect_kind, OperationKind};
+        match detect_kind(repo)? {
+            Some(OperationKind::Merge) => {
+                if let Err(abort) = git_text(repo, &["merge", "--abort"]) {
+                    git_text(repo, &["reset", "--merge"]).map_err(|reset| {
+                        format!(
+                            "`git merge --abort` failed ({abort}) and so did `git reset --merge` ({reset})"
+                        )
+                    })?;
+                }
+            }
+            Some(OperationKind::SquashMerge) => {
+                git_text(repo, &["reset", "--merge"])
+                    .map_err(|e| format!("`git reset --merge` failed: {e}"))?;
+            }
+            Some(other) => {
+                return Err(format!(
+                    "a {} is parked in the checkout, which this merge did not start; it was left alone",
+                    other.label()
+                ));
+            }
+            None => {
+                if !git_text(repo, &["ls-files", "--unmerged"])?
+                    .trim()
+                    .is_empty()
+                {
+                    git_text(repo, &["reset", "--merge"])
+                        .map_err(|e| format!("`git reset --merge` failed: {e}"))?;
+                }
+            }
+        }
+        let mut left = Vec::new();
+        if let Some(kind) = detect_kind(repo)? {
+            left.push(format!("a {} is still in progress", kind.label()));
+        }
+        if !git_text(repo, &["ls-files", "--unmerged"])?
+            .trim()
+            .is_empty()
+        {
+            left.push("unmerged entries remain in the index".to_string());
+        }
+        if left.is_empty() {
+            Ok(())
+        } else {
+            Err(format!(
+                "the checkout was not restored: {}",
+                left.join("; ")
+            ))
+        }
+    }
+
     /// The argv pair [`Self::set_identity`] runs, program included. Shared
     /// with the command gate so the judged lines are the lines that run.
     pub fn identity_argv(scope: IdentityScope, name: &str, email: &str) -> [Vec<String>; 2] {
@@ -1009,8 +1086,7 @@ Unset the local override with `git config --local --unset-all user.name` and \
     }
 
     fn quick_commit_inner(repo: &Path, message: &str) -> Result<String, String> {
-        Self::require_identity(repo)?;
-        Self::refuse_fixture_identity(repo, false)?;
+        Self::require_commit_identity(repo)?;
         let unmerged = git_text(repo, &["ls-files", "--unmerged"])?;
         if !unmerged.trim().is_empty() {
             return Err("Resolve merge conflicts before committing.".into());
@@ -1038,8 +1114,7 @@ Unset the local override with `git config --local --unset-all user.name` and \
             return Err("Commit message must not be empty".into());
         }
         let paths = literal_paths(&repo, files)?;
-        Self::require_identity(&repo)?;
-        Self::refuse_fixture_identity(&repo, false)?;
+        Self::require_commit_identity(&repo)?;
         let _repo_lock = repo_mutation_lock(&repo);
         let _guard = _repo_lock
             .lock()
@@ -1598,26 +1673,24 @@ Unset the local override with `git config --local --unset-all user.name` and \
     ) -> Result<bool, SquashFailure> {
         // Checked first: once the merge has staged the squash, a missing
         // identity would leave it stranded in the index.
-        Self::require_identity(repo).map_err(SquashFailure::Merge)?;
-        Self::refuse_fixture_identity(repo, false).map_err(SquashFailure::Merge)?;
+        Self::require_commit_identity(repo).map_err(SquashFailure::Merge)?;
         let merge = Self::merge_argv(branch, MergeMode::Squash);
         gate(&merge).map_err(SquashFailure::Merge)?;
-        git_text(repo, &merge).map_err(SquashFailure::Merge)?;
-        // `git merge` refuses to start over staged changes, so whatever is
-        // staged now is the squash.
-        let staged =
-            git_text(repo, &["diff", "--cached", "--name-only"]).map_err(SquashFailure::Merge)?;
-        if staged.trim().is_empty() {
-            return Ok(false);
-        }
-        let commit = Self::squash_commit_argv(branch);
-        let commit: Vec<&str> = commit.iter().map(String::as_str).collect();
+        git_text(repo, &merge).map_err(SquashFailure::Conflict)?;
         let staged_note = |e: String| {
             SquashFailure::Commit(format!(
                 "The squashed changes of {branch} are staged but could not be committed: {e}. \
                  Commit the staged changes, or undo them with `git reset --merge`."
             ))
         };
+        // `git merge` refuses to start over staged changes, so whatever is
+        // staged now is the squash.
+        let staged = git_text(repo, &["diff", "--cached", "--name-only"]).map_err(staged_note)?;
+        if staged.trim().is_empty() {
+            return Ok(false);
+        }
+        let commit = Self::squash_commit_argv(branch);
+        let commit: Vec<&str> = commit.iter().map(String::as_str).collect();
         gate(&commit).map_err(staged_note)?;
         git_text(repo, &commit).map_err(staged_note)?;
         Ok(true)
@@ -2882,6 +2955,112 @@ mod tests {
         crate::test_support::trust_repo(dir.path());
         let side = git_stdout(dir.path(), &["rev-parse", "side"]);
         (dir, side)
+    }
+
+    /// A trusted checkout on `main` where merging `side` conflicts in `f.txt`.
+    fn conflicting_checkout() -> tempfile::TempDir {
+        let dir = tempfile::TempDir::new().unwrap();
+        let git = |args: &[&str]| {
+            let mut full = vec!["-c", "user.name=Ada", "-c", "user.email=ada@gitpulse.dev"];
+            full.extend_from_slice(args);
+            git_ok(dir.path(), &full);
+        };
+        git(&["init", "-q", "-b", "main"]);
+        std::fs::write(dir.path().join("f.txt"), "base\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-qm", "base"]);
+        git(&["switch", "-qc", "side"]);
+        std::fs::write(dir.path().join("f.txt"), "side\n").unwrap();
+        git(&["commit", "-qam", "side"]);
+        git(&["switch", "-q", "main"]);
+        std::fs::write(dir.path().join("f.txt"), "main\n").unwrap();
+        git(&["commit", "-qam", "main"]);
+        crate::test_support::trust_repo(dir.path());
+        dir
+    }
+
+    fn checkout_is_clean(repo: &std::path::Path) {
+        assert_eq!(git_stdout(repo, &["status", "--porcelain"]), "");
+        assert_eq!(crate::engine::repo_op::detect_kind(repo).unwrap(), None);
+    }
+
+    #[test]
+    fn rollback_restores_a_conflicted_merge_a_conflicted_squash_and_a_markerless_conflict() {
+        for flavour in ["merge", "squash", "markerless"] {
+            let dir = conflicting_checkout();
+            let repo = dir.path();
+            let args: &[&str] = if flavour == "squash" {
+                &["merge", "--squash", "side"]
+            } else {
+                &["merge", "--no-edit", "side"]
+            };
+            assert!(
+                !git_captured(repo, args).unwrap().success,
+                "{flavour}: the fixture merge should conflict"
+            );
+            if flavour == "markerless" {
+                // Unmerged entries, and no control file to say what made them.
+                std::fs::remove_file(repo.join(".git/MERGE_HEAD")).unwrap();
+            }
+            GitWriter::rollback_failed_merge_locked(repo)
+                .unwrap_or_else(|e| panic!("{flavour}: {e}"));
+            checkout_is_clean(repo);
+            assert!(
+                !repo.join(".git/SQUASH_MSG").exists(),
+                "{flavour}: SQUASH_MSG"
+            );
+            assert_eq!(
+                std::fs::read_to_string(repo.join("f.txt")).unwrap(),
+                "main\n"
+            );
+        }
+    }
+
+    #[test]
+    fn rollback_with_nothing_to_undo_is_ok() {
+        let dir = conflicting_checkout();
+        GitWriter::rollback_failed_merge_locked(dir.path()).unwrap();
+        checkout_is_clean(dir.path());
+    }
+
+    /// Both `merge --abort` and the `reset --merge` it falls back to need the
+    /// index lock. A rollback that could not run must say so, not report a
+    /// checkout it left parked as restored.
+    #[test]
+    fn rollback_that_cannot_restore_the_checkout_says_so() {
+        let dir = conflicting_checkout();
+        let repo = dir.path();
+        assert!(
+            !git_captured(repo, &["merge", "--no-edit", "side"])
+                .unwrap()
+                .success
+        );
+        let lock = repo.join(".git/index.lock");
+        std::fs::write(&lock, "").unwrap();
+        let failed = GitWriter::rollback_failed_merge_locked(repo).unwrap_err();
+        assert!(
+            failed.contains("merge --abort") && failed.contains("reset --merge"),
+            "{failed}"
+        );
+        assert!(repo.join(".git/MERGE_HEAD").exists());
+        std::fs::remove_file(&lock).unwrap();
+        GitWriter::rollback_failed_merge_locked(repo).unwrap();
+        checkout_is_clean(repo);
+    }
+
+    /// A cherry-pick the user parked is not this merge's to undo.
+    #[test]
+    fn rollback_leaves_another_operation_alone() {
+        let dir = conflicting_checkout();
+        let repo = dir.path();
+        assert!(
+            !git_captured(repo, &["cherry-pick", "side"])
+                .unwrap()
+                .success
+        );
+        let refused = GitWriter::rollback_failed_merge_locked(repo).unwrap_err();
+        assert!(refused.contains("cherry-pick"), "{refused}");
+        assert!(repo.join(".git/CHERRY_PICK_HEAD").exists());
     }
 
     fn git_stdout(dir: &std::path::Path, args: &[&str]) -> String {

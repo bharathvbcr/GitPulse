@@ -260,17 +260,46 @@ export interface WorktreeInfo {
   scan_note?: string;
 }
 
+/**
+ * `engine::worktree::MergeTeardownResult`. A result is only ever one where the
+ * merge landed; cleanup that did not finish after it is `worktree_removed` /
+ * `branch_deleted` false with the reason beside it, not a failure.
+ */
 export interface MergeTeardownResult {
+  merged: boolean;
   merged_branch: string;
   target_branch: string;
   commits_merged: number;
+  /** The target's tip before the merge, and after it (null when git could not say). */
+  before_oid: string;
+  after_oid: string | null;
+  /** The commit the lane was cut from, when the lane recorded one. */
+  base_oid: string | null;
   worktree_removed: boolean;
+  removal_error: string | null;
   branch_deleted: boolean;
+  branch_error: string | null;
   /** A `post_merge` hook failed after the merge and teardown had happened. */
   hook_error: string | null;
   /** Hooks the repository lists were not approved, so did not run. */
   hook_notice?: string | null;
 }
+
+/**
+ * `engine::worktree::MergeTeardownError`: why a merge-and-teardown did not
+ * merge, as `{code, message, ...}`. Every variant carries a `message` to show.
+ */
+export type MergeTeardownError =
+  /** The merge conflicted. `rolled_back` false means the main checkout is still mid-merge (`rollback_error` says what is left). */
+  | { code: "conflict"; message: string; paths: string[]; total: number; rolled_back: boolean; rollback_error: string | null }
+  /** The branch is not at the commit that was checked; nothing was merged. */
+  | { code: "moved"; message: string; branch: string; expected: string; actual: string }
+  /** The worktree was cut from a branch or base the target no longer is. */
+  | { code: "base_mismatch"; message: string; base_branch: string; target_branch: string; base_oid: string }
+  /** A squash is staged in the main checkout and not committed. */
+  | { code: "squash_parked"; message: string }
+  /** Refused or failed before anything was merged. */
+  | { code: "refused"; message: string };
 
 /** `engine::worktree_hooks::WorktreeHooksConfig`. */
 export interface WorktreeHooksConfig {
@@ -310,10 +339,23 @@ export interface WorktreeCreated {
  * left undone: one sentence per step, empty when there is nothing to say.
  */
 export function worktreeSetupNotices(
-  done: { cache_error?: string | null; hook_error?: string | null; hook_notice?: string | null },
+  done: {
+    cache_error?: string | null;
+    hook_error?: string | null;
+    hook_notice?: string | null;
+    worktree_removed?: boolean;
+    removal_error?: string | null;
+    branch_deleted?: boolean;
+    branch_error?: string | null;
+  },
   when: "create" | "merge",
 ): string[] {
   const notices: string[] = [];
+  if (when === "merge" && done.worktree_removed === false) {
+    notices.push(`Merged, but the worktree was not removed: ${done.removal_error ?? "no reason was given"}. The merge stands; remove the worktree when it is free.`);
+  } else if (when === "merge" && done.branch_deleted === false) {
+    notices.push(`Merged and the worktree was removed, but the branch was kept: ${done.branch_error ?? "no reason was given"}`);
+  }
   if (done.cache_error) notices.push(`The worktree was created, but its build caches were not copied: ${done.cache_error}`);
   if (done.hook_error) {
     notices.push(when === "create"

@@ -8,8 +8,10 @@
 //! write.
 
 use crate::engine::git_cli::{
-    git_text, git_text_with_timeout, plain_path_text, resolve_git_common_dir, validate_repo,
+    git_text, git_text_with_timeout, plain_path_text, resolve_git_common_dir, resolve_git_dir,
+    validate_repo,
 };
+use crate::engine::git_writer::validate_oid;
 use crate::engine::git_writer::validate_oid_or_revision;
 use crate::engine::git_writer::validate_ref_name;
 use crate::engine::git_writer::{GitWriter, MergeMode, SquashFailure};
@@ -1805,11 +1807,29 @@ pub fn add_worktree_extended(
 /// Outcome of merging a worktree branch and tearing down the worktree directory.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct MergeTeardownResult {
+    /// The merge landed on the target. An `Ok` result is only ever one that
+    /// did; a merge that did not land is a [`MergeTeardownError`].
+    pub merged: bool,
     pub merged_branch: String,
     pub target_branch: String,
     pub commits_merged: usize,
+    /// The target's tip before the merge.
+    pub before_oid: String,
+    /// The target's tip after the merge, as read back. `None` only when git
+    /// could not answer after a merge that had landed; the worktree is then
+    /// kept and `removal_error` says so.
+    pub after_oid: Option<String>,
+    /// Where the lane was cut from, when [`write_base_record`] recorded it.
+    pub base_oid: Option<String>,
+    /// False when the merge landed but the worktree is still there; the
+    /// reason is `removal_error`. This is a cleanup left to do, not a failed
+    /// merge.
     pub worktree_removed: bool,
+    pub removal_error: Option<String>,
     pub branch_deleted: bool,
+    /// Why the branch is still there. Always set when `branch_deleted` is
+    /// false.
+    pub branch_error: Option<String>,
     /// A `post_merge` hook failed, timed out, or was refused. The merge and
     /// the teardown had already happened; this says the cleanup after them
     /// did not, where it used to be discarded.
@@ -1818,6 +1838,118 @@ pub struct MergeTeardownResult {
     #[serde(default)]
     pub hook_notice: Option<String>,
 }
+
+/// Why a merge and teardown did not merge. It crosses the IPC boundary as
+/// `{code, message, ...}`: every variant carries a `message` fit to show, and
+/// the code is what a caller (the wave) branches on.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "code", rename_all = "snake_case")]
+pub enum MergeTeardownError {
+    /// The merge conflicted. `rolled_back` says the main checkout is as it
+    /// was; when false, `rollback_error` names what was left parked there.
+    Conflict {
+        message: String,
+        paths: Vec<String>,
+        total: usize,
+        rolled_back: bool,
+        rollback_error: Option<String>,
+    },
+    /// The branch is not at the commit the caller checked. Nothing was merged.
+    Moved {
+        message: String,
+        branch: String,
+        expected: String,
+        actual: String,
+    },
+    /// The worktree was cut from a branch or a base the target no longer is.
+    BaseMismatch {
+        message: String,
+        base_branch: String,
+        target_branch: String,
+        base_oid: String,
+    },
+    /// A squash is staged in the main checkout and not committed: this
+    /// merge's own commit step failed, or an earlier one's did.
+    SquashParked { message: String },
+    /// Refused or failed before anything was merged.
+    Refused { message: String },
+}
+
+impl MergeTeardownError {
+    pub fn message(&self) -> &str {
+        match self {
+            Self::Conflict { message, .. }
+            | Self::Moved { message, .. }
+            | Self::BaseMismatch { message, .. }
+            | Self::SquashParked { message }
+            | Self::Refused { message } => message,
+        }
+    }
+}
+
+impl std::fmt::Display for MergeTeardownError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.message())
+    }
+}
+
+impl std::error::Error for MergeTeardownError {}
+
+impl From<String> for MergeTeardownError {
+    fn from(message: String) -> Self {
+        Self::Refused { message }
+    }
+}
+
+/// Written into a lane's private Git directory when it is provisioned: the
+/// branch it was cut from and that branch's tip then, as `<branch>\n<oid>\n`.
+pub const BASE_RECORD: &str = "gitpulse-base";
+
+/// Records where `worktree` was cut from, next to the other per-worktree
+/// state, never in its files where `git status` would show it.
+pub fn write_base_record(worktree: &Path, branch: &str, oid: &str) -> Result<(), String> {
+    validate_ref_name(branch)?;
+    validate_oid(oid)?;
+    let dir = resolve_git_dir(worktree)?;
+    std::fs::write(dir.join(BASE_RECORD), format!("{branch}\n{oid}\n")).map_err(|e| {
+        format!(
+            "could not write {BASE_RECORD} for {}: {e}",
+            worktree.display()
+        )
+    })
+}
+
+/// The `(branch, oid)` [`write_base_record`] recorded. `None` when there is
+/// no record (a lane made before it existed, or by the Worktrees panel). A
+/// record that is there and cannot be read is an error, not "no record": a
+/// check that could not run must not pass as one that did.
+fn read_base_record(worktree: &Path) -> Result<Option<(String, String)>, String> {
+    let path = resolve_git_dir(worktree)?.join(BASE_RECORD);
+    let raw = match std::fs::read(&path) {
+        Ok(raw) => raw,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(format!("could not read {}: {e}", path.display())),
+    };
+    let corrupt = |why: &str| format!("{} is not a branch and a commit id: {why}", path.display());
+    if raw.len() > 4096 {
+        return Err(corrupt("it is far larger than it should be"));
+    }
+    let text = String::from_utf8(raw).map_err(|_| corrupt("it is not text"))?;
+    let mut lines = text.lines().map(str::trim);
+    let (Some(branch), Some(oid), None) = (lines.next(), lines.next(), lines.next()) else {
+        return Err(corrupt("it does not have exactly two lines"));
+    };
+    validate_ref_name(branch).map_err(|e| corrupt(&e))?;
+    validate_oid(oid).map_err(|e| corrupt(&e))?;
+    Ok(Some((branch.to_string(), oid.to_ascii_lowercase())))
+}
+
+/// How many times the removal of a merged worktree is tried. A scanner or an
+/// indexer holding a file open (Windows) fails the first try and lets go.
+const MAX_REMOVE_ATTEMPTS: usize = 3;
+/// Waits before the second and third try.
+const REMOVE_BACKOFF: [Duration; MAX_REMOVE_ATTEMPTS - 1] =
+    [Duration::from_millis(100), Duration::from_millis(300)];
 
 /// Merges a worktree branch into target_branch (defaulting to main/master) in the primary
 /// repository checkout, tears down the worktree cleanly, and prunes the merged branch.
@@ -1828,17 +1960,64 @@ pub struct MergeTeardownResult {
 /// branch deletion. The caller used to ask once, up front, about
 /// `merge --ff-only <target>` — a command this never ran, and spelled without
 /// the program, so it was judged as a program named `merge` — and the three
-/// later mutations were not asked about at all.
+/// later mutations were not asked about at all. The restoring of a merge that
+/// conflicted is not asked about: it undoes what the gate had just allowed.
+///
+/// `expected_tip` is the commit the caller verified the branch at. When it is
+/// given and the branch is anywhere else under the lock, nothing is merged.
+///
+/// The result is `Err` only while nothing has landed. A merge that did land
+/// is `Ok` whatever happens to the cleanup after it: a worktree or branch
+/// that could not be removed is `worktree_removed: false` / `branch_deleted:
+/// false` with the reason, never a "not merged".
 pub fn merge_and_teardown_worktree(
     repo_path: &str,
     worktree_path: &str,
     target_branch: Option<&str>,
     squash: bool,
+    expected_tip: Option<&str>,
     gate: &mut dyn FnMut(&[&str]) -> Result<(), String>,
-) -> Result<MergeTeardownResult, String> {
+) -> Result<MergeTeardownResult, MergeTeardownError> {
+    merge_and_teardown_with(
+        repo_path,
+        worktree_path,
+        target_branch,
+        squash,
+        expected_tip,
+        gate,
+        &mut std::thread::sleep,
+    )
+}
+
+/// [`merge_and_teardown_worktree`] with the wait between removal attempts
+/// passed in, so a test does not sleep through the backoff.
+fn merge_and_teardown_with(
+    repo_path: &str,
+    worktree_path: &str,
+    target_branch: Option<&str>,
+    squash: bool,
+    expected_tip: Option<&str>,
+    gate: &mut dyn FnMut(&[&str]) -> Result<(), String>,
+    sleep: &mut dyn FnMut(Duration),
+) -> Result<MergeTeardownResult, MergeTeardownError> {
+    // The tip comes from the webview; it is a commit id or it is refused.
+    let expected_tip = match expected_tip.map(str::trim) {
+        None => None,
+        Some(tip) if tip.len() >= 40 && validate_oid(tip).is_ok() => Some(tip.to_ascii_lowercase()),
+        Some(tip) => {
+            return Err(format!(
+                "The expected branch tip '{tip}' is not a full commit id; nothing was merged."
+            )
+            .into())
+        }
+    };
     let family = resolve_worktree_family(repo_path, worktree_path)?;
     if family.worktree == family.anchor {
-        return Err("Cannot merge and teardown the repository's primary checkout".into());
+        return Err(
+            "Cannot merge and teardown the repository's primary checkout"
+                .to_string()
+                .into(),
+        );
     }
 
     let repo = family.anchor.clone();
@@ -1848,7 +2027,11 @@ pub fn merge_and_teardown_worktree(
     let branch_raw = git_text(&worktree, &["rev-parse", "--abbrev-ref", "HEAD"])?;
     let branch = branch_raw.trim().to_string();
     if branch.is_empty() || branch == "HEAD" {
-        return Err("Worktree has a detached HEAD; cannot merge an unbranched checkout".into());
+        return Err(
+            "Worktree has a detached HEAD; cannot merge an unbranched checkout"
+                .to_string()
+                .into(),
+        );
     }
 
     let default_target = if git_text(&repo, &["rev-parse", "--verify", "refs/heads/main"]).is_ok() {
@@ -1908,6 +2091,30 @@ pub fn merge_and_teardown_worktree(
     // The pre-merge hooks above may have switched the main checkout.
     main_is_on_target()?;
 
+    // A merge, rebase or squash parked in the main checkout is somebody's
+    // unfinished work. Merging over it would tangle the two, and rolling a
+    // failure back would undo theirs.
+    if let Some(kind) = crate::engine::repo_op::detect_kind(&repo)? {
+        return Err(
+            if kind == crate::engine::repo_op::OperationKind::SquashMerge {
+                MergeTeardownError::SquashParked {
+                    message: format!(
+                    "A squash merge is parked in the main checkout: its changes are staged and not \
+                     committed. Commit them, or undo them with `git reset --merge`, before merging \
+                     {branch}. Nothing was merged."
+                ),
+                }
+            } else {
+                MergeTeardownError::Refused {
+                message: format!(
+                    "A {} is in progress in the main checkout. Finish or abort it before merging {branch}; nothing was merged.",
+                    kind.label()
+                ),
+            }
+            },
+        );
+    }
+
     // 3. Collision / uncommitted changes check
     let worktree_text = worktree.to_string_lossy().to_string();
     let (changed, _) = changed_paths(&worktree_text)?;
@@ -1915,7 +2122,8 @@ pub fn merge_and_teardown_worktree(
         return Err(format!(
             "Worktree has {} uncommitted file changes; commit or stash them before merging",
             changed.len()
-        ));
+        )
+        .into());
     }
     // The branch tip being merged. Anything that lands on the branch after
     // this is not in the merge and must not be deleted with it.
@@ -1923,14 +2131,82 @@ pub fn merge_and_teardown_worktree(
     let merged_tip = git_text(&repo, &["rev-parse", "--verify", branch_ref.as_str()])?
         .trim()
         .to_string();
+    if let Some(expected) = expected_tip {
+        if expected != merged_tip {
+            return Err(MergeTeardownError::Moved {
+                message: format!(
+                    "{branch} is at {merged_tip}, not the {expected} that was checked. \
+                     It moved after the check, so nothing was merged and the worktree was kept."
+                ),
+                branch: branch.clone(),
+                expected,
+                actual: merged_tip,
+            });
+        }
+    }
+
+    // The target the merge lands on. An unborn one has no tip to merge onto.
+    let target_ref = format!("refs/heads/{target}");
+    let before_oid = git_text(&repo, &["rev-parse", "--verify", target_ref.as_str()])
+        .map_err(|e| format!("{target} has no commits to merge onto ({e}); nothing was merged."))?
+        .trim()
+        .to_string();
+
+    // The lane is merged into the branch it was cut from. A main checkout
+    // switched to another branch since, or a target rewritten so that the
+    // lane's base is no longer in it, would take the merge somewhere the
+    // lane was never based on.
+    let base_oid = match read_base_record(&worktree)? {
+        None => None,
+        Some((base_branch, base_oid)) => {
+            let mismatch = |message: String| MergeTeardownError::BaseMismatch {
+                message,
+                base_branch: base_branch.clone(),
+                target_branch: target.to_string(),
+                base_oid: base_oid.clone(),
+            };
+            if base_branch != target {
+                return Err(mismatch(format!(
+                    "{branch} was cut from {base_branch}, but the merge target is {target}. Nothing was merged."
+                )));
+            }
+            let ancestor = crate::engine::git_cli::git_captured(
+                &repo,
+                &[
+                    "merge-base",
+                    "--is-ancestor",
+                    base_oid.as_str(),
+                    target_ref.as_str(),
+                ],
+            )?;
+            match ancestor.status_code {
+                0 => {}
+                1 => {
+                    return Err(mismatch(format!(
+                        "{branch} was cut from {base_oid} on {base_branch}, which {target} no longer contains: \
+                         incompatible merge-base. Nothing was merged."
+                    )))
+                }
+                code => {
+                    return Err(format!(
+                        "Could not check whether {target} still contains {base_oid} (git exit {code}): {}. Nothing was merged.",
+                        String::from_utf8_lossy(&ancestor.stderr).trim()
+                    )
+                    .into())
+                }
+            }
+            Some(base_oid)
+        }
+    };
 
     // Count commits being merged
-    let count_stdout = git_text(
+    let commits_merged: usize = git_text(
         &repo,
         &["rev-list", "--count", &format!("{target}..{branch}")],
-    )
-    .unwrap_or_else(|_| "0".into());
-    let commits_merged: usize = count_stdout.trim().parse().unwrap_or(0);
+    )?
+    .trim()
+    .parse()
+    .map_err(|_| format!("git did not report how many commits {branch} adds to {target}"))?;
 
     // 4. Merge in anchor repository
     if squash {
@@ -1940,23 +2216,53 @@ pub fn merge_and_teardown_worktree(
         // discarded, and the next steps removed the worktree and
         // force-deleted the branch whose work was never committed.
         GitWriter::squash_merge_locked(&repo, &branch, gate).map_err(|failure| match failure {
-            SquashFailure::Merge(e) => e,
-            SquashFailure::Commit(e) => {
-                format!("{e} The worktree and the branch {branch} were kept on {target}.")
-            }
+            SquashFailure::Merge(e) => MergeTeardownError::Refused { message: e },
+            SquashFailure::Conflict(e) => failed_merge_error(&repo, &branch, target, e),
+            // Staged, not rolled back: `git reset --merge` is the user's call.
+            SquashFailure::Commit(e) => MergeTeardownError::SquashParked {
+                message: format!("{e} The worktree and the branch {branch} were kept on {target}."),
+            },
         })?;
     } else {
         let fast_forward = merge_teardown_argv(&branch, false);
         let fast_forward: Vec<&str> = fast_forward.iter().map(String::as_str).collect();
         gate(&fast_forward)?;
         if let Err(ff_err) = git_text(&repo, &fast_forward) {
+            // The same two guards the squash runs, before the commit a merge
+            // commit is.
+            GitWriter::require_commit_identity(&repo)?;
             let commit_msg = format!("Merge branch '{branch}' into {target}");
-            let merge = ["merge", branch.as_str(), "-m", commit_msg.as_str()];
+            let merge = [
+                "merge",
+                "--no-edit",
+                branch.as_str(),
+                "-m",
+                commit_msg.as_str(),
+            ];
             gate(&merge)?;
-            git_text(&repo, &merge)
-                .map_err(|e| format!("Merge failed (ff error: {ff_err}): {e}"))?;
+            if let Err(e) = git_text(&repo, &merge) {
+                return Err(failed_merge_error(
+                    &repo,
+                    &branch,
+                    target,
+                    format!("Merge failed (ff error: {ff_err}): {e}"),
+                ));
+            }
         }
     }
+
+    // From here the merge has landed. Nothing below returns `Err`: what it
+    // cannot finish is reported on the result.
+    let (after_oid, after_error) =
+        match git_text(&repo, &["rev-parse", "--verify", target_ref.as_str()]) {
+            Ok(tip) => (Some(tip.trim().to_string()), None),
+            Err(e) => (
+                None,
+                Some(format!(
+                    "the new tip of {target} could not be read ({e}), so the worktree and the branch were kept"
+                )),
+            ),
+        };
 
     // What the destructive steps below may destroy is what was merged.
     let unchanged_since_merge = |repo: &Path, worktree_present: bool| -> Result<(), String> {
@@ -1989,15 +2295,33 @@ pub fn merge_and_teardown_worktree(
     let remove = remove_worktree_argv(&worktree_text, true);
     // That builder spells the program; the gate takes git's arguments.
     let remove: Vec<&str> = remove.iter().skip(1).map(String::as_str).collect();
-    gate(&remove)?;
-    unchanged_since_merge(&repo, true)?;
-    remove_worktree_locked(&repo, &worktree_text, true)?;
+    let removal = match after_error {
+        Some(kept) => Err(kept),
+        None => gate(&remove)
+            .and_then(|()| unchanged_since_merge(&repo, true))
+            .and_then(|()| remove_with_retry(&repo, &worktree_text, gate, sleep)),
+    };
+    let (worktree_removed, removal_error) = match removal {
+        Ok(()) => (true, None),
+        Err(e) => (false, Some(e)),
+    };
 
-    // 6. Delete merged branch
+    // 6. Delete merged branch. A branch checked out in a worktree that is
+    // still there cannot be deleted, and is not wanted deleted.
     let delete = ["branch", if squash { "-D" } else { "-d" }, branch.as_str()];
-    let branch_deleted = gate(&delete).is_ok()
-        && unchanged_since_merge(&repo, false).is_ok()
-        && git_text(&repo, &delete).is_ok();
+    let branch_result = if worktree_removed {
+        gate(&delete)
+            .and_then(|()| unchanged_since_merge(&repo, false))
+            .and_then(|()| git_text(&repo, &delete).map(drop))
+    } else {
+        Err(format!(
+            "{branch} was kept because its worktree is still there"
+        ))
+    };
+    let (branch_deleted, branch_error) = match branch_result {
+        Ok(()) => (true, None),
+        Err(e) => (false, Some(e)),
+    };
     drop(_guard);
 
     // 7. Post-merge hooks
@@ -2016,11 +2340,17 @@ pub fn merge_and_teardown_worktree(
     }
 
     Ok(MergeTeardownResult {
+        merged: true,
         merged_branch: branch,
         target_branch: target.to_string(),
         commits_merged,
-        worktree_removed: true,
+        before_oid,
+        after_oid,
+        base_oid,
+        worktree_removed,
+        removal_error,
         branch_deleted,
+        branch_error,
         hook_error,
         hook_notice: if hook_notices.is_empty() {
             None
@@ -2028,6 +2358,99 @@ pub fn merge_and_teardown_worktree(
             Some(hook_notices.join(" "))
         },
     })
+}
+
+/// What a merge that failed after it started leaves the caller: a conflict,
+/// with the checkout restored, or, when git failed for a reason that changed
+/// nothing, a plain refusal. Runs under the repository lock.
+fn failed_merge_error(
+    repo: &Path,
+    branch: &str,
+    target: &str,
+    cause: String,
+) -> MergeTeardownError {
+    let (paths, total, listing_error) = match crate::engine::repo_op::conflicted_paths(repo) {
+        Ok((paths, total)) => (paths, total, None),
+        Err(e) => (Vec::new(), 0, Some(e)),
+    };
+    // A failure that left no operation and no unmerged entry changed
+    // nothing (a dirty file the merge would overwrite, a refused hook). One
+    // that could not be read is assumed to have.
+    let started = listing_error.is_some()
+        || total > 0
+        || !matches!(crate::engine::repo_op::detect_kind(repo), Ok(None));
+    let rollback = GitWriter::rollback_failed_merge_locked(repo);
+    if !started && rollback.is_ok() {
+        return MergeTeardownError::Refused {
+            message: format!("Merging {branch} into {target} failed; nothing was changed: {cause}"),
+        };
+    }
+    let what = if total > 0 {
+        let shown: Vec<&str> = paths.iter().take(5).map(String::as_str).collect();
+        let more = if total > shown.len() {
+            format!(" and {} more", total - shown.len())
+        } else {
+            String::new()
+        };
+        format!("conflicted in {total} file(s): {}{more}", shown.join(", "))
+    } else {
+        format!("failed part-way: {cause}")
+    };
+    let (rolled_back, rollback_error) = match rollback {
+        Ok(()) => (true, None),
+        Err(e) => (false, Some(e)),
+    };
+    let outcome = match &rollback_error {
+        None => "It was rolled back; nothing was merged and the worktree and the branch were kept."
+            .to_string(),
+        Some(e) => format!(
+            "It could not be rolled back ({e}): the main checkout is left in the middle of it. \
+             Abort the merge there before merging anything else."
+        ),
+    };
+    let listing_note = listing_error
+        .map(|e| format!(" The conflicted files could not be listed: {e}."))
+        .unwrap_or_default();
+    MergeTeardownError::Conflict {
+        message: format!("Merging {branch} into {target} {what}. {outcome}{listing_note}"),
+        paths,
+        total,
+        rolled_back,
+        rollback_error,
+    }
+}
+
+/// Removes the merged worktree, trying up to [`MAX_REMOVE_ATTEMPTS`] times
+/// with [`REMOVE_BACKOFF`] between. When a try fails after taking the
+/// directory away (a partial delete), git still lists the worktree, and
+/// pruning is what finishes the removal. Caller holds the repository lock.
+fn remove_with_retry(
+    repo: &Path,
+    worktree_text: &str,
+    gate: &mut dyn FnMut(&[&str]) -> Result<(), String>,
+    sleep: &mut dyn FnMut(Duration),
+) -> Result<(), String> {
+    let mut last = String::new();
+    for attempt in 0..MAX_REMOVE_ATTEMPTS {
+        if attempt > 0 {
+            sleep(REMOVE_BACKOFF[attempt - 1]);
+        }
+        match remove_worktree_locked(repo, worktree_text, true) {
+            Ok(()) => return Ok(()),
+            Err(e) => last = e,
+        }
+        if !Path::new(worktree_text).exists() {
+            let prune = prune_worktree_argv();
+            let prune: Vec<&str> = prune.iter().skip(1).map(String::as_str).collect();
+            gate(&prune)?;
+            return git_text(repo, &prune)
+                .map(drop)
+                .map_err(|e| format!("{last}; pruning what was left of it failed: {e}"));
+        }
+    }
+    Err(format!(
+        "The worktree could not be removed after {MAX_REMOVE_ATTEMPTS} attempts: {last}"
+    ))
 }
 
 /// Git's arguments for the merge step of [`merge_and_teardown_worktree`].
@@ -3410,12 +3833,14 @@ some-future-field whatever
             wt.path().to_str().unwrap(),
             Some("main"),
             false,
+            None,
             &mut |args: &[&str]| {
                 asked.push(args.join(" "));
                 Ok(())
             },
         )
-        .unwrap_err();
+        .unwrap_err()
+        .to_string();
         assert!(refused.contains("is on elsewhere, not main"), "{refused}");
         assert!(
             asked.is_empty(),
@@ -3445,9 +3870,11 @@ some-future-field whatever
             wt.path().to_str().unwrap(),
             Some("main"),
             true,
+            None,
             &mut allow_all,
         )
-        .unwrap_err();
+        .unwrap_err()
+        .to_string();
         assert!(
             refused.contains("could not be committed") && refused.contains("git reset --merge"),
             "{refused}"
@@ -3487,6 +3914,7 @@ some-future-field whatever
             wt.path().to_str().unwrap(),
             Some("main"),
             true,
+            None,
             &mut |args: &[&str]| {
                 asked.push(args.join(" "));
                 Ok(())
@@ -3505,11 +3933,14 @@ some-future-field whatever
 
         let (dir, wt) = teardown_fixture(None);
         let repo = dir.path();
-        let refused = merge_and_teardown_worktree(
+        // The merge had landed when the removal was refused, so this is a
+        // merge with a cleanup left to do, not a merge that did not happen.
+        let kept = merge_and_teardown_worktree(
             repo.to_str().unwrap(),
             wt.path().to_str().unwrap(),
             Some("main"),
             false,
+            None,
             &mut |args: &[&str]| {
                 if args.first() == Some(&"worktree") {
                     Err("policy: worktree removal denied".into())
@@ -3518,8 +3949,14 @@ some-future-field whatever
                 }
             },
         )
-        .unwrap_err();
-        assert!(refused.contains("worktree removal denied"), "{refused}");
+        .expect("a landed merge is not reported as a failure");
+        assert!(kept.merged && !kept.worktree_removed && !kept.branch_deleted);
+        let reason = kept.removal_error.expect("the refusal is the reason");
+        assert!(reason.contains("worktree removal denied"), "{reason}");
+        assert!(kept
+            .branch_error
+            .expect("a kept branch says why")
+            .contains("still there"));
         assert!(
             repo.join("feature.txt").exists(),
             "the merge before the refusal stands"
@@ -3547,6 +3984,7 @@ some-future-field whatever
             wt.path().to_str().unwrap(),
             Some("main"),
             false,
+            None,
             &mut allow_all,
         )
         .unwrap();
@@ -3618,9 +4056,15 @@ some-future-field whatever
             .output_locked();
 
         // Merge and teardown
-        let res =
-            merge_and_teardown_worktree(repo_path, wt_path, Some("main"), false, &mut allow_all)
-                .expect("merged and torn down");
+        let res = merge_and_teardown_worktree(
+            repo_path,
+            wt_path,
+            Some("main"),
+            false,
+            None,
+            &mut allow_all,
+        )
+        .expect("merged and torn down");
         assert_eq!(res.hook_error, None);
         assert_eq!(res.merged_branch, "feature-x");
         assert_eq!(res.target_branch, "main");
@@ -3643,7 +4087,7 @@ some-future-field whatever
     fn teardown_with_outside_write(
         outside_write: impl Fn(&Path),
     ) -> (
-        Result<MergeTeardownResult, String>,
+        Result<MergeTeardownResult, MergeTeardownError>,
         tempfile::TempDir,
         tempfile::TempDir,
     ) {
@@ -3660,6 +4104,7 @@ some-future-field whatever
             wt.path().to_str().unwrap(),
             Some("main"),
             false,
+            None,
             &mut gate,
         );
         (result, dir, wt)
@@ -3671,8 +4116,15 @@ some-future-field whatever
         let (result, dir, wt) = teardown_with_outside_write(|wt| {
             std::fs::write(wt.join("outside.txt"), "an agent's work\n").unwrap();
         });
-        let error = result.expect_err("the late write must stop the removal");
-        assert!(error.contains("kept"), "{error}");
+        // The merge had landed: the late write keeps the worktree, and says
+        // so on a merged result instead of failing the merge.
+        let result = result.expect("a landed merge is not reported as a failure");
+        assert!(result.merged && !result.worktree_removed);
+        let reason = result
+            .removal_error
+            .expect("the removal says why it stopped");
+        assert!(reason.contains("kept"), "{reason}");
+        assert!(result.branch_error.is_some());
         assert!(
             wt.path().join("outside.txt").exists(),
             "the file was destroyed"
@@ -3689,13 +4141,632 @@ some-future-field whatever
         let (result, dir, wt) = teardown_with_outside_write(|wt| {
             crate::test_support::git_in(wt, &["commit", "-q", "--allow-empty", "-m", "late"]);
         });
-        let error = result.expect_err("the late commit must stop the removal");
-        assert!(error.contains("moved"), "{error}");
+        let result = result.expect("a landed merge is not reported as a failure");
+        assert!(result.merged && !result.worktree_removed);
+        let reason = result
+            .removal_error
+            .expect("the removal says why it stopped");
+        assert!(reason.contains("moved"), "{reason}");
         assert!(wt.path().exists(), "the worktree was removed");
         assert!(
             branch_exists(dir.path(), "feature-x"),
             "the unmerged commit's branch was deleted"
         );
+    }
+
+    /// `teardown_fixture` plus a README edit on both sides, so the merge of
+    /// `feature-x` into `main` conflicts.
+    fn conflicting_fixture() -> (tempfile::TempDir, tempfile::TempDir) {
+        let (dir, wt) = teardown_fixture(None);
+        std::fs::write(wt.path().join("README.md"), "lane edit\n").unwrap();
+        crate::test_support::git_in(wt.path(), &["commit", "-qam", "lane edits README"]);
+        std::fs::write(dir.path().join("README.md"), "main edit\n").unwrap();
+        crate::test_support::git_in(dir.path(), &["commit", "-qam", "main edits README"]);
+        (dir, wt)
+    }
+
+    fn main_checkout_is_idle(repo: &Path) {
+        let porcelain = git_text(repo, &["status", "--porcelain"]).unwrap();
+        assert!(
+            porcelain.trim().is_empty(),
+            "primary checkout dirty: {porcelain}"
+        );
+        let git_dir = crate::engine::git_cli::resolve_git_dir(repo).unwrap();
+        for control in ["MERGE_HEAD", "SQUASH_MSG", "MERGE_MSG"] {
+            assert!(
+                !git_dir.join(control).exists(),
+                "{control} was left in the primary checkout"
+            );
+        }
+    }
+
+    #[test]
+    fn a_conflicting_plain_merge_leaves_the_primary_checkout_as_it_was() {
+        let (dir, wt) = conflicting_fixture();
+        let repo = dir.path();
+        let before = git_text(repo, &["rev-parse", "HEAD"]).unwrap();
+        let refused = merge_and_teardown_worktree(
+            repo.to_str().unwrap(),
+            wt.path().to_str().unwrap(),
+            Some("main"),
+            false,
+            None,
+            &mut allow_all,
+        )
+        .unwrap_err();
+        let MergeTeardownError::Conflict {
+            message,
+            paths,
+            total,
+            rolled_back,
+            rollback_error,
+        } = refused
+        else {
+            panic!("a conflict was reported as {refused:?}");
+        };
+        assert_eq!(paths, ["README.md"], "{message}");
+        assert_eq!((total, rolled_back, rollback_error), (1, true, None));
+        main_checkout_is_idle(repo);
+        assert_eq!(git_text(repo, &["rev-parse", "HEAD"]).unwrap(), before);
+        assert!(wt.path().join("feature.txt").exists() && branch_exists(repo, "feature-x"));
+    }
+
+    #[test]
+    fn a_conflicting_squash_merge_leaves_the_primary_checkout_as_it_was() {
+        let (dir, wt) = conflicting_fixture();
+        let repo = dir.path();
+        let refused = merge_and_teardown_worktree(
+            repo.to_str().unwrap(),
+            wt.path().to_str().unwrap(),
+            Some("main"),
+            true,
+            None,
+            &mut allow_all,
+        )
+        .unwrap_err();
+        let MergeTeardownError::Conflict {
+            paths, rolled_back, ..
+        } = refused
+        else {
+            panic!("a squash conflict was reported as {refused:?}");
+        };
+        assert_eq!(paths, ["README.md"]);
+        assert!(rolled_back);
+        main_checkout_is_idle(repo);
+        assert_eq!(crate::engine::repo_op::detect_kind(repo).unwrap(), None);
+        assert!(wt.path().join("feature.txt").exists() && branch_exists(repo, "feature-x"));
+    }
+
+    /// Runs a teardown into `main` with the gate allowing everything.
+    fn teardown(
+        dir: &tempfile::TempDir,
+        wt: &tempfile::TempDir,
+        squash: bool,
+        expected_tip: Option<&str>,
+    ) -> Result<MergeTeardownResult, MergeTeardownError> {
+        merge_and_teardown_worktree(
+            dir.path().to_str().unwrap(),
+            wt.path().to_str().unwrap(),
+            Some("main"),
+            squash,
+            expected_tip,
+            &mut allow_all,
+        )
+    }
+
+    fn rev(repo: &Path, name: &str) -> String {
+        git_text(repo, &["rev-parse", name])
+            .unwrap()
+            .trim()
+            .to_string()
+    }
+
+    /// `main` gains a file the lane does not have, so `--ff-only` fails and
+    /// the merge needs a merge commit, without conflicting.
+    fn diverge_main(dir: &tempfile::TempDir) {
+        std::fs::write(dir.path().join("main-only.txt"), "main work\n").unwrap();
+        crate::test_support::git_in(dir.path(), &["add", "main-only.txt"]);
+        crate::test_support::git_in(dir.path(), &["commit", "-qm", "main moves on"]);
+    }
+
+    #[test]
+    fn a_rename_only_conflict_is_listed_and_rolled_back() {
+        let (dir, wt) = teardown_fixture(None);
+        let repo = dir.path();
+        crate::test_support::git_in(wt.path(), &["mv", "README.md", "lane-name.md"]);
+        crate::test_support::git_in(wt.path(), &["commit", "-qm", "lane renames README"]);
+        crate::test_support::git_in(repo, &["mv", "README.md", "main-name.md"]);
+        crate::test_support::git_in(repo, &["commit", "-qm", "main renames README"]);
+        for squash in [false, true] {
+            let MergeTeardownError::Conflict {
+                paths, rolled_back, ..
+            } = teardown(&dir, &wt, squash, None).unwrap_err()
+            else {
+                panic!("a rename conflict was not reported as a conflict (squash: {squash})");
+            };
+            assert!(
+                !paths.is_empty(),
+                "no paths for a rename conflict (squash: {squash})"
+            );
+            assert!(rolled_back);
+            main_checkout_is_idle(repo);
+        }
+    }
+
+    #[test]
+    fn a_successful_merge_reports_where_the_target_moved_from_and_to() {
+        let (dir, wt) = teardown_fixture(None);
+        let repo = dir.path();
+        let before = rev(repo, "main");
+        let tip = rev(wt.path(), "HEAD");
+        let result = teardown(&dir, &wt, false, Some(&tip)).unwrap();
+        assert!(result.merged && result.worktree_removed && result.branch_deleted);
+        assert_eq!(result.removal_error, None);
+        assert_eq!(result.branch_error, None);
+        assert_eq!(result.before_oid, before);
+        assert_eq!(
+            result.after_oid.as_deref(),
+            Some(rev(repo, "main").as_str())
+        );
+        assert_eq!(result.after_oid.as_deref(), Some(tip.as_str()));
+    }
+
+    #[test]
+    fn a_branch_that_moved_since_it_was_checked_is_not_merged() {
+        let (dir, wt) = teardown_fixture(None);
+        let repo = dir.path();
+        let before = rev(repo, "main");
+        let checked = rev(wt.path(), "HEAD");
+        crate::test_support::git_in(wt.path(), &["commit", "-q", "--allow-empty", "-m", "late"]);
+        let actual = rev(wt.path(), "HEAD");
+        let MergeTeardownError::Moved {
+            branch,
+            expected,
+            actual: reported,
+            ..
+        } = teardown(&dir, &wt, false, Some(&checked)).unwrap_err()
+        else {
+            panic!("a moved branch was not reported as moved");
+        };
+        assert_eq!(
+            (branch.as_str(), expected, reported),
+            ("feature-x", checked, actual)
+        );
+        assert_eq!(rev(repo, "HEAD"), before, "something was merged");
+        main_checkout_is_idle(repo);
+        assert!(wt.path().join("feature.txt").exists() && branch_exists(repo, "feature-x"));
+    }
+
+    #[test]
+    fn an_expected_tip_that_is_not_a_commit_id_is_refused() {
+        let (dir, wt) = teardown_fixture(None);
+        for bad in ["feature-x", "abc1234", "--upload-pack=x", ""] {
+            let refused = teardown(&dir, &wt, false, Some(bad)).unwrap_err();
+            assert!(
+                matches!(refused, MergeTeardownError::Refused { .. }),
+                "{bad:?} was {refused:?}"
+            );
+        }
+        assert!(!dir.path().join("feature.txt").exists());
+    }
+
+    #[test]
+    fn a_parked_operation_in_the_main_checkout_refuses_the_merge() {
+        let (dir, wt) = conflicting_fixture();
+        let repo = dir.path();
+        // The user's own conflicted merge, parked in the main checkout.
+        crate::test_support::git_in(repo, &["switch", "-qc", "other", "HEAD~1"]);
+        std::fs::write(repo.join("README.md"), "other edit\n").unwrap();
+        crate::test_support::git_in(repo, &["commit", "-qam", "other edits README"]);
+        crate::test_support::git_in(repo, &["switch", "-q", "main"]);
+        let merge = git_captured_status(repo, &["merge", "other"]);
+        assert_ne!(merge, 0, "the fixture merge should conflict");
+        let refused = teardown(&dir, &wt, false, None).unwrap_err();
+        assert!(
+            matches!(&refused, MergeTeardownError::Refused { message } if message.contains("merge")),
+            "{refused:?}"
+        );
+        assert!(
+            repo.join(".git/MERGE_HEAD").exists(),
+            "the user's merge was rolled back"
+        );
+    }
+
+    fn git_captured_status(repo: &Path, args: &[&str]) -> i32 {
+        crate::engine::git_cli::git_captured(repo, args)
+            .unwrap()
+            .status_code
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_parked_squash_refuses_the_next_merge_and_keeps_the_lane() {
+        use std::os::unix::fs::PermissionsExt;
+        let (dir, wt) = teardown_fixture(None);
+        let repo = dir.path();
+        let hook = repo.join(".git/hooks/pre-commit");
+        std::fs::write(&hook, "#!/bin/sh\necho refusing this commit >&2\nexit 1\n").unwrap();
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let parked = teardown(&dir, &wt, true, None).unwrap_err();
+        assert!(
+            matches!(&parked, MergeTeardownError::SquashParked { message } if message.contains("git reset --merge")),
+            "{parked:?}"
+        );
+        assert_eq!(
+            crate::engine::repo_op::detect_kind(repo).unwrap(),
+            Some(crate::engine::repo_op::OperationKind::SquashMerge)
+        );
+        assert!(wt.path().join("feature.txt").exists() && branch_exists(repo, "feature-x"));
+
+        let mut asked = Vec::new();
+        let again = merge_and_teardown_worktree(
+            repo.to_str().unwrap(),
+            wt.path().to_str().unwrap(),
+            Some("main"),
+            true,
+            None,
+            &mut |args: &[&str]| {
+                asked.push(args.join(" "));
+                Ok(())
+            },
+        )
+        .unwrap_err();
+        assert!(
+            matches!(again, MergeTeardownError::SquashParked { .. }),
+            "{again:?}"
+        );
+        assert!(asked.is_empty(), "a refused merge asked the gate {asked:?}");
+    }
+
+    #[test]
+    fn the_target_switched_since_provision_refuses_naming_both_branches() {
+        let (dir, wt) = teardown_fixture(None);
+        let repo = dir.path();
+        let base = rev(repo, "main");
+        write_base_record(wt.path(), "main", &base).unwrap();
+        crate::test_support::git_in(repo, &["switch", "-qc", "elsewhere"]);
+        let refused = merge_and_teardown_worktree(
+            repo.to_str().unwrap(),
+            wt.path().to_str().unwrap(),
+            Some("elsewhere"),
+            false,
+            None,
+            &mut allow_all,
+        )
+        .unwrap_err();
+        let MergeTeardownError::BaseMismatch {
+            message,
+            base_branch,
+            target_branch,
+            ..
+        } = &refused
+        else {
+            panic!("{refused:?}");
+        };
+        assert_eq!(
+            (base_branch.as_str(), target_branch.as_str()),
+            ("main", "elsewhere")
+        );
+        assert!(
+            message.contains("main") && message.contains("elsewhere"),
+            "{message}"
+        );
+        assert!(!repo.join("feature.txt").exists());
+        assert!(wt.path().exists() && branch_exists(repo, "feature-x"));
+    }
+
+    #[test]
+    fn a_target_rewritten_past_the_base_is_an_incompatible_merge_base() {
+        let (dir, wt) = teardown_fixture(None);
+        let repo = dir.path();
+        write_base_record(wt.path(), "main", &rev(repo, "main")).unwrap();
+        crate::test_support::git_in(repo, &["commit", "-q", "--amend", "-m", "rewritten"]);
+        let refused = teardown(&dir, &wt, false, None).unwrap_err();
+        let MergeTeardownError::BaseMismatch { message, .. } = &refused else {
+            panic!("{refused:?}");
+        };
+        assert!(message.contains("incompatible merge-base"), "{message}");
+        assert!(!repo.join("feature.txt").exists());
+        assert!(wt.path().exists() && branch_exists(repo, "feature-x"));
+    }
+
+    #[test]
+    fn the_base_record_is_reported_and_an_unreadable_one_refuses() {
+        let (dir, wt) = teardown_fixture(None);
+        let repo = dir.path();
+        assert_eq!(read_base_record(wt.path()).unwrap(), None);
+        let base = rev(repo, "main");
+        write_base_record(wt.path(), "main", &base).unwrap();
+        assert_eq!(
+            read_base_record(wt.path()).unwrap(),
+            Some(("main".to_string(), base.clone()))
+        );
+        let record = crate::engine::git_cli::resolve_git_dir(wt.path())
+            .unwrap()
+            .join(BASE_RECORD);
+        std::fs::write(&record, "main\r\n").unwrap();
+        let refused = teardown(&dir, &wt, false, None).unwrap_err();
+        assert!(
+            matches!(&refused, MergeTeardownError::Refused { message } if message.contains(BASE_RECORD)),
+            "{refused:?}"
+        );
+        assert!(!repo.join("feature.txt").exists());
+
+        std::fs::write(&record, format!("main\r\n{base}\r\n")).unwrap();
+        let merged = teardown(&dir, &wt, false, None).unwrap();
+        assert_eq!(merged.base_oid, Some(base));
+    }
+
+    #[test]
+    fn a_lane_without_a_base_record_merges_with_no_base_reported() {
+        let (dir, wt) = teardown_fixture(None);
+        let merged = teardown(&dir, &wt, false, None).unwrap();
+        assert_eq!(merged.base_oid, None);
+    }
+
+    /// The test checkout's pre-commit guard, and the identity it refuses.
+    fn guard_fixture_identity(repo: &Path) {
+        std::fs::create_dir_all(repo.join(".githooks")).unwrap();
+        std::fs::write(repo.join(".githooks/pre-commit"), "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::write(repo.join(".git/info/exclude"), ".githooks/\n").unwrap();
+        // Not `test_support::git_in`, which refuses to persist this identity.
+        git_text(repo, &["config", "user.name", "GitPulse Contract"]).unwrap();
+        git_text(repo, &["config", "user.email", "contract@gitpulse.test"]).unwrap();
+    }
+
+    #[test]
+    fn a_fixture_identity_is_refused_on_the_merge_commit_and_the_squash() {
+        for squash in [false, true] {
+            let (dir, wt) = teardown_fixture(None);
+            let repo = dir.path();
+            diverge_main(&dir);
+            guard_fixture_identity(repo);
+            let before = rev(repo, "main");
+            let refused = teardown(&dir, &wt, squash, None).unwrap_err();
+            assert!(
+                matches!(&refused, MergeTeardownError::Refused { message } if message.contains("contract@gitpulse.test")),
+                "squash {squash}: {refused:?}"
+            );
+            assert_eq!(
+                rev(repo, "main"),
+                before,
+                "squash {squash}: a commit was made"
+            );
+            main_checkout_is_idle(repo);
+            assert!(
+                !repo.join("feature.txt").exists(),
+                "squash {squash}: merged"
+            );
+            assert!(wt.path().exists() && branch_exists(repo, "feature-x"));
+        }
+    }
+
+    #[test]
+    fn a_diverged_plain_merge_makes_a_merge_commit_and_asks_the_gate_for_each_step() {
+        let (dir, wt) = teardown_fixture(None);
+        let repo = dir.path();
+        diverge_main(&dir);
+        let wt_path = wt
+            .path()
+            .canonicalize()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        let mut asked = Vec::new();
+        let result = merge_and_teardown_worktree(
+            repo.to_str().unwrap(),
+            wt.path().to_str().unwrap(),
+            Some("main"),
+            false,
+            None,
+            &mut |args: &[&str]| {
+                asked.push(args.join(" "));
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            asked,
+            [
+                "merge --ff-only feature-x".to_string(),
+                "merge --no-edit feature-x -m Merge branch 'feature-x' into main".to_string(),
+                format!("worktree remove --force {wt_path}"),
+                "branch -d feature-x".to_string(),
+            ]
+        );
+        assert!(result.worktree_removed && result.branch_deleted);
+        assert_ne!(
+            result.after_oid.as_deref(),
+            Some(result.before_oid.as_str())
+        );
+        assert!(repo.join("feature.txt").exists() && repo.join("main-only.txt").exists());
+    }
+
+    /// Removal that git refuses (a locked worktree) after a merge that landed:
+    /// the merge is reported, the worktree and branch are kept with reasons,
+    /// and the removal was tried [`MAX_REMOVE_ATTEMPTS`] times, waiting
+    /// [`REMOVE_BACKOFF`] between — on a clock the test supplies.
+    #[test]
+    fn a_removal_that_keeps_failing_is_retried_a_bounded_number_of_times() {
+        let (dir, wt) = teardown_fixture(None);
+        let repo = dir.path();
+        crate::test_support::git_in(repo, &["worktree", "lock", wt.path().to_str().unwrap()]);
+        let mut waits = Vec::new();
+        let result = merge_and_teardown_with(
+            repo.to_str().unwrap(),
+            wt.path().to_str().unwrap(),
+            Some("main"),
+            false,
+            None,
+            &mut allow_all,
+            &mut |wait| waits.push(wait),
+        )
+        .expect("a landed merge is not reported as a failure");
+        assert!(result.merged && !result.worktree_removed && !result.branch_deleted);
+        let reason = result
+            .removal_error
+            .expect("the removal says why it failed");
+        assert!(
+            reason.contains(&format!("after {MAX_REMOVE_ATTEMPTS} attempts")),
+            "{reason}"
+        );
+        assert!(result.branch_error.is_some(), "a kept branch must say why");
+        assert_eq!(
+            waits, REMOVE_BACKOFF,
+            "the retries did not back off as specified"
+        );
+        assert!(repo.join("feature.txt").exists(), "the merge was undone");
+        assert!(wt.path().exists() && branch_exists(repo, "feature-x"));
+    }
+
+    /// A removal that fails once and then works leaves nothing behind, and a
+    /// directory already gone is pruned rather than failed.
+    #[test]
+    fn a_worktree_directory_that_is_already_gone_is_pruned() {
+        let (dir, wt) = teardown_fixture(None);
+        let repo = dir.path();
+        std::fs::remove_dir_all(wt.path()).unwrap();
+        let mut waits = Vec::new();
+        remove_with_retry(
+            repo,
+            wt.path().to_str().unwrap(),
+            &mut allow_all,
+            &mut |wait| waits.push(wait),
+        )
+        .unwrap();
+        assert!(waits.is_empty(), "a vanished directory was waited for");
+        assert_eq!(list_worktrees(repo.to_str().unwrap()).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_refused_prune_is_reported_not_swallowed() {
+        let (dir, wt) = teardown_fixture(None);
+        std::fs::remove_dir_all(wt.path()).unwrap();
+        let refused = remove_with_retry(
+            dir.path(),
+            wt.path().to_str().unwrap(),
+            &mut |_| Err("policy: prune denied".into()),
+            &mut |_| {},
+        )
+        .unwrap_err();
+        assert!(refused.contains("prune denied"), "{refused}");
+    }
+
+    #[test]
+    fn the_result_and_every_error_serialize_to_the_contract_shape() {
+        let keys = |value: &serde_json::Value| -> Vec<String> {
+            let mut keys: Vec<String> = value.as_object().unwrap().keys().cloned().collect();
+            keys.sort();
+            keys
+        };
+        let result = MergeTeardownResult {
+            merged: true,
+            merged_branch: "feature-x".into(),
+            target_branch: "main".into(),
+            commits_merged: 1,
+            before_oid: "a".repeat(40),
+            after_oid: Some("b".repeat(40)),
+            base_oid: None,
+            worktree_removed: false,
+            removal_error: Some("locked".into()),
+            branch_deleted: false,
+            branch_error: Some("kept".into()),
+            hook_error: None,
+            hook_notice: None,
+        };
+        let value = serde_json::to_value(&result).unwrap();
+        assert_eq!(
+            keys(&value),
+            [
+                "after_oid",
+                "base_oid",
+                "before_oid",
+                "branch_deleted",
+                "branch_error",
+                "commits_merged",
+                "hook_error",
+                "hook_notice",
+                "merged",
+                "merged_branch",
+                "removal_error",
+                "target_branch",
+                "worktree_removed",
+            ]
+        );
+        assert_eq!(value["base_oid"], serde_json::Value::Null);
+        assert_eq!(
+            serde_json::from_value::<MergeTeardownResult>(value).unwrap(),
+            result
+        );
+
+        let cases: Vec<(MergeTeardownError, &str, Vec<&str>)> = vec![
+            (
+                MergeTeardownError::Conflict {
+                    message: "m".into(),
+                    paths: vec!["a".into()],
+                    total: 1,
+                    rolled_back: true,
+                    rollback_error: None,
+                },
+                "conflict",
+                vec![
+                    "code",
+                    "message",
+                    "paths",
+                    "rollback_error",
+                    "rolled_back",
+                    "total",
+                ],
+            ),
+            (
+                MergeTeardownError::Moved {
+                    message: "m".into(),
+                    branch: "b".into(),
+                    expected: "e".into(),
+                    actual: "a".into(),
+                },
+                "moved",
+                vec!["actual", "branch", "code", "expected", "message"],
+            ),
+            (
+                MergeTeardownError::BaseMismatch {
+                    message: "m".into(),
+                    base_branch: "x".into(),
+                    target_branch: "y".into(),
+                    base_oid: "o".into(),
+                },
+                "base_mismatch",
+                vec![
+                    "base_branch",
+                    "base_oid",
+                    "code",
+                    "message",
+                    "target_branch",
+                ],
+            ),
+            (
+                MergeTeardownError::SquashParked {
+                    message: "m".into(),
+                },
+                "squash_parked",
+                vec!["code", "message"],
+            ),
+            (
+                MergeTeardownError::from("m".to_string()),
+                "refused",
+                vec!["code", "message"],
+            ),
+        ];
+        for (error, code, expected_keys) in cases {
+            let value = serde_json::to_value(&error).unwrap();
+            assert_eq!(value["code"], code);
+            assert_eq!(keys(&value), expected_keys, "{code}");
+            assert_eq!(error.to_string(), "m");
+            assert_eq!(
+                serde_json::from_value::<MergeTeardownError>(value).unwrap(),
+                error
+            );
+        }
     }
 
     fn spawned_with(cwds: &[PathBuf], needle: &str) -> usize {
