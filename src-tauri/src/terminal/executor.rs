@@ -207,7 +207,6 @@ impl Executor {
     }
 
     /// Worker threads alive, for tests and diagnostics.
-    #[cfg(test)]
     pub(crate) fn workers(&self) -> usize {
         self.handle.shared.lock().threads
     }

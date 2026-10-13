@@ -327,6 +327,18 @@ impl TerminalSessions {
             .ok_or_else(|| format!("Terminal session '{session_id}' not found"))
     }
 
+    /// Threads alive on the open sessions' input and geometry lanes. A
+    /// process-wide thread count cannot tell these apart from tokio's pool,
+    /// which grows and shrinks on its own; tests that need to see lanes
+    /// retire ask this.
+    #[doc(hidden)]
+    pub fn lane_threads(&self) -> usize {
+        self.lock_sessions()
+            .values()
+            .map(|session| session.input.workers() + session.geometry.workers())
+            .sum()
+    }
+
     /// The lane that applies `session_id`'s resizes.
     fn geometry_lane(&self, session_id: &str) -> Result<Executor, String> {
         self.lock_sessions()
@@ -2235,6 +2247,21 @@ impl Drop for MasterHold {
     fn drop(&mut self) {
         self.finish();
     }
+}
+
+/// The size the kernel holds for `session_id`'s PTY, as `(rows, cols)`. For
+/// tests that need to know which of many resizes was applied last.
+#[doc(hidden)]
+pub fn pty_size(state: &TerminalSessions, session_id: &str) -> Result<(u16, u16), String> {
+    let master = state
+        .lock_sessions()
+        .get(session_id)
+        .map(|session| session.master.clone())
+        .ok_or_else(|| format!("Terminal session '{session_id}' not found"))?;
+    let size = lock_within(&master, MASTER_LOCK_BUDGET)?
+        .get_size()
+        .map_err(|e| format!("Failed to read the terminal size: {e}"))?;
+    Ok((size.rows, size.cols))
 }
 
 /// Takes `session_id`'s master lock on a thread of its own and returns once it

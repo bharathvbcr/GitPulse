@@ -19,7 +19,7 @@ use gitpulse_lib::commands::{cmd_terminal_resize, cmd_terminal_write};
 use gitpulse_lib::procguard::LockedSpawn;
 use gitpulse_lib::terminal::{
     acknowledge_output, hold_master, kill_session, list_sessions, spawn_session, TerminalSessions,
-    GEOMETRY_QUEUE_CAPACITY,
+    GEOMETRY_QUEUE_CAPACITY, INPUT_QUEUE_CAPACITY,
 };
 use std::collections::HashMap;
 use std::future::Future;
@@ -810,6 +810,628 @@ fn thirty_two_sessions_keep_every_byte_in_order_with_the_blocking_pool_full() {
         threads()
     );
     drop(pool);
+}
+
+/// A child that reads nothing for `pause` seconds and then copies its input to
+/// `file`: writes made before then fill the tty and wait on the lane.
+fn start_late_cat_to_file(
+    app: &tauri::App<tauri::test::MockRuntime>,
+    state: &TerminalSessions,
+    output: &Mutex<HashMap<String, Vec<u8>>>,
+    dir: &std::path::Path,
+    file: &std::path::Path,
+    pause: &str,
+) -> String {
+    start(
+        app,
+        state,
+        output,
+        dir,
+        Some(vec![
+            "-c".into(),
+            format!("stty raw -echo; echo READY; sleep {pause}; exec cat > \"$0\""),
+            file.to_str().unwrap().into(),
+        ]),
+    )
+}
+
+/// `[writer:n]` tokens in `bytes`, in the order they appear. Panics on bytes
+/// that are not a whole number of tokens: a torn or interleaved write.
+fn tokens_in(bytes: &[u8]) -> Vec<(usize, usize)> {
+    let text = String::from_utf8(bytes.to_vec()).expect("tokens are ASCII");
+    let text = text.trim_end_matches('.');
+    text.split_terminator(']')
+        .map(|piece| {
+            let piece = piece.trim_start_matches('.');
+            let (writer, n) = piece
+                .strip_prefix('[')
+                .and_then(|rest| rest.split_once(':'))
+                .unwrap_or_else(|| panic!("a torn token: {piece:?}"));
+            (writer.parse().unwrap(), n.parse().unwrap())
+        })
+        .collect()
+}
+
+fn write_now(
+    handle: &tauri::AppHandle<tauri::test::MockRuntime>,
+    id: &str,
+    data: String,
+) -> Result<(), String> {
+    tauri::async_runtime::block_on(cmd_terminal_write(
+        handle.state::<TerminalSessions>(),
+        id.to_owned(),
+        data,
+        None,
+    ))
+}
+
+/// Several callers write to one session at once: the lane serves them one at
+/// a time in the order they were queued, so each caller's own writes arrive in
+/// its order, every byte arrives once, and no write is torn by another.
+#[test]
+fn concurrent_writers_to_one_session_keep_each_callers_order_and_every_byte() {
+    const WRITERS: usize = 4;
+    const ROUNDS: usize = 150;
+    let _serial = serial();
+    let state = TerminalSessions::default();
+    let app = mock_app(&state);
+    let _cleanup = TerminalCleanup(state.clone());
+    let output = collecting(&app, &state);
+    let dir = repo();
+    let file = dir.path().join("concurrent.out");
+    let id = start_cat_to_file(&app, &state, &output, dir.path(), &file);
+    let handle = app.handle().clone();
+    std::thread::scope(|scope| {
+        for writer in 0..WRITERS {
+            let (handle, id) = (&handle, &id);
+            scope.spawn(move || {
+                for n in 0..ROUNDS {
+                    write_now(handle, id, token(writer, n)).unwrap();
+                }
+            });
+        }
+    });
+    let expected_len: usize = (0..WRITERS)
+        .flat_map(|w| (0..ROUNDS).map(move |n| token(w, n).len()))
+        .sum();
+    let read = || std::fs::read(&file).unwrap_or_default();
+    assert!(
+        wait_until(Duration::from_secs(30), || read().len() >= expected_len),
+        "only {} of {expected_len} bytes reached cat",
+        read().len()
+    );
+    std::thread::sleep(Duration::from_millis(50));
+    let seen = tokens_in(&read());
+    assert_eq!(seen.len(), WRITERS * ROUNDS, "a write was lost or doubled");
+    for writer in 0..WRITERS {
+        let own: Vec<usize> = seen
+            .iter()
+            .filter(|(w, _)| *w == writer)
+            .map(|(_, n)| *n)
+            .collect();
+        assert_eq!(
+            own,
+            (0..ROUNDS).collect::<Vec<_>>(),
+            "writer {writer}'s writes arrived out of order"
+        );
+    }
+    kill_session(&state, &id).unwrap();
+}
+
+/// Webview reloads drop command futures mid-flight, often. A write whose
+/// future was dropped before its job started is skipped (its bytes never
+/// reach the PTY), one that had started finishes once, the queue slots the
+/// dropped ones held come back, and the lane keeps serving.
+#[test]
+fn dropped_write_futures_are_skipped_or_run_once_and_give_their_slots_back() {
+    let _serial = serial();
+    let state = TerminalSessions::default();
+    let app = mock_app(&state);
+    let _cleanup = TerminalCleanup(state.clone());
+    let output = collecting(&app, &state);
+    let dir = repo();
+    let file = dir.path().join("dropped.out");
+    let id = start_late_cat_to_file(&app, &state, &output, dir.path(), &file, "1");
+    let handle = app.handle().clone();
+
+    // More than the tty holds, so this write is still spinning on the lane
+    // when everything below is queued and dropped behind it.
+    let first = format!("[0:0]{}", ".".repeat(1500));
+    let stuck = {
+        let (handle, id, first) = (handle.clone(), id.clone(), first.clone());
+        std::thread::spawn(move || write_now(&handle, &id, first))
+    };
+    std::thread::sleep(Duration::from_millis(300));
+
+    // Queue a full lane's worth and drop every future before its job starts.
+    let mut refused = 0;
+    let queuing = Instant::now();
+    for n in 1..=INPUT_QUEUE_CAPACITY + 8 {
+        let mut call = Box::pin(cmd_terminal_write(
+            handle.state::<TerminalSessions>(),
+            id.clone(),
+            token(1, n),
+            None,
+        ));
+        if let Poll::Ready(result) = poll_once(&mut call) {
+            let message = result.unwrap_err();
+            assert!(message.contains("queue is full"), "{message}");
+            refused += 1;
+        }
+        drop(call);
+    }
+    let queued_in = queuing.elapsed();
+    println!("{refused} refused while {INPUT_QUEUE_CAPACITY} dropped futures held the queue, in {queued_in:?}");
+    assert!(
+        refused >= 8,
+        "dropped futures that were still queued must hold their slots until skipped"
+    );
+    assert!(
+        queued_in < prompt(),
+        "a full lane refused slowly: {queued_in:?}"
+    );
+
+    // The stuck write finishes when cat starts reading; then the skipped jobs
+    // are passed over and the next write goes straight through.
+    stuck.join().unwrap().unwrap();
+    let after = Instant::now();
+    write_now(&handle, &id, token(2, 0)).unwrap();
+    println!(
+        "write after {INPUT_QUEUE_CAPACITY} skipped jobs took {:?}",
+        after.elapsed()
+    );
+
+    // Every slot is back: a whole queue's worth is accepted at once.
+    let mut burst = Vec::new();
+    for n in 1..=INPUT_QUEUE_CAPACITY {
+        let mut call = Box::pin(cmd_terminal_write(
+            handle.state::<TerminalSessions>(),
+            id.clone(),
+            token(3, n),
+            None,
+        ));
+        match poll_once(&mut call) {
+            Poll::Ready(result) => result.unwrap(),
+            Poll::Pending => burst.push(call),
+        }
+    }
+    for call in burst {
+        tauri::async_runtime::block_on(call).unwrap();
+    }
+
+    // Many more, dropped at random points on a lane that is draining: each
+    // either never ran or ran once, in order.
+    let mut kept = Vec::new();
+    for n in 0..1000usize {
+        let mut call = Box::pin(cmd_terminal_write(
+            handle.state::<TerminalSessions>(),
+            id.clone(),
+            token(4, n),
+            None,
+        ));
+        let polled = poll_once(&mut call);
+        if n % 7 == 0 {
+            match polled {
+                Poll::Ready(result) => result.unwrap(),
+                Poll::Pending => kept.push((n, call)),
+            }
+        } else if n % 5 == 0 {
+            std::thread::sleep(Duration::from_micros(200));
+        }
+    }
+    let kept_ids: Vec<usize> = kept.iter().map(|(n, _)| *n).collect();
+    for (_, call) in kept {
+        tauri::async_runtime::block_on(call).unwrap();
+    }
+    write_now(&handle, &id, token(5, 0)).unwrap();
+    let read = || std::fs::read(&file).unwrap_or_default();
+    assert!(
+        wait_until(Duration::from_secs(20), || read()
+            .ends_with(token(5, 0).as_bytes())),
+        "the last write never arrived"
+    );
+    let seen = tokens_in(&read());
+    assert_eq!(seen[0], (0, 0), "the stuck write is first");
+    assert!(
+        !seen.iter().any(|(w, _)| *w == 1),
+        "a write whose future was dropped before it started reached the PTY: {:?}",
+        seen.iter().filter(|(w, _)| *w == 1).collect::<Vec<_>>()
+    );
+    let fours: Vec<usize> = seen
+        .iter()
+        .filter(|(w, _)| *w == 4)
+        .map(|(_, n)| *n)
+        .collect();
+    assert!(
+        fours.windows(2).all(|pair| pair[0] < pair[1]),
+        "dropped writes ran twice or out of order"
+    );
+    for n in &kept_ids {
+        assert!(
+            fours.contains(n),
+            "kept write {n} was answered but never arrived"
+        );
+    }
+    let threes = seen.iter().filter(|(w, _)| *w == 3).count();
+    assert_eq!(threes, INPUT_QUEUE_CAPACITY);
+    println!(
+        "{} of 1000 randomly dropped writes ran; {} were kept",
+        fours.len(),
+        kept_ids.len()
+    );
+    kill_session(&state, &id).unwrap();
+}
+
+/// Views attach and detach (a reload, a tab moved to another window) while
+/// keystrokes are queued behind a write the child has not read yet. Neither
+/// touches the input lane: every queued write is delivered once, in order.
+#[test]
+fn attach_and_detach_while_writes_are_queued_keep_every_byte_in_order() {
+    const WRITERS: usize = 3;
+    const ROUNDS: usize = 120;
+    let _serial = serial();
+    let state = TerminalSessions::default();
+    let app = mock_app(&state);
+    let _cleanup = TerminalCleanup(state.clone());
+    let output = collecting(&app, &state);
+    let dir = repo();
+    let file = dir.path().join("reattach.out");
+    let id = start_late_cat_to_file(&app, &state, &output, dir.path(), &file, "1");
+    let handle = app.handle().clone();
+    let failures: Mutex<Vec<String>> = Mutex::default();
+    std::thread::scope(|scope| {
+        for writer in 0..WRITERS {
+            let (handle, id, failures) = (&handle, &id, &failures);
+            scope.spawn(move || {
+                for n in 0..ROUNDS {
+                    // Padded so the first few fill the tty before cat reads.
+                    let data = format!("[{writer}:{n}]{}", ".".repeat(40));
+                    if let Err(error) = write_now(handle, id, data) {
+                        failures
+                            .lock()
+                            .unwrap()
+                            .push(format!("{writer}:{n}: {error}"));
+                    }
+                }
+            });
+        }
+        let (state, id) = (&state, &id);
+        scope.spawn(move || {
+            for round in 0..30u16 {
+                let _ = gitpulse_lib::terminal::detach_session(state, id).unwrap();
+                gitpulse_lib::terminal::attach_session(state, id, 20 + round, 80).unwrap();
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        });
+    });
+    let failures = failures.into_inner().unwrap();
+    assert!(failures.is_empty(), "{failures:?}");
+    let expected = WRITERS * ROUNDS;
+    let read = || std::fs::read(&file).unwrap_or_default();
+    assert!(
+        wait_until(Duration::from_secs(30), || tokens_in(&read()).len()
+            >= expected),
+        "only {} of {expected} writes reached cat",
+        tokens_in(&read()).len()
+    );
+    std::thread::sleep(Duration::from_millis(50));
+    let seen = tokens_in(&read());
+    assert_eq!(seen.len(), expected, "a write was lost or doubled");
+    for writer in 0..WRITERS {
+        let own: Vec<usize> = seen
+            .iter()
+            .filter(|(w, _)| *w == writer)
+            .map(|(_, n)| *n)
+            .collect();
+        assert_eq!(
+            own,
+            (0..ROUNDS).collect::<Vec<_>>(),
+            "writer {writer} reordered"
+        );
+    }
+    kill_session(&state, &id).unwrap();
+}
+
+/// A storm of resizes from many callers, then a run of resizes queued in order
+/// behind a busy master: the PTY ends at the size requested last, never at a
+/// stale one that was applied after it.
+#[test]
+fn a_resize_storm_leaves_the_pty_at_the_last_size_requested() {
+    let _serial = serial();
+    let state = TerminalSessions::default();
+    let app = mock_app(&state);
+    let _cleanup = TerminalCleanup(state.clone());
+    let output = collecting(&app, &state);
+    let dir = repo();
+    let id = start_cat(&app, &state, &output, dir.path());
+    let handle = app.handle().clone();
+    std::thread::scope(|scope| {
+        for caller in 0..8u16 {
+            let (handle, id) = (&handle, &id);
+            scope.spawn(move || {
+                for n in 0..100u16 {
+                    let result = tauri::async_runtime::block_on(cmd_terminal_resize(
+                        handle.state::<TerminalSessions>(),
+                        id.clone(),
+                        10 + (caller * 7 + n) % 90,
+                        20 + (caller * 13 + n) % 200,
+                    ));
+                    if let Err(error) = result {
+                        assert!(error.contains("queue is full"), "{error}");
+                    }
+                }
+            });
+        }
+    });
+    // In submission order on one thread, all queued behind a held master.
+    let hold = hold_master(&state, &id).unwrap();
+    let sizes: Vec<(u16, u16)> = (0..GEOMETRY_QUEUE_CAPACITY as u16)
+        .map(|n| (30 + n, 100 + 3 * n))
+        .collect();
+    let mut queued = Vec::new();
+    for &(rows, cols) in &sizes {
+        let mut call = Box::pin(cmd_terminal_resize(
+            handle.state::<TerminalSessions>(),
+            id.clone(),
+            rows,
+            cols,
+        ));
+        assert!(poll_once(&mut call).is_pending(), "the master is held");
+        queued.push(call);
+    }
+    hold.release();
+    for call in queued {
+        // The first may give up on the held lock; the rest must apply.
+        let _ = tauri::async_runtime::block_on(call);
+    }
+    assert_eq!(
+        gitpulse_lib::terminal::pty_size(&state, &id).unwrap(),
+        *sizes.last().unwrap(),
+        "the PTY was left at a size other than the last one asked for"
+    );
+    kill_session(&state, &id).unwrap();
+}
+
+/// The control pool (context, close, attach) can be full — every thread busy
+/// and its queue at capacity — without a keystroke or a resize waiting on it,
+/// and what is refused is refused at once.
+#[test]
+fn a_full_control_pool_does_not_hold_up_writes_or_resizes_and_refuses_at_once() {
+    use gitpulse_lib::commands::{cmd_terminal_context, cmd_terminal_kill};
+    let _serial = serial();
+    let state = TerminalSessions::default();
+    let app = mock_app(&state);
+    let _cleanup = TerminalCleanup(state.clone());
+    let output = collecting(&app, &state);
+    let dir = repo();
+    let id = start_cat(&app, &state, &output, dir.path());
+    let handle = app.handle().clone();
+
+    // 128 threads each running a job that waits on `gate`, then 256 queued
+    // behind them: the pool's whole capacity. The queued ones go in only once
+    // every thread holds its job, so none of them is taken and the pool's
+    // state cannot change until the gate opens.
+    let gate = Arc::new((Mutex::new(false), Condvar::new()));
+    let running = Arc::new(AtomicUsize::new(0));
+    let hold = || {
+        let (gate, running) = (gate.clone(), running.clone());
+        Box::pin(gitpulse_lib::terminal::control_async(
+            &state,
+            "test_hold",
+            move |_| {
+                running.fetch_add(1, Ordering::SeqCst);
+                let (open, changed) = &*gate;
+                let mut open = open.lock().unwrap();
+                while !*open {
+                    open = changed.wait(open).unwrap();
+                }
+                Ok(())
+            },
+        ))
+    };
+    let threads_wide = gitpulse_lib::terminal::MAX_PTY_SESSIONS;
+    let mut held = Vec::new();
+    for _ in 0..threads_wide {
+        let mut call = hold();
+        assert!(
+            poll_once(&mut call).is_pending(),
+            "the pool refused below its capacity"
+        );
+        held.push(call);
+    }
+    assert!(
+        wait_until(Duration::from_secs(60), || running.load(Ordering::SeqCst)
+            == threads_wide),
+        "only {} of {threads_wide} control threads started",
+        running.load(Ordering::SeqCst)
+    );
+    for _ in 0..256 {
+        let mut call = hold();
+        assert!(
+            poll_once(&mut call).is_pending(),
+            "the pool refused below its capacity"
+        );
+        held.push(call);
+    }
+    // Positive control: the pool really is full.
+    let mut extra = hold();
+    assert!(
+        matches!(poll_once(&mut extra), Poll::Ready(Err(ref m)) if m.contains("queue is full")),
+        "the control pool accepted more than its capacity"
+    );
+    // 300 closes and context reads arrive at once: each is refused, promptly.
+    let refusing = Instant::now();
+    let refusals: Vec<String> = std::thread::scope(|scope| {
+        let calls: Vec<_> = (0..300)
+            .map(|n| {
+                let (handle, id) = (&handle, &id);
+                scope.spawn(move || {
+                    let state = handle.state::<TerminalSessions>();
+                    if n % 2 == 0 {
+                        tauri::async_runtime::block_on(cmd_terminal_context(state, id.clone()))
+                            .map(|_| ())
+                    } else {
+                        tauri::async_runtime::block_on(cmd_terminal_kill(state, id.clone()))
+                    }
+                })
+            })
+            .collect();
+        calls
+            .into_iter()
+            .map(|call| call.join().unwrap().unwrap_err())
+            .collect()
+    });
+    let refused_in = refusing.elapsed();
+    println!("300 control calls refused in {refused_in:?} with the pool full");
+    assert!(
+        refused_in < prompt(),
+        "refusing 300 calls took {refused_in:?}"
+    );
+    for message in &refusals {
+        assert!(message.contains("queue is full"), "{message}");
+        assert!(
+            !gitpulse_lib::terminal::reads_as_session_gone(message),
+            "{message}"
+        );
+    }
+    // The session was never closed: its lanes are untouched by the full pool.
+    let (written, took) = timed_write(&handle, &id, "typed-with-control-full;", prompt())
+        .expect("a write waited on the control pool");
+    written.unwrap();
+    let resizing = Instant::now();
+    tauri::async_runtime::block_on(cmd_terminal_resize(
+        handle.state::<TerminalSessions>(),
+        id.clone(),
+        33,
+        99,
+    ))
+    .unwrap();
+    println!(
+        "write {took:?}, resize {:?} with the control pool full",
+        resizing.elapsed()
+    );
+    assert!(resizing.elapsed() < prompt());
+    assert!(
+        wait_until(Duration::from_secs(10), || after_ready(&output, &id)
+            .is_some_and(|b| b == b"typed-with-control-full;")),
+        "the keystrokes did not come back through cat"
+    );
+    {
+        let (open, changed) = &*gate;
+        *open.lock().unwrap() = true;
+        changed.notify_all();
+    }
+    for call in held {
+        tauri::async_runtime::block_on(call).unwrap();
+    }
+    // Drained: the pool takes work again.
+    tauri::async_runtime::block_on(cmd_terminal_context(
+        handle.state::<TerminalSessions>(),
+        id.clone(),
+    ))
+    .unwrap();
+    kill_session(&state, &id).unwrap();
+}
+
+/// The session cap's worth of sessions, each with both lanes started: the lane
+/// threads end after their idle time while the sessions stay open, and closing
+/// them all (application exit) is bounded and gives back every thread and
+/// descriptor.
+#[test]
+fn the_session_caps_worth_of_lanes_retire_when_idle_and_all_end_at_shutdown() {
+    let sessions = gitpulse_lib::terminal::MAX_PTY_SESSIONS;
+    let _serial = serial();
+    let state = TerminalSessions::default();
+    let app = mock_app(&state);
+    let _cleanup = TerminalCleanup(state.clone());
+    state.set_session_limit(sessions);
+    let output = collecting(&app, &state);
+    let dir = repo();
+    let handle = app.handle().clone();
+
+    let warm = start_cat(&app, &state, &output, dir.path());
+    write_now(&handle, &warm, "warm".into()).unwrap();
+    kill_session(&state, &warm).unwrap();
+    assert!(wait_until(Duration::from_secs(10), || list_sessions(
+        &state
+    )
+    .is_empty()));
+    std::thread::sleep(Duration::from_millis(500));
+    // Descriptors are this test's alone. Threads are not: an earlier test's
+    // full blocking pool shrinks on tokio's own clock, so the process count
+    // is compared only after that has run out (below), and the lanes are
+    // counted by `lane_threads`, which sees nothing else.
+    let fds_before = open_descriptors();
+
+    let ids: Vec<String> = (0..sessions)
+        .map(|_| start_cat(&app, &state, &output, dir.path()))
+        .collect();
+    let started_lanes = Instant::now();
+    for id in &ids {
+        write_now(&handle, id, "x".into()).unwrap();
+        tauri::async_runtime::block_on(cmd_terminal_resize(
+            handle.state::<TerminalSessions>(),
+            id.clone(),
+            25,
+            81,
+        ))
+        .unwrap();
+    }
+    let lanes = state.lane_threads();
+    println!("{lanes} lane threads with {sessions} sessions open and both lanes used");
+    assert_eq!(lanes, 2 * sessions, "one thread per lane, never two");
+    // The lanes' idle time is 30 s; the sessions stay open meanwhile.
+    let retired = wait_until(Duration::from_secs(60), || state.lane_threads() == 0);
+    println!(
+        "lanes retired {:?} after their last job; {} lane threads left",
+        started_lanes.elapsed(),
+        state.lane_threads()
+    );
+    assert!(
+        retired,
+        "lane threads did not retire while their sessions stayed open"
+    );
+    assert!(
+        started_lanes.elapsed() >= Duration::from_secs(25),
+        "lanes retired before their idle time: the count is not measuring them"
+    );
+    assert_eq!(
+        list_sessions(&state).len(),
+        sessions,
+        "the sessions stayed open"
+    );
+    // Every pool thread from before this test has had its keep-alive by now.
+    let threads_idle = threads();
+    // Typing again starts a lane again.
+    write_now(&handle, &ids[0], "y".into()).unwrap();
+    assert_eq!(state.lane_threads(), 1);
+
+    let closing = Instant::now();
+    gitpulse_lib::terminal::shutdown_sessions(&state).unwrap();
+    let closed_in = closing.elapsed();
+    println!("shutdown of {sessions} sessions took {closed_in:?}");
+    assert!(
+        closed_in < common::env::coverage_relaxed(Duration::from_secs(20)),
+        "shutdown of {sessions} sessions took {closed_in:?}"
+    );
+    // Each session's reader ends, and the one lane started since; nothing that
+    // closing started is left behind.
+    let slack = 8;
+    assert!(
+        wait_until(Duration::from_secs(20), || {
+            open_descriptors() <= fds_before + slack && threads() + sessions <= threads_idle + slack
+        }),
+        "descriptors {fds_before} -> {}, threads {threads_idle} with {sessions} idle \
+         sessions -> {} after shutdown",
+        open_descriptors(),
+        threads()
+    );
+    println!(
+        "threads {threads_idle} with {sessions} idle sessions -> {} after shutdown; \
+         descriptors {fds_before} -> {}",
+        threads(),
+        open_descriptors()
+    );
 }
 
 mod common;
