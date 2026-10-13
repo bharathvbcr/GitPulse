@@ -520,13 +520,16 @@ fn close_wakes_a_reader_blocked_on_a_full_output_window() {
     let state = TerminalSessions::default();
     let _cleanup = TerminalCleanup(state.clone());
     let dir = repo();
+    // The window is full when the next event no longer fits, which leaves
+    // up to one event unused: an event is up to `OUTPUT_CHUNK_BYTES`.
+    const NEAR_FULL: usize = 256 * 1024 - gitpulse_lib::terminal::OUTPUT_CHUNK_BYTES;
     let total = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let received = total.clone();
     let (send, receive) = mpsc::channel();
     app.listen("terminal-output", move |event| {
         let (_id, bytes) = take_output(event.payload());
         if received.fetch_add(bytes.len(), std::sync::atomic::Ordering::SeqCst) + bytes.len()
-            >= 256 * 1024 - 4096
+            >= NEAR_FULL
         {
             let _ = send.send(());
         }
@@ -558,7 +561,7 @@ fn close_wakes_a_reader_blocked_on_a_full_output_window() {
         .expect("the output window never reached its limit");
     std::thread::sleep(Duration::from_millis(50));
     let pending = total.load(std::sync::atomic::Ordering::SeqCst);
-    assert!((256 * 1024 - 4096..=256 * 1024).contains(&pending));
+    assert!((NEAR_FULL..=256 * 1024).contains(&pending));
     kill_session(&state, &session.id).unwrap();
     gitpulse_lib::terminal::shutdown_sessions(&state).unwrap();
 }

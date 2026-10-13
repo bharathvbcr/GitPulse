@@ -13,25 +13,39 @@ use std::time::{Duration, Instant};
 /// notification, including hangup, only triggers another read: buffered bytes
 /// must still be drained before the reader can declare EOF.
 pub(super) fn wait_for_output(fd: std::os::fd::RawFd) -> std::io::Result<()> {
+    wait_for_output_within(fd, std::time::Duration::from_millis(100)).map(|_| ())
+}
+
+/// [`wait_for_output`] for at most `timeout` (rounded up to a millisecond,
+/// which is poll's resolution). Whether the descriptor became ready: `false`
+/// is a timeout or an interruption, both of which hand control back to the
+/// caller so it can run its own shutdown checks.
+pub(super) fn wait_for_output_within(
+    fd: std::os::fd::RawFd,
+    timeout: std::time::Duration,
+) -> std::io::Result<bool> {
     let mut descriptor = libc::pollfd {
         fd,
         events: libc::POLLIN,
         revents: 0,
     };
+    let millis = timeout.as_nanos().div_ceil(1_000_000).min(i32::MAX as u128) as libc::c_int;
     // SAFETY: descriptor is one initialized pollfd, and poll only borrows it.
     // The reader thread retains the master owning fd throughout this call.
-    let result = unsafe { libc::poll(&mut descriptor, 1, 100) };
+    let result = unsafe { libc::poll(&mut descriptor, 1, millis) };
     if result < 0 {
         let error = std::io::Error::last_os_error();
         if error.kind() != ErrorKind::Interrupted {
             return Err(error);
         }
-    } else if fd < 0 || descriptor.revents & libc::POLLNVAL != 0 {
+        return Ok(false);
+    }
+    if fd < 0 || descriptor.revents & libc::POLLNVAL != 0 {
         return Err(std::io::Error::from_raw_os_error(libc::EBADF));
     }
     // Timeout and interruption return control to the caller, preserving its
     // shutdown checks. Never sleep after the descriptor has become ready.
-    Ok(())
+    Ok(result > 0)
 }
 
 pub(super) fn open(master: &dyn MasterPty) -> Result<Box<dyn Write + Send>, String> {
@@ -240,6 +254,35 @@ mod tests {
         assert_eq!(
             wait_for_output(-1).unwrap_err().raw_os_error(),
             Some(libc::EBADF)
+        );
+    }
+
+    /// The reader's gather wait: a timeout is `false` and ends on time, readiness
+    /// (data or hangup) is `true` at once, and a sub-millisecond ask still waits
+    /// a whole poll tick instead of rounding to a busy loop.
+    #[test]
+    fn a_bounded_wait_reports_readiness_and_timeout_distinctly() {
+        let (mut reader, mut writer) = UnixStream::pair().unwrap();
+        reader.set_nonblocking(true).unwrap();
+        let fd = reader.as_raw_fd();
+        let start = Instant::now();
+        assert!(!super::wait_for_output_within(fd, Duration::from_millis(30)).unwrap());
+        let waited = start.elapsed();
+        assert!(waited >= Duration::from_millis(25), "{waited:?}");
+        assert!(waited < crate::test_support::coverage_relaxed(Duration::from_secs(1)));
+        writer.write_all(b"x").unwrap();
+        let ready = Instant::now();
+        assert!(super::wait_for_output_within(fd, Duration::from_secs(10)).unwrap());
+        assert!(ready.elapsed() < crate::test_support::coverage_relaxed(Duration::from_secs(1)));
+        let mut one = [0; 1];
+        reader.read_exact(&mut one).unwrap();
+        let tick = Instant::now();
+        assert!(!super::wait_for_output_within(fd, Duration::from_micros(1)).unwrap());
+        assert!(tick.elapsed() >= Duration::from_micros(500));
+        drop(writer);
+        assert!(
+            super::wait_for_output_within(fd, Duration::from_secs(10)).unwrap(),
+            "a hangup is readiness: the reader must go read the EOF"
         );
     }
 

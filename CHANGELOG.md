@@ -13,6 +13,15 @@ before that tag is pushed.
 
 ### Fixed
 
+- A terminal that prints a lot no longer costs the webview a script evaluation
+  per kilobyte. Each `terminal-output` event is a script run on the app's main
+  thread, and macOS hands a PTY reader about 1 KiB per read, so a 1 MiB burst
+  was 1024 events. The reader now gathers what the tty has queued (a stream
+  that goes quiet for 2 ms, or has been held 8 ms, is sent; anything under
+  512 bytes, such as an echoed key or a prompt, is sent at once) into events of
+  up to 16 KiB: the same burst is 64 events, byte for byte, with the same
+  acknowledgement accounting. A repainting TUI already arrived as about one
+  event per frame and is unchanged.
 - Every signal GitPulse sends now goes through one guarded primitive,
   `procguard::signal`. It refuses pid 0, 1 and negative ids, the app's own
   process, group and session, a group GitPulse did not create, and a pid whose

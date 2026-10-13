@@ -108,9 +108,16 @@ pub struct TerminalSpawned {
     pub cwd: String,
 }
 
-/// Bytes one `read` may reserve. The renderer refuses a reserved length
-/// outside `1..=OUTPUT_CHUNK_BYTES` instead of guessing one from base64.
-pub const OUTPUT_CHUNK_BYTES: usize = 4096;
+/// Bytes one `terminal-output` event may carry, and reserve. The renderer
+/// refuses a reserved length outside `1..=OUTPUT_CHUNK_BYTES` instead of
+/// guessing one from base64. Written as a literal: the frontend's
+/// `MAX_TERMINAL_OUTPUT_CHUNK` is checked against this line by text.
+///
+/// This is the size of an *event*, not of a `read`: the reader gathers what the
+/// program has printed into one event because each event is a script evaluated
+/// in the webview, and the kernel hands a macOS PTY reader at most 1 KiB at a
+/// time. Event-per-read made a flood cost one evaluation per KiB.
+pub const OUTPUT_CHUNK_BYTES: usize = 16384;
 
 #[derive(Clone, Serialize)]
 pub struct TerminalOutputPayload {
@@ -131,7 +138,7 @@ fn output_payload_names_the_reserved_length() {
     let value = serde_json::to_value(&payload).unwrap();
     assert_eq!(value["bytes"], 1);
     assert_eq!(value["data_b64"], "QQ==");
-    assert_eq!(OUTPUT_CHUNK_BYTES, 4096);
+    assert_eq!(OUTPUT_CHUNK_BYTES, 16384);
 }
 
 /// Output a live session's view will never see. The process keeps running;
@@ -150,6 +157,21 @@ pub const SHED_NOTICE: &str = "Terminal output was skipped while this window was
 /// sheds instead. Long enough that a busy page is not shed for a hiccup;
 /// shedding no longer costs the process, only skipped output.
 pub const DEFAULT_OUTPUT_STALL: Duration = Duration::from_secs(30);
+
+/// Output at least this large, read and still dry, is the front of a stream
+/// rather than an echo or a prompt, and is worth a short wait for more. Below
+/// it the reader sends at once: a typed character must not pay for batching.
+#[cfg(unix)]
+const GATHER_MIN_BYTES: usize = 512;
+/// How long a stream may go quiet before what has been gathered is sent. A
+/// producer faster than the reader leaves gaps far shorter than this; a
+/// finished frame leaves a longer one.
+#[cfg(unix)]
+const GATHER_QUIET: Duration = Duration::from_millis(2);
+/// The longest output waits to be sent once it has begun to be gathered, so a
+/// steady trickle still reaches the view this often.
+#[cfg(unix)]
+const GATHER_MAX_HOLD: Duration = Duration::from_millis(8);
 
 #[derive(Clone, Serialize)]
 pub struct TerminalExitPayload {
@@ -1533,101 +1555,160 @@ fn spawn_session_inner<R: tauri::Runtime>(
             let mut reservation = Some(reservation);
             let mut failure = None;
             let mut watcher = watcher;
+            // One event's worth: output is gathered here until the tty has
+            // nothing more queued, or the event is full.
             let mut buf = [0u8; OUTPUT_CHUNK_BYTES];
+            // How much of `buf` is read but not yet sent. Invariant at the top
+            // of the loop: `filled < buf.len()`, so a read never has an empty
+            // slice to fill (which would answer `Ok(0)`, the end of the tty).
+            let mut filled = 0usize;
+            // When `buf` last went from empty to holding output.
+            #[cfg_attr(not(unix), allow(unused_assignments, unused_variables))]
+            let mut gathering_since = Instant::now();
             // Logged once per run of failures, not once per chunk.
             let mut emit_failing = false;
+            // Sends `data` to the view as one event. A reservation that fails
+            // (the flow was stopped) ends the process, as before; everything
+            // else (a view that is detached, behind, or whose emit failed) is
+            // handled here and never ends it.
+            let mut deliver = |data: &[u8], failure: &mut Option<String>| {
+                let n = data.len();
+                let stall = Duration::from_millis(output_stall_ms.load(Ordering::Acquire));
+                let delivery = output_flow.reserve(n, stall).map(|route| {
+                    let resumed = match route {
+                        // Detached: the page that would paint this is gone.
+                        // The process keeps running; the bytes are not sent.
+                        Route::Hold => return,
+                        // The view is alive but behind. Never a reason to
+                        // end the process: drop, keep draining, say so once.
+                        Route::Shed { began } => {
+                            if began {
+                                log::warn!(
+                                    target: "terminal",
+                                    "{program_for_log} terminal: view did not acknowledge output for {}ms; skipping output until it catches up (process left running)",
+                                    stall.as_millis()
+                                );
+                                if let Err(error) = app_handle.emit("terminal-loss", TerminalLossPayload {
+                                    id: sid_for_thread.clone(),
+                                    message: SHED_NOTICE.into(),
+                                }) {
+                                    log::warn!(target: "terminal", "{program_for_log} terminal: could not report skipped output: {error}");
+                                }
+                            }
+                            return;
+                        }
+                        Route::Resume => true,
+                        Route::Deliver => false,
+                    };
+                    let sent = app_handle.emit("terminal-output", TerminalOutputPayload {
+                        id: sid_for_thread.clone(),
+                        data_b64: BASE64_STANDARD.encode(data),
+                        bytes: n,
+                    });
+                    match sent {
+                        Ok(()) => {
+                            emit_failing = false;
+                            if resumed {
+                                log::info!(target: "terminal", "{program_for_log} terminal: view caught up; output resumed");
+                                repaint_current(&thread_master);
+                            }
+                        }
+                        // A failed emit is the event loop's trouble,
+                        // not the process's; it keeps running. Shed
+                        // as after a stall (see `OutputFlow::shed`).
+                        Err(error) => {
+                            if !std::mem::replace(&mut emit_failing, true) {
+                                log::warn!(target: "terminal", "{program_for_log} terminal: failed to emit terminal-output, skipping output: {error}");
+                            }
+                            if output_flow.shed(n) {
+                                if let Err(error) = app_handle.emit("terminal-loss", TerminalLossPayload {
+                                    id: sid_for_thread.clone(),
+                                    message: SHED_NOTICE.into(),
+                                }) {
+                                    log::warn!(target: "terminal", "{program_for_log} terminal: could not report skipped output: {error}");
+                                }
+                            }
+                        }
+                    }
+                });
+                if let Err(error) = delivery {
+                    if !dead_flag.swap(true, Ordering::SeqCst) {
+                        *failure = Some(error);
+                        output_flow.stop();
+                        if let Err(error) = terminate_pty_child(&thread_child, &thread_master) {
+                            log::warn!(target: "terminal", "could not signal failed terminal: {error}");
+                        }
+                    }
+                }
+            };
+            // Sends what has been gathered, unless the session is being torn
+            // down: then the bytes are only drained, as `dead_flag` always did.
+            macro_rules! flush {
+                () => {
+                    if filled > 0 && !dead_flag.load(Ordering::Relaxed) {
+                        deliver(&buf[..filled], &mut failure);
+                    }
+                    filled = 0;
+                };
+            }
             // A panic anywhere in the loop (the scanner, an event listener) is
             // contained here: the thread must not end with the child alive and
             // nothing reading its tty, which is a session "running" forever.
             let pumped = catch_unwind(AssertUnwindSafe(|| loop {
-                match reader.read(&mut buf) {
-                    Ok(0) => break,
+                match reader.read(&mut buf[filled..]) {
+                    Ok(0) => {
+                        flush!();
+                        break;
+                    }
                     Ok(n) => {
                         // Read before the liveness check below: a session being
                         // torn down can still be asking for attention, and this
                         // costs one pass over bytes already in cache.
-                        watcher.observe(&buf[..n]);
+                        watcher.observe(&buf[filled..filled + n]);
+                        if filled == 0 {
+                            gathering_since = Instant::now();
+                        }
+                        filled += n;
                         // On close, drain kernel output until EOF. Leaving a
                         // full tty queue undrained can prevent a killed writer
                         // from completing on macOS, stranding its process slot.
                         if dead_flag.load(Ordering::Relaxed) {
+                            filled = 0;
                             continue;
                         }
-                        let stall = Duration::from_millis(output_stall_ms.load(Ordering::Acquire));
-                        let delivery = output_flow.reserve(n, stall).map(|route| {
-                            let resumed = match route {
-                                // Detached: the page that would paint this is gone.
-                                // The process keeps running; the bytes are not sent.
-                                Route::Hold => return,
-                                // The view is alive but behind. Never a reason to
-                                // end the process: drop, keep draining, say so once.
-                                Route::Shed { began } => {
-                                    if began {
-                                        log::warn!(
-                                            target: "terminal",
-                                            "{program_for_log} terminal: view did not acknowledge output for {}ms; skipping output until it catches up (process left running)",
-                                            stall.as_millis()
-                                        );
-                                        if let Err(error) = app_handle.emit("terminal-loss", TerminalLossPayload {
-                                            id: sid_for_thread.clone(),
-                                            message: SHED_NOTICE.into(),
-                                        }) {
-                                            log::warn!(target: "terminal", "{program_for_log} terminal: could not report skipped output: {error}");
-                                        }
-                                    }
-                                    return;
-                                }
-                                Route::Resume => true,
-                                Route::Deliver => false,
-                            };
-                            let sent = app_handle.emit("terminal-output", TerminalOutputPayload {
-                                id: sid_for_thread.clone(),
-                                data_b64: BASE64_STANDARD.encode(&buf[..n]),
-                                bytes: n,
-                            });
-                            match sent {
-                                Ok(()) => {
-                                    emit_failing = false;
-                                    if resumed {
-                                        log::info!(target: "terminal", "{program_for_log} terminal: view caught up; output resumed");
-                                        repaint_current(&thread_master);
-                                    }
-                                }
-                                // A failed emit is the event loop's trouble,
-                                // not the process's; it keeps running. Shed
-                                // as after a stall (see `OutputFlow::shed`).
-                                Err(error) => {
-                                    if !std::mem::replace(&mut emit_failing, true) {
-                                        log::warn!(target: "terminal", "{program_for_log} terminal: failed to emit terminal-output, skipping output: {error}");
-                                    }
-                                    if output_flow.shed(n) {
-                                        if let Err(error) = app_handle.emit("terminal-loss", TerminalLossPayload {
-                                            id: sid_for_thread.clone(),
-                                            message: SHED_NOTICE.into(),
-                                        }) {
-                                            log::warn!(target: "terminal", "{program_for_log} terminal: could not report skipped output: {error}");
-                                        }
-                                    }
-                                }
-                            }
-                        });
-                        if let Err(error) = delivery {
-                            if !dead_flag.swap(true, Ordering::SeqCst) {
-                                failure = Some(error);
-                                output_flow.stop();
-                                if let Err(error) =
-                                    terminate_pty_child(&thread_child, &thread_master)
-                                {
-                                    log::warn!(target: "terminal", "could not signal failed terminal: {error}");
-                                }
-                            }
+                        // Keep reading while the tty has more: the kernel hands
+                        // out a KiB or so per read, and an event per read is a
+                        // script evaluated in the webview per KiB. A full
+                        // event goes now; otherwise the WouldBlock arm below
+                        // sends what has been gathered once the tty is dry.
+                        // Off Unix the read blocks and never says WouldBlock,
+                        // so each read is its own event there.
+                        if filled == buf.len() || cfg!(not(unix)) {
+                            flush!();
                         }
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
                     #[cfg(unix)]
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                        // Nothing is queued, so everything the session printed
-                        // has been read. A job left running in the background
+                        // Nothing is queued. Output that looks like a stream may
+                        // be only a gap in one: give it a moment, never past
+                        // `GATHER_MAX_HOLD` from the first byte.
+                        if filled >= GATHER_MIN_BYTES {
+                            let held = gathering_since.elapsed();
+                            if held < GATHER_MAX_HOLD {
+                                let wait = GATHER_QUIET.min(GATHER_MAX_HOLD - held);
+                                if matches!(
+                                    input::wait_for_output_within(reader_fd, wait),
+                                    Ok(true)
+                                ) {
+                                    continue;
+                                }
+                            }
+                        }
+                        // Everything the session printed has been read: send
+                        // it before waiting for more.
+                        flush!();
+                        // A job left running in the background
                         // (`sleep &`, a dev server) still holds the terminal
                         // open, and EOF will not come while it lives: the
                         // session is over when its own process is, the way
@@ -1652,8 +1733,13 @@ fn spawn_session_inner<R: tauri::Runtime>(
                             break;
                         }
                     }
-                    Err(e) if is_end_of_terminal(&e) => break,
+                    Err(e) if is_end_of_terminal(&e) => {
+                        flush!();
+                        break;
+                    }
                     Err(e) => {
+                        // What was read before the failure is still output.
+                        flush!();
                         // The shell may still be running, with nothing left
                         // reading what it prints or delivering what is typed:
                         // stop it and say why, rather than leave a frozen tab.

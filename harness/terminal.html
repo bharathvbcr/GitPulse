@@ -788,7 +788,7 @@
           while (performance.now() < corruptDeadline && !acks.slice(ackMark).some((row) => row.sessionId === lastWriteId && row.bytes === 4)) await wait(20);
           check("a corrupt chunk acknowledges its reserved length", () =>
             acks.slice(ackMark).some((row) => row.sessionId === lastWriteId && row.bytes === 4) && report.killed === killedBeforeCorrupt);
-          await emit("terminal-output", { id: lastWriteId, data_b64: "A".repeat(8193) });
+          await emit("terminal-output", { id: lastWriteId, data_b64: "A".repeat(21849) });
           const liveDeadline = performance.now() + 2000;
           let liveStatus = "";
           while (performance.now() < liveDeadline) {

@@ -13,8 +13,16 @@
  */
 export const OUTPUT_CREDIT_WINDOW = 256 * 1024;
 
-/** One native read. A reserved length outside this range is not a length. */
-export const MAX_TERMINAL_OUTPUT_CHUNK = 4096;
+/**
+ * One `terminal-output` event. The reader coalesces what a program wrote in a
+ * burst into one event (up to this many bytes) because every event is a script
+ * evaluated in the webview. A reserved length outside `1..=` this is not a
+ * length. Pinned to Rust's `OUTPUT_CHUNK_BYTES` by `outputCredit.test.ts`.
+ */
+export const MAX_TERMINAL_OUTPUT_CHUNK = 16 * 1024;
+
+/** Longest base64 text an event of `MAX_TERMINAL_OUTPUT_CHUNK` bytes can carry. */
+export const MAX_TERMINAL_OUTPUT_B64 = Math.ceil(MAX_TERMINAL_OUTPUT_CHUNK / 3) * 4;
 
 /**
  * The byte count the reader reserved, or null when the event cannot name one.
@@ -231,8 +239,8 @@ export const frameAckScheduler: AckScheduler = (flush) => {
 /**
  * Coalesces `cmd_terminal_ack` calls.
  *
- * Every painted chunk (at most one 4 KiB read) used to be acknowledged with
- * its own IPC call. `OutputFlow::acknowledge` accepts any total up to what it
+ * Every painted chunk (at most `MAX_TERMINAL_OUTPUT_CHUNK`) used to be
+ * acknowledged with its own IPC call. `OutputFlow::acknowledge` accepts any total up to what it
  * has reserved, and the sum of released credit is by construction never more
  * than that, so one call per session per frame carries the same credit.
  * Owed credit is sent at once when any session reaches
