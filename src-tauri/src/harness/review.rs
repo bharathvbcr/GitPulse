@@ -174,7 +174,7 @@ fn push_unique(landed: &mut Vec<Landed>, attempt: &Landed) {
 
 /// Whether `tip` contains `commit`. Git answers 0 for yes and 1 for no; any
 /// other outcome is an error, not a no.
-fn contains(repo: &Path, tip: &str, commit: &str) -> Result<bool, String> {
+pub(crate) fn contains(repo: &Path, tip: &str, commit: &str) -> Result<bool, String> {
     let run = git_cli::git_captured(repo, &["merge-base", "--is-ancestor", commit, tip])?;
     match (run.cancelled, run.status_code) {
         (false, 0) => Ok(true),

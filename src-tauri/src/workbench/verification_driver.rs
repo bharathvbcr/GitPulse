@@ -533,8 +533,13 @@ fn describe(
 }
 
 /// A card's manual Verify: the card's worktree is the one its newest claim
-/// named, or the repository's checkout when it has none. Each press is its own
-/// request, so it can re-run a verdict the automatic one already reached.
+/// named while it still exists, else the repository's checkout — when no claim
+/// names a worktree, or when the claimed worktree is gone and the claimed
+/// commit is in the checkout's HEAD (merged, then torn down). A worktree that
+/// is gone with its commit nowhere in the checkout was abandoned, not merged:
+/// judging the checkout then would pass work that never landed, so it is
+/// refused. Each press is its own request, so it can re-run a verdict the
+/// automatic one already reached.
 pub(crate) fn run_now(
     store: &Store,
     backend: &dyn Backend,
@@ -543,9 +548,8 @@ pub(crate) fn run_now(
     let card = intake::get_item(store, id)?
         .ok_or_else(|| WorkbenchError::new("not_found", "The task does not exist."))?;
     let identity = repository_identity(store, &card)?;
-    let worktree = match target_of(&card) {
-        Some(target) => target.worktree,
-        None => identity
+    let checkout = || {
+        identity
             .strip_prefix("local:")
             .and_then(|git_dir| git_dir.strip_suffix("/.git").or(Some(git_dir)))
             .filter(|path| Path::new(path).is_dir())
@@ -555,7 +559,35 @@ pub(crate) fn run_now(
                     "repository_unavailable",
                     "This task's repository has no local checkout to verify.",
                 )
-            })?,
+            })
+    };
+    let worktree = match target_of(&card) {
+        None => checkout()?,
+        Some(target) if Path::new(&target.worktree).is_dir() => target.worktree,
+        // The claimed worktree is gone. Its work is judged in the checkout
+        // only once the checkout holds the claimed commit; otherwise the
+        // checkout would stand in for work that never reached it.
+        Some(target) => {
+            let path = checkout()?;
+            let merged = crate::harness::review::contains(Path::new(&path), "HEAD", &target.head)
+                .map_err(|why| {
+                    WorkbenchError::new(
+                        "repository_unavailable",
+                        format!("The claimed worktree is gone and whether its work reached the checkout could not be read: {why}"),
+                    )
+                })?;
+            if !merged {
+                return Err(WorkbenchError::new(
+                    "repository_unavailable",
+                    format!(
+                        "The claimed worktree {} is gone and its commit {} is not merged into the checkout, so there is no copy of the work to verify.",
+                        target.worktree,
+                        target.head.get(..12).unwrap_or(&target.head)
+                    ),
+                ));
+            }
+            path
+        }
     };
     let local = intake::resolve(&worktree)?;
     if local.identity != identity {

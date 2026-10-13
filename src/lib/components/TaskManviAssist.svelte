@@ -229,7 +229,7 @@
   );
   /** Why the selected proposal cannot be applied here, or "" when it can. */
   const applyBlock = $derived(enhancementApplyBlock(proposal, task));
-  const liveAttempt = $derived(liveEnhancement(proposal) || liveEnhancement(latestActive) || entries.some((entry) => liveEnhancement(entry)));
+  const liveAttempt = $derived(liveEnhancement(proposal, now) || liveEnhancement(latestActive, now) || entries.some((entry) => liveEnhancement(entry, now)));
   const stale = $derived(Boolean(proposal && task && proposal.source_revision !== task.revision));
   const ready = $derived(proposal?.state === "ready");
   /**
@@ -292,7 +292,7 @@
   );
   const revisionDirty = $derived(proposal?.fields.some((field) => revisionDraft[field] !== proposal?.proposed[field]) ?? false);
   const failureAdvice = $derived(proposal?.failure ? explainEnhancementFailure(proposal.failure) : null);
-  const expiredLive = $derived(Boolean(proposal && liveEnhancement(proposal) && now >= proposal.expires_at));
+  const expiredLive = $derived(Boolean(proposal && liveEnhancement(proposal, now) && now >= proposal.expires_at));
 
   function toggleField(field: EnhancementField, on: boolean) {
     if (acting || disabled || lockedFields.includes(field)) return;
@@ -573,7 +573,8 @@
       // this check belongs to neither of them in particular.
       const existing = await bounded(latestEnhancement(saved.id, LIVE_ENHANCEMENT_STATES));
       if (disposed) return;
-      if (existing) {
+      // The filter is the store's states, not its clock: a pending proposal past its expiry no longer counts.
+      if (existing && liveEnhancement(existing)) {
         const current = await bounded(getEnhancement(existing.id));
         if (!disposed) { proposal = current; note = "A suggestion is already in progress."; await history(); }
         return;
@@ -769,7 +770,7 @@
   {#if ready && (dirty || stale)}<p class="warn">{dirty ? "Save or reload your edits before accepting a suggestion." : "This suggestion is for an older task revision. Request a fresh suggestion."}</p>{/if}
   {#if error}<p role="alert" class="error">{error}</p>{/if}
   {#if note}<p role="status" class="meta">{note}</p>{/if}
-  {#if proposal && liveEnhancement(proposal)}
+  {#if proposal && liveEnhancement(proposal, now)}
     <p class="meta" role="status">
       {proposal.state === "running" ? "Manvi is drafting…" : proposal.state === "cancel_requested" ? "Waiting for cancellation…" : "Waiting to start."}
       {#if expiredLive} The deadline passed; termination is unconfirmed.{/if}

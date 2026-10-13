@@ -17,7 +17,7 @@
  * Nothing here calls a write on its own: every function that writes is called
  * from a person's click.
  */
-import { getRefinement, newID, request, WorkbenchError, type RefinePart, type Task } from "./client";
+import { getRefinement, newID, request, REFINE_PARTS, WorkbenchError, type RefinePart, type StoredRefinement, type Task } from "./client";
 import { selectionWire, type ModelSelection } from "./taskModel";
 
 export type ProposalMethod =
@@ -154,6 +154,33 @@ export function categoryLabel(category: string): string { return CATEGORY_LABELS
 // ---------------------------------------------------------------------------
 
 export interface RelatedTask { item_id: string; title: string; status: string }
+
+/**
+ * The most `item_id`s one `reviewed_related` may carry. The host's own bound
+ * (`MAX_REVIEWED_RELATED`, intake.rs), which the `gitpulse_add_task` schema
+ * advertises too; a list longer than this is refused whole.
+ */
+export const MAX_REVIEWED_RELATED = 500;
+/**
+ * The reviewed set to send when the person confirms the related tasks they
+ * were just shown: everything they confirmed before, plus these.
+ *
+ * A refusal names one page of related tasks (25) and omits those already
+ * reviewed, so the next refusal is the next page. Sending back only the page on
+ * screen drops the earlier ones, which then reappear: past 25 related tasks the
+ * two refusals alternate for ever. This is the single owner of that set for
+ * every proposal path (filing a scan proposal, applying a refinement); the host
+ * is the other half of the protocol (`is_reviewed` in intake.rs).
+ */
+export function confirmReviewed(reviewed: readonly string[], shown: readonly Pick<RelatedTask, "item_id">[]): string[] {
+  const kept = new Set<string>();
+  for (const id of [...reviewed, ...shown.map((t) => t.item_id)]) {
+    const trimmed = id.trim();
+    if (trimmed && kept.size < MAX_REVIEWED_RELATED) kept.add(trimmed);
+  }
+  return [...kept];
+}
+
 export type FileOutcome =
   | { outcome: "filed" | "already_filed"; item_id: string; title: string }
   | { outcome: "related_tasks_exist"; related: RelatedTask[] };
@@ -269,16 +296,66 @@ export interface RefineDiff {
   duplicates: (RefineResult["duplicates"][number] & { state: DiffState })[];
   splits: RefineResult["splits"];
 }
-/** The proposal as a diff against `task`: what it would add, and what the task already has. */
+/**
+ * The proposal as a diff against `task`: what it would add, and what the task already has.
+ *
+ * Criteria are compared trimmed on both sides, and shown as they would be
+ * stored. A whitespace-only criterion is nothing, and one repeated within the
+ * proposal is one: the store appends what it is given and checks neither.
+ */
 export function refineDiff(task: Task, result: RefineResult): RefineDiff {
   const have = new Set(task.acceptance_criteria.map((c) => c.trim()));
   const linked = new Set(task.links.filter((l) => l.kind === "duplicate_of").map((l) => l.item_id));
+  const seen = new Set<string>();
+  const criteria: RefineDiff["criteria"] = [];
+  for (const c of result.criteria) {
+    const text = c.text.trim();
+    if (!text || seen.has(text)) continue;
+    seen.add(text);
+    criteria.push({ ...c, text, state: have.has(text) ? "present" : "add" });
+  }
   return {
     stale: task.revision !== result.source_revision,
-    criteria: result.criteria.map((c) => ({ ...c, state: have.has(c.text.trim()) ? "present" : "add" })),
+    criteria,
     duplicates: result.duplicates.map((d) => ({ ...d, state: linked.has(d.id) ? "present" : "add" })),
     splits: result.splits,
   };
+}
+
+/**
+ * Which parts of a proposal the person can choose, and which start chosen.
+ *
+ * A part the task has locked is never offered and never ticked: the store
+ * refuses it as `field_locked`. Criteria start chosen only when one is new;
+ * splits create tasks and duplicates link one, so they wait for a choice.
+ */
+export function selectableParts(task: Task, result: RefineResult): { locked: RefinePart[]; initial: RefinePart[] } {
+  const lockedFields: readonly string[] = task.locked_fields ?? [];
+  const locked = REFINE_PARTS.filter((part) => lockedFields.includes(part));
+  const fresh = refineDiff(task, result).criteria.some((c) => c.state === "add");
+  return { locked, initial: fresh && !locked.includes("acceptance_criteria") ? ["acceptance_criteria"] : [] };
+}
+
+export interface ApplyConflict { cause: "proposal" | "task" | "unknown"; message: string }
+/**
+ * Why an apply was refused as a `revision_conflict`, from a fresh read of both
+ * sides: the proposal (dismissed or accepted elsewhere, or revised) or the task
+ * (edited since the review). The store's one code covers both, and naming the
+ * wrong one sends the person to re-read a task that did not move. The proposal
+ * is checked first: one settled elsewhere is the more specific cause. A side
+ * that could not be re-read is not assumed unchanged.
+ */
+export function applyConflict(reviewed: RefineResult, task: Pick<Task, "revision"> | null, stored: Pick<StoredRefinement, "state" | "revision"> | null): ApplyConflict {
+  if (stored && (stored.state !== "ready" || stored.revision !== reviewed.enhancement_revision)) {
+    const why = stored.state === "accepted" ? "was already applied elsewhere"
+      : stored.state === "dismissed" ? "was dismissed elsewhere"
+      : stored.state === "ready" ? "was changed elsewhere" : `is now ${stored.state}`;
+    return { cause: "proposal", message: `This suggestion ${why}, so nothing was applied here. Ask again for a fresh one.` };
+  }
+  if (task && task.revision !== reviewed.source_revision) {
+    return { cause: "task", message: "The task changed after this suggestion was made, so nothing was applied. It has been re-read; ask again to refine the current version." };
+  }
+  return { cause: "unknown", message: "The suggestion or the task changed after it was made, so nothing was applied. Ask again to refine the current version." };
 }
 
 export interface ApplyReceipt { outcome: "applied"; revision: number; criteriaAdded: number; linksAdded: number; createdTaskIds: string[] }
