@@ -1,13 +1,18 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { get } from "svelte/store";
 import { invoke } from "@tauri-apps/api/core";
-import { previewDevmapEdits } from "./client";
+import { cancelCodeintelQuery, previewDevmapEdits } from "./client";
 import { CODEINTEL_FANOUT_CAP } from "./fanout";
 import { previewStore } from "./previewStore";
 import type { DevmapPreviewOutcome } from "./types";
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
-vi.mock("./client", () => ({ previewDevmapEdits: vi.fn() }));
+vi.mock("./client", () => ({
+  previewDevmapEdits: vi.fn(),
+  cancelCodeintelQuery: vi.fn(async () => true),
+  newCodeintelCancelToken: vi.fn(() => `token-${++mintedTokens}`),
+}));
+let mintedTokens = 0;
 
 function emptyOutcome(overrides: Partial<DevmapPreviewOutcome> = {}): DevmapPreviewOutcome {
   return {
@@ -94,5 +99,57 @@ describe("previewStore.refresh", () => {
     ]);
     const unread = get(previewStore).files.filter((file) => !file.available);
     expect(unread).toEqual([{ file_path: "src/b.ts", available: false, reason: "permission denied", report: null }]);
+  });
+
+  // D8: the backend's cancel flag was the constant `false`, so a superseded
+  // batch ran its remaining files to the end with only the answer ignored.
+  describe("abandoned previews", () => {
+    beforeEach(() => {
+      vi.mocked(cancelCodeintelQuery).mockClear();
+    });
+
+    function holdPreview() {
+      const calls: Array<{ token: string | undefined; release: () => void }> = [];
+      vi.mocked(previewDevmapEdits).mockImplementation(
+        (_repo, _pairs, token) =>
+          new Promise((resolve) => {
+            calls.push({ token, release: () => resolve(emptyOutcome()) });
+          }),
+      );
+      return calls;
+    }
+
+    it("sends a cancel token with the batch", async () => {
+      const calls = holdPreview();
+      const done = previewStore.refresh("/repo", ["src/a.ts"]);
+      await vi.waitFor(() => expect(calls).toHaveLength(1));
+      expect(calls[0].token).toMatch(/^token-/);
+      calls[0].release();
+      await done;
+      expect(cancelCodeintelQuery).not.toHaveBeenCalled();
+    });
+
+    it("cancels the batch in flight when a different request supersedes it", async () => {
+      const calls = holdPreview();
+      const first = previewStore.refresh("/repo", ["src/a.ts"]);
+      await vi.waitFor(() => expect(calls).toHaveLength(1));
+      const second = previewStore.refresh("/repo", ["src/b.ts"]);
+      expect(cancelCodeintelQuery).toHaveBeenCalledWith(calls[0].token);
+      await vi.waitFor(() => expect(calls).toHaveLength(2));
+      expect(calls[1].token).not.toBe(calls[0].token);
+      calls[1].release();
+      calls[0].release();
+      await Promise.all([first, second]);
+    });
+
+    it("cancels the batch in flight on reset", async () => {
+      const calls = holdPreview();
+      const done = previewStore.refresh("/repo", ["src/a.ts"]);
+      await vi.waitFor(() => expect(calls).toHaveLength(1));
+      previewStore.reset();
+      expect(cancelCodeintelQuery).toHaveBeenCalledWith(calls[0].token);
+      calls[0].release();
+      await done;
+    });
   });
 });
