@@ -245,7 +245,7 @@ pub fn spawn_once(
 }
 
 /// [`spawn_once`] for a subsystem that has several instances alive at once
-/// (one writer per stream, one worker per request). A record is by subsystem
+/// (the output writers, one per stream). A record is by subsystem
 /// name, not by thread, so a clean exit of one instance would clear the
 /// `stopped` record another instance's panic had just made: the failure was
 /// erased from Diagnostics by an unrelated thread finishing. This variant
