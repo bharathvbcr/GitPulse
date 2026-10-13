@@ -179,22 +179,13 @@ pub async fn cmd_discard_changes(
     repo_path: String,
     file_path: String,
 ) -> Result<Guarded<()>, String> {
-    off_thread(move || discard_changes_now(&repo_path, &file_path)).await
-}
-
-/// [`cmd_discard_changes`]'s body, on the calling thread.
-pub(super) fn discard_changes_now(
-    repo_path: &str,
-    file_path: &str,
-) -> Result<Guarded<()>, String> {
-    // A click, from its first spawn: the probe that picks the declared
-    // operation is git too, and shed as a read it would fail closed to
-    // "delete" for a file that is only being restored.
-    crate::engine::git_cli::mark_user_action(repo_path);
-    let op = discard_file_op(repo_path, file_path);
-    let policy = guard_file(repo_path, file_path, op)?;
-    GitWriter::discard_changes(repo_path, file_path)?;
-    Ok(Guarded { policy, output: () })
+    off_thread(move || {
+        let op = discard_file_op(&repo_path, &file_path);
+        let policy = guard_file(&repo_path, &file_path, op)?;
+        GitWriter::discard_changes(&repo_path, &file_path)?;
+        Ok(Guarded { policy, output: () })
+    })
+    .await
 }
 
 /// The file operation `GitWriter::discard_changes` will actually perform.
@@ -208,7 +199,12 @@ pub(super) fn discard_changes_now(
 ///
 /// An unreadable index fails closed to the destructive reading: a probe that
 /// could not run must not produce the gentler claim.
+///
+/// The probe is git and runs before the gate does, so it promotes the click
+/// first: shed as a deferrable read under memory pressure it would fail closed
+/// to "delete" for a file that is only being restored.
 pub(super) fn discard_file_op(repo_path: &str, file_path: &str) -> &'static str {
+    crate::engine::git_cli::mark_user_action(repo_path);
     match GitReader::is_tracked(repo_path, file_path) {
         Ok(true) => "modify",
         Ok(false) | Err(_) => "delete",

@@ -740,7 +740,7 @@ pub(super) fn register_app(governor: Arc<Mutex<Governor>>) -> bool {
 
 #[cfg(test)]
 thread_local! {
-    static INJECTED: std::cell::RefCell<Option<Governor>> = const { std::cell::RefCell::new(None) };
+    static INJECTED: std::cell::RefCell<Option<(Input, Governor)>> = const { std::cell::RefCell::new(None) };
 }
 
 /// Test seam: makes this thread's governor hold `input`, as one sample would,
@@ -748,8 +748,16 @@ thread_local! {
 /// governor is never pressed by this one.
 #[cfg(test)]
 pub(crate) fn inject(input: Input) -> Injected {
-    INJECTED.with(|slot| *slot.borrow_mut() = Some(Governor::instant(Instant::now(), input)));
+    let governor = Governor::instant(Instant::now(), input.clone());
+    INJECTED.with(|slot| *slot.borrow_mut() = Some((input, governor)));
     Injected
+}
+
+/// The input this thread's injection holds, for a test that must hand it to
+/// the pool thread a command hops to (the slot is thread-local).
+#[cfg(test)]
+pub(crate) fn injected_input() -> Option<Input> {
+    INJECTED.with(|slot| slot.borrow().as_ref().map(|(input, _)| input.clone()))
 }
 
 #[cfg(test)]
@@ -787,7 +795,7 @@ impl Input {
 pub fn report() -> GovernorReport {
     let now = Instant::now();
     #[cfg(test)]
-    if let Some(report) = INJECTED.with(|slot| slot.borrow().as_ref().map(|g| g.report(now))) {
+    if let Some(report) = INJECTED.with(|slot| slot.borrow().as_ref().map(|(_, g)| g.report(now))) {
         return report;
     }
     match APP_GOVERNOR.get() {
@@ -804,7 +812,9 @@ pub fn report() -> GovernorReport {
 pub fn shed() -> Shed {
     let now = Instant::now();
     #[cfg(test)]
-    if let Some(shed) = INJECTED.with(|slot| slot.borrow().as_ref().map(|g| g.verdict(now).shed)) {
+    if let Some(shed) =
+        INJECTED.with(|slot| slot.borrow().as_ref().map(|(_, g)| g.verdict(now).shed))
+    {
         return shed;
     }
     // A process with no governor (the MCP server, the daemon, a hook) sheds

@@ -44,14 +44,14 @@ mod sampler;
 mod sensor;
 mod snapshot;
 
-#[cfg(test)]
-pub(crate) use governor::inject as inject_governor;
 pub use governor::{
     admit, admit_anyway, admit_on, decide, grant_override, report as governor_report, shed,
     Admitted, Binding, Governor, GovernorPulse, GovernorReport, GovernorVerdict,
     Input as GovernorInput, Observation, Reason, Refused, Shed, Site, Tier, ENTER_SAMPLES,
     EXIT_SAMPLES, OVERRIDE_WINDOW, REFUSAL_CODE, REFUSAL_NOTICE_AFTER,
 };
+#[cfg(test)]
+pub(crate) use governor::{inject as inject_governor, injected_input as injected_governor_input};
 pub use procscan::{
     terminate_orphan, AgentKind, AgentSession, ForeignProcess, LaunchedTree, MemguardHealth,
     Orphan, ProcView, ScanContext, Scanner as ProcessScanner, SessionCount,
