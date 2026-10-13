@@ -5,6 +5,42 @@ import { releaseRevisions } from "./app-version.mjs";
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 
+/** A source-map reference written as the comment bundlers append to an output. */
+const SOURCE_MAP_REFERENCE = /(?:\/\/|\/\*)[#@]\s*sourceMappingURL=/;
+const SCANNED_EXTENSIONS = new Set([".js", ".mjs", ".cjs", ".css"]);
+
+/**
+ * Every file under `dir` that would hand a reader the app's sources: a `.map`
+ * file, or a script or stylesheet that still points at one. Paths are relative
+ * to `dir`, sorted, and `/`-separated.
+ *
+ * `privateSourceMaps` moves the maps out of the bundle, but nothing else
+ * stands between a future plugin, a `public/` file or a config change and a
+ * `dist/` that carries them. Tauri's `frontendDist` is what the installer
+ * ships, so this is asserted against the files actually written.
+ *
+ * Symlinks are not followed: a link is reported only if its own name ends in
+ * `.map`.
+ * @param {string} dir
+ * @returns {string[]}
+ */
+export function shippedSourceMaps(dir) {
+  /** @type {string[]} */
+  const found = [];
+  const walk = (/** @type {string} */ current) => {
+    for (const entry of readdirSync(current, { withFileTypes: true })) {
+      const full = path.join(current, entry.name);
+      const relative = path.relative(dir, full).split(path.sep).join("/");
+      if (entry.name.endsWith(".map")) found.push(relative);
+      else if (entry.isDirectory()) walk(full);
+      else if (entry.isFile() && SCANNED_EXTENSIONS.has(path.extname(entry.name))
+        && SOURCE_MAP_REFERENCE.test(readFileSync(full, "utf8"))) found.push(relative);
+    }
+  };
+  walk(dir);
+  return found.sort();
+}
+
 /**
  * How many snapshots survive a successful build.
  *
@@ -61,7 +97,14 @@ export function privateSourceMaps(stamp, root = path.resolve(".build-evidence"),
         this.emitFile({ type: "asset", fileName: "build-info.json", source: JSON.stringify(stamp) });
       },
     },
-    writeBundle() {
+    writeBundle(options) {
+      // Checked on disk, after every plugin has written, and before retention
+      // runs: a build that would ship its sources must also not prune the
+      // evidence of the build it was meant to replace.
+      if (options.dir) {
+        const leaked = shippedSourceMaps(options.dir);
+        if (leaked.length) this.error(`the bundle would ship its source maps: ${leaked.join(", ")}`);
+      }
       const { pruned, failed } = pruneEvidence(evidenceRoot, stamp.id, retention);
       // A snapshot that could not be removed is a disk-space problem, not a
       // broken build: the bundle is already written. Say so, loudly.
