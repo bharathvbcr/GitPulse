@@ -29,11 +29,14 @@ describe("shared test PRNG", () => {
     for (const seed of [0, 1, 0x51f1e7, 0xffffffff, -5]) {
       const shared = mulberry32Uint32(seed);
       const oracle = integerOracle(seed);
+      const got: number[] = [];
+      const want: number[] = [];
       for (let i = 0; i < 10_000; i += 1) {
-        const value = shared();
-        expect(Number.isInteger(value)).toBe(true);
-        expect(value).toBe(oracle());
+        got.push(shared());
+        want.push(oracle());
       }
+      expect(got.every(Number.isInteger)).toBe(true);
+      expect(got).toEqual(want);
     }
   });
 });
