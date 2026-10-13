@@ -11,7 +11,6 @@ import {
 import { withDeadline } from "../async/deadline";
 import { whenDocumentShown } from "../runtime/foreground";
 import { activity, observeSettled } from "../diagnostics/activity";
-import { SHARED_READ_COMMANDS } from "./sharedReads";
 
 /**
  * The one IPC entry point the frontend uses.
@@ -85,6 +84,24 @@ export type DeferralRetryOptions = {
   /** Resolves when a retry may run; defaults to "the window is shown". */
   whenShown?: () => Promise<void>;
 };
+
+/**
+ * The commands whose identical in-flight calls are answered with one
+ * (`sharedReads.ts`). Empty until a window registers its set.
+ *
+ * Injected rather than imported: the list is a set of `cmd_*` literals, and
+ * this module is reached by every window's bundle. The status popover's ACL
+ * grant is derived from the commands its import graph names, so importing the
+ * list here would credit the popover with nine commands it never calls (and
+ * would have it grant them). Only the main window's entry registers the set,
+ * which is also the only window that does snapshot reads worth joining.
+ */
+let sharedReads: ReadonlySet<string> = new Set();
+
+/** Registers the commands whose identical in-flight calls are joined. Replaces any earlier set. */
+export function configureSharedReads(commands: ReadonlySet<string>): void {
+  sharedReads = commands;
+}
 
 /**
  * The join generation for identical in-flight reads (`sharedReads.ts`). A call
@@ -218,7 +235,7 @@ export function withDeferralRetry(raw: Raw, options: DeferralRetryOptions = {}) 
     // promise is shared as it is: each caller's deadline or abort signal wraps
     // it in `bound`, so one caller giving up detaches that caller and leaves
     // the call running for the others.
-    if (SHARED_READ_COMMANDS.has(cmd)) {
+    if (sharedReads.has(cmd)) {
       if (rest.length <= 1 && !isBinary(rest[0])) {
         const key = lazyRetryKey(cmd, rest[0]);
         if (key !== null) {
