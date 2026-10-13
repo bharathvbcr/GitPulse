@@ -25,7 +25,6 @@ use serde::Serialize;
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
-use std::thread;
 use std::time::{Duration, Instant};
 
 /// How close together deaths by one signal must be to be one incident.
@@ -648,10 +647,9 @@ impl Recorder {
             return Ok(());
         }
         let me = Arc::clone(self);
-        match thread::Builder::new()
-            .name("pty-incident".into())
-            .spawn(move || me.work())
-        {
+        match crate::supervisor::spawn_once("pty-incident", "terminal incident worker", move || {
+            me.work()
+        }) {
             Ok(_) => inner.worker_running = true,
             Err(error) => {
                 log::warn!(target: "terminal", "could not start the incident worker: {error}");
@@ -703,13 +701,23 @@ impl Recorder {
         let me = Arc::clone(self);
         let for_thread = incident.clone();
         let for_sink = sink.clone();
-        let spawned = thread::Builder::new()
-            .name("pty-incident-sender".into())
-            .spawn(move || {
-                let attribution = (me.attributor)(&for_thread);
+        let spawned = crate::supervisor::spawn_once(
+            "pty-incident-sender",
+            "terminal incident attribution",
+            move || {
+                // A lookup that panics must neither lose the incident nor keep
+                // its place among MAX_ATTRIBUTIONS: it is published without a
+                // sender, saying why.
+                let attribution = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    (me.attributor)(&for_thread)
+                }))
+                .unwrap_or_else(|_| {
+                    Attribution::none("attribution failed: the sender lookup panicked")
+                });
                 me.attributing.fetch_sub(1, Ordering::AcqRel);
                 me.publish(&for_thread, attribution, for_sink.as_ref());
-            });
+            },
+        );
         if let Err(error) = spawned {
             self.attributing.fetch_sub(1, Ordering::AcqRel);
             let note = format!("attribution not started: {error}");
@@ -751,6 +759,7 @@ impl Recorder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::thread;
 
     const TERM: &str = "Terminated: 15";
 
@@ -1319,5 +1328,38 @@ mod tests {
             wait_until("the worker to stop", || !rec.worker_running());
         }
         assert_eq!(rec.recent().len(), MAX_STORED);
+    }
+
+    /// The defect: the attribution thread was a raw start whose panic nothing
+    /// caught, so a lookup that panicked lost the incident it was attributing
+    /// and never returned its place among `MAX_ATTRIBUTIONS`: after a couple of
+    /// them every later incident was published without a sender.
+    #[test]
+    fn an_attributor_that_panics_still_delivers_the_incident_and_frees_its_place() {
+        let rec = Arc::new(Recorder::new(
+            Duration::from_millis(20),
+            THRESHOLD,
+            Arc::new(|_| panic!("the log query blew up")),
+        ));
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let into = seen.clone();
+        let sink: Sink = Arc::new(move |p| into.lock().unwrap().push(p.clone()));
+        for i in 0..THRESHOLD {
+            report(&rec, &sink, &format!("p{i}"));
+        }
+        wait_until("the incident to be delivered", || {
+            !seen.lock().unwrap().is_empty()
+        });
+        let got = seen.lock().unwrap().clone();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].session_ids.len(), THRESHOLD);
+        assert!(
+            got[0].sender_note.contains("attribution failed"),
+            "{:?}",
+            got[0].sender_note
+        );
+        wait_until("the attribution place to be returned", || {
+            rec.attributing.load(Ordering::Acquire) == 0
+        });
     }
 }
