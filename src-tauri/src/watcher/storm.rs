@@ -213,16 +213,54 @@ fn assert_storm_stays_bounded(scale: Scale) {
     );
 }
 
+/// Set in the re-executed test binary that runs the storm for real.
+const STORM_CHILD: &str = "GITPULSE_STORM_CHILD";
+
+/// Runs the storm in a process of its own.
+///
+/// The bounds are process-wide: `getrusage(RUSAGE_SELF)` and peak RSS count
+/// every thread, so beside the other lib tests (default `cargo test` runs them
+/// in parallel, as the test-parallel workflow does) the watched window, which
+/// is several times longer than the baseline one, absorbed their CPU and
+/// memory and failed with 37 s "of watching" on 10 s of writes, on
+/// `hx/perf-reconcile` alone as well. The test binary is re-executed with this
+/// one test selected; the child has nothing else running, so what it measures
+/// is the watch pipeline.
+fn isolated(test: &str, scale: Scale) {
+    use crate::procguard::LockedSpawn;
+    if std::env::var_os(STORM_CHILD).is_some() {
+        return assert_storm_stays_bounded(scale);
+    }
+    let out = std::process::Command::new(std::env::current_exe().expect("the test binary"))
+        .args(["--exact", test, "--include-ignored", "--nocapture"])
+        .args(["--test-threads=1"])
+        .env(STORM_CHILD, "1")
+        .output_locked()
+        .expect("re-executing the test binary");
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        out.status.success() && text.contains("1 passed"),
+        "the isolated storm failed:\n{text}"
+    );
+}
+
 /// Reduced storm: 3 watched repositories, 10k ignored-directory writes, 1k
 /// tracked and 400 object writes each.
 #[test]
 fn event_storm_across_watched_repos_stays_bounded() {
-    assert_storm_stays_bounded(Scale {
-        repos: 3,
-        ignored: 10_000,
-        tracked: 1_000,
-        objects: 400,
-    });
+    isolated(
+        "watcher::storm::event_storm_across_watched_repos_stays_bounded",
+        Scale {
+            repos: 3,
+            ignored: 10_000,
+            tracked: 1_000,
+            objects: 400,
+        },
+    );
 }
 
 /// The full storm: 50k ignored-directory writes plus 5k tracked and 2k object
@@ -230,10 +268,13 @@ fn event_storm_across_watched_repos_stays_bounded() {
 #[test]
 #[ignore = "full-size storm takes minutes; run explicitly with --ignored"]
 fn full_event_storm_across_watched_repos_stays_bounded() {
-    assert_storm_stays_bounded(Scale {
-        repos: 3,
-        ignored: 50_000,
-        tracked: 5_000,
-        objects: 2_000,
-    });
+    isolated(
+        "watcher::storm::full_event_storm_across_watched_repos_stays_bounded",
+        Scale {
+            repos: 3,
+            ignored: 50_000,
+            tracked: 5_000,
+            objects: 2_000,
+        },
+    );
 }
