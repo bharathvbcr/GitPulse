@@ -29,6 +29,7 @@
 //! by every later consumer.
 
 pub mod bindings;
+mod consolidated;
 pub mod ids;
 pub mod redact;
 
@@ -1928,10 +1929,16 @@ fn import_legacy_page(
 /// Only active worktrees authenticated by `git worktree list` are considered.
 /// Rows retain their ULID and timestamp but receive the family anchor as their
 /// repository and the source checkout when old data omitted that distinction.
-/// A per-source cursor keyed by Git's opaque object digest makes steady-state
-/// checks cheap without persisting a credential-shaped path or collapsing two
+/// A per-source cursor keyed by Git's opaque object digest records how far each
+/// import got without persisting a credential-shaped path or collapsing two
 /// redaction-equivalent names. The unique ULID plus a payload comparison makes
 /// retries idempotent without hiding collisions.
+///
+/// A source is imported when something changed, not on every read: one whose
+/// database and write-ahead log are as they were at its last complete import
+/// is skipped without a Git process or a database open (see [`consolidated`]).
+/// A sibling's first ledger, its next row, and a worktree added to the family
+/// all change what is on disk, so none of them is skipped.
 pub(crate) fn consolidate_worktree_ledgers(
     anchor: &str,
     members: &[PathBuf],
@@ -1950,13 +1957,46 @@ pub(crate) fn consolidate_worktree_ledgers(
             continue;
         }
         let source_db = ledger_path(&source.to_string_lossy());
-        if checked_state_file_metadata(&source_db, Some(source))?.is_none() {
+        let Some(database) = checked_state_file_metadata(&source_db, Some(source))? else {
+            continue;
+        };
+        // Taken before the import reads anything: a write that lands during it
+        // changes the files, so the next read sees a different stamp.
+        let wal = PathBuf::from(format!("{}-wal", source_db.display()));
+        let stamp = consolidated::SourceStamp::of(
+            &database,
+            checked_state_file_metadata(&wal, Some(source))?.as_ref(),
+        );
+        if consolidated::is_current(&anchor_path, file_id(&ledger_path(&anchor)), source, &stamp) {
             continue;
         }
+        imported_total += import_source(&anchor_path, &anchor, source, &source_db, members)?;
+        consolidated::record(
+            &anchor_path,
+            file_id(&ledger_path(&anchor)),
+            source,
+            stamp,
+        );
+    }
 
+    Ok(imported_total)
+}
+
+/// Imports everything one sibling ledger holds that the anchor has not seen.
+fn import_source(
+    anchor_path: &Path,
+    anchor: &str,
+    source: &Path,
+    source_db: &Path,
+    members: &[PathBuf],
+) -> Result<usize, LedgerError> {
+    let mut imported_total = 0usize;
+    {
         let source_name = source.to_string_lossy().into_owned();
-        let source_key = family_source_key(&anchor_path, &source_name)?;
+        let source_key = family_source_key(anchor_path, &source_name)?;
         let mut cursor = family_import_cursor(&anchor, &source_key)?;
+        #[cfg(test)]
+        tests::LEDGER_SIBLING_OPENS.with(|opens| opens.set(opens.get() + 1));
         let source_conn = Connection::open_with_flags(&source_db, OpenFlags::SQLITE_OPEN_READ_ONLY)
             .map_err(|error| {
                 LedgerError::new(
@@ -2029,7 +2069,7 @@ pub(crate) fn consolidate_worktree_ledgers(
                 import_legacy_page(&anchor, &source_key, &source_name, &normalized, cursor)?;
             imported_total += imported;
             if let Some(newest_cursor) = newest_cursor {
-                announce(&anchor, newest_cursor);
+                announce(anchor, newest_cursor);
             }
         }
     }
@@ -3026,11 +3066,17 @@ pub(crate) mod tests_support {
     pub fn reset_registry() {
         super::registry().lock().unwrap().clear();
         super::dropped_registry().lock().unwrap().clear();
+        super::consolidated::clear();
     }
 
     /// Read-write ledger opens this thread has made so far.
     pub fn write_opens() -> usize {
         super::tests::LEDGER_WRITE_OPENS.with(std::cell::Cell::get)
+    }
+
+    /// Sibling (legacy) ledgers consolidation has opened on this thread.
+    pub fn sibling_opens() -> usize {
+        super::tests::LEDGER_SIBLING_OPENS.with(std::cell::Cell::get)
     }
 }
 
@@ -3055,6 +3101,8 @@ mod tests {
         /// Read-write opens ([`open`]) this thread has made: each one is the
         /// chmod pass, the WAL pragmas and the schema DDL.
         pub(super) static LEDGER_WRITE_OPENS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+        /// Sibling (legacy) ledgers consolidation has opened on this thread.
+        pub(super) static LEDGER_SIBLING_OPENS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     }
 
     /// The env var that turns [`shm_lock_probe_child`] from a no-op into the
