@@ -1,6 +1,7 @@
 <script lang="ts">
   import { repoStore } from "../stores/repoStore";
   import { displayName } from "../repos/paths";
+  import { repoScope } from "../repos/repoScope.svelte";
   import BranchList from "./BranchList.svelte";
   import CommitComposer from "./CommitComposer.svelte";
   import AgentCommitMenu from "./AgentCommitMenu.svelte";
@@ -70,6 +71,22 @@
   /** Set on pointerup after a real drag; dblclick inside the window is ignored. */
   let lastDragEndAt = 0;
   let bodyScroller: HTMLDivElement | undefined = $state();
+
+  /* --- Repository switch -----------------------------------------------------
+   * The sidebar is mounted once per window, so a tab switch re-points the store
+   * it reads and nothing else. The filter text, how far each list was grown and
+   * how far the body was scrolled belong to the repository being left; the
+   * persisted section flags and the width are the person's, and stay.
+   */
+  repoScope(
+    () => $repoStore.currentPath,
+    () => {
+      fileFilter = "";
+      stagedLimit = FILE_LIST_STEP;
+      unstagedLimit = FILE_LIST_STEP;
+      if (bodyScroller) bodyScroller.scrollTop = 0;
+    },
+  );
 
   /* --- Derived repo pulse --------------------------------------------------- */
 

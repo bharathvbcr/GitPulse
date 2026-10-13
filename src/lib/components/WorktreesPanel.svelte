@@ -7,6 +7,7 @@
   import { invoke } from "../ipc/invoke";
   import { reportPanelError } from "../diagnostics/report";
   import { repoStore } from "../stores/repoStore";
+  import { repoScope } from "../repos/repoScope.svelte";
   import { harnessStore, type Guarded } from "../stores/harnessStore";
   import { createAsyncGuard, type AsyncGuard } from "../async/guard";
   import {
@@ -106,6 +107,37 @@
     };
   });
 
+  /**
+   * Mounted once per window, so a tab switch re-points the store and nothing
+   * else. The list above is the previous repository's until `load()` answers,
+   * and the effect that starts it deliberately leaves the list alone on a
+   * same-repository reload (a refresh must not blank it) — so the repository
+   * change itself is what clears the rows, the task bindings, summaries, the
+   * add-worktree form and any error. It runs before the DOM updates, so the
+   * old repository's worktrees are never painted under the new one's name.
+   */
+  const tabScope = repoScope(
+    () => $repoStore.currentPath,
+    (path) => {
+      inflight?.cancel();
+      worktrees = [];
+      taskView = null;
+      bindings = {};
+      scopes = {};
+      liveRuns = [];
+      aiSummaries = {};
+      loadingSummaries = {};
+      error = null;
+      isLoading = path !== null;
+      isCreating = false;
+      showAddForm = false;
+      newPath = "";
+      newBranch = "";
+      startPoint = "";
+      cowCaches = true;
+    },
+  );
+
   async function load() {
     const repo = $repoStore.currentPath;
     if (!repo) return;
@@ -200,55 +232,69 @@
   async function bindTask(wt: WorktreeInfo, taskId: string) {
     const repo = $repoStore.currentPath;
     if (!repo) return;
+    const epoch = tabScope.epoch;
     try {
       await invoke<number>("cmd_bind_worktree_task", {
         repoPath: repo,
         worktreePath: wt.path,
         taskId,
       });
+      if (!tabScope.isCurrent(epoch)) return;
       bindings = { ...bindings, [wt.path]: taskId };
     } catch (err: unknown) {
-      error = reportPanelError("worktrees", err);
+      const message = reportPanelError("worktrees", err);
+      if (tabScope.isCurrent(epoch)) error = message;
     }
   }
 
   async function unbindTask(wt: WorktreeInfo) {
     const repo = $repoStore.currentPath;
     if (!repo) return;
+    const epoch = tabScope.epoch;
     try {
       await invoke<number>("cmd_unbind_worktree_task", {
         repoPath: repo,
         worktreePath: wt.path,
       });
+      if (!tabScope.isCurrent(epoch)) return;
       bindings = { ...bindings, [wt.path]: null };
     } catch (err: unknown) {
-      error = reportPanelError("worktrees", err);
+      const message = reportPanelError("worktrees", err);
+      if (tabScope.isCurrent(epoch)) error = message;
     }
   }
 
   async function toggleLock(wt: WorktreeInfo) {
     const repo = $repoStore.currentPath;
     if (!repo) return;
+    const epoch = tabScope.epoch;
     try {
       if (wt.is_locked) {
         await invoke("cmd_unlock_worktree", { repoPath: repo, targetPath: wt.path });
       } else {
         await invoke("cmd_lock_worktree", { repoPath: repo, targetPath: wt.path, reason: null });
       }
+      // `load()` reads the ACTIVE repository; after a switch that is not the
+      // one this lock was for, and the new one has just loaded itself.
+      if (!tabScope.isCurrent(epoch)) return;
       await load();
     } catch (err: unknown) {
-      error = reportPanelError("worktrees", err);
+      const message = reportPanelError("worktrees", err);
+      if (tabScope.isCurrent(epoch)) error = message;
     }
   }
 
   async function prune() {
     const repo = $repoStore.currentPath;
     if (!repo) return;
+    const epoch = tabScope.epoch;
     try {
       await invoke("cmd_prune_worktree", { repoPath: repo });
+      if (!tabScope.isCurrent(epoch)) return;
       await load();
     } catch (err: unknown) {
-      error = reportPanelError("worktrees", err);
+      const message = reportPanelError("worktrees", err);
+      if (tabScope.isCurrent(epoch)) error = message;
     }
   }
 
@@ -260,6 +306,7 @@
     if (!repo || !targetPath) return;
     const actionLabel = branch ? `${branch} → ${targetPath}` : targetPath;
     let createCompleted = false;
+    const epoch = tabScope.epoch;
     isCreating = true;
     error = null;
     try {
@@ -294,7 +341,9 @@
       if ($repoStore.currentPath !== repo) return;
       error = reportPanelError("worktrees", err);
     } finally {
-      isCreating = false;
+      // A create started in the repository left behind has no say over the
+      // new one's button; the switch already cleared the flag.
+      if (tabScope.isCurrent(epoch)) isCreating = false;
     }
   }
 
@@ -430,6 +479,7 @@
   async function fetchAiSummary(wt: WorktreeInfo) {
     const repo = $repoStore.currentPath;
     if (!repo) return;
+    const epoch = tabScope.epoch;
     loadingSummaries = { ...loadingSummaries, [wt.path]: true };
     try {
       const summary = await invoke<string>("cmd_worktree_ai_summary", {
@@ -437,22 +487,27 @@
         worktreePath: wt.path,
         branch: wt.branch ?? null,
       });
+      if (!tabScope.isCurrent(epoch)) return;
       aiSummaries = { ...aiSummaries, [wt.path]: summary };
     } catch (err: unknown) {
+      if (!tabScope.isCurrent(epoch)) return;
       error = reportPanelError("worktrees", err);
     } finally {
-      loadingSummaries = { ...loadingSummaries, [wt.path]: false };
+      if (tabScope.isCurrent(epoch)) loadingSummaries = { ...loadingSummaries, [wt.path]: false };
     }
   }
 
   async function syncCowCaches(wt: WorktreeInfo) {
     const repo = $repoStore.currentPath;
     if (!repo) return;
+    const epoch = tabScope.epoch;
     try {
       await invoke("cmd_worktree_cow_sync", { repoPath: repo, targetPath: wt.path });
+      if (!tabScope.isCurrent(epoch)) return;
       await load();
     } catch (err: unknown) {
-      error = reportPanelError("worktrees", err);
+      const message = reportPanelError("worktrees", err);
+      if (tabScope.isCurrent(epoch)) error = message;
     }
   }
 
