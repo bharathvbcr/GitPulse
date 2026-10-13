@@ -898,3 +898,678 @@ fn a_failing_existence_check_is_counted_and_the_call_keeps_its_live_root() {
     });
     assert_eq!(nested.rows()[0].0.as_deref(), Some(w.as_str()));
 }
+
+// ---------------------------------------------------------------------------
+// Adversarial cases for nested-worktree attribution.
+// ---------------------------------------------------------------------------
+
+type Row = (Option<String>, String, Option<String>);
+
+impl Nested {
+    /// Makes the anchor a Git repository, which task bindings require.
+    fn init_git(&self) {
+        use crate::test_support::{git_in, trust_repo};
+        let root = std::path::Path::new(&self.base);
+        git_in(root, &["init", "-b", "main"]);
+        std::fs::write(root.join("seed.txt"), "seed").unwrap();
+        git_in(root, &["add", "seed.txt"]);
+        git_in(root, &["commit", "-m", "seed"]);
+        trust_repo(root);
+    }
+
+    fn rows_for(&self, needle: &str) -> Vec<Row> {
+        self.rows()
+            .into_iter()
+            .filter(|r| r.1.contains(needle))
+            .collect()
+    }
+}
+
+/// An ancestor that is a dangling symlink is something on disk, not a removed
+/// worktree: a cwd that goes through it must not mint a departed root below it.
+#[test]
+fn adv_a_dangling_symlink_ancestor_is_not_a_departed_worktree() {
+    let nested = Nested::new();
+    let link = format!("{}/dangling", nested.base);
+    std::os::unix::fs::symlink("/definitely/not/here", &link).unwrap();
+    with_transcript_root(&nested.corpus, || {
+        let cwd = format!("{link}/sub");
+        write_lines(
+            &nested.file("S1.jsonl"),
+            &[command_line(&cwd, "S1", 1, "ls")],
+        );
+        nested.pass(&nested.base, &[]);
+    });
+    let rows = nested.rows();
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(
+        rows[0].0, None,
+        "a path below a dangling link is not a worktree: {rows:?}"
+    );
+}
+
+/// A cwd that is a regular file (or lies below one) is not a removed worktree.
+#[test]
+fn adv_a_cwd_that_is_a_file_is_not_departed() {
+    let nested = Nested::new();
+    let file = format!("{}/plain.txt", nested.base);
+    std::fs::write(&file, "x").unwrap();
+    with_transcript_root(&nested.corpus, || {
+        write_lines(
+            &nested.file("F1.jsonl"),
+            &[
+                command_line(&file, "F1", 1, "ls"),
+                command_line(&format!("{file}/below"), "F1", 2, "ls"),
+            ],
+        );
+        let out = nested.pass(&nested.base, &[]);
+        assert_eq!(out.recorded, 2, "{out:?}");
+    });
+    let rows = nested.rows();
+    assert!(rows.iter().all(|r| r.0.is_none()), "{rows:?}");
+}
+
+/// A real permission-denied directory is an error, never "departed".
+#[test]
+fn adv_a_permission_denied_directory_is_not_departed() {
+    use std::os::unix::fs::PermissionsExt;
+    let nested = Nested::new();
+    let locked = format!("{}/locked", nested.base);
+    std::fs::create_dir_all(format!("{locked}/inner")).unwrap();
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+    with_transcript_root(&nested.corpus, || {
+        write_lines(
+            &nested.file("P1.jsonl"),
+            &[command_line(&format!("{locked}/inner"), "P1", 1, "ls")],
+        );
+        nested.pass(&nested.base, &[]);
+    });
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let rows = nested.rows();
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0].0, None, "{rows:?}");
+}
+
+/// `/repo-old/.claude/worktrees/x` shares a byte prefix with `/repo` only.
+#[test]
+fn adv_a_sibling_repo_with_a_shared_prefix_is_nobodys() {
+    let nested = Nested::new();
+    let sibling = format!("{}-old", nested.base);
+    with_transcript_root(&nested.corpus, || {
+        let gone = format!("{sibling}/.claude/worktrees/x");
+        write_lines(
+            &nested.file("X1.jsonl"),
+            &[
+                command_line(&gone, "X1", 1, "ls"),
+                edit_line(&gone, "X1", 2, &format!("{gone}/a.rs")),
+            ],
+        );
+        nested.pass(&nested.base, &[]);
+    });
+    assert_eq!(nested.rows(), vec![], "a foreign repo is never recorded here");
+}
+
+/// The last worktree is removed and `.claude` goes with it: the departed root
+/// must still be the worktree, not a plain parent directory.
+#[test]
+fn adv_a_removed_worktrees_directory_does_not_become_the_root() {
+    let nested = Nested::new();
+    let w = nested.worktrees[0].clone();
+    with_transcript_root(&nested.corpus, || {
+        write_lines(
+            &nested.file("R1.jsonl"),
+            &[edit_line(&w, "R1", 1, &format!("{w}/a.rs"))],
+        );
+        std::fs::remove_dir_all(format!("{}/.claude", nested.base)).unwrap();
+        nested.pass(&nested.base, &[]);
+    });
+    let rows = nested.rows();
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(
+        rows[0].0.as_deref(),
+        Some(w.as_str()),
+        "worktree_path must be the worktree, got {:?}",
+        rows[0].0
+    );
+}
+
+/// A plain subdirectory deleted by a branch switch, used as cwd by an old
+/// session in main. The brief accepts this false positive; this records what
+/// it costs: main's own work leaves main and loses main's task.
+#[test]
+fn adv_a_deleted_plain_subdirectory_stays_on_main() {
+    let nested = Nested::new();
+    let base = nested.base.clone();
+    nested.init_git();
+    ledger::bindings::bind(&base, &base, "T-MAIN").unwrap();
+    with_transcript_root(&nested.corpus, || {
+        let gone = format!("{base}/old_dir_removed_by_checkout");
+        write_lines(
+            &nested.file("Q1.jsonl"),
+            &[
+                command_line(&gone, "Q1", 1, "cargo test"),
+                edit_line(&gone, "Q1", 2, &format!("{gone}/a.rs")),
+            ],
+        );
+        nested.pass(&nested.base, &[]);
+    });
+    let rows = nested.rows();
+    assert_eq!(rows.len(), 2, "{rows:?}");
+    for r in &rows {
+        assert_eq!(r.0, None, "main work attributed to a fake worktree: {rows:?}");
+        assert_eq!(r.2.as_deref(), Some("T-MAIN"), "{rows:?}");
+    }
+}
+
+/// w removed, a call recorded as departed, then a different worktree created at
+/// the same path: later calls are live again, earlier ones stay departed rows,
+/// and replaying changes nothing.
+#[test]
+fn adv_a_worktree_recreated_at_the_same_path_between_passes() {
+    let nested = Nested::new();
+    let w = nested.worktrees[0].clone();
+    nested.init_git();
+    std::fs::remove_dir_all(&w).unwrap();
+    crate::test_support::git_in(
+        std::path::Path::new(&nested.base),
+        &["worktree", "add", "--detach", &w],
+    );
+    crate::test_support::trust_repo(std::path::Path::new(&w));
+    ledger::bindings::bind(&nested.base, &w, "T-W").unwrap();
+    with_transcript_root(&nested.corpus, || {
+        write_lines(
+            &nested.file("C1.jsonl"),
+            &[edit_line(&w, "C1", 1, &format!("{w}/a.rs"))],
+        );
+        nested.pass(&nested.base, &[&w]);
+        std::fs::remove_dir_all(&w).unwrap();
+        append_text(
+            &nested.file("C1.jsonl"),
+            &(edit_line(&w, "C1", 2, &format!("{w}/gone.rs")) + "\n"),
+        );
+        nested.pass(&nested.base, &[]);
+        std::fs::create_dir_all(format!("{w}/src")).unwrap();
+        append_text(
+            &nested.file("C1.jsonl"),
+            &(edit_line(&w, "C1", 3, &format!("{w}/back.rs")) + "\n"),
+        );
+        nested.pass(&nested.base, &[&w]);
+        let first = nested.rows();
+        for _ in 0..3 {
+            let out = nested.pass(&nested.base, &[&w]);
+            assert_eq!(out.recorded, 0, "{out:?}");
+            assert_eq!(nested.rows(), first);
+        }
+    });
+    let rows = nested.rows();
+    let task = |needle: &str| nested.rows_for(needle)[0].2.clone();
+    assert_eq!(rows.len(), 3, "{rows:?}");
+    assert!(
+        rows.iter().all(|r| r.0.as_deref() == Some(w.as_str())),
+        "{rows:?}"
+    );
+    assert_eq!(task("gone.rs"), None);
+}
+
+/// Worktree b nested in worktree a (both under the repo).
+#[test]
+fn adv_a_worktree_nested_two_levels_deep() {
+    let nested = Nested::new();
+    let a = nested.worktrees[0].clone();
+    let b = format!("{a}/.claude/worktrees/b");
+    std::fs::create_dir_all(format!("{b}/src")).unwrap();
+    // live a, departed b: b owns its calls.
+    with_transcript_root(&nested.corpus, || {
+        write_lines(
+            &nested.file("L1.jsonl"),
+            &[edit_line(&b, "L1", 1, &format!("{b}/x.rs"))],
+        );
+        std::fs::remove_dir_all(&b).unwrap();
+        nested.pass(&nested.base, &[&a]);
+    });
+    let rows = nested.rows();
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(
+        rows[0].0.as_deref(),
+        Some(b.as_str()),
+        "live a, departed b: {rows:?}"
+    );
+
+    // both departed: the deepest removed root is b, not a.
+    let nested = Nested::new();
+    let a = nested.worktrees[0].clone();
+    let b = format!("{a}/.claude/worktrees/b");
+    std::fs::create_dir_all(format!("{b}/src")).unwrap();
+    with_transcript_root(&nested.corpus, || {
+        write_lines(
+            &nested.file("L2.jsonl"),
+            &[edit_line(&b, "L2", 1, &format!("{b}/x.rs"))],
+        );
+        std::fs::remove_dir_all(&a).unwrap();
+        nested.pass(&nested.base, &[]);
+    });
+    let rows = nested.rows();
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(
+        rows[0].0.as_deref(),
+        Some(b.as_str()),
+        "both departed: {rows:?}"
+    );
+}
+
+/// 300 distinct departed cwds in one pass: what the 256-entry memo cap does.
+#[test]
+fn adv_more_departed_cwds_than_the_memo_holds() {
+    let nested = Nested::new();
+    let base = nested.base.clone();
+    with_transcript_root(&nested.corpus, || {
+        let lines: Vec<String> = (0..300)
+            .map(|i| {
+                let g = format!("{base}/.claude/worktrees/gone{i}");
+                edit_line(&g, "M1", (i % 59) as u32, &format!("{g}/a.rs"))
+            })
+            .collect();
+        write_lines(&nested.file("M1.jsonl"), &lines);
+        let out = nested.pass(&nested.base, &[]);
+        println!(
+            "MEMO recorded={} unverified={}",
+            out.recorded, out.unverified_departed
+        );
+        assert_eq!(out.recorded, 300);
+    });
+    let rows = nested.rows();
+    let main = rows.iter().filter(|r| r.0.is_none()).count();
+    println!("MEMO main_rows={main} departed_rows={}", rows.len() - main);
+    assert_eq!(main, 0, "{main} of 300 departed calls fell back to main");
+}
+
+/// A family bigger than the participant cap: a call in worktree #70 must still
+/// be recorded somewhere (it went to main before attribution picked one owner).
+#[test]
+fn adv_a_worktree_beyond_the_participant_cap_is_not_lost() {
+    let nested = Nested::new();
+    let base = nested.base.clone();
+    let wts: Vec<String> = (0..70)
+        .map(|i| {
+            let p = format!("{base}/.claude/worktrees/live{i:02}");
+            std::fs::create_dir_all(&p).unwrap();
+            p
+        })
+        .collect();
+    with_transcript_root(&nested.corpus, || {
+        let lines: Vec<String> = wts
+            .iter()
+            .enumerate()
+            .map(|(i, w)| edit_line(w, "B1", (i % 59) as u32, &format!("{w}/a.rs")))
+            .collect();
+        write_lines(&nested.file("B1.jsonl"), &lines);
+        let out = pass::ingest_family_until(&base, &base, &wts, &mut |_| false);
+        println!("CAP recorded={}", out.recorded);
+    });
+    let rows = nested.rows();
+    assert_eq!(
+        rows.len(),
+        70,
+        "calls lost beyond the cap: {}",
+        70 - rows.len()
+    );
+}
+
+/// Hostile and malformed records, none of which may panic or duplicate.
+#[test]
+fn adv_hostile_records_never_panic_or_double() {
+    let nested = Nested::new();
+    let base = nested.base.clone();
+    let w = nested.worktrees[0].clone();
+    let raw = |cwd: Option<&str>, tool: &str, input: serde_json::Value, sec: u32| {
+        let mut v = serde_json::json!({
+            "type":"assistant","sessionId":"Z1",
+            "timestamp": format!("2026-09-01T12:00:{sec:02}.000Z"),
+            "message":{"content":[{"type":"tool_use","name":tool,"input":input}]}
+        });
+        if let Some(c) = cwd {
+            v["cwd"] = serde_json::json!(c);
+        }
+        v.to_string()
+    };
+    with_transcript_root(&nested.corpus, || {
+        let lines = vec![
+            raw(None, "Bash", serde_json::json!({"command":"no cwd"}), 1),
+            raw(Some(""), "Bash", serde_json::json!({"command":"empty cwd"}), 2),
+            raw(
+                Some("foo/bar"),
+                "Bash",
+                serde_json::json!({"command":"relative"}),
+                3,
+            ),
+            raw(Some("/"), "Bash", serde_json::json!({"command":"root"}), 4),
+            raw(
+                Some(&base),
+                "Edit",
+                serde_json::json!({"file_path":"/elsewhere/a.rs"}),
+                5,
+            ),
+            raw(
+                Some(&base),
+                "Edit",
+                serde_json::json!({"file_path":format!("{w}/under_w.rs")}),
+                6,
+            ),
+            raw(
+                Some(&format!("{base}/.claude/worktrees/ghost")),
+                "Edit",
+                serde_json::json!({"file_path":format!("{base}/main_file.rs")}),
+                7,
+            ),
+            raw(
+                Some(&format!("{base}/{}", "x".repeat(1 << 20))),
+                "Bash",
+                serde_json::json!({"command":"huge"}),
+                8,
+            ),
+            "{not json".to_string(),
+        ];
+        write_lines(&nested.file("Z1.jsonl"), &lines);
+        append_text(&nested.file("Z1.jsonl"), "{\"cwd\":\"");
+        let mut f = std::fs::File::options()
+            .append(true)
+            .open(nested.file("Z1.jsonl"))
+            .unwrap();
+        std::io::Write::write_all(&mut f, b"\xff\xfe\"}\n").unwrap();
+        let out = nested.pass(&base, &[&w]);
+        assert_eq!(out.error, "");
+        let again = nested.pass(&base, &[&w]);
+        assert_eq!(again.recorded, 0);
+    });
+    let rows = nested.rows();
+    let by = |n: &str| nested.rows_for(n);
+    assert_eq!(
+        by("under_w.rs")[0].0.as_deref(),
+        Some(w.as_str()),
+        "{rows:?}"
+    );
+    // cwd in a ghost worktree but the edited file is in main: not the ghost's.
+    assert_eq!(by("main_file.rs")[0].0, None, "{rows:?}");
+    assert_eq!(by("/elsewhere/a.rs").len(), 0, "{rows:?}");
+    assert_eq!(
+        by("relative").len() + by("root").len() + by("empty cwd").len(),
+        0,
+        "{rows:?}"
+    );
+}
+
+/// A transcript shared by two departed worktrees, one of which ran alone first.
+#[test]
+fn adv_one_transcript_two_departed_worktrees() {
+    let nested = Nested::new();
+    let [w1, w2, _] = nested.worktrees.clone();
+    with_transcript_root(&nested.corpus, || {
+        write_lines(
+            &nested.file("K1.jsonl"),
+            &[
+                edit_line(&w1, "K1", 1, &format!("{w1}/a.rs")),
+                edit_line(&w2, "K1", 2, &format!("{w2}/a.rs")),
+            ],
+        );
+        ingest_transcripts_into(&nested.base, &w1);
+        std::fs::remove_dir_all(&w1).unwrap();
+        std::fs::remove_dir_all(&w2).unwrap();
+        append_text(
+            &nested.file("K1.jsonl"),
+            &(edit_line(&w1, "K1", 3, &format!("{w1}/b.rs"))
+                + "\n"
+                + &edit_line(&w2, "K1", 4, &format!("{w2}/b.rs"))
+                + "\n"),
+        );
+        nested.pass(&nested.base, &[]);
+        nested.pass(&nested.base, &[]);
+    });
+    let rows = nested.rows();
+    let n = |w: &str, f: &str| {
+        rows.iter()
+            .filter(|r| r.0.as_deref() == Some(w) && r.1.ends_with(f))
+            .count()
+    };
+    assert_eq!(n(&w1, "a.rs"), 1, "{rows:?}");
+    assert_eq!(n(&w1, "b.rs"), 1, "{rows:?}");
+    assert_eq!(n(&w2, "a.rs"), 1, "{rows:?}");
+    assert_eq!(n(&w2, "b.rs"), 1, "{rows:?}");
+    assert_eq!(rows.len(), 4, "{rows:?}");
+}
+
+/// Rewrite longer than the departed cursor: the departed cursor is not
+/// rotation-aware, so lines it never consumed would be skipped.
+#[test]
+fn adv_rotation_longer_than_the_departed_cursor_loses_nothing() {
+    let nested = Nested::new();
+    let w = nested.worktrees[0].clone();
+    with_transcript_root(&nested.corpus, || {
+        write_lines(
+            &nested.file("O1.jsonl"),
+            &[edit_line(&w, "O1", 1, &format!("{w}/a.rs"))],
+        );
+        ingest_transcripts_into(&nested.base, &w);
+        std::fs::remove_dir_all(&w).unwrap();
+        write_lines(
+            &nested.file("O1.jsonl"),
+            &[
+                edit_line(&w, "O1", 2, &format!("{w}/new1.rs")),
+                edit_line(&w, "O1", 3, &format!("{w}/new2.rs")),
+                edit_line(&w, "O1", 4, &format!("{w}/new3.rs")),
+            ],
+        );
+        nested.pass(&nested.base, &[]);
+    });
+    let rows = nested.rows();
+    for f in ["new1.rs", "new2.rs", "new3.rs"] {
+        assert_eq!(nested.rows_for(f).len(), 1, "{f} lost: {rows:?}");
+    }
+}
+
+/// Race: two passes on the same family at once keep every row exactly-once,
+/// departed rows included.
+#[test]
+fn adv_racing_passes_keep_departed_rows_exactly_once() {
+    let nested = Nested::new();
+    let base = nested.base.clone();
+    let w = nested.worktrees[0].clone();
+    with_transcript_root(&nested.corpus, || {
+        std::fs::remove_dir_all(&w).unwrap();
+        let lines: Vec<String> = (0..200)
+            .map(|i| {
+                if i % 2 == 0 {
+                    edit_line(&w, "G1", (i % 59) as u32, &format!("{w}/f{i}.rs"))
+                } else {
+                    edit_line(&base, "G1", (i % 59) as u32, &format!("{base}/f{i}.rs"))
+                }
+            })
+            .collect();
+        write_lines(&nested.file("G1.jsonl"), &lines);
+        let a = std::thread::scope(|s| {
+            let h1 = s.spawn(|| nested.pass(&base, &[]));
+            let h2 = s.spawn(|| nested.pass(&base, &[]));
+            (h1.join().unwrap(), h2.join().unwrap())
+        });
+        println!("RACE recorded {} + {}", a.0.recorded, a.1.recorded);
+        nested.pass(&base, &[]);
+    });
+    let rows = nested.rows();
+    assert_eq!(rows.len(), 200, "{}", rows.len());
+    let mut objs: Vec<_> = rows.iter().map(|r| r.1.clone()).collect();
+    objs.sort();
+    objs.dedup();
+    assert_eq!(objs.len(), 200);
+}
+
+/// Replay idempotency over a mixed family, three passes.
+#[test]
+fn adv_replaying_a_mixed_family_is_idempotent() {
+    let nested = Nested::new();
+    let base = nested.base.clone();
+    let [w1, w2, w3] = nested.worktrees.clone();
+    with_transcript_root(&nested.corpus, || {
+        write_lines(
+            &nested.file("I1.jsonl"),
+            &[
+                edit_line(&w1, "I1", 1, &format!("{w1}/a.rs")),
+                edit_line(&w2, "I1", 2, &format!("{w2}/a.rs")),
+                edit_line(&w3, "I1", 3, &format!("{w3}/a.rs")),
+                edit_line(&base, "I1", 4, &format!("{base}/a.rs")),
+            ],
+        );
+        std::fs::remove_dir_all(&w3).unwrap();
+        nested.pass(&base, &[&w1, &w2]);
+        let first = nested.rows();
+        assert_eq!(first.len(), 4);
+        for _ in 0..3 {
+            nested.pass(&base, &[&w1, &w2]);
+            assert_eq!(nested.rows(), first);
+        }
+    });
+}
+
+/// Property: random families, random calls; at most one row per call, at the
+/// deepest live-or-departed root containing it.
+#[test]
+fn adv_property_one_row_per_call_at_the_deepest_root() {
+    let mut s: u64 = 0x9E37_79B9_7F4A_7C15;
+    let mut next = move || {
+        s ^= s << 13;
+        s ^= s >> 7;
+        s ^= s << 17;
+        s
+    };
+    for round in 0..25 {
+        let nested = Nested::new();
+        let base = nested.base.clone();
+        let n = 1 + (next() % 6) as usize;
+        let mut roots: Vec<(String, bool)> = Vec::new();
+        for i in 0..n {
+            let parent = if i > 0 && next() % 3 == 0 {
+                roots[(next() as usize) % roots.len()].0.clone()
+            } else {
+                base.clone()
+            };
+            roots.push((format!("{parent}/.claude/worktrees/p{round}_{i}"), true));
+        }
+        for (p, _) in &roots {
+            std::fs::create_dir_all(format!("{p}/src")).unwrap();
+        }
+        for (p, _) in roots.iter() {
+            if next() % 3 == 0 {
+                let _ = std::fs::remove_dir_all(p);
+            }
+        }
+        for (p, live) in roots.iter_mut() {
+            *live = std::fs::symlink_metadata(&*p).is_ok();
+        }
+        let live: Vec<String> = roots.iter().filter(|r| r.1).map(|r| r.0.clone()).collect();
+        let mut lines = Vec::new();
+        let mut expected: Vec<(String, String)> = Vec::new();
+        for k in 0..30u32 {
+            let pick = (next() as usize) % (roots.len() + 1);
+            let dir = if pick == roots.len() {
+                base.clone()
+            } else {
+                roots[pick].0.clone()
+            };
+            let file = format!("{dir}/f{round}_{k}.rs");
+            lines.push(edit_line(&dir, "PR", k % 59, &file));
+            // A removed root below another removed root is the outer one's
+            // (the shallowest gone ancestor); live roots never sit below one.
+            let best = roots
+                .iter()
+                .filter(|r| {
+                    r.1 || !roots
+                        .iter()
+                        .any(|o| !o.1 && o.0 != r.0 && r.0.starts_with(&format!("{}/", o.0)))
+                })
+                .map(|r| &r.0)
+                .filter(|r| file.starts_with(&format!("{r}/")))
+                .max_by_key(|r| r.len())
+                .cloned()
+                .unwrap_or_default();
+            expected.push((file, best));
+        }
+        with_transcript_root(&nested.corpus, || {
+            write_lines(&nested.file("PR.jsonl"), &lines);
+            let sib: Vec<&str> = live.iter().map(String::as_str).collect();
+            nested.pass(&base, &sib);
+            nested.pass(&base, &sib);
+        });
+        let rows = nested.rows();
+        for (file, want) in &expected {
+            let got: Vec<_> = rows.iter().filter(|r| &r.1 == file).collect();
+            assert_eq!(got.len(), 1, "round {round}: {file}: {got:?}");
+            assert_eq!(
+                got[0].0.clone().unwrap_or_default(),
+                *want,
+                "round {round}: {file} roots={roots:?}"
+            );
+        }
+    }
+}
+
+fn perf_n(var: &str, default: u32) -> u32 {
+    std::env::var(var)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
+}
+
+/// Timing, no threshold: lines over a live family, and distinct cwds. Set
+/// GITPULSE_ADV_PERF_LINES=100000 and GITPULSE_ADV_PERF_CWDS=10000 for the full size.
+#[test]
+fn adv_perf_pass_time_on_a_large_corpus() {
+    let mut best_a = u128::MAX;
+    let mut best_b = u128::MAX;
+    for _ in 0..3 {
+        let nested = Nested::new();
+        let wts = nested.worktrees.clone();
+        let base = nested.base.clone();
+        with_transcript_root(&nested.corpus, || {
+            let roots = [base.clone(), wts[0].clone(), wts[1].clone(), wts[2].clone()];
+            let lines: Vec<String> = (0..perf_n("GITPULSE_ADV_PERF_LINES", 20_000))
+                .map(|i| {
+                    let r = &roots[(i % 4) as usize];
+                    edit_line(
+                        &format!("{r}/src"),
+                        "PF",
+                        i % 59,
+                        &format!("{r}/src/f{}.rs", i % 500),
+                    )
+                })
+                .collect();
+            write_lines(&nested.file("PF.jsonl"), &lines);
+            let sib: Vec<String> = wts.to_vec();
+            let t = std::time::Instant::now();
+            let out = pass::ingest_family_until(&base, &base, &sib, &mut |_| false);
+            best_a = best_a.min(t.elapsed().as_millis());
+            assert_eq!(
+                out.recorded,
+                i64::from(perf_n("GITPULSE_ADV_PERF_LINES", 20_000)),
+                "{out:?}"
+            );
+        });
+        let nested = Nested::new();
+        let base = nested.base.clone();
+        with_transcript_root(&nested.corpus, || {
+            let lines: Vec<String> = (0..perf_n("GITPULSE_ADV_PERF_CWDS", 2_000))
+                .map(|i| {
+                    let c = format!("{base}/d{i}");
+                    edit_line(&c, "PG", i % 59, &format!("{c}/a.rs"))
+                })
+                .collect();
+            write_lines(&nested.file("PG.jsonl"), &lines);
+            let t = std::time::Instant::now();
+            let out = pass::ingest_family_until(&base, &base, &[], &mut |_| false);
+            best_b = best_b.min(t.elapsed().as_millis());
+            assert_eq!(
+                out.recorded,
+                i64::from(perf_n("GITPULSE_ADV_PERF_CWDS", 2_000)),
+                "{out:?}"
+            );
+        });
+    }
+    println!("PERF 100k-lines min-of-3 = {best_a} ms; 10k-distinct-cwds min-of-3 = {best_b} ms");
+}
