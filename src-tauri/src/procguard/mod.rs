@@ -771,6 +771,40 @@ pub fn install_signal_handlers() -> SignalGuard {
     sys::install_signal_handlers()
 }
 
+/// A pipe for waking a thread that would otherwise sleep until its timeout:
+/// `(read end, write end)`, both non-blocking, both close-on-exec before any
+/// child can be created (it is made under [`with_inheritance_lock`], like the
+/// shutdown watcher's own). The waiter polls the read end; anyone writes one
+/// byte to the write end to wake it, and a full pipe means a wake is already
+/// pending.
+#[cfg(unix)]
+pub fn wake_pipe() -> io::Result<(std::os::fd::OwnedFd, std::os::fd::OwnedFd)> {
+    use std::os::fd::{FromRawFd, OwnedFd};
+    let mut fds: [libc::c_int; 2] = [-1; 2];
+    if !sys::cloexec_pipe(&mut fds) {
+        let why = io::Error::last_os_error();
+        for fd in fds.into_iter().filter(|fd| *fd >= 0) {
+            // SAFETY: a descriptor `pipe` created here and handed to no one.
+            unsafe { libc::close(fd) };
+        }
+        return Err(why);
+    }
+    // SAFETY: two fresh descriptors this function owns and nothing else has.
+    let ends = unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
+    for fd in [&ends.0, &ends.1] {
+        use std::os::fd::AsRawFd;
+        // SAFETY: `F_GETFL` and `F_SETFL` on a descriptor `ends` keeps open.
+        let set = unsafe {
+            let flags = libc::fcntl(fd.as_raw_fd(), libc::F_GETFL);
+            flags >= 0 && libc::fcntl(fd.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) == 0
+        };
+        if !set {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    Ok(ends)
+}
+
 #[cfg(unix)]
 mod sys {
     use super::{reap_all, SignalGuard, CHILD_GRACE};
@@ -947,7 +981,7 @@ mod sys {
     /// lock, which every spawn takes. One line, because `tests/spawn_seam.rs`
     /// checks that a `pipe` names the lock where it is made.
     #[rustfmt::skip]
-    fn cloexec_pipe(fds: &mut [libc::c_int; 2]) -> bool {
+    pub(super) fn cloexec_pipe(fds: &mut [libc::c_int; 2]) -> bool {
         // SAFETY: `pipe` fills `fds` on success, and `fcntl` on those is defined.
         super::with_inheritance_lock(|| unsafe { libc::pipe(fds.as_mut_ptr()) == 0 && fds.iter().all(|&fd| libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) == 0) })
     }

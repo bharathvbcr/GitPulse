@@ -105,4 +105,20 @@ describe("parseDependabotReport / parseCodeScanningReport", () => {
     expect(parsed.alerts).toEqual([]);
     expect(parsed.unavailable_reason).toBe("product_disabled");
   });
+
+  it("carries the severity tiers a partial result could not read", () => {
+    const base = { available: true, alerts: [], truncated: true };
+    expect(parseDependabotReport({ ...base, partial_tiers: ["high", "low"] }).partial_tiers).toEqual([
+      "high",
+      "low",
+    ]);
+    expect(parseCodeScanningReport({ ...base, partial_tiers: ["error"] }).partial_tiers).toEqual(["error"]);
+  });
+
+  it("reads an absent partial_tiers as none, and refuses a corrupt one", () => {
+    expect(parseDependabotReport({ available: true, alerts: [], truncated: false }).partial_tiers).toEqual([]);
+    expect(() =>
+      parseDependabotReport({ available: true, alerts: [], truncated: true, partial_tiers: "high" }),
+    ).toThrow(/partial_tiers/);
+  });
 });

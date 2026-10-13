@@ -3,6 +3,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import { render } from "svelte/server";
+import GithubAlertsSection from "./GithubAlertsSection.svelte";
 import HealthSection from "./HealthSection.svelte";
 import HealthTable from "./HealthTable.svelte";
 import { HEALTH_CONTENT_WIDTH, HEALTH_SECTIONS } from "../../health/sections";
@@ -53,6 +54,53 @@ describe("GithubAlertsSection — a failed fetch is not a missing CLI", () => {
   it("takes the wire types rather than redeclaring their shape", () => {
     expect(text).toContain("DependabotReport | CodeScanningReport");
     expect(text).not.toMatch(/interface\s+AlertsReport\s*\{/);
+  });
+
+  // A result missing severity tiers is neither "could not fetch" nor an
+  // all-clear: the rows it has are shown with the missing tiers named.
+  describe("a result missing severity tiers", () => {
+    const report = (alerts: unknown[], partial_tiers: string[]) => ({
+      available: true,
+      cli_present: true,
+      is_github_remote: true,
+      slug: "o/r",
+      alerts,
+      truncated: partial_tiers.length > 0,
+      partial_tiers,
+      error: null,
+    });
+    const props = (r: ReturnType<typeof report>, shown: number) => ({
+      id: "dependabot",
+      report: r as never,
+      requestFailed: false,
+      count: { shown, total: shown, atLeast: true },
+      noun: "Dependabot alerts",
+      columns: [{ label: "Severity" }],
+      row: (() => {}) as never,
+    });
+
+    it("names the missing tiers and never says the fetch failed", () => {
+      const { body } = render(GithubAlertsSection, {
+        props: props(report([{ number: 1 }], ["critical", "high"]), 1),
+      });
+      expect(body).toContain('data-testid="github-alerts-partial"');
+      expect(body).toContain("critical, high");
+      expect(body).not.toContain("Could not fetch");
+    });
+
+    it("does not render an empty partial result as 'No open alerts'", () => {
+      const { body } = render(GithubAlertsSection, {
+        props: props(report([], ["critical"]), 0),
+      });
+      expect(body).toContain('data-testid="github-alerts-partial"');
+      expect(body).not.toContain("No open Dependabot alerts");
+    });
+
+    it("shows no notice for a complete result", () => {
+      const { body } = render(GithubAlertsSection, { props: props(report([], []), 0) });
+      expect(body).not.toContain("github-alerts-partial");
+      expect(body).toContain("No open Dependabot alerts");
+    });
   });
 });
 

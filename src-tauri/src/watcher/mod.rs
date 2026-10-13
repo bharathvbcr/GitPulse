@@ -29,8 +29,60 @@ use tauri::{AppHandle, Emitter};
 /// just opened. Open tabs are no longer bounded by it.
 pub const MAX_WATCHES: usize = 32;
 
+/// What a watch loop is woken with: a path-less event.
+type WakeSender = std::sync::mpsc::SyncSender<Result<Event, notify::Error>>;
+
+/// Ends a watch loop, and wakes it to notice.
+///
+/// The loop blocks on its event channel for as long as nothing happens, which
+/// is most of the time, so a flag alone would be seen at the next event or the
+/// next heartbeat. Setting it therefore also queues a path-less event on that
+/// channel through a clone of its sender; the loop checks the flag as soon as
+/// anything arrives. Every way of stopping a loop goes through [`Self::stop`]
+/// so there is no way to set the flag and forget the wake.
+pub(crate) struct StopSignal {
+    stopped: AtomicBool,
+    wake: Mutex<Option<WakeSender>>,
+}
+
+impl StopSignal {
+    pub(crate) fn new() -> Arc<Self> {
+        Arc::new(Self {
+            stopped: AtomicBool::new(false),
+            wake: Mutex::new(None),
+        })
+    }
+
+    /// Gives the signal the channel to wake. A signal already stopped wakes it
+    /// now, so a stop that raced the loop's start is not lost.
+    pub(crate) fn arm(&self, wake: WakeSender) {
+        let mut slot = crate::supervisor::lock_or_recover(&self.wake);
+        *slot = Some(wake);
+        if self.stopped.load(Ordering::SeqCst) {
+            Self::send_wake(slot.as_ref());
+        }
+    }
+
+    pub(crate) fn stop(&self) {
+        self.stopped.store(true, Ordering::SeqCst);
+        Self::send_wake(crate::supervisor::lock_or_recover(&self.wake).as_ref());
+    }
+
+    pub(crate) fn is_stopped(&self) -> bool {
+        self.stopped.load(Ordering::SeqCst)
+    }
+
+    /// A full queue is a loop with events to read, which it will check the flag
+    /// on; a gone receiver is a loop that has already ended.
+    fn send_wake(wake: Option<&WakeSender>) {
+        if let Some(wake) = wake {
+            let _ = wake.try_send(Ok(Event::new(EventKind::Other)));
+        }
+    }
+}
+
 pub struct WatchSession {
-    stop: Arc<AtomicBool>,
+    stop: Arc<StopSignal>,
     retired: Option<std::sync::mpsc::Receiver<Result<(), String>>>,
     /// Path spellings that identified this session when it was created:
     /// the canonical map key plus whatever raw path the caller supplied.
@@ -42,7 +94,7 @@ pub struct WatchSession {
 
 impl Drop for WatchSession {
     fn drop(&mut self) {
-        self.stop.store(true, Ordering::SeqCst);
+        self.stop.stop();
     }
 }
 
@@ -205,7 +257,7 @@ impl WatcherState {
 
     /// Drops a reserved slot only if it is still the session we inserted.
     /// Used when thread spawn fails after the sessions lock has been released.
-    fn abandon_watch_slot(&self, key: &str, stop: &Arc<AtomicBool>) -> Result<(), String> {
+    fn abandon_watch_slot(&self, key: &str, stop: &Arc<StopSignal>) -> Result<(), String> {
         let mut guard = self.lock_sessions()?;
         let same = guard
             .get(key)
@@ -222,7 +274,7 @@ fn insert_watch_session(
     key: &str,
     caller_paths: &[String],
     retired: Option<std::sync::mpsc::Receiver<Result<(), String>>>,
-) -> Result<Option<Arc<AtomicBool>>, String> {
+) -> Result<Option<Arc<StopSignal>>, String> {
     if sessions.contains_key(key) {
         return Ok(None);
     }
@@ -235,7 +287,7 @@ fn insert_watch_session(
             aliases.push(path.clone());
         }
     }
-    let stop = Arc::new(AtomicBool::new(false));
+    let stop = StopSignal::new();
     sessions.insert(
         key.to_string(),
         WatchSession {
@@ -869,6 +921,62 @@ fn scan_is_due(
         && last_scan.is_none_or(|previous| now.saturating_duration_since(previous) >= SCAN_COALESCE)
 }
 
+/// How often a loop with nothing to do looks anyway. It is the bound on the
+/// two things no event announces: a repository that vanished without a
+/// filesystem event reaching us, and a backend that died. Everything else wakes
+/// the loop by sending to it.
+const IDLE_HEARTBEAT: Duration = Duration::from_secs(30);
+/// How soon a repository that has just been missed is looked for again, so
+/// that the loop's three consecutive misses take as long as they ever did
+/// rather than three heartbeats.
+const DEAD_RECHECK: Duration = Duration::from_millis(200);
+
+/// When a failed ignore-rules query is next due for its retry, if one is.
+fn rules_retry_at(rules: &IgnoreRules, last_load: Instant) -> Option<Instant> {
+    (rules.load_error.is_some() && !rules.truncated).then(|| last_load + IGNORE_RETRY)
+}
+
+/// What the loop is waiting for, as plain values so the wait is a function of
+/// them and nothing else.
+struct WaitPlan {
+    now: Instant,
+    pending: bool,
+    last_event: Instant,
+    first_pending: Option<Instant>,
+    last_scan: Option<Instant>,
+    dead_misses: u32,
+    rules_retry_at: Option<Instant>,
+}
+
+/// How long the loop may sleep before something it owns is due.
+///
+/// The earliest of: the pending refresh becoming emittable (quiet for
+/// [`DEBOUNCE_QUIET`] or [`DEBOUNCE_MAX_WAIT`] old, but not before
+/// [`SCAN_COALESCE`] after the last scan, exactly [`scan_is_due`]'s rule), the
+/// ignore-rules retry, a repository that was just missed being looked at
+/// again, and [`IDLE_HEARTBEAT`]. An event or a stop ends the wait sooner by
+/// arriving.
+fn next_wait(plan: &WaitPlan) -> Duration {
+    let mut wait = IDLE_HEARTBEAT;
+    if plan.dead_misses > 0 {
+        wait = wait.min(DEAD_RECHECK);
+    }
+    if plan.pending {
+        let quiet_at = plan.last_event + DEBOUNCE_QUIET;
+        let emit_at = plan
+            .first_pending
+            .map_or(quiet_at, |first| quiet_at.min(first + DEBOUNCE_MAX_WAIT));
+        let due_at = plan
+            .last_scan
+            .map_or(emit_at, |scan| emit_at.max(scan + SCAN_COALESCE));
+        wait = wait.min(due_at.saturating_duration_since(plan.now));
+    }
+    if let Some(at) = plan.rules_retry_at {
+        wait = wait.min(at.saturating_duration_since(plan.now));
+    }
+    wait
+}
+
 /// Everything the debounce loop needs to know about WHERE it is watching and
 /// WHAT to emit. Bundled so [`run_watch_loop`] stays under the argument cap:
 /// `git_dir` is the liveness probe target, `internal_roots` scopes the
@@ -878,6 +986,9 @@ struct WatchLoopContext {
     git_dir: std::path::PathBuf,
     internal_roots: Vec<std::path::PathBuf>,
     emit_path: String,
+    /// Times the loop's wait ran out with nothing to read. An idle watch
+    /// should add none for as long as it is idle; a test reads this to say so.
+    timer_wakes: Arc<std::sync::atomic::AtomicU64>,
 }
 
 /// Why the debounce loop ended. The spawn-site supervisor logs every
@@ -898,9 +1009,9 @@ enum WatchLoopExit {
 fn run_watch_loop<F>(
     watcher: &RepoFileWatcher,
     ctx: WatchLoopContext,
-    stop: Arc<AtomicBool>,
+    stop: Arc<StopSignal>,
     sessions: Option<std::sync::Arc<Mutex<HashMap<String, WatchSession>>>>,
-    session_stop: Arc<AtomicBool>,
+    session_stop: Arc<StopSignal>,
     on_change: F,
 ) -> WatchLoopExit
 where
@@ -910,6 +1021,7 @@ where
         git_dir,
         internal_roots,
         emit_path: path,
+        timer_wakes,
     } = ctx;
     let mut pending = false;
     let mut last_event = Instant::now();
@@ -932,7 +1044,7 @@ where
     const DEAD_MISSES: u32 = 3;
     let mut dead_misses: u32 = 0;
     let mut exit = WatchLoopExit::Stopped;
-    'outer: while !stop.load(Ordering::Relaxed) {
+    'outer: while !stop.is_stopped() {
         if !git_dir.exists() {
             dead_misses += 1;
             if dead_misses >= DEAD_MISSES {
@@ -952,7 +1064,18 @@ where
             pending = true;
             last_event = Instant::now();
         }
-        match watcher.receiver.recv_timeout(Duration::from_millis(200)) {
+        let wait = next_wait(&WaitPlan {
+            now: Instant::now(),
+            pending,
+            last_event,
+            first_pending,
+            last_scan,
+            dead_misses,
+            rules_retry_at: rules_retry_at(&rules, last_rules_load),
+        });
+        match watcher.receiver.recv_timeout(wait) {
+            // A stop wakes the loop with a path-less event; it is not a change.
+            Ok(_) if stop.is_stopped() => break,
             Ok(Ok(event)) => {
                 // Noise gate before any accumulation: a batch whose every
                 // path is git-internal churn must not open or extend the
@@ -1038,6 +1161,14 @@ where
                 last_event = Instant::now();
             }
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                timer_wakes.fetch_add(1, Ordering::Relaxed);
+                // The channel's own sender stays open here (the stop signal
+                // wakes through it), so a backend that died cannot announce
+                // it by disconnecting: its callback going away is the sign.
+                if !watcher.backend_alive() {
+                    exit = WatchLoopExit::EventStreamClosed;
+                    break;
+                }
                 if rules_due(&rules, last_rules_load, Instant::now(), false) {
                     rules = IgnoreRules::load(Path::new(&path));
                     last_rules_load = Instant::now();
@@ -1221,6 +1352,8 @@ where
             Some(stop) => stop,
         }
     };
+    // Before the loop exists: a stop that lands in between is replayed here.
+    stop.arm(watcher.waker());
 
     // Release the sessions mutex before spawn. Holding it across spawn can
     // deadlock if the watch thread (or `on_change`) needs the same lock.
@@ -1249,6 +1382,7 @@ where
                     git_dir,
                     internal_roots,
                     emit_path: emit_path.clone(),
+                    timer_wakes: Default::default(),
                 },
                 thread_stop,
                 Some(loop_sessions.clone()),
@@ -1379,7 +1513,7 @@ pub fn unwatch_all(state: &WatcherState) -> Result<(), String> {
 fn retire_sessions(mut sessions: Vec<WatchSession>) -> Result<(), String> {
     let deadline = Instant::now() + Duration::from_secs(3);
     for session in &sessions {
-        session.stop.store(true, Ordering::SeqCst);
+        session.stop.stop();
     }
     let mut errors = Vec::new();
     for session in &mut sessions {
@@ -1996,6 +2130,7 @@ mod tests {
                 git_dir: git_dir.clone(),
                 internal_roots: vec![git_dir],
                 emit_path: key.clone(),
+                timer_wakes: Default::default(),
             },
             stop.clone(),
             Some(state.sessions.clone()),
@@ -2040,6 +2175,7 @@ mod tests {
                 git_dir: git_dir.clone(),
                 internal_roots: vec![git_dir],
                 emit_path: key.clone(),
+                timer_wakes: Default::default(),
             },
             stop.clone(),
             Some(state.sessions.clone()),
@@ -2052,7 +2188,7 @@ mod tests {
             &state.lock_sessions().unwrap().get(&key).unwrap().stop,
             &replacement
         ));
-        assert!(!replacement.load(Ordering::Relaxed));
+        assert!(!replacement.is_stopped());
         drop(old_session);
         unwatch_all(&state).unwrap();
     }
@@ -2099,7 +2235,7 @@ mod tests {
         let state_for_worker = state.clone();
         let worker = thread::spawn(move || {
             let deadline = Instant::now() + Duration::from_secs(2);
-            while !(one.load(Ordering::SeqCst) && two.load(Ordering::SeqCst)) {
+            while !(one.is_stopped() && two.is_stopped()) {
                 assert!(
                     Instant::now() < deadline,
                     "every session must be signalled before waiting"
@@ -2333,7 +2469,7 @@ mod tests {
         dir: &Path,
     ) -> (
         std::sync::mpsc::Receiver<RepoChangedPayload>,
-        Arc<AtomicBool>,
+        Arc<StopSignal>,
         PathBuf,
     ) {
         use std::process::Command;
@@ -2350,7 +2486,8 @@ mod tests {
         let watcher =
             RepoFileWatcher::watch_repo(&git_dir, Some(&canonical), None).expect("watcher");
 
-        let stop = Arc::new(AtomicBool::new(false));
+        let stop = StopSignal::new();
+        stop.arm(watcher.waker());
         let thread_stop = stop.clone();
         let session_stop = stop.clone();
         let emit_path = canonical.to_string_lossy().into_owned();
@@ -2366,6 +2503,7 @@ mod tests {
                         git_dir: loop_git_dir,
                         internal_roots,
                         emit_path,
+                        timer_wakes: Default::default(),
                     },
                     thread_stop,
                     None,
@@ -2505,7 +2643,7 @@ mod tests {
                 Err(e) => panic!("channel failed during quiet window: {e}"),
             }
         }
-        stop.store(true, Ordering::SeqCst);
+        stop.stop();
     }
 
     /// The reason for the second watch: an unstaged top-level edit fires the
@@ -2579,7 +2717,7 @@ mod tests {
             );
         }
 
-        stop.store(true, Ordering::SeqCst);
+        stop.stop();
     }
 
     /// Decision table for the emission rule: quiet period alone emits, but a
@@ -3025,7 +3163,7 @@ mod tests {
         // lost callback, not against millisecond-level latency.
         let got = rx.recv_timeout(Duration::from_secs(20));
         churn_stop.store(true, Ordering::SeqCst);
-        stop.store(true, Ordering::SeqCst);
+        stop.stop();
         let _ = writer.join();
         got.expect("continuous churn must still yield a refresh within the max wait");
     }
@@ -3504,7 +3642,7 @@ mod tests {
                     "the watcher went silent under {config:?}, so the quiet window proves nothing"
                 );
             }
-            stop.store(true, Ordering::SeqCst);
+            stop.stop();
         }
     }
 
@@ -3583,7 +3721,7 @@ mod tests {
                 "the watcher went silent, so the quiet window above proves nothing"
             );
         }
-        stop.store(true, Ordering::SeqCst);
+        stop.stop();
     }
 
     /// Ref moves, real index/HEAD/packed-refs writes and directories that
@@ -4030,10 +4168,10 @@ mod tests {
             std::fs::create_dir_all(dir.path().join(name)).unwrap();
         }
         let (rx, stop, canonical) = spawn_loop(dir.path());
-        struct StopOnDrop(Arc<AtomicBool>);
+        struct StopOnDrop(Arc<StopSignal>);
         impl Drop for StopOnDrop {
             fn drop(&mut self) {
-                self.0.store(true, Ordering::SeqCst);
+                self.0.stop();
             }
         }
         let _stop = StopOnDrop(stop);
@@ -4138,7 +4276,7 @@ mod tests {
                 "real edits must still trigger after the noise gate ({n} probes)"
             );
         }
-        stop.store(true, Ordering::SeqCst);
+        stop.stop();
     }
 
     /// Mixed burst: noise paths next to a genuine `.git/index` write settle
@@ -4187,7 +4325,7 @@ mod tests {
                 Err(e) => panic!("channel failed during quiet window: {e}"),
             }
         }
-        stop.store(true, Ordering::SeqCst);
+        stop.stop();
     }
 
     /// The leaf-name rules target transient FILES: a directory whose name
@@ -4217,7 +4355,7 @@ mod tests {
                  ({n} attempts within {PRIME_DEADLINE:?})"
             );
         }
-        stop.store(true, Ordering::SeqCst);
+        stop.stop();
     }
 
     // ---- audit: access events, rescans, noise starvation, sibling worktrees ----
@@ -4332,9 +4470,10 @@ mod tests {
     /// Runs the real debounce loop over a hand-fed event channel, reporting
     /// when each refresh was emitted.
     struct FedLoop {
-        events: std::sync::mpsc::Sender<Result<notify::Event, notify::Error>>,
+        events: WakeSender,
         emitted: std::sync::mpsc::Receiver<(Instant, RepoChangedPayload)>,
-        stop: Arc<AtomicBool>,
+        stop: Arc<StopSignal>,
+        timer_wakes: Arc<std::sync::atomic::AtomicU64>,
         thread: Option<thread::JoinHandle<()>>,
         root: PathBuf,
         _dir: TempDir,
@@ -4347,17 +4486,22 @@ mod tests {
             let root = dir.path().canonicalize().unwrap();
             let git_dir = root.join(".git");
             let mut watcher = RepoFileWatcher::watch(&git_dir).unwrap();
-            let (events, receiver) = std::sync::mpsc::channel();
+            let (events, receiver) = std::sync::mpsc::sync_channel(debouncer::EVENT_QUEUE_CAPACITY);
             watcher.receiver = receiver;
             if overflow_first {
                 watcher.simulate_overflow();
             }
-            let stop = Arc::new(AtomicBool::new(false));
+            // This loop reads the hand-fed channel, so that is the one a stop
+            // has to wake.
+            let stop = StopSignal::new();
+            stop.arm(events.clone());
+            let timer_wakes = Arc::<std::sync::atomic::AtomicU64>::default();
             let (tx, emitted) = std::sync::mpsc::channel();
             let ctx = WatchLoopContext {
                 git_dir: git_dir.clone(),
                 internal_roots: vec![git_dir],
                 emit_path: root.to_string_lossy().into_owned(),
+                timer_wakes: timer_wakes.clone(),
             };
             let (loop_stop, session_stop) = (stop.clone(), stop.clone());
             let thread = thread::spawn(move || {
@@ -4369,6 +4513,7 @@ mod tests {
                 events,
                 emitted,
                 stop,
+                timer_wakes,
                 thread: Some(thread),
                 root,
                 _dir: dir,
@@ -4382,7 +4527,7 @@ mod tests {
 
     impl Drop for FedLoop {
         fn drop(&mut self) {
-            self.stop.store(true, Ordering::Relaxed);
+            self.stop.stop();
             if let Some(thread) = self.thread.take() {
                 let _ = thread.join();
             }
@@ -4441,6 +4586,197 @@ mod tests {
                 .is_err(),
             "one rescan, one refresh"
         );
+    }
+
+    /// An idle watch has nothing to do until an event arrives, so it must not
+    /// wake on a timer to find that out. The loop used to poll its channel
+    /// every 200 ms for the stop flag, the repository's liveness and a debounce
+    /// that was not pending: five wakes a second, per watched repository, for
+    /// as long as the app was open.
+    #[test]
+    fn an_idle_watch_does_not_wake_on_a_timer() {
+        let fed = FedLoop::start(false);
+        thread::sleep(Duration::from_millis(1200));
+        let wakes = fed.timer_wakes.load(Ordering::Relaxed);
+        assert!(wakes <= 1, "an idle watch loop woke {wakes} times in 1.2 s");
+    }
+
+    /// The loop now sleeps for as long as 30 s when idle, so a stop that did
+    /// not wake it would hang `unwatch` for that long (and fail it at the
+    /// 3 s retirement deadline).
+    #[test]
+    fn a_stop_ends_a_sleeping_loop_without_waiting_for_its_heartbeat() {
+        let mut fed = FedLoop::start(false);
+        thread::sleep(Duration::from_millis(100));
+        let stopped_at = Instant::now();
+        fed.stop.stop();
+        fed.thread.take().unwrap().join().unwrap();
+        assert!(
+            stopped_at.elapsed() < crate::test_support::coverage_relaxed(Duration::from_secs(2)),
+            "a stopped loop took {:?} to end",
+            stopped_at.elapsed()
+        );
+    }
+
+    #[test]
+    fn a_stop_that_precedes_the_wake_channel_is_replayed_when_it_is_armed() {
+        let signal = StopSignal::new();
+        signal.stop();
+        let (tx, rx) = std::sync::mpsc::sync_channel(4);
+        signal.arm(tx);
+        assert!(rx.try_recv().is_ok(), "the late arm did not wake anyone");
+        assert!(signal.is_stopped());
+    }
+
+    #[test]
+    fn a_watcher_is_alive_until_its_backend_is_released() {
+        let dir = TempDir::new().unwrap();
+        git_init(dir.path(), false);
+        let mut watcher = RepoFileWatcher::watch(&dir.path().join(".git")).unwrap();
+        assert!(watcher.backend_alive());
+        watcher.shutdown().unwrap();
+        assert!(!watcher.backend_alive());
+    }
+
+    fn plan(now: Instant) -> WaitPlan {
+        WaitPlan {
+            now,
+            pending: false,
+            last_event: now,
+            first_pending: None,
+            last_scan: None,
+            dead_misses: 0,
+            rules_retry_at: None,
+        }
+    }
+
+    #[test]
+    fn an_idle_loop_waits_for_its_heartbeat() {
+        assert_eq!(next_wait(&plan(Instant::now())), IDLE_HEARTBEAT);
+    }
+
+    #[test]
+    fn a_missed_repository_is_looked_for_again_soon() {
+        let now = Instant::now();
+        let mut p = plan(now);
+        p.dead_misses = 1;
+        assert_eq!(next_wait(&p), DEAD_RECHECK);
+    }
+
+    #[test]
+    fn a_pending_refresh_wakes_the_loop_when_it_has_been_quiet_long_enough() {
+        let now = Instant::now();
+        let mut p = plan(now);
+        p.pending = true;
+        p.first_pending = Some(now);
+        assert_eq!(next_wait(&p), DEBOUNCE_QUIET);
+        p.last_event = now - Duration::from_millis(150);
+        assert_eq!(next_wait(&p), DEBOUNCE_QUIET - Duration::from_millis(150));
+        // Quiet already: due now, not later.
+        p.last_event = now - DEBOUNCE_QUIET;
+        assert_eq!(next_wait(&p), Duration::ZERO);
+        p.last_event = now - DEBOUNCE_QUIET - Duration::from_secs(5);
+        assert_eq!(next_wait(&p), Duration::ZERO);
+    }
+
+    #[test]
+    fn continuous_churn_is_cut_at_the_max_wait() {
+        let now = Instant::now();
+        let mut p = plan(now);
+        p.pending = true;
+        p.last_event = now - Duration::from_millis(10);
+        p.first_pending = Some(now - DEBOUNCE_MAX_WAIT + Duration::from_millis(100));
+        assert_eq!(next_wait(&p), Duration::from_millis(100));
+        p.first_pending = Some(now - DEBOUNCE_MAX_WAIT);
+        assert_eq!(next_wait(&p), Duration::ZERO);
+    }
+
+    /// Without this the loop would be told "due now" by the quiet rule and
+    /// find `scan_is_due` false, and spin until the coalesce window ended.
+    #[test]
+    fn a_refresh_inside_the_coalesce_window_waits_for_the_window() {
+        let now = Instant::now();
+        let mut p = plan(now);
+        p.pending = true;
+        p.first_pending = Some(now - Duration::from_secs(1));
+        p.last_event = now - DEBOUNCE_QUIET;
+        p.last_scan = Some(now - Duration::from_millis(500));
+        assert_eq!(next_wait(&p), SCAN_COALESCE - Duration::from_millis(500));
+        p.last_scan = Some(now - SCAN_COALESCE);
+        assert_eq!(next_wait(&p), Duration::ZERO);
+    }
+
+    #[test]
+    fn the_wait_ends_exactly_when_a_scan_becomes_due() {
+        let now = Instant::now();
+        for (quiet_for, pending_for, scanned_ago) in [
+            (0u64, 0u64, None),
+            (150, 600, None),
+            (399, 399, None),
+            (10, 1990, None),
+            (400, 700, Some(100u64)),
+            (10, 2000, Some(1999)),
+            (900, 900, Some(2000)),
+        ] {
+            let mut p = plan(now);
+            p.pending = true;
+            p.last_event = now - Duration::from_millis(quiet_for);
+            p.first_pending = Some(now - Duration::from_millis(pending_for));
+            p.last_scan = scanned_ago.map(|ms| now - Duration::from_millis(ms));
+            let wait = next_wait(&p);
+            let due =
+                |at: Instant| scan_is_due(true, p.last_event, p.first_pending, p.last_scan, at);
+            assert!(
+                due(now + wait),
+                "not due at the end of a {wait:?} wait: {quiet_for} {pending_for} {scanned_ago:?}"
+            );
+            if wait > Duration::ZERO {
+                assert!(
+                    !due(now + wait - Duration::from_nanos(1)),
+                    "due before the end of a {wait:?} wait: {quiet_for} {pending_for} {scanned_ago:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_rules_retry_bounds_the_wait_and_a_past_one_is_due_now() {
+        let now = Instant::now();
+        let mut p = plan(now);
+        p.rules_retry_at = Some(now + Duration::from_secs(5));
+        assert_eq!(next_wait(&p), Duration::from_secs(5));
+        p.rules_retry_at = Some(now + Duration::from_secs(90));
+        assert_eq!(next_wait(&p), IDLE_HEARTBEAT);
+        p.rules_retry_at = Some(now - Duration::from_secs(1));
+        assert_eq!(next_wait(&p), Duration::ZERO);
+    }
+
+    #[test]
+    fn the_earliest_of_several_deadlines_wins() {
+        let now = Instant::now();
+        let mut p = plan(now);
+        p.dead_misses = 2;
+        p.pending = true;
+        p.first_pending = Some(now);
+        p.last_event = now - Duration::from_millis(350);
+        p.rules_retry_at = Some(now + Duration::from_secs(1));
+        assert_eq!(next_wait(&p), Duration::from_millis(50));
+    }
+
+    #[test]
+    fn a_failed_ignore_query_is_retried_only_while_it_could_succeed() {
+        let now = Instant::now();
+        let mut rules = IgnoreRules {
+            prefixes: HashSet::new(),
+            load_error: None,
+            truncated: false,
+        };
+        assert_eq!(rules_retry_at(&rules, now), None);
+        rules.load_error = Some("git ls-files timed out".into());
+        assert_eq!(rules_retry_at(&rules, now), Some(now + IGNORE_RETRY));
+        // A truncated answer is final: asking again returns the same truncation.
+        rules.truncated = true;
+        assert_eq!(rules_retry_at(&rules, now), None);
     }
 
     #[test]

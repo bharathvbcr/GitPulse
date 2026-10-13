@@ -141,6 +141,11 @@ pub fn handle_menu_event<R: Runtime>(app: &AppHandle<R>, id: &str) {
 }
 
 pub fn handle_window_event<R: Runtime>(window: &Window<R>, event: &WindowEvent) {
+    // A window that has just taken focus is on screen. (Losing focus says
+    // nothing: the window may still be showing.)
+    if matches!(event, WindowEvent::Focused(true)) && window.label() == "main" {
+        crate::workbench::external_changes::note_main_window_on_screen(true);
+    }
     if let WindowEvent::CloseRequested { api, .. } = event {
         if request_window_close(window) {
             api.prevent_close();
@@ -167,6 +172,7 @@ fn request_window_close<R: Runtime>(window: &Window<R>) -> bool {
     if menu_state(app).show_status_icon && app.tray_by_id(tray::TRAY_ID).is_some() {
         match window.hide() {
             Ok(()) => {
+                crate::workbench::external_changes::note_main_window_on_screen(false);
                 #[cfg(target_os = "macos")]
                 {
                     let state = menu_state(app);
@@ -526,6 +532,7 @@ fn reveal_main<R: Runtime>(app: &AppHandle<R>) -> Result<(), String> {
     }
     window.show().map_err(|error| error.to_string())?;
     window.unminimize().map_err(|error| error.to_string())?;
+    crate::workbench::external_changes::note_main_window_on_screen(true);
     window.set_focus().map_err(|error| error.to_string())
 }
 

@@ -322,13 +322,11 @@ pub async fn cmd_devmap_maybe_refresh(
     repo_path: String,
     repo_changed: Option<bool>,
 ) -> Result<crate::devmap::LiveRefreshOutcome, String> {
-    off_thread(move || {
-        crate::engine::git_cli::with_background_processes(|| {
-            Ok(crate::devmap::live::start_refresh(
-                &repo_path,
-                repo_changed.unwrap_or(true),
-            ))
-        })
+    off_thread_background(move || {
+        Ok(crate::devmap::live::start_refresh(
+            &repo_path,
+            repo_changed.unwrap_or(true),
+        ))
     })
     .await
 }
@@ -346,16 +344,44 @@ pub async fn cmd_devmap_preview(
     file_path: String,
     content: String,
 ) -> Result<crate::devmap::PreviewFileResult, String> {
+    // Refused before the buffer is moved into the worker or copied again.
+    super::payload::check_content(
+        "preview file content",
+        &content,
+        super::payload::MAX_PREVIEW_FILE_BYTES,
+    )?;
     off_thread(move || Ok(crate::devmap::preview(&repo_path, &file_path, &content))).await
 }
 
-/// Preview many changed files; cancellable between files via a shared flag.
+/// Preview many changed files; cancellable between files.
+///
+/// `cancel_token` names the request: `cmd_codeintel_cancel` with the same
+/// token stops the batch before its next file (the caller abandoned it), and
+/// the 30 s query backstop stops it regardless. The result then says
+/// `cancelled`, never a complete-looking list.
+///
+/// The count and byte caps run here, before `preview_many` clones any entry.
 #[tauri::command(async)]
 pub async fn cmd_devmap_preview_many(
     repo_path: String,
     files: Vec<(String, String)>,
+    cancel_token: Option<String>,
 ) -> Result<crate::devmap::PreviewOutcome, String> {
-    off_thread(move || Ok(crate::devmap::preview_many(&repo_path, &files, || false))).await
+    super::payload::check_preview_batch(&files)?;
+    off_thread(move || Ok(preview_many_cancellable(&repo_path, &files, cancel_token))).await
+}
+
+/// [`crate::devmap::preview_many`] with its cancel flag bound to `cancel_token`
+/// in the shared query registry.
+fn preview_many_cancellable(
+    repo_path: &str,
+    files: &[(String, String)],
+    cancel_token: Option<String>,
+) -> crate::devmap::PreviewOutcome {
+    let cancel = crate::codeintel::begin_cancellable_query(cancel_token.as_deref());
+    let outcome = crate::devmap::preview_many(repo_path, files, || cancel.is_cancelled());
+    crate::codeintel::finish_cancellable_query(cancel_token.as_deref());
+    outcome
 }
 
 /// Read `.devcouncil/repo_map.json` into GitPulse's typed navigator mirror.
@@ -575,4 +601,120 @@ pub async fn cmd_fleet_record_metrics(
             .map_err(|e| e.to_string())
     })
     .await
+}
+
+#[cfg(test)]
+mod payload_cap_tests {
+    use super::*;
+    use crate::commands::payload::{MAX_CONTENT_BYTES, MAX_PREVIEW_FILE_BYTES};
+
+    /// The over-cap request is refused with a size error before any worker
+    /// runs: a repository that does not exist would otherwise be the error.
+    #[test]
+    fn devmap_preview_refuses_an_oversized_buffer_at_the_boundary() {
+        let huge = "x".repeat(MAX_PREVIEW_FILE_BYTES + 1);
+        let err = tauri::async_runtime::block_on(cmd_devmap_preview(
+            "/no/such/repo".into(),
+            "src/lib.rs".into(),
+            huge,
+        ))
+        .expect_err("over the cap");
+        assert!(err.contains("too large"), "{err}");
+    }
+
+    #[test]
+    fn preview_many_refuses_seventeen_files_with_one_huge_body_before_any_work() {
+        let mut files: Vec<(String, String)> = (0..16)
+            .map(|i| (format!("src/f{i}.rs"), "fn x() {}\n".into()))
+            .collect();
+        files.push(("src/huge.rs".into(), "x".repeat(MAX_PREVIEW_FILE_BYTES + 1)));
+        let err = tauri::async_runtime::block_on(cmd_devmap_preview_many(
+            "/no/such/repo".into(),
+            files,
+            None,
+        ))
+        .expect_err("over the cap");
+        assert!(err.contains("too large"), "{err}");
+    }
+
+    #[test]
+    fn write_file_content_refuses_an_oversized_buffer_at_the_boundary() {
+        let huge = "x".repeat(MAX_CONTENT_BYTES + 1);
+        let err = tauri::async_runtime::block_on(super::super::cmd_write_file_content(
+            "/no/such/repo".into(),
+            "src/lib.rs".into(),
+            huge,
+        ))
+        .expect_err("over the cap");
+        assert!(err.contains("too large"), "{err}");
+    }
+
+    /// A fake `devmap` whose `preview` takes a moment and logs each file it
+    /// is asked about, so a test can stop the batch while it is mid-file.
+    #[cfg(unix)]
+    fn slow_logging_devmap(dir: &std::path::Path, log: &std::path::Path) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join("devmap");
+        let script = format!(
+            "#!/bin/sh
+if [ \"$1\" = \"preview\" ]; then
+  cat >/dev/null
+  echo \"$*\" >> '{log}'
+  sleep 1
+  printf '%s\\n' '{{\"file_path\":\"x\",\"parse_status\":\"Clean\",\"delta_available\":true,\"file_is_indexed\":true,\"compared_against\":\"disk\",\"symbols\":[],\"bodies_not_compared\":0,\"ambiguous_callers\":0}}'
+  exit 0
+fi
+exit 2
+",
+            log = log.display()
+        );
+        std::fs::write(&path, script).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    /// Cancelling the request's token mid-batch stops it after the file in
+    /// flight: three files, the first running when the cancel lands, one
+    /// `devmap` invocation, and an outcome that says `cancelled`.
+    #[cfg(unix)]
+    #[test]
+    fn cancelling_the_token_stops_preview_many_within_one_file() {
+        let _lock = crate::harness::sidecar::test_serial();
+        crate::devmap::cli::clear_preview_debounces();
+        let repo = crate::test_support::git_repo();
+        let fixture = tempfile::TempDir::new().unwrap();
+        let log = fixture.path().join("calls.log");
+        let bin = slow_logging_devmap(fixture.path(), &log);
+        let _bound = crate::devmap::cli::bind_test_binary(bin.to_string_lossy().into_owned());
+        let files: Vec<(String, String)> = (0..3)
+            .map(|i| (format!("src/f{i}.rs"), "fn x() {}\n".into()))
+            .collect();
+        let repo_path = repo.path().to_string_lossy().into_owned();
+
+        let outcome = std::thread::scope(|scope| {
+            let worker = scope.spawn(|| {
+                preview_many_cancellable(&repo_path, &files, Some("preview-cancel-test".into()))
+            });
+            // The first file is running once its call is logged; the token is
+            // registered before that.
+            let started = std::time::Instant::now();
+            while std::fs::read_to_string(&log).map_or(true, |text| text.lines().count() == 0) {
+                assert!(
+                    started.elapsed()
+                        < crate::test_support::env::coverage_relaxed(
+                            std::time::Duration::from_secs(30)
+                        ),
+                    "no preview started"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            assert!(crate::codeintel::cancel_query("preview-cancel-test"));
+            worker.join().unwrap()
+        });
+        crate::devmap::cli::clear_preview_debounces();
+
+        assert!(outcome.cancelled, "{:?}", outcome.reason);
+        let calls = std::fs::read_to_string(&log).unwrap().lines().count();
+        assert_eq!(calls, 1, "the batch stopped after the file in flight");
+    }
 }

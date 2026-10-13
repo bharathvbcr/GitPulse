@@ -572,12 +572,17 @@ describe("repository content revisions", () => {
       return snapshotFor("/r/content").statuses as never;
     } }));
     await store.openRepo("/r/content");
+    const opened = get(store.contentRevisions)["/r/content"];
+    // The second refresh waits for the slow first one and reads once more
+    // (hydrateFlight.ts), so both snapshots land and each advances the revision.
     const pending = store.refresh();
-    await store.refresh();
-    const current = get(store.contentRevisions)["/r/content"];
+    const queued = store.refresh();
     slow.resolve(snapshotFor("/r/content").statuses);
     await pending;
-    expect(get(store.contentRevisions)["/r/content"]).toBe(current);
+    await queued;
+    const current = get(store.contentRevisions)["/r/content"];
+    expect(current).not.toBe(opened);
+    // A snapshot that fails (call 4) publishes nothing as fresh content.
     await store.refresh();
     expect(get(store.contentRevisions)["/r/content"]).toBe(current);
   });
@@ -2766,10 +2771,12 @@ describe("repoStore snapshot hydration ordering", () => {
     }));
   }
 
-  it("lets the latest-started snapshot win when two loads share one generation", async () => {
-    // activateTab starts a hydrate at generation N; refresh() starts more at
-    // the SAME N. The older fetch must not overwrite fresher data when it
-    // resolves last (F2).
+  it("reads once behind a running snapshot instead of beside it, and the later read wins", async () => {
+    // activateTab starts a hydrate at generation N; refresh() asks for more at
+    // the SAME N. They used to run side by side and the older answer, landing
+    // last, had to be discarded by a run token (F2). They no longer overlap:
+    // the second waits for the first and reads once more, so the answer that
+    // lands last is also the one read last (hydrateFlight.ts).
     const staleStatus = deferred<unknown>();
     let call = 0;
     let armedAt = Number.POSITIVE_INFINITY;
@@ -2786,15 +2793,18 @@ describe("repoStore snapshot hydration ordering", () => {
     armedAt = call + 1; // the NEXT status fetch hangs
     const staleLoad = store.refresh();
     const freshLoad = store.refresh();
-    await freshLoad;
-    // Calls so far: 1 = initial hydration, 2 = the hung stale load, 3 = fresh.
-    expect(get(store).statuses[0]?.path).toBe("probe-3");
+    await flushMicro();
+    // Calls so far: 1 = initial hydration, 2 = the hung load. The second
+    // refresh has not started a read beside it.
+    expect(call).toBe(armedAt);
 
-    // The first load settles LAST; its result must be discarded.
     staleStatus.resolve(statusProbe([{ path: "probe-stale" }]));
     await staleLoad;
+    await freshLoad;
     await flushMicro();
 
+    // 3 = the read owed behind the first; it landed last and is what shows.
+    expect(call).toBe(armedAt + 1);
     const state = get(store);
     expect(state.statuses[0]?.path).toBe("probe-3");
     expect(state.error).toBeNull();

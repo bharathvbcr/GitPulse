@@ -529,6 +529,56 @@
             return `min ${sorted[0].toFixed(1)} / p50 ${sorted[Math.floor(sorted.length / 2)].toFixed(1)} / max ${sorted[sorted.length - 1].toFixed(1)} ms`;
           };
           diagnostics = `${flushed.length} A<->B switches: to DOM flush ${stat(flushed)}; to second frame ${stat(framed)}; cmd_apple_intelligence_status per switch ${JSON.stringify(applePerSwitch)}; IPC per switch: ${ipcPerSwitch.map((s, i) => `[${i + 1}] ${s}`).join(" | ")}`;
+          // ---- the graph keeps rows for a bounded number of repositories ---------
+          // The real App, its real graph scheduler and the real graph store, with
+          // a backend that answers the commit graph. After 8 repositories have
+          // been visited the first has been shed; coming back must show its
+          // rows again, within a deadline, with the commit that was selected.
+          // Runs last: it leaves 8 more tabs open and answers the graph command
+          // with rows, which the checks above do not expect.
+          const { graphStore } = await import("../src/lib/stores/graphStore.ts");
+          const originalGraph = fixtures.cmd_get_commit_graph;
+          const graphRow = (id, parent) => ({
+            id, summary: id, author_name: "ada", timestamp: NOW, lane: 0, parent_ids: parent ? [parent] : [],
+          });
+          fixtures.cmd_get_commit_graph = (a) => ({
+            rows: [graphRow(`${a.repoPath}#2`, `${a.repoPath}#1`), graphRow(`${a.repoPath}#1`)],
+            head_id: `${a.repoPath}#2`,
+          });
+          fixtures.cmd_get_commit_details = (a) => ({
+            id: a.commitId, summary: "details", changed_files: [], total_additions: 0, total_deletions: 0,
+          });
+          const LRU = Array.from({ length: 8 }, (_, i) => `/code/tabs/lru-${i}`);
+          const graphFetches = (path) => calls.filter((c) => c.cmd === "cmd_get_commit_graph" && c.repo === path).length;
+          const showsRows = (path) => {
+            const g = get(graphStore);
+            return g.visiblePath === path && !g.isLoading && g.rows.length === 2 && g.rows[0].id.startsWith(path);
+          };
+          for (const path of LRU) {
+            await repoStore.openRepo(path, { activate: true });
+            await sleepUntil(() => showsRows(path), 5000);
+          }
+          check("each of 8 repositories showed its own rows when first visited", () => showsRows(LRU[7]));
+          // Back to the first, which is selected-then-shed: select a commit in it
+          // while it is the one on screen, then visit the others past the limit.
+          await switchTo(LRU[0]);
+          await sleepUntil(() => showsRows(LRU[0]), 5000);
+          const chosen = get(graphStore).rows[1];
+          await graphStore.selectCommit(chosen, LRU[0]);
+          const fetchedBefore = graphFetches(LRU[0]);
+          for (const path of LRU.slice(1)) {
+            await switchTo(path);
+            await sleepUntil(() => showsRows(path), 5000);
+          }
+          await switchTo(LRU[0]);
+          const loadingSeen = get(graphStore).isLoading || graphFetches(LRU[0]) > fetchedBefore;
+          const returned = await sleepUntil(() => showsRows(LRU[0]) && graphFetches(LRU[0]) > fetchedBefore, 8000);
+          check("the first repository was shed after 8 visits: coming back fetched its graph again", () => loadingSeen && graphFetches(LRU[0]) > fetchedBefore);
+          check("…and shows its rows again within the deadline, not stuck on the loader", () => returned && showsRows(LRU[0]));
+          check("…with the commit that was selected still selected", () => get(graphStore).selectedCommit?.id === chosen.id);
+          fixtures.cmd_get_commit_graph = originalGraph;
+          delete fixtures.cmd_get_commit_details;
+          check("the graph and commit-details commands had fixtures throughout", () => unexpected.length === 0);
           report_();
         } catch (error) {
           stopped(error);

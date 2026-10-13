@@ -251,6 +251,17 @@ export function formatHealthReport(
       `GitHub Code Scanning: ${codeScanning.truncated ? "at least " : ""}${codeScanning.alerts.length} open alert(s).`,
     );
   }
+  for (const [label, github] of [
+    ["Dependabot", dependabot],
+    ["Code Scanning", codeScanning],
+  ] as const) {
+    const missing = github?.available ? (github.partial_tiers ?? []).map(safeText) : [];
+    if (missing.length > 0) {
+      out.push(
+        `NOTE: GitHub ${label} could not read the ${missing.join(", ")} severity; its alerts below are incomplete, not all-clear.`,
+      );
+    }
+  }
   const deadItems = deadCode ? deadCodeItems(deadCode) : [];
   const deadTotal = deadCode ? deadCodeObservedTotal(deadCode, deadItems.length) : 0;
   const incompleteWalk = deadCode?.available ? deadCode.walk_incomplete?.trim() : null;

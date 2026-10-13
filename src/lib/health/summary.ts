@@ -230,7 +230,18 @@ function githubFacet(
       caveat: `${label} could not be checked: ${why}.`,
     };
   }
+  const missing = report.partial_tiers ?? [];
   if (report.alerts.length === 0) {
+    // A result missing severity tiers has not shown that nothing is open.
+    if (missing.length > 0) {
+      return {
+        id,
+        label,
+        value: "incomplete",
+        tone: "unknown",
+        caveat: `${label} alerts could not be read for the ${missing.join(", ")} severity: none are shown, which is not the same as none being open.`,
+      };
+    }
     return { id, label, value: "0 open", tone: "clear" };
   }
   const tone = worstTone(report.alerts.map((alert) => severityTone(alert.severity)));
@@ -239,9 +250,12 @@ function githubFacet(
     label,
     value: `${report.alerts.length}${report.truncated ? "+" : ""} open`,
     tone,
-    caveat: report.truncated
-      ? `Only the first ${report.alerts.length} ${label.toLowerCase()} alerts were returned; more remain.`
-      : `${report.alerts.length} open ${label.toLowerCase()} alerts.`,
+    caveat:
+      missing.length > 0
+        ? `The ${missing.join(", ")} severity of ${label.toLowerCase()} alerts could not be read; ${report.alerts.length} are shown and more may be open.`
+        : report.truncated
+          ? `Only the first ${report.alerts.length} ${label.toLowerCase()} alerts were returned; more remain.`
+          : `${report.alerts.length} open ${label.toLowerCase()} alerts.`,
   };
 }
 

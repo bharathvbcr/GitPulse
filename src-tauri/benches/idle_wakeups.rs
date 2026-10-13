@@ -28,6 +28,12 @@
 //! than claiming them measured. They are in the installed-app qualification
 //! (ft-9167572a).
 //!
+//! The pollers that are reachable from a library have their own rows: `idle N
+//! watches` starts N repository watch sessions (the debounce loop that woke on
+//! a 200 ms timer per watch), and `idle mailbox` claims a profile as `Primary`
+//! (the single-instance accept loop that polled its listener every 500 ms).
+//! Their difference from the 0-session floor is the cost of that poller.
+//!
 //! The row's time is the idle window itself, so it is not gated; the figure is
 //! the `*_wkups_per_s` metric. Wakeups are tiny numbers on a quiet machine and
 //! scheduler-dependent on a loaded one: read them with the host-load snapshot
@@ -163,6 +169,61 @@ mod imp {
             .into_iter()
             .map(|n| Case::new(format!("idle {n} sessions"), move || idle_with(n)).ungated())
             .collect();
+        let repos: Vec<String> = (0..24)
+            .map(|n| {
+                let dir = temp.path().join(format!("watched-{n}"));
+                std::fs::create_dir_all(&dir).expect("repo dir");
+                git(&dir, &["init", "-q", "-b", "main"]);
+                trust_repo(&dir);
+                dir.to_str().expect("utf-8").to_owned()
+            })
+            .collect();
+        let watch_state = gitpulse_lib::watcher::WatcherState::default();
+        let idle_watches = |count: usize| -> Sample {
+            for path in &repos[..count] {
+                gitpulse_lib::watcher::bench_seam::start_idle_watch(&watch_state, path)
+                    .unwrap_or_else(|error| panic!("watch {path}: {error}"));
+            }
+            // Registration, the first ignore-rule read and the first scan all
+            // settle before the window opens.
+            std::thread::sleep(Duration::from_millis(1500));
+            let (before, started) = (counters(), Instant::now());
+            std::thread::sleep(window);
+            let (elapsed, after) = (started.elapsed(), counters());
+            let _ = gitpulse_lib::watcher::unwatch_all(&watch_state);
+            std::thread::sleep(Duration::from_millis(600));
+            let secs = elapsed.as_secs_f64();
+            Sample::default()
+                .counter("watches", count as u64)
+                .metric(NAMES.0, after.0.saturating_sub(before.0) as f64 / secs)
+                .metric(NAMES.1, after.1.saturating_sub(before.1) as f64 / secs)
+                .elapsed(elapsed)
+        };
+        let profile = temp.path().join("profile");
+        let idle_mailbox = || -> Sample {
+            use gitpulse_lib::desktop::instance::{claim, Claim};
+            let Claim::Primary(owner) = claim(&profile, Duration::from_secs(2)) else {
+                panic!("the bench profile is not claimable as Primary");
+            };
+            assert!(owner.mailbox_error().is_none(), "the mailbox did not open");
+            std::thread::sleep(Duration::from_millis(600));
+            let (before, started) = (counters(), Instant::now());
+            std::thread::sleep(window);
+            let (elapsed, after) = (started.elapsed(), counters());
+            drop(owner);
+            std::thread::sleep(Duration::from_millis(700));
+            let secs = elapsed.as_secs_f64();
+            Sample::default()
+                .counter("mailbox", 1)
+                .metric(NAMES.0, after.0.saturating_sub(before.0) as f64 / secs)
+                .metric(NAMES.1, after.1.saturating_sub(before.1) as f64 / secs)
+                .elapsed(elapsed)
+        };
+        let mut cases = cases;
+        cases.push(Case::new("idle mailbox", idle_mailbox).ungated());
+        for n in [8usize, 24] {
+            cases.push(Case::new(format!("idle {n} watches"), move || idle_watches(n)).ungated());
+        }
         let rows = interleave(cases, report.opts.samples(3), 0);
         let wake = |name: &str| {
             rows.iter()

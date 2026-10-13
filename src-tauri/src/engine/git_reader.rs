@@ -19,6 +19,12 @@ use std::sync::{Mutex, OnceLock, PoisonError};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const MAX_BRANCH_STAT_TARGETS: usize = 96;
+/// How long one `branch_stats` call may spend walking uncached tips. A cold
+/// pass of 96 tips is two git children each; measured at up to 32.7 s in one
+/// call. Past this the call stops starting new tips and reports `capped`, and
+/// the next call resumes (the oid-keyed churn cache is the cursor). The tip in
+/// progress finishes, so a call can overrun by one walk, never by a pass.
+const BRANCH_STATS_CALL_BUDGET: Duration = Duration::from_secs(5);
 
 /// Sidebar tag ceiling: newest-first via `--sort=-creatordate`, then cut here
 /// so a 10k-tag monorepo cannot ship megabytes over IPC. The payload says
@@ -680,6 +686,12 @@ impl GitReader {
     /// during) list_branches so the list renders immediately, and memoizes
     /// through the oid-keyed churn cache so repeat calls are cheap.
     pub fn branch_stats(repo_path: &str) -> Result<BranchStatsReport, String> {
+        Self::branch_stats_within(repo_path, BRANCH_STATS_CALL_BUDGET)
+    }
+
+    /// [`Self::branch_stats`] with the walking budget named, so a test can
+    /// exhaust it without a repository that takes five seconds to walk.
+    fn branch_stats_within(repo_path: &str, budget: Duration) -> Result<BranchStatsReport, String> {
         let repo = validate_repo(repo_path)?;
         let DefaultBase {
             remote,
@@ -779,7 +791,7 @@ impl GitReader {
         }
 
         let (updates, computed, cached, capped, compute_failures) =
-            compute_eligible_churn(&repo, &base_oid, eligible);
+            compute_eligible_churn(&repo, &base_oid, eligible, budget);
 
         Ok(BranchStatsReport {
             compared_to,
@@ -3305,6 +3317,7 @@ fn compute_eligible_churn(
     repo: &Path,
     base_oid: &str,
     eligible: Vec<BranchStatTarget>,
+    budget: Duration,
 ) -> (Vec<BranchStatsUpdate>, usize, usize, bool, usize) {
     let inputs = churn_store::Inputs::read(repo, base_oid);
     let mut unique_tips: Vec<String> = Vec::new();
@@ -3323,9 +3336,8 @@ fn compute_eligible_churn(
     let remaining_after = unique_uncached
         .len()
         .saturating_sub(MAX_BRANCH_STAT_TARGETS);
-    let capped = remaining_after > 0;
+    let mut capped = remaining_after > 0;
     unique_uncached.truncate(MAX_BRANCH_STAT_TARGETS);
-    let attempted = unique_uncached.len();
 
     // One tip at a time. `into_par_iter` started up to 96 tips at once, two
     // `git` processes each, and a concurrency cap of ~16 children that finish
@@ -3339,20 +3351,30 @@ fn compute_eligible_churn(
     } else {
         tip_counts_against(repo, base_oid).unwrap_or_default()
     };
-    let computed_map: HashMap<String, Churn> = unique_uncached
-        .into_iter()
-        .filter_map(|tip| {
-            let pin = inputs.pin(&tip);
-            compute_branch_churn(
-                repo,
-                base_oid,
-                &tip,
-                counts.get(&tip).copied(),
-                pin.as_deref(),
-            )
-            .map(|churn| (tip, churn))
-        })
-        .collect();
+    // A time budget on top of the target cap: the cap bounds how many tips a
+    // call may start, not how long they take. The first tip always runs so a
+    // call makes progress however small the budget; tips left unstarted are
+    // not failures, they are `capped` and the next call takes them.
+    let started = Instant::now();
+    let mut attempted: usize = 0;
+    let mut computed_map: HashMap<String, Churn> = HashMap::new();
+    for tip in unique_uncached {
+        if attempted > 0 && started.elapsed() >= budget {
+            capped = true;
+            break;
+        }
+        attempted += 1;
+        let pin = inputs.pin(&tip);
+        if let Some(churn) = compute_branch_churn(
+            repo,
+            base_oid,
+            &tip,
+            counts.get(&tip).copied(),
+            pin.as_deref(),
+        ) {
+            computed_map.insert(tip, churn);
+        }
+    }
     let compute_failures = attempted.saturating_sub(computed_map.len());
 
     churn_store::keep(repo, &inputs, base_oid, &computed_map);
@@ -9513,6 +9535,60 @@ __GP_PULSE__\0def456\0abc123\x001700000100\0N\0second\0Ada\0ada@example.com\0\0\
             "one walk per tip when the listing fails"
         );
         assert_eq!(summary(&listed), summary(&walked));
+    }
+
+    /// A cold pass is bounded by time, not only by the target cap: a call that
+    /// has spent its budget stops starting tips, says `capped`, and the next
+    /// call resumes from the churn cache. Every call still makes progress, and
+    /// the computed / cached / capped counts add up across calls.
+    #[test]
+    fn branch_stats_stops_at_its_time_budget_and_resumes_next_call() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        crate::test_support::git_in(&root, &["init", "-q", "-b", "main"]);
+        std::fs::write(root.join("base.txt"), "0\n").unwrap();
+        crate::test_support::git_in(&root, &["add", "."]);
+        crate::test_support::git_in(&root, &["commit", "-q", "-m", "base"]);
+        for n in 0..6 {
+            let branch = format!("topic-{n}");
+            crate::test_support::git_in(&root, &["checkout", "-q", "-b", &branch, "main"]);
+            std::fs::write(root.join(format!("{branch}.txt")), "x\n").unwrap();
+            crate::test_support::git_in(&root, &["add", "."]);
+            crate::test_support::git_in(&root, &["commit", "-q", "-m", &branch]);
+        }
+        crate::test_support::git_in(&root, &["checkout", "-q", "main"]);
+
+        let path = root.to_str().unwrap();
+        let mut computed_total = 0;
+        for call in 1..=6 {
+            // A zero budget leaves room for exactly the first tip.
+            let report = GitReader::branch_stats_within(path, Duration::ZERO).unwrap();
+            assert_eq!(report.computed, 1, "call {call} makes progress, one tip");
+            assert_eq!(
+                report.cached,
+                call - 1,
+                "call {call} rides the tips already done"
+            );
+            assert_eq!(
+                report.updates.len(),
+                call,
+                "call {call} reports every tip it has"
+            );
+            assert_eq!(
+                report.compute_failures, 0,
+                "unstarted tips are not failures"
+            );
+            assert_eq!(
+                report.capped,
+                call < 6,
+                "call {call}: more remain until the sixth"
+            );
+            computed_total += report.computed;
+        }
+        assert_eq!(computed_total, 6);
+
+        let warm = GitReader::branch_stats(path).unwrap();
+        assert_eq!((warm.computed, warm.cached, warm.capped), (0, 6, false));
     }
 
     /// What `git remote` would say, read from one config listing: a legacy

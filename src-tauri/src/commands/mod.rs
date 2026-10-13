@@ -53,6 +53,7 @@ mod history;
 mod inspect;
 mod intel;
 mod knowledge;
+mod payload;
 mod policy;
 mod refs;
 mod remote;
@@ -107,6 +108,45 @@ where
     })
     .await
     .map_err(|e| format!("background task failed: {e}"))?
+}
+
+/// How many blocking-pool threads a class of command may hold at once, or
+/// `None` for no limit of its own.
+///
+/// An exhaustive match so that a new [`Admission`] class has to say. Background
+/// work is the live index and docs refreshes a watcher event starts for every
+/// open repository; they are admitted by `git_cli` one child process at a time,
+/// but until then each held a pool thread asleep, and a burst of them could
+/// leave none for the commands a person is waiting on.
+fn pool_limit(class: crate::engine::git_cli::Admission) -> Option<usize> {
+    use crate::engine::git_cli::Admission;
+    match class {
+        Admission::Interactive | Admission::Reactive => None,
+        Admission::Background => Some(2),
+    }
+}
+
+/// [`off_thread`] for work whose child processes are `Admission::Background`:
+/// waits for a permit first (see [`pool_limit`]) without holding a pool thread
+/// while it waits.
+async fn off_thread_background<F, T>(body: F) -> Result<T, String>
+where
+    F: FnOnce() -> Result<T, String> + Send + 'static,
+    T: Send + 'static,
+{
+    use crate::engine::git_cli::Admission;
+    static PERMITS: std::sync::OnceLock<tokio::sync::Semaphore> = std::sync::OnceLock::new();
+    let permits = PERMITS.get_or_init(|| {
+        tokio::sync::Semaphore::new(
+            pool_limit(Admission::Background).expect("background work is limited"),
+        )
+    });
+    // The semaphore is never closed, so acquiring cannot fail.
+    let _permit = permits
+        .acquire()
+        .await
+        .map_err(|_| "background work is shutting down".to_string())?;
+    off_thread(move || crate::engine::git_cli::with_background_processes(body)).await
 }
 
 #[cfg(test)]

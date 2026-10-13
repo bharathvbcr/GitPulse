@@ -1,6 +1,12 @@
 import { writable } from "svelte/store";
 import { createDeferredWrite, flushOnPageHide } from "../async/deferredWrite";
-import { clampTerminalFontSize, TERMINAL_FONT_DEFAULT } from "../terminal/viewControls";
+import {
+  clampTerminalFontSize,
+  clampTerminalScrollback,
+  TERMINAL_AGENT_SCROLLBACK_DEFAULT,
+  TERMINAL_FONT_DEFAULT,
+  TERMINAL_SCROLLBACK_DEFAULT,
+} from "../terminal/viewControls";
 import { LAUNCHERS, type LauncherKind } from "../terminal/tabs";
 import {
   isGraphWidthMode,
@@ -241,6 +247,15 @@ export interface InterfacePrefs {
   terminalDockHeight: number;
   terminalFontSize: number;
   /**
+   * Rows of history a shell terminal keeps, and the (smaller) amount an agent
+   * CLI or task-run terminal keeps. xterm allocates `cols * 12` bytes per row
+   * whether or not it holds text, and every visited repository tab keeps its
+   * terminals mounted; see `TERMINAL_SCROLLBACK_MIN`. Read when a terminal is
+   * created, and applied to live ones when changed.
+   */
+  terminalScrollback: number;
+  terminalAgentScrollback: number;
+  /**
    * Builds xterm's accessibility tree — a row list plus a live region that
    * announces new output — so VoiceOver and other assistive technology can
    * read the terminal at all. Without it the grid is a canvas of glyphs with
@@ -254,6 +269,13 @@ export interface InterfacePrefs {
    * by reading and rewriting the focused field still cannot act here.
    */
   terminalScreenReader: boolean;
+  /**
+   * macOS only: treat Option as Meta in terminals, so Option+B / Option+F send
+   * ESC b / ESC f (word motion) instead of composing a glyph. On by default.
+   * Turn off to type characters your layout puts on Option, such as `@` on a
+   * German keyboard. Applied to live terminals.
+   */
+  terminalOptionAsMeta: boolean;
   terminalLauncher: LauncherKind;
   /** Map of dismissed coach mark IDs. */
   seenCoachMarks: Record<string, boolean>;
@@ -328,7 +350,10 @@ const DEFAULTS: InterfacePrefs = {
   taskHandoff: defaultHandoff(),
   terminalDockHeight: TERMINAL_DOCK_DEFAULT_HEIGHT,
   terminalFontSize: TERMINAL_FONT_DEFAULT,
+  terminalScrollback: TERMINAL_SCROLLBACK_DEFAULT,
+  terminalAgentScrollback: TERMINAL_AGENT_SCROLLBACK_DEFAULT,
   terminalScreenReader: false,
+  terminalOptionAsMeta: true,
   terminalLauncher: "shell",
   seenCoachMarks: {},
   checkForUpdates: false,
@@ -477,7 +502,13 @@ function readPrefs(): InterfacePrefs {
       taskQuickAddAssist: bool(parsed.taskQuickAddAssist, DEFAULTS.taskQuickAddAssist),
       taskHandoff: sanitizeHandoff(parsed.taskHandoff),
       terminalFontSize: typeof parsed.terminalFontSize === "number" ? clampTerminalFontSize(parsed.terminalFontSize) : TERMINAL_FONT_DEFAULT,
+      terminalScrollback: clampTerminalScrollback(parsed.terminalScrollback, TERMINAL_SCROLLBACK_DEFAULT),
+      terminalAgentScrollback: clampTerminalScrollback(
+        parsed.terminalAgentScrollback,
+        TERMINAL_AGENT_SCROLLBACK_DEFAULT,
+      ),
       terminalScreenReader: bool(parsed.terminalScreenReader, DEFAULTS.terminalScreenReader),
+      terminalOptionAsMeta: bool(parsed.terminalOptionAsMeta, DEFAULTS.terminalOptionAsMeta),
       terminalLauncher: LAUNCHERS.find((launcher) => launcher.kind === parsed.terminalLauncher)?.kind ?? "shell",
       // Clamped on read, not just on write: a height persisted by another
       // build (or hand-edited) must not be able to render a dock too small
@@ -717,7 +748,12 @@ function createInterfaceStore() {
         taskHandoff: defaultHandoff(),
       }),
     setTerminalFontSize: (size: number) => patch({ terminalFontSize: clampTerminalFontSize(size) }),
+    setTerminalScrollback: (rows: number) =>
+      patch({ terminalScrollback: clampTerminalScrollback(rows, TERMINAL_SCROLLBACK_DEFAULT) }),
+    setTerminalAgentScrollback: (rows: number) =>
+      patch({ terminalAgentScrollback: clampTerminalScrollback(rows, TERMINAL_AGENT_SCROLLBACK_DEFAULT) }),
     setTerminalScreenReader: (on: boolean) => patch({ terminalScreenReader: on }),
+    setTerminalOptionAsMeta: (on: boolean) => patch({ terminalOptionAsMeta: on }),
     setTerminalLauncher: (launcher: LauncherKind) => patch({ terminalLauncher: LAUNCHERS.find((l) => l.kind === launcher)?.kind ?? "shell" }),
     setTerminalDockHeight: (px: number) =>
       patch({ terminalDockHeight: clampTerminalDockHeight(px) }),

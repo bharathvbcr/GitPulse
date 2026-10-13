@@ -109,6 +109,7 @@ describe("summarizeHealth — the all-clear is earned, never assumed", () => {
     ["the audit was partial", { report: report({ audit_complete: false }) }],
     ["Dependabot was never fetched", { dependabot: null }],
     ["Dependabot could not be reached", { dependabot: dependabot({ available: false, error: "gh exited 1" }) }],
+    ["Dependabot came back missing a severity tier", { dependabot: dependabot({ truncated: true, partial_tiers: ["critical"] }) }],
     ["code scanning was never fetched", { codeScanning: null }],
     ["code scanning could not be reached", { codeScanning: codeScanning({ available: false, error: "no access" }) }],
     ["npm is missing so nothing could be checked for updates", { report: report({ npm_cli_present: false }) }],
@@ -199,6 +200,31 @@ describe("summarizeHealth — GitHub alert states are all distinguishable", () =
     );
     expect(f.value).toBe("1+ open");
     expect(f.caveat).toContain("more remain");
+  });
+
+  it("names the severity tiers a partial list could not read", () => {
+    const f = facet(
+      cleanInput({
+        dependabot: dependabot({
+          truncated: true,
+          partial_tiers: ["critical", "high"],
+          alerts: [{ severity: "low" } as never],
+        }),
+      }),
+      "dependabot",
+    );
+    expect(f.value).toBe("1+ open");
+    expect(f.caveat).toContain("critical, high");
+    expect(f.caveat).toContain("more may be open");
+  });
+
+  it("does not report an empty partial list as '0 open'", () => {
+    const f = facet(
+      cleanInput({ dependabot: dependabot({ truncated: true, partial_tiers: ["critical"], alerts: [] }) }),
+      "dependabot",
+    );
+    expect(f.value).toBe("incomplete");
+    expect(f.tone).toBe("unknown");
   });
 
   it("reads GitHub severities whatever case they arrive in", () => {

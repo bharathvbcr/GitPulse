@@ -175,11 +175,11 @@ describe("withDeferralRetry", () => {
         return "/r";
       },
     });
-    const first = h.invoke("cmd_stash_list", args());
+    const first = h.invoke("cmd_stash_apply", args());
     await h.settle();
     expect(h.sleeping(), "first was declined and is waiting to retry").toBe(1);
     expect(reads, "keyed once, at the deferral").toBe(1);
-    const second = h.invoke("cmd_stash_list", args());
+    const second = h.invoke("cmd_stash_apply", args());
     await h.tick();
     await expect(Promise.all([first, second])).resolves.toEqual(["answer", "answer"]);
     expect(h.raw, "the identical call joined the waiting retry").toHaveBeenCalledTimes(2);
@@ -187,8 +187,8 @@ describe("withDeferralRetry", () => {
 
   it("joins two identical calls that are both deferred before either is keyed", async () => {
     const h = harness([DEFERRAL, DEFERRAL, "answer"]);
-    const first = h.invoke("cmd_stash_list", { repoPath: "/r" });
-    const second = h.invoke("cmd_stash_list", { repoPath: "/r" });
+    const first = h.invoke("cmd_stash_apply", { repoPath: "/r" });
+    const second = h.invoke("cmd_stash_apply", { repoPath: "/r" });
     await h.settle();
     expect(h.sleeping(), "one retry chain for both").toBe(1);
     await h.tick();

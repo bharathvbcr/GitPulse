@@ -67,6 +67,22 @@ describe("TerminalSession PTY contracts", () => {
     expect(source.match(/new XTerm\(/g)?.length).toBe(1);
   });
 
+  it("builds its xterm options from the shared owners, not literals", () => {
+    const ensureBody = source.slice(
+      source.indexOf("function ensureTerm"),
+      source.indexOf("function refitIfResized"),
+    );
+    expect(ensureBody).toContain("scrollback: sessionScrollback()");
+    expect(ensureBody).toContain("...macOptionOptions(get(hostPlatform).os, get(interfaceStore).terminalOptionAsMeta)");
+    expect(ensureBody).not.toMatch(/scrollback:\s*\d/);
+  });
+
+  it("applies the Option-as-Meta setting to live sessions", () => {
+    expect(source).toContain("$interfaceStore.terminalOptionAsMeta");
+    expect(source).toContain("term.options.macOptionIsMeta = options.macOptionIsMeta");
+    expect(source).toContain("term.options.macOptionClickForcesSelection = options.macOptionClickForcesSelection");
+  });
+
   it("decouples creation from attachment: ensureTerm never opens a container", () => {
     const ensureBody = source.slice(
       source.indexOf("function ensureTerm"),

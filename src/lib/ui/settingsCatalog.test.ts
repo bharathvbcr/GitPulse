@@ -157,7 +157,7 @@ describe("host-gated settings", () => {
 });
 
 describe("search on a host missing a capability", () => {
-  const WITHOUT_DOCK = unsupportedSettingIds({ dockHiding: false, appleIntelligence: true });
+  const WITHOUT_DOCK = unsupportedSettingIds({ dockHiding: false, appleIntelligence: true, macos: true });
 
   it("omits the unsupported control from an unfiltered listing", () => {
     const listed = matchSettings("", WITHOUT_DOCK);
@@ -182,7 +182,7 @@ describe("search on a host missing a capability", () => {
   it("still finds the control on a host that supports it", () => {
     const result = matchSettings(
       "dock accessory",
-      unsupportedSettingIds({ dockHiding: true, appleIntelligence: true }),
+      unsupportedSettingIds({ dockHiding: true, appleIntelligence: true, macos: true }),
     );
     expect(result.settings).toContain("hide-dock");
     expect(result.sections).toContain("layout");

@@ -1096,6 +1096,163 @@ fn a_panicking_mailbox_handler_releases_its_slot() {
     assert_eq!(shared.active.load(Ordering::Acquire), 0);
 }
 
+#[test]
+fn a_panicking_job_keeps_its_worker_and_gives_back_its_slot() {
+    let shared = Arc::new(Shared::new(0));
+    let pool = HandlerPool::new(shared.clone());
+    shared.active.fetch_add(1, Ordering::AcqRel);
+    let slot = HandlerSlot(shared.clone());
+    pool.submit(Box::new(move || {
+        let _slot = slot;
+        panic!("handler panicked");
+    }))
+    .unwrap();
+    // The job unwinds (and prints) on the worker; its slot comes back as it
+    // does, and the worker goes back to waiting.
+    let waited = Instant::now();
+    while shared.active.load(Ordering::Acquire) != 0 || pool.lock().idle != 1 {
+        assert!(
+            waited.elapsed() < coverage_relaxed(Duration::from_secs(5)),
+            "the panicking job never gave back its slot, or its worker ended"
+        );
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    let (done, finished) = mpsc::channel();
+    pool.submit(Box::new(move || done.send(()).unwrap()))
+        .unwrap();
+    finished
+        .recv_timeout(Duration::from_secs(5))
+        .expect("the next job was never run");
+    assert_eq!(
+        shared.handler_threads.load(Ordering::Relaxed),
+        1,
+        "the surviving worker should have taken the next job"
+    );
+    pool.close();
+}
+
+#[test]
+fn the_pool_never_starts_more_threads_than_the_mailbox_admits() {
+    let shared = Arc::new(Shared::new(0));
+    let pool = HandlerPool::new(shared.clone());
+    let release = Arc::new(AtomicBool::new(false));
+    let ran = Arc::new(AtomicUsize::new(0));
+    let jobs = MAX_HANDLERS + MAX_GATE_HANDLERS + 6;
+    for _ in 0..jobs {
+        let (release, ran) = (release.clone(), ran.clone());
+        pool.submit(Box::new(move || {
+            while !release.load(Ordering::Acquire) {
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            ran.fetch_add(1, Ordering::SeqCst);
+        }))
+        .unwrap();
+    }
+    std::thread::sleep(Duration::from_millis(150));
+    assert_eq!(
+        shared.handler_threads.load(Ordering::Relaxed),
+        MAX_HANDLERS + MAX_GATE_HANDLERS
+    );
+    release.store(true, Ordering::Release);
+    let waited = Instant::now();
+    while ran.load(Ordering::SeqCst) < jobs {
+        assert!(
+            waited.elapsed() < coverage_relaxed(Duration::from_secs(5)),
+            "queued jobs were not run"
+        );
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    pool.close();
+}
+
+#[test]
+fn closing_the_pool_ends_idle_workers() {
+    let shared = Arc::new(Shared::new(0));
+    let pool = HandlerPool::new(shared);
+    let (done, finished) = mpsc::channel();
+    pool.submit(Box::new(move || done.send(()).unwrap()))
+        .unwrap();
+    finished.recv_timeout(Duration::from_secs(5)).unwrap();
+    std::thread::sleep(Duration::from_millis(50));
+    assert_eq!(pool.lock().idle, 1, "the worker should be waiting");
+    pool.close();
+    let waited = Instant::now();
+    while pool.lock().workers > 0 {
+        assert!(
+            waited.elapsed() < coverage_relaxed(Duration::from_secs(5)),
+            "an idle worker outlived the pool"
+        );
+        std::thread::sleep(Duration::from_millis(2));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// What an idle mailbox costs
+// ---------------------------------------------------------------------------
+
+/// An owner nobody is talking to has nothing to accept, so its accept thread
+/// must not wake to find that out. It used to poll its listener every 500 ms
+/// only to notice a shutdown, which is two wakeups a second for as long as the
+/// app was open.
+#[test]
+fn an_idle_mailbox_never_wakes_its_accept_thread() {
+    let dir = profile();
+    let owner = primary(dir.path());
+    std::thread::sleep(Duration::from_millis(1300));
+    let wakes = owner.shared.accept_wakes.load(Ordering::Relaxed);
+    assert_eq!(wakes, 0, "the accept thread woke {wakes} times while idle");
+}
+
+/// The wait that no longer times out must still end when the owner steps down.
+#[test]
+fn shutdown_ends_a_blocked_accept_thread_promptly() {
+    let dir = profile();
+    let owner = primary(dir.path());
+    let shared = owner.shared.clone();
+    // Let the thread reach its wait.
+    std::thread::sleep(Duration::from_millis(100));
+    let stepped_down = Instant::now();
+    owner.shutdown();
+    while !shared.accept_exited.load(Ordering::Acquire) {
+        assert!(
+            stepped_down.elapsed() < coverage_relaxed(Duration::from_secs(5)),
+            "the accept thread did not end after shutdown"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert!(
+        stepped_down.elapsed() < coverage_relaxed(Duration::from_millis(100)),
+        "the accept thread took {:?} to notice shutdown",
+        stepped_down.elapsed()
+    );
+}
+
+/// Answering a launch used to start a thread for it. The owner is asked about
+/// as often as a hook fires, so those starts and exits were a steady drip; the
+/// handlers are a pool that keeps its threads.
+#[test]
+fn successive_launches_are_answered_by_the_same_handler_threads() {
+    let dir = profile();
+    let owner = primary(dir.path());
+    let received = recorder(&owner);
+    for _ in 0..6 {
+        secondary(dir.path())
+            .forward(&Request::Reveal)
+            .expect("forward");
+        assert_eq!(
+            received.recv_timeout(Duration::from_secs(5)),
+            Ok(Request::Reveal)
+        );
+        // The handler gives its slot back just after it has answered.
+        std::thread::sleep(Duration::from_millis(30));
+    }
+    let started = owner.shared.handler_threads.load(Ordering::Relaxed);
+    assert!(
+        started <= 2,
+        "six launches started {started} handler threads"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Hook verdicts over the mailbox
 // ---------------------------------------------------------------------------

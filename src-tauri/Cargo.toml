@@ -77,6 +77,11 @@ tauri-plugin-opener = "2.7.0"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 rayon = "1.12"
+# The async runtime `pools::install_async_runtime` builds and hands to tauri.
+# Pinned to the version already resolved in Cargo.lock (the framework's own
+# `tokio` dependency), so declaring it adds no package: `rt-multi-thread` is
+# the runtime builder, `sync` the semaphore that bounds background commands.
+tokio = { version = "=1.53.1", features = ["rt-multi-thread", "sync"] }
 notify = "8.2"
 regex = "1.13"
 rfd = "0.17"

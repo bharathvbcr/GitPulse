@@ -11,6 +11,7 @@ import {
 import { withDeadline } from "../async/deadline";
 import { whenDocumentShown } from "../runtime/foreground";
 import { activity, observeSettled } from "../diagnostics/activity";
+import { SHARED_READ_COMMANDS } from "./sharedReads";
 
 /**
  * The one IPC entry point the frontend uses.
@@ -85,6 +86,27 @@ export type DeferralRetryOptions = {
   whenShown?: () => Promise<void>;
 };
 
+/**
+ * The join generation for identical in-flight reads (`sharedReads.ts`). A call
+ * joins a running read only if both started in the same generation.
+ *
+ * Module-wide, not per `withDeferralRetry` instance: what ends a generation
+ * (a write through any entry point, a watcher event) is a fact about the
+ * repository, not about one wrapper.
+ */
+let readGeneration = 0;
+
+/**
+ * Ends the current join generation: reads already running will not be joined
+ * by a call made from now on. For the one place that learns the repository
+ * changed outside this window's own commands (`repoStore.handleRepoChanged`,
+ * where watcher events enter), called BEFORE the refresh is requested, so the
+ * refresh reads after the change instead of riding a read that began before it.
+ */
+export function invalidateSharedReads(): void {
+  readGeneration += 1;
+}
+
 function messageOf(error: unknown): string {
   if (typeof error === "string") return error;
   if (error instanceof Error) return error.message;
@@ -105,6 +127,14 @@ function retryKey(cmd: string, args: InvokeArgs | undefined): string | null {
     if (value !== null && typeof value === "object") {
       const proto = Object.getPrototypeOf(value);
       if (proto !== Object.prototype && proto !== Array.prototype && proto !== null) plain = false;
+      // Canonical: the same arguments written in another key order are the
+      // same call, and a key that differed only in order would let two
+      // identical reads past each other.
+      if (proto === Object.prototype || proto === null) {
+        return Object.fromEntries(
+          Object.entries(value as Record<string, unknown>).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0)),
+        );
+      }
     } else if (typeof value === "function" || typeof value === "bigint" || typeof value === "symbol") {
       plain = false;
     }
@@ -138,6 +168,8 @@ export function withDeferralRetry(raw: Raw, options: DeferralRetryOptions = {}) 
   const random = options.random ?? Math.random;
   const whenShown = options.whenShown ?? whenDocumentShown;
   const retrying = new Map<string, Promise<unknown>>();
+  /** Allowlisted reads in flight, by command and canonical arguments; see `sharedReads.ts`. */
+  const sharing = new Map<string, { promise: Promise<unknown>; generation: number }>();
 
   /**
    * One call to `raw`, always as a promise. Tauri's own `invoke` returns one;
@@ -182,6 +214,44 @@ export function withDeferralRetry(raw: Raw, options: DeferralRetryOptions = {}) 
   // The exported `invoke` sits one microtask above `tauriInvoke`, for the
   // stall-attribution note below.
   function dispatch<T>(cmd: string, rest: Rest): Promise<T> {
+    // An identical read already in flight is the answer to this one. The
+    // promise is shared as it is: each caller's deadline or abort signal wraps
+    // it in `bound`, so one caller giving up detaches that caller and leaves
+    // the call running for the others.
+    if (SHARED_READ_COMMANDS.has(cmd)) {
+      if (rest.length <= 1 && !isBinary(rest[0])) {
+        const key = lazyRetryKey(cmd, rest[0]);
+        if (key !== null) {
+          const live = sharing.get(key);
+          // Only a call that started in the same generation: anything that
+          // may have changed the repository since (a write, an unknown
+          // command, a watcher event) makes the running read a pre-change
+          // answer, which a caller asking now must not be handed.
+          if (live && live.generation === readGeneration) return live.promise as Promise<T>;
+          const shared = dispatchOne<T>(cmd, rest);
+          sharing.set(key, { promise: shared, generation: readGeneration });
+          const clear = () => {
+            if (sharing.get(key)?.promise === shared) sharing.delete(key);
+          };
+          shared.then(clear, clear);
+          return shared;
+        }
+      }
+      return dispatchOne<T>(cmd, rest);
+    }
+    // Not a named read: it may change what a read would answer, so it ends
+    // the generation twice, when it is sent and when it settles. A read that
+    // started before either is never joined by one that starts after.
+    readGeneration += 1;
+    const call = dispatchOne<T>(cmd, rest);
+    const settled = () => {
+      readGeneration += 1;
+    };
+    call.then(settled, settled);
+    return call;
+  }
+
+  function dispatchOne<T>(cmd: string, rest: Rest): Promise<T> {
     // A call carrying options (request headers, for raw-body commands) is
     // treated like one with non-plain arguments: neither retried nor joined.
     // So is a byte buffer; both are known without serializing anything.

@@ -326,10 +326,12 @@ export async function previewDevmapEdit(
 export async function previewDevmapEdits(
   repoPath: string,
   files: Array<[string, string]>,
+  cancelToken?: string,
 ): Promise<DevmapPreviewOutcome> {
   return invoke<DevmapPreviewOutcome>("cmd_devmap_preview_many", {
     repoPath,
     files,
+    ...(cancelToken ? { cancelToken } : {}),
   });
 }
 

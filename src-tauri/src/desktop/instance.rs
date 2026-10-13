@@ -31,12 +31,13 @@
 use std::collections::VecDeque;
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
+use std::os::fd::OwnedFd;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::os::unix::io::AsRawFd;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
@@ -82,8 +83,6 @@ const HELLO_TIMEOUT: Duration = Duration::from_secs(2);
 /// saturated for one [`HANDLER_TIMEOUT`].
 pub const CLAIM_DEADLINE: Duration = Duration::from_secs(8);
 const RETRY: Duration = Duration::from_millis(50);
-/// How often the accept loop wakes to notice [`Primary::shutdown`].
-const ACCEPT_POLL: Duration = Duration::from_millis(500);
 
 /// What a launch that found GitPulse already running asks of it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -575,6 +574,12 @@ struct Shared {
     gate: Mutex<Option<GateSink>>,
     inbox: Mutex<Inbox>,
     own_uid: u32,
+    /// Times the accept loop's wait returned. An idle mailbox adds none.
+    accept_wakes: AtomicU64,
+    /// Set when the accept loop has ended.
+    accept_exited: AtomicBool,
+    /// Threads started to answer connections.
+    handler_threads: AtomicUsize,
 }
 
 impl Shared {
@@ -586,6 +591,9 @@ impl Shared {
             gate: Mutex::new(None),
             inbox: Mutex::new(Inbox::default()),
             own_uid,
+            accept_wakes: AtomicU64::new(0),
+            accept_exited: AtomicBool::new(false),
+            handler_threads: AtomicUsize::new(0),
         }
     }
 }
@@ -598,6 +606,49 @@ pub struct Primary {
     socket_identity: Option<(u64, u64)>,
     shared: Arc<Shared>,
     mailbox_error: Option<String>,
+    /// What [`Self::shutdown`] writes to so the accept thread, which waits
+    /// with no timeout, looks at `closing`.
+    wake: Option<Arc<Wake>>,
+}
+
+/// The two ends of the accept thread's wake pipe.
+struct Wake {
+    reader: OwnedFd,
+    writer: OwnedFd,
+}
+
+impl Wake {
+    fn new() -> std::io::Result<Self> {
+        let (reader, writer) = crate::procguard::wake_pipe()?;
+        Ok(Self { reader, writer })
+    }
+
+    /// Makes the reader readable. A full pipe already is.
+    fn notify(&self) {
+        let byte = 1u8;
+        // SAFETY: one byte from a live local to a descriptor `self` keeps
+        // open; the result is deliberately ignored (see above).
+        unsafe { libc::write(self.writer.as_raw_fd(), std::ptr::addr_of!(byte).cast(), 1) };
+    }
+
+    /// Empties the pipe so the next wait blocks again.
+    fn drain(&self) {
+        let mut buffer = [0u8; 64];
+        loop {
+            // SAFETY: reads into a live local buffer of the length given, from
+            // a non-blocking descriptor `self` keeps open.
+            let read = unsafe {
+                libc::read(
+                    self.reader.as_raw_fd(),
+                    buffer.as_mut_ptr().cast(),
+                    buffer.len(),
+                )
+            };
+            if read < buffer.len() as isize {
+                return;
+            }
+        }
+    }
 }
 
 impl Primary {
@@ -618,6 +669,7 @@ impl Primary {
             socket_identity: None,
             shared,
             mailbox_error: None,
+            wake: None,
         };
         if let Err(error) = primary.open_mailbox() {
             primary.mailbox_error = Some(error);
@@ -626,6 +678,11 @@ impl Primary {
     }
 
     fn open_mailbox(&mut self) -> Result<(), String> {
+        // Before the socket, so a mailbox is never bound that cannot be told
+        // to stop.
+        let wake = Arc::new(
+            Wake::new().map_err(|error| format!("cannot create the mailbox wake pipe: {error}"))?,
+        );
         // We hold the lock, so a socket at this path is a dead owner's, which
         // this replaces; anything else there is left alone and reported.
         let listener =
@@ -634,11 +691,13 @@ impl Primary {
             .map_err(|error| format!("mailbox vanished: {error}"))?;
         self.socket_identity = Some((meta.dev(), meta.ino()));
         let shared = self.shared.clone();
+        let accept_wake = wake.clone();
         crate::supervisor::spawn_once("instance-mailbox", "single-instance mailbox", move || {
-            accept_loop(listener, shared)
+            accept_loop(listener, shared, &accept_wake)
         })
-        .map(|_| ())
-        .map_err(|error| format!("cannot start the mailbox: {error}"))
+        .map_err(|error| format!("cannot start the mailbox: {error}"))?;
+        self.wake = Some(wake);
+        Ok(())
     }
 
     /// Why launches cannot reach this owner, when they cannot. The lock still
@@ -684,6 +743,9 @@ impl Primary {
         if self.shared.closing.swap(true, Ordering::AcqRel) {
             return;
         }
+        if let Some(wake) = &self.wake {
+            wake.notify();
+        }
         let ours = std::fs::symlink_metadata(&self.paths.socket)
             .ok()
             .map(|meta| (meta.dev(), meta.ino()));
@@ -695,16 +757,148 @@ impl Primary {
 
 /// An owner that stops owning — a launch that deferred after winning the lock,
 /// or a test — takes its mailbox down with it, so the next owner never meets a
-/// socket nobody answers, and the accept thread ends at its next poll.
+/// socket nobody answers, and the accept thread ends when it is woken.
 impl Drop for Primary {
     fn drop(&mut self) {
         self.shutdown();
     }
 }
 
-fn accept_loop(listener: UnixListener, shared: Arc<Shared>) {
+/// The threads that answer connections. A connection used to start a thread,
+/// and the owner is asked about as often as a hook fires; these are started on
+/// demand, kept, and ended when the mailbox closes.
+///
+/// No more than [`MAX_HANDLERS`] + [`MAX_GATE_HANDLERS`] exist, which is the
+/// most connections the accept loop admits at once (each holds a
+/// [`HandlerSlot`] from admission until its job ends), so a connection is never
+/// left waiting for a thread that cannot be started. The last job's thread
+/// takes the next job from the queue, so one that has not yet gone back to
+/// waiting when the next connection arrives still serves it.
+struct HandlerPool {
+    state: Mutex<PoolState>,
+    ready: Condvar,
+    shared: Arc<Shared>,
+}
+
+type Job = Box<dyn FnOnce() + Send + 'static>;
+
+#[derive(Default)]
+struct PoolState {
+    jobs: VecDeque<Job>,
+    /// Workers waiting for a job.
+    idle: usize,
+    workers: usize,
+    closed: bool,
+}
+
+impl HandlerPool {
+    const MAX_WORKERS: usize = MAX_HANDLERS + MAX_GATE_HANDLERS;
+
+    fn new(shared: Arc<Shared>) -> Arc<Self> {
+        Arc::new(Self {
+            state: Mutex::new(PoolState::default()),
+            ready: Condvar::new(),
+            shared,
+        })
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, PoolState> {
+        crate::supervisor::lock_or_recover(&self.state)
+    }
+
+    /// Queues `job` for a worker, starting one if none is free and the pool
+    /// has room. On `Err` the job was dropped unrun, releasing whatever it held.
+    fn submit(self: &Arc<Self>, job: Job) -> std::io::Result<()> {
+        let mut state = self.lock();
+        state.jobs.push_back(job);
+        if state.idle >= state.jobs.len() || state.workers >= Self::MAX_WORKERS {
+            drop(state);
+            self.ready.notify_one();
+            return Ok(());
+        }
+        state.workers += 1;
+        drop(state);
+        let pool = self.clone();
+        let started = crate::supervisor::spawn_once(
+            "instance-mailbox-conn",
+            "single-instance mailbox",
+            move || pool.work(),
+        );
+        match started {
+            Ok(_) => {
+                self.shared.handler_threads.fetch_add(1, Ordering::Relaxed);
+                Ok(())
+            }
+            Err(error) => {
+                let mut state = self.lock();
+                state.workers -= 1;
+                let job = state.jobs.pop_back();
+                drop(state);
+                drop(job);
+                Err(error)
+            }
+        }
+    }
+
+    /// Ends every worker as it goes idle. Jobs already queued still run.
+    fn close(&self) {
+        self.lock().closed = true;
+        self.ready.notify_all();
+    }
+
+    fn work(&self) {
+        let mut state = self.lock();
+        loop {
+            if let Some(job) = state.jobs.pop_front() {
+                drop(state);
+                // A panicking handler must neither end the worker nor leave
+                // the mailbox without a record of it; its slot is released by
+                // the job's own drop as it unwinds.
+                match std::panic::catch_unwind(std::panic::AssertUnwindSafe(job)) {
+                    Ok(()) => crate::supervisor::note_recovered("single-instance mailbox"),
+                    Err(panic) => {
+                        crate::supervisor::note_stopped("single-instance mailbox", &*panic);
+                    }
+                }
+                state = self.lock();
+                continue;
+            }
+            if state.closed {
+                state.workers -= 1;
+                return;
+            }
+            state.idle += 1;
+            state = self
+                .ready
+                .wait(state)
+                .unwrap_or_else(PoisonError::into_inner);
+            state.idle -= 1;
+        }
+    }
+}
+
+fn accept_loop(listener: UnixListener, shared: Arc<Shared>, wake: &Wake) {
+    let pool = HandlerPool::new(shared.clone());
+    struct Exited(Arc<Shared>, Arc<HandlerPool>);
+    impl Drop for Exited {
+        fn drop(&mut self) {
+            self.1.close();
+            self.0.accept_exited.store(true, Ordering::Release);
+        }
+    }
+    let _exited = Exited(shared.clone(), pool.clone());
     while !shared.closing.load(Ordering::Acquire) {
-        if !crate::local_socket::wait_readable(listener.as_raw_fd(), ACCEPT_POLL) {
+        // No timeout: nothing here needs to run unless a connection arrives or
+        // `Primary::shutdown` writes to the wake pipe.
+        let ready = crate::local_socket::wait_readable_or_woken(
+            listener.as_raw_fd(),
+            wake.reader.as_raw_fd(),
+        );
+        shared.accept_wakes.fetch_add(1, Ordering::Relaxed);
+        if ready.woken {
+            wake.drain();
+        }
+        if !ready.listener {
             continue;
         }
         // Accepting creates a descriptor that is made close-on-exec only
@@ -733,14 +927,10 @@ fn accept_loop(listener: UnixListener, shared: Arc<Shared>) {
         // gives it back like one that returns. Eight panics would otherwise
         // fill MAX_HANDLERS and silently drop every later relaunch.
         let slot = HandlerSlot(shared.clone());
-        let spawned = crate::supervisor::spawn_once(
-            "instance-mailbox-conn",
-            "single-instance mailbox",
-            move || handle(stream, &slot.0),
-        );
-        if let Err(error) = spawned {
-            // The closure, and the slot it owned, were dropped by the failed
-            // spawn, which released the count already.
+        let submitted = pool.submit(Box::new(move || handle(stream, &slot.0)));
+        if let Err(error) = submitted {
+            // The job, and the slot it owned, were dropped by the failed
+            // start, which released the count already.
             log::warn!(target: "desktop", "instance mailbox could not answer a launch: {error}");
         }
     }
