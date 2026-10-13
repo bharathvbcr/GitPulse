@@ -4,6 +4,7 @@ import { createSessionLifecycle, type SessionTransport } from "./sessionLifecycl
 import { createSessionRegistry } from "./sessionRegistry";
 import type { PtySessionHandlers } from "./ptyBus";
 import { DEFAULT_TERMINAL_SESSIONS } from "./sessionLimit";
+import { CONTEXT_READ_MS, KILL_HARD_MS } from "./inputQueue";
 
 type Slot = ReturnType<ReturnType<typeof createSessionRegistry>["reserve"]>;
 
@@ -224,7 +225,7 @@ describe("terminal lifecycle races", () => {
       const pending = deferred<void>(), f = fixture({ kill: () => pending.promise });
       await f.owner.start();
       const restart = f.owner.restart();
-      await vi.advanceTimersByTimeAsync(5000); await restart;
+      await vi.advanceTimersByTimeAsync(KILL_HARD_MS + 500); await restart;
       expect(get(f.registry)).toHaveLength(1);
       expect(f.transport.spawn).toHaveBeenCalledTimes(1);
       pending.resolve(); await get(f.registry)[0].close();
@@ -565,7 +566,7 @@ describe("a view that goes away without Close", () => {
         const f = fixture({}, registry, "tab-a", false, { keep, idle });
         await f.owner.start();
         f.owner.dispose();
-        await vi.advanceTimersByTimeAsync(2000); await flush();
+        await vi.advanceTimersByTimeAsync(CONTEXT_READ_MS + 500); await flush();
         expect(f.transport.kill).not.toHaveBeenCalled();
         expect(f.transport.detach).toHaveBeenCalledWith("native-a");
         expect(get(registry).map((r) => r.key)).toEqual(["detached:native-a"]);

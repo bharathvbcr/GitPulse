@@ -1,6 +1,9 @@
 import { mergeTerminalNotice, type PtyBus, type TerminalExitEvent } from "./ptyBus";
 import type { TerminalSpawned } from "./runResult";
-import { INPUT_HARD_MS, TerminalTimeoutError, createTerminalInput, sessionIsGone, terminalDeadline } from "./inputQueue";
+import {
+  CLOSE_SLOW_NOTICE, CONTEXT_READ_MS, CONTROL_QUICK_MS, INPUT_HARD_MS, KEEP_MS, KILL_HARD_MS, KILL_SOFT_MS, RENDERER_DRAIN_MS,
+  TerminalTimeoutError, createTerminalInput, sessionIsGone, terminalDeadline, type DeadlineClock,
+} from "./inputQueue";
 import { SessionCapacityError, type createSessionRegistry } from "./sessionRegistry";
 import type { LauncherKind } from "./tabs";
 
@@ -84,6 +87,8 @@ export function createSessionLifecycle(options: {
    * or absent: this lifecycle stays the owner, listed and stoppable.
    */
   keep?: (sessionId: string) => Promise<((slot: Slot) => void) | null>;
+  /** The page's sense of time for every deadline here; absent, the real one. A test seam. */
+  clock?: DeadlineClock;
 }) {
   const { bus, registry, transport, hooks } = options;
   let id: string | null = null;
@@ -137,7 +142,20 @@ export function createSessionLifecycle(options: {
     input?.dispose();
     const notice = mergeTerminalNotice(shownError, lossNotice);
     slot?.update(notice ?? "closing");
-    closing = terminalDeadline(transport.kill(target), 5000, "Closing terminal").then(() => {
+    // The bounds and the reason for each are in `inputQueue.ts` (KILL_HARD_MS).
+    // A close is something the user is watching, so a slow one is said, in
+    // the view and in Sessions, and retracted when it settles. A window nobody
+    // can see does not count against it: the failure it would report, "Close
+    // failed", could not be seen either, and the kill lands regardless.
+    closing = terminalDeadline(transport.kill(target), KILL_HARD_MS, "Closing terminal", {
+      clock: options.clock,
+      pauseWhileHidden: true,
+      softMs: KILL_SOFT_MS,
+      onSlow: (slow) => {
+        if (id === target) slot?.update(slow ? CLOSE_SLOW_NOTICE : notice ?? "closing");
+        if (!disposed || !slow) hooks.slow?.(slow ? CLOSE_SLOW_NOTICE : null);
+      },
+    }).then(() => {
       if (id === target) {
         attemptEnded = true;
         release();
@@ -174,19 +192,19 @@ export function createSessionLifecycle(options: {
     if (!target) { release(); return; }
     let idle = false;
     try {
-      idle = options.idle ? await terminalDeadline(options.idle(target), 1500, "Reading terminal context") : false;
+      idle = options.idle ? await terminalDeadline(options.idle(target), CONTEXT_READ_MS, "Reading terminal context", { clock: options.clock }) : false;
     } catch { idle = false; }
     if (id !== target) return;
     if (idle) { await closeCurrent(); return; }
     let adopt: ((slot: Slot) => void) | null = null;
     try {
-      adopt = options.keep ? await terminalDeadline(options.keep(target), 3000, "Listing terminal") : null;
+      adopt = options.keep ? await terminalDeadline(options.keep(target), KEEP_MS, "Listing terminal", { clock: options.clock }) : null;
     } catch { adopt = null; }
     if (id !== target) return;
     input?.dispose();
     let kept = false;
     try {
-      kept = await terminalDeadline(transport.detach(target), 5000, "Detaching terminal");
+      kept = await terminalDeadline(transport.detach(target), CONTROL_QUICK_MS, "Detaching terminal", { clock: options.clock, pauseWhileHidden: true });
     } catch (error) {
       if (id === target) slot?.update(`Still running; its view closed but it could not be detached. ${String(error)}`);
       throw error;
@@ -264,7 +282,7 @@ export function createSessionLifecycle(options: {
         input = createTerminalInput((data, binary) => transport.write(spawned.id, data, binary), (message, fatal) => {
           if (fatal) fail(message);
           else if (!disposed) hooks.warning(message);
-        }, { onSlow: (message) => { if (!disposed || message === null) hooks.slow?.(message); } });
+        }, { clock: options.clock, onSlow: (message) => { if (!disposed || message === null) hooks.slow?.(message); } });
         state("running");
         if (!reattached) {
           // This id belongs to a new process. Its predecessor's loss does not.
@@ -348,7 +366,7 @@ export function createSessionLifecycle(options: {
         const size = pendingSize, target = id;
         pendingSize = null;
         try {
-          await terminalDeadline(transport.resize(target, size.rows, size.cols), INPUT_HARD_MS, "Terminal resize", { pauseWhileHidden: true });
+          await terminalDeadline(transport.resize(target, size.rows, size.cols), INPUT_HARD_MS, "Terminal resize", { clock: options.clock, pauseWhileHidden: true });
           resizeWarned = false;
         } catch (error) {
           if (!disposed && id === target && !sessionIsGone(error) && !resizeWarned) {
@@ -370,7 +388,7 @@ export function createSessionLifecycle(options: {
         if (disposed) return;
         if (options.singleAttempt) { await start(true); return; }
         await closeCurrent();
-        await terminalDeadline(Promise.resolve(hooks.reset()), 5000, "Draining terminal renderer");
+        await terminalDeadline(Promise.resolve(hooks.reset()), RENDERER_DRAIN_MS, "Draining terminal renderer", { clock: options.clock, pauseWhileHidden: true });
         await start();
       })().catch((error: unknown) => state("error", String(error))).finally(() => { restarting = null; });
       return restarting;

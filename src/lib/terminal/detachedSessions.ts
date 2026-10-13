@@ -24,6 +24,7 @@ import { get } from "svelte/store";
 import { invoke as tauriInvoke } from "../ipc/invoke";
 import { ptyBus as tauriBus } from "./ptyBus.tauri";
 import type { PtyBus } from "./ptyBus";
+import { FAMILY_LOOKUP_MS, terminalDeadline, type DeadlineClock } from "./inputQueue";
 import type { TerminalListing } from "./runResult";
 import { terminalSessions, type createSessionRegistry, type TerminalSessionRecord } from "./sessionRegistry";
 import { enqueueTaskTerminal } from "./taskLaunches";
@@ -169,6 +170,27 @@ export function keepDetached(
     confirm: deps.confirm ?? askConfirm,
     bus: deps.bus ?? tauriBus,
   });
+}
+
+/**
+ * The repository family a task attempt's session is shown under, or null.
+ * Advisory: null means "stands alone", the same answer an unreadable family
+ * already gives. It is bounded on its own because the lookup is the git pool's
+ * (`cmd_resolve_repo`), which a burst of git commands holds for minutes; left
+ * inside the one deadline around `keep`, a slow family lookup took the whole
+ * hand-over with it and the session was never listed in Sessions.
+ */
+export async function listingFamily(
+  listing: Pick<TerminalListing, "run_id" | "repo">,
+  familyOf: (repo: string) => Promise<string | null>,
+  clock?: DeadlineClock,
+): Promise<string | null> {
+  if (!listing.run_id) return null;
+  try {
+    return await terminalDeadline(familyOf(listing.repo), FAMILY_LOOKUP_MS, "Resolving repository family", { clock });
+  } catch {
+    return null;
+  }
 }
 
 function launcherOf(listing: TerminalListing): LauncherKind {

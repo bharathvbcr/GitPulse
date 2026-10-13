@@ -77,7 +77,7 @@
   import { themeStore } from "../stores/themeStore";
   import { formatError } from "../ui/formatError";
   import { createSessionLifecycle } from "../terminal/sessionLifecycle";
-  import { terminalDeadline } from "../terminal/inputQueue";
+  import { CONTEXT_READ_MS, terminalDeadline } from "../terminal/inputQueue";
   import { parseTerminalContext, type TerminalContext } from "../terminal/sessionContext";
   import { isEditingElsewhere } from "../keyboard/terminalFocus";
   import { planPaste } from "../terminal/pasteGuard";
@@ -109,7 +109,7 @@
   import { openTaskForRun } from "../workbench/taskOpen";
   import { noteAttempt } from "../terminal/taskLaunches";
   import { toastStore } from "../stores/toastStore";
-  import { keepDetached, parseListing } from "../terminal/detachedSessions";
+  import { keepDetached, listingFamily, parseListing } from "../terminal/detachedSessions";
   import {
     clampTerminalFontSize, hasRenderedBox, macLineEditing, spawnGridSize, terminalViewChord, terminalSearchSummary,
     TERMINAL_FONT_DEFAULT, TERMINAL_FONT_MIN, TERMINAL_FONT_MAX,
@@ -683,7 +683,7 @@
         const raw = await invoke<unknown>("cmd_terminal_sessions");
         const listing = Array.isArray(raw) ? raw.map(parseListing).find((row) => row?.id === sessionId) ?? null : null;
         if (!listing) return null;
-        const family = listing.run_id ? await repoStore.familyOf(listing.repo).catch(() => null) : null;
+        const family = await listingFamily(listing, (repo) => repoStore.familyOf(repo));
         return (slot) => keepDetached({ ...listing, detached: true }, slot, { family });
       },
       hooks: {
@@ -945,14 +945,16 @@
 
   /**
    * What this session is running and where, or null when it has no live
-   * process or the answer is malformed. Bounded: a stuck query must not hold
-   * up the close or the new tab that asked.
+   * process or the answer is malformed. Bounded (CONTEXT_READ_MS, whose reason
+   * is in `inputQueue.ts`): a stuck query must not hold up the close or the new
+   * tab that asked. Null on timeout is "could not tell", not "nothing is
+   * running": the caller decides what that means.
    */
   export async function readContext(): Promise<TerminalContext | null> {
     const sessionId = nativeSessionId;
     if (!sessionId || !lifecycle?.isCurrent(sessionId)) return null;
     try {
-      const raw = await terminalDeadline(invoke<unknown>("cmd_terminal_context", { sessionId }), 1500, "Reading terminal context");
+      const raw = await terminalDeadline(invoke<unknown>("cmd_terminal_context", { sessionId }), CONTEXT_READ_MS, "Reading terminal context");
       return parseTerminalContext(raw);
     } catch {
       return null;

@@ -138,6 +138,73 @@ export const INPUT_SOFT_MS = 5000;
 export const INPUT_HARD_MS = 60_000;
 export const INPUT_SLOW_NOTICE = "Terminal is responding slowly; typing is queued and will be sent in order.";
 
+/*
+ * The deadlines of the slower terminal commands, in one place. Each is the
+ * backend's worst case, read off its code, plus headroom for what the backend
+ * cannot see (the webview's IPC, starting a control-pool thread, a host too
+ * loaded to schedule either): the same reasoning as `INPUT_HARD_MS`. A bound
+ * that is merely near the worst case turns a slow answer into a reported
+ * failure, which for a close or a detach is a wrong one: the work is done.
+ *
+ * Backend worst cases (`src-tauri/src/terminal/mod.rs`):
+ *
+ *   kill   `kill_session`, on the control pool. Sleeps, which nothing shortens
+ *          for a job that ignores the hangup:
+ *            HANGUP_GRACE                          2500 ms
+ *            the two SIGKILL sweeps after it         40 ms
+ *            portable_pty's reap after SIGHUP   4 x 50 = 200 ms
+ *            the cleanup poll before "retry Close" 2000 ms
+ *                                                  ------
+ *                                                  4740 ms (4750 with a poll step)
+ *          plus at least four process-table scans on the way (the first
+ *          listing, the grace loop's last one, the two sweeps). A scan was
+ *          measured at up to 1209 ms on a host at load ~400 (gitpulse.log,
+ *          `cmd_terminal_context` work_ms), so 4 x 1.2 s more: about 10 s.
+ *          Routine closes logged 2.6 to 3.2 s.
+ *   context `session_context`: one scan and two process reads, 1.2 s measured.
+ *          It can also wait for the child lock a closing `kill` holds (up to
+ *          the kill's own time), but nobody asks for the context of a session
+ *          they are closing, and its answer would be moot.
+ *   detach, sessions, attach: a session-map lock (a closing kill takes it every
+ *          10 ms for an instant) and, for attach, two TIOCSWINSZ ioctls. No
+ *          sleep, no scan: well under a second.
+ *
+ * The frontend bounds, with the ratio over the worst case above:
+ *   KILL_HARD_MS      30 s  about 3x the ~10 s kill. A timeout keeps the slot and
+ *                           the process id ("Close failed; use Sessions to retry").
+ *   KILL_SOFT_MS       6 s  past the 4.75 s a close takes with nothing slow in the
+ *                           way, so the notice means "the host", not "the grace".
+ *   CONTEXT_READ_MS    5 s  4x the measured read. A user is waiting on the answer
+ *                           (a close question, a new tab's directory), so it is
+ *                           not stretched further; a timeout is "could not tell".
+ *   CONTROL_QUICK_MS  15 s  detach and the session listing: 15x. Nobody waits on
+ *                           these, and giving up early costs something real (a
+ *                           view that could not be detached; a session left out
+ *                           of Sessions), so they are generous.
+ *   FAMILY_LOOKUP_MS  10 s  `cmd_resolve_repo` shares the git pool, where git
+ *                           commands were logged taking 5 to 160 s. The family is
+ *                           advisory (null means "stands alone"), so it must not
+ *                           decide whether a session is listed.
+ *   RENDERER_DRAIN_MS 30 s  no backend in it: the page parsing what it was sent
+ *                           (a 256 KiB window plus xterm's own buffer), which a
+ *                           starved or hidden page does slowly.
+ *
+ * All are measured by `terminalDeadline`, so a stalled page does not count and
+ * `pauseWhileHidden` is set where a window nobody is looking at would otherwise
+ * report a failure it cannot show: the close and the detach (they change the
+ * process's state) and the renderer drain (a hidden page does not drain).
+ * `terminalBounds.test.ts` holds the backend figures above to the Rust source.
+ */
+export const KILL_HARD_MS = 30_000;
+export const KILL_SOFT_MS = 6_000;
+export const CONTEXT_READ_MS = 5_000;
+export const CONTROL_QUICK_MS = 15_000;
+export const FAMILY_LOOKUP_MS = 10_000;
+/** A session listing, then the optional family lookup: what handing a session to Sessions may take. */
+export const KEEP_MS = CONTROL_QUICK_MS + FAMILY_LOOKUP_MS;
+export const RENDERER_DRAIN_MS = 30_000;
+export const CLOSE_SLOW_NOTICE = "Closing is taking longer than usual; the terminal host is responding slowly.";
+
 export function createTerminalInput(
   send: (data: string, binary: boolean) => Promise<void>,
   onError: (message: string, fatal: boolean) => void,
