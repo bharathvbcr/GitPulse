@@ -7,7 +7,7 @@ pub mod actions;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GitHubRepoRef {
@@ -280,6 +280,12 @@ pub struct DependabotReport {
     pub slug: String,
     pub alerts: Vec<DependabotAlertInfo>,
     pub truncated: bool,
+    /// Severity tiers whose alerts are missing from `alerts` because that
+    /// tier's request failed or the fetch deadline cut it off. Non-empty means
+    /// the list is a lower bound (`truncated` is set too): an absent critical
+    /// alert is not a clean bill of health.
+    #[serde(default)]
+    pub partial_tiers: Vec<String>,
     pub error: Option<String>,
     /// Set when `available` is false. Absent on a successful fetch.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -323,6 +329,9 @@ pub struct CodeScanningReport {
     pub slug: String,
     pub alerts: Vec<CodeScanningAlertInfo>,
     pub truncated: bool,
+    /// Same contract as [`DependabotReport::partial_tiers`].
+    #[serde(default)]
+    pub partial_tiers: Vec<String>,
     pub error: Option<String>,
     /// Set when `available` is false. Absent on a successful fetch.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1121,6 +1130,7 @@ struct AlertOutcome<T> {
     slug: String,
     alerts: Vec<T>,
     truncated: bool,
+    partial_tiers: Vec<String>,
     error: Option<String>,
     unavailable_reason: Option<GithubUnavailableReason>,
 }
@@ -1136,6 +1146,7 @@ impl<T> AlertOutcome<T> {
             slug: String::new(),
             alerts: Vec::new(),
             truncated: false,
+            partial_tiers: Vec::new(),
             error: Some(error),
             unavailable_reason: Some(GithubUnavailableReason::Transport),
         }
@@ -1153,6 +1164,7 @@ macro_rules! report_from_outcome {
                     slug: o.slug,
                     alerts: o.alerts,
                     truncated: o.truncated,
+                    partial_tiers: o.partial_tiers,
                     error: o.error,
                     unavailable_reason: o.unavailable_reason,
                 }
@@ -1178,7 +1190,7 @@ report_from_outcome!(CodeScanningReport, CodeScanningAlertInfo);
 /// explicit reason, never as an empty success.
 fn load_alert_outcome<T>(
     repo_path: &str,
-    list: impl FnOnce(&GitHubRepoRef) -> Result<(Vec<T>, bool), String>,
+    list: impl FnOnce(&GitHubRepoRef) -> Result<AlertList<T>, String>,
 ) -> AlertOutcome<T> {
     let gh = probe_gh_cli();
     let cli_present = gh_cli_reported_present(&gh);
@@ -1192,13 +1204,14 @@ fn load_alert_outcome<T>(
         return unavailable_alert_outcome(cli_present, true, remote.slug(), Some(reason));
     }
     match list(&remote) {
-        Ok((alerts, truncated)) => AlertOutcome {
+        Ok(listed) => AlertOutcome {
             available: true,
             cli_present: true,
             is_github_remote: true,
             slug: remote.slug(),
-            alerts,
-            truncated,
+            alerts: listed.alerts,
+            truncated: listed.truncated,
+            partial_tiers: listed.partial_tiers,
             error: None,
             unavailable_reason: None,
         },
@@ -1224,41 +1237,94 @@ fn unavailable_alert_outcome<T>(
         slug,
         alerts: Vec::new(),
         truncated: false,
+        partial_tiers: Vec::new(),
         error,
         unavailable_reason,
     }
 }
 
+/// What listing one alert family produced: the capped rows, whether more
+/// exist, and which severity tiers could not be read.
+struct AlertList<T> {
+    alerts: Vec<T>,
+    truncated: bool,
+    partial_tiers: Vec<String>,
+}
+
+impl<T> AlertList<T> {
+    /// A list missing a tier is a lower bound whatever the cap said, so the
+    /// consumer's "at least N" wording follows from `truncated`.
+    fn new(alerts: Vec<T>, truncated: bool, partial_tiers: Vec<String>) -> Self {
+        Self {
+            truncated: truncated || !partial_tiers.is_empty(),
+            alerts,
+            partial_tiers,
+        }
+    }
+}
+
 fn list_dependabot_alerts(
     remote: &GitHubRepoRef,
-) -> Result<(Vec<DependabotAlertInfo>, bool), String> {
+) -> Result<AlertList<DependabotAlertInfo>, String> {
     let endpoint = format!(
         "repos/{}/{}/dependabot/alerts?state=open",
         remote.owner, remote.name
     );
-    let text = fetch_alerts_worst_first(remote, &endpoint, &["critical", "high", "medium", "low"])?;
-    parse_dependabot_alerts(&text, ALERT_DISPLAY_LIMIT)
+    let fetched =
+        fetch_alerts_worst_first(remote, &endpoint, &["critical", "high", "medium", "low"])?;
+    let (alerts, truncated) = parse_dependabot_alerts(&fetched.text, ALERT_DISPLAY_LIMIT)?;
+    Ok(AlertList::new(alerts, truncated, fetched.partial_tiers))
 }
 
 /// Largest page the alerts REST endpoints serve.
 const ALERT_PAGE_MAX: usize = 100;
 
-/// A JSON array of open alerts that is the worst of them: every alert when
-/// they fit one page, else the worst [`ALERT_DISPLAY_LIMIT`] + 1.
+/// Severity tiers asked for at once. Three keeps the wait to a couple of
+/// rounds without turning one Health open into a burst of `gh` processes.
+const ALERT_TIER_CONCURRENCY: usize = 3;
+
+/// One deadline over a whole alert fetch (the first page and every tier). A
+/// request that has not answered by then is reported as missing, not waited on:
+/// a single `gh api` call was allowed 45 s and a fetch could stack several.
+const ALERT_FETCH_DEADLINE: Duration = Duration::from_secs(20);
+
+/// The open alerts of one family as a JSON array, and the severity tiers that
+/// array is missing.
+struct AlertFetch {
+    text: String,
+    /// Tiers whose request failed or was cut off by [`ALERT_FETCH_DEADLINE`].
+    partial_tiers: Vec<String>,
+}
+
+/// One page of alerts: the `query` suffix (`""` or `&severity=high`), the page
+/// size, and the longest the request may take.
+type AlertPageFetch<'a> = dyn Fn(&str, usize, Duration) -> Result<Vec<Value>, String> + Sync + 'a;
+
+/// The worst open alerts of one family: every alert when they fit one page,
+/// else the worst [`ALERT_DISPLAY_LIMIT`] + 1.
 ///
 /// "Sort worst-first, then cap" only ranks what was fetched, and the first 51
 /// rows are the newest 51 — a critical alert beyond them was never seen. So:
 /// one full-size page first, which is the whole answer for nearly every
 /// repository; only when that page is full (more may exist) are the severities
-/// asked for one at a time, worst first, until the cap is passed. Whatever the
-/// cap then drops is no worse than what is kept.
+/// asked for, worst first, [`ALERT_TIER_CONCURRENCY`] at a time, until the cap
+/// is passed. Whatever the cap then drops is no worse than what is kept.
+///
+/// A tier that fails or misses the deadline does not discard the others: it is
+/// named in [`AlertFetch::partial_tiers`] and the newest-first page stands in
+/// for what it would have contributed. Only the first page failing fails the
+/// fetch, since then nothing is known.
 fn fetch_alerts_worst_first(
     remote: &GitHubRepoRef,
     endpoint: &str,
     tiers: &[&str],
-) -> Result<String, String> {
-    let page = |query: &str, per_page: usize| -> Result<Vec<Value>, String> {
-        let out = capture_gh_api(remote, &format!("{endpoint}&per_page={per_page}{query}"))?;
+) -> Result<AlertFetch, String> {
+    let page = |query: &str, per_page: usize, timeout: Duration| -> Result<Vec<Value>, String> {
+        let out = capture_gh_api(
+            remote,
+            &format!("{endpoint}&per_page={per_page}{query}"),
+            timeout,
+        )?;
         if !out.success {
             return Err(gh_api_error_message(&out));
         }
@@ -1268,26 +1334,84 @@ fn fetch_alerts_worst_first(
             Err(error) => Err(format!("could not parse gh alerts output: {error}")),
         }
     };
-    let first = page("", ALERT_PAGE_MAX)?;
+    collect_alerts_worst_first(&page, tiers, Instant::now() + ALERT_FETCH_DEADLINE)
+}
+
+/// [`fetch_alerts_worst_first`] over an injected page fetcher and deadline.
+fn collect_alerts_worst_first(
+    page: &AlertPageFetch<'_>,
+    tiers: &[&str],
+    deadline: Instant,
+) -> Result<AlertFetch, String> {
+    let remaining = || deadline.saturating_duration_since(Instant::now());
+    let json = |rows: &[Value]| serde_json::to_string(rows).map_err(|e| e.to_string());
+    let first = page("", ALERT_PAGE_MAX, remaining())?;
     if first.len() < ALERT_PAGE_MAX {
-        return serde_json::to_string(&first).map_err(|e| e.to_string());
+        return Ok(AlertFetch {
+            text: json(&first)?,
+            partial_tiers: Vec::new(),
+        });
     }
+    // An alert can answer to two tiers (its CodeQL and its security severity);
+    // count it once.
     let mut seen = std::collections::HashSet::new();
     let mut worst: Vec<Value> = Vec::new();
-    for tier in tiers {
-        let want = ALERT_DISPLAY_LIMIT + 1 - worst.len().min(ALERT_DISPLAY_LIMIT);
-        for row in page(&format!("&severity={tier}"), want)? {
-            // An alert can answer to two tiers (its CodeQL and its security
-            // severity); count it once.
+    let mut partial_tiers: Vec<String> = Vec::new();
+    let mut next = 0;
+    while next < tiers.len() && worst.len() <= ALERT_DISPLAY_LIMIT {
+        let budget = remaining();
+        if budget.is_zero() {
+            partial_tiers.extend(tiers[next..].iter().map(|tier| (*tier).to_string()));
+            break;
+        }
+        let wave = &tiers[next..tiers.len().min(next + ALERT_TIER_CONCURRENCY)];
+        next += wave.len();
+        let answers: Vec<Result<Vec<Value>, String>> = std::thread::scope(|scope| {
+            let handles: Vec<_> = wave
+                .iter()
+                .map(|tier| {
+                    let query = format!("&severity={tier}");
+                    scope.spawn(move || page(&query, ALERT_DISPLAY_LIMIT + 1, budget))
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|handle| {
+                    handle
+                        .join()
+                        .unwrap_or_else(|_| Err("alert tier worker panicked".to_string()))
+                })
+                .collect()
+        });
+        for (tier, answer) in wave.iter().zip(answers) {
+            match answer {
+                Ok(rows) => {
+                    for row in rows {
+                        if seen.insert(row.get("number").and_then(Value::as_u64)) {
+                            worst.push(row);
+                        }
+                    }
+                }
+                Err(error) => {
+                    log::warn!(target: "github", "alert tier {tier} not fetched: {error}");
+                    partial_tiers.push((*tier).to_string());
+                }
+            }
+        }
+    }
+    if !partial_tiers.is_empty() {
+        // What the missing tiers would have added is unknown; the newest page
+        // is the one view of them that was actually read.
+        for row in first {
             if seen.insert(row.get("number").and_then(Value::as_u64)) {
                 worst.push(row);
             }
         }
-        if worst.len() > ALERT_DISPLAY_LIMIT {
-            break;
-        }
     }
-    serde_json::to_string(&worst).map_err(|e| e.to_string())
+    Ok(AlertFetch {
+        text: json(&worst)?,
+        partial_tiers,
+    })
 }
 
 /// Extra flags that pin a read-only `gh api` call to this remote's host.
@@ -1305,11 +1429,15 @@ pub(crate) fn api_host_flags(remote: &GitHubRepoRef) -> Vec<String> {
 }
 
 /// Runs one read-only `gh api` call pinned to this remote's host.
-fn capture_gh_api(remote: &GitHubRepoRef, endpoint: &str) -> Result<CapturedOutput, String> {
+fn capture_gh_api(
+    remote: &GitHubRepoRef,
+    endpoint: &str,
+    timeout: Duration,
+) -> Result<CapturedOutput, String> {
     let mut args: Vec<String> = vec!["api".to_string(), endpoint.to_string()];
     args.extend(api_host_flags(remote));
     let refs: Vec<&str> = args.iter().map(String::as_str).collect();
-    capture_command("gh", &refs, None, Duration::from_secs(45), &[])
+    capture_command("gh", &refs, None, timeout, &[])
 }
 
 /// HTTP status printed by `gh` (`gh: HTTP 404`), never the process exit code.
@@ -1612,7 +1740,7 @@ pub fn load_code_scanning_alerts(repo_path: &str) -> CodeScanningReport {
 
 fn list_code_scanning_alerts(
     remote: &GitHubRepoRef,
-) -> Result<(Vec<CodeScanningAlertInfo>, bool), String> {
+) -> Result<AlertList<CodeScanningAlertInfo>, String> {
     // Official REST: GET /repos/{owner}/{repo}/code-scanning/alerts
     // Query params confirmed: state, per_page (max 100), ref, tool_name,
     // severity, page. We request open alerts, worst first when there are more
@@ -1623,14 +1751,15 @@ fn list_code_scanning_alerts(
         "repos/{}/{}/code-scanning/alerts?state=open",
         remote.owner, remote.name
     );
-    let text = fetch_alerts_worst_first(
+    let fetched = fetch_alerts_worst_first(
         remote,
         &endpoint,
         &[
             "critical", "high", "error", "medium", "warning", "low", "note",
         ],
     )?;
-    parse_code_scanning_alerts(&text, ALERT_DISPLAY_LIMIT)
+    let (alerts, truncated) = parse_code_scanning_alerts(&fetched.text, ALERT_DISPLAY_LIMIT)?;
+    Ok(AlertList::new(alerts, truncated, fetched.partial_tiers))
 }
 
 fn parse_code_scanning_alerts(
@@ -4554,5 +4683,282 @@ esac
         assert_eq!(report.alerts[0].severity, "critical");
         assert!(report.truncated, "more than the cap exist");
         assert_eq!(report.alerts.len(), ALERT_DISPLAY_LIMIT);
+    }
+
+    /// A fake `gh` whose answer to a full first page (100 low rows) is fixed
+    /// and whose per-severity answers are `severity_cases` (shell `case` arms
+    /// keyed on `*severity=<tier>*`). Returns the fixture dir (kept alive by
+    /// the caller) and the `PATH` that reaches it.
+    #[cfg(unix)]
+    fn fake_alert_gh(severity_cases: &str) -> (tempfile::TempDir, String) {
+        use std::os::unix::fs::PermissionsExt;
+        let fixture = tempfile::TempDir::new().unwrap();
+        let bin = fixture.path().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let script = format!(
+            "#!/bin/sh
+case \"$1\" in --version) echo 'gh version 2.102.0'; exit 0;; esac
+case \"$*\" in
+{severity_cases}
+  *severity=*) printf '[]';;
+  *) i=1; printf '['; while [ $i -le 100 ]; do [ $i -gt 1 ] && printf ','; printf '{{\"number\":%s,\"security_vulnerability\":{{\"severity\":\"low\"}}}}' $i; i=$((i+1)); done; printf ']';;
+esac
+"
+        );
+        std::fs::write(bin.join("gh"), script).unwrap();
+        std::fs::set_permissions(bin.join("gh"), std::fs::Permissions::from_mode(0o755)).unwrap();
+        let path = format!("{}:/usr/bin:/bin", bin.display());
+        (fixture, path)
+    }
+
+    #[cfg(unix)]
+    fn github_remote_repo() -> tempfile::TempDir {
+        let repo = crate::test_support::git_repo();
+        crate::test_support::git_in(
+            repo.path(),
+            &["remote", "add", "origin", "https://github.com/o/r.git"],
+        );
+        repo
+    }
+
+    /// Dependabot has four severity tiers. Asked one after another, a slow
+    /// answer from each (45 s each, 4.2 s on average in the field) added up to
+    /// the whole of the wait; asked together, up to three at a time, they take
+    /// two rounds. Four tiers of one second each finish in about two seconds,
+    /// where a sequential fetch needs four.
+    #[cfg(unix)]
+    #[test]
+    fn severity_tiers_are_fetched_concurrently_not_one_after_another() {
+        let serial = crate::harness::sidecar::test_serial();
+        let (_fixture, path) = fake_alert_gh("  *severity=*) sleep 1; printf '[]';;");
+        let _env = crate::test_support::env::bind_env(&serial).set("PATH", path);
+        let repo = github_remote_repo();
+
+        let started = std::time::Instant::now();
+        let report = load_dependabot_alerts(repo.path().to_str().unwrap());
+        let elapsed = started.elapsed();
+        assert!(report.available, "{:?}", report.error);
+        assert!(
+            elapsed < crate::test_support::env::coverage_relaxed(Duration::from_millis(3200)),
+            "four one-second tiers took {elapsed:?}; a sequential fetch needs 4 s"
+        );
+    }
+
+    /// One tier failing (a 502 on `high`) used to discard the tiers already
+    /// fetched, so the Health view said "could not fetch Dependabot alerts"
+    /// next to a critical alert that had been read successfully.
+    #[cfg(unix)]
+    #[test]
+    fn a_failing_tier_no_longer_discards_the_other_tiers() {
+        let serial = crate::harness::sidecar::test_serial();
+        let (_fixture, path) = fake_alert_gh(
+            "  *severity=critical*) printf '[{\"number\":9001,\"security_vulnerability\":{\"severity\":\"critical\"}}]';;
+  *severity=high*) echo 'gh: HTTP 502 Bad Gateway' >&2; exit 1;;",
+        );
+        let _env = crate::test_support::env::bind_env(&serial).set("PATH", path);
+        let repo = github_remote_repo();
+
+        let report = load_dependabot_alerts(repo.path().to_str().unwrap());
+        assert!(
+            report.available,
+            "one failed tier is not an unavailable fetch: {:?}",
+            report.error
+        );
+        assert_eq!(report.alerts[0].number, 9001, "the critical alert is kept");
+        assert!(report.truncated, "a list missing a tier is a lower bound");
+    }
+
+    /// The failed tier is named, on both reports, so the UI can say which
+    /// severities it could not read instead of showing a short list as whole.
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_tier_is_named_on_the_report() {
+        let serial = crate::harness::sidecar::test_serial();
+        let (_fixture, path) = fake_alert_gh(
+            "  *severity=critical*) printf '[{\"number\":9001,\"security_vulnerability\":{\"severity\":\"critical\"}}]';;
+  *severity=high*) echo 'gh: HTTP 502 Bad Gateway' >&2; exit 1;;",
+        );
+        let _env = crate::test_support::env::bind_env(&serial).set("PATH", path);
+        let repo = github_remote_repo();
+
+        let report = load_dependabot_alerts(repo.path().to_str().unwrap());
+        assert_eq!(report.partial_tiers, vec!["high".to_string()]);
+        assert!(report.error.is_none(), "a partial answer is not an error");
+        assert!(report.unavailable_reason.is_none());
+        // The tier that failed has no rows, and the newest page stands in.
+        assert!(
+            report.alerts.len() > 1,
+            "the newest page is kept: {}",
+            report.alerts.len()
+        );
+    }
+
+    fn page_row(number: u64) -> Value {
+        serde_json::json!({ "number": number })
+    }
+
+    /// A full first page, then per-tier answers from `tier`.
+    fn tiered_fetch<'a>(
+        tier: impl Fn(&str) -> Result<Vec<Value>, String> + Sync + 'a,
+    ) -> impl Fn(&str, usize, Duration) -> Result<Vec<Value>, String> + Sync + 'a {
+        move |query, _per_page, _timeout| {
+            if query.is_empty() {
+                Ok((1..=ALERT_PAGE_MAX as u64).map(page_row).collect())
+            } else {
+                tier(query)
+            }
+        }
+    }
+
+    fn rows_in(fetched: &AlertFetch) -> Vec<Value> {
+        serde_json::from_str(&fetched.text).unwrap()
+    }
+
+    /// At most `ALERT_TIER_CONCURRENCY` tier requests are in flight, and more
+    /// than one is: that is the whole of the speed-up over a sequential loop,
+    /// shown here without a wall clock.
+    #[test]
+    fn tiers_run_up_to_the_concurrency_cap_and_no_further() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let in_flight = AtomicUsize::new(0);
+        let peak = AtomicUsize::new(0);
+        let fetch = tiered_fetch(|_| {
+            let now = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+            peak.fetch_max(now, Ordering::SeqCst);
+            std::thread::sleep(Duration::from_millis(60));
+            in_flight.fetch_sub(1, Ordering::SeqCst);
+            Ok(Vec::new())
+        });
+        let tiers = [
+            "critical", "high", "medium", "low", "note", "warning", "error",
+        ];
+        let fetched =
+            collect_alerts_worst_first(&fetch, &tiers, Instant::now() + Duration::from_secs(30))
+                .unwrap();
+        assert!(fetched.partial_tiers.is_empty());
+        assert_eq!(peak.load(Ordering::SeqCst), ALERT_TIER_CONCURRENCY);
+    }
+
+    /// A tier past the deadline is not waited for and not forgotten: it is
+    /// named, and none of its requests is made.
+    #[test]
+    fn tiers_past_the_deadline_are_named_not_requested() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let tier_calls = AtomicUsize::new(0);
+        let fetch = tiered_fetch(|_| {
+            tier_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(Vec::new())
+        });
+        let fetched =
+            collect_alerts_worst_first(&fetch, &["critical", "high"], Instant::now()).unwrap();
+        assert_eq!(tier_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(fetched.partial_tiers, vec!["critical", "high"]);
+        // Nothing of the tiers was read, so the newest page is what is shown.
+        assert_eq!(rows_in(&fetched).len(), ALERT_PAGE_MAX);
+    }
+
+    /// Every request is handed the time left, never more than the deadline:
+    /// a slow tier cannot hold the fetch past it.
+    #[test]
+    fn each_request_is_bounded_by_the_time_left_on_the_deadline() {
+        let longest = std::sync::Mutex::new(Duration::ZERO);
+        let fetch = |query: &str, _per_page: usize, timeout: Duration| {
+            let mut longest = longest.lock().unwrap();
+            *longest = (*longest).max(timeout);
+            if query.is_empty() {
+                Ok((1..=ALERT_PAGE_MAX as u64).map(page_row).collect())
+            } else {
+                Ok(Vec::new())
+            }
+        };
+        let budget = Duration::from_secs(7);
+        collect_alerts_worst_first(&fetch, &["critical"], Instant::now() + budget).unwrap();
+        let longest = *longest.lock().unwrap();
+        assert!(longest <= budget, "a request was allowed {longest:?}");
+        assert!(
+            longest > Duration::from_secs(5),
+            "and not starved: {longest:?}"
+        );
+    }
+
+    /// A tier that errors loses only itself.
+    #[test]
+    fn a_tier_error_keeps_the_rows_of_the_tiers_that_answered() {
+        let fetch = tiered_fetch(|query| match query {
+            "&severity=critical" => Ok(vec![page_row(9001)]),
+            "&severity=high" => Err("HTTP 502".to_string()),
+            _ => Ok(Vec::new()),
+        });
+        let fetched = collect_alerts_worst_first(
+            &fetch,
+            &["critical", "high", "medium"],
+            Instant::now() + Duration::from_secs(30),
+        )
+        .unwrap();
+        assert_eq!(fetched.partial_tiers, vec!["high"]);
+        let numbers: Vec<u64> = rows_in(&fetched)
+            .iter()
+            .filter_map(|row| row.get("number").and_then(Value::as_u64))
+            .collect();
+        assert!(numbers.contains(&9001));
+        assert_eq!(
+            numbers.len(),
+            ALERT_PAGE_MAX + 1,
+            "the critical row plus the newest page, each counted once"
+        );
+    }
+
+    /// Every tier failing is a short, loudly partial list, never an empty one.
+    #[test]
+    fn all_tiers_failing_is_partial_with_the_newest_page_not_empty() {
+        let fetch = tiered_fetch(|_| Err("HTTP 500".to_string()));
+        let fetched = collect_alerts_worst_first(
+            &fetch,
+            &["critical", "high", "medium", "low"],
+            Instant::now() + Duration::from_secs(30),
+        )
+        .unwrap();
+        assert_eq!(
+            fetched.partial_tiers,
+            vec!["critical", "high", "medium", "low"]
+        );
+        assert_eq!(rows_in(&fetched).len(), ALERT_PAGE_MAX);
+    }
+
+    /// A first page that fails is the one failure that fails the fetch: there
+    /// is nothing to be partial about.
+    #[test]
+    fn a_failing_first_page_fails_the_fetch() {
+        let fetch = |_: &str, _: usize, _: Duration| -> Result<Vec<Value>, String> {
+            Err("HTTP 401".to_string())
+        };
+        let error = collect_alerts_worst_first(
+            &fetch,
+            &["critical"],
+            Instant::now() + Duration::from_secs(5),
+        )
+        .err()
+        .unwrap();
+        assert_eq!(error, "HTTP 401");
+    }
+
+    /// A page that is not full is the whole answer, with no tier requests.
+    #[test]
+    fn a_short_first_page_asks_for_no_tiers() {
+        let fetch = |query: &str, _: usize, _: Duration| -> Result<Vec<Value>, String> {
+            assert!(
+                query.is_empty(),
+                "no tier request for a short page: {query}"
+            );
+            Ok(vec![page_row(1), page_row(2)])
+        };
+        let fetched = collect_alerts_worst_first(
+            &fetch,
+            &["critical"],
+            Instant::now() + Duration::from_secs(5),
+        )
+        .unwrap();
+        assert!(fetched.partial_tiers.is_empty());
+        assert_eq!(rows_in(&fetched).len(), 2);
     }
 }

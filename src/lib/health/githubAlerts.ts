@@ -94,6 +94,41 @@ function wasDeferredUnderLoad(snapshot: GithubAlertsSnapshot): boolean {
   );
 }
 
+/** Reasons that describe this attempt rather than the repository. */
+const TRANSIENT_REASONS = new Set<string>(["transport", "unknown"]);
+
+function halfIsTransient(
+  requestFailed: boolean,
+  report: DependabotReport | CodeScanningReport,
+): boolean {
+  if (requestFailed) return true;
+  if ((report.partial_tiers?.length ?? 0) > 0) return true;
+  return (
+    !report.available &&
+    report.unavailable_reason !== undefined &&
+    TRANSIENT_REASONS.has(report.unavailable_reason)
+  );
+}
+
+/**
+ * Whether a snapshot is an answer worth keeping for the session.
+ *
+ * A fetch that failed in transit (a timeout, a rejected invoke, a deferral), a
+ * reason the backend could not classify, or a result missing severity tiers
+ * describes that one attempt, not the repository. Kept, it stood in for the
+ * check until the entry was evicted or the user forced a refresh; reopening
+ * Health after one timeout showed the same timeout. GitHub's own refusals
+ * (403, product off, no remote, rate limit) are answers a retry would repeat,
+ * so those stay cached.
+ */
+export function isCacheableGithubSnapshot(snapshot: GithubAlertsSnapshot): boolean {
+  if (wasDeferredUnderLoad(snapshot)) return false;
+  return !(
+    halfIsTransient(snapshot.dependabotRequestFailed, snapshot.dependabot) ||
+    halfIsTransient(snapshot.codeScanningRequestFailed, snapshot.codeScanning)
+  );
+}
+
 function snapshotFromSettled(
   depSettled: PromiseSettledResult<DependabotReport>,
   csSettled: PromiseSettledResult<CodeScanningReport>,
@@ -159,9 +194,10 @@ export function loadGithubAlerts(
   }
   const pending = fetchGithubAlerts(repoPath, commands, now).then((snapshot) => {
     // A slower launch fetch must not overwrite a later Health refresh. A
-    // check the spawn gate deferred never ran, so it is not a result to keep:
-    // cached, it stood in for the real answer until the entry was evicted.
-    if (inflight.get(repoPath) === pending && !wasDeferredUnderLoad(snapshot)) {
+    // check that failed in transit, was deferred, or came back missing
+    // severity tiers is not a result to keep: cached, it stood in for the
+    // real answer until the entry was evicted.
+    if (inflight.get(repoPath) === pending && isCacheableGithubSnapshot(snapshot)) {
       githubAlertsCache.set(repoPath, snapshot);
     }
     return snapshot;
@@ -321,6 +357,21 @@ function checkFailureMessage(
   return error;
 }
 
+/**
+ * A result missing severity tiers answered only in part. It is not "failed"
+ * (the alerts it holds are real), but it must not read as a clean check either.
+ */
+function partialFailureMessage(
+  label: string,
+  report: DependabotReport | CodeScanningReport,
+): string | null {
+  const tiers = report.partial_tiers ?? [];
+  if (!report.available || tiers.length === 0) return null;
+  return `${label} alerts are incomplete: the ${tiers.join(", ")} severity ${
+    tiers.length === 1 ? "tier" : "tiers"
+  } could not be read.`;
+}
+
 function githubCheckFailed(snapshot: GithubAlertsSnapshot): string | null {
   return (
     checkFailureMessage(
@@ -334,7 +385,9 @@ function githubCheckFailed(snapshot: GithubAlertsSnapshot): string | null {
       snapshot.codeScanningRequestFailed,
       snapshot.codeScanning.error,
       snapshot.codeScanning.unavailable_reason,
-    )
+    ) ??
+    partialFailureMessage("Dependabot", snapshot.dependabot) ??
+    partialFailureMessage("Code scanning", snapshot.codeScanning)
   );
 }
 
