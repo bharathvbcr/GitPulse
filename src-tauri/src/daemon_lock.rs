@@ -279,50 +279,79 @@ mod tests {
         }
     }
 
+    /// A pipe whose ends close on exec, made where `procguard` makes its own.
+    #[cfg(unix)]
+    fn cloexec_pipe() -> (i32, i32) {
+        let mut fds = [0i32; 2];
+        let made = crate::procguard::with_inheritance_lock(|| {
+            // SAFETY: `fds` is a valid two-element buffer for pipe(2); fcntl
+            // acts on the descriptors it just returned.
+            unsafe {
+                libc::pipe(fds.as_mut_ptr()) == 0
+                    && fds
+                        .iter()
+                        .all(|&fd| libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) == 0)
+            }
+        });
+        assert!(made, "pipe(2) failed");
+        (fds[0], fds[1])
+    }
+
     /// The window `released` exists for, made deterministic: a child forked
     /// while the lock is held keeps it after its owner dropped it, until the
     /// child execs.
     #[cfg(unix)]
     #[test]
     fn a_child_forked_under_the_lock_holds_it_until_it_execs() {
+        use crate::procguard::LockedSpawn;
         use std::os::unix::process::CommandExt;
         let dir = tempfile::tempdir().unwrap();
         let first = match acquire(dir.path(), "1.4.0") {
             Acquire::Held(lock) => lock,
             other => panic!("the first daemon was not admitted: {other:?}"),
         };
-        let mut fds = [0i32; 2];
-        // SAFETY: `fds` is a valid two-element buffer for pipe(2).
-        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
-        let (read_fd, write_fd) = (fds[0], fds[1]);
+        // `ready` tells this thread the child is between fork and exec;
+        // `go` tells the child it may exec.
+        let (ready_read, ready_write) = cloexec_pipe();
+        let (go_read, go_write) = cloexec_pipe();
         let spawner = std::thread::spawn(move || {
             let mut command = std::process::Command::new("true");
             // SAFETY: the closure runs between fork and exec and calls only
-            // the async-signal-safe write and usleep.
+            // the async-signal-safe write and poll.
             unsafe {
                 command.pre_exec(move || {
-                    libc::write(write_fd, b"x".as_ptr().cast(), 1);
-                    libc::usleep(300_000);
+                    libc::write(ready_write, b"x".as_ptr().cast(), 1);
+                    let mut wait = libc::pollfd {
+                        fd: go_read,
+                        events: libc::POLLIN,
+                        revents: 0,
+                    };
+                    // Bounded, so a parent that panicked cannot strand it.
+                    libc::poll(&mut wait, 1, 10_000);
                     Ok(())
                 });
             }
-            command.status()
+            command.status_locked()
         });
         let mut byte = [0u8; 1];
-        // SAFETY: `byte` is a valid one-byte buffer and `read_fd` is open.
-        let read = unsafe { libc::read(read_fd, byte.as_mut_ptr().cast(), 1) };
+        // SAFETY: `byte` is a valid one-byte buffer and `ready_read` is open.
+        let read = unsafe { libc::read(ready_read, byte.as_mut_ptr().cast(), 1) };
         assert_eq!(read, 1, "the child never reached its pre-exec hook");
         drop(first);
+        let held_by_child = status_in(dir.path(), "1.4.0").running;
+        // SAFETY: `byte` is a valid one-byte buffer and `go_write` is open.
+        unsafe { libc::write(go_write, b"x".as_ptr().cast(), 1) };
+        spawner.join().unwrap().unwrap();
         assert!(
-            status_in(dir.path(), "1.4.0").running,
+            held_by_child,
             "a forked child holds the open file description, so the lock outlives its owner"
         );
-        spawner.join().unwrap().unwrap();
         assert!(released(dir.path()));
-        // SAFETY: both descriptors were opened above and are closed once.
+        // SAFETY: the four descriptors were opened above and are closed once.
         unsafe {
-            libc::close(read_fd);
-            libc::close(write_fd);
+            for fd in [ready_read, ready_write, go_read, go_write] {
+                libc::close(fd);
+            }
         }
     }
 
