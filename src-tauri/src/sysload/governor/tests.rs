@@ -600,7 +600,7 @@ fn one_sample_reread_never_trips_the_hysteresis() {
             age_ms: Some(tick * 2000),
             ..input(Level::Critical)
         };
-        let seen = governor.observe_repeat(t0 + 2 * tick * SECOND, reread);
+        let seen = governor.observe_repeat(t0 + SECOND * (2 * tick) as u32, reread);
         assert!(seen.verdict.admit, "tick {tick}: {:?}", seen.verdict);
         assert_eq!(seen.verdict.tier, Tier::Clear, "tick {tick}");
     }
