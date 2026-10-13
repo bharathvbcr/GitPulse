@@ -179,13 +179,22 @@ pub async fn cmd_discard_changes(
     repo_path: String,
     file_path: String,
 ) -> Result<Guarded<()>, String> {
-    off_thread(move || {
-        let op = discard_file_op(&repo_path, &file_path);
-        let policy = crate::harness::guard_file(&repo_path, &file_path, op)?;
-        GitWriter::discard_changes(&repo_path, &file_path)?;
-        Ok(Guarded { policy, output: () })
-    })
-    .await
+    off_thread(move || discard_changes_now(&repo_path, &file_path)).await
+}
+
+/// [`cmd_discard_changes`]'s body, on the calling thread.
+pub(super) fn discard_changes_now(
+    repo_path: &str,
+    file_path: &str,
+) -> Result<Guarded<()>, String> {
+    // A click, from its first spawn: the probe that picks the declared
+    // operation is git too, and shed as a read it would fail closed to
+    // "delete" for a file that is only being restored.
+    crate::engine::git_cli::mark_user_action(repo_path);
+    let op = discard_file_op(repo_path, file_path);
+    let policy = guard_file(repo_path, file_path, op)?;
+    GitWriter::discard_changes(repo_path, file_path)?;
+    Ok(Guarded { policy, output: () })
 }
 
 /// The file operation `GitWriter::discard_changes` will actually perform.

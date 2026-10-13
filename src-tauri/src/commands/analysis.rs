@@ -123,10 +123,10 @@ pub async fn cmd_hygiene_execute(
                         &repo_path,
                         &argv.iter().map(String::as_str).collect::<Vec<_>>(),
                     )?;
-                    let file_policy = crate::harness::guard_file(&repo_path, path, "delete")?;
+                    let file_policy = guard_file(&repo_path, path, "delete")?;
                     Ok(strictest_verdict(command_policy, file_policy))
                 }
-                None => crate::harness::guard_file(&repo_path, path, "delete"),
+                None => guard_file(&repo_path, path, "delete"),
             })?;
         Ok(Guarded { policy, output })
     })
