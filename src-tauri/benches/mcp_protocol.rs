@@ -94,7 +94,10 @@ fn checked_tool_call(tool: &str, repo: &str) -> Sample {
     let (response, bytes) = call("tools/call", &params);
     let result = &response["result"];
     if !response["error"].is_null() || result.is_null() {
-        panic!("{tool}: JSON-RPC error instead of a result: {}", response["error"]);
+        panic!(
+            "{tool}: JSON-RPC error instead of a result: {}",
+            response["error"]
+        );
     }
     if result["isError"] == true {
         panic!(

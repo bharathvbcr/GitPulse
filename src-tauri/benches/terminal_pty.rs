@@ -53,10 +53,8 @@ mod imp {
     const FLOOD_BYTES: u64 = 16 * 1024 * 1024;
     const KEYSTROKES: usize = 12;
     /// A producer that outlives any echo sample: killed when the sample ends.
-    const LONG_FLOOD: &str =
-        "dd if=/dev/zero bs=65536 count=1024 2>/dev/null | tr '\\0' x";
-    const SHORT_FLOOD: &str =
-        "dd if=/dev/zero bs=65536 count=256 2>/dev/null | tr '\\0' x";
+    const LONG_FLOOD: &str = "dd if=/dev/zero bs=65536 count=1024 2>/dev/null | tr '\\0' x";
+    const SHORT_FLOOD: &str = "dd if=/dev/zero bs=65536 count=256 2>/dev/null | tr '\\0' x";
     const DEADLINE: Duration = Duration::from_secs(120);
 
     /// What the listener has seen, by session id.
@@ -143,7 +141,10 @@ mod imp {
             // have been delivered (exit follows the final read).
             loop {
                 let remaining = DEADLINE.saturating_sub(started.elapsed());
-                assert!(!remaining.is_zero(), "the 16 MiB flood did not finish in {DEADLINE:?}");
+                assert!(
+                    !remaining.is_zero(),
+                    "the 16 MiB flood did not finish in {DEADLINE:?}"
+                );
                 let got = exit_rx.lock().unwrap().recv_timeout(remaining);
                 match got {
                     Ok(done) if done == id => break,
@@ -163,6 +164,7 @@ mod imp {
             // Let the flood reach steady state, and drain cat's startup.
             std::thread::sleep(Duration::from_millis(150));
             while rx.try_recv().is_ok() {}
+            let flood_before = flood_id.as_deref().map(|id| seen.bytes_of(id));
             let mut latencies = Vec::with_capacity(KEYSTROKES);
             for _ in 0..KEYSTROKES {
                 let started = Instant::now();
@@ -175,16 +177,31 @@ mod imp {
                 std::thread::sleep(Duration::from_millis(5));
             }
             *seen.echo.lock().unwrap() = None;
+            // The flood row is only a flood if bytes were flowing while the
+            // keystrokes were timed.
+            let flood_during = flood_id
+                .as_deref()
+                .zip(flood_before)
+                .map(|(id, before)| seen.bytes_of(id) - before);
+            if let Some(during) = flood_during {
+                assert!(
+                    during > 0,
+                    "the flood delivered nothing while the keystrokes were timed: this is an idle row"
+                );
+            }
             let _ = kill_session(&state, &echo_id);
             if let Some(flood_id) = flood_id {
                 let _ = kill_session(&state, &flood_id);
             }
             latencies.sort();
             let median = latencies[latencies.len() / 2];
-            Sample::default()
+            let mut sample = Sample::default()
                 .counter("keystrokes", KEYSTROKES as u64)
-                .metric("echo_max_ms", latencies.last().unwrap().as_secs_f64() * 1e3)
-                .elapsed(median)
+                .metric("echo_max_ms", latencies.last().unwrap().as_secs_f64() * 1e3);
+            if let Some(during) = flood_during {
+                sample = sample.metric("flood_kib_during_echo", during as f64 / 1024.0);
+            }
+            sample.elapsed(median)
         };
 
         report.note(format!(

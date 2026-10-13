@@ -133,7 +133,10 @@ fn main() {
     // Work counters (git processes) in their own untimed pass.
     let (_, snapshot_procs) = count_git_processes(|| snapshot(&path));
     let (_, list_procs) = count_git_processes(|| list(&path));
-    let (_, lang_procs) = count_git_processes(|| GitReader::get_repo_language_stats(&path));
+    // Unbounded: the production 10 s deadline is a property of the host's load,
+    // and a scan it cut short would be timed as if it were the whole work.
+    let (_, lang_procs) =
+        count_git_processes(|| GitReader::get_repo_language_stats_bounded(&path, None));
     let (_, details_procs) = count_git_processes(|| GitReader::get_commit_details(&path, &commit));
 
     // Settle catch_up's watermark (first pass over the transcripts).
@@ -160,11 +163,13 @@ fn main() {
                 .counter("git_processes", list_procs)
         }),
         Case::new("language stats", || {
-            let report = GitReader::get_repo_language_stats(&path)
+            let report = GitReader::get_repo_language_stats_bounded(&path, None)
                 .unwrap_or_else(|error| panic!("language stats failed: {error}"));
             assert!(
                 !report.truncated,
-                "the language scan was truncated, so this run would time a partial scan"
+                "the language scan was truncated ({} of {} candidates scanned), so this run \
+                 would time a partial scan",
+                report.scanned_files, report.candidate_files
             );
             std::hint::black_box(&report);
             Sample::default()
@@ -174,8 +179,8 @@ fn main() {
                 .counter("git_processes", lang_procs)
         }),
         Case::new("docs refresh", || {
-            let status = docs::refresh(&path)
-                .unwrap_or_else(|error| panic!("docs refresh failed: {error}"));
+            let status =
+                docs::refresh(&path).unwrap_or_else(|error| panic!("docs refresh failed: {error}"));
             assert!(
                 !status.truncated && status.skipped_unreadable == 0,
                 "the docs vault was partial: {status:?}"
@@ -201,7 +206,13 @@ fn main() {
     // outside the timed span.
     let cold = Case::new("catch_up cold", || {
         let dir = tempfile::tempdir().expect("temp dir");
-        let small = Spec { files: 50, dirs: 5, extra_commits: 4, touch: 2, linked_worktrees: 0 };
+        let small = Spec {
+            files: 50,
+            dirs: 5,
+            extra_commits: 4,
+            touch: 2,
+            linked_worktrees: 0,
+        };
         let fresh = build_repo(&dir.path().join("cold"), &small);
         let root = dir.path().join("transcripts");
         write_transcripts(&root, fresh.path(), 60, 8);

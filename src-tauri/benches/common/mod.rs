@@ -360,13 +360,8 @@ fn load1(host: &Value) -> Option<f64> {
 /// The runner class a baseline is keyed on: `GITPULSE_BENCH_RUNNER_CLASS`
 /// (the workflow sets it to the runner label) or `local-<os>-<arch>`.
 pub fn runner_class() -> String {
-    std::env::var("GITPULSE_BENCH_RUNNER_CLASS").unwrap_or_else(|_| {
-        format!(
-            "local-{}-{}",
-            std::env::consts::OS,
-            std::env::consts::ARCH
-        )
-    })
+    std::env::var("GITPULSE_BENCH_RUNNER_CLASS")
+        .unwrap_or_else(|_| format!("local-{}-{}", std::env::consts::OS, std::env::consts::ARCH))
 }
 
 fn git_output(args: &[&str]) -> Option<String> {
@@ -387,7 +382,8 @@ pub fn commit() -> (Option<String>, Option<bool>) {
         return (Some(sha), Some(false));
     }
     let sha = git_output(&["rev-parse", "HEAD"]);
-    let dirty = git_output(&["status", "--porcelain", "--untracked-files=no"]).map(|s| !s.is_empty());
+    let dirty =
+        git_output(&["status", "--porcelain", "--untracked-files=no"]).map(|s| !s.is_empty());
     (sha, dirty)
 }
 
@@ -408,7 +404,10 @@ impl Report {
     pub fn new(bench: &'static str) -> Self {
         let opts = Opts::from_args(bench);
         let host_start = host_snapshot();
-        println!("bench    : {bench}{}", if opts.smoke { " (smoke)" } else { "" });
+        println!(
+            "bench    : {bench}{}",
+            if opts.smoke { " (smoke)" } else { "" }
+        );
         println!("cpus     : {}", cpu_count());
         if let Some(load) = load1(&host_start) {
             let cpus = cpu_count() as f64;
@@ -449,15 +448,29 @@ impl Report {
 
     /// Prints the table and writes the JSON. Consumes the report.
     pub fn finish(self) {
-        let width = self.rows.iter().map(|r| r.name.len()).max().unwrap_or(0).max(9);
+        let width = self
+            .rows
+            .iter()
+            .map(|r| r.name.len())
+            .max()
+            .unwrap_or(0)
+            .max(9);
         println!(
             "\n{:<width$}  {:>4}  {:>10}  {:>10}  {:>10}  {:>10}  counters / metrics",
             "row", "n", "min", "p50", "p95", "max"
         );
         println!("{}", "-".repeat(width + 60));
         for row in &self.rows {
-            let counters: Vec<String> = row.counters.iter().map(|(k, v)| format!("{k}={v}")).collect();
-            let metrics: Vec<String> = row.metrics.iter().map(|(k, v)| format!("{k}~{v:.2}")).collect();
+            let counters: Vec<String> = row
+                .counters
+                .iter()
+                .map(|(k, v)| format!("{k}={v}"))
+                .collect();
+            let metrics: Vec<String> = row
+                .metrics
+                .iter()
+                .map(|(k, v)| format!("{k}~{v:.2}"))
+                .collect();
             println!(
                 "{:<width$}  {:>4}  {:>10}  {:>10}  {:>10}  {:>10}  {} {}",
                 row.name,

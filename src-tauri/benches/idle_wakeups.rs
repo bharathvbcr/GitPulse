@@ -59,7 +59,12 @@ mod imp {
                 info.as_mut_ptr().cast(),
             )
         };
-        assert_eq!(rc, 0, "proc_pid_rusage failed: {}", std::io::Error::last_os_error());
+        assert_eq!(
+            rc,
+            0,
+            "proc_pid_rusage failed: {}",
+            std::io::Error::last_os_error()
+        );
         // SAFETY: the call succeeded, so the struct is initialised.
         let info = unsafe { info.assume_init() };
         (info.ri_interrupt_wkups, info.ri_pkg_idle_wkups)
@@ -102,8 +107,7 @@ mod imp {
             app.listen("terminal-output", move |event| {
                 let payload: serde_json::Value =
                     serde_json::from_str(event.payload()).unwrap_or_default();
-                if let (Some(id), Some(bytes)) =
-                    (payload["id"].as_str(), payload["bytes"].as_u64())
+                if let (Some(id), Some(bytes)) = (payload["id"].as_str(), payload["bytes"].as_u64())
                 {
                     let _ = acknowledge_output(&state, id, bytes as usize);
                 }
@@ -160,7 +164,11 @@ mod imp {
             .map(|n| Case::new(format!("idle {n} sessions"), move || idle_with(n)).ungated())
             .collect();
         let rows = interleave(cases, report.opts.samples(3), 0);
-        let wake = |name: &str| rows.iter().find(|r| r.name == name).map(|r| r.metrics[NAMES.0]);
+        let wake = |name: &str| {
+            rows.iter()
+                .find(|r| r.name == name)
+                .map(|r| r.metrics[NAMES.0])
+        };
         if let (Some(floor), Some(many)) = (wake("idle 0 sessions"), wake("idle 32 sessions")) {
             report.note(format!(
                 "{}: {floor:.1}/s with no sessions, {many:.1}/s with 32: about {:.2}/s per idle session",

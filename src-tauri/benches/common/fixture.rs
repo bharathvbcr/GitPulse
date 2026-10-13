@@ -95,6 +95,16 @@ pub fn build_repo(root: &Path, spec: &Spec) -> Repo {
     git(&main, &["config", "user.name", "Bench"]);
     git(&main, &["config", "user.email", "bench@example.com"]);
     git(&main, &["config", "commit.gpgsign", "false"]);
+    // GitPulse's own state (ledger, code-graph store, WAL/SHM files that come and
+    // go while a command runs) lives under these and would otherwise be listed
+    // as untracked files by `git ls-files --others`, then vanish before they
+    // are read: a language scan would report itself incomplete for a reason
+    // that has nothing to do with the work being measured.
+    std::fs::write(
+        main.join(".git/info/exclude"),
+        ".devcouncil/\n.devmap/\n.gitpulse/\n",
+    )
+    .expect("write info/exclude");
     for index in 0..spec.files {
         let path = main.join(rel_path(index, spec.dirs));
         std::fs::create_dir_all(path.parent().expect("file has a parent")).expect("mkdir");
@@ -105,8 +115,11 @@ pub fn build_repo(root: &Path, spec: &Spec) -> Repo {
     for commit in 1..=spec.extra_commits {
         for k in 0..spec.touch {
             let index = (commit * 13 + k * 101) % spec.files.max(1);
-            std::fs::write(main.join(rel_path(index, spec.dirs)), content(index, commit))
-                .expect("rewrite fixture file");
+            std::fs::write(
+                main.join(rel_path(index, spec.dirs)),
+                content(index, commit),
+            )
+            .expect("rewrite fixture file");
         }
         git(&main, &["add", "-A"]);
         git(
@@ -120,11 +133,21 @@ pub fn build_repo(root: &Path, spec: &Spec) -> Repo {
         let branch = format!("wt/{n:02}");
         git(
             &main,
-            &["worktree", "add", "-q", "-b", &branch, path.to_str().expect("utf-8")],
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                &branch,
+                path.to_str().expect("utf-8"),
+            ],
         );
         let index = (n * 7) % spec.files.max(1);
-        std::fs::write(path.join(rel_path(index, spec.dirs)), content(index, 9_000 + n))
-            .expect("dirty a linked worktree");
+        std::fs::write(
+            path.join(rel_path(index, spec.dirs)),
+            content(index, 9_000 + n),
+        )
+        .expect("dirty a linked worktree");
         linked.push(path);
     }
     trust_repo(&main);
@@ -167,6 +190,9 @@ pub fn count_git_processes<T>(body: impl FnOnce() -> T) -> (T, u64) {
     let _ = std::fs::remove_file(&config);
     let text = std::fs::read_to_string(&log).unwrap_or_default();
     let _ = std::fs::remove_file(&log);
-    let processes = text.lines().filter(|l| l.contains("\"event\":\"start\"")).count() as u64;
+    let processes = text
+        .lines()
+        .filter(|l| l.contains("\"event\":\"start\""))
+        .count() as u64;
     (result, processes)
 }

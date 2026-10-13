@@ -51,9 +51,17 @@ mod imp {
     pub fn main() {
         gitpulse_lib::engine::git_cli::run_process_with_unlimited_spawn_rate();
         let mut report = Report::new("live_index");
-        let ticks = if report.opts.smoke { 12 } else { 40 };
+        // The same storm in smoke and full mode (only the sample count differs),
+        // so the row name and its `ticks` counter match the baseline's.
+        let ticks = 40;
         let temp = tempfile::tempdir().expect("temp dir");
-        let spec = Spec { files: 40, dirs: 4, extra_commits: 2, touch: 2, linked_worktrees: 0 };
+        let spec = Spec {
+            files: 40,
+            dirs: 4,
+            extra_commits: 2,
+            touch: 2,
+            linked_worktrees: 0,
+        };
         let repo = build_repo(&temp.path().join("fixture"), &spec);
         let path = repo.path().to_string();
 
@@ -104,7 +112,9 @@ mod imp {
                 if outcome.build.is_some() {
                     building += took;
                 }
-                *decisions.entry(format!("{:?}", outcome.decision)).or_default() += 1;
+                *decisions
+                    .entry(format!("{:?}", outcome.decision))
+                    .or_default() += 1;
             }
             let wall = started.elapsed();
             let invocations = std::fs::read_to_string(&log).unwrap_or_default();
@@ -116,7 +126,8 @@ mod imp {
                 .metric("status_probes", count("status"));
             for (decision, n) in &decisions {
                 // Static names for the few decisions that exist.
-                let name: &'static str = Box::leak(format!("ticks_{}", decision.to_lowercase()).into_boxed_str());
+                let name: &'static str =
+                    Box::leak(format!("ticks_{}", decision.to_lowercase()).into_boxed_str());
                 sample = sample.metric(name, *n as f64);
             }
             sample.elapsed(wall)

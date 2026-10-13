@@ -35,12 +35,24 @@ fn main() {
     let shapes = [
         Shape {
             label: "1k files",
-            spec: Spec { files: 1_000, dirs: 50, extra_commits: 3, touch: 5, linked_worktrees: 0 },
+            spec: Spec {
+                files: 1_000,
+                dirs: 50,
+                extra_commits: 3,
+                touch: 5,
+                linked_worktrees: 0,
+            },
             dirty: 50,
         },
         Shape {
             label: "10k files",
-            spec: Spec { files: 10_000, dirs: 200, extra_commits: 3, touch: 5, linked_worktrees: 0 },
+            spec: Spec {
+                files: 10_000,
+                dirs: 200,
+                extra_commits: 3,
+                touch: 5,
+                linked_worktrees: 0,
+            },
             dirty: 500,
         },
     ];

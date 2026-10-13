@@ -46,7 +46,9 @@ fn burst(worktree: &Path) -> Vec<Event> {
                 // 10% inside a directory the ignore rules cover.
                 15 | 16 => worktree.join(format!("scratch{:03}/out/{i}.log", i % IGNORED_PREFIXES)),
                 // 5% git internals, 5% generated state a refresh itself writes.
-                17 => worktree.join(".git").join(format!("objects/{:02x}/{i:038x}", i % 256)),
+                17 => worktree
+                    .join(".git")
+                    .join(format!("objects/{:02x}/{i:038x}", i % 256)),
                 18 => worktree.join(format!(".devcouncil/codeintel/part{}.sqlite-wal", i % 7)),
                 // 5% documents, which add a second change class.
                 _ => worktree.join(format!("docs/page{i}.md")),
