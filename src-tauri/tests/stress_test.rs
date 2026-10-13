@@ -744,7 +744,7 @@ fn shell_metacharacter_ref_names_are_inert_through_the_git_writer() {
             .unwrap_or_else(|e| panic!("rename {name:?}: {e}"));
         let listed = branches();
         assert!(
-            listed.iter().any(|b| *b == renamed),
+            listed.contains(&renamed),
             "{renamed:?} missing: {listed:?}"
         );
         assert!(
@@ -753,7 +753,7 @@ fn shell_metacharacter_ref_names_are_inert_through_the_git_writer() {
         );
         GitWriter::delete_branch(&path, &renamed, false)
             .unwrap_or_else(|e| panic!("delete {renamed:?}: {e}"));
-        assert!(!branches().iter().any(|b| *b == renamed));
+        assert!(!branches().contains(&renamed));
 
         GitWriter::create_tag(&path, name, None, None)
             .unwrap_or_else(|e| panic!("tag {name:?}: {e}"));
