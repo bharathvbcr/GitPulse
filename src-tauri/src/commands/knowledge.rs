@@ -30,14 +30,11 @@ pub async fn cmd_docs_refresh(
     repo_path: String,
     background: Option<bool>,
 ) -> Result<crate::docs::DocsStatus, String> {
-    off_thread(move || {
-        if background.unwrap_or(false) {
-            crate::engine::git_cli::with_background_processes(|| crate::docs::refresh(&repo_path))
-        } else {
-            crate::docs::refresh(&repo_path)
-        }
-    })
-    .await
+    if background.unwrap_or(false) {
+        off_thread_background(move || crate::docs::refresh(&repo_path)).await
+    } else {
+        off_thread(move || crate::docs::refresh(&repo_path)).await
+    }
 }
 
 #[tauri::command(async)]

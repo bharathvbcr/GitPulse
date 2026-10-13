@@ -13,6 +13,22 @@ before that tag is pushed.
 
 ### Changed
 
+- **An idle GitPulse wakes far less often.**
+  - Each watched repository's loop waits for an event instead of waking five
+    times a second; it looks at the repository itself every 30 s.
+  - The single-instance mailbox waits for a connection or for shutdown instead
+    of polling twice a second, and answers connections on a small pool of
+    kept threads rather than starting one per connection.
+  - The task-board change check now does two `stat` calls per second and reads
+    the database only when its files changed, and no longer asks the main
+    thread whether the window is visible on every pass.
+  - Background commands (the live index and docs refresh) hold at most two
+    blocking-pool threads at once; the async runtime uses 2 to 4 workers and
+    at most 64 blocking threads, and rayon uses half the cores.
+  - Measured with `idle_wakeups` (interrupt wakeups per second, process-wide):
+    an idle mailbox went from 4.7 to the 2.7 floor, 8 idle watches from 39.9
+    to 2.7, and 24 idle watches from 117.3 to 2.7.
+
 - **Switching repository tabs no longer rebuilds the sidebar, the view shell
   or the status bar.** All three were keyed on the active repository's path, so
   every switch destroyed and recreated them. They now stay mounted and re-point

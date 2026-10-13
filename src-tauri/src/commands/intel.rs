@@ -322,13 +322,11 @@ pub async fn cmd_devmap_maybe_refresh(
     repo_path: String,
     repo_changed: Option<bool>,
 ) -> Result<crate::devmap::LiveRefreshOutcome, String> {
-    off_thread(move || {
-        crate::engine::git_cli::with_background_processes(|| {
-            Ok(crate::devmap::live::start_refresh(
-                &repo_path,
-                repo_changed.unwrap_or(true),
-            ))
-        })
+    off_thread_background(move || {
+        Ok(crate::devmap::live::start_refresh(
+            &repo_path,
+            repo_changed.unwrap_or(true),
+        ))
     })
     .await
 }
