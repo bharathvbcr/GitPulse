@@ -118,13 +118,14 @@ export function inputIsDead(error: unknown): boolean {
 /** Soft deadline: input is not stopped, the user is told it is queued. */
 export const INPUT_SOFT_MS = 5000;
 /**
- * Hard deadline: 60 s with no answer at all. The backend's own write cap is 2 s
- * (`terminal/input.rs::write_with_timeout`), but a write is queued on the same
- * blocking pool as every git command, and those are capped at 90 s; so a write
- * parked behind a 90 s command can still trip this bound. That is the trade:
- * long enough to ride out an overloaded host (the case that motivated this),
- * short enough that a send which is never going to answer does not hold the tab
- * for good.
+ * Hard deadline: 60 s with no answer at all. The backend answers every write
+ * within its own 2 s cap (`terminal/input.rs::write_with_timeout`), on the
+ * session's own input lane (`terminal/executor.rs`), which no git command
+ * shares and which this queue, sending one chunk at a time, never fills. What
+ * is left between the two is the webview's IPC and a host too loaded to
+ * schedule either side. That is the trade: long enough to ride out an
+ * overloaded host (the case that motivated this), short enough that a send
+ * which is never going to answer does not hold the tab for good.
  */
 export const INPUT_HARD_MS = 60_000;
 export const INPUT_SLOW_NOTICE = "Terminal is responding slowly; typing is queued and will be sent in order.";
