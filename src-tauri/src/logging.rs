@@ -2003,11 +2003,17 @@ mod tests {
         fs::remove_dir(&sink.current).unwrap();
         // Inside the backoff nothing is opened, so the path stays absent.
         sink.write_line("dropped while backing off");
-        assert!(!sink.current.exists(), "the disk was touched while backing off");
+        assert!(
+            !sink.current.exists(),
+            "the disk was touched while backing off"
+        );
         sink.state.lock().unwrap().retry_at = None;
         sink.write_line("lands once the path is usable");
         let written = fs::read_to_string(&sink.current).unwrap();
-        assert!(written.contains("lands once the path is usable"), "{written}");
+        assert!(
+            written.contains("lands once the path is usable"),
+            "{written}"
+        );
         assert!(!written.contains("refused by the open"));
         assert_eq!(sink.state.lock().unwrap().dropped, 2);
     }

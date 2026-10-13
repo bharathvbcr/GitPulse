@@ -463,7 +463,10 @@ fn a_clean_prune_pass_is_not_repeated_within_the_interval() {
     assert_eq!((first.deleted, first.error.as_str()), (0, ""));
     age_all_events(&repo);
     let second = prune_with_policy(&repo, 1, 5, None);
-    assert_eq!(second.deleted, 0, "a clean ledger was scanned again at once");
+    assert_eq!(
+        second.deleted, 0,
+        "a clean ledger was scanned again at once"
+    );
     assert_eq!(event_count(&repo), 20);
 }
 
