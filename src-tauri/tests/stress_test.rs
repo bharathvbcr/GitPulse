@@ -743,10 +743,7 @@ fn shell_metacharacter_ref_names_are_inert_through_the_git_writer() {
         GitWriter::rename_branch(&path, name, &renamed)
             .unwrap_or_else(|e| panic!("rename {name:?}: {e}"));
         let listed = branches();
-        assert!(
-            listed.contains(&renamed),
-            "{renamed:?} missing: {listed:?}"
-        );
+        assert!(listed.contains(&renamed), "{renamed:?} missing: {listed:?}");
         assert!(
             !listed.iter().any(|b| b == name),
             "{name:?} should be gone: {listed:?}"
