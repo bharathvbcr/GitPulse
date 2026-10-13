@@ -725,8 +725,12 @@
    * The list is mounted once per window, so a tab switch re-points the store
    * and nothing else. Everything below is the repository being left: what was
    * typed, which folders were opened, the highlighted row, an open context menu
-   * or merge dialog (aimed at the old repository's branches), a half-typed new
-   * branch name, and how far the list was scrolled. The pins are re-read for
+   * (an open context menu included), a half-typed new branch name, and how far
+   * the list was scrolled. The merge dialog is NOT closed here: it carries the
+   * repository it was opened for and owns this case itself, staying up with
+   * "The repository changed" and refusing to merge (`mergeBlockedReason`,
+   * pinned by the `branches` harness). Closing it from under that contract
+   * would also take away the one place that says why. The pins are re-read for
    * the new repository here rather than waiting for the effect above, which
    * runs after the first paint. `freshnessStore` is reset by its own effect.
    */
@@ -744,7 +748,6 @@
       selectedIndex = -1;
       locateName = null;
       closeMenu();
-      mergeRequest = null;
       scrollTop = 0;
       if (containerEl) containerEl.scrollTop = 0;
       pinnedSignature = null;
