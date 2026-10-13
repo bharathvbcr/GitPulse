@@ -28,7 +28,12 @@
       const unexpected = [];
       addEventListener("error", (event) => errors.push(event.message));
       addEventListener("unhandledrejection", (event) => errors.push(String(event.reason)));
-      const raf = () => new Promise((resolve) => requestAnimationFrame(() => resolve()));
+      // A frame, or 50 ms if none comes: a window that is not on screen (the
+      // WebKit runner's) never delivers animation frames.
+      const raf = () => new Promise((resolve) => {
+        const timer = setTimeout(resolve, 50);
+        requestAnimationFrame(() => { clearTimeout(timer); resolve(); });
+      });
 
       const ALPHA = "/code/tabs/alpha";
       const BETA = "/code/tabs/beta";
@@ -163,6 +168,9 @@
         return null;
       };
 
+      // The window is looked at for the whole run (WKWebView reports no focus).
+      const { holdForeground } = await import("./foreground.ts");
+      holdForeground();
       const { mockIPCWithEvents } = await import("./tauriMocks.ts");
       mockIPCWithEvents(handler);
 
@@ -171,6 +179,7 @@
       const { createChecks, CheckFailed } = await import("./checks.ts");
       const { repoStore } = await import("../src/lib/stores/repoStore.ts");
       const { interfaceStore } = await import("../src/lib/stores/interfaceStore.ts");
+      const { locMetric } = await import("../src/lib/metrics/repoMetrics.ts");
       const App = (await import("../src/App.svelte")).default;
       // The view is a lazy chunk; on a cold dev server compiling its graph is
       // seconds of work that has nothing to do with a switch. Pulled in now,
@@ -249,6 +258,28 @@
       };
       let diagnostics = "";
 
+      // A run that hangs is reported, not timed out: the runner hands back only
+      // the verdict, so a hang would otherwise say nothing about where.
+      let published = false;
+      const publish = async () => {
+        if (published) return;
+        published = true;
+        document.documentElement.dataset.gpResult = encodeURIComponent(JSON.stringify({ results, errors, unexpected: [...new Set(unexpected)], diagnostics }));
+        const reportPath = params.get("report");
+        if (reportPath?.startsWith("/__gp_result/")) {
+          await fetch(reportPath, { method: "POST", body: document.documentElement.outerHTML });
+        }
+      };
+      setTimeout(() => {
+        if (published) return;
+        const last = results.at(-1)?.name ?? "the start";
+        results.push({
+          name: `hung after "${last}"; sidebar=${!!sidebar()} workspace=${!!$("main.gp-workspace")} lastCalls=${calls.slice(-6).map((c) => c.cmd).join(",")} errors=${errors.join(" | ").slice(0, 300)}`,
+          pass: false,
+        });
+        void publish();
+      }, 105000);
+
       (async () => {
         try {
           interfaceStore.setAutoHideRepoTabs(false);
@@ -262,6 +293,10 @@
           repoStore.setActiveTab("history");
           await switchTo(ALPHA);
           repoStore.setActiveTab("history");
+          // Measurements follow the visible window on their own; an unfocused
+          // WebKit runner is not one, so ask for the scans a person would have.
+          await locMetric.refresh(ALPHA, { force: true });
+          await locMetric.refresh(BETA, { force: true });
           await sleepUntil(() => worktreesPanel() && text(worktreesPanel()).includes("alpha-wt-one") && langTrigger() && $('main.gp-workspace [role="tabpanel"]'), 25000);
           await settle();
           hardCheck("boots on alpha with the sidebar, status bar and workspace on screen", () =>
@@ -442,7 +477,10 @@
           const flushed = [];
           const framed = [];
           const rounds = Number(params.get("rounds") ?? 24);
-          for (let i = 0; i < rounds; i += 1) {
+          // Bounded in time as well as in count: a window that is not on screen
+          // clamps timers, and the bench is a proxy, not a verdict.
+          const benchEnds = performance.now() + 20000;
+          for (let i = 0; i < rounds && performance.now() < benchEnds; i += 1) {
             const target = i % 2 === 0 ? BETA : ALPHA;
             const started = performance.now();
             await repoStore.activateTab(tabFor(target).id);
@@ -457,17 +495,13 @@
             const sorted = [...series].sort((a, b) => a - b);
             return `min ${sorted[0].toFixed(1)} / p50 ${sorted[Math.floor(sorted.length / 2)].toFixed(1)} / max ${sorted[sorted.length - 1].toFixed(1)} ms`;
           };
-          diagnostics = `${rounds} A<->B switches: to DOM flush ${stat(flushed)}; to second frame ${stat(framed)}; cmd_apple_intelligence_status per switch ${JSON.stringify(applePerSwitch)}; IPC per switch: ${ipcPerSwitch.map((s, i) => `[${i + 1}] ${s}`).join(" | ")}`;
+          diagnostics = `${flushed.length} A<->B switches: to DOM flush ${stat(flushed)}; to second frame ${stat(framed)}; cmd_apple_intelligence_status per switch ${JSON.stringify(applePerSwitch)}; IPC per switch: ${ipcPerSwitch.map((s, i) => `[${i + 1}] ${s}`).join(" | ")}`;
           report_();
         } catch (error) {
           stopped(error);
           report_();
         }
-        document.documentElement.dataset.gpResult = encodeURIComponent(JSON.stringify({ results, errors, unexpected: [...new Set(unexpected)], diagnostics }));
-        const reportPath = params.get("report");
-        if (reportPath?.startsWith("/__gp_result/")) {
-          await fetch(reportPath, { method: "POST", body: document.documentElement.outerHTML });
-        }
+        await publish();
       })();
     </script>
   </body>
