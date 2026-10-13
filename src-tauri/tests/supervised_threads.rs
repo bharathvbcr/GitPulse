@@ -33,6 +33,7 @@ const ALLOWED: &[(&str, usize, &str)] = &[
 const TEST_ONLY: &[(&str, &str)] = &[
     ("alerts/stress.rs", "alerts/mod.rs"),
     ("watcher/registration_timing.rs", "watcher/mod.rs"),
+    ("watcher/storm.rs", "watcher/mod.rs"),
 ];
 
 fn src() -> PathBuf {
