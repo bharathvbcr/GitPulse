@@ -819,7 +819,7 @@ mod scope_tests {
             .unwrap();
         crate::ledger::bindings::bind(repo, repo, "TASK-HOOK").expect("bind");
         // A hook is a fresh process: nothing cached.
-        crate::ledger::tests_support::reset_registry();
+        crate::ledger::tests_support::reset_registry_for(repo);
         let opens = crate::ledger::tests_support::write_opens();
 
         let HookScope::Declared(scope) = hook_scope(repo) else {

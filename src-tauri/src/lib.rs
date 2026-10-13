@@ -27,6 +27,7 @@ pub mod limits;
 #[cfg(unix)]
 pub mod local_socket;
 pub mod logging;
+pub mod lru_map;
 pub mod markdown;
 pub mod mcp;
 pub mod ndjson;
