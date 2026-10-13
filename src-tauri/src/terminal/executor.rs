@@ -351,7 +351,9 @@ mod tests {
         }
         let started = Instant::now();
         let refused = block_on(lane.run("test_full", || Ok(99)));
-        assert!(started.elapsed() < Duration::from_millis(500));
+        assert!(
+            started.elapsed() < crate::test_support::coverage_relaxed(Duration::from_millis(500))
+        );
         let message = refused.unwrap_err();
         assert!(message.contains("queue is full"), "{message}");
         drop(gate);
@@ -499,7 +501,7 @@ mod tests {
         let started = Instant::now();
         block_on(pool.run("test_wide", || Ok(()))).unwrap();
         assert!(
-            started.elapsed() < Duration::from_secs(2),
+            started.elapsed() < crate::test_support::coverage_relaxed(Duration::from_secs(2)),
             "a quick job waited for a slow one"
         );
         gate.send(()).unwrap();

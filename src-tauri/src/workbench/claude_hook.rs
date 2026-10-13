@@ -264,10 +264,15 @@ mod tests {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
-        // Only `for_launch` reads this variable.
-        std::env::set_var("GITPULSE_HOOK_PATH", &binary);
-        let decision = for_launch("claude");
-        std::env::remove_var("GITPULSE_HOOK_PATH");
+        // Only `for_launch` reads this variable. Bound through the env owner so
+        // the write is serialized against every other test and restored even if
+        // an assertion fails before the end of the test.
+        let decision = {
+            let serial = crate::test_support::env::env_serial();
+            let _env =
+                crate::test_support::env::bind_env(&serial).set("GITPULSE_HOOK_PATH", &binary);
+            for_launch("claude")
+        };
         assert_eq!(decision, HookInjection::Inject(binary));
     }
 

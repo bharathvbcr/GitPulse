@@ -3279,7 +3279,7 @@ mod tests {
         // Refused for its size, or evaluated: either way an answer, in time.
         let started = std::time::Instant::now();
         let _ = run_in(&giant, &world());
-        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(started.elapsed() < crate::test_support::coverage_relaxed(Duration::from_secs(2)));
     }
 
     #[test]
@@ -3408,7 +3408,7 @@ mod tests {
                 let facts = world();
                 let started = std::time::Instant::now();
                 let output = decide(&plan_with(&command, fake_env), &facts);
-                prop_assert!(started.elapsed() < Duration::from_secs(1));
+                prop_assert!(started.elapsed() < crate::test_support::coverage_relaxed(Duration::from_secs(1)));
                 let json = output.render().unwrap_or_default();
                 prop_assert!(!json.contains("\"allow\""));
             }

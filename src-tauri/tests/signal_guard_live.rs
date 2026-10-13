@@ -202,7 +202,7 @@ fn many_hooks_deciding_at_once_all_agree_and_none_panics() {
         }
     }
     assert!(
-        started.elapsed() < Duration::from_secs(60),
+        started.elapsed() < hermetic_env::coverage_relaxed(Duration::from_secs(60)),
         "48 decisions over the real table took {:?}",
         started.elapsed()
     );
@@ -213,7 +213,7 @@ fn one_decision_over_the_real_table_is_far_inside_the_hook_budget() {
     let started = Instant::now();
     let _ = check_command("pkill -f \"sleep 60\" -u nobody-here");
     assert!(
-        started.elapsed() < Duration::from_secs(2),
+        started.elapsed() < hermetic_env::coverage_relaxed(Duration::from_secs(2)),
         "took {:?}, and the guard's own deadline is 2s",
         started.elapsed()
     );

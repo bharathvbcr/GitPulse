@@ -363,7 +363,7 @@ fn a_resize_storm_with_degenerate_sizes_leaves_the_session_usable() {
     }
     resize_session(&state, &spawned.id, 33, 77).unwrap();
     assert!(
-        started.elapsed() < Duration::from_secs(30),
+        started.elapsed() < common::env::coverage_relaxed(Duration::from_secs(30)),
         "10k resizes took {:?}",
         started.elapsed()
     );
@@ -407,7 +407,7 @@ fn writing_to_a_dead_pty_fails_fast_and_never_wedges() {
         assert!(resize_session(&state, &spawned.id, 24, 80).is_err());
     }
     assert!(
-        started.elapsed() < Duration::from_secs(5),
+        started.elapsed() < common::env::coverage_relaxed(Duration::from_secs(5)),
         "{:?}",
         started.elapsed()
     );
@@ -430,7 +430,7 @@ fn writing_to_a_dead_pty_fails_fast_and_never_wedges() {
         assert!(write_to_session(&state, &live.id, "x").is_err());
     }
     assert!(
-        started.elapsed() < Duration::from_secs(5),
+        started.elapsed() < common::env::coverage_relaxed(Duration::from_secs(5)),
         "{:?}",
         started.elapsed()
     );

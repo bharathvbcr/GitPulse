@@ -40,7 +40,7 @@ impl Marked {
             .collect::<Vec<_>>();
         // `arg0` is applied at exec; wait until every child shows it.
         let started = Instant::now();
-        while started.elapsed() < Duration::from_secs(20) {
+        while started.elapsed() < crate::hermetic_env::coverage_relaxed(Duration::from_secs(20)) {
             if pgrep(&["-f", &marker]).len() == count {
                 break;
             }
