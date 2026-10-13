@@ -1220,7 +1220,7 @@ fn a_hidden_sessions_output_is_batched_at_least_ten_times_harder_and_still_whole
     seen.bind(&visible_id);
     let hidden_id = spawn_for(&app, &state, &dir, script, hidden_sink);
     hidden.bind(&hidden_id);
-    gitpulse_lib::terminal::set_background_sessions(&state, &[hidden_id.clone()]);
+    gitpulse_lib::terminal::set_background_sessions(&state, std::slice::from_ref(&hidden_id));
     let total = 150 * 2048;
     assert!(
         wait_for(Duration::from_secs(30), || seen.bytes() >= total

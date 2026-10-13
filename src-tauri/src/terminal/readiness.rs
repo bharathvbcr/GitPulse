@@ -131,11 +131,18 @@ impl Readiness {
     /// level-triggered: output the caller has not read ends the next wait at
     /// once, so call this only once the master has answered `WouldBlock`.
     pub(super) fn wait(&mut self) -> io::Result<()> {
+        self.wait_within(Duration::MAX)
+    }
+
+    /// [`Readiness::wait`], returning after `cap` at the latest. Ending on the
+    /// cap is a timer like any other: the exit hint is set.
+    pub(super) fn wait_within(&mut self, cap: Duration) -> io::Result<()> {
         let timeout = if self.watching_exit {
             self.safety_net
         } else {
             POLL_LAP
-        };
+        }
+        .min(cap);
         let woke = match &self.backend {
             #[cfg(target_os = "macos")]
             Backend::Kqueue { kq } => kqueue_wait(kq, timeout)?,
@@ -166,12 +173,12 @@ struct Woke {
 }
 
 #[cfg(target_os = "macos")]
-fn open(master: RawFd, child: Option<u32>) -> io::Result<(Backend, bool)> {
+/// A kqueue that no spawned child inherits. `kqueue()` returns a descriptor
+/// without close-on-exec; the two calls are not atomic, so a concurrent spawn
+/// could inherit it. Spawns hold the inheritance lock across their fork.
+fn new_kqueue() -> io::Result<OwnedFd> {
     use std::os::fd::FromRawFd;
-    // `kqueue()` returns a descriptor without close-on-exec; the two calls
-    // are not atomic, so a concurrent spawn could inherit it. Spawns hold the
-    // inheritance lock across their fork.
-    let kq = crate::procguard::with_inheritance_lock(|| {
+    crate::procguard::with_inheritance_lock(|| {
         // SAFETY: kqueue takes no arguments; the result is checked below.
         let kq = unsafe { libc::kqueue() };
         if kq < 0 {
@@ -184,7 +191,12 @@ fn open(master: RawFd, child: Option<u32>) -> io::Result<(Backend, bool)> {
             return Err(io::Error::last_os_error());
         }
         Ok(owned)
-    })?;
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn open(master: RawFd, child: Option<u32>) -> io::Result<(Backend, bool)> {
+    let kq = new_kqueue()?;
     use std::os::fd::AsRawFd;
     // Level-triggered: output not yet read keeps the master ready.
     kevent_change(
@@ -389,9 +401,204 @@ fn open(_master: RawFd, _child: Option<u32>) -> io::Result<(Backend, bool)> {
     Ok((Backend::Poll, false))
 }
 
+/// What registering one process's exit came to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Watch {
+    /// Its exit will end a [`ExitWatch::wait`].
+    Watching,
+    /// It was already gone when it was registered.
+    Gone,
+    /// The OS would not say. The caller finds out when this one exits the slow
+    /// way.
+    Unavailable,
+}
+
+/// A wait for several processes to exit. They need not be children: a close
+/// waits for every job in a terminal's session, most of which the shell
+/// started, not GitPulse.
+///
+/// This is the same kernel facility as [`Readiness`] (kqueue
+/// `EVFILT_PROC`/`NOTE_EXIT` on macOS, an epoll set of pidfds on Linux) used to
+/// replace a 20 ms loop that read the whole process table each lap. It is a
+/// hint, as there: whether a process is still in a session is decided by
+/// listing the session, never by this.
+pub(super) struct ExitWatch {
+    #[cfg(target_os = "macos")]
+    kq: OwnedFd,
+    #[cfg(target_os = "linux")]
+    ep: OwnedFd,
+    /// Open pidfds by pid. Closing one removes it from the epoll set.
+    #[cfg(target_os = "linux")]
+    pidfds: std::collections::HashMap<i32, OwnedFd>,
+}
+
+/// Most exits one wait collects. More are collected by the next call.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+const EXITS_PER_WAIT: usize = 32;
+
+impl ExitWatch {
+    /// `None` where the platform has no such facility or refused to start it.
+    #[cfg(target_os = "macos")]
+    pub(super) fn new() -> Option<Self> {
+        match new_kqueue() {
+            Ok(kq) => Some(Self { kq }),
+            Err(error) => {
+                log::warn!(target: "terminal", "cannot wait on process exits; polling: {error}");
+                None
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(super) fn new() -> Option<Self> {
+        use std::os::fd::FromRawFd;
+        // SAFETY: epoll_create1 takes flags only; the result is checked below.
+        let ep = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
+        if ep < 0 {
+            log::warn!(
+                target: "terminal",
+                "cannot wait on process exits; polling: {}",
+                io::Error::last_os_error()
+            );
+            return None;
+        }
+        Some(Self {
+            // SAFETY: ep is a fresh descriptor this call owns.
+            ep: unsafe { OwnedFd::from_raw_fd(ep) },
+            pidfds: std::collections::HashMap::new(),
+        })
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    pub(super) fn new() -> Option<Self> {
+        None
+    }
+
+    /// Registers `pid`. Register a pid once.
+    #[cfg(target_os = "macos")]
+    pub(super) fn watch(&mut self, pid: i32) -> Watch {
+        use std::os::fd::AsRawFd;
+        match kevent_change(
+            self.kq.as_raw_fd(),
+            pid as libc::uintptr_t,
+            libc::EVFILT_PROC,
+            libc::EV_ADD | libc::EV_ENABLE | libc::EV_ONESHOT,
+            libc::NOTE_EXIT,
+        ) {
+            Ok(()) => Watch::Watching,
+            Err(error) if error.raw_os_error() == Some(libc::ESRCH) => Watch::Gone,
+            Err(_) => Watch::Unavailable,
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(super) fn watch(&mut self, pid: i32) -> Watch {
+        use std::os::fd::{AsRawFd, FromRawFd};
+        // SAFETY: pidfd_open(pid, 0) takes no pointers; the result is checked.
+        let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid as libc::pid_t, 0) };
+        if fd < 0 {
+            return if io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
+                Watch::Gone
+            } else {
+                Watch::Unavailable
+            };
+        }
+        // SAFETY: pidfd_open returned a descriptor this call owns (close-on-exec).
+        let pidfd = unsafe { OwnedFd::from_raw_fd(fd as RawFd) };
+        if epoll_add(self.ep.as_raw_fd(), pidfd.as_raw_fd(), pid as u64).is_err() {
+            return Watch::Unavailable;
+        }
+        self.pidfds.insert(pid, pidfd);
+        Watch::Watching
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    pub(super) fn watch(&mut self, _pid: i32) -> Watch {
+        Watch::Unavailable
+    }
+
+    /// Sleeps until a registered process exits or `timeout` passes, and says
+    /// how many exited. An interruption returns early with none.
+    #[cfg(target_os = "macos")]
+    pub(super) fn wait(&mut self, timeout: Duration) -> io::Result<usize> {
+        use std::os::fd::AsRawFd;
+        let limit = libc::timespec {
+            tv_sec: timeout.as_secs().min(i64::MAX as u64) as libc::time_t,
+            tv_nsec: libc::c_long::from(timeout.subsec_nanos() as i32),
+        };
+        // SAFETY: an all-zero kevent is a valid (empty) record.
+        let mut events: [libc::kevent; EXITS_PER_WAIT] = unsafe { std::mem::zeroed() };
+        // SAFETY: the event list is initialized records and `limit` outlives
+        // the call.
+        let ready = unsafe {
+            libc::kevent(
+                self.kq.as_raw_fd(),
+                std::ptr::null(),
+                0,
+                events.as_mut_ptr(),
+                events.len() as libc::c_int,
+                &limit,
+            )
+        };
+        if ready < 0 {
+            let error = io::Error::last_os_error();
+            return if error.kind() == io::ErrorKind::Interrupted {
+                Ok(0)
+            } else {
+                Err(error)
+            };
+        }
+        Ok(events[..ready as usize]
+            .iter()
+            .filter(|event| {
+                event.filter == libc::EVFILT_PROC && event.fflags & libc::NOTE_EXIT != 0
+            })
+            .count())
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(super) fn wait(&mut self, timeout: Duration) -> io::Result<usize> {
+        use std::os::fd::AsRawFd;
+        let millis = timeout.as_nanos().div_ceil(1_000_000).min(i32::MAX as u128) as libc::c_int;
+        let mut events = [libc::epoll_event { events: 0, u64: 0 }; EXITS_PER_WAIT];
+        // SAFETY: the event list is initialized records.
+        let ready = unsafe {
+            libc::epoll_wait(
+                self.ep.as_raw_fd(),
+                events.as_mut_ptr(),
+                events.len() as libc::c_int,
+                millis,
+            )
+        };
+        if ready < 0 {
+            let error = io::Error::last_os_error();
+            return if error.kind() == io::ErrorKind::Interrupted {
+                Ok(0)
+            } else {
+                Err(error)
+            };
+        }
+        let mut exited = 0;
+        for event in &events[..ready as usize] {
+            // Dropping the pidfd closes it, which takes it out of the set: a
+            // pidfd stays readable once its process is gone.
+            if self.pidfds.remove(&(event.u64 as i32)).is_some() {
+                exited += 1;
+            }
+        }
+        Ok(exited)
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    pub(super) fn wait(&mut self, _timeout: Duration) -> io::Result<usize> {
+        Ok(0)
+    }
+}
+
 #[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
 mod tests {
     use super::*;
+    use crate::procguard::LockedSpawn;
     use portable_pty::{native_pty_system, CommandBuilder, PtySize};
     use std::time::Instant;
 
@@ -496,7 +703,7 @@ mod tests {
         // raises when a session leader exits, and so end the sleep itself.
         let mut child = std::process::Command::new("/bin/sh")
             .args(["-c", "sleep 0.2"])
-            .spawn()
+            .spawn_locked()
             .unwrap();
         let mut ready = Readiness::with_options(
             fd,
@@ -578,5 +785,80 @@ mod tests {
         );
         assert!(ready.take_exit_hint(), "the net ends in a question");
         let _ = child.kill();
+    }
+
+    fn sleeper(seconds: &str) -> std::process::Child {
+        std::process::Command::new("/bin/sleep")
+            .arg(seconds)
+            .spawn_locked()
+            .expect("spawn sleep")
+    }
+
+    #[test]
+    fn an_exit_watch_ends_its_wait_when_a_watched_process_exits() {
+        let mut quick = sleeper("0.3");
+        let mut watch = ExitWatch::new().expect("a watch");
+        assert_eq!(watch.watch(quick.id() as i32), Watch::Watching);
+        let started = Instant::now();
+        let mut exited = 0;
+        while exited == 0 && started.elapsed() < Duration::from_secs(5) {
+            exited = watch.wait(Duration::from_secs(5)).unwrap();
+        }
+        assert_eq!(exited, 1);
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "the wait outlived the exit: {:?}",
+            started.elapsed()
+        );
+        quick.wait().unwrap();
+    }
+
+    #[test]
+    fn an_exit_watch_counts_every_process_it_watches() {
+        let mut jobs: Vec<_> = (0..5).map(|_| sleeper("0.2")).collect();
+        let mut watch = ExitWatch::new().expect("a watch");
+        for job in &jobs {
+            assert_eq!(watch.watch(job.id() as i32), Watch::Watching);
+        }
+        let mut exited = 0;
+        let started = Instant::now();
+        while exited < jobs.len() && started.elapsed() < Duration::from_secs(5) {
+            exited += watch.wait(Duration::from_secs(5)).unwrap();
+        }
+        assert_eq!(exited, jobs.len());
+        for job in &mut jobs {
+            job.wait().unwrap();
+        }
+    }
+
+    /// A quiet watch sleeps its whole timeout and reports nothing: it does not
+    /// lap on its own.
+    #[test]
+    fn an_exit_watch_with_nothing_exiting_sleeps_its_timeout() {
+        let mut long = sleeper("5");
+        let mut watch = ExitWatch::new().expect("a watch");
+        assert_eq!(watch.watch(long.id() as i32), Watch::Watching);
+        let started = Instant::now();
+        assert_eq!(watch.wait(Duration::from_millis(300)).unwrap(), 0);
+        let slept = started.elapsed();
+        assert!(
+            slept >= Duration::from_millis(250),
+            "woke after {slept:?} with nothing to report"
+        );
+        let _ = long.kill();
+        long.wait().unwrap();
+    }
+
+    /// A process that exited and was reaped before it was registered is not an
+    /// error and is not waited for.
+    #[test]
+    fn an_exit_watch_reports_a_process_that_is_already_gone() {
+        let mut done = std::process::Command::new("true")
+            .spawn_locked()
+            .expect("spawn true");
+        let pid = done.id() as i32;
+        done.wait().unwrap();
+        let mut watch = ExitWatch::new().expect("a watch");
+        assert_eq!(watch.watch(pid), Watch::Gone);
     }
 }

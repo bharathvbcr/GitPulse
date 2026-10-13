@@ -121,6 +121,15 @@ before that tag is pushed.
   instead of being dropped with its credit still owed. An exit waits for an end
   marker sent down the channel after the last byte, so it can no longer
   overtake output still being fetched.
+- Closing a terminal waits for its jobs by sleeping on their exit, not by
+  reading the whole process table every 20 ms. A cleanup that takes 0.8 s read
+  the table 32 times and now reads it twice; jobs that obey the hangup end the
+  wait in about a millisecond instead of a lap. The shell's lock is no longer
+  held for the grace (up to 2.5 s), so the unmount check's context read and a
+  second close are not stuck behind a job that ignores the hangup: a read made
+  during a close reports nothing known and answers at once, where it used to
+  wait out the grace. A job that ignores the hangup is still killed when the
+  grace ends, and the groups signalled are the same ones as before.
 - Closing a terminal no longer skips its question when GitPulse could not tell
   what was running in it. A context read that timed out, failed or came back
   unreadable was treated as "nothing running", so a shell with a live job closed

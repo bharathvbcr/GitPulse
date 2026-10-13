@@ -19,6 +19,8 @@ pub mod incident;
 mod input;
 mod ipc;
 #[cfg(unix)]
+mod jobs;
+#[cfg(unix)]
 mod readiness;
 mod sink;
 use executor::Executor;
@@ -255,6 +257,13 @@ const GATHER_MAX_HOLD: Duration = Duration::from_millis(8);
 #[cfg(unix)]
 const HIDDEN_MAX_HOLD: Duration = Duration::from_millis(250);
 
+/// How often a reader whose session is being closed looks up from its wait. It
+/// holds back its question about the shell while a close runs (only the closer
+/// reaps meanwhile), and must ask soon after the close is over rather than
+/// sleep until the next event: with no more output and no hangup, there may
+/// not be one.
+const CLOSING_LAP: Duration = Duration::from_millis(50);
+
 #[derive(Clone, Serialize)]
 pub struct TerminalExitPayload {
     pub id: String,
@@ -289,6 +298,8 @@ struct SessionEntry {
     /// The view reports this session's tab is not on screen, so its output is
     /// batched harder (see `HIDDEN_MAX_HOLD`). Unreported is visible.
     hidden: Arc<AtomicBool>,
+    /// Closes in progress on this session (see `ClosingGuard`).
+    closing: Arc<AtomicUsize>,
     tracked_run: Option<String>,
     spawned: TerminalSpawned,
     /// Canonical repository root. `spawned.cwd` is where the process started,
@@ -1219,22 +1230,37 @@ pub struct TerminalContext {
 /// Reads [`TerminalContext`] for one session.
 ///
 /// The child lock is held across the reads, as `terminate_pty_child` holds it
-/// across its signal: the reader thread cannot reap the shell meanwhile, so
-/// its pid — and the session it leads — cannot be reused under this call.
+/// across its listings and signals: the reader thread cannot reap the shell
+/// meanwhile, so its pid — and the session it leads — cannot be reused under
+/// this call. A terminal that is being closed answers with nothing known, as an
+/// exited one does: its closer holds the shell unreaped while it waits, and a
+/// read here would reap it.
 pub fn session_context(
     state: &TerminalSessions,
     session_id: &str,
 ) -> Result<TerminalContext, String> {
-    let (child, master, repo) = state
+    let (child, master, repo, closing) = state
         .lock_sessions()
         .get(session_id)
-        .map(|s| (s.child.clone(), s.master.clone(), s.repo.clone()))
+        .map(|s| {
+            (
+                s.child.clone(),
+                s.master.clone(),
+                s.repo.clone(),
+                s.closing.clone(),
+            )
+        })
         .ok_or_else(|| format!("Terminal session '{session_id}' not found"))?;
     #[cfg(unix)]
     {
         let mut child = child
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Checked with the lock held: a close that has begun is relying on the
+        // shell staying unreaped, and the `try_wait` below would reap it.
+        if closing.load(Ordering::SeqCst) > 0 {
+            return Ok(TerminalContext::default());
+        }
         if child.try_wait().map_err(|e| e.to_string())?.is_some() {
             return Ok(TerminalContext::default());
         }
@@ -1277,7 +1303,7 @@ pub fn session_context(
     }
     #[cfg(not(unix))]
     {
-        let _ = (child, master, repo);
+        let _ = (child, master, repo, closing);
         Ok(TerminalContext::default())
     }
 }
@@ -1653,6 +1679,7 @@ fn spawn_session_inner<R: tauri::Runtime>(
     let output_slot = Arc::new(OutputSlot::new(output));
     let hidden = Arc::new(AtomicBool::new(false));
     let master = Arc::new(Mutex::new(pair.master));
+    let closing = Arc::new(AtomicUsize::new(0));
     let entry = SessionEntry {
         master: master.clone(),
         writer: Arc::new(Mutex::new(writer)),
@@ -1662,6 +1689,7 @@ fn spawn_session_inner<R: tauri::Runtime>(
         wakeups: wakeups.clone(),
         output: output_slot.clone(),
         hidden: hidden.clone(),
+        closing: closing.clone(),
         tracked_run: observer.as_ref().map(|o| o.run_id().to_owned()),
         spawned: TerminalSpawned {
             id: session_id.clone(),
@@ -1693,6 +1721,7 @@ fn spawn_session_inner<R: tauri::Runtime>(
     );
     let thread_child = child.clone();
     let thread_master = master.clone();
+    let thread_closing = closing.clone();
     let thread_observer = observer.clone();
     let incident_log = state.incidents.clone();
     let incident_program = shell.clone();
@@ -1700,7 +1729,7 @@ fn spawn_session_inner<R: tauri::Runtime>(
     if start_error.is_some() {
         dead.store(true, Ordering::SeqCst);
         output_flow.stop();
-        if let Err(error) = terminate_pty_child(&child, &master) {
+        if let Err(error) = terminate_pty_child(&child, &master, &closing) {
             log::error!(target: "terminal", "could not stop a task session after bookkeeping failure: {error}");
         }
     }
@@ -1803,7 +1832,9 @@ fn spawn_session_inner<R: tauri::Runtime>(
                     if !dead_flag.swap(true, Ordering::SeqCst) {
                         *failure = Some(error);
                         output_flow.stop();
-                        if let Err(error) = terminate_pty_child(&thread_child, &thread_master) {
+                        if let Err(error) =
+                            terminate_pty_child(&thread_child, &thread_master, &thread_closing)
+                        {
                             log::warn!(target: "terminal", "could not signal failed terminal: {error}");
                         }
                     }
@@ -1909,23 +1940,37 @@ fn spawn_session_inner<R: tauri::Runtime>(
                         // Asked when the readiness wait says the answer may have
                         // changed (an exit, a timer, the first lap), not on every
                         // pass: output alone says nothing about the child.
-                        if readiness.take_exit_hint() && child_has_exited(&thread_child) {
+                        //
+                        // Not while a close is under way: only the closer reaps
+                        // the shell until it is done (see `ClosingGuard`), and
+                        // the hint is kept for the pass after.
+                        let closing = thread_closing.load(Ordering::SeqCst) > 0;
+                        if !closing && readiness.take_exit_hint() && child_has_exited(&thread_child)
+                        {
                             break;
                         }
                         // thread_master owns reader_fd until this thread exits.
                         // The kernel wakes this thread for output or for the
                         // child's exit; a quiet session sleeps, bounded only by
-                        // the safety net.
-                        let waited = readiness.wait();
+                        // the safety net. During a close it laps instead, so
+                        // an exit heard while the question was held back is
+                        // asked about as soon as the close is over.
+                        let waited = if closing {
+                            readiness.wait_within(CLOSING_LAP)
+                        } else {
+                            readiness.wait()
+                        };
                         wakeups.fetch_add(1, Ordering::Relaxed);
                         if let Err(error) = waited {
                             if !dead_flag.swap(true, Ordering::SeqCst) {
                                 failure =
                                     Some(format!("Terminal output readiness failed: {error}"));
                                 output_flow.stop();
-                                if let Err(error) =
-                                    terminate_pty_child(&thread_child, &thread_master)
-                                {
+                                if let Err(error) = terminate_pty_child(
+                                    &thread_child,
+                                    &thread_master,
+                                    &thread_closing,
+                                ) {
                                     log::warn!(target: "terminal", "could not signal failed terminal: {error}");
                                 }
                             }
@@ -1945,7 +1990,9 @@ fn spawn_session_inner<R: tauri::Runtime>(
                         if !dead_flag.swap(true, Ordering::SeqCst) {
                             failure = Some(format!("Terminal output could not be read: {e}"));
                             output_flow.stop();
-                            if let Err(error) = terminate_pty_child(&thread_child, &thread_master) {
+                            if let Err(error) =
+                                terminate_pty_child(&thread_child, &thread_master, &thread_closing)
+                            {
                                 log::warn!(target: "terminal", "could not signal failed terminal: {error}");
                             }
                         }
@@ -1965,7 +2012,9 @@ fn spawn_session_inner<R: tauri::Runtime>(
                 });
                 dead_flag.store(true, Ordering::SeqCst);
                 output_flow.stop();
-                if let Err(error) = terminate_pty_child(&thread_child, &thread_master) {
+                if let Err(error) =
+                    terminate_pty_child(&thread_child, &thread_master, &thread_closing)
+                {
                     log::warn!(target: "terminal", "could not signal a terminal whose reader panicked: {error}");
                 }
             }
@@ -1982,6 +2031,12 @@ fn spawn_session_inner<R: tauri::Runtime>(
                 move || loop {
                     // Do not hold the child mutex across a blocking wait: EOF
                     // can precede process exit, and Close must still work.
+                    // Nor reap under a close in progress: its closer is relying on
+                    // the shell staying unreaped (see `ClosingGuard`).
+                    if thread_closing.load(Ordering::SeqCst) > 0 {
+                        thread::sleep(Duration::from_millis(10));
+                        continue;
+                    }
                     let result = thread_child
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -2049,7 +2104,7 @@ fn spawn_session_inner<R: tauri::Runtime>(
         guard.remove(&session_id);
         drop(guard);
         dead.store(true, Ordering::SeqCst);
-        terminate_pty_child(&child, &master)?;
+        terminate_pty_child(&child, &master, &closing)?;
         let exit = child
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -2400,17 +2455,18 @@ pub fn kill_session(state: &TerminalSessions, session_id: &str) -> Result<(), St
                 s.master.clone(),
                 s.flow.clone(),
                 s.dead.clone(),
+                s.closing.clone(),
             )
         })
     };
-    if let Some((child, master, flow, dead)) = handles {
+    if let Some((child, master, flow, dead, closing)) = handles {
         log::info!(target: "terminal", "terminal close requested");
         // Marked before the first signal, not after: the reader that sees the
         // child die reads this flag to tell a close GitPulse asked for from an
         // external death, and a reader finishing between the signal and the
         // store would count our own hangup as someone else's kill.
         dead.store(true, Ordering::SeqCst);
-        terminate_pty_child(&child, &master)?;
+        terminate_pty_child(&child, &master, &closing)?;
         flow.stop();
         let deadline = Instant::now() + Duration::from_secs(2);
         loop {
@@ -2528,109 +2584,91 @@ fn child_has_exited(child: &Arc<Mutex<Box<dyn Child + Send + Sync>>>) -> bool {
 /// hangup pays all of it.
 pub(crate) const HANGUP_GRACE: Duration = Duration::from_millis(2500);
 
-/// Hangs up every process group in the session `sid` (and continues it, so a
-/// stopped job can act on the hangup), then kills the groups still standing
-/// after `grace`. Returns when the session holds nothing but its leader.
+/// Counts the closes in progress on one session. While it is above zero only a
+/// closer reaps the shell: the reader's exit check and its final reap wait,
+/// and a context read answers that the terminal is closing.
 ///
-/// Groups are found by session id, not read off the tty: the tty names one
-/// foreground group, and `cmd &`, `nohup`, an agent's dev server, a `^Z`'d
-/// editor all live in others. Only groups with a member in this session are
-/// signalled, and never this process's own.
-#[cfg(unix)]
-fn stop_session_jobs(sid: i32, grace: Duration) {
-    use std::collections::BTreeSet;
-    // SAFETY: getpgrp has no arguments and cannot fail.
-    let own = unsafe { libc::getpgrp() };
-    let groups = || -> Result<BTreeSet<i32>, String> {
-        Ok(foreground::session_members(sid)?
-            .into_iter()
-            .map(|(_, group)| group)
-            .filter(|group| *group != own)
-            .collect())
-    };
-    let signal = |signo: libc::c_int, groups: &BTreeSet<i32>| {
-        for group in groups {
-            // The group has a member in the session this call owns (the leader
-            // cannot be reaped while its lock is held). The primitive still
-            // refuses an id that is not an ordinary group, our own group or
-            // session, and a group whose leader is now in another session.
-            let _ = crate::procguard::signal::signal_group(
-                *group,
-                signo,
-                crate::procguard::signal::Basis::Session(sid),
-                "terminal close",
-            );
-        }
-    };
-    let first = match groups() {
-        Ok(groups) if groups.is_empty() => return,
-        Ok(groups) => groups,
-        Err(error) => {
-            log::warn!(target: "terminal", "could not list the terminal's jobs: {error}");
-            return;
-        }
-    };
-    signal(libc::SIGHUP, &first);
-    signal(libc::SIGCONT, &first);
-    let deadline = Instant::now() + grace;
-    while Instant::now() < deadline {
-        if matches!(groups(), Ok(left) if left.is_empty()) {
-            return;
-        }
-        thread::sleep(Duration::from_millis(20));
+/// A close must not hold the shell's lock for its whole grace (a context read
+/// or a second close waited out seconds behind a stubborn job), yet it relies
+/// on the shell staying unreaped from the first signal to the last: an
+/// unreaped leader keeps its pid, and so the session it leads, from being
+/// reused while a signal is aimed at that session. This is that guarantee
+/// without the lock.
+struct ClosingGuard(Arc<AtomicUsize>);
+
+impl ClosingGuard {
+    fn enter(closing: &Arc<AtomicUsize>) -> Self {
+        closing.fetch_add(1, Ordering::SeqCst);
+        Self(closing.clone())
     }
-    // A job forked while the first sweep ran is found by the next one; two
-    // passes settle a fork bomb no worse than the kernel's own limits.
-    for _ in 0..2 {
-        match groups() {
-            Ok(left) if left.is_empty() => return,
-            Ok(left) => signal(libc::SIGKILL, &left),
-            Err(error) => {
-                log::warn!(target: "terminal", "could not list the terminal's jobs: {error}");
-                return;
-            }
-        }
-        thread::sleep(Duration::from_millis(20));
+}
+
+impl Drop for ClosingGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
 fn terminate_pty_child(
     child: &Arc<Mutex<Box<dyn Child + Send + Sync>>>,
     master: &Arc<Mutex<Box<dyn MasterPty + Send>>>,
+    closing: &Arc<AtomicUsize>,
 ) -> Result<(), String> {
-    terminate_pty_child_within(child, master, HANGUP_GRACE)
+    terminate_pty_child_within(child, master, closing, HANGUP_GRACE)
 }
 
 fn terminate_pty_child_within(
     child: &Arc<Mutex<Box<dyn Child + Send + Sync>>>,
     master: &Arc<Mutex<Box<dyn MasterPty + Send>>>,
+    closing: &Arc<AtomicUsize>,
     grace: Duration,
 ) -> Result<(), String> {
-    // Held across the whole stop, as `session_context` holds it across its
-    // reads: the reader thread cannot reap the shell meanwhile, so its pid -
-    // and the session it leads - cannot be reused under this call. A panic
-    // elsewhere must not make the terminal unkillable.
-    let mut child = child
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if child.try_wait().map_err(|e| e.to_string())?.is_some() {
+    // Before the first look at the shell and until this returns: nothing else
+    // reaps it, so its pid, and the session it leads, cannot be reused under
+    // this call, with or without the lock below. A panic elsewhere must not
+    // make the terminal unkillable.
+    let _closing = ClosingGuard::enter(closing);
+    let lock = || {
+        child
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    };
+    #[cfg_attr(not(unix), allow(unused_mut))]
+    let mut shell = lock();
+    if shell.try_wait().map_err(|e| e.to_string())?.is_some() {
         return Ok(());
     }
     #[cfg(unix)]
-    if let Some(pid) = child.process_id().and_then(|p| i32::try_from(p).ok()) {
+    {
         // The shell is a session leader only when it still owns the tty; a
         // reused pid or an unrelated session is never signalled.
-        // SAFETY: getsid takes a numeric id and reads nothing else.
-        if pid > 1 && unsafe { libc::getsid(pid) } == pid {
-            stop_session_jobs(pid, grace);
+        let session = shell
+            .process_id()
+            .and_then(|p| i32::try_from(p).ok())
+            // SAFETY: getsid takes a numeric id and reads nothing else.
+            .filter(|pid| *pid > 1 && unsafe { libc::getsid(*pid) } == *pid);
+        if let Some(sid) = session {
+            // The lock is held to list and signal the session and to list and
+            // kill what is left, and released for the wait between them.
+            if let Some(hung) = jobs::hang_up(sid, &foreground::session_members) {
+                drop(shell);
+                let gone = jobs::wait_for_exit(hung, grace, &foreground::session_members);
+                shell = lock();
+                if !gone {
+                    jobs::kill_stragglers(sid, &foreground::session_members);
+                }
+            }
         }
     }
-    #[cfg(not(unix))]
-    let _ = (master, grace);
-    #[cfg(unix)]
     let _ = master;
+    #[cfg(not(unix))]
+    let _ = grace;
+    // The shell may have gone with its jobs; there is nothing left to signal.
+    if shell.try_wait().map_err(|e| e.to_string())?.is_some() {
+        return Ok(());
+    }
     // The shell itself: `kill` hangs it up before it kills it.
-    child.kill().map_err(|e| {
+    shell.kill().map_err(|e| {
         log::warn!(target: "terminal", "could not signal terminal child: {e}");
         format!("Could not stop terminal process: {e}")
     })
@@ -4365,7 +4403,7 @@ mod tests {
         assert!(!hidden(&a.id) && !hidden(&b.id), "unreported is seen");
         set_background_sessions(&state, &[a.id.clone(), "term-unknown".into()]);
         assert!(hidden(&a.id) && !hidden(&b.id));
-        set_background_sessions(&state, &[b.id.clone()]);
+        set_background_sessions(&state, std::slice::from_ref(&b.id));
         assert!(!hidden(&a.id) && hidden(&b.id));
         set_background_sessions(&state, &[]);
         assert!(!hidden(&a.id) && !hidden(&b.id));
@@ -4494,6 +4532,337 @@ mod tests {
             done.exists(),
             "the job was killed before its cleanup finished"
         );
+    }
+
+    /// The shell's pid, the id of the session it leads.
+    #[cfg(unix)]
+    fn leader_pid(state: &TerminalSessions, id: &str) -> i32 {
+        let child = state
+            .lock_sessions()
+            .get(id)
+            .map(|s| s.child.clone())
+            .expect("open session");
+        let pid = child.lock().unwrap().process_id().expect("a running shell");
+        i32::try_from(pid).unwrap()
+    }
+
+    /// The handles `kill_session` takes, so a test can run a close by hand.
+    #[cfg(unix)]
+    #[allow(clippy::type_complexity)]
+    fn close_handles(
+        state: &TerminalSessions,
+        id: &str,
+    ) -> (
+        Arc<Mutex<Box<dyn Child + Send + Sync>>>,
+        Arc<Mutex<Box<dyn MasterPty + Send>>>,
+        Arc<AtomicUsize>,
+    ) {
+        state
+            .lock_sessions()
+            .get(id)
+            .map(|s| (s.child.clone(), s.master.clone(), s.closing.clone()))
+            .expect("open session")
+    }
+
+    /// A close with a chosen grace, the way `kill_session` runs it.
+    #[cfg(unix)]
+    fn close_for_test(
+        child: &Arc<Mutex<Box<dyn Child + Send + Sync>>>,
+        master: &Arc<Mutex<Box<dyn MasterPty + Send>>>,
+        closing: &Arc<AtomicUsize>,
+        grace: Duration,
+    ) -> Result<(), String> {
+        terminate_pty_child_within(child, master, closing, grace)
+    }
+
+    /// The signal target set. A process that left the terminal's session
+    /// (`setsid`) is not that terminal's job any more and a close does not
+    /// reach it, however it was started; every group still in the session
+    /// does. Neither the wait nor its bookkeeping changes who is signalled.
+    #[cfg(unix)]
+    #[test]
+    fn a_close_signals_the_groups_of_its_session_and_nobody_outside_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = TerminalSessions::default();
+        let spawned = spawn_script(
+            &state,
+            dir.path(),
+            format!(
+                "perl -e 'use POSIX; POSIX::setsid() or die; exec \"sleep\", \"302\"' & echo $! > '{p}.escapee'; \
+                 set -m; sleep 300 & echo $! > '{p}.member'; sleep 301 & echo $! > '{p}.other'; wait",
+                p = dir.path().join("pids").display()
+            ),
+        );
+        let escapee = read_pid(&dir.path().join("pids.escapee"));
+        let member = read_pid(&dir.path().join("pids.member"));
+        let other = read_pid(&dir.path().join("pids.other"));
+        // SAFETY: getsid reads one numeric id.
+        let escaped = wait_until(Duration::from_secs(5), || unsafe {
+            libc::getsid(escapee) == escapee
+        });
+        assert!(escaped, "the test's escapee never left the session");
+        kill_session(&state, &spawned.id).unwrap();
+        let stopped = wait_until(Duration::from_secs(3), || !alive(member) && !alive(other));
+        let escapee_survived = alive(escapee);
+        // SAFETY: the test started this process and holds its pid.
+        unsafe { libc::kill(escapee, libc::SIGKILL) };
+        assert!(stopped, "a job in the session survived Close");
+        assert!(
+            escapee_survived,
+            "a process outside the session was signalled"
+        );
+    }
+
+    /// The defect: the wait for the jobs to go was a 20 ms loop that read the
+    /// whole process table each lap, so a cleanup that takes 0.8 s read it
+    /// ~40 times, per closed terminal, and a quit with a full dock did that
+    /// for every one at once. The wait now sleeps on the jobs' exit.
+    #[cfg(unix)]
+    #[test]
+    fn waiting_for_jobs_to_clean_up_does_not_poll_the_process_table() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = TerminalSessions::default();
+        let ready = dir.path().join("ready");
+        let spawned = spawn_script(
+            &state,
+            dir.path(),
+            format!(
+                "set -m; (trap 'sleep 0.8; exit 0' HUP; : > '{ready}'; while :; do sleep 0.05; done) & wait",
+                ready = ready.display()
+            ),
+        );
+        assert!(wait_until(Duration::from_secs(5), || ready.exists()));
+        let sid = leader_pid(&state, &spawned.id);
+        let scans = AtomicUsize::new(0);
+        let started = Instant::now();
+        jobs::stop_with(sid, HANGUP_GRACE, &|session| {
+            scans.fetch_add(1, Ordering::SeqCst);
+            foreground::session_members(session)
+        });
+        let waited = started.elapsed();
+        let scans = scans.load(Ordering::SeqCst);
+        println!("cleanup took {waited:?}, {scans} reads of the process table");
+        assert!(
+            waited < HANGUP_GRACE,
+            "the job cleaned up on its own, so nothing waits out the grace ({waited:?})"
+        );
+        assert!(
+            scans <= 4,
+            "{scans} reads of the process table for a 0.8 s cleanup"
+        );
+        kill_session(&state, &spawned.id).unwrap();
+    }
+
+    /// A close that obeys the hangup is not slowed by the way it waits: the
+    /// jobs are gone in a few milliseconds and so is the wait.
+    #[cfg(unix)]
+    #[test]
+    fn a_job_that_obeys_the_hangup_ends_the_wait_at_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = TerminalSessions::default();
+        let pids = dir.path().join("pids");
+        let spawned = spawn_script(
+            &state,
+            dir.path(),
+            format!(
+                "set -m; sleep 300 & echo $! > '{p}.a'; sleep 301 & echo $! > '{p}.b'; wait",
+                p = pids.display()
+            ),
+        );
+        let a = read_pid(&dir.path().join("pids.a"));
+        let b = read_pid(&dir.path().join("pids.b"));
+        let sid = leader_pid(&state, &spawned.id);
+        let scans = AtomicUsize::new(0);
+        let started = Instant::now();
+        jobs::stop_with(sid, HANGUP_GRACE, &|session| {
+            scans.fetch_add(1, Ordering::SeqCst);
+            foreground::session_members(session)
+        });
+        let waited = started.elapsed();
+        let scans = scans.load(Ordering::SeqCst);
+        println!("hangup obeyed in {waited:?}, {scans} reads of the process table");
+        assert!(
+            waited < crate::test_support::coverage_relaxed(Duration::from_millis(50)),
+            "{waited:?} for jobs that exit on the hangup"
+        );
+        assert!(scans <= 3, "{scans} reads of the process table");
+        // The shell reaps them in its own time; until it does they are zombies
+        // that still answer a probe.
+        assert!(wait_until(Duration::from_secs(2), || !alive(a) && !alive(b)));
+        kill_session(&state, &spawned.id).unwrap();
+    }
+
+    /// A job that ignores the hangup is escalated at the end of the grace, not
+    /// before it and not later.
+    #[cfg(unix)]
+    #[test]
+    fn a_job_that_ignores_the_hangup_is_killed_when_the_grace_ends() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = TerminalSessions::default();
+        let spawned = spawn_script(
+            &state,
+            dir.path(),
+            format!(
+                "set -m; (trap '' HUP; exec sleep 300) & echo $! > '{}'; wait",
+                dir.path().join("stubborn").display()
+            ),
+        );
+        let pid = read_pid(&dir.path().join("stubborn"));
+        let sid = leader_pid(&state, &spawned.id);
+        let grace = Duration::from_millis(600);
+        let started = Instant::now();
+        jobs::stop_with(sid, grace, &foreground::session_members);
+        let waited = started.elapsed();
+        assert!(
+            waited >= grace,
+            "escalated after {waited:?}, before the {grace:?} grace"
+        );
+        assert!(
+            waited < grace + crate::test_support::coverage_relaxed(Duration::from_millis(500)),
+            "{waited:?} for a {grace:?} grace"
+        );
+        assert!(wait_until(Duration::from_secs(1), || !alive(pid)));
+        kill_session(&state, &spawned.id).unwrap();
+    }
+
+    /// The defect: the child lock was held across the whole grace, so anything
+    /// that needed the shell (the unmount check's context read, a second
+    /// close) waited out up to 2.5 s behind a stubborn job.
+    #[cfg(unix)]
+    #[test]
+    fn a_close_waiting_on_a_stubborn_job_does_not_hold_the_shells_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = TerminalSessions::default();
+        let ready = dir.path().join("ready");
+        let spawned = spawn_script(
+            &state,
+            dir.path(),
+            format!(
+                "set -m; (trap '' HUP; : > '{ready}'; exec sleep 300) & echo $! > '{pid}'; wait",
+                ready = ready.display(),
+                pid = dir.path().join("stubborn").display()
+            ),
+        );
+        assert!(wait_until(Duration::from_secs(5), || ready.exists()));
+        let pid = read_pid(&dir.path().join("stubborn"));
+        let (child, master, closing) = close_handles(&state, &spawned.id);
+        let grace = Duration::from_millis(1500);
+        let closing = {
+            let (child, master, closing) = (child.clone(), master.clone(), closing.clone());
+            thread::spawn(move || close_for_test(&child, &master, &closing, grace))
+        };
+        // Past the hangup, well inside the grace.
+        thread::sleep(Duration::from_millis(300));
+        let started = Instant::now();
+        let free = child.try_lock().is_ok();
+        let waited = started.elapsed();
+        let context = session_context(&state, &spawned.id);
+        let answered = started.elapsed();
+        closing.join().unwrap().unwrap();
+        println!("lock free: {free}; try_lock {waited:?}; context {answered:?} ({context:?})");
+        assert!(free, "the shell's lock was held through the grace");
+        assert!(
+            matches!(&context, Ok(read) if read.jobs.is_none() && read.busy.is_none()),
+            "a terminal being closed reports nothing known, not a guess: {context:?}"
+        );
+        assert!(
+            answered < crate::test_support::coverage_relaxed(Duration::from_millis(300)),
+            "a context read waited {answered:?} behind a close"
+        );
+        assert!(wait_until(Duration::from_secs(2), || !alive(pid)));
+        kill_session(&state, &spawned.id).unwrap();
+    }
+
+    /// The process state letter `ps` reports for `pid`, empty when it is gone.
+    #[cfg(unix)]
+    fn process_state(pid: i32) -> String {
+        let out = std::process::Command::new("ps")
+            .args(["-o", "stat=", "-p", &pid.to_string()])
+            .output_locked()
+            .expect("ps");
+        String::from_utf8_lossy(&out.stdout).trim().to_owned()
+    }
+
+    /// While a close waits out its grace the shell stays unreaped, even after
+    /// it has died: the closer is signalling a session its pid still names.
+    /// The closer used to guarantee that by holding the shell's lock, which
+    /// kept the reader from reaping; now the close itself holds the reader
+    /// back. A reaped leader frees its pid for a stranger.
+    #[cfg(unix)]
+    #[test]
+    fn the_reader_does_not_reap_a_shell_that_dies_while_its_close_waits() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = TerminalSessions::default();
+        let ready = dir.path().join("ready");
+        let spawned = spawn_script(
+            &state,
+            dir.path(),
+            format!(
+                "sh=$$; set -m; (trap \"kill -9 $sh; exit 0\" HUP; : > '{ready}'; while :; do sleep 0.05; done) & \
+                 (trap '' HUP; exec sleep 300) & echo $! > '{stubborn}'; wait",
+                ready = ready.display(),
+                stubborn = dir.path().join("stubborn").display()
+            ),
+        );
+        assert!(wait_until(Duration::from_secs(5), || ready.exists()));
+        let stubborn = read_pid(&dir.path().join("stubborn"));
+        let sid = leader_pid(&state, &spawned.id);
+        let (child, master, closing) = close_handles(&state, &spawned.id);
+        let closer = {
+            let (child, master, closing) = (child.clone(), master.clone(), closing.clone());
+            thread::spawn(move || {
+                close_for_test(&child, &master, &closing, Duration::from_millis(1500))
+            })
+        };
+        // The first job's hangup killed the shell; the second still runs, so
+        // the close is still inside its grace.
+        thread::sleep(Duration::from_millis(600));
+        let state_of_shell = process_state(sid);
+        let stubborn_alive = alive(stubborn);
+        closer.join().unwrap().unwrap();
+        assert!(stubborn_alive, "the close ended before its grace");
+        assert!(
+            state_of_shell.starts_with('Z'),
+            "the shell should be dead and unreaped during its close, but ps says {state_of_shell:?}"
+        );
+        // Once the close is over the reader reaps it and the session ends.
+        assert!(
+            wait_until(Duration::from_secs(5), || list_sessions(&state).is_empty()),
+            "the session never ended after its close"
+        );
+        assert!(wait_until(Duration::from_secs(1), || !alive(stubborn)));
+    }
+
+    /// Two closes of one terminal at once (a click and a quit) both finish, and
+    /// the session ends once.
+    #[cfg(unix)]
+    #[test]
+    fn two_closes_of_one_terminal_at_once_both_finish() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = Arc::new(TerminalSessions::default());
+        let ready = dir.path().join("ready");
+        let spawned = spawn_script(
+            &state,
+            dir.path(),
+            format!(
+                "set -m; (trap '' HUP; : > '{ready}'; exec sleep 300) & echo $! > '{pid}'; wait",
+                ready = ready.display(),
+                pid = dir.path().join("stubborn").display()
+            ),
+        );
+        assert!(wait_until(Duration::from_secs(5), || ready.exists()));
+        let pid = read_pid(&dir.path().join("stubborn"));
+        let closes: Vec<_> = (0..2)
+            .map(|_| {
+                let (state, id) = (state.clone(), spawned.id.clone());
+                thread::spawn(move || kill_session(&state, &id))
+            })
+            .collect();
+        for close in closes {
+            close.join().unwrap().unwrap();
+        }
+        assert!(wait_until(Duration::from_secs(1), || !alive(pid)));
+        assert!(list_sessions(&state).is_empty());
     }
 
     /// The jobs a close would kill are visible to the unmount check: a prompt
