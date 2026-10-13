@@ -85,7 +85,7 @@ fn storm(root: &Path, scale: Scale) {
 }
 
 struct Watched {
-    stop: Arc<AtomicBool>,
+    stop: Arc<StopSignal>,
     emits: Arc<AtomicU32>,
     stamps: Arc<Mutex<Vec<Instant>>>,
     handle: thread::JoinHandle<()>,
@@ -94,7 +94,7 @@ struct Watched {
 fn watch(root: &Path) -> Watched {
     let git_dir = resolve_git_dir(root).expect("git dir");
     let watcher = RepoFileWatcher::watch_repo(&git_dir, Some(root), None).expect("watcher");
-    let stop = Arc::new(AtomicBool::new(false));
+    let stop = StopSignal::new();
     let emits = Arc::new(AtomicU32::new(0));
     let stamps = Arc::new(Mutex::new(Vec::new()));
     let (t_stop, t_emits, t_stamps) = (stop.clone(), emits.clone(), stamps.clone());
@@ -102,6 +102,7 @@ fn watch(root: &Path) -> Watched {
         git_dir: root.to_path_buf(),
         internal_roots: vec![root.join(".git")],
         emit_path: root.to_string_lossy().into_owned(),
+        timer_wakes: Default::default(),
     };
     let handle = thread::spawn(move || {
         let session_stop = t_stop.clone();
@@ -183,7 +184,7 @@ fn assert_storm_stays_bounded(scale: Scale) {
         );
     }
     for w in &watched {
-        w.stop.store(true, Ordering::SeqCst);
+        w.stop.stop();
     }
     for w in watched {
         w.handle.join().unwrap();
