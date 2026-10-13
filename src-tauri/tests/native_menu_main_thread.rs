@@ -18,6 +18,11 @@
 //! Failures are reported by exiting non-zero after printing, because there is
 //! no harness to catch a panic and attribute it.
 
+// The hermetic test environment: a per-process home, git config and trust
+// store, rewritten before `main`. See `src/test_support/env.rs`.
+#[path = "../src/test_support/env.rs"]
+mod hermetic_env;
+
 use gitpulse_lib::desktop::actions::SECTION_MENUS;
 use gitpulse_lib::desktop::{
     install_menu, menu_state, recent_menu_entries, set_menu_state, set_recent_menu, DesktopState,

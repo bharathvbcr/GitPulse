@@ -138,7 +138,7 @@ fn a_shell_that_exits_is_over_even_while_a_background_job_holds_the_terminal() {
         .exits
         .recv_timeout(Duration::from_secs(5))
         .expect("the shell exited, so the session must end without waiting for its job");
-    assert!(started.elapsed() < Duration::from_secs(5));
+    assert!(started.elapsed() < common::env::coverage_relaxed(Duration::from_secs(5)));
     assert_eq!(exit["id"], session.id.as_str());
     assert_eq!(exit["exit_code"], 3);
     assert!(
@@ -154,6 +154,10 @@ fn a_shell_that_exits_is_over_even_while_a_background_job_holds_the_terminal() {
 /// Closing an idle interactive shell must hang it up, not SIGKILL it: only a
 /// shell that receives SIGHUP passes it on to its jobs. Killing it outright
 /// orphans every job it started, and the orphan then holds the terminal.
+///
+/// Bash by name, not `/bin/sh`: re-sending the hangup to its jobs is the
+/// shell's doing, bash does it, and `/bin/sh` is dash on Debian and Ubuntu.
+/// The job outlived the close on ubuntu-latest, where `/bin/sh` is dash.
 #[test]
 fn closing_an_idle_shell_hangs_up_its_jobs_and_finishes_promptly() {
     let h = harness();
@@ -166,7 +170,7 @@ fn closing_an_idle_shell_hangs_up_its_jobs_and_finishes_promptly() {
         dir.path().to_str().unwrap(),
         24,
         80,
-        Some("/bin/sh".into()),
+        Some("/bin/bash".into()),
         Some(vec!["-i".into()]),
         None,
     )
@@ -182,7 +186,7 @@ fn closing_an_idle_shell_hangs_up_its_jobs_and_finishes_promptly() {
     assert!(alive(job));
     let started = Instant::now();
     kill_session(&h.state, &session.id).expect("Close must finish, not ask for a retry");
-    assert!(started.elapsed() < Duration::from_secs(3));
+    assert!(started.elapsed() < common::env::coverage_relaxed(Duration::from_secs(3)));
     let deadline = Instant::now() + Duration::from_secs(3);
     while alive(job) && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(20));
@@ -220,15 +224,18 @@ fn closing_stops_a_foreground_program_that_ignores_hangup() {
     assert!(wait_for_output(&h.output, "ready", Duration::from_secs(10)));
     let started = Instant::now();
     kill_session(&h.state, &session.id).unwrap();
-    assert!(started.elapsed() < Duration::from_secs(3));
+    // A program that ignores the hangup is given the 2.5 s grace (an agent's
+    // SessionEnd needs seconds) and is then killed; the bound is that grace
+    // plus slack, which is what keeps Close from hanging on it.
+    assert!(started.elapsed() < common::env::coverage_relaxed(Duration::from_secs(6)));
     h.exits
         .recv_timeout(Duration::from_secs(3))
         .expect("a closed session reports its exit");
 }
 
 /// Quitting closes every session at once. A shell that ignores the hangup
-/// costs its full kill grace; one after another, a dock of them made quitting
-/// wait for the sum.
+/// costs its full hangup grace (2.5 s); one after another, a dock of them made
+/// quitting wait for the sum.
 #[test]
 fn quitting_closes_every_session_concurrently() {
     const SESSIONS: usize = 12;
@@ -261,8 +268,9 @@ fn quitting_closes_every_session_concurrently() {
     let started = Instant::now();
     gitpulse_lib::terminal::shutdown_sessions(&h.state).unwrap();
     let took = started.elapsed();
-    // Each close waits out a 200 ms hangup grace: 2.4 s in sequence.
-    assert!(took < Duration::from_millis(1500), "shutdown took {took:?}");
+    // Each close waits out the 2.5 s hangup grace: 30 s in sequence. Together
+    // it is one grace, whatever the number of sessions.
+    assert!(took < Duration::from_secs(6), "shutdown took {took:?}");
     for _ in 0..SESSIONS {
         h.exits
             .recv_timeout(Duration::from_secs(2))

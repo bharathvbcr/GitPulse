@@ -27,6 +27,16 @@ export async function runDevmapChecks(setLoad: (load: GraphVizLoad) => void): Pr
   }});
   await settle();
   if (before === canvas.toDataURL()) throw new Error("Same-count payload did not repaint");
+  // A lost context comes back blank; the restore event must repaint it.
+  const painted = canvas.toDataURL();
+  const lost = new Event("contextlost", { cancelable: true });
+  canvas.dispatchEvent(lost);
+  if (!lost.defaultPrevented) throw new Error("contextlost was not claimed, so the browser will not restore the context");
+  canvas.getContext("2d")?.clearRect(0, 0, canvas.width, canvas.height);
+  if (canvas.toDataURL() === painted) throw new Error("Harness could not blank the canvas");
+  canvas.dispatchEvent(new Event("contextrestored"));
+  await settle();
+  if (canvas.toDataURL() !== painted) throw new Error("contextrestored did not repaint the graph");
   setLoad({available:true,kind:"code_graph",path:"/fixture/repo-a",payload});
   await settle();
   const search = document.querySelector<HTMLInputElement>('input[aria-label="Find a file or symbol"]');

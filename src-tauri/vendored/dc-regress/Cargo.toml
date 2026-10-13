@@ -2,6 +2,7 @@
 name = "dc-regress"
 version = "0.2.4"
 edition = "2021"
+rust-version = "1.99"
 license = "Apache-2.0"
 repository = "https://github.com/bharathvbcr/DevCouncil"
 description = "Which commits could have caused this symptom: git blame joined to the code graph, with the blob identity that makes the join honest"

@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { repoStore } from "../stores/repoStore";
+  import { currentRepoPath, repoStore } from "../stores/repoStore";
   import { displayName } from "../repos/paths";
   import { repoScope } from "../repos/repoScope.svelte";
   import BranchList from "./BranchList.svelte";
@@ -79,7 +79,7 @@
    * persisted section flags and the width are the person's, and stay.
    */
   repoScope(
-    () => $repoStore.currentPath,
+    () => $currentRepoPath,
     () => {
       fileFilter = "";
       stagedLimit = FILE_LIST_STEP;

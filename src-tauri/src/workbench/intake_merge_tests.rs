@@ -164,7 +164,7 @@ fn a_merge_folds_each_source_into_the_target_and_deletes_it() {
             }
         );
         // An agent launched on a merged task is pointed at where it went.
-        let error = complete_task(&store, repo_path, source, "done", None, None).unwrap_err();
+        let error = complete_task(&store, repo_path, source, "done", None, None, None).unwrap_err();
         assert_eq!(error.code, "task_merged");
         assert!(error.message.contains(&target), "{}", error.message);
     }
@@ -850,7 +850,7 @@ fn concurrent_merges_and_edits_never_lose_a_cards_work() {
                             1 => {
                                 let status = ["in_progress", "review", "done"][rng.below(3)];
                                 let summary = format!("progress-{worker}-{op}");
-                                match complete_task(&store, &repo_path, &into, status, None, Some(&summary)) {
+                                match complete_task(&store, &repo_path, &into, status, None, Some(&summary), None) {
                                     Ok(report) => seen.push(format!("complete-{}", report["outcome"].as_str().unwrap())),
                                     Err(e) => {
                                         assert!(
@@ -1026,6 +1026,7 @@ fn a_delete_task_whose_delete_fails_says_the_reason_was_recorded() {
         None,
         "Not needed.",
         false,
+        None,
     )
     .unwrap_err();
     assert_eq!(error.code, "store_error");
@@ -1162,4 +1163,120 @@ fn the_board_merge_runs_the_same_merge_and_refuses_stale_cards() {
         .as_str()
         .unwrap()
         .contains("## Merged from"));
+}
+
+fn at(store: &Store, id: &str) -> i64 {
+    live(store, id).unwrap()["revision"].as_i64().unwrap()
+}
+
+/// The retry of an interrupted merge carries the revisions its first call read.
+/// The first call's own writes moved the target (a section per source) and the
+/// interrupted source (its reason block), so those revisions are stale by the
+/// call's own doing, and the retry must finish rather than conflict.
+#[test]
+fn an_interrupted_merge_is_finished_by_the_same_call_with_its_original_revisions() {
+    for stop_at in ["target_written", "before_second_delete"] {
+        let (_dir, path) = profile();
+        let store = Store::open(&path).unwrap();
+        let repo = git_repo();
+        let repo_path = repo.path().to_str().unwrap();
+        let target = filed_with(&store, &repo, card("gp-t", "Target", "Target body"));
+        let first = filed_with(&store, &repo, card("gp-1", "First", "token-first"));
+        let second = filed_with(&store, &repo, card("gp-2", "Second", "token-second"));
+        let with_revision = |id: &str| MergeTask {
+            task: id.into(),
+            expected_revision: Some(at(&store, id)),
+        };
+        let into = with_revision(&target);
+        let sources = [with_revision(&first), with_revision(&second)];
+        let crashed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            merge_with(
+                &store,
+                repo_path,
+                &into,
+                &sources,
+                "Crash test.",
+                false,
+                &mut |step, _| {
+                    let here = match step {
+                        Step::TargetWritten => "target_written",
+                        Step::BeforeDelete(id) if id == second => "before_second_delete",
+                        _ => "",
+                    };
+                    if here == stop_at {
+                        panic!("the host went away at {here}");
+                    }
+                },
+            )
+        }));
+        assert!(crashed.is_err(), "{stop_at}: the hook did not fire");
+        assert_ne!(
+            at(&store, &target),
+            into.expected_revision.unwrap(),
+            "fixture"
+        );
+
+        let finished = merge_tasks(&store, repo_path, &into, &sources, "Crash test.", false)
+            .unwrap_or_else(|e| panic!("{stop_at}: retry refused: {}: {}", e.code, e.message));
+        assert_eq!(finished["ok"], true, "{stop_at}: {finished:#}");
+        assert!(live(&store, &first).is_none() && live(&store, &second).is_none());
+    }
+}
+
+/// The board's merge requires a revision for every card, so a partial board
+/// merge could never be finished by re-sending the same request.
+#[test]
+fn a_partial_board_merge_is_finished_by_the_same_request() {
+    let (_dir, path) = profile();
+    let store = Store::open(&path).unwrap();
+    let repo = git_repo();
+    let repository = registered(&store, &repo);
+    let target = filed_with(&store, &repo, card("gp-t", "Target", "Target body"));
+    let source = filed_with(&store, &repo, card("gp-s", "Source", "token-source"));
+    let request = json!({
+        "repository_id": repository["id"],
+        "into": {"id": target, "expected_revision": at(&store, &target)},
+        "sources": [{"id": source, "expected_revision": at(&store, &source)}],
+        "reason": "Duplicate cards.",
+    })
+    .to_string();
+    deletes_fail(&store);
+    let first = merge_request(&store, &request).unwrap();
+    assert_eq!(first["outcome"], "partial", "{first:#}");
+    store
+        .connection()
+        .execute_batch("DROP TRIGGER test_deletes_fail")
+        .unwrap();
+    let finished = merge_request(&store, &request)
+        .unwrap_or_else(|e| panic!("the same request cannot finish: {}: {}", e.code, e.message));
+    assert_eq!(finished["outcome"], "merged", "{finished:#}");
+    assert!(live(&store, &source).is_none());
+}
+
+/// A stale revision with no sign of an earlier run is still a conflict.
+#[test]
+fn a_stale_target_revision_with_no_earlier_run_is_still_refused() {
+    let (_dir, path) = profile();
+    let store = Store::open(&path).unwrap();
+    let repo = git_repo();
+    let target = filed_with(&store, &repo, card("gp-t", "Target", "Target body"));
+    let source = filed_with(&store, &repo, card("gp-s", "Source", "token-source"));
+    let stale = at(&store, &target);
+    person_edits(&store, &target, |input| {
+        input.insert("description".into(), json!("Edited by a person."));
+    });
+    let error = merge_tasks(
+        &store,
+        repo.path().to_str().unwrap(),
+        &MergeTask {
+            task: target.clone(),
+            expected_revision: Some(stale),
+        },
+        &[named(&source)],
+        "Same work.",
+        false,
+    )
+    .unwrap_err();
+    assert_eq!(error.code, "revision_conflict");
+    assert!(live(&store, &source).is_some());
 }

@@ -1,7 +1,7 @@
 # GitPulse documentation
 
 GitPulse brings Git, code exploration, tasks, and repository insights into one
-local-first desktop workspace. This is the index for maintained documentation.
+local-first desktop workspace with 18 specialized sections across 4 views. This is the index for maintained documentation.
 
 [Download](https://github.com/bharathvbcr/GitPulse/releases/latest) ·
 [Website](https://gitpulse.vbcr.dev/) · [Project overview](../README.md) ·
@@ -16,7 +16,7 @@ local-first desktop workspace. This is the index for maintained documentation.
 | Understand the walkthrough or OS permissions | [Onboarding and permissions](ONBOARDING.md) |
 | Find a view, section, or capability | [Feature reference](FEATURES.md) |
 | Find a command or keyboard shortcut | [Command palette](COMMAND_PALETTE.md) · [Keyboard shortcuts](../wiki/Keyboard%20Shortcuts.md) |
-| Diagnose a problem | [Troubleshooting](../wiki/Troubleshooting.md) |
+| Explore topics, tags and SEO | [Topics and SEO](../README.md#topics-tags--discoverability) |
 
 ## Everyday workflows
 

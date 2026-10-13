@@ -33,7 +33,10 @@ pub use hooks::{
 };
 
 mod preflight;
-pub use preflight::{git_preflight, GitPreflight, GitPreflightStatus, MIN_GIT_VERSION};
+pub use preflight::{
+    git_preflight, require_git_for_clone, GitPreflight, GitPreflightStatus, MIN_CLONE_GIT_VERSION,
+    MIN_GIT_VERSION, MIN_SUBMODULE_GIT_VERSION,
+};
 
 /// Shared grace window for pipe EOF after child exit. Unix closes unfinished
 /// descriptors; Windows cancels workers and retains their resource slots until
@@ -298,32 +301,127 @@ pub fn sandbox_write_edited_text(
     crate::diff::write_regular(&dest, &bytes)
 }
 
-/// True for inherited environment names that can redirect git's config,
-/// transport, or credential resolution away from what the user picked.
+/// Environment names git reads that can redirect it away from the repository
+/// and settings the caller picked, or change what it prints. Every git child
+/// has these removed ([`pin_git_environment`]), whichever builder spawned it.
 ///
-/// `GIT_CONFIG_PARAMETERS` is the shell-quoted config channel (`'alias.st=!sh
-/// -c …'` outranks even repo-local config), so it is injected by definition;
-/// `GIT_CONFIG_GLOBAL`/`GIT_CONFIG_SYSTEM` are listed here too so the
-/// classification stays in lockstep with the explicit strip list in
-/// [`git_command`] — anything stripped must classify as injected.
+/// - the repository pointers: where the index, objects, alternates, common dir,
+///   namespace and shallow file live;
+/// - the config channels, `GIT_CONFIG_PARAMETERS` being the shell-quoted one
+///   (`'alias.st=!sh -c …'` outranks even repo-local config);
+/// - transport and credential redirection: `GIT_SSH`, `GIT_SSH_COMMAND`,
+///   `GIT_PROXY_COMMAND`, `GIT_ASKPASS` and friends;
+/// - output and matching behaviour: `GIT_DIFF_OPTS` overrides `-U3`, and the
+///   pathspec switches (`GIT_LITERAL_PATHSPECS`, `GIT_GLOB_PATHSPECS`,
+///   `GIT_NOGLOB_PATHSPECS`, `GIT_ICASE_PATHSPECS`) retarget the `:(literal)`
+///   pathspecs the writers rely on, so `stage f*.txt` could touch other files;
+/// - `GIT_ATTR_SOURCE`, which swaps the attributes diffs and filters see.
+const STRIPPED_GIT_ENV: &[&str] = &[
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_INDEX_FILE",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_COMMON_DIR",
+    "GIT_NAMESPACE",
+    "GIT_SHALLOW_FILE",
+    "GIT_ATTR_SOURCE",
+    "GIT_CONFIG",
+    "GIT_CONFIG_GLOBAL",
+    "GIT_CONFIG_SYSTEM",
+    "GIT_CONFIG_COUNT",
+    "GIT_CONFIG_PARAMETERS",
+    "GIT_EXTERNAL_DIFF",
+    "GIT_SEQUENCE_EDITOR",
+    "GIT_EXEC_PATH",
+    "GIT_SSH",
+    "GIT_SSH_COMMAND",
+    "GIT_SSH_VARIANT",
+    "GIT_PROXY_COMMAND",
+    "GIT_ASKPASS",
+    "GIT_DIFF_OPTS",
+    "GIT_LITERAL_PATHSPECS",
+    "GIT_GLOB_PATHSPECS",
+    "GIT_NOGLOB_PATHSPECS",
+    "GIT_ICASE_PATHSPECS",
+];
+
+/// Families of names removed by prefix: the numbered config channel, credential
+/// helper overrides, and every tracing switch (`GIT_TRACE`, `GIT_TRACE2*`,
+/// `GIT_TRACE_PACKET`, ...), whose output floods stderr and pushes the fatal
+/// line out of the few bytes of it that are kept.
+const STRIPPED_GIT_ENV_PREFIXES: &[&str] = &[
+    "GIT_CONFIG_KEY_",
+    "GIT_CONFIG_VALUE_",
+    "GIT_CREDHELPER",
+    "GIT_TRACE",
+];
+
+/// True for inherited environment names [`pin_git_environment`] removes.
 fn is_injected_git_env(name: &str) -> bool {
     let upper = name.to_ascii_uppercase();
-    upper.starts_with("GIT_CONFIG_KEY_")
-        || upper.starts_with("GIT_CONFIG_VALUE_")
-        || upper.starts_with("GIT_CREDHELPER")
-        || matches!(
-            upper.as_str(),
-            "GIT_CONFIG_COUNT"
-                | "GIT_CONFIG_PARAMETERS"
-                | "GIT_CONFIG_GLOBAL"
-                | "GIT_CONFIG_SYSTEM"
-                | "GIT_SSH_COMMAND"
-                | "GIT_SSH_VARIANT"
-                | "GIT_ASKPASS"
-                | "GIT_EXTERNAL_DIFF"
-                | "GIT_SEQUENCE_EDITOR"
-                | "GIT_EXEC_PATH"
-        )
+    STRIPPED_GIT_ENV.contains(&upper.as_str())
+        || STRIPPED_GIT_ENV_PREFIXES
+            .iter()
+            .any(|prefix| upper.starts_with(prefix))
+}
+
+/// Config every git child is run with, ahead of its subcommand, so a
+/// developer's own settings cannot change what the parsers read:
+/// `core.quotepath` keeps non-ASCII paths as raw bytes; `log.showSignature`
+/// prints a "No signature" line (and runs gpg) in front of every commit id;
+/// the colour settings put ANSI escapes in diffs (the specific keys outrank
+/// `color.ui`, so they are pinned too); `diff.noprefix` and
+/// `diff.mnemonicPrefix` change the `a/` `b/` prefixes the diff parser keys on.
+const PINNED_GIT_CONFIG: &[&str] = &[
+    "core.quotepath=false",
+    "log.showSignature=false",
+    "color.ui=never",
+    "color.diff=never",
+    "color.status=never",
+    "color.branch=never",
+    "diff.noprefix=false",
+    "diff.mnemonicPrefix=false",
+];
+
+/// Subcommands that print a patch, where `diff.external` (a config key, which
+/// no `-c` can blank) would run a program instead of git's own diff.
+const PATCH_SUBCOMMANDS: &[&str] = &["diff", "show", "log"];
+
+/// The one place the environment of a git child is decided. Both spawn
+/// builders ([`git_command_with_env`] for git itself and
+/// [`build_capture_command_in`] for tools that shell out to git, such as `gh`)
+/// call it, so they cannot drift apart: a setting added here reaches both.
+///
+/// Prompts and pagers are off, the locale is `C` (the parsers match git's
+/// English words), optional locks are skipped so a read never contends with a
+/// writer, every name in [`STRIPPED_GIT_ENV`] and [`STRIPPED_GIT_ENV_PREFIXES`]
+/// is removed, and the editors are pinned to `true`.
+///
+/// Editors are neutralized AFTER the strip, which would otherwise remove
+/// `GIT_SEQUENCE_EDITOR` right back out again. Removal alone is not enough:
+/// with none set, git falls back to `core.editor` and then to vi, and any
+/// subcommand that wants a message (`rebase --continue`, `am --continue`,
+/// `merge --continue`, a bare `commit`) launches it against a null stdin and
+/// blocks until the command timeout — surfacing as "git timed out" rather than
+/// a result. `true` exits 0 immediately, so git accepts the message it
+/// prepared. Every message-bearing call here already passes `-m` or
+/// `--no-edit`, so no existing caller's behaviour changes.
+fn pin_git_environment(cmd: &mut Command) {
+    cmd.env("GIT_TERMINAL_PROMPT", "0")
+        .env("GCM_INTERACTIVE", "never")
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .env("LC_ALL", "C");
+    for name in STRIPPED_GIT_ENV {
+        cmd.env_remove(name);
+    }
+    for (name, _) in std::env::vars_os() {
+        if is_injected_git_env(&name.to_string_lossy()) {
+            cmd.env_remove(&name);
+        }
+    }
+    cmd.env("GIT_EDITOR", "true")
+        .env("GIT_SEQUENCE_EDITOR", "true");
 }
 
 /// Reads `PATH`/`HOME` from the process and defers to
@@ -366,62 +464,20 @@ fn git_command_with_env(
         )
     });
     let mut cmd = Command::new(program.as_deref().unwrap_or_else(|| Path::new("git")));
-    // `core.quotepath=false` keeps non-ASCII paths as raw bytes in every
-    // command's output (`status`, `diff --numstat`, `show`, ...). Without it,
-    // porcelain text output arrives C-quoted ("\\346\\226\\207...") while `-z`
-    // output emits raw bytes, so the same file matches under two different
-    // spellings. Harmless for commands whose output has no paths at all.
-    // Inherited CI-style environments can export GIT_* pointers that redirect
-    // git's index, object database, alternates, common dir, namespace, or
-    // config away from the repository the user actually picked. Strip them all
-    // so a GUI-initiated git call always operates on the repo it was given.
-    cmd.args(["-c", "core.quotepath=false"])
-        .args(args)
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .env("GCM_INTERACTIVE", "never")
-        .env("GIT_OPTIONAL_LOCKS", "0")
-        .env("LC_ALL", "C")
-        .env_remove("GIT_DIR")
-        .env_remove("GIT_WORK_TREE")
-        .env_remove("GIT_INDEX_FILE")
-        .env_remove("GIT_OBJECT_DIRECTORY")
-        .env_remove("GIT_ALTERNATE_OBJECT_DIRECTORIES")
-        .env_remove("GIT_COMMON_DIR")
-        .env_remove("GIT_NAMESPACE")
-        .env_remove("GIT_CONFIG")
-        .env_remove("GIT_CONFIG_GLOBAL")
-        .env_remove("GIT_CONFIG_SYSTEM")
-        // The numbered-config channel (GIT_CONFIG_COUNT + GIT_CONFIG_KEY_n /
-        // VALUE_n) and the shell-quoted GIT_CONFIG_PARAMETERS channel inject
-        // arbitrary config without any of the names above — the latter
-        // outranks even repo-local config, so an `alias.*=!sh -c …` planted
-        // there would execute on the next GUI status call.
-        .env_remove("GIT_CONFIG_COUNT")
-        .env_remove("GIT_CONFIG_PARAMETERS")
-        .env_remove("GIT_EXTERNAL_DIFF")
-        .env_remove("GIT_SEQUENCE_EDITOR")
-        .env_remove("GIT_EXEC_PATH");
-    for (name, _) in std::env::vars_os() {
-        if is_injected_git_env(&name.to_string_lossy()) {
-            cmd.env_remove(&name);
-        }
+    // The pinned config goes ahead of the caller's arguments, so a `-c` the
+    // caller passes itself still wins; `--no-ext-diff` goes right after the
+    // subcommand of a patch-printing command.
+    for pin in PINNED_GIT_CONFIG {
+        cmd.args(["-c", pin]);
     }
-    // Editors are neutralized AFTER the strip loop, which would otherwise
-    // remove GIT_SEQUENCE_EDITOR right back out again.
-    //
-    // Stripping the editor variables is not enough on its own: with none set,
-    // git falls back to `core.editor` and then to vi, and any subcommand that
-    // wants a message (`rebase --continue`, `am --continue`, `merge
-    // --continue`, a bare `commit`) launches it against a null stdin and
-    // blocks until the 90s command timeout — surfacing as "git timed out"
-    // rather than a result. `true` is a real program that exits 0 immediately,
-    // so git accepts the message it prepared and the command completes.
-    //
-    // This changes no existing caller's behavior: every message-bearing call
-    // in this codebase already passes `-m` or `--no-edit`, so no editor was
-    // ever supposed to open. It converts a whole class of hangs into success.
-    cmd.env("GIT_EDITOR", "true")
-        .env("GIT_SEQUENCE_EDITOR", "true");
+    match subcommand_index(args) {
+        Some(at) if PATCH_SUBCOMMANDS.contains(&args[at]) => cmd
+            .args(&args[..=at])
+            .arg("--no-ext-diff")
+            .args(&args[at + 1..]),
+        _ => cmd.args(args),
+    };
+    pin_git_environment(&mut cmd);
     // Git resolves its own helpers through the child's PATH, so a GUI launch
     // handed them the same minimal `/usr/bin:/bin:/usr/sbin:/sbin` that hid
     // `gh` and `cargo` from us: `gpg` for a signed commit, the interpreter a
@@ -491,8 +547,20 @@ pub fn git_text_capped(
     args: &[&str],
     cap: usize,
 ) -> Result<(String, Option<Incomplete>), String> {
-    let (bytes, incomplete) = git_run_capped(Some(repo), args, DEFAULT_TIMEOUT, None, cap)?;
+    let (bytes, incomplete) = git_bytes_capped(repo, args, cap)?;
     Ok((String::from_utf8_lossy(&bytes).into_owned(), incomplete))
+}
+
+/// [`git_text_capped`] without the UTF-8 decode: git's exact stdout bytes plus
+/// the truncation flag. For the one reader whose consumer defines its input as
+/// bytes (the Lappi caller contract), where a lossy decode would substitute
+/// U+FFFD for what git printed while still reporting a matching length.
+pub fn git_bytes_capped(
+    repo: &Path,
+    args: &[&str],
+    cap: usize,
+) -> Result<(Vec<u8>, Option<Incomplete>), String> {
+    git_run_capped(Some(repo), args, DEFAULT_TIMEOUT, None, cap)
 }
 
 /// Runs `git` in `repo` and hands back the finished run *whatever* its exit
@@ -742,6 +810,45 @@ fn gui_launch_fallback_dirs(home: Option<&std::ffi::OsStr>) -> Vec<PathBuf> {
     dirs
 }
 
+/// Whose `PATH` a spawn was handed, which decides whether the
+/// [`gui_launch_fallback_dirs`] may widen it.
+///
+/// The fallback dirs repair an *inherited* PATH that a GUI launch left
+/// minimal. A PATH a caller chose on purpose — a test simulating a host with
+/// a tool absent — is the whole answer, and widening it made the choice
+/// meaningless: a scan told "cargo-deny is not on this PATH" still found
+/// `/opt/homebrew/bin/cargo-deny` on any host that had one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PathSource {
+    /// Read from the process environment: searched first, then the fallback
+    /// dirs, and the child's PATH is extended the same way.
+    Inherited,
+    /// Supplied by the caller: searched alone, and handed to the child as is.
+    Explicit,
+}
+
+/// Directories a bare program name is searched in, in precedence order.
+///
+/// Single owner of that list for resolution ([`resolve_spawn_program_in`],
+/// [`find_external_tool_with`]). Empty entries are dropped: POSIX reads one as
+/// "the current directory".
+fn tool_search_dirs(
+    path_var: Option<&std::ffi::OsStr>,
+    home: Option<&std::ffi::OsStr>,
+    source: PathSource,
+) -> Vec<PathBuf> {
+    let mut dirs: Vec<PathBuf> = path_var
+        .map(std::env::split_paths)
+        .into_iter()
+        .flatten()
+        .filter(|entry| !entry.as_os_str().is_empty())
+        .collect();
+    if source == PathSource::Inherited {
+        dirs.extend(gui_launch_fallback_dirs(home));
+    }
+    dirs
+}
+
 /// First entry of `dirs` holding a spawnpable file named `program`.
 ///
 /// Deliberately stricter than an `is_file()` scan so resolution matches what
@@ -941,14 +1048,16 @@ pub(crate) fn extended_child_path(
     if path_var.is_some_and(|value| value.len() >= MAX_INHERITED_PATH_BYTES) {
         return None;
     }
-    // Empty entries are dropped: POSIX reads one as "the current directory",
-    // which would let whatever repo the user has open inject executables into
-    // every spawned tool's lookup path.
+    // Only absolute entries survive. An empty entry is POSIX for "the current
+    // directory", and `.`, `bin` or `./node_modules/.bin` resolve against the
+    // child's cwd, which for git helpers and sidecars is the repository the
+    // user opened. Keeping any of them would let an untrusted clone put its
+    // own `git-*`, `node` or `npm` ahead of the real ones.
     let mut entries: Vec<PathBuf> = path_var
         .map(std::env::split_paths)
         .into_iter()
         .flatten()
-        .filter(|entry| !entry.as_os_str().is_empty())
+        .filter(|entry| entry.is_absolute())
         .collect();
     if path_var.is_none() && cfg!(unix) {
         // PATH entirely absent (daemon/launchd-style contexts): seed the Unix
@@ -1055,17 +1164,21 @@ pub(crate) fn resolve_spawn_program_with(
     path_var: Option<&std::ffi::OsStr>,
     home: Option<&std::ffi::OsStr>,
 ) -> String {
+    resolve_spawn_program_in(program, path_var, home, PathSource::Inherited)
+}
+
+/// [`resolve_spawn_program_with`] for a `path_var` of known [`PathSource`]:
+/// an explicit one is searched alone.
+pub(crate) fn resolve_spawn_program_in(
+    program: &str,
+    path_var: Option<&std::ffi::OsStr>,
+    home: Option<&std::ffi::OsStr>,
+    source: PathSource,
+) -> String {
     if program.contains('/') || program.contains('\\') {
         return program.to_string();
     }
-    let mut dirs: Vec<PathBuf> = path_var
-        .map(std::env::split_paths)
-        .into_iter()
-        .flatten()
-        .filter(|entry| !entry.as_os_str().is_empty())
-        .collect();
-    dirs.extend(gui_launch_fallback_dirs(home));
-    find_in_dirs(program, &dirs)
+    find_in_dirs(program, &tool_search_dirs(path_var, home, source))
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_else(|| program.to_string())
 }
@@ -1102,14 +1215,11 @@ pub(crate) fn find_external_tool_with(
     if program.is_empty() || program.contains('/') || program.contains('\\') {
         return None;
     }
-    let mut dirs: Vec<PathBuf> = path_var
-        .map(std::env::split_paths)
-        .into_iter()
-        .flatten()
-        .filter(|entry| !entry.as_os_str().is_empty())
-        .collect();
-    dirs.extend(gui_launch_fallback_dirs(home));
-    find_in_dirs(program, &dirs).map(|p| p.to_string_lossy().into_owned())
+    find_in_dirs(
+        program,
+        &tool_search_dirs(path_var, home, PathSource::Inherited),
+    )
+    .map(|p| p.to_string_lossy().into_owned())
 }
 
 /// Windows' legacy path limit. Beyond it a path needs the `\\?\` prefix to be
@@ -1175,13 +1285,29 @@ fn simplified_windows_path(path: &str) -> Option<String> {
 /// On every other platform this is `canonicalize`, unchanged.
 pub(crate) fn canonicalize_plain(path: &Path) -> std::io::Result<PathBuf> {
     let canonical = path.canonicalize()?;
+    Ok(match canonical.to_str() {
+        Some(text) => PathBuf::from(plain_path_text(text)),
+        None => canonical,
+    })
+}
+
+/// `path` in the spelling git takes as a command-line argument.
+///
+/// [`canonicalize_plain`] for a path that is already in hand as text: the
+/// repository admission and trust identity spell every checkout `\\?\C:\...`
+/// (the sandbox containment checks depend on that), and git refuses that form
+/// as an argument -- `git worktree add '\\?\C:\...\wt'` dies with `could not
+/// create leading directories ... Invalid argument`. A path with no ordinary
+/// spelling (beyond the legacy limit, a device path) is returned unchanged.
+///
+/// The same string reaches the command gate and the spawn, so both judge one
+/// spelling. Identity off Windows, where a backslash is a filename character.
+pub(crate) fn plain_path_text(path: &str) -> String {
     #[cfg(windows)]
-    {
-        if let Some(simplified) = canonical.to_str().and_then(simplified_windows_path) {
-            return Ok(PathBuf::from(simplified));
-        }
+    if let Some(simplified) = simplified_windows_path(path) {
+        return simplified;
     }
-    Ok(canonical)
+    path.to_owned()
 }
 
 /// Assembles the `capture_command` child with injectable `PATH`/home lookups,
@@ -1202,46 +1328,45 @@ pub(crate) fn build_capture_command(
     path_var: Option<&std::ffi::OsStr>,
     home: Option<&std::ffi::OsStr>,
 ) -> Command {
-    let resolved = resolve_spawn_program_with(program, path_var, home);
+    build_capture_command_in(
+        program,
+        args,
+        cwd,
+        extra_env,
+        path_var,
+        home,
+        PathSource::Inherited,
+    )
+}
+
+/// [`build_capture_command`] for a `path_var` of known [`PathSource`]. An
+/// explicit PATH is both the resolution search path and, verbatim apart from
+/// dropped empty entries, the child's PATH — so nothing the child re-resolves
+/// (a shebang interpreter, a nested tool) reaches past it either.
+fn build_capture_command_in(
+    program: &str,
+    args: &[&str],
+    cwd: Option<&Path>,
+    extra_env: &[(&str, &str)],
+    path_var: Option<&std::ffi::OsStr>,
+    home: Option<&std::ffi::OsStr>,
+    source: PathSource,
+) -> Command {
+    let resolved = resolve_spawn_program_in(program, path_var, home, source);
     let mut cmd = Command::new(&resolved);
-    // The same injected-GIT-* strip [`git_command`] applies: captured tools
-    // shell out to git themselves (`gh pr checkout` fetches and merges in the
-    // repo; npm/go/cargo read git config), and CI-style inherited pointers
-    // (GIT_DIR, GIT_INDEX_FILE, GIT_CONFIG_PARAMETERS, ...) would redirect
-    // them off the repository the caller picked. Applied before `extra_env`,
-    // so a caller that explicitly passes one of these still wins.
-    for (name, _) in std::env::vars_os() {
-        if is_injected_git_env(&name.to_string_lossy()) {
-            cmd.env_remove(&name);
-        }
-    }
-    cmd.env_remove("GIT_DIR")
-        .env_remove("GIT_WORK_TREE")
-        .env_remove("GIT_INDEX_FILE")
-        .env_remove("GIT_OBJECT_DIRECTORY")
-        .env_remove("GIT_ALTERNATE_OBJECT_DIRECTORIES")
-        .env_remove("GIT_COMMON_DIR")
-        .env_remove("GIT_NAMESPACE")
-        .env_remove("GIT_CONFIG")
-        .env_remove("GIT_CONFIG_GLOBAL")
-        .env_remove("GIT_CONFIG_SYSTEM")
-        .env_remove("GIT_CONFIG_COUNT")
-        .env_remove("GIT_CONFIG_PARAMETERS")
-        .env_remove("GIT_EXTERNAL_DIFF")
-        .env_remove("GIT_EXEC_PATH")
-        // Same editor pin as [`git_command`], for the same two reasons: these
-        // tools shell out to git themselves (`gh pr checkout` fetches and
-        // merges), and a spawned editor against a null stdin blocks until the
-        // timeout. Removal alone would leave git's `core.editor` config
-        // fallback open, so both variables are pinned to a program that exits
-        // immediately.
-        .env("GIT_EDITOR", "true")
-        .env("GIT_SEQUENCE_EDITOR", "true")
-        .env("GH_PROMPT_DISABLED", "1")
+    // The same environment [`git_command`] gives git ([`pin_git_environment`]):
+    // captured tools shell out to git themselves (`gh pr checkout` fetches and
+    // merges in the repo; npm/go/cargo read git config), and CI-style inherited
+    // pointers (GIT_DIR, GIT_INDEX_FILE, GIT_CONFIG_PARAMETERS, ...) would
+    // redirect them off the repository the caller picked, a localized message
+    // would defeat the parsers, and a credential manager could prompt. Applied
+    // before `extra_env`, so a caller that explicitly passes one of these
+    // still wins.
+    pin_git_environment(&mut cmd);
+    cmd.env("GH_PROMPT_DISABLED", "1")
         // gh consults this before printing update notices; keep subprocess
         // output deterministic instead of interleaving a self-update banner.
         .env("GH_NO_UPDATE_NOTIFIER", "1")
-        .env("GIT_TERMINAL_PROMPT", "0")
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -1251,8 +1376,22 @@ pub(crate) fn build_capture_command(
     }
     if !cfg!(windows) {
         // Applied before `extra_env` so an explicit caller-provided PATH wins.
-        if let Some(child_path) = extended_child_path(path_var, home) {
-            cmd.env("PATH", child_path);
+        match source {
+            PathSource::Inherited => {
+                if let Some(child_path) = extended_child_path(path_var, home) {
+                    cmd.env("PATH", child_path);
+                }
+            }
+            // Never left to inherit: the process PATH is exactly what an
+            // explicit one replaces.
+            PathSource::Explicit => {
+                match path_var.and_then(|value| {
+                    std::env::join_paths(tool_search_dirs(Some(value), home, source)).ok()
+                }) {
+                    Some(child_path) => cmd.env("PATH", child_path),
+                    None => cmd.env_remove("PATH"),
+                };
+            }
         }
     }
     for (key, value) in extra_env {
@@ -1283,13 +1422,16 @@ pub fn capture_command(
         extra_env,
         path_var.as_deref(),
         home.as_deref(),
+        PathSource::Inherited,
     )
 }
 
 /// [`capture_command`] with injectable `PATH`/home lookups — the seam its
 /// callers fill from the process environment by default. Tests use it to run
 /// the exact production spawn path under a simulated GUI-minimal environment
-/// without mutating process-global state.
+/// without mutating process-global state. `source` says which of those two
+/// `path_var` is; see [`PathSource`].
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn capture_command_with_env(
     program: &str,
     args: &[&str],
@@ -1298,8 +1440,9 @@ pub(crate) fn capture_command_with_env(
     extra_env: &[(&str, &str)],
     path_var: Option<&std::ffi::OsStr>,
     home: Option<&std::ffi::OsStr>,
+    source: PathSource,
 ) -> Result<CapturedOutput, String> {
-    let cmd = build_capture_command(program, args, cwd, extra_env, path_var, home);
+    let cmd = build_capture_command_in(program, args, cwd, extra_env, path_var, home, source);
 
     let out = run_bounded(cmd, program, timeout, None)?.require_complete(program)?;
     Ok(CapturedOutput {
@@ -1422,6 +1565,11 @@ const DEFERRED_MARKER: &str = " deferred under load after ";
 /// argument named `-c` for every read that set a config value, and an
 /// `--attr-source=<oid>` would have put an object id where a command belongs.
 pub(crate) fn subcommand<'a>(args: &[&'a str]) -> &'a str {
+    subcommand_index(args).map_or("", |at| args[at])
+}
+
+/// Where in `args` the subcommand is, past git's global options.
+fn subcommand_index(args: &[&str]) -> Option<usize> {
     /// Global options whose value is the next argument.
     const TAKES_VALUE: [&str; 6] = [
         "-c",
@@ -1431,15 +1579,15 @@ pub(crate) fn subcommand<'a>(args: &[&'a str]) -> &'a str {
         "--namespace",
         "--config-env",
     ];
-    let mut rest = args.iter();
-    while let Some(arg) = rest.next() {
+    let mut rest = args.iter().enumerate();
+    while let Some((at, arg)) = rest.next() {
         if TAKES_VALUE.contains(arg) {
             rest.next();
         } else if !arg.starts_with('-') {
-            return arg;
+            return Some(at);
         }
     }
-    ""
+    None
 }
 
 /// True when `err` is the gate declining to start a child under load. The
@@ -2345,19 +2493,27 @@ impl SpawnGate {
     }
 
     /// Asks the shared budget for the token a non-interactive spawn is about
-    /// to spend. `true` when it was granted or could not be asked (counted,
-    /// and logged at most every [`REFUSAL_REPORT_INTERVAL`]); `false` when
-    /// the processes together have spent it.
-    fn take_shared(&self, state: &mut GateState, class: Admission) -> bool {
+    /// to spend. Does file IO and may wait on a lock another process holds, so
+    /// it must be called with the gate mutex released; the answer is applied
+    /// by [`Self::settle_shared`].
+    fn ask_shared(&self, class: Admission) -> shared_budget::Take {
         let Some(shared) = &self.shared else {
-            return true;
+            return shared_budget::Take::Granted;
         };
         let floor = if class == Admission::Background {
             self.background_reserve()
         } else {
             0
         };
-        match shared.take(floor, self.burst, self.refill_per_sec) {
+        shared.take(floor, self.burst, self.refill_per_sec)
+    }
+
+    /// Applies [`Self::ask_shared`]'s answer under the gate lock: `true` when
+    /// the token was granted or could not be asked (counted, and logged at
+    /// most every [`REFUSAL_REPORT_INTERVAL`]); `false` when the processes
+    /// together have spent it.
+    fn settle_shared(&self, state: &mut GateState, taken: shared_budget::Take) -> bool {
+        match taken {
             shared_budget::Take::Granted => true,
             shared_budget::Take::Denied => false,
             shared_budget::Take::Unavailable(reason) => {
@@ -2451,6 +2607,12 @@ impl SpawnGate {
         }
         reservation.held = background || interactive;
         let mut token_wait_started: Option<Instant> = None;
+        // A token the shared budget granted while the gate lock was released.
+        // Kept for the next pass, which re-reads the gate before spending it:
+        // the slot it was asked for may have gone to another waiter meanwhile.
+        // One that is never spent (the waiter is cancelled or times out first)
+        // is lost to the shared budget, which has no way to take it back.
+        let mut shared_token_held = false;
         let outcome = loop {
             // The cancel check is the caller's code. Under the gate lock, a
             // check that took a lock of its own or spawned anything would
@@ -2485,7 +2647,7 @@ impl SpawnGate {
             // available slot if no background child is running, so sustained
             // reactive traffic cannot indefinitely postpone all indexing. A
             // waiting user action outranks both.
-            let eligible = match class {
+            let eligibility = |state: &GateState| match class {
                 Admission::Interactive => true,
                 Admission::Background => {
                     state.waiting_interactive == 0 && state.background < (self.limit / 4).max(1)
@@ -2497,18 +2659,48 @@ impl SpawnGate {
                             || state.in_flight < self.limit.saturating_sub(1))
                 }
             };
-            self.refill(&mut state, now);
-            let mut tokens_ok = match class {
+            let tokens_available = |state: &GateState| match class {
                 Admission::Interactive => true,
                 Admission::Reactive => !rate_limited || state.tokens >= 1,
                 Admission::Background => !rate_limited || state.tokens > self.background_reserve(),
             };
+            let mut eligible = eligibility(&state);
+            self.refill(&mut state, now);
+            let mut tokens_ok = tokens_available(&state);
             // The shared budget is asked last, and only by a spawn that would
             // otherwise start now, so a granted token is spent at once below
             // and never taken for a waiter that then gives up.
-            if tokens_ok && rate_limited && !interactive && state.in_flight < self.limit && eligible
+            if tokens_ok
+                && rate_limited
+                && !interactive
+                && !shared_token_held
+                && state.in_flight < self.limit
+                && eligible
+                && self.shared.is_some()
             {
-                tokens_ok = self.take_shared(&mut state, class);
+                // The shared record is a file under a lock that may sleep-poll
+                // for [`shared_budget::LOCK_PATIENCE`], and a denial writes it
+                // too. None of that may happen under the gate mutex, where it
+                // would queue every other acquire, a user action included,
+                // behind a background re-poll. Released like the cancel check
+                // above, and everything is re-read once the answer is in.
+                drop(state);
+                let taken = self.ask_shared(class);
+                state = self
+                    .state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if self.settle_shared(&mut state, taken) {
+                    shared_token_held = true;
+                    // The lock was released: another waiter may have taken the
+                    // slot or the local token, so both are read again. The
+                    // deadline is not: a token already granted is spent, not
+                    // thrown away because the wait for it ran long.
+                    eligible = eligibility(&state);
+                    tokens_ok = tokens_available(&state);
+                } else {
+                    tokens_ok = false;
+                }
             }
             if !tokens_ok {
                 // Background is shed at once: it is the first thing to go
@@ -2730,20 +2922,80 @@ fn shared_budget_path() -> Result<PathBuf, String> {
 }
 
 /// Every child the gate actually started, so a test can count spawns in its
-/// own repository instead of inferring them from timing. Bounded: the whole
-/// suite shares it, and only the newest entries matter to a running test.
+/// own repository instead of inferring them from timing.
+///
+/// Kept per working directory. The suite shares one process, and a log shared
+/// by every test is evicted by whichever tests spawn the most: a test counting
+/// its own children by position (`spawns_in(cwd).len()` before and after) then
+/// lost its oldest entries to its neighbours and counted short, more often the
+/// longer it ran, which is to say under load. A test's directory is only ever
+/// pushed to by that test, so its entries are evicted by nothing but its own
+/// volume, and a directory that has gone quiet is the first to be dropped.
 #[cfg(test)]
 pub(crate) mod spawn_log {
-    use std::collections::VecDeque;
+    use std::collections::{HashMap, VecDeque};
     use std::path::{Path, PathBuf};
     use std::process::Command;
     use std::sync::Mutex;
 
     use super::Admission;
 
-    const CAPACITY: usize = 16_384;
-    type Entry = (PathBuf, Vec<String>, Admission);
-    static LOG: Mutex<VecDeque<Entry>> = Mutex::new(VecDeque::new());
+    /// Entries kept for one directory, and directories kept at once.
+    const PER_DIRECTORY: usize = 16_384;
+    const DIRECTORIES: usize = 1_024;
+    type Entry = (Vec<String>, Admission);
+
+    struct Log {
+        per_directory: usize,
+        directories: usize,
+        by_directory: HashMap<PathBuf, (u64, VecDeque<Entry>)>,
+        touched: u64,
+    }
+
+    impl Log {
+        fn bounded(per_directory: usize, directories: usize) -> Self {
+            Self {
+                per_directory,
+                directories,
+                by_directory: HashMap::new(),
+                touched: 0,
+            }
+        }
+
+        fn push(&mut self, cwd: &Path, entry: Entry) {
+            self.touched += 1;
+            let touched = self.touched;
+            if !self.by_directory.contains_key(cwd) && self.by_directory.len() >= self.directories {
+                // The directory nothing has spawned in for longest.
+                if let Some(stale) = self
+                    .by_directory
+                    .iter()
+                    .min_by_key(|(_, (last, _))| *last)
+                    .map(|(dir, _)| dir.clone())
+                {
+                    self.by_directory.remove(&stale);
+                }
+            }
+            let (last, entries) = self
+                .by_directory
+                .entry(cwd.to_path_buf())
+                .or_insert_with(|| (touched, VecDeque::new()));
+            *last = touched;
+            if entries.len() == self.per_directory {
+                entries.pop_front();
+            }
+            entries.push_back(entry);
+        }
+
+        fn entries(&self, cwd: &Path) -> Vec<Entry> {
+            self.by_directory
+                .get(cwd)
+                .map(|(_, entries)| entries.iter().cloned().collect())
+                .unwrap_or_default()
+        }
+    }
+
+    static LOG: Mutex<Option<Log>> = Mutex::new(None);
 
     pub(super) fn record(cmd: &Command) {
         let Some(cwd) = cmd.get_current_dir() else {
@@ -2753,13 +3005,11 @@ pub(crate) mod spawn_log {
             .get_args()
             .map(|arg| arg.to_string_lossy().into_owned())
             .collect();
-        let mut log = LOG
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if log.len() == CAPACITY {
-            log.pop_front();
-        }
-        log.push_back((cwd.to_path_buf(), argv, super::current_admission()));
+        let class = super::current_admission();
+        LOG.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get_or_insert_with(|| Log::bounded(PER_DIRECTORY, DIRECTORIES))
+            .push(cwd, (argv, class));
     }
 
     /// Argument vectors of every recorded child whose working directory was
@@ -2776,10 +3026,50 @@ pub(crate) mod spawn_log {
     pub(crate) fn classed_spawns_in(cwd: &Path) -> Vec<(Vec<String>, Admission)> {
         LOG.lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .iter()
-            .filter(|(dir, _, _)| dir == cwd)
-            .map(|(_, argv, class)| (argv.clone(), *class))
-            .collect()
+            .as_ref()
+            .map(|log| log.entries(cwd))
+            .unwrap_or_default()
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn entry() -> Entry {
+            (vec!["status".into()], Admission::Reactive)
+        }
+
+        /// The defect: a count taken by position was shortened by other tests'
+        /// spawns. One directory's volume no longer evicts another's entries.
+        #[test]
+        fn a_busy_neighbour_does_not_evict_a_quiet_directory() {
+            let mut log = Log::bounded(8, 4);
+            let (quiet, busy) = (Path::new("/quiet"), Path::new("/busy"));
+            for _ in 0..3 {
+                log.push(quiet, entry());
+            }
+            for _ in 0..100 {
+                log.push(busy, entry());
+            }
+            assert_eq!(log.entries(quiet).len(), 3);
+            assert_eq!(log.entries(busy).len(), 8, "bounded by its own volume");
+        }
+
+        #[test]
+        fn the_directory_that_went_quiet_is_the_one_dropped() {
+            let mut log = Log::bounded(8, 3);
+            let (first, live) = (Path::new("/first"), Path::new("/live"));
+            log.push(first, entry());
+            log.push(live, entry());
+            for other in ["/a", "/b", "/c", "/d"] {
+                log.push(Path::new(other), entry());
+                // A live directory keeps spawning, so it stays.
+                log.push(live, entry());
+            }
+            assert!(log.entries(first).is_empty(), "the quiet one went");
+            assert!(!log.entries(live).is_empty(), "the busy one stayed");
+            assert_eq!(log.by_directory.len(), 3, "never more than its bound");
+        }
     }
 }
 
@@ -3095,6 +3385,11 @@ thread_local! {
     #[cfg(test)]
     static FORCED_FAILURE_HOOK: std::cell::RefCell<Option<Box<dyn Fn()>>> =
         const { std::cell::RefCell::new(None) };
+    /// Labels of the children this thread asked the gate to run, newest last,
+    /// for [`spawn_labels_during`].
+    #[cfg(test)]
+    static SPAWN_LABELS: std::cell::RefCell<Vec<String>> =
+        const { std::cell::RefCell::new(Vec::new()) };
     /// Fails only the spawns on this thread whose arguments include this one.
     #[cfg(test)]
     static FORCED_FAILURE_ARG: std::cell::RefCell<Option<String>> =
@@ -3212,6 +3507,18 @@ pub(crate) fn with_forced_spawn_failure_then<T>(
     with_forced_spawn_failure(body)
 }
 
+/// Runs `body` and returns the label of every child it asked this thread's
+/// gate to spawn — the spawn-count assertion for "one process, not N". Only
+/// spawns made on the calling thread are seen, which is where a synchronous
+/// reader makes them.
+#[cfg(test)]
+pub(crate) fn spawn_labels_during<R>(body: impl FnOnce() -> R) -> (R, Vec<String>) {
+    SPAWN_LABELS.with(|labels| labels.borrow_mut().clear());
+    let result = body();
+    let seen = SPAWN_LABELS.with(|labels| std::mem::take(&mut *labels.borrow_mut()));
+    (result, seen)
+}
+
 /// [`run_with_gate`] with `on_admitted` called after the gate admits the
 /// child and before it is spawned — the last moment at which nothing has been
 /// read yet, which is what [`run_read_shared`] needs to stop new joiners.
@@ -3226,6 +3533,8 @@ fn run_admitted(
     gate: &'static SpawnGate,
     on_admitted: &dyn Fn(),
 ) -> Result<BoundedRun, String> {
+    #[cfg(test)]
+    SPAWN_LABELS.with(|labels| labels.borrow_mut().push(label.to_string()));
     #[cfg(test)]
     if FORCE_SPAWN_FAILURE.get() || forced_failure_matches(cmd) {
         FORCED_FAILURE_HOOK.with(|slot| {
@@ -3417,7 +3726,9 @@ fn run_admitted_inner(
         input.pump();
         output.observe(observer, &mut cursors);
         if observer.cancelled() {
-            break match guard.stop_and_reap(&mut child, Duration::ZERO) {
+            // Asked first: git removes its own `.git/index.lock` when asked and
+            // cannot when killed, so a cancelled commit would block the next.
+            break match guard.ask_then_stop_and_reap(&mut child) {
                 Ok(status) => Halt::Exited(status, true),
                 Err(e) => Halt::Failed(format!("Failed to reap cancelled {label}: {e}")),
             };
@@ -3431,9 +3742,11 @@ fn run_admitted_inner(
                 if Instant::now() >= deadline {
                     let message = format!("{label}{TIMEOUT_MARKER}{}s", timeout.as_secs_f64());
                     // Reap before reading the rest of the pipes: a live child
-                    // can hold them open, and the prefix is whatever was
-                    // already printed, not a reason to wait out the grace.
-                    guard.stop_and_reap(&mut child, Duration::ZERO).ok();
+                    // can hold them open. The ask comes first so git can
+                    // release `.git/index.lock`; a child that ignores it is
+                    // killed after [`CHILD_GRACE`], which a child that exits
+                    // sooner does not wait out.
+                    guard.ask_then_stop_and_reap(&mut child).ok();
                     break Halt::Deadline(message);
                 }
                 #[cfg(unix)]
@@ -3721,11 +4034,7 @@ fn git_run_inner(
                 );
                 continue;
             }
-            if diagnosis.len() > MAX_FAILURE_MESSAGE_BYTES {
-                let cut = truncate_utf8_bytes(diagnosis, MAX_FAILURE_MESSAGE_BYTES);
-                return Err(format!("{cut}… (git {} output truncated)", sub));
-            }
-            return Err(diagnosis.to_owned());
+            return Err(clamp_failure_message(diagnosis, sub));
         }
         return Err(format!(
             "git {} failed with status {}",
@@ -3781,16 +4090,38 @@ fn incomplete_is_failure(sub: &str, reason: Incomplete) -> String {
 /// drags megabytes into an error string.
 const MAX_FAILURE_MESSAGE_BYTES: usize = 2_000;
 
-/// Truncates `s` to at most `max_bytes` on a UTF-8 character boundary.
-fn truncate_utf8_bytes(s: &str, max_bytes: usize) -> &str {
-    if s.len() <= max_bytes {
-        return s;
+/// Share of [`MAX_FAILURE_MESSAGE_BYTES`] given to the head of a clamped
+/// failure; the tail gets the rest. A hook or command opens with routine
+/// chatter and *ends* with the reason it failed.
+const FAILURE_HEAD_SHARE_PERCENT: usize = 35;
+
+/// Bounds a failure diagnosis to [`MAX_FAILURE_MESSAGE_BYTES`], keeping both
+/// ends on UTF-8 boundaries and announcing what was dropped.
+///
+/// Head-only truncation kept the wrong half: a pre-push hook running CI
+/// printed its command banners and test-runner warnings first, so the 2 KB
+/// head held only those and the failing check at the end was discarded.
+/// The frontend's `clampMessage` keeps both ends for the same reason.
+fn clamp_failure_message(diagnosis: &str, sub: &str) -> String {
+    if diagnosis.len() <= MAX_FAILURE_MESSAGE_BYTES {
+        return diagnosis.to_owned();
     }
-    let mut cut = max_bytes;
-    while cut > 0 && !s.is_char_boundary(cut) {
-        cut -= 1;
+    let head_budget = MAX_FAILURE_MESSAGE_BYTES * FAILURE_HEAD_SHARE_PERCENT / 100;
+    let tail_budget = MAX_FAILURE_MESSAGE_BYTES - head_budget;
+    let mut head_end = head_budget;
+    while !diagnosis.is_char_boundary(head_end) {
+        head_end -= 1;
     }
-    &s[..cut]
+    let mut tail_start = diagnosis.len() - tail_budget;
+    while !diagnosis.is_char_boundary(tail_start) {
+        tail_start += 1;
+    }
+    format!(
+        "{}\n… {} bytes elided (git {sub} output truncated) …\n{}",
+        &diagnosis[..head_end],
+        tail_start - head_end,
+        &diagnosis[tail_start..],
+    )
 }
 
 #[cfg(test)]
@@ -4026,7 +4357,8 @@ mod tests {
         let shed = with_background_processes(|| gate.acquire_until(far(), &|| false).err());
         assert_eq!(shed, Some(Refusal::Shed));
         assert!(
-            began.elapsed() < std::time::Duration::from_millis(500),
+            began.elapsed()
+                < crate::test_support::coverage_relaxed(std::time::Duration::from_millis(500)),
             "shedding must not wait out the budget: {:?}",
             began.elapsed()
         );
@@ -4283,7 +4615,8 @@ mod tests {
             slowest = slowest.max(waited);
         }
         assert!(
-            started.elapsed() < std::time::Duration::from_secs(4),
+            started.elapsed()
+                < crate::test_support::coverage_relaxed(std::time::Duration::from_secs(4)),
             "join took {:?}; a refused spawn must not sit until the 90s git deadline",
             started.elapsed()
         );
@@ -4309,7 +4642,9 @@ mod tests {
             let gate = Arc::clone(&gate);
             let admitted = Arc::clone(&admitted);
             threads.push(std::thread::spawn(move || {
-                while started.elapsed() < std::time::Duration::from_millis(500) {
+                while started.elapsed()
+                    < crate::test_support::coverage_relaxed(std::time::Duration::from_millis(500))
+                {
                     if let Some(permit) = gate
                         .acquire(std::time::Instant::now() + std::time::Duration::from_millis(15))
                     {
@@ -4322,11 +4657,19 @@ mod tests {
         for thread in threads {
             thread.join().unwrap();
         }
+        // The cap is a rate, so it is measured against the window that actually
+        // ran: coverage_relaxed stretches the 500 ms window tenfold under
+        // instrumentation, and a bound fixed for 500 ms then fails on refills
+        // the gate was right to grant. Windows up to a second keep the bound the
+        // fixed version had (a second of refill plus 4 of slack); an uncapped
+        // gate admits hundreds in the same window.
+        let window = started.elapsed().as_secs_f64();
         let n = admitted.load(Ordering::Relaxed);
+        let cap = 8 + (4.0 * window.max(1.0)).ceil() as u32 + 4;
         assert!(n >= 8, "burst was not issued: {n}");
         assert!(
-            n <= 8 + 4 + 4,
-            "concurrent storm admitted {n}; cap is burst 8 plus 4/s"
+            n <= cap,
+            "concurrent storm admitted {n} in {window:.2}s; cap is burst 8 plus 4/s = {cap}"
         );
     }
 
@@ -4472,6 +4815,32 @@ mod tests {
         );
         assert!(error.contains("output truncated"));
     }
+
+    /// End to end: a failing command whose cause is its last line keeps that
+    /// line in the error, however much it printed before it.
+    #[cfg(unix)]
+    #[test]
+    fn failure_diagnosis_keeps_the_last_line_of_long_output() {
+        let dir = crate::test_support::git_repo();
+        let error = git_run_capped(
+            Some(dir.path()),
+            &[
+                "-c",
+                "alias.noisy=!yes chatter | head -n 2000 >&2; echo 'error: failed to push some refs' >&2; exit 1",
+                "noisy",
+            ],
+            Duration::from_secs(5),
+            None,
+            1024,
+        )
+        .unwrap_err();
+        assert!(error.starts_with("chatter"), "{error}");
+        assert!(
+            error.ends_with("error: failed to push some refs"),
+            "failing tail dropped: …{}",
+            &error[error.len().saturating_sub(120)..]
+        );
+    }
     #[test]
     #[cfg(unix)]
     fn audit_capture_refuses_incomplete_stderr() {
@@ -4485,22 +4854,76 @@ mod tests {
         assert!(result.is_err(), "capture erased stderr completeness");
     }
     #[cfg(unix)]
+    const RETRYING_ALIAS: &str =
+        "alias.retry=!echo attempt >> attempts; sleep 0.08; echo 'cannot lock ref' >&2; exit 1";
+
+    /// Where the total budget runs out between two lock retries decides which
+    /// seam reports it: the top of the loop returns an error, a child killed
+    /// in flight returns its prefix tagged [`Incomplete::Deadline`]. Which one
+    /// happens depends on the backoff (pid-derived) and on scheduling, so a
+    /// capped caller must accept either, and a caller that needs the whole
+    /// stream must get an error from both.
+    #[cfg(unix)]
     #[test]
     fn audit_lock_retries_share_one_total_deadline() {
         let dir = crate::test_support::git_repo();
         let started = Instant::now();
-        let error = git_run_capped(Some(dir.path()), &[
-            "-c", "alias.retry=!echo attempt >> attempts; sleep 0.08; echo 'cannot lock ref' >&2; exit 1", "retry"
-        ], Duration::from_millis(150), None, 1024).unwrap_err();
+        let capped = git_run_capped(
+            Some(dir.path()),
+            &["-c", RETRYING_ALIAS, "retry"],
+            Duration::from_millis(150),
+            None,
+            1024,
+        );
+        let whole = git_timeout(
+            Some(dir.path()),
+            &["-c", RETRYING_ALIAS, "retry"],
+            Duration::from_millis(150),
+            None,
+        );
+        // Two sequential runs of one 150 ms budget each.
         assert!(
-            started.elapsed() < Duration::from_millis(500),
+            started.elapsed() < crate::test_support::coverage_relaxed(Duration::from_millis(1000)),
             "retries renewed the timeout: {:?}",
             started.elapsed()
         );
+        match capped {
+            Err(error) => assert!(error.contains("timed out"), "{error}"),
+            Ok((_, Some(Incomplete::Deadline { message, .. }))) => {
+                assert!(message.contains("timed out"), "{message}")
+            }
+            other => panic!("a deadline must never look like success: {other:?}"),
+        }
+        let error = whole.expect_err("a caller that needs the whole stream cannot accept a prefix");
         assert!(
             error.contains("timed out"),
             "deadline expiry must be explicit: {error}"
         );
+    }
+
+    /// The in-flight half, deterministically: no lock error, so the budget can
+    /// only run out inside the child.
+    #[cfg(unix)]
+    #[test]
+    fn audit_a_deadline_in_flight_is_a_tagged_prefix_for_capped_callers() {
+        let dir = crate::test_support::git_repo();
+        let args = ["-c", "alias.slow=!sleep 5", "slow"];
+        let capped = git_run_capped(
+            Some(dir.path()),
+            &args,
+            Duration::from_millis(100),
+            None,
+            1024,
+        )
+        .expect("a killed child is a tagged prefix, not an error");
+        assert!(
+            matches!(capped.1, Some(Incomplete::Deadline { .. })),
+            "{:?}",
+            capped.1
+        );
+        let error = git_timeout(Some(dir.path()), &args, Duration::from_millis(100), None)
+            .expect_err("whole-stream callers fail a deadline");
+        assert!(error.contains("timed out"), "{error}");
     }
 
     #[cfg(unix)]
@@ -4566,7 +4989,7 @@ mod tests {
             Some(&vec![b'x'; 1024 * 1024]),
         );
         assert!(
-            started.elapsed() < Duration::from_secs(2),
+            started.elapsed() < crate::test_support::coverage_relaxed(Duration::from_secs(2)),
             "stdin join outlived the child: {:?}",
             started.elapsed()
         );
@@ -4916,6 +5339,7 @@ mod tests {
             &[],
             Some(std::ffi::OsStr::new("")),
             None,
+            PathSource::Inherited,
         );
         match classify_tool_probe("gitpulse-no-such-tool-7f3a", missing) {
             ToolProbe::NotFound(error) => {
@@ -5281,7 +5705,7 @@ mod tests {
             ),
         }
         assert!(
-            started.elapsed() < Duration::from_secs(10),
+            started.elapsed() < crate::test_support::coverage_relaxed(Duration::from_secs(10)),
             "bounded run should finish promptly once pipes drain"
         );
     }
@@ -5322,6 +5746,74 @@ mod tests {
             Path::new(&resolved),
             &tool,
             "bare name must resolve through the fallback dir on an empty PATH"
+        );
+    }
+
+    /// An explicit PATH is the whole search path: the same tool in the same
+    /// fallback dir stays unresolved, and the child is handed that PATH
+    /// without the fallback dirs, so neither the spawn nor anything the child
+    /// re-resolves can reach past it.
+    #[cfg(unix)]
+    #[test]
+    fn an_explicit_path_is_not_widened_by_fallback_dirs() {
+        let home = tempfile::TempDir::new().unwrap();
+        let bin = home.path().join(".local/bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let tool = bin.join("gitpulse-fake-tool");
+        std::fs::write(&tool, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&tool, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .unwrap();
+
+        assert_eq!(
+            resolve_spawn_program_in(
+                "gitpulse-fake-tool",
+                Some(std::ffi::OsStr::new("/usr/bin:/bin")),
+                Some(home.path().as_os_str()),
+                PathSource::Explicit,
+            ),
+            "gitpulse-fake-tool",
+            "a tool outside the explicit PATH must not resolve"
+        );
+
+        let cmd = build_capture_command_in(
+            "gitpulse-fake-tool",
+            &[],
+            None,
+            &[],
+            Some(std::ffi::OsStr::new("/usr/bin::/bin")),
+            Some(home.path().as_os_str()),
+            PathSource::Explicit,
+        );
+        assert_eq!(
+            cmd.get_program(),
+            std::ffi::OsStr::new("gitpulse-fake-tool")
+        );
+        let child_path: Vec<Option<std::ffi::OsString>> = cmd
+            .get_envs()
+            .filter(|(key, _)| *key == std::ffi::OsStr::new("PATH"))
+            .map(|(_, value)| value.map(std::ffi::OsStr::to_os_string))
+            .collect();
+        assert_eq!(
+            child_path,
+            vec![Some(std::ffi::OsString::from("/usr/bin:/bin"))],
+            "the child gets the explicit PATH, empty entries dropped, nothing appended"
+        );
+
+        // No explicit value at all is not "inherit the process PATH".
+        let unset = build_capture_command_in(
+            "sh",
+            &[],
+            None,
+            &[],
+            None,
+            Some(home.path().as_os_str()),
+            PathSource::Explicit,
+        );
+        assert!(
+            unset
+                .get_envs()
+                .any(|(key, value)| key == std::ffi::OsStr::new("PATH") && value.is_none()),
+            "an explicit unset PATH must be removed from the child"
         );
     }
 
@@ -5510,16 +6002,17 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn git_launch_preserves_relative_path_resolution_and_unset_path_defaults() {
-        // Relative PATH entries have child-cwd semantics; let the OS retain
-        // those semantics rather than silently bypassing a user-selected git.
+    fn git_launch_drops_relative_path_entries_and_unset_path_defaults() {
+        // A relative PATH entry has child-cwd semantics, and the child's cwd
+        // is the repository: it is dropped rather than honoured, so git is
+        // resolved from the absolute entries and never from inside the repo.
         let cmd = git_command_with_env(
             None,
             &["status"],
             Some(std::ffi::OsStr::new("relative:/usr/bin")),
             None,
         );
-        assert_eq!(cmd.get_program(), "git");
+        assert!(Path::new(cmd.get_program()).is_absolute());
         let cmd = git_command_with_env(None, &["status"], None, None);
         assert!(Path::new(cmd.get_program()).is_absolute());
     }
@@ -5828,6 +6321,26 @@ mod tests {
             [Path::new("/usr/bin"), Path::new("/bin")],
             "unset PATH must seed the Unix default search set"
         );
+    }
+
+    /// A relative entry resolves against the child's cwd, which is the repo.
+    #[cfg(unix)]
+    #[test]
+    fn extended_child_path_drops_relative_entries() {
+        let home = tempfile::TempDir::new().unwrap();
+        let hostile = extended_child_path(
+            Some(std::ffi::OsStr::new(
+                "./node_modules/.bin:.:bin:/usr/local/bin:../x:node_modules/.bin",
+            )),
+            Some(home.path().as_os_str()),
+        )
+        .expect("join");
+        let entries: Vec<PathBuf> = std::env::split_paths(&hostile).collect();
+        assert!(
+            entries.iter().all(|e| e.is_absolute()),
+            "relative PATH entries must be dropped: {entries:?}"
+        );
+        assert_eq!(entries.first(), Some(&PathBuf::from("/usr/local/bin")));
     }
 
     /// The extended child PATH appends only the fallback dirs that are not
@@ -6367,6 +6880,38 @@ mod tests {
         );
     }
 
+    /// The text form of [`canonicalize_plain`], for the paths the command gate
+    /// and `git worktree add` receive already spelled: a canonicalized checkout
+    /// joined with a lane directory.
+    #[cfg(windows)]
+    #[test]
+    fn plain_path_text_drops_the_verbatim_prefix_git_cannot_use() {
+        assert_eq!(
+            plain_path_text(r"\\?\C:\Users\runneradmin\repo\.gitpulse\worktrees\lane"),
+            r"C:\Users\runneradmin\repo\.gitpulse\worktrees\lane"
+        );
+        assert_eq!(
+            plain_path_text(r"\\?\UNC\server\share\repo"),
+            r"\\server\share\repo"
+        );
+        // No ordinary spelling exists: unchanged rather than invented.
+        assert_eq!(
+            plain_path_text(r"\\?\Volume{0123}\repo"),
+            r"\\?\Volume{0123}\repo"
+        );
+        assert_eq!(plain_path_text(r"C:\already\plain"), r"C:\already\plain");
+    }
+
+    /// Off Windows a backslash is a filename character and `\\?\` means
+    /// nothing, so every spelling is left exactly as given.
+    #[cfg(not(windows))]
+    #[test]
+    fn plain_path_text_is_the_identity_off_windows() {
+        for path in [r"\\?\C:\repo\wt", "/tmp/repo/wt", r"/tmp/odd\name", ""] {
+            assert_eq!(plain_path_text(path), path);
+        }
+    }
+
     /// Off Windows there is nothing to strip, and a backslash is an ordinary
     /// filename character -- rewriting one would rename the file.
     #[cfg(not(windows))]
@@ -6455,6 +7000,137 @@ mod tests {
         }
     }
 
+    /// The environment of every git child, from either builder. `gh` and the
+    /// other captured tools shell out to git, so they must see the same locale,
+    /// credential, lock and redirect settings git itself is given — the capture
+    /// builder used to set only a third of them.
+    fn git_environment_of(cmd: &Command) -> std::collections::HashMap<String, Option<String>> {
+        cmd.get_envs()
+            .map(|(k, v)| {
+                (
+                    k.to_string_lossy().into_owned(),
+                    v.map(|v| v.to_string_lossy().into_owned()),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn both_builders_pin_the_same_git_environment() {
+        let git = git_environment_of(&git_command(Some(Path::new("/tmp")), &["status"]));
+        let capture = git_environment_of(&build_capture_command_in(
+            "gh",
+            &["--version"],
+            None,
+            &[],
+            None,
+            None,
+            PathSource::Inherited,
+        ));
+        for key in [
+            "LC_ALL",
+            "GCM_INTERACTIVE",
+            "GIT_OPTIONAL_LOCKS",
+            "GIT_TERMINAL_PROMPT",
+            "GIT_EDITOR",
+            "GIT_SEQUENCE_EDITOR",
+        ] {
+            assert!(
+                git.get(key).is_some_and(Option::is_some),
+                "git_command sets {key}"
+            );
+            assert_eq!(
+                capture.get(key),
+                git.get(key),
+                "the capture builder's {key}"
+            );
+        }
+        assert_eq!(git["LC_ALL"].as_deref(), Some("C"));
+        for key in [
+            "GIT_DIR",
+            "GIT_WORK_TREE",
+            "GIT_INDEX_FILE",
+            "GIT_COMMON_DIR",
+            "GIT_CONFIG_PARAMETERS",
+            "GIT_SHALLOW_FILE",
+            "GIT_ATTR_SOURCE",
+            "GIT_LITERAL_PATHSPECS",
+            "GIT_GLOB_PATHSPECS",
+            "GIT_NOGLOB_PATHSPECS",
+            "GIT_ICASE_PATHSPECS",
+            "GIT_SSH",
+            "GIT_SSH_COMMAND",
+            "GIT_PROXY_COMMAND",
+            "GIT_DIFF_OPTS",
+        ] {
+            assert_eq!(git.get(key), Some(&None), "git_command must remove {key}");
+            assert_eq!(
+                capture.get(key),
+                Some(&None),
+                "the capture builder must remove {key}"
+            );
+        }
+    }
+
+    /// Tracing floods stderr, of which only a few bytes are kept: the fatal
+    /// line is the one that goes missing. Every `GIT_TRACE*` switch is removed
+    /// by name or by prefix, including ones this build has never heard of.
+    #[test]
+    fn every_git_trace_switch_is_stripped() {
+        let name = "GIT_TRACE2_EVENT_NESTING_FROM_THE_FUTURE";
+        assert!(is_injected_git_env(name));
+        for name in [
+            "GIT_TRACE",
+            "GIT_TRACE_PACKET",
+            "GIT_TRACE2",
+            "git_trace_setup",
+        ] {
+            assert!(is_injected_git_env(name), "{name}");
+        }
+        assert!(
+            !is_injected_git_env("GIT_AUTHOR_NAME"),
+            "identity is not redirection"
+        );
+    }
+
+    /// A developer's `log.showSignature`, colour and diff-prefix settings change
+    /// what the parsers read, so each rides every invocation; and a patch
+    /// command never hands the diff to `diff.external`.
+    #[test]
+    fn git_command_pins_output_format_config_and_skips_the_external_diff() {
+        let argv = |args: &[&str]| -> Vec<String> {
+            git_command(Some(Path::new("/tmp")), args)
+                .get_args()
+                .map(|a| a.to_string_lossy().into_owned())
+                .collect()
+        };
+        let log = argv(&["log", "-n1", "--format=%H"]);
+        for pin in [
+            "log.showSignature=false",
+            "color.ui=never",
+            "diff.noprefix=false",
+            "diff.mnemonicPrefix=false",
+        ] {
+            assert!(
+                log.windows(2).any(|pair| pair[0] == "-c" && pair[1] == pin),
+                "missing -c {pin} in {log:?}"
+            );
+        }
+        for patch in ["diff", "show", "log"] {
+            let args = argv(&[patch, "HEAD"]);
+            let at = args.iter().position(|a| a == patch).expect("subcommand");
+            assert_eq!(args[at + 1], "--no-ext-diff", "{patch}: {args:?}");
+            assert_eq!(args[at + 2], "HEAD", "{patch}: {args:?}");
+        }
+        // A global option with a value before the subcommand does not hide it,
+        // and a command that prints no patch is left alone.
+        let notes = argv(&["-c", "x.y=z", "notes", "show", "HEAD"]);
+        assert!(!notes.iter().any(|a| a == "--no-ext-diff"), "{notes:?}");
+        let global = argv(&["-C", "/tmp", "diff", "--cached"]);
+        let at = global.iter().position(|a| a == "diff").unwrap();
+        assert_eq!(global[at + 1], "--no-ext-diff", "{global:?}");
+    }
+
     /// The editor variables are PINNED rather than removed, and the difference
     /// is a security property, not a style choice.
     ///
@@ -6530,7 +7206,7 @@ mod tests {
         };
         assert!(err.contains("timed out"), "got: {err}");
         assert!(
-            started.elapsed() < Duration::from_secs(10),
+            started.elapsed() < crate::test_support::coverage_relaxed(Duration::from_secs(10)),
             "kill must be prompt, took {:?}",
             started.elapsed()
         );
@@ -6607,7 +7283,7 @@ mod tests {
         .expect("bytes written before the deadline are the result");
         drop(kept);
         assert!(
-            started.elapsed() < Duration::from_secs(5),
+            started.elapsed() < crate::test_support::coverage_relaxed(Duration::from_secs(5)),
             "kill must be prompt, took {:?}",
             started.elapsed()
         );
@@ -6732,7 +7408,8 @@ mod tests {
                 )
                 .expect("prefix");
                 assert!(
-                    started.elapsed() < Duration::from_secs(5),
+                    started.elapsed()
+                        < crate::test_support::coverage_relaxed(Duration::from_secs(5)),
                     "reader {index} took {:?}",
                     started.elapsed()
                 );
@@ -6780,16 +7457,17 @@ mod tests {
             "GIT_EXTERNAL_DIFF",
             "GIT_SEQUENCE_EDITOR",
             "GIT_EXEC_PATH",
+            // Tracing floods the few bytes of stderr that are kept, and the
+            // fatal line is the one that goes missing.
+            "GIT_TRACE",
+            "GIT_SSH",
+            "GIT_PROXY_COMMAND",
+            "GIT_DIFF_OPTS",
+            "GIT_LITERAL_PATHSPECS",
         ] {
             assert!(is_injected_git_env(name), "{name} must be stripped");
         }
-        for safe in [
-            "GIT_AUTHOR_NAME",
-            "GIT_PAGER",
-            "EDITOR",
-            "PATH",
-            "GIT_TRACE",
-        ] {
+        for safe in ["GIT_AUTHOR_NAME", "GIT_PAGER", "EDITOR", "PATH"] {
             assert!(!is_injected_git_env(safe), "{safe} must survive");
         }
     }
@@ -6986,7 +7664,7 @@ mod tests {
         let err = run_bounded(cmd, "sh", Duration::from_secs(1), None).expect_err("timeout");
         assert!(err.contains("timed out"), "got: {err}");
         assert!(
-            started.elapsed() < Duration::from_secs(15),
+            started.elapsed() < crate::test_support::coverage_relaxed(Duration::from_secs(15)),
             "timeout handling must stay bounded (one shared grace window), took {:?}",
             started.elapsed()
         );
@@ -7590,7 +8268,7 @@ mod tests {
             }
         }
         assert!(
-            started.elapsed() < Duration::from_secs(10),
+            started.elapsed() < crate::test_support::coverage_relaxed(Duration::from_secs(10)),
             "refusals sat until the command deadline: {:?}",
             started.elapsed()
         );
@@ -8059,12 +8737,41 @@ mod tests {
     }
 
     #[test]
-    fn truncate_utf8_bytes_cuts_on_a_character_boundary() {
-        let s = "éééé"; // each é is 2 bytes
-        assert_eq!(truncate_utf8_bytes(s, 100), s);
-        assert_eq!(truncate_utf8_bytes(s, 3).len(), 2);
-        assert!(truncate_utf8_bytes(s, 3).is_char_boundary(truncate_utf8_bytes(s, 3).len()));
-        assert!(!truncate_utf8_bytes(s, 3).contains('\u{FFFD}'));
+    fn clamp_failure_message_cuts_on_character_boundaries() {
+        let short = "éééé"; // each é is 2 bytes
+        assert_eq!(clamp_failure_message(short, "push"), short);
+        // Odd budgets land mid-character at both cut points.
+        let long = format!("x{}", "é".repeat(MAX_FAILURE_MESSAGE_BYTES));
+        let clamped = clamp_failure_message(&long, "push");
+        assert!(!clamped.contains('\u{FFFD}'));
+        assert!(clamped.len() < MAX_FAILURE_MESSAGE_BYTES + 100);
+        assert!(clamped.contains("bytes elided (git push output truncated)"));
+    }
+
+    /// A pre-push hook prints its banners and warnings first and the failing
+    /// check last; the clamp must keep the last line, not only the first.
+    #[test]
+    fn clamp_failure_message_keeps_the_failing_tail() {
+        let chatter = "stderr | Received `false` for a non-boolean attribute\n".repeat(200);
+        let diagnosis =
+            format!("$ node scripts/local-ci.js\n{chatter}FAIL src/a.test.ts > breaks\nerror: failed to push some refs");
+        let clamped = clamp_failure_message(&diagnosis, "push");
+        assert!(clamped.starts_with("$ node scripts/local-ci.js"));
+        assert!(clamped.ends_with("FAIL src/a.test.ts > breaks\nerror: failed to push some refs"));
+        let elided: usize = clamped
+            .split("… ")
+            .nth(1)
+            .and_then(|rest| rest.split(' ').next())
+            .and_then(|n| n.parse().ok())
+            .expect("elision notice names a byte count");
+        let kept = clamped.len()
+            - clamped
+                .lines()
+                .find(|l| l.contains("elided"))
+                .unwrap()
+                .len()
+            - 2;
+        assert_eq!(kept + elided, diagnosis.len());
     }
 
     fn init_plain_git_repo(dir: &Path) {
@@ -8141,7 +8848,7 @@ mod tests {
                 .unwrap_err()
                 .contains("timed out")
         );
-        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(started.elapsed() < crate::test_support::coverage_relaxed(Duration::from_secs(2)));
     }
 
     #[test]
@@ -8172,7 +8879,7 @@ mod tests {
         assert!(out.cancelled && !out.success);
         assert_eq!(out.stdout, b"progress");
         assert_eq!(observer.0, b"progress");
-        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(started.elapsed() < crate::test_support::coverage_relaxed(Duration::from_secs(2)));
     }
 }
 
@@ -8180,10 +8887,33 @@ mod tests {
 #[cfg(test)]
 mod admission_scope_tests {
     use super::*;
+    #[cfg(unix)]
     use crate::procguard::LockedSpawn;
 
     fn leak(gate: SpawnGate) -> &'static SpawnGate {
         Box::leak(Box::new(gate))
+    }
+
+    /// A gate whose bucket cannot refill during the test. The rate is real
+    /// time, so on a loaded machine the second between two spawns that a test
+    /// calls "budget spent" arrives, a token lands, and the spawn it expected
+    /// to be refused is admitted. Putting the bucket's clock in the future
+    /// makes elapsed time zero for as long as the test runs.
+    fn frozen(gate: SpawnGate) -> &'static SpawnGate {
+        let gate = leak(gate);
+        gate.state.lock().unwrap().tokens_at = Some(Instant::now() + Duration::from_secs(86_400));
+        gate
+    }
+
+    /// Keeps `repo`'s post-action credit open for the test: its window is real
+    /// time too, and thirty-two real process spawns do not fit in three
+    /// seconds on a busy machine. The window's own expiry is pinned by
+    /// `a_credit_expires_with_its_window`, against explicit instants.
+    #[cfg(unix)]
+    fn hold_credit_open(repo: &Path) {
+        let mut credits = post_action_credits().lock().unwrap();
+        credits.get_mut(repo).expect("a credit was granted").until =
+            Instant::now() + Duration::from_secs(86_400);
     }
 
     fn shared_gate(path: &Path, burst: u32, rate: u32) -> &'static SpawnGate {
@@ -8253,6 +8983,58 @@ mod admission_scope_tests {
             shared.take(0, 3, 1),
             shared_budget::Take::Denied,
             "the click took no shared token"
+        );
+    }
+
+    /// The shared record's file lock can sleep-poll for a few milliseconds and
+    /// a denial writes the file. With the gate mutex held across that, every
+    /// other acquire, a user's click included, queued behind a background
+    /// re-poll.
+    #[test]
+    fn a_user_action_does_not_queue_behind_the_shared_budget_io() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("budget");
+        let gate = shared_gate(&path, 100_000, 100_000);
+        // Another process pinning the record: every shared take now waits out
+        // the whole lock patience before falling back.
+        let holder = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        holder.lock().unwrap();
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let pollers: Vec<_> = (0..3)
+            .map(|_| {
+                let stop = std::sync::Arc::clone(&stop);
+                std::thread::spawn(move || {
+                    while !stop.load(Ordering::Relaxed) {
+                        let _ = gate.acquire(Instant::now() + Duration::from_millis(200));
+                    }
+                })
+            })
+            .collect();
+        std::thread::sleep(Duration::from_millis(30));
+        let mut fastest = Duration::MAX;
+        for _ in 0..20 {
+            let started = Instant::now();
+            let clicked = with_admission(Admission::Interactive, || {
+                gate.acquire_until(Instant::now() + Duration::from_millis(500), &|| false)
+                    .map(|_| ())
+            });
+            fastest = fastest.min(started.elapsed());
+            assert_eq!(clicked, Ok(()));
+            std::thread::sleep(Duration::from_millis(3));
+        }
+        stop.store(true, Ordering::Relaxed);
+        for poller in pollers {
+            poller.join().unwrap();
+        }
+        holder.unlock().unwrap();
+        assert!(
+            fastest < Duration::from_millis(5),
+            "every user action waited behind shared-budget IO: fastest was {fastest:?}"
         );
     }
 
@@ -8382,8 +9164,8 @@ mod admission_scope_tests {
         let repo = dir.path().canonicalize().unwrap();
         let other = tempfile::tempdir().unwrap();
         let other = other.path().canonicalize().unwrap();
-        // One token, a refill too slow to matter inside this test.
-        let gate = leak(SpawnGate::with_rate(16, 1, 1));
+        // One token, and no refill at all inside this test.
+        let gate = frozen(SpawnGate::with_rate(16, 1, 1));
         reactive_spawn_in(gate, &repo).expect("the one token");
         let starved = reactive_spawn_in(gate, &repo).unwrap_err();
         assert!(
@@ -8400,19 +9182,18 @@ mod admission_scope_tests {
         let read: Result<(), String> = run_command_scope(|| Ok(()));
         read.unwrap();
         assert!(reactive_spawn_in(gate, &other).is_err());
-        let started = Instant::now();
+        hold_credit_open(&repo);
         for i in 0..POST_ACTION_CREDIT_SPAWNS {
             reactive_spawn_in(gate, &repo)
                 .unwrap_or_else(|e| panic!("credited spawn {i} refused: {e}"));
         }
-        // Spent: what is admitted now is only the 1/s refill, not more credit.
+        // Spent, and the bucket cannot refill: nothing more is admitted.
         let extra = (0..6)
             .take_while(|_| reactive_spawn_in(gate, &repo).is_ok())
             .count();
-        let refill = started.elapsed().as_secs() as usize + 1;
-        assert!(
-            extra <= refill,
-            "{extra} spawns past the {POST_ACTION_CREDIT_SPAWNS}-spawn credit (refill allows {refill})"
+        assert_eq!(
+            extra, 0,
+            "{extra} spawns past the {POST_ACTION_CREDIT_SPAWNS}-spawn credit"
         );
     }
 
@@ -8424,14 +9205,36 @@ mod admission_scope_tests {
     fn a_tab_activation_admits_its_hydrate_when_the_budget_is_spent() {
         let dir = crate::test_support::git_repo();
         let repo = dir.path().canonicalize().unwrap();
-        let gate = leak(SpawnGate::with_rate(16, 1, 1));
+        let gate = frozen(SpawnGate::with_rate(16, 1, 1));
         reactive_spawn_in(gate, &repo).expect("the one token");
         assert!(reactive_spawn_in(gate, &repo).is_err(), "budget spent");
 
         note_tab_activated(repo.to_str().unwrap()).expect("activation");
+        hold_credit_open(&repo);
         for i in 0..POST_ACTION_CREDIT_SPAWNS {
             reactive_spawn_in(gate, &repo)
                 .unwrap_or_else(|e| panic!("activation read {i} refused: {e}"));
+        }
+    }
+
+    /// What the two credit tests rely on: a frozen bucket takes no token from
+    /// the passing of time, however long a loaded machine makes a test, while
+    /// an ordinary one does.
+    #[test]
+    fn a_frozen_bucket_does_not_refill_and_an_ordinary_one_does() {
+        let later = Instant::now() + Duration::from_secs(30);
+        for (gate, refilled) in [
+            (frozen(SpawnGate::with_rate(16, 4, 1)), false),
+            (leak(SpawnGate::with_rate(16, 4, 1)), true),
+        ] {
+            let mut state = gate.state.lock().unwrap();
+            state.tokens = 0;
+            if refilled {
+                // An ordinary gate starts its clock at its first look.
+                state.tokens_at = Some(Instant::now());
+            }
+            gate.refill(&mut state, later);
+            assert_eq!(state.tokens > 0, refilled, "tokens {}", state.tokens);
         }
     }
 

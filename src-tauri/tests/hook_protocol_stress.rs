@@ -17,6 +17,11 @@
 //! is why the harness failure modes below stand up deliberately broken `manvi`
 //! executables rather than mocking a verdict.
 
+// The hermetic test environment: a per-process home, git config and trust
+// store, rewritten before `main`. See `src/test_support/env.rs`.
+#[path = "../src/test_support/env.rs"]
+mod hermetic_env;
+
 use gitpulse_lib::procguard::LockedSpawn;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -280,6 +285,153 @@ fn concurrent_hooks_each_answer_completely_and_none_interleave() {
     }
 }
 
+/// Names the repository [`persistent_grant_child`] approves.
+#[cfg(unix)]
+const GRANT_CHILD_ENV: &str = "GITPULSE_HOOK_STRESS_GRANT_REPO";
+
+/// Not a test on its own: with [`GRANT_CHILD_ENV`] set, approves that
+/// repository persistently under this process's `HOME`. A session grant lives
+/// only in the process that made it, and the hooks are other processes; the
+/// parent runs this with a private `HOME` so the developer's own trust store
+/// is never written.
+#[cfg(unix)]
+#[test]
+fn persistent_grant_child() {
+    let Ok(repo) = std::env::var(GRANT_CHILD_ENV) else {
+        return;
+    };
+    let preview = gitpulse_lib::repository_trust::inspect(&repo).expect("inspect");
+    gitpulse_lib::repository_trust::grant(&repo, &preview.identity, true).expect("persist");
+}
+
+/// Sixty-four agent Bash calls at once against an initialised ledger the app
+/// is writing to while they run.
+///
+/// Each hook reads the checkout's task binding through a read-only WAL
+/// connection, and a read-only WAL connection still maps `-shm` — the class
+/// behind the earlier failure, where sixteen concurrent hooks reading one
+/// ledger died of SIGBUS twelve to fourteen at a time. A signal exit fails
+/// [`assert_protocol`]. The checkout is bound to a task whose store does not
+/// exist, so every hook that really read the binding refuses with
+/// `task.scope_unavailable`: the assertion that each answer says so is what
+/// proves all sixty-four reached the ledger rather than stopping short of it.
+#[cfg(unix)]
+#[test]
+fn sixty_four_concurrent_hooks_read_a_live_ledger() {
+    use gitpulse_lib::ledger::{self, ActorKind, Draft, Outcome};
+    use std::os::unix::fs::PermissionsExt;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo_buf = dir.path().canonicalize().expect("canonical repo");
+    let repo = repo_buf.to_str().expect("utf8").to_string();
+    let git = |args: &[&str]| {
+        let status = Command::new("git")
+            .args([
+                "-c",
+                "user.name=GitPulse",
+                "-c",
+                "user.email=gitpulse@test.local",
+                "-c",
+                "commit.gpgsign=false",
+            ])
+            .args(args)
+            .current_dir(&repo_buf)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status_locked()
+            .expect("spawn git");
+        assert!(status.success(), "git {args:?}");
+    };
+    git(&["init", "-q", "-b", "main"]);
+    git(&["commit", "-q", "--allow-empty", "-m", "seed"]);
+    // Trusted here for `bind`, and persistently — in a private `HOME`, not
+    // the developer's trust store — for the hook processes.
+    let preview = gitpulse_lib::repository_trust::inspect(&repo).expect("inspect");
+    gitpulse_lib::repository_trust::grant(&repo, &preview.identity, false).expect("trust");
+    let home = dir.path().join("home");
+    std::fs::create_dir_all(&home).expect("mkdir home");
+    let granted = Command::new(std::env::current_exe().expect("test binary"))
+        .args(["--exact", "persistent_grant_child", "--test-threads=1"])
+        .env(GRANT_CHILD_ENV, &repo)
+        .env("HOME", &home)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status_locked()
+        .expect("spawn grant child");
+    assert!(granted.success(), "the grant child failed");
+    ledger::bindings::bind(&repo, &repo, "TASK-STRESS").expect("bind");
+
+    let db = ledger::ledger_path(&repo);
+    std::fs::set_permissions(&db, std::fs::Permissions::from_mode(0o644)).expect("chmod");
+
+    // The app, writing while the hooks read: its connection keeps the WAL and
+    // its index live for the whole run.
+    let stop = Arc::new(AtomicBool::new(false));
+    let writer = {
+        let (stop, repo) = (Arc::clone(&stop), repo.clone());
+        std::thread::spawn(move || {
+            let mut rows = 0u32;
+            while !stop.load(Ordering::Relaxed) {
+                ledger::append(Draft {
+                    repo_path: repo.clone(),
+                    action: "git.commit".into(),
+                    actor_kind: Some(ActorKind::Human),
+                    outcome: Some(Outcome::Ok),
+                    ..Default::default()
+                })
+                .expect("app append during the hooks");
+                rows += 1;
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            rows
+        })
+    };
+
+    let payload = serde_json::json!({
+        "hook_event_name": "PreToolUse",
+        "cwd": repo,
+        "tool_name": "Bash",
+        "tool_input": {"command": "ls"},
+    })
+    .to_string();
+    let workers: Vec<_> = (0..64)
+        .map(|i| {
+            let payload = payload.clone();
+            let home = home.clone();
+            std::thread::spawn(move || {
+                (
+                    i,
+                    ask("command-gate", payload.as_bytes(), &[("HOME", &home)]),
+                )
+            })
+        })
+        .collect();
+    let answers: Vec<_> = workers
+        .into_iter()
+        .map(|worker| worker.join().expect("hook thread"))
+        .collect();
+    stop.store(true, Ordering::Relaxed);
+    let rows = writer.join().expect("writer thread");
+    assert!(rows > 0, "the app never wrote while the hooks ran");
+
+    for (i, answer) in answers {
+        let label = format!("live-ledger hook #{i}");
+        let value = assert_protocol(&label, &answer)
+            .unwrap_or_else(|| panic!("{label}: a bound checkout's call was answered silently"));
+        assert!(
+            value.to_string().contains("task.scope_unavailable"),
+            "{label}: did not read the binding from the ledger: {value}"
+        );
+    }
+    let mode = std::fs::metadata(&db).expect("ledger").permissions().mode() & 0o777;
+    assert_eq!(
+        mode, 0o644,
+        "a hook secured (chmodded) the ledger it only reads"
+    );
+}
+
 /// Write an executable stand-in for `manvi` into a fresh directory.
 ///
 /// Gated with its only caller. The body already branches on `cfg!(windows)` for
@@ -421,7 +573,7 @@ fn the_identity_flag_cannot_be_reached_by_a_hook_payload() {
         "identity output parses as hook JSON, so a host could read it as a decision"
     );
     assert!(
-        answer.elapsed < Duration::from_secs(10),
+        answer.elapsed < hermetic_env::coverage_relaxed(Duration::from_secs(10)),
         "identity waited on stdin it does not read"
     );
 }

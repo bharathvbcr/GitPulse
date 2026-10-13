@@ -5,24 +5,28 @@ import { createSessionRegistry } from "./sessionRegistry";
 import type { PtySessionHandlers } from "./ptyBus";
 import { DEFAULT_TERMINAL_SESSIONS } from "./sessionLimit";
 
+type Slot = ReturnType<ReturnType<typeof createSessionRegistry>["reserve"]>;
+
 function deferred<T>() { let resolve!: (value: T) => void; const promise = new Promise<T>((r) => { resolve = r; }); return { promise, resolve }; }
 const flush = async () => { for (let i = 0; i < 30; i++) await Promise.resolve(); };
-function fixture(overrides: Partial<SessionTransport> = {}, registry = createSessionRegistry(), key = "tab-a", singleAttempt = false) {
+type LifecycleExtras = Pick<Parameters<typeof createSessionLifecycle>[0], "idle" | "keep" | "launcher">;
+function fixture(overrides: Partial<SessionTransport> = {}, registry = createSessionRegistry(), key = "tab-a", singleAttempt = false, extras: LifecycleExtras = {}) {
   let handlers: PtySessionHandlers | null = null;
   const readyRelease = vi.fn(), unsubscribe = vi.fn();
   const prepare = vi.fn<() => Promise<() => void>>(async () => readyRelease);
   const transport = {
     spawn: vi.fn(overrides.spawn ?? (async () => ({ id: "native-a", shell: "/bin/sh", cwd: "/repo" }))),
     write: vi.fn(overrides.write ?? (async () => {})), resize: vi.fn(overrides.resize ?? (async () => {})), kill: vi.fn(overrides.kill ?? (async () => {})),
+    detach: vi.fn(overrides.detach ?? (async () => true)),
   };
   const hooks = { state: vi.fn(), started: vi.fn(), output: vi.fn(), exit: vi.fn(), reset: vi.fn(), warning: vi.fn() };
-  const owner = createSessionLifecycle({ key, repoPath: "/repo", label: "Shell", registry, transport, hooks, singleAttempt,
+  const owner = createSessionLifecycle({ key, repoPath: "/repo", label: "Shell", registry, transport, hooks, singleAttempt, ...extras,
     bus: { prepare, pendingCount: () => 0, subscribe(_id, h) { handlers = h; return unsubscribe; } },
   });
   return { owner, hooks, registry, transport, prepare, readyRelease, unsubscribe, output: (s: string, reserved?: number) => {
     if (typeof reserved === "number") handlers?.onOutput(s, reserved);
     else handlers?.onOutput(s);
-  }, error: (message: string) => handlers?.onError?.(message), exit: () => handlers?.onExit({ id: "native-a", exit_code: 0, signal: "", error: null, reaped: true }) };
+  }, error: (message: string) => handlers?.onError?.(message), notice: (message: string) => handlers?.onNotice?.(message), exit: () => handlers?.onExit({ id: "native-a", exit_code: 0, signal: "", error: null, reaped: true }) };
 }
 
 describe("the session record", () => {
@@ -30,7 +34,7 @@ describe("the session record", () => {
     // The label is display text ("Claude"); the kind is what a chip and any
     // other surface decide on, and it was not on the record at all.
     const registry = createSessionRegistry();
-    const transport = { spawn: vi.fn(async () => ({ id: "native-l", shell: "/bin/sh", cwd: "/repo" })), write: vi.fn(async () => {}), resize: vi.fn(async () => {}), kill: vi.fn(async () => {}) };
+    const transport = { spawn: vi.fn(async () => ({ id: "native-l", shell: "/bin/sh", cwd: "/repo" })), write: vi.fn(async () => {}), resize: vi.fn(async () => {}), kill: vi.fn(async () => {}), detach: vi.fn(async () => true) };
     const hooks = { state: vi.fn(), started: vi.fn(), output: vi.fn(), exit: vi.fn(), reset: vi.fn(), warning: vi.fn() };
     const owner = createSessionLifecycle({ key: "tab-l", repoPath: "/repo", label: "Claude", launcher: "claude", registry, transport, hooks,
       bus: { prepare: async () => () => {}, pendingCount: () => 0, subscribe: () => () => {} },
@@ -182,7 +186,7 @@ describe("terminal lifecycle races", () => {
     const f = fixture(); await f.owner.start();
     expect(f.prepare.mock.invocationCallOrder[0]).toBeLessThan(f.transport.spawn.mock.invocationCallOrder[0]);
     expect(f.readyRelease).toHaveBeenCalledTimes(1);
-    f.owner.dispose(); await flush();
+    await f.owner.close(); f.owner.dispose(); await flush();
     expect(get(f.registry)).toHaveLength(0);
     expect(f.unsubscribe).toHaveBeenCalledTimes(1);
   });
@@ -228,14 +232,22 @@ describe("terminal lifecycle races", () => {
       f.owner.dispose(); await flush();
     } finally { vi.useRealTimers(); }
   });
-  it("reclaims a spawn that completes after disposal without rendering or journaling it", async () => {
+  it("keeps a spawn that completes after disposal, without rendering or journaling it", async () => {
+    // It used to be killed. A task tab whose pane remounted mid-launch lost
+    // the agent it had just started; the process now goes to Sessions.
     const pending = deferred<{ id: string; shell: string; cwd: string }>();
-    const f = fixture({ spawn: () => pending.promise }); const started = f.owner.start();
+    const registry = createSessionRegistry();
+    const keep = vi.fn(async (id: string) => (slot: Slot) => {
+      slot.handOver({ key: `detached:${id}`, repoPath: "/repo", label: "Shell", status: "kept", sessionId: id, close: async () => {} });
+    });
+    const f = fixture({ spawn: () => pending.promise }, registry, "tab-a", false, { keep });
+    const started = f.owner.start();
     await flush(); f.owner.dispose(); pending.resolve({ id: "late", shell: "sh", cwd: "/repo" });
     await started; await flush();
-    expect(f.transport.kill).toHaveBeenCalledWith("late");
+    expect(f.transport.kill).not.toHaveBeenCalled();
+    expect(f.transport.detach).toHaveBeenCalledWith("late");
     expect(f.hooks.started).not.toHaveBeenCalled();
-    expect(get(f.registry)).toHaveLength(0);
+    expect(get(registry).map((r) => r.key)).toEqual(["detached:late"]);
   });
   it("does not spawn after disposal while listener preparation is pending", async () => {
     const pending = deferred<() => void>(), f = fixture();
@@ -249,10 +261,12 @@ describe("terminal lifecycle races", () => {
     await f.owner.start(); await f.owner.restart();
     expect(f.transport.spawn).toHaveBeenCalledTimes(1);
     expect(get(f.registry)).toHaveLength(1);
-    f.owner.dispose(); await flush();
+    await expect(f.owner.close()).rejects.toThrow("native unavailable");
     expect(get(f.registry)[0].status).toContain("Close failed");
     kill.mockResolvedValueOnce(undefined); await get(f.registry)[0].close();
     expect(get(f.registry)).toHaveLength(0);
+    f.owner.dispose(); await flush();
+    expect(f.transport.detach).not.toHaveBeenCalled();
   });
   it("deduplicates rapid restarts and waits for kill before spawn", async () => {
     const pending = deferred<void>(), kill = vi.fn(() => pending.promise), f = fixture({ kill });
@@ -277,34 +291,41 @@ describe("terminal lifecycle races", () => {
     expect(f.hooks.output).toHaveBeenLastCalledWith("Qg==", "native-a");
     f.owner.dispose(); await flush();
   });
-  it("kills a session whose output credit cannot be measured and keeps the error", async () => {
+  it("reports output whose credit cannot be measured as lost, and keeps the process", async () => {
     const f = fixture();
     await f.owner.start();
-    await f.owner.stop("Invalid terminal output");
-    expect(f.transport.kill).toHaveBeenCalledWith("native-a");
+    f.owner.fail("Invalid terminal output", true);
+    expect(f.transport.kill).not.toHaveBeenCalled();
     expect(f.hooks.state).toHaveBeenLastCalledWith("error", expect.stringContaining("Invalid"));
-    expect(f.owner.write("after-stop")).toBe(false);
-    f.owner.dispose(); await flush();
+    expect(f.owner.isCurrent("native-a")).toBe(true);
+    await f.owner.close(); f.owner.dispose(); await flush();
   });
   it("keeps delivering output after dispose until the process is released", async () => {
-    // Native reserve() already counted these bytes. Dropping them here leaves
-    // the reader blocked until the stall timeout kills the child, because
-    // kill's flow.stop() has not run yet. The view acks; this layer must not
+    // Native reserve() already counted these bytes, and the host has not
+    // detached the session yet. Dropping them here would leave the reader
+    // waiting until the stall timeout. The view acks; this layer must not
     // swallow the chunk. After release, the session is gone and a late chunk
     // is not a credit the reader is still waiting on.
-    const pending = deferred<void>();
-    const f = fixture({ kill: () => pending.promise });
+    const pending = deferred<boolean>();
+    const f = fixture({ detach: () => pending.promise });
     await f.owner.start();
     f.owner.dispose();
+    await flush();
     f.output("still-reserved");
     expect(f.hooks.output).toHaveBeenCalledWith("still-reserved", "native-a");
     for (let i = 0; i < 1000; i++) f.output(`c${i}`);
     expect(f.hooks.output).toHaveBeenCalledTimes(1001);
-    pending.resolve();
+    // The session ended while detaching: nothing is kept, and its exit
+    // (still delivered here) is what releases it.
+    pending.resolve(false);
     await flush();
+    expect(get(f.registry)).toHaveLength(1);
+    f.exit();
+    expect(get(f.registry)).toHaveLength(0);
     f.hooks.output.mockClear();
     f.output("after-release");
     expect(f.hooks.output).not.toHaveBeenCalled();
+    expect(f.transport.kill).not.toHaveBeenCalled();
   });
   it("coalesces 10000 resize requests, preserving the final size", async () => {
     const pending = deferred<void>(), resize = vi.fn(() => pending.promise), f = fixture({ resize });
@@ -323,7 +344,8 @@ describe("terminal lifecycle races", () => {
     await Promise.all(sessions.map((f) => f.owner.start()));
     expect(get(registry)).toHaveLength(DEFAULT_TERMINAL_SESSIONS);
     expect(sessions.reduce((n, f) => n + f.transport.spawn.mock.calls.length, 0)).toBe(DEFAULT_TERMINAL_SESSIONS);
-    for (const f of sessions) f.owner.dispose(); await flush(); expect(get(registry)).toHaveLength(0);
+    await Promise.all(sessions.map((f) => f.owner.close())); for (const f of sessions) f.owner.dispose();
+    await flush(); expect(get(registry)).toHaveLength(0);
   });
 });
 
@@ -341,7 +363,7 @@ it("waits for the old renderer to drain before starting a replacement", async ()
 describe("a hosted session's record", () => {
   it("keeps the host as repoPath and carries the checkout it runs in", async () => {
     const registry = createSessionRegistry();
-    const transport = { spawn: vi.fn(async () => ({ id: "native-h", shell: "claude", cwd: "/repo/.gitpulse/worktrees/a" })), write: vi.fn(async () => {}), resize: vi.fn(async () => {}), kill: vi.fn(async () => {}) };
+    const transport = { spawn: vi.fn(async () => ({ id: "native-h", shell: "claude", cwd: "/repo/.gitpulse/worktrees/a" })), write: vi.fn(async () => {}), resize: vi.fn(async () => {}), kill: vi.fn(async () => {}), detach: vi.fn(async () => true) };
     const owner = createSessionLifecycle({ key: "tab-h", repoPath: "/repo", checkout: "/repo/.gitpulse/worktrees/a", label: "Claude", registry, transport,
       hooks: { state: vi.fn(), started: vi.fn(), output: vi.fn(), exit: vi.fn(), reset: vi.fn(), warning: vi.fn() },
       bus: { prepare: async () => () => {}, pendingCount: () => 0, subscribe: () => () => {} },
@@ -354,7 +376,7 @@ describe("a hosted session's record", () => {
 
 describe("admission to a session slot", () => {
   function owner(registry: ReturnType<typeof createSessionRegistry>, key: string, hooks: { admitted?: () => void; refused?: (m: string) => boolean }) {
-    const transport = { spawn: vi.fn(async () => ({ id: `native-${key}`, shell: "/bin/sh", cwd: "/repo" })), write: vi.fn(async () => {}), resize: vi.fn(async () => {}), kill: vi.fn(async () => {}) };
+    const transport = { spawn: vi.fn(async () => ({ id: `native-${key}`, shell: "/bin/sh", cwd: "/repo" })), write: vi.fn(async () => {}), resize: vi.fn(async () => {}), kill: vi.fn(async () => {}), detach: vi.fn(async () => true) };
     const state = vi.fn();
     const lifecycle = createSessionLifecycle({ key, repoPath: "/repo", label: "Claude", registry, transport,
       hooks: { state, started: vi.fn(), output: vi.fn(), exit: vi.fn(), reset: vi.fn(), warning: vi.fn(), ...hooks },
@@ -399,5 +421,186 @@ describe("admission to a session slot", () => {
       late.lifecycle.dispose(); await flush();
     }
     for (const slot of held) slot.release();
+  });
+});
+
+/**
+ * The reported defect: an agent's tab unmounting for any reason other than
+ * Close — its repository tab closed, its pane crashed, the dock re-hosted —
+ * killed the agent, and its work was lost.
+ */
+describe("a view that goes away without Close", () => {
+  function keeper() {
+    const adopted: string[] = [];
+    const keep = vi.fn(async (id: string) => (slot: Slot) => {
+      slot.handOver({ key: `detached:${id}`, repoPath: "/repo", label: "Claude", status: "Still running", sessionId: id, close: async () => {} });
+      adopted.push(id);
+    });
+    return { keep, adopted };
+  }
+
+  it("detaches a running agent and hands its slot to Sessions; it is never killed", async () => {
+    const registry = createSessionRegistry();
+    const { keep, adopted } = keeper();
+    const f = fixture({}, registry, "tab-a", false, { keep, launcher: "claude" });
+    await f.owner.start();
+    // The slot must never be observably free during the hand-over: another
+    // tab could take it, and the adopted record would then be refused.
+    const sizes: number[] = [];
+    const stop = registry.subscribe((records) => sizes.push(records.length));
+    f.owner.dispose(); await flush();
+    stop();
+    expect(f.transport.kill).not.toHaveBeenCalled();
+    expect(f.transport.detach).toHaveBeenCalledWith("native-a");
+    expect(adopted).toEqual(["native-a"]);
+    expect(get(registry).map((r) => r.key)).toEqual(["detached:native-a"]);
+    expect(Math.min(...sizes)).toBe(1);
+    expect(f.unsubscribe).toHaveBeenCalledTimes(1);
+  });
+
+  it("ends a plain shell positively idle at its prompt, so empty shells do not pile up", async () => {
+    const registry = createSessionRegistry();
+    const { keep } = keeper();
+    const idle = vi.fn(async () => true);
+    const f = fixture({}, registry, "tab-a", false, { keep, idle });
+    await f.owner.start();
+    f.owner.dispose(); await flush();
+    expect(idle).toHaveBeenCalledWith("native-a");
+    expect(f.transport.kill).toHaveBeenCalledWith("native-a");
+    expect(f.transport.detach).not.toHaveBeenCalled();
+    expect(get(registry)).toHaveLength(0);
+  });
+
+  it("keeps the process when idleness cannot be read: unknown is not idle", async () => {
+    for (const idle of [vi.fn(async () => { throw new Error("context failed"); }), vi.fn(() => new Promise<boolean>(() => {}))]) {
+      vi.useFakeTimers();
+      try {
+        const registry = createSessionRegistry();
+        const { keep } = keeper();
+        const f = fixture({}, registry, "tab-a", false, { keep, idle });
+        await f.owner.start();
+        f.owner.dispose();
+        await vi.advanceTimersByTimeAsync(2000); await flush();
+        expect(f.transport.kill).not.toHaveBeenCalled();
+        expect(f.transport.detach).toHaveBeenCalledWith("native-a");
+        expect(get(registry).map((r) => r.key)).toEqual(["detached:native-a"]);
+      } finally { vi.useRealTimers(); }
+    }
+  });
+
+  it("keeps ownership, and says so, when the host cannot detach", async () => {
+    const registry = createSessionRegistry();
+    const { keep, adopted } = keeper();
+    const f = fixture({ detach: async () => { throw new Error("host busy"); } }, registry, "tab-a", false, { keep });
+    await f.owner.start();
+    f.owner.dispose(); await flush();
+    expect(f.transport.kill).not.toHaveBeenCalled();
+    expect(adopted).toEqual([]);
+    expect(get(registry)).toHaveLength(1);
+    expect(get(registry)[0].status).toContain("could not be detached");
+    // Still stoppable from Sessions.
+    await get(registry)[0].close();
+    expect(f.transport.kill).toHaveBeenCalledWith("native-a");
+    expect(get(registry)).toHaveLength(0);
+  });
+
+  it("stays the owner when there is nothing to hand over to", async () => {
+    for (const keep of [undefined, vi.fn(async () => null), vi.fn(async () => { throw new Error("list failed"); })]) {
+      const registry = createSessionRegistry();
+      const f = fixture({}, registry, "tab-a", false, keep ? { keep } : {});
+      await f.owner.start();
+      f.owner.dispose(); await flush();
+      expect(f.transport.kill).not.toHaveBeenCalled();
+      expect(get(registry)).toHaveLength(1);
+      expect(get(registry)[0].status).toContain("Still running");
+      f.exit();
+      expect(get(registry)).toHaveLength(0);
+    }
+  });
+
+  it("still hears the exit of a process spawned after its view went away, when nothing took it over", async () => {
+    const pending = deferred<{ id: string; shell: string; cwd: string }>();
+    const registry = createSessionRegistry();
+    const f = fixture({ spawn: () => pending.promise }, registry, "tab-a", false, { keep: async () => null });
+    const started = f.owner.start();
+    await flush(); f.owner.dispose(); pending.resolve({ id: "native-a", shell: "sh", cwd: "/repo" });
+    await started; await flush();
+    expect(f.transport.kill).not.toHaveBeenCalled();
+    expect(f.hooks.started).not.toHaveBeenCalled();
+    expect(get(registry)[0].status).toContain("Still running");
+    f.exit();
+    expect(get(registry)).toHaveLength(0);
+  });
+
+  it("adopts nothing when the process exits while it is being detached", async () => {
+    const registry = createSessionRegistry();
+    const { keep, adopted } = keeper();
+    const pending = deferred<boolean>();
+    const f = fixture({ detach: () => pending.promise }, registry, "tab-a", false, { keep });
+    await f.owner.start();
+    f.owner.dispose(); await flush();
+    f.exit();
+    pending.resolve(true); await flush();
+    expect(adopted).toEqual([]);
+    expect(get(registry)).toHaveLength(0);
+    expect(f.transport.kill).not.toHaveBeenCalled();
+  });
+
+  it("lets a Close already under way finish rather than detach behind it", async () => {
+    const registry = createSessionRegistry();
+    const { keep, adopted } = keeper();
+    const pending = deferred<void>();
+    const f = fixture({ kill: () => pending.promise }, registry, "tab-a", false, { keep });
+    await f.owner.start();
+    const closing = f.owner.close();
+    f.owner.dispose(); await flush();
+    pending.resolve(); await closing; await flush();
+    expect(f.transport.detach).not.toHaveBeenCalled();
+    expect(adopted).toEqual([]);
+    expect(get(registry)).toHaveLength(0);
+  });
+
+  it("an explicit Close still ends the process", async () => {
+    const f = fixture();
+    await f.owner.start();
+    await f.owner.close();
+    expect(f.transport.kill).toHaveBeenCalledWith("native-a");
+    expect(get(f.registry)).toHaveLength(0);
+    f.owner.dispose(); await flush();
+    expect(f.transport.detach).not.toHaveBeenCalled();
+  });
+
+  it("shows skipped output as a warning; the session keeps its running status", async () => {
+    const f = fixture();
+    await f.owner.start();
+    f.hooks.state.mockClear();
+    const skipped = vi.fn();
+    (f.hooks as { skipped?: () => void }).skipped = skipped;
+    f.notice("Terminal output was skipped while this window was not keeping up");
+    expect(skipped).toHaveBeenCalledTimes(1);
+    expect(f.hooks.warning).toHaveBeenCalledWith(expect.stringContaining("skipped"));
+    expect(f.hooks.state).not.toHaveBeenCalled();
+    expect(get(f.registry)[0].status).toBe("running");
+    await f.owner.close(); f.owner.dispose(); await flush();
+  });
+
+  it("survives a storm: every tab at the session limit disposed at once, none killed, no slot leaked", async () => {
+    const registry = createSessionRegistry();
+    const { keep, adopted } = keeper();
+    const tabs = Array.from({ length: DEFAULT_TERMINAL_SESSIONS }, (_, i) =>
+      fixture({ spawn: async () => ({ id: `native-${i}`, shell: "/bin/sh", cwd: "/repo" }) }, registry, `t${i}`, false, { keep, launcher: "claude" }));
+    await Promise.all(tabs.map((t) => t.owner.start()));
+    expect(get(registry)).toHaveLength(DEFAULT_TERMINAL_SESSIONS);
+    // A new tab racing the hand-overs must be refused: no slot is ever free.
+    const racer = fixture({}, registry, "racer");
+    for (const t of tabs) t.owner.dispose();
+    const raced = racer.owner.start();
+    await flush(); await raced;
+    expect(racer.transport.spawn).not.toHaveBeenCalled();
+    expect(tabs.every((t) => t.transport.kill.mock.calls.length === 0)).toBe(true);
+    expect(adopted).toHaveLength(DEFAULT_TERMINAL_SESSIONS);
+    expect(get(registry)).toHaveLength(DEFAULT_TERMINAL_SESSIONS);
+    expect(get(registry).every((r) => r.key.startsWith("detached:"))).toBe(true);
+    racer.owner.dispose(); await flush();
   });
 });

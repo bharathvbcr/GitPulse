@@ -159,9 +159,10 @@
    * language. `null` means "use the regex tokenizer" — either no grammar, or
    * the IPC call failed / is still in flight. Never treat an empty array as
    * "highlighted": that would paint a tree-sitter language as plain text
-   * while the request is outstanding.
+   * while the request is outstanding. Raw: a whole-document token table,
+   * only ever replaced, never edited in place.
    */
-  let treeSitterLines = $state<SyntaxToken[][] | null>(null);
+  let treeSitterLines = $state.raw<SyntaxToken[][] | null>(null);
   let treeSitterGuard: ReturnType<typeof createAsyncGuard> | null = null;
 
   $effect(() => {
@@ -169,7 +170,10 @@
     const text = isEditing ? editDraft : content;
     treeSitterGuard?.cancel();
     treeSitterLines = null;
-    if (!usesTreeSitter(lang) || isEditing) return;
+    // A file past the render cap is drawn only up to the cap, so a
+    // whole-document pass would tokenize lines nobody can scroll to.
+    // `highlightDocument` itself refuses anything over the backend's 1 MiB.
+    if (!usesTreeSitter(lang) || isEditing || linesTruncated) return;
     const guard = createAsyncGuard();
     treeSitterGuard = guard;
     void highlightDocument(lang, text).then((lines) => {

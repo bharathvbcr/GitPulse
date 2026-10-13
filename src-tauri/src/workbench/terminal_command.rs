@@ -48,12 +48,15 @@ impl BriefFile {
             std::process::id(),
             FILE_SEQUENCE.fetch_add(1, Ordering::Relaxed)
         ));
-        let mut builder = std::fs::DirBuilder::new();
         #[cfg(unix)]
-        {
+        let builder = {
             use std::os::unix::fs::DirBuilderExt;
+            let mut builder = std::fs::DirBuilder::new();
             builder.mode(0o700);
-        }
+            builder
+        };
+        #[cfg(not(unix))]
+        let builder = std::fs::DirBuilder::new();
         // Not recursive: an existing directory at this name is refused rather
         // than adopted, so a planted one cannot become the agent's grant.
         builder
@@ -456,10 +459,17 @@ pub(crate) fn launch_model_choice(
     Ok(Some(choice))
 }
 
+/// The longest value the store records for one model field on a run — the
+/// vendored store's `runs.rs` refuses more — with `fallback` counted joined,
+/// as it is stored. Above any real id; a plain terminal tab records nothing
+/// and is held only to [`MAX_MODEL_ID_LEN`] per name.
+pub(crate) const MAX_RECORDED_MODEL_FIELD: usize = 128;
+
 /// A [`ModelChoice`] as the store records it on a run (`model_choice`): one
 /// string per field, `fallback` joined by commas — a model name never holds
-/// one ([`validate_model_id`]).
-pub(crate) fn model_choice_record(choice: &ModelChoice) -> serde_json::Value {
+/// one ([`validate_model_id`]). A field longer than the store records is
+/// refused here, by name, before a launch prepares anything for it.
+pub(crate) fn model_choice_record(choice: &ModelChoice) -> Result<serde_json::Value, String> {
     let mut record = serde_json::Map::new();
     for (field, value) in [
         ("model", choice.model.clone()),
@@ -471,10 +481,16 @@ pub(crate) fn model_choice_record(choice: &ModelChoice) -> serde_json::Value {
         ("advisor", choice.advisor.clone()),
     ] {
         if let Some(value) = value {
+            if value.len() > MAX_RECORDED_MODEL_FIELD {
+                return Err(format!(
+                    "The {field} setting is {} bytes as a task attempt records it; an attempt records at most {MAX_RECORDED_MODEL_FIELD}.",
+                    value.len()
+                ));
+            }
             record.insert(field.into(), serde_json::Value::String(value));
         }
     }
-    serde_json::Value::Object(record)
+    Ok(serde_json::Value::Object(record))
 }
 
 /// The run's recorded choice back as a [`ModelChoice`]; `None` for a run that
@@ -707,22 +723,29 @@ pub(super) fn check(
     mode: &str,
     options: &LaunchOptions<'_>,
 ) -> Result<(), WorkbenchError> {
-    let version = capture_command(
-        program,
-        &["--version"],
-        Some(Path::new(cwd)),
-        Duration::from_secs(8),
-        &[],
-    )
-    .map_err(|e| error("capability_error", e))?;
-    let help = capture_command(
-        program,
-        &["--help"],
-        Some(Path::new(cwd)),
-        Duration::from_secs(8),
-        &[],
-    )
-    .map_err(|e| error("capability_error", e))?;
+    // `--version` and `--help` describe the binary, not the repository or the
+    // launch, and used to run serially before every agent launch. They are
+    // kept per binary (path, size, mtime), so an upgrade is seen at once.
+    static PROBES: crate::tool_capability::BinaryProbeCache<
+        Result<(CapturedOutput, CapturedOutput), String>,
+    > = crate::tool_capability::BinaryProbeCache::new();
+    let probed = PROBES.get_or_probe(program, || {
+        let probe = |arg: &str| {
+            capture_command(
+                program,
+                &[arg],
+                Some(Path::new(cwd)),
+                Duration::from_secs(8),
+                &[],
+            )
+        };
+        let outcome = probe("--version").and_then(|v| probe("--help").map(|h| (v, h)));
+        // A refusal or a failed run may pass on the next try; only a binary
+        // that answered both is remembered.
+        let cacheable = outcome.as_ref().is_ok_and(|(v, h)| v.success && h.success);
+        (outcome, cacheable)
+    });
+    let (version, help) = probed.map_err(|e| error("capability_error", e))?;
     advertises(provider, mode, options, &version, &help)
 }
 
@@ -1029,6 +1052,20 @@ fn policy(provider: &str, mode: &str) -> Result<(Vec<&'static str>, bool), Workb
         }
     };
     Ok((flags, mode == "inspect"))
+}
+
+/// The environment half of the launch table: what every PTY launch carries
+/// beside [`policy`]'s flags, by name, with `None` meaning "remove it".
+///
+/// `GITPULSE_RUN_ID` is the task attempt's run id, and absent from every
+/// other terminal — removed rather than left alone, because a GitPulse that
+/// was itself started inside an attempt (a dev build run from an agent's
+/// terminal) would otherwise hand that outer run's id to every shell tab, and
+/// each would be counted as part of a run it has nothing to do with. Every
+/// descendant inherits the value, which is how the host-load scan attributes a
+/// child that launchd adopted to the run that started it.
+pub(crate) fn launch_env(run_id: Option<&str>) -> [(&'static str, Option<String>); 1] {
+    [(crate::sysload::RUN_ID_ENV, run_id.map(str::to_owned))]
 }
 
 /// What a launched agent is told about finishing. How to work is not said
@@ -1594,7 +1631,10 @@ mod tests {
         assert_eq!(separator, args.len() - 2, "{args:?}");
         assert!(args.iter().position(|a| a == "--add-dir").unwrap() < separator);
         assert!(args.iter().position(|a| a == "--settings").unwrap() < separator);
-        assert!(args[separator + 1].contains(&*brief.path.to_string_lossy()));
+        // The prompt carries the path as a JSON string, so a Windows path's
+        // backslashes are doubled there.
+        let quoted = serde_json::to_string(&*brief.path.to_string_lossy()).unwrap();
+        assert!(args[separator + 1].contains(&quoted), "{args:?}");
 
         // An id Claude would refuse is left out, never reshaped into one.
         for id in ["run", "6F1C2A7E0D4B4C1E9A553B0E8F2D9C11", "../../run", ""] {
@@ -1936,6 +1976,39 @@ mod tests {
         );
         assert_eq!(removed, 0);
         assert!(live.path.exists());
+    }
+
+    /// `--version` and `--help` ran serially before every agent launch. They
+    /// describe the binary, so they run once per binary (path, size, mtime).
+    #[cfg(unix)]
+    #[test]
+    fn an_agent_clis_version_and_help_are_probed_once_per_binary() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("claude");
+        let write = |tag: &str| {
+            std::fs::write(
+                &bin,
+                format!("#!/bin/sh\ncase \"$1\" in --version) echo 'Claude Code {tag}';; *) echo 'usage';; esac\n"),
+            )
+            .unwrap();
+            std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        };
+        write("1.0");
+        let program = bin.to_str().unwrap();
+        let cwd = dir.path().to_str().unwrap();
+        let spawns = |program: &str| {
+            let (_, labels) = crate::engine::git_cli::spawn_labels_during(|| {
+                // The verdict is not the point (the fake advertises no flags);
+                // how many children were started to reach it is.
+                let _ = super::check(program, cwd, "claude", "ask", &opts(true, None));
+            });
+            labels.len()
+        };
+        assert_eq!(spawns(program), 2, "first launch: --version and --help");
+        assert_eq!(spawns(program), 0, "second launch reuses the answer");
+        write("2.0.1-longer");
+        assert_eq!(spawns(program), 2, "an upgraded binary is probed again");
     }
 
     #[test]
@@ -2947,7 +3020,10 @@ mod model_tests {
 
 #[cfg(test)]
 mod launch_choice_tests {
-    use super::{launch_model_choice, model_choice_from_record, model_choice_record};
+    use super::{
+        launch_model_choice, model_choice_from_record, model_choice_record,
+        MAX_RECORDED_MODEL_FIELD,
+    };
     use crate::tool_config::ModelChoice;
     use serde_json::json;
 
@@ -3006,7 +3082,7 @@ mod launch_choice_tests {
             advisor: Some("opus".into()),
             ..choice(Some("opus[1m]"), Some("high"))
         };
-        let record = model_choice_record(&original);
+        let record = model_choice_record(&original).unwrap();
         assert_eq!(
             record,
             json!({"model":"opus[1m]","effort":"high","fallback":"sonnet,haiku","advisor":"opus"})
@@ -3015,5 +3091,26 @@ mod launch_choice_tests {
         assert_eq!(model_choice_from_record(&json!(null)).unwrap(), None);
         assert!(model_choice_from_record(&json!({"temperature":"1"})).is_err());
         assert!(model_choice_from_record(&json!({"model":7})).is_err());
+    }
+
+    /// The store refuses a recorded field over 128 bytes; the record says so
+    /// first, naming the field, and counts `fallback` the way it is stored.
+    #[test]
+    fn the_record_refuses_a_field_the_store_would() {
+        let at_cap = "m".repeat(MAX_RECORDED_MODEL_FIELD);
+        assert!(model_choice_record(&choice(Some(&at_cap), None)).is_ok());
+        let over = "m".repeat(MAX_RECORDED_MODEL_FIELD + 1);
+        let refused = model_choice_record(&choice(Some(&over), None)).unwrap_err();
+        assert!(
+            refused.contains("model") && refused.contains("128"),
+            "{refused}"
+        );
+        let half = "f".repeat(MAX_RECORDED_MODEL_FIELD / 2);
+        let joined = ModelChoice {
+            fallback: Some(vec![half.clone(), half]),
+            ..ModelChoice::default()
+        };
+        let refused = model_choice_record(&joined).unwrap_err();
+        assert!(refused.contains("fallback"), "{refused}");
     }
 }

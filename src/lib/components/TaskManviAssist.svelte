@@ -19,11 +19,12 @@
     type Enhancement,
     type EnhancementConfiguration,
     type EnhancementField,
+    type LockableField,
     type EnhancementMutation,
     type EnhancementSummary,
     type Task,
   } from "../workbench/client";
-  import { acceptEnhancementInput, assistEngineName, draftingKind, draftingVerb, enhancementApplyBlock, enhancementOptionLabel, runAppleEnhancement, startQuickEnhance, DEFAULT_ASSIST_ENGINE, ENHANCEMENT_STATE_LABELS, EnhancementAction, appendedHistory, liveEnhancement, refreshedHistory, type AssistEngine } from "../workbench/taskEnhance";
+  import { acceptEnhancementInput, assistEngineName, draftingKind, draftingVerb, enhancementApplyBlock, enhancementOptionLabel, runAppleEnhancement, startQuickEnhance, DEFAULT_ASSIST_ENGINE, ENHANCEMENT_STATE_LABELS, EnhancementAction, appendedHistory, enhancementMoved, liveEnhancement, refreshedHistory, type AssistEngine } from "../workbench/taskEnhance";
   import { timestampFormat } from "../ui/timestampFormat";
   import {
     appleBadge,
@@ -56,7 +57,7 @@
     description = $bindable(""),
     repositoryIds = [],
     repositoryNames = [],
-    lockedFields = $bindable<EnhancementField[]>([]),
+    lockedFields = $bindable<LockableField[]>([]),
     prepareTask = async (): Promise<Task | null> => task,
     onApplied,
     onBusy,
@@ -86,7 +87,7 @@
      * around. A caller that has no names passes none and the line is omitted.
      */
     repositoryNames?: readonly string[];
-    lockedFields?: EnhancementField[];
+    lockedFields?: LockableField[];
     prepareTask?: () => Promise<Task | null>;
     onApplied: (task: Task) => void;
     onBusy: (busy: boolean) => void;
@@ -369,7 +370,8 @@
   // the one-live-attempt guard stay true while it runs.
   $effect(() => {
     if (!active || !visible || !latestActive || !liveEnhancement(latestActive) || latestActive.id === proposal?.id) return;
-    return createAdaptiveTimer(() => { if (!acting && !editing) void history(); }, 2000);
+    const id = latestActive.id;
+    return createAdaptiveTimer(() => { if (!acting && !editing) void follow(id); }, 2000);
   });
   /**
    * Read the model configuration, sharing one request between callers.
@@ -487,11 +489,30 @@
     try {
       const next = await bounded(getEnhancement(id));
       if (disposed || ticket !== epoch || acting || proposal?.id !== id || next.revision < (proposal?.revision ?? 0)) return;
-      proposal = next;
       error = "";
+      // Nothing moved: keep the object on screen and skip the history read.
+      if (!enhancementMoved(proposal, next)) return;
+      proposal = next;
       if (task) void history();
     } catch (cause) {
       if (!disposed && ticket === epoch) error = `Status refresh failed: ${explainError(cause)}`;
+    } finally { polling = false; }
+  }
+
+  /**
+   * Follows a live attempt the review is not on. One read of that attempt
+   * per tick; the history (two reads) only when it moved.
+   */
+  async function follow(id: string) {
+    if (polling || acting || disposed || !active || readBackgroundDocument()) return;
+    polling = true;
+    try {
+      const next = await bounded(getEnhancement(id));
+      if (disposed || latestActive?.id !== id || !enhancementMoved(latestActive, next)) return;
+      void history();
+    } catch {
+      // Fall back to the read this tick used to make; it reports its own failure.
+      if (!disposed) void history();
     } finally { polling = false; }
   }
 

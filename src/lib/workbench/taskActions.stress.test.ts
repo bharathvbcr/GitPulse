@@ -12,6 +12,7 @@ import { contextMenuAnchor, duplicateTitle, flattenVisibleIds, rangeSelect, task
 import { MAX_TASK_LABELS, nextLabels, TaskBatch } from "./taskActions";
 import { cardMatchesFacet, collectFacetOptions, dueInputValue, dueState, emptyFacet, hiddenTaskDetails, parseDueInput } from "./taskOrganize";
 import type { Task, TaskCard, TaskStatus } from "./client";
+import { wallClockBudget } from "../testing/wallClock";
 
 function card(i: number): TaskCard {
   return {
@@ -101,7 +102,7 @@ describe("adversarial stress", () => {
     };
     const started = performance.now();
     const items = taskMenuItems({ cards: [card(0)], column: "inbox", vocabulary });
-    expect(performance.now() - started).toBeLessThan(120);
+    expect(performance.now() - started).toBeLessThan(wallClockBudget(120));
     expect(items.length).toBeLessThan(80);
     expect(new Set(items.map((item) => item.id)).size).toBe(items.length);
   });

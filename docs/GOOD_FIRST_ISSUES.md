@@ -4,11 +4,13 @@ A staging ground for scoped, self-contained work. Each entry names the files to
 touch, what "done" means, and how to verify it — enough that a contributor can start
 without a design conversation first.
 
-> **Status: every entry above is closed.** A1–A3, B1–B3, C1–C3, and D1–D2 are
-> implemented (B2 investigated and declined), so this file currently reads as a record
-> of completed work rather than an invitation. New entries follow the format in
-> *Proposing an entry* below, and a maintainer files them as GitHub issues with the
-> label set in [`.github/labels.yml`](../.github/labels.yml).
+> **Status: six open entries (E1–E6) below; the lettered sections A–D after them
+> are the closed record.** Each open entry was checked against `main` on
+> 2026-10-11 and cites the line that shows it is still true. Re-check that line
+> before starting: if it no longer holds, the entry is done, so delete it. New
+> entries follow the format in *Proposing an entry* below, and a maintainer files
+> them as GitHub issues with the label set in
+> [`.github/labels.yml`](../.github/labels.yml).
 
 Every entry assumes you have read [CONTRIBUTING.md](../CONTRIBUTING.md) and can get
 `bun run ci:local` green.
@@ -16,6 +18,101 @@ Every entry assumes you have read [CONTRIBUTING.md](../CONTRIBUTING.md) and can 
 **Difficulty:** 🟢 first issue · 🟡 needs orientation · 🔴 needs design discussion
 
 ---
+
+## Open entries
+
+### E1 · `ci:local --only <gate-id>` to rerun one gate 🟢
+**Labels:** `good first issue`, `area: ci`
+
+`scripts/ci-local.mjs` accepts only `--list`, `--help` and `-h`; any other
+argument exits 2 (`main`, the `unknown` check). Rerunning one red gate means
+copying its command out of `--list`. Add `--only <id>` (repeatable) that runs just
+the named gates by their `id` (`gusset-check`, `coverage-floor`, ...) and exits 2
+with the valid ids for an unknown one.
+
+**Done when:** `--only` runs exactly the named gates; an unknown id and `--only`
+with no value both exit 2 and list the ids; `--help` documents the flag; a
+selection that skips the `Coverage floor` gate says so in the summary instead of
+printing a clean result.
+**Verify:** extend `scripts/ci-local.test.ts`, then `bun run test scripts/ci-local.test.ts`.
+
+### E2 · A contract that the README's `ci:local` scope stays true 🟢
+**Labels:** `documentation`, `area: ci`
+
+The README row for `bun run ci:local` lists what it does and does not run. Nothing
+checks it: a gate added to `scripts/ci-local.mjs` (or a CI job added to
+`.github/workflows/`) leaves the row wrong. Add a test beside
+`scripts/documented-counts-contract.test.ts` that reads `GATES` and fails when
+the README names a command no gate runs, or when a workflow job such as
+`bun audit` or `go vet` is claimed as covered by `ci:local`.
+
+**Done when:** the test fails against a README that claims `cargo deny` is
+covered, and passes today.
+**Verify:** `bun run test scripts/documented-counts-contract.test.ts`.
+
+### E3 · Doc `bun run` commands exist in `package.json` 🟢
+**Labels:** `documentation`, `test`
+
+README, CONTRIBUTING and the install guides name dozens of `bun run <script>`
+commands. All of them resolve today (checked 2026-10-11), but no test pins it, so
+a renamed script leaves a dead instruction. Add a contract that extracts every
+`bun run <name>` from the tracked docs and asserts each is a `package.json`
+script.
+
+**Done when:** renaming a script in `package.json` fails the test with the doc and
+line that still names it.
+**Verify:** `bun run test scripts/<new>-contract.test.ts`, and list it in the
+CONTRIBUTING contract table (`documented-counts-contract` fails until you do).
+
+### E4 · Detect one wire shape declared under two names 🟡
+**Labels:** `area: frontend`, `test`
+
+`scripts/wire-type-locality-contract.test.ts` now fails when a wire-shaped type
+name is declared in two frontend files, but it keys on the *name*. The earlier
+`FileBlobPayload` (a byte-identical copy of `FileBlob`) and `CommitDetailsPayload`
+copies would have passed, because the names differ. Compare the snake_case field
+sets of the declarations instead, and fail on identical or near-identical sets
+(subset of three or more fields) in different files.
+
+**Done when:** a fixture with the same fields under two names fails; the current
+tree either passes or the report lists real copies you then fold into the
+canonical module.
+**Verify:** `bun run test scripts/wire-type-locality-contract.test.ts`, then
+`bun run check:types`.
+
+### E5 · Read `agents.live` in the Work view, and show Codex as unknown 🟡
+**Labels:** `area: frontend`, `area: rust-core`
+
+The insights snapshot carries `agents.live` (running Claude Code sessions per
+worktree, with a per-kind `ok`; Codex is reported `ok: false` because it keeps no
+readable registry). The frontend only types it in test fixtures
+(`src/lib/agents/plane.test.ts:47`): `rg 'agents\.live' src` finds no consumer, and
+`WorkView.svelte` derives agent kinds from worktree paths alone
+(`agentKindsOn`, line 206). Show running sessions per worktree, and for a kind
+whose facet is `ok: false` show "unknown", never a zero that reads as none.
+
+**Done when:** a component test with a Claude session and `kinds: [{kind: "codex",
+ok: false}]` shows the session and the unknown Codex state; a snapshot without
+`live` renders as before.
+**Verify:** `bun run test src/lib/agents src/lib/work`, then `bun run check`.
+
+### E6 · Move future performance evidence into the repository 🟡
+**Labels:** `documentation`, `performance`
+
+`docs/PERFORMANCE.md`, `docs/AGENTIC_WORKSPACES_PLAN.md` and
+`docs/NATIVE_NOTIFICATIONS_ADAPTER.md` quote results from run logs that were never
+committed; their file names are now kept only as a record, under a note at the top
+of each. Add a tracked `docs/evidence/` convention (a short README and one worked
+example, such as the spawn benchmark summary in `PERFORMANCE.md`) so the next
+measurement commits a small summary file and links to it.
+
+**Done when:** `docs/evidence/README.md` states the format and size limit, one
+existing claim links to a committed file, and the `/tmp` rejection in
+`scripts/documented-counts-contract.test.ts` still passes.
+**Verify:** `bun run test scripts/documented-counts-contract.test.ts`.
+
+## Closed record
+
 
 ## A. Developer tooling & CLI ergonomics
 

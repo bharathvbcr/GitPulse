@@ -23,6 +23,7 @@ pub use policy::{
 pub use protocol::{
     HelloResult, PrepareResult, ProbeResult, ScanModel, ScanResult, ScanServer, SettleResult,
 };
+pub(crate) use sidecar::Lane;
 pub use sidecar::{HarnessError, DEFAULT_CALL_TIMEOUT};
 
 /// What the UI shows about the harness.
@@ -95,10 +96,14 @@ pub(crate) fn guard_command_allowing(
     allowed: &[String],
 ) -> Result<PolicyVerdict, String> {
     let command = render_command(argv);
+    // Resolved once: the scope this action is judged under and the ledger row
+    // that records the judgement are addressed by the same answer.
+    let address = crate::ledger::bindings::repository_address(repo_path);
     if let Err(refused) = review::gate(repo_path, argv) {
         let action = crate::ledger::action_for_argv(argv);
         record_gate(
             repo_path,
+            address.as_ref().ok(),
             &action,
             &command,
             serde_json::to_string(argv).ok(),
@@ -106,7 +111,7 @@ pub(crate) fn guard_command_allowing(
         );
         return gated(*refused);
     }
-    let verdict = match scope_for(repo_path) {
+    let verdict = match scope_at(&address) {
         Ok(scope) => check_command_allowing(repo_path, &command, scope.as_ref(), allowed),
         Err(failure) if failure.kind == ScopeFailureKind::Missing => {
             return Err(failure.missing_checkout(&command));
@@ -115,20 +120,32 @@ pub(crate) fn guard_command_allowing(
     };
     let action = crate::ledger::action_for_argv(argv);
     let argv_json = serde_json::to_string(argv).ok();
-    record_gate(repo_path, &action, &command, argv_json, &verdict);
+    record_gate(
+        repo_path,
+        address.as_ref().ok(),
+        &action,
+        &command,
+        argv_json,
+        &verdict,
+    );
     gated(verdict)
 }
 
 /// Judges a command line against this checkout's bound task scope, recording
 /// nothing.
 ///
-/// The agent hook's entry to the gate (`hooks::run_command_gate`). It resolves
-/// the scope through the same [`scope_for`] that [`guard_command`] uses, so an
-/// agent's Bash call and GitPulse's own guarded action are measured against one
-/// declaration — including the fail-closed answer when a binding names a task
-/// whose scope cannot be read. It does not write a ledger row: the hook runs on
-/// every Bash call an agent makes, and the gate rows record GitPulse's own
-/// actions, which an agent's shell is not.
+/// The agent hook's entry to the gate (`hooks::run_command_gate`). It turns a
+/// binding into a scope through the same [`scope_from_binding`] that
+/// [`guard_command`] uses, so an agent's Bash call and GitPulse's own guarded
+/// action are measured against one declaration — including the fail-closed
+/// answer when a binding names a task whose scope cannot be read. The binding
+/// itself is read with [`resolve_binding_readonly`], since the hook is a fresh
+/// process per tool call and must not create, secure or migrate the ledger. It
+/// does not write a ledger row: the hook runs on every Bash call an agent
+/// makes, and the gate rows record GitPulse's own actions, which an agent's
+/// shell is not.
+///
+/// [`resolve_binding_readonly`]: crate::ledger::bindings::resolve_binding_readonly
 ///
 /// One case is not failed closed here, where [`guard_command`] would: a
 /// repository GitPulse is not trusted in. Resolving a binding runs Git, which
@@ -146,24 +163,33 @@ pub(crate) fn guard_command_allowing(
 /// will meet a missing directory on its own.
 ///
 /// Whether a scope was declared comes back beside the verdict, because the
-/// verdict cannot say: the harness stamps every command decision with its
-/// `host-scope` placeholder task, scope or no scope.
-pub(crate) fn check_command_in_scope(repo_path: &str, command: &str) -> ScopedVerdict {
+/// verdict cannot say: a command decision carries either the declared task's
+/// id or the harness's `host-scope` placeholder (always the placeholder from a
+/// `manvi` older than the scope allowlist fix), so its task id is no evidence of
+/// a binding.
+///
+/// `lane` is the sidecar that answers: the hook process's own one-shot child
+/// ([`Lane::Shared`]) or the app's long-lived hook child ([`Lane::Hook`], via
+/// `hooks::serve_gate`). It is the one body both run, so they cannot disagree
+/// about what a scope is.
+pub(crate) fn check_command_in_scope(lane: Lane, repo_path: &str, command: &str) -> ScopedVerdict {
+    let ask =
+        |scope: Option<&HostScope>| policy::check_command_on(lane, repo_path, command, scope, &[]);
     match hook_scope(repo_path) {
         HookScope::Declared(scope) => ScopedVerdict {
             bound: true,
             unscoped: None,
-            verdict: check_command(repo_path, command, Some(&scope)),
+            verdict: ask(Some(&scope)),
         },
         HookScope::Unbound => ScopedVerdict {
             bound: false,
             unscoped: None,
-            verdict: check_command(repo_path, command, None),
+            verdict: ask(None),
         },
         HookScope::Untrusted => ScopedVerdict {
             bound: false,
             unscoped: Some(UNSCOPED_UNTRUSTED),
-            verdict: check_command(repo_path, command, None),
+            verdict: ask(None),
         },
         HookScope::Unresolved(failure) => ScopedVerdict {
             bound: true,
@@ -219,7 +245,7 @@ pub(crate) enum FileScopeCheck {
 /// Why the hook judged a checkout without a scope it could not rule out.
 pub(crate) const UNSCOPED_UNTRUSTED: &str = "unscoped: repository not trusted";
 
-/// The scope the agent hook measures against, resolved by [`scope_for`] and
+/// The scope the agent hook measures against, resolved by [`hook_scope`] and
 /// sorted by how each outcome degrades on the hook's side of the gate.
 enum HookScope {
     Declared(HostScope),
@@ -233,7 +259,8 @@ enum HookScope {
 }
 
 fn hook_scope(repo_path: &str) -> HookScope {
-    match scope_for(repo_path) {
+    let binding = crate::ledger::bindings::resolve_binding_readonly(repo_path, repo_path);
+    match scope_from_binding(binding) {
         Ok(Some(scope)) => HookScope::Declared(scope),
         Ok(None) => HookScope::Unbound,
         Err(failure) => match failure.kind {
@@ -264,19 +291,34 @@ pub(crate) fn guard_file(
     op: &str,
 ) -> Result<PolicyVerdict, String> {
     let action = format!("file.{}", if op.is_empty() { "write" } else { op });
-    let scope = match scope_for(repo_path) {
+    let address = crate::ledger::bindings::repository_address(repo_path);
+    let scope = match scope_at(&address) {
         Ok(scope) => scope,
         Err(failure) if failure.kind == ScopeFailureKind::Missing => {
             return Err(failure.missing_checkout(file_path));
         }
         Err(failure) => {
             let verdict = failure.verdict(file_path);
-            record_gate(repo_path, &action, file_path, None, &verdict);
+            record_gate(
+                repo_path,
+                address.as_ref().ok(),
+                &action,
+                file_path,
+                None,
+                &verdict,
+            );
             return gated(verdict);
         }
     };
     let verdict = check_file(repo_path, file_path, op, scope.as_ref());
-    record_gate(repo_path, &action, file_path, None, &verdict);
+    record_gate(
+        repo_path,
+        address.as_ref().ok(),
+        &action,
+        file_path,
+        None,
+        &verdict,
+    );
     gated(verdict)
 }
 
@@ -365,20 +407,40 @@ impl ScopeFailure {
     }
 }
 
-fn scope_for(repo_path: &str) -> Result<Option<HostScope>, ScopeFailure> {
-    let binding =
-        crate::ledger::bindings::resolve_binding(repo_path, repo_path).map_err(|error| {
-            let kind = match error.code {
-                "untrusted_worktree" => ScopeFailureKind::Untrusted,
-                crate::ledger::bindings::MISSING_WORKTREE => ScopeFailureKind::Missing,
-                _ => ScopeFailureKind::Broken,
-            };
-            ScopeFailure {
-                task_id: String::new(),
-                kind,
-                reason: format!("could not resolve this worktree's task binding: {error}"),
-            }
-        })?;
+/// The scope at a family address the app's gate resolved for this action.
+///
+/// A failed resolution is classified exactly as a failed binding lookup, which
+/// is what it was: the address is the first half of every binding lookup.
+fn scope_at(
+    address: &Result<crate::ledger::bindings::BindingAddress, crate::ledger::LedgerError>,
+) -> Result<Option<HostScope>, ScopeFailure> {
+    scope_from_binding(
+        address
+            .clone()
+            .and_then(|address| crate::ledger::bindings::binding_at(&address)),
+    )
+}
+
+/// Turns a binding lookup into the scope it declares.
+///
+/// The one owner of that step for both callers: the app's gate, which looks
+/// the binding up at the address it resolved ([`scope_at`]), and the agent
+/// hook, which looks it up read-only ([`hook_scope`]).
+fn scope_from_binding(
+    binding: Result<Option<crate::ledger::bindings::ResolvedBinding>, crate::ledger::LedgerError>,
+) -> Result<Option<HostScope>, ScopeFailure> {
+    let binding = binding.map_err(|error| {
+        let kind = match error.code {
+            "untrusted_worktree" => ScopeFailureKind::Untrusted,
+            crate::ledger::bindings::MISSING_WORKTREE => ScopeFailureKind::Missing,
+            _ => ScopeFailureKind::Broken,
+        };
+        ScopeFailure {
+            task_id: String::new(),
+            kind,
+            reason: format!("could not resolve this worktree's task binding: {error}"),
+        }
+    })?;
     let Some(binding) = binding else {
         return Ok(None);
     };
@@ -436,8 +498,12 @@ fn scope_for(repo_path: &str) -> Result<Option<HostScope>, ScopeFailure> {
 /// carry the operation's own outcome, are written by the callers that observe
 /// it and are absent from this build — the distinction is recorded here rather
 /// than left for a reader to infer.
+///
+/// `address` is the family address the caller resolved for this action, or
+/// `None` when it could not be resolved; the row then goes to `repo_path`.
 fn record_gate(
     repo_path: &str,
+    address: Option<&crate::ledger::bindings::BindingAddress>,
     action: &str,
     target: &str,
     argv_json: Option<String>,
@@ -450,13 +516,11 @@ fn record_gate(
     // otherwise the history would show an authorised action the app refused.
     let blocked = verdict.blocks() || verdict.gate_failed();
 
-    let address = crate::ledger::bindings::repository_address(repo_path).ok();
     let ledger_repo = address
-        .as_ref()
         .map(|address| address.anchor.clone())
         .unwrap_or_else(|| repo_path.to_string());
     let worktree_path = address
-        .and_then(|address| (address.worktree != address.anchor).then_some(address.worktree));
+        .and_then(|address| (address.worktree != address.anchor).then(|| address.worktree.clone()));
 
     crate::ledger::record(Draft {
         repo_path: ledger_repo,
@@ -664,6 +728,147 @@ mod scope_tests {
         (main, parent, worktree)
     }
 
+    /// The scope the app's gate computes for `repo`: one family resolution,
+    /// then the binding at that address.
+    fn scope_for(repo: &str) -> Result<Option<HostScope>, ScopeFailure> {
+        scope_at(&crate::ledger::bindings::repository_address(repo))
+    }
+
+    /// `git worktree list` children spawned in `cwd` while `f` ran.
+    fn family_resolutions<T>(cwd: &str, f: impl FnOnce() -> T) -> (T, usize) {
+        let cwd = std::path::Path::new(cwd);
+        let before = crate::engine::git_cli::spawn_log::spawns_in(cwd).len();
+        let value = f();
+        let count = crate::engine::git_cli::spawn_log::spawns_in(cwd)
+            .into_iter()
+            .skip(before)
+            .filter(|argv| {
+                argv.windows(2)
+                    .any(|w| w[0] == "worktree" && w[1] == "list")
+            })
+            .count();
+        (value, count)
+    }
+
+    /// One gated action resolves its worktree family once. The scope lookup
+    /// and the ledger row each used to resolve it — a `git worktree list` and
+    /// a consolidation pass apiece — so every guarded command or write paid
+    /// two.
+    #[cfg(unix)]
+    #[test]
+    fn a_gated_action_resolves_its_family_once() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (main, _parent, worktree) = linked_repo();
+        let main_path_buf = main.path().canonicalize().expect("canonical repository");
+        let main_path = main_path_buf.to_str().expect("utf8 repository");
+        let script = main.path().join("allowing-manvi");
+        std::fs::write(&script, FAKE_ALLOW).expect("write fake sidecar");
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let serial = sidecar::test_serial();
+        let _binary = sidecar::bind_test_binary(&serial, script.to_string_lossy());
+
+        let before = crate::ledger::latest_cursor(main_path).expect("family cursor");
+        let (written, resolutions) = family_resolutions(&worktree, || {
+            guard_file(&worktree, "src/planned.rs", "modify")
+        });
+        written.expect("allowed write");
+        assert_eq!(
+            resolutions, 1,
+            "a guarded write resolved its family {resolutions} times"
+        );
+
+        // The first action authenticated this family with Git and it is
+        // remembered while the registry is unchanged, so the second asks Git
+        // no more: "at most once", never twice.
+        let (ran, resolutions) =
+            family_resolutions(&worktree, || guard_command(&worktree, &["git", "status"]));
+        ran.expect("allowed command");
+        assert!(
+            resolutions <= 1,
+            "a guarded command resolved its family {resolutions} times"
+        );
+
+        // Still recorded once each, in the family ledger, under the checkout.
+        let events = crate::ledger::tail(main_path, before, 10).expect("family tail");
+        assert_eq!(events.len(), 2, "{events:?}");
+        assert!(events
+            .iter()
+            .all(|event| event.worktree_path.as_deref() == Some(worktree.as_str())));
+    }
+
+    /// The hook's scope comes from the read-only binding lookup: a bound
+    /// checkout still declares its scope, and no read-write ledger open — the
+    /// chmod pass, WAL pragmas and schema DDL — happens to find it.
+    #[test]
+    fn the_hook_scope_is_read_without_opening_the_ledger_for_writing() {
+        let dir = git_repo();
+        let repo_path = dir.path().canonicalize().expect("canonical repository");
+        let repo = repo_path.to_str().expect("utf8");
+        let db = crate::tasks::store_path(repo);
+        std::fs::create_dir_all(db.parent().unwrap()).unwrap();
+        let store = dc_store::Store::open(&db).unwrap();
+        store
+            .connection()
+            .execute(
+                "INSERT INTO tasks (id, title, description, planned_files_json, status)
+                 VALUES ('TASK-HOOK', 'Hook', '',
+                     '[{\"path\":\"src/planned.rs\",\"allowed_change\":\"modify\"}]', 'in_progress')",
+                [],
+            )
+            .unwrap();
+        crate::ledger::bindings::bind(repo, repo, "TASK-HOOK").expect("bind");
+        // A hook is a fresh process: nothing cached.
+        crate::ledger::tests_support::reset_registry();
+        let opens = crate::ledger::tests_support::write_opens();
+
+        let HookScope::Declared(scope) = hook_scope(repo) else {
+            panic!("a bound checkout must declare its scope to the hook");
+        };
+        assert_eq!(scope.task_id, "TASK-HOOK");
+        assert_eq!(scope.planned_files, ["src/planned.rs"]);
+        assert_eq!(
+            crate::ledger::tests_support::write_opens(),
+            opens,
+            "the hook opened the ledger read-write to read a binding"
+        );
+    }
+
+    /// The hook sorts the read-only lookup's failures exactly as before:
+    /// untrusted is judged unscoped (and says so), a missing checkout has no
+    /// binding, and history it cannot rule out fails closed.
+    #[test]
+    fn the_hook_scope_sorts_each_failure_as_before() {
+        let (main, _parent, worktree) = linked_repo();
+        let main_path_buf = main.path().canonicalize().expect("canonical repository");
+        let main_path = main_path_buf.to_str().expect("utf8 repository");
+
+        // Legacy sibling history the anchor has not imported: Broken.
+        crate::ledger::append(crate::ledger::Draft {
+            repo_path: worktree.clone(),
+            worktree_path: Some(worktree.clone()),
+            action: "git.commit".to_string(),
+            actor_kind: Some(crate::ledger::ActorKind::Human),
+            outcome: Some(crate::ledger::Outcome::Ok),
+            ..Default::default()
+        })
+        .expect("legacy sibling row");
+        assert!(matches!(hook_scope(&worktree), HookScope::Unresolved(_)));
+
+        // Consolidated by GitPulse: unbound again.
+        crate::ledger::bindings::repository_address(main_path).expect("consolidate");
+        assert!(matches!(hook_scope(&worktree), HookScope::Unbound));
+
+        // Untrusted.
+        crate::repository_trust::revoke(main_path).expect("revoke");
+        assert!(matches!(hook_scope(&worktree), HookScope::Untrusted));
+        crate::test_support::trust_repo(main.path());
+
+        // Missing.
+        std::fs::remove_dir_all(&worktree).expect("delete worktree");
+        assert!(matches!(hook_scope(&worktree), HookScope::Unbound));
+    }
+
     /// A `manvi serve` stand-in that answers the handshake, records every
     /// later request, and refuses with a scope verdict.
     #[cfg(unix)]
@@ -751,9 +956,9 @@ done
         let _binary = sidecar::bind_test_binary(&serial, script.to_string_lossy());
 
         // The hook learns the binding from here, never from the verdict's
-        // task id (the harness stamps `host-scope` on every command decision).
+        // task id, which may be the harness's `host-scope` placeholder.
         assert!(
-            check_command_in_scope(repo, "ls").bound,
+            check_command_in_scope(Lane::Shared, repo, "ls").bound,
             "a bound checkout must report that it is bound"
         );
         std::fs::remove_file(&requests).ok();
@@ -955,7 +1160,7 @@ done
         );
         assert!(!verdict.gate_failed(), "a refusal, not a gate outage");
         // And the agent hook, which judges through the same owner, refuses too.
-        let judged = check_command_in_scope(&worktree, "echo x > src/planned.rs");
+        let judged = check_command_in_scope(Lane::Shared, &worktree, "echo x > src/planned.rs");
         assert!(judged.verdict.blocks() && judged.bound, "{judged:?}");
     }
 
@@ -1014,7 +1219,8 @@ done
 
         // The agent hook path: no binding to read, so judged unscoped rather
         // than refused for want of one.
-        let ScopedVerdict { verdict, bound, .. } = check_command_in_scope(&worktree, "ls");
+        let ScopedVerdict { verdict, bound, .. } =
+            check_command_in_scope(Lane::Shared, &worktree, "ls");
         assert!(!bound, "a missing checkout declares no scope");
         assert_ne!(verdict.rule, TASK_SCOPE_UNAVAILABLE, "{verdict:?}");
     }

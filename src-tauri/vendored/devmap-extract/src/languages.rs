@@ -752,6 +752,7 @@ pub fn detect_language(path: &Path) -> &'static str {
         || filename == "go.mod"
         || filename == "jsconfig.json"
         || filename == "tsconfig.json"
+        || filename == "AndroidManifest.xml"
     {
         return "config";
     }
@@ -1388,6 +1389,7 @@ mod tests {
             "go.mod",
             "jsconfig.json",
             "tsconfig.json",
+            "AndroidManifest.xml",
         ] {
             assert_eq!(
                 detect_language(Path::new(filename)),

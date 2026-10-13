@@ -8,7 +8,8 @@
    * own failure rather than failing the pane — a broken `.gitmodules` must not
    * hide the remote list.
    */
-  import { repoStore } from "../stores/repoStore";
+  import { untrack } from "svelte";
+  import { currentRepoPath, repoStore } from "../stores/repoStore";
   import { toastStore } from "../stores/toastStore";
   import type { DiffPayload } from "../stores/repoStore";
   import CodeViewer from "./files/CodeViewer.svelte";
@@ -126,18 +127,20 @@
   let renameError = $state<string | null>(null);
 
   let guard: AsyncGuard | null = null;
-  let loadedPath: string | null = null;
 
-  const repoPath = $derived($repoStore.currentPath);
+  const repoPath = $derived($currentRepoPath);
   // The stash stack rides the session snapshot, so it is already refreshed by
   // every mutation and watcher event — no separate load or staleness here.
   const stashEntries = $derived($repoStore.stashEntries);
   const stashFailed = $derived($repoStore.stashFailed);
 
+  // Keyed on the repository alone; everything below runs untracked, so the
+  // store's other publishes neither reset the panel nor reload it.
   $effect(() => {
     const path = repoPath;
-    if (path === loadedPath) return;
-    loadedPath = path;
+    untrack(() => resetForRepository(path));
+  });
+  function resetForRepository(path: string | null) {
     armed = null;
     previewGuard?.cancel();
     previewKey = null;
@@ -168,7 +171,7 @@
       return;
     }
     void load();
-  });
+  }
 
   $effect(() => () => { guard?.cancel(); previewGuard?.cancel(); });
 

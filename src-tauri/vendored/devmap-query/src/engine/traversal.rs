@@ -226,6 +226,7 @@ pub(super) fn indexed_traversal_starts(
 ) -> anyhow::Result<Vec<(String, String)>> {
     let query = crate::query_match::classify(target);
     let mut ids: Vec<u32> = Vec::new();
+    let mut symbol_fallback = false;
     match query {
         crate::query_match::StartQuery::Nothing => {}
         crate::query_match::StartQuery::Qualified { file, symbol } => {
@@ -252,6 +253,19 @@ pub(super) fn indexed_traversal_starts(
                 if crate::query_match::path_matches(candidate, path) {
                     ids.extend_from_slice(group);
                 }
+            }
+            // `Thing.go` ends in a source extension, so it reads as a path — but
+            // no file by that name is indexed, and a symbol is: the method `go`
+            // of `Thing`. A dotted name with no separator that names no file is
+            // asked of the symbols before the answer is "no start".
+            if ids.is_empty() && !path.contains(['/', '\\']) {
+                for (checked, (candidate, group)) in index.symbols(reverse).enumerate() {
+                    cancel.check_every(checked)?;
+                    if crate::query_match::symbol_matches(candidate, path) {
+                        ids.extend_from_slice(group);
+                    }
+                }
+                symbol_fallback = true;
             }
         }
         crate::query_match::StartQuery::Symbol(name) => {
@@ -283,7 +297,7 @@ pub(super) fn indexed_traversal_starts(
         .collect();
     // Bare names only. A file seed expanding to every member, or a qualified
     // `file::symbol`, is a deliberate scope — unioning those is correct.
-    if matches!(query, crate::query_match::StartQuery::Symbol(_)) {
+    if symbol_fallback || matches!(query, crate::query_match::StartQuery::Symbol(_)) {
         let unique: BTreeSet<&(String, String)> = starts.iter().collect();
         if unique.len() > 1 {
             let candidates: Vec<String> = unique

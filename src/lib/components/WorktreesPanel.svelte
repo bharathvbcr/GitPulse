@@ -1,12 +1,13 @@
 <script lang="ts">
-  import { worktreeSetupNotices, type MergeTeardownResult, type WorktreeCreated, type WorktreeInfo, type WorktreeRouteInfo } from "../branches/types";
+  import { untrack } from "svelte";
+  import { worktreeSetupNotices, type MergeTeardownResult, type WorktreeCreated, type WorktreeHooksPreview, type WorktreeInfo, type WorktreeRouteInfo } from "../branches/types";
   import { toastStore } from "../stores/toastStore";
   import type { TaskScope, TaskView } from "../tasks/types";
   import { loadWorktreeTasks } from "../tasks/bindings";
   import { loadTaskScopes } from "../tasks/scopes";
   import { invoke } from "../ipc/invoke";
   import { reportPanelError } from "../diagnostics/report";
-  import { repoStore } from "../stores/repoStore";
+  import { currentRepoPath, repoStore } from "../stores/repoStore";
   import { repoScope } from "../repos/repoScope.svelte";
   import { harnessStore, type Guarded } from "../stores/harnessStore";
   import { createAsyncGuard, type AsyncGuard } from "../async/guard";
@@ -55,6 +56,45 @@
   let newBranch = $state("");
   let startPoint = $state("");
   let cowCaches = $state(true);
+  // Repository hooks run shell commands from a file the working tree
+  // controls, so they are off until asked for and, even then, run only when the
+  // exact file text was approved here.
+  let runHooks = $state(false);
+  let hooksPreview = $state<WorktreeHooksPreview | null>(null);
+  let hooksError = $state<string | null>(null);
+  let hooksBusy = $state(false);
+
+  async function readHooksPreview() {
+    const repo = $repoStore.currentPath;
+    hooksPreview = null;
+    hooksError = null;
+    if (!repo || !runHooks) return;
+    hooksBusy = true;
+    try {
+      const preview = await invoke<WorktreeHooksPreview | null>("cmd_preview_worktree_hooks", { repoPath: repo });
+      if ($repoStore.currentPath === repo) hooksPreview = preview;
+    } catch (err: unknown) {
+      if ($repoStore.currentPath === repo) hooksError = reportPanelError("worktrees", err);
+    } finally {
+      hooksBusy = false;
+    }
+  }
+
+  async function approveHooks() {
+    const repo = $repoStore.currentPath;
+    const shown = hooksPreview;
+    if (!repo || !shown) return;
+    hooksBusy = true;
+    hooksError = null;
+    try {
+      await invoke("cmd_approve_worktree_hooks", { repoPath: repo, content: shown.content });
+    } catch (err: unknown) {
+      hooksError = reportPanelError("worktrees", err);
+    } finally {
+      hooksBusy = false;
+    }
+    await readHooksPreview();
+  }
   let mergeConfirmPath = $state<string | null>(null);
   let mergingPath = $state<string | null>(null);
   let mergeTimer: ReturnType<typeof setTimeout> | null = null;
@@ -70,33 +110,24 @@
   let liveRuns = $state<TaskRun[]>([]);
   let confirmTimer: ReturnType<typeof setTimeout> | null = null;
 
-  // Load trigger keyed on the real dependencies: active repo + its hydration
-  // epoch. Memoized because every store emission re-runs the effect — an
-  // unguarded rerun cancels in-flight loads and disarms the row-delete
-  // confirm on each ~6s poll tick.
-  let prevRepoPath: string | null = null;
-  let prevGeneration: number | null = null;
-  // Extending trust widens what every row here can report, and the offer that
-  // does it now lives above the branch list rather than in this panel — so the
-  // grant arrives as an announcement instead of a local `load()` call. Read as
-  // part of the same change check: a new count is a reason to reload for the
-  // same repository and generation, which nothing else in this effect is.
-  let prevExtended: number | null = null;
+  // Load trigger keyed on the real dependencies: the active repository and
+  // its hydration epoch, both compared by value, so the store's other
+  // publishes (every ~6s poll tick) neither cancel a load in flight nor disarm
+  // the row-delete confirm. Extending trust widens what every row here can
+  // report, and the offer that does it lives above the branch list rather
+  // than in this panel — so the grant arrives as an announcement, and a new
+  // count is a reason to reload for the same repository and generation.
+  const generation = $derived($repoStore.generation);
   $effect(() => {
-    const repo = $repoStore.currentPath;
-    const generation = $repoStore.generation;
-    const extended = $trustExtended;
-    if (repo === prevRepoPath && generation === prevGeneration && extended === prevExtended) return;
-    prevRepoPath = repo;
-    prevGeneration = generation;
-    prevExtended = extended;
-    void load();
+    void $currentRepoPath;
+    void generation;
+    void $trustExtended;
+    untrack(() => void load());
     return () => {
       // A load that outlives its repo/generation must not apply: the next
       // effect run (or unmount) cancels it here, and load() re-checks below.
       inflight?.cancel();
-      // Disarm any pending removal confirm; it must not leak across repos
-      // and there is no teardown left that would otherwise fire per tick.
+      // Disarm any pending removal confirm; it must not leak across repos.
       if (confirmTimer !== null) clearTimeout(confirmTimer);
       confirmTimer = null;
       removingPath = null;
@@ -117,7 +148,7 @@
    * old repository's worktrees are never painted under the new one's name.
    */
   const tabScope = repoScope(
-    () => $repoStore.currentPath,
+    () => $currentRepoPath,
     (path) => {
       inflight?.cancel();
       worktrees = [];
@@ -147,7 +178,10 @@
     isLoading = true;
     error = null;
     try {
-      const next = await invoke<WorktreeInfo[]>("cmd_list_worktrees", { repoPath: repo });
+      // The rows render diff stats, divergence from main and dev-server
+      // routes, which only the full scan measures; a listing that does not
+      // ask is the cheap one.
+      const next = await invoke<WorktreeInfo[]>("cmd_list_worktrees", { repoPath: repo, depth: "full" });
       if (!guard.isLive()) return;
       worktrees = next;
       await Promise.all([loadTaskState(repo, next, guard), loadLaneRuns(next, guard)]);
@@ -317,6 +351,7 @@
         startPoint: base || null,
         detach: !branch,
         cowCaches,
+        runHooks,
       });
       createCompleted = true;
       // Created, but not everything it was asked to do happened. Said now,
@@ -587,8 +622,41 @@
       </div>
       <label class="flex items-center gap-1.5 text-[9px] text-textMuted cursor-pointer select-none">
         <input type="checkbox" bind:checked={cowCaches} class="rounded border-border text-accent focus:ring-accent" />
-        <span>CoW Build Cache Sharing (reflink / clonefile)</span>
+        <span>Share build caches (reflink / clonefile)</span>
       </label>
+      <label class="flex items-center gap-1.5 text-[9px] text-textMuted cursor-pointer select-none">
+        <input
+          type="checkbox"
+          bind:checked={runHooks}
+          onchange={readHooksPreview}
+          class="rounded border-border text-accent focus:ring-accent"
+        />
+        <span>Run repository hooks (.gitpulse/hooks)</span>
+      </label>
+      {#if runHooks}
+        <div class="rounded border border-border/80 p-1.5 text-[9px] text-textMuted" data-testid="worktree-hooks-consent">
+          {#if hooksError}
+            <p class="text-rose-400">{hooksError}</p>
+          {:else if hooksBusy && !hooksPreview}
+            <p>Reading the hooks file…</p>
+          {:else if !hooksPreview}
+            <p>This repository has no hooks file.</p>
+          {:else}
+            <p>
+              {hooksPreview.file} runs these as shell commands in the new worktree and when merging:
+            </p>
+            <pre class="mt-1 max-h-32 overflow-auto whitespace-pre-wrap font-mono text-textPrimary">{hooksPreview.content}</pre>
+            {#if hooksPreview.approved}
+              <p class="mt-1">Approved. Editing the file asks again.</p>
+            {:else}
+              <p class="mt-1">Not approved: nothing runs until you approve exactly this text.</p>
+              <button type="button" class="gp-btn-primary px-2! py-0.5! text-[10px]! mt-1" disabled={hooksBusy} onclick={approveHooks}>
+                Approve these hooks
+              </button>
+            {/if}
+          {/if}
+        </div>
+      {/if}
       <div class="flex items-center justify-between">
         <span class="text-[9px] text-textMuted">No branch name creates a detached checkout.</span>
         <button type="submit" disabled={isCreating || !newPath.trim()} class="gp-btn-primary px-2! py-0.5! text-[10px]!">

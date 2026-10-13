@@ -6,7 +6,7 @@
 //! nothing. Nothing here mutates a repository.
 
 mod entity_collision;
-mod live_sessions;
+pub(crate) mod live_sessions;
 
 pub use entity_collision::{
     classify_overlapping_path, classify_party_symbols, parse_old_side_ranges,
@@ -14,11 +14,11 @@ pub use entity_collision::{
 };
 
 use crate::codeintel::{self, CodeintelStatus};
-use crate::engine::git_cli::git_text;
+use crate::engine::git_cli::{current_admission, git_text, with_admission};
 use crate::engine::git_reader::{FileStatus, GitReader};
 use crate::engine::repo_op::{self, RepoOperation};
 use crate::engine::validate_repo;
-use crate::engine::worktree::{self, agent_layout, changed_paths, ScanDepth, WorktreeInfo};
+use crate::engine::worktree::{self, agent_layout, changed_paths_within, StatusRead, WorktreeInfo};
 use crate::ledger::{FleetMetrics, LedgerStatus};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -371,11 +371,25 @@ pub struct McpInfo {
     pub binary_found: bool,
     pub binary_path: String,
     pub binary_error: String,
+    /// The bare `gitpulse-mcp` the plugin manifest names resolves on `PATH`.
+    pub binary_on_path: bool,
+    /// `gitpulse-hook`, resolved the same way as the server above.
+    pub hook_found: bool,
+    pub hook_path: String,
+    pub hook_error: String,
+    pub hook_on_path: bool,
     pub plugin_found: bool,
     pub plugin_path: String,
     pub plugin_error: String,
     pub plugin_manifest_json: String,
+    /// The portable manifest, naming `gitpulse-mcp` bare.
     pub plugin_mcp_json: String,
+    /// The MCP manifest to install: `command` is the resolved absolute path.
+    /// Empty when the server was not found.
+    pub mcp_config_json: String,
+    /// The hooks manifest to install: absolute path, deciding hooks refusing
+    /// when the binary is missing. Empty when the hook binary was not found.
+    pub hooks_config_json: String,
     pub tools: Vec<McpToolInfo>,
 }
 
@@ -576,8 +590,10 @@ fn detect_operation(path: &str) -> (String, bool) {
     let Ok(repo) = validate_repo(path) else {
         return (String::new(), false);
     };
-    match repo_op::detect(&repo) {
-        Ok(Some(op)) => (format!("{:?}", op.kind), true),
+    // The kind alone: this row reports which operation is parked, and the full
+    // report's branch, incoming commit and conflict list cost a child each.
+    match repo_op::detect_kind(&repo) {
+        Ok(Some(kind)) => (format!("{kind:?}"), true),
         Ok(None) => (String::new(), true),
         Err(_) => (String::new(), false),
     }
@@ -710,18 +726,23 @@ fn changes_from_status(files: &[FileStatus], truncated: bool) -> ChangesFacet {
 
 /// Soft deadline for one whole snapshot, not per probe.
 ///
-/// The expensive half of this call is unbounded in `git` spawns: a parked-
-/// operation probe per worktree (2-5 spawns each, up to
-/// [`MAX_SNAPSHOT_WORKTREES`] of them) and then a cross-worktree collision
-/// scan. Git's own per-spawn timeout is 90 s with no ceiling above it, so a
-/// pathological tree could hold the single-threaded MCP server — which
-/// answers nothing else meanwhile — for minutes. Past the deadline those two
-/// stages are skipped and say so, exactly as [`FLEET_DEADLINE`] does for a
-/// workspace sweep.
+/// The expensive half of this call is one `git status` per worktree, up to
+/// [`MAX_SNAPSHOT_WORKTREES`] of them, which feeds both the worktree rows and
+/// the cross-worktree collision scan. Git's own per-spawn timeout is 90 s with
+/// no ceiling above it, so a pathological tree could hold the single-threaded
+/// MCP server — which answers nothing else meanwhile — for minutes. One
+/// [`worktree::ScanDeadline`] is handed to that read: no wave of statuses
+/// starts after it, one already running is given only the time left, and the
+/// worktrees it did not reach are reported unknown in the rows and unscanned in
+/// the collision facet (`ok: false`, with the reason), exactly as
+/// [`FLEET_DEADLINE`] does for a workspace sweep.
 ///
-/// The fixed-cost stages — one worktree listing, one `git status`, two local
-/// store reads — always run. Cutting them would leave a snapshot with nothing
-/// in it, and their cost does not grow with the number of worktrees.
+/// The fixed-cost stages — one worktree listing, one `git status` of the main
+/// checkout, two local store reads — always run. Cutting them would leave a
+/// snapshot with nothing in it, and their cost does not grow with the number of
+/// worktrees. The parked-operation probe reads control files and starts no
+/// process, so it is bounded by the worktree count; the clock still ends it
+/// early.
 const SNAPSHOT_DEADLINE: Duration = Duration::from_secs(10);
 
 /// One-shot read of everything an agent needs to see the repository as the
@@ -753,7 +774,11 @@ fn snapshot_observed(
     observation: &live_sessions::Observation,
 ) -> InsightsSnapshot {
     let started = Instant::now();
-    let listed = worktree::list_worktrees_scanned(repo_path, ScanDepth::Dirty);
+    // One clock for the whole pass, handed to every stage that can run long.
+    let clock = worktree::ScanDeadline::after(started, deadline);
+    // The listing alone: one process. The per-worktree status read is made
+    // below, once, for the worktree rows and the collision scan together.
+    let mut listed = worktree::list_worktrees_lite(repo_path);
     let mut deadline_expired = false;
     // Attributed over the whole listing, not the capped summaries: a session
     // in the 65th worktree is still a session in this repository.
@@ -761,6 +786,27 @@ fn snapshot_observed(
         Ok(list) => live_in(observation, list),
         Err(error) => live_sessions::unattributed(error),
     };
+
+    let changes = match GitReader::get_status(repo_path) {
+        // The facet carries counts, not rows, and the whole status is already
+        // in memory: count every file. Counting only the first
+        // `MAX_ACTIVE_FILES` made every total a floor on a busy tree.
+        Ok(files) => changes_from_status(&files, false),
+        Err(error) => empty_changes(error),
+    };
+
+    // The only `git status` of each worktree this snapshot makes, and the last
+    // git read it makes: the rows' dirty counts and the collision scan's paths
+    // come out of it together, so the two facets describe the same moment, and
+    // an edit made before a worktree is read is in both. The read is bounded by
+    // the same clock as everything else; a worktree it did not reach stays
+    // unknown in both facets rather than reading as clean in either.
+    if let Ok(list) = &mut listed {
+        if worktree::read_dirty(list, &clock) > 0 {
+            deadline_expired = true;
+        }
+    }
+
     let (worktrees, agents) = match &listed {
         Ok(list) => {
             let truncated = list.len() > max_worktrees;
@@ -768,11 +814,11 @@ fn snapshot_observed(
                 .iter()
                 .take(max_worktrees)
                 .map(|info| {
-                    // Sequential on purpose: `repo_op::detect` spawns several
-                    // git processes for each worktree parked mid-operation,
-                    // and 64 of those at once is the spawn storm this
-                    // deadline exists to bound.
-                    if started.elapsed() >= deadline {
+                    // `detect_operation` reads control files and starts no
+                    // process, so this stage's cost is bounded by the number of
+                    // worktrees; the clock still ends it early on a host too
+                    // slow to read even those.
+                    if clock.expired() {
                         deadline_expired = true;
                         return summarise_worktree(info, String::new(), false);
                     }
@@ -790,31 +836,16 @@ fn snapshot_observed(
         Err(error) => (empty_worktrees(error.clone()), unknown_agents(error)),
     };
 
-    let changes = match GitReader::get_status(repo_path) {
-        Ok(files) => {
-            let truncated = files.len() > MAX_ACTIVE_FILES;
-            let kept = if truncated {
-                &files[..MAX_ACTIVE_FILES]
-            } else {
-                &files
-            };
-            let mut facet = changes_from_status(kept, truncated);
-            facet.files = files.len() as u32;
-            facet
-        }
-        Err(error) => empty_changes(error),
-    };
-
     let collisions = match &listed {
         Ok(list) => {
-            if started.elapsed() >= deadline {
+            if clock.expired() {
                 deadline_expired = true;
-                // A scan that never started is a failed facet, not an empty
-                // one: `ok: false` with a reason, never `overlapping_files: 0`.
-                empty_collisions("the snapshot ran out of time before the collision scan")
-            } else {
-                collision_from_list(list, &live)
             }
+            // Past the clock the scan spawns nothing: it uses the statuses
+            // already read and counts every worktree it has none for as
+            // unscanned, with `ok: false` and the reason — never
+            // `overlapping_files: 0` for a scan that did not look.
+            collision_from_list(list, &live, Some(&clock))
         }
         Err(error) => empty_collisions(error.clone()),
     };
@@ -1084,11 +1115,23 @@ fn fleet_commit_stats(
     // One over the cap, so "we stopped early" is observable rather than
     // indistinguishable from a repository that happens to have exactly the cap.
     let limit = (MAX_FLEET_COMMITS + 1).to_string();
+    // Only commits inside the window count toward the cap. Without a date
+    // bound the cap was spent on history older than the window, so a
+    // repository with more than the cap in total read as truncated even when
+    // every commit of the window had been seen; with it, `truncated` means the
+    // window itself hit the cap. `--since-as-filter` (git 2.37) rather than
+    // `--since`: plain `--since` stops walking at the first old commit, so one
+    // commit with a skewed clock at the tip hid everything behind it.
+    let since = format!(
+        "--since-as-filter={}",
+        anchor_epoch.saturating_sub(i64::from(window_days) * BUCKET_SECONDS)
+    );
     let text = match git_text(
         repo,
         &[
             "log",
             "--no-show-signature",
+            &since,
             "-n",
             &limit,
             "--format=%ct%x1f%ae",
@@ -1378,7 +1421,20 @@ fn shared_paths(live: &LiveSessionFacet) -> HashSet<&str> {
         .collect()
 }
 
-fn collision_from_list(list: &[WorktreeInfo], live: &LiveSessionFacet) -> CollisionRisk {
+/// Overlapping dirty files across `list`'s worktrees, and the dirty files of
+/// any worktree two live sessions share.
+///
+/// A worktree whose status the listing already read ([`StatusRead`]) costs
+/// nothing here: its paths are used as read, once, rather than read again. One
+/// that was never read is read now, on rayon's pool but in the caller's
+/// admission class, for at most [`MAX_COLLISION_SCANS`] of them. With a
+/// `deadline`, none is read once it has passed: those worktrees are counted as
+/// unscanned and the facet says `ok: false` and why.
+fn collision_from_list(
+    list: &[WorktreeInfo],
+    live: &LiveSessionFacet,
+    deadline: Option<&worktree::ScanDeadline>,
+) -> CollisionRisk {
     let shared = shared_paths(live);
     // A worktree that two sessions share is scanned ahead of the cap: it is
     // the one place a collision is already known to be possible.
@@ -1386,21 +1442,45 @@ fn collision_from_list(list: &[WorktreeInfo], live: &LiveSessionFacet) -> Collis
         .iter()
         .filter(|w| !w.is_bare)
         .partition(|w| shared.contains(w.path.as_str()));
-    let scan_targets: Vec<&WorktreeInfo> = first
-        .into_iter()
-        .chain(rest)
-        .take(MAX_COLLISION_SCANS)
-        .collect();
-    let unscanned = list
-        .iter()
-        .filter(|w| !w.is_bare)
-        .count()
-        .saturating_sub(scan_targets.len());
 
-    let scans: Vec<_> = scan_targets
+    type Read = Result<(Vec<String>, bool), String>;
+    let mut scans: Vec<(&WorktreeInfo, Option<Read>)> = Vec::new();
+    let mut pending: Vec<usize> = Vec::new();
+    let mut fresh_reads_left = MAX_COLLISION_SCANS;
+    let mut over_the_cap = 0usize;
+    let mut cut_off = 0usize;
+    for wt in first.into_iter().chain(rest) {
+        match &wt.status_read {
+            StatusRead::Read { paths, truncated } => {
+                scans.push((wt, Some(Ok((paths.clone(), *truncated)))));
+            }
+            // Already tried inside this pass; trying again would repeat the
+            // refusal and spend the time twice.
+            StatusRead::Failed(reason) => scans.push((wt, Some(Err(reason.clone())))),
+            StatusRead::NotRead if deadline.is_some_and(worktree::ScanDeadline::expired) => {
+                cut_off += 1;
+            }
+            StatusRead::NotRead if fresh_reads_left > 0 => {
+                fresh_reads_left -= 1;
+                pending.push(scans.len());
+                scans.push((wt, None));
+            }
+            StatusRead::NotRead => over_the_cap += 1,
+        }
+    }
+    let unscanned = over_the_cap + cut_off;
+
+    // The pool's threads start in the default admission class, so the class
+    // the caller asked under travels in explicitly.
+    let class = current_admission();
+    let to_read: Vec<&WorktreeInfo> = pending.iter().map(|&at| scans[at].0).collect();
+    let fresh: Vec<Read> = to_read
         .into_par_iter()
-        .map(|wt| (wt, changed_paths(&wt.path)))
+        .map(|wt| with_admission(class, || changed_paths_within(&wt.path, deadline)))
         .collect();
+    for (at, read) in pending.into_iter().zip(fresh) {
+        scans[at].1 = Some(read);
+    }
 
     let mut by_path: HashMap<String, Vec<CollisionParty>> = HashMap::new();
     let mut scan_error = String::new();
@@ -1409,7 +1489,7 @@ fn collision_from_list(list: &[WorktreeInfo], live: &LiveSessionFacet) -> Collis
     let mut paths_truncated = false;
     let mut shared_scans: HashMap<&str, (Vec<String>, bool)> = HashMap::new();
     for (wt, result) in scans {
-        match result {
+        match result.unwrap_or_else(|| Err("the worktree was not read".to_string())) {
             Ok((paths, truncated)) => {
                 scanned += 1;
                 paths_truncated |= truncated;
@@ -1436,6 +1516,16 @@ fn collision_from_list(list: &[WorktreeInfo], live: &LiveSessionFacet) -> Collis
                 }
             }
         }
+    }
+
+    if cut_off > 0 {
+        let reason =
+            format!("{cut_off} worktree(s) were not read before the snapshot ran out of time");
+        scan_error = if scan_error.is_empty() {
+            reason
+        } else {
+            format!("{scan_error}; {reason}")
+        };
     }
 
     let mut items: Vec<CollisionItem> = by_path
@@ -1496,7 +1586,11 @@ fn collision_from_list(list: &[WorktreeInfo], live: &LiveSessionFacet) -> Collis
         // `truncated` already report a short scan, and folding that in here
         // would make one field mean both "cut short" and "broken", the same
         // conflation `fleet_snapshot::truncated` is documented to avoid.
-        ok: failed == 0,
+        //
+        // The deadline does: a worktree skipped because the clock ran out is
+        // one the caller asked about and did not get an answer for, not one
+        // it declined to ask about.
+        ok: failed == 0 && cut_off == 0,
         error: scan_error,
         overlapping_files,
         worktrees_involved: involved.len() as u32,
@@ -1517,21 +1611,28 @@ fn collision_from_list(list: &[WorktreeInfo], live: &LiveSessionFacet) -> Collis
 ///
 /// The porcelain path scan stays bounded and cheap. Symbol classification runs
 /// afterwards on the first overlapping path only — see
-/// [`entity_collision::enrich_first_item`].
+/// [`entity_collision::enrich_item`].
 pub fn collision_risk(repo_path: &str) -> CollisionRisk {
-    collision_risk_observed(repo_path, &live_sessions::observe())
+    collision_risk_observed(repo_path, &live_sessions::observe(), None)
+}
+
+/// [`collision_risk`] whose symbol verdict is computed for `path`, the file
+/// being edited, instead of the first overlapping row.
+pub fn collision_risk_for_path(repo_path: &str, path: &str) -> CollisionRisk {
+    collision_risk_observed(repo_path, &live_sessions::observe(), Some(path))
 }
 
 /// [`collision_risk`] over a live-session observation the caller made.
 fn collision_risk_observed(
     repo_path: &str,
     observation: &live_sessions::Observation,
+    focus: Option<&str>,
 ) -> CollisionRisk {
     match worktree::list_worktrees_lite(repo_path) {
-        Ok(list) => entity_collision::enrich_first_item(collision_from_list(
-            &list,
-            &live_in(observation, &list),
-        )),
+        Ok(list) => entity_collision::enrich_item(
+            collision_from_list(&list, &live_in(observation, &list), None),
+            focus,
+        ),
         Err(error) => empty_collisions(error),
     }
 }
@@ -1550,16 +1651,6 @@ fn to_changed(file: &FileStatus) -> ChangedFile {
     }
 }
 
-/// Resolves the worktree an insights read is about, and proves it belongs to
-/// `repo_path`.
-///
-/// Without this, `worktree_path` was taken on trust: a path naming a totally
-/// unrelated repository came back stamped with `repo_path`'s identity, so the
-/// answer described one repository while claiming to describe another. The
-/// ledger route has always authenticated this pair; these read tools now use
-/// the same gate. The returned path is the canonical one git registered, so
-/// later comparisons against the worktree listing are not defeated by
-/// symlinks or a trailing slash.
 /// Do two path strings name the same directory?
 ///
 /// A literal comparison is not enough on macOS, where every temporary directory
@@ -1572,8 +1663,9 @@ fn to_changed(file: &FileStatus) -> ChangedFile {
 /// Canonicalization is attempted on both sides and the literal comparison is
 /// the fallback, because a worktree that was removed between the listing and
 /// this call cannot be canonicalized and must still compare equal to itself.
-fn same_path(left: &str, right: &str) -> bool {
-    if Path::new(left) == Path::new(right) {
+pub(crate) fn same_path(left: impl AsRef<Path>, right: impl AsRef<Path>) -> bool {
+    let (left, right) = (left.as_ref(), right.as_ref());
+    if left == right {
         return true;
     }
     match (std::fs::canonicalize(left), std::fs::canonicalize(right)) {
@@ -1582,6 +1674,16 @@ fn same_path(left: &str, right: &str) -> bool {
     }
 }
 
+/// Resolves the worktree an insights read is about, and proves it belongs to
+/// `repo_path`.
+///
+/// Without this, `worktree_path` was taken on trust: a path naming a totally
+/// unrelated repository came back stamped with `repo_path`'s identity, so the
+/// answer described one repository while claiming to describe another. The
+/// ledger route has always authenticated this pair; these read tools now use
+/// the same gate. The returned path is the canonical one git registered, so
+/// later comparisons against the worktree listing are not defeated by
+/// symlinks or a trailing slash.
 fn resolve_target(repo_path: &str, worktree_path: Option<&str>) -> Result<String, String> {
     let Some(requested) = worktree_path else {
         // No worktree named: the repository itself is the target, and there is
@@ -1621,7 +1723,9 @@ fn changes_in(repo_path: &str, target: &str, limit: Option<u32>) -> ActiveChange
             let total = files.len() as u32;
             let truncated = files.len() > cap;
             let kept: Vec<FileStatus> = files.iter().take(cap).cloned().collect();
-            let counts = count_statuses(&kept);
+            // Totals describe the whole worktree, like `total`; only the row
+            // list is capped. Counting the rows kept understated them.
+            let counts = count_statuses(&files);
             ActiveChanges {
                 repo_path: repo_path.to_string(),
                 worktree_path: target.to_string(),
@@ -1677,6 +1781,7 @@ fn unlisted_info(target: &str) -> WorktreeInfo {
         main_divergence: None,
         active_routes: Vec::new(),
         scan_note: None,
+        status_read: worktree::StatusRead::NotRead,
     }
 }
 
@@ -1813,60 +1918,179 @@ pub fn change_context(repo_path: &str, worktree_path: Option<&str>) -> ChangeCon
     }
 }
 
-fn looks_like_mcp_binary(name: &str) -> bool {
-    let stem = name.strip_suffix(".exe").unwrap_or(name);
-    stem == "gitpulse-mcp" || stem.starts_with("gitpulse-mcp-")
+/// Where one of the app's bundled executables is, and whether a bare name
+/// would reach it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct BinaryStatus {
+    found: bool,
+    path: String,
+    error: String,
+    /// The bare command name resolves on `PATH`. The plugin's own manifests
+    /// name it bare, so with an empty `PATH` they cannot start it even when
+    /// `found`.
+    on_path: bool,
 }
 
-fn resolve_mcp_binary() -> (bool, String, String) {
-    if let Ok(explicit) = std::env::var("GITPULSE_MCP_PATH") {
-        let path = Path::new(&explicit);
-        if path.is_file() {
-            return (true, explicit, String::new());
+/// `gitpulse-mcp`, or the target-triple build Tauri names it (`gitpulse-mcp-<triple>`).
+fn looks_like_binary(name: &str, stem: &str) -> bool {
+    let name = name.strip_suffix(".exe").unwrap_or(name);
+    name == stem
+        || name
+            .strip_prefix(stem)
+            .is_some_and(|rest| rest.starts_with('-'))
+}
+
+/// Whether `stem` is an executable file in one of the directories of `path_var`.
+/// `None` and an empty value find nothing.
+fn on_path_in(stem: &str, path_var: Option<std::ffi::OsString>) -> bool {
+    let Some(path_var) = path_var else {
+        return false;
+    };
+    std::env::split_paths(&path_var).any(|dir| {
+        !dir.as_os_str().is_empty()
+            && [stem.to_string(), format!("{stem}.exe")]
+                .iter()
+                .any(|name| dir.join(name).is_file())
+    })
+}
+
+/// Resolves one bundled executable: an explicit `env_var` override, else this
+/// process itself or a file beside it (the app bundle's `Contents/MacOS`).
+fn resolve_bundled_binary(env_var: &str, stem: &str) -> BinaryStatus {
+    let on_path = on_path_in(stem, std::env::var_os("PATH"));
+    let missing = |error: String| BinaryStatus {
+        error,
+        on_path,
+        ..BinaryStatus::default()
+    };
+    let found = |path: String| BinaryStatus {
+        found: true,
+        path,
+        error: String::new(),
+        on_path,
+    };
+    if let Ok(explicit) = std::env::var(env_var) {
+        if Path::new(&explicit).is_file() {
+            return found(explicit);
         }
-        return (
-            false,
-            explicit,
-            "GITPULSE_MCP_PATH does not point at a file".into(),
-        );
+        return BinaryStatus {
+            path: explicit,
+            ..missing(format!("{env_var} does not point at a file"))
+        };
     }
     let exe = match std::env::current_exe() {
         Ok(p) => p,
-        Err(e) => {
-            return (
-                false,
-                String::new(),
-                format!("could not resolve this process path: {e}"),
-            )
-        }
+        Err(e) => return missing(format!("could not resolve this process path: {e}")),
     };
-    if looks_like_mcp_binary(exe.file_name().and_then(|n| n.to_str()).unwrap_or_default())
-        && exe.is_file()
+    if looks_like_binary(
+        exe.file_name().and_then(|n| n.to_str()).unwrap_or_default(),
+        stem,
+    ) && exe.is_file()
     {
-        return (true, exe.to_string_lossy().into_owned(), String::new());
+        return found(exe.to_string_lossy().into_owned());
     }
     let Some(dir) = exe.parent() else {
-        return (
-            false,
-            String::new(),
-            "gitpulse-mcp is not next to this process".into(),
-        );
+        return missing(format!("{stem} is not next to this process"));
     };
     if let Ok(entries) = std::fs::read_dir(dir) {
         for entry in entries.flatten() {
             let path = entry.path();
             let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-            if path.is_file() && looks_like_mcp_binary(name) {
-                return (true, path.to_string_lossy().into_owned(), String::new());
+            if path.is_file() && looks_like_binary(name, stem) {
+                return found(path.to_string_lossy().into_owned());
             }
         }
     }
-    (
-        false,
-        String::new(),
-        "gitpulse-mcp is not next to this app. Build it with `cargo build --bin gitpulse-mcp --manifest-path src-tauri/Cargo.toml`, or set GITPULSE_MCP_PATH."
-            .into(),
-    )
+    missing(format!(
+        "{stem} is not next to this app. Build it with `cargo build --bin {stem} --manifest-path src-tauri/Cargo.toml`, or set {env_var}."
+    ))
+}
+
+/// Single-quotes `text` for a POSIX shell.
+fn sh_quote(text: &str) -> String {
+    format!("'{}'", text.replace('\'', "'\\''"))
+}
+
+/// The plugin's MCP manifest with `gitpulse` started by `binary`'s absolute
+/// path. A bare `gitpulse-mcp` only works when something put it on `PATH`, and
+/// a released app does not.
+fn mcp_config_with(template: &str, binary: &str) -> Result<String, String> {
+    let mut value: serde_json::Value =
+        serde_json::from_str(template).map_err(|e| format!("the MCP manifest is not JSON: {e}"))?;
+    let server = value
+        .pointer_mut("/mcpServers/gitpulse")
+        .and_then(|s| s.as_object_mut())
+        .ok_or("the MCP manifest has no gitpulse server")?;
+    server.insert(
+        "command".into(),
+        serde_json::Value::String(binary.to_string()),
+    );
+    serde_json::to_string_pretty(&value).map_err(|e| e.to_string())
+}
+
+/// The plugin's hooks manifest with every `gitpulse-hook` spelled as the
+/// absolute path of `binary`.
+///
+/// The hooks that decide something (`collision-guard`, `command-gate`) also
+/// refuse when the binary is missing: a host treats a hook that cannot start as
+/// a non-blocking error and runs the call anyway, so the bare command left the
+/// gate silently off. Exit status 2 is the host's "block", with the reason on
+/// stderr. `session-brief` cannot block anything, so it tells the session
+/// instead. Reports (`notify`) stay as they are: losing one loses a
+/// notification, never a decision. On Windows there is no `sh` to wrap with, so
+/// every command is the quoted path alone.
+fn hooks_config_with(template: &str, binary: &str) -> Result<String, String> {
+    let mut value: serde_json::Value = serde_json::from_str(template)
+        .map_err(|e| format!("the hooks manifest is not JSON: {e}"))?;
+    let events = value
+        .get_mut("hooks")
+        .and_then(|h| h.as_object_mut())
+        .ok_or("the hooks manifest has no hooks")?;
+    let quoted = sh_quote(binary);
+    for groups in events.values_mut() {
+        for group in groups.as_array_mut().into_iter().flatten() {
+            for handler in group
+                .get_mut("hooks")
+                .and_then(|h| h.as_array_mut())
+                .into_iter()
+                .flatten()
+            {
+                let Some(command) = handler.get("command").and_then(|c| c.as_str()) else {
+                    continue;
+                };
+                let Some(args) = command.strip_prefix("gitpulse-hook ") else {
+                    return Err(format!("unexpected hook command: {command}"));
+                };
+                let wrapped = if cfg!(windows) {
+                    format!("\"{binary}\" {args}")
+                } else {
+                    match args.split_whitespace().next() {
+                        Some("collision-guard" | "command-gate") => format!(
+                            "[ -x {quoted} ] || {{ echo {} >&2; exit 2; }}; exec {quoted} {args}",
+                            sh_quote(&format!(
+                                "GitPulse blocked this call: its safety hook {binary} cannot run. Reinstall GitPulse or set the hook path in Settings."
+                            ))
+                        ),
+                        Some("session-brief") => format!(
+                            "[ -x {quoted} ] || {{ printf '%s' {}; exit 0; }}; exec {quoted} {args}",
+                            sh_quote(&serde_json::json!({
+                                "hookSpecificOutput": {
+                                    "hookEventName": "SessionStart",
+                                    "additionalContext": format!(
+                                        "WARNING: GitPulse's safety hooks cannot run ({binary} is missing), so the collision guard and command gate are OFF in this session."
+                                    )
+                                }
+                            })
+                            .to_string())
+                        ),
+                        _ => format!("{quoted} {args}"),
+                    }
+                };
+                handler["command"] = serde_json::Value::String(wrapped);
+            }
+        }
+    }
+    serde_json::to_string_pretty(&value).map_err(|e| e.to_string())
 }
 
 fn is_native_plugin_root(path: &Path) -> bool {
@@ -1919,30 +2143,54 @@ fn resolve_plugin_root() -> (bool, String, String) {
 /// manifests, and the tool catalog. Never claims a binary is present when the
 /// file could not be found.
 pub fn mcp_info() -> McpInfo {
-    let (binary_found, binary_path, binary_error) = resolve_mcp_binary();
+    let mcp = resolve_bundled_binary("GITPULSE_MCP_PATH", "gitpulse-mcp");
+    let hook = resolve_bundled_binary("GITPULSE_HOOK_PATH", "gitpulse-hook");
     let (plugin_found, plugin_path, plugin_error) = resolve_plugin_root();
-    let (plugin_manifest_json, plugin_mcp_json) = if plugin_found {
-        let root = Path::new(&plugin_path);
-        let manifest =
-            std::fs::read_to_string(root.join(".codex-plugin/plugin.json")).unwrap_or_default();
-        let mcp = std::fs::read_to_string(root.join(".mcp.json")).unwrap_or_default();
-        (manifest, mcp)
-    } else {
-        (String::new(), String::new())
-    };
+    let (plugin_manifest_json, plugin_mcp_json, mcp_config_json, hooks_config_json) =
+        if plugin_found {
+            let root = Path::new(&plugin_path);
+            let manifest =
+                std::fs::read_to_string(root.join(".codex-plugin/plugin.json")).unwrap_or_default();
+            let mcp_template = std::fs::read_to_string(root.join(".mcp.json")).unwrap_or_default();
+            let hooks_template =
+                std::fs::read_to_string(root.join("hooks/hooks.json")).unwrap_or_default();
+            // What Settings copies is the command that will run, so it is built
+            // from the path just resolved. Nothing is offered for a binary that
+            // was not found: a copy naming a bare command is the bug.
+            let mcp_config = if mcp.found {
+                mcp_config_with(&mcp_template, &mcp.path).unwrap_or_default()
+            } else {
+                String::new()
+            };
+            let hooks_config = if hook.found {
+                hooks_config_with(&hooks_template, &hook.path).unwrap_or_default()
+            } else {
+                String::new()
+            };
+            (manifest, mcp_template, mcp_config, hooks_config)
+        } else {
+            (String::new(), String::new(), String::new(), String::new())
+        };
     McpInfo {
         protocol_version: crate::mcp::PROTOCOL_VERSION.to_string(),
         server_name: crate::mcp::SERVER_NAME.to_string(),
         server_version: crate::mcp::server_version().to_string(),
         read_only: true,
-        binary_found,
-        binary_path,
-        binary_error,
+        binary_found: mcp.found,
+        binary_path: mcp.path,
+        binary_error: mcp.error,
+        binary_on_path: mcp.on_path,
+        hook_found: hook.found,
+        hook_path: hook.path,
+        hook_error: hook.error,
+        hook_on_path: hook.on_path,
         plugin_found,
         plugin_path,
         plugin_error,
         plugin_manifest_json,
         plugin_mcp_json,
+        mcp_config_json,
+        hooks_config_json,
         tools: crate::mcp::tool_catalog(),
     }
 }
@@ -1954,6 +2202,25 @@ mod tests {
     use std::fs;
 
     use crate::test_support::git_in;
+
+    #[test]
+    fn same_path_takes_strings_and_paths_and_sees_through_symlinks() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real");
+        fs::create_dir(&real).unwrap();
+        assert!(same_path(real.to_str().unwrap(), &real));
+        assert!(!same_path(&real, dir.path()));
+        // A removed directory cannot be canonicalised and compares literally.
+        let gone = dir.path().join("gone");
+        assert!(same_path(&gone, &gone));
+        assert!(!same_path(&gone, &real));
+        #[cfg(unix)]
+        {
+            let link = dir.path().join("link");
+            std::os::unix::fs::symlink(&real, &link).unwrap();
+            assert!(same_path(&link, &real));
+        }
+    }
 
     fn init_repo() -> tempfile::TempDir {
         let dir = tempfile::TempDir::new().unwrap();
@@ -1982,35 +2249,8 @@ mod tests {
             main_divergence: None,
             active_routes: Vec::new(),
             scan_note: None,
+            status_read: worktree::StatusRead::NotRead,
         }
-    }
-
-    /// One builder per fact. Two hand-written `WorktreeSummary` literals and a
-    /// third agent-kind scan in the collision path each had to be kept in step
-    /// by hand; a new field, or a change to how a path is labelled, landed in
-    /// one and not the others.
-    #[test]
-    fn worktree_rows_and_agent_labels_each_have_one_builder() {
-        let source = include_str!("mod.rs");
-        let production = &source[..source
-            .find("#[cfg(test)]\nmod tests")
-            .expect("test module marker")];
-        // A struct literal opens on a line of its own; signatures returning
-        // the type and the definition do not.
-        assert_eq!(
-            production
-                .lines()
-                .filter(|line| line.trim() == "WorktreeSummary {")
-                .count(),
-            1,
-            "summarise_worktree is the only WorktreeSummary literal"
-        );
-        assert_eq!(
-            production.matches("agent_layout(").count(),
-            1,
-            "agent_labels is the one scan"
-        );
-        assert!(!production.contains("agent_kind(&"));
     }
 
     /// The snapshot row and the change-context row for an unlisted checkout
@@ -2037,8 +2277,10 @@ mod tests {
 
     /// A running process registered as one Claude Code session in `cwd`.
     /// Killed when dropped, so a failing assertion leaves nothing behind.
+    #[cfg(unix)]
     struct SimulatedSession(std::process::Child);
 
+    #[cfg(unix)]
     impl Drop for SimulatedSession {
         fn drop(&mut self) {
             let _ = self.0.kill();
@@ -2046,6 +2288,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     fn simulate_session(registry: &Path, cwd: &Path) -> SimulatedSession {
         let child = std::process::Command::new("sleep")
             .arg("60")
@@ -2094,7 +2337,7 @@ mod tests {
         let claude = observation.iter().find(|k| k.kind == "claude").unwrap();
         assert_eq!(claude.live.len(), 2, "both stand-ins are alive: {claude:?}");
 
-        let risk = collision_risk_observed(repo, &observation);
+        let risk = collision_risk_observed(repo, &observation, None);
         assert!(risk.ok, "{risk:?}");
         assert_eq!(risk.overlapping_files, 0, "one worktree overlaps nothing");
         assert_eq!(risk.shared_worktree_files, 1, "{risk:?}");
@@ -2152,7 +2395,7 @@ mod tests {
             &crate::workbench::process_birth::running_since,
         );
 
-        let risk = collision_risk_observed(repo, &observation);
+        let risk = collision_risk_observed(repo, &observation, None);
         assert!(risk.ok, "{risk:?}");
         assert!(risk.shared_worktrees.is_empty(), "{risk:?}");
         assert_eq!(risk.shared_worktree_files, 0);
@@ -2199,7 +2442,11 @@ mod tests {
         assert!(!snap.changes.ok);
         assert!(!snap.collisions.ok);
         assert_eq!(snap.collisions.overlapping_files, 0);
-        assert!(!snap.collisions.items.is_empty() || snap.collisions.items.is_empty());
+        assert!(
+            snap.collisions.items.is_empty(),
+            "a collision scan that failed must not invent overlaps: {:?}",
+            snap.collisions.items
+        );
         // Zero overlapping files plus ok:false is "we did not look", not clean.
         assert!(!snap.worktrees.ok && snap.collisions.overlapping_files == 0);
     }
@@ -2277,7 +2524,7 @@ mod tests {
         fs::write(wt.join("shared.txt"), "agent-edit").unwrap();
 
         let list = worktree::list_worktrees(repo).expect("list");
-        let scanned = collision_from_list(&list, &live_in(&Vec::new(), &list));
+        let scanned = collision_from_list(&list, &live_in(&Vec::new(), &list), None);
         assert!(
             scanned.items.iter().all(|item| item.entity.is_none()),
             "porcelain scan must leave entity unset: {scanned:?}"
@@ -2317,6 +2564,31 @@ mod tests {
         assert!(!changes.error.is_empty());
         assert!(changes.files.is_empty());
         assert_eq!(changes.total, 0);
+    }
+
+    /// 250 untracked files, a cap of 200 on rows: the totals cover all 250.
+    /// They were rolled from the first 200 and read as exact.
+    #[test]
+    fn change_totals_cover_every_file_not_the_capped_list() {
+        let main = init_repo();
+        let repo = main.path().to_str().unwrap();
+        for i in 0..250 {
+            fs::write(main.path().join(format!("f{i}.txt")), "x\n").unwrap();
+        }
+        let snap = snapshot(repo);
+        assert!(snap.changes.ok, "{:?}", snap.changes);
+        assert_eq!(snap.changes.files, 250);
+        assert_eq!(snap.changes.untracked, 250, "{:?}", snap.changes);
+        assert!(!snap.changes.truncated, "{:?}", snap.changes);
+
+        let listed = active_changes(repo, None, Some(10));
+        assert_eq!(listed.files.len(), 10);
+        assert_eq!(listed.total, 250);
+        assert!(listed.truncated, "the row list is capped");
+        assert_eq!(
+            listed.untracked, 250,
+            "totals are not the capped rows: {listed:?}"
+        );
     }
 
     /// Commits an empty change stamped at an exact instant.
@@ -2545,6 +2817,53 @@ mod tests {
             "every in-window commit is counted, whatever order the dates arrive in"
         );
         assert_eq!(stats.active_days, 4);
+    }
+
+    /// More history than the cap, all of it older than the window except three
+    /// commits: the window was fully covered, so nothing is a floor.
+    #[test]
+    fn a_long_history_older_than_the_window_is_not_truncated() {
+        use std::io::Write;
+        let dir = tempfile::TempDir::new().unwrap();
+        git_in(dir.path(), &["init", "-b", "main"]);
+        let anchor = 1_800_000_000i64;
+        let old_total = MAX_FLEET_COMMITS + 50;
+        let mut stream = String::new();
+        for i in 0..old_total + 3 {
+            let stamp = if i < old_total {
+                anchor - 400 * 86_400 + i as i64
+            } else {
+                anchor - 100 * (1 + (i - old_total) as i64)
+            };
+            stream.push_str(&format!(
+                "commit refs/heads/main\nmark :{}\ncommitter A <a@example.com> {stamp} +0000\ndata 2\nc\n",
+                i + 1
+            ));
+            if i > 0 {
+                stream.push_str(&format!("from :{i}\n"));
+            }
+            stream.push('\n');
+        }
+        let file = dir.path().join("stream");
+        fs::File::create(&file)
+            .unwrap()
+            .write_all(stream.as_bytes())
+            .unwrap();
+        let status = std::process::Command::new("git")
+            .args(["fast-import", "--quiet"])
+            .current_dir(dir.path())
+            .stdin(fs::File::open(&file).unwrap())
+            .status_locked()
+            .expect("spawn git fast-import");
+        assert!(status.success());
+
+        let stats =
+            fleet_commit_stats(dir.path(), anchor, FLEET_COMMIT_WINDOW_DAYS).expect("probe runs");
+        assert_eq!(stats.commits, 3);
+        assert!(
+            !stats.truncated,
+            "the window held 3 commits; history past the window must not spend the cap"
+        );
     }
 
     #[test]
@@ -2971,6 +3290,7 @@ mod tests {
             main_divergence: None,
             active_routes: Vec::new(),
             scan_note: None,
+            status_read: worktree::StatusRead::NotRead,
         };
         let items: Vec<WorktreeSummary> = [
             info("/repo", true),
@@ -3332,6 +3652,171 @@ mod tests {
         assert!(!info.tools.is_empty());
     }
 
+    fn plugin_hooks_template() -> String {
+        fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../plugins/gitpulse/hooks/hooks.json"),
+        )
+        .expect("the plugin ships a hooks manifest")
+    }
+
+    /// The commands of the generated hooks manifest, keyed by the subcommand
+    /// they run.
+    fn generated_commands(binary: &str) -> Vec<(String, String)> {
+        let json = hooks_config_with(&plugin_hooks_template(), binary).expect("rewritten");
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let mut found = Vec::new();
+        for groups in value["hooks"].as_object().unwrap().values() {
+            for group in groups.as_array().unwrap() {
+                for handler in group["hooks"].as_array().unwrap() {
+                    let command = handler["command"].as_str().unwrap().to_string();
+                    let sub = command.rsplit(' ').next().unwrap_or_default().to_string();
+                    found.push((sub, command));
+                }
+            }
+        }
+        found
+    }
+
+    /// A released app has nothing on `PATH`, so the manifest it hands out must
+    /// name the binary by path. The shipped one names it bare.
+    #[test]
+    fn the_generated_hooks_and_mcp_manifests_name_the_binary_by_absolute_path() {
+        let commands =
+            generated_commands("/Applications/GitPulse.app/Contents/MacOS/gitpulse-hook");
+        assert!(!commands.is_empty());
+        for (_, command) in &commands {
+            assert!(
+                command.contains("/Applications/GitPulse.app/Contents/MacOS/gitpulse-hook"),
+                "{command}"
+            );
+            assert!(!command.starts_with("gitpulse-hook "), "{command}");
+        }
+        let mcp = mcp_config_with(
+            r#"{"mcpServers":{"gitpulse":{"type":"stdio","command":"gitpulse-mcp"}}}"#,
+            "/Applications/GitPulse.app/Contents/MacOS/gitpulse-mcp",
+        )
+        .unwrap();
+        assert!(
+            mcp.contains("\"command\": \"/Applications/GitPulse.app/Contents/MacOS/gitpulse-mcp\""),
+            "{mcp}"
+        );
+        assert!(mcp_config_with("{}", "/x").is_err());
+        assert!(hooks_config_with(
+            r#"{"hooks":{"Stop":[{"hooks":[{"command":"other x"}]}]}}"#,
+            "/x"
+        )
+        .is_err());
+    }
+
+    /// A hook that cannot launch must not read as a hook that allowed the
+    /// call. Run for real: with the binary missing, the deciding hooks exit 2
+    /// (the host's "block") with the reason on stderr, session start says the
+    /// hooks are off, and a present binary is simply run.
+    #[cfg(unix)]
+    #[test]
+    fn a_missing_hook_binary_refuses_deciding_hooks_and_warns_at_session_start() {
+        use std::process::Command;
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("gitpulse hook's dir/gitpulse-hook");
+        let run = |command: &str| {
+            Command::new("sh")
+                .arg("-c")
+                .arg(command)
+                .output_locked()
+                .expect("sh runs")
+        };
+        let commands = generated_commands(missing.to_str().unwrap());
+        for (sub, command) in &commands {
+            let out = run(command);
+            match sub.as_str() {
+                "collision-guard" | "command-gate" => {
+                    assert_eq!(out.status.code(), Some(2), "{sub}: {command}");
+                    let stderr = String::from_utf8_lossy(&out.stderr);
+                    assert!(stderr.contains("blocked this call"), "{sub}: {stderr}");
+                }
+                "session-brief" => {
+                    assert_eq!(out.status.code(), Some(0), "{sub}");
+                    let stdout = String::from_utf8_lossy(&out.stdout);
+                    let value: serde_json::Value =
+                        serde_json::from_str(&stdout).unwrap_or_else(|e| panic!("{e}: {stdout}"));
+                    assert!(
+                        value["hookSpecificOutput"]["additionalContext"]
+                            .as_str()
+                            .unwrap()
+                            .contains("OFF"),
+                        "{stdout}"
+                    );
+                }
+                _ => {}
+            }
+        }
+        assert!(commands.iter().any(|(sub, _)| sub == "command-gate"));
+        assert!(commands.iter().any(|(sub, _)| sub == "session-brief"));
+
+        // Present: the wrapper hands control to the binary with its arguments.
+        std::fs::create_dir_all(missing.parent().unwrap()).unwrap();
+        std::fs::write(&missing, "#!/bin/sh\necho \"ran $*\"\nexit 0\n").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&missing, std::fs::Permissions::from_mode(0o755)).unwrap();
+        for (sub, command) in generated_commands(missing.to_str().unwrap()) {
+            let out = run(&command);
+            assert_eq!(out.status.code(), Some(0), "{sub}");
+            assert!(
+                String::from_utf8_lossy(&out.stdout).starts_with("ran "),
+                "{sub}"
+            );
+        }
+    }
+
+    /// The bare command a plugin manifest names reaches nothing with an empty
+    /// `PATH`; Settings says so instead of reporting the binary as fine.
+    #[test]
+    fn a_bare_command_is_not_reachable_on_an_empty_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let name = if cfg!(windows) {
+            "gitpulse-hook.exe"
+        } else {
+            "gitpulse-hook"
+        };
+        fs::write(dir.path().join(name), "").unwrap();
+        assert!(on_path_in(
+            "gitpulse-hook",
+            Some(dir.path().as_os_str().to_owned())
+        ));
+        assert!(!on_path_in(
+            "gitpulse-hook",
+            Some(std::ffi::OsString::new())
+        ));
+        assert!(!on_path_in("gitpulse-hook", None));
+        assert!(!on_path_in(
+            "gitpulse-mcp",
+            Some(dir.path().as_os_str().to_owned())
+        ));
+        assert!(looks_like_binary(
+            "gitpulse-hook-aarch64-apple-darwin",
+            "gitpulse-hook"
+        ));
+        assert!(looks_like_binary("gitpulse-hook.exe", "gitpulse-hook"));
+        assert!(!looks_like_binary("gitpulse-hookah", "gitpulse-hook"));
+    }
+
+    /// With the hook binary unresolved nothing is offered to copy: a manifest
+    /// naming a binary that is not there is the failure being fixed.
+    #[test]
+    fn mcp_info_offers_no_hooks_manifest_for_a_hook_binary_it_did_not_find() {
+        let serial = crate::harness::sidecar::test_serial();
+        let _env = crate::test_support::env::bind_env(&serial)
+            .set("GITPULSE_HOOK_PATH", "/no/such/gitpulse-hook");
+        let info = mcp_info();
+        assert!(!info.hook_found);
+        assert!(
+            info.hook_error.contains("GITPULSE_HOOK_PATH"),
+            "{}",
+            info.hook_error
+        );
+        assert!(info.hooks_config_json.is_empty());
+    }
+
     #[test]
     fn mcp_info_reads_the_native_codex_package() {
         let info = mcp_info();
@@ -3399,5 +3884,295 @@ mod tests {
             .iter()
             .all(|w| w.dirty_files.is_some()));
         assert_eq!(measured(&cwds), 0, "snapshot");
+    }
+
+    /// A repository with `linked` extra worktrees, all trusted. Returns the
+    /// main checkout, the directory holding the linked ones, and their
+    /// canonical paths.
+    fn repo_with_linked_worktrees(
+        linked: usize,
+    ) -> (
+        tempfile::TempDir,
+        tempfile::TempDir,
+        Vec<std::path::PathBuf>,
+    ) {
+        let main = init_repo();
+        let parent = tempfile::TempDir::new().unwrap();
+        let paths = (0..linked)
+            .map(|i| {
+                let path = parent.path().join(format!("wt-{i:02}"));
+                git_in(
+                    main.path(),
+                    &[
+                        "worktree",
+                        "add",
+                        "-q",
+                        "-b",
+                        &format!("agent/{i:02}"),
+                        path.to_str().unwrap(),
+                    ],
+                );
+                crate::test_support::trust_repo(&path);
+                path.canonicalize().unwrap()
+            })
+            .collect();
+        (main, parent, paths)
+    }
+
+    /// Children that ran `git status` in `dir`, whichever way the path was
+    /// spelled to the spawn.
+    fn status_spawns_in(
+        dir: &std::path::Path,
+    ) -> Vec<(Vec<String>, crate::engine::git_cli::Admission)> {
+        crate::engine::git_cli::spawn_log::classed_spawns_in(dir)
+            .into_iter()
+            .filter(|(argv, _)| argv.iter().any(|arg| arg == "status"))
+            .collect()
+    }
+
+    /// One `git status` per worktree, shared by the worktree rows and the
+    /// collision scan. The collision scan used to re-run the status the
+    /// listing had already read, in every worktree it covered.
+    #[test]
+    fn a_snapshot_reads_each_worktrees_status_once() {
+        let (main, _parent, linked) = repo_with_linked_worktrees(17);
+        let root = main.path().canonicalize().unwrap();
+        // Two worktrees dirty the same file, so the collision scan has a real
+        // overlap to find from the statuses it is given.
+        fs::write(linked[0].join("shared.txt"), "first").unwrap();
+        fs::write(linked[1].join("shared.txt"), "second").unwrap();
+
+        let snap = snapshot(root.to_str().unwrap());
+        assert_eq!(snap.worktrees.count, 18, "{:?}", snap.worktrees);
+        assert!(snap.collisions.ok, "{:?}", snap.collisions);
+        assert_eq!(
+            snap.collisions.overlapping_files, 1,
+            "{:?}",
+            snap.collisions
+        );
+
+        for dir in &linked {
+            assert_eq!(
+                status_spawns_in(dir).len(),
+                1,
+                "{} was read more than once",
+                dir.display()
+            );
+        }
+        // The main checkout is read by the listing and once more by
+        // `get_status`, which needs per-file untracked rows (`-u`) and churn
+        // the listing's count does not: the O(1) beside the N statuses.
+        assert!(
+            status_spawns_in(&root).len() <= 2,
+            "{:?}",
+            status_spawns_in(&root)
+        );
+    }
+
+    /// The collision scan runs on rayon's pool, whose threads start in the
+    /// default class. Under a caller that asked for background work, its
+    /// statuses competed as refresh traffic.
+    #[test]
+    fn the_collision_scan_keeps_the_callers_admission_class() {
+        use crate::engine::git_cli::{with_admission, Admission};
+        let (main, _parent, linked) = repo_with_linked_worktrees(10);
+        let root = main.path().canonicalize().unwrap();
+        let risk = with_admission(Admission::Background, || {
+            collision_risk(root.to_str().unwrap())
+        });
+        assert!(risk.ok, "{risk:?}");
+        assert_eq!(risk.scanned_worktrees, 11, "{risk:?}");
+
+        let mut checked = 0;
+        let mut escaped = Vec::new();
+        for dir in linked.iter().chain(std::iter::once(&root)) {
+            for (argv, class) in status_spawns_in(dir) {
+                checked += 1;
+                if class != Admission::Background {
+                    escaped.push((dir.clone(), argv, class));
+                }
+            }
+        }
+        assert_eq!(checked, 11, "every worktree was read once");
+        assert!(
+            escaped.is_empty(),
+            "{} of {checked} status reads left the caller's class: {escaped:?}",
+            escaped.len()
+        );
+    }
+
+    /// The snapshot reports which operation is parked and nothing else about
+    /// it, so reading the parked state is a look at control files. The full
+    /// report also resolves the branch, describes the incoming commit and
+    /// lists conflicts: three more children per parked worktree, run one
+    /// worktree after another inside the deadline-bounded stage.
+    #[test]
+    fn a_parked_operation_is_named_without_starting_a_process() {
+        let (main, _parent, linked) = repo_with_linked_worktrees(2);
+        let root = main.path().canonicalize().unwrap();
+        let parked = &linked[0];
+        let head = git_text(parked, &["rev-parse", "HEAD"]).unwrap();
+        let git_dir = fs::read_to_string(parked.join(".git")).unwrap();
+        let git_dir = std::path::PathBuf::from(git_dir.trim().trim_start_matches("gitdir: "));
+        fs::write(git_dir.join("MERGE_HEAD"), head).unwrap();
+        let before = crate::engine::git_cli::spawn_log::spawns_in(parked).len();
+
+        let snap = snapshot(root.to_str().unwrap());
+        let row = snap
+            .worktrees
+            .items
+            .iter()
+            .find(|w| same_path(&w.path, parked.to_str().unwrap()))
+            .expect("the parked worktree is listed");
+        assert_eq!(row.operation_kind, "Merge", "{row:?}");
+        assert!(row.operation_ok, "{row:?}");
+        assert_eq!(snap.worktrees.blocked, 1, "{:?}", snap.worktrees);
+
+        let beyond_status: Vec<_> = crate::engine::git_cli::spawn_log::spawns_in(parked)
+            .into_iter()
+            .skip(before)
+            .filter(|argv| !argv.iter().any(|arg| arg == "status"))
+            .collect();
+        assert!(
+            beyond_status.is_empty(),
+            "probing the parked operation started: {beyond_status:?}"
+        );
+    }
+
+    /// The deadline bounds the work, not only the gaps between stages: the
+    /// worktree status reads ran to completion whatever it said, and the
+    /// snapshot returned when they finished.
+    #[test]
+    fn a_snapshot_returns_within_its_deadline_when_every_status_is_slow() {
+        let (main, _parent, linked) = repo_with_linked_worktrees(17);
+        let root = main.path().canonicalize().unwrap();
+        let mut everywhere = linked.clone();
+        everywhere.push(root.clone());
+        let deadline = Duration::from_secs(1);
+
+        let started = Instant::now();
+        let snap = crate::engine::worktree::status_probes::with_probe(
+            &everywhere,
+            |_| std::thread::sleep(Duration::from_millis(500)),
+            || snapshot_within(root.to_str().unwrap(), deadline, MAX_SNAPSHOT_WORKTREES),
+        );
+        let took = started.elapsed();
+
+        assert!(
+            took < deadline + Duration::from_secs(1),
+            "a 1 s deadline returned after {took:?} (the snapshot reports {} ms)",
+            snap.duration_ms
+        );
+        assert!(snap.deadline_expired, "{snap:?}");
+        // The reads that did not happen are unknown, never clean.
+        assert_eq!(snap.worktrees.count, 18, "{:?}", snap.worktrees);
+        assert!(snap.worktrees.dirty_unknown > 0, "{:?}", snap.worktrees);
+        assert!(snap.worktrees.scanned < 18, "{:?}", snap.worktrees);
+        assert!(!snap.collisions.ok, "{:?}", snap.collisions);
+        assert!(snap.collisions.truncated, "{:?}", snap.collisions);
+        assert!(
+            snap.collisions.scanned_worktrees
+                + snap.collisions.failed_worktrees
+                + snap.collisions.unscanned_worktrees
+                >= 18,
+            "{:?}",
+            snap.collisions
+        );
+    }
+
+    fn row<'a>(snap: &'a InsightsSnapshot, dir: &std::path::Path) -> &'a WorktreeSummary {
+        snap.worktrees
+            .items
+            .iter()
+            .find(|w| same_path(&w.path, dir.to_str().unwrap()))
+            .expect("the worktree is listed")
+    }
+
+    /// An edit made while the snapshot is running is reported when it lands
+    /// before that worktree is read: the read is the last git stage, after the
+    /// listing and the main checkout's status, and the rows and the collision
+    /// scan both come out of it.
+    #[test]
+    fn an_edit_made_mid_snapshot_before_its_worktrees_read_is_reported() {
+        let (main, _parent, linked) = repo_with_linked_worktrees(9);
+        let root = main.path().canonicalize().unwrap();
+        let first = linked.first().unwrap().clone();
+        let last = linked.last().unwrap().clone();
+        fs::write(first.join("shared.txt"), "first").unwrap();
+
+        // The main checkout is in the first wave and the last worktree in the
+        // third: the edit lands after the snapshot began and before the last
+        // worktree's turn. Relies on a fan-out of 4: with 10 worktrees, main is
+        // read in wave 1 and the last in wave 3, so a change to
+        // DIRTY_SCAN_FAN_OUT that put them in one wave would make this vacuous.
+        let edited = last.clone();
+        let snap = crate::engine::worktree::status_probes::with_probe(
+            std::slice::from_ref(&root),
+            move |_| fs::write(edited.join("shared.txt"), "mid-snapshot").unwrap(),
+            || snapshot(root.to_str().unwrap()),
+        );
+
+        assert!(snap.collisions.ok, "{:?}", snap.collisions);
+        assert_eq!(
+            snap.collisions.overlapping_files, 1,
+            "{:?}",
+            snap.collisions
+        );
+        assert_eq!(snap.collisions.items[0].path, "shared.txt");
+        assert_eq!(
+            row(&snap, &last).dirty_files,
+            Some(1),
+            "{:?}",
+            snap.worktrees
+        );
+    }
+
+    /// One read per worktree means the rows and the collision scan can only
+    /// disagree about a worktree if they read it at different moments. An edit
+    /// that lands after a worktree was read is in neither facet of that
+    /// snapshot, and in both of the next one: the snapshot is a point-in-time
+    /// read of each worktree, bounded by its own `duration_ms`, and says the
+    /// same thing in both places. Before, the listing said "clean" and the
+    /// collision scan, reading again later, said "dirty".
+    #[test]
+    fn the_rows_and_the_collision_scan_describe_one_read_of_each_worktree() {
+        let (main, _parent, linked) = repo_with_linked_worktrees(9);
+        let root = main.path().canonicalize().unwrap();
+        let last = linked.last().unwrap().clone();
+        fs::write(linked[0].join("late.txt"), "first").unwrap();
+
+        // The last worktree is read in the third wave; the main checkout, read
+        // in the first, is edited just before it. Relies on the same fan-out of 4
+        // as the test above.
+        let edited = root.clone();
+        let snap = crate::engine::worktree::status_probes::with_probe(
+            std::slice::from_ref(&last),
+            move |_| fs::write(edited.join("late.txt"), "after main was read").unwrap(),
+            || snapshot(root.to_str().unwrap()),
+        );
+        assert_eq!(
+            row(&snap, &root).dirty_files,
+            Some(0),
+            "{:?}",
+            snap.worktrees
+        );
+        assert_eq!(
+            snap.collisions.overlapping_files, 0,
+            "the collision scan saw an edit the row did not: {:?}",
+            snap.collisions
+        );
+
+        let next = snapshot(root.to_str().unwrap());
+        assert_eq!(
+            row(&next, &root).dirty_files,
+            Some(1),
+            "{:?}",
+            next.worktrees
+        );
+        assert_eq!(
+            next.collisions.overlapping_files, 1,
+            "{:?}",
+            next.collisions
+        );
     }
 }

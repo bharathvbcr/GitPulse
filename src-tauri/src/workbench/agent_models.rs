@@ -276,41 +276,65 @@ fn read_claude_settings(home: Option<&std::ffi::OsStr>) -> Option<Vec<u8>> {
 
 static CACHE: Mutex<Option<HashMap<String, (Instant, AgentModelCatalog)>>> = Mutex::new(None);
 
-/// `launcher`'s catalog. A successful CLI listing is reused for
-/// [`CACHE_TTL`] unless `refresh`; a failure is never cached, so asking again
-/// asks again. The lock is held across the listing on purpose: a second
-/// request waits for the first and then reads its answer, rather than running
-/// the CLI twice.
+/// How long a failed listing is remembered. Short, so a CLI that signs in or
+/// comes back is noticed quickly; long enough that a dead CLI is not run once
+/// per keystroke of a model picker, 20 s a time.
+const FAILURE_TTL: Duration = Duration::from_secs(5);
+
+/// `launcher`'s catalog. A listing is reused for [`CACHE_TTL`] (a failure for
+/// [`FAILURE_TTL`]) unless `refresh`. The cache lock is held only to read or
+/// write an entry, never across the CLI: concurrent requests for one launcher
+/// share a single run, and a slow listing blocks nothing else.
 pub(crate) fn models_for(launcher: &str, refresh: bool) -> Result<AgentModelCatalog, String> {
     let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"));
     match listing_kind(launcher) {
         Some("known") => Ok(claude_catalog(
             read_claude_settings(home.as_deref()).as_deref(),
         )),
-        Some("listed") => {
-            let mut cache = CACHE
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let entries = cache.get_or_insert_with(HashMap::new);
-            if !refresh {
-                if let Some((at, answer)) = entries.get(launcher) {
-                    if at.elapsed() < CACHE_TTL {
-                        let mut answer = answer.clone();
-                        answer.cached = true;
-                        return Ok(answer);
-                    }
-                }
-            }
-            let answer = agy_catalog(list_with_cli(launcher));
-            if answer.error.is_none() {
-                entries.insert(launcher.to_owned(), (Instant::now(), answer.clone()));
-            } else {
-                entries.remove(launcher);
-            }
-            Ok(answer)
-        }
+        Some("listed") => Ok(listed_models(launcher, refresh, || list_with_cli(launcher))),
         _ => Err(format!("{launcher} has no model list GitPulse can read.")),
     }
+}
+
+/// The cache-and-share half of [`models_for`], with the CLI run injected.
+fn listed_models(
+    launcher: &str,
+    refresh: bool,
+    list: impl FnOnce() -> Result<CapturedOutput, String>,
+) -> AgentModelCatalog {
+    static FLIGHTS: std::sync::OnceLock<
+        crate::singleflight::SingleFlight<String, AgentModelCatalog>,
+    > = std::sync::OnceLock::new();
+    if !refresh {
+        if let Some(hit) = cached(launcher) {
+            return hit;
+        }
+    }
+    FLIGHTS
+        .get_or_init(Default::default)
+        .run(launcher.to_owned(), || {
+            let answer = agy_catalog(list());
+            crate::supervisor::lock_or_recover(&CACHE)
+                .get_or_insert_with(HashMap::new)
+                .insert(launcher.to_owned(), (Instant::now(), answer.clone()));
+            answer
+        })
+}
+
+/// A fresh cached answer for `launcher`, marked as cached.
+fn cached(launcher: &str) -> Option<AgentModelCatalog> {
+    let cache = crate::supervisor::lock_or_recover(&CACHE);
+    let (at, answer) = cache.as_ref()?.get(launcher)?;
+    let ttl = if answer.error.is_none() {
+        CACHE_TTL
+    } else {
+        FAILURE_TTL
+    };
+    (at.elapsed() < ttl).then(|| {
+        let mut answer = answer.clone();
+        answer.cached = true;
+        answer
+    })
 }
 
 /// Runs the CLI's own listing command from the temporary directory: never the
@@ -508,6 +532,61 @@ mod tests {
         file.set_len(MAX_SETTINGS_BYTES + 1).unwrap();
         assert_eq!(read_claude_settings(Some(home.path().as_os_str())), None);
         assert_eq!(read_claude_settings(None), None);
+    }
+
+    fn good_listing() -> Result<CapturedOutput, String> {
+        answer("gemini-3-pro\ngemini-3-flash\n", "", true, 0)
+    }
+
+    /// The defect: the cache lock was held across the CLI call (up to 20 s),
+    /// so every reader waited behind it, two requests could not share one
+    /// run, and a failure was asked for again on every keystroke.
+    #[test]
+    fn a_slow_listing_blocks_nobody_is_shared_and_failures_are_remembered_briefly() {
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let slow = |calls: std::sync::Arc<std::sync::atomic::AtomicUsize>| {
+            move || {
+                calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                std::thread::sleep(Duration::from_millis(600));
+                good_listing()
+            }
+        };
+        let first = {
+            let list = slow(calls.clone());
+            std::thread::spawn(move || listed_models("agy-test-shared", true, list))
+        };
+        std::thread::sleep(Duration::from_millis(100));
+        // The cache is free while the CLI runs.
+        let started = Instant::now();
+        assert!(cached("agy-test-other").is_none());
+        assert!(
+            started.elapsed() < crate::test_support::coverage_relaxed(Duration::from_millis(200)),
+            "{:?}",
+            started.elapsed()
+        );
+        // A second request for the same launcher shares the running listing.
+        let list = slow(calls.clone());
+        let second = listed_models("agy-test-shared", true, list);
+        let first = first.join().unwrap();
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(first.models, second.models);
+
+        // A failure is cached: asking again inside the window does not rerun it.
+        let failures = std::sync::atomic::AtomicUsize::new(0);
+        let failing = || {
+            failures.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            answer("", "not signed in", false, 1)
+        };
+        let failed = listed_models("agy-test-failing", false, failing);
+        assert!(failed.error.is_some());
+        let again = listed_models("agy-test-failing", false, || {
+            panic!("a cached failure was rerun")
+        });
+        assert!(again.cached && again.error.is_some());
+        assert_eq!(failures.load(std::sync::atomic::Ordering::SeqCst), 1);
+        // `refresh` always asks.
+        let fresh = listed_models("agy-test-failing", true, good_listing);
+        assert!(fresh.error.is_none());
     }
 
     #[test]

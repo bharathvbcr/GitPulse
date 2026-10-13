@@ -205,12 +205,20 @@ pub fn list(repo_path: &str) -> Result<SubmoduleList, String> {
 }
 
 fn list_in(repo: &Path) -> Result<SubmoduleList, String> {
-    // Both calls fail on a repository with no submodules at all (no
-    // `.gitmodules`, nothing in the index). That is an empty answer, not an
-    // error worth failing a status refresh over.
-    let status = git_text(repo, &["submodule", "status"]).unwrap_or_default();
-    let gitmodules =
-        git_text(repo, &["config", "-f", ".gitmodules", "--list", "-z"]).unwrap_or_default();
+    // `submodule status` succeeds with no output on a repository without
+    // submodules, so a failure is a read that did not happen (a refused or
+    // timed-out spawn, a broken `.gitmodules`) and is reported: it used to
+    // read as "this repository has no submodules".
+    let status = git_text(repo, &["submodule", "status"])
+        .map_err(|e| format!("Could not read the submodule status: {e}"))?;
+    // A missing `.gitmodules` is absence, and only that: a file that is there
+    // and unreadable or malformed fails the listing.
+    let gitmodules = if repo.join(".gitmodules").exists() {
+        git_text(repo, &["config", "-f", ".gitmodules", "--list", "-z"])
+            .map_err(|e| format!("Could not read .gitmodules: {e}"))?
+    } else {
+        String::new()
+    };
     Ok(assemble(&status, &gitmodules))
 }
 
@@ -362,6 +370,9 @@ where
         }
     }
 
+    if change.is_network() {
+        crate::engine::git_cli::require_git_for_clone(true)?;
+    }
     let argv = change.argv();
     let verdict = judge(&argv)?;
     let output = if change.is_network() {
@@ -574,5 +585,28 @@ mod tests {
             force: false
         }
         .is_network());
+    }
+
+    /// A repository with no submodules lists none; a `.gitmodules` git cannot
+    /// read, or a refused status read, is not "no submodules".
+    #[test]
+    fn a_broken_gitmodules_or_failed_status_is_an_error_not_an_empty_list() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::test_support::git_in(dir.path(), &["init", "-q", "-b", "main"]);
+        let path = dir.path().to_str().unwrap();
+        let none = list(path).expect("no submodules is an empty list");
+        assert!(none.submodules.is_empty());
+
+        let refused =
+            crate::engine::git_cli::with_forced_spawn_failure_of("submodule", || list(path));
+        assert!(refused.is_err(), "a refused status read listed {refused:?}");
+
+        std::fs::write(
+            dir.path().join(".gitmodules"),
+            "[submodule \"x\"\n\tpath = x\n",
+        )
+        .unwrap();
+        let broken = list(path);
+        assert!(broken.is_err(), "a malformed .gitmodules listed {broken:?}");
     }
 }

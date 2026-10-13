@@ -10,7 +10,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::{hash_map::DefaultHasher, HashMap};
-use std::fs::{self, OpenOptions};
+use std::fs::{self, File, OpenOptions};
 use std::hash::{Hash, Hasher};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -230,13 +230,15 @@ fn directory(path: &Path) -> Result<DirectoryIdentity, String> {
     })
 }
 
-fn bounded_text(path: &Path, limit: u64) -> Result<String, String> {
+/// Reads a regular file of at most `limit` bytes, refusing a larger one rather
+/// than returning a prefix, and refusing anything that is not a regular file.
+pub(crate) fn bounded_text(path: &Path, limit: u64) -> Result<String, String> {
     let mut options = OpenOptions::new();
     options.read(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        // A substituted FIFO must not park the trust prompt indefinitely.
+        // A substituted FIFO must not park the reader indefinitely.
         options.custom_flags(libc::O_NONBLOCK);
     }
     let file = options
@@ -250,10 +252,7 @@ fn bounded_text(path: &Path, limit: u64) -> Result<String, String> {
         .read_to_string(&mut text)
         .map_err(|e| format!("Cannot read {}: {e}", path.display()))?;
     if text.len() as u64 > limit {
-        return Err(format!(
-            "Repository metadata exceeds {limit} bytes: {}",
-            path.display()
-        ));
+        return Err(format!("File exceeds {limit} bytes: {}", path.display()));
     }
     Ok(text)
 }
@@ -734,10 +733,131 @@ pub fn refused(message: &str) -> bool {
     message.contains(REQUIRED)
 }
 
+/// Runs `f` holding the trust directory's write lock.
+///
+/// Granting, revoking and migrating all rewrite the same directory, and each
+/// is a check followed by an act: migration checks that a stable name is free
+/// and then renames onto it, revocation walks a listing and deletes what names
+/// the repository. Interleaved, a record renamed behind a revoke's listing
+/// survives it and the repository is trusted again. One lock around each whole
+/// act makes them take turns. It is an `flock` on a hidden file inside the
+/// directory, so another process (a second app instance) takes turns too.
+fn with_store_lock<T>(root: &Path, f: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
+    // Windows has no `flock` here, so threads of one process take turns on a
+    // process-wide mutex instead; Unix needs only the file lock, which already
+    // separates two descriptors in one process, and must not serialise
+    // unrelated trust directories behind each other.
+    #[cfg(not(unix))]
+    let _local = {
+        static LOCAL: Mutex<()> = Mutex::new(());
+        LOCAL
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    };
+    let _file = lock_directory(root)?;
+    f()
+}
+
+#[cfg(unix)]
+fn lock_directory(root: &Path) -> Result<Option<File>, String> {
+    use std::os::unix::fs::OpenOptionsExt;
+    use std::os::unix::io::AsRawFd;
+    let lock = match OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(root.join(STORE_LOCK))
+    {
+        Ok(file) => file,
+        // A directory that is not there holds no records to race over.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(format!("Cannot lock repository trust storage: {error}")),
+    };
+    loop {
+        // SAFETY: the descriptor is open for the duration of the call.
+        if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) } == 0 {
+            return Ok(Some(lock));
+        }
+        let error = std::io::Error::last_os_error();
+        if error.kind() != std::io::ErrorKind::Interrupted {
+            return Err(format!("Cannot lock repository trust storage: {error}"));
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn lock_directory(_root: &Path) -> Result<Option<File>, String> {
+    Ok(None)
+}
+
+/// The lock file's name. A leading dot keeps it out of migration and listing.
+#[cfg(unix)]
+const STORE_LOCK: &str = ".store.lock";
+
+/// Renames `source` to `dest` and never replaces an existing `dest`: the
+/// kernel refuses with `AlreadyExists` when the name is taken. `fs::rename`
+/// replaces silently, which is how a grant saved between a free-name check and
+/// the move would be overwritten.
+#[cfg(target_os = "macos")]
+fn rename_no_replace(source: &Path, dest: &Path) -> std::io::Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+    let c = |path: &Path| {
+        std::ffi::CString::new(path.as_os_str().as_bytes())
+            .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))
+    };
+    let (from, to) = (c(source)?, c(dest)?);
+    // SAFETY: both pointers are NUL-terminated strings that outlive the call.
+    if unsafe { libc::renamex_np(from.as_ptr(), to.as_ptr(), libc::RENAME_EXCL) } == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn rename_no_replace(source: &Path, dest: &Path) -> std::io::Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+    let c = |path: &Path| {
+        std::ffi::CString::new(path.as_os_str().as_bytes())
+            .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))
+    };
+    let (from, to) = (c(source)?, c(dest)?);
+    // SAFETY: both pointers are NUL-terminated strings that outlive the call.
+    let done = unsafe {
+        libc::syscall(
+            libc::SYS_renameat2,
+            libc::AT_FDCWD,
+            from.as_ptr(),
+            libc::AT_FDCWD,
+            to.as_ptr(),
+            libc::RENAME_NOREPLACE,
+        )
+    };
+    if done == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+/// Elsewhere: a hard link fails when the name is taken, and the source is
+/// removed only after it succeeded.
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn rename_no_replace(source: &Path, dest: &Path) -> std::io::Result<()> {
+    fs::hard_link(source, dest)?;
+    fs::remove_file(source)
+}
+
 fn save_grant(root: &Path, current: &Grant) -> Result<(), String> {
+    fs::create_dir_all(root).map_err(|e| format!("Cannot create repository trust storage: {e}"))?;
+    with_store_lock(root, || save_grant_locked(root, current))
+}
+
+fn save_grant_locked(root: &Path, current: &Grant) -> Result<(), String> {
     use std::sync::atomic::{AtomicU64, Ordering};
     static NEXT: AtomicU64 = AtomicU64::new(0);
-    fs::create_dir_all(root).map_err(|e| format!("Cannot create repository trust storage: {e}"))?;
     let path = repository_record(root, &current.repository.path);
     let temporary = root.join(format!(
         ".grant-{}-{}",
@@ -816,6 +936,30 @@ pub fn grant(repo_path: &str, expected_identity: &str, remember: bool) -> Result
     }
 }
 
+/// [`grant`] with `remember`, for a request that came from the webview.
+///
+/// Trust is what lets a repository's hooks, filters and tools run, so the
+/// approval cannot be an in-page modal alone: script that reaches the IPC
+/// bridge could skip it. `confirm` (the OS dialog in production) names the
+/// exact directory and must say yes before anything is recorded.
+pub fn grant_confirmed(
+    repo_path: &str,
+    expected_identity: &str,
+    confirm: &dyn Fn(&str, &str) -> bool,
+) -> Result<(), String> {
+    let preview = inspect(repo_path)?;
+    let message = format!(
+        "Trust the repository at:\n\n{}\n\nGitPulse and its agents will be allowed to run \
+         this repository's Git hooks, filters and tools on this computer. Only continue if you \
+         trust everyone who can change it.",
+        preview.path
+    );
+    if !confirm("Trust this repository?", &message) {
+        return Err("Repository was not trusted: the approval was not confirmed".into());
+    }
+    grant(repo_path, expected_identity, true)
+}
+
 /// Filename digest written before record names moved to [`fnv1a64`].
 ///
 /// Lookup still accepts it. New records and [`migrate_store`] do not.
@@ -852,8 +996,16 @@ pub fn migrate_store(root: &Path) -> Result<(), String> {
         }
         paths.push(entry.path());
     }
-    for path in &paths {
-        migrate_entry(root, path);
+    // One lock hold for the whole pass (a few hundred milliseconds for the
+    // 4096-entry cap), so a revoke waits for it rather than interleaving with
+    // it, and the lock is not re-taken per record.
+    if let Err(error) = with_store_lock(root, || {
+        for path in &paths {
+            migrate_entry(root, path);
+        }
+        Ok(())
+    }) {
+        log::warn!(target: "trust", "repository trust migration did not run: {error}");
     }
     if stopped_early {
         log::warn!(
@@ -927,26 +1079,18 @@ fn relocate_record(source: &Path, dest: &Path) {
     if source == dest {
         return;
     }
-    match fs::symlink_metadata(dest) {
-        Ok(_) => log::warn!(
+    match rename_no_replace(source, dest) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => log::warn!(
             target: "trust",
             "leaving {} in place; stable record {} already exists",
             source.display(),
             dest.display()
         ),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            if let Err(error) = fs::rename(source, dest) {
-                log::warn!(
-                    target: "trust",
-                    "cannot rename trust record {} to {}: {error}",
-                    source.display(),
-                    dest.display()
-                );
-            }
-        }
         Err(error) => log::warn!(
             target: "trust",
-            "cannot check stable trust record {}: {error}",
+            "cannot rename trust record {} to {}: {error}",
+            source.display(),
             dest.display()
         ),
     }
@@ -960,6 +1104,10 @@ fn relocate_record(source: &Path, dest: &Path) {
 /// siblings, would make "revoked" mean "revoked except where you forgot" —
 /// so every record naming this repository goes, not only the one keyed by it.
 pub fn revoke(repo_path: &str) -> Result<(), String> {
+    revoke_at(&persistent_root()?, repo_path)
+}
+
+fn revoke_at(root: &Path, repo_path: &str) -> Result<(), String> {
     let repo = crate::engine::git_cli::validate_repo_path(repo_path)?;
     // A checkout that has already been removed cannot name its family any
     // more; revoking then falls back to the path itself, which is all that is
@@ -971,7 +1119,7 @@ pub fn revoke(repo_path: &str) -> Result<(), String> {
         .retain(|key, grant| {
             Some(key.as_path()) != repository.as_deref() && grant.approved.path != repo
         });
-    forget_records(&persistent_root()?, repository.as_deref(), &repo)
+    with_store_lock(root, || forget_records(root, repository.as_deref(), &repo))
 }
 
 /// Deletes every stored approval that names this repository or this checkout.
@@ -1263,6 +1411,31 @@ mod tests {
             .unwrap();
         assert!(status.success());
         dir
+    }
+
+    /// The desktop's grant command is plain IPC, so the approval has to be
+    /// raised from Rust: a declined (or undrawable) dialog grants nothing.
+    #[test]
+    fn a_grant_from_the_webview_needs_the_native_confirmation() {
+        let repo = fixture();
+        let path = repo.path().to_string_lossy().into_owned();
+        let identity = inspect(&path).unwrap().identity;
+
+        let shown = std::cell::RefCell::new(String::new());
+        let refused = grant_confirmed(&path, &identity, &|_, body| {
+            *shown.borrow_mut() = body.to_string();
+            false
+        })
+        .expect_err("declined");
+        assert!(refused.contains("not confirmed"), "{refused}");
+        assert!(shown.borrow().contains(&inspect(&path).unwrap().path));
+        assert!(
+            require(repo.path()).is_err(),
+            "a declined grant records nothing"
+        );
+
+        grant_confirmed(&path, &identity, &|_, _| true).expect("confirmed");
+        require(repo.path()).expect("granted after confirmation");
     }
 
     fn approval_for(current: &Identity) -> Grant {
@@ -1914,6 +2087,75 @@ mod tests {
         assert_ne!(ran_in, elsewhere.canonicalize().unwrap());
     }
 
+    /// The Windows counterpart of the substitution test above. Windows cannot
+    /// re-anchor the child, so the guarantee is that the substitution is
+    /// impossible: while the admission guard lives, the pinned chain omits
+    /// `FILE_SHARE_DELETE`, so neither the admitted directory nor any ancestor
+    /// can be renamed or removed to leave a different object under the name.
+    /// Dropping the guard releases them, which proves the guard is what held.
+    #[cfg(windows)]
+    #[test]
+    fn a_substituted_directory_cannot_replace_an_admitted_one_while_the_guard_is_held() {
+        let base = tempfile::tempdir().unwrap();
+        let base = base.path().canonicalize().unwrap();
+        let admitted_path = base.join("outer").join("admitted");
+        let elsewhere = base.join("elsewhere");
+        fs::create_dir_all(&admitted_path).unwrap();
+        fs::create_dir(&elsewhere).unwrap();
+
+        let mut cmd = std::process::Command::new("cmd");
+        cmd.current_dir(&admitted_path);
+        let admission = check_command(&mut cmd).expect("a plain directory is admitted");
+
+        let moved = base.join("moved");
+        assert!(
+            fs::rename(&admitted_path, &moved).is_err(),
+            "the admitted directory was renamed out from under its guard"
+        );
+        assert!(
+            fs::rename(base.join("outer"), base.join("outer-moved")).is_err(),
+            "an ancestor of the admitted directory was renamed under its guard"
+        );
+        assert!(
+            fs::remove_dir(&admitted_path).is_err(),
+            "the admitted directory was removed under its guard"
+        );
+        assert!(admitted_path.is_dir(), "the admitted directory is intact");
+
+        drop(admission);
+        fs::rename(&admitted_path, &moved)
+            .expect("once the guard is dropped the directory is free to move");
+    }
+
+    /// A reparse point is the Windows symlink: the pin refuses one outright
+    /// rather than following it, and admission canonicalizes first so a
+    /// junction in the caller's spelling is an ordinary route to the real
+    /// directory, not an attack and not a way to run somewhere else.
+    #[cfg(windows)]
+    #[test]
+    fn a_junction_is_refused_by_the_pin_and_resolved_before_admission() {
+        let base = tempfile::tempdir().unwrap();
+        let base = base.path().canonicalize().unwrap();
+        let real = base.join("real");
+        fs::create_dir_all(real.join("inner")).unwrap();
+        let alias = base.join("alias");
+        let status = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(&alias)
+            .arg(&real)
+            .status_locked()
+            .expect("run mklink");
+        assert!(status.success(), "mklink /J failed");
+
+        let refused = crate::fs_entry::pin_directory(&alias)
+            .expect_err("a reparse point must not be pinned as a real directory");
+        assert_eq!(refused.kind(), std::io::ErrorKind::InvalidInput);
+
+        let mut cmd = std::process::Command::new("cmd");
+        cmd.current_dir(alias.join("inner"));
+        let _admission = check_command(&mut cmd).expect("a junctioned ancestor is not an attack");
+    }
+
     /// The fast path is taken on exactly one condition, so that condition is
     /// asserted directly rather than inferred from a timing difference: a
     /// private chain is exclusive, and one world-writable ancestor is enough
@@ -2094,7 +2336,10 @@ mod tests {
         assert_eq!(unsafe { libc::mkfifo(cpath.as_ptr(), 0o600) }, 0);
         let start = std::time::Instant::now();
         assert!(inspect(repo.path().to_str().unwrap()).is_err());
-        assert!(start.elapsed() < std::time::Duration::from_secs(2));
+        assert!(
+            start.elapsed()
+                < crate::test_support::coverage_relaxed(std::time::Duration::from_secs(2))
+        );
     }
 
     #[cfg(unix)]
@@ -2441,7 +2686,8 @@ mod tests {
         let started = std::time::Instant::now();
         migrate_store(storage.path()).unwrap();
         assert!(
-            started.elapsed() < std::time::Duration::from_secs(2),
+            started.elapsed()
+                < crate::test_support::coverage_relaxed(std::time::Duration::from_secs(2)),
             "migration blocked on a fifo"
         );
         assert!(link.symlink_metadata().unwrap().file_type().is_symlink());
@@ -2516,6 +2762,12 @@ mod tests {
         assert_eq!(left, 1);
     }
 
+    /// How many times the cost of reading every record once a pass over the
+    /// store may take, and the least it is ever held to (a pass faster than
+    /// this cannot have scanned a store anything like this size).
+    const RELATIVE_COST: u32 = 60;
+    const MIN_ALLOWANCE: std::time::Duration = std::time::Duration::from_millis(50);
+
     #[test]
     fn trust_persistence_two_thousand_records_stay_under_budget() {
         let repo = fixture();
@@ -2551,6 +2803,15 @@ mod tests {
         )
         .unwrap();
 
+        // The unit of work any pass over the store needs: reading every record
+        // once. Measured here, beside the passes it is compared with, so a
+        // slow or contended machine slows the yardstick as much as the passes.
+        let started = std::time::Instant::now();
+        for entry in fs::read_dir(storage.path()).unwrap() {
+            std::hint::black_box(fs::read(entry.unwrap().path()).unwrap());
+        }
+        let yardstick = started.elapsed();
+
         let started = std::time::Instant::now();
         migrate_store(storage.path()).unwrap();
         let migrating = started.elapsed();
@@ -2558,10 +2819,25 @@ mod tests {
         let scope = read_grant(storage.path(), &current).unwrap();
         let reading = started.elapsed();
         assert_eq!(scope, TrustScope::Repository);
-        println!("records={RECORDS} migrate={migrating:?} read_grant={reading:?}");
+        println!(
+            "records={RECORDS} read_all={yardstick:?} migrate={migrating:?} read_grant={reading:?}"
+        );
+        // What matters is how the passes scale with the store: a per-record
+        // rescan costs many reads of every record, which no clock speed hides.
+        // A fixed wall-clock fraction of the hook budget also measured the
+        // machine's load, so it could fail under contention with the code
+        // unchanged.
         for (label, taken) in [("migrate", migrating), ("read_grant", reading)] {
             assert!(
-                taken < crate::hooks::BUDGET / 5,
+                taken <= yardstick.saturating_mul(RELATIVE_COST).max(MIN_ALLOWANCE),
+                "{label} took {taken:?} on {RECORDS} records; reading them all once takes {yardstick:?}"
+            );
+        }
+        // And the hook's own budget is a ceiling whatever the yardstick says,
+        // scaled for the machine like every wall-clock limit in the suite.
+        for (label, taken) in [("migrate", migrating), ("read_grant", reading)] {
+            assert!(
+                taken < crate::test_support::coverage_relaxed(crate::hooks::BUDGET),
                 "{label} took {taken:?} on {RECORDS} records, which threatens the {:?} hook budget",
                 crate::hooks::BUDGET
             );
@@ -2681,5 +2957,97 @@ mod tests {
                 });
             }
         });
+    }
+
+    /// A revoke and a migration each check and then act on the same directory.
+    /// Held apart by one lock, the revoke can neither list a record the
+    /// migration is about to move behind it nor leave the moved copy trusted.
+    #[test]
+    fn a_revoke_waits_for_a_migration_that_holds_the_store_lock() {
+        let repo = fixture();
+        let path = repo.path().to_str().unwrap().to_owned();
+        let storage = tempfile::tempdir().unwrap();
+        let current = identity(&path).unwrap();
+        save_grant(storage.path(), &approval_for(&current)).unwrap();
+
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            let root = storage.path();
+            scope.spawn(move || {
+                with_store_lock(root, || {
+                    held_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                    Ok(())
+                })
+                .unwrap();
+            });
+            held_rx.recv().unwrap();
+            let path = &path;
+            scope.spawn(move || {
+                done_tx.send(revoke_at(root, path)).unwrap();
+            });
+            let waited = done_rx
+                .recv_timeout(std::time::Duration::from_millis(400))
+                .is_err();
+            // Released before asserting, so a failure cannot leave the holder
+            // thread blocked and hang the scope.
+            let released = release_tx.send(());
+            assert!(waited, "a revoke ran while a migration held the store lock");
+            released.unwrap();
+            done_rx
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .expect("the revoke finishes once the lock is free")
+                .unwrap();
+        });
+        assert_eq!(
+            read_grant(storage.path(), &current).unwrap(),
+            TrustScope::None
+        );
+    }
+
+    /// Whatever the interleaving, a revoke leaves no record that trusts the
+    /// repository, whether the record sat under its old or its stable name.
+    #[test]
+    fn a_revoke_racing_a_migration_leaves_no_grant() {
+        let repo = fixture();
+        let path = repo.path().to_str().unwrap().to_owned();
+        let current = identity(&path).unwrap();
+        for _ in 0..40 {
+            let storage = tempfile::tempdir().unwrap();
+            let previous = storage.path().join(default_hasher_record_name(
+                &current.common_dir.path,
+                ".repository.json",
+            ));
+            fs::write(
+                &previous,
+                serde_json::to_vec(&approval_for(&current)).unwrap(),
+            )
+            .unwrap();
+            std::thread::scope(|scope| {
+                let root = storage.path();
+                scope.spawn(move || migrate_store(root).unwrap());
+                scope.spawn(|| revoke_at(root, &path).unwrap());
+            });
+            assert_eq!(
+                read_grant(storage.path(), &current).unwrap(),
+                TrustScope::None,
+                "a migration undid a revoke"
+            );
+        }
+    }
+
+    #[test]
+    fn a_free_name_is_not_replaced_by_a_migration_or_a_late_grant() {
+        let source = tempfile::tempdir().unwrap();
+        let from = source.path().join("from.json");
+        let to = source.path().join("to.json");
+        fs::write(&from, b"old").unwrap();
+        fs::write(&to, b"newer grant").unwrap();
+        let error = rename_no_replace(&from, &to).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(fs::read(&to).unwrap(), b"newer grant");
+        assert!(from.exists(), "the source stays when the name is taken");
     }
 }

@@ -48,7 +48,7 @@
 //! keeps a branch with commits, and a tree something still has open is kept.
 
 use super::WorkbenchError;
-use crate::engine::git_cli::{git_captured, resolve_git_common_dir, resolve_git_dir};
+use crate::engine::git_cli::{resolve_git_common_dir, resolve_git_dir};
 use crate::engine::worktree::{gitpulse_lane_container, GITPULSE_LANE_DIR as EXCLUDED};
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
@@ -130,24 +130,16 @@ fn main_checkout(selected: &Path) -> Result<PathBuf, WorkbenchError> {
 
 /// Whether `path` is already a worktree of this repository on `branch`.
 fn existing(selected: &Path, path: &Path, branch: &str) -> Result<bool, WorkbenchError> {
-    let run = git_captured(selected, &["worktree", "list", "--porcelain"])
-        .and_then(|r| r.require_complete("Worktree listing"))
-        .map_err(refused)?;
-    if run.status_code != 0 {
-        return Err(refused("Could not list this repository's worktrees."));
-    }
-    let text = String::from_utf8_lossy(&run.stdout);
+    let entries = crate::engine::worktree::read_worktree_entries(selected).map_err(refused)?;
     let wanted = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-    let mut here = false;
-    for line in text.lines() {
-        if let Some(entry) = line.strip_prefix("worktree ") {
-            let entry = Path::new(entry);
-            here = entry.canonicalize().unwrap_or_else(|_| entry.to_path_buf()) == wanted;
-        } else if here && line == format!("branch refs/heads/{branch}") {
-            return Ok(true);
-        }
-    }
-    Ok(false)
+    Ok(entries.iter().any(|entry| {
+        let listed = Path::new(&entry.path);
+        listed
+            .canonicalize()
+            .unwrap_or_else(|_| listed.to_path_buf())
+            == wanted
+            && entry.branch.as_deref() == Some(branch)
+    }))
 }
 
 /// The one naming rule: an attempt's worktree directory name, from the task
@@ -232,6 +224,8 @@ pub(super) fn provision(
         None,
         false,
         true,
+        // Approved hooks only: an unapproved file is reported, not run.
+        true,
     )
     .map_err(refused)?;
     let provisioned = Provisioned {
@@ -243,6 +237,9 @@ pub(super) fn provision(
     if let Some(cache) = created.cache_error {
         // Caches only save a rebuild; the agent can work without them.
         log::warn!(target: "workbench", "agent worktree {} has no copied build caches: {cache}", provisioned.path);
+    }
+    if let Some(notice) = created.hook_notice {
+        log::warn!(target: "workbench", "agent worktree {}: {notice}", provisioned.path);
     }
     if let Some(hook) = created.hook_error {
         // The repository's own setup did not finish (dependencies, seeds), so
@@ -446,11 +443,9 @@ mod tests {
         git_global(&["init", "-b", "main", root.to_str().unwrap()]).unwrap();
         crate::test_support::trust_repo(&root);
         std::fs::create_dir_all(root.join(".gitpulse")).unwrap();
-        std::fs::write(
-            root.join(".gitpulse/hooks.json"),
-            r#"{"worktree":{"post_create":["echo npm ci failed >&2; exit 7"]}}"#,
-        )
-        .unwrap();
+        let hooks = r#"{"worktree":{"post_create":["echo npm ci failed >&2; exit 7"]}}"#;
+        std::fs::write(root.join(".gitpulse/hooks.json"), hooks).unwrap();
+        crate::engine::approve_worktree_hooks(&root, hooks).unwrap();
         git_text(&root, &["add", "."]).unwrap();
         git_text(
             &root,

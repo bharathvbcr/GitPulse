@@ -9,6 +9,7 @@ import {
   matchesInLine,
   stepMatch,
 } from "./lineSearch";
+import { wallClockBudget } from "../testing/wallClock";
 
 describe("buildMatcher", () => {
   it("treats a plain query literally, metacharacters and all", () => {
@@ -123,7 +124,7 @@ describe("buildMatcher", () => {
       // The class being caught is exponential backtracking, which on 40 `a`s
       // does not finish at all — so a second separates it from a linear match
       // exactly as decisively as 50 ms did, and survives a loaded machine.
-      expect(performance.now() - started, pattern).toBeLessThan(1_000);
+      expect(performance.now() - started, pattern).toBeLessThan(wallClockBudget(1_000));
     }
   });
 
@@ -161,7 +162,7 @@ describe("findMatches", () => {
       // Guards a non-advancing `exec` loop, which spins forever; any finite
       // bound catches that, so this one is sized for a busy box rather than
       // for how long two lines ought to take.
-      expect(Date.now() - started, pattern).toBeLessThan(2_000);
+      expect(Date.now() - started, pattern).toBeLessThan(wallClockBudget(2_000));
       expect(result.invalid, pattern).toBe(false);
     }
   });
@@ -215,7 +216,7 @@ describe("findMatches", () => {
     const many = { length: 3_000_000, at: (i: number) => `line ${i} with words` };
     const started = Date.now();
     const result = findMatches(many, "words", { maxMatches: 10_000_000, maxMillis: 5 });
-    expect(Date.now() - started).toBeLessThan(5_000);
+    expect(Date.now() - started).toBeLessThan(wallClockBudget(5_000));
     expect(result.truncated).toBe(true);
     expect(result.matches.length).toBeLessThan(3_000_000);
   });
@@ -254,7 +255,7 @@ describe("findMatches", () => {
     // Throughput is still guarded, at a bound a genuine regression would blow
     // through: the slowest rate ever observed here is the instrumented one
     // above, ~154k lines/s, which puts this scan near 0.65 s.
-    expect(Date.now() - started).toBeLessThan(5_000);
+    expect(Date.now() - started).toBeLessThan(wallClockBudget(5_000));
   });
 
   it("returns no matches for an empty input", () => {

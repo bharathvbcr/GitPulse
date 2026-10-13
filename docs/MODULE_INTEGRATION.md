@@ -100,14 +100,20 @@ sequenceDiagram
         Rust-->>UI: Success & ledger event
     end
 
-    Note over UI,DevCouncil: 2. Profile Workbench & Tasks
+    Note over UI,DevCouncil: 2. Profile Workbench & Tasks (in-process, no sidecar)
     UI->>Rust: cmd_workbench_request (Tasks / Briefs CRUD)
-    Rust->>Manvi: Dispatch workbench operation
-    Manvi->>DevCouncil: Read / Write dc-store workbench database
-    DevCouncil-->>Manvi: Revisions, receipts & membership
-    Manvi-->>Rust: Typed response payload
+    Rust->>DevCouncil: Store::workbench_request on the vendored dc-store
+    DevCouncil-->>Rust: Revisions, receipts & membership
     Rust-->>UI: Reactive store update
 ```
+
+Board CRUD never crosses the Manvi seam: `cmd_workbench_request`
+(`src-tauri/src/workbench.rs`) calls `query()`, which calls the vendored
+`dc-store` in the GitPulse process. `manvi serve` carries the policy gate and,
+for launches, the managed-run and enhancement operations; the ops GitPulse names
+and the shapes it sends are pinned by `contracts/serve.ops.schema.json`, which
+Manvi generates from its Go types and `scripts/serve-ops-contract.test.ts`
+checks the Rust side against.
 
 ## Integrate or replace a module
 

@@ -1,3 +1,5 @@
+import os from "node:os";
+import path from "node:path";
 import { defineConfig } from "vite";
 import { svelte } from "@sveltejs/vite-plugin-svelte";
 import tailwindcss from "@tailwindcss/vite";
@@ -16,7 +18,7 @@ import { gitpulseIgnoreNestedWorktrees } from "./scripts/vite-watch.mjs";
 // unnoticed: looking at the page is the one thing this config is for.
 export default defineConfig({
   plugins: [tailwindcss(), svelte(), gitpulseIgnoreNestedWorktrees()],
-  cacheDir: "/private/tmp/claude-501/gp-harness-vite-cache",
+  cacheDir: path.join(os.tmpdir(), "gp-harness-vite-cache"),
   define: { __APP_VERSION__: JSON.stringify(appVersion()) },
   server: { port: 5188, strictPort: true },
 });

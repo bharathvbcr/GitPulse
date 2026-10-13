@@ -11,26 +11,54 @@
 //! (`run_process_with_shared_spawn_budget`); a test or bench process that
 //! links the same engine keeps to its own bucket.
 //!
-//! It fails open, and says so. A record that cannot be opened safely leaves
-//! the process on its own bucket with a logged reason; a lock another process
-//! holds past [`LOCK_PATIENCE`] lets this one decision fall back to the process
-//! bucket, counted. Failing closed instead would let one stopped process — a
-//! debugger, a `SIGSTOP` — defer every read in every other GitPulse process.
+//! A record it cannot reach fails open, and says so. One that cannot be
+//! opened safely leaves the process on its own bucket with a logged reason; a
+//! lock another process or thread holds past [`LOCK_PATIENCE`] lets this one
+//! decision fall back to the process bucket, counted. Failing closed there
+//! would let one stopped process — a debugger, a `SIGSTOP` — defer every read
+//! in every other GitPulse process.
+//!
+//! A record it reaches but cannot decode fails closed. Torn, foreign or of
+//! another layout, it is rewritten as an EMPTY budget that refills at the rate
+//! from now: it grants nothing, because a reset to a full burst is a fresh
+//! burst for every process that meets it — which is how layout 1, resetting
+//! to full, handed out 192-spawn bursts over a hundred times in three hours.
+//! The warning names the bytes and the writer pid they carry. A record of a
+//! newer layout is its writer's: this one leaves it untouched and falls back
+//! for the decision as for a held lock.
+//!
+//! The layout is versioned twice, in the header and in the file name, and the
+//! name moves with the layout. Binaries of two layouts coexist until every
+//! install is refreshed; sharing one record, each would read the other's as
+//! undecodable and their resets would either free both fleets (a reset to
+//! full) or starve one (a reset to empty). Two names keep them apart.
+//!
+//! Every thread of a process shares one handle, so one open file description,
+//! and an advisory lock does not exclude within that: a second thread's
+//! `try_lock` succeeds while the first is mid-update. The record is therefore
+//! also held behind an in-process mutex, and every seek, read and write goes
+//! through its guard. Without it the threads' updates interleaved on the
+//! shared offset, tearing the record (the "held 23/25 unreadable byte(s)"
+//! warnings) and, worse, reading zero bytes past the end, which looks like a
+//! record never written.
 
-use std::fs::{File, OpenOptions, TryLockError};
+use std::fs::{File, TryLockError};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, MutexGuard, TryLockError as GuardTryLockError};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const MAGIC: [u8; 4] = *b"GPSB";
-const VERSION: u32 = 1;
-/// `MAGIC`, `VERSION`, tokens (u32), reserved (u32), refill anchor (u64 ns).
+/// The record layout; [`FILE_NAME`] carries it too.
+const VERSION: u32 = 2;
+/// `MAGIC`, `VERSION`, tokens (u32), writer pid (u32), refill anchor (u64 ns).
 const RECORD_LEN: usize = 24;
-/// How long one decision waits for another process to finish its update.
-/// An update is a 24-byte read and write, so anything this long is a holder
-/// that is stopped or wedged, not one that is busy.
+/// How long one decision waits for another process or thread to finish its
+/// update. An update is a 24-byte read and write, so anything this long is a
+/// holder that is stopped or wedged, not one that is busy.
 const LOCK_PATIENCE: Duration = Duration::from_millis(25);
-const FILE_NAME: &str = "spawn-budget.v1";
+/// Moves with [`VERSION`]: a binary of another layout opens another record.
+const FILE_NAME: &str = "spawn-budget.v2";
 
 /// Where every GitPulse process of this user finds the shared record.
 ///
@@ -44,7 +72,10 @@ pub(super) fn default_path() -> Result<PathBuf, String> {
 }
 
 pub(super) struct SharedBudget {
-    file: File,
+    /// The record, reachable only through [`SharedBudget::lock`], which
+    /// excludes this process's other threads before taking the advisory lock
+    /// that excludes other processes.
+    file: Mutex<File>,
     path: PathBuf,
 }
 
@@ -67,15 +98,30 @@ struct State {
     at_ns: u64,
 }
 
-/// Releases the advisory lock on every path out of an update.
-struct Locked<'a>(&'a File);
+/// What a decoded record says.
+#[derive(Debug, PartialEq)]
+enum Record {
+    /// This layout's record.
+    Current(State),
+    /// Another build's newer layout, which this one must not rewrite.
+    Newer(u32),
+    /// Torn, foreign, or an older layout.
+    Unreadable,
+}
+
+/// The record for one update: the in-process guard, and the advisory lock
+/// taken through it. Releases the lock and then the guard on every path out
+/// (`drop` runs before the fields are dropped).
+struct Locked<'a> {
+    file: MutexGuard<'a, File>,
+}
 
 impl Drop for Locked<'_> {
     fn drop(&mut self) {
         // Closing the descriptor would release it too; the record stays open
         // for the next decision, so release explicitly. Nothing useful can be
         // done about a failure here, and the next `try_lock` reports it.
-        let _ = self.0.unlock();
+        let _ = self.file.unlock();
     }
 }
 
@@ -83,25 +129,9 @@ impl SharedBudget {
     /// Opens (creating if absent) the record at `path`, refusing one that is
     /// not a regular file this user alone owns and can read.
     pub(super) fn open(path: &Path) -> Result<Self, String> {
-        if let Some(dir) = path.parent() {
-            std::fs::create_dir_all(dir)
-                .map_err(|e| format!("could not create {}: {e}", dir.display()))?;
-        }
-        let mut options = OpenOptions::new();
-        options.read(true).write(true).create(true).truncate(false);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            // A symlink planted at the path would otherwise redirect the
-            // writes; with O_NOFOLLOW the open fails instead.
-            options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
-        }
-        let file = options
-            .open(path)
-            .map_err(|e| format!("could not open {}: {e}", path.display()))?;
-        verify_owner(&file, path)?;
+        let file = crate::fs_entry::open_private_record(path)?;
         Ok(Self {
-            file,
+            file: Mutex::new(file),
             path: path.to_path_buf(),
         })
     }
@@ -117,11 +147,11 @@ impl SharedBudget {
     }
 
     fn take_at(&self, floor: u32, burst: u32, per_sec: u32, now_ns: u64) -> Take {
-        let _locked = match self.lock() {
+        let locked = match self.lock() {
             Ok(locked) => locked,
             Err(reason) => return Take::Unavailable(reason),
         };
-        let mut state = match self.read_state(burst, now_ns) {
+        let mut state = match self.read_state(&locked, burst, now_ns) {
             Ok(state) => state,
             Err(reason) => return Take::Unavailable(reason),
         };
@@ -131,7 +161,7 @@ impl SharedBudget {
             state.tokens -= 1;
         }
         // Written even on a denial: the refill anchor moved.
-        if let Err(reason) = self.write_state(state) {
+        if let Err(reason) = self.write_state(&locked, state) {
             return Take::Unavailable(reason);
         }
         if granted {
@@ -141,18 +171,42 @@ impl SharedBudget {
         }
     }
 
+    /// Takes the in-process guard and then the advisory lock, both within one
+    /// [`LOCK_PATIENCE`]: a thread wedged inside an update is as bounded for
+    /// its peers as a wedged process is.
     fn lock(&self) -> Result<Locked<'_>, String> {
         let started = Instant::now();
-        loop {
+        let held = |holder: &str| {
+            format!(
+                "{holder} held {} for over {} ms",
+                self.path.display(),
+                LOCK_PATIENCE.as_millis()
+            )
+        };
+        let file = loop {
             match self.file.try_lock() {
-                Ok(()) => return Ok(Locked(&self.file)),
+                Ok(file) => break file,
+                // The state is the record, not the mutex, so a thread that
+                // panicked while holding the guard leaves nothing to distrust.
+                Err(GuardTryLockError::Poisoned(poisoned)) => break poisoned.into_inner(),
+                Err(GuardTryLockError::WouldBlock) => {
+                    if started.elapsed() >= LOCK_PATIENCE {
+                        return Err(held("another thread of this GitPulse process"));
+                    }
+                    // The holder is a peer inside a microseconds-long update,
+                    // or polling a held advisory lock; a millisecond's sleep
+                    // per try would starve a burst of threads into spurious
+                    // unavailability.
+                    std::thread::sleep(Duration::from_micros(50));
+                }
+            }
+        };
+        loop {
+            match file.try_lock() {
+                Ok(()) => return Ok(Locked { file }),
                 Err(TryLockError::WouldBlock) => {
                     if started.elapsed() >= LOCK_PATIENCE {
-                        return Err(format!(
-                            "another GitPulse process held {} for over {} ms",
-                            self.path.display(),
-                            LOCK_PATIENCE.as_millis()
-                        ));
+                        return Err(held("another GitPulse process"));
                     }
                     std::thread::sleep(Duration::from_millis(1));
                 }
@@ -163,54 +217,64 @@ impl SharedBudget {
         }
     }
 
-    /// The record, or a full burst when there is none yet. A record that is
-    /// present but unreadable is replaced with a full burst and logged: the
-    /// alternative, refusing, would turn one bad write into a permanent stop.
-    fn read_state(&self, burst: u32, now_ns: u64) -> Result<State, String> {
-        let fresh = State {
-            tokens: burst,
-            at_ns: now_ns,
-        };
-        let mut file = &self.file;
+    /// The record, or a full burst when there is none yet. Only this layout
+    /// opens this file and every write leaves it [`RECORD_LEN`] long under
+    /// both locks, so an empty file is one never written, not one torn.
+    ///
+    /// A record present but undecodable is rewritten as an empty budget and
+    /// logged with its bytes and writer; refusing instead would turn one bad
+    /// write into a permanent stop, and a full burst would be a gift. A newer
+    /// layout's record is an error, so the decision falls back and nothing is
+    /// written over it.
+    fn read_state(&self, locked: &Locked<'_>, burst: u32, now_ns: u64) -> Result<State, String> {
+        let mut file: &File = &locked.file;
         file.seek(SeekFrom::Start(0))
             .map_err(|e| format!("could not read {}: {e}", self.path.display()))?;
-        let mut buf = Vec::with_capacity(RECORD_LEN);
+        // One byte more than a record, so a longer file reads as unreadable
+        // rather than as a good record with trailing bytes.
+        let mut buf = Vec::with_capacity(RECORD_LEN + 1);
         file.take(RECORD_LEN as u64 + 1)
             .read_to_end(&mut buf)
             .map_err(|e| format!("could not read {}: {e}", self.path.display()))?;
         if buf.is_empty() {
-            return Ok(fresh);
+            return Ok(State {
+                tokens: burst,
+                at_ns: now_ns,
+            });
         }
         match decode(&buf) {
-            Some(state) => Ok(State {
+            Record::Current(state) => Ok(State {
                 tokens: state.tokens.min(burst),
                 ..state
             }),
-            None => {
-                log::warn!(
-                    target: "spawn_gate",
-                    "{} held {} unreadable byte(s); reset to a full budget",
-                    self.path.display(),
-                    buf.len()
-                );
-                Ok(fresh)
+            Record::Newer(version) => Err(format!(
+                "{} holds a layout-{version} record from a newer GitPulse (this one \
+                 reads layout {VERSION}); left for its writer",
+                self.path.display()
+            )),
+            Record::Unreadable => {
+                log::warn!(target: "spawn_gate", "{}", unreadable_warning(&self.path, &buf));
+                Ok(State {
+                    tokens: 0,
+                    at_ns: now_ns,
+                })
             }
         }
     }
 
-    fn write_state(&self, state: State) -> Result<(), String> {
-        let mut file = &self.file;
+    fn write_state(&self, locked: &Locked<'_>, state: State) -> Result<(), String> {
+        let mut file: &File = &locked.file;
         let record = encode(state);
         file.seek(SeekFrom::Start(0))
             .and_then(|_| file.write_all(&record))
-            .and_then(|_| self.file.set_len(RECORD_LEN as u64))
+            .and_then(|_| file.set_len(RECORD_LEN as u64))
             .map_err(|e| format!("could not write {}: {e}", self.path.display()))
     }
 
     #[cfg(test)]
     fn tokens_now(&self, burst: u32, per_sec: u32, now_ns: u64) -> u32 {
-        let _locked = self.lock().expect("lock");
-        let mut state = self.read_state(burst, now_ns).expect("read");
+        let locked = self.lock().expect("lock");
+        let mut state = self.read_state(&locked, burst, now_ns).expect("read");
         refill(&mut state, burst, per_sec, now_ns);
         state.tokens
     }
@@ -246,27 +310,88 @@ fn refill(state: &mut State, burst: u32, per_sec: u32, now_ns: u64) {
         .min(now_ns);
 }
 
+/// The record as this process writes it, signed with its pid so the reader of
+/// a record that later fails to decode can say whose it was.
 fn encode(state: State) -> [u8; RECORD_LEN] {
     let mut record = [0u8; RECORD_LEN];
     record[0..4].copy_from_slice(&MAGIC);
     record[4..8].copy_from_slice(&VERSION.to_le_bytes());
     record[8..12].copy_from_slice(&state.tokens.to_le_bytes());
+    record[12..16].copy_from_slice(&std::process::id().to_le_bytes());
     record[16..24].copy_from_slice(&state.at_ns.to_le_bytes());
     record
 }
 
-fn decode(buf: &[u8]) -> Option<State> {
-    if buf.len() != RECORD_LEN || buf[0..4] != MAGIC {
+/// The little-endian u32 at `at`, when `buf` is long enough to hold it.
+fn word_at(buf: &[u8], at: usize) -> Option<u32> {
+    let bytes: [u8; 4] = buf.get(at..at.checked_add(4)?)?.try_into().ok()?;
+    Some(u32::from_le_bytes(bytes))
+}
+
+/// The layout a record claims, when it carries this file's magic at all.
+fn claimed_version(buf: &[u8]) -> Option<u32> {
+    if buf.get(0..4)? != MAGIC {
         return None;
     }
-    let word = |range: std::ops::Range<usize>| -> Option<[u8; 4]> { buf[range].try_into().ok() };
-    if u32::from_le_bytes(word(4..8)?) != VERSION {
-        return None;
+    word_at(buf, 4)
+}
+
+fn decode(buf: &[u8]) -> Record {
+    match claimed_version(buf) {
+        Some(version) if version > VERSION => Record::Newer(version),
+        Some(VERSION) if buf.len() == RECORD_LEN => {
+            let (Some(tokens), Some(at_ns)) = (
+                word_at(buf, 8),
+                buf.get(16..24)
+                    .and_then(|bytes| <[u8; 8]>::try_from(bytes).ok())
+                    .map(u64::from_le_bytes),
+            ) else {
+                return Record::Unreadable;
+            };
+            Record::Current(State { tokens, at_ns })
+        }
+        _ => Record::Unreadable,
     }
-    Some(State {
-        tokens: u32::from_le_bytes(word(8..12)?),
-        at_ns: u64::from_le_bytes(buf[16..24].try_into().ok()?),
-    })
+}
+
+/// The warning for an undecodable record: its bytes, the writer they name,
+/// and the reader that reset it, so a flip-flop between two writers can be
+/// attributed from the logs alone.
+fn unreadable_warning(path: &Path, buf: &[u8]) -> String {
+    format!(
+        "{} held {} unreadable byte(s) [{}] ({}); reset to an empty budget by pid {}, \
+         GitPulse {}",
+        path.display(),
+        buf.len(),
+        hex(buf),
+        writer_of(buf),
+        std::process::id(),
+        env!("CARGO_PKG_VERSION")
+    )
+}
+
+/// Who an undecodable record says wrote it, as far as its bytes still say.
+fn writer_of(buf: &[u8]) -> String {
+    let Some(version) = claimed_version(buf) else {
+        return "not a GitPulse spawn-budget record; writer unknown".to_string();
+    };
+    match word_at(buf, 12) {
+        None => format!("layout {version}, cut short before the writer pid"),
+        // Layout 1 kept that word reserved and always wrote zero.
+        Some(0) => format!("layout {version}, writer pid unrecorded"),
+        Some(pid) => format!("layout {version}, writer pid {pid}"),
+    }
+}
+
+/// Lowercase hex, two digits a byte. Callers pass at most `RECORD_LEN + 1`.
+fn hex(bytes: &[u8]) -> String {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for &byte in bytes {
+        out.push(char::from(DIGITS[usize::from(byte >> 4)]));
+        out.push(char::from(DIGITS[usize::from(byte & 0x0f)]));
+    }
+    out
 }
 
 fn wall_ns() -> u64 {
@@ -275,47 +400,6 @@ fn wall_ns() -> u64 {
         .map(|elapsed| u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX))
         // Before 1970: anchor at zero; the backwards-clock clamp handles it.
         .unwrap_or(0)
-}
-
-#[cfg(unix)]
-fn verify_owner(file: &File, path: &Path) -> Result<(), String> {
-    use std::os::unix::fs::MetadataExt;
-    let meta = file
-        .metadata()
-        .map_err(|e| format!("could not inspect {}: {e}", path.display()))?;
-    if !meta.is_file() {
-        return Err(format!("{} is not a regular file", path.display()));
-    }
-    // SAFETY: geteuid has no preconditions and cannot fail.
-    let me = unsafe { libc::geteuid() };
-    if meta.uid() != me {
-        return Err(format!(
-            "{} is owned by uid {}, not this user (uid {me})",
-            path.display(),
-            meta.uid()
-        ));
-    }
-    if meta.mode() & 0o077 != 0 {
-        return Err(format!(
-            "{} is accessible to other users (mode {:o})",
-            path.display(),
-            meta.mode() & 0o777
-        ));
-    }
-    Ok(())
-}
-
-/// The per-user `APPDATA` directory is already private to its owner.
-#[cfg(not(unix))]
-fn verify_owner(file: &File, path: &Path) -> Result<(), String> {
-    let meta = file
-        .metadata()
-        .map_err(|e| format!("could not inspect {}: {e}", path.display()))?;
-    if meta.is_file() {
-        Ok(())
-    } else {
-        Err(format!("{} is not a regular file", path.display()))
-    }
 }
 
 #[cfg(test)]
@@ -364,26 +448,286 @@ mod tests {
         assert_eq!(b.take_at(0, 8, 1, now), Take::Granted);
     }
 
+    /// A record in this file's layout but stamped `version`, as a binary of
+    /// another layout would leave it, holding `tokens`.
+    fn stamped(version: u32, tokens: u32, at_ns: u64) -> Vec<u8> {
+        let mut record = vec![0u8; RECORD_LEN];
+        record[0..4].copy_from_slice(&MAGIC);
+        record[4..8].copy_from_slice(&version.to_le_bytes());
+        record[8..12].copy_from_slice(&tokens.to_le_bytes());
+        record[16..24].copy_from_slice(&at_ns.to_le_bytes());
+        record
+    }
+
+    fn write_private(path: &Path, bytes: &[u8]) {
+        std::fs::write(path, bytes).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+    }
+
+    /// What a torn or foreign record grants is nothing: an undecodable record
+    /// is rewritten as an EMPTY budget that refills at the rate, never a full
+    /// burst. A reset to full is what let a torn record hand every GitPulse
+    /// process a fresh 192-spawn burst, 138 times in three hours.
     #[test]
-    fn a_corrupt_or_short_record_resets_to_a_full_burst() {
+    fn an_undecodable_record_resets_to_an_empty_budget() {
+        let burst = 192;
+        let v1_full = stamped(1, burst, 9 * S);
+        let older = stamped(0, burst, 9 * S);
+        let mut torn_long = stamped(1, burst, 9 * S);
+        torn_long.push(0x47);
+        let torn_short = stamped(1, burst, 9 * S)[..RECORD_LEN - 1].to_vec();
         for junk in [
             &b"garbage"[..],
             &[0u8; RECORD_LEN][..],
+            &[0xFFu8; RECORD_LEN][..],
             &[0xFFu8; RECORD_LEN + 7][..],
+            &torn_long[..],
+            &torn_short[..],
+            &older[..],
+            &v1_full[..],
         ] {
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join(FILE_NAME);
-            std::fs::write(&path, junk).unwrap();
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
-            }
+            write_private(&path, junk);
             let shared = SharedBudget::open(&path).unwrap();
-            assert_eq!(shared.take_at(0, 4, 1, 9 * S), Take::Granted);
-            assert_eq!(shared.tokens_now(4, 1, 9 * S), 3);
+            assert_eq!(
+                shared.take_at(0, burst, 8, 9 * S),
+                Take::Denied,
+                "{junk:02x?} granted a token"
+            );
+            assert!(
+                shared.tokens_now(burst, 8, 9 * S) <= burst / 4,
+                "{junk:02x?} left more than a quarter burst"
+            );
+            assert_eq!(shared.tokens_now(burst, 8, 9 * S), 0, "{junk:02x?}");
             assert_eq!(std::fs::metadata(&path).unwrap().len(), RECORD_LEN as u64);
+            // And it refills at the rate from the reset, like any spent record.
+            assert_eq!(shared.take_at(0, burst, 8, 10 * S), Take::Granted);
+            assert_eq!(shared.tokens_now(burst, 8, 10 * S), 7);
         }
+    }
+
+    /// Another layout's writer rewriting the record between this one's
+    /// decisions — the flip-flop the card's runtime evidence describes — can
+    /// never lift what this process is granted above one burst plus the rate.
+    #[test]
+    fn a_flip_flopping_foreign_writer_cannot_mint_past_burst_plus_rate() {
+        let dir = tempfile::tempdir().unwrap();
+        let shared = budget(&dir);
+        let (burst, per_sec) = (16u32, 2u32);
+        let start = 1_000 * S;
+        let step = S / 10;
+        let steps = 600u64;
+        let mut granted = 0u64;
+        for i in 0..steps {
+            let now = start + i * step;
+            match i % 3 {
+                0 => std::fs::write(shared.path(), stamped(1, burst, now)).unwrap(),
+                1 => {
+                    let mut torn = stamped(1, burst, now);
+                    torn.push(0);
+                    std::fs::write(shared.path(), torn).unwrap();
+                }
+                _ => {}
+            }
+            for _ in 0..5 {
+                if shared.take_at(0, burst, per_sec, now) == Take::Granted {
+                    granted += 1;
+                }
+            }
+        }
+        let elapsed_s = (steps - 1) * step / S;
+        let bound = u64::from(burst) + u64::from(per_sec) * elapsed_s;
+        assert!(
+            granted <= bound,
+            "granted {granted} over {elapsed_s} s; burst + rate * t is {bound}"
+        );
+    }
+
+    /// The same flip-flop from a writer that does take the advisory lock, the
+    /// way another GitPulse process does, running concurrently.
+    #[test]
+    fn a_concurrent_locking_foreign_writer_cannot_mint_past_burst_plus_rate() {
+        let dir = tempfile::tempdir().unwrap();
+        let shared = budget(&dir);
+        let path = shared.path().to_path_buf();
+        let (burst, per_sec) = (16u32, 2u32);
+        let start = 1_000 * S;
+        let step = S / 1000;
+        let steps = 2_000u64;
+        let stop = std::sync::atomic::AtomicBool::new(false);
+        let granted = std::thread::scope(|scope| {
+            scope.spawn(|| {
+                let foreign = File::options().read(true).write(true).open(&path).unwrap();
+                let mut torn = stamped(1, burst, start);
+                torn.push(0);
+                for round in 0..20_000u32 {
+                    if stop.load(std::sync::atomic::Ordering::Relaxed) {
+                        break;
+                    }
+                    foreign.lock().unwrap();
+                    let bytes = if round % 2 == 0 {
+                        &torn[..]
+                    } else {
+                        &torn[..RECORD_LEN]
+                    };
+                    let mut handle = &foreign;
+                    handle.seek(SeekFrom::Start(0)).unwrap();
+                    handle.write_all(bytes).unwrap();
+                    foreign.set_len(bytes.len() as u64).unwrap();
+                    foreign.unlock().unwrap();
+                    std::thread::yield_now();
+                }
+            });
+            let mut granted = 0u64;
+            for i in 0..steps {
+                if shared.take_at(0, burst, per_sec, start + i * step) == Take::Granted {
+                    granted += 1;
+                }
+            }
+            stop.store(true, std::sync::atomic::Ordering::Relaxed);
+            granted
+        });
+        let elapsed_s = (steps * step).div_ceil(S);
+        let bound = u64::from(burst) + u64::from(per_sec) * elapsed_s;
+        assert!(
+            granted <= bound,
+            "granted {granted} over {elapsed_s} s; burst + rate * t is {bound}"
+        );
+    }
+
+    /// Every thread of a process shares one `SharedBudget`, and so one open
+    /// file description — which an advisory lock does not exclude within. At a
+    /// frozen clock the threads together get exactly one burst, and the record
+    /// is never left torn.
+    #[test]
+    fn threads_of_one_process_share_one_burst_and_never_tear_the_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let shared = budget(&dir);
+        let burst = 64u32;
+        let now = 1_000 * S;
+        let granted: u64 = std::thread::scope(|scope| {
+            let workers: Vec<_> = (0..8)
+                .map(|_| {
+                    scope.spawn(|| {
+                        let mut granted = 0u64;
+                        for _ in 0..500 {
+                            if shared.take_at(0, burst, 1, now) == Take::Granted {
+                                granted += 1;
+                            }
+                        }
+                        granted
+                    })
+                })
+                .collect();
+            workers.into_iter().map(|w| w.join().unwrap()).sum()
+        });
+        assert_eq!(granted, u64::from(burst), "threads minted past one burst");
+        assert_eq!(
+            std::fs::metadata(shared.path()).unwrap().len(),
+            RECORD_LEN as u64
+        );
+        assert_eq!(shared.tokens_now(burst, 1, now), 0);
+    }
+
+    /// A record from a newer build is that build's to rewrite. This one steps
+    /// aside for the decision (the gate's counted fallback) and leaves every
+    /// byte where it was.
+    #[test]
+    fn a_newer_record_is_left_alone_and_the_decision_is_unavailable() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(FILE_NAME);
+        let mut newer = stamped(VERSION + 1, 3, 9 * S);
+        newer.extend_from_slice(b"appended by a later layout");
+        write_private(&path, &newer);
+        let shared = SharedBudget::open(&path).unwrap();
+        let outcome = shared.take_at(0, 192, 8, 9 * S);
+        assert!(
+            matches!(&outcome, Take::Unavailable(reason) if reason.contains("newer")),
+            "{outcome:?}"
+        );
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            newer,
+            "the newer record was clobbered"
+        );
+    }
+
+    #[test]
+    fn the_file_name_moves_with_the_layout() {
+        assert_eq!(FILE_NAME, format!("spawn-budget.v{VERSION}"));
+    }
+
+    /// The warning is what attributes a flip-flop from the logs: the bytes
+    /// themselves, the writer pid they carry, and the reader that reset them.
+    #[test]
+    fn a_record_names_its_writer_and_the_warning_shows_its_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let shared = budget(&dir);
+        assert_eq!(shared.take_at(0, 4, 1, S), Take::Granted);
+        let written = std::fs::read(shared.path()).unwrap();
+        assert_eq!(word_at(&written, 12), Some(std::process::id()));
+        assert_eq!(
+            decode(&written),
+            Record::Current(State {
+                tokens: 3,
+                at_ns: S
+            })
+        );
+
+        let mut torn = written.clone();
+        torn.push(0xab);
+        let warning = unreadable_warning(shared.path(), &torn);
+        let me = std::process::id();
+        for expected in [
+            format!("{} held 25 unreadable byte(s) [", shared.path().display()),
+            format!("[{}]", hex(&torn)),
+            format!("(layout {VERSION}, writer pid {me})"),
+            format!("reset to an empty budget by pid {me}, GitPulse "),
+            env!("CARGO_PKG_VERSION").to_string(),
+        ] {
+            assert!(
+                warning.contains(&expected),
+                "{expected:?} missing from {warning}"
+            );
+        }
+        assert!(hex(&torn).starts_with("47505342"), "the magic, in hex");
+        assert!(hex(&torn).ends_with("ab"));
+        assert_eq!(hex(&[0x00, 0x0f, 0x7f, 0xff]), "000f7fff");
+
+        assert_eq!(
+            writer_of(&stamped(1, 3, S)),
+            "layout 1, writer pid unrecorded"
+        );
+        assert_eq!(
+            writer_of(b"GPSB\x01\x00\x00\x00\x09"),
+            "layout 1, cut short before the writer pid"
+        );
+        assert_eq!(
+            writer_of(b"garbage"),
+            "not a GitPulse spawn-budget record; writer unknown"
+        );
+        assert_eq!(
+            writer_of(b""),
+            "not a GitPulse spawn-budget record; writer unknown"
+        );
+    }
+
+    /// A never-written record is the one case that starts full: only this
+    /// layout opens this file, and it never leaves it shorter than a record.
+    #[test]
+    fn an_empty_file_is_a_new_record_and_starts_full() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(FILE_NAME);
+        write_private(&path, b"");
+        let shared = SharedBudget::open(&path).unwrap();
+        assert_eq!(shared.take_at(0, 4, 1, 9 * S), Take::Granted);
+        assert_eq!(shared.tokens_now(4, 1, 9 * S), 3);
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), RECORD_LEN as u64);
     }
 
     #[test]
@@ -435,7 +779,10 @@ mod tests {
             matches!(&outcome, Take::Unavailable(reason) if reason.contains("held")),
             "{outcome:?}"
         );
-        assert!(started.elapsed() < Duration::from_secs(1), "bounded wait");
+        assert!(
+            started.elapsed() < crate::test_support::coverage_relaxed(Duration::from_secs(1)),
+            "bounded wait"
+        );
         holder.unlock().unwrap();
         assert_eq!(shared.take_at(0, 4, 1, S), Take::Granted);
     }

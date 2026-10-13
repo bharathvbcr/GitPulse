@@ -12,6 +12,7 @@ import {
   type PlaneTask,
   type PlaneTerminal,
 } from "./plane";
+import { mulberry32 } from "../__tests__/prng";
 
 /**
  * The plane under mixtures no unit test would write down.
@@ -23,16 +24,6 @@ import {
  * the reporting rules, checked against the output rather than re-derived by
  * copying the projector.
  */
-
-function mulberry32(seed: number): () => number {
-  let a = seed >>> 0;
-  return () => {
-    a = (a + 0x6d2b79f5) | 0;
-    let t = Math.imul(a ^ (a >>> 15), a | 1);
-    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
-    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
-  };
-}
 
 const PATHS = { caseInsensitive: false };
 const KINDS = ["claude", "codex", "grok", "cursor", ""];

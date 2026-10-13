@@ -27,7 +27,7 @@ INTERPOSE(probe_create, FSEventStreamCreate);
 static Boolean probe_purge(dev_t device, FSEventStreamEventId event) {
     (void)device;
     (void)event;
-    sleep(10);
+    sleep(60);
     return false;
 }
 INTERPOSE(probe_purge, FSEventsPurgeEventsForDeviceUpToEventId);

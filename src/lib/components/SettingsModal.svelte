@@ -49,6 +49,7 @@
   } from "../ui/settingsSections";
   import { matchSettings, unsupportedSettingIds } from "../ui/settingsCatalog";
   import { hostPlatform } from "../stores/platformStore";
+  import { readLaunchAtLogin, writeLaunchAtLogin, type LaunchAtLogin } from "../desktop/launchAtLogin";
   import { launchAtLoginMechanism, shortcutTextLabel, statusIconLocationName, statusIconSettingLabel } from "../ui/platformCopy";
   import { appleIntelligenceStatus, appleReady, type AppleIntelligenceStatus } from "../ai/appleIntelligence";
   import { VIEW_NAV } from "../views/viewNav";
@@ -73,6 +74,7 @@
   import SessionAlertSettings from "./SessionAlertSettings.svelte";
   import AgentDefaultsSettings from "./AgentDefaultsSettings.svelte";
   import LappiSettings from "./LappiSettings.svelte";
+  import HostLoadSetting from "./HostLoadSetting.svelte";
   import AgentLimitSetting from "./AgentLimitSetting.svelte";
   import { DEFAULT_LIVE_RUNS, MAX_LIVE_RUNS } from "../workbench/vocabulary";
   import { DEFAULT_TERMINAL_SESSIONS, MAX_TERMINAL_SESSIONS } from "../terminal/sessionLimit";
@@ -91,7 +93,7 @@
 
   let activeSection = $state<SettingsSectionId>("appearance");
   let themePreference = $state<ThemePreference>(themeStore.preference());
-  let launchAtLogin = $state(false);
+  let launchAtLogin = $state<LaunchAtLogin>({ state: "unknown", error: "still reading" });
 
   /**
    * Settings is the only entry point to the tour, so it has to get out of the
@@ -104,24 +106,11 @@
   }
 
   async function refreshLaunchAtLogin() {
-    try {
-      const { isEnabled } = await import("@tauri-apps/plugin-autostart");
-      launchAtLogin = await isEnabled();
-    } catch {
-      launchAtLogin = false;
-    }
+    launchAtLogin = await readLaunchAtLogin();
   }
 
   async function setLaunchAtLogin(next: boolean) {
-    try {
-      const { enable, disable, isEnabled } = await import("@tauri-apps/plugin-autostart");
-      if (next) await enable();
-      else await disable();
-      launchAtLogin = await isEnabled();
-    } catch (error) {
-      launchAtLogin = false;
-      console.warn("Launch at login unavailable:", error);
-    }
+    launchAtLogin = await writeLaunchAtLogin(next);
   }
 
   $effect(() => {
@@ -819,9 +808,13 @@
                         label="Launch at login"
                         description={`Start GitPulse when you sign in. Uses ${launchAtLoginMechanism($hostPlatform.os)}; the operating system is the source of truth.`}
                         ariaLabel="Launch GitPulse at login"
-                        checked={launchAtLogin}
+                        checked={launchAtLogin.state === "on"}
+                        disabled={launchAtLogin.state === "unknown"}
                         onchange={(next) => void setLaunchAtLogin(next)}
                       />
+                      {#if launchAtLogin.state === "unknown"}
+                        <p class="mt-1 text-[10px] text-amber-500" role="status">Launch at login is unknown: it could not be read ({launchAtLogin.error}).</p>
+                      {/if}
                     </div>
                   </div>
                   <div data-setting="status-bar" hidden={!shown("status-bar")}>
@@ -1141,6 +1134,9 @@
                 <div class="border-border/70 mt-3 border-t pt-3" data-setting="lappi" hidden={!shown("lappi")}>
                   <LappiSettings active={isOpen && activeSection === "agents"} />
                 </div>
+                <div class="border-border/70 mt-3 border-t pt-3" data-setting="host-load" hidden={!shown("host-load")}>
+                  <HostLoadSetting active={isOpen && activeSection === "agents"} />
+                </div>
                 <div data-setting="mcp-plugin" hidden={!shown("mcp-plugin")}>
                   <p class="text-textMuted text-[10px] leading-snug mb-2">
                     Agents connect through the native Codex plugin package
@@ -1169,6 +1165,26 @@
                               {mcpInfo.binary_error}
                             {/if}
                           </div>
+                          <div class="text-textMuted text-[10px] font-mono break-all" data-testid="hook-binary-status">
+                            gitpulse-hook:
+                            {#if mcpInfo.hook_found}
+                              {mcpInfo.hook_path}
+                            {:else}
+                              not reachable. {mcpInfo.hook_error}
+                            {/if}
+                          </div>
+                          {#if !mcpInfo.binary_on_path || !mcpInfo.hook_on_path}
+                            <div class="text-amber-600 dark:text-amber-400 text-[10px] mt-1" data-testid="path-status">
+                              {#if !mcpInfo.binary_on_path && !mcpInfo.hook_on_path}
+                                `gitpulse-mcp` and `gitpulse-hook` are not on PATH, so the plugin's own manifests cannot start them.
+                              {:else if !mcpInfo.binary_on_path}
+                                `gitpulse-mcp` is not on PATH, so the plugin's own manifest cannot start it.
+                              {:else}
+                                `gitpulse-hook` is not on PATH, so the plugin's own hooks cannot start it and the collision guard and command gate are off.
+                              {/if}
+                              Copy the manifests below instead: they name the binaries by absolute path.
+                            </div>
+                          {/if}
                           <div class="text-textMuted text-[10px] mt-1">
                             {#if mcpInfo.plugin_found}
                               Plugin: {mcpInfo.plugin_path}
@@ -1191,11 +1207,20 @@
                         <button
                           type="button"
                           class="gp-btn py-0.5! px-2! text-[10px] inline-flex items-center gap-1"
-                          disabled={!mcpInfo.plugin_mcp_json}
-                          onclick={() => void copyMcp("mcp", mcpInfo?.plugin_mcp_json ?? "")}
+                          disabled={!mcpInfo.mcp_config_json}
+                          onclick={() => void copyMcp("mcp", mcpInfo?.mcp_config_json ?? "")}
                         >
                           {#if mcpCopied === "mcp"}<Check size={10} />{:else}<Copy size={10} />{/if}
                           .mcp.json
+                        </button>
+                        <button
+                          type="button"
+                          class="gp-btn py-0.5! px-2! text-[10px] inline-flex items-center gap-1"
+                          disabled={!mcpInfo.hooks_config_json}
+                          onclick={() => void copyMcp("hooks", mcpInfo?.hooks_config_json ?? "")}
+                        >
+                          {#if mcpCopied === "hooks"}<Check size={10} />{:else}<Copy size={10} />{/if}
+                          hooks.json
                         </button>
                       </div>
                       {#if mcpInfo.tools.length > 0}

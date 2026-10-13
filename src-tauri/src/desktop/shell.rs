@@ -93,6 +93,69 @@ pub fn resolve_worktree_path(repo: &str, relative: &str) -> Result<PathBuf, Stri
     Ok(target)
 }
 
+/// Extensions whose default application is the OS launcher, not a viewer.
+///
+/// `open` on these runs code: a `.command` or `.terminal` file starts Terminal
+/// on macOS, a `.fileloc`/`.inetloc` navigates, an `.app` bundle launches, and
+/// the Windows and desktop-Linux entries are launched by their shell handlers.
+/// Files cloned from a repository carry no quarantine flag, so nothing else
+/// would stop a one-click run.
+const LAUNCHER_EXTENSIONS: &[&str] = &[
+    "app", "command", "terminal", "fileloc", "inetloc", "webloc", "workflow", "action", "scpt",
+    "scptd", "tool", "pkg", "mpkg", "dmg", "sh", "exe", "bat", "cmd", "com", "msi", "msp", "ps1",
+    "scr", "lnk", "vbs", "vbe", "jse", "wsf", "hta", "reg", "jar", "url", "desktop", "appimage",
+    "run",
+];
+
+/// Why opening `target` would execute it rather than show it, if it would.
+///
+/// A file with any execute bit counts whatever its name: git preserves the
+/// bit, so a repository can ship an executable called `README`.
+fn execution_risk(target: &Path) -> Option<String> {
+    let extension = target
+        .extension()
+        .map(|e| e.to_string_lossy().to_ascii_lowercase());
+    if let Some(extension) = extension.filter(|e| LAUNCHER_EXTENSIONS.contains(&e.as_str())) {
+        return Some(format!(
+            "a .{extension} file or bundle that the OS can launch"
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Ok(meta) = std::fs::metadata(target) {
+            if meta.is_file() && meta.permissions().mode() & 0o111 != 0 {
+                return Some("an executable file".to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Everything that must hold before a repo-relative path is handed to the OS:
+/// the path stays inside the repository, the repository is trusted, and an
+/// executable or launcher is confirmed by the user in a dialog the page cannot
+/// answer. `confirm` is [`confirm::native`] in production.
+fn prepare_open(
+    repo: &str,
+    relative: &str,
+    confirm: &dyn Fn(&str, &str) -> bool,
+) -> Result<PathBuf, String> {
+    let target = resolve_worktree_path(repo, relative)?;
+    crate::repository_trust::require(Path::new(repo))?;
+    if let Some(risk) = execution_risk(&target) {
+        let message = format!(
+            "{relative} is {risk}. Opening it can run code from this repository.\n\nOpen it anyway?"
+        );
+        if !confirm("Open a file that can run code?", &message) {
+            return Err(format!(
+                "Not opened: {relative} can run code and was not confirmed"
+            ));
+        }
+    }
+    Ok(target)
+}
+
 /// Opens a repo-relative path with the OS default application.
 #[tauri::command(async)]
 pub fn cmd_open_worktree_path(
@@ -100,7 +163,7 @@ pub fn cmd_open_worktree_path(
     repo: String,
     relative: String,
 ) -> Result<(), String> {
-    let target = resolve_worktree_path(&repo, &relative)?;
+    let target = prepare_open(&repo, &relative, &super::confirm::native)?;
     app.opener()
         .open_path(target.to_string_lossy().into_owned(), None::<&str>)
         .map_err(|e| format!("Could not open {relative}: {e}"))
@@ -131,6 +194,8 @@ pub fn cmd_reveal_repository(app: AppHandle, repo: String) -> Result<(), String>
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    use crate::procguard::LockedSpawn;
     use std::fs;
 
     fn repo_with(files: &[&str]) -> tempfile::TempDir {
@@ -264,5 +329,75 @@ mod tests {
         let root = repo.path().to_string_lossy().into_owned();
         let resolved = resolve_worktree_path(&root, "日本語/ファイル—名.txt").expect("inside");
         assert!(resolved.exists(), "{resolved:?}");
+    }
+
+    #[cfg(unix)]
+    fn trusted_repo_with(files: &[(&str, u32)]) -> tempfile::TempDir {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = repo_with(&[]);
+        let init = std::process::Command::new("git")
+            .args(["init", "-q", "-b", "main"])
+            .current_dir(dir.path())
+            .status_locked()
+            .expect("git init");
+        assert!(init.success());
+        for (file, mode) in files {
+            let path = dir.path().join(file);
+            fs::create_dir_all(path.parent().expect("parent")).expect("parent");
+            fs::write(&path, b"x").expect("write");
+            fs::set_permissions(&path, fs::Permissions::from_mode(*mode)).expect("mode");
+        }
+        crate::test_support::trust_repo(dir.path());
+        dir
+    }
+
+    /// An untrusted clone must not get anything opened, however harmless the
+    /// file looks; the refusal carries the marker the desktop already handles.
+    #[cfg(unix)]
+    #[test]
+    fn open_refuses_an_untrusted_repository_without_asking() {
+        let dir = repo_with(&["notes.txt"]);
+        let init = std::process::Command::new("git")
+            .args(["init", "-q", "-b", "main"])
+            .current_dir(dir.path())
+            .status_locked()
+            .expect("git init");
+        assert!(init.success());
+        let root = dir.path().to_string_lossy().into_owned();
+        let err = prepare_open(&root, "notes.txt", &|_, _| panic!("must not prompt"))
+            .expect_err("untrusted");
+        assert!(err.contains(crate::repository_trust::REQUIRED), "{err}");
+    }
+
+    /// Launchers and executables need a native Yes; a No refuses; plain
+    /// documents open without a prompt.
+    #[cfg(unix)]
+    #[test]
+    fn open_confirms_launchers_and_executables_but_not_documents() {
+        let repo = trusted_repo_with(&[
+            ("docs/readme.md", 0o644),
+            ("run.command", 0o644),
+            ("Tool.APP/Contents/x", 0o644),
+            ("README", 0o755),
+            ("x.fileloc", 0o644),
+            ("x.terminal", 0o644),
+        ]);
+        let root = repo.path().to_string_lossy().into_owned();
+        prepare_open(&root, "docs/readme.md", &|_, _| {
+            panic!("a document must not prompt")
+        })
+        .expect("plain document");
+        for risky in ["run.command", "README", "x.fileloc", "x.terminal"] {
+            let asked = std::cell::Cell::new(false);
+            let refused = prepare_open(&root, risky, &|_, _| {
+                asked.set(true);
+                false
+            })
+            .expect_err(risky);
+            assert!(asked.get(), "{risky} must raise a confirmation");
+            assert!(refused.contains("not confirmed"), "{refused}");
+            prepare_open(&root, risky, &|_, _| true).expect("confirmed");
+        }
+        assert!(execution_risk(&repo.path().join("Tool.APP")).is_some());
     }
 }

@@ -8,7 +8,8 @@
    * answer says "partial" and why, never just a count.
    */
   import { Search, X } from "@lucide/svelte";
-  import { repoStore } from "../stores/repoStore";
+  import { untrack } from "svelte";
+  import { currentRepoPath, repoStore } from "../stores/repoStore";
   import { invoke } from "../ipc/invoke";
   import { formatError } from "../ui/formatError";
   import { createAsyncGuard, type AsyncGuard } from "../async/guard";
@@ -85,15 +86,14 @@
   }
 
   // A different repository is a different subject.
-  let lastRepo: string | null = null;
   $effect(() => {
-    const repo = $repoStore.currentPath;
-    if (repo === lastRepo) return;
-    lastRepo = repo;
-    stop();
-    running = false;
-    report = null;
-    error = null;
+    void $currentRepoPath;
+    untrack(() => {
+      stop();
+      running = false;
+      report = null;
+      error = null;
+    });
   });
 
   $effect(() => () => stop());

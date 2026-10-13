@@ -94,6 +94,9 @@ pub struct WorkspaceSearchResult {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkspaceLinksResult {
     pub links: Vec<LinkCandidate>,
+    /// What could not be read (a store, a `go.mod`, a directory), with why: an
+    /// empty `links` is "no links" only when this is empty too.
+    pub coverage_gaps: Vec<RepoUnavailable>,
     pub count: usize,
     pub repos_considered: usize,
 }
@@ -381,10 +384,11 @@ pub fn search(
 pub fn link_candidates(registry_root: &str) -> Result<WorkspaceLinksResult, String> {
     let root = resolve_registry_root(registry_root)?;
     let workspace = Workspace::load(&root).map_err(|e| e.to_string())?;
-    let links = devmap_query::link_candidates(&workspace).map_err(|e| e.to_string())?;
-    let count = links.len();
+    let found = devmap_query::link_candidates(&workspace).map_err(|e| e.to_string())?;
+    let count = found.links.len();
     Ok(WorkspaceLinksResult {
-        links,
+        links: found.links,
+        coverage_gaps: found.coverage_gaps,
         count,
         repos_considered: workspace.repos.len(),
     })

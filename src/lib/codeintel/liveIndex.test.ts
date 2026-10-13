@@ -7,7 +7,13 @@
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { get } from "svelte/store";
-import { busyRetryDelayMs, createLiveIndex } from "./liveIndex";
+import {
+  busyRetryDelayMs,
+  createLiveIndex,
+  LIVE_INDEX_BUILD_WAIT_MS,
+  LIVE_INDEX_BUSY_RETRIES,
+  LIVE_INDEX_COOLDOWN_REASKS,
+} from "./liveIndex";
 import type { LiveRefreshOutcome } from "./types";
 
 const warnings = vi.hoisted(() => vi.fn());
@@ -111,7 +117,8 @@ describe("liveIndex controller", () => {
 
   it("backs off a busy writer instead of asking once a second", async () => {
     const maybeRefresh = vi.fn(async () => outcome("skip_building"));
-    const index = createLiveIndex({ debounceMs: 0, maybeRefresh });
+    // The base backoff, unspread: the spread has its own test below.
+    const index = createLiveIndex({ debounceMs: 0, maybeRefresh, random: () => 0 });
     index.onRepoChanged("/busy");
     // Asks at 0, 1, 3, 7, 15 and 31 s: a fixed one-second rest asked ~30 times.
     await vi.advanceTimersByTimeAsync(30_000);
@@ -120,6 +127,20 @@ describe("liveIndex controller", () => {
     expect(maybeRefresh).toHaveBeenCalledTimes(6);
     // Still retrying where the fixed rest had already given up.
     expect(index.get("/busy").phase).toBe("scheduled");
+    index.reset();
+  });
+
+  it("spreads a busy writer's retry upward, through the shared jitter", async () => {
+    const maybeRefresh = vi.fn(async () => outcome("skip_building"));
+    const index = createLiveIndex({ debounceMs: 0, maybeRefresh, random: () => 1 });
+    index.onRepoChanged("/busy");
+    await vi.advanceTimersByTimeAsync(0);
+    expect(maybeRefresh).toHaveBeenCalledTimes(1);
+    // 1 s lengthened by the whole jitter: not before 1.5 s.
+    await vi.advanceTimersByTimeAsync(1_400);
+    expect(maybeRefresh).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(200);
+    expect(maybeRefresh).toHaveBeenCalledTimes(2);
     index.reset();
   });
 
@@ -302,8 +323,11 @@ describe("liveIndex controller", () => {
     index.reset();
   });
 
-  it("surfaces skip_cooldown as scheduled without busy-retrying", async () => {
-    const maybeRefresh = vi.fn(async () =>
+  it("re-asks a watcher tick once when the backend's wait ends, never an activation, and bounds the chain", async () => {
+    // A watcher tick answered `skip_cooldown` used to be dropped: the edit
+    // that landed inside the wait was indexed only if another edit came
+    // after it. It is owed one ask when the wait ends — not a busy spin.
+    const maybeRefresh = vi.fn(async (_repo: string, _changed: boolean) =>
       outcome("skip_cooldown", {
         reason: "live index cooldown active; retry in 1000ms",
         cooldown_remaining_ms: 1000,
@@ -315,8 +339,237 @@ describe("liveIndex controller", () => {
     expect(index.get("/repo").phase).toBe("scheduled");
     expect(index.get("/repo").decision).toBe("skip_cooldown");
     expect(index.get("/repo").reason).toContain("cooldown");
-    await vi.advanceTimersByTimeAsync(5_000);
     expect(maybeRefresh).toHaveBeenCalledTimes(1);
+    // Not before the wait ends.
+    await vi.advanceTimersByTimeAsync(500);
+    expect(maybeRefresh).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(600);
+    expect(maybeRefresh).toHaveBeenCalledTimes(2);
+    expect(maybeRefresh.mock.calls.every(([, changed]) => changed === true)).toBe(true);
+    // A backend that keeps answering with a fresh wait is asked a bounded
+    // number of times, then the next edit is the next request.
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(maybeRefresh).toHaveBeenCalledTimes(1 + LIVE_INDEX_COOLDOWN_REASKS);
+    expect(vi.getTimerCount()).toBe(0);
+    index.reset();
+
+    // Activation inside a wait is not owed a build.
+    maybeRefresh.mockClear();
+    index.setScope({ activeKey: "/other", retainedKeys: ["/other"], visible: true });
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(maybeRefresh).toHaveBeenCalledExactlyOnceWith("/other", false);
+    index.reset();
+  });
+
+  it("folds a 10-minute watcher storm into one ask per backend rest window and loses no edit", async () => {
+    // The backend governor in miniature: a build rests 30 s, and a watcher
+    // tick inside the rest is answered `skip_cooldown` without a build.
+    let restUntil = 0;
+    const builds: number[] = [];
+    const maybeRefresh = vi.fn(async (_repo: string, repoChanged: boolean) => {
+      const now = Date.now();
+      if (repoChanged && now < restUntil) {
+        return outcome("skip_cooldown", { reason: "resting", cooldown_remaining_ms: restUntil - now });
+      }
+      builds.push(now);
+      restUntil = now + 30_000;
+      return outcome("refresh", { cooldown_remaining_ms: 30_000 });
+    });
+    // Status poll and watcher both route through `onRepoChanged`, once a
+    // second each, for ten minutes.
+    const index = createLiveIndex({ maybeRefresh });
+    for (let second = 0; second < 600; second++) {
+      index.onRepoChanged("/repo");
+      index.onRepoChanged("/repo");
+      await vi.advanceTimersByTimeAsync(1_000);
+    }
+    const lastEdit = Date.now() - 1_000;
+    await vi.advanceTimersByTimeAsync(60_000);
+    // One ask per window, not one per edit (1,200 edits; ~20 windows).
+    expect(maybeRefresh.mock.calls.length).toBeLessThanOrEqual(45);
+    expect(builds.length).toBeGreaterThanOrEqual(19);
+    expect(builds.length).toBeLessThanOrEqual(22);
+    // The storm's last edit is indexed: dirt inside a window is owed one
+    // build at its end, rather than waiting for an edit that never comes.
+    expect(builds[builds.length - 1]).toBeGreaterThanOrEqual(lastEdit);
+    expect(vi.getTimerCount()).toBe(0);
+    index.reset();
+  });
+
+  it("collects a build the backend started in the background, keeping the stage bar, without spending busy retries", async () => {
+    // The command no longer holds the IPC call for the build: it answers
+    // `started`, and asks while the child runs answer `skip_building`. More of
+    // those than the busy budget allows must not fail a build that is simply
+    // still running.
+    const answers: LiveRefreshOutcome[] = [
+      outcome("started"),
+      ...Array.from({ length: LIVE_INDEX_BUSY_RETRIES + 10 }, () => outcome("skip_building")),
+      outcome("refresh", { cooldown_remaining_ms: 30_000 }),
+    ];
+    const maybeRefresh = vi.fn(async (_repo: string, _changed: boolean) => answers.shift() ?? outcome("skip_fresh"));
+    const index = createLiveIndex({ debounceMs: 0, maybeRefresh });
+    index.onRepoChanged("/repo");
+    await vi.advanceTimersByTimeAsync(0);
+    expect(index.get("/repo").phase).toBe("running");
+    expect(index.get("/repo").refreshing).toBe(true);
+    index.onBuildProgress("/repo", 2, 5);
+    await vi.advanceTimersByTimeAsync(60_000);
+    // Still collecting, and the kernel's stage survives every ask.
+    expect(index.get("/repo").phase).toBe("running");
+    expect(index.get("/repo").stage).toEqual({ current: 2, total: 5 });
+    await vi.advanceTimersByTimeAsync(10 * 60_000);
+    expect(index.get("/repo").phase).toBe("ready");
+    expect(index.get("/repo").revision).toBe(1);
+    expect(maybeRefresh).toHaveBeenCalledTimes(LIVE_INDEX_BUSY_RETRIES + 12);
+    // Asks while the build ran were collection, not new requests: the build
+    // took the edit, so none of them reported a dirty tree after the first.
+    expect(maybeRefresh.mock.calls.slice(1).every(([, changed]) => changed === false)).toBe(true);
+    expect(vi.getTimerCount()).toBe(0);
+    index.reset();
+  });
+
+  it("another repository waits, without asking, while a background build is collected", async () => {
+    // The queue slot used to serialize builds by holding the IPC call. With
+    // the build off the IPC path, a second repository asking during it was
+    // refused by the backend's one-build slot after paying for a status
+    // probe, then spent its busy budget against a writer that was not its own.
+    const answers: Record<string, LiveRefreshOutcome[]> = {
+      "/a": [
+        outcome("started"),
+        ...Array.from({ length: 12 }, () => outcome("skip_building")),
+        outcome("refresh", { cooldown_remaining_ms: 30_000 }),
+      ],
+      "/b": [outcome("refresh", { cooldown_remaining_ms: 30_000 })],
+    };
+    const maybeRefresh = vi.fn(async (repo: string, _changed: boolean) => answers[repo]?.shift() ?? outcome("skip_fresh"));
+    const index = createLiveIndex({ debounceMs: 0, maybeRefresh });
+    index.onRepoChanged("/a");
+    await vi.advanceTimersByTimeAsync(0);
+    expect(index.get("/a").phase).toBe("running");
+    index.onRepoChanged("/b");
+    const callsFor = (repo: string) => maybeRefresh.mock.calls.filter(([r]) => r === repo);
+    await vi.advanceTimersByTimeAsync(90_000);
+    expect(callsFor("/b")).toHaveLength(0);
+    expect(index.get("/b").phase).toBe("scheduled");
+    await vi.advanceTimersByTimeAsync(5 * 60_000);
+    expect(index.get("/a").phase).toBe("ready");
+    // Once, after the build it waited behind, and still owed its edit.
+    expect(callsFor("/b")).toEqual([["/b", true]]);
+    expect(index.get("/b").phase).toBe("ready");
+    expect(vi.getTimerCount()).toBe(0);
+    index.reset();
+  });
+
+  it("gives up collecting a background build that outlives its deadline", async () => {
+    const maybeRefresh = vi.fn(async (_repo: string, _changed: boolean) => outcome("skip_building"))
+      .mockResolvedValueOnce(outcome("started"));
+    const index = createLiveIndex({ debounceMs: 0, maybeRefresh });
+    index.onRepoChanged("/repo");
+    await vi.advanceTimersByTimeAsync(LIVE_INDEX_BUILD_WAIT_MS + 60_000);
+    expect(index.get("/repo").phase).toBe("failed");
+    expect(index.get("/repo").revision).toBe(0);
+    // Bounded: at most one ask every ten seconds for the deadline.
+    expect(maybeRefresh.mock.calls.length).toBeLessThanOrEqual(LIVE_INDEX_BUILD_WAIT_MS / 10_000 + 8);
+    expect(vi.getTimerCount()).toBe(0);
+    index.reset();
+  });
+
+  it("a timed-out build pauses the strip as too slow rather than queued, and asks again only when the pause ends", async () => {
+    const tooSlow =
+      "Index too slow: the last automatic build ran past its 15-minute limit, so automatic indexing is paused for 10 min. Press Build to index now.";
+    const answers: LiveRefreshOutcome[] = [
+      outcome("refresh", {
+        build: {
+          ok: false, binary: "/bin/devmap", lookup: "path_search", exit_code: null,
+          stdout: "", stderr: "devmap timed out after 900s", timed_out: true,
+        },
+        reason: tooSlow,
+        index_too_slow: true,
+        cooldown_remaining_ms: 600_000,
+      }),
+      outcome("refresh", { cooldown_remaining_ms: 30_000 }),
+    ];
+    const maybeRefresh = vi.fn(async (_repo: string, _changed: boolean) => answers.shift() ?? outcome("skip_fresh"));
+    const index = createLiveIndex({ debounceMs: 0, maybeRefresh });
+    index.onRepoChanged("/repo");
+    await vi.advanceTimersByTimeAsync(0);
+    expect(index.get("/repo").phase).toBe("paused");
+    expect(index.get("/repo").reason).toContain("Index too slow");
+    expect(index.get("/repo").revision).toBe(0);
+    // Agents keep editing through the pause; nothing is asked until it ends.
+    for (let i = 0; i < 9 * 60; i++) {
+      index.onRepoChanged("/repo");
+      await vi.advanceTimersByTimeAsync(1_000);
+      // Still too slow, not "queued", for as long as the pause lasts.
+      expect(index.get("/repo").phase).toBe("paused");
+    }
+    expect(maybeRefresh).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(2 * 60_000);
+    expect(maybeRefresh).toHaveBeenCalledTimes(2);
+    expect(index.get("/repo").phase).toBe("ready");
+    index.reset();
+  });
+
+  it("a pause answered to an activation still reads as too slow", async () => {
+    const maybeRefresh = vi.fn(async () =>
+      outcome("skip_cooldown", {
+        reason: "Index too slow: paused for 7 min.",
+        index_too_slow: true,
+        cooldown_remaining_ms: 420_000,
+      }),
+    );
+    const index = createLiveIndex({ debounceMs: 0, maybeRefresh });
+    index.setScope({ activeKey: "/repo", retainedKeys: ["/repo"], visible: true });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(index.get("/repo").phase).toBe("paused");
+    expect(index.get("/repo").reason).toContain("too slow");
+    await vi.advanceTimersByTimeAsync(30 * 60_000);
+    expect(maybeRefresh).toHaveBeenCalledTimes(1);
+    index.reset();
+  });
+
+  it("hiding the window does not make an unfocused tab's watcher edits live", async () => {
+    const maybeRefresh = vi.fn(async (_repo: string, _changed: boolean) => outcome("skip_fresh"));
+    const index = createLiveIndex({ debounceMs: 0, maybeRefresh });
+    const tabs = ["/focused", "/background"];
+    index.setScope({ activeKey: "/focused", retainedKeys: tabs, visible: true });
+    await vi.advanceTimersByTimeAsync(5_000);
+    maybeRefresh.mockClear();
+    index.setScope({ activeKey: "/focused", retainedKeys: tabs, visible: false });
+    index.onRepoChanged("/background");
+    index.setScope({ activeKey: "/focused", retainedKeys: tabs, visible: true });
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(maybeRefresh).not.toHaveBeenCalled();
+    index.reset();
+  });
+
+  it("holds a watcher tick for a tab that is not focused until it is activated", async () => {
+    // Every open worktree tab an agent edits used to rebuild in turn. Only the
+    // focused one is live; the others are owed one build when focused.
+    const maybeRefresh = vi.fn(async (_repo: string, _changed: boolean) => outcome("skip_fresh"));
+    const index = createLiveIndex({ debounceMs: 0, maybeRefresh });
+    const tabs = ["/focused", "/background"];
+    index.setScope({ activeKey: "/focused", retainedKeys: tabs, visible: true });
+    await vi.advanceTimersByTimeAsync(5_000);
+    maybeRefresh.mockClear();
+    for (let i = 0; i < 30; i++) {
+      index.onRepoChanged("/background");
+      await vi.advanceTimersByTimeAsync(1_000);
+    }
+    expect(maybeRefresh).not.toHaveBeenCalled();
+    // The focused tab is still live.
+    index.onRepoChanged("/focused");
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(maybeRefresh).toHaveBeenCalledExactlyOnceWith("/focused", true);
+    index.setScope({ activeKey: "/background", retainedKeys: tabs, visible: true });
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(maybeRefresh).toHaveBeenLastCalledWith("/background", true);
+    expect(maybeRefresh).toHaveBeenCalledTimes(2);
+    // Closing a tab forgets what it was owed.
+    index.onRepoChanged("/focused");
+    index.setScope({ activeKey: "/background", retainedKeys: ["/background"], visible: true });
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(maybeRefresh).toHaveBeenCalledTimes(2);
     index.reset();
   });
   beforeEach(() => {
@@ -333,7 +586,8 @@ describe("liveIndex controller", () => {
       reason: "devmap deferred under load after 0.000s: background work is shed while the git spawn rate budget is low",
     });
     const maybeRefresh = vi.fn(async (_repo: string, _changed: boolean) => shed);
-    const index = createLiveIndex({ debounceMs: 0, maybeRefresh });
+    // The base backoff, unspread: the spread has its own test below.
+    const index = createLiveIndex({ debounceMs: 0, maybeRefresh, random: () => 0 });
     index.setScope({ activeKey: "/repo", retainedKeys: ["/repo"], visible: true });
     await vi.advanceTimersByTimeAsync(0);
     expect(maybeRefresh).toHaveBeenCalledTimes(1);
@@ -351,6 +605,26 @@ describe("liveIndex controller", () => {
     expect(maybeRefresh).toHaveBeenCalledTimes(3);
     expect(maybeRefresh.mock.calls.every(([, changed]) => changed === false)).toBe(true);
     expect(index.get("/repo").phase).toBe("ready");
+    index.reset();
+  });
+
+  it("spreads the retries of repositories one storm deferred, never shortening one", async () => {
+    // Every tab restored at launch is deferred by the same storm. Asked back
+    // on one schedule, they met the same empty budget together again.
+    const shed = outcome("skip_deferred", {
+      facts: { available: false, is_fresh: false, schema_ok: false, already_building: false },
+      reason: "devmap deferred under load after 0.000s: background work is shed while the git spawn rate budget is low",
+    });
+    const maybeRefresh = vi.fn(async (_repo: string, _changed: boolean) => shed);
+    const draws = [0, 0.5, 1];
+    const index = createLiveIndex({ debounceMs: 0, maybeRefresh, random: () => draws.shift() ?? 0 });
+    const tabs = ["/a", "/b", "/c"];
+    index.setScope({ activeKey: "/a", retainedKeys: tabs, visible: true });
+    await vi.advanceTimersByTimeAsync(2_500);
+    expect(maybeRefresh).toHaveBeenCalledTimes(3);
+    const waits = tabs.map((tab) => index.get(tab).reason?.match(/retrying in (\d+) s/)?.[1]);
+    // 3 s, 3.75 s and 4.5 s: the base backoff, lengthened by each draw.
+    expect([...waits].sort()).toEqual(["3", "4", "5"]);
     index.reset();
   });
 

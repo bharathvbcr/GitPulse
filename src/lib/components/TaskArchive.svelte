@@ -46,15 +46,17 @@
    * window so short that the panel's own chrome overflows the cap.
    */
   import { onMount, untrack } from "svelte";
-  import { listen } from "@tauri-apps/api/event";
   import { Archive, ExternalLink } from "@lucide/svelte";
-  import { isTauri } from "../platform";
   import { createListenerTracker } from "../dom/listenerTracker";
+  import { createLiveLoader } from "../workbench/liveLoader";
   import { createAdaptiveTimer } from "../runtime/adaptiveTimer";
-  import { bindForegroundChanges, readBackgroundDocument } from "../runtime/foreground";
+  import { readBackgroundDocument } from "../runtime/foreground";
   import { formatRelativeTime } from "../format";
   import { MAX_TASK_SELECTION, type TaskAction } from "../workbench/taskActions";
   import { MAX_DELETE_BATCH } from "../workbench/taskDelete";
+  import { cardMatchesQuery, parseTaskQuery, type QueryContext } from "../workbench/taskQuery";
+  import { searchCards } from "../workbench/taskRank";
+  import { words as lexiconWords } from "../workbench/taskLexicon";
   import { ARCHIVE_RULE, archiveStamp, archiveSummary, refreshPages, restoreAction, type ArchiveView } from "../workbench/taskArchive";
   import {
     STATUS_LABELS, explainError, listTasks,
@@ -70,6 +72,7 @@
     onopen,
     onaction,
     onrestoredeleted,
+    repository = () => undefined,
   }: {
     scope: Scope;
     active?: boolean;
@@ -83,6 +86,8 @@
     onaction: (cards: TaskCard[], action: TaskAction) => void;
     /** Bring deleted tasks back; resolves with the line to show. */
     onrestoredeleted: (cards: TaskCard[]) => Promise<string>;
+    /** The board's repositories by id, so `repo:` finds one by name here too. */
+    repository?: QueryContext["repository"];
   } = $props();
 
   let view = $state<ArchiveView>("archived");
@@ -93,11 +98,31 @@
   let selected = $state<Set<string>>(new Set());
   let error = $state(""), notice = $state(""), visible = $state(!readBackgroundDocument()), working = $state(false);
   let now = $state(Math.floor(Date.now() / 1000));
-  let generation = 0, disposed = false, loading = false, again = false;
-  let refreshTimer: ReturnType<typeof setTimeout> | undefined;
 
-  const rows = $derived((result?.items ?? []).filter((card) => !hiddenIds.has(card.id)));
-  const hiddenHere = $derived((result?.items.length ?? 0) - rows.length);
+  /**
+   * The search read as the board reads its own (`taskQuery.ts`): the words go
+   * to the store, the filters narrow the rows loaded here. Sending the whole
+   * box searched for `is:bug` as the words "is" and "bug".
+   */
+  const parsed = $derived(parseTaskQuery(query));
+  const storeQuery = $derived(parsed.text);
+  const queryContext = $derived<QueryContext>({ repository, nowSec: now });
+  /** Loaded rows not waiting out the board's undo window. */
+  const live = $derived((result?.items ?? []).filter((card) => !hiddenIds.has(card.id)));
+  const passing = $derived(live.filter((card) => cardMatchesQuery(card, parsed, queryContext)));
+  /**
+   * The store has already matched every word it was sent (`parsed.text`),
+   * descriptions included, so only what it could not be asked is checked
+   * here: `OR` alternatives and phrases, read the board's way (`taskRank`).
+   * Never relaxed — the archive lists matches in completion order.
+   */
+  const sentWords = $derived(new Set(lexiconWords(storeQuery)));
+  const rows = $derived(parsed.words
+    ? searchCards(passing, parsed.words, { repoName: (id) => repository(id)?.name, storeMatched: (_, word) => sentWords.has(word) }, { order: "board", relax: false }).cards.map((hit) => hit.card)
+    : passing);
+  /** Words checked here rather than by the store: phrases, and clauses the store was not sent. */
+  const localWords = $derived(Boolean(parsed.words && (parsed.words.phrases.length || parsed.words.clauses.some((clause) => !clause.some((word) => sentWords.has(word))))));
+  const hiddenHere = $derived((result?.items.length ?? 0) - live.length);
   // `null` until a read succeeds, so an unread dock never renders as an empty
   // archive. The dock defers while the window is in the background, which is
   // exactly when that distinction stops being theoretical.
@@ -110,7 +135,7 @@
   const canAct = $derived(chosen.length > 0 && !overCap && !busy && !working);
 
   function read(cursor: string | undefined) {
-    return listTasks(scope, null, query, cursor, 30, view === "archived"
+    return listTasks(scope, null, storeQuery, cursor, 30, view === "archived"
       ? { archived: true, order: "completed" }
       : { deleted: true, order: "updated" });
   }
@@ -119,65 +144,55 @@
    * `"first"` starts over (scope, search or view changed); `"more"` appends
    * the next page; `"refresh"` re-reads the pages already on screen.
    */
-  async function load(mode: "first" | "more" | "refresh" = "refresh") {
-    if (!active || !visible || disposed) return;
-    if (loading) { again = true; return; }
-    const epoch = generation;
-    loading = true;
-    try {
+  type LoadMode = "first" | "more" | "refresh";
+  const loader = createLiveLoader<LoadMode>({
+    canRun: () => active && visible,
+    read: async (requested, isCurrent) => {
+      const mode = requested ?? "refresh";
       if (mode === "more" && result?.next_cursor) {
         const next = await read(result.next_cursor);
-        if (epoch !== generation || disposed) return;
+        if (!isCurrent()) return;
         const items = [...new Map([...(result?.items ?? []), ...next.items].map((item) => [item.id, item])).values()];
         result = { ...next, items, shown: items.length };
         pages++;
       } else {
         const fresh = await refreshPages(mode === "first" || !result ? 1 : pages, read);
-        if (epoch !== generation || disposed) return;
+        if (!isCurrent()) return;
         result = { items: fresh.items, total: fresh.total, shown: fresh.items.length, has_more: fresh.next_cursor !== null, next_cursor: fresh.next_cursor };
         pages = fresh.pages;
       }
       const items = result.items;
       selected = new Set([...selected].filter((id) => items.some((item) => item.id === id)));
       error = "";
-    } catch (cause) {
-      if (epoch === generation && !disposed) error = explainError(cause);
-    } finally {
-      loading = false;
-      if (again) { again = false; void load(); }
-    }
-  }
-
-  function schedule() {
-    if (!active || !visible || disposed) return;
-    clearTimeout(refreshTimer);
-    refreshTimer = setTimeout(() => { void load(); }, 200);
-  }
+    },
+    onError: (cause) => { error = explainError(cause); },
+  });
+  const load = (mode: LoadMode = "refresh") => loader.load(mode);
 
   onMount(() => {
     const listeners = createListenerTracker();
-    if (isTauri()) {
-      void listen("workbench-changed", schedule)
-        .then((stop) => listeners.track(stop))
-        .catch((cause) => { if (!disposed) notice = `Live updates unavailable: ${explainError(cause)}. Use Refresh.`; });
-    }
-    const onForeground = () => {
-      visible = !readBackgroundDocument();
-      if (visible) schedule();
-    };
+    listeners.track(loader.connect({
+      onVisibility: (next) => { visible = next; },
+      onUnavailable: (message) => { notice = `Live updates unavailable: ${message}. Use Refresh.`; },
+    }));
     const stopClock = createAdaptiveTimer(() => { now = Math.floor(Date.now() / 1000); }, 30_000);
     listeners.track(stopClock);
-    listeners.track(bindForegroundChanges(document, typeof window === "undefined" ? null : window, onForeground));
-    return () => { disposed = true; generation++; clearTimeout(refreshTimer); listeners.dispose(); };
+    return () => { loader.dispose(); listeners.dispose(); };
   });
 
   // Scope, search and view each change what the list is, so the page starts
   // over. A completed write only changes rows within it: refreshed in place.
+  // The window's focus is not among them: a blur (Cmd-Tab) pauses loads, and
+  // coming back refreshes in place (`onForeground`), so a selection made over
+  // several pages survives a look at another app.
   $effect(() => {
-    scope; query; view; active; visible;
-    generation++; result = null; pages = 0; selected = new Set(); clearTimeout(refreshTimer);
+    scope; storeQuery; view; active;
+    loader.reset(); result = null; pages = 0; selected = new Set();
     untrack(() => { void load("first"); });
   });
+  // Filters change which loaded rows show, not the list: no re-read, but a
+  // selection they may have hidden is dropped rather than acted on.
+  $effect(() => { query; untrack(() => { selected = new Set(); }); });
   let seenToken = untrack(() => refreshToken);
   $effect(() => {
     if (refreshToken === seenToken) return;
@@ -200,7 +215,7 @@
     working = true;
     try { await onopen(card.id); }
     catch (cause) { error = explainError(cause); }
-    finally { if (!disposed) working = false; }
+    finally { if (!loader.isDisposed()) working = false; }
   }
 
   async function restore() {
@@ -209,7 +224,7 @@
     working = true;
     try { notice = await onrestoredeleted([...chosen]); error = ""; }
     catch (cause) { error = explainError(cause); }
-    finally { if (!disposed) { working = false; void load("refresh"); } }
+    finally { if (!loader.isDisposed()) { working = false; void load("refresh"); } }
   }
 
   function remove() {
@@ -246,6 +261,7 @@
   <p class="summary" role="status" data-testid="task-archive-summary">
     {summary.text}
     {#if summary.partial}<span class="more-note">Load more to see the rest.</span>{/if}
+    {#if (parsed.terms.length || localWords) && !summary.pending}<span class="more-note" data-testid="task-archive-filter-note">Filters apply to the {live.length} loaded.</span>{/if}
     <!-- Deferring the query while the window is in the background is the
          Inbox's behaviour too, and worth the saved round trips. Leaving the
          reader to guess why the panel is blank is not. -->
@@ -257,6 +273,11 @@
     {view === "archived" ? ARCHIVE_RULE : "Deleted tasks keep their history; Restore brings one back with its id, fields and archive state."}
   </p>
 
+  {#if parsed.problems.length}
+    <ul class="problems" role="status" aria-live="polite" data-testid="task-archive-query-problems">
+      {#each parsed.problems as problem}<li>{problem}</li>{/each}
+    </ul>
+  {/if}
   {#if error}<div role="alert">{error}</div>{/if}
   {#if notice}<p class="notice" role="status">{notice}</p>{/if}
 
@@ -327,6 +348,7 @@
      the whole of an over-tall panel is taken out of the row list and the
      action bar cannot be the part that goes off screen. */
   .archive > *{flex:0 0 auto}
+  .problems{margin:4px 0 0;padding:0;list-style:none;font-size:11px;color:rgb(var(--c-status-amber))}
   header,.controls{display:flex;align-items:center;gap:8px;flex-wrap:wrap}header{justify-content:space-between}
   header strong{display:flex;align-items:center;gap:6px;font-weight:600}
   p{margin:6px 0;color:rgb(var(--c-text-muted))}

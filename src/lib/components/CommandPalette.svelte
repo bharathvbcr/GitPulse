@@ -3,7 +3,7 @@
   import { get } from "svelte/store";
   import { fade, scale } from "svelte/transition";
   import { FileCode, FolderGit2, GitBranch, GitCommit, Search, X, ArrowRight, LoaderCircle } from "@lucide/svelte";
-  import { repoStore } from "../stores/repoStore";
+  import { currentRepoPath, repoStore } from "../stores/repoStore";
   import { graphStore } from "../stores/graphStore";
   import { promptState } from "../stores/modalStore";
   import { sameRepo, isCaseInsensitiveFs, displayName } from "../repos/paths";
@@ -44,7 +44,7 @@
   let mode = $derived.by(() => parsed.mode);
   let effectiveSearchText = $derived(parsed.text);
   let currentMode = $derived(PALETTE_MODES.find(entry => entry.mode === mode) ?? PALETTE_MODES[0]);
-  let repoPath = $derived($repoStore.currentPath);
+  let repoPath = $derived($currentRepoPath);
   let commands = $derived(buildCommands($repoStore, changeMode, { onClone, onRebase }));
   let isRemoteSearch = $derived(mode === "files" || mode === "symbols" || mode === "workspace");
   let symbolSearchNote = $derived(mode === "symbols" ? searchResult.note : null);
@@ -52,11 +52,12 @@
 
   // Query text does not reload the file list; filtering operates on the current
   // snapshot. The opening epoch, repository generation and Retry refresh it.
+  const repoGeneration = $derived($repoStore.generation);
   $effect(() => {
     const open = isOpen;
     const searchMode = mode;
     const path = repoPath;
-    const generation = $repoStore.generation;
+    const generation = repoGeneration;
     const searchText = searchMode === "files" ? "" : effectiveSearchText;
     const semantic = searchMode === "workspace" ? parsed.semantic : false;
     void generation; void retrySignal;

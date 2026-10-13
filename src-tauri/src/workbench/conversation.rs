@@ -96,6 +96,105 @@ pub(crate) fn claude_home() -> Option<PathBuf> {
         .map(|home| PathBuf::from(home).join(".claude"))
 }
 
+/// Every Claude Code configuration directory this account may be running
+/// sessions under, and whether the list is known to be complete.
+///
+/// `CLAUDE_CONFIG_DIR` points one launch at one directory, and people with
+/// several accounts keep one per account (`~/.claude-work`, `~/.claude-lab`).
+/// A reader that looked only at the current process's directory counted 5 of
+/// 15 live sessions on a real machine while reporting itself healthy, so the
+/// candidates are: `CLAUDE_CONFIG_DIR`, `GITPULSE_CLAUDE_CONFIG_DIRS` (a PATH-style
+/// list for directories outside the conventions), `~/.claude`, the XDG
+/// `claude` directory, and every `~/.claude-*` directory.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ClaudeConfigDirs {
+    pub dirs: Vec<PathBuf>,
+    /// Set when the home directory could not be listed for `~/.claude-*`:
+    /// directories may exist that are not in `dirs`, so the list is not
+    /// evidence of absence.
+    pub error: Option<String>,
+}
+
+pub(crate) fn claude_config_dirs() -> ClaudeConfigDirs {
+    let var = |name: &str| std::env::var_os(name).filter(|v| !v.is_empty());
+    let home = var("HOME")
+        .or_else(|| var("USERPROFILE"))
+        .map(PathBuf::from);
+    config_dirs_in(
+        var("CLAUDE_CONFIG_DIR").map(PathBuf::from),
+        var("GITPULSE_CLAUDE_CONFIG_DIRS"),
+        var("XDG_CONFIG_HOME").map(PathBuf::from),
+        home.as_deref(),
+    )
+}
+
+/// [`claude_config_dirs`] with the environment as arguments.
+pub(crate) fn config_dirs_in(
+    config_dir: Option<PathBuf>,
+    extra: Option<std::ffi::OsString>,
+    xdg_config_home: Option<PathBuf>,
+    home: Option<&Path>,
+) -> ClaudeConfigDirs {
+    /// More sibling directories than any person keeps; past it the list is
+    /// reported incomplete rather than read without bound.
+    const MAX_HOME_ENTRIES: usize = 4096;
+    let mut out = ClaudeConfigDirs::default();
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    candidates.extend(config_dir);
+    if let Some(extra) = extra {
+        candidates.extend(std::env::split_paths(&extra).filter(|p| !p.as_os_str().is_empty()));
+    }
+    if let Some(home) = home {
+        candidates.push(home.join(".claude"));
+        candidates.push(
+            xdg_config_home
+                .clone()
+                .unwrap_or_else(|| home.join(".config"))
+                .join("claude"),
+        );
+        match std::fs::read_dir(home) {
+            Ok(entries) => {
+                let mut siblings: Vec<PathBuf> = Vec::new();
+                for (seen, entry) in entries.enumerate() {
+                    if seen >= MAX_HOME_ENTRIES {
+                        out.error = Some(format!(
+                            "{} holds more than {MAX_HOME_ENTRIES} entries; some `.claude-*` directories may not be listed",
+                            home.display()
+                        ));
+                        break;
+                    }
+                    let Ok(entry) = entry else { continue };
+                    let name = entry.file_name();
+                    if name.to_string_lossy().starts_with(".claude-")
+                        && entry.file_type().is_ok_and(|t| t.is_dir())
+                    {
+                        siblings.push(entry.path());
+                    }
+                }
+                siblings.sort();
+                candidates.extend(siblings);
+            }
+            Err(error) => {
+                out.error = Some(format!(
+                    "cannot list {} for `.claude-*` config directories: {error}",
+                    home.display()
+                ));
+            }
+        }
+    } else if let Some(xdg) = xdg_config_home {
+        candidates.push(xdg.join("claude"));
+    }
+    let mut seen: Vec<PathBuf> = Vec::new();
+    for dir in candidates {
+        let key = std::fs::canonicalize(&dir).unwrap_or_else(|_| dir.clone());
+        if !seen.contains(&key) {
+            seen.push(key);
+            out.dirs.push(dir);
+        }
+    }
+    out
+}
+
 /// Looks for `<home>/projects/<any>/<session>.jsonl`.
 ///
 /// Every project directory is tried rather than the one Claude Code would

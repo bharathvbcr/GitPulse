@@ -10,6 +10,7 @@
     TERMINAL_DOCK_MAX_HEIGHT,
     TERMINAL_DOCK_MIN_HEIGHT,
     TERMINAL_DOCK_RESIZE_STEP,
+    clampTerminalDockHeight,
     fitTerminalDockHeight,
   } from "../terminal/dockMetrics";
   import { nextHostedTerminals } from "../terminal/repoHosts";
@@ -28,11 +29,12 @@
    * *against* something: a Health remediation, a failing test, the diff you
    * are about to commit. A full-screen terminal hid all of it.
    *
-   * Mounted on first open and kept mounted after, because unmounting kills
-   * the shell. Closing hides it. Switching repository tabs also hides rather
+   * Mounted on first open and kept mounted after, because unmounting loses
+   * the scrollback (and detaches anything running). Closing hides it. Switching repository tabs also hides rather
    * than unmounts: one panel per visited tab, bound to that tab's path, so
    * the scrollback is still there when you come back. Closing the repository
-   * tab is what drops the panel.
+   * tab is what drops the panel; what was still running there is detached,
+   * not killed, and stays under Sessions.
    */
 
   let {
@@ -71,14 +73,12 @@
    * panel alive after the user leaves it.
    */
   let hostedIds = $state(new Set<string>());
+  // The tab ids as a value: repoStore rebuilds openTabs on every publish.
+  const openTabIdsKey = $derived($repoStore.openTabs.map((tab) => tab.id).join("\n"));
+  const activeTabId = $derived($repoStore.activeTabId);
   $effect(() => {
-    const next = nextHostedTerminals(
-      hostedIds,
-      $repoStore.openTabs.map((tab) => tab.id),
-      $repoStore.activeTabId,
-      open,
-      awaited,
-    );
+    const ids = openTabIdsKey === "" ? [] : openTabIdsKey.split("\n");
+    const next = nextHostedTerminals(hostedIds, ids, activeTabId, open, awaited);
     if (next !== hostedIds) untrack(() => { hostedIds = next; });
   });
 
@@ -104,6 +104,16 @@
   let expanded = $state(false);
   /** Height of the column the dock shares with the view, for the ceiling. */
   let containerHeight = $state(0);
+  /**
+   * The height a pointer drag is asking for, held locally until the drag ends.
+   *
+   * Writing the store per pointermove meant a synchronous localStorage write
+   * and an interfaceStore publish per frame — and every subscriber of that
+   * store (App's zoom, the graph's palette, …) re-ran with it. The drag
+   * renders from this value and commits once on pointerup/pointercancel.
+   * Null whenever no drag is in flight; the keyboard path never uses it.
+   */
+  let dragHeight = $state<number | null>(null);
 
   // The stored height is a request; what renders also respects the room the
   // window actually has, so a dock sized on a large display cannot swallow
@@ -114,7 +124,9 @@
   let height = $derived(
     expanded
       ? fitTerminalDockHeight(TERMINAL_DOCK_MAX_HEIGHT, containerHeight, 0)
-      : fitTerminalDockHeight($interfaceStore.terminalDockHeight, containerHeight),
+      : dragHeight !== null
+        ? fitTerminalDockHeight(dragHeight, containerHeight)
+        : fitTerminalDockHeight($interfaceStore.terminalDockHeight, containerHeight),
   );
 
   $effect(() => {
@@ -130,10 +142,10 @@
     event.preventDefault();
     const startY = event.clientY;
     const startHeight = height;
-    if (expanded) {
-      interfaceStore.setTerminalDockHeight(height);
-      expanded = false;
-    }
+    // Collapsing out of the expanded state starts the drag from what was on
+    // screen; like every other drag height, it reaches the store on release.
+    dragHeight = expanded ? clampTerminalDockHeight(startHeight) : null;
+    expanded = false;
     dragging = true;
 
     // Pointer capture, not window listeners: a drag that leaves the window
@@ -142,10 +154,12 @@
     handle.setPointerCapture(event.pointerId);
 
     const move = (moveEvent: PointerEvent) => {
-      // Dragging up grows the dock, so the delta is inverted.
-      interfaceStore.setTerminalDockHeight(startHeight + (startY - moveEvent.clientY));
+      // Dragging up grows the dock, so the delta is inverted. Clamped exactly
+      // as the store would clamp it, so the release commits what was shown.
+      dragHeight = clampTerminalDockHeight(startHeight + (startY - moveEvent.clientY));
     };
     const end = () => {
+      commitDragHeight();
       dragging = false;
       handle.releasePointerCapture(event.pointerId);
       handle.removeEventListener("pointermove", move);
@@ -155,6 +169,13 @@
     handle.addEventListener("pointermove", move);
     handle.addEventListener("pointerup", end);
     handle.addEventListener("pointercancel", end);
+  }
+
+  /** One store write per drag, not one per pointermove. */
+  function commitDragHeight() {
+    if (dragHeight === null) return;
+    interfaceStore.setTerminalDockHeight(dragHeight);
+    dragHeight = null;
   }
 
   function handleSeparatorKey(event: KeyboardEvent) {
@@ -170,6 +191,8 @@
   }
 
   onDestroy(() => {
+    // A dock torn down mid-drag still keeps the height the reader chose.
+    commitDragHeight();
     dragging = false;
   });
 </script>

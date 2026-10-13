@@ -132,7 +132,8 @@ describe("autoInit", () => {
       )
       .mockResolvedValue(report());
     const warn = vi.fn();
-    const index = createAutoInit({ debounceMs: 0, initialize, warn });
+    // The base backoff, unspread: the spread has its own test below.
+    const index = createAutoInit({ debounceMs: 0, initialize, warn, random: () => 0 });
     index.setScope(scope("/a", ["/a"]));
     await vi.advanceTimersByTimeAsync(0);
     expect(initialize).toHaveBeenCalledTimes(1);
@@ -149,6 +150,34 @@ describe("autoInit", () => {
     expect(initialize).toHaveBeenCalledTimes(2);
     expect(index.get("/a").report?.workspace_registry).toBe("/a/.devmap/workspace.json");
     index.reset();
+  });
+
+  it("spreads a deferred retry upward, through the shared jitter", async () => {
+    const deferred = "git check-ignore deferred under load after 2.008s: the git spawn rate limit admitted nothing sooner";
+    const shed = report({
+      exclude: { status: "refused", reason: deferred },
+      workspace_registry: null,
+      workspace_reason: `the ignore check did not run (${deferred}); not creating untracked state until it does`,
+    });
+    const retryAt = async (draw: number) => {
+      const initialize = vi
+        .fn<(repo: string, open: string[]) => Promise<InitReport>>()
+        .mockResolvedValueOnce(shed)
+        .mockResolvedValue(report());
+      const index = createAutoInit({ debounceMs: 0, initialize, warn: () => {}, random: () => draw });
+      index.setScope(scope("/a", ["/a"]));
+      await vi.advanceTimersByTimeAsync(0);
+      let waited = 0;
+      while (initialize.mock.calls.length < 2 && waited < 10_000) {
+        await vi.advanceTimersByTimeAsync(250);
+        waited += 250;
+      }
+      index.reset();
+      return waited;
+    };
+    // The same deferral, three draws: three different waits, none shorter
+    // than the 3 s base.
+    expect([await retryAt(0), await retryAt(0.5), await retryAt(1)]).toEqual([3_000, 3_750, 4_500]);
   });
 
   it("keeps initializing a different repository while one deferral is backing off", async () => {
@@ -191,7 +220,7 @@ describe("autoInit", () => {
         workspace_reason: `the ignore check did not run (${deferred}); not creating untracked state until it does`,
       }),
     );
-    const index = createAutoInit({ debounceMs: 0, initialize });
+    const index = createAutoInit({ debounceMs: 0, initialize, random: () => 0 });
     index.setScope(scope("/a", ["/a"]));
     await vi.advanceTimersByTimeAsync(0);
     // 3s + 6s + 12s + 24s + 30s of backoff, then one settled attempt.

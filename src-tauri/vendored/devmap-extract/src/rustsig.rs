@@ -112,6 +112,35 @@ pub fn returns_type(header: &Header<'_>, type_name: &str, unwrapped: bool) -> bo
     false
 }
 
+/// The type a call's value has, read off the written return type `returns`.
+///
+/// `Arc`/`Rc`/`Box` are seen through, because a method call sees through them.
+/// A `Result` or `Option` is peeled to its first type argument only when the
+/// caller `unwrapped` it (`?`, `.unwrap()`, `.expect(..)`): a `Result<T>` has
+/// its own methods and is not a `T`. Any other generic (`Vec<T>`, a user
+/// generic) answers `None` — it names no type a method can be dispatched on
+/// here. The answer is the type text as written; whether it names one indexed
+/// type is the resolver's decision.
+pub fn value_type(returns: &str, unwrapped: bool) -> Option<&str> {
+    let mut ty = returns.trim();
+    let mut peeled_wrapper = false;
+    for _ in 0..8 {
+        let Some((outer, args)) = generic_parts(ty) else {
+            return (!ty.is_empty()).then_some(ty);
+        };
+        let first = split_top(args, ',').into_iter().next().unwrap_or("").trim();
+        if crate::deref::RUST_DEREF_TRANSPARENT.contains(&outer) {
+            ty = first;
+        } else if !peeled_wrapper && unwrapped && (outer == "Result" || outer == "Option") {
+            peeled_wrapper = true;
+            ty = first;
+        } else {
+            return None;
+        }
+    }
+    None
+}
+
 /// The type a closure passed as argument `arg` receives as its parameter
 /// `param`, when the header declares that argument as a closure type.
 ///
@@ -358,6 +387,20 @@ fn find_top_word(text: &str, word: &str) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_call_value_is_peeled_only_as_far_as_the_caller_unwrapped_it() {
+        assert_eq!(value_type("Outcome", false), Some("Outcome"));
+        assert_eq!(value_type("Box<Outcome>", false), Some("Outcome"));
+        assert_eq!(value_type("Result<Outcome, String>", true), Some("Outcome"));
+        assert_eq!(value_type("Option<Rc<Outcome>>", true), Some("Outcome"));
+        // A `Result` is not an `Outcome` until something unwraps it.
+        assert_eq!(value_type("Result<Outcome, String>", false), None);
+        // Two wrappers are one more than `?` removes.
+        assert_eq!(value_type("Option<Option<Outcome>>", true), None);
+        assert_eq!(value_type("Vec<Outcome>", true), None);
+        assert_eq!(value_type("", false), None);
+    }
 
     #[test]
     fn a_header_splits_into_its_parts() {

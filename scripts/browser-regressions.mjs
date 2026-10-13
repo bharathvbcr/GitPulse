@@ -9,7 +9,7 @@ import { promisify } from "node:util";
 import { createServer } from "vite";
 
 const run = promisify(execFile);
-export const BROWSER_HARNESSES = Object.freeze(["diagnostics", "pull-requests", "search", "conflicts", "uncommitted", "coverage", "health", "blame", "branches", "hygiene", "palette", "status", "tasks", "task-materials", "task-runs", "onboarding", "firebase", "delivery", "terminal", "impact", "secrets", "markdown", "repo-tabs", "agents", "agent-capacity", "tab-switch"]);
+export const BROWSER_HARNESSES = Object.freeze(["diagnostics", "pull-requests", "search", "conflicts", "uncommitted", "coverage", "health", "blame", "branches", "hygiene", "palette", "status", "tasks", "task-materials", "task-runs", "onboarding", "firebase", "delivery", "terminal", "impact", "secrets", "markdown", "repo-tabs", "scroll-cue", "agents", "agent-capacity", "repo-churn", "diff", "file-tree", "github-panel", "fleet", "tab-switch"]);
 
 /**
  * How long one page may take, from server start to verdict.
@@ -64,27 +64,56 @@ export function chromeBinary() {
     : process.platform === "win32" ? "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe" : "google-chrome");
 }
 
-/** How Chrome is started so that it cannot outlive this runner.
- *
- * `finally` covers every way a harness ends inside this process, but not this
- * process being killed — Ctrl-C, a CI step timeout, a SIGKILL — and a plain
- * headless Chrome survives its parent: one was found still running three days
- * after its run. With `--remote-debugging-pipe` Chrome reads its control
- * channel from fds 3 and 4, and the kernel closes those when this process
- * dies, however it dies; Chrome then exits.
+/** How Chrome is started. Chrome is its own process group, so its helpers can
+ * be ended with it.
  * @param {string} chrome @param {string} profile @param {string} url
  */
 export function chromeLaunch(chrome, profile, url) {
   return {
     file: chrome,
     args: [
-      "--headless", "--remote-debugging-pipe", `--user-data-dir=${profile}`, "--no-first-run",
+      "--headless", `--user-data-dir=${profile}`, "--no-first-run",
       "--no-default-browser-check", "--disable-background-networking", "--window-size=1400,1000",
       url,
     ],
     /** @type {import('node:child_process').StdioOptions} */
-    stdio: ["ignore", "ignore", "ignore", "pipe", "pipe"],
+    stdio: ["ignore", "ignore", "ignore"],
   };
+}
+
+/** Runs in its own process, polling the runner and the browser. When the
+ * runner is gone it ends Chrome's whole process group and removes the profile.
+ * It exits as soon as either side is gone, so it never outlives the pair.
+ */
+const WATCHDOG = `
+const runner = Number(process.argv[1]), chrome = Number(process.argv[2]), profile = process.argv[3];
+const alive = pid => { try { process.kill(pid, 0); return true; } catch (e) { return e.code === "EPERM"; } };
+const tick = setInterval(() => {
+  if (alive(runner)) { if (!alive(chrome)) process.exit(0); return; }
+  clearInterval(tick);
+  try { process.kill(process.platform === "win32" ? chrome : -chrome, "SIGKILL"); } catch {}
+  try { require("node:fs").rmSync(profile, { recursive: true, force: true, maxRetries: 5 }); } catch {}
+  process.exit(0);
+}, 200);
+`;
+
+/** Starts Chrome so that it cannot outlive this runner.
+ *
+ * `finally` covers every way a harness ends inside this process, but not this
+ * process being killed — Ctrl-C, a CI step timeout, a SIGKILL — and a plain
+ * headless Chrome survives its parent: one was found still running three days
+ * after its run. `--remote-debugging-pipe` does not help: measured with Chrome
+ * 154, the browser keeps running after the pipe's other end closes. So a
+ * detached watchdog, which SIGKILL of the runner cannot reach, ends it.
+ * @param {string} chrome @param {string} profile @param {string} url
+ */
+export function startChrome(chrome, profile, url) {
+  const launch = chromeLaunch(chrome, profile, url);
+  const child = spawn(launch.file, launch.args, { stdio: launch.stdio, detached: process.platform !== "win32" });
+  if (child.pid) {
+    spawn(process.execPath, ["-e", WATCHDOG, String(process.pid), String(child.pid), profile], { detached: true, stdio: "ignore" }).unref();
+  }
+  return child;
 }
 
 /** What a signal or an uncaught error must still undo: the live browser and
@@ -165,8 +194,7 @@ async function runHarness(harness, webkit) {
       browser = execFile("xcrun", ["swift", fileURLToPath(new URL("./webkit-regressions.swift", import.meta.url)), url, String(seconds + 5)],
         { timeout: (seconds + 5) * 1000, maxBuffer: 1024 * 1024, killSignal: "SIGKILL" });
     } else {
-      const launch = chromeLaunch(chrome, profile, url);
-      browser = spawn(launch.file, launch.args, { stdio: launch.stdio });
+      browser = startChrome(chrome, profile, url);
     }
     const exited = new Promise((_, reject) => {
       browser?.once("error", reject);

@@ -24,3 +24,21 @@ describe("a deferral routed to an error toast", () => {
     expect(failed.duration).toBe(0);
   });
 });
+
+describe("eviction at the cap (ft-038e6ba5)", () => {
+  afterEach(() => toastStore.clear());
+
+  it("drops the oldest non-error toast, never an error, while a non-error exists", () => {
+    toastStore.error("first failure");
+    for (let i = 0; i < 5; i += 1) toastStore.info(`note ${i}`);
+    const kept = get(toastStore);
+    expect(kept).toHaveLength(5);
+    expect(kept.some((t) => t.message === "first failure")).toBe(true);
+    expect(kept.filter((t) => t.message.startsWith("note")).map((t) => t.message)).toEqual(["note 1", "note 2", "note 3", "note 4"]);
+  });
+
+  it("evicts the oldest error only when every toast is an error", () => {
+    for (let i = 0; i < 6; i += 1) toastStore.error(`failure ${i}`);
+    expect(get(toastStore).map((t) => t.message)).toEqual(["failure 1", "failure 2", "failure 3", "failure 4", "failure 5"]);
+  });
+});

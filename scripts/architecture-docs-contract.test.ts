@@ -1,6 +1,7 @@
 import { execFileSync } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
+import { readCommandsSource } from "./commands-source";
 
 /**
  * The architecture docs listed "Tokio" beside "Rayon" as though both were
@@ -88,10 +89,7 @@ describe("architecture documentation contract", () => {
 
   it("points at the real off-thread mechanism", () => {
     expect(architecture).toContain("tauri::async_runtime::spawn_blocking");
-    const commands = readFileSync(
-      new URL("../src-tauri/src/commands/mod.rs", import.meta.url),
-      "utf8",
-    );
+    const commands = readCommandsSource();
     // The doc names `off_thread`; it must still exist and use that runtime.
     expect(commands).toContain("async fn off_thread");
     expect(commands).toContain("tauri::async_runtime::spawn_blocking");

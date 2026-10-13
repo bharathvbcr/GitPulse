@@ -3,7 +3,26 @@
   "version": "1.4.0",
   "private": true,
   "license": "MIT",
-  "description": "High-performance native Git desktop client built with Rust (Tauri 2) and Svelte 5",
+  "description": "Fast, local-first Git desktop client, code intelligence suite, and task workspace built with Rust (Tauri 2) and Svelte 5",
+  "keywords": [
+    "git",
+    "git-client",
+    "git-gui",
+    "tauri",
+    "tauri-v2",
+    "rust",
+    "svelte",
+    "svelte-5",
+    "local-first",
+    "code-intelligence",
+    "commit-graph",
+    "merge-conflicts",
+    "developer-tools",
+    "devtools",
+    "desktop-app",
+    "mcp",
+    "terminal"
+  ],
   "repository": {
     "type": "git",
     "url": "git+https://github.com/bharathvbcr/GitPulse.git"
@@ -22,11 +41,14 @@
     "check:coverage": "node scripts/check-coverage-floor.mjs",
     "check:workflows": "node scripts/check-workflows.mjs",
     "check:vendor-schema": "node scripts/check-vendor-schema.mjs",
+    "check:schema-parity": "node scripts/check-schema-parity.mjs",
+    "check:fixture-authors": "bash .githooks/lib/fixture-commits.sh",
     "mcp:install": "cargo install --path src-tauri --bin gitpulse-mcp --bin gitpulse-hook --locked --force && node scripts/record-install.mjs",
     "mcp:doctor": "node scripts/check-mcp-install.mjs",
     "gusset:check": "node scripts/gusset-check.mjs",
     "vendor": "node scripts/vendor-crates.mjs",
     "vendor:check": "node scripts/vendor-crates.mjs --check",
+    "check:vendor-edits": "node scripts/vendor-crates.mjs --check --allow-drift",
     "release:notes": "node scripts/release-notes.mjs",
     "release:ready": "node scripts/release-state.mjs ready",
     "ci:local": "node scripts/ci-local.mjs",
@@ -40,8 +62,8 @@
     "test:webkit:all": "node scripts/browser-regressions.mjs --webkit --all"
   },
   "dependencies": {
-    "@lucide/svelte": "^1.52.0",
-    "@tauri-apps/api": "^2.12.0",
+    "@lucide/svelte": "^1.54.0",
+    "@tauri-apps/api": "^2.12.2",
     "@tauri-apps/plugin-autostart": "^2.6.0",
     "@tauri-apps/plugin-opener": "^2.6.0",
     "@xterm/addon-fit": "^0.11.0",
@@ -55,11 +77,11 @@
     "@types/node": "^26.6.3",
     "@typescript/native": "npm:typescript@^7.0.2",
     "@vitest/coverage-v8": "^5.0.2",
-    "svelte": "^5.57.1",
+    "svelte": "^5.57.2",
     "svelte-check": "^4.7.6",
     "tailwindcss": "^4.3.3",
     "typescript": "npm:@typescript/typescript6@^6.0.2",
-    "vite": "^8.3.1",
+    "vite": "^8.3.4",
     "vitest": "^5.0.3"
   }
 }

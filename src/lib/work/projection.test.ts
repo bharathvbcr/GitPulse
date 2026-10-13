@@ -80,6 +80,7 @@ function lease(task_id: string, over: Partial<TaskLease> = {}): TaskLease {
     status: "in_progress",
     created_at: "2026-09-01T12:00:00Z",
     expires_at: null,
+    expiry_error: null,
     ...over,
   };
 }
@@ -203,6 +204,22 @@ describe("projectWork joins", () => {
     );
     const withPr = p.rows.filter((r) => r.pullRequests.length > 0).map((r) => r.taskId);
     expect(withPr.sort()).toEqual(["TASK-1", "TASK-2"]);
+  });
+
+  it("never attaches a fork pull request to the local branch of the same name", () => {
+    const fork = { ...pr(11, "main"), is_cross_repository: true };
+    const p = projectWork(
+      inputs({
+        leases: [lease("TASK-1")],
+        worktrees: [worktree("/wt/a", "main")],
+        bindings: { "/wt/a": "TASK-1" },
+        pullRequests: [fork],
+      }),
+    );
+    expect(p.rows.find((r) => r.taskId === "TASK-1")!.pullRequests).toEqual([]);
+    expect(
+      p.rows.find((r) => r.taskId === UNBOUND_ROW_ID)!.pullRequests.map((x) => x.number),
+    ).toEqual([11]);
   });
 
   it("does not guess a task for a pull request no worktree matches", () => {

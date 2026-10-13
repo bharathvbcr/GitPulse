@@ -203,6 +203,17 @@ pub struct Response<T> {
     /// them would report a complete dead-symbol list as partial.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dead_clusters_incomplete: Option<String>,
+    /// The symbols a dead-code answer never examined. Set by `dead_symbols`
+    /// alone, as `dead_clusters` is.
+    ///
+    /// `total: 0` over a Swift app whose every declaration is `internal` and a
+    /// corpus with no dead code were the same answer — DevType's 5,401 symbols
+    /// produced exactly that. Per language, this counts the uncalled symbols
+    /// spared for their visibility and those spared by a recorded reason, by
+    /// reason token, so a zero can be told apart from an exempted corpus.
+    /// `None` only on a query that is not about dead code.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub excluded: Option<devmap_analyze::ExcludedPopulation>,
     /// Call sites the resolver could **not** bind whose callee has the target's
     /// name — the candidates an edge walk cannot show. Set by `impact` alone.
     ///
@@ -466,6 +477,12 @@ pub struct SymbolHit {
     /// consumers see no new key for top-level symbols.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_indent: Option<String>,
+    /// `"secret_path"` when the file is one of `policy.SecretPathPatterns`.
+    /// The location is reported and the text is not: an empty `source_span` with
+    /// this set was withheld, which is a different answer from a symbol whose
+    /// span is empty or a file that could not be read. Absent otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub withheld: Option<String>,
     pub score: f32,
 }
 
@@ -569,6 +586,12 @@ pub struct ExploreDefinition {
     /// `source` is the whole span.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_omitted_bytes: Option<u32>,
+    /// `"secret_path"` when the file is one of `policy.SecretPathPatterns`.
+    /// The location is reported and the text is not: an empty `source` with
+    /// this set was withheld, which is a different answer from a symbol whose
+    /// span is empty or a file that could not be read. Absent otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub withheld: Option<String>,
     pub score: f32,
     /// Inbound edges. A whole [`Response`], so `total` stays exact even when
     /// the budget bought no items — "0 shown of 42" is not "no callers".
@@ -621,9 +644,16 @@ pub struct ExploreReport {
 pub struct LiteralSite {
     pub file_path: String,
     pub line: u32,
+    /// The literal's text, or `secret::WITHHELD_LITERAL_VALUE` when
+    /// `withheld` is set.
     pub value: String,
     pub qualified_name: String,
     pub symbol_name: String,
+    /// `"secret_path"` when the file is one of `policy.SecretPathPatterns`.
+    /// The location is reported and the text is not: `value` is the
+    /// withheld marker, never the string the file writes. Absent otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub withheld: Option<String>,
 }
 
 /// Where a string value is written.
@@ -795,6 +825,12 @@ pub struct SkeletonSymbol {
     /// silent hole.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub signature_note: Option<String>,
+    /// `"secret_path"` when the file is one of `policy.SecretPathPatterns`.
+    /// The span is reported and the declaration text is not: `signature` is
+    /// absent and `signature_note` says it was withheld rather than not
+    /// extracted. Absent otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub withheld: Option<String>,
 }
 
 /// File signatures without bodies, budgeted like every other query envelope.

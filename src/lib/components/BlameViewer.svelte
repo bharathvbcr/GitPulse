@@ -5,7 +5,7 @@
   import type { BlameLine } from "../files/types";
   import { densityStore } from "../stores/densityStore";
   import { rowHeight } from "../ui/density";
-  import { repoStore } from "../stores/repoStore";
+  import { currentRepoPath, repoStore } from "../stores/repoStore";
   import { invoke } from "../ipc/invoke";
   import { CornerLeftUp, FileCode, PanelLeftClose, PanelLeftOpen, Search, Undo2, X } from "@lucide/svelte";
   import { createAsyncGuard, type AsyncGuard } from "../async/guard";
@@ -17,6 +17,7 @@
     bandColor,
     blameRowTint,
     buildAgeTicks,
+    areBlameLinesEqual,
     buildBlameTimeline,
     columnHeight,
     describePeriod,
@@ -44,7 +45,9 @@
   const AXIS_HEIGHT = 30;
 
   let filePath = $state("");
-  let blameLines: BlameLine[] = $state([]);
+  // Raw: replaced wholesale with each blame answer (thousands of rows), never
+  // edited in place.
+  let blameLines: BlameLine[] = $state.raw([]);
   /**
    * The instant this file's blame is measured against.
    *
@@ -93,25 +96,6 @@
   const detailScope = paneDetails.register("blame");
   let requestCount = 0;
   let loadedSubject: string | null = null;
-
-  function areBlameLinesEqual(a: BlameLine[], b: BlameLine[]): boolean {
-    if (a === b) return true;
-    if (a.length !== b.length) return false;
-    for (let i = 0; i < a.length; i++) {
-      const la = a[i];
-      const lb = b[i];
-      if (
-        la.line_no !== lb.line_no ||
-        la.commit_id !== lb.commit_id ||
-        la.timestamp !== lb.timestamp ||
-        la.author_name !== lb.author_name ||
-        la.content !== lb.content
-      ) {
-        return false;
-      }
-    }
-    return true;
-  }
 
   async function loadBlameFor(repo: string, path: string, revision: string | null = null) {
     if (!repo || !path) return;
@@ -273,7 +257,7 @@
   // tip (external commits land through watcher refreshes).
   const blameFingerprint = $derived.by(() => {
     const selected = $repoStore.selectedFilePath;
-    const repo = $repoStore.currentPath;
+    const repo = $currentRepoPath;
     const fileStatus = selected
       ? $repoStore.statuses.find((s) => s.path === selected)
       : undefined;
@@ -286,17 +270,15 @@
     return `${repo ?? ""}\u0000${selected ?? ""}\u0000${statusCode}\u0000${tip}\u0000${revision}`;
   });
 
-  let prevKey: string | null = null;
+  const selectedPath = $derived($repoStore.selectedFilePath);
   $effect(() => {
     // Only a changed fingerprint invalidates this effect. Reading the whole
     // store here used to cancel the live guard on every poll, then skip its
-    // replacement because prevKey had not changed: Loading… forever.
-    const key = blameFingerprint;
-    return untrack(() => {
-      if (key === prevKey) return;
-      prevKey = key;
-      const selected = $repoStore.selectedFilePath;
-      const repo = $repoStore.currentPath;
+    // replacement behind a hand-kept key: Loading… forever.
+    void blameFingerprint;
+    untrack(() => {
+      const selected = selectedPath;
+      const repo = $currentRepoPath;
       filePath = selected ?? "";
       if (revisionTrail.length > 0) {
         // A historical blame is fixed; worktree churn cannot change it. Only

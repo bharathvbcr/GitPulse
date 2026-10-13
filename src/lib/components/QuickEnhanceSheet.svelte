@@ -6,7 +6,7 @@
   import { LAYERS } from "../ui/layers";
   import { cardScale, backdropFade, backdropFadeOut } from "../ui/transitions";
   import { fade, scale } from "svelte/transition";
-  import { getTask, explainError, type EnhancementField, type Task } from "../workbench/client";
+  import { getTask, explainError, type LockableField, type Task } from "../workbench/client";
   import { hiddenTaskDetails, visibleHiddenDetails } from "../workbench/taskOrganize";
   import { bounded } from "../workbench/taskActions";
   import { askConfirm } from "../stores/modalStore";
@@ -47,7 +47,7 @@
   let showEmpty = $state(false);
   let title = $state("");
   let description = $state("");
-  let lockedFields = $state<EnhancementField[]>([]);
+  let lockedFields = $state<LockableField[]>([]);
   let disposed = false;
   const details = $derived(task ? hiddenTaskDetails(task, repoName) : []);
   const visibleDetails = $derived(visibleHiddenDetails(details, showEmpty));

@@ -65,6 +65,16 @@ pub const MAX_REFLOG_BYTES: usize = 4 * 1024 * 1024;
 /// Scan Deeper control raises the commit cap, not this byte budget.
 pub const MAX_PULSE_BYTES: usize = 16 * 1024 * 1024;
 
+/// `git show --numstat -z` for one commit: its metadata plus one record per
+/// changed path.
+///
+/// 4 MiB is some 40,000 ordinary paths, eight times the 5,000-row list the
+/// pane keeps (`MAX_COMMIT_FILES`). Past it the churn totals are a lower bound
+/// and the payload says so (`numstat_truncation_reason`) rather than the
+/// commit passing for a smaller one. Kept at half the ref cache's per-entry
+/// ceiling so a complete answer is always retained.
+pub const MAX_COMMIT_NUMSTAT_BYTES: usize = 4 * 1024 * 1024;
+
 /// Cut `text` to at most `cap` bytes, ending on a line boundary.
 ///
 /// A diff cut mid-line renders as a corrupt row and, worse, can parse as a
@@ -80,7 +90,7 @@ pub fn truncate_at_line_boundary(text: String, cap: usize) -> (String, bool) {
     if text.len() <= cap {
         return (text, false);
     }
-    let head = &text[..char_boundary_at_or_before(&text, cap)];
+    let head = &text[..text.floor_char_boundary(cap)];
     let cut = match head.rfind('\n') {
         // Keep the newline: the parser drops exactly one trailing empty
         // element, so a cut that ends mid-file still ends cleanly.
@@ -117,18 +127,26 @@ pub fn drop_partial_last_line(text: String) -> String {
     }
 }
 
-/// Largest index <= `cap` that is a UTF-8 character boundary in `text`.
-fn char_boundary_at_or_before(text: &str, cap: usize) -> usize {
-    let mut index = cap.min(text.len());
-    while index > 0 && !text.is_char_boundary(index) {
-        index -= 1;
+/// `text` cut to at most `max` characters, with `…` appended when anything was
+/// dropped. For short diagnostics quoted into an error message.
+pub(crate) fn truncate_chars_ellipsis(text: &str, max: usize) -> String {
+    if text.chars().count() <= max {
+        return text.to_string();
     }
-    index
+    text.chars().take(max).collect::<String>() + "…"
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ellipsis_truncation_counts_characters_not_bytes() {
+        assert_eq!(truncate_chars_ellipsis("abc", 3), "abc");
+        assert_eq!(truncate_chars_ellipsis("abcd", 3), "abc…");
+        assert_eq!(truncate_chars_ellipsis("ééé", 2), "éé…");
+        assert_eq!(truncate_chars_ellipsis("abc", 0), "…");
+    }
 
     #[test]
     fn text_within_budget_is_returned_untouched() {

@@ -1,6 +1,7 @@
 <script lang="ts">
   import { invoke } from "../ipc/invoke";
-  import { repoStore } from "../stores/repoStore";
+  import { untrack } from "svelte";
+  import { currentRepoPath, repoStore } from "../stores/repoStore";
   import { graphStore, normalizeDiffPayload } from "../stores/graphStore";
   import { harnessStore, type AiGeneration } from "../stores/harnessStore";
   import { createAsyncGuard, type AsyncGuard } from "../async/guard";
@@ -23,6 +24,7 @@
   import MarkdownBody from "./MarkdownBody.svelte";
   import { formatPathParts } from "../files/formatPath";
   import { formatDate, shortHash } from "../format";
+  import { summarizeCommitFiles } from "../diff/commitFilesNotice";
   import { formatError } from "../ui/formatError";
   import { copyText } from "../desktop/clipboard";
   import { toastStore } from "../stores/toastStore";
@@ -53,12 +55,7 @@
   });
   // When the backend capped the list, the header reports the true file count
   // instead of the size of the capped slice.
-  let filesListTruncated = $derived(details?.files_list_truncated === true);
-  let changedFileCount = $derived(
-    filesListTruncated && typeof details?.files_total_count === "number"
-      ? details.files_total_count
-      : details?.changed_files.length ?? 0
-  );
+  let filesSummary = $derived(summarizeCommitFiles(details));
 
   // Same story for the inline preview: a capped slice keeps the pane
   // responsive, and the full diff opens in the virtualized Diff view. The
@@ -81,7 +78,6 @@
   let aiReady = $derived($harnessStore.ai?.ready ?? false);
   let currentCommitId = $derived($repoStore.selectedCommitId || $graphStore.selectedCommit?.id || null);
   let explainGuard: AsyncGuard | null = null;
-  const explainTarget = { repo: null as string | null, id: null as string | null };
 
   let copiedSha = $state(false);
   let copiedMessage = $state(false);
@@ -135,18 +131,18 @@
     return () => explainGuard?.cancel();
   });
 
+  // A new commit or repository outdates an explanation still being written.
   $effect(() => {
-    const id = currentCommitId;
-    const repo = $repoStore.currentPath;
-    if (explainTarget.repo === repo && explainTarget.id === id) return;
-    explainTarget.repo = repo;
-    explainTarget.id = id;
-    explainGuard?.cancel();
-    isExplaining = false;
+    void currentCommitId;
+    void $currentRepoPath;
+    untrack(() => {
+      explainGuard?.cancel();
+      isExplaining = false;
+    });
   });
 
   $effect(() => {
-    const id = $repoStore.selectedCommitId || $graphStore.selectedCommit?.id;
+    const id = currentCommitId;
     if (!id) {
       details = null;
       return;
@@ -173,9 +169,12 @@
    *  never leave an earlier commit's provenance on a later one. */
   let provenanceToken = 0;
 
+  // Keyed by value on the repository and the commit, so a store publish that
+  // changed neither keeps the badge and any fetch in flight. Only a new
+  // target blanks it and outdates the previous request.
   $effect(() => {
-    const repo = $repoStore.currentPath;
-    const id = $repoStore.selectedCommitId || $graphStore.selectedCommit?.id;
+    const repo = $currentRepoPath;
+    const id = currentCommitId;
     const mine = ++provenanceToken;
     provenance = null;
     if (!repo || !id) return;
@@ -255,10 +254,10 @@
     <div class="flex-1 grid grid-cols-3 divide-x divide-border min-h-0">
       <div class="p-2 overflow-y-auto space-y-1">
         <div class="text-[10px] font-semibold uppercase text-textMuted px-2 py-1">
-          Changed Files ({changedFileCount})
+          Changed Files ({filesSummary.count})
           {#if details}
-            <span class="normal-case font-mono text-green-400 ml-1">+{details.total_additions}</span>
-            <span class="normal-case font-mono text-red-400">-{details.total_deletions}</span>
+            <span class="normal-case font-mono text-green-400 ml-1">+{details.total_additions}{filesSummary.partial ? "+" : ""}</span>
+            <span class="normal-case font-mono text-red-400">-{details.total_deletions}{filesSummary.partial ? "+" : ""}</span>
           {/if}
         </div>
         {#if details?.body}
@@ -311,9 +310,12 @@
             </div>
           {/if}
         </div>
-        {#if filesListTruncated}
-          <div class="px-2 pb-1 text-[10px] text-textMuted">
-            +only first {(details?.changed_files.length ?? 0).toLocaleString()} listed
+        {#if filesSummary.note}
+          <div
+            class="px-2 pb-1 text-[10px] {filesSummary.partial ? 'text-amber-400' : 'text-textMuted'}"
+            data-testid="commit-files-note"
+          >
+            {filesSummary.note}
           </div>
         {/if}
         {#each fileList as f (f.path)}

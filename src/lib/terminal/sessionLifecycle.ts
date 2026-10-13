@@ -4,11 +4,18 @@ import { createTerminalInput, terminalDeadline } from "./inputQueue";
 import { SessionCapacityError, type createSessionRegistry } from "./sessionRegistry";
 import type { LauncherKind } from "./tabs";
 
+type Slot = ReturnType<ReturnType<typeof createSessionRegistry>["reserve"]>;
+
 export interface SessionTransport {
   spawn(): Promise<TerminalSpawned>;
   write(id: string, data: string, binary: boolean): Promise<void>;
   resize(id: string, rows: number, cols: number): Promise<void>;
   kill(id: string): Promise<void>;
+  /**
+   * Leave the process running with no view (`cmd_terminal_detach`). Resolves
+   * whether there was a live session to keep.
+   */
+  detach(id: string): Promise<boolean>;
 }
 export interface SessionHooks {
   state(status: "starting" | "running" | "exited" | "error", message?: string): void;
@@ -17,6 +24,12 @@ export interface SessionHooks {
   exit(event: TerminalExitEvent): void;
   reset(): void | Promise<void>;
   warning(message: string): void;
+  /**
+   * Output was skipped for this view (`terminal-loss`). What it had painted
+   * may end mid escape sequence; the view must leave that sequence before
+   * the next chunk, or the emulator can swallow what follows.
+   */
+  skipped?(): void;
   /** This tab now holds a session slot; called once per slot taken. */
   admitted?(): void;
   /**
@@ -50,6 +63,20 @@ export function createSessionLifecycle(options: {
   title?: string;
   taskRunId?: string;
   continuesRunId?: string;
+  /**
+   * Whether this session is positively idle — a plain shell at its prompt —
+   * so a view going away may end it. Anything else, including "could not
+   * tell", keeps the process. Absent: every session is kept.
+   */
+  idle?: (sessionId: string) => Promise<boolean>;
+  /**
+   * Prepares the Sessions record a still-running process becomes when its
+   * view goes away. Called while this lifecycle still owns the slot; the
+   * returned adopter takes the slot over synchronously after the host has
+   * detached the session (`detachedSessions.keepDetached`). Null, a throw,
+   * or absent: this lifecycle stays the owner, listed and stoppable.
+   */
+  keep?: (sessionId: string) => Promise<((slot: Slot) => void) | null>;
 }) {
   const { bus, registry, transport, hooks } = options;
   let id: string | null = null;
@@ -93,17 +120,6 @@ export function createSessionLifecycle(options: {
     if (retain) lossNotice = mergeTerminalNotice(lossNotice, message);
     state("error", message);
   }
-  /**
-   * End the process, not only the keyboard. A chunk whose reserved length
-   * cannot be known still sits in `OutputFlow.reserve`; `kill` calls
-   * `flow.stop`, which is what wakes that wait. The banner stays on the
-   * failure: a kill that finishes without an exit event must not say the
-   * session exited cleanly.
-   */
-  function stop(message: string): Promise<void> {
-    fail(message, true);
-    return closeCurrent();
-  }
   async function closeCurrent() {
     if (closing) return closing;
     const target = id;
@@ -132,6 +148,51 @@ export function createSessionLifecycle(options: {
   async function close() {
     if (starting) await starting;
     await closeCurrent();
+  }
+  /**
+   * The view is going away and nobody asked to close it: an unmount from a
+   * repository tab closing, a pane that crashed, the dock re-hosting its
+   * panels. None of those is a reason to end an agent's work. The process is
+   * detached and its slot handed to Sessions (`options.keep`); only a session
+   * known to be an idle shell is closed, so empty prompts do not pile up.
+   * A detach that fails keeps the slot and says so: never a silent kill.
+   */
+  async function leave() {
+    if (starting) await starting;
+    if (closing) { await closing; return; }
+    const target = id;
+    if (!target) { release(); return; }
+    let idle = false;
+    try {
+      idle = options.idle ? await terminalDeadline(options.idle(target), 1500, "Reading terminal context") : false;
+    } catch { idle = false; }
+    if (id !== target) return;
+    if (idle) { await closeCurrent(); return; }
+    let adopt: ((slot: Slot) => void) | null = null;
+    try {
+      adopt = options.keep ? await terminalDeadline(options.keep(target), 3000, "Listing terminal") : null;
+    } catch { adopt = null; }
+    if (id !== target) return;
+    input?.dispose();
+    let kept = false;
+    try {
+      kept = await terminalDeadline(transport.detach(target), 5000, "Detaching terminal");
+    } catch (error) {
+      if (id === target) slot?.update(`Still running; its view closed but it could not be detached. ${String(error)}`);
+      throw error;
+    }
+    // Not kept: it had already ended, and its exit (still subscribed) releases.
+    if (id !== target || !kept) return;
+    const handed = slot;
+    if (adopt && handed) {
+      try {
+        adopt(handed);
+        slot = null;
+        release();
+        return;
+      } catch { /* the slot was not taken; this lifecycle keeps it below */ }
+    }
+    slot?.update("Still running — its tab was closed");
   }
   async function launch(reconnect: boolean) {
     if (disposed || (id && !reconnect)) return;
@@ -178,23 +239,29 @@ export function createSessionLifecycle(options: {
       // Published before the session can produce anything: a notification that
       // arrives before the registry knows this id has no tab to open.
       slot?.identify(spawned.id);
-      if (disposed || timedOut) {
+      if (timedOut) {
         await closeCurrent();
-        if (timedOut) state("error", "Starting terminal timed out; the late process was closed. Retry to start again.");
+        state("error", "Starting terminal timed out; the late process was closed. Retry to start again.");
         return;
       }
       input?.dispose();
       subscription?.(); subscription = null;
-      input = createTerminalInput((data, binary) => transport.write(spawned.id, data, binary), (message, fatal) => {
-        if (fatal) fail(message);
-        else if (!disposed) hooks.warning(message);
-      });
-      state("running");
-      if (!reattached) {
-        // This id belongs to a new process. Its predecessor's loss does not.
-        lossNotice = null;
-        hooks.started(spawned);
-      } else if (lossNotice) state("error", lossNotice);
+      // The view went away mid-spawn. `dispose` waits for this launch and
+      // then decides, so the new process is left for it, not killed here —
+      // and it is not shown, typed into or journaled. It is still watched
+      // below: its output is acknowledged and its exit releases its slot.
+      if (!disposed) {
+        input = createTerminalInput((data, binary) => transport.write(spawned.id, data, binary), (message, fatal) => {
+          if (fatal) fail(message);
+          else if (!disposed) hooks.warning(message);
+        });
+        state("running");
+        if (!reattached) {
+          // This id belongs to a new process. Its predecessor's loss does not.
+          lossNotice = null;
+          hooks.started(spawned);
+        } else if (lossNotice) state("error", lossNotice);
+      }
       subscription = bus.subscribe(spawned.id, {
         // Dispose must not swallow output. Rust already reserved these bytes,
         // and kill has not stopped the reader yet — dropping the chunk here
@@ -215,6 +282,13 @@ export function createSessionLifecycle(options: {
           lossNotice = mergeTerminalNotice(lossNotice, message);
           state("error", message);
         },
+        // Output skipped while the view lagged. The process is fine and is
+        // still running, so this is a warning, never an error status.
+        onNotice(message) {
+          if (id !== spawned.id || disposed) return;
+          hooks.skipped?.();
+          hooks.warning(message);
+        },
         onExit(event) {
           if (id !== spawned.id) return;
           attemptEnded = true;
@@ -226,7 +300,7 @@ export function createSessionLifecycle(options: {
       });
       // An exit may have been replayed synchronously by subscribe().
       if (!id) { subscription(); subscription = null; }
-      else void resizeLatest();
+      else if (!disposed) void resizeLatest();
     } catch (error) {
       state("error", String(error));
       if (!id) release();
@@ -278,14 +352,15 @@ export function createSessionLifecycle(options: {
       void resizeLatest();
     },
     fail,
-    stop,
+    /** The user's Close: ends the process. A view going away uses `dispose`. */
+    close,
     isCurrent: (sessionId: string) => !disposed && id === sessionId,
     dispose() {
       disposed = true;
       input?.dispose();
       pendingSize = null;
-      // Failed closes stay in the global registry, with an explicit retry.
-      void close().catch(() => { /* closeCurrent retained and reported ownership */ });
+      // Failures keep the slot in the global registry, with an explicit retry.
+      void leave().catch(() => { /* leave/closeCurrent retained and reported ownership */ });
     },
   };
 }

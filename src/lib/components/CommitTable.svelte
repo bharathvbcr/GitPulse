@@ -67,6 +67,7 @@
   import CommitRow, { type RefItem } from "./CommitRow.svelte";
   import GraphNodeTooltip from "./GraphNodeTooltip.svelte";
   import ScrollCue from "./ScrollCue.svelte";
+  import GraphClipNotice from "./GraphClipNotice.svelte";
 
   let isLoadingMore = $state(false);
 
@@ -752,6 +753,7 @@
     });
   });
 
+  const selectedCommitId = $derived($repoStore.selectedCommitId);
   $effect(() => {
     filteredRows;
     startIndex;
@@ -759,9 +761,9 @@
     containerHeight;
     graphContentWidth;
     graphViewportWidth;
-    $repoStore.selectedCommitId;
+    selectedCommitId;
     // The canvas ring must not wait on the async diff round-trip: selecting
-    // updates graphStore synchronously, repoStore.selectedCommitId only after
+    // updates graphStore synchronously, repoStore's selectedCommitId only after
     // the diff resolves (or never, when it fails). Both are dependencies.
     $graphStore.selectedCommit;
     $graphStore.headId;
@@ -808,9 +810,14 @@
   // `--accent-color` for its selection ring, and an accent change writes
   // `--c-accent` without touching the theme class. Listed here so picking a
   // new accent repaints the graph instead of leaving one blue ring behind.
+  //
+  // Read through a strictly-equal derived: interfaceStore publishes a fresh
+  // object for every preference write, and `$interfaceStore.accent` here would
+  // throw away every cached graph tile on a dock resize or a surface switch.
+  const graphAccent = $derived($interfaceStore.accent);
   $effect(() => {
     $themeStore;
-    $interfaceStore.accent;
+    graphAccent;
     cachedTheme = null;
     gutterRect = null;
     rootRect = null;
@@ -934,6 +941,10 @@
       </div>
     </div>
     <ScrollCue target={graphViewport} axis="x" hint={graphOverflow} />
+    <GraphClipNotice
+      clippedWidth={graphLayout.clippedWidth}
+      laneWidth={renderer.getConfig().laneWidth}
+    />
   </div>
 
   <div

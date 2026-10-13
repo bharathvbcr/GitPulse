@@ -95,6 +95,54 @@ fn immediate_output_and_exit_status_survive_spawn() {
     assert!(exit["error"].is_null());
 }
 
+/// A shell that crashes or is killed has no exit code. Reporting portable-pty's
+/// stand-in 1 made a killed agent's run read "exit 1", like a command that
+/// failed on its own.
+#[test]
+fn a_shell_killed_by_a_signal_reports_the_signal_and_no_exit_code() {
+    let app = tauri::test::mock_builder()
+        .build(gitpulse_lib::context())
+        .unwrap();
+    let state = TerminalSessions::default();
+    let _cleanup = TerminalCleanup(state.clone());
+    let ack = state.clone();
+    app.listen("terminal-output", move |event| {
+        let (id, bytes) = take_output(event.payload());
+        acknowledge_output(&ack, &id, bytes.len()).unwrap();
+    });
+    let (send, receive) = mpsc::channel();
+    app.listen("terminal-exit", move |event| {
+        send.send(event.payload().to_string()).unwrap();
+    });
+    let dir = repo();
+    for signal in ["KILL", "SEGV", "ABRT"] {
+        spawn_session(
+            app.handle(),
+            &state,
+            dir.path().to_str().unwrap(),
+            24,
+            80,
+            Some("/bin/sh".into()),
+            // Core dumps off, so a crashing shell leaves nothing behind.
+            Some(vec!["-c".into(), format!("ulimit -c 0; kill -{signal} $$")]),
+            None,
+        )
+        .unwrap();
+        let exit: serde_json::Value =
+            serde_json::from_str(&receive.recv_timeout(Duration::from_secs(10)).unwrap()).unwrap();
+        assert!(
+            exit["exit_code"].is_null(),
+            "SIG{signal}: a signal death has no exit code, got {exit}"
+        );
+        assert!(
+            exit["signal"].as_str().is_some_and(|name| !name.is_empty()),
+            "SIG{signal}: the signal must be named, got {exit}"
+        );
+        assert_eq!(exit["reaped"], true, "SIG{signal}: the death was confirmed");
+        assert!(exit["error"].is_null(), "SIG{signal}: {exit}");
+    }
+}
+
 #[test]
 fn output_flood_is_backpressured_then_drains_without_loss() {
     let app = tauri::test::mock_builder()
@@ -113,14 +161,47 @@ fn output_flood_is_backpressured_then_drains_without_loss() {
     let dir = repo();
     let spawned = spawn_session(app.handle(), &state, dir.path().to_str().unwrap(), 24, 80,
         Some("/bin/sh".into()), Some(vec!["-c".into(), "i=0; while [ $i -lt 32768 ]; do printf 0123456789abcdef0123456789abcdef; i=$((i+1)); done".into()]), None).unwrap();
-    std::thread::sleep(Duration::from_millis(250));
+    // Receive without acknowledging until the stream goes quiet. Quiet after
+    // the producer demonstrably ran is the observable "blocked on flow
+    // control"; a producer that ignored backpressure would instead deliver
+    // every byte, which the cap below turns into a failure.
+    const PRODUCED: usize = 1024 * 1024;
+    let mut held: Vec<Vec<u8>> = Vec::new();
+    let mut unacknowledged = 0usize;
+    while unacknowledged < PRODUCED {
+        match receive.recv_timeout(Duration::from_millis(400)) {
+            Ok(payload) => {
+                let (_id, bytes) = take_output(&payload);
+                unacknowledged += bytes.len();
+                held.push(bytes);
+            }
+            Err(_) => break,
+        }
+    }
+    assert!(
+        unacknowledged > 0,
+        "positive control: the producer ran and delivered before it was held"
+    );
+    assert!(
+        unacknowledged < PRODUCED,
+        "producer must wait for render acknowledgements (delivered {unacknowledged} unacknowledged bytes)"
+    );
     assert!(
         exit_receive.try_recv().is_err(),
-        "producer must wait for render acknowledgements"
+        "a producer held by flow control must not have exited"
     );
+
+    // Now repay what was held, in order, and drain the rest without loss.
     let mut total = 0usize;
+    for bytes in held {
+        for (offset, byte) in bytes.iter().enumerate() {
+            assert_eq!(*byte, b"0123456789abcdef"[(total + offset) % 16]);
+        }
+        total += bytes.len();
+        acknowledge_output(&state, &spawned.id, bytes.len()).unwrap();
+    }
     let deadline = Instant::now() + Duration::from_secs(15);
-    while total < 1024 * 1024 && Instant::now() < deadline {
+    while total < PRODUCED && Instant::now() < deadline {
         let (_id, bytes) = take_output(&receive.recv_timeout(Duration::from_secs(3)).unwrap());
         for (offset, byte) in bytes.iter().enumerate() {
             assert_eq!(*byte, b"0123456789abcdef"[(total + offset) % 16]);
@@ -128,7 +209,7 @@ fn output_flood_is_backpressured_then_drains_without_loss() {
         total += bytes.len();
         acknowledge_output(&state, &spawned.id, bytes.len()).unwrap();
     }
-    assert_eq!(total, 1024 * 1024);
+    assert_eq!(total, PRODUCED);
     exit_receive.recv_timeout(Duration::from_secs(5)).unwrap();
 }
 
@@ -161,7 +242,7 @@ fn interactive_round_trips_do_not_accumulate_polling_delays() {
         acknowledge_output(&state, &spawned.id, bytes.len()).unwrap();
         write_to_session(&state, &spawned.id, "\n").unwrap();
         assert!(
-            started.elapsed() < Duration::from_secs(4),
+            started.elapsed() < common::env::coverage_relaxed(Duration::from_secs(4)),
             "round {round}: readiness must wake the reader without a fixed delay"
         );
     }
@@ -224,7 +305,7 @@ fn a_blocked_writer_does_not_block_other_sessions_or_close() {
     resize_session(&state, &b.id, 40, 120).unwrap();
     kill_session(&state, &a.id).unwrap();
     kill_session(&state, &b.id).unwrap();
-    assert!(start.elapsed() < Duration::from_secs(3));
+    assert!(start.elapsed() < common::env::coverage_relaxed(Duration::from_secs(3)));
     assert!(written_receive
         .recv_timeout(Duration::from_secs(3))
         .expect("closing a session must release its blocked input request")
@@ -369,7 +450,7 @@ fn closing_after_stdio_eof_still_reaps_the_live_child() {
     std::thread::sleep(Duration::from_millis(100));
     let start = Instant::now();
     kill_session(&state, &session.id).unwrap();
-    assert!(start.elapsed() < Duration::from_secs(3));
+    assert!(start.elapsed() < common::env::coverage_relaxed(Duration::from_secs(3)));
     gitpulse_lib::terminal::shutdown_sessions(&state).unwrap();
 }
 

@@ -315,12 +315,12 @@ fn run(
     let stdout = String::from_utf8_lossy(&run.stdout).into_owned();
     if !run.success {
         let stderr = String::from_utf8_lossy(&run.stderr);
-        let detail = if stderr.trim().is_empty() {
-            format!("devmap integrate exited {}", run.status_code)
-        } else {
-            stderr.trim().chars().take(400).collect()
-        };
-        return Err(detail);
+        let detail = super::cli::failure_detail(
+            &stdout,
+            &stderr,
+            format!("devmap integrate exited {}", run.status_code),
+        );
+        return Err(detail.chars().take(400).collect());
     }
     serde_json::from_str::<Value>(stdout.trim())
         .map_err(|e| format!("devmap integrate returned non-JSON stdout: {e}"))

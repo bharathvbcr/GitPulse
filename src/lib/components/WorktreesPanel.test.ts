@@ -115,21 +115,13 @@ describe("WorktreesPanel controls say what they do", () => {
 });
 
 describe("WorktreesPanel removal safety", () => {
-  it("force-removes only a scanned dirty worktree after confirm, never an unscanned one", () => {
-    // dirty_files === null means the scan did not run. Coercing that to 0
-    // and passing --force is how an agent farm past the scan cap lost work.
-    expect(source).toContain(
-      "const force = typeof wt.dirty_files === \"number\" && wt.dirty_files > 0;",
-    );
-    expect(source).not.toContain("const force = (wt.dirty_files ?? 0) === 0;");
-    expect(source).not.toMatch(/cmd_remove_worktree[\s\S]{0,120}?force:\s*true/);
-    expect(source).toMatch(/cmd_remove_worktree[\s\S]{0,120}?force\s*\}/);
-  });
-
-  it("names the discard cost in the armed confirm when files would be lost", () => {
-    expect(source).toContain("`Discard ${wt.dirty_files} changed files? Click again to remove`");
-    expect(source).toContain("`Discard ${wt.dirty_files} changed files?`");
-    expect(source).toContain("Not scanned for changes");
+  // Rendered in harness/branches.html: arming removes nothing; the second
+  // click force-removes a scanned dirty worktree after the armed label named
+  // "Discard 12 changed files?"; an unscanned one (dirty_files null) says
+  // "Not scanned for changes" and is removed without force.
+  it("arms a clean worktree's remove without naming a cost it does not have", () => {
+    // The fixture has no clean linked worktree; the third branch of the label.
+    expect(source).toContain(': "Click again to remove";');
   });
 
   it("closes the stranded tab instead of leaving it on the removed directory (T-F09)", () => {
@@ -205,30 +197,27 @@ describe("WorktreesPanel store-emission churn guards", () => {
   it("keeps exactly one mount trigger for the worktree list load", () => {
     // The load effect runs on mount; a second onMount(load) double-fetched.
     expect(source).not.toContain("onMount");
-    const effect = source.slice(source.indexOf("let prevRepoPath"), source.indexOf("async function load"));
-    expect(effect).toContain("void load();");
+    const effect = source.slice(source.indexOf("const generation = $derived($repoStore.generation);"), source.indexOf("async function load"));
+    expect(effect).toContain("untrack(() => void load());");
   });
 
-  it("memo-guards the load effect so unrelated store emissions are no-ops", () => {
-    const effect = source.slice(source.indexOf("let prevRepoPath"), source.indexOf("async function load"));
-    const guard = effect.match(/if \(([^)]*)\) return;/)?.[1] ?? "";
-    expect(guard, "the load effect must open with a memo guard").not.toBe("");
-    // Derived rather than spelled out: every reactive value the effect reads
-    // has to appear in the memo key. One that is read but not compared makes
-    // the guard a no-op for that value, and the ~6s poll tick publishes on
-    // every repository — which is the churn this guard exists to absorb. A
-    // literal copy of the condition had to be re-typed each time the effect
-    // learned to watch something new, and re-typing it is how a term gets
-    // dropped.
-    const reads = [...effect.matchAll(/const (\w+) = \$[\w.]+;/g)].map((m) => m[1]);
-    expect(reads.length, "the effect must read something").toBeGreaterThan(0);
-    for (const name of reads) {
-      expect(guard, `${name} is read by the effect but absent from the memo key`).toContain(name);
-    }
+  it("depends only on value-compared keys, so unrelated store emissions are no-ops", () => {
+    // The hand-copied memo guard this replaced had to list every value the
+    // effect read, and re-typing it is how a term got dropped. Now the effect
+    // reads only keys that compare by value — the repository path store, a
+    // derived generation, the trust count — and runs the load untracked, so
+    // nothing else it touches can re-run it. The browser harness
+    // (harness/repo-churn.html) proves the armed confirm survives a publish.
+    const effect = source.slice(source.indexOf("const generation = $derived($repoStore.generation);"), source.indexOf("async function load"));
+    expect(effect).toContain("void $currentRepoPath;");
+    expect(effect).toContain("void generation;");
+    expect(effect).toContain("void $trustExtended;");
+    expect(effect).not.toMatch(/\bprev[A-Z]\w* =/);
+    expect(effect.slice(effect.indexOf("$effect("))).not.toContain("$repoStore.");
   });
 
   it("resets the armed remove confirm only on real repo/generation change or unmount", () => {
-    const effect = source.slice(source.indexOf("let prevRepoPath"), source.indexOf("async function load"));
+    const effect = source.slice(source.indexOf("const generation = $derived($repoStore.generation);"), source.indexOf("async function load"));
     expect(effect).toContain("clearTimeout(confirmTimer)");
     // Clearing the timer without disarming would strand a permanently armed confirm.
     expect(effect).toContain("removingPath = null;");
@@ -249,10 +238,9 @@ describe("WorktreesPanel legacy-trust extension", () => {
     // across a grant, so an unconsidered count would return early and leave
     // every row showing the gaps the grant just closed.
     expect(source).toContain('import { trustExtended } from "../repos/trustExtension"');
-    const effect = source.slice(source.indexOf("let prevRepoPath"), source.indexOf("async function load"));
-    expect(effect).toContain("const extended = $trustExtended;");
-    expect(effect).toMatch(/if \(repo === prevRepoPath &&[\s\S]*?extended === prevExtended\) return;/);
-    expect(effect).toContain("prevExtended = extended;");
+    const effect = source.slice(source.indexOf("const generation = $derived($repoStore.generation);"), source.indexOf("async function load"));
+    expect(effect).toContain("void $trustExtended;");
+    expect(effect).not.toContain("return;");
   });
 
   it("no longer carries a second copy of the offer", () => {
@@ -278,3 +266,12 @@ describe("WorktreesPanel GitPulse task worktrees", () => {
     expect(source).toContain("{lane.task_title || \"Task\"} · {runStateLabel(lane.state)}");
   });
 });
+
+/**
+ * Repository hooks consent is rendered in harness/branches.html: a new
+ * worktree starts with hooks off and cache sharing on and sends that choice;
+ * asking for hooks shows the file's exact text and says nothing runs until it
+ * is approved; approving after the file changed on disk sends the text that
+ * was shown, not the newer file, and leaves it unapproved; approving the text
+ * on screen marks it approved; creating then sends runHooks.
+ */

@@ -1,6 +1,11 @@
 //! Real GTK3/WebKit smoke test. Linux CI runs this under Xvfb and a session bus.
 //! A missing display is a failure; the macOS/Windows branches are inapplicable.
 
+// The hermetic test environment: a per-process home, git config and trust
+// store, rewritten before `main`. See `src/test_support/env.rs`.
+#[path = "../src/test_support/env.rs"]
+mod hermetic_env;
+
 #[cfg(target_os = "linux")]
 fn main() {
     use gitpulse_lib::desktop::{install_menu, set_recent_menu, DesktopState};

@@ -62,3 +62,40 @@ export async function copyText(
     return false;
   }
 }
+
+/**
+ * A "Copied" indicator that lights for `ms` after a successful copy and goes
+ * out on its own. A second copy restarts the countdown, and `dispose` cancels
+ * it so a closed panel never writes to unmounted state.
+ */
+export function createCopyFlash(setCopied: (copied: boolean) => void, ms = 1500) {
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  const clear = () => {
+    if (timer !== null) clearTimeout(timer);
+    timer = null;
+  };
+  const flash = () => {
+    setCopied(true);
+    clear();
+    timer = setTimeout(() => {
+      timer = null;
+      setCopied(false);
+    }, ms);
+  };
+  return {
+    /** Copies, then lights the indicator; returns false (and leaves it alone) on failure. */
+    async copy(text: string, deps?: Parameters<typeof copyText>[1]): Promise<boolean> {
+      if (!(await copyText(text, deps))) return false;
+      flash();
+      return true;
+    },
+    /** Lights the indicator for a copy the caller already made and has checked is still wanted. */
+    flash,
+    /** Puts the indicator out at once: the thing it described is gone. */
+    reset(): void {
+      clear();
+      setCopied(false);
+    },
+    dispose: clear,
+  };
+}

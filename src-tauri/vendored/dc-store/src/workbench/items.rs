@@ -105,7 +105,7 @@ fn checklist(input: &Input<'_>) -> Result<Option<String>> {
 /// none. A new link names a live task other than this one (a link the task
 /// already holds may outlive its target); a task has at most one parent, and
 /// a parent may not be one of its own descendants.
-fn links(input: &Input<'_>, id: &str) -> Result<Option<Links>> {
+pub(super) fn links(input: &Input<'_>, id: &str) -> Result<Option<Links>> {
     match input.kind("links")?.as_deref() {
         None | Some("null") => return Ok(None),
         Some("array") => {}

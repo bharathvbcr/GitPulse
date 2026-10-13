@@ -20,31 +20,18 @@ describe("CommitComposer", () => {
     expect(body).not.toContain("Commit all");
   });
 
-  it("offers include-unstaged as the quick-commit option", () => {
-    expect(source).toContain("includeUnstaged");
-    expect(source).toContain("repoStore.quickCommit");
-    expect(source).toContain("Commit all");
-    expect(source).toContain("onclick={() => void handleCommit()}");
-  });
-
-  it("keeps staged-only commit as the default path", () => {
+  // Rendered in harness/repo-churn.html: the default commit takes the staged
+  // files only ("Commit (1)"); an empty message cannot commit; Cmd/Ctrl+Enter
+  // commits the staged files without amending; Shift adds the unstaged files
+  // as a quick commit; Include unstaged names "Commit all" and counts both;
+  // a conflict disables Commit and the chord sends nothing.
+  it("passes the amend choice through the staged-only commit", () => {
+    // The fixture never amends.
     expect(source).toContain("repoStore.commit(message, isAmending)");
-    expect(source).toContain("Amend");
   });
-
-  it("routes Cmd/Ctrl+Enter through the composer and Shift to include unstaged", () => {
-    expect(source).toContain("onMessageKeydown");
+  it("leaves an IME composition's Enter to the composition", () => {
     expect(source).toContain("isImeComposition");
-    expect(source).toContain('event.key !== "Enter"');
-    expect(source).toContain("event.shiftKey");
-    expect(source).toContain("handleCommit(true)");
-    expect(source).toContain("forceQuick");
   });
-
-  it("disables commit when conflicts are present", () => {
-    expect(source).toContain("conflictedCount > 0");
-  });
-
   it("previews staged edits via the shared codeintel preview store", () => {
     expect(source).toContain("previewStore.refresh");
     expect(source).toContain("What this commit breaks");
@@ -127,5 +114,28 @@ describe("CommitComposer", () => {
     for (const label of ["Amend", "Include unstaged"]) {
       expect(standIn, `stand-in footer is missing ${label}`).toContain(label);
     }
+  });
+
+
+  /**
+   * `$repoStore.currentPath` read in an effect tracks the whole store, and the
+   * store publishes a fresh object on every draft keystroke — so each key
+   * typed cancelled the staged blast-radius query and issued it again. The
+   * effects read a derived repository path, which compares by value.
+   */
+  it("re-runs the preview and blast-radius effects on repo or staged-key change, not per keystroke", () => {
+    expect(source).toMatch(/import \{ currentRepoPath, repoStore \} from "\.\.\/stores\/repoStore";/);
+    const region = source.slice(
+      source.indexOf("// The effects below key on the shared repository path"),
+      source.indexOf("$effect(() => () => blastGuard?.cancel());"),
+    );
+    const effects = region.split("$effect(() => {").slice(1);
+    expect(effects).toHaveLength(2);
+    for (const effect of effects) {
+      expect(effect).toContain("const repo = $currentRepoPath;");
+      expect(effect).toContain("void previewPathsKey;");
+      expect(effect).not.toContain("$repoStore");
+    }
+    expect(effects[1]).toContain("getImpactLayeredMany(repo");
   });
 });

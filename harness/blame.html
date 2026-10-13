@@ -90,13 +90,18 @@
       /** Every blame request's arguments, so a step can be checked by what it asked for. */
       const blameCalls = [];
       let coverageCalls = 0;
+      /** A coverage read that fails, and a blame read that answers late. */
+      let coverageRefused = false, blameDelayMs = 0;
 
       mockIPCWithEvents((cmd, args) => {
         switch (cmd) {
           case "cmd_resolve_repo": return { path: args.repoPath, name: args.repoPath.split("/").pop(), is_bare: false };
-          case "cmd_get_file_blame": blameCalls.push(args); return FIXTURES[mode](args);
+          case "cmd_get_file_blame":
+            blameCalls.push(args);
+            return blameDelayMs ? new Promise(resolve => setTimeout(() => resolve(FIXTURES[mode](args)), blameDelayMs)) : FIXTURES[mode](args);
           case "cmd_get_file_coverage":
             coverageCalls += 1;
+            if (coverageRefused) throw new Error("Coverage fixture refused");
             return { path: args.filePath, language: "TypeScript", color_hex: "#3178c6", lines: [{ line_no: 1, hits: 3 }, { line_no: 2, hits: 0 }], totals: { lines_found: 2, lines_hit: 1, percentage: 50 }, truncated: false, lines_truncated: false };
           case "cmd_list_repo_files": return ["src/mixed.ts", "src/fresh.ts", "src/other.ts"];
           case "cmd_list_branches": return [{ name: "main", is_current: true, tip_commit_id: oid("7"), is_remote: false, upstream: null, ahead: 0, behind: 0 }];
@@ -116,6 +121,7 @@
       const { interfaceStore } = await import("../src/lib/stores/interfaceStore");
       const { rowHeight } = await import("../src/lib/ui/density");
       const { createChecks } = await import("./checks.ts");
+      const { diagnostics } = await import("../src/lib/diagnostics/diagnostics");
       const Host = (await import("./BlameHost.svelte")).default;
 
       await repoStore.openRepo("/fixture/GitPulse");
@@ -134,7 +140,9 @@
         while (!test() && Date.now() < end) await wait();
         if (!test()) throw new Error("Fixture condition timed out");
       };
-      const text = () => document.body.textContent;
+      // The page body also holds this inline script and the result box, whose text
+      // would satisfy any includes() check, so read only the mounted app.
+      const text = () => document.querySelector("#app").textContent;
       const strip = () => document.querySelector('[role="group"][aria-label^="Code age timeline"]');
       const columns = () => [...(strip()?.querySelectorAll("button") ?? [])];
       const rows = () => [...document.querySelectorAll("[data-blame-line]")];
@@ -356,7 +364,13 @@
           setMode("empty"); await until(() => text().includes("Empty file"));
           check("an empty file draws no timeline at all", () => !strip() && rows().length === 0);
 
+          diagnostics.clear();
           setMode("error"); await until(() => !!buttonNamed("Retry"));
+          check("the failure also lands in the diagnostics ring, tagged blame", () => {
+            let kept = [];
+            diagnostics.subscribe(entries => { kept = entries; })();
+            return kept.some(entry => entry.source === "blame" && entry.message.includes("fixture refused"));
+          });
           check("a failed blame explains itself and offers a way back", () =>
             text().includes("fixture refused") && !strip());
           mode = "mixed";
@@ -400,6 +414,47 @@
           setMode("fresh"); await until(() => rows().length === 20);
           check("a new selection ends the walk back", () =>
             !document.querySelector("[data-blame-revision]") && lastBlame().revision == null);
+
+          // --- claims the source-text tests used to make ------------------------
+          setMode("mixed"); await until(() => rows().length > 0 && !!strip());
+          const explorerToggle = () => [...document.querySelectorAll("button")].find(node => /Explorer/.test(node.title));
+          const explorerOpen = () => !!document.querySelector('[role="tree"]');
+          check("the explorer is open beside the blame pane, with a toggle that names its state", () =>
+            explorerOpen() && /^Hide Explorer/.test(explorerToggle()?.title ?? ""));
+          explorerToggle().click(); await tick(); await wait();
+          check("the toggle hides the explorer and says Show", () => !explorerOpen() && /^Show Explorer/.test(explorerToggle()?.title ?? ""));
+          window.dispatchEvent(new KeyboardEvent("keydown", { key: "b", metaKey: true, bubbles: true, cancelable: true })); await tick(); await wait();
+          check("Command-B brings it back", () => explorerOpen());
+
+          coverageRefused = true;
+          setMode("fresh"); await until(() => rows().length === 20);
+          await until(() => text().includes("Coverage unavailable"));
+          check("a failed coverage read is said on screen while the blame stays", () => text().includes("Coverage unavailable") && rows().length > 0);
+          coverageRefused = false;
+
+          setMode("mixed"); await until(() => rows().length > 0 && !!strip());
+          // A filter and a scroll position the reader chose, and the identical answer a refresh brings back.
+          await until(() => !!bandButton("< 7d") && text().includes("100 lines"));
+          bandButton("< 7d").click(); await tick();
+          const filtered = showing();
+          await until(() => scroller().scrollHeight > scroller().clientHeight + 100);
+          scroller().scrollTop = 120; await wait();
+          const scrolledTo = scroller().scrollTop;
+          const beforeRefresh = blameCalls.length;
+          blameDelayMs = 700;
+          await repoStore.refresh("/fixture/GitPulse");
+          await until(() => blameCalls.length > beforeRefresh);
+          check("a full refresh blames the selected file again", () => blameCalls.length > beforeRefresh);
+          check("and the rows and timeline stay on screen while the new answer is pending", () => rows().length > 0 && !!strip() && !text().includes("Loading"));
+          await new Promise(resolve => setTimeout(resolve, blameDelayMs + 200));
+          blameDelayMs = 0;
+          await until(() => rows().length > 0 && !!strip());
+          check("an identical answer does not reset the reader's filter or scroll position", () => {
+            const after = showing();
+            return filtered && after && after.shown === filtered.shown && after.total === filtered.total
+              && scrolledTo > 0 && Math.abs(scroller().scrollTop - scrolledTo) <= 1;
+          });
+          buttonNamed("Clear").click(); await tick();
 
           // --- the strip must not push the pane sideways ---------------------
           // The toolbar summary is the longest string in its row and the axis

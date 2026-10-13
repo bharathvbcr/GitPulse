@@ -2,6 +2,7 @@
 name = "dc-regress-store"
 version = "0.2.4"
 edition = "2021"
+rust-version = "1.99"
 license = "Apache-2.0"
 repository = "https://github.com/bharathvbcr/DevCouncil"
 description = "Presents a persisted devmap generation through dc-regress's CodeGraph trait, so every host asks the same question of the same graph"

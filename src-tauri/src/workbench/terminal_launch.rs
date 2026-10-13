@@ -56,15 +56,10 @@ fn parse(input: &str) -> Result<Preparation, WorkbenchError> {
         &request.task_id,
         &request.repository_id,
     ];
-    if ids.iter().any(|id| {
-        id.is_empty()
-            || id.len() > 128
-            || !id
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
-    }) || [request.source_revision, request.repository_revision]
-        .iter()
-        .any(|r| *r == 0 || *r > 9_007_199_254_740_991)
+    if ids.iter().any(|id| !super::is_record_id(id))
+        || [request.source_revision, request.repository_revision]
+            .iter()
+            .any(|r| *r == 0 || *r > 9_007_199_254_740_991)
         || !super::terminal_command::is_terminal_provider(&request.provider)
         || ![
             "inspect",
@@ -187,6 +182,43 @@ fn checkout(repo_path: &str) -> Result<Checkout, WorkbenchError> {
     })
 }
 
+/// `runs.checkout_identity`: the Git identity of the checkout holding a
+/// directory, by the same probe a preparation records.
+///
+/// The handoff form asks which attempt already holds the checkout it is about
+/// to launch in. The store refuses by `git_dir`, and an attempt's recorded
+/// directory may be a subfolder of its checkout, so only this key lets the
+/// form agree with the store before Launch. Read-only, and gated exactly as
+/// `runs.prepare_terminal` is: it runs Git only in a trusted checkout.
+pub(super) fn checkout_identity(input: &str) -> Result<Value, WorkbenchError> {
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Ask {
+        repo_path: String,
+    }
+    if input.len() > 8_192 || !input.trim_start().starts_with('{') {
+        return Err(WorkbenchError::new(
+            "invalid_input",
+            "A checkout identity request must be a JSON object of at most 8 KiB.",
+        ));
+    }
+    let ask: Ask = serde_json::from_str(input)
+        .map_err(|e| WorkbenchError::new("invalid_input", e.to_string()))?;
+    if !valid_path(&ask.repo_path) {
+        return Err(WorkbenchError::new(
+            "invalid_input",
+            "A checkout identity needs an absolute path of at most 4 KiB.",
+        ));
+    }
+    let observed = checkout(&ask.repo_path)?;
+    Ok(json!({
+        "ok": true,
+        "cwd": observed.cwd,
+        "git_dir": observed.git_dir,
+        "git_common_dir": observed.git_common_dir,
+    }))
+}
+
 pub(super) fn prepare(state: &WorkbenchState, input: &str) -> Result<Value, WorkbenchError> {
     prepare_kind(state, input, "external_terminal")
 }
@@ -263,11 +295,44 @@ fn prepare_kind(state: &WorkbenchState, input: &str, kind: &str) -> Result<Value
             "Managed launches require Codex or Claude Code and an attempt identity of at most 100 characters.",
         ));
     }
+    // Held across the whole build, hook included, so a retry of this attempt
+    // never meets a tree that is still being set up — and so a cancel cannot
+    // reclaim it halfway. Taken before the lookup below, so a retry during
+    // setup is told so rather than handed an attempt still being made.
+    let _place = if input.worktree {
+        Some(
+            state
+                .0
+                .preparations
+                .try_enter(&input.id)
+                .map_err(|_| setting_up())?,
+        )
+    } else {
+        None
+    };
+    // A retry of a preparation the store already committed is answered with
+    // that attempt, before anything the host reads now — limits, the saved
+    // model, HEAD — can make the request differ from the one it committed.
+    if let Some(prepared) = own_prepared(state, &input, kind)? {
+        return Ok(prepared);
+    }
     if kind == "managed" {
         managed_adapter_gate(state, &input.provider)?;
     }
+    let model_choice = recorded_model_choice(&input, kind)?;
+    // Two retries can both find nothing above and both send; the store
+    // commits one and refuses the other, whose host-read fields differ, as
+    // an idempotency conflict. That loser's attempt is the winner's.
+    let in_place = || {
+        prepare_in(state, &input, kind, &input.repo_path, &model_choice).or_else(|error| {
+            if error.code != "idempotency_conflict" {
+                return Err(error);
+            }
+            own_prepared(state, &input, kind)?.ok_or(error)
+        })
+    };
     if !input.worktree && kind != "managed" {
-        return prepare_in(state, &input, kind, &input.repo_path);
+        return in_place();
     }
     let (_, root, inside) =
         crate::terminal::checkout_root(&input.repo_path).map_err(unavailable)?;
@@ -284,43 +349,17 @@ fn prepare_kind(state: &WorkbenchState, input: &str, kind: &str) -> Result<Value
             ));
         }
         if !input.worktree {
-            return prepare_in(state, &input, kind, &input.repo_path);
+            return in_place();
         }
     }
-    // Held across the whole build, hook included, so a retry of this attempt
-    // never meets a tree that is still being set up — and so a cancel cannot
-    // reclaim it halfway.
-    let _place = state
-        .0
-        .preparations
-        .try_enter(&input.id)
-        .map_err(|_| setting_up())?;
-    let accepted = match state
-        .with_store(|store| query(store, "runs.get", &json!({"id":input.id}).to_string()))
-    {
-        Ok(saved) if saved["item"]["state"] == "prepared" => true,
-        // Building a tree for an attempt that has ended would only leave one
-        // behind for nothing to use.
-        Ok(saved) => {
-            return Err(WorkbenchError::new(
-                "launch_consumed",
-                format!(
-                    "This attempt is already {}. Prepare a new attempt.",
-                    saved["item"]["state"].as_str().unwrap_or("over")
-                ),
-            ))
-        }
-        Err(error) if error.code == "not_found" => false,
-        Err(error) => return Err(error),
-    };
-    if !accepted {
-        ensure_room(state)?;
-    }
+    // Nothing prepared under this id (`own_prepared` answered every other
+    // case), so this attempt needs room and a tree of its own.
+    ensure_room(state)?;
     let task = state
         .with_store(|store| query(store, "items.get", &json!({"id":input.task_id}).to_string()))?;
     let title = task["item"]["title"].as_str().unwrap_or_default();
     let provisioned =
-        super::agent_worktree::provision(&native_path(&root)?, &input.id, title, accepted)?;
+        super::agent_worktree::provision(&native_path(&root)?, &input.id, title, false)?;
     // The same folder, in the new tree: an attempt chosen for a package of a
     // monorepo works in that package of its own worktree. A folder the new
     // branch does not have (untracked here) is refused by `checkout`, and
@@ -329,7 +368,7 @@ fn prepare_kind(state: &WorkbenchState, input: &str, kind: &str) -> Result<Value
         Some(inside) => native_path(&Path::new(&provisioned.path).join(inside))?,
         None => provisioned.path.clone(),
     };
-    let prepared = prepare_in(state, &input, kind, &cwd);
+    let prepared = prepare_in(state, &input, kind, &cwd, &model_choice);
     if let Err(refusal) = prepared {
         // The attempt does not exist, so neither may the worktree made for it.
         return Err(match super::agent_worktree::discard(&provisioned) {
@@ -346,36 +385,126 @@ fn prepare_kind(state: &WorkbenchState, input: &str, kind: &str) -> Result<Value
     prepared
 }
 
-fn prepare_in(
+/// The attempt this request already committed, when one exists under its id.
+///
+/// An attempt id is minted fresh for one preparation and the store never
+/// prepares an id twice ("a launch attempt is immutable"), so a run under
+/// this id was made by this preparation — provided every field the renderer
+/// owns agrees, which [`replay_verdict`] checks. `None` when there is none.
+fn own_prepared(
     state: &WorkbenchState,
     input: &Preparation,
     kind: &str,
-    repo_path: &str,
+) -> Result<Option<Value>, WorkbenchError> {
+    match state.with_store(|store| query(store, "runs.get", &json!({"id":input.id}).to_string())) {
+        Ok(saved) => {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|elapsed| elapsed.as_secs())
+                .unwrap_or_default();
+            replay_verdict(&saved, input, kind, now).map(Some)
+        }
+        Err(error) if error.code == "not_found" => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+/// What a retry is answered with, given the attempt saved under its id.
+///
+/// The saved attempt in the shape a preparation answers with (no brief), when
+/// every renderer-owned field matches and it is still launchable. A mismatch
+/// is a different request under a reused id, and is refused rather than
+/// answered with someone else's attempt; an attempt that has moved on or
+/// expired (at `expires_at`, as the store counts it) is not handed back as
+/// launchable. Host-read fields — limits, model, checkout — are not compared:
+/// they are what may honestly have changed since.
+fn replay_verdict(
+    saved: &Value,
+    input: &Preparation,
+    kind: &str,
+    now: u64,
 ) -> Result<Value, WorkbenchError> {
-    let checkout = checkout(repo_path)?;
-    // A managed agent's model is Manvi's to set, not these flags: an override
-    // there would be recorded on the attempt and never applied.
-    let model_choice = if kind == "managed" {
+    let item = &saved["item"];
+    let same = item["task_id"] == input.task_id
+        && item["source_revision"] == input.source_revision
+        && item["repository_id"] == input.repository_id
+        && item["provider"] == input.provider
+        && item["permission_mode"] == input.permission_mode
+        && item["bypass_acknowledged"] == input.acknowledge_bypass
+        && item["kind"] == kind;
+    if !same {
+        return Err(WorkbenchError::new(
+            "invalid_state",
+            "This attempt ID already names a different preparation. Prepare a new attempt.",
+        ));
+    }
+    if item["state"] != "prepared" {
+        // Building a tree, or answering "prepared", for an attempt that has
+        // ended would only offer a launch the store will refuse.
+        return Err(WorkbenchError::new(
+            "launch_consumed",
+            format!(
+                "This attempt is already {}. Prepare a new attempt.",
+                item["state"].as_str().unwrap_or("over")
+            ),
+        ));
+    }
+    if item["expires_at"]
+        .as_u64()
+        .is_none_or(|expires| expires <= now)
+    {
+        return Err(WorkbenchError::new(
+            "launch_consumed",
+            "This attempt expired before its preparation was confirmed. Prepare a new attempt.",
+        ));
+    }
+    let mut item = item.clone();
+    if let Some(fields) = item.as_object_mut() {
+        fields.remove("brief");
+    }
+    Ok(json!({"ok": true, "item": item}))
+}
+
+/// The model choice this attempt records: the saved default with this
+/// launch's override laid over it, in the form the store keeps.
+///
+/// A pure function of the request and the saved default, so `prepare_kind`
+/// answers it before building anything — a worktree's setup hook can take
+/// minutes, and a refusal after it threw that work away. A managed agent's
+/// model is Manvi's to set, not these flags: an override there would be
+/// recorded on the attempt and never applied.
+fn recorded_model_choice(input: &Preparation, kind: &str) -> Result<Value, WorkbenchError> {
+    if kind == "managed" {
         if input.model_choice.is_some() {
             return Err(WorkbenchError::new(
                 "unsupported_operation",
                 "A model for one launch applies to agents started in a terminal; a managed agent uses Manvi's model.",
             ));
         }
-        Value::Null
-    } else {
-        let defaults = crate::tool_config::agent_defaults();
-        match super::terminal_command::launch_model_choice(
-            &input.provider,
-            defaults.model_for(&input.provider),
-            input.model_choice.as_ref(),
-        )
-        .map_err(|message| WorkbenchError::new("invalid_input", message))?
-        {
-            Some(choice) => super::terminal_command::model_choice_record(&choice),
-            None => Value::Null,
-        }
-    };
+        return Ok(Value::Null);
+    }
+    let defaults = crate::tool_config::agent_defaults();
+    let choice = super::terminal_command::launch_model_choice(
+        &input.provider,
+        defaults.model_for(&input.provider),
+        input.model_choice.as_ref(),
+    )
+    .map_err(|message| WorkbenchError::new("invalid_input", message))?;
+    match choice {
+        Some(choice) => super::terminal_command::model_choice_record(&choice)
+            .map_err(|message| WorkbenchError::new("invalid_input", message)),
+        None => Ok(Value::Null),
+    }
+}
+
+fn prepare_in(
+    state: &WorkbenchState,
+    input: &Preparation,
+    kind: &str,
+    repo_path: &str,
+    model_choice: &Value,
+) -> Result<Value, WorkbenchError> {
+    let checkout = checkout(repo_path)?;
     let body = json!({
         "model_choice": model_choice,
         "id":input.id, "request_id":input.request_id, "expected_revision":0,
@@ -397,8 +526,8 @@ fn prepare_in(
         // a refusal is rolled back, so the same request_id is still unused.
         Err(error) if matches!(error.code.as_str(), "checkout_busy" | "capacity_reached") => {
             match super::reconcile::sweep(state) {
-                Ok(released) if released > 0 => prepare(),
-                Ok(_) => Err(error),
+                Ok(swept) if swept.released > 0 => prepare(),
+                Ok(swept) => Err(swept.qualify(error)),
                 Err(sweep) => {
                     log::warn!(target: "workbench", "run reconciliation before a launch failed: {}: {}", sweep.code, sweep.message);
                     Err(error)
@@ -426,25 +555,31 @@ fn ensure_room(state: &WorkbenchState) -> Result<(), WorkbenchError> {
     if super::reconcile::live_count(state)? < u64::from(limit) {
         return Ok(());
     }
+    let mut swept = None;
     match super::reconcile::sweep(state) {
-        Ok(released) if released > 0 => {
+        Ok(done) if done.released > 0 => {
             if super::reconcile::live_count(state)? < u64::from(limit) {
                 return Ok(());
             }
+            swept = Some(done);
         }
-        Ok(_) => {}
+        Ok(done) => swept = Some(done),
         Err(sweep) => {
             log::warn!(target: "workbench", "run reconciliation before a launch failed: {}: {}", sweep.code, sweep.message);
         }
     }
-    capacity_hint(Err(WorkbenchError::new(
+    let refusal = WorkbenchError::new(
         "capacity_reached",
         // The store's sentence (dc-store `runs::prepare`), word for word; a
         // test holds the two together.
         format!(
             "{limit} runs are already prepared, active or unresolved; finish or reconcile one before launching another"
         ),
-    )))
+    );
+    capacity_hint(Err(match swept {
+        Some(swept) => swept.qualify(refusal),
+        None => refusal,
+    }))
     .map(|_| ())
 }
 
@@ -538,13 +673,8 @@ pub(super) fn claim(state: &WorkbenchState, input: &str) -> Result<Value, Workbe
         &claim.session_id,
     ]
     .iter()
-    .any(|id| {
-        id.is_empty()
-            || id.len() > 128
-            || !id
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
-    }) || claim.expected_revision == 0
+    .any(|id| !super::is_record_id(id))
+        || claim.expected_revision == 0
         || claim.expected_revision > 9_007_199_254_740_991
     {
         return Err(WorkbenchError::new(
@@ -568,6 +698,7 @@ pub(super) fn claim(state: &WorkbenchState, input: &str) -> Result<Value, Workbe
 #[cfg(test)]
 mod tests {
     use super::super::{Inner, WorkbenchState};
+    use super::{replay_verdict, Preparation};
     use crate::engine::git_cli::{git_global, git_text};
     use serde_json::{json, Value};
     use std::path::Path;
@@ -680,9 +811,13 @@ mod tests {
             result["item"]["head_oid"],
             git_text(&linked, &["rev-parse", "HEAD"]).unwrap().trim()
         );
+        // A retry is answered with the attempt itself. Not the receipt's
+        // envelope: its `sequence` announced a change that a retry does not
+        // make, and the renderer reads only `ok` and `item`.
+        let replayed = state.request("runs.prepare_terminal", &input).unwrap();
         assert_eq!(
-            state.request("runs.prepare_terminal", &input).unwrap(),
-            result
+            (&replayed["ok"], &replayed["item"]),
+            (&result["ok"], &result["item"])
         );
         assert_eq!(
             state.request("items.get", r#"{"id":"task"}"#).unwrap()["item"]["revision"],
@@ -861,9 +996,14 @@ mod tests {
             )
             .unwrap();
         std::fs::write(root.join(".git/HEAD"), "invalid head\n").unwrap();
+        // A fresh attempt: "run" was cancelled, and a retry of it is refused
+        // as consumed before any checkout is probed.
+        let mut fresh = prepare(&root);
+        fresh["id"] = json!("run-broken");
+        fresh["request_id"] = json!("prepare-broken");
         assert_eq!(
             state
-                .request("runs.prepare_terminal", &prepare(&root).to_string())
+                .request("runs.prepare_terminal", &fresh.to_string())
                 .unwrap_err()
                 .code,
             "repository_unavailable"
@@ -873,7 +1013,16 @@ mod tests {
         crate::test_support::trust_repo(&bare);
         assert_eq!(
             state
-                .request("runs.prepare_terminal", &prepare(&bare).to_string())
+                .request(
+                    "runs.prepare_terminal",
+                    &{
+                        let mut bare_attempt = prepare(&bare);
+                        bare_attempt["id"] = json!("run-bare");
+                        bare_attempt["request_id"] = json!("prepare-bare");
+                        bare_attempt
+                    }
+                    .to_string()
+                )
                 .unwrap_err()
                 .code,
             "repository_unavailable"
@@ -882,7 +1031,13 @@ mod tests {
             state
                 .request(
                     "runs.prepare_terminal",
-                    &prepare(&dir.path().join("missing")).to_string()
+                    &{
+                        let mut missing = prepare(&dir.path().join("missing"));
+                        missing["id"] = json!("run-missing");
+                        missing["request_id"] = json!("prepare-missing");
+                        missing
+                    }
+                    .to_string()
                 )
                 .unwrap_err()
                 .code,
@@ -1154,14 +1309,332 @@ mod tests {
         );
     }
 
+    /// A retry of an unanswered preparation returns the attempt the store
+    /// committed, though values the host reads at call time have moved.
+    ///
+    /// The host builds the store request from the renderer's fields plus
+    /// `max_active_runs`, the saved model and the checkout probe, and the
+    /// store replays a receipt only for an identical request — so a retry
+    /// after any of those changed was refused as "request_id was already used
+    /// for a different request", and the committed attempt held its slot.
+    #[cfg(unix)]
+    #[test]
+    fn a_retry_returns_the_committed_attempt_after_host_values_moved() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("repo");
+        init(&root);
+        commit(&root);
+        let db = dir.path().join("profile.sqlite");
+        let state = limited(&db, 2);
+        seed(&state, &root);
+        for input in [prepare(&root), with_worktree(&root, "cafe0123-d")] {
+            let input = input.to_string();
+            let first = state.request("runs.prepare_terminal", &input).unwrap();
+            // The reply was lost; meanwhile the limit changed and HEAD moved.
+            commit(&root);
+            let retried = limited(&db, 3)
+                .request("runs.prepare_terminal", &input)
+                .unwrap_or_else(|e| panic!("{}: {}", e.code, e.message));
+            assert_eq!(first["item"], retried["item"]);
+            assert!(
+                retried["item"].get("brief").is_none(),
+                "a replay answered in a different shape: {retried}"
+            );
+            state.request("runs.cancel", &json!({"id": first["item"]["id"], "request_id": format!("cancel-{}", first["item"]["id"].as_str().unwrap()), "expected_revision": 1}).to_string()).unwrap();
+        }
+        assert_eq!(state.request("runs.list", "{}").unwrap()["total"], 2);
+    }
+
+    /// The same, when the saved model default changed before the retry: the
+    /// attempt keeps the choice it recorded, and a default that would now be
+    /// refused does not refuse a replay of an attempt that already exists.
+    #[test]
+    fn a_retry_keeps_the_model_its_attempt_recorded() {
+        let serial = crate::test_support::env::env_serial();
+        let dir = tempfile::tempdir().unwrap();
+        let _env = crate::test_support::env::bind_env(&serial)
+            .set(
+                crate::tool_config::TOOL_CONFIG_ENV,
+                dir.path().join("tools.json"),
+            )
+            .invalidating(crate::tool_config::invalidate_cache);
+        let root = dir.path().join("repo");
+        init(&root);
+        commit(&root);
+        let state = host(&dir.path().join("profile.sqlite"));
+        seed(&state, &root);
+        let mut input = prepare(&root);
+        input["provider"] = json!("claude");
+        input["model_choice"] = json!({"model": "opus"});
+        let first = state
+            .request("runs.prepare_terminal", &input.to_string())
+            .unwrap();
+        let mut defaults = crate::tool_config::AgentDefaults::default();
+        defaults.models.insert(
+            "claude".into(),
+            crate::tool_config::ModelChoice {
+                effort: Some("max".into()),
+                ..Default::default()
+            },
+        );
+        crate::tool_config::set_agent_defaults(defaults).unwrap();
+        let retried = state
+            .request("runs.prepare_terminal", &input.to_string())
+            .unwrap_or_else(|e| panic!("{}: {}", e.code, e.message));
+        assert_eq!(retried["item"]["model_choice"], json!({"model": "opus"}));
+        assert_eq!(first["item"], retried["item"]);
+    }
+
+    /// An attempt id names one preparation: a different request under it is
+    /// refused, never answered with the other request's attempt, and an
+    /// attempt that has moved on is not handed back as launchable.
+    #[test]
+    fn an_attempt_id_is_never_handed_to_a_different_or_finished_request() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("repo");
+        init(&root);
+        commit(&root);
+        let state = host(&dir.path().join("profile.sqlite"));
+        seed(&state, &root);
+        state
+            .request("runs.prepare_terminal", &prepare(&root).to_string())
+            .unwrap();
+        for (field, value) in [
+            ("provider", json!("claude")),
+            ("permission_mode", json!("ask")),
+            ("source_revision", json!(2)),
+            ("task_id", json!("other")),
+        ] {
+            let mut other = prepare(&root);
+            other[field] = value;
+            let refused = state
+                .request("runs.prepare_terminal", &other.to_string())
+                .unwrap_err();
+            assert!(
+                matches!(
+                    refused.code.as_str(),
+                    "invalid_state" | "invalid_input" | "not_found"
+                ),
+                "{field}: {} {}",
+                refused.code,
+                refused.message
+            );
+        }
+        assert_eq!(state.request("runs.list", "{}").unwrap()["total"], 1);
+        state
+            .request(
+                "runs.cancel",
+                &json!({"id":"run","request_id":"cancel","expected_revision":1}).to_string(),
+            )
+            .unwrap();
+        let consumed = state
+            .request("runs.prepare_terminal", &prepare(&root).to_string())
+            .unwrap_err();
+        assert_eq!(consumed.code, "launch_consumed", "{}", consumed.message);
+    }
+
+    #[test]
+    fn the_replay_verdict_reads_only_what_the_renderer_owns() {
+        let input: Preparation = serde_json::from_value(json!({"id":"run","request_id":"r","task_id":"task","source_revision":3,"repository_id":"repo","repository_revision":1,"provider":"codex","permission_mode":"inspect","acknowledge_bypass":false,"repo_path":"/w"})).unwrap();
+        let saved = |state: &str, expires: u64| json!({"ok":true,"item":{"id":"run","task_id":"task","source_revision":3,"repository_id":"repo","provider":"codex","permission_mode":"inspect","bypass_acknowledged":false,"kind":"external_terminal","state":state,"expires_at":expires,"head_oid":"anything","brief":{"markdown":"x"}}});
+        let ok =
+            replay_verdict(&saved("prepared", 1_000), &input, "external_terminal", 999).unwrap();
+        assert!(ok["item"].get("brief").is_none() && ok["ok"] == json!(true));
+        // Expired at exactly its expiry, as the store counts it.
+        assert_eq!(
+            replay_verdict(
+                &saved("prepared", 1_000),
+                &input,
+                "external_terminal",
+                1_000
+            )
+            .unwrap_err()
+            .code,
+            "launch_consumed"
+        );
+        assert_eq!(
+            replay_verdict(&saved("starting", 1_000), &input, "external_terminal", 0)
+                .unwrap_err()
+                .code,
+            "launch_consumed"
+        );
+        assert_eq!(
+            replay_verdict(&saved("prepared", 1_000), &input, "managed", 0)
+                .unwrap_err()
+                .code,
+            "invalid_state"
+        );
+        // A record missing a field it must match is not a match.
+        let mut partial = saved("prepared", 1_000);
+        partial["item"].as_object_mut().unwrap().remove("provider");
+        assert_eq!(
+            replay_verdict(&partial, &input, "external_terminal", 0)
+                .unwrap_err()
+                .code,
+            "invalid_state"
+        );
+        // Fuzz: change any one renderer-owned field and the verdict refuses.
+        for field in [
+            "task_id",
+            "source_revision",
+            "repository_id",
+            "provider",
+            "permission_mode",
+            "bypass_acknowledged",
+            "kind",
+        ] {
+            for value in [json!(null), json!("x"), json!(0), json!(true), json!(4)] {
+                let mut moved = saved("prepared", 1_000);
+                if moved["item"][field] == value {
+                    continue;
+                }
+                moved["item"][field] = value.clone();
+                assert!(
+                    replay_verdict(&moved, &input, "external_terminal", 0).is_err(),
+                    "{field}={value} was accepted"
+                );
+            }
+        }
+    }
+
+    /// Concurrent replays of one preparation, from hosts that read different
+    /// limits, answer with one attempt and create exactly one.
+    #[test]
+    fn concurrent_replays_create_one_attempt() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("repo");
+        init(&root);
+        commit(&root);
+        let db = dir.path().join("profile.sqlite");
+        let state = limited(&db, 2);
+        seed(&state, &root);
+        let input = prepare(&root).to_string();
+        let answers: Vec<_> = std::thread::scope(|scope| {
+            let workers: Vec<_> = (0..8u32)
+                .map(|n| {
+                    let host = if n % 2 == 0 {
+                        state.clone()
+                    } else {
+                        limited(&db, 2 + n)
+                    };
+                    let input = input.clone();
+                    scope.spawn(move || host.request("runs.prepare_terminal", &input))
+                })
+                .collect();
+            workers.into_iter().map(|w| w.join().unwrap()).collect()
+        });
+        let items: Vec<_> = answers
+            .iter()
+            .filter_map(|a| a.as_ref().ok())
+            .map(|a| a["item"].clone())
+            .collect();
+        for refused in answers.iter().filter_map(|a| a.as_ref().err()) {
+            // Contention may refuse a racer; it must never be a second attempt or a conflict.
+            assert_ne!(refused.code, "idempotency_conflict", "{}", refused.message);
+        }
+        assert!(!items.is_empty());
+        assert!(
+            items.windows(2).all(|w| w[0] == w[1]),
+            "replays answered with different attempts"
+        );
+        assert_eq!(state.request("runs.list", "{}").unwrap()["total"], 1);
+    }
+
+    /// The form's "is this checkout taken" is asked by the key the store
+    /// refuses on, which only the host can observe.
+    #[cfg(unix)]
+    #[test]
+    fn a_checkout_identity_names_the_git_directory_a_preparation_records() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("repo");
+        init(&root);
+        commit(&root);
+        std::fs::create_dir_all(root.join("pkg/web")).unwrap();
+        std::fs::write(root.join("pkg/web/keep"), "").unwrap();
+        git_text(&root, &["add", "pkg"]).unwrap();
+        commit(&root);
+        let state = host(&dir.path().join("profile.sqlite"));
+        seed(&state, &root);
+        let sub = root.join("pkg/web");
+        let prepared = state
+            .request("runs.prepare_terminal", &prepare(&sub).to_string())
+            .unwrap();
+        for path in [&root, &sub] {
+            let identity = state
+                .request(
+                    "runs.checkout_identity",
+                    &json!({"repo_path": path}).to_string(),
+                )
+                .unwrap();
+            assert_eq!(
+                identity["git_dir"],
+                prepared["item"]["git_dir"],
+                "{}",
+                path.display()
+            );
+            assert_eq!(
+                identity["git_common_dir"],
+                prepared["item"]["git_common_dir"]
+            );
+        }
+        // A worktree nested inside the checkout is a checkout of its own.
+        let nested = state
+            .request(
+                "runs.prepare_terminal",
+                &with_worktree(&root, "cafe0123-n").to_string(),
+            )
+            .unwrap();
+        let identity = state
+            .request(
+                "runs.checkout_identity",
+                &json!({"repo_path": nested["item"]["cwd"]}).to_string(),
+            )
+            .unwrap();
+        assert_eq!(identity["git_dir"], nested["item"]["git_dir"]);
+        assert_ne!(identity["git_dir"], prepared["item"]["git_dir"]);
+        // Refused as input: relative, oversized, unknown fields, not an object.
+        for input in [
+            json!({"repo_path":"repo"}).to_string(),
+            json!({"repo_path": format!("/{}", "x".repeat(4_200))}).to_string(),
+            json!({"repo_path":"/r","extra":1}).to_string(),
+            "[]".into(),
+            "x".repeat(9_000),
+        ] {
+            assert_eq!(
+                state
+                    .request("runs.checkout_identity", &input)
+                    .unwrap_err()
+                    .code,
+                "invalid_input",
+                "{}",
+                &input[..input.len().min(60)]
+            );
+        }
+        // Git is not run in a checkout nobody trusted.
+        let stranger = dir.path().join("stranger");
+        git_global(&["init", stranger.to_str().unwrap()]).unwrap();
+        assert_eq!(
+            state
+                .request(
+                    "runs.checkout_identity",
+                    &json!({"repo_path": stranger}).to_string()
+                )
+                .unwrap_err()
+                .code,
+            "repository_unavailable"
+        );
+        assert_eq!(state.request("runs.list", "{}").unwrap()["total"], 2);
+    }
+
     /// Commits a `post_create` hook, so a provisioned worktree runs it.
+    #[cfg(unix)]
     fn post_create(root: &Path, command: &str) {
         std::fs::create_dir_all(root.join(".gitpulse")).unwrap();
-        std::fs::write(
-            root.join(".gitpulse/hooks.json"),
-            json!({"worktree":{"post_create":[command]}}).to_string(),
-        )
-        .unwrap();
+        let hooks = json!({"worktree":{"post_create":[command]}}).to_string();
+        std::fs::write(root.join(".gitpulse/hooks.json"), &hooks).unwrap();
+        // Hooks run only once approved; these tests are about what a hook
+        // that runs does, so the file is approved as written.
+        crate::engine::approve_worktree_hooks(root, &hooks).unwrap();
         git_text(root, &["add", ".gitpulse/hooks.json"]).unwrap();
         commit(root);
     }
@@ -1243,6 +1716,62 @@ mod tests {
             "the setup hook ran for an attempt the profile had no room for"
         );
         assert!(!lane(&root, "preserve-e42-f00dcafe").exists());
+        assert_eq!(gitpulse_branches(&root), "");
+    }
+
+    /// A model choice the launch cannot record is refused before the
+    /// repository's setup hook runs, not after.
+    ///
+    /// The choice was resolved inside `prepare_in`, after the worktree was
+    /// added and its hook had run — minutes of dependency installs, then a
+    /// refusal and a discarded tree. It is a pure function of the request and
+    /// the saved default, so it is answered first.
+    #[cfg(unix)]
+    #[test]
+    fn a_model_choice_the_launch_cannot_record_refuses_before_building_a_worktree() {
+        let dir = tempfile::tempdir().unwrap();
+        let sentinel = dir.path().join("setup-ran");
+        let root = dir.path().join("repo");
+        init(&root);
+        commit(&root);
+        post_create(&root, &format!("touch '{}'", sentinel.display()));
+        let state = limited(&dir.path().join("profile.sqlite"), 2);
+        seed(&state, &root);
+        let arn = |n: u8| {
+            format!("arn:aws:bedrock:us-east-1:123456789012:inference-profile/us.anthropic.claude-model-{n}")
+        };
+        for (id, provider, choice, says) in [
+            // Codex takes a model and nothing else.
+            ("f00dcafe-1", "codex", json!({"effort":"high"}), "effort"),
+            // Each id fits; joined, as the store records them, they do not.
+            (
+                "f00dcafe-2",
+                "claude",
+                json!({"fallback":[arn(1), arn(2)]}),
+                "128",
+            ),
+        ] {
+            let mut input = with_worktree(&root, id);
+            input["provider"] = json!(provider);
+            input["model_choice"] = choice;
+            let refused = state
+                .request("runs.prepare_terminal", &input.to_string())
+                .unwrap_err();
+            assert_eq!(
+                refused.code, "invalid_input",
+                "{provider}: {}",
+                refused.message
+            );
+            assert!(
+                refused.message.contains(says),
+                "{provider}: {}",
+                refused.message
+            );
+        }
+        assert!(
+            !sentinel.exists(),
+            "the setup hook ran for a launch that was always going to be refused"
+        );
         assert_eq!(gitpulse_branches(&root), "");
     }
 
@@ -1445,7 +1974,13 @@ mod tests {
             .request("runs.prepare_managed", &managed.to_string())
             .unwrap_err();
         assert_eq!(refused.code, "unsupported_operation");
-        assert!(refused.message.contains("pkg/web"), "{}", refused.message);
+        // The folder is named in the platform's own separator.
+        let inside = Path::new("pkg").join("web");
+        assert!(
+            refused.message.contains(&*inside.to_string_lossy()),
+            "{}",
+            refused.message
+        );
 
         let lane_run = state
             .request(
@@ -1574,7 +2109,7 @@ mod tests {
     /// (`terminal_run::spawn`), not whatever the default is by then.
     #[test]
     fn a_launch_records_the_saved_default_with_its_own_override() {
-        let serial = crate::tool_config::lock_config_env();
+        let serial = crate::test_support::env::env_serial();
         let dir = tempfile::tempdir().unwrap();
         let _env = crate::test_support::env::bind_env(&serial)
             .set(

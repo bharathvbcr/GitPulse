@@ -1,6 +1,6 @@
 <script lang="ts">
   import { untrack } from "svelte";
-  import { repoStore } from "../stores/repoStore";
+  import { currentRepoPath, repoStore } from "../stores/repoStore";
   import { guardedDismiss } from "./modalGuard";
   import { graphStore } from "../stores/graphStore";
   import { fade, scale } from "svelte/transition";
@@ -48,16 +48,18 @@
       .map((c) => c.id)
       .join(",");
 
+  const repoGeneration = $derived($repoStore.generation);
+  const defaultBranch = $derived($repoStore.defaultBranch);
   $effect(() => {
     const current = planSignature($graphStore.commits);
     // Rebuild the plan only when it cannot destroy user work: on opening, or
     // while pristine and the underlying history actually moved.
     if ((!wasOpen || planCurrent) && shouldReseed({ isOpen, wasOpen, dirty: planDirty, currentSignature: current, seededSignature })) {
       untrack(() => {
-        planRepoPath = $repoStore.currentPath;
-        planGeneration = $repoStore.generation;
+        planRepoPath = $currentRepoPath;
+        planGeneration = repoGeneration;
         errorMsg = null;
-        ontoBranch = $repoStore.defaultBranch || "main";
+        ontoBranch = defaultBranch || "main";
         items = seedRebasePlan($graphStore.commits);
         seededSignature = current;
         planDirty = false;

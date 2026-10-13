@@ -41,6 +41,19 @@ describe("titleFromNotes", () => {
     expect(titleFromNotes("- [ ] Preserve repository scope")).toBe("Preserve repository scope");
     expect(titleFromNotes("* Keep both repository links")).toBe("Keep both repository links");
   });
+
+  it("skips pasted links and strips quotes and invisible characters", () => {
+    expect(titleFromNotes("https://github.com/acme/app/issues/42\nLogin loops after the token refresh")).toBe(
+      "Login loops after the token refresh",
+    );
+    expect(titleFromNotes("https://github.com/acme/app/issues/42")).toBe("");
+    expect(titleFromNotes("---\nKeep the retry bounded")).toBe("Keep the retry bounded");
+    expect(titleFromNotes("> Keep the retry bounded")).toBe("Keep the retry bounded");
+    expect(titleFromNotes("“Keep the retry bounded”")).toBe("Keep the retry bounded");
+    // Zero-width and bidi controls make a title read other than what it holds.
+    expect(titleFromNotes("Fix\u200B the \u202Elogin\u202C loop")).toBe("Fix the login loop");
+    expect(titleFromNotes("Fix the login loop\u2028Second line")).toBe("Fix the login loop");
+  });
 });
 
 describe("applyNotesToDraft", () => {
@@ -115,6 +128,13 @@ describe("canAskManvi", () => {
 });
 
 describe("agent copy", () => {
+  it("copies a draft with no priority as Normal, and keeps Urgent as Urgent", () => {
+    const base = { title: "T", description: "d" };
+    expect(formatDraftAgentCopy(base)).toContain("Priority: Normal");
+    expect(formatDraftAgentCopy({ ...base, priority: 0 })).toContain("Priority: Urgent");
+    expect(formatDraftAgentCopy({ ...base, priority: 3 })).toContain("Priority: Low");
+  });
+
   it("labels drafts as unsaved and never invents a revision", () => {
     const copy = formatDraftAgentCopy({
       title: "Keep E42",

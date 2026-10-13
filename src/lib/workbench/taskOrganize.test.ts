@@ -12,9 +12,12 @@ import {
   enhanceableFields,
   facetActive,
   hiddenTaskDetails,
+  normalizePriority,
   parseDueInput,
   partitionLanes,
+  priorityLabel,
   reorderPlan,
+  sortByPriority,
   visibleHiddenDetails,
 } from "./taskOrganize";
 
@@ -35,6 +38,15 @@ const task: Task = {
   locked_fields: ["title"],
 };
 
+describe("normalizePriority", () => {
+  it("accepts numbers 0-3 and their numeric strings, and 'all' for the rest", () => {
+    expect([0, 1, 2, 3, "0", "3"].map(normalizePriority)).toEqual([0, 1, 2, 3, 0, 3]);
+    for (const bad of [true, false, 1.5, -1, 4, "4", "", "all", "high", " 1", Number.NaN, null, undefined, [1]]) {
+      expect(normalizePriority(bad)).toBe("all");
+    }
+  });
+});
+
 describe("facets", () => {
   it("starts inactive and becomes active on any constraint", () => {
     expect(facetActive(emptyFacet())).toBe(false);
@@ -52,6 +64,13 @@ describe("facets", () => {
     expect(cardMatchesFacet(card(), { ...emptyFacet(), label: "missing" }, now)).toBe(false);
     expect(cardMatchesFacet(card(), { ...emptyFacet(), due: "overdue" }, 200)).toBe(true);
     expect(cardMatchesFacet(card({ due_at: null }), { ...emptyFacet(), due: "none" }, now)).toBe(true);
+    // Any linked repository counts, not only the primary one.
+    expect(cardMatchesFacet(card(), { ...emptyFacet(), repository: "r2" }, now)).toBe(true);
+    expect(cardMatchesFacet(card(), { ...emptyFacet(), repository: "r9" }, now)).toBe(false);
+  });
+
+  it("is active while a repository is chosen", () => {
+    expect(facetActive({ ...emptyFacet(), repository: "r1" })).toBe(true);
   });
 
   it("collects sorted unique kinds, owners and labels from loaded cards", () => {
@@ -63,6 +82,7 @@ describe("facets", () => {
     expect(options.kinds).toEqual(["bug", "feature"]);
     expect(options.owners).toEqual(["Ann", "Zed"]);
     expect(options.labels).toEqual(["a", "b"]);
+    expect(options.repositories).toEqual(["r1", "r2"]);
   });
 });
 
@@ -183,5 +203,42 @@ describe("partitionLanes", () => {
   it("orders status lanes by the board's status order, not by name", () => {
     const lanes = partitionLanes([card({ id: "a", status: "review" }), card({ id: "b", status: "inbox" }), card({ id: "c", status: "ready" })], "status", label, order);
     expect(lanes.map((lane) => lane.label)).toEqual(["INBOX", "READY", "REVIEW"]);
+  });
+});
+
+describe("severity facet", () => {
+  it("matches case-insensitively, and \"\" means no severity", () => {
+    const high = card({ severity: "High" }), none = card({ id: "t2", severity: null }), blank = card({ id: "t3", severity: "  " });
+    expect(cardMatchesFacet(high, { ...emptyFacet(), severity: "high" }, 0)).toBe(true);
+    expect(cardMatchesFacet(none, { ...emptyFacet(), severity: "high" }, 0)).toBe(false);
+    expect([high, none, blank].filter((c) => cardMatchesFacet(c, { ...emptyFacet(), severity: "" }, 0)).map((c) => c.id)).toEqual(["t2", "t3"]);
+  });
+  it("counts as an active filter and offers each spelling once", () => {
+    expect(facetActive({ ...emptyFacet(), severity: "high" })).toBe(true);
+    expect(facetActive(emptyFacet())).toBe(false);
+    expect(collectFacetOptions([card({ severity: "High" }), card({ id: "b", severity: "high" }), card({ id: "c", severity: null }), card({ id: "d", severity: "critical" })]).severities).toEqual(["critical", "High"]);
+  });
+  it("combines with the other filters", () => {
+    const facet = { ...emptyFacet(), severity: "high", priority: 1, kind: "bug" };
+    expect(cardMatchesFacet(card(), facet, 0)).toBe(true);
+    expect(cardMatchesFacet(card({ priority: 2 }), facet, 0)).toBe(false);
+    expect(cardMatchesFacet(card({ kind: "feature" }), facet, 0)).toBe(false);
+  });
+});
+
+describe("sortByPriority", () => {
+  const c = (id: string, priority: number, due_at: number | null = null) => card({ id, priority, due_at });
+  it("puts urgent first, then the earlier due date, then the board's own order", () => {
+    const board = [c("low", 3), c("n1", 2), c("urgent", 0), c("n-due", 2, 500), c("n2", 2), c("high", 1)];
+    expect(sortByPriority(board).map((x) => x.id)).toEqual(["urgent", "high", "n-due", "n1", "n2", "low"]);
+  });
+  it("does not mutate its input and reads an out-of-range priority as normal", () => {
+    const board = [c("a", 9), c("b", 0)];
+    expect(sortByPriority(board).map((x) => x.id)).toEqual(["b", "a"]);
+    expect(board.map((x) => x.id)).toEqual(["a", "b"]);
+    expect(sortByPriority([])).toEqual([]);
+  });
+  it("names priorities for chips and screen readers", () => {
+    expect([0, 1, 2, 3, 7, null].map(priorityLabel)).toEqual(["Urgent", "High", "Normal", "Low", "Normal", "Normal"]);
   });
 });

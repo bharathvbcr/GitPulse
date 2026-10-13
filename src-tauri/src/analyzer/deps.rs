@@ -22,8 +22,8 @@ use crate::analyzer::cargo_supply::{
 };
 use crate::analyzer::language::LanguageDetector;
 use crate::engine::git_cli::{
-    capture_command_with_env, classify_tool_probe, git_text, resolve_spawn_program_with,
-    sandbox_join, sandbox_join_canonical, validate_repo, CapturedOutput, ToolProbe,
+    capture_command_with_env, classify_tool_probe, git_text, resolve_spawn_program_in,
+    sandbox_join, sandbox_join_canonical, validate_repo, CapturedOutput, PathSource, ToolProbe,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -100,6 +100,12 @@ pub struct NpmManifest {
     pub engines_node: Option<String>,
     pub package_manager: String,
     pub lockfile: Option<String>,
+    /// Directory (repo-relative, empty for the root) that holds `lockfile`.
+    /// Differs from this manifest's own directory for a workspace member that
+    /// shares its workspace root's lockfile. `serde(default)` keeps older
+    /// serialized reports loadable.
+    #[serde(default)]
+    pub lockfile_dir: Option<String>,
     pub has_workspaces: bool,
     pub dep_count: usize,
     pub dev_dep_count: usize,
@@ -226,17 +232,26 @@ pub struct DepsHealthReport {
     pub govulncheck_present: bool,
     pub composer_present: bool,
     pub bundler_audit_present: bool,
-    /// Scanners that issued at least one real CLI command during this scan
-    /// (`npm`, `bun`, `cargo`, `cargo-deny`, `cargo-crev`, `pip-audit`,
-    /// `govulncheck`, `composer`, `bundler-audit`). The `*_present` flags say
-    /// what COULD run; this says
-    /// what DID. `serde(default)` keeps older serialized reports loadable.
+    /// Scanners that ran a real CLI command and produced output this scan
+    /// could parse (`npm`, `bun`, `cargo`, `cargo-deny`, `cargo-crev`,
+    /// `pip-audit`, `govulncheck`, `composer`, `bundler-audit`). A scanner that
+    /// was dispatched but exited without a usable result is an issue, not an
+    /// entry here. The `*_present` flags say what COULD run; this says what
+    /// DID. `serde(default)` keeps older serialized reports loadable.
     #[serde(default)]
     pub scanners_ran: Vec<String>,
     /// True only when every discovered, supported audit target was scanned
     /// successfully and no coverage-affecting safety cap was hit.
     #[serde(default)]
     pub audit_complete: bool,
+    /// Audit targets found versus audited, with the ones that were not. Both
+    /// numbers travel so "complete" is never read off a sample.
+    /// `serde(default)` keeps older serialized reports loadable.
+    #[serde(default)]
+    pub audit_coverage: AuditCoverage,
+    /// Keys of the targets whose scanner ran and produced a parsed result.
+    #[serde(skip)]
+    audited_targets: Vec<String>,
     pub manifests: Vec<NpmManifest>,
     pub ecosystems: Vec<EcosystemHint>,
     pub issues: Vec<HealthIssue>,
@@ -247,6 +262,17 @@ pub struct DepsHealthReport {
     /// Exact retained/observed counts for every safety budget that fired.
     #[serde(default)]
     pub limit_notices: Vec<ScanLimitNotice>,
+}
+
+/// How much of what was found got audited. `found` counts every audit target
+/// the walk saw — including ecosystems no scanner here can read — and
+/// `audited` only those whose scanner ran and parsed.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuditCoverage {
+    pub found: usize,
+    pub audited: usize,
+    /// `family:path` for each found target that was not audited.
+    pub unaudited: Vec<String>,
 }
 
 /// Ecosystem artifacts collected while listing tracked files; the CLI enrichers
@@ -260,6 +286,10 @@ struct ScanTargets {
     go_mods: Vec<String>,
     composer_locks: Vec<String>,
     gemfile_locks: Vec<String>,
+    /// Python lockfiles and project files pip-audit is not wired to read
+    /// here (`uv.lock`, `poetry.lock`, `pyproject.toml`, …), and artifacts of
+    /// families with no scanner at all. Each is `(family, path)`.
+    unaudited: Vec<(String, String)>,
 }
 
 #[derive(Debug, Clone)]
@@ -268,11 +298,15 @@ pub struct ScanOptions {
     /// still runs. Tests use this so a missing lockfile does not hit the registry.
     pub run_cli: bool,
     /// Test seam: when set, replaces the process `PATH` for every probe and
-    /// spawn this scan performs, so a GUI-minimal launch environment can be
-    /// simulated without mutating process state. `None` inherits the real
-    /// environment (app behavior).
+    /// spawn this scan performs, and is the whole search path — the GUI-launch
+    /// fallback dirs are not added to it, so a tool absent from it is absent.
+    /// `None` inherits the real environment, fallback dirs included (app
+    /// behavior).
     pub path_var: Option<std::ffi::OsString>,
-    /// Test seam: same contract as [`ScanOptions::path_var`] for `HOME`.
+    /// Test seam: when set, replaces the process `HOME` for every probe and
+    /// spawn this scan performs. Under an inherited PATH it also roots the
+    /// home-relative fallback dirs (`~/.cargo/bin`, `~/go/bin`, …); under an
+    /// explicit [`ScanOptions::path_var`] no fallback dir is searched.
     pub home: Option<std::ffi::OsString>,
 }
 
@@ -295,6 +329,9 @@ impl Default for ScanOptions {
 #[derive(Debug, Clone)]
 struct ScanEnv {
     path_var: Option<std::ffi::OsString>,
+    /// Whether `path_var` is the override or the process value; only the
+    /// latter is widened by the GUI-launch fallback dirs.
+    path_source: PathSource,
     home: Option<std::ffi::OsString>,
 }
 
@@ -302,11 +339,13 @@ impl ScanEnv {
     /// Environment view implied by the options: an override wins wholesale,
     /// otherwise the process value is used as-is (`None` stays `None`).
     fn from_options(options: &ScanOptions) -> Self {
+        let (path_var, path_source) = match &options.path_var {
+            Some(path_var) => (Some(path_var.clone()), PathSource::Explicit),
+            None => (std::env::var_os("PATH"), PathSource::Inherited),
+        };
         Self {
-            path_var: options
-                .path_var
-                .clone()
-                .or_else(|| std::env::var_os("PATH")),
+            path_var,
+            path_source,
             home: options
                 .home
                 .clone()
@@ -373,6 +412,7 @@ impl DepsScanner {
         report.audit = AuditSummary::from_vulns(&report.vulnerabilities);
         sort_report(&mut report);
         cap_report(&mut report);
+        report.audit_coverage = audit_coverage(&report, &targets);
         report.audit_complete = audit_is_complete(&report, &targets, options.run_cli);
         Ok(report)
     }
@@ -430,6 +470,7 @@ fn local_scan(repo: &Path, env: &ScanEnv) -> Result<(DepsHealthReport, ScanTarge
         });
     }
     cap_scan_targets(&mut targets, &mut limit_notices);
+    collect_unaudited_targets(&listed, &other, &mut targets);
 
     let node_probe = probe_tool_version(node_program(), &["-v"], env, VERSION_TIMEOUT);
     let npm_probe = probe_tool_version(npm_program(), &["--version"], env, VERSION_TIMEOUT);
@@ -611,6 +652,8 @@ fn local_scan(repo: &Path, env: &ScanEnv) -> Result<(DepsHealthReport, ScanTarge
             bundler_audit_present,
             scanners_ran: Vec::new(),
             audit_complete: false,
+            audit_coverage: AuditCoverage::default(),
+            audited_targets: Vec::new(),
             manifests,
             ecosystems,
             issues,
@@ -622,6 +665,58 @@ fn local_scan(repo: &Path, env: &ScanEnv) -> Result<(DepsHealthReport, ScanTarge
         },
         targets,
     ))
+}
+
+/// Files that name Python dependencies but that this scan cannot audit.
+fn python_unaudited_name(name: &str) -> bool {
+    matches!(
+        name,
+        "uv.lock" | "poetry.lock" | "Pipfile.lock" | "pdm.lock" | "pyproject.toml" | "Pipfile"
+    ) || name == "setup.py"
+        || name == "setup.cfg"
+}
+
+/// Records artifacts that were found but have no audit path, so completeness
+/// cannot be read off the families that happen to have one.
+///
+/// Python lockfiles are never readable by the wired pip-audit invocation
+/// (`-r requirements.txt`); a `pyproject.toml`/`setup.py` directory is
+/// unaudited unless a requirements file sits beside it. Families with no
+/// scanner wired at all (JVM, Swift, Dart, Elixir, .NET) are unaudited as a
+/// whole. Cargo, Go, npm, PHP and Ruby have their own checks, and `native`
+/// build files declare no dependencies.
+fn collect_unaudited_targets(
+    listed: &[String],
+    other: &BTreeMap<String, Vec<String>>,
+    targets: &mut ScanTargets,
+) {
+    let requirement_dirs: std::collections::BTreeSet<String> =
+        targets.py_requirements.iter().map(|r| dir_of(r)).collect();
+    for rel in listed {
+        let name = rel.rsplit('/').next().unwrap_or(rel.as_str());
+        if !python_unaudited_name(name) {
+            continue;
+        }
+        let always = matches!(
+            name,
+            "uv.lock" | "poetry.lock" | "Pipfile.lock" | "pdm.lock"
+        );
+        if always || !requirement_dirs.contains(&dir_of(rel)) {
+            targets.unaudited.push(("python".into(), rel.clone()));
+        }
+    }
+    for (family, files) in other {
+        if matches!(
+            family.as_str(),
+            "jvm" | "swift" | "dart" | "elixir" | "dotnet"
+        ) {
+            for rel in files {
+                targets.unaudited.push((family.clone(), rel.clone()));
+            }
+        }
+    }
+    targets.unaudited.sort();
+    targets.unaudited.dedup();
 }
 
 /// Records non-npm scan inputs spotted during the tracked-file walk.
@@ -807,16 +902,27 @@ fn enrich_npm(repo: &Path, report: &mut DepsHealthReport, env: &ScanEnv) -> JsCl
         let lock_name = report
             .manifests
             .iter()
-            .find(|manifest| dir_of(&manifest.path) == rel_dir)
+            .find(|manifest| {
+                manifest
+                    .lockfile_dir
+                    .clone()
+                    .unwrap_or_else(|| dir_of(&manifest.path))
+                    == rel_dir
+                    && manifest.lockfile.is_some()
+            })
             .and_then(|manifest| manifest.lockfile.clone());
         match js_lock_kind(lock_name.as_deref()) {
             JsLockKind::Npm if report.npm_cli_present => {
-                dispatch_npm_audit(&cwd, report, env, &label);
-                npm = true;
+                if dispatch_npm_audit(&cwd, report, env, &label) {
+                    npm = true;
+                    mark_audited(report, format!("npm:{rel_dir}"));
+                }
             }
             JsLockKind::Bun if report.bun_cli_present => {
-                dispatch_bun_audit(&cwd, report, env, &label);
-                bun = true;
+                if dispatch_bun_audit(&cwd, report, env, &label) {
+                    bun = true;
+                    mark_audited(report, format!("npm:{rel_dir}"));
+                }
             }
             JsLockKind::Unsupported => {
                 let name = lock_name.as_deref().unwrap_or("lockfile");
@@ -839,40 +945,55 @@ fn enrich_npm(repo: &Path, report: &mut DepsHealthReport, env: &ScanEnv) -> JsCl
     JsCliDispatch { npm, bun }
 }
 
-fn dispatch_npm_audit(cwd: &Path, report: &mut DepsHealthReport, env: &ScanEnv, label: &str) {
-    match run_npm_json(cwd, &["audit", "--json"], env) {
-        Ok(text) => match parse_npm_audit_json(&text) {
-            Ok((mut vulns, err)) => {
-                if let Some(err) = err {
-                    push_issue(
-                        &mut report.issues,
-                        "error",
-                        "audit_failed",
-                        err,
-                        Some(label.to_string()),
-                    );
-                }
-                report.vulnerabilities.append(&mut vulns);
-            }
-            Err(e) => push_issue(
-                &mut report.issues,
-                "error",
-                "audit_failed",
-                e,
-                Some(label.to_string()),
-            ),
-        },
-        Err(e) => push_issue(
+/// True when the audit ran and its report parsed without an error.
+fn dispatch_npm_audit(
+    cwd: &Path,
+    report: &mut DepsHealthReport,
+    env: &ScanEnv,
+    label: &str,
+) -> bool {
+    let fail = |report: &mut DepsHealthReport, message: String| {
+        push_issue(
             &mut report.issues,
             "error",
             "audit_failed",
-            e,
+            message,
             Some(label.to_string()),
-        ),
+        );
+        false
+    };
+    match run_npm_json(cwd, &["audit", "--json"], env) {
+        Ok(text) => match parse_npm_audit_json(&text) {
+            Ok((mut vulns, err)) => {
+                report.vulnerabilities.append(&mut vulns);
+                match err {
+                    Some(err) => fail(report, err),
+                    None => true,
+                }
+            }
+            Err(e) => fail(report, e),
+        },
+        Err(e) => fail(report, e),
     }
 }
 
-fn dispatch_bun_audit(cwd: &Path, report: &mut DepsHealthReport, env: &ScanEnv, label: &str) {
+/// True when the audit ran and its report parsed.
+fn dispatch_bun_audit(
+    cwd: &Path,
+    report: &mut DepsHealthReport,
+    env: &ScanEnv,
+    label: &str,
+) -> bool {
+    let fail = |report: &mut DepsHealthReport, message: String| {
+        push_issue(
+            &mut report.issues,
+            "error",
+            "bun_audit_failed",
+            message,
+            Some(label.to_string()),
+        );
+        false
+    };
     match run_json_cli(cwd, bun_program(), &["audit", "--json"], env) {
         Ok(text) => match parse_bun_audit_json(&text) {
             Ok(mut vulns) => {
@@ -881,22 +1002,11 @@ fn dispatch_bun_audit(cwd: &Path, report: &mut DepsHealthReport, env: &ScanEnv, 
                     vuln.is_direct = sections.contains_key(&vuln.name);
                 }
                 report.vulnerabilities.append(&mut vulns);
+                true
             }
-            Err(e) => push_issue(
-                &mut report.issues,
-                "error",
-                "bun_audit_failed",
-                e,
-                Some(label.to_string()),
-            ),
+            Err(e) => fail(report, e),
         },
-        Err(e) => push_issue(
-            &mut report.issues,
-            "error",
-            "bun_audit_failed",
-            e,
-            Some(label.to_string()),
-        ),
+        Err(e) => fail(report, e),
     }
 }
 
@@ -967,7 +1077,6 @@ fn enrich_cargo(
             &[("CARGO_TERM_COLOR", "never")],
         ) {
             Ok(out) => {
-                ran = true;
                 let text = out.stdout_text();
                 if text.trim().is_empty() && !out.success {
                     push_issue(
@@ -985,6 +1094,8 @@ fn enrich_cargo(
                 }
                 match parse_cargo_audit_json(&text) {
                     Ok((mut vulns, warnings)) => {
+                        ran = true;
+                        mark_audited(report, format!("cargo:{rel}"));
                         report.vulnerabilities.append(&mut vulns);
                         for mut warning in warnings {
                             warning.path = Some(rel.clone());
@@ -1007,7 +1118,6 @@ fn enrich_cargo(
                 }
             }
             Err(e) => {
-                ran = true;
                 push_issue(
                     &mut report.issues,
                     "warning",
@@ -1249,7 +1359,6 @@ fn enrich_cargo_crev(
             &[("CARGO_TERM_COLOR", "never"), ("CARGO_NET_OFFLINE", "true")],
         ) {
             Ok(out) => {
-                ran = true;
                 let stdout = out.stdout_text();
                 let stderr = out.stderr_text();
                 if stdout.trim().is_empty() {
@@ -1279,6 +1388,7 @@ fn enrich_cargo_crev(
                 }
                 match parse_cargo_crev_jsonl(&stdout) {
                     Ok(scan) => {
+                        ran = true;
                         if let Some((severity, message)) = crev_summary(&scan) {
                             push_issue(
                                 &mut report.issues,
@@ -1299,7 +1409,6 @@ fn enrich_cargo_crev(
                 }
             }
             Err(err) => {
-                ran = true;
                 push_issue(
                     &mut report.issues,
                     "warning",
@@ -1666,7 +1775,6 @@ fn enrich_python(
             AUDIT_TIMEOUT,
             &[("NO_COLOR", "1"), ("PIP_AUDIT_PROGRESS_SPINNER", "off")],
         );
-        ran = true;
         let Some(text) = scanner_stdout(
             out,
             &mut report.issues,
@@ -1677,7 +1785,11 @@ fn enrich_python(
             continue;
         };
         match parse_pip_audit_json(&text) {
-            Ok(mut vulns) => report.vulnerabilities.append(&mut vulns),
+            Ok(mut vulns) => {
+                ran = true;
+                mark_audited(report, format!("pip:{rel}"));
+                report.vulnerabilities.append(&mut vulns);
+            }
             Err(e) => push_issue(
                 &mut report.issues,
                 "warning",
@@ -1740,7 +1852,26 @@ fn enrich_go(
                 ("GOTOOLCHAIN", "local"),
             ],
         );
-        ran = true;
+        // `-json` exits 0 whether or not it finds anything; a non-zero exit
+        // (killed, build failure, timeout) leaves a stream that may stop on a
+        // message boundary and still parse, so it is never trusted.
+        if let Ok(o) = &out {
+            if !o.success {
+                let err = o.stderr_text();
+                push_issue(
+                    &mut report.issues,
+                    "warning",
+                    "govulncheck_failed",
+                    if err.is_empty() {
+                        format!("govulncheck exited {}", o.status_code)
+                    } else {
+                        err
+                    },
+                    Some(rel.clone()),
+                );
+                continue;
+            }
+        }
         let Some(text) = scanner_stdout(
             out,
             &mut report.issues,
@@ -1751,7 +1882,11 @@ fn enrich_go(
             continue;
         };
         match parse_govulncheck_stream(&text) {
-            Ok(mut vulns) => report.vulnerabilities.append(&mut vulns),
+            Ok(mut vulns) => {
+                ran = true;
+                mark_audited(report, format!("go:{rel}"));
+                report.vulnerabilities.append(&mut vulns);
+            }
             Err(e) => push_issue(
                 &mut report.issues,
                 "warning",
@@ -1816,7 +1951,6 @@ fn enrich_php(
                 ("COMPOSER_DISABLE_NETWORK", "0"),
             ],
         );
-        ran = true;
         let Some(text) = scanner_stdout(
             out,
             &mut report.issues,
@@ -1827,7 +1961,11 @@ fn enrich_php(
             continue;
         };
         match parse_composer_audit_json(&text) {
-            Ok(mut vulns) => report.vulnerabilities.append(&mut vulns),
+            Ok(mut vulns) => {
+                ran = true;
+                mark_audited(report, format!("php:{rel}"));
+                report.vulnerabilities.append(&mut vulns);
+            }
             Err(e) => push_issue(
                 &mut report.issues,
                 "warning",
@@ -1887,7 +2025,6 @@ fn enrich_ruby(
             AUDIT_TIMEOUT,
             &[("NO_COLOR", "1")],
         );
-        ran = true;
         let Some(text) = scanner_stdout(
             out,
             &mut report.issues,
@@ -1898,7 +2035,11 @@ fn enrich_ruby(
             continue;
         };
         match parse_bundler_audit_json(&text) {
-            Ok(mut vulns) => report.vulnerabilities.append(&mut vulns),
+            Ok(mut vulns) => {
+                ran = true;
+                mark_audited(report, format!("ruby:{rel}"));
+                report.vulnerabilities.append(&mut vulns);
+            }
             Err(e) => push_issue(
                 &mut report.issues,
                 "warning",
@@ -2026,9 +2167,9 @@ pub(crate) fn parse_bundler_audit_json(text: &str) -> Result<Vec<Vulnerability>,
 ///
 /// A check that could not run must never look like a check that ran clean:
 /// a non-zero exit with no parsable output is recorded as an issue naming the
-/// tool's stderr (or exit status when stderr is mute). Only a successful run
-/// with empty output counts as zero findings — scanners like pip-audit always
-/// emit at least `[]`, so emptiness there would itself be suspicious.
+/// tool's stderr (or exit status when stderr is mute). Empty output is never
+/// zero findings, even on exit 0: these scanners always emit at least `[]` or
+/// a config message, so emptiness is itself a failed run.
 fn scanner_stdout(
     out: Result<crate::engine::git_cli::CapturedOutput, String>,
     issues: &mut Vec<HealthIssue>,
@@ -2040,14 +2181,16 @@ fn scanner_stdout(
         Ok(o) => {
             let text = o.stdout_text();
             if text.trim().is_empty() {
-                if o.success {
-                    return None;
-                }
                 let err = o.stderr_text();
-                let message = if err.is_empty() {
-                    format!("{program} exited {} with no output", o.status_code)
-                } else {
+                let message = if !err.is_empty() {
                     err
+                } else if o.success {
+                    // Every wired scanner emits a document (at least `[]` or a
+                    // config message) even for a clean tree, so silence is a
+                    // run that produced nothing, not zero findings.
+                    format!("{program} exited 0 but printed nothing to parse")
+                } else {
+                    format!("{program} exited {} with no output", o.status_code)
                 };
                 push_issue(issues, "warning", code, message, label);
                 return None;
@@ -2061,16 +2204,29 @@ fn scanner_stdout(
     }
 }
 
+/// Every directory whose npm/bun lockfile needs its own audit: the repository
+/// root when it has a `package.json`, plus each distinct directory holding a
+/// lockfile (a nested `docs/package-lock.json` is its own audit). Workspace
+/// members that share their root's lockfile map to the root's directory, so
+/// they do not add roots.
 fn npm_scan_roots(manifests: &[NpmManifest]) -> Vec<String> {
-    let has_root = manifests.iter().any(|m| m.path == "package.json");
-    if has_root {
-        return vec![String::new()];
+    let mut roots: Vec<String> = Vec::new();
+    if manifests.iter().any(|m| m.path == "package.json") {
+        roots.push(String::new());
     }
-    manifests
-        .iter()
-        .filter(|m| m.lockfile.is_some())
-        .map(|m| dir_of(&m.path))
-        .collect()
+    for manifest in manifests {
+        if manifest.lockfile.is_none() {
+            continue;
+        }
+        let dir = manifest
+            .lockfile_dir
+            .clone()
+            .unwrap_or_else(|| dir_of(&manifest.path));
+        if !roots.contains(&dir) {
+            roots.push(dir);
+        }
+    }
+    roots
 }
 
 fn dir_of(path: &str) -> String {
@@ -2176,8 +2332,12 @@ fn npm_missing_message(npm_probe: &ToolProbe, node_probe: &ToolProbe, env: &Scan
             // Resolution re-runs the same PATH/fallback lookup the successful
             // spawn would have used; a bare-name passthrough means no absolute
             // location is known, and the message simply omits it.
-            let resolved =
-                resolve_spawn_program_with(npm_program(), env.path(), env.home());
+            let resolved = resolve_spawn_program_in(
+                npm_program(),
+                env.path(),
+                env.home(),
+                env.path_source,
+            );
             let location = if resolved.contains('/') || resolved.contains('\\') {
                 format!(" at {resolved}")
             } else {
@@ -2219,6 +2379,7 @@ fn capture_scanner_command(
         extra_env,
         env.path(),
         env.home(),
+        env.path_source,
     )
 }
 
@@ -2424,7 +2585,10 @@ fn read_npm_manifest(repo: &Path, rel: &str) -> Result<Option<NpmManifest>, Stri
 
 fn manifest_from_json(rel: &str, value: &Value, repo: &Path) -> NpmManifest {
     let dir = dir_of(rel);
-    let lockfile = detect_lockfile(repo, &dir);
+    let (lockfile, lockfile_dir) = match resolve_lockfile(repo, &dir) {
+        Some((name, lock_dir)) => (Some(name), Some(lock_dir)),
+        None => (None, None),
+    };
     let package_manager = declared_package_manager(value)
         .or_else(|| lockfile.as_deref().map(lockfile_to_manager))
         .unwrap_or("npm")
@@ -2465,6 +2629,7 @@ fn manifest_from_json(rel: &str, value: &Value, repo: &Path) -> NpmManifest {
             .map(|s| s.to_string()),
         package_manager,
         lockfile,
+        lockfile_dir,
         has_workspaces: value
             .get("workspaces")
             .map(|w| w.is_array() || w.is_object())
@@ -2497,6 +2662,61 @@ fn declared_package_manager(value: &Value) -> Option<&'static str> {
     } else {
         None
     }
+}
+
+/// The lockfile that covers the package in `dir`, and the directory holding it.
+///
+/// A package's own directory wins. A workspace member without one is covered
+/// by the nearest ancestor that declares workspaces (`package.json`
+/// `workspaces`, or `pnpm-workspace.yaml`) and has a lockfile: npm, yarn,
+/// pnpm and bun all keep one lockfile at the workspace root. An ancestor that
+/// merely happens to hold a lockfile does not cover an unrelated package.
+fn resolve_lockfile(repo: &Path, dir: &str) -> Option<(String, String)> {
+    if let Some(name) = detect_lockfile(repo, dir) {
+        return Some((name, dir.to_string()));
+    }
+    let mut current = dir.to_string();
+    while !current.is_empty() {
+        current = dir_of(&current);
+        if !declares_workspaces(repo, &current) {
+            continue;
+        }
+        if let Some(name) = detect_lockfile(repo, &current) {
+            return Some((name, current));
+        }
+    }
+    None
+}
+
+fn declares_workspaces(repo: &Path, dir: &str) -> bool {
+    let join = |name: &str| {
+        if dir.is_empty() {
+            name.to_string()
+        } else {
+            format!("{dir}/{name}")
+        }
+    };
+    if sandbox_join(repo, &join("pnpm-workspace.yaml")).is_ok_and(|p| p.is_file()) {
+        return true;
+    }
+    let Ok(path) = sandbox_join(repo, &join("package.json")) else {
+        return false;
+    };
+    let Ok(meta) = std::fs::metadata(&path) else {
+        return false;
+    };
+    if !meta.is_file() || meta.len() > MAX_MANIFEST_BYTES {
+        return false;
+    }
+    std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|text| serde_json::from_str::<Value>(text.trim_start_matches('\u{feff}')).ok())
+        .and_then(|value| {
+            value
+                .get("workspaces")
+                .map(|w| w.is_array() || w.is_object())
+        })
+        .unwrap_or(false)
 }
 
 fn detect_lockfile(repo: &Path, dir: &str) -> Option<String> {
@@ -2553,13 +2773,21 @@ fn js_lock_kind(lockfile: Option<&str>) -> JsLockKind {
 }
 
 fn js_audits_satisfied(report: &DepsHealthReport, ran: &dyn Fn(&str) -> bool) -> bool {
-    report.manifests.iter().all(
-        |manifest| match js_lock_kind(manifest.lockfile.as_deref()) {
-            JsLockKind::Npm => report.npm_cli_present && ran("npm"),
-            JsLockKind::Bun => report.bun_cli_present && ran("bun"),
+    report.manifests.iter().all(|manifest| {
+        // The audit that covers a manifest is the one over the directory that
+        // holds its lockfile (its own, or its workspace root's), and it must
+        // have parsed — not merely some audit having run somewhere.
+        let lock_dir = manifest
+            .lockfile_dir
+            .clone()
+            .unwrap_or_else(|| dir_of(&manifest.path));
+        let audited = report.audited_targets.contains(&format!("npm:{lock_dir}"));
+        match js_lock_kind(manifest.lockfile.as_deref()) {
+            JsLockKind::Npm => report.npm_cli_present && ran("npm") && audited,
+            JsLockKind::Bun => report.bun_cli_present && ran("bun") && audited,
             JsLockKind::Unsupported | JsLockKind::Missing => false,
-        },
-    )
+        }
+    })
 }
 
 fn skip_source(path: &str) -> bool {
@@ -2629,6 +2857,50 @@ fn cap_report(report: &mut DepsHealthReport) {
     }
 }
 
+/// Every audit target found, and which of them a scanner actually covered.
+fn audit_coverage(report: &DepsHealthReport, targets: &ScanTargets) -> AuditCoverage {
+    let mut found: Vec<String> = Vec::new();
+    for dir in npm_scan_roots(&report.manifests) {
+        found.push(format!("npm:{dir}"));
+    }
+    for (prefix, list) in [
+        ("cargo", &targets.cargo_locks),
+        ("pip", &targets.py_requirements),
+        ("go", &targets.go_mods),
+        ("php", &targets.composer_locks),
+        ("ruby", &targets.gemfile_locks),
+    ] {
+        found.extend(list.iter().map(|rel| format!("{prefix}:{rel}")));
+    }
+    let audited = found
+        .iter()
+        .filter(|key| report.audited_targets.contains(key))
+        .count();
+    let mut unaudited: Vec<String> = found
+        .iter()
+        .filter(|key| !report.audited_targets.contains(key))
+        .cloned()
+        .collect();
+    let total = found.len() + targets.unaudited.len();
+    unaudited.extend(
+        targets
+            .unaudited
+            .iter()
+            .map(|(family, rel)| format!("{family}:{rel}")),
+    );
+    AuditCoverage {
+        found: total,
+        audited,
+        unaudited,
+    }
+}
+
+fn mark_audited(report: &mut DepsHealthReport, key: String) {
+    if !report.audited_targets.contains(&key) {
+        report.audited_targets.push(key);
+    }
+}
+
 fn audit_is_complete(report: &DepsHealthReport, targets: &ScanTargets, run_cli: bool) -> bool {
     let coverage_limited = report
         .limit_notices
@@ -2674,6 +2946,14 @@ fn audit_is_complete(report: &DepsHealthReport, targets: &ScanTargets, run_cli: 
         || requirements
             .iter()
             .any(|(expected, completed)| *expected && !*completed)
+    {
+        return false;
+    }
+    // Both numbers must agree: a found target nobody audited — a second npm
+    // lockfile, a uv.lock, a family with no scanner — blocks completeness even
+    // though every family that did get a scanner ran.
+    if !report.audit_coverage.unaudited.is_empty()
+        || report.audit_coverage.audited != report.audit_coverage.found
     {
         return false;
     }
@@ -3124,11 +3404,31 @@ pub(crate) fn parse_cargo_audit_json(
 ) -> Result<(Vec<Vulnerability>, Vec<HealthIssue>), String> {
     let value: Value =
         serde_json::from_str(text.trim()).map_err(|e| format!("cargo audit JSON: {e}"))?;
+    // A document without a vulnerabilities list (`{"error": ...}`, a schema
+    // change) is a run that reported nothing, not a clean tree.
     let list = value
         .pointer("/vulnerabilities/list")
         .and_then(|v| v.as_array())
         .cloned()
-        .unwrap_or_default();
+        .ok_or_else(|| {
+            let detail = value
+                .get("error")
+                .and_then(|e| e.as_str())
+                .map(|e| format!(": {e}"))
+                .unwrap_or_default();
+            format!("cargo audit JSON has no vulnerabilities list{detail}")
+        })?;
+    if let Some(count) = value
+        .pointer("/vulnerabilities/count")
+        .and_then(|c| c.as_u64())
+    {
+        if count != list.len() as u64 {
+            return Err(format!(
+                "cargo audit JSON reports {count} vulnerabilities but lists {}",
+                list.len()
+            ));
+        }
+    }
     let mut out = Vec::new();
     for item in list {
         let advisory = item.get("advisory").unwrap_or(&item);
@@ -3163,7 +3463,7 @@ pub(crate) fn parse_cargo_audit_json(
             .get("cvss")
             .and_then(|v| v.as_str())
             .map(cvss_to_severity)
-            .unwrap_or_else(|| "high".into());
+            .unwrap_or_else(|| SEVERITY_UNKNOWN.into());
         out.push(Vulnerability {
             name: pkg,
             severity,
@@ -3234,8 +3534,16 @@ pub(crate) fn parse_cargo_audit_json(
     Ok((out, warnings))
 }
 
+/// Maps a CVSS score (`"7.5"`) or a CVSS v3 vector string
+/// (`"CVSS:3.1/AV:N/..."`, what RustSec publishes) to a severity bucket.
+///
+/// Anything that cannot be scored — a v4 vector, a malformed vector, a zero
+/// score — is [`SEVERITY_UNKNOWN`], never a guessed rating.
 fn cvss_to_severity(score: &str) -> String {
-    let n: f64 = score.parse().unwrap_or(0.0);
+    let n = match score.trim().parse::<f64>() {
+        Ok(n) => n,
+        Err(_) => cvss3_base_score(score).unwrap_or(0.0),
+    };
     if n >= 9.0 {
         "critical".into()
     } else if n >= 7.0 {
@@ -3245,9 +3553,97 @@ fn cvss_to_severity(score: &str) -> String {
     } else if n > 0.0 {
         "low".into()
     } else {
-        "high".into()
+        SEVERITY_UNKNOWN.into()
     }
 }
+
+/// CVSS v3.0/v3.1 base score from a vector string (FIRST specification,
+/// section 7.1), or `None` when the vector is not a complete v3 base vector.
+fn cvss3_base_score(vector: &str) -> Option<f64> {
+    let mut parts = vector.trim().split('/');
+    let head = parts.next()?;
+    if head != "CVSS:3.0" && head != "CVSS:3.1" {
+        return None;
+    }
+    let (mut av, mut ac, mut pr, mut ui, mut scope, mut c, mut i, mut a) =
+        (None, None, None, None, None, None, None, None);
+    for metric in parts {
+        let (key, value) = metric.split_once(':')?;
+        let slot = match key {
+            "AV" => &mut av,
+            "AC" => &mut ac,
+            "PR" => &mut pr,
+            "UI" => &mut ui,
+            "S" => &mut scope,
+            "C" => &mut c,
+            "I" => &mut i,
+            "A" => &mut a,
+            // Temporal and environmental metrics do not move the base score.
+            _ => continue,
+        };
+        *slot = Some(value);
+    }
+    let changed = match scope? {
+        "U" => false,
+        "C" => true,
+        _ => return None,
+    };
+    let av = match av? {
+        "N" => 0.85,
+        "A" => 0.62,
+        "L" => 0.55,
+        "P" => 0.2,
+        _ => return None,
+    };
+    let ac = match ac? {
+        "L" => 0.77,
+        "H" => 0.44,
+        _ => return None,
+    };
+    let pr = match (pr?, changed) {
+        ("N", _) => 0.85,
+        ("L", false) => 0.62,
+        ("L", true) => 0.68,
+        ("H", false) => 0.27,
+        ("H", true) => 0.5,
+        _ => return None,
+    };
+    let ui = match ui? {
+        "N" => 0.85,
+        "R" => 0.62,
+        _ => return None,
+    };
+    let cia = |v: Option<&str>| match v? {
+        "H" => Some(0.56),
+        "L" => Some(0.22),
+        "N" => Some(0.0),
+        _ => None,
+    };
+    let iss: f64 = 1.0 - (1.0 - cia(c)?) * (1.0 - cia(i)?) * (1.0 - cia(a)?);
+    let impact = if changed {
+        7.52 * (iss - 0.029) - 3.25 * (iss - 0.02).powi(15)
+    } else {
+        6.42 * iss
+    };
+    if impact <= 0.0 {
+        return Some(0.0);
+    }
+    let exploitability = 8.22 * av * ac * pr * ui;
+    let raw: f64 = if changed {
+        1.08 * (impact + exploitability)
+    } else {
+        impact + exploitability
+    };
+    // Roundup per the specification's integer formulation, immune to float
+    // noise such as 4.000000000000001.
+    let scaled = (raw.min(10.0) * 100_000.0).round() as i64;
+    Some(if scaled % 10_000 == 0 {
+        scaled as f64 / 100_000.0
+    } else {
+        ((scaled / 10_000) + 1) as f64 / 10.0
+    })
+}
+
 /// Parses `pip-audit --format json` output.
 ///
 /// Two root shapes exist in the wild: current releases (verified against
@@ -3356,7 +3752,7 @@ pub(crate) fn parse_pip_audit_json(text: &str) -> Result<Vec<Vulnerability>, Str
 pub(crate) fn parse_govulncheck_stream(text: &str) -> Result<Vec<Vulnerability>, String> {
     let trimmed = text.trim();
     if trimmed.is_empty() {
-        return Ok(Vec::new());
+        return Err("govulncheck output was empty".into());
     }
     struct ModuleFinding {
         name: String,
@@ -3367,18 +3763,19 @@ pub(crate) fn parse_govulncheck_stream(text: &str) -> Result<Vec<Vulnerability>,
     let mut osv_urls: BTreeMap<String, String> = BTreeMap::new();
     let mut seen: BTreeMap<(String, String), ModuleFinding> = BTreeMap::new();
     let mut parsed_any = false;
+    let mut saw_config = false;
 
     let deserializer = serde_json::Deserializer::from_str(trimmed);
     for item in deserializer.into_iter::<Value>() {
-        // A corrupt trailing segment (truncated run, interleaved writer)
-        // skips rather than poisoning everything before it.
-        let Ok(value) = item else {
-            continue;
-        };
+        // A corrupt segment means findings after it were never read; an
+        // incomplete stream must not report the findings before it as the
+        // whole answer.
+        let value = item.map_err(|e| format!("govulncheck stream is truncated or corrupt: {e}"))?;
         if !value.is_object() {
             continue;
         }
         parsed_any = true;
+        saw_config |= value.get("config").is_some();
         if let Some(osv) = value.get("osv") {
             let id = json_str(osv, "id");
             if id.is_empty() {
@@ -3442,6 +3839,11 @@ pub(crate) fn parse_govulncheck_stream(text: &str) -> Result<Vec<Vulnerability>,
 
     if !parsed_any {
         return Err("govulncheck output contained no JSON messages".into());
+    }
+    if !saw_config {
+        // govulncheck -json opens every stream with a config message; without
+        // it this is not a complete run's output.
+        return Err("govulncheck stream has no config message".into());
     }
     let mut out = Vec::new();
     for ((id, _module), mf) in seen {
@@ -3570,12 +3972,14 @@ fn composer_error_message(value: &Value) -> Option<String> {
     }
 }
 
-/// Conservative engines.node check: flag only when the running Node major
+/// Conservative engines.node check: flag only when the running Node version
 /// satisfies NONE of the spec's `||` alternatives. Each alternative is an AND
-/// of its comparators; unparsable fragments are skipped rather than allowed
-/// to discard their neighbours, and unparseable specs produce no warning.
+/// of its comparators, compared on full `major.minor.patch` (so `>18.5.0`
+/// admits 18.20.0 and `<20.1` bounds the minor); unparsable fragments are
+/// skipped rather than allowed to discard their neighbours, and unparseable
+/// specs produce no warning.
 pub(crate) fn engines_mismatch(spec: &str, node_version: &str) -> Option<String> {
-    let current = parse_node_major(node_version)?;
+    let current = parse_node_version(node_version)?;
     let spec = spec.trim();
     if spec.is_empty() || spec == "*" {
         return None;
@@ -3583,12 +3987,12 @@ pub(crate) fn engines_mismatch(spec: &str, node_version: &str) -> Option<String>
     let mut parsed_any = false;
     let mut satisfied_any = false;
     for clause in spec.split("||") {
-        let Some((min_major, max_exclusive)) = parse_engine_bounds(clause) else {
+        let Some(bounds) = parse_engine_bounds(clause) else {
             continue;
         };
         parsed_any = true;
-        let above_min = min_major.is_none_or(|min| current >= min);
-        let below_max = max_exclusive.is_none_or(|max| current < max);
+        let above_min = bounds.min.is_none_or(|min| current >= min);
+        let below_max = bounds.max_exclusive.is_none_or(|max| current < max);
         if above_min && below_max {
             satisfied_any = true;
         }
@@ -3601,46 +4005,115 @@ pub(crate) fn engines_mismatch(spec: &str, node_version: &str) -> Option<String>
     None
 }
 
-pub(crate) fn parse_node_major(version: &str) -> Option<u32> {
-    let s = version.trim().trim_start_matches('v');
-    let digits: String = s.chars().take_while(|c| c.is_ascii_digit()).collect();
-    digits.parse().ok()
+type Version = [u64; 3];
+
+/// Inclusive lower and exclusive upper bound of one `||`-free clause.
+#[derive(Default)]
+struct EngineBounds {
+    min: Option<Version>,
+    max_exclusive: Option<Version>,
 }
 
-/// Parses ONE `||`-free clause into inclusive-major bounds. Comparators AND
-/// together; a hyphen range (`16.4.0 - 18.2.0`, spaced or glued) is the
-/// interval [A, B] with B inclusive; unknown fragments are skipped instead
-/// of discarding the bounds already parsed.
-fn parse_engine_bounds(clause: &str) -> Option<(Option<u32>, Option<u32>)> {
+impl EngineBounds {
+    fn raise_min(&mut self, v: Version) {
+        self.min = Some(self.min.map_or(v, |m| m.max(v)));
+    }
+    fn lower_max(&mut self, v: Version) {
+        self.max_exclusive = Some(self.max_exclusive.map_or(v, |m| m.min(v)));
+    }
+}
+
+fn parse_node_version(version: &str) -> Option<Version> {
+    let (parts, _) = parse_partial(version)?;
+    Some([parts[0]?, parts[1].unwrap_or(0), parts[2].unwrap_or(0)])
+}
+
+/// `18`, `18.5`, `v18.5.0`, `18.x`, `18.5.0-rc.1` → the numeric parts given
+/// (wildcards and missing parts are `None`) and how many were given.
+fn parse_partial(raw: &str) -> Option<([Option<u64>; 3], usize)> {
+    let raw = raw.trim().trim_start_matches('v').trim_start_matches('=');
+    // Prerelease and build tags do not move the numeric bounds.
+    let raw = raw.split(['-', '+']).next().unwrap_or("");
+    let mut parts = [None; 3];
+    let mut given = 0;
+    for (i, piece) in raw.split('.').enumerate() {
+        if i >= 3 {
+            return None;
+        }
+        match piece {
+            "x" | "X" | "*" | "" => break,
+            digits => {
+                parts[i] = Some(digits.parse().ok()?);
+                given = i + 1;
+            }
+        }
+    }
+    parts[0]?;
+    Some((parts, given))
+}
+
+fn padded(parts: [Option<u64>; 3]) -> Version {
+    [
+        parts[0].unwrap_or(0),
+        parts[1].unwrap_or(0),
+        parts[2].unwrap_or(0),
+    ]
+}
+
+/// The first version above everything the partial `parts` (of `given` numbers)
+/// stands for: `18` → 19.0.0, `18.5` → 18.6.0, `18.5.2` → 18.5.3.
+fn next_after(parts: [Option<u64>; 3], given: usize) -> Version {
+    let mut v = padded(parts);
+    let idx = given.clamp(1, 3) - 1;
+    v[idx] += 1;
+    for slot in v.iter_mut().skip(idx + 1) {
+        *slot = 0;
+    }
+    v
+}
+
+/// Parses ONE `||`-free clause. Comparators AND together; an operator may be
+/// separated from its operand by whitespace (`< 20`); a hyphen range
+/// (`16.4.0 - 18.2.0`, spaced or glued) is `>=A <=B`; unknown fragments are
+/// skipped instead of discarding the bounds already parsed.
+fn parse_engine_bounds(clause: &str) -> Option<EngineBounds> {
     let clause = clause.trim();
     if clause.is_empty() || clause == "*" {
         return None;
     }
-    let mut min: Option<u32> = None;
-    let mut max_ex: Option<u32> = None;
-
-    // Split glued hyphen ranges first so token iteration stays uniform.
-    let mut tokens: Vec<String> = Vec::new();
+    // Uniform tokens: split glued hyphen ranges, then glue each bare operator
+    // to the operand that follows it.
+    let mut raw_tokens: Vec<String> = Vec::new();
     for raw in clause.split_whitespace() {
-        let mut piece = raw.trim().to_string();
-        if !piece.contains(' ') && !piece.contains('-') {
-            tokens.push(piece);
+        match find_hyphen_range_split(raw) {
+            Some(idx) => {
+                raw_tokens.push(raw[..idx].to_string());
+                raw_tokens.push("-".to_string());
+                raw_tokens.push(raw[idx + 1..].to_string());
+            }
+            None => raw_tokens.push(raw.to_string()),
+        }
+    }
+    let mut tokens: Vec<String> = Vec::new();
+    let mut pending_op = String::new();
+    for token in raw_tokens {
+        let token = token.trim_matches(',').to_string();
+        if !token.is_empty()
+            && token
+                .chars()
+                .all(|c| matches!(c, '<' | '>' | '=' | '^' | '~'))
+        {
+            pending_op.push_str(&token);
             continue;
         }
-        // Hyphen ranges carry a '-' between two version-looking operands.
-        if let Some(idx) = find_hyphen_range_split(&piece) {
-            let a = piece[..idx].to_string();
-            let b = piece[idx + 1..].to_string();
-            tokens.push(a);
-            tokens.push("-".to_string());
-            piece = b;
-        }
-        tokens.push(piece);
+        tokens.push(format!("{pending_op}{token}"));
+        pending_op.clear();
     }
 
+    let mut bounds = EngineBounds::default();
     let mut expect_upper = false;
-    for token in &tokens {
-        let token = token.trim().trim_matches(',');
+    for (index, token) in tokens.iter().enumerate() {
+        let token = token.as_str();
         if token.is_empty() || token == "||" {
             continue;
         }
@@ -3648,41 +4121,78 @@ fn parse_engine_bounds(clause: &str) -> Option<(Option<u32>, Option<u32>)> {
             expect_upper = true;
             continue;
         }
-        if let Some(rest) = token.strip_prefix(">=") {
-            min = Some(leading_major(rest).unwrap_or(min.unwrap_or(0)));
-        } else if let Some(rest) = token.strip_prefix('>') {
-            if let Some(n) = leading_major(rest) {
-                min = Some(n.saturating_add(1));
-            }
-        } else if let Some(rest) = token.strip_prefix("<=") {
-            if let Some(n) = leading_major(rest) {
-                max_ex = Some(n.saturating_add(1));
-            }
-        } else if let Some(rest) = token.strip_prefix('<') {
-            if let Some(n) = leading_major(rest) {
-                max_ex = Some(n);
-            }
-        } else if let Some(rest) = token.strip_prefix('^').or_else(|| token.strip_prefix('~')) {
-            let m = leading_major(rest);
-            min = m;
-            if let Some(n) = m {
-                max_ex = Some(n.saturating_add(1));
-            }
-        } else if expect_upper {
-            // Upper bound of a hyphen range: inclusive, hence +1 exclusive.
-            if let Some(n) = leading_major(token) {
-                max_ex = Some(n.saturating_add(1));
+        if expect_upper {
+            // Upper bound of a hyphen range: inclusive of what it names.
+            if let Some((parts, given)) = parse_partial(token) {
+                bounds.lower_max(next_after(parts, given));
             }
             expect_upper = false;
-        } else if token.chars().next().is_some_and(|c| c.is_ascii_digit()) {
-            min = leading_major(token);
+            continue;
+        }
+        if let Some(rest) = token.strip_prefix(">=") {
+            if let Some((parts, _)) = parse_partial(rest) {
+                bounds.raise_min(padded(parts));
+            }
+        } else if let Some(rest) = token.strip_prefix('>') {
+            if let Some((parts, given)) = parse_partial(rest) {
+                bounds.raise_min(next_after(parts, given));
+            }
+        } else if let Some(rest) = token.strip_prefix("<=") {
+            if let Some((parts, given)) = parse_partial(rest) {
+                bounds.lower_max(next_after(parts, given));
+            }
+        } else if let Some(rest) = token.strip_prefix('<') {
+            if let Some((parts, _)) = parse_partial(rest) {
+                bounds.lower_max(padded(parts));
+            }
+        } else if let Some(rest) = token.strip_prefix('^') {
+            if let Some((parts, given)) = parse_partial(rest) {
+                let v = padded(parts);
+                bounds.raise_min(v);
+                let at = if v[0] > 0 || given <= 1 {
+                    0
+                } else if v[1] > 0 || given <= 2 {
+                    1
+                } else {
+                    2
+                };
+                bounds.lower_max(next_at(v, at));
+            }
+        } else if let Some(rest) = token.strip_prefix('~') {
+            if let Some((parts, given)) = parse_partial(rest) {
+                bounds.raise_min(padded(parts));
+                bounds.lower_max(next_at(padded(parts), if given >= 2 { 1 } else { 0 }));
+            }
+        } else if token
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_digit() || c == 'v')
+        {
+            // A bare version: `18`/`18.x` is the whole major, `18.5.2` itself.
+            if let Some((parts, given)) = parse_partial(token) {
+                bounds.raise_min(padded(parts));
+                // The lower end of `A - B` is only a minimum.
+                let starts_range = tokens.get(index + 1).is_some_and(|t| t == "-");
+                if given < 3 && !starts_range {
+                    bounds.lower_max(next_after(parts, given));
+                }
+            }
         }
     }
-    if min.is_none() && max_ex.is_none() {
+    if bounds.min.is_none() && bounds.max_exclusive.is_none() {
         None
     } else {
-        Some((min, max_ex))
+        Some(bounds)
     }
+}
+
+/// Bumps `v[at]` and zeroes what follows it.
+fn next_at(mut v: Version, at: usize) -> Version {
+    v[at] += 1;
+    for slot in v.iter_mut().skip(at + 1) {
+        *slot = 0;
+    }
+    v
 }
 
 /// Finds the split index of a hyphen-range operator inside a single token:
@@ -3716,12 +4226,6 @@ fn find_hyphen_range_split(token: &str) -> Option<usize> {
         }
     }
     None
-}
-
-fn leading_major(s: &str) -> Option<u32> {
-    let s = s.trim().trim_start_matches('v');
-    let digits: String = s.chars().take_while(|c| c.is_ascii_digit()).collect();
-    digits.parse().ok()
 }
 
 #[cfg(test)]
@@ -4211,7 +4715,7 @@ mod tests {
         assert!(engines_mismatch("^18.0.0", "v16.0.0").is_some());
         assert!(engines_mismatch("*", "v12.0.0").is_none());
         assert!(engines_mismatch("not-a-spec", "v20.0.0").is_none());
-        assert_eq!(parse_node_major("v20.11.1"), Some(20));
+        assert_eq!(parse_node_version("v20.11.1"), Some([20, 11, 1]));
     }
 
     /// Regression (audit M8): a hyphen range used to overwrite its own
@@ -4219,7 +4723,11 @@ mod tests {
     #[test]
     fn engines_hyphen_range_is_treated_as_inclusive_interval() {
         assert!(engines_mismatch("16.4.0 - 18.2.0", "v17.9.0").is_none());
-        assert!(engines_mismatch("16.4.0 - 18.2.0", "v18.2.99").is_none());
+        // Reason this changed: it asserted 18.2.99 satisfies `... - 18.2.0`,
+        // an artifact of comparing majors only. A full-version upper bound is
+        // inclusive of that version and nothing above it.
+        assert!(engines_mismatch("16.4.0 - 18.2.0", "v18.2.0").is_none());
+        assert!(engines_mismatch("16.4.0 - 18.2.0", "v18.2.99").is_some());
         assert!(engines_mismatch("16.4.0 - 18.2.0", "v15.0.0").is_some());
         assert!(engines_mismatch("16.4.0 - 18.2.0", "v19.0.0").is_some());
         // Glued form without spaces.
@@ -4530,11 +5038,14 @@ mod tests {
 {"finding":{"osv":"GO-2022-0969","fixed_version":"","trace":[{"module":"stdlib","version":"go1.24.0"}]}}
 {"finding":{"osv":"GO-2021-0111","fixed_version":"v0.3.7","trace":[{"module":"golang.org/x/text","version":"v0.3.5","package":"golang.org/x/text/language"}]}}
 {"finding":{"osv":"GO-2021-0111","fixed_version":"v0.3.7","trace":[{"module":"golang.org/x/text","version":"v0.3.5","package":"golang.org/x/text/language","function":"Parse"},{"module":"tmp","function":"main"}]}}
-not-json-at-all
 "#;
 
     #[test]
     fn parse_govulncheck_keeps_module_level_and_dedupes() {
+        // A trailing garbage line used to ride along in this fixture and be
+        // skipped; corrupt segments are now an error (see
+        // govulncheck_killed_midstream_is_not_clean).
+        assert!(parse_govulncheck_stream(&format!("{GOVULN_STREAM}not-json-at-all\n")).is_err());
         let vulns = parse_govulncheck_stream(GOVULN_STREAM).expect("parse");
         assert_eq!(vulns.len(), 2, "one row per (osv, module): {vulns:?}");
         let xtext = vulns
@@ -4561,8 +5072,8 @@ not-json-at-all
 
     #[test]
     fn parse_govulncheck_empty_and_all_garbage() {
-        assert!(parse_govulncheck_stream("").unwrap().is_empty());
-        assert!(parse_govulncheck_stream("   \n \n").unwrap().is_empty());
+        assert!(parse_govulncheck_stream("").is_err());
+        assert!(parse_govulncheck_stream("   \n \n").is_err());
         assert!(parse_govulncheck_stream("garbage\nmore garbage").is_err());
     }
 
@@ -4570,11 +5081,11 @@ not-json-at-all
     fn parse_govulncheck_survives_truncated_stream_mid_line() {
         let truncated =
             "{\"config\":{\"protocol_version\":\"v1.0.0\"}}\n{\"finding\":{\"osv\":\"GO-202";
-        let vulns = parse_govulncheck_stream(truncated).unwrap();
-        assert!(
-            vulns.is_empty(),
-            "partial finding line is skipped: {vulns:?}"
-        );
+        // Reason this changed: it used to assert the partial line is skipped
+        // and the stream reads as zero findings, which reports a killed run
+        // as clean. A truncated stream is now an error.
+        let err = parse_govulncheck_stream(truncated).unwrap_err();
+        assert!(err.contains("truncated or corrupt"), "{err}");
     }
 
     /// Captured verbatim (abbreviated) from govulncheck v1.7.0 against a
@@ -5228,6 +5739,7 @@ not-json-at-all
                 engines_node: None,
                 package_manager: "npm".into(),
                 lockfile: Some("package-lock.json".into()),
+                lockfile_dir: Some(String::new()),
                 has_workspaces: true,
                 dep_count: 0,
                 dev_dep_count: 0,
@@ -5244,6 +5756,7 @@ not-json-at-all
                 engines_node: None,
                 package_manager: "npm".into(),
                 lockfile: None,
+                lockfile_dir: None,
                 has_workspaces: false,
                 dep_count: 0,
                 dev_dep_count: 0,
@@ -5662,6 +6175,65 @@ not-json-at-all
         assert!(!report.audit_complete);
     }
 
+    /// An explicit `path_var` is the whole search path. The GUI-launch
+    /// fallback dirs exist for an *inherited* minimal PATH; searched under a
+    /// caller's PATH they made the seam leak, so a test that hid cargo-deny
+    /// still saw `/opt/homebrew/bin/cargo-deny` on any host that had one.
+    /// The tool sits in `~/.cargo/bin` of a scratch HOME — a fallback dir the
+    /// seam itself controls — so this holds on every host.
+    #[cfg(unix)]
+    #[test]
+    fn an_explicit_path_var_is_not_widened_by_gui_fallback_dirs() {
+        let repo = git_repo();
+        write(repo.path(), "Cargo.lock", "# generated\nversion = 3\n");
+        write(
+            repo.path(),
+            "Cargo.toml",
+            "[package]\nname = \"demo\"\nversion = \"1.0.0\"\n",
+        );
+        write(repo.path(), "deny.toml", "[advisories]\n");
+        git_add(repo.path(), "Cargo.lock");
+        git_add(repo.path(), "Cargo.toml");
+        git_add(repo.path(), "deny.toml");
+        let home = TempDir::new().unwrap();
+        let cargo_bin = home.path().join(".cargo/bin");
+        fs::create_dir_all(&cargo_bin).unwrap();
+        let deny_log = home.path().join("cargo-deny-argv");
+        write_exec(
+            &cargo_bin,
+            "cargo-deny",
+            &format!(
+                "#!/bin/sh\necho \"$*\" >> {}\necho 'cargo-deny 0.20.2'\nexit 0\n",
+                deny_log.display()
+            ),
+        );
+        let stubs = TempDir::new().unwrap();
+        write_exec(
+            stubs.path(),
+            "cargo-audit",
+            "#!/bin/sh\nif [ \"$2\" = --version ]; then echo 'cargo-audit 0.22.0'; exit 0; fi\necho '{\"vulnerabilities\":{\"list\":[]},\"warnings\":{}}'\nexit 0\n",
+        );
+        let path_var =
+            std::env::join_paths([stubs.path(), Path::new("/usr/bin"), Path::new("/bin")]).unwrap();
+        let report = DepsScanner::scan_with(
+            repo.path().to_str().unwrap(),
+            ScanOptions {
+                run_cli: true,
+                path_var: Some(path_var),
+                home: Some(home.path().as_os_str().to_owned()),
+            },
+        )
+        .expect("scan");
+        assert!(report.cargo_audit_present);
+        assert!(
+            !deny_log.exists(),
+            "cargo-deny outside the explicit PATH was spawned: {}",
+            fs::read_to_string(&deny_log).unwrap_or_default()
+        );
+        assert!(!report.cargo_deny_present);
+        assert!(!report.audit_complete);
+    }
+
     /// `cargo crev verify` creates an identity when none exists. A Health scan
     /// must not be that write.
     #[cfg(unix)]
@@ -5760,7 +6332,9 @@ not-json-at-all
         )
         .expect("scan");
 
-        assert_eq!(report.scanners_ran, vec!["npm".to_string()]);
+        // Reason this changed: a scanner whose output could not be parsed is
+        // not "ran" (it used to be, because the command was dispatched).
+        assert!(report.scanners_ran.is_empty(), "{:?}", report.scanners_ran);
         assert!(!report.audit_complete);
         assert!(report
             .issues
@@ -6108,6 +6682,7 @@ not-json-at-all
     fn npm_missing_message_matches_resolution_truth() {
         let env = ScanEnv {
             path_var: None,
+            path_source: PathSource::Inherited,
             home: None,
         };
         let broken = ToolProbe::FoundButFailed("env: node: No such file or directory".to_string());
@@ -6146,6 +6721,7 @@ not-json-at-all
         write_exec(dir.path(), "gitpulse-silent-probe", "#!/bin/sh\nexit 0\n");
         let silent_env = ScanEnv {
             path_var: Some(dir.path().as_os_str().to_os_string()),
+            path_source: PathSource::Explicit,
             home: None,
         };
         match probe_tool_version(
@@ -6169,6 +6745,7 @@ not-json-at-all
         );
         let slow_env = ScanEnv {
             path_var: Some(dir.path().as_os_str().to_os_string()),
+            path_source: PathSource::Explicit,
             home: None,
         };
         match probe_tool_version(
@@ -6191,6 +6768,7 @@ not-json-at-all
     fn probe_reports_not_found_with_spawn_error_text() {
         let env = ScanEnv {
             path_var: Some(std::ffi::OsString::new()),
+            path_source: PathSource::Explicit,
             home: None,
         };
         match probe_tool_version(
@@ -6324,5 +6902,356 @@ not-json-at-all
             handle.join().expect("scan thread panicked");
         }
         assert_eq!(ok.load(Ordering::SeqCst), rounds);
+    }
+}
+
+#[cfg(test)]
+mod fail_closed_tests {
+    use super::*;
+    use crate::engine::git_cli::CapturedOutput;
+
+    fn captured(status: i32, success: bool, stdout: &str, stderr: &str) -> CapturedOutput {
+        CapturedOutput {
+            stdout: stdout.as_bytes().to_vec(),
+            stderr: stderr.as_bytes().to_vec(),
+            success,
+            status_code: status,
+        }
+    }
+
+    /// The scanner_stdout -> parse_govulncheck_stream path enrich_go runs.
+    /// Returns whether the run was reported (an issue or a parse error).
+    fn go_reported(out: CapturedOutput) -> bool {
+        let mut issues = Vec::new();
+        match scanner_stdout(
+            Ok(out),
+            &mut issues,
+            "govulncheck_failed",
+            "govulncheck",
+            None,
+        ) {
+            None => !issues.is_empty(),
+            Some(text) => parse_govulncheck_stream(&text).is_err() || !issues.is_empty(),
+        }
+    }
+
+    #[test]
+    fn govulncheck_killed_midstream_is_not_clean() {
+        let out = captured(
+            137,
+            false,
+            "{\"config\":{\"protocol_version\":\"v1.0.0\"}}\n{\"finding\":{\"osv\":\"GO-202",
+            "signal: killed",
+        );
+        assert!(go_reported(out));
+    }
+
+    #[test]
+    fn govulncheck_exit_zero_empty_stdout_is_not_clean() {
+        assert!(go_reported(captured(0, true, "", "")));
+    }
+
+    #[test]
+    fn govulncheck_stream_without_config_is_not_a_complete_run() {
+        let err = parse_govulncheck_stream(r#"{"osv":{"id":"GO-1"}}"#).unwrap_err();
+        assert!(err.contains("config"), "{err}");
+        assert!(
+            parse_govulncheck_stream(r#"{"config":{"protocol_version":"v1.0.0"}}"#)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn scanner_stdout_flags_silent_success_for_every_scanner() {
+        for program in ["pip-audit", "composer", "bundler-audit"] {
+            let mut issues = Vec::new();
+            let text = scanner_stdout(
+                Ok(captured(0, true, "  \n", "")),
+                &mut issues,
+                "x_failed",
+                program,
+                None,
+            );
+            assert!(text.is_none());
+            assert_eq!(issues.len(), 1, "{program}: {issues:?}");
+        }
+    }
+
+    #[test]
+    fn cargo_audit_without_vulnerabilities_section_is_not_clean() {
+        let err =
+            parse_cargo_audit_json(r#"{"error":"couldn't fetch advisory database"}"#).unwrap_err();
+        assert!(err.contains("couldn't fetch"), "{err}");
+        assert!(parse_cargo_audit_json(r#"{"vulnerabilities":{"found":false}}"#).is_err());
+    }
+
+    #[test]
+    fn cargo_audit_count_must_match_the_list() {
+        let doc = r#"{"vulnerabilities":{"found":true,"count":2,"list":[
+            {"advisory":{"id":"RUSTSEC-1","package":"a"},"versions":{"patched":[]}}]}}"#;
+        let err = parse_cargo_audit_json(doc).unwrap_err();
+        assert!(err.contains("2") && err.contains("1"), "{err}");
+        let ok = r#"{"vulnerabilities":{"found":false,"count":0,"list":[]}}"#;
+        assert!(parse_cargo_audit_json(ok).unwrap().0.is_empty());
+    }
+
+    #[test]
+    fn cvss_vectors_map_to_their_real_severity() {
+        assert_eq!(
+            cvss_to_severity("CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"),
+            "critical"
+        );
+        assert_eq!(
+            cvss_to_severity("CVSS:3.1/AV:P/AC:H/PR:H/UI:R/S:U/C:L/I:N/A:N"),
+            "low"
+        );
+        // 6.1: the classic reflected-XSS vector.
+        assert_eq!(
+            cvss_to_severity("CVSS:3.1/AV:N/AC:L/PR:N/UI:R/S:C/C:L/I:L/A:N"),
+            "moderate"
+        );
+        assert_eq!(
+            cvss_to_severity("CVSS:3.0/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:N/A:N"),
+            "high"
+        );
+        assert_eq!(cvss_to_severity("7.5"), "high");
+    }
+
+    #[test]
+    fn unscorable_cvss_is_unknown_not_high() {
+        for bad in [
+            "",
+            "garbage",
+            "CVSS:4.0/AV:N/AC:L/AT:N/PR:N/UI:N/VC:H/VI:H/VA:H/SC:N/SI:N/SA:N",
+            "CVSS:3.1/AV:N",
+            "0.0",
+        ] {
+            assert_eq!(cvss_to_severity(bad), SEVERITY_UNKNOWN, "{bad}");
+        }
+    }
+
+    #[test]
+    fn cargo_audit_missing_cvss_is_unknown() {
+        let doc = r#"{"vulnerabilities":{"count":1,"list":[
+            {"advisory":{"id":"RUSTSEC-1","package":"a"},"versions":{"patched":[]}}]}}"#;
+        assert_eq!(
+            parse_cargo_audit_json(doc).unwrap().0[0].severity,
+            SEVERITY_UNKNOWN
+        );
+    }
+
+    // -- engines.node ranges ---------------------------------------------------
+
+    #[test]
+    fn engines_ranges_compare_full_versions() {
+        // Spaced operator: used to read `20` as a minimum and flag v18.
+        assert!(engines_mismatch(">=18 < 20", "v18.20.0").is_none());
+        assert!(engines_mismatch(">=18 < 20", "v20.0.0").is_some());
+        // `< 20` alone used to read `20` as a minimum and miss v22.
+        assert!(engines_mismatch("< 20", "v22.0.0").is_some());
+        assert!(engines_mismatch("< 20", "v18.0.0").is_none());
+        // Minor-level strict bound: 18.20.0 is above 18.5.0.
+        assert!(engines_mismatch(">18.5.0", "v18.20.0").is_none());
+        assert!(engines_mismatch(">18.5.0", "v18.5.0").is_some());
+        assert!(engines_mismatch(">=18.5.0 <18.6", "v18.5.9").is_none());
+        assert!(engines_mismatch(">=18.5.0 <18.6", "v18.6.0").is_some());
+        assert!(engines_mismatch("<=20.1", "v20.1.9").is_none());
+        assert!(engines_mismatch("~18.5", "v18.6.0").is_some());
+        assert!(engines_mismatch("^0.2.3", "v0.3.0").is_some());
+        assert!(engines_mismatch("18.x", "v18.19.0").is_none());
+        assert!(engines_mismatch("18.x", "v20.0.0").is_some());
+        assert!(engines_mismatch("16 - 18", "v18.9.0").is_none());
+        assert!(engines_mismatch("16 - 18", "v19.0.0").is_some());
+    }
+
+    // -- coverage: found versus audited -----------------------------------------
+
+    #[cfg(unix)]
+    fn scan_with_stubs(repo: &Path, scripts: &[(&str, &str)]) -> DepsHealthReport {
+        use std::os::unix::fs::PermissionsExt;
+        let stubs = tempfile::TempDir::new().unwrap();
+        for (name, body) in scripts {
+            let path = stubs.path().join(name);
+            std::fs::write(&path, body).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let path_var =
+            std::env::join_paths([stubs.path(), Path::new("/usr/bin"), Path::new("/bin")]).unwrap();
+        DepsScanner::scan_with(
+            repo.to_str().unwrap(),
+            ScanOptions {
+                run_cli: true,
+                path_var: Some(path_var),
+                home: None,
+            },
+        )
+        .expect("scan")
+    }
+
+    #[cfg(unix)]
+    fn git_add_all(repo: &Path) {
+        use crate::procguard::LockedSpawn;
+        let status = std::process::Command::new("git")
+            .args(["add", "-A"])
+            .current_dir(repo)
+            .status_locked()
+            .unwrap();
+        assert!(status.success());
+    }
+
+    #[cfg(unix)]
+    const NODE_STUB: (&str, &str) = (
+        "node",
+        "#!/bin/sh\nif [ \"$1\" = -v ]; then echo v20.0.0; fi\n",
+    );
+    #[cfg(unix)]
+    const CLEAN_NPM_STUB: (&str, &str) = (
+        "npm",
+        "#!/bin/sh\ncase \"$1\" in\n  --version) echo 10.9.0 ;;\n  audit) echo '{\"auditReportVersion\":2,\"vulnerabilities\":{},\"metadata\":{\"vulnerabilities\":{\"total\":0}}}' ;;\n  outdated) echo '{}' ;;\nesac\n",
+    );
+
+    #[cfg(unix)]
+    fn npm_repo(files: &[(&str, &str)]) -> tempfile::TempDir {
+        let repo = crate::test_support::git_repo();
+        for (rel, content) in files {
+            crate::test_support::write(repo.path(), rel, content);
+        }
+        git_add_all(repo.path());
+        repo
+    }
+
+    #[cfg(unix)]
+    const PKG: &str = r#"{"name":"demo","version":"1.0.0"}"#;
+    #[cfg(unix)]
+    const LOCK: &str = r#"{"name":"demo","lockfileVersion":3}"#;
+
+    #[cfg(unix)]
+    #[test]
+    fn a_clean_root_audit_alone_is_complete_with_matching_counts() {
+        let repo = npm_repo(&[("package.json", PKG), ("package-lock.json", LOCK)]);
+        let report = scan_with_stubs(repo.path(), &[NODE_STUB, CLEAN_NPM_STUB]);
+        assert!(report.audit_complete, "{:?}", report.issues);
+        assert_eq!(report.audit_coverage.found, 1);
+        assert_eq!(report.audit_coverage.audited, 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_nested_npm_lockfile_is_audited_or_blocks_completeness() {
+        let repo = npm_repo(&[
+            ("package.json", PKG),
+            ("package-lock.json", LOCK),
+            ("docs/package.json", PKG),
+            ("docs/package-lock.json", LOCK),
+        ]);
+        let report = scan_with_stubs(repo.path(), &[NODE_STUB, CLEAN_NPM_STUB]);
+        assert_eq!(
+            report.audit_coverage.found, 2,
+            "{:?}",
+            report.audit_coverage
+        );
+        assert_eq!(report.audit_coverage.audited, 2);
+        assert!(report.audit_complete, "{:?}", report.issues);
+
+        // Without npm the nested lockfile cannot be audited and the audit
+        // must not claim it was.
+        let none = scan_with_stubs(repo.path(), &[NODE_STUB]);
+        assert!(!none.audit_complete);
+        assert_eq!(none.audit_coverage.found, 2);
+        assert_eq!(none.audit_coverage.audited, 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_workspace_member_uses_the_root_lockfile() {
+        let repo = npm_repo(&[
+            (
+                "package.json",
+                r#"{"name":"w","version":"1.0.0","workspaces":["packages/*"]}"#,
+            ),
+            ("package-lock.json", LOCK),
+            ("packages/a/package.json", PKG),
+        ]);
+        let report = scan_with_stubs(repo.path(), &[NODE_STUB, CLEAN_NPM_STUB]);
+        assert!(
+            !report.issues.iter().any(|i| i.code == "missing_lockfile"),
+            "{:?}",
+            report.issues
+        );
+        let member = report
+            .manifests
+            .iter()
+            .find(|m| m.path == "packages/a/package.json")
+            .unwrap();
+        assert_eq!(member.lockfile.as_deref(), Some("package-lock.json"));
+        assert_eq!(member.lockfile_dir.as_deref(), Some(""));
+        assert!(report.audit_complete, "{:?}", report.issues);
+        assert_eq!(report.audit_coverage.found, 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_lockfile_in_a_non_workspace_ancestor_does_not_cover_a_package() {
+        let repo = npm_repo(&[
+            ("package.json", PKG),
+            ("package-lock.json", LOCK),
+            ("tools/package.json", PKG),
+        ]);
+        let report = scan_with_stubs(repo.path(), &[NODE_STUB, CLEAN_NPM_STUB]);
+        assert!(report.issues.iter().any(|i| i.code == "missing_lockfile"));
+        assert!(!report.audit_complete);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn python_lockfiles_and_pyproject_only_projects_are_not_audited() {
+        for files in [
+            vec![
+                ("uv.lock", "version = 1\n"),
+                ("pyproject.toml", "[project]\nname='x'\n"),
+            ],
+            vec![("poetry.lock", "# lock\n")],
+            vec![("pyproject.toml", "[project]\nname='x'\n")],
+        ] {
+            let mut all = vec![("package.json", PKG), ("package-lock.json", LOCK)];
+            all.extend(files);
+            let repo = npm_repo(&all);
+            let report = scan_with_stubs(repo.path(), &[NODE_STUB, CLEAN_NPM_STUB]);
+            assert!(!report.audit_complete, "{:?}", report.audit_coverage);
+            assert!(
+                report
+                    .audit_coverage
+                    .unaudited
+                    .iter()
+                    .any(|u| u.starts_with("python:")),
+                "{:?}",
+                report.audit_coverage
+            );
+            assert!(report.audit_coverage.found > report.audit_coverage.audited);
+        }
+    }
+
+    #[test]
+    fn a_family_with_no_scanner_is_found_but_never_audited() {
+        let mut targets = ScanTargets::default();
+        let mut other = BTreeMap::new();
+        other.insert("jvm".to_string(), vec!["pom.xml".to_string()]);
+        other.insert("native".to_string(), vec!["Makefile".to_string()]);
+        collect_unaudited_targets(&[], &other, &mut targets);
+        assert_eq!(
+            targets.unaudited,
+            vec![("jvm".to_string(), "pom.xml".to_string())]
+        );
+    }
+
+    #[test]
+    fn empty_cargo_crev_output_is_not_a_run() {
+        assert!(cargo_supply::parse_cargo_crev_jsonl("").is_err());
+        assert!(cargo_supply::parse_cargo_crev_jsonl("  \n\n").is_err());
+        let ok = cargo_supply::parse_cargo_crev_jsonl(
+            r#"{"name":"a","version":"1.0.0","status":"pass"}"#,
+        );
+        assert_eq!(ok.unwrap().verified, 1);
     }
 }

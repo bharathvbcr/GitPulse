@@ -186,7 +186,7 @@ fn a_full_queue_refuses_rather_than_blocking_its_producer() {
     let (status, depth) = drive(offered, 4);
     assert_eq!(accounted(&status), count);
     assert!(
-        started.elapsed() < Duration::from_secs(30),
+        started.elapsed() < crate::test_support::coverage_relaxed(Duration::from_secs(30)),
         "{count} offers took {:?}",
         started.elapsed()
     );
@@ -212,7 +212,7 @@ fn the_scanner_keeps_up_with_a_terminal_writing_as_fast_as_it_can() {
     let elapsed = started.elapsed();
     assert_eq!(signals, 0, "ordinary terminal output raised a notification");
     assert!(
-        elapsed < Duration::from_secs(20),
+        elapsed < crate::test_support::coverage_relaxed(Duration::from_secs(20)),
         "scanning {} MiB took {elapsed:?}",
         rounds * chunk.len() / (1024 * 1024)
     );

@@ -577,3 +577,26 @@ fn file_names_that_are_not_keys_still_get_a_stable_one() {
     let dir = repo_with(&[("My Task (draft).md", b"---\ntitle: T\n---\n")]);
     assert_eq!(scan(&dir).files[0].key.as_deref(), Some("my-task-draft"));
 }
+
+/// The corpus `src/lib/workbench/priority.cases.json` is shared with the
+/// TypeScript twin (`taskPriority.test.ts`); changing either parser alone turns
+/// one of the two red.
+#[test]
+fn priority_parse_matches_the_shared_corpus() {
+    let corpus: serde_json::Value = serde_json::from_str(include_str!(
+        "../../../src/lib/workbench/priority.cases.json"
+    ))
+    .expect("parsing priority.cases.json");
+    let cases = corpus["cases"].as_array().expect("cases array");
+    assert!(
+        cases.len() >= 25,
+        "the shared corpus shrank to {}",
+        cases.len()
+    );
+    for case in cases {
+        let input = case["input"].as_str().expect("input string");
+        let got = parse_priority(input).ok();
+        let want = case["expected"].as_u64().map(|n| n as u8);
+        assert_eq!(got, want, "priority {input:?}");
+    }
+}

@@ -147,11 +147,17 @@ pub fn symbol_matches(symbol: &str, query: &str) -> bool {
     }
     // File-path node ids (`pkg/foo.go`) are not `Type.method`. Treating the
     // extension as a method made `impact go` start from every Go file.
-    if looks_like_path(tail) {
+    //
+    // Only for a file node, which has no `::`. In `a.go::Type.go` the part
+    // after `::` is a symbol name by construction — a method that happens to be
+    // called `go` — and `impact go` / `impact Type.go` must be able to start
+    // from it.
+    let is_file_node = !symbol.contains("::");
+    if is_file_node && looks_like_path(tail) {
         return false;
     }
     if let Some((_, method)) = tail.rsplit_once('.') {
-        if method == query && !has_source_extension(method) {
+        if method == query && (!is_file_node || !has_source_extension(method)) {
             return true;
         }
     }
@@ -308,6 +314,19 @@ mod tests {
         // A file-path node id is not a `Type.method`, so its extension is not
         // a method name — otherwise `impact go` starts from every Go file.
         assert!(!symbol_matches("pkg/foo.go", "go"));
+    }
+
+    /// A method may be called `go`: past `::` the tail is a symbol name, so the
+    /// source-extension guard that keeps `impact go` off every Go file does not
+    /// apply to it.
+    #[test]
+    fn a_method_named_like_an_extension_is_still_a_symbol() {
+        assert!(symbol_matches("a.ts::Thing.go", "go"));
+        assert!(symbol_matches("a.ts::Thing.go", "Thing.go"));
+        assert!(!symbol_matches("a.ts::Thing.go", "Other.go"));
+        // The file node itself is still not a method named `go`.
+        assert!(!symbol_matches("pkg/foo.go", "go"));
+        assert!(!symbol_matches("foo.go", "go"));
     }
 
     #[test]

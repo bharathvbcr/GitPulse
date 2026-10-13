@@ -119,10 +119,33 @@ pub fn workspace_search(
 /// Deliberately not included: matching on symbol names. Two repositories both
 /// declaring `Client` is not a link, and asserting one would produce edges at a
 /// rate that buries the real ones.
-pub(super) fn provided_modules(root: &std::path::Path) -> Vec<(String, String)> {
+///
+/// The second half of the answer is what could not be read: a `go.mod` walk
+/// that failed, a manifest it refused, a directory it could not list. Each of
+/// those was an `if let Ok` that dropped the error, so a provider whose
+/// `go.mod` was unreadable simply provided nothing and every import of it read
+/// as unlinked.
+pub(super) fn provided_modules(root: &std::path::Path) -> (Vec<(String, String)>, Vec<String>) {
     let mut provided: Vec<(String, String)> = Vec::new();
+    let mut gaps: Vec<String> = Vec::new();
 
-    if let Ok(modules) = devmap_extract::collect_go_modules(root) {
+    let modules = match devmap_extract::collect_project_manifests(root) {
+        Ok(manifests) => {
+            for (path, reason) in &manifests.refusals {
+                if path.ends_with("go.mod") {
+                    gaps.push(format!(
+                        "{path} was not read ({reason}), so the module it declares is unknown"
+                    ));
+                }
+            }
+            manifests.go_modules
+        }
+        Err(error) => {
+            gaps.push(format!("its go.mod files could not be collected: {error}"));
+            Vec::new()
+        }
+    };
+    {
         for module in modules {
             if module.prefix.is_empty() {
                 continue;
@@ -139,40 +162,52 @@ pub(super) fn provided_modules(root: &std::path::Path) -> Vec<(String, String)> 
         }
     }
 
-    if let Ok(entries) = std::fs::read_dir(root) {
-        for entry in entries.flatten() {
-            if !entry.path().is_dir() {
-                continue;
-            }
-            let name = entry.file_name().to_string_lossy().into_owned();
-            if name.starts_with('.') || name == "node_modules" || name == "target" {
-                continue;
-            }
-            if entry.path().join("__init__.py").is_file() {
-                provided.push((
-                    name.clone(),
-                    format!("{name}/__init__.py declares a Python package"),
-                ));
+    match std::fs::read_dir(root) {
+        Err(error) => gaps.push(format!(
+            "its root could not be listed for Python packages: {error}"
+        )),
+        Ok(entries) => {
+            for entry in entries.flatten() {
+                if !entry.path().is_dir() {
+                    continue;
+                }
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if name.starts_with('.') || name == "node_modules" || name == "target" {
+                    continue;
+                }
+                if entry.path().join("__init__.py").is_file() {
+                    provided.push((
+                        name.clone(),
+                        format!("{name}/__init__.py declares a Python package"),
+                    ));
+                }
             }
         }
     }
     // A `src/` layout puts the package one level down, which is where this
-    // repository's own `devcouncil` package lives.
-    if let Ok(entries) = std::fs::read_dir(root.join("src")) {
-        for entry in entries.flatten() {
-            if entry.path().join("__init__.py").is_file() {
-                let name = entry.file_name().to_string_lossy().into_owned();
-                provided.push((
-                    name.clone(),
-                    format!("src/{name}/__init__.py declares a Python package"),
-                ));
+    // repository's own `devcouncil` package lives. No `src/` is the ordinary
+    // case; a `src/` that cannot be listed is a gap.
+    match std::fs::read_dir(root.join("src")) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => gaps.push(format!(
+            "its src/ could not be listed for Python packages: {error}"
+        )),
+        Ok(entries) => {
+            for entry in entries.flatten() {
+                if entry.path().join("__init__.py").is_file() {
+                    let name = entry.file_name().to_string_lossy().into_owned();
+                    provided.push((
+                        name.clone(),
+                        format!("src/{name}/__init__.py declares a Python package"),
+                    ));
+                }
             }
         }
     }
 
     provided.sort();
     provided.dedup();
-    provided
+    (provided, gaps)
 }
 
 /// Whether `specifier` is satisfied by a module named `prefix`.
@@ -199,20 +234,51 @@ pub(super) fn specifier_matches(specifier: &str, prefix: &str) -> bool {
 /// ones.
 pub fn link_candidates(
     workspace: &crate::workspace::Workspace,
-) -> anyhow::Result<Vec<crate::workspace::LinkCandidate>> {
-    use crate::workspace::LinkCandidate;
+) -> anyhow::Result<crate::workspace::LinkCandidates> {
+    use crate::workspace::{LinkCandidate, RepoUnavailable};
 
+    let mut coverage_gaps: Vec<RepoUnavailable> = Vec::new();
     // What each repository provides.
     let mut providers: Vec<(&str, Vec<(String, String)>)> = Vec::new();
     for repo in &workspace.repos {
-        providers.push((repo.name.as_str(), provided_modules(&repo.root)));
+        let (provided, gaps) = provided_modules(&repo.root);
+        coverage_gaps.extend(gaps.into_iter().map(|reason| RepoUnavailable {
+            repo: repo.name.clone(),
+            reason,
+        }));
+        providers.push((repo.name.as_str(), provided));
     }
 
     let mut candidates: Vec<LinkCandidate> = Vec::new();
     let mut loaded: Vec<(&str, Vec<devmap_extract::model::Extraction>)> = Vec::new();
     for repo in &workspace.repos {
-        let Ok(Some(store)) = devmap_store::Store::open_existing(repo.db_path()) else {
-            continue;
+        // A repository whose store is missing or will not open contributes
+        // no imports. Recorded, as `workspace_search` records it: this was a
+        // `let Ok(Some(..)) else continue`, and a workspace answer assembled
+        // from a subset read exactly like the whole.
+        let db = repo.db_path();
+        let store = match devmap_store::Store::open_existing(&db) {
+            Ok(Some(store)) => store,
+            Ok(None) => {
+                coverage_gaps.push(RepoUnavailable {
+                    repo: repo.name.clone(),
+                    reason: format!(
+                        "no store at {}, so none of its imports were examined",
+                        db.display()
+                    ),
+                });
+                continue;
+            }
+            Err(error) => {
+                coverage_gaps.push(RepoUnavailable {
+                    repo: repo.name.clone(),
+                    reason: format!(
+                        "store at {} could not be opened ({error}), so none of its imports were examined",
+                        db.display()
+                    ),
+                });
+                continue;
+            }
         };
         loaded.push((repo.name.as_str(), store.latest_extractions()?));
     }
@@ -301,7 +367,10 @@ pub fn link_candidates(
             && a.to_repo == b.to_repo
             && a.from_symbol == b.from_symbol
     });
-    Ok(candidates)
+    Ok(crate::workspace::LinkCandidates {
+        links: candidates,
+        coverage_gaps,
+    })
 }
 
 /// Strings in `extraction` that name a Metal entry point another repository

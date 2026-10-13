@@ -71,8 +71,3 @@ export function lookupGroupColor(
   }
   return null;
 }
-
-/** A tab's own color wins. Otherwise the group color shows through. */
-export function effectiveTabColor(own: unknown, groupColor: unknown): TabColor | null {
-  return normalizeTabColor(own) ?? normalizeTabColor(groupColor);
-}

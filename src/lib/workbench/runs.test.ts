@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { invoke } from "@tauri-apps/api/core";
-import { cancelTaskRun, findConversation, listHoldingRuns, listLiveTaskRuns, releaseTaskRun, getRepository, getTaskRun, launchManagedRun, stopManagedRun, listTaskRuns, prepareTaskRun, taskRun, type RunPreparation, type TaskRun } from "./client";
+import { cancelTaskRun, checkoutIdentity, findConversation, listHoldingRuns, listLiveTaskRuns, releaseTaskRun, getRepository, getTaskRun, launchManagedRun, stopManagedRun, listTaskRuns, prepareTaskRun, taskRun, type RunPreparation, type TaskRun } from "./client";
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
 const native = vi.mocked(invoke);
@@ -124,6 +124,23 @@ describe("task attempt transport", () => {
     }
     native.mockResolvedValueOnce(JSON.stringify({ok:true,released:"yes",reason:"x",item:released}));
     await expect(releaseTaskRun("run")).rejects.toMatchObject({code:"protocol_error"});
+  });
+});
+
+describe("the Git identity of a checkout", () => {
+  it("keeps a run's Git directories when recorded, and refuses ones that are not text", () => {
+    expect(taskRun({...run, git_dir:"/r/.git", git_common_dir:"/r/.git"})).toMatchObject({git_dir:"/r/.git", git_common_dir:"/r/.git"});
+    expect(taskRun(run)).not.toHaveProperty("git_dir");
+    for (const git_dir of [7, null, ["/r/.git"]]) expect(() => taskRun({...run, git_dir})).toThrow();
+  });
+  it("asks the host for a checkout's identity and believes only a complete answer", async () => {
+    native.mockResolvedValueOnce(JSON.stringify({ok:true,cwd:"/r/pkg",git_dir:"/r/.git",git_common_dir:"/r/.git"}));
+    expect(await checkoutIdentity("/r/pkg")).toEqual({cwd:"/r/pkg",git_dir:"/r/.git",git_common_dir:"/r/.git"});
+    expect(native).toHaveBeenLastCalledWith("cmd_workbench_request", {method:"runs.checkout_identity",input:'{"repo_path":"/r/pkg"}'});
+    for (const change of [{git_dir:""},{git_dir:7},{cwd:null},{ok:false}]) {
+      native.mockResolvedValueOnce(JSON.stringify({ok:true,cwd:"/r/pkg",git_dir:"/r/.git",git_common_dir:"/r/.git",...change}));
+      await expect(checkoutIdentity("/r/pkg")).rejects.toMatchObject({code:"protocol_error"});
+    }
   });
 });
 

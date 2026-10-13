@@ -45,6 +45,12 @@ export interface TaskLease {
    * reclaimable on that basis.
    */
   expires_at: string | null;
+  /**
+   * Set when the stored expiry is not a timestamp: the lease is still marked
+   * active but cannot be judged live or lapsed, so it is listed with the stored
+   * text. Null for every readable lease.
+   */
+  expiry_error: string | null;
 }
 
 export interface TaskEvidence {
@@ -77,7 +83,7 @@ export interface TaskGap {
   stderr_path: string | null;
 }
 
-export interface TaskRun {
+export interface DevCouncilRun {
   id: string;
   task_id: string;
   sandbox: string;
@@ -100,7 +106,7 @@ export interface TaskView {
   evidence_truncated: boolean;
   gaps: TaskGap[];
   gaps_truncated: boolean;
-  runs: TaskRun[];
+  runs: DevCouncilRun[];
   runs_truncated: boolean;
   /**
    * Empty when the store could be read; otherwise why it could not.

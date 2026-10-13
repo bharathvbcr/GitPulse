@@ -7,6 +7,7 @@ import {
   WALK_INCOMPLETE_MAX_CHARS,
   WALK_INCOMPLETE_TOOLTIP_CHARS,
 } from "./walkIncomplete";
+import { wallClockBudget } from "../testing/wallClock";
 
 const COVERAGE =
   "28637 of 69195 unresolved attribution site(s) have no indexed target after excluding 40548 known builtin, runtime-global, and external-import site(s); these repository-wide counts are not specific to this target, so this answer may omit callers or dependencies";
@@ -149,7 +150,7 @@ describe("summarizeWalkIncomplete", () => {
     const parts = Array.from({ length: 500 }, (_, i) => seedWalk(i + 1));
     const text = summarizeWalkIncomplete(parts)!;
     const elapsed = performance.now() - started;
-    expect(elapsed).toBeLessThan(100);
+    expect(elapsed).toBeLessThan(wallClockBudget(100));
     expect(text.length).toBeLessThan(WALK_INCOMPLETE_MAX_CHARS);
     expect(text).toContain("500 seeds");
     expect(text).toContain("1\u2013500");

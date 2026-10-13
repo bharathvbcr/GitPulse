@@ -267,6 +267,12 @@ export const SETTINGS_CATALOG: readonly SettingEntry[] = [
     keywords: "lappi decision model commit type conventional ambiguous classifier suggest record caller data local held out privacy socket qd",
   },
   {
+    id: "host-load",
+    section: "agents",
+    label: "Host load",
+    keywords: "host load memory pressure swap compressor thrash sessions agents sampler sensor governor kill switch memguard orphan crash stability",
+  },
+  {
     id: "external-tools",
     section: "agents",
     label: "devmap and manvi",

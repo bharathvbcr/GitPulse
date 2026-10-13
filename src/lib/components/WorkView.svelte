@@ -19,7 +19,7 @@
 
 <script lang="ts">
   import { untrack } from "svelte";
-  import { repoStore } from "../stores/repoStore";
+  import { currentRepoPath, repoStore } from "../stores/repoStore";
   import { openExternal } from "../desktop/openExternal";
   import {
     AlertTriangle,
@@ -123,33 +123,33 @@
     });
   }
 
-  let previousRepo: string | null = null;
-  let previousGeneration: number | null = null;
+  // A repo switch hydrates from cache so the last join is on screen
+  // immediately; a generation bump refreshes in place so "clean" cannot
+  // outlive the working tree. Only activation bumps it (re-activating this
+  // tab, or revealing it when a neighbour closes) — `refresh()`, the status
+  // poll and watcher events never do (repoStore `bumped()`). Both keys
+  // compare by value, so the store's other publishes run neither effect; the
+  // hydration is declared first, so a switch hydrates before it refreshes.
+  const generation = $derived($repoStore.generation);
   $effect(() => {
-    const repo = $repoStore.currentPath;
-    const generation = $repoStore.generation;
-    if (repo === previousRepo && generation === previousGeneration) return;
-    const repoChanged = repo !== previousRepo;
-    previousRepo = repo;
-    previousGeneration = generation;
-    // A repo switch hydrates from cache so the last join is on screen
-    // immediately; a generation bump refreshes in place so "clean" cannot
-    // outlive the working tree. Only activation bumps it (re-activating this
-    // tab, or revealing it when a neighbour closes) — `refresh()`, the status
-    // poll and watcher events never do (repoStore `bumped()`).
-    if (repoChanged) {
-      const cached = repo ? workCache.get(repo) : undefined;
-      untrack(() => {
-        projection = cached?.projection ?? null;
-        loadedAt = cached?.loadedAt ?? null;
-        navigationError = null;
-        refreshError = null;
-        collisions = null;
-        collisionError = null;
-      });
-    }
-    if (repo) refresh(repo);
-    else { refreshWork.cancel(); loading = false; refreshEpoch += 1; }
+    const repo = $currentRepoPath;
+    const cached = repo ? workCache.get(repo) : undefined;
+    untrack(() => {
+      projection = cached?.projection ?? null;
+      loadedAt = cached?.loadedAt ?? null;
+      navigationError = null;
+      refreshError = null;
+      collisions = null;
+      collisionError = null;
+    });
+  });
+  $effect(() => {
+    const repo = $currentRepoPath;
+    void generation;
+    untrack(() => {
+      if (repo) refresh(repo);
+      else { refreshWork.cancel(); loading = false; refreshEpoch += 1; }
+    });
   });
 
   $effect(() => () => { disposed = true; refreshWork.cancel(); });
@@ -248,7 +248,7 @@
   let query = $state("");
   let rowLimit = $state(100);
   $effect(() => {
-    void facet; void query; void $repoStore.currentPath;
+    void facet; void query; void $currentRepoPath;
     untrack(() => { rowLimit = 100; });
   });
 
@@ -275,11 +275,8 @@
   // A repository switch must not leave the previous repository's narrowing
   // on: the reader would be looking at a filtered view of a list they have
   // never seen, with rows missing for a reason that is off screen.
-  let facetRepo: string | null = null;
   $effect(() => {
-    const repo = $repoStore.currentPath;
-    if (repo === facetRepo) return;
-    facetRepo = repo;
+    void $currentRepoPath;
     untrack(() => {
       facet = "all";
       query = "";

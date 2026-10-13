@@ -27,7 +27,15 @@ pub const PUBLIC_DEVMAP_REPO: &str = "https://github.com/bharathvbcr/DevCouncil"
 pub const PUBLIC_MANVI_REPO: &str = "https://github.com/bharathvbcr/Manvi";
 pub const PUBLIC_DEVMAP_GIT: &str = "https://github.com/bharathvbcr/DevCouncil.git";
 pub const PUBLIC_MANVI_GIT: &str = "https://github.com/bharathvbcr/Manvi.git";
-pub const MANVI_GO_INSTALL: &str = "github.com/bharathvbcr/Manvi/manvi/cmd/manvi@latest";
+/// Commits the remote installs build, as 40-hex SHAs rather than tags or
+/// `latest`: a tag can be moved and `@latest` follows whatever was pushed
+/// last, while a SHA names one tree. Both are the newest published release
+/// (DevCouncil v0.2.3, Manvi v0.0.5); bump them together with the version
+/// GitPulse is qualified against, never to "whatever is newest".
+pub const PUBLIC_DEVMAP_REV: &str = "97741aec2a7150e7288733542200e4d26e939daa";
+pub const MANVI_GO_REV: &str = "2b804415503017a8f56910c285c85be61d37ff22";
+pub const MANVI_GO_INSTALL: &str =
+    "github.com/bharathvbcr/Manvi/manvi/cmd/manvi@2b804415503017a8f56910c285c85be61d37ff22";
 
 /// Wall-clock budget for `cargo install` / `go install`.
 pub const INSTALL_DEADLINE: Duration = Duration::from_secs(20 * 60);
@@ -505,16 +513,33 @@ fn documented_command(tool: ExternalTool, target: Option<&Path>) -> String {
     }
 }
 
-fn remote_install_command(tool: ExternalTool) -> String {
+/// Arguments after the program for the pinned remote install. One owner for
+/// both the command that runs and the one shown to the user.
+fn remote_install_args(tool: ExternalTool) -> Vec<&'static str> {
     match tool {
-        ExternalTool::Devmap => {
-            format!("cargo install --git {PUBLIC_DEVMAP_GIT} --locked --force devmap-cli")
-        }
-        ExternalTool::Manvi => format!("go install {MANVI_GO_INSTALL}"),
+        ExternalTool::Devmap => vec![
+            "install",
+            "--git",
+            PUBLIC_DEVMAP_GIT,
+            "--rev",
+            PUBLIC_DEVMAP_REV,
+            "--locked",
+            "--force",
+            "devmap-cli",
+        ],
+        ExternalTool::Manvi => vec!["install", MANVI_GO_INSTALL],
     }
 }
 
-fn probe_version(path: &str, tool: ExternalTool) -> Option<String> {
+fn remote_install_command(tool: ExternalTool) -> String {
+    let program = match tool {
+        ExternalTool::Devmap => "cargo",
+        ExternalTool::Manvi => "go",
+    };
+    format!("{program} {}", remote_install_args(tool).join(" "))
+}
+
+pub(crate) fn probe_version(path: &str, tool: ExternalTool) -> Option<String> {
     let mut cmd = Command::new(path);
     match tool {
         ExternalTool::Devmap => {
@@ -1185,12 +1210,15 @@ fn finish_ok(
 ) -> InstallOutcome {
     tool_capability::invalidate(tool);
     let status = resolve_status(tool);
-    if let Some(ref path) = status.path {
-        let _ = tool_config::set_binary(tool, path);
-    }
+    // A path that could not be saved resolves again only until the next
+    // launch, so the install is not reported as done.
+    let persist_error = status
+        .path
+        .as_deref()
+        .and_then(|path| tool_config::set_binary(tool, path).err());
     InstallOutcome {
         tool,
-        ok: status.installed,
+        ok: status.installed && persist_error.is_none(),
         binary: status.path.clone(),
         lookup: Some(status.lookup.clone()),
         version: status.version.clone(),
@@ -1201,7 +1229,12 @@ fn finish_ok(
         stderr,
         timed_out: false,
         cancelled: false,
-        reason: if status.installed {
+        reason: if let Some(error) = persist_error {
+            Some(format!(
+                "{} installed but its path could not be saved: {error}",
+                tool.as_str()
+            ))
+        } else if status.installed {
             None
         } else {
             Some(format!(
@@ -1219,9 +1252,18 @@ fn install_prebuilt_rung(tool: ExternalTool) -> InstallOutcome {
         "downloading prebuilt release…",
         Some(InstallRung::PrebuiltRelease),
     );
-    match release::install_prebuilt(tool) {
+    let installed = release::install_prebuilt(tool).and_then(|path| {
+        tool_config::set_binary(tool, &path.display().to_string())
+            .map(|()| path)
+            .map_err(|e| {
+                format!(
+                    "{} installed but its path could not be saved: {e}",
+                    tool.as_str()
+                )
+            })
+    });
+    match installed {
         Ok(path) => {
-            let _ = tool_config::set_binary(tool, &path.display().to_string());
             tool_capability::invalidate(tool);
             finish_ok(
                 tool,
@@ -1296,14 +1338,7 @@ fn install_toolchain_remote(tool: ExternalTool) -> InstallOutcome {
                 }
             };
             let mut cmd = Command::new(&cargo);
-            cmd.args([
-                "install",
-                "--git",
-                PUBLIC_DEVMAP_GIT,
-                "--locked",
-                "--force",
-                "devmap-cli",
-            ]);
+            cmd.args(remote_install_args(ExternalTool::Devmap));
             cmd
         }
         ExternalTool::Manvi => {
@@ -1329,13 +1364,40 @@ fn install_toolchain_remote(tool: ExternalTool) -> InstallOutcome {
                 }
             };
             let mut cmd = Command::new(&go);
-            cmd.args(["install", MANVI_GO_INSTALL]);
+            cmd.args(remote_install_args(ExternalTool::Manvi));
             cmd
         }
     };
+    // A fixed, empty directory of our own: `cargo` reads `.cargo/config.toml`
+    // from every ancestor of its cwd and `go` reads `go.work`/`go.mod`, so
+    // inheriting whatever directory GitPulse was launched from would let a
+    // file there redirect the install to another source or toolchain.
+    match release::install_work_dir() {
+        Ok(dir) => {
+            cmd.current_dir(dir);
+        }
+        Err(reason) => {
+            return InstallOutcome {
+                tool,
+                ok: false,
+                binary: None,
+                lookup: None,
+                version: None,
+                source_used: None,
+                command,
+                exit_code: None,
+                stdout: String::new(),
+                stderr: String::new(),
+                timed_out: false,
+                cancelled: false,
+                reason: Some(reason),
+                rung: Some(InstallRung::ToolchainRemote),
+            };
+        }
+    }
     let label = match tool {
-        ExternalTool::Devmap => "cargo install --git",
-        ExternalTool::Manvi => "go install @latest",
+        ExternalTool::Devmap => "cargo install --git --rev",
+        ExternalTool::Manvi => "go install @<commit>",
     };
     match run_cancellable_install(&mut cmd, label, tool, Some(InstallRung::ToolchainRemote)) {
         InstallRun::Cancelled { stdout, stderr } => InstallOutcome {
@@ -1973,15 +2035,22 @@ pub fn clone_source(tool: ExternalTool, parent_dir: &str) -> CloneSourceOutcome 
         Ok(cloned) => {
             let dest = PathBuf::from(&cloned);
             match install_target(tool, &dest) {
-                Ok(_) => {
-                    let _ = tool_config::set_source_root(tool, &cloned);
-                    CloneSourceOutcome {
+                Ok(_) => match tool_config::set_source_root(tool, &cloned) {
+                    Ok(()) => CloneSourceOutcome {
                         tool,
                         ok: true,
                         path: Some(cloned),
                         reason: None,
-                    }
-                }
+                    },
+                    Err(error) => CloneSourceOutcome {
+                        tool,
+                        ok: false,
+                        path: Some(cloned),
+                        reason: Some(format!(
+                            "cloned but the source root could not be saved: {error}"
+                        )),
+                    },
+                },
                 Err(reason) => CloneSourceOutcome {
                     tool,
                     ok: false,
@@ -2016,6 +2085,7 @@ pub fn select_rung_for_test(rungs: &[RungStatus]) -> Option<InstallRung> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
     use crate::procguard::LockedSpawn;
     #[test]
     fn audit_schema_numbers_cannot_wrap_into_supported_versions() {
@@ -2081,7 +2151,7 @@ mod tests {
         let started = Instant::now();
         let run = run_cancellable_install(&mut cmd, "fixture", ExternalTool::Devmap, None);
         assert!(
-            started.elapsed() < Duration::from_secs(3),
+            started.elapsed() < crate::test_support::coverage_relaxed(Duration::from_secs(3)),
             "install drain hung: {:?}",
             started.elapsed()
         );
@@ -2159,10 +2229,30 @@ mod tests {
         assert!(cmd.contains("devmap-cli"));
         let cmd = remote_install_command(ExternalTool::Manvi);
         assert!(cmd.contains(MANVI_GO_INSTALL));
+        assert!(!MANVI_GO_INSTALL.ends_with("@latest"));
+    }
+
+    /// Remote installs name one commit: no `latest`, no branch, no tag that
+    /// can move.
+    #[test]
+    fn remote_installs_are_pinned_to_a_full_commit() {
+        for rev in [PUBLIC_DEVMAP_REV, MANVI_GO_REV] {
+            assert_eq!(rev.len(), 40, "{rev}");
+            assert!(
+                rev.chars().all(|c| matches!(c, '0'..='9' | 'a'..='f')),
+                "{rev}"
+            );
+        }
+        let devmap = remote_install_args(ExternalTool::Devmap);
+        let at = devmap.iter().position(|a| *a == "--rev").expect("--rev");
+        assert_eq!(devmap[at + 1], PUBLIC_DEVMAP_REV);
+        assert!(devmap.contains(&"--locked"));
+        let manvi = remote_install_args(ExternalTool::Manvi);
         assert_eq!(
-            MANVI_GO_INSTALL,
-            "github.com/bharathvbcr/Manvi/manvi/cmd/manvi@latest"
+            manvi.last().copied(),
+            Some(format!("github.com/bharathvbcr/Manvi/manvi/cmd/manvi@{MANVI_GO_REV}").as_str())
         );
+        assert!(remote_install_command(ExternalTool::Manvi).contains(MANVI_GO_REV));
     }
 
     #[test]
@@ -2475,7 +2565,7 @@ mod tests {
     #[test]
     fn saved_config_binary_precedes_path_and_tags_lookup() {
         let _lock = crate::harness::sidecar::test_serial();
-        let _cfg_env = crate::tool_config::lock_config_env();
+        let _cfg_env = crate::test_support::env::env_serial();
         let dir = TempDir::new().unwrap();
         let bin = dir.path().join("fake-devmap");
         #[cfg(unix)]
@@ -2513,7 +2603,7 @@ mod tests {
     #[test]
     fn disabled_tool_is_not_installed_without_env() {
         let _lock = crate::harness::sidecar::test_serial();
-        let _cfg_env = crate::tool_config::lock_config_env();
+        let _cfg_env = crate::test_support::env::env_serial();
         let dir = TempDir::new().unwrap();
         let cfg_path = dir.path().join("tools.json");
         let _env = crate::test_support::env::bind_env(&_cfg_env)
@@ -2536,7 +2626,7 @@ mod tests {
     #[test]
     fn app_bin_dir_follows_tool_config_env() {
         let _lock = crate::harness::sidecar::test_serial();
-        let _cfg_env = crate::tool_config::lock_config_env();
+        let _cfg_env = crate::test_support::env::env_serial();
         let dir = TempDir::new().unwrap();
         let cfg_path = dir.path().join("tools.json");
         let _env = crate::test_support::env::bind_env(&_cfg_env)
@@ -2550,7 +2640,7 @@ mod tests {
     #[test]
     fn uninstall_removes_broken_symlink_and_skips_directory() {
         let _lock = crate::harness::sidecar::test_serial();
-        let _cfg_env = crate::tool_config::lock_config_env();
+        let _cfg_env = crate::test_support::env::env_serial();
         let dir = TempDir::new().unwrap();
         let cfg_path = dir.path().join("tools.json");
         let _env = crate::test_support::env::bind_env(&_cfg_env)

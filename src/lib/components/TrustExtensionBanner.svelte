@@ -16,7 +16,8 @@
    */
   import { invoke } from "../ipc/invoke";
   import { AlertTriangle } from "@lucide/svelte";
-  import { repoStore } from "../stores/repoStore";
+  import { untrack } from "svelte";
+  import { currentRepoPath, repoStore } from "../stores/repoStore";
   import { createAsyncGuard, type AsyncGuard } from "../async/guard";
   import { needsExtension, type TrustPreview } from "../repos/repositoryTrust";
   import { announceTrustExtended } from "../repos/trustExtension";
@@ -29,13 +30,12 @@
   let trustExtendable = $state(false);
   let inflight: AsyncGuard | null = null;
 
-  let prevRepoPath: string | null = null;
   $effect(() => {
-    const repo = $repoStore.currentPath;
-    if (repo === prevRepoPath) return;
-    prevRepoPath = repo;
-    trustExtendable = false;
-    if (repo) void loadTrustScope(repo);
+    const repo = $currentRepoPath;
+    untrack(() => {
+      trustExtendable = false;
+      if (repo) void loadTrustScope(repo);
+    });
     return () => inflight?.cancel();
   });
 

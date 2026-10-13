@@ -5,6 +5,11 @@
 //! `evaluate`, which decide whether the app tells a user an update exists.
 //! A false positive nags; a false negative hides a fix. Both are decided here.
 
+// The hermetic test environment: a per-process home, git config and trust
+// store, rewritten before `main`. See `src/test_support/env.rs`.
+#[path = "../src/test_support/env.rs"]
+mod hermetic_env;
+
 use gitpulse_lib::updates::{evaluate, latest_stable_tag, parse_release_tag, parse_version};
 
 /// Shape of one `git ls-remote --tags` line.
@@ -117,22 +122,22 @@ fn malformed_lines_do_not_abort_the_scan() {
 
 #[test]
 fn reports_an_update_only_when_the_remote_is_strictly_newer() {
-    let newer = evaluate("1.0.0", &ls_remote(&["v1.0.1"]));
+    let newer = evaluate("1.0.0", &ls_remote(&["v1.0.1"]), &|_, _| Ok(true));
     assert!(newer.checked && newer.update_available);
     assert_eq!(newer.latest_version, "1.0.1");
 
-    let same = evaluate("1.0.1", &ls_remote(&["v1.0.1"]));
+    let same = evaluate("1.0.1", &ls_remote(&["v1.0.1"]), &|_, _| Ok(true));
     assert!(same.checked && !same.update_available);
 
     // A local build ahead of the remote is not an update.
-    let ahead = evaluate("2.0.0", &ls_remote(&["v1.0.1"]));
+    let ahead = evaluate("2.0.0", &ls_remote(&["v1.0.1"]), &|_, _| Ok(true));
     assert!(ahead.checked && !ahead.update_available);
 }
 
 #[test]
 fn a_check_that_could_not_run_is_not_reported_as_up_to_date() {
     for (current, output) in [("not-a-version", "" as &str), ("1.0.0", "")] {
-        let result = evaluate(current, output);
+        let result = evaluate(current, output, &|_, _| Ok(true));
         assert!(
             !result.checked,
             "an unusable input must not count as a completed check"

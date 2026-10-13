@@ -55,7 +55,16 @@
       });
       // Alpha is deliberately the bigger one: enough changed files that the
       // sidebar body scrolls, so a scroll offset left behind is observable.
+      // Gamma carries a branch row the branch list cannot draw (no name), so the
+      // sidebar's pane fails on it and on nothing else: the status bar and the
+      // workspace read branches too, but only the grouping in BranchList throws.
+      const GAMMA = "/code/tabs/gamma";
       const DATA = {
+        [GAMMA]: {
+          branches: [branch("main", { is_current: true, is_default: true }), { ...branch("undrawable"), name: null }],
+          statuses: [file("src/gamma.ts")],
+          worktrees: [worktree(GAMMA, "gamma", "main", true)],
+        },
         [ALPHA]: {
           branches: [branch("main", { is_current: true, is_default: true }), branch("feat/alpha-only")],
           statuses: [file("src/alpha/staged.ts", true), ...Array.from({ length: 60 }, (_, i) => file(`src/alpha/file-${String(i).padStart(2, "0")}.ts`))],
@@ -151,7 +160,7 @@
         "cmd_harness_status", "cmd_git_preflight", "cmd_tool_capability_refresh", "cmd_tool_config_get", "cmd_set_menu_state",
         "cmd_session_attention_standing", "cmd_set_exit_guard_ready", "cmd_ai_status", "cmd_external_tools_status",
         "cmd_workbench_request", "cmd_take_pending_open", "cmd_github_dependabot_alerts", "cmd_github_code_scanning_alerts",
-        "cmd_catch_up", "cmd_ledger_status", "cmd_codeintel_cancel",
+        "cmd_catch_up", "cmd_ledger_status", "cmd_codeintel_cancel", "cmd_host_load_status",
       ]);
       // The code-graph service is not installed in this fixture, which is what
       // a refused call means to its callers.
@@ -354,7 +363,7 @@
           await settle();
           type(worktreePath(), "/tmp/alpha-new-worktree");
           includeUnstaged().click();
-          repoStore.setCommitDraft("alpha draft");
+          repoStore.commitDraft.set("alpha draft");
           agentTrigger().click();
           await settle();
           type(agentNote(), "note about alpha");
@@ -436,7 +445,7 @@
           generateBtn().click();
           await sleepUntil(() => calls.some((c) => c.cmd === "cmd_ai_generate_commit_message" && c.repo === ALPHA));
           await switchTo(BETA);
-          repoStore.setCommitDraft("beta draft");
+          repoStore.commitDraft.set("beta draft");
           releaseGenerate();
           await settle();
           check("in flight: alpha's generated message does not replace beta's draft", () => textarea().value === "beta draft");
@@ -444,12 +453,12 @@
             !text(composerBox()).includes("fixture-model") && !text(composerBox()).includes("Writing"));
 
           await switchTo(ALPHA);
-          repoStore.setCommitDraft("alpha commit message");
+          repoStore.commitDraft.set("alpha commit message");
           const releaseCommit = hold("cmd_commit", ALPHA);
           commitBtn().click();
           await sleepUntil(() => calls.some((c) => c.cmd === "cmd_commit" && c.repo === ALPHA));
           await switchTo(BETA);
-          repoStore.setCommitDraft("beta draft must survive");
+          repoStore.commitDraft.set("beta draft must survive");
           releaseCommit();
           await settle();
           check("in flight: alpha's finished commit does not clear beta's draft", () => textarea().value === "beta draft must survive");
@@ -467,6 +476,22 @@
 
           check("every IPC call had a fixture", () => unexpected.length === 0);
           check("no unhandled runtime errors", () => errors.length === 0);
+
+          // ---- a crashed sidebar recovers on the next switch --------------------
+          // The sidebar used to be rebuilt per repository, which cleared a crash
+          // caused by one repository's data. It is not rebuilt now, so its
+          // failure view resets the pane when the repository changes.
+          const paneFailedText = () => $$("span").some((el) => text(el) === "Pane failed to render");
+          await repoStore.openRepo(GAMMA, { activate: false });
+          await switchTo(GAMMA);
+          await sleepUntil(() => !sidebar() && paneFailedText(), 5000);
+          check("a repository whose branch list cannot be drawn fails the sidebar pane", () => !sidebar() && paneFailedText());
+          check("…and only the sidebar: the status bar and the workspace are still up", () =>
+            statusBar() && $("main.gp-workspace") && $$("span").filter((el) => text(el) === "Pane failed to render").length === 1);
+          await switchTo(ALPHA);
+          await sleepUntil(() => sidebar() && !paneFailedText(), 5000);
+          check("switching to another repository brings the sidebar back", () => !!sidebar() && !paneFailedText());
+          check("…showing that repository's own data", () => text(branchList()).includes("alpha-only") || text(sidebar()).includes("file-00"));
 
           // ---- a harness-level proxy for the switch itself -----------------------
           // Not the installed app's performance:nav settle: no native webview,

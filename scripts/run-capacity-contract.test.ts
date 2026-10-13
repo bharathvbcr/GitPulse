@@ -19,6 +19,10 @@ import { DEFAULT_LIVE_RUNS, MAX_LIVE_RUNS } from "../src/lib/workbench/vocabular
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const RUNS = path.join(ROOT, "src-tauri/vendored/dc-store/src/workbench/runs.rs");
 
+// The store's enforcement is not asserted from its source here: the limit the
+// host names (`capacity_reached`, src-tauri/src/workbench/terminal_launch.rs
+// tests) and the per-checkout busy refusal (`checkout_busy`, the same file and
+// reconcile_tests.rs) are driven through `runs.prepare_terminal` in Rust.
 function storeConstant(source: string, name: string): number {
   const match = new RegExp(`^pub const ${name}: i64 = (\\d+);$`, "m").exec(source);
   if (!match) throw new Error(`dc-store no longer declares \`pub const ${name}: i64 = N;\` in runs.rs`);
@@ -34,22 +38,6 @@ describe("the renderer's run capacity is the store's", () => {
 
   it("MAX_LIVE_RUNS equals dc-store's MAX_ACTIVE_RUNS_CEILING", () => {
     expect(MAX_LIVE_RUNS).toBe(storeConstant(source, "MAX_ACTIVE_RUNS_CEILING"));
-  });
-
-  it("the store enforces the limit the host names, not a fixed one", () => {
-    // A re-vendor back to a fixed bound would make the setting a no-op that
-    // still saves and still displays — the silent kind of broken.
-    expect(source).toContain('"max_active_runs"');
-    expect(source).toMatch(/if active >= limit \{/);
-  });
-
-  it("the store keys its busy check on the checkout, not the repository", () => {
-    // The whole multi-task design rests on this predicate. A re-vendor that
-    // went back to `repository_id` alone would make every worktree launch
-    // fail again with no renderer-side signal.
-    expect(source).toMatch(/repository_id=\?2 AND json_extract\(body,'\$\.git_dir'\)=\?3/);
-    expect(source).toContain('"checkout_busy"');
-    expect(source).not.toContain('"repository_busy"');
   });
 
   it("refuses a parse it cannot make rather than passing", () => {

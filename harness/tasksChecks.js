@@ -1,5 +1,6 @@
 import "../src/app.css";
 import { mount, tick } from "svelte";
+import { emit } from "@tauri-apps/api/event";
 import { get } from "svelte/store";
 import { promptState } from "../src/lib/stores/modalStore";
 import { mockIPCWithEvents } from "./tauriMocks";
@@ -16,6 +17,8 @@ import { describeForeground, holdForeground } from "./foreground";
 
 const params = new URLSearchParams(location.search);
 const results = [], crashes = [], writes = [], unknown = [];
+// Every workbench method the host was asked for, in order: what the board costs while nothing changes.
+const ipcMethods = [];
 // Attempts holding a checkout and their requests, for the board's agent
 // marks. Empty until the checks for those marks fill them.
 let boardRuns = [], boardDecisions = [], boardRunsFail = false;
@@ -44,6 +47,13 @@ const workspace = { id: "workspace", name: "Developer tools", revision: 1, updat
 const emptyWorkspace = { id: "workspace-empty", name: "Fresh space", revision: 1, updated_at: 1, icon: "", color: "", pinned: false, archived: false, position: 2, description: "", repository_ids: [], repository_count: 0 };
 const workspaces = [workspace, emptyWorkspace];
 const workspaceWrites = [];
+/** Every `query` the board sent `items.list`, to prove filters never reach the store. */
+const listQueries = [];
+/** Every `tasks.suggest` the board sent, in order, and the replies parked while `suggestMode` is "hold". */
+const suggestCalls = [], heldSuggest = [];
+let suggestMode = "ok";
+const suggestable = input => tasks.filter(task => task.status !== "done" && !deleted.has(task.id) && (!input.repository_id || task.repository_ids.includes(input.repository_id)) && (input.max_priority === undefined || task.priority <= input.max_priority));
+const suggestRanking = input => [...suggestable(input)].sort((a, b) => a.priority - b.priority || (a.id < b.id ? -1 : 1)).slice(0, input.limit ?? 5);
 const makeTask = (id, title, repository, status = "ready") => ({ id, title, kind: "feature", status, priority: 2, severity: null, owner: null, due_at: null, labels: [], repository_ids: [repository], primary_repository_id: repository, home_workspace_id: null, position: Number(id.replace(/\D/g, "")) || 1, revision: 1, updated_at: 1, description: "Keep changes focused and verify the result.", acceptance_criteria: [], locked_fields: [], checklist: [], links: [],
   // As dc-store schema 11's upgrade leaves a profile: work that was Done is
   // archived, with the time it was completed.
@@ -63,8 +73,13 @@ let tasks = [
 let corruptDelete = false, loseDelete = false;
 const deleted = new Set(), deleteWrites = [], restoreWrites = [], mergeWrites = [];
 let mergeFailSource = "";
+// Reads of one workspace's membership, and a switch that makes them fail.
+let workspaceGets = 0, failWorkspaceGet = false;
 let failList = false, corruptSave = false, loseSave = false, holdSave = false, releaseSave, holdSearch = false, heldSearch = [], holdGet = false, releaseGet;
 const receipts = new Map(), proposals = new Map(), enhancementWrites = [], enhancementReads = [];
+const verdicts = new Map(), verdictReads = [];
+let verifyOptIn = false;
+const verifyPosts = [];
 let failConfiguration = false, blankConfiguration = false, loseEnhancement = false, holdDelete = false, releaseDelete;
 // Relinking a moved checkout and importing tab groups (see the end of the run).
 let pickFolderResult = null, registerUnknown = false, loseRelink = false;
@@ -73,6 +88,9 @@ const missingCheckouts = new Set(), uncheckableCheckouts = new Set();
 // What `repoStore.openRepo` asks the host for, answered the way an empty,
 // healthy repository would. Only the tab-group checks open tabs.
 const fixtureRepoCommands = {
+  cmd_note_tab_activated: () => null,
+  cmd_verify_status_enabled: () => verifyOptIn,
+  cmd_verify_status_post: a => { verifyPosts.push(a); return { sha: "0123456789abcdef0123456789abcdef01234567", state: "success", description: "", dry_run: false, status_posted: true, commented: [], comment_note: null, would_run: [] }; },
   cmd_resolve_repo: a => ({ path: a.repoPath, name: a.repoPath.split("/").pop(), is_bare: false }),
   // A task terminal opens the checkout holding the attempt's directory; the
   // fixture's directories are checkout roots.
@@ -161,6 +179,7 @@ mockIPCWithEvents(async (cmd, args) => {
   }
   if (cmd !== "cmd_workbench_request") { unknown.push(cmd); throw Error(`Unconfigured command: ${cmd}`); }
   const input = JSON.parse(args.input);
+  ipcMethods.push(args.method);
   switch (args.method) {
     case "repositories.list": return JSON.stringify(page(repos));
     case "repositories.get": return JSON.stringify({ok:true, item: repos.find(repo => repo.id === input.id)});
@@ -169,6 +188,10 @@ mockIPCWithEvents(async (cmd, args) => {
       const items = boardRuns.filter(run => (!input.state || run.state === input.state) && (!input.task_id || run.task_id === input.task_id) && (!input.repository_id || run.repository_id === input.repository_id));
       return JSON.stringify({ok:true, items, shown:items.length, total:items.length, has_more:false, next_cursor:null});
     }
+    // A fixture checkout is its own repository: its Git directory sits inside
+    // it, and nothing shares its common directory.
+    case "runs.checkout_identity":
+      return JSON.stringify({ok:true, cwd: input.repo_path, git_dir: `${input.repo_path}/.git`, git_common_dir: `${input.repo_path}/.git`});
     case "decisions.list": {
       const items = boardDecisions.filter(item => item.run_id === input.run_id && (!input.state || item.state === input.state));
       return JSON.stringify({ok:true, items, shown:items.length, total:items.length, has_more:false, next_cursor:null});
@@ -190,7 +213,10 @@ mockIPCWithEvents(async (cmd, args) => {
     // `ORDER BY position,id`, as the store lists them. Array order would make
     // a reorder look persisted whether or not its position was written.
     case "workspaces.list": return JSON.stringify(page([...workspaces].sort((a, b) => a.position - b.position || (a.id < b.id ? -1 : 1))));
-    case "workspaces.get": return JSON.stringify({ok: true, item: workspaces.find(space => space.id === input.id) ?? workspace});
+    case "workspaces.get":
+      workspaceGets++;
+      if (failWorkspaceGet) throw {code: "store_error", message: "Fixture workspace membership offline"};
+      return JSON.stringify({ok: true, item: workspaces.find(space => space.id === input.id) ?? workspace});
     case "workspaces.put": {
       workspaceWrites.push(structuredClone(input));
       const index = workspaces.findIndex(space => space.id === input.id);
@@ -212,6 +238,13 @@ mockIPCWithEvents(async (cmd, args) => {
       return result;
     }
     case "runs.list": return JSON.stringify(page([]));
+    // What Manvi's verification says about a card, as the host reads it from the
+    // store. `verdicts` holds the cards that have one; every other card is "none".
+    case "verifications.board": {
+      verdictReads.push([...input.ids]);
+      return JSON.stringify({ok: true, items: Object.fromEntries(input.ids.filter(id => verdicts.has(id)).map(id => [id, verdicts.get(id)]))});
+    }
+    case "verifications.status": return JSON.stringify(verdicts.get(input.id) ?? {ok: true, state: "none", stale: false, record: null});
     case "enhancements.configuration": {
       if(failConfiguration) throw {code:"worker_error",message:"Manvi temporarily unavailable"};
       return JSON.stringify({ok:true,provider:"local",model:blankConfiguration ? "" : "quick-fixture",model_source:"fixture",providers:["local"]});
@@ -266,6 +299,7 @@ mockIPCWithEvents(async (cmd, args) => {
       return result;
     }
     case "items.list": {
+      listQueries.push(input.query ?? "");
       if (failList) throw {code: "store_error", message: "Fixture task storage offline"};
       // dc-store schema 11: `deleted` reads deleted tasks instead of live
       // ones, `archived` filters on the flag (omitted: both), `status` is
@@ -368,6 +402,17 @@ mockIPCWithEvents(async (cmd, args) => {
       if (loseSave) { loseSave = false; throw {code:"transport_error", message:"Fixture lost the save reply"}; }
       return result;
     }
+    // Manvi's ranking of the open tasks, as the store would answer it: the
+    // priority order, scoped to a repository when one is asked for.
+    case "tasks.suggest": {
+      suggestCalls.push(structuredClone(input));
+      if (suggestMode === "fail") throw {code:"store_error", message:"Fixture suggestions offline"};
+      const open = suggestable(input), ranked = suggestRanking(input);
+      const answer = JSON.stringify({ok: true, generated_at: 1, candidates: open.length, blocked: [], excluded: {in_progress: 0, review: 0, duplicate: 0, blocked: 0, filtered: 0}, board: {scanned: open.length, complete: true, unhydrated: 0}, verification: {checked: 0, unchecked: 0, failed: 0},
+        suggestions: ranked.map((task, i) => ({rank: i + 1, id: task.id, title: task.title, status: task.status, priority: task.priority, score: 100 - i, reason: `fixture rank ${i + 1}`, signals: []}))});
+      if (suggestMode === "hold") return new Promise(resolve => heldSuggest.push(() => resolve(answer)));
+      return answer;
+    }
     default: unknown.push(args.method); throw Error(`Unconfigured method: ${args.method}`);
   }
 });
@@ -455,13 +500,134 @@ const moveThroughMenu = async (id, status) => {
 await wait(() => card("task-1"));
 if (params.has("check")) {
   try {
+    // ---- The drag preview sits under the pointer ----------------------------
+    // The board lives in a `.gp-pane`, whose `contain: layout paint` is the
+    // containing block of any `position: fixed` inside it. A ghost rendered
+    // there was offset by the pane's own origin, so it trailed the pointer by
+    // the header's height. Every drag here is cancelled, never dropped, so the
+    // board the later blocks read is the one they expect.
+    {
+      const ghost = () => document.querySelector('[data-testid="task-drag-ghost"]');
+      const pointer = (target, type, x, y, extra = {}) => target.dispatchEvent(new PointerEvent(type, {
+        bubbles: true, cancelable: true, composed: true, pointerId: 1, pointerType: "mouse", isPrimary: true,
+        button: 0, buttons: type === "pointerup" ? 0 : 1, clientX: x, clientY: y, ...extra,
+      }));
+      const grabbed = card("task-1");
+      const box = grabbed.getBoundingClientRect();
+      const grab = { x: Math.round(box.width * 0.8), y: Math.round(box.height * 0.6) };
+      const start = { x: box.left + grab.x, y: box.top + grab.y };
+      const at = { x: start.x + 37, y: start.y + 23 };
+      const beginDrag = async () => {
+        pointer(card("task-1"), "pointerdown", start.x, start.y);
+        pointer(card("task-1"), "pointermove", at.x, at.y); await settle();
+      };
+      const writesBefore = writes.length;
+
+      await beginDrag();
+      const shown = ghost()?.getBoundingClientRect();
+      check("dragging a card shows its preview", Boolean(shown));
+      check("the drag preview is portaled out of the contained pane", ghost()?.parentElement === document.body);
+      check("the drag preview sits under the pointer",
+        Boolean(shown) && at.x >= shown.left && at.x <= shown.right && at.y >= shown.top && at.y <= shown.bottom);
+      check("the drag preview keeps the point the card was grabbed by",
+        Boolean(shown) && Math.abs(at.x - shown.left - grab.x) <= 1 && Math.abs(at.y - shown.top - grab.y) <= 1);
+      check("the drag preview is the card's own width", Boolean(shown) && Math.abs(shown.width - box.width) <= 1);
+      // A second finger or pen must not take over a drag the first one owns.
+      pointer(card("task-1"), "pointerdown", start.x + 200, start.y, { pointerId: 7, pointerType: "touch", isPrimary: false });
+      pointer(card("task-1"), "pointermove", 5, 5, { pointerId: 7, pointerType: "touch", isPrimary: false });
+      pointer(card("task-1"), "pointerup", 5, 5, { pointerId: 7, pointerType: "touch", isPrimary: false }); await settle();
+      const still = ghost()?.getBoundingClientRect();
+      check("another pointer cannot steal, move or end a drag in progress",
+        Boolean(still) && Math.abs(still.left - shown.left) <= 1 && Math.abs(still.top - shown.top) <= 1);
+
+      // The drop target is measured once per frame, not once per pointer event.
+      {
+        const realFromPoint = document.elementFromPoint.bind(document);
+        let probes = 0;
+        document.elementFromPoint = (x, y) => { probes++; return realFromPoint(x, y); };
+        try {
+          for (let i = 0; i < 200; i++) pointer(card("task-1"), "pointermove", at.x + (i % 7), at.y + (i % 5));
+          check("200 pointermoves in one frame measure the drop target at most once", probes <= 1);
+          await settle();
+          check("the drop target is measured again once the frame runs", probes >= 1);
+        } finally { document.elementFromPoint = realFromPoint; }
+      }
+      document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true })); await settle();
+      check("Escape cancels a drag", !ghost());
+      pointer(document.body, "pointerup", at.x, at.y); await settle();
+      check("a cancelled drag writes nothing when the pointer is released", writes.length === writesBefore);
+
+      // The captured card can leave the DOM mid-drag (a refresh, another agent
+      // moving it), and then the release lands elsewhere. It must still end.
+      await beginDrag();
+      pointer(document.body, "pointerup", at.x, at.y); await settle();
+      check("a release away from the card still ends the drag", !ghost());
+
+      await beginDrag();
+      card("task-1").dispatchEvent(new PointerEvent("lostpointercapture", { bubbles: true, pointerId: 1 })); await settle();
+      check("losing pointer capture ends the drag", !ghost());
+
+      await beginDrag();
+      window.dispatchEvent(new Event("blur")); await settle();
+      check("leaving the window ends the drag", !ghost());
+      pointer(document.body, "pointerup", at.x, at.y); await settle();
+      check("drags that never dropped wrote nothing", writes.length === writesBefore);
+
+      // A backgrounded window runs no animation frames (WKWebView suspends
+      // them while hidden). The click a drop swallows used to be released by
+      // the next frame, so in a hidden window every later card click was
+      // swallowed too and no task would open. Frames are withheld only while
+      // the release is handled, the moment the board arms its guard.
+      await beginDrag();
+      const frame = window.requestAnimationFrame;
+      window.requestAnimationFrame = () => 0;
+      try { pointer(document.body, "pointerup", at.x, at.y); } finally { window.requestAnimationFrame = frame; }
+      await settle(100);
+      card("task-1").click();
+      let opened = false;
+      for (let i = 0; i < 30 && !opened; i++) { opened = Boolean(editor()); if (!opened) await settle(100); }
+      check("a card click after a drop opens the task even when the window runs no frames", opened);
+      if (editor()) await click("Close task details");
+      await wait(() => !editor());
+      // A press left over from any of the above would turn the next click into a drag.
+      await settle(50);
+    }
+
     // These assertions exercise the pre-fix defects through production components.
     await click("GitPulse fixture"); await settle(400);
     check("repository prop changes reload the board scope", !card("task-3") && Boolean(card("task-1")));
     await click("Manvi fixture"); await settle(400);
     check("switching repository tabs replaces prior task cards", Boolean(card("task-3")) && !card("task-1"));
+    check("each board load reads verdicts in one batch of at most 256 distinct ids", verdictReads.length > 0 && verdictReads.every(ids => ids.length > 0 && ids.length <= 256 && new Set(ids).size === ids.length));
+    check("a card nobody has verified shows no verdict chip", root.querySelectorAll('[data-testid="card-verdict"]').length === 0);
+    verdicts.set("task-1", {ok: true, state: "passed", stale: false, record: null});
     await click("Global fixture"); await settle(400);
+    check("a verified card shows its verdict on the card", card("task-1")?.querySelector('[data-testid="card-verdict"]')?.dataset.state === "passed");
     card("task-1").click(); await wait(editor);
+    await wait(() => editor().querySelector('[data-testid="verification-chip"]'));
+    check("the task sheet shows the verdict, a Verify action and the refine action",
+      editor().querySelector('[data-testid="verification-chip"]').dataset.state === "passed"
+      && Boolean(editor().querySelector('[data-testid="task-verify"]')) && Boolean(editor().querySelector('[data-testid="task-refine-ask"]')));
+    // Post verify result: off until the repository opted in, and it asks first.
+    const postButton = () => editor().querySelector('[data-testid="task-verify-post"]');
+    check("Post verify result is disabled while the repository has not opted in", Boolean(postButton()) && postButton().disabled === true && verifyPosts.length === 0);
+    // The sheet posts for the repository tab the person has open.
+    await click("Close task details"); await settle();
+    await repoStore.openRepo("/fixture/GitPulse", { activate: true }); verifyOptIn = true;
+    card("task-1").click(); await wait(editor);
+    await wait(() => postButton() && postButton().disabled === false);
+    check("Post verify result is enabled once the repository opted in", postButton().disabled === false);
+    postButton().click(); await settle();
+    const postPrompt = [...document.querySelectorAll('[role="dialog"]')].find(node => node.getAttribute("aria-label") === "Post verify result?");
+    check("posting asks for confirmation and sends nothing before the answer", Boolean(postPrompt) && verifyPosts.length === 0);
+    button("Cancel", postPrompt)?.click(); await settle();
+    check("cancelling the confirmation posts nothing", verifyPosts.length === 0);
+    postButton().click(); await settle();
+    button("Post to GitHub", [...document.querySelectorAll('[role="dialog"]')].find(node => node.getAttribute("aria-label") === "Post verify result?"))?.click(); await settle(100);
+    check("confirming posts that task once, not as a dry run", verifyPosts.length === 1 && verifyPosts[0].taskId === "task-1" && verifyPosts[0].dryRun === false);
+    verifyOptIn = false;
+    await repoStore.removeRepo("/fixture/GitPulse");
+    verdicts.delete("task-1");
     const title = field("Title"); await change(title, "Unsaved task title");
     confirmations = 0;
     confirmAnswer = false;
@@ -536,6 +702,35 @@ if (params.has("check")) {
       && Boolean(primaryRadio().closest(".repo-row")?.querySelector('input[type="checkbox"]')?.checked)
       && repoSummaryText().includes("primary GitPulse")
       && !editor().textContent.includes("Linked repositories"));
+    // Collapsing the list into a dropdown costs nothing only if the closed
+    // trigger still names every link and marks the primary among them, with
+    // the summary sentence kept on screen for what chips cannot say.
+    {
+      const picker = editor().querySelector("[data-task-repo-picker]");
+      const chips = [...picker.querySelectorAll(".repo-trigger .repo-chip")];
+      const primaries = chips.filter(chip => chip.classList.contains("is-primary"));
+      check("the closed trigger names each linked repository and stars the primary",
+        chips.map(chip => chip.textContent.trim()).sort().join() === "GitPulse,Manvi"
+        && primaries.length === 1 && primaries[0].textContent.trim() === "GitPulse" && Boolean(primaries[0].querySelector("svg"))
+        && !chips.find(chip => !chip.classList.contains("is-primary"))?.querySelector("svg")
+        && picker.querySelector('[data-testid="task-repo-summary-line"]')?.textContent.includes("primary GitPulse")
+        && !picker.querySelector(".repo-trigger-label"));
+    }
+    // Tab inside the popup moves focus; Tab off its last control closes it
+    // rather than leaving a floating panel behind the reader's focus.
+    {
+      const focusables = () => [...(repoPopup()?.querySelectorAll("input:not(:disabled), button:not(:disabled)") ?? [])];
+      const tab = (el, shiftKey = false) => { if (!el) return; el.focus(); el.dispatchEvent(new KeyboardEvent("keydown", { key: "Tab", shiftKey, bubbles: true, cancelable: true })); };
+      tab(focusables()[0]); await settle(60);
+      const stayed = Boolean(repoPopup());
+      tab(focusables().at(-1)); await settle(60);
+      check("Tab within the repository dropdown keeps it open; Tab off its last control closes it",
+        stayed && !repoPopup() && Boolean(editor()));
+      await openRepoPicker();
+      tab(focusables()[0], true); await settle(60);
+      check("Shift+Tab off the dropdown's first control closes it too", !repoPopup() && Boolean(editor()));
+      await openRepoPicker();
+    }
     // A popover inside `.sheet-body` would be clipped by the scroller it is
     // trying to escape, so it is portaled — and then clamped into the viewport.
     const popupRect = () => repoPopup()?.getBoundingClientRect();
@@ -683,6 +878,54 @@ if (params.has("check")) {
       }
     }
 
+    // The rows of that menu. A workspace holding nothing is offered every open
+    // tab and every registered repository, each with an "Add all" row, and what
+    // either adds is written to the workspace's membership and said in full.
+    try {
+      const emptyIndex = () => workspaces.findIndex(space => space.id === "workspace-empty");
+      const emptyIt = () => { workspaces[emptyIndex()] = { ...workspaces[emptyIndex()], repository_ids: [], repository_count: 0 }; };
+      await repoStore.openRepo("/fixture/GitPulse", { activate: false });
+      await repoStore.openRepo("/fixture/Manvi", { activate: false });
+      const fresh = workspaceTab("Fresh space");
+      fresh.click();
+      await wait(() => fresh.getAttribute("aria-pressed") === "true" && (addRepoTrigger()?.getAttribute("aria-label") ?? "").includes("Fresh space"));
+      await wait(() => !root.querySelector('[aria-label="Refresh"]')?.disabled);
+      const openAddMenu = async () => { for (let i = 0; i < 25 && !addRepoMenu(); i++) { addRepoTrigger()?.click(); await settle(80); } return addRepoMenu(); };
+      const rowsOf = menu => [...menu.querySelectorAll('[role="menuitem"]')].map(el => el.textContent.trim().replace(/\s+/g, " "));
+      let menu = await openAddMenu();
+      check("an empty workspace's add menu groups its open tabs and its registered repositories under their own headings",
+        Boolean(menu) && JSON.stringify([...menu.querySelectorAll(".add-menu-label")].map(el => el.textContent.trim())) === JSON.stringify(["Open", "Registered"]));
+      check("it offers Add all open and Add all registered, and Choose folder last",
+        Boolean(menu) && rowsOf(menu).includes("Add all open") && rowsOf(menu).includes("Add all registered") && rowsOf(menu).at(-1) === "Choose folder…");
+      let writesBefore = workspaceWrites.length;
+      button("Add all registered", menu).click();
+      await wait(() => workspaces[emptyIndex()].repository_ids.length === repos.length);
+      await settle(150);
+      check("Add all registered joins every registered repository to the workspace in one write",
+        workspaceWrites.length === writesBefore + 1 && JSON.stringify([...workspaceWrites.at(-1).repository_ids].sort()) === JSON.stringify(repos.map(repo => repo.id).sort()));
+      check("and says it joined the workspace, not only the catalog", document.body.textContent.includes(`Added ${repos.length} repositories to Fresh space`));
+      emptyIt();
+      await click("Refresh");
+      await wait(() => !root.querySelector('[aria-label="Refresh"]')?.disabled);
+      menu = await openAddMenu();
+      writesBefore = workspaceWrites.length;
+      button("Add all open", menu).click();
+      await wait(() => workspaces[emptyIndex()].repository_ids.length === 2);
+      await settle(150);
+      check("Add all open registers and joins every open tab in one write, naming the workspace",
+        workspaceWrites.length === writesBefore + 1 && JSON.stringify([...workspaceWrites.at(-1).repository_ids].sort()) === JSON.stringify(["repo-0", "repo-1"])
+        && document.body.textContent.includes("Added 2 repositories to Fresh space"));
+    } catch (error) { check(`the add menu row checks ran to the end (${error.message})`, false); }
+    finally {
+      if (addRepoMenu()) { document.body.dispatchEvent(new PointerEvent("pointerdown", { bubbles: true })); await settle(60); }
+      const at = workspaces.findIndex(space => space.id === "workspace-empty");
+      if (at >= 0) workspaces[at] = { ...workspaces[at], repository_ids: [], repository_count: 0 };
+      await repoStore.removeRepo("/fixture/GitPulse"); await repoStore.removeRepo("/fixture/Manvi");
+      workspaceTab("All")?.click();
+      await click("Refresh");
+      await wait(() => Boolean(card("task-1")));
+    }
+
     await click("Add task to Ready");
     check("column creation uses that column's status", field("Status").value === "ready");
     check("new tasks default to normal priority", field("Priority").value === "2");
@@ -765,7 +1008,9 @@ if (params.has("check")) {
     check("empty searches explain the result and hide previous tasks", root.textContent.includes("No tasks match") && root.querySelectorAll('[data-task-card]').length === 0);
     await click("Clear task search"); await wait(() => card("task-1"));
     check("clearing search restores the board", Boolean(card("task-1")));
-    holdSearch = true; await change(search, "older"); await wait(() => heldSearch.length === 6);
+    // A search reads one status-less candidate set plus one full-text read for
+    // its most selective word; only the full-text read carries "older".
+    holdSearch = true; await change(search, "older"); await wait(() => heldSearch.length === 1);
     await change(search, "Ready task 01"); await wait(() => card("task-10"));
     heldSearch.forEach(release => release()); holdSearch = false; heldSearch = []; await settle();
     check("late search responses cannot replace newer results", Boolean(card("task-10")) && root.querySelectorAll('[data-task-card]').length === 1);
@@ -774,6 +1019,97 @@ if (params.has("check")) {
     failList = false; await click("Retry loading tasks"); await settle(300);
     check("a failed search can be retried", root.textContent.includes("No tasks match") && !root.textContent.includes("Fixture task storage offline"));
     await click("Clear task search"); await wait(() => card("task-1"));
+
+    // Ranked search: word forms, close spellings, related words, OR, phrases,
+    // comma lists and completions, all through the one shared parser.
+    const shownIds = () => [...root.querySelectorAll("[data-task-card]")].map(el => el.dataset.cardId).sort();
+    const coverage = () => root.querySelector('[data-testid="task-query-coverage"]')?.textContent ?? "";
+    await change(search, "sheet easer"); await settle(400);
+    check("search matches word forms and close spellings", JSON.stringify(shownIds()) === JSON.stringify(["task-2"]));
+    check("the coverage line says what was searched and how", coverage().includes("1 match in all") && coverage().includes("close spellings"));
+    await change(search, "bot"); await settle(400);
+    check("search finds related words and says why a card matched", JSON.stringify(shownIds()) === JSON.stringify(["task-3"])
+      && (card("task-3").querySelector('[data-testid="task-match-hint"]')?.textContent ?? "").includes("related word"));
+    await change(search, "handoff OR sheets"); await settle(400);
+    check("OR matches either word", JSON.stringify(shownIds()) === JSON.stringify(["task-2", "task-3"]));
+    await change(search, '"agent handoff"'); await settle(400);
+    check("a quoted phrase matches the phrase", JSON.stringify(shownIds()) === JSON.stringify(["task-3"]));
+    await change(search, "label:usability,nothing"); await settle(400);
+    check("a comma list is any of its values and shows as one removable chip", JSON.stringify(shownIds()) === JSON.stringify(["task-2"])
+      && root.querySelectorAll(".query-chip").length === 1 && Boolean(root.querySelector('[aria-label="Remove filter label:usability,nothing"]')));
+    root.querySelector('[aria-label="Remove filter label:usability,nothing"]')?.click(); await settle(400);
+    check("removing the chip removes the whole list", search.value === "" && Boolean(card("task-1")));
+    await change(search, "repo:manvi -review"); await settle(400);
+    check("an excluded word drops its tasks", JSON.stringify(shownIds()) === JSON.stringify(["task-2"]));
+    await change(search, "ready task"); await settle(400);
+    check("a worded search offers Relevance and Board order", button("Relevance")?.getAttribute("aria-pressed") === "true" && Boolean(button("Board order")));
+    search.focus(); await change(search, "label:us"); await settle(100);
+    const completions = () => document.querySelector('[role="listbox"][aria-label="Search completions"]');
+    check("the search box completes filter values from the loaded tasks", (completions()?.textContent ?? "").includes("label:usability"));
+    search.dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowDown", bubbles: true })); await settle();
+    search.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true })); await settle(400);
+    check("taking a completion writes it into the query", search.value.trim() === "label:usability" && JSON.stringify(shownIds()) === JSON.stringify(["task-2"]));
+    search.blur();
+    await click("Clear task search"); await wait(() => card("task-1"));
+
+    // Filters typed into the search box. The store's search is full-text, so
+    // the board used to send `is:improvement` as words and find nothing; the
+    // fixture's title match reproduces that exactly.
+    listQueries.length = 0;
+    await change(search, "is:improvement"); await settle(400);
+    check("is: filters the board by type instead of searching for the words",
+      Boolean(card("task-2")) && !card("task-1") && !card("task-3") && !root.textContent.includes("No tasks match"));
+    check("a search of only filters does not reload the board from the store", listQueries.every(query => query === ""));
+    await change(search, "is:improvement Make"); await settle(400);
+    // The store is asked for the search's most selective word, folded.
+    check("words beside a filter still reach the store, without the filter",
+      Boolean(card("task-2")) && listQueries.some(query => query.toLowerCase() === "make") && !listQueries.some(query => query.includes("is:")));
+    await change(search, "-is:improvement"); await settle(400);
+    check("a leading minus excludes the type", !card("task-2") && Boolean(card("task-1")) && Boolean(card("task-3")));
+    await change(search, "repo:manvi"); await settle(400);
+    check("repo: keeps tasks linked to that repository, primary or not", Boolean(card("task-2")) && Boolean(card("task-3")) && !card("task-1"));
+    const chip = root.querySelector('[aria-label="Remove filter repo:manvi"]');
+    chip?.click(); await settle(400);
+    check("a filter chip removes its filter from the search", Boolean(chip) && search.value === "" && Boolean(card("task-1")));
+    await change(search, "priority:huge"); await settle(400);
+    check("an unreadable filter is reported and not applied",
+      root.querySelector('[data-testid="task-query-problems"]')?.textContent.includes("priority:huge is not a priority") && Boolean(card("task-1")));
+    await change(search, ""); await settle(300);
+    await click("Filters"); await settle(100);
+    await click("Bugs"); await settle(400);
+    check("the Bugs quick filter writes is:bug into the search", search.value === "is:bug" && button("Bugs").getAttribute("aria-pressed") === "true" && root.textContent.includes("No tasks match"));
+    await click("Bugs"); await settle(400);
+    check("pressing a quick filter again takes it out", search.value === "" && Boolean(card("task-1")));
+    const repoFilter = root.querySelector('[data-testid="task-filter-repository"]');
+    await change(repoFilter, "repo-1", "change"); await settle(300);
+    check("the repository filter narrows the global board", Boolean(card("task-3")) && Boolean(card("task-2")) && !card("task-1"));
+    root.querySelector('[data-repository-row="repo-0"] button')?.click(); await settle(400);
+    check("a repository filter carried onto a repository board stays on screen",
+      root.querySelector('[data-testid="task-filter-repository"]')?.value === "repo-1" && Boolean(button("Clear filters")));
+    await change(root.querySelector('[data-testid="task-filter-repository"]'), "all", "change"); await settle(300);
+    check("clearing the carried filter brings that board's tasks back", Boolean(card("task-1")));
+    button("All", root.querySelector('nav[aria-label="Task scopes"]'))?.click(); await settle(400);
+    // A facet is changed in place (`facet.kind = …`), not reassigned. The
+    // selection must still be dropped, or a bulk Delete acts on cards the
+    // filter has just taken off screen.
+    card("task-1").dispatchEvent(new MouseEvent("click", { bubbles: true, ctrlKey: true })); await settle();
+    const selectedBefore = root.querySelector(".selection")?.textContent.includes("1 selected");
+    await change(root.querySelector('[aria-label="Filter by type"]'), "improvement", "change"); await settle(300);
+    check("changing a filter drops a selection it may have hidden",
+      selectedBefore && !card("task-1") && !root.querySelector(".selection"));
+    await change(root.querySelector('[aria-label="Filter by type"]'), "all", "change"); await settle(300);
+    await click("Filters"); await settle(100);
+    const navSearch = root.querySelector('[data-testid="task-nav-search"]');
+    await change(navSearch, "manv"); await settle(100);
+    check("the navigator finds a repository by name",
+      Boolean(root.querySelector('[data-repository-row="repo-1"]')) && !root.querySelector('[data-repository-row="repo-0"]'));
+    await change(navSearch, "fixture/gitpulse"); await settle(100);
+    check("the navigator finds a repository by its path",
+      Boolean(root.querySelector('[data-repository-row="repo-0"]')) && !root.querySelector('[data-repository-row="repo-1"]'));
+    await change(navSearch, "zzz-nothing"); await settle(100);
+    check("the navigator says when nothing matches", Boolean(root.querySelector('[data-testid="task-nav-no-repositories"]')) && Boolean(root.querySelector('[data-testid="task-nav-no-workspaces"]')));
+    navSearch.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true })); await settle(100);
+    check("Escape clears the navigator search", navSearch.value === "" && Boolean(root.querySelector('[data-repository-row="repo-0"]')) && Boolean(workspaceTab("Developer tools")));
 
     await click("Developer tools"); await wait(() => Boolean(card("task-3")) && !card("task-1"));
     await click("New task");
@@ -983,9 +1319,11 @@ if (params.has("check")) {
     check("bulk organization preserves both task briefs", ["task-14","task-15"].every(id=>tasks.find(task=>task.id===id).status==="review" && tasks.find(task=>task.id===id).description.includes("Keep changes focused")));
     await click("List view");
     check("list layout reuses the same task data", Boolean(root.querySelector('[aria-label="Task list"]')) && Boolean(card("task-14")));
-    await click("Filters"); await change(root.querySelector('[aria-label="Filter by priority"]'),"1","change");
+    // A filter searches every task on the board, not just the loaded pages,
+    // so it waits for its candidates like a typed search does.
+    await click("Filters"); await change(root.querySelector('[aria-label="Filter by priority"]'),"1","change"); await settle(400);
     check("priority filtering only shows matching loaded tasks", [...root.querySelectorAll('[data-task-card]')].every(el=>tasks.find(task=>task.id===el.dataset.cardId).priority===1) && root.querySelectorAll("[data-task-card]").length>0);
-    await change(root.querySelector('[aria-label="Filter by priority"]'),"0","change"); await change(root.querySelector('[aria-label="Filter by label"]'),"usability","change");
+    await change(root.querySelector('[aria-label="Filter by priority"]'),"0","change"); await change(root.querySelector('[aria-label="Filter by label"]'),"usability","change"); await settle(400);
     check("filtered empty states explain how to recover", root.textContent.includes("No tasks match") && Boolean(button("Clear filters")));
     await click("Clear filters"); await click("Board view");
     await selectCard("task-16"); await change(root.querySelector('[aria-label="Search tasks"]'),"Ready task"); await settle(400);
@@ -1102,11 +1440,41 @@ if (params.has("check")) {
     check("due dates round-trip through the task editor",
       tasks.some(task => task.id === "task-2" && task.due_at === dueExpected)
       && dueTrigger().textContent.includes("2026"));
+    {
+      // The calendar opens on the month the task is due in, not the month the
+      // reader last browsed; Escape closes the picker, not the sheet; Clear
+      // removes the date and has nothing to do once there is none.
+      const duePopup = () => document.querySelector('[data-testid="task-due-popup"]');
+      const month = () => duePopup()?.querySelector('[data-testid="task-due-month"]')?.textContent.trim();
+      const september = new Date(2026, 8, 1).toLocaleDateString(undefined, { month: "long", year: "numeric" });
+      dueTrigger().click(); await settle(80);
+      const openedOn = month();
+      duePopup()?.querySelector('[aria-label="Next month"]')?.click(); await settle(30);
+      const browsedTo = month();
+      document.body.dispatchEvent(new PointerEvent("pointerdown", { bubbles: true })); await settle(60);
+      dueTrigger().click(); await settle(80);
+      check("the due calendar opens on the due month, and forgets the browsing once closed",
+        openedOn === september && browsedTo !== september && month() === september);
+      duePopup()?.querySelector('[data-testid="task-due-phrase"]')?.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true }));
+      await settle(60);
+      check("Escape in the due picker closes it and leaves the sheet open", !duePopup() && Boolean(editor()));
+      dueTrigger().click(); await settle(80);
+      duePopup()?.querySelector('[data-testid="task-due-clear"]')?.click(); await settle(60);
+      const clearAfter = duePopup()?.querySelector('[data-testid="task-due-clear"]');
+      document.body.dispatchEvent(new PointerEvent("pointerdown", { bubbles: true })); await settle(60);
+      await click("Save task"); await settle(100);
+      check("Clear removes the due date, saves as none, and has nothing to clear after",
+        dueTrigger().textContent.includes("No due date") && tasks.find(task => task.id === "task-2")?.due_at === null
+        && (!clearAfter || clearAfter.disabled));
+    }
     editor().querySelector('[data-sheet-tab="agent"]').click(); await settle();
     await change(field("Owner"),"ada"); await click("Save task"); await settle(100);
     check("saving keeps the reader on the pane they were editing", editor().querySelector('[data-sheet-tab="agent"]').getAttribute("aria-selected")==="true");
     editor().querySelector('[data-sheet-tab="task"]').click(); await settle();
     await change(field("Description"),"Unsaved context");
+    check("a saved task's assist offers to improve it rather than compose a new one",
+      editor().querySelector(".assist-title")?.textContent.trim() === "Improve this task"
+      && editor().querySelector(".assist-hint")?.textContent.trim() === "Ask for a better title and description, or paste notes to rewrite them.");
     check("unsaved edits stay local until Manvi prepare saves", editor().querySelector("header small").textContent==="Unsaved" && Boolean(enhanceButton()) && !enhanceButton().matches(":disabled"));
     confirmAnswer=true; await click("Close task details");
     await click("New task");
@@ -1117,6 +1485,10 @@ if (params.has("check")) {
     // verb and the request's kind that `draftingKind`/`draftingVerb` were
     // extracted to end, so it was asserting the bug rather than the fix.
     check("new tasks start with one idea field and the current repository", Boolean(idea) && idea.getClientRects().length>0 && Boolean(button("Draft with Manvi")) && !editor().querySelector('.sheet-tabs'));
+    // The assist speaks compose copy only when the sheet says this is a new task.
+    check("a new task's assist asks what is needed and says notes become fields to accept",
+      editor().querySelector(".assist-title")?.textContent.trim() === "What do you need?"
+      && editor().querySelector(".assist-hint")?.textContent.trim() === "Notes become a title and description you accept below.");
     check("a new task does not fold its notes",
       !assistToggle() && assistBody() && !assistBody().hidden
       && (idea.compareDocumentPosition(field("Title")) & Node.DOCUMENT_POSITION_FOLLOWING) !== 0);
@@ -1166,6 +1538,17 @@ if (params.has("check")) {
     loseEnhancement=true; acceptButton().click(); await settle();
     const retryInline=button("Retry pending action");
     check("a lost acceptance retains a retry and blocks closing", Boolean(retryInline) && button("Close task details").disabled);
+    {
+      // While that acceptance is unresolved, save and leave are refused, and each refusal names the wait.
+      const savesBefore = writes.length;
+      const notes = () => [...editor().querySelectorAll('[role="status"]')].map(el => el.textContent.trim());
+      field("Title").dispatchEvent(new KeyboardEvent("keydown", { key: "s", metaKey: true, ctrlKey: true, bubbles: true, cancelable: true })); await settle();
+      check("Command-S while an acceptance is unresolved saves nothing and says to wait for it",
+        writes.length === savesBefore && notes().includes("Wait for Manvi to finish before saving."));
+      field("Title").dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true })); await settle();
+      check("Escape then keeps the sheet open and says to wait for it",
+        Boolean(editor()) && notes().includes("Wait for Manvi to finish before leaving this task."));
+    }
     if(retryInline) await click("Retry pending action");
     await wait(()=>tasks.find(task=>task.id===quickProposal.task_id)?.title==="Reliable task notifications");
     check("applying the default quick enhancement updates title and description together", tasks.find(task=>task.id===quickProposal.task_id).description.includes("verify recovery"));
@@ -1382,6 +1765,16 @@ if (params.has("check")) {
     const expected = archivedCount();
     check("the board badges the server's archived total, not a page of it",
       expected > 30 && archiveToggle()?.textContent.trim() === String(expected));
+    // The dock has its own search, so the board's must not narrow the badge:
+    // a filtered board advertising fewer archived tasks misreports the archive.
+    {
+      const boardSearch = root.querySelector('[aria-label="Search tasks"]');
+      await change(boardSearch, "Ready task 01"); await settle(400);
+      const narrowed = archiveToggle()?.textContent.trim();
+      await change(boardSearch, ""); await settle(400);
+      check("the archive badge counts the scope's archive whatever the board search",
+        narrowed === String(expected) && archiveToggle()?.textContent.trim() === String(expected));
+    }
     // dc-store schema 11: Done and archived are separate. Archived Done work
     // is off the board, and the Done column holds only what is not archived.
     check("archived work is not drawn in the Done column",
@@ -1405,13 +1798,46 @@ if (params.has("check")) {
     // archive they have only partly seen.
     check("a partly loaded archive says so, with both numbers",
       archiveSummaryText() === `Showing 30 of ${expected} archived tasks. Load more to see the rest.`);
+    // Load more extends the rows, so it scrolls with them: a fixed row outside
+    // the scroller competed with the list for the panel's height.
+    {
+      const more = button("Load more", archive()), list = archive().querySelector(".entries");
+      check("Load more sits inside the row scroller, after the last row",
+        Boolean(more) && list.contains(more) && list.lastElementChild === more
+        && archiveRows().at(-1).compareDocumentPosition(more) === Node.DOCUMENT_POSITION_FOLLOWING);
+    }
     button("Load more", archive()).click(); await settle(200);
     check("Load more grows the page instead of replacing it",
       archiveRows().length === expected && archiveSummaryText() === `${expected} archived tasks.`);
+    check("Load more is gone once the store says there is no next page", !button("Load more", archive()));
+    // "Select all" over a paged list would claim rows the dock has not loaded;
+    // the head says how many it means and selects exactly those.
+    {
+      const head = archive().querySelector(".list-head");
+      const all = head.querySelector('input[type="checkbox"]');
+      all.click(); await settle();
+      const picked = archiveRows().filter(row => row.querySelector('input[type="checkbox"]').checked).length;
+      check("the select-all head names the loaded count and selects exactly those rows",
+        head.textContent.replace(/\s+/g, " ").trim() === `Select the ${expected} loaded`
+        && picked === expected && archive().querySelector(".actions")?.textContent.includes(`${expected} selected`));
+      button("Clear", archive().querySelector(".actions")).click(); await settle();
+      check("Clear empties the archive selection and takes its actions away",
+        !archive().querySelector(".actions") && archiveRows().every(row => !row.querySelector('input[type="checkbox"]').checked)
+        && all.checked === false);
+    }
     // A restore is the board's own update, so it must land in the board's
     // confirm dialog rather than writing straight through.
     archiveRows()[0].querySelector('input[type="checkbox"]').click(); await settle();
     archiveRows()[1].querySelector('input[type="checkbox"]').click(); await settle();
+    // ft-30d0d11d: Cmd-Tab away and back. A blur pauses loads; it must not
+    // reset the page or the selection the reader built over several pages.
+    {
+      const checked = () => archiveRows().filter(row => row.querySelector('input[type="checkbox"]').checked).map(row => row.getAttribute("data-card-id"));
+      const chosen = checked(), rowsBefore = archiveRows().length;
+      window.dispatchEvent(new Event("blur")); await settle(400);
+      check("a window blur and return keep the archive's selection and loaded pages",
+        chosen.length === 2 && checked().join() === chosen.join() && archiveRows().length === rowsBefore);
+    }
     // The defect this panel was reported for, measured rather than asserted
     // about the stylesheet. With the rows loaded, the Restore/Delete bar used
     // to render ~107px below the panel's own fold at scroll top: ticking a
@@ -1471,6 +1897,22 @@ if (params.has("check")) {
     await settle(350);
     check("the archive searches archived work without touching the board's search",
       archiveRows().length === 1 && root.querySelector('[aria-label="Search tasks"]').value === "");
+    // The archive had its own copy of the defect: it too sent `is:bug` to the
+    // store as the words "is" and "bug".
+    const archiveSearch = archive().querySelector('[aria-label="Search archived tasks"]');
+    await change(archiveSearch, ""); await settle(350);
+    listQueries.length = 0;
+    await change(archiveSearch, "is:feature Completed task 30"); await settle(350);
+    check("the archive applies filters itself and sends the store only the words",
+      archiveRows().length === 1 && listQueries.includes("Completed task 30") && !listQueries.some(query => query.includes("is:")));
+    await change(archiveSearch, "is:bug"); await settle(350);
+    check("an archive filter nothing matches says so instead of listing everything",
+      archiveRows().length === 0 && archive().textContent.includes("No archived tasks match"));
+    listQueries.length = 0;
+    await change(archiveSearch, "is:feature"); await settle(350);
+    check("adding a filter to the archive's words does not re-read the store", listQueries.length === 0 || listQueries.every(query => query === ""));
+    await change(archiveSearch, "priority:huge"); await settle(350);
+    check("the archive reports an unreadable filter", archive().querySelector('[data-testid="task-archive-query-problems"]')?.textContent.includes("priority:huge"));
     await change(archive().querySelector('[aria-label="Search archived tasks"]'), "");
     await settle(350);
     // ---- The Deleted view: restore a deleted task with its id ------------
@@ -1555,6 +1997,8 @@ if (params.has("check")) {
     check("the selection bar offers Archive beside Delete",
       Boolean(bulkButton()) && !bulkButton().disabled
       && root.querySelector('[aria-label="Selected task actions"]').textContent.includes("2 selected"));
+    check("the enabled Archive says it keeps each task's status, and does not claim they are already archived",
+      bulkButton().title.includes("keeping their status") && !bulkButton().title.includes("Already archived"));
     bulkButton().click(); await settle(450);
     check("bulk Archive files each task away once, keeping its status",
       [second, third].every(id => of(id).archived === true && of(id).status === "ready" && !card(id))
@@ -1636,7 +2080,10 @@ if (params.has("check")) {
 
     // ---- Filing a task as a GitHub issue ----------------------------------
     {
-      const issuePrompt = () => [...document.querySelectorAll('[role="dialog"]')].filter(node => node.getAttribute("aria-label") === "Create GitHub issue").at(-1);
+      // Only the prompt the store still holds is open. A dismissed dialog lingers in the DOM for its fade-out, and WebKit runs that fade
+      // longer than Chrome does, so a bare DOM lookup finds the previous task's dialog and answers it.
+      const livePrompt = title => get(promptState)?.options.title === title ? [...document.querySelectorAll('[role="dialog"]')].filter(node => node.getAttribute("aria-label") === title).at(-1) : undefined;
+      const issuePrompt = () => livePrompt("Create GitHub issue");
       // By its stem: a selection's row reads "Create 2 GitHub issues…".
       const issueRow = () => menu() && [...menu().querySelectorAll("button")].find(el => /^Create (\d+ )?GitHub issues?…/.test(el.textContent.trim()));
       const labelsOf = id => tasks.find(task => task.id === id).labels;
@@ -1685,7 +2132,7 @@ if (params.has("check")) {
         if (root.querySelector('[aria-label="Selected task actions"]')) await click("Clear task selection");
         for (const id of ids) { card(id).dispatchEvent(new MouseEvent("click",{bubbles:true,ctrlKey:true})); await settle(); }
       };
-      const batchPrompt = () => [...document.querySelectorAll('[role="dialog"]')].filter(node => node.getAttribute("aria-label") === "Create GitHub issues").at(-1);
+      const batchPrompt = () => livePrompt("Create GitHub issues");
       await multiSelect(["task-23", "task-24", "task-20"]);
       await openMenu("task-23");
       check(`a selection offers one run and counts the linked task it will skip (${issueRow()?.textContent.trim()})`,
@@ -1847,10 +2294,14 @@ if (params.has("check")) {
     const overrideField = name => override()?.querySelector(`[aria-label="${name}"]`);
     check("a terminal handoff offers this launch's model, effort and advisor for Claude Code",
       Boolean(overrideField("Model")) && Boolean(overrideField("Effort")) && Boolean(overrideField("Advisor model")));
-    await change(overrideField("Model"), "opus 4");
-    check("a model that is not a model name closes the gate, by name, instead of being dropped",
-      sheet().querySelector(".gate").textContent.includes("“opus 4” is not a model name"));
-    await change(overrideField("Model"), "opus");
+    // Claude Code's model is chosen from its aliases, so an id that is not a
+    // model name cannot be entered at all: the select has no option to hold it.
+    await change(overrideField("Model"), "opus 4", "change");
+    const modelOptions = [...(overrideField("Model")?.options ?? [])].map(option => option.value);
+    check("Claude Code's model is chosen from its aliases, so a model that is not a model name cannot be entered",
+      overrideField("Model")?.tagName === "SELECT" && modelOptions.includes("opus") && !modelOptions.includes("opus 4")
+      && overrideField("Model").value === "" && !sheet().querySelector(".gate").textContent.includes("opus 4"));
+    await change(overrideField("Model"), "opus", "change");
     await change(overrideField("Effort"), "high", "change");
     const preparedBefore = preparedRuns.length;
     const launchClaude = [...sheet().querySelectorAll("button")].find(el => el.textContent.trim().startsWith("Launch in"));
@@ -2400,6 +2851,68 @@ if (params.has("check")) {
       await refreshBoard(); await settle(200);
     } catch (error) { check(`the paging checks ran to the end (${error.message} at ${guardStep})`, false); }
 
+    // ---- ft-1259cd60 / ft-608b881a: what a refresh keeps, where a move lands, one event once -----
+    try {
+      guardStep = "board paging";
+      for (let i = 0; i < 65; i++) tasks.push(makeTask(`task-${500 + i}`, `Wave4 review ${String(i + 1).padStart(2, "0")}`, "repo-0", "review"));
+      boardRuns = []; boardDecisions = [];
+      root.querySelector('button[aria-label="Refresh"]').click(); await settle(300);
+      const review = () => root.querySelector('[data-task-column="review"]');
+      const reviewCards = () => review().querySelectorAll("[data-task-card]").length;
+      await wait(() => button("Load more Review tasks", review()));
+      button("Load more Review tasks", review()).click();
+      await wait(() => reviewCards() === 60);
+      const refreshes = () => ipcMethods.filter(method => method === "repositories.list").length;
+      let reads = refreshes();
+      await emit("workbench-changed", { sequence: 100 });
+      await wait(() => refreshes() > reads); await settle(500);
+      check("a workbench change after Load more keeps the 60 cards that were loaded", reviewCards() === 60 && Boolean(button("Load more Review tasks", review())));
+      // One write is announced twice by the host (the command, then the
+      // data_version poll). It must cost one refresh, not two.
+      reads = refreshes();
+      await emit("workbench-changed", { sequence: 101 });
+      await settle(450);
+      await emit("workbench-changed", { sequence: null, source: "external" });
+      await settle(900);
+      check("one write and its external echo refresh the board once", refreshes() - reads === 1);
+      reads = refreshes();
+      await emit("workbench-changed", { sequence: null, source: "external" });
+      await wait(() => refreshes() > reads);
+      check("a change from outside the app still refreshes the board", refreshes() - reads === 1);
+      // A reader typing: the board keeps its cards, marked busy, while the load is pending.
+      const searchBox = root.querySelector('[aria-label="Search tasks"]');
+      const columns = () => root.querySelector('[data-testid="task-columns"]');
+      const typed = [], counts = [];
+      for (const text of ["Wa", "Wav", "Wave", "Wave4"]) {
+        searchBox.focus(); await change(searchBox, text);
+        typed.push(root.querySelectorAll("[data-task-card]").length > 0 && Boolean(columns()));
+        counts.push(`${text}:${root.querySelectorAll("[data-task-card]").length}/${columns()?.getAttribute("aria-busy")}`);
+      }
+      check(`typing in search never empties the board while its load is pending (${counts.join(" ")})`, typed.every(Boolean));
+      await settle(600);
+      await click("Clear task search"); await settle(500);
+      // Keyboard move to the bottom of a column with more behind it.
+      guardStep = "move to the end of a paged column";
+      await wait(() => button("Load more Review tasks", review()));
+      const lastReview = () => Math.max(...tasks.filter(task => task.status === "review" && task.id !== "task-1").map(task => task.position));
+      const inProgressOf1 = tasks.find(task => task.id === "task-1").status;
+      card("task-1").focus(); card("task-1").dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowRight", bubbles: true, cancelable: true }));
+      await wait(() => tasks.find(task => task.id === "task-1").status === "review");
+      await settle(400);
+      check("a card moved to the bottom of a paged column sorts after every card in it, so it is still there on reload",
+        inProgressOf1 !== "review" && tasks.find(task => task.id === "task-1").position > lastReview());
+      check("and it is on screen", Boolean(review().querySelector('[data-card-id="task-1"]')));
+      // Nothing changing costs nothing: no polls on a visible, idle board.
+      guardStep = "idle board";
+      await settle(1200);
+      const idleFrom = ipcMethods.length;
+      await new Promise(resolve => setTimeout(resolve, 10_000));
+      check(`a visible board with no writes makes no IPC in 10 s${ipcMethods.length === idleFrom ? "" : ` (${ipcMethods.slice(idleFrom).join(",")})`}`, ipcMethods.length === idleFrom);
+      // Leave the fixture as the next checks expect it.
+      tasks = tasks.filter(task => !task.title.startsWith("Wave4 review")).map(task => task.id === "task-1" ? { ...task, status: "in_progress", position: 1 } : task);
+      root.querySelector('button[aria-label="Refresh"]').click(); await settle(300);
+    } catch (error) { check(`the board refresh checks ran to the end (${error.message} at ${guardStep})`, false); }
+
     // ---- Work-in-progress limits, lanes and saved views, per board --------
     try {
       guardStep = "views: scopes";
@@ -2459,6 +2972,9 @@ if (params.has("check")) {
       const before = writes.length;
       card("task-2").focus(); card("task-2").dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowLeft", bubbles: true, cancelable: true }));
       await wait(() => writes.length > before && card("task-2")?.closest("[data-task-column]")?.dataset.taskColumn === to);
+      await settle();
+      check("after ArrowLeft the moved card holds focus", document.activeElement === card("task-2"));
+      check("after ArrowLeft the live region names the new column", /moved to /.test(root.querySelector('[role="status"][aria-live="polite"].sr-only')?.textContent ?? "") && root.querySelector('[role="status"][aria-live="polite"].sr-only').textContent.toLowerCase().includes(to.replace("_", " ")));
       check("a keyboard move in a lane changes the status and keeps the card in its lane", writes.at(-1).status === to && writes.at(-1).owner === ownerOf2 && laneOf("task-2") === `owner:${ownerOf2}`);
       guardStep = `views: lane move back; now ${card("task-2")?.closest("[data-task-column]")?.dataset.taskColumn} writes=${writes.length}`;
       card("task-2").focus(); card("task-2").dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowRight", bubbles: true, cancelable: true }));
@@ -2485,6 +3001,8 @@ if (params.has("check")) {
       await saveAs("Owners");
       check("saving a view names it on the control and keeps it for this board", viewsToggle().textContent.trim() === "Owners"
         && get(interfaceStore).taskBoards.global?.views.some(view => view.name === "Owners" && view.swimlane === "owner" && view.facet.priority === 1));
+      // Preference saves are deferred; leaving the page flushes them, as this does.
+      interfaceStore.flush();
       check("a saved view survives a reload: it is in the stored preferences", JSON.stringify({ ...localStorage }).includes("Owners"));
       await closeViews();
       await openView(); viewMenu().querySelector('[data-task-lane-option="none"]').click(); await settle(); await closeView();
@@ -2514,6 +3032,245 @@ if (params.has("check")) {
       interfaceStore.setTaskSwimlane("none");
       await click("Clear filters"); await settle(200);
     } catch (error) { check(`the board view checks ran to the end (${error.message} at ${guardStep}; error=${root.querySelector(".banner.error")?.textContent ?? ""})`, false); }
+
+    // ---- Claims the board's source-text tests used to make from the markup ---
+    try {
+      guardStep = "claims: chrome";
+      const scopes = root.querySelector('nav[aria-label="Task scopes"]');
+      button("All", scopes).click(); await settle(400);
+      if (button("Board")) { button("Board").click(); await settle(200); }
+      const drawn = root.textContent;
+      const banned = ["GLOBAL BOARD", "WORKSPACE BOARD", "REPOSITORY BOARD", "Drop a Git repository", "Drop a task here", "Activity inbox", "Add repositories to start creating linked tasks"];
+      check(`the board chrome carries none of the generic marketing labels (${banned.filter(label => drawn.includes(label)).join(", ")})`, banned.every(label => !drawn.includes(label)));
+      check("the header offers New task and an Inbox", Boolean(button("New task")) && Boolean(root.querySelector('[aria-label="Inbox"]')));
+      const urgent = card("task-2")?.querySelector('[aria-label$=" priority"]');
+      check("a card names its priority for a screen reader, not by colour alone", /^High priority$/.test(urgent?.getAttribute("aria-label") ?? ""));
+
+      guardStep = "claims: quick add dims";
+      const quickRow = () => root.querySelector('[data-testid="task-quick-add-row"]');
+      check("the quick-add row is live while no task sheet is open", !editor() && !quickRow().classList.contains("dimmed") && !quickRow().querySelector("input").disabled);
+      card("task-3").dispatchEvent(new MouseEvent("click", { bubbles: true })); await wait(editor);
+      check("the quick-add row is dimmed and disabled while a task sheet is open", quickRow().classList.contains("dimmed") && quickRow().querySelector("input").disabled);
+      confirmAnswer = true; await click("Close task details"); await wait(() => !editor());
+      check("closing the sheet brings the quick-add row back", !quickRow().classList.contains("dimmed") && !quickRow().querySelector("input").disabled);
+
+      guardStep = "claims: priority order locks moves";
+      const readyIds = () => [...root.querySelectorAll('[data-task-column="ready"] [data-task-card]')].map(el => el.dataset.cardId);
+      button("Priority first").click(); await settle(200);
+      const lockedFrom = readyIds(), lockedWrites = writes.length;
+      const lockedCard = root.querySelector('[data-task-column="ready"] [data-task-card]');
+      lockedCard.focus(); lockedCard.dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowDown", altKey: true, bubbles: true, cancelable: true })); await settle(300);
+      check("under Priority first a card is not moved within its column, and the board says why",
+        writes.length === lockedWrites && readyIds().join() === lockedFrom.join() && /Switch to Board order/.test(root.querySelector('[role="status"][aria-live="polite"].sr-only')?.textContent ?? ""));
+      button("Board order").click(); await settle(200);
+      const freeFirst = root.querySelector('[data-task-column="ready"] [data-task-card]');
+      freeFirst.focus(); freeFirst.dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowDown", altKey: true, bubbles: true, cancelable: true }));
+      await wait(() => writes.length > lockedWrites);
+      check("back in Board order the same key moves the card with a write", writes.length === lockedWrites + 1);
+
+      guardStep = "claims: drop onto a column";
+      // Every drag above is cancelled; this one is released over another
+      // column, which is the only path that writes a status from a drag.
+      {
+        const pointer = (target, type, x, y) => target.dispatchEvent(new PointerEvent(type, {
+          bubbles: true, cancelable: true, composed: true, pointerId: 1, pointerType: "mouse", isPrimary: true,
+          button: 0, buttons: type === "pointerup" ? 0 : 1, clientX: x, clientY: y,
+        }));
+        const draggedId = readyIds()[0];
+        const dragged = card(draggedId), from = tasks.find(task => task.id === draggedId);
+        const grabBox = dragged.getBoundingClientRect();
+        const target = root.querySelector('[data-task-column="backlog"]').getBoundingClientRect();
+        const dest = { x: target.left + target.width / 2, y: target.top + Math.min(target.height - 4, 60) };
+        const dropWrites = writes.length;
+        pointer(dragged, "pointerdown", grabBox.left + 10, grabBox.top + 10);
+        pointer(dragged, "pointermove", dest.x, dest.y); await settle(80);
+        pointer(dragged, "pointermove", dest.x, dest.y + 1); await settle(80);
+        pointer(document.body, "pointerup", dest.x, dest.y + 1);
+        await wait(() => tasks.find(task => task.id === draggedId).status === "backlog");
+        await settle(300);
+        check("releasing a dragged card over another column writes that status, once", writes.length === dropWrites + 1 && writes.at(-1).id === draggedId && writes.at(-1).status === "backlog");
+        check("and the card is drawn in that column", Boolean(root.querySelector(`[data-task-column="backlog"] [data-card-id="${draggedId}"]`)));
+        tasks = tasks.map(task => task.id === draggedId ? { ...task, status: from.status, position: from.position } : task);
+      }
+
+      guardStep = "claims: editor subtasks and shortcuts";
+      {
+        card("task-3").dispatchEvent(new MouseEvent("click", { bubbles: true })); await wait(editor);
+        const part = testid => editor().querySelector(`[data-testid="${testid}"]`);
+        const typed = async text => { await change(part("task-subtask-add-input"), text); };
+        check("Add stays disabled until a subtask is typed", part("task-subtask-add-button").disabled === true);
+        await typed("Write the tests");
+        check("and is enabled once one is", part("task-subtask-add-button").disabled === false);
+        part("task-subtask-add-button").click(); await settle();
+        check("Add lists the subtask, puts it in the criteria and clears the box",
+          part("task-subtask-item-0")?.textContent.includes("Write the tests") && part("task-criteria").value === "Write the tests" && part("task-subtask-add-input").value === "");
+        await typed("Ship it");
+        part("task-subtask-add-input").dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true, cancelable: true })); await settle();
+        check("Enter in the box adds one too", part("task-subtask-item-1")?.textContent.includes("Ship it") && part("task-criteria").value === "Write the tests\nShip it");
+        part("task-subtask-remove-0").click(); await settle();
+        check("Remove drops that subtask and keeps the other", part("task-subtask-item-0")?.textContent.includes("Ship it") && !part("task-subtask-item-1") && part("task-criteria").value === "Ship it");
+        await change(field("Description"), "Plan:\n- [ ] Alpha step\n- [ ] Beta step");
+        part("task-extract-subtasks").click(); await settle();
+        check("Extract subtasks moves the checklist out of the description into the criteria, keeping what was there",
+          part("task-criteria").value === "Ship it\nAlpha step\nBeta step" && !field("Description").value.includes("Alpha step") && /Extracted 2 subtasks/.test(editor().textContent));
+        // Cmd+S from inside the repository popover, which is portaled out of the sheet.
+        await openRepoPicker();
+        const savesBefore = writes.length;
+        repoPopup().dispatchEvent(new KeyboardEvent("keydown", { key: "s", metaKey: true, ctrlKey: true, bubbles: true, cancelable: true }));
+        await wait(() => writes.length > savesBefore); await settle(200);
+        check("Command-S saves from inside the repository popover, with the criteria as stored lines",
+          JSON.stringify(writes.at(-1).acceptance_criteria) === JSON.stringify(["Ship it", "Alpha step", "Beta step"]));
+        await closeRepoPicker();
+        await click("Close task details"); await wait(() => !editor());
+      }
+
+      guardStep = "claims: membership retry";
+      failWorkspaceGet = true;
+      workspaceTab("Developer tools").click(); await wait(() => root.querySelector(".banner.error"));
+      check("a failed workspace membership read is reported with a Retry", /membership offline/.test(root.querySelector(".banner.error").textContent) && Boolean(button("Retry", root.querySelector(".banner.error"))));
+      failWorkspaceGet = false;
+      const getsBeforeRetry = workspaceGets;
+      button("Retry", root.querySelector(".banner.error")).click();
+      await wait(() => !root.querySelector(".banner.error"));
+      check("Retry reads the workspace membership again, not just the board", workspaceGets > getsBeforeRetry);
+      button("All", scopes).click(); await settle(400);
+    } catch (error) { check(`the board claim checks ran to the end (${error.message} at ${guardStep})`, false); }
+
+    // ---- Suggest next, the severity filter, key e, scope labels, the sheet's controls
+    {
+      let step = "start";
+      const scopesNav = () => root.querySelector('nav[aria-label="Task scopes"]');
+      const toAll = async () => { button("All", scopesNav()).click(); await settle(300); };
+      const same = (a, b) => JSON.stringify(a) === JSON.stringify(b);
+      const toRepo = async id => { root.querySelector(`[data-repository-row="${id}"] button`).click(); await settle(300); };
+      try {
+        step = "suggest next";
+        const toggle = () => root.querySelector('[data-testid="task-suggest-toggle"]');
+        const panel = () => root.querySelector('[data-testid="task-suggest"]');
+        const listed = () => [...(panel()?.querySelectorAll('[data-testid="task-suggest-item"]') ?? [])].map(el => el.dataset.taskId);
+        const idle = () => panel()?.getAttribute("aria-busy") === "false";
+        const ids = input => suggestRanking(input).map(task => task.id);
+        await toAll();
+        suggestCalls.length = 0; suggestMode = "ok";
+        check("Suggest next asks nothing until it is pressed", suggestCalls.length === 0 && !panel() && toggle().getAttribute("aria-pressed") === "false");
+        toggle().click(); await wait(() => idle() && listed().length > 0);
+        check("pressing it asks once, for the whole board, and lists the ranking with each reason",
+          suggestCalls.length === 1 && suggestCalls[0].limit === 5 && !("repository_id" in suggestCalls[0]) && !("max_priority" in suggestCalls[0])
+          && toggle().getAttribute("aria-pressed") === "true" && same(listed(), ids({ limit: 5 })) && panel().textContent.includes("fixture rank 1"));
+        const globalIds = listed();
+        await toRepo("repo-1"); await wait(() => suggestCalls.length === 2 && idle());
+        check("moving to a repository's board asks again, for that repository only",
+          suggestCalls.at(-1).repository_id === "repo-1" && same(listed(), ids({ repository_id: "repo-1", limit: 5 })) && !same(listed(), globalIds));
+        await change(panel().querySelector('[aria-label="Suggest tasks at or above this priority"]'), "1", "change"); await wait(() => suggestCalls.length === 3 && idle());
+        check("the priority picker asks again with that ceiling, as a number",
+          suggestCalls.at(-1).max_priority === 1 && suggestCalls.at(-1).repository_id === "repo-1" && same(listed(), ids({ repository_id: "repo-1", max_priority: 1, limit: 5 })));
+        await change(panel().querySelector('[aria-label="Suggest tasks at or above this priority"]'), "all", "change"); await wait(() => suggestCalls.length === 4 && idle());
+        check("Any priority asks with no ceiling at all", !("max_priority" in suggestCalls.at(-1)));
+        // Two asks in flight: the board's own scope change makes the second. The answers
+        // arrive newest first, and the older one must not replace what is on screen.
+        suggestMode = "hold"; heldSuggest.length = 0;
+        button("All", scopesNav()).click(); await wait(() => heldSuggest.length === 1);
+        root.querySelector('[data-repository-row="repo-1"] button').click(); await wait(() => heldSuggest.length === 2);
+        heldSuggest[1](); await settle(100);
+        heldSuggest[0](); await settle(150);
+        check("an older answer that arrives after a newer one is dropped",
+          idle() && same(listed(), ids({ repository_id: "repo-1", limit: 5 })) && !same(listed(), globalIds));
+        suggestMode = "fail";
+        button("Refresh", panel()).click(); await wait(() => panel().querySelector('[data-testid="task-suggest-error"]'));
+        check("a failed ask shows its reason and clears the list instead of leaving the old one",
+          panel().querySelector('[data-testid="task-suggest-error"]').textContent.includes("Fixture suggestions offline") && listed().length === 0);
+        suggestMode = "ok";
+        // The failure dropped the old answer, so closing and reopening asks again
+        // instead of putting the list from before the failure back on screen.
+        const beforeReopen = suggestCalls.length;
+        button("Close suggestions", panel()).click(); await settle();
+        toggle().click(); await wait(() => idle() && listed().length > 0);
+        check("after a failure, reopening the panel asks again rather than showing the old list", suggestCalls.length === beforeReopen + 1);
+        button("Refresh", panel()).click(); await wait(() => idle() && listed().length > 0);
+        check("Refresh asks again and the list comes back", !panel().querySelector('[data-testid="task-suggest-error"]') && same(listed(), ids({ repository_id: "repo-1", limit: 5 })));
+        button("Close suggestions", panel()).click(); await settle();
+        check("Close puts the panel away", !panel() && toggle().getAttribute("aria-pressed") === "false");
+        await toAll();
+      } catch (error) { check(`the Suggest next checks ran to the end (${error.message} at ${step})`, false); }
+      finally { suggestMode = "ok"; for (const release of heldSuggest.splice(0)) release(); if (root.querySelector('[data-testid="task-suggest"]')) { button("Close suggestions", root)?.click(); await settle(); } }
+
+      try {
+        step = "severity filter";
+        const original = tasks;
+        const plain = [...root.querySelectorAll('[data-task-column="ready"] [data-task-card]')].map(el => el.dataset.cardId).find(id => !["task-1", "task-2", "task-3"].includes(id));
+        tasks = tasks.map(task => task.id === "task-1" ? { ...task, severity: "High" } : task.id === "task-3" ? { ...task, severity: "high" } : task.id === "task-2" ? { ...task, severity: "low" } : task);
+        await click("Refresh"); await wait(() => card("task-1") && card("task-2") && card("task-3") && card(plain));
+        const pick = () => root.querySelector('[aria-label="Filter by severity"]');
+        if (!pick()) await click("Filters");
+        const names = () => [card("task-1"), card("task-2"), card("task-3"), card(plain)].map(Boolean);
+        check("the severity filter offers each spelling once, case aside, after Any and No severity",
+          same([...pick().options].map(option => option.textContent.trim().toLowerCase()), ["any severity", "no severity", "high", "low"]));
+        await change(pick(), "high", "change"); await settle(300);
+        check("choosing High keeps every High card, however it is spelled, and takes the rest off the board", same(names(), [true, false, true, false]));
+        await change(pick(), "low", "change"); await settle(300);
+        check("choosing Low keeps only the Low card", same(names(), [false, true, false, false]));
+        await change(pick(), "", "change"); await settle(300);
+        check("No severity keeps only the cards with none", same(names(), [false, false, false, true]));
+        await change(pick(), "all", "change"); await settle(300);
+        check("Any severity brings every card back", same(names(), [true, true, true, true]));
+        tasks = original;
+        await click("Filters"); await click("Refresh"); await wait(() => card("task-1"));
+      } catch (error) { check(`the severity filter checks ran to the end (${error.message} at ${step})`, false); }
+
+      try {
+        step = "key e";
+        const enhanceSheet = () => document.querySelector('[aria-labelledby="quick-enhance-title"]');
+        card("task-3").focus();
+        card("task-3").dispatchEvent(new KeyboardEvent("keydown", { key: "e", metaKey: true, bubbles: true, cancelable: true })); await settle(200);
+        check("Command-E on a card does not open Quick Enhance", !enhanceSheet());
+        card("task-3").dispatchEvent(new KeyboardEvent("keydown", { key: "e", bubbles: true, cancelable: true })); await wait(enhanceSheet);
+        check("e on a focused card opens Quick Enhance on that task", [...enhanceSheet().querySelectorAll("input,textarea")].some(el => el.value.includes("Review the agent handoff")) || enhanceSheet().textContent.includes("Review the agent handoff"));
+        button("Close Quick Enhance", enhanceSheet()).click(); await wait(() => !enhanceSheet());
+      } catch (error) { check(`the key e checks ran to the end (${error.message} at ${step})`, false); }
+
+      try {
+        step = "scope labels";
+        const navButtons = [...scopesNav().querySelectorAll("button.gp-seg-btn")];
+        const label = btn => btn.querySelector(":scope > span:not(.gp-liquid-selection)");
+        check("every scope button keeps its name in a label span, with no loose text beside it",
+          navButtons.length >= 3 && navButtons.every(btn => label(btn)?.textContent.trim() && [...btn.childNodes].filter(node => node.nodeType === 3).every(node => !node.textContent.trim())));
+        if (document.documentElement.classList.contains("macos")) {
+          const picked = navButtons.find(btn => btn.dataset.active === "true");
+          check("on macOS the selected scope has its liquid pill and its label is lifted above it",
+            Boolean(picked?.querySelector(".gp-liquid-selection")) && getComputedStyle(label(picked)).position === "relative");
+        }
+      } catch (error) { check(`the scope label checks ran to the end (${error.message} at ${step})`, false); }
+
+      try {
+        step = "sheet controls";
+        const originalTasks = tasks;
+        tasks = tasks.map(task => task.id === "task-3" ? { ...task, kind: "custom-category" } : task);
+        card("task-3").dispatchEvent(new MouseEvent("click", { bubbles: true })); await wait(editor);
+        const severity = () => field("Severity");
+        check("Severity offers None and the four levels, and a task without one shows None",
+          same([...severity().options].map(option => option.textContent.trim()), ["None", "Low", "Medium", "High", "Critical"]) && severity().selectedOptions[0].textContent.trim() === "None");
+        const owner = editor().querySelector(".owner-field input");
+        check("the text controls carry the store's length limits",
+          field("Title").maxLength === 300 && field("Description").maxLength === 65536 && editor().querySelector('[data-testid="task-criteria"]').maxLength === 65536
+          && editor().querySelector('[data-testid="task-subtask-add-input"]').maxLength === 4096 && owner.maxLength === 300 && field("Custom type")?.maxLength === 64);
+        const notifications = editor().querySelector(".notifications-row");
+        check("a saved task offers its mute control under the profile-wide Notifications heading",
+          notifications?.querySelector(".notifications-label")?.textContent.trim() === "Notifications (profile-wide; mute this task)" && notifications.querySelectorAll("button").length > 0);
+        await change(severity(), "critical", "change");
+        const savesBefore = writes.length;
+        await click("Save task"); await wait(() => writes.length > savesBefore);
+        check("a chosen severity is what Save writes", writes.at(-1).severity === "critical");
+        severity().selectedIndex = 0; severity().dispatchEvent(new Event("change", { bubbles: true })); await settle();
+        const savesAfter = writes.length;
+        await click("Save task"); await wait(() => writes.length > savesAfter);
+        check("choosing None writes no severity at all", writes.at(-1).severity === null);
+        await click("Close task details"); await wait(() => !editor());
+        tasks = originalTasks.map(task => task.id === "task-3" ? { ...task, revision: tasks.find(item => item.id === "task-3").revision, severity: null } : task);
+        await click("New task"); await wait(editor);
+        check("a task not yet saved has no mute control to offer", !editor().querySelector(".notifications-row") && Boolean(field("Severity")));
+        await click("Close task details"); await wait(() => !editor());
+      } catch (error) { check(`the sheet control checks ran to the end (${error.message} at ${step})`, false); if (editor()) { await click("Close task details").catch(() => {}); } }
+    }
 
     // ---- A repository's board reaches the global board -------------------
     try {

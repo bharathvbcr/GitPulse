@@ -13,6 +13,7 @@
    */
   import { CornerDownLeft, Plus, Sparkles, TriangleAlert, X } from "@lucide/svelte";
   import SettingSegment from "./SettingSegment.svelte";
+  import { priorityLabel } from "../workbench/taskPriority";
   import {
     QUICK_ADD_HINT,
     parseQuickAdd,
@@ -164,7 +165,7 @@
       <p class="summary" role="status">
         {#if parsed.usable}
           <span class="chip chip-title">{parsed.title}</span>
-          {#if parsed.priority !== null}<span class="chip tok-priority">{["Urgent", "High", "Normal", "Low"][parsed.priority]}</span>{/if}
+          {#if parsed.priority !== null}<span class="chip tok-priority">{priorityLabel(parsed.priority)}</span>{/if}
           {#if parsed.kind}<span class="chip tok-kind">{parsed.kind}</span>{/if}
           {#if parsed.owner}<span class="chip tok-owner">{parsed.owner}</span>{/if}
           {#if parsed.repositoryId}<span class="chip tok-repo">{repositories.find((repo) => repo.id === parsed.repositoryId)?.name ?? parsed.repositoryId}</span>{/if}

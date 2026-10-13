@@ -296,7 +296,7 @@ fn release_batch_checks_every_path_and_policy_before_mutating() {
 }
 
 #[test]
-fn release_batch_deduplicates_and_reports_a_partial_git_failure() {
+fn release_batch_deduplicates_and_a_git_failure_leaves_the_index_untouched() {
     use gitpulse_lib::engine::git_writer::IndexAction;
     let repo = TestRepo::init();
     repo.write("valid", "work\n");
@@ -316,14 +316,21 @@ fn release_batch_deduplicates_and_reports_a_partial_git_failure() {
     let error =
         GitWriter::change_index_with(&repo.path_str(), &files, IndexAction::Stage, |_| Ok(()))
             .unwrap_err();
-    assert!(error.contains("after 128 of 129"), "{error}");
+    // One git process applies the whole selection under one lock, so a path
+    // git refuses fails the batch and none of the 128 valid ones is staged
+    // (the chunked form stopped partway and left 128 of them behind).
+    assert!(
+        error.contains("Index update failed for the 129 selected paths"),
+        "{error}"
+    );
     assert_eq!(
         GitReader::get_status(&repo.path_str())
             .unwrap()
             .iter()
             .filter(|s| s.is_staged)
             .count(),
-        129
+        1,
+        "only the earlier, successful `valid` is staged"
     );
     let lock = repo.dir.path().join(".git/index.lock");
     fs::write(&lock, "another writer").unwrap();
@@ -334,7 +341,10 @@ fn release_batch_deduplicates_and_reports_a_partial_git_failure() {
         |_| Ok(()),
     )
     .unwrap_err();
-    assert!(error.contains("after 0 of 1"), "{error}");
+    assert!(
+        error.contains("Index update failed for the 1 selected paths"),
+        "{error}"
+    );
     assert_eq!(fs::read_to_string(lock).unwrap(), "another writer");
 }
 
@@ -1200,7 +1210,8 @@ fn test_rebase_failed_step_restores_original_branch() {
 #[test]
 fn test_coverage_scan_of_rust_lcov_in_opened_repo() {
     let repo = TestRepo::init();
-    repo.write("src/lib.rs", "pub fn x() {}\n");
+    // Two lines on disk: the scanner drops hits past the end of the file.
+    repo.write("src/lib.rs", "pub fn x() {}\npub fn y() {}\n");
     repo.write(
         "lcov.info",
         "SF:src/lib.rs\nDA:1,1\nDA:2,0\nend_of_record\n",
@@ -1617,17 +1628,26 @@ fn reset_preview_names_what_a_rewind_leaves_behind() {
 /// parent's path is the old name.
 #[test]
 fn blame_at_revision_steps_to_the_parent_across_a_rename() {
+    // The quotes make git C-quote the name in its porcelain output, which the
+    // parser must undo. `"` is not a legal Windows filename (`git mv` fails
+    // with "Invalid argument"), so there the rename target is a plain name
+    // with a space, and the quoted-name parse is exercised off Windows only.
+    let new_name = if cfg!(windows) {
+        "new q.txt"
+    } else {
+        "new \"q\".txt"
+    };
     let repo = TestRepo::init();
     repo.write("old name.txt", "one\ntwo\n");
     repo.commit_all("c1");
-    run_git(repo.dir.path(), &["mv", "old name.txt", "new \"q\".txt"]);
-    repo.write("new \"q\".txt", "one\nTWO\n");
+    run_git(repo.dir.path(), &["mv", "old name.txt", new_name]);
+    repo.write(new_name, "one\nTWO\n");
     repo.commit_all("c2");
     // The working tree moves on; a revision blame must not see it.
-    repo.write("new \"q\".txt", "one\nTWO\nthree\n");
+    repo.write(new_name, "one\nTWO\nthree\n");
 
     let at_head =
-        GitReader::get_file_blame(&repo.path_str(), "new \"q\".txt", Some("HEAD")).expect("blame");
+        GitReader::get_file_blame(&repo.path_str(), new_name, Some("HEAD")).expect("blame");
     assert_eq!(at_head.len(), 2, "HEAD has two lines, the worktree three");
     assert_eq!(at_head[1].content, "TWO");
     let parent = at_head[1].previous_commit.clone().expect("c2 has a parent");
@@ -1648,7 +1668,7 @@ fn blame_at_revision_steps_to_the_parent_across_a_rename() {
 
     // The working-tree form is unchanged by the new argument.
     assert_eq!(
-        GitReader::get_file_blame(&repo.path_str(), "new \"q\".txt", None)
+        GitReader::get_file_blame(&repo.path_str(), new_name, None)
             .expect("worktree")
             .len(),
         3

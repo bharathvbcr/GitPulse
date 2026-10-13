@@ -16,9 +16,6 @@
 mod env;
 
 use std::path::Path;
-use std::sync::Mutex;
-
-static ENV_SERIAL: Mutex<()> = Mutex::new(());
 
 fn files_under(dir: &Path, out: &mut Vec<std::path::PathBuf>) {
     for entry in std::fs::read_dir(dir).unwrap() {
@@ -32,7 +29,7 @@ fn files_under(dir: &Path, out: &mut Vec<std::path::PathBuf>) {
 
 #[test]
 fn an_integration_process_never_opens_the_per_user_spawn_budget() {
-    let serial = ENV_SERIAL.lock().unwrap();
+    let serial = env::env_serial();
     let home = tempfile::tempdir().unwrap();
     // Every variable the per-user config directory is resolved from, on
     // every platform, so the record would land in `home` wherever it lands.

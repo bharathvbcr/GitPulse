@@ -73,6 +73,45 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError, TryLockError};
 use std::time::{Duration, Instant};
 
+/// How long the registered shutdown hook may run before the sweep goes ahead
+/// without it. It stops what procguard does not own (terminal sessions); a
+/// wedged hook must cost the exit this much and no more.
+pub const HOOK_DEADLINE: Duration = Duration::from_secs(8);
+
+/// Work an owner registered to run before the sweep on a signal exit.
+type ShutdownHook = Arc<dyn Fn() + Send + Sync>;
+
+static SHUTDOWN_HOOK: Mutex<Option<ShutdownHook>> = Mutex::new(None);
+
+/// Registers what a signal exit must do before [`reap_all`]: stop the
+/// children procguard does not own, such as a terminal's PTY sessions, which
+/// the normal exit path stops itself. Replaces any earlier hook.
+pub fn set_shutdown_hook(hook: impl Fn() + Send + Sync + 'static) {
+    *lock(&SHUTDOWN_HOOK) = Some(Arc::new(hook));
+}
+
+/// Runs the registered hook, giving up on it after [`HOOK_DEADLINE`]. Returns
+/// whether there was no hook or it finished; a hook that outlives its deadline
+/// is abandoned, not waited for, so the sweep and the exit still happen.
+#[cfg_attr(not(unix), allow(dead_code))]
+fn run_shutdown_hook(deadline: Duration) -> bool {
+    let Some(hook) = lock(&SHUTDOWN_HOOK).clone() else {
+        return true;
+    };
+    let (done, finished) = std::sync::mpsc::channel();
+    let spawned = std::thread::Builder::new()
+        .name("shutdown-hook".into())
+        .spawn(move || {
+            // A panicking hook must still release the waiter below.
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| hook()));
+            let _ = done.send(());
+        });
+    match spawned {
+        Ok(_) => finished.recv_timeout(deadline).is_ok(),
+        Err(_) => false,
+    }
+}
+
 /// How long a child gets between "please stop" and "stop".
 ///
 /// This is the window in which `git` runs its own cleanup and removes
@@ -99,7 +138,7 @@ const LIVENESS_POLL: Duration = Duration::from_millis(10);
 /// Comfortably more than [`CHILD_GRACE`] plus the syscalls around it, so the
 /// bound only ever fires if the watcher is wedged — in which case exiting with
 /// the signal's code is still a better answer than reporting success.
-const HANDOVER: Duration = Duration::from_secs(2);
+const HANDOVER: Duration = Duration::from_secs(2).saturating_add(HOOK_DEADLINE);
 
 /// A registered child.
 ///
@@ -232,6 +271,27 @@ impl Registration {
         self.reap(|| child.wait())
     }
 
+    /// [`Self::stop_and_reap`] for a child nobody has asked to stop yet: sends
+    /// the ask (SIGTERM to its group) itself, gives it [`CHILD_GRACE`] to act
+    /// on it, then kills and reaps.
+    ///
+    /// For a cancel or a deadline, where the child is out of budget but may be
+    /// holding something it can clean up: `git` removes `.git/index.lock` when
+    /// it is asked and cannot when it is killed, and a slow hook it spawned is
+    /// in the same group and is asked too. Where the platform cannot ask
+    /// (Windows) there is nothing to wait for, so the grace is skipped.
+    pub fn ask_then_stop_and_reap(&self, child: &mut Child) -> io::Result<ExitStatus> {
+        let grace = if sys::CAN_ASK_TO_STOP {
+            if let Some(pid) = *lock(&self.slot.pid) {
+                let _ = sys::request_stop(pid);
+            }
+            CHILD_GRACE
+        } else {
+            Duration::ZERO
+        };
+        self.stop_and_reap(child, grace)
+    }
+
     /// True once the child has exited, **without** reaping it.
     ///
     /// Reaping is what frees the pid for reuse, and on Unix the pid *is* the
@@ -241,7 +301,7 @@ impl Registration {
     ///
     /// A pid already forgotten means another reap path got there first, so
     /// there is nothing left to wait for.
-    fn exited(&self, child: &mut Child) -> bool {
+    pub fn exited(&self, child: &mut Child) -> bool {
         #[cfg(unix)]
         {
             let _ = child;
@@ -976,6 +1036,9 @@ mod sys {
             .map(|(_, n)| *n)
             .unwrap_or("signal");
 
+        if !super::run_shutdown_hook(super::HOOK_DEADLINE) {
+            log::warn!(target: "shutdown", "{name}: the shutdown hook did not finish in time");
+        }
         let sweep = reap_all(CHILD_GRACE);
         if sweep.is_complete() {
             log::info!(target: "shutdown", "{name}: {}", sweep.describe());
@@ -1102,7 +1165,8 @@ mod tests {
         let started = std::time::Instant::now();
         let result = super::run_tree_killer(&mut cmd, std::time::Duration::from_millis(100));
         assert!(
-            started.elapsed() < std::time::Duration::from_secs(1),
+            started.elapsed()
+                < crate::test_support::coverage_relaxed(std::time::Duration::from_secs(1)),
             "tree killer waited {:?}",
             started.elapsed()
         );

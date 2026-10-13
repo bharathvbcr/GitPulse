@@ -2,6 +2,7 @@
 name = "devmap-store"
 version = "0.2.4"
 edition = "2021"
+rust-version = "1.99"
 license = "Apache-2.0"
 repository = "https://github.com/bharathvbcr/DevCouncil"
 description = "SQLite store and schema migrations for the DevCouncil code-intelligence kernel"

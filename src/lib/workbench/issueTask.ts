@@ -29,6 +29,7 @@ import {
   type TaskStatus,
 } from "./client";
 import { bounded, MAX_TASK_LABELS } from "./taskActions";
+import { DEFAULT_PRIORITY, type Priority } from "./taskPriority";
 import type { IssueInfo } from "../ops/model";
 
 export const MAX_ISSUE_TASK_TITLE = 300;
@@ -95,44 +96,41 @@ export function inferTaskKind(labels: readonly unknown[]): "bug" | "feature" | "
   return "bug";
 }
 
-/** Infer priority (0..3) from issue labels. */
-export function inferTaskPriority(labels: readonly unknown[]): number {
-  if (!Array.isArray(labels)) return 1;
-  const normalized = labels
-    .filter((l): l is string => typeof l === "string")
-    .map((l) => l.toLowerCase().trim());
+/** Label words that name a priority on the board's scale (0 Urgent … 3 Low). */
+const LABEL_PRIORITIES: Readonly<Record<string, Priority>> = Object.assign(Object.create(null), {
+  p0: 0, critical: 0, blocker: 0, urgent: 0,
+  p1: 1, high: 1, important: 1,
+  p2: 2, medium: 2, normal: 2,
+  p3: 3, low: 3, minor: 3, trivial: 3,
+});
 
-  if (
-    normalized.some((l) =>
-      ["p0", "critical", "blocker", "urgent", "priority:critical", "priority:urgent"].some((k) =>
-        l === k || l.startsWith(`${k}:`) || l.endsWith(`:${k}`),
-      ),
-    )
-  ) {
-    return 3;
+/** Namespaces a tracker puts before the word: `priority:high`, `prio/critical`. */
+const LABEL_NAMESPACES: ReadonlySet<string> = new Set(["priority", "prio", "pri", "severity", "sev"]);
+
+/** The priority one label names, or null: `P1`, `high`, `priority: high`, `prio/critical`, `p0: outage`. */
+function labelPriority(label: string): Priority | null {
+  const pieces = label.split(/\s*[:/]\s*/).filter(Boolean);
+  if (pieces.length === 0) return null;
+  const word = pieces.length === 1 || !LABEL_NAMESPACES.has(pieces[0]) ? pieces[0] : pieces[1];
+  return word in LABEL_PRIORITIES ? LABEL_PRIORITIES[word] : null;
+}
+
+/**
+ * Infer priority (0 Urgent … 3 Low) from issue labels. With several priority
+ * labels the most urgent wins; with none, the default (Normal).
+ */
+export function inferTaskPriority(labels: readonly unknown[]): Priority {
+  if (!Array.isArray(labels)) return DEFAULT_PRIORITY;
+  let best: Priority = 3;
+  let found = false;
+  for (const label of labels) {
+    if (typeof label !== "string") continue;
+    const priority = labelPriority(label.toLowerCase().trim());
+    if (priority === null) continue;
+    found = true;
+    if (priority < best) best = priority;
   }
-
-  if (
-    normalized.some((l) =>
-      ["p1", "high", "important", "priority:high"].some(
-        (k) => l === k || l.startsWith(`${k}:`) || l.endsWith(`:${k}`),
-      ),
-    )
-  ) {
-    return 2;
-  }
-
-  if (
-    normalized.some((l) =>
-      ["p3", "low", "minor", "trivial", "priority:low"].some(
-        (k) => l === k || l.startsWith(`${k}:`) || l.endsWith(`:${k}`),
-      ),
-    )
-  ) {
-    return 0;
-  }
-
-  return 1;
+  return found ? best : DEFAULT_PRIORITY;
 }
 
 /** Infer severity string ("critical" | "high" | null) from labels. */
@@ -318,7 +316,7 @@ export function linkedIssueNumber(card: Pick<TaskCard, "title" | "labels">): num
 
 /** Find existing task matching issue number. */
 export function findTaskForIssue(
-  tasks: readonly TaskCard[],
+  tasks: readonly TaskCard[] | null,
   issueNumber: number,
 ): TaskCard | undefined {
   if (!Array.isArray(tasks) || issueNumber <= 0) return undefined;
@@ -403,19 +401,29 @@ export async function createTaskFromIssue(
   return saved;
 }
 
+/** Why an import was refused before it wrote anything. */
+export const TASK_CATALOG_UNREAD_MESSAGE =
+  "The existing task list has not been read (it is still loading or failed to load), so issues cannot be checked against it. Reload the tasks and retry.";
+
 /**
  * Batch create workbench tasks from multiple GitHub issues, skipping any
  * issues that already have a corresponding task.
+ *
+ * `existingTasks` is the catalog as it was actually read: `null` means it was
+ * not (still loading, or the read failed), and the import refuses. An empty
+ * array is a real, empty catalog. Treating an unread catalog as empty made
+ * "Add all issues" re-create every task that already existed.
  */
 export async function batchCreateTasksFromIssues(
   issues: readonly IssueInfo[],
   repoPath: string,
-  existingTasks: readonly TaskCard[] = [],
+  existingTasks: readonly TaskCard[] | null,
   options: IssueTaskOptions = {},
 ): Promise<BatchCreateResult> {
   if (!repoPath || !repoPath.trim()) {
     throw new Error("Cannot batch create tasks: repository path is missing.");
   }
+  if (existingTasks === null) throw new Error(TASK_CATALOG_UNREAD_MESSAGE);
 
   const result: BatchCreateResult = {
     created: [],

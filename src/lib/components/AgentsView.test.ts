@@ -76,4 +76,11 @@ describe("AgentsView", () => {
     expect(source).toContain("$registeredStatus.error");
     expect(source).toContain("!$registeredStatus.complete");
   });
+
+  it("ticks its clock on the visibility-aware timer, not a raw interval", () => {
+    // ft-0ff882a6: a raw one-second setInterval kept waking the renderer
+    // while the window was hidden.
+    expect(source).not.toMatch(/\bsetInterval\(/);
+    expect(source).toContain("const stopClock = createAdaptiveTimer(() => {");
+  });
 });

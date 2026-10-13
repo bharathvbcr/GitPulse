@@ -1,11 +1,15 @@
 <script lang="ts">
   import { onDestroy, onMount, untrack } from "svelte";
   import { bounded } from "../workbench/taskActions";
+  import { DEFAULT_PRIORITY, PRIORITY_LABELS } from "../workbench/taskPriority";
   import { Clipboard, X } from "@lucide/svelte";
   import { copyText } from "../desktop/clipboard";
   import TaskAgentPanel from "./TaskAgentPanel.svelte";
   import NativeNotificationSettings from "./NativeNotificationSettings.svelte";
   import TaskManviAssist from "./TaskManviAssist.svelte";
+  import TaskVerification from "./TaskVerification.svelte";
+  import TaskRefine from "./TaskRefine.svelte";
+  import { repoStore } from "../stores/repoStore";
   import TaskRepositoryPicker from "./TaskRepositoryPicker.svelte";
   import TaskDuePicker from "./TaskDuePicker.svelte";
   import LabelInput from "./LabelInput.svelte";
@@ -49,7 +53,7 @@
   let current = $state(initial.value);
   let draft = $state<TaskDraft>((() => {
     const base = initial.value ? taskDraft(initial.value) : {
-      title: "", description: "", kind: "feature", status: initial.initialStatus, priority: 2, severity: null,
+      title: "", description: "", kind: "feature", status: initial.initialStatus, priority: DEFAULT_PRIORITY, severity: null,
       owner: null, due_at: null, labels: [], acceptance_criteria: [], repository_ids: initial.primary ? [initial.primary] : [],
       primary_repository_id: initial.primary, home_workspace_id: initial.home, position: Date.now(), locked_fields: [] as EnhancementField[],
       logs: "", ...freshTaskFields(),
@@ -575,6 +579,7 @@
           model's suggestions are not a seventh section; they live inside assist.
         -->
         <div class="steps">
+          {#if current}<TaskVerification taskId={current.id} revision={current.revision} repositoryPath={$repoStore.currentPath ?? ""} />{/if}
           {#each sections as section (section.id)}
             <section class="step" data-editor-section={section.id} data-assist-open={section.id === "assist" ? String(assistChrome.open) : undefined}>
               <div class="step-head">
@@ -660,6 +665,9 @@
                     onStatus={({ state, uncertain }) => { assistState = state; assistUncertain = uncertain; }}
                     disabled={saving || reloading || pending !== null || pendingDelete !== null}
                   />
+                  {#if current}
+                    <TaskRefine task={current} repositoryPath={$repoStore.currentPath ?? ""} disabled={dirty || saving || reloading || pending !== null || pendingDelete !== null || enhancementBusy} onApplied={applied} />
+                  {/if}
                 </div>
               {:else if section.id === "title"}
                 <fieldset disabled={enhancementBusy}>
@@ -753,7 +761,7 @@
                 <fieldset disabled={enhancementBusy}>
                   <div class="pair">
                     <label>Status<select class="gp-select" bind:value={draft.status}>{#each STATUSES as status}<option value={status}>{STATUS_LABELS[status]}</option>{/each}</select></label>
-                    <label>Priority<select class="gp-select" bind:value={draft.priority}><option value={0}>Urgent</option><option value={1}>High</option><option value={2}>Normal</option><option value={3}>Low</option></select></label>
+                    <label>Priority<select class="gp-select" bind:value={draft.priority}>{#each PRIORITY_LABELS as name, level}<option value={level}>{name}</option>{/each}</select></label>
                   </div>
                   <div class="pair">
                     <label>Type

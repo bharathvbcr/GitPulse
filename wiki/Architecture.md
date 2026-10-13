@@ -8,7 +8,7 @@ GitPulse is a Tauri 2 desktop app: **Rust owns privileged work**, **Svelte 5 own
 flowchart TB
     subgraph Frontend["Svelte 5 + TypeScript"]
         direction TB
-        Views["4 Views · 17 Sections<br/>(Work, Code, History, Insights)"]
+        Views["4 Views · 18 Sections<br/>(Work, Code, History, Insights)"]
         Canvas["GPU Canvas Graph"]
         Dock["Terminal Dock (portable-pty)"]
         Stores["Domain Stores & SWR Cache"]

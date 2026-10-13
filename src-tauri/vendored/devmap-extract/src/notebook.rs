@@ -574,6 +574,7 @@ fn extract_notebook_with_parser(
         diagnostics,
     );
     let mut partial_ranges = Vec::new();
+    let mut nameless_ranges = Vec::new();
     let mut incomplete = Vec::new();
     for (index, cell) in cells.iter().enumerate() {
         let fail = |reason: String| {
@@ -608,7 +609,13 @@ fn extract_notebook_with_parser(
         };
         match parsed.parse_outcome {
             ParseOutcome::Clean => {}
-            ParseOutcome::Partial { error_ranges } => partial_ranges.extend(error_ranges),
+            ParseOutcome::Partial {
+                error_ranges,
+                nameless_ranges: nameless,
+            } => {
+                partial_ranges.extend(error_ranges);
+                nameless_ranges.extend(nameless);
+            }
             ParseOutcome::Fallback { reason } | ParseOutcome::Skipped { reason } => {
                 incomplete.push(format!("cell {}: {reason}", index + 1));
             }
@@ -646,8 +653,11 @@ fn extract_notebook_with_parser(
     } else if !partial_ranges.is_empty() {
         partial_ranges.sort_by_key(|range| (range.start_byte, range.end_byte));
         partial_ranges.dedup();
+        nameless_ranges.sort_by_key(|range| (range.start_byte, range.end_byte));
+        nameless_ranges.dedup();
         extraction.parse_outcome = ParseOutcome::Partial {
             error_ranges: partial_ranges,
+            nameless_ranges,
         };
     }
     extraction.local_bindings.sort();
@@ -738,8 +748,12 @@ fn relocate_cell(
             rewrite_owner(owner);
         }
     }
-    if let ParseOutcome::Partial { error_ranges } = &mut parsed.parse_outcome {
-        for range in error_ranges {
+    if let ParseOutcome::Partial {
+        error_ranges,
+        nameless_ranges,
+    } = &mut parsed.parse_outcome
+    {
+        for range in error_ranges.iter_mut().chain(nameless_ranges.iter_mut()) {
             let mut span = Span {
                 start_byte: range.start_byte,
                 end_byte: range.end_byte,

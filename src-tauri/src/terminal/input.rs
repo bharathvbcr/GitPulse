@@ -91,14 +91,29 @@ fn write_with_timeout(
         }
     };
     let mut written = 0;
+    // The delivery that gave up part-way leaves the terminal in whatever state
+    // the delivered prefix set; the one state that outlives the write and
+    // swallows what is typed next is an open bracketed paste.
+    let give_up = |written: usize, error: String, writer: &mut Box<dyn Write + Send>| {
+        if is_paste_open(&data[..written]) {
+            close_paste(writer.as_mut());
+        }
+        Err(error)
+    };
     while written < data.len() {
-        check(written)?;
+        if let Err(error) = check(written) {
+            return give_up(written, error, &mut writer);
+        }
         match writer.write(&data[written..]) {
             Ok(0) => {
-                return Err(format!(
-                    "Terminal input made no progress after {written} of {} bytes",
-                    data.len()
-                ))
+                return give_up(
+                    written,
+                    format!(
+                        "Terminal input made no progress after {written} of {} bytes",
+                        data.len()
+                    ),
+                    &mut writer,
+                )
             }
             Ok(n) => written += n,
             Err(e) if e.kind() == ErrorKind::Interrupted => continue,
@@ -106,10 +121,14 @@ fn write_with_timeout(
                 std::thread::sleep(Duration::from_millis(5))
             }
             Err(e) => {
-                return Err(format!(
-                    "Terminal input failed after {written} of {} bytes: {e}",
-                    data.len()
-                ))
+                return give_up(
+                    written,
+                    format!(
+                        "Terminal input failed after {written} of {} bytes: {e}",
+                        data.len()
+                    ),
+                    &mut writer,
+                )
             }
         }
     }
@@ -117,9 +136,52 @@ fn write_with_timeout(
     Ok(())
 }
 
+const PASTE_START: &[u8] = b"\x1b[200~";
+const PASTE_END: &[u8] = b"\x1b[201~";
+
+/// How long closing a cut-off paste may take. It is a three-byte courtesy to a
+/// terminal that was just too full to take the rest; it never extends a stall.
+const PASTE_CLOSE_BUDGET: Duration = Duration::from_millis(250);
+
+fn last_position(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack
+        .windows(needle.len())
+        .rposition(|window| window == needle)
+}
+
+/// Whether `delivered` opened a bracketed paste it never closed.
+fn is_paste_open(delivered: &[u8]) -> bool {
+    match (
+        last_position(delivered, PASTE_START),
+        last_position(delivered, PASTE_END),
+    ) {
+        (Some(start), Some(end)) => start > end,
+        (Some(_), None) => true,
+        _ => false,
+    }
+}
+
+/// Sends the paste terminator, once, within [`PASTE_CLOSE_BUDGET`]. Best
+/// effort: the write that brought us here already failed, so a failure here
+/// is the same trouble and is not reported twice.
+fn close_paste(writer: &mut (dyn Write + Send)) {
+    let deadline = Instant::now() + PASTE_CLOSE_BUDGET;
+    let mut sent = 0;
+    while sent < PASTE_END.len() && Instant::now() < deadline {
+        match writer.write(&PASTE_END[sent..]) {
+            Ok(0) => return,
+            Ok(n) => sent += n,
+            Err(e) if matches!(e.kind(), ErrorKind::Interrupted | ErrorKind::WouldBlock) => {
+                std::thread::sleep(Duration::from_millis(5))
+            }
+            Err(_) => return,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{wait_for_output, write_with_timeout};
+    use super::{is_paste_open, wait_for_output, write_with_timeout};
     use std::io::{self, Read, Write};
     use std::os::fd::AsRawFd;
     use std::os::unix::net::UnixStream;
@@ -133,7 +195,7 @@ mod tests {
         reader.set_nonblocking(true).unwrap();
         let start = Instant::now();
         wait_for_output(reader.as_raw_fd()).unwrap();
-        assert!(start.elapsed() < Duration::from_secs(1));
+        assert!(start.elapsed() < crate::test_support::coverage_relaxed(Duration::from_secs(1)));
         assert_eq!(
             reader.read(&mut [0]).unwrap_err().kind(),
             io::ErrorKind::WouldBlock
@@ -185,7 +247,9 @@ mod tests {
             .unwrap_err();
             assert!(error.contains("3 of 6"), "{error}");
             assert!(error.contains("timed out"), "{error}");
-            assert!(start.elapsed() < Duration::from_secs(1));
+            assert!(
+                start.elapsed() < crate::test_support::coverage_relaxed(Duration::from_secs(1))
+            );
         }
     }
 
@@ -210,6 +274,76 @@ mod tests {
         )
         .unwrap_err()
         .contains("0 of 1"));
-        assert!(start.elapsed() < Duration::from_secs(1));
+        assert!(start.elapsed() < crate::test_support::coverage_relaxed(Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn only_an_unclosed_bracketed_paste_counts_as_open() {
+        assert!(is_paste_open(b"\x1b[200~half a paste"));
+        assert!(!is_paste_open(b"\x1b[200~whole\x1b[201~"));
+        assert!(is_paste_open(b"\x1b[200~a\x1b[201~ then \x1b[200~b"));
+        assert!(!is_paste_open(b"plain typing"));
+        assert!(!is_paste_open(b""));
+    }
+
+    /// Accepts `accept` bytes, then pushes back `blocked` times, then takes
+    /// everything; every accepted byte is kept.
+    struct Backpressure {
+        accept: usize,
+        blocked: usize,
+        taken: std::sync::Arc<Mutex<Vec<u8>>>,
+    }
+    impl Write for Backpressure {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            let mut taken = self.taken.lock().unwrap();
+            if taken.len() < self.accept {
+                let n = (self.accept - taken.len()).min(bytes.len());
+                taken.extend_from_slice(&bytes[..n]);
+                return Ok(n);
+            }
+            if self.blocked > 0 {
+                self.blocked -= 1;
+                return Err(io::ErrorKind::WouldBlock.into());
+            }
+            taken.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// The defect: a paste whose write timed out part-way left the terminal in
+    /// paste mode, so everything typed afterwards was swallowed as paste text.
+    #[test]
+    fn a_cut_off_bracketed_paste_is_closed() {
+        let taken = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let writer: Mutex<Box<dyn Write + Send>> = Mutex::new(Box::new(Backpressure {
+            accept: 12,
+            blocked: 6,
+            taken: taken.clone(),
+        }));
+        let error = write_with_timeout(
+            &writer,
+            &AtomicBool::new(false),
+            b"\x1b[200~0123456789abcdef\x1b[201~",
+            Duration::from_millis(20),
+        )
+        .unwrap_err();
+        assert!(error.contains("timed out"), "{error}");
+        let taken = taken.lock().unwrap().clone();
+        assert!(
+            taken.ends_with(b"\x1b[201~"),
+            "the paste was left open: {taken:?}"
+        );
+        // The next write goes through untouched.
+        write_with_timeout(
+            &writer,
+            &AtomicBool::new(false),
+            b"next",
+            Duration::from_secs(1),
+        )
+        .unwrap();
+        assert!(taken.len() >= 12);
     }
 }

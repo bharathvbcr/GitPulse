@@ -2,7 +2,7 @@
   import type { AiGeneration } from "../stores/harnessStore";
   import { onMount, untrack } from "svelte";
   import { invoke } from "../ipc/invoke";
-  import { repoStore, type BranchInfo, type TagInfo } from "../stores/repoStore";
+  import { currentRepoPath, repoStore, type BranchInfo, type TagInfo } from "../stores/repoStore";
   import { askConfirm, askText } from "../stores/modalStore";
   import { toastStore } from "../stores/toastStore";
   import { filterStore } from "../stores/filterStore";
@@ -11,7 +11,7 @@
   import { copyText as copyToClipboard } from "../desktop/clipboard";
   import { mergeRef, type MergeMode, type MergeRequest } from "../branches/mergeSelection";
   import MergeBranchDialog from "./MergeBranchDialog.svelte";
-  import { enumerateFocusables } from "../ui/focusTrap";
+  import { focusAdjacentToMenuOpener } from "../ui/focusTrap";
   import {
     branchLeafName,
     countFolder,
@@ -323,25 +323,35 @@
    * badge is claiming: not that the verified tree changed (it cannot), but how
    * far the mainline has moved past the point where it was checked. Without a
    * default branch we send null and the backend measures against HEAD.
+   *
+   * Both effects read only the repository key and these derived values, never
+   * `$repoStore` itself: reading the store makes an effect re-run on every
+   * emission — a status poll, a diff selection, a loading flag — and each
+   * re-run here was a batch. These notify only when they change, so the batch
+   * is asked again when the branches are re-read (a refresh, which is also
+   * when a new note can have been written) or the repository changes, and not
+   * otherwise. The reset depends on the repository alone.
    */
-  const branchTips = $derived([...new Set($repoStore.branches.map((b) => b.tip_commit_id))]);
+  const freshness = freshnessStore.consumer("branches");
+  const branchInfos = $derived($repoStore.branches);
+  const branchTips = $derived([...new Set(branchInfos.map((b) => b.tip_commit_id))]);
   const defaultBranchName = $derived(
-    $repoStore.branches.find((b) => b.is_default && !b.is_remote)?.name ?? null,
+    branchInfos.find((b) => b.is_default && !b.is_remote)?.name ?? null,
   );
 
   $effect(() => {
-    const path = $repoStore.currentPath;
+    const path = $currentRepoPath;
     const tips = branchTips;
     const base = defaultBranchName;
     if (!path || tips.length === 0) return;
-    void freshnessStore.load(path, tips, base);
+    void freshness.load(path, tips, base);
   });
 
   $effect(() => {
     // A repository switch must not leave the previous repository's
-    // verifications painted onto this one's branches.
-    void $repoStore.currentPath;
-    freshnessStore.reset();
+    // verifications painted onto this one's branches. Idempotent, so it
+    // cannot drop a load already made for this repository.
+    freshnessStore.forRepo($currentRepoPath);
   });
 
   function selectRef(name: string) {
@@ -504,34 +514,6 @@
   function menuItemEls(): HTMLButtonElement[] {
     if (!menuEl) return [];
     return [...menuEl.querySelectorAll<HTMLButtonElement>('[role="menuitem"]')];
-  }
-
-  function focusAdjacentToMenuOpener(
-    popup: HTMLElement,
-    opener: HTMLElement | null,
-    backwards: boolean,
-  ) {
-    const candidates = enumerateFocusables<HTMLElement>(document).filter(
-      (candidate) =>
-        candidate.tabIndex >= 0 &&
-        !popup.contains(candidate) &&
-        candidate.getClientRects().length > 0,
-    );
-    if (candidates.length === 0) return;
-
-    const openerIndex = opener ? candidates.indexOf(opener) : -1;
-    let target = openerIndex >= 0
-      ? candidates[openerIndex + (backwards ? -1 : 1)]
-      : undefined;
-    if (!target && opener?.isConnected) {
-      const direction = backwards
-        ? Node.DOCUMENT_POSITION_PRECEDING
-        : Node.DOCUMENT_POSITION_FOLLOWING;
-      const ordered = backwards ? [...candidates].reverse() : candidates;
-      target = ordered.find((candidate) => opener.compareDocumentPosition(candidate) & direction);
-    }
-    target ??= candidates[backwards ? candidates.length - 1 : 0];
-    window.setTimeout(() => target?.focus(), 0);
   }
 
   function handleMenuKeydown(e: KeyboardEvent) {
@@ -736,9 +718,7 @@
   });
 
   $effect(() => {
-    if ($repoStore.currentPath) {
-      loadPinned();
-    }
+    if ($currentRepoPath) untrack(loadPinned);
   });
 
   /**
@@ -751,7 +731,7 @@
    * runs after the first paint. `freshnessStore` is reset by its own effect.
    */
   const tabScope = repoScope(
-    () => $repoStore.currentPath,
+    () => $currentRepoPath,
     () => {
       applyFilter.cancel();
       query = "";

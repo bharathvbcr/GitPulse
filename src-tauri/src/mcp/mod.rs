@@ -41,7 +41,11 @@ use crate::insights::{self, McpToolInfo};
 pub const PROTOCOL_VERSION: &str = "2026-07-28";
 pub const SERVER_NAME: &str = "gitpulse-mcp";
 
-/// Legacy handshake-based revisions this binary still answers.
+/// Legacy handshake-based revisions this binary still answers, newest first.
+/// The first is what an `initialize` for any version not listed here is answered
+/// with: the lifecycle spec says the server "MUST respond with another protocol
+/// version it supports. This SHOULD be the *latest* version supported by the
+/// server", and it is the client's job to disconnect if it cannot use it.
 pub const LEGACY_VERSIONS: &[&str] = &["2025-11-25", "2024-11-05"];
 
 const TOOLS_TTL_MS: u64 = 3_600_000;
@@ -415,7 +419,7 @@ fn build_tools() -> Vec<Value> {
         tool(
             "gitpulse_insights",
             "Repository insights",
-            "One-shot snapshot of worktrees, agent sessions (agents.live: running Claude Code sessions per worktree path; kinds it cannot observe, such as Codex, are reported unknown), uncommitted changes, overlapping dirty files, ledger, and code-graph availability. Facets fail independently so a missed scan never looks clean.",
+            "One-shot snapshot of worktrees, agent sessions (agents.live: running Claude Code and Codex sessions per worktree path, found by executable in the process table; a kind that could not be observed is reported unknown, never zero), uncommitted changes, overlapping dirty files, ledger, and code-graph availability. Facets fail independently so a missed scan never looks clean.",
             json!({ "repo_path": repo_prop() }),
             &["repo_path"],
             json!({
@@ -588,7 +592,7 @@ fn build_tools() -> Vec<Value> {
                     "type": "boolean",
                     "description": "Replace the content of the task already filed under this task_id, or of the board task whose item_id is task_id (default false). Its column position and links are kept. This is how related work is folded into an existing task: send its current content plus yours."
                 },
-                "reviewed_related": string_array_prop("item_ids of the open tasks a related_tasks_exist refusal listed, once you have read them and this task is genuinely separate work", crate::workbench::intake::MAX_RELATED, 128)
+                "reviewed_related": string_array_prop("item_ids of the open tasks a related_tasks_exist refusal listed, once you have read them and this task is genuinely separate work", crate::workbench::intake::MAX_REVIEWED_RELATED, 128)
             }),
             &["repo_path", "title"],
             json!({
@@ -701,7 +705,7 @@ fn build_tools() -> Vec<Value> {
         mutating_tool(
             "gitpulse_complete_task",
             "Complete task",
-            "Move your GitPulse board task to done when the work is finished (or to review to hand it to a person, or in_progress when you start). Pass the task id from your brief's 'Task:' line, or the task_id it was filed with. Only the status changes, plus an optional summary appended to the task's logs so the person sees what you did; a person's concurrent edit is never overwritten. Call it only when the acceptance criteria are met and your verification passed. Idempotent: the same move twice is reported as unchanged. A task already done is never reopened. Requires the repository to be trusted in GitPulse.",
+            "Move your GitPulse board task to done when the work is finished. Done is evidence-gated: it lands only if Manvi's verification passed for your worktree's current head, otherwise the task goes to review with the reason (held_for_review: true) for a person to judge, and no argument changes that (or to review to hand it to a person, or in_progress when you start). Pass the task id from your brief's 'Task:' line, or the task_id it was filed with. Only the status changes, plus an optional summary appended to the task's logs so the person sees what you did; a person's concurrent edit is never overwritten. Call it only when the acceptance criteria are met and your verification passed. Idempotent: the same move twice is reported as unchanged. A task already done is never reopened. Requires the repository to be trusted in GitPulse.",
             json!({
                 "repo_path": repo_prop(),
                 "task_id": bounded_string_prop("The task id from your brief ('Task: <id>'), its board item_id, or the task_id it was filed with", 1, 128),
@@ -712,7 +716,8 @@ fn build_tools() -> Vec<Value> {
                     "description": "Only move it if the task is still at this revision (from your brief or gitpulse_get_task); otherwise it is refused so you can re-read it",
                     "minimum": 1,
                     "maximum": 9_007_199_254_740_991_i64
-                }
+                },
+                "request_id": request_id_prop()
             }),
             &["repo_path", "task_id"],
             json!({
@@ -749,7 +754,8 @@ fn build_tools() -> Vec<Value> {
                 "even_if_running": {
                     "type": "boolean",
                     "description": "Delete it even though an agent attempt on it may still be working (task_in_use). Only when that agent is you, or the person asked for this. Default false"
-                }
+                },
+                "request_id": request_id_prop()
             }),
             &["repo_path", "task_id", "reason"],
             json!({
@@ -1058,6 +1064,18 @@ fn validate_arguments(name: &str, arguments: &Value) -> Result<(), String> {
     ))
 }
 
+/// A caller's idempotency key for a task write: the same key with the same
+/// request replays the first answer instead of writing again, so a call whose
+/// response was lost can be sent again safely.
+fn request_id_prop() -> Value {
+    json!({
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 120,
+        "description": "Optional idempotency key (letters, digits, '-' and '_'). Send the same key to repeat this call after a lost response; the store answers with the first result instead of writing twice"
+    })
+}
+
 fn parse_string_vec(val: &Value) -> Option<Vec<String>> {
     val.as_array().map(|arr| {
         arr.iter()
@@ -1078,13 +1096,21 @@ fn open_task_profile(create: bool) -> Result<Option<dc_store::Store>, String> {
             std::fs::create_dir_all(parent)
                 .map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
         }
-        return dc_store::Store::open(&path)
-            .map(Some)
-            .map_err(|e| e.to_string());
+        return open_shared_profile(dc_store::Store::open(&path));
     }
-    dc_store::Store::open_existing(&path)
-        .map(Some)
-        .map_err(|e| e.to_string())
+    open_shared_profile(dc_store::Store::open_existing(&path))
+}
+
+/// The task profile is shared with the desktop app, which owns its schema.
+/// This server may be older or newer than the app, so its handle never
+/// upgrades: a request that needs the upgrade fails with
+/// `schema_upgrade_required` and leaves the profile as it found it.
+fn open_shared_profile(
+    opened: Result<dc_store::Store, dc_store::StoreError>,
+) -> Result<Option<dc_store::Store>, String> {
+    let mut store = opened.map_err(|e| e.to_string())?;
+    store.refuse_workbench_upgrades();
+    Ok(Some(store))
 }
 
 #[cfg(not(test))]
@@ -1146,7 +1172,7 @@ fn handle_tool_call(name: &str, arguments: &Value) -> Result<Value, String> {
                 .as_u64()
                 .map(|n| n as u32)
                 .unwrap_or(LEDGER_DEFAULT_LIMIT);
-            let address = crate::ledger::bindings::repository_address(repo)
+            let address = crate::ledger::bindings::repository_address_readonly(repo)
                 .map_err(|error| error.to_string())?;
             // `tail` pages *forward* from a cursor — deliberately, so a
             // consumer holding the last id it saw gets the same answer whether
@@ -1158,32 +1184,11 @@ fn handle_tool_call(name: &str, arguments: &Value) -> Result<Value, String> {
             // any size; `returned` says what it is, `truncated` says when more
             // follow, and `next_cursor` is what to pass to get them.
             let cursor = arguments["cursor"].as_i64().unwrap_or(0);
-            match crate::ledger::tail_readonly(&address.anchor, cursor, limit)
-                .map_err(|e| e.to_string())?
-            {
-                Some(events) => {
-                    let truncated = events.len() as u32 >= limit;
-                    let next_cursor = events.last().map(|event| event.id);
-                    Ok(json!({
-                        "ok": true,
-                        "returned": events.len(),
-                        "truncated": truncated,
-                        "next_cursor": next_cursor,
-                        "events": events,
-                    }))
-                }
-                None => Ok(json!({
-                    "ok": false,
-                    "error": "no ledger in this repository yet; nothing has been recorded",
-                    "returned": 0,
-                    "truncated": false,
-                    "events": [],
-                })),
-            }
+            resources::ledger_page(&address.anchor, cursor, limit)
         }
         "gitpulse_task_view" => {
             let repo = arguments["repo_path"].as_str().ok_or("missing repo_path")?;
-            let address = crate::ledger::bindings::repository_address(repo)
+            let address = crate::ledger::bindings::repository_address_readonly(repo)
                 .map_err(|error| error.to_string())?;
             let task_id = arguments["task_id"].as_str();
             let view = crate::tasks::view_filtered(&address.anchor, task_id);
@@ -1278,6 +1283,7 @@ fn handle_tool_call(name: &str, arguments: &Value) -> Result<Value, String> {
                 status,
                 arguments["expected_revision"].as_i64(),
                 arguments["summary"].as_str(),
+                arguments["request_id"].as_str(),
             )
             .map_err(workbench_message)
         }
@@ -1295,6 +1301,7 @@ fn handle_tool_call(name: &str, arguments: &Value) -> Result<Value, String> {
                 arguments["expected_revision"].as_i64(),
                 reason,
                 arguments["even_if_running"].as_bool().unwrap_or(false),
+                arguments["request_id"].as_str(),
             )
             .map_err(workbench_message)
         }
@@ -1465,11 +1472,15 @@ impl Ready {
             self.id.clone(),
             -32603,
             format!(
-                "{} exceeded the {} ms server budget and was abandoned",
+                "{} exceeded the {} ms server budget and the client stopped waiting; the work is not cancelled and may still finish, so a write's outcome is unknown. Read the state back before retrying",
                 self.method,
                 budget.as_millis()
             ),
-            Some(json!({ "method": self.method, "timeoutMs": budget.as_millis() as u64 })),
+            Some(json!({
+                "method": self.method,
+                "timeoutMs": budget.as_millis() as u64,
+                "outcomeUnknown": true,
+            })),
         )
     }
 
@@ -1483,6 +1494,20 @@ impl Ready {
             -32603,
             format!("{} panicked; the server is still running", self.method),
             Some(json!({ "method": self.method })),
+        )
+    }
+
+    /// The answer to send when no thread could be started to run this request.
+    /// The request never ran, so the client may retry it.
+    pub fn unstarted(&self) -> JsonRpcResponse {
+        err(
+            self.id.clone(),
+            -32603,
+            format!(
+                "{} did not run: the server could not start a thread for it; retry",
+                self.method
+            ),
+            Some(json!({ "method": self.method, "ran": false })),
         )
     }
 }
@@ -1551,9 +1576,9 @@ pub fn accept(req: JsonRpcRequest, era: &mut Era) -> Accepted {
 
     if req.method == "initialize" {
         *era = Era::Legacy;
-        let requested = req.params["protocolVersion"]
-            .as_str()
-            .unwrap_or("2024-11-05");
+        // An absent version asks for nothing in particular, so it gets the same
+        // answer as an unknown one rather than being assumed to mean the oldest.
+        let requested = req.params["protocolVersion"].as_str().unwrap_or("");
         let protocol_version = if LEGACY_VERSIONS.contains(&requested) {
             requested
         } else if requested == PROTOCOL_VERSION {
@@ -1561,7 +1586,7 @@ pub fn accept(req: JsonRpcRequest, era: &mut Era) -> Accepted {
             // they asked for so they are not stuck, and name the modern version.
             PROTOCOL_VERSION
         } else {
-            LEGACY_VERSIONS[1]
+            LEGACY_VERSIONS[0]
         };
         return Accepted::Answered(ok(
             id,
@@ -2027,6 +2052,54 @@ mod tests {
         }
     }
 
+    /// Regression (oldest-version fallback): a client asking for a revision this
+    /// binary does not list was answered 2024-11-05, the *oldest* it speaks,
+    /// under which `outputSchema` and `structuredContent` (the `ok` and
+    /// `unscanned_worktrees` facets) may be ignored. The spec says the latest.
+    #[test]
+    fn an_unlisted_requested_version_is_answered_with_the_newest_supported() {
+        assert!(
+            LEGACY_VERSIONS.windows(2).all(|pair| pair[0] > pair[1]),
+            "LEGACY_VERSIONS must be newest first: {LEGACY_VERSIONS:?}"
+        );
+        for requested in [
+            json!("2025-06-18"),
+            json!("2025-03-26"),
+            json!("1999-01-01"),
+            json!(null),
+        ] {
+            let mut era = Era::Unknown;
+            let resp = process_request(
+                request(
+                    "initialize",
+                    Some(json!(1)),
+                    json!({ "protocolVersion": requested, "capabilities": {} }),
+                ),
+                &mut era,
+            )
+            .expect("answered");
+            assert_eq!(
+                resp.result.unwrap()["protocolVersion"],
+                LEGACY_VERSIONS[0],
+                "requested {requested}"
+            );
+        }
+        // A listed version is still answered with itself.
+        for version in LEGACY_VERSIONS {
+            let mut era = Era::Unknown;
+            let resp = process_request(
+                request(
+                    "initialize",
+                    Some(json!(1)),
+                    json!({ "protocolVersion": version }),
+                ),
+                &mut era,
+            )
+            .expect("answered");
+            assert_eq!(resp.result.unwrap()["protocolVersion"], *version);
+        }
+    }
+
     #[test]
     fn the_legacy_handshake_advertises_the_same_capabilities_as_discover() {
         let mut era = Era::Unknown;
@@ -2462,6 +2535,31 @@ mod tests {
         }
     }
 
+    /// Tools whose `outputSchema` is only `{"type":"object"}`, each with why.
+    ///
+    /// An object-only schema accepts any object, so validating against it
+    /// proves nothing; leaving that silent is how "every tool validated" came
+    /// to mean "five of them". Each is named here instead, and
+    /// `every_advertised_tool_result_matches_its_declared_output_schema` fails
+    /// both for a tool missing from this list and for one that no longer
+    /// belongs on it.
+    const OBJECT_ONLY_OUTPUT_SCHEMAS: &[(&str, &str)] = &[
+        (
+            "gitpulse_task_view",
+            "relays Manvi's task view; the shape is Manvi's contract",
+        ),
+        (
+            "gitpulse_provenance",
+            "relays git-notes provenance records, which carry per-commit free-form fields",
+        ),
+    ];
+
+    fn is_object_only_exempt(name: &str) -> bool {
+        OBJECT_ONLY_OUTPUT_SCHEMAS
+            .iter()
+            .any(|(exempt, _)| *exempt == name)
+    }
+
     /// A tool's result is checked by the client against its `outputSchema`,
     /// and a mismatch fails the whole call. `gitpulse_change_context` declared
     /// `collisions` an array while it has always returned the collision facet
@@ -2470,8 +2568,16 @@ mod tests {
     /// been deleted (the collision scan fails), and on a path that is not a
     /// repository at all, because the failure paths are where a payload
     /// drifts from its happy-path shape.
+    ///
+    /// Every advertised tool is held to it, the task-board writers included
+    /// (they run as one lifecycle on the healthy repository), and a tool whose
+    /// every call errored is a failure, not a skip: this used to `continue`
+    /// past an error and require five of the 27 tools, so the other 22 could
+    /// drift without a test noticing. The only tools exempt are those named in
+    /// [`OBJECT_ONLY_OUTPUT_SCHEMAS`], each with the reason its schema is not
+    /// typed here.
     #[test]
-    fn every_read_only_tool_result_matches_its_declared_output_schema() {
+    fn every_advertised_tool_result_matches_its_declared_output_schema() {
         let git = |args: &[&str]| {
             let out = std::process::Command::new("git")
                 .args(args)
@@ -2537,14 +2643,61 @@ mod tests {
 
         let missing = "/no/such/gitpulse-output-schema-repo".to_string();
 
+        // One repository with an indexed generation, so the DevMap tools answer
+        // with data rather than only their unavailable envelopes.
+        let indexed_dir = crate::codeintel::tests::repo_with_one_generation();
+        let indexed = indexed_dir.path().to_string_lossy().into_owned();
+        crate::test_support::trust_repo(indexed_dir.path());
+
         let mut validated = std::collections::BTreeSet::new();
-        for repo in [&healthy, &broken, &untrusted, &ledgered, &missing] {
+        let mut errors: std::collections::BTreeMap<String, Vec<String>> = Default::default();
+        let mut check =
+            |name: &str,
+             label: &str,
+             schema: &Value,
+             outcome: Result<Value, String>,
+             validated: &mut std::collections::BTreeSet<String>| {
+                // An execution error is reported as `isError` text and carries no
+                // structured content, so there is no schema to meet. It is recorded
+                // rather than skipped: a tool with no successful call is reported
+                // below.
+                let payload = match outcome {
+                    Ok(payload) => payload,
+                    Err(error) => {
+                        errors
+                            .entry(name.to_string())
+                            .or_default()
+                            .push(format!("{label}: {error}"));
+                        return;
+                    }
+                };
+                let violations: Vec<String> = validate::validate(&payload, schema)
+                    .iter()
+                    .map(validate::Violation::render)
+                    .collect();
+                assert!(
+                violations.is_empty(),
+                "{name} on {label} violates its outputSchema: {violations:?}\npayload: {payload}"
+            );
+                let nulls = nulls_the_schema_does_not_allow(&payload, schema, "");
+                assert!(
+                    nulls.is_empty(),
+                    "{name} on {label} returns null where its outputSchema forbids it: {nulls:?}"
+                );
+                validated.insert(name.to_string());
+            };
+        for repo in [&healthy, &broken, &untrusted, &ledgered, &missing, &indexed] {
             for tool in tools() {
                 let name = tool["name"].as_str().expect("name");
+                // Exempt tools are still run and held to the object schema they
+                // declare; only a tool that never succeeds escapes (below).
                 if tool["annotations"]["readOnlyHint"] != true {
                     continue;
                 }
                 let mut arguments = json!({ "repo_path": repo });
+                if tool["inputSchema"]["properties"]["targets"].is_object() {
+                    arguments["targets"] = json!(["probe_caller"]);
+                }
                 for extra in [
                     "query",
                     "target",
@@ -2555,33 +2708,140 @@ mod tests {
                     "task_id",
                     "symptom",
                     "since",
+                    "file",
+                    "content",
                 ] {
                     if tool["inputSchema"]["properties"][extra].is_object() {
                         arguments[extra] = json!("probe");
                     }
                 }
-                // An execution error is reported as `isError` text and carries
-                // no structured content, so there is no schema to meet.
-                let Ok(payload) = handle_tool_call(name, &arguments) else {
-                    continue;
-                };
-                let schema = &tool["outputSchema"];
-                let violations: Vec<String> = validate::validate(&payload, schema)
-                    .iter()
-                    .map(validate::Violation::render)
-                    .collect();
-                assert!(
-                    violations.is_empty(),
-                    "{name} on {repo} violates its outputSchema: {violations:?}\npayload: {payload}"
+                check(
+                    name,
+                    repo,
+                    &tool["outputSchema"],
+                    handle_tool_call(name, &arguments),
+                    &mut validated,
                 );
-                let nulls = nulls_the_schema_does_not_allow(&payload, schema, "");
-                assert!(
-                    nulls.is_empty(),
-                    "{name} on {repo} returns null where its outputSchema forbids it: {nulls:?}"
-                );
-                validated.insert(name.to_string());
             }
         }
+
+        // The writers, as the lifecycle an agent runs: file two tasks, import
+        // briefs, finish one, merge the other into it, delete a third. Each
+        // reply is held to the schema the tool advertises. The task profile is
+        // the fixture's own (`PROFILE_OVERRIDE`), so nothing here touches a
+        // real board.
+        let schema_of = |name: &str| -> Value {
+            tools()
+                .into_iter()
+                .find(|tool| tool["name"] == name)
+                .map(|tool| tool["outputSchema"].clone())
+                .unwrap_or_else(|| panic!("{name} is not advertised"))
+        };
+        let mut call_writer =
+            |name: &str, arguments: Value, validated: &mut std::collections::BTreeSet<String>| {
+                let outcome = handle_tool_call(name, &arguments);
+                check(
+                    name,
+                    "the task-board lifecycle",
+                    &schema_of(name),
+                    outcome,
+                    validated,
+                );
+            };
+        for (task, title) in [
+            ("gp-schema-first", "Rotate the signing keys"),
+            ("gp-schema-second", "Paginate the activity feed"),
+            ("gp-schema-third", "Compress the ledger archives"),
+        ] {
+            call_writer(
+                "gitpulse_add_task",
+                json!({ "repo_path": healthy, "task_id": task, "title": title, "status": "ready", "priority": 2 }),
+                &mut validated,
+            );
+        }
+        call_writer(
+            "gitpulse_import_tasks",
+            json!({ "repo_path": healthy }),
+            &mut validated,
+        );
+        call_writer(
+            "gitpulse_complete_task",
+            json!({ "repo_path": healthy, "task_id": "gp-schema-first", "status": "review", "summary": "schema probe" }),
+            &mut validated,
+        );
+        call_writer(
+            "gitpulse_merge_tasks",
+            json!({
+                "repo_path": healthy,
+                "into_task_id": "gp-schema-first",
+                "sources": [{ "task_id": "gp-schema-second" }],
+                "reason": "schema probe: duplicate of the first"
+            }),
+            &mut validated,
+        );
+        call_writer(
+            "gitpulse_delete_task",
+            json!({ "repo_path": healthy, "task_id": "gp-schema-third", "reason": "schema probe cleanup" }),
+            &mut validated,
+        );
+        // And the readers that depend on those tasks existing.
+        for name in ["gitpulse_list_tasks", "gitpulse_get_task"] {
+            let tool = tools()
+                .into_iter()
+                .find(|tool| tool["name"] == name)
+                .unwrap();
+            let arguments = json!({ "repo_path": healthy, "task_id": "gp-schema-first" });
+            check(
+                name,
+                "the task-board lifecycle",
+                &tool["outputSchema"],
+                handle_tool_call(name, &arguments),
+                &mut validated,
+            );
+        }
+
+        // Every advertised tool is validated or explicitly exempt. A tool whose
+        // every call errored was never checked, and says why.
+        for tool in tools() {
+            let name = tool["name"].as_str().expect("name");
+            if is_object_only_exempt(name) {
+                continue;
+            }
+            assert!(
+                validated.contains(name),
+                "{name} was never validated against its outputSchema (every call errored): {:?}",
+                errors.get(name)
+            );
+        }
+        // The DevMap tools are exempt from a typed schema, not from a payload:
+        // each must have produced a checked object on at least one repository.
+        for name in devmap_parity::TOOL_NAMES {
+            assert!(
+                validated.contains(*name),
+                "{name} was never validated against its declared outputSchema: {:?}",
+                errors.get(*name)
+            );
+        }
+        // The allow-list cannot go stale: an exempt tool must still declare
+        // only an object, and a tool that gained a real schema must leave it.
+        for (name, reason) in OBJECT_ONLY_OUTPUT_SCHEMAS {
+            let tool = tools()
+                .into_iter()
+                .find(|tool| tool["name"] == *name)
+                .unwrap_or_else(|| panic!("{name} is exempt but no longer advertised"));
+            assert_eq!(
+                tool["outputSchema"],
+                json!({ "type": "object" }),
+                "{name} now declares a real outputSchema; drop it from OBJECT_ONLY_OUTPUT_SCHEMAS ({reason})"
+            );
+        }
+        assert!(
+            tools().iter().all(|tool| {
+                let name = tool["name"].as_str().unwrap();
+                tool["outputSchema"] != json!({ "type": "object" }) || is_object_only_exempt(name)
+            }),
+            "a tool declares only {{\"type\":\"object\"}} without being listed, with a reason, in OBJECT_ONLY_OUTPUT_SCHEMAS"
+        );
         // A tool that only ever errored here was never checked; these are the
         // ones whose declared shapes this test was written against.
         for name in [
@@ -2808,6 +3068,69 @@ mod tests {
         (dir, profile, repo)
     }
 
+    /// The task profile belongs to the desktop app. An MCP server that shares
+    /// it may be older or newer, so it never moves the schema: a request that
+    /// needs the upgrade is refused with a typed error and leaves the profile,
+    /// and every other host's view of it, untouched.
+    #[test]
+    fn the_mcp_server_never_upgrades_a_shared_task_profile() {
+        let (dir, profile, repo) = task_fixture();
+        crate::test_support::trust_repo(dir.path());
+        let database = profile.path().join("workbench.sqlite");
+        let (error, added) = tool_json(
+            "gitpulse_add_task",
+            json!({"repo_path": repo, "title": "Filed before the profile aged"}),
+        );
+        assert!(!error, "{added}");
+
+        // The profile as an older desktop app left it.
+        let held_back = rusqlite::Connection::open(&database).unwrap();
+        held_back
+            .execute("UPDATE work_meta SET version = 11 WHERE id = 1", [])
+            .unwrap();
+        drop(held_back);
+
+        for (tool, arguments) in [
+            (
+                "gitpulse_add_task",
+                json!({"repo_path": repo, "title": "Needs the upgrade"}),
+            ),
+            ("gitpulse_list_tasks", json!({"repo_path": repo})),
+        ] {
+            let (error, refused) = tool_json(tool, arguments);
+            assert!(error, "{tool}: {refused}");
+            assert!(
+                refused
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("schema_upgrade_required"),
+                "{tool}: {refused}"
+            );
+        }
+        // A write that fails for another reason still must not upgrade first:
+        // the schema step runs before the request is read.
+        let store = open_task_profile(true).unwrap().unwrap();
+        let error = store
+            .workbench_request("items.put", "{}")
+            .expect_err("refused before the request is looked at");
+        assert_eq!(error.code, "schema_upgrade_required", "{}", error.message);
+        drop(store);
+        let after = rusqlite::Connection::open(&database).unwrap();
+        let version: i64 = after
+            .query_row("SELECT version FROM work_meta WHERE id = 1", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(version, 11, "the profile was left at the schema it had");
+        assert!(
+            !profile
+                .path()
+                .join("workbench.sqlite.pre-schema-11.bak")
+                .exists(),
+            "an upgrade that did not run took no backup"
+        );
+    }
+
     /// The defect this replaced: `gitpulse_add_task` reported success and the
     /// task appeared on no board. So the assertion is made through the exact
     /// calls the board makes — `registerRepository`, then a repository-scoped
@@ -2995,7 +3318,7 @@ mod tests {
             format!("At most {} bytes. |", ft::MAX_OWNER_BYTES),
             format!(
                 "At most {} `item_id`s",
-                crate::workbench::intake::MAX_RELATED
+                crate::workbench::intake::MAX_REVIEWED_RELATED
             ),
             format!(
                 "`reason` is required (at most {} characters)",
@@ -3111,6 +3434,13 @@ mod tests {
         crate::test_support::trust_repo(dir.path());
         let id = "6f1c2a7e-0d4b-4c1e-9a55-3b0e8f2d9c11";
         let (board, _) = board_task(profile.path(), &repo, id);
+        // An agent's `done` needs Manvi's passed verdict for the current head.
+        crate::test_support::git_in(dir.path(), &["commit", "-q", "--allow-empty", "-m", "base"]);
+        crate::workbench::intake::gate_tests::verified(
+            &dc_store::Store::open(profile.path().join("workbench.sqlite")).unwrap(),
+            &dir,
+            id,
+        );
         let before = board
             .board_request("items.get", &json!({"id": id}).to_string())
             .unwrap()["item"]
@@ -3162,7 +3492,11 @@ mod tests {
         }
         let logs = after["logs"].as_str().unwrap();
         assert!(
-            logs.starts_with("first trace\n\n--- Agent moved this task to done ("),
+            logs.starts_with("first trace\n\n--- Verification passed ("),
+            "the verdict is attached to the history: {logs}"
+        );
+        assert!(
+            logs.contains("\n\n--- Agent moved this task to done ("),
             "{logs}"
         );
         assert!(logs.ends_with(summary), "{logs}");
@@ -3205,6 +3539,11 @@ mod tests {
         crate::test_support::git_in(dir.path(), &["commit", "-q", "--allow-empty", "-m", "base"]);
         let id = "0b7d4e2a-91c3-4f6e-8a2d-5c4b3a291e70";
         let (board, _) = board_task(profile.path(), &repo, id);
+        crate::workbench::intake::gate_tests::verified(
+            &dc_store::Store::open(profile.path().join("workbench.sqlite")).unwrap(),
+            &dir,
+            id,
+        );
         let lane = dir.path().join(".gitpulse/worktrees/import-0b7d4e2a");
         crate::test_support::git_in(
             dir.path(),
@@ -3841,6 +4180,62 @@ mod tests {
         assert!(!error, "{filed}");
         assert_eq!(filed["outcome"], "created");
         assert_eq!(filed["related_check"]["related_open_tasks"], 1);
+    }
+
+    #[test]
+    fn a_timeout_says_the_work_may_still_finish_and_the_outcome_is_unknown() {
+        let ready = Ready {
+            id: json!(7),
+            modern: true,
+            method: "tools/call".into(),
+            params: json!({}),
+        };
+        let response = ready.timed_out(std::time::Duration::from_millis(1500));
+        let error = response.error.expect("an error");
+        let message = error["message"].as_str().unwrap();
+        assert!(message.contains("not cancelled"), "{message}");
+        assert!(message.contains("outcome is unknown"), "{message}");
+        assert!(!message.contains("was abandoned"), "{message}");
+        assert_eq!(error["data"]["outcomeUnknown"], true);
+    }
+
+    /// With 26 or more related open tasks, `add_task` used to be impossible:
+    /// it required every related id in `reviewed_related`, whose schema capped
+    /// the array at the 25 a refusal names.
+    #[test]
+    fn a_task_can_be_filed_after_reviewing_more_than_twenty_five_related_ones() {
+        let (dir, _profile, repo) = task_fixture();
+        crate::test_support::trust_repo(dir.path());
+        let mut ids: Vec<String> = Vec::new();
+        for n in 0..30 {
+            let (error, filed) = tool_json(
+                "gitpulse_add_task",
+                json!({
+                    "repo_path": repo, "task_id": format!("imp-{n}"),
+                    "title": format!("Importer crash handling case{n}x"), "labels": ["import"],
+                    "reviewed_related": ids,
+                }),
+            );
+            assert!(
+                !error,
+                "filing task {n} with {} reviewed: {filed}",
+                ids.len()
+            );
+            ids.push(filed["item_id"].as_str().unwrap().to_owned());
+        }
+        // A refusal names one page and says the rest follow.
+        let (error, refused) = tool_json(
+            "gitpulse_add_task",
+            json!({ "repo_path": repo, "task_id": "imp-last", "title": "Importer crash handling again", "labels": ["import"] }),
+        );
+        assert!(error, "{refused}");
+        let message = refused.as_str().unwrap();
+        assert!(message.contains("30 open tasks"), "{message}");
+        assert!(message.contains("and 5 more"), "{message}");
+        assert!(
+            message.contains("the next refusal names the following ones"),
+            "{message}"
+        );
     }
 
     #[test]

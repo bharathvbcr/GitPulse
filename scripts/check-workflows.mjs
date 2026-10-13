@@ -24,6 +24,10 @@ import { fileURLToPath } from "node:url";
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const WORKFLOW_DIR = path.join(REPO_ROOT, ".github", "workflows");
 
+// actionlint reads a handful of YAML files; a minute is generous. A kill at
+// the deadline arrives as `result.error`, which `interpret` maps to exit 2.
+export const ACTIONLINT_TIMEOUT_MS = 60_000;
+
 export const INSTALL_HINT =
   "actionlint is not installed. Install it with `brew install actionlint`, or see " +
   "https://github.com/rhysd/actionlint/blob/main/docs/install.md";
@@ -89,7 +93,12 @@ export function main() {
     console.error(`FAIL: no workflow files found in ${WORKFLOW_DIR} — nothing was checked`);
     return 2;
   }
-  const result = spawnSync("actionlint", ["-color"], { cwd: REPO_ROOT, stdio: "inherit" });
+  const result = spawnSync("actionlint", ["-color"], {
+    cwd: REPO_ROOT,
+    stdio: "inherit",
+    timeout: ACTIONLINT_TIMEOUT_MS,
+    killSignal: "SIGKILL",
+  });
   const { code, message } = interpret(result);
   if (code === 0) {
     console.log(`OK: ${files.length} workflow files lint clean (${files.join(", ")})`);

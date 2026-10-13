@@ -4,7 +4,7 @@
   import { reportPanelError } from "../diagnostics/report";
   import { paneDetails } from "../diagnostics/paneCrash";
   import { keyedList } from "../ui/eachKeys";
-  import { repoStore } from "../stores/repoStore";
+  import { currentRepoPath, repoStore } from "../stores/repoStore";
   import { liveIndex } from "../codeintel/liveIndex";
   import { copyDevmapLogs } from "../codeintel/diagnostics";
   import {
@@ -34,6 +34,7 @@
     RepoMapSubsystem,
     WorkspaceLinksResult,
   } from "../codeintel/types";
+  import { buildFailureReason } from "../codeintel/types";
   import {
     docsBrokenLinks,
     docsGraph,
@@ -170,6 +171,8 @@
         return snapshot.reason
           ? `The automatic index failed: ${boundStrip(snapshot.reason)}`
           : "The automatic index failed.";
+      case "paused":
+        return indexPausedText(snapshot.reason);
       case "skipped":
         // A skip the user needs to know about is one a rebuild cannot fix.
         return snapshot.decision === "skip_schema_outdated" && snapshot.reason
@@ -178,6 +181,20 @@
       default:
         return null;
     }
+  });
+  /**
+   * The automatic index is paused because its last build ran past the
+   * deadline. Shown over a map that did load too: the map on screen is then
+   * the last one that finished, and nothing will refresh it on its own until
+   * the pause ends or Build is pressed.
+   */
+  function indexPausedText(reason: string | null): string {
+    return boundStrip(reason) ?? "Index too slow: automatic indexing is paused. Press Build to index now.";
+  }
+  const indexPaused = $derived.by((): string | null => {
+    if (!currentRepo || !load?.available) return null;
+    const snapshot = $indexSnapshots[currentRepo];
+    return snapshot?.phase === "paused" ? indexPausedText(snapshot.reason) : null;
   });
   const cliKnownAbsent = $derived(cliStatus != null && !cliStatus.available);
   const selected = $derived.by((): RepoMapSubsystem | null => {
@@ -194,7 +211,7 @@
   const brokenDisplay = $derived(brokenLinksHonesty(brokenLinks, BROKEN_LINKS_DISPLAY_CAP));
   const linksHonesty = $derived(linkCandidatesHonesty(linkResult));
 
-  const currentRepo = $derived($repoStore.currentPath);
+  const currentRepo = $derived($currentRepoPath);
   const indexSnapshots = liveIndex.snapshots;
   const contentRevisions = repoStore.contentRevisions;
   const indexRevision = $derived(currentRepo ? ($indexSnapshots[currentRepo]?.revision ?? 0) : 0);
@@ -401,7 +418,7 @@
       if (!live()) return;
       if (!outcome.ok) {
         actionNote = reportMapFailure(kind, repoPath,
-          outcome.stderr.trim() || outcome.stdout.trim() || `devmap ${kind} failed`);
+          buildFailureReason(outcome, outcome.stdout.trim() || `devmap ${kind} failed`));
       } else {
         actionNote = `Map ${kind === "build" ? "built" : "refreshed"}.`;
       }
@@ -613,6 +630,10 @@
       {:else}
         <p class="text-[11px] text-amber-600 dark:text-amber-400">{mapFailureText}</p>
       {/if}
+    </div>
+  {:else if indexPaused}
+    <div class="shrink-0 border-b border-border/50 px-3 py-2">
+      <p class="text-[11px] text-amber-600 dark:text-amber-400" data-testid="map-index-paused">{indexPaused}</p>
     </div>
   {/if}
 

@@ -8,6 +8,13 @@ does not constitute completion. Evidence below must identify the exact check and
 its scope; unit tests do not prove native desktop behavior or provider integration.
 
 Design status: complete for the agreed scope. Implementation status: in progress.
+
+> **Evidence names.** Log and evidence file names quoted in this document (`*.log`,
+> `*.json`) name local run artifacts that were never committed and are not
+> retained; the figures quoted beside them are the record. They are not paths a
+> reader can open. `scripts/documented-counts-contract.test.ts` rejects any new
+> `/tmp/...` evidence path.
+
 The six required areas below remain the acceptance contract; this is not a claim
 that all planned capabilities have shipped.
 
@@ -303,23 +310,23 @@ reads both.
   inbox emits a failure notice even when the helper exits with code zero. A failure
   does not change task status/revision, start a replacement, or inherit bypass.
 - **Regression evidence:** pre-fix missing-executable capacity retention and a nil
-  session panic (`/tmp/manvi-recovery-before.log`); provider readiness accepted
-  before native birth (`/tmp/manvi-recovery-schema-before.log`); missing failure
-  receipt support (`/tmp/manvi-recovery-finish-before.log`); decoder refusal
-  (`/tmp/gitpulse-recovery-client-before.log`); and unsafe old-host activation
-  (`/tmp/gitpulse-recovery-native-before.log`). Retained tests pass after the fixes.
+  session panic (`manvi-recovery-before.log`); provider readiness accepted
+  before native birth (`manvi-recovery-schema-before.log`); missing failure
+  receipt support (`manvi-recovery-finish-before.log`); decoder refusal
+  (`gitpulse-recovery-client-before.log`); and unsafe old-host activation
+  (`gitpulse-recovery-native-before.log`). Retained tests pass after the fixes.
 - **Verified:** canonical dc-store tests and Clippy; Go protocol/host/CLI race
   suites; full Go vet/tests (4,107 passed, seven skipped, 45 tested packages);
   112 workbench frontend tests; 28 native workbench tests (three separately opt-in);
   Svelte/TypeScript checks. The installed Codex read-only native integration test
   passed against rebuilt Manvi/schema-ten binaries and left the task in Inbox.
-  Logs: `/tmp/manvi-recovery-store.log`, `/tmp/manvi-recovery-race.log`,
-  `/tmp/manvi-recovery-go.jsonl`, `/tmp/gitpulse-recovery-native.log`,
-  `/tmp/gitpulse-recovery-native-live.log`.
+  Logs: `manvi-recovery-store.log`, `manvi-recovery-race.log`,
+  `manvi-recovery-go.jsonl`, `gitpulse-recovery-native.log`,
+  `gitpulse-recovery-native-live.log`.
 - **Verified browser:** all 30 handoff/review/recovery checks passed with zero
   recorded runtime errors. Initial runs were interrupted by development reloads
   during report/document writes; the complete settled run is saved in
-  `/tmp/gitpulse-recovery-browser.json`. Simulated terminal events still emit
+  `gitpulse-recovery-browser.json`. Simulated terminal events still emit
   Tauri callback warnings. This fixture does not qualify OS notification delivery.
 - **Full gates:** GitPulse `ci:local` exited zero: 5,304 frontend tests (one
   skipped), 2,090 Rust tests (twelve ignored), 24 standard browser regressions,
@@ -332,9 +339,10 @@ reads both.
   checks. RustSec and the configured local-provider wire check passed. Missing
   golangci-lint/debt ratchet, govulncheck, nilaway, the legacy DevCouncil environment,
   and live Anthropic/Gemini/xAI wire checks remain unverified. The flat graph export
-  is still generation 1; refreshed DevMap stores reached Manvi 20 and GitPulse 18,
-  with incomplete walks. Logs: `/tmp/manvi-recovery-verify.log`,
-  `/tmp/gitpulse-recovery-ci.log`, `/tmp/gitpulse-recovery-vendor.log`.
+  Manvi's gate read was the stale legacy `.devcouncil/code_graph.json`, not DevMap's
+  `.devcouncil/graph/code_graph.json` ([current state](#flat-graph-export-path-and-freshness));
+  refreshed DevMap stores reached Manvi 20 and GitPulse 18, with incomplete walks. Logs: `manvi-recovery-verify.log`,
+  `gitpulse-recovery-ci.log`, `gitpulse-recovery-vendor.log`.
 - **Open:** unactivated-helper and legacy host-crash reconciliation, escaped
   descendants, writer fencing, managed Claude, real-account approvals, richer
   review and orchestration, the remaining board/workspace features, installed
@@ -358,8 +366,8 @@ reads both.
   handshake, a direct marker turn and the native GitPulse → Manvi → Codex → store
   flow in a disposable checkout. The native flow retained task revision 1/Inbox
   and replaying launch returned the same completed attempt. Evidence:
-  `/tmp/manvi-managed-live-handshake.log`, `/tmp/manvi-managed-live-turn.log`,
-  `/tmp/gitpulse-managed-native-live.log`.
+  `manvi-managed-live-handshake.log`, `manvi-managed-live-turn.log`,
+  `gitpulse-managed-native-live.log`.
 - **Verified with scripted providers:** protocol and Go host race suites, 111
   workbench frontend tests, 27 native workbench tests and 28 browser interaction
   checks pass. The browser fixture had zero recorded runtime errors and emitted
@@ -373,20 +381,22 @@ reads both.
   tests** (twelve ignored), **24 standard browser regressions**, type/contract/
   vendor/schema checks, Clippy, formatting, production build and coverage floors.
   Coverage: frontend lines **96.14%**, branches **88.92%**, Rust lines **84.11%**.
-  Evidence: `/tmp/gitpulse-managed-ci.log`.
+  Evidence: `gitpulse-managed-ci.log`.
 - Manvi `verify.sh` completed with a **qualified pass**: 231 Rust tests, 4,104
   discovered Go tests (seven skipped), 81.5% Go coverage and 869 benchmark checks.
   After the final output-buffer fix, fresh `go vet ./...` and `go test ./...`
   passed: **4,098 tests passed**, seven skipped, 45 packages; the protocol/host
   race suites also passed. The two installed-Codex opt-in tests skipped by the
   general suite were executed successfully in the separate live checks above.
-  Logs: `/tmp/manvi-managed-verify-final.log`,
-  `/tmp/manvi-managed-go-final.jsonl`, `/tmp/manvi-managed-backpressure-after.log`.
+  Logs: `manvi-managed-verify-final.log`,
+  `manvi-managed-go-final.jsonl`, `manvi-managed-backpressure-after.log`.
 - Unrun verifier gates remain explicit: golangci-lint/debt ratchet, govulncheck,
   nilaway, legacy DevCouncil environment interop, and live Anthropic/Gemini/xAI
   wire checks. RustSec and the configured local-provider wire check passed.
-  The flat graph export remains generation 1; refreshed DevMap stores are
-  GitPulse generation 17 and Manvi generation 19. Graph walks remain incomplete.
+  The flat graph export read was the stale legacy `.devcouncil/code_graph.json`, not
+  `.devcouncil/graph/code_graph.json` ([current state](#flat-graph-export-path-and-freshness));
+  refreshed DevMap stores are GitPulse generation 17 and Manvi generation 19. Graph
+  walks remain incomplete.
 - **Open:** real-account approval modes and additional protocol callbacks, managed
   Claude, process-tree termination/recovery, launch fencing, richer reviews,
   installed notifications, workspace/board completion and performance targets.
@@ -427,14 +437,14 @@ reads both.
   runtime errors, including exact payload display, lost-reply retry, stale
   controls, reopening receipts and per-attempt bypass acknowledgment. Its process
   and provider responses are simulated. Evidence:
-  `/tmp/gitpulse-decisions-browser-evidence.json`.
+  `gitpulse-decisions-browser-evidence.json`.
 - Manvi `env -u DEVCOUNCIL_ROOT ./verify.sh` returned a qualified pass with
   **230 Rust tests**, 4090 Go cases (five skipped), 82.1% Go statement coverage,
   and 53 real-binary store tests. Missing golangci-lint/lint-debt, govulncheck and
   nilaway checks, absent sibling Python lease environment, the generation-one
   flat graph versus generation-fifteen index, and scripted cloud-provider wire
   checks remain explicit gaps. RustSec audit and the local provider wire probe
-  passed. Log: `/tmp/manvi-decisions-verify.log`.
+  passed. Log: `manvi-decisions-verify.log`.
 - GitPulse validation passed **5301 frontend tests** (one skipped), **2087 Rust
   tests** (eleven ignored), and **24 existing browser regressions**, including
   the native test refusing forged renderer callbacks/claims. Type checks, IPC,
@@ -444,8 +454,8 @@ reads both.
   gate was rerun serially and passed: frontend lines **96.13%**, branches
   **88.96%**, Rust lines **84.24%**. The final exact-payload UI change also passed
   fresh type checks, all frontend tests/coverage and a production build. Logs:
-  `/tmp/gitpulse-decisions-ci.log`, `/tmp/gitpulse-decisions-ui-final.log` and
-  `/tmp/gitpulse-decisions-coverage-final.log`. The full-profile browser reload
+  `gitpulse-decisions-ci.log`, `gitpulse-decisions-ui-final.log` and
+  `gitpulse-decisions-coverage-final.log`. The full-profile browser reload
   retained all three saved responses, removed stale approval controls and
   displayed the exact stored payload, with zero runtime errors.
 - DevMap impact answers remain incomplete lower bounds; GitNexus did not resolve
@@ -484,8 +494,8 @@ reads both.
   hours, and the action remains a draft until Save.
 - Verified: the final Manvi Rust workspace has **221 passing tests**, including
   eight notification regressions; workspace all-target Clippy and formatting pass.
-  Logs: `/tmp/manvi-notifications-rust-tests-final.log` and
-  `/tmp/manvi-notifications-rust-clippy-final.log`. The earlier full
+  Logs: `manvi-notifications-rust-tests-final.log` and
+  `manvi-notifications-rust-clippy-final.log`. The earlier full
   `env -u DEVCOUNCIL_ROOT ./verify.sh` returned a qualified pass: 218 Rust tests at
   that checkpoint, 4089 Go tests with five skipped, 82.1% Go coverage and 52
   real-binary store tests. The final Rust checks include the three subsequently
@@ -493,26 +503,27 @@ reads both.
 - The full Manvi gate did not cover golangci-lint/lint-debt ratcheting,
   govulncheck or nilaway because those tools were unavailable; incumbent Python
   lease interop lacked the sibling virtual environment; the flat navigation
-  graph was generation 1 versus DevMap generation 14. Anthropic/Gemini/xAI wire
-  checks used scripted servers. RustSec audit and a local provider wire request
-  did pass. These limitations are recorded in `/tmp/manvi-notifications-verify.log`.
+  graph read was the stale legacy `.devcouncil/code_graph.json` while DevMap was at
+  generation 14 ([current state](#flat-graph-export-path-and-freshness)).
+  Anthropic/Gemini/xAI wire checks used scripted servers. RustSec audit and a local provider wire request
+  did pass. These limitations are recorded in `manvi-notifications-verify.log`.
   Focused `go test -race ./dc/store ./serve ./cmd/manvi` also passed with CGO enabled
-  and the inherited root override removed (`/tmp/manvi-notifications-race.log`).
+  and the inherited root override removed (`manvi-notifications-race.log`).
 - Verified on the final implementation: GitPulse `npm run ci:local` passed with
   **5283 frontend tests passed, one skipped; 2086 Rust tests passed, eleven
   ignored; and 24/24 browser regressions passed**. Svelte/TypeScript, IPC/type
   contracts, vendor/schema checks, production build, Rust formatting and
   all-target Clippy passed. Coverage floors held at **96.12% frontend lines,
   88.96% frontend branches and 84.22% Rust lines**. Log:
-  `/tmp/gitpulse-notifications-complete-ci.log`. Documentation was reconciled
+  `gitpulse-notifications-complete-ci.log`. Documentation was reconciled
   afterward; its eight Manvi contract checks and both repository whitespace
-  checks passed (`/tmp/manvi-notifications-docs-final.log`).
+  checks passed (`manvi-notifications-docs-final.log`).
 - Verified: nineteen browser checks used a disposable real profile, including
   quiet-hour/mute persistence, current/stale activation recovery, unchanged
   task/proposal state, draft-only mute clearing and bounded inbox layout. The
   final runtime error count was zero. The fixture explicitly reports unavailable
   OS delivery and event updates; seeded activation records are not OS evidence.
-  Evidence: `/tmp/gitpulse-native-notifications-browser-evidence.json`.
+  Evidence: `gitpulse-native-notifications-browser-evidence.json`.
 - Unverified: installed bundle identity/permission/Focus behavior, real banners
   and action clicks, click-after-quit, Windows/Linux native delivery and measured
   native idle resources. Managed coding-agent permissions/review, the remaining
@@ -555,16 +566,16 @@ reads both.
   Focused `go test -race ./dc/store ./serve ./cmd/manvi` passed. Missing optional
   analysis tools, incumbent lease interop, stale flat navigation and live cloud
   providers retain the preceding checkpoint's unverified status. Logs:
-  `/tmp/manvi-attention-verify.log`, `/tmp/manvi-attention-race.log`.
+  `manvi-attention-verify.log`, `manvi-attention-race.log`.
 - GitPulse `npm run ci:local` passed: 5,262 frontend tests across 402 files
   (one skipped), 2,084 Rust test passes across 60 result groups (11 ignored),
   type checks, production build, formatting and all-target Clippy. The final
   coverage gate reported 96.13% frontend lines, 88.98% frontend branches and
   84.70% Rust lines, all above the required floors. Log:
-  `/tmp/gitpulse-attention-validated-ci.log`. These local checks do not qualify
+  `gitpulse-attention-validated-ci.log`. These local checks do not qualify
   native OS delivery, live provider permissions or the outstanding performance
   stress and installed-platform gates.
-- Browser evidence: `/tmp/gitpulse-attention-browser-evidence.json`. The preview
+- Browser evidence: `gitpulse-attention-browser-evidence.json`. The preview
   uses a disposable Vite cache to avoid collisions with concurrent verification.
   An existing signal-cleanup regression exposed cancelled optimizer writes after
   `server.close`; eager cleanup plus final cleanup after the event loop drains
@@ -604,22 +615,22 @@ reads both.
   additional reaping-boundary regression, and all 18 PTY event-bus tests passed
   after that regression. Explicit installed-provider help probing passed for both
   providers and all six modes. No live coding task was sent to either CLI.
-- Evidence: `/tmp/gitpulse-handoff-shutdown-before.log`,
-  `/tmp/gitpulse-handoff-shutdown-after.log`,
-  `/tmp/gitpulse-handoff-reconnect-before.log`,
-  `/tmp/gitpulse-handoff-frontend-tests.log`,
-  `/tmp/gitpulse-handoff-capability-before.log`,
-  `/tmp/gitpulse-handoff-installed-help.log`, and
-  `/tmp/gitpulse-handoff-reap-wire-after.log`. The final browser result is saved
-  in `/tmp/gitpulse-handoff-browser-passed.json`.
+- Evidence: `gitpulse-handoff-shutdown-before.log`,
+  `gitpulse-handoff-shutdown-after.log`,
+  `gitpulse-handoff-reconnect-before.log`,
+  `gitpulse-handoff-frontend-tests.log`,
+  `gitpulse-handoff-capability-before.log`,
+  `gitpulse-handoff-installed-help.log`, and
+  `gitpulse-handoff-reap-wire-after.log`. The final browser result is saved
+  in `gitpulse-handoff-browser-passed.json`.
 - Manvi `verify.sh` reached a qualified PASS on the current store revision:
   204 Rust tests, 82.1% Go coverage, 4,087 collected Go tests with five skipped,
   869 benchmark-instrument checks and a real local-provider wire request. Focused
   Go race checks for `./dc/store ./serve ./cmd/manvi` passed. Missing golangci-lint
   and its lint-debt check, govulncheck, nilaway, incumbent DevCouncil lease interop,
   stale flat navigation output and live cloud-provider checks remain unverified.
-  Logs: `/tmp/manvi-handoff-final-verify.log` and
-  `/tmp/manvi-handoff-final-race.log`. The initial verifier invocation incorrectly
+  Logs: `manvi-handoff-final-verify.log` and
+  `manvi-handoff-final-race.log`. The initial verifier invocation incorrectly
   supplied a root override to the entire test process and failed disposable-root
   tests; the corrected invocation removes that override. Its misdirected
   `hello.txt` fixture was preserved outside the worktree.
@@ -628,7 +639,7 @@ reads both.
   24 browser diagnostics, production build, formatting and all-target Clippy.
   Coverage floors passed at 96.12% frontend lines, 88.95% frontend branches
   and 84.70% Rust lines. IPC checked 190 registered handlers; the type contract
-  checked 884 fields. Log: `/tmp/gitpulse-handoff-validated-ci.log`.
+  checked 884 fields. Log: `gitpulse-handoff-validated-ci.log`.
 - Remaining: structured provider approval and review channels, observed effective
   account/configuration policy, startup recovery and process-tree reconciliation,
   durable retry of failed receipt writes, host-session namespaces across process
@@ -654,8 +665,9 @@ reads both.
   203 Rust tests, 82.1% Go coverage, 4,087 Go tests collected with five skipped,
   869 benchmark-instrument checks, and a real local provider wire request.
   Missing golangci-lint/lint-debt checks, govulncheck, nilaway, incumbent
-  `../DevCouncil/.venv`, stale flat navigation export (generation 1 versus index
-  12), and live cloud-provider qualification remain explicit gaps.
+  `../DevCouncil/.venv`, stale flat navigation export (the legacy
+  `.devcouncil/code_graph.json` versus index generation 12), and live cloud-provider
+  qualification remain explicit gaps.
 - Verified: GitPulse `npm run ci:local` passed with 5,230 frontend tests and one
   skip, 24 browser regressions, and 2,074 Rust tests with ten ignored. That run
   measured frontend lines/branches at 96.06%/88.85% and Rust lines at 84.72%.
@@ -664,10 +676,10 @@ reads both.
   (one existing live-host test ignored), format check and all-target clippy.
   Frontend source was unchanged after the full gate; the full gate was not
   repeated for that final path correction.
-- Evidence logs: `/tmp/manvi-runs-headref-store.log`,
-  `/tmp/manvi-native-runs-race.log`, `/tmp/manvi-native-runs-verify.log`,
-  `/tmp/gitpulse-native-runs-ci.log`, `/tmp/gitpulse-native-path-before.log`,
-  `/tmp/gitpulse-native-path-fixed.log`, and `/tmp/gitpulse-native-path-clippy.log`.
+- Evidence logs: `manvi-runs-headref-store.log`,
+  `manvi-native-runs-race.log`, `manvi-native-runs-verify.log`,
+  `gitpulse-native-runs-ci.log`, `gitpulse-native-path-before.log`,
+  `gitpulse-native-path-fixed.log`, and `gitpulse-native-path-clippy.log`.
 - Remaining: actual private-file/PTY handoff and its UI, verified effective CLI
   policies and child environment, process identity and startup/exit ordering,
   termination proof for uncertain starts, and native notifications. Current Git
@@ -803,7 +815,7 @@ reads both.
   4,085 collected Go tests (five skipped), and 869 benchmark-instrument checks.
   Its local-provider wire probe passed. Missing lint/nil/vulnerability tools,
   incumbent Python lease interoperability, the stale flat graph artifact
-  (generation one versus index eight), and live cloud-provider checks remain
+  (the legacy `.devcouncil/code_graph.json` versus index generation eight), and live cloud-provider checks remain
   unverified. These are verification gaps, not successful checks.
 - This proves automatic workflow wiring and controlled provider behavior. It
   does not prove live model semantic quality, installed desktop notification/UI
@@ -868,8 +880,8 @@ reads both.
   behavior. Full Manvi verification passed again with the same qualifications
   after the prompt change: 82.2% Go statement coverage, five skipped cases out
   of 4,073 Go tests, and 176 Rust tests across the workspace. Missing analysis
-  tools, Python lease interop, the stale flat navigation graph (generation one
-  versus index seven), and live cloud-provider checks remain unverified.
+  tools, Python lease interop, the stale flat navigation graph (the legacy
+  `.devcouncil/code_graph.json` versus index generation seven), and live cloud-provider checks remain unverified.
   The existing output-boundary fuzz target passed 9,658 executions in a bounded
   20-second run. These checks do not constitute a semantic quality corpus.
 
@@ -1083,11 +1095,32 @@ reads both.
   incumbent Python lease interoperability and live cloud-provider qualification
   remain uncovered. The live local-provider wire probe passed; this is separate
   from task-enhancement semantic quality.
-- The broad Manvi navigation gate also reported a stale artifact: it reads
-  `.devcouncil/code_graph.json` at generation one, while the rebuilt index was at
-  generation four. The DevMap build emitted its graph under
-  `.devcouncil/graph/code_graph.json`. That path mismatch remains a navigation
-  qualification gap; the successful generation tests do not qualify it.
+- The broad Manvi navigation gate also reported a stale artifact: it read the
+  legacy `.devcouncil/code_graph.json` while the rebuilt index was at generation
+  four, because DevMap writes its export to `.devcouncil/graph/code_graph.json`.
+  That path mismatch remains a navigation qualification gap; the successful
+  generation tests do not qualify it.
+
+#### Flat graph export path and freshness
+
+Corrected 2026-10-09. DevMap writes the flat export to
+`.devcouncil/graph/code_graph.json`. Its schema 2 carries no generation counter, so
+earlier revisions of the checkpoints above, which called it "generation 1", were
+describing the stale legacy file, not a property of the export. Freshness is the export's `generated_head` against the
+checkout's `HEAD`; the index generation is what `gitpulse_insights` reports as
+`codeintel.generation_id`. On 2026-10-09:
+
+| Repository | Index generation (fresh) | `graph/code_graph.json` `generated_head` |
+| --- | --- | --- |
+| GitPulse | 4045 | `0d3e9f77`, 60 commits behind `HEAD` |
+| DevCouncil | 4395 | `673073d3`, 72 commits behind `HEAD` |
+| Manvi | 564 | `c2950614`, at `HEAD` |
+
+Manvi still defaults to the legacy path (`manvi/cmd/manvi/root.go`
+`graphArtifactPath`, and `verify.sh`'s `MANVI_GRAPH` default), and its legacy file
+is at `063632ff`, 35 commits behind. The index and the export advance
+independently — every index above is fresh while two exports trail `HEAD` — so a
+fresh index is not evidence of a fresh export.
 
 ### Storage checkpoint
 

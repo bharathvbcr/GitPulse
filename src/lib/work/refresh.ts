@@ -1,7 +1,8 @@
 import { loadWork } from "./load";
 import { getCollisionRisk } from "../insights/client";
 import { validateWorkResponse } from "./contracts";
-import { withinDeadline, WORK_TIMEOUT_MS } from "./request";
+import { withDeadline } from "../async/deadline";
+import { WORK_DEADLINE_MESSAGE, WORK_TIMEOUT_MS } from "./request";
 import { formatError } from "../ui/formatError";
 import type { WorkProjection } from "./projection";
 import type { CollisionRisk } from "../insights/types";
@@ -26,13 +27,13 @@ export function createWorkRefresh(deps = { load: loadWork, collisions: getCollis
       running = job;
       let error: string | null = null;
       try {
-        const result = await withinDeadline(() => deps.load(job.repo, { signal: job.controller.signal }), Date.now() + WORK_TIMEOUT_MS);
+        const result = await withDeadline(() => deps.load(job.repo, { signal: job.controller.signal }), WORK_TIMEOUT_MS, { signal: job.controller.signal, message: WORK_DEADLINE_MESSAGE });
         if (!job.controller.signal.aborted) {
           job.observer.projection(result, Date.now());
           // Finish this scan even when status notifications queued another load.
           // Otherwise steady file changes could starve overlap detection forever.
           try {
-            const risk = await withinDeadline(() => deps.collisions(job.repo), Date.now() + WORK_TIMEOUT_MS);
+            const risk = await withDeadline(() => deps.collisions(job.repo), WORK_TIMEOUT_MS, { signal: job.controller.signal, message: WORK_DEADLINE_MESSAGE });
             validateWorkResponse("cmd_collision_risk", risk);
             if (!job.controller.signal.aborted) job.observer.collisions(risk, risk.ok ? null : risk.error || "collision check failed");
           } catch (failure) {

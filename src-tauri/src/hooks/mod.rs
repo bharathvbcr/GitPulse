@@ -40,7 +40,7 @@ use serde_json::{json, Value};
 use crate::engine::agent_session_slug;
 use crate::engine::git_cli::find_git_root;
 use crate::harness::{self, PolicyStatus, ScopedVerdict};
-use crate::insights::{self, CollisionRisk, InsightsSnapshot};
+use crate::insights::{self, same_path, CollisionRisk, InsightsSnapshot};
 
 /// Wall-clock ceiling for the work behind one hook invocation.
 ///
@@ -52,6 +52,39 @@ use crate::insights::{self, CollisionRisk, InsightsSnapshot};
 /// check — exactly the failure this module exists to prevent. Giving up here
 /// instead lets us give up *loudly*.
 pub const BUDGET: Duration = Duration::from_secs(5);
+
+/// Wall-clock ceiling for the whole process, from the moment `main` starts.
+///
+/// [`BUDGET`] bounds one wait, but a hook makes several in a row (stdin, then
+/// the scope check, then the collision scan), so their sum reached the host's
+/// 10 s timeout and the decision was dropped with the notice that explains it.
+/// Every wait is clamped to what is left of this, so the work ends at least
+/// [`HOST_TIMEOUT_MARGIN`] before the host would kill it, leaving room to print
+/// and to take down a child. `scripts/plugin-contract.test.ts` keeps this and
+/// the margin inside every deciding hook's `timeout`.
+pub const TOTAL_BUDGET: Duration = Duration::from_secs(8);
+
+/// What the host's `timeout` must exceed [`TOTAL_BUDGET`] by: printing the
+/// answer (up to a second) and reaping children (up to
+/// [`crate::procguard::CHILD_GRACE`]).
+pub const HOST_TIMEOUT_MARGIN: Duration = Duration::from_secs(2);
+
+static STARTED: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+
+/// Starts the one deadline. Called first thing in `main`; later calls keep the
+/// first instant. A process that never calls it (the unit tests, the library
+/// embedded elsewhere) is bounded by [`BUDGET`] per wait only.
+pub fn start_deadline() {
+    let _ = STARTED.set(std::time::Instant::now());
+}
+
+/// `budget`, cut to what is left of [`TOTAL_BUDGET`] since `started`.
+fn clamp_to_total(budget: Duration, started: Option<std::time::Instant>) -> Duration {
+    match started {
+        Some(started) => budget.min(TOTAL_BUDGET.saturating_sub(started.elapsed())),
+        None => budget,
+    }
+}
 
 pub const MAX_INPUT_BYTES: usize = 4 * 1024 * 1024;
 
@@ -407,8 +440,24 @@ impl HookOutput {
 
     fn render_cursor(&self) -> Option<String> {
         if let Some(specific) = &self.hook_specific_output {
-            if specific.permission_decision.is_some() {
-                return None;
+            if let Some(decision) = specific.permission_decision {
+                // Claude's nested `permissionDecision` is a schema mismatch that
+                // blocks a Cursor tool, so it is not sent. Printing nothing
+                // instead made a deny look like a clean pass, so the decision
+                // goes out as a visible warning that says what it was.
+                let verb = match decision {
+                    PermissionDecision::Deny => "GitPulse would block this call",
+                    PermissionDecision::Ask => "GitPulse asks you to confirm this call",
+                };
+                let reason = specific
+                    .permission_decision_reason
+                    .as_deref()
+                    .unwrap_or_default();
+                let message = match &self.system_message {
+                    Some(note) => format!("{verb}: {reason}\n{note}"),
+                    None => format!("{verb}: {reason}"),
+                };
+                return Some(json!({ "systemMessage": message }).to_string());
             }
             if let Some(ctx) = &specific.additional_context {
                 return Some(json!({ "additional_context": ctx }).to_string());
@@ -526,6 +575,27 @@ pub fn collision_decision(facts: &CollisionFacts) -> HookOutput {
         reason.push_str(&format!("\n(Scan was incomplete: {}.)", facts.partial));
     }
 
+    // Same file, but the symbols do not overlap (or the index could not say):
+    // an Ask would turn an edit that cannot conflict into a refusal, because a
+    // headless agent's Ask is a deny. The agent is told instead.
+    if facts.entity.as_ref().is_some_and(|e| {
+        e.kind == crate::insights::EntityCollisionKind::DisjointSymbols || e.index_stale()
+    }) {
+        let summary = format!(
+            "GitPulse: {} is also changed in another worktree, but this edit is not known to conflict.",
+            or_unknown(&facts.target)
+        );
+        return HookOutput {
+            hook_specific_output: Some(HookSpecificOutput {
+                hook_event_name: PRE_TOOL_USE.to_string(),
+                permission_decision: None,
+                permission_decision_reason: None,
+                additional_context: Some(reason),
+            }),
+            system_message: Some(summary),
+        };
+    }
+
     HookOutput {
         hook_specific_output: Some(decision(PRE_TOOL_USE, PermissionDecision::Ask, reason)),
         system_message: None,
@@ -605,7 +675,7 @@ pub fn collision_facts(
         .map(|item| {
             item.worktrees
                 .iter()
-                .filter(|party| !same_path(Path::new(&party.path), here))
+                .filter(|party| !same_path(&party.path, here))
                 .map(|party| CollisionOther {
                     worktree: party.path.clone(),
                     branch: party.branch.clone().unwrap_or_default(),
@@ -746,7 +816,10 @@ fn collision_guard_with(
     };
 
     let remaining = BUDGET.saturating_sub(started.elapsed());
-    let scanned = within_budget(remaining, move || insights::collision_risk(&root_arg));
+    let scanned = within_budget(remaining, {
+        let target = target.clone();
+        move || insights::collision_risk_for_path(&root_arg, &target)
+    });
     let Some(risk) = scanned else {
         return merge_outputs(
             scoped,
@@ -781,10 +854,16 @@ fn collision_guard_with(
 fn write_op(tool_name: &str, file: &Path) -> &'static str {
     match tool_name {
         "Write" if !file.exists() => "create",
-        "Write" | "Edit" | "MultiEdit" | "NotebookEdit" => "modify",
+        t if FILE_WRITE_TOOLS.contains(&t) => "modify",
         _ => "write",
     }
 }
+
+/// The tools collision-guard judges. `plugins/gitpulse/hooks/hooks.json`
+/// matches exactly these on `PreToolUse`; a tool in one list and not the other
+/// is either a write nobody checks or a check nobody asks for, so a contract
+/// test keeps the two equal.
+pub const FILE_WRITE_TOOLS: [&str; 4] = ["Edit", "MultiEdit", "NotebookEdit", "Write"];
 
 /// The scope half of collision-guard, over a verdict the harness returned.
 ///
@@ -968,6 +1047,144 @@ pub fn run_command_gate(input: &HookInput) -> HookOutput {
     command_gate_with(input, |job| within_budget(BUDGET, job))
 }
 
+/// Judges one command line the way the hook does, on `lane`'s sidecar.
+///
+/// The one body behind both halves of the command gate: this process's own
+/// per-call path, and the app answering a hook over its mailbox
+/// ([`serve_gate`]). They cannot disagree about what a repository root is or
+/// when a scope applies, because there is only this.
+pub(crate) fn judge_command(lane: harness::Lane, cwd: &str, command: &str) -> ScopedVerdict {
+    match find_git_root(Path::new(cwd)) {
+        Some(root) => harness::check_command_in_scope(lane, &root.to_string_lossy(), command),
+        None => ScopedVerdict {
+            verdict: harness::policy::check_command_on(lane, cwd, command, None, &[]),
+            bound: false,
+            unscoped: None,
+        },
+    }
+}
+
+/// A verdict as it crosses the app's mailbox.
+#[derive(Serialize, serde::Deserialize)]
+struct GateReply {
+    verdict: harness::PolicyVerdict,
+    bound: bool,
+    /// [`harness::UNSCOPED_UNTRUSTED`] is the only reason a verdict carries for
+    /// having been reached without a scope, so a flag says it.
+    untrusted: bool,
+}
+
+/// The app's half of the command gate: judges `command` on its own hook-lane
+/// sidecar and returns the verdict for [`judged_by_app`] to read.
+///
+/// A verdict that is not a real one — the harness missing, busy or faulted —
+/// is an error, never a reply. The hook then judges the command itself and
+/// reports exactly what it would have reported without an app, so "could not
+/// decide" cannot be turned into anything by crossing the socket.
+pub fn serve_gate(cwd: &str, command: &str) -> Result<Value, String> {
+    let judged = judge_command(harness::Lane::Hook, cwd, command);
+    if !judged.verdict.checked {
+        return Err(format!(
+            "the harness did not judge it: {}",
+            judged.verdict.reason
+        ));
+    }
+    let untrusted = match judged.unscoped {
+        None => false,
+        Some(harness::UNSCOPED_UNTRUSTED) => true,
+        Some(other) => {
+            return Err(format!(
+                "unscoped for a reason the mailbox cannot carry: {other}"
+            ))
+        }
+    };
+    serde_json::to_value(GateReply {
+        verdict: judged.verdict,
+        bound: judged.bound,
+        untrusted,
+    })
+    .map_err(|error| error.to_string())
+}
+
+/// How long a hook gives the app to judge one command before judging it itself.
+///
+/// Well under the host's hook timeout and under [`BUDGET`]: a hook that finds
+/// the app wedged pays this once and then does what it always did. It is long
+/// enough for the app's hook-lane sidecar to start cold, which the first
+/// verdict after the app launches pays.
+///
+/// Only the macOS app answers a hook's gate request (`judged_by_app`).
+#[cfg(target_os = "macos")]
+const GATE_APP_DEADLINE: Duration = Duration::from_millis(750);
+
+#[cfg(target_os = "macos")]
+fn judged_by_app(cwd: &str, command: &str) -> Option<ScopedVerdict> {
+    judged_by_app_in(crate::tool_config::default_config_dir()?, cwd, command)
+}
+
+/// [`judged_by_app`] against the app that owns profile directory `dir`.
+#[cfg(target_os = "macos")]
+fn judged_by_app_in(dir: PathBuf, cwd: &str, command: &str) -> Option<ScopedVerdict> {
+    use crate::desktop::instance::{reach_owner, Request};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+    let id = format!(
+        "gate-{}-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.as_nanos()),
+        SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    );
+    let request = Request::GateCommand {
+        id,
+        cwd: cwd.to_string(),
+        command: command.to_string(),
+    };
+    // Detached at the deadline, like every other wait on another process here.
+    let answer = within_budget(GATE_APP_DEADLINE + Duration::from_millis(100), move || {
+        reach_owner(&dir, GATE_APP_DEADLINE)
+            .ok_or_else(|| "no GitPulse is answering".to_string())?
+            .gate(&request, GATE_APP_DEADLINE)
+    });
+    let reply = match answer {
+        Some(Ok(reply)) => reply,
+        Some(Err(why)) => {
+            log::debug!(target: "hooks", "command gate: judging it here, the app did not: {why}");
+            return None;
+        }
+        None => {
+            log::debug!(target: "hooks", "command gate: judging it here, the app missed its deadline");
+            return None;
+        }
+    };
+    let reply: GateReply = match serde_json::from_value(reply) {
+        Ok(reply) => reply,
+        Err(error) => {
+            log::warn!(target: "hooks", "command gate: judging it here, the app's verdict was malformed: {error}");
+            return None;
+        }
+    };
+    // A reply that says it was not judged is not a verdict. Taking it would
+    // let a peer pick between "unchecked" and a real answer.
+    if !reply.verdict.checked || reply.verdict.status == PolicyStatus::Unchecked {
+        log::warn!(target: "hooks", "command gate: judging it here, the app sent an unchecked verdict");
+        return None;
+    }
+    Some(ScopedVerdict {
+        verdict: reply.verdict,
+        bound: reply.bound,
+        unscoped: reply.untrusted.then_some(harness::UNSCOPED_UNTRUSTED),
+    })
+}
+
+/// There is no mailbox off macOS; the hook judges the command itself.
+#[cfg(not(target_os = "macos"))]
+fn judged_by_app(_cwd: &str, _command: &str) -> Option<ScopedVerdict> {
+    None
+}
+
 /// One harness judgement, built on the caller's thread and run on whichever
 /// thread `run` chooses.
 type CommandJob = Box<dyn FnOnce() -> ScopedVerdict + Send>;
@@ -995,27 +1212,23 @@ fn command_gate_with(
     // A checkout bound to a task is judged against that task's scope, resolved
     // by the same owner `harness::guard_command` uses — so a redirection into a
     // file outside the plan reaches `scope.unplanned`, which Manvi does not
-    // demote once a scope is declared. Resolving it opens the ledger and the
-    // task store, so it runs inside the budget the host's timeout allows.
+    // demote once a scope is declared. Resolving it reads the ledger
+    // (read-only, and not at all when no checkout has one) and the task
+    // store, so it runs inside the budget the host's timeout allows.
     //
     // Outside a Git repository there is no checkout to be bound, and asking the
     // ledger about a bare directory would fail closed — refusing every command
     // an agent runs anywhere else. That case is judged with no scope, as it
     // always was.
-    let job: CommandJob = match find_git_root(Path::new(&input.cwd)) {
-        Some(root) => {
-            let root = root.to_string_lossy().into_owned();
-            Box::new(move || harness::check_command_in_scope(&root, &command))
-        }
-        None => {
-            let root = input.cwd.clone();
-            Box::new(move || ScopedVerdict {
-                verdict: harness::check_command(&root, &command, None),
-                bound: false,
-                unscoped: None,
-            })
-        }
-    };
+    //
+    // The running app is asked first (`judged_by_app`); this process judges the
+    // command itself whenever the app does not answer, so the app can only ever
+    // make a verdict faster, never make one possible.
+    let cwd = input.cwd.clone();
+    let job: CommandJob = Box::new(move || {
+        judged_by_app(&cwd, &command)
+            .unwrap_or_else(|| judge_command(harness::Lane::Shared, &cwd, &command))
+    });
     let judged = run(job);
     if let Some(ScopedVerdict { verdict, bound, .. }) = judged.as_ref() {
         // The verdict is the only record of why this hook stayed silent, and
@@ -1150,7 +1363,7 @@ pub fn session_brief(snapshot: &InsightsSnapshot, here: &str, source: &str) -> S
         .worktrees
         .items
         .iter()
-        .find(|w| same_path(Path::new(&w.path), Path::new(here)));
+        .find(|w| same_path(&w.path, here));
     match mine {
         Some(w) => out.push_str(&format!(
             "branch here: {}{}\n",
@@ -1216,7 +1429,7 @@ pub fn session_brief(snapshot: &InsightsSnapshot, here: &str, source: &str) -> S
             .items
             .iter()
             .filter(|w| w.dirty_files.unwrap_or(0) > 0)
-            .filter(|w| !same_path(Path::new(&w.path), Path::new(here)))
+            .filter(|w| !same_path(&w.path, here))
         {
             out.push_str(&format!(
                 "  - {} [{}] {} dirty{}\n",
@@ -1591,6 +1804,7 @@ fn notify_send(path: &std::path::Path, payload: &str) -> Result<(), String> {
 }
 
 /// Whether the socket's one-line answer accepted the report.
+#[cfg(unix)]
 fn acknowledged(reply: &[u8]) -> Result<(), String> {
     match serde_json::from_slice::<Value>(reply)
         .ok()
@@ -1629,6 +1843,7 @@ fn within_budget<T: Send + 'static>(
     budget: Duration,
     work: impl FnOnce() -> T + Send + 'static,
 ) -> Option<T> {
+    let budget = clamp_to_total(budget, STARTED.get().copied());
     let (tx, rx) = mpsc::channel();
     // A send onto a dropped receiver is an error, not a panic, so the worker
     // outliving our patience cannot take the process down with it.
@@ -1690,15 +1905,6 @@ fn repo_relative(root: &Path, file: &Path) -> Option<String> {
     }
 }
 
-/// Path equality that survives symlinks, falling back to a literal comparison
-/// when either side cannot be canonicalised (a pruned worktree, say).
-fn same_path(a: &Path, b: &Path) -> bool {
-    match (a.canonicalize(), b.canonicalize()) {
-        (Ok(x), Ok(y)) => x == y,
-        _ => a == b,
-    }
-}
-
 /// The brief's live-session line: how many running agents this repository
 /// and this worktree hold, per kind, with every kind that could not be
 /// observed named as unknown rather than left out of the sum.
@@ -1719,7 +1925,7 @@ fn live_sessions_lines(live: &crate::insights::LiveSessionFacet, here: &str) -> 
     let here_count = live
         .worktrees
         .iter()
-        .filter(|w| same_path(Path::new(&w.path), Path::new(here)))
+        .filter(|w| same_path(&w.path, here))
         .map(|w| w.sessions.len())
         .sum::<usize>();
     format!(
@@ -2280,20 +2486,22 @@ mod tests {
                 shared_symbols: Vec::new(),
             }),
         });
-        let reason = output
-            .hook_specific_output
-            .as_ref()
-            .and_then(|s| s.permission_decision_reason.as_deref())
-            .unwrap_or_default();
+        let specific = output.hook_specific_output.as_ref().expect("a notice");
+        // An Ask is a deny to a headless agent, which would refuse an edit
+        // that cannot conflict: the agent is told, and nothing is decided.
+        assert_eq!(specific.permission_decision, None);
+        assert!(output.system_message.is_some());
+        let reason = specific.additional_context.as_deref().unwrap_or_default();
         assert!(
             !reason.contains("will conflict when these branches meet"),
             "disjoint must not use collision wording: {reason}"
         );
         assert!(reason.contains("not a merge promise"), "{reason}");
+        assert!(!output.render().unwrap().contains("permissionDecision"));
     }
 
     #[test]
-    fn head_sha_mismatch_entity_keeps_file_level_collision_wording() {
+    fn head_sha_mismatch_entity_keeps_file_level_wording_as_a_notice() {
         let output = collision_decision(&CollisionFacts {
             ok: true,
             error: String::new(),
@@ -2312,11 +2520,12 @@ mod tests {
                 shared_symbols: Vec::new(),
             }),
         });
-        let reason = output
-            .hook_specific_output
-            .as_ref()
-            .and_then(|s| s.permission_decision_reason.as_deref())
-            .unwrap_or_default();
+        let specific = output.hook_specific_output.as_ref().expect("a notice");
+        assert_eq!(
+            specific.permission_decision, None,
+            "a stale index says nothing about the symbols, so it informs and does not Ask"
+        );
+        let reason = specific.additional_context.as_deref().unwrap_or_default();
         assert!(
             reason.contains("will conflict when these branches meet"),
             "{reason}"
@@ -2608,8 +2817,8 @@ mod tests {
     }
 
     /// The shape `manvi serve` really sends for a refused command, measured:
-    /// every command decision carries the `host-scope` placeholder task,
-    /// whether or not a scope was declared. A fixture with an empty `task_id`
+    /// an unscoped command decision carries the `host-scope` placeholder task
+    /// (and every one did, before `manvi` honoured the scope's allowlist). A fixture with an empty `task_id`
     /// passed these tests while the real binary still got denied — the binding
     /// has to come from GitPulse, never from the verdict.
     fn unreadable(rule: &str) -> PolicyVerdict {
@@ -2946,6 +3155,52 @@ done
         assert!(rendered.contains("scope.unplanned"), "{rendered}");
     }
 
+    /// Which commands count as writing a file is the harness's call, not the
+    /// hook's: the hook must not pre-filter by program name and must not alter
+    /// what it sends. Every argument-writing program the fence is asked about
+    /// reaches the harness verbatim, with the bound task's scope, so a
+    /// harness that learns to read one more writer fences it with no change
+    /// here. (The writers the shipped harness does not yet read are listed in
+    /// `tests/hook_scope_fence.rs` and the wiki.)
+    #[cfg(unix)]
+    #[test]
+    fn every_argument_writer_reaches_the_harness_verbatim_with_the_scope() {
+        let writers = [
+            "rm docs/elsewhere.md",
+            "truncate -s 0 docs/elsewhere.md",
+            "touch docs/elsewhere.md",
+            "dd if=seed.txt of=docs/elsewhere.md",
+            "perl -pi -e 's/a/b/' docs/elsewhere.md",
+            "install seed.txt docs/elsewhere.md",
+            "ln -sf seed.txt docs/elsewhere.md",
+            "rsync seed.txt docs/elsewhere.md",
+            "patch docs/elsewhere.md < x.diff",
+            "git apply x.diff",
+            "echo docs/elsewhere.md | xargs rm",
+            "find docs -name elsewhere.md -exec rm {} +",
+        ];
+        let (dir, repo, requests) = scoped_hook_fixture(true);
+        let serial = crate::harness::sidecar::test_serial();
+        let _binary = install_scoped_manvi(dir.path(), &requests, &serial);
+
+        for writer in writers {
+            let _ = std::fs::remove_file(&requests);
+            let _ = gate_here(&bash_call(&repo, writer));
+            let sent = std::fs::read_to_string(&requests).unwrap_or_default();
+            let request: Value = serde_json::from_str(
+                sent.lines()
+                    .next()
+                    .unwrap_or_else(|| panic!("`{writer}` was never put to the harness")),
+            )
+            .expect("the request is JSON");
+            assert_eq!(request["params"]["command"], writer, "altered in flight");
+            assert_eq!(
+                request["params"]["scope"]["task_id"], "TASK-HOOK",
+                "`{writer}` was judged without the bound scope: {request}"
+            );
+        }
+    }
+
     /// An unbound checkout declares nothing, and the same command keeps the
     /// answer it always had.
     #[cfg(unix)]
@@ -3015,6 +3270,7 @@ done
         )
     }
 
+    #[cfg(unix)]
     fn edit_call(cwd: &str, file_path: &str) -> HookInput {
         HookInput {
             hook_event_name: PRE_TOOL_USE.to_string(),
@@ -3453,26 +3709,43 @@ done
     }
 
     /// Cursor preToolUse is a permission hook. Claude's nested
-    /// `permissionDecision` is a schema mismatch that blocks the tool.
+    /// `permissionDecision` is a schema mismatch that blocks the tool, so it is
+    /// not sent; but printing nothing made a deny or ask look like a clean
+    /// pass, so it goes out as a visible `systemMessage` naming the decision.
     #[test]
-    fn a_cursor_permission_decision_renders_nothing() {
-        let output = HookOutput {
-            hook_specific_output: Some(decision(
-                PRE_TOOL_USE,
-                PermissionDecision::Deny,
-                "other worktree holds this file".to_string(),
-            )),
-            system_message: None,
-        };
-        assert_eq!(
-            output.render_for_host(true),
-            None,
-            "Cursor must fail open rather than block on a Claude permission document"
-        );
-        assert!(
-            output.render_for_host(false).is_some(),
-            "Claude must still receive deny/ask"
-        );
+    fn a_cursor_permission_decision_renders_as_a_visible_system_message() {
+        for (decision_kind, verb) in [
+            (PermissionDecision::Deny, "would block"),
+            (PermissionDecision::Ask, "asks you to confirm"),
+        ] {
+            let output = HookOutput {
+                hook_specific_output: Some(decision(
+                    PRE_TOOL_USE,
+                    decision_kind,
+                    "other worktree holds this file".to_string(),
+                )),
+                system_message: None,
+            };
+            let rendered = output.render_for_host(true).expect("Cursor must be told");
+            let value: Value = serde_json::from_str(&rendered).expect("JSON");
+            let message = value["systemMessage"].as_str().expect("a system message");
+            assert!(message.contains(verb), "{message}");
+            assert!(
+                message.contains("other worktree holds this file"),
+                "{message}"
+            );
+            assert!(
+                !rendered.contains("permissionDecision"),
+                "Cursor must not get Claude's nested permission document: {rendered}"
+            );
+            assert!(
+                output
+                    .render_for_host(false)
+                    .expect("Claude")
+                    .contains("permissionDecision"),
+                "Claude must still receive deny/ask"
+            );
+        }
     }
 
     /// Notices (`systemMessage`) already parse on Cursor sessionStart. Keep
@@ -3592,19 +3865,10 @@ done
 
     /* ── notify ───────────────────────────────────────────────────────────── */
 
-    /// Serialises the notify tests' environment overrides.
-    ///
-    /// These two variables are not hypothetical in this process: running the
-    /// suite from inside a GitPulse agent tab sets both, so a test that read
-    /// the ambient value would pass on a laptop and fail in CI, or the reverse.
-    /// Every notify test pins both.
-    static NOTIFY_ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    fn notify_serial() -> std::sync::MutexGuard<'static, ()> {
-        NOTIFY_ENV
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-    }
+    // The notify tests pin the agent-session variables through `bind_env`.
+    // These variables are not hypothetical in this process: running the suite
+    // from inside a GitPulse agent tab sets them, so a test that read the
+    // ambient value would pass on a laptop and fail in CI, or the reverse.
 
     fn notify_input() -> HookInput {
         HookInput {
@@ -3639,7 +3903,7 @@ done
     /// written twice could never do.
     #[test]
     fn what_the_hook_sends_is_what_the_socket_accepts() {
-        let serial = notify_serial();
+        let serial = crate::test_support::env::env_serial();
         let _env = crate::test_support::env::bind_env(&serial)
             .set(AGENT_KIND_ENV, "claude")
             .set(crate::alerts::bridge::SESSION_ENV, "term-4-1")
@@ -3661,7 +3925,7 @@ done
 
     #[test]
     fn every_event_the_plugin_can_route_produces_an_acceptable_report() {
-        let serial = notify_serial();
+        let serial = crate::test_support::env::env_serial();
         let _env = crate::test_support::env::bind_env(&serial)
             .set(AGENT_KIND_ENV, "codex")
             .set(crate::alerts::bridge::SESSION_ENV, "term-4-1")
@@ -3681,7 +3945,7 @@ done
 
     #[test]
     fn an_event_the_manifest_and_this_binary_disagree_about_is_an_error() {
-        let serial = notify_serial();
+        let serial = crate::test_support::env::env_serial();
         let _env = crate::test_support::env::bind_env(&serial)
             .set(crate::alerts::bridge::SOCKET_ENV, "/tmp/gitpulse-test.sock");
         // The failure this catches is a plugin manifest updated without the
@@ -3698,7 +3962,7 @@ done
 
     #[test]
     fn a_session_outside_gitpulse_still_reports_and_identifies_itself() {
-        let serial = notify_serial();
+        let serial = crate::test_support::env::env_serial();
         let _env = crate::test_support::env::bind_env(&serial)
             .remove(AGENT_KIND_ENV)
             .remove(crate::alerts::bridge::SESSION_ENV)
@@ -3717,7 +3981,7 @@ done
 
     #[test]
     fn an_agent_kind_the_socket_does_not_know_is_not_forwarded_as_one() {
-        let serial = notify_serial();
+        let serial = crate::test_support::env::env_serial();
         let _env = crate::test_support::env::bind_env(&serial)
             .set(AGENT_KIND_ENV, "not-an-agent")
             .remove(crate::alerts::bridge::SESSION_ENV)
@@ -3729,7 +3993,7 @@ done
 
     #[test]
     fn a_socket_that_never_answers_does_not_hold_the_users_turn() {
-        let serial = notify_serial();
+        let serial = crate::test_support::env::env_serial();
         let _env = crate::test_support::env::bind_env(&serial)
             .set(crate::alerts::bridge::SOCKET_ENV, "/tmp/gitpulse-test.sock");
         let started = std::time::Instant::now();
@@ -3868,7 +4132,7 @@ done
 
     #[test]
     fn a_permission_request_and_its_result_reach_the_socket_as_one_subject() {
-        let serial = notify_serial();
+        let serial = crate::test_support::env::env_serial();
         let _env = crate::test_support::env::bind_env(&serial)
             .set(AGENT_KIND_ENV, "claude")
             .set(crate::alerts::bridge::SESSION_ENV, "term-4-1")
@@ -3899,7 +4163,7 @@ done
 
     #[test]
     fn a_state_outside_a_gitpulse_terminal_never_touches_the_socket() {
-        let serial = notify_serial();
+        let serial = crate::test_support::env::env_serial();
         let _env = crate::test_support::env::bind_env(&serial)
             .remove(crate::alerts::bridge::SESSION_ENV)
             .set(crate::alerts::bridge::SOCKET_ENV, "/tmp/gitpulse-test.sock");
@@ -3917,7 +4181,7 @@ done
 
     #[test]
     fn a_long_final_message_is_cut_rather_than_costing_the_report() {
-        let serial = notify_serial();
+        let serial = crate::test_support::env::env_serial();
         let _env = crate::test_support::env::bind_env(&serial)
             .set(crate::alerts::bridge::SESSION_ENV, "term-4-1")
             .set(crate::alerts::bridge::SOCKET_ENV, "/tmp/gitpulse-test.sock");
@@ -3943,6 +4207,7 @@ done
         assert_eq!(notice.detail.as_deref(), Some("rate_limit"));
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_refused_or_garbled_answer_is_not_reported_as_delivered() {
         assert_eq!(acknowledged(b"{\"ok\":true}\n"), Ok(()));
@@ -3965,7 +4230,10 @@ done
         ] {
             let path = base.join(format!("gph-ack-{}-{ok}.sock", std::process::id()));
             let _ = std::fs::remove_file(&path);
-            let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+            let listener = crate::procguard::with_inheritance_lock(|| {
+                std::os::unix::net::UnixListener::bind(&path)
+            })
+            .unwrap();
             let server = thread::spawn(move || {
                 let (mut stream, _) = listener.accept().unwrap();
                 let mut seen = Vec::new();
@@ -3982,7 +4250,7 @@ done
 
     #[test]
     fn a_report_never_produces_a_decision_or_a_transcript_warning() {
-        let serial = notify_serial();
+        let serial = crate::test_support::env::env_serial();
         let _env = crate::test_support::env::bind_env(&serial)
             .set(crate::alerts::bridge::SOCKET_ENV, "/tmp/gitpulse-test.sock");
         let (result, _) = captured("agent_completed", &notify_input());
@@ -4037,6 +4305,67 @@ done
         assert!(cut.ends_with("… truncated"));
     }
 
+    /// The waits of one hook add up: stdin, then the scope check, then the
+    /// scan. Each is cut to what is left of the one deadline, so a late start
+    /// leaves a short wait and an exhausted deadline leaves none.
+    #[test]
+    fn every_wait_is_cut_to_what_is_left_of_the_one_deadline() {
+        let now = std::time::Instant::now();
+        assert_eq!(clamp_to_total(BUDGET, None), BUDGET, "no deadline started");
+        assert_eq!(clamp_to_total(BUDGET, Some(now)), BUDGET);
+        let late = clamp_to_total(BUDGET, Some(now - Duration::from_secs(6)));
+        assert!(late <= TOTAL_BUDGET - Duration::from_secs(6), "{late:?}");
+        assert_eq!(
+            clamp_to_total(BUDGET, Some(now - TOTAL_BUDGET - Duration::from_secs(1))),
+            Duration::ZERO
+        );
+        // Two full BUDGET waits used to be allowed back to back (10 s) against
+        // a host timeout of 10 s.
+        assert!(
+            BUDGET * 2 > TOTAL_BUDGET,
+            "the clamp is what bounds the sum"
+        );
+        assert!(TOTAL_BUDGET + HOST_TIMEOUT_MARGIN <= Duration::from_secs(10));
+    }
+
+    /// collision-guard is registered for exactly the tools it knows how to
+    /// judge: a tool in the manifest matcher and not in `write_op` is judged
+    /// as a generic write, and one in `write_op` and not the matcher is never
+    /// asked about. MultiEdit was in the second state.
+    #[test]
+    fn the_manifest_matcher_and_the_judged_write_tools_agree() {
+        let manifest: Value = serde_json::from_str(
+            &std::fs::read_to_string(
+                Path::new(env!("CARGO_MANIFEST_DIR")).join("../plugins/gitpulse/hooks/hooks.json"),
+            )
+            .expect("the plugin ships a hooks manifest"),
+        )
+        .expect("JSON");
+        let matcher = manifest["hooks"]["PreToolUse"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|group| group["matcher"].as_str())
+            .find(|m| m.contains("Edit"))
+            .expect("a file-write matcher");
+        let inner = matcher
+            .strip_prefix("^(")
+            .and_then(|m| m.strip_suffix(")$"))
+            .expect("an anchored alternation");
+        let mut matched: Vec<&str> = inner.split('|').collect();
+        matched.sort_unstable();
+        let mut judged = FILE_WRITE_TOOLS.to_vec();
+        judged.sort_unstable();
+        assert_eq!(matched, judged);
+        for tool in FILE_WRITE_TOOLS {
+            assert_ne!(
+                write_op(tool, Path::new("/definitely/not/there")),
+                "write",
+                "{tool} is judged as an unspecialised write"
+            );
+        }
+    }
+
     #[test]
     fn the_budget_gives_up_rather_than_waiting_on_work_that_will_not_finish() {
         let slow = within_budget(Duration::from_millis(20), || {
@@ -4048,5 +4377,298 @@ done
             "the hook must stop waiting, not hang the editor"
         );
         assert_eq!(within_budget(Duration::from_secs(5), || 7), Some(7));
+    }
+
+    /// The command gate asked of the running app over its mailbox. The app's
+    /// answer must be the answer this process would have reached itself, and
+    /// every way the app can fail to give one must land on this process judging
+    /// the command — never on an allow the per-call path would not give.
+    #[cfg(all(unix, target_os = "macos"))]
+    mod over_the_app {
+        use super::*;
+        use crate::desktop::instance::{claim, Claim, Primary};
+        use std::io::{BufRead, BufReader, Write};
+        use std::os::unix::net::UnixListener;
+        use std::sync::Arc;
+
+        /// `manvi serve` as Manvi answers a command: a force push and anything
+        /// under a declared scope are denied, the rest is a demoted allow.
+        const FAKE_GATE_MANVI: &str = r#"#!/bin/sh
+reply() {
+  id=$(printf '%s' "$1" | sed -n 's/^{"id":"\([0-9]*\)".*/\1/p')
+  printf '{"id":"%s","ok":true,"result":%s}\n' "$id" "$2"
+}
+IFS= read -r line || exit 1
+reply "$line" '{"protocol":1,"ops":["hello","policy.check.command","policy.check.file"],"posture":"host"}'
+while IFS= read -r line; do
+  case "$line" in
+    *'--force'*) reply "$line" '{"action":"deny","rule":"command.force_push","severity":"hard","reason":"Force pushes are not allowed.","target":"git push --force","task_id":"host-scope","demoted":"","degraded":[]}' ;;
+    *'"scope"'*) reply "$line" '{"action":"deny","rule":"scope.unplanned","severity":"soft","reason":"outside the plan","target":"x","task_id":"TASK-HOOK","demoted":"","degraded":[]}' ;;
+    *) reply "$line" '{"action":"allow","rule":"command.not_allowed","severity":"soft","reason":"not listed","target":"x","task_id":"host-scope","demoted":"serve.posture=host: allowlist not enforced","degraded":[]}' ;;
+  esac
+done
+"#;
+
+        fn install(
+            dir: &Path,
+            body: &str,
+            serial: &crate::harness::sidecar::SidecarTestGuard,
+        ) -> crate::harness::sidecar::TestBinaryBinding {
+            use std::os::unix::fs::PermissionsExt;
+            let script = dir.join("gate-manvi");
+            std::fs::write(&script, body).expect("write fake sidecar");
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+            crate::harness::sidecar::bind_test_binary(serial, script.to_string_lossy())
+        }
+
+        /// A profile directory short enough for its socket: the per-user temp
+        /// directory is already most of `sun_path`.
+        fn profile() -> tempfile::TempDir {
+            tempfile::Builder::new()
+                .prefix("gg")
+                .tempdir_in("/tmp")
+                .expect("profile dir")
+        }
+
+        fn app(dir: &Path) -> Primary {
+            match claim(dir, Duration::from_millis(200)) {
+                Claim::Primary(primary) => {
+                    primary.attach_gate(Arc::new(serve_gate));
+                    primary
+                }
+                _ => panic!("expected to own the fixture profile"),
+            }
+        }
+
+        fn same(label: &str, a: &ScopedVerdict, b: &ScopedVerdict) {
+            assert_eq!(
+                serde_json::to_value(&a.verdict).unwrap(),
+                serde_json::to_value(&b.verdict).unwrap(),
+                "{label}: the verdicts differ"
+            );
+            assert_eq!(a.bound, b.bound, "{label}: bound differs");
+            assert_eq!(a.unscoped, b.unscoped, "{label}: unscoped differs");
+        }
+
+        const COMMANDS: [&str; 8] = [
+            "git push --force origin main",
+            "ls",
+            "echo x > docs/elsewhere.md",
+            "rm -rf /",
+            "cd /tmp && git push --force",
+            "printf 'a\"b' | cat",
+            "echo one\necho two",
+            "git status",
+        ];
+
+        #[test]
+        fn the_app_answers_what_this_process_would_have() {
+            let serial = crate::harness::sidecar::test_serial();
+            let scratch = tempfile::tempdir().expect("scratch");
+            let _binary = install(scratch.path(), FAKE_GATE_MANVI, &serial);
+            let (_bound_dir, bound, _) = scoped_hook_fixture(true);
+            let (_unbound_dir, unbound, _) = scoped_hook_fixture(false);
+            let bare = tempfile::tempdir().expect("a directory with no repository");
+            let bare = bare
+                .path()
+                .canonicalize()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned();
+            let profile = profile();
+            let _app = app(profile.path());
+
+            for (place, cwd) in [("bound", &bound), ("unbound", &unbound), ("bare", &bare)] {
+                for command in COMMANDS {
+                    let label = format!("{place}: {command:?}");
+                    let via_app = judged_by_app_in(profile.path().to_path_buf(), cwd, command)
+                        .unwrap_or_else(|| panic!("{label}: the app did not answer"));
+                    let here = judge_command(harness::Lane::Shared, cwd, command);
+                    assert!(here.verdict.checked, "{label}: fixture did not judge");
+                    same(&label, &via_app, &here);
+                }
+            }
+            // The corpus is not vacuous: both a refusal and an allow crossed.
+            let refused = judged_by_app_in(profile.path().to_path_buf(), &bound, COMMANDS[0])
+                .expect("answered");
+            assert!(refused.verdict.blocks());
+            let allowed =
+                judged_by_app_in(profile.path().to_path_buf(), &unbound, "ls").expect("answered");
+            assert!(!allowed.verdict.blocks());
+        }
+
+        #[test]
+        fn an_app_that_could_not_judge_leaves_the_command_to_this_process() {
+            let serial = crate::harness::sidecar::test_serial();
+            let scratch = tempfile::tempdir().expect("scratch");
+            let _binary = install(scratch.path(), "#!/bin/sh\nexit 3\n", &serial);
+            let (_dir, repo, _) = scoped_hook_fixture(false);
+            let profile = profile();
+            let _app = app(profile.path());
+
+            assert!(serve_gate(&repo, "git push --force").is_err());
+            assert!(
+                judged_by_app_in(profile.path().to_path_buf(), &repo, "git push --force").is_none(),
+                "an unjudged command must not come back as a verdict"
+            );
+            // And this process, judging it, says it could not: the same
+            // answer there is with no app at all.
+            let here = judge_command(harness::Lane::Shared, &repo, "git push --force");
+            assert!(!here.verdict.checked);
+        }
+
+        /// Serves one connection at `dir`'s mailbox path with a canned answer
+        /// built from the request's own id.
+        fn rogue(
+            dir: &Path,
+            answer: impl Fn(&str) -> String + Send + 'static,
+        ) -> std::thread::JoinHandle<()> {
+            let socket = dir.canonicalize().unwrap().join("instance.sock");
+            let listener = UnixListener::bind(&socket).expect("bind rogue mailbox");
+            std::thread::spawn(move || {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    return;
+                };
+                let _ = stream.write_all(b"{\"v\":1,\"pid\":1}\n");
+                let mut line = String::new();
+                let _ = BufReader::new(stream.try_clone().unwrap()).read_line(&mut line);
+                let request: Value = serde_json::from_str(&line).unwrap_or(Value::Null);
+                let id = request["request"]["id"].as_str().unwrap_or_default();
+                let _ = stream.write_all(format!("{}\n", answer(id)).as_bytes());
+            })
+        }
+
+        fn verdict_json(checked: bool, status: &str, action: &str) -> Value {
+            json!({
+                "verdict": {
+                    "checked": checked, "status": status, "action": action,
+                    "rule": "x", "severity": "soft", "reason": "r", "target": "t",
+                    "task_id": "", "demoted": "", "degraded": [], "detail": "",
+                    "detail_code": ""
+                },
+                "bound": false,
+                "untrusted": false
+            })
+        }
+
+        /// A real verdict, serialised, so the positive control cannot drift
+        /// from the shape the app sends.
+        fn real_reply(id: &str, action: &str) -> String {
+            let raw = harness::protocol::RawDecision {
+                action: action.into(),
+                rule: "command.force_push".into(),
+                severity: "hard".into(),
+                reason: "r".into(),
+                target: "t".into(),
+                task_id: "host-scope".into(),
+                ..Default::default()
+            };
+            let verdict = PolicyVerdict::from_decision("t", raw);
+            json!({
+                "accepted": true, "id": id,
+                "reply": { "verdict": verdict, "bound": false, "untrusted": false }
+            })
+            .to_string()
+        }
+
+        type Answer = Box<dyn Fn(&str) -> String + Send>;
+
+        #[test]
+        fn a_peer_that_answers_wrongly_is_not_believed() {
+            let (_dir, repo, _) = scoped_hook_fixture(false);
+            let ask = |answer: Answer| {
+                let profile = profile();
+                let server = rogue(profile.path(), answer);
+                let got = judged_by_app_in(profile.path().to_path_buf(), &repo, "ls");
+                drop(server);
+                got
+            };
+
+            // The control: a well-formed, correctly addressed verdict is taken.
+            let taken = ask(Box::new(|id| real_reply(id, "allow")));
+            assert!(taken.is_some(), "the control reply was refused");
+
+            let cases: Vec<(&str, Answer)> = vec![
+                (
+                    "another request's id",
+                    Box::new(|_| real_reply("someone-else", "allow")),
+                ),
+                (
+                    "no id",
+                    Box::new(|id| real_reply(id, "allow").replace(id, "")),
+                ),
+                (
+                    "no reply",
+                    Box::new(|id| json!({"accepted": true, "id": id}).to_string()),
+                ),
+                (
+                    "a refusal",
+                    Box::new(|_| json!({"accepted": false, "reason": "no"}).to_string()),
+                ),
+                ("garbage", Box::new(|_| "not json at all".to_string())),
+                (
+                    "a reply of the wrong shape",
+                    Box::new(|id| {
+                        json!({"accepted": true, "id": id, "reply": {"allow": true}}).to_string()
+                    }),
+                ),
+                (
+                    "a verdict that says it was not judged",
+                    Box::new(|id| {
+                        json!({"accepted": true, "id": id,
+                            "reply": verdict_json(false, "unchecked", "allow")})
+                        .to_string()
+                    }),
+                ),
+                (
+                    "an unchecked status claiming to be checked",
+                    Box::new(|id| {
+                        json!({"accepted": true, "id": id,
+                            "reply": verdict_json(true, "unchecked", "allow")})
+                        .to_string()
+                    }),
+                ),
+            ];
+            for (label, answer) in cases {
+                assert!(
+                    ask(answer).is_none(),
+                    "{label}: a verdict was taken from it"
+                );
+            }
+        }
+
+        #[test]
+        fn a_peer_that_never_answers_costs_one_deadline_and_no_more() {
+            let (_dir, repo, _) = scoped_hook_fixture(false);
+            let profile = profile();
+            let socket = profile.path().canonicalize().unwrap().join("instance.sock");
+            let listener = UnixListener::bind(&socket).expect("bind");
+            let held = std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().expect("accept");
+                let _ = stream.write_all(b"{\"v\":1,\"pid\":1}\n");
+                thread::sleep(Duration::from_secs(4));
+            });
+            let started = std::time::Instant::now();
+            let got = judged_by_app_in(profile.path().to_path_buf(), &repo, "ls");
+            let waited = started.elapsed();
+            assert!(got.is_none());
+            assert!(
+                waited < GATE_APP_DEADLINE + Duration::from_millis(600),
+                "waited {waited:?} on a peer that never answered"
+            );
+            drop(held);
+        }
+
+        #[test]
+        fn no_app_at_all_is_not_an_error_and_not_a_wait() {
+            let (_dir, repo, _) = scoped_hook_fixture(false);
+            let profile = profile();
+            let started = std::time::Instant::now();
+            assert!(judged_by_app_in(profile.path().to_path_buf(), &repo, "ls").is_none());
+            assert!(
+                started.elapsed()
+                    < crate::test_support::coverage_relaxed(Duration::from_millis(300))
+            );
+        }
     }
 }

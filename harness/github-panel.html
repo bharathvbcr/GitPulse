@@ -1,0 +1,532 @@
+<!doctype html>
+<html lang="en" class="dark">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>GitHub panel checks</title>
+    <style>
+      body { margin: 0; background: rgb(11 14 23); }
+      #stage { width: 1360px; height: 2400px; display: flex; }
+      #result { font: 12px ui-monospace, monospace; white-space: pre-wrap; padding: 12px; color: #ccc; }
+    </style>
+  </head>
+  <body>
+    <div id="stage"></div>
+    <pre id="result">Loading…</pre>
+    <script type="module">
+      /**
+       * The Remote (GitHub) panel, rendered against fixtures.
+       *
+       * These checks replace GitHubPanel.test.ts's reading of the .svelte
+       * source: what the panel shows when a listing is cut short or failed,
+       * that a narrowing filter never reads as an empty repository, that a
+       * guarded action reports gh's output and files its verdict, that the
+       * live run poll uses the narrow command and only lets a poll that ran
+       * replace rows, and that a remount hydrates from the cache. Nothing here
+       * runs gh; every IPC answer is a fixture and every request is recorded.
+       */
+      import "../src/app.css";
+
+      const params = new URLSearchParams(location.search);
+      const errors = [];
+      const unexpected = [];
+      addEventListener("error", (event) => errors.push(event.message));
+      addEventListener("unhandledrejection", (event) => errors.push(String(event.reason)));
+
+      const A = "/fixture/acme";
+      const B = "/fixture/beta";
+      const C = "/fixture/gamma";
+      const BRANCH = { [A]: "feat/search", [B]: "main", [C]: "main" };
+      const branches = (path) => {
+        const current = BRANCH[path];
+        const row = (name) => ({
+          name, is_current: name === current, is_remote: false, remote_name: null, tip_commit_id: "abc123456789",
+          is_default: name === "main", is_gone: false, last_commit_timestamp: 1700000000, last_author: "Ada", last_summary: "Work",
+        });
+        return current === "main" ? [row("main")] : [row(current), row("main")];
+      };
+      const iso = (minutesAgo) => new Date(Date.now() - minutesAgo * 60_000).toISOString();
+      const pr = (number, extra = {}) => ({
+        number, title: `PR ${number}`, state: "OPEN", head_ref: `topic-${number}`, base_ref: "main",
+        url: `https://github.com/acme/app/pull/${number}`, is_draft: false, ci_status: "success",
+        created_at: iso(600 + number), updated_at: iso(60), review_decision: "APPROVED", first_review_at: iso(300), ...extra,
+      });
+      const run = (id, extra = {}) => ({
+        id, name: "CI", title: `run ${id}`, status: "completed", conclusion: "success", head_branch: "main",
+        url: `https://github.com/acme/app/actions/runs/${id}`, created_at: iso(id), started_at: iso(id), updated_at: iso(id),
+        head_sha: "d".repeat(40), event: "push", ...extra,
+      });
+      const issue = (number) => ({
+        number, title: `Issue ${number}`, state: "OPEN", url: `https://github.com/acme/app/issues/${number}`,
+        labels: ["bug"], updated_at: iso(30), author: "ada",
+      });
+      const release = (tag, latest) => ({
+        tag_name: tag, name: tag, is_draft: false, is_prerelease: false, is_latest: latest,
+        published_at: iso(1000), created_at: iso(1000), url: `https://github.com/acme/app/releases/${tag}`,
+      });
+      // Fifteen runs for A: the first three on the checked-out branch, one in
+      // flight far below the preview and on another branch, and the four
+      // in-flight and verdict states the colour check reads.
+      const runsA = Array.from({ length: 15 }, (_, i) => run(i + 1, {
+        head_branch: i < 3 ? "feat/search" : "main",
+        ...(i === 3 ? { status: "waiting", conclusion: "" } : {}),
+        ...(i === 4 ? { status: "requested", conclusion: "" } : {}),
+        ...(i === 6 ? { conclusion: "failure" } : {}),
+        ...(i === 9 ? { status: "in_progress", conclusion: "", head_branch: "release", title: "release build" } : {}),
+      }));
+      const contexts = {
+        [A]: {
+          available: true, cli_present: true, host: "github.com", owner: "acme", repo: "app", html_url: "https://github.com/acme/app",
+          pull_requests: [
+            pr(1, { review_decision: "", first_review_at: "" }),
+            pr(2, { ci_status: "failure" }),
+            pr(3, { is_draft: true }),
+            pr(4),
+            pr(5, { ci_status: "failure" }),
+          ],
+          prs_truncated: true,
+          issues: [issue(11), issue(12), issue(13), issue(14), issue(15)], issues_truncated: true, issues_error: null,
+          workflow_runs: runsA, runs_error: null, runs_truncated: true,
+          releases: [release("v3.0.0", true), release("v2.0.0", false), release("v1.0.0", false)], releases_truncated: false, releases_error: null,
+          warnings: ["gh is older than 2.40; some fields are missing"], error: null,
+        },
+        [B]: {
+          available: true, cli_present: true, host: "github.com", owner: "acme", repo: "beta", html_url: "https://github.com/acme/beta",
+          pull_requests: [], prs_truncated: false,
+          issues: [], issues_truncated: false, issues_error: "issues are disabled for this repository",
+          workflow_runs: [run(201, { head_branch: "other" }), run(202, { head_branch: "other" })], runs_error: null, runs_truncated: false,
+          releases: [release("b2", false), release("b1", false)], releases_truncated: false, releases_error: null, warnings: [], error: null,
+        },
+        [C]: {
+          available: true, cli_present: true, host: "github.com", owner: "acme", repo: "gamma", html_url: "https://github.com/acme/gamma",
+          pull_requests: [], prs_truncated: false, issues: [], issues_truncated: false, issues_error: null,
+          workflow_runs: [], runs_error: "gh: API rate limit exceeded", runs_truncated: false,
+          releases: [], releases_truncated: false, releases_error: null, warnings: [], error: null,
+        },
+      };
+      const workflowsFor = (path) => path === A
+        ? { available: true, cli_present: true, truncated: true, error: null,
+            workflows: Array.from({ length: 12 }, (_, i) => ({ id: i + 1, name: `Workflow ${i + 1}`, path: `.github/workflows/w${i + 1}.yml`, state: "active" })) }
+        : { available: true, cli_present: true, truncated: false, error: null, workflows: [] };
+
+      const VERDICT = {
+        status: "warned", checked: true, target: "gh", rule: "remote-actions", severity: "warn", reason: "outside the task scope",
+        demoted: "", grant_id: "", granted_by: "", widened: "", degraded: [],
+      };
+      const calls = [];
+      const count = (cmd) => calls.filter((c) => c.cmd === cmd).length;
+      const lastArgs = (cmd) => calls.filter((c) => c.cmd === cmd).at(-1)?.args;
+      /** Answers for the narrow runs poll, in order. */
+      const pollAnswers = [];
+      /** A held cmd_github_context: resolves when released. */
+      let contextGate = null;
+      const holdContext = () => { let release; const promise = new Promise((resolve) => { release = resolve; }); return { promise, release }; };
+      /** Pending cmd_ci_local calls, resolved by the checks. */
+      const ciPending = [];
+      let actionOutput = "";
+
+      const fixtures = {
+        cmd_resolve_repo: (a) => ({ path: a.repoPath, name: a.repoPath.split("/").pop(), is_bare: false, common_dir: `${a.repoPath}/.git` }),
+        cmd_list_branches: (a) => branches(a.repoPath),
+        cmd_get_status: () => [],
+        cmd_list_tags: () => ({ tags: [], truncated: false }),
+        cmd_repo_operation: () => null,
+        cmd_stash_list: () => ({ entries: [], truncated: false }),
+        cmd_branch_stats: () => ({ updates: [], capped: false, compute_failures: 0, compared_to: "main" }),
+        cmd_watch_repo: (a) => a.repoPath,
+        cmd_unwatch_repo: () => null,
+        cmd_set_recent_menu: () => null,
+        cmd_last_fetch_at: () => null,
+        cmd_note_tab_activated: () => null,
+        cmd_get_commit_graph: () => ({ nodes: [], edges: [], total_commits: 0, truncated: false }),
+        cmd_workspace_sync: () => ({ repos: [] }),
+        cmd_devcouncil_init: (a) => ({
+          repo: a.repoPath, state_dir: `${a.repoPath}/.devmap`, exclude: { status: "already_ignored", source: "harness" },
+          workspace_registry: null, workspace_reason: null, skipped_untrusted: [], skipped_unavailable: [], devmap_available: false,
+        }),
+        cmd_devmap_maybe_refresh: () => ({
+          decision: "skip_unavailable", facts: { available: false, is_fresh: false, schema_ok: false, already_building: false }, reason: null,
+        }),
+        cmd_github_context: async (a) => {
+          if (contextGate) await contextGate.promise;
+          return structuredClone(contexts[a.repoPath]);
+        },
+        cmd_github_workflows: (a) => workflowsFor(a.repoPath),
+        cmd_github_runs: (a) => pollAnswers.shift() ?? { available: true, checked: false, cli_present: true, owner: "acme", repo: "app", runs: [], truncated: false, error: "no answer queued" },
+        cmd_github_trigger_workflow: () => ({ policy: VERDICT, output: actionOutput }),
+        cmd_github_rerun_run: () => ({ policy: null, output: "rerun queued by gh" }),
+        cmd_github_cancel_run: () => ({ policy: null, output: "" }),
+        cmd_github_checkout_pr: () => ({ policy: VERDICT, output: "Switched to branch 'topic-4'" }),
+        cmd_ci_local: () => new Promise((resolve) => ciPending.push(resolve)),
+        cmd_provenance_freshness_batch: () => [],
+        cmd_firebase_status: () => ({
+          configured: false, firebaserc_error: null, firebasejson_error: null, cli: { present: false, reason: "not installed" },
+          projects: [], projects_truncated: false, default_alias: null, has_apphosting_config: false,
+        }),
+      };
+      const opened = [];
+      window.__TAURI_INTERNALS__ = {
+        invoke: async (cmd, args) => {
+          if (cmd === "plugin:opener|open_url") { opened.push(args.url); return null; }
+          if (cmd.startsWith("plugin:")) return 1;
+          calls.push({ cmd, args: args ?? {} });
+          if (fixtures[cmd]) return fixtures[cmd](args ?? {});
+          unexpected.push(cmd);
+          return null;
+        },
+        transformCallback: (cb) => cb,
+      };
+      const windowOpens = [];
+      window.open = (...args) => { windowOpens.push(args); return null; };
+
+      const { mount, unmount, tick } = await import("svelte");
+      const { get } = await import("svelte/store");
+      const { createChecks } = await import("./checks.ts");
+      const { holdForeground } = await import("./foreground.ts");
+      const { repoStore } = await import("../src/lib/stores/repoStore.ts");
+      const { filterStore } = await import("../src/lib/stores/filterStore.ts");
+      const { harnessStore } = await import("../src/lib/stores/harnessStore.ts");
+      const { isMacOS } = await import("../src/lib/platform.ts");
+      const GitHubPanel = (await import("../src/lib/components/GitHubPanel.svelte")).default;
+
+      const verdicts = [];
+      const recordVerdict = harnessStore.recordVerdict;
+      harnessStore.recordVerdict = (verdict, repoPath) => { verdicts.push({ verdict, repoPath }); return recordVerdict(verdict, repoPath); };
+
+      const { results, check, stopped } = createChecks();
+      const wait = (ms = 60) => new Promise((resolve) => setTimeout(resolve, ms));
+      const settle = async () => { await tick(); await wait(); await tick(); };
+      const until = async (test, ms = 8000) => {
+        const end = Date.now() + ms;
+        while (!test() && Date.now() < end) await wait(40);
+        return test();
+      };
+      const $ = (selector, root = document) => root.querySelector(selector);
+      const $$ = (selector, root = document) => [...root.querySelectorAll(selector)];
+      const stage = $("#stage");
+      const text = () => stage.textContent.replace(/\s+/g, " ");
+      const words = (el) => el.textContent.replace(/\s+/g, " ").trim();
+      const button = (name, root = stage) => $$("button", root).find((el) => words(el) === name);
+      const buttonLabelled = (label) => $(`button[aria-label="${label}"]`, stage);
+      const section = (heading) => $$("section", stage).find((el) => words($("h3", el) ?? el) === heading);
+      const runTitles = () => $$("span.truncate", section("Workflow runs")).map(words).filter((t) => t.startsWith("run ") || t.startsWith("polled ") || t === "release build");
+      const activate = async (path) => {
+        await repoStore.activateTab(get(repoStore).openTabs.find((t) => t.path === path).id);
+        await settle();
+      };
+      const input = async (el, value) => { el.value = value; el.dispatchEvent(new Event("input", { bubbles: true })); await settle(); };
+      const report_ = () => {
+        $("#result").textContent = results.map((row) => `${row.pass ? "PASS" : "FAIL"} ${row.name}`).join("\n");
+      };
+
+      (async () => {
+        try {
+          // The live run poll stops while the window is in the background, and
+          // the WebKit runner's window may never hold focus on its own.
+          holdForeground();
+          for (const path of [B, C, A]) await repoStore.openRepo(path, { activate: path === A });
+          let panel = mount(GitHubPanel, { target: stage });
+          await until(() => text().includes("PR 1") && text().includes("Workflow 1"));
+          await settle();
+
+          // ---- what was fetched, and what was cut short --------------------
+          check("the pane is titled the way its section is", () => words($("h2", stage)).startsWith("Remote"));
+          check("the fetch is stamped", () => /fetched /.test(text()));
+          check("the issues the context fetched are on screen", () =>
+            !!section("Open issues") && words(section("Open issues")).includes("#11 Issue 11"));
+          check("a cut-short pull request listing says so", () => text().includes("Showing 5 pull requests; more open PRs exist."));
+          check("a cut-short issue listing says so", () => text().includes("Showing 5 issues; more open issues exist."));
+          check("backend warnings are shown, not swallowed", () => text().includes("gh is older than 2.40"));
+          check("the workflow truncation notice counts what was fetched, not the preview", () => text().includes("Showing 12 workflows; more exist."));
+          check("the run truncation notice counts what was fetched, not the preview", () => text().includes("Showing the 15 most recent runs; older runs exist."));
+
+          // ---- the rail: deploy section first, previews second -------------
+          const heading = (name) => $$("h3", stage).find((el) => words(el) === name);
+          const firebase = $('[data-panel="firebase"]', stage);
+          check("the deploy section is mounted once", () => $$('[data-panel="firebase"]', stage).length === 1);
+          check("it sits below Workflows and above the runs and releases", () =>
+            !!(heading("Workflows").compareDocumentPosition(firebase) & Node.DOCUMENT_POSITION_FOLLOWING) &&
+            !!(firebase.compareDocumentPosition(heading("Workflow runs")) & Node.DOCUMENT_POSITION_FOLLOWING) &&
+            !!(firebase.compareDocumentPosition(heading("Releases")) & Node.DOCUMENT_POSITION_FOLLOWING));
+          const wfRows = () => $$("button[aria-label^='Dispatch ']", section("Workflows"));
+          const wfExpander = () => button("Show all 12 workflows") ?? button("Show fewer", section("Workflows"));
+          check("workflows preview five, with an expander that is collapsed", () =>
+            wfRows().length === 5 && wfExpander()?.getAttribute("aria-expanded") === "false");
+          const previewRowHeight = $("button[aria-label^='Dispatch ']", section("Workflows")).parentElement.getBoundingClientRect().height;
+          wfExpander().click();
+          await settle();
+          check("expanding draws all twelve and says it is expanded", () =>
+            wfRows().length === 12 && wfExpander().getAttribute("aria-expanded") === "true" && words(wfExpander()) === "Show fewer");
+          check("twelve rows draw compact, and every one still shows its dispatch path", () =>
+            $("button[aria-label^='Dispatch ']", section("Workflows")).parentElement.getBoundingClientRect().height < previewRowHeight &&
+            Array.from({ length: 12 }, (_, i) => `.github/workflows/w${i + 1}.yml`).every((p) => words(section("Workflows")).includes(p)));
+          wfExpander().click();
+          await settle();
+          check("and collapsing goes back to five", () => wfRows().length === 5);
+          const runsSection = () => section("Workflow runs");
+          // The last such control in the section: the duration timeline above the
+          // cards has an expander of its own.
+          const runExpander = () => $$("button", runsSection()).filter((el) => ["Show all 15 runs", "Show fewer"].includes(words(el))).at(-1);
+          check("runs preview three cards, with a collapsed expander", () =>
+            runTitles().length === 3 && runExpander()?.getAttribute("aria-expanded") === "false");
+          check("the duration timeline measures every run the filter admits, not the three cards", () =>
+            $$("[data-delivery-strip-seg]", runsSection()).length === 15);
+          runExpander().click();
+          await settle();
+          check("expanding draws every run", () => runTitles().length === 15 && runExpander().getAttribute("aria-expanded") === "true");
+          const labelFor = (title, state) => {
+            const card = $$("span.truncate", runsSection()).find((el) => words(el) === title)?.closest("div.min-w-0");
+            return card ? $$("span", card).find((el) => words(el) === state) : null;
+          };
+          const inkOf = (el) => getComputedStyle(el).color;
+          const waiting = labelFor("run 4", "waiting");
+          const requested = labelFor("run 5", "requested");
+          const inProgress = labelFor("release build", "in_progress");
+          const success = labelFor("run 1", "success");
+          const failure = labelFor("run 7", "failure");
+          check("waiting and requested runs are coloured as in flight, like in_progress", () =>
+            !!waiting && !!requested && !!inProgress && inkOf(waiting) === inkOf(inProgress) && inkOf(requested) === inkOf(inProgress) &&
+            inkOf(waiting) !== inkOf(success) && inkOf(waiting) !== inkOf(failure));
+          const darkInk = [inkOf(success), inkOf(failure), inkOf(waiting)];
+          document.documentElement.classList.remove("dark");
+          await wait(20);
+          check("every verdict has its own light-theme shade", () =>
+            inkOf(success) !== darkInk[0] && inkOf(failure) !== darkInk[1] && inkOf(waiting) !== darkInk[2]);
+          document.documentElement.classList.add("dark");
+          runExpander().click();
+          await settle();
+
+          // ---- narrowing never reads as an empty repository -----------------
+          const prCards = () => $$("button[aria-label^='Checkout pull request #'], button[aria-label^='Checking out PR #']", stage).length;
+          const facet = (label) => $$('[role="tablist"][aria-label="Pull request filter"] [role="tab"]', stage).find((el) => words(el).startsWith(label));
+          const chipCount = (label) => Number(words(facet(label)).replace(label, "").trim());
+          check("the pull request facets are a tablist, liquid on macOS only", () => {
+            const list = $('[role="tablist"][aria-label="Pull request filter"]', stage);
+            return !!list && list.classList.contains("gp-liquid-tabs") === isMacOS();
+          });
+          for (const label of ["Failing", "Drafts", "Awaiting review"]) {
+            facet(label).click();
+            await settle();
+            check(`the ${label} chip counts exactly the rows it shows`, () =>
+              facet(label).getAttribute("aria-selected") === "true" && chipCount(label) === prCards() && prCards() > 0);
+          }
+          facet("All").click();
+          await settle();
+          await input($('input[aria-label="Filter pull requests"]', stage), "no such pull request");
+          check("a pull request filter matching nothing says so, and names how many are loaded", () =>
+            text().includes("No pull request matches this filter") && text().includes("5 open pull requests are loaded.") &&
+            !text().includes("No open pull requests"));
+          button("Clear filter").click();
+          await settle();
+          check("Clear filter brings every pull request back", () => prCards() === 5);
+          await input($('input[aria-label="Filter issues"]', stage), "zzz");
+          check("an issue filter matching nothing says so instead of 'No open issues'", () =>
+            text().includes("No issue matches this filter") && !text().includes("No open issues"));
+          button("Clear filter").click();
+          await settle();
+          check("and its Clear filter restores the issues", () => words(section("Open issues")).includes("Issue 15"));
+          const releasesSection = () => section("Releases");
+          check("releases default to the latest one", () =>
+            words(releasesSection()).includes("v3.0.0") && !words(releasesSection()).includes("v2.0.0"));
+
+          // ---- guarded actions ------------------------------------------------
+          const dispatch = buttonLabelled("Dispatch Workflow 1 at feat/search");
+          actionOutput = "";
+          dispatch.click();
+          await until(() => text().includes("Dispatched Workflow 1"));
+          check("a dispatch with no gh output falls back to a real sentence, with the verdict", () =>
+            text().includes("Dispatched Workflow 1 at feat/search. It may take a moment to appear. — Policy: allowed with a warning") &&
+            !text().includes("[object Object]"));
+          check("and files its verdict against the repository", () =>
+            verdicts.at(-1)?.verdict?.status === "warned" && verdicts.at(-1)?.repoPath === A &&
+            lastArgs("cmd_github_trigger_workflow")?.workflow === ".github/workflows/w1.yml" && lastArgs("cmd_github_trigger_workflow")?.gitRef === "feat/search");
+          actionOutput = "gh: created workflow_dispatch event";
+          await settle();
+          buttonLabelled("Dispatch Workflow 1 at feat/search").click();
+          await until(() => text().includes("gh: created workflow_dispatch event"));
+          check("gh's own output wins over the fallback", () =>
+            text().includes("gh: created workflow_dispatch event — Policy: allowed with a warning"));
+          const verdictsBefore = verdicts.length;
+          buttonLabelled("Re-run workflow run 1").click();
+          await until(() => text().includes("rerun queued by gh"));
+          check("a re-run reports gh's output and files a verdict even when there is no gate", () =>
+            text().includes("rerun queued by gh") && !text().includes("[object Object]") &&
+            verdicts.length === verdictsBefore + 1 && verdicts.at(-1).verdict === null && verdicts.at(-1).repoPath === A);
+          runExpander().click();
+          await settle();
+          buttonLabelled("Cancel run release build").click();
+          await until(() => text().includes("Cancellation requested for “release build”."));
+          check("a cancel with no output says the cancellation was requested", () =>
+            text().includes("Cancellation requested for “release build”.") && verdicts.length === verdictsBefore + 2);
+          runExpander().click();
+          await settle();
+          filterStore.setSearch("author:ada");
+          filterStore.selectBranch("main");
+          const graphsBefore = count("cmd_get_commit_graph");
+          buttonLabelled("Checkout pull request #4").click();
+          await until(() => count("cmd_get_commit_graph") > graphsBefore);
+          await settle();
+          check("checking out a pull request files its verdict", () =>
+            lastArgs("cmd_github_checkout_pr")?.number === 4 && verdicts.at(-1)?.verdict?.status === "warned");
+          check("and reloads the graph with the filter the reader can see", () =>
+            lastArgs("cmd_get_commit_graph")?.query === "author:ada" && lastArgs("cmd_get_commit_graph")?.revision === "main");
+          filterStore.clear();
+
+          // ---- external links --------------------------------------------------
+          button("New pull request", $("h2", stage).parentElement.parentElement).click();
+          await settle();
+          check("New pull request opens GitHub's compare form through the canonical opener", () =>
+            opened.at(-1)?.startsWith("https://github.com/acme/app/compare/main...") && windowOpens.length === 0);
+          buttonLabelled("Open PR #2 on GitHub").click();
+          await settle();
+          check("and so does every pull request link — never window.open", () =>
+            opened.at(-1) === "https://github.com/acme/app/pull/2" && windowOpens.length === 0);
+
+          // ---- CI:local -------------------------------------------------------------
+          button("Run CI locally").click();
+          await settle();
+          check("CI:local says it is running", () => text().includes("Running this repository's CI pipeline locally"));
+          await activate(B);
+          await until(() => text().includes("issues are disabled"));
+          button("Run CI locally").click();
+          await settle();
+          // B's run lands first; the run started on A lands after it and must lose.
+          ciPending[1]({ steps: [{ name: "vitest", command: "npx vitest run", status: "passed", detail: "ok", duration_ms: 1200 }], passed: 1, failed: 0, skipped: 0,
+            total_duration_ms: 1200, recorded_commit: "0123456789abcdef", not_recorded_reason: "",
+            test_scope: { mode: "full", reason: "the graph is unavailable", seeds: [], test_files: [], fail_closed: true } });
+          await settle();
+          check("the live run's report lands, with its fail-closed full-suite reason", () =>
+            text().includes("CI:local") && text().includes("full suite — the graph is unavailable"));
+          ciPending[0]({ steps: [{ name: "stale", command: "x", status: "passed", detail: "", duration_ms: 1 }], passed: 1, failed: 0, skipped: 0,
+            total_duration_ms: 1000, recorded_commit: "", not_recorded_reason: "stale run", test_scope: undefined });
+          await settle();
+          check("a superseded CI:local run's late report never replaces it", () =>
+            !text().includes("stale run") && text().includes("full suite — the graph is unavailable"));
+          $('button[aria-expanded="true"][title="Hide the steps"]', stage).click();
+          await settle();
+          check("folding the report away keeps whether it was recorded", () =>
+            !text().includes("npx vitest run") && text().includes("recorded on 01234567"));
+
+          // ---- B: empty and narrowed states -------------------------------------------
+          check("a failed issue listing says so rather than 'No open issues'", () =>
+            text().includes("Issue listing unavailable: issues are disabled for this repository") && !text().includes("No open issues"));
+          button("this branch").click();
+          await settle();
+          check("a branch with no runs says so and counts the runs it hid", () =>
+            text().includes("No run on this branch") && text().includes("2 recent runs are loaded, none of them for main."));
+          check("…and the timeline does not claim no runs were ever recorded", () => !text().includes("No runs recorded for this repository."));
+          button("Show all runs").click();
+          await settle();
+          check("Show all runs lifts the branch filter", () => runTitles().length === 2);
+          check("no release marked latest says so, rather than 'No releases found'", () =>
+            text().includes("No latest release found") && text().includes("2 releases are loaded, none of them marked latest.") && !text().includes("No releases found"));
+          button("Show all releases").click();
+          await settle();
+          check("Show all releases lists them", () => words(releasesSection()).includes("b2") && words(releasesSection()).includes("b1"));
+
+          // ---- C: a failed run listing ---------------------------------------------------
+          await activate(C);
+          await until(() => text().includes("acme/gamma") && !text().includes("acme/beta"));
+          check("a failed run listing says so instead of 'No recent Actions runs'", () =>
+            text().includes("Run listing unavailable: gh: API rate limit exceeded") && !text().includes("No recent Actions runs"));
+
+          // ---- switching back drops the previous repository's narrowing ---------------
+          await activate(A);
+          await until(() => text().includes("PR 1"));
+          await input($('input[aria-label="Filter pull requests"]', stage), "PR 2");
+          button("this branch").click();
+          wfExpander().click();
+          button("latest only").click();
+          await settle();
+          check("(narrowing is on before the switch)", () => prCards() === 1 && runTitles().length === 3 && wfRows().length === 12);
+          await activate(B);
+          await activate(A);
+          await until(() => text().includes("PR 5"));
+          check("a repository switch drops the filter, the branch narrowing, the expansions and all-releases", () =>
+            $('input[aria-label="Filter pull requests"]', stage).value === "" && prCards() === 5 &&
+            button("this branch").getAttribute("aria-pressed") === "false" && wfRows().length === 5 && runTitles().length === 3 &&
+            button("latest only").getAttribute("aria-pressed") === "true");
+
+          // A switch to a repository whose context is cached shows that listing at
+          // once, but its stamp is the old repository's until its own fetch lands.
+          contextGate = holdContext();
+          await activate(B);
+          check("a switch to a cached repository carries no stamp until its own fetch lands", () =>
+            text().includes("acme/beta") && !/fetched /.test(text()));
+          contextGate.release();
+          contextGate = null;
+          await until(() => /fetched /.test(text()));
+          await activate(A);
+          await until(() => text().includes("PR 5") && /fetched /.test(text()));
+
+          // ---- freshness is asked once per repository and pull request set ------------
+          const batches = count("cmd_provenance_freshness_batch");
+          check("the open pull requests' freshness was asked for", () => batches > 0 && lastArgs("cmd_provenance_freshness_batch")?.repoPath === A);
+          repoStore.setError("an unrelated store emission");
+          await settle();
+          repoStore.setError(null);
+          await settle();
+          check("an unrelated repository-store emission asks for no new batch", () => count("cmd_provenance_freshness_batch") === batches);
+
+          // ---- the layout ------------------------------------------------------------------
+          const prColumn = section("Open pull requests").parentElement.getBoundingClientRect();
+          const rail = heading("Workflows").closest("section").parentElement.getBoundingClientRect();
+          check("the listings sit in two columns, the pull requests wider than the rail", () =>
+            prColumn.right <= rail.left + 1 && Math.abs(prColumn.top - rail.top) < 4 && prColumn.width > rail.width * 1.5);
+
+          // ---- remount: hydrate from the cache, then poll the narrow command ----------
+          unmount(panel);
+          await settle();
+          contextGate = holdContext();
+          const contextsBefore = count("cmd_github_context");
+          panel = mount(GitHubPanel, { target: stage });
+          await tick();
+          check("a remount draws the cached context at once, while the refetch is still out", () =>
+            text().includes("PR 5") && count("cmd_github_context") === contextsBefore + 1);
+          check("a hydrated listing carries no fetch stamp until the refetch lands", () => !/fetched /.test(text()));
+          check("and the refetch blanks nothing behind a full-pane placeholder", () => !!section("Open pull requests") && prCards() === 5);
+          button("this branch").click();
+          await settle();
+          // The in-flight run is on another branch and far past the preview:
+          // the poll must watch it anyway. The first answer could not run; the
+          // second ran, and the run it was watching went red.
+          pollAnswers.push(
+            { available: true, checked: false, cli_present: true, owner: "acme", repo: "app", runs: [], truncated: false, error: "gh: network down" },
+            { available: true, checked: true, cli_present: true, owner: "acme", repo: "app", truncated: false, error: null,
+              runs: runsA.map((r) => r.id === 10 ? { ...r, status: "completed", conclusion: "failure" } : { ...r, title: `polled ${r.id}` }) },
+          );
+          const contextsDuringPoll = count("cmd_github_context");
+          await until(() => count("cmd_github_runs") >= 1, 15000);
+          await settle();
+          check("a filtered-off, collapsed in-flight run is still polled — on the narrow runs command", () =>
+            count("cmd_github_runs") >= 1 && count("cmd_github_context") === contextsDuringPoll);
+          check("a poll that could not run leaves the fetched rows in place", () =>
+            runTitles().join() === "run 1,run 2,run 3" && !text().includes("Run listing unavailable"));
+          await until(() => text().includes("Failed while watching:"), 15000);
+          check("a run that went red while watched is reported", () => text().includes("Failed while watching: release build"));
+          button("this branch").click();
+          await settle();
+          check("a poll that ran replaces the rows", () => runTitles()[0] === "polled 1");
+          contextGate.release();
+          contextGate = null;
+          await until(() => /fetched /.test(text()));
+          await settle();
+          check("a newer full context supersedes the poll's snapshot", () => runTitles()[0] === "run 1");
+
+          check("no window.open anywhere", () => windowOpens.length === 0);
+          check("every IPC call had a fixture", () => unexpected.length === 0);
+          check("no unhandled runtime errors", () => errors.length === 0);
+          report_();
+        } catch (error) {
+          stopped(error);
+          report_();
+        }
+        document.documentElement.dataset.gpResult = encodeURIComponent(JSON.stringify({ results, errors, unexpected }));
+        const reportPath = params.get("report");
+        if (reportPath?.startsWith("/__gp_result/")) {
+          await fetch(reportPath, { method: "POST", body: document.documentElement.outerHTML });
+        }
+      })();
+    </script>
+  </body>
+</html>

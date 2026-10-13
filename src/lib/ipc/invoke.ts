@@ -8,6 +8,7 @@ import {
   isDeferredUnderLoad,
   jitteredRetryDelayMs,
 } from "../async/deferral";
+import { withDeadline } from "../async/deadline";
 import { whenDocumentShown } from "../runtime/foreground";
 import { activity, observeSettled } from "../diagnostics/activity";
 
@@ -34,12 +35,46 @@ import { activity, observeSettled } from "../diagnostics/activity";
  * delay is jittered upward (`jitteredRetryDelayMs`), so the calls one storm
  * declined do not all come back on the same millisecond into the same empty
  * budget. And a retry waits while the window is hidden: nobody can see its
- * answer, and the spawn budget it would spend is shared with every agent
- * session on the machine.
+ * answer, and the spawn budget it would spend is shared with every other
+ * GitPulse process of this user — the agent servers (`gitpulse-mcp`), the
+ * hooks and `gitpulsed` draw from the same per-user record
+ * (`engine/git_cli/shared_budget.rs`). Agent sessions themselves do not: the
+ * `git` an agent runs on its own never passes through this budget.
  */
 type Raw = <T>(cmd: string, args?: InvokeArgs, options?: InvokeOptions) => Promise<T>;
-/** Exactly what the caller passed after `cmd`, forwarded with the same arity. */
+
+/**
+ * How long one caller waits, and what ends the wait early. Carried in the
+ * options argument beside Tauri's own (`headers`), stripped before the call
+ * is forwarded, so the backend never sees them and a call that carries only
+ * these is still retried and joined like any other.
+ *
+ * The deadline covers the whole call as this caller sees it, deferral
+ * backoff included. It stops the wait, not the native operation, so a write
+ * that times out may still have landed: report it as unknown, not as failed.
+ */
+export type IpcBound = {
+  /** Rejects with a `DeadlineError` after this many ms; `Infinity` waits unbounded. */
+  deadlineMs?: number;
+  /** Rejects with the signal's reason at once, and never sends the call if already aborted. */
+  signal?: AbortSignal;
+};
+export type IpcOptions = Partial<InvokeOptions> & IpcBound;
+/** What the backend is sent: exactly what the caller passed after `cmd`, with the same arity. */
 type Rest = [args?: InvokeArgs, options?: InvokeOptions];
+type Given = [args?: InvokeArgs, options?: IpcOptions];
+
+/**
+ * Commands that shell out to `gh` over the network and so can hang on a dead
+ * connection, bounded by default so a panel shows a message instead of a
+ * spinner for good. `cmd_github_context` runs four `gh` round trips (see
+ * WorkspaceView), hence the longer bound. A caller's `deadlineMs` overrides.
+ */
+export const COMMAND_DEADLINES_MS: Readonly<Record<string, number>> = {
+  cmd_github_context: 60_000,
+  cmd_github_runs: 30_000,
+  cmd_github_workflows: 30_000,
+};
 
 export type DeferralRetryOptions = {
   /** Stand-in for `setTimeout`-based sleeping, for tests. */
@@ -64,7 +99,7 @@ function messageOf(error: unknown): string {
  */
 function retryKey(cmd: string, args: InvokeArgs | undefined): string | null {
   if (args === undefined) return JSON.stringify([cmd]);
-  if (args instanceof ArrayBuffer || ArrayBuffer.isView(args)) return null;
+  if (isBinary(args)) return null;
   let plain = true;
   const text = JSON.stringify([cmd, args], (_key, value: unknown) => {
     if (value !== null && typeof value === "object") {
@@ -76,6 +111,23 @@ function retryKey(cmd: string, args: InvokeArgs | undefined): string | null {
     return value;
   });
   return plain ? text : null;
+}
+
+function isBinary(args: InvokeArgs | undefined): boolean {
+  return args instanceof ArrayBuffer || ArrayBuffer.isView(args);
+}
+
+/**
+ * `retryKey` that never throws. Arguments that cannot be serialized (a cycle,
+ * a `bigint`) are simply not retryable: the call goes out as given, and a
+ * deferral is its answer rather than a serializer error in its place.
+ */
+function lazyRetryKey(cmd: string, args: InvokeArgs | undefined): string | null {
+  try {
+    return retryKey(cmd, args);
+  } catch {
+    return null;
+  }
 }
 
 const defaultSleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
@@ -124,27 +176,64 @@ export function withDeferralRetry(raw: Raw, options: DeferralRetryOptions = {}) 
   //
   // Not an `async` function: each extra `await` layer delays every answer by
   // microtasks, and callers that publish an answer to a store and are read in
-  // the same turn saw the delay. A call that cannot be retried adds nothing
-  // here; one that can adds a single `.catch`. The exported `invoke` sits one
-  // microtask above `tauriInvoke`, for the stall-attribution note below.
-  return function invoke<T>(cmd: string, ...rest: Rest): Promise<T> {
+  // the same turn saw the delay. A call known up front not to be retryable
+  // (options, a byte buffer) adds nothing here; any other adds a single
+  // `.catch`, and is checked for plain data only if it is actually deferred.
+  // The exported `invoke` sits one microtask above `tauriInvoke`, for the
+  // stall-attribution note below.
+  function dispatch<T>(cmd: string, rest: Rest): Promise<T> {
     // A call carrying options (request headers, for raw-body commands) is
     // treated like one with non-plain arguments: neither retried nor joined.
-    const key = rest.length > 1 ? null : retryKey(cmd, rest[0]);
-    if (key === null) return call<T>(cmd, rest);
-    const pending = retrying.get(key);
-    if (pending) return pending as Promise<T>;
+    // So is a byte buffer; both are known without serializing anything.
+    if (rest.length > 1 || isBinary(rest[0])) return call<T>(cmd, rest);
+    // The key exists only to join a call already waiting to retry. With none
+    // waiting there is nothing to join, so it is not computed up front: every
+    // file save and terminal write would otherwise serialize its whole payload
+    // for nothing. It is computed below instead, at the moment this call is
+    // deferred and registers its own retry, so a later identical call still
+    // finds and joins it.
+    let key: string | null | undefined;
+    if (retrying.size > 0) {
+      key = lazyRetryKey(cmd, rest[0]);
+      if (key === null) return call<T>(cmd, rest);
+      const pending = retrying.get(key);
+      if (pending) return pending as Promise<T>;
+    }
     return call<T>(cmd, rest).catch((error: unknown) => {
       if (!isDeferredUnderLoad(messageOf(error))) throw error;
-      const joined = retrying.get(key);
+      if (key === undefined) key = lazyRetryKey(cmd, rest[0]);
+      // Not plain data: the deferral is the answer, exactly as if the call
+      // had never been eligible for a retry.
+      if (key === null) throw error;
+      const settledKey = key;
+      const joined = retrying.get(settledKey);
       if (joined) return joined as Promise<T>;
       const chain = retry<T>(cmd, rest, error).finally(() => {
-        if (retrying.get(key) === chain) retrying.delete(key);
+        if (retrying.get(settledKey) === chain) retrying.delete(settledKey);
       });
-      retrying.set(key, chain);
+      retrying.set(settledKey, chain);
       return chain;
     });
+  }
+
+  return function invoke<T>(cmd: string, ...given: Given): Promise<T> {
+    if (given.length < 2) return bound(cmd, given.length === 0 ? [] : [given[0]], COMMAND_DEADLINES_MS[cmd], undefined);
+    const [args, options] = given;
+    if (options === undefined) return bound(cmd, [args], COMMAND_DEADLINES_MS[cmd], undefined);
+    const { deadlineMs, signal, headers } = options;
+    const rest: Rest = headers !== undefined ? [args, { headers }] : args === undefined ? [] : [args];
+    return bound(cmd, rest, deadlineMs ?? COMMAND_DEADLINES_MS[cmd], signal);
   };
+
+  /** `dispatch` under the caller's wait bound; a call with neither adds nothing. */
+  function bound<T>(cmd: string, rest: Rest, deadlineMs: number | undefined, signal: AbortSignal | undefined): Promise<T> {
+    const limited = deadlineMs !== undefined && Number.isFinite(deadlineMs);
+    if (!limited && !signal) return dispatch<T>(cmd, rest);
+    return withDeadline(() => dispatch<T>(cmd, rest), limited ? deadlineMs : Infinity, {
+      signal,
+      message: `${cmd} timed out after ${Math.round((deadlineMs ?? 0) / 1000)} s without an answer`,
+    });
+  }
 }
 
 // Each answer is noted for UI stall attribution (diagnostics/activity.ts).

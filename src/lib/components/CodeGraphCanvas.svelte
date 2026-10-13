@@ -9,6 +9,8 @@
   } from "../canvas/codeGraph/CodeGraphRenderer";
   import {
     buildCodeGraphModel,
+    CODE_GRAPH_LAYOUT_HEIGHT,
+    CODE_GRAPH_LAYOUT_WIDTH,
     graphLanguageLegend,
     truncationLegend,
     type CodeGraphModel,
@@ -66,14 +68,20 @@
   let lastPointer = { x: 0, y: 0 };
 
   const scheduler = createFrameScheduler();
+  // Hover hit testing walks every node and link; one pass per frame, from the
+  // newest pointer position, instead of one per pointer event.
+  const hoverScheduler = createFrameScheduler();
   let gpuCtx: CanvasRenderingContext2D | null = null;
   let stopResize: (() => void) | null = null;
 
   const payload = $derived(
     load?.available ? load.payload ?? null : null,
   );
+  // Laid out once per payload in a fixed content space. The viewport is only
+  // a pan/zoom window onto it, so a splitter drag repaints but never re-lays
+  // out (up to 100k nodes and millions of neighbour visits per frame).
   const model = $derived.by((): CodeGraphModel =>
-    buildCodeGraphModel(payload, width, height),
+    buildCodeGraphModel(payload, CODE_GRAPH_LAYOUT_WIDTH, CODE_GRAPH_LAYOUT_HEIGHT),
   );
   const legend = $derived(
     truncationLegend(
@@ -142,24 +150,22 @@
     schedulePaint();
   }
 
-  function pointerToLocal(e: PointerEvent): { x: number; y: number } {
-    const rect = canvasEl!.getBoundingClientRect();
-    return { x: e.clientX - rect.left, y: e.clientY - rect.top };
-  }
 
   function onPointerDown(e: PointerEvent) {
     if (!canvasEl || e.button !== 0) return;
     canvasEl.focus();
     canvasEl.setPointerCapture(e.pointerId);
+    hoverScheduler.cancel();
     dragging = true;
-    lastPointer = pointerToLocal(e);
+    lastPointer = { x: e.clientX, y: e.clientY };
     pointerStart = lastPointer;
     dragDistance = 0;
   }
 
   function onPointerMove(e: PointerEvent) {
     if (!canvasEl) return;
-    const pt = pointerToLocal(e);
+    // Drag arithmetic is in client space (deltas), so it never reads layout.
+    const pt = { x: e.clientX, y: e.clientY };
     if (dragging) {
       dragDistance = Math.max(dragDistance, Math.hypot(pt.x - pointerStart.x, pt.y - pointerStart.y));
       panX += pt.x - lastPointer.x;
@@ -168,12 +174,16 @@
       schedulePaint();
       return;
     }
-    const hit = hitTestCodeGraph(model, pt.x, pt.y, panX, panY, scale, visibleIds);
-    const next = hit?.kind === "node" ? hit.id : null;
-    if (next !== hoveredId) {
-      hoveredId = next;
-      schedulePaint();
-    }
+    hoverScheduler.schedule(() => {
+      if (!canvasEl || dragging) return;
+      const rect = canvasEl.getBoundingClientRect();
+      const hit = hitTestCodeGraph(model, pt.x - rect.left, pt.y - rect.top, panX, panY, scale, visibleIds);
+      const next = hit?.kind === "node" ? hit.id : null;
+      if (next !== hoveredId) {
+        hoveredId = next;
+        schedulePaint();
+      }
+    });
   }
 
   function onPointerUp(e: PointerEvent) {
@@ -273,15 +283,36 @@
     schedulePaint();
   }
 
+  // A lost 2D context leaves every later paint drawing into a dead one, so the
+  // map freezes. Drop the cached context and repaint once it is back (the
+  // browser only fires contextrestored when the context is usable again).
+  function onContextLost(event: Event) {
+    event.preventDefault();
+    gpuCtx = null;
+    schedulePaint();
+  }
+
+  function onContextRestored() {
+    gpuCtx = null;
+    schedulePaint();
+  }
+
   onMount(() => {
     measure();
     // Updating responsive classes inside an observer delivery can resize the
     // observed stage again. Defer and coalesce writes outside that delivery.
     if (hostEl) stopResize = observeResize(hostEl, () => measure());
-  });
+    const canvas = canvasEl;
+    canvas?.addEventListener("contextlost", onContextLost);
+    canvas?.addEventListener("contextrestored", onContextRestored);
+    return () => {
+      canvas?.removeEventListener("contextlost", onContextLost);
+      canvas?.removeEventListener("contextrestored", onContextRestored);
+    };  });
 
   onDestroy(() => {
     scheduler.cancel();
+    hoverScheduler.cancel();
     stopResize?.();
     stopResize = null;
     gpuCtx = null;

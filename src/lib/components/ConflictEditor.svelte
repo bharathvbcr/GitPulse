@@ -111,7 +111,7 @@
 </script>
 
 <script lang="ts">
-  import { repoStore, type DiffPayload } from "../stores/repoStore";
+  import { currentRepoPath, repoStore, type DiffPayload } from "../stores/repoStore";
   import { hostPlatform } from "../stores/platformStore";
   import { platformChord } from "../ui/platformCopy";
   import { tick, untrack } from "svelte";
@@ -135,7 +135,10 @@
   let parked = $derived(operationState.operation !== null);
   let selectedFile = $state<string | null>(null);
   let parsedDoc = $state<ConflictDocument | null>(null);
-  let draft = $state<ConflictDraft | null>(null);
+  // Raw: every draft is a fresh copy from `conflictSessions` (source document,
+  // history and recovery included) and is only ever replaced, never edited in
+  // place, so a deep proxy over it would only cost.
+  let draft = $state.raw<ConflictDraft | null>(null);
   let sessionVersion = $state(0);
   let retained = $derived.by(() => { sessionVersion; return $repoStore.currentPath ? conflictSessions.summaries($repoStore.currentPath) : []; });
   let storageNotice = $state(conflictSessions.warning);
@@ -178,7 +181,7 @@
   let hasUnresolved = $derived(!wholeChoice && !pendingStage && (parsedDoc === null || chunks.length === 0 || remaining > 0 || diagnostics.length > 0));
   let canSave = $derived(Boolean(draft) && !isSaving && !isLoading && (wholeChoice !== null || pendingStage || (!hasUnresolved && !isPreviewing && !previewError && resolvedPreview !== null)));
   let reviewPath = $state<string | null>(null);
-  let reviewDiff = $state<DiffPayload | null>(null);
+  let reviewDiff = $state.raw<DiffPayload | null>(null);
   let reviewError = $state<string | null>(null);
   let reviewLoading = $state(false);
   let reviewGuard: AsyncGuard | null = null;
@@ -233,14 +236,14 @@
     conflictSessions.flush();
   });
 
-  let loadedKey: string | null = null;
-  let loadedRetry = -1;
+  // Loads on a new repository, file or Retry, each compared by value.
   $effect(() => {
-    const repo = $repoStore.currentPath;
+    const repo = $currentRepoPath;
     const file = selectedFile;
-    const key = repo && file ? `${repo}\u0000${file}` : null;
-    if (key === loadedKey && loadedRetry === retryRevision) return;
-    loadedKey = key; loadedRetry = retryRevision;
+    void retryRevision;
+    untrack(() => loadConflict(repo, file));
+  });
+  function loadConflict(repo: string | null, file: string | null) {
     loadGuard?.cancel(); previewGuard?.cancel(); saveGuard?.cancel();
     parsedDoc = null; draft = null; resolvedPreview = null;
     isLoading = Boolean(repo && file); isPreviewing = false; isSaving = false;
@@ -260,14 +263,14 @@
         if (guard.isLive()) loadError = reportPanelError("conflict", error);
       } finally { if (guard.isLive()) isLoading = false; }
     })();
-  });
+  }
 
   // Real repository refreshes may change bytes without changing the UU status.
   // Probe in the background; identical snapshots leave focus and keystrokes alone.
   let checkedContent = "";
   let probeSequence = 0;
   $effect(() => {
-    const repo = $repoStore.currentPath;
+    const repo = $currentRepoPath;
     const revision = repo ? $contentRevisions[repo] ?? "" : "";
     const file = selectedFile;
     const current = draft?.pending?.revision ?? draft?.snapshot.revision;
@@ -280,10 +283,10 @@
     void (async () => {
       try {
         const snapshot = await invoke<ConflictSnapshot>("cmd_conflict_snapshot", { repoPath: repo, filePath: file });
-        if (sequence !== probeSequence || !guard?.isLive() || isSaving || $repoStore.currentPath !== repo || selectedFile !== file) return;
+        if (sequence !== probeSequence || !guard?.isLive() || isSaving || $currentRepoPath !== repo || selectedFile !== file) return;
         if (snapshot.revision !== (draft?.pending?.revision ?? draft?.snapshot.revision)) await acceptSnapshot(repo, snapshot);
       } catch (error) {
-        if (sequence === probeSequence && guard?.isLive() && $repoStore.currentPath === repo && selectedFile === file) sourceNotice = `Source refresh failed: ${formatError(error)}. Your draft is retained; reload before saving.`;
+        if (sequence === probeSequence && guard?.isLive() && $currentRepoPath === repo && selectedFile === file) sourceNotice = `Source refresh failed: ${formatError(error)}. Your draft is retained; reload before saving.`;
       }
     })();
   });
@@ -447,14 +450,15 @@
     catch (error) { if (guard.isLive()) reviewError = formatError(error); }
     finally { if (guard.isLive()) reviewLoading = false; }
   }
-  let reviewedRepository = "";
+  const reviewedRepository = $derived(
+    JSON.stringify([$currentRepoPath, $currentRepoPath ? $contentRevisions[$currentRepoPath] : null]),
+  );
   $effect(() => {
-    const repo = $repoStore.currentPath;
-    const key = JSON.stringify([repo, repo ? $contentRevisions[repo] : null]);
-    if (reviewedRepository === key) return;
-    reviewedRepository = key;
-    reviewGuard?.cancel(); reviewPath = null; reviewDiff = null; reviewError = null; reviewLoading = false;
-    recoveryFile = null; recoveryVersion = 0;
+    void reviewedRepository;
+    untrack(() => {
+      reviewGuard?.cancel(); reviewPath = null; reviewDiff = null; reviewError = null; reviewLoading = false;
+      recoveryFile = null; recoveryVersion = 0;
+    });
   });
 </script>
 

@@ -16,7 +16,7 @@ updatable; this app takes only the subset it needs. See
 flowchart TB
     subgraph Frontend["Svelte 5 + TypeScript Frontend"]
         direction TB
-        UI["Views & Components (17 Sections)<br/><code>src/lib/components/</code>"]
+        UI["Views & Components (18 Sections)<br/><code>src/lib/components/</code>"]
         Stores["State & Mutation Stores<br/><code>src/lib/stores/</code>"]
         Registry["View Registry & Routerless Nav<br/><code>src/lib/views/</code>"]
         Canvas["Canvas 2D Rendering<br/><code>src/lib/canvas/</code>"]
@@ -31,13 +31,13 @@ flowchart TB
     subgraph IPC["Tauri 2 IPC Seam (snake_case ↔ camelCase)"]
         direction TB
         Invoke["<code>invoke('cmd_*', args)</code>"]
-        ContractCheck["265 Handlers Enforced by <code>check:ipc</code>"]
+        ContractCheck["278 Handlers Enforced by <code>check:ipc</code>"]
         Invoke -.-> ContractCheck
     end
 
     subgraph Backend["Rust Backend (Tauri 2 / Rayon)"]
         direction TB
-        CmdRegistry["Command Registry (265 Handlers)<br/><code>src-tauri/src/commands/</code>"]
+        CmdRegistry["Command Registry (278 Handlers)<br/><code>src-tauri/src/commands/</code>"]
         
         subgraph Subsystems["Core Subsystems & In-Process Modules"]
             GitEngine["Git Engine & Sandbox<br/><code>src-tauri/src/engine/</code>"]
@@ -199,7 +199,7 @@ When switching between repositories or triggering fast refilters, in-flight IPC 
 ```mermaid
 classDiagram
     class CommandRegistry {
-        +265 Registered Handlers
+        +278 Registered Handlers
         +Checked by scripts/check-ipc-contract.mjs
     }
     class GitEngine {
@@ -348,6 +348,7 @@ for contracts, regression evidence and platform verification limits.
 - **`ingest/`**: Attribution sources beyond live commands (reflog and transcript replay) that feed durable provenance and audit history.
 - **`ledger/`**: WAL-backed action store with redaction, cursors, and bounded replay for history projection.
 - **`mcp/`**: Read-only MCP 2.0 + Agent Plugins 1.0 server surface, including tool caching and capability discovery.
+- **`sysload/`**: The host-load sensor. A sampler in the app process only reads memory pressure, swap, compressor counters, load, open files, disk, thermal state and power every 2 s, scans the process table for agent sessions (by executable, launched vs observed through `GITPULSE_RUN_ID` / `GITPULSE_SESSION_ID`), launched-tree footprints and disk-write rates, memguard and foreign orphans, and publishes `host-load.v1`: a fixed-size sequence-locked record in the per-user config directory that any GitPulse process reads without asking the app. It measures and publishes only; admission, shedding and leases consume it. See [Load governor](LOAD_GOVERNOR.md).
 - **`logging.rs`**: Diagnostics for the backend. A 1,000-entry in-memory ring behind the `log` facade, a panic hook that records the payload, the location and a bounded backtrace, and a durable append-only mirror under the platform log directory (`~/Library/Logs/GitPulse` on macOS, `%LOCALAPPDATA%\\GitPulse\\logs` on Windows, `$XDG_STATE_HOME/gitpulse` otherwise; `GITPULSE_LOG_DIR` overrides all three). See [Diagnostics](#5-diagnostics) below.
 
 ---
@@ -412,7 +413,7 @@ sequenceDiagram
 
 - **Ref scope — the walk and the labels are one decision** (`graph/ref_scope.rs`): the history walk and the decoration listing are derived from a single list, so the graph cannot open a lane it has no name for. `RefScope::Named` (the default) walks `HEAD --branches --remotes --tags` and labels `refs/heads`, `refs/remotes`, `refs/tags`; `RefScope::All` walks git's `--all` and labels everything under `refs/` as `RefKind::Other`. `--all` used to be hard-coded on the walk side alone, so machine-written namespaces (agent turn checkpoints, `refs/prefetch/*`, CI `refs/pull/*`) opened anonymous lanes — on one real repository, 18 such refs took 65 commits of straight history to 101 rows and 35 lanes. Whatever a named walk leaves out is counted and named in the payload's `warnings` (`probe_hidden_history`), because history that is not drawn must not look like history that does not exist — and the count is of hidden COMMITS, not hidden refs, since a `refs/archive/*` pointing at an ancestor of `main` is drawn and hides nothing. The same named set feeds the Pulse report, so contributor and churn metrics measure people rather than tooling. Two rules are load-bearing and each has a test that fails without it: the named set matches on PATH COMPONENTS (`refs/headsfoo/x` is not a branch, and `tests/graph_ref_scope_stress.rs` checks the classifier against git itself rather than against our belief about git), and the walk carries `--ignore-missing` because naming `HEAD` otherwise fails outright on an unborn HEAD — a fresh repository or any `git checkout --orphan` branch. Decoration lists are capped per kind (`REFS_TAG_CAP`, `REFS_OTHER_CAP`) and a `RefListing` reports how many were dropped, so a CI mirror's six figures of `refs/pull/*` can neither reach the IPC payload nor pass for a complete label set.
 - **Topological Lane Solver**: Runs natively in Rust (`graph/lane_solver.rs`), single-threaded — one linear pass over the `--topo-order` walk. History is decomposed into first-parent segments, each holding one column for its whole lifetime (in-flight connectors included) by greedy interval allocation, so the graph is exactly as wide as its peak concurrent occupancy.
-- **Pinned mainline**: The default branch's first-parent chain (`resolve_mainline_hint` in `commands/mod.rs`: the repository's default branch, local tip first, extended through a remote-tracking copy that is ahead; HEAD as the fallback; the newest commit otherwise) is reserved before any row is walked and pinned to column 0 in palette colour 0 for the entire window. Feature chains close INTO that column and can never claim a main ancestor first, so `main` is one straight rail however the walk interleaved merged branches with it; at a window cut the rail ends with a stub rather than continuing into a merged-in branch. Rows carry `is_mainline`, the payload carries `mainline_id`/`mainline_name`, and the graph tooltip names the rail.
+- **Pinned mainline**: The default branch's first-parent chain (`resolve_mainline_hint` in `commands/commit_graph.rs`: the repository's default branch, local tip first, extended through a remote-tracking copy that is ahead; HEAD as the fallback; the newest commit otherwise) is reserved before any row is walked and pinned to column 0 in palette colour 0 for the entire window. Feature chains close INTO that column and can never claim a main ancestor first, so `main` is one straight rail however the walk interleaved merged branches with it; at a window cut the rail ends with a stub rather than continuing into a merged-in branch. Rows carry `is_mainline`, the payload carries `mainline_id`/`mainline_name`, and the graph tooltip names the rail.
 - **Async runtime**: `rayon` is the only direct concurrency dependency in `src-tauri/Cargo.toml`. Blocking work leaves the IPC thread through `tauri::async_runtime::spawn_blocking` (see `off_thread` in `commands/mod.rs`). Tokio is present, but transitively through Tauri — nothing here depends on it directly, so `use tokio::…` will not compile without adding the crate first.
 - **Nogap Lookback Bounds**: Prevents disconnected lane lines across virtualized scrolling regions.
 - **Author Avatars**: Fast on-canvas rendering with caching for author initials, identicons, and GitHub avatars.
@@ -426,8 +427,8 @@ GitPulse enforces compile-time and pre-commit contract safety across the Rust/Ty
 
 | Contract Tool | Command | Description |
 | --- | --- | --- |
-| **IPC Checker** | `bun run check:ipc` | Verifies all 265 Rust `cmd_*` handlers match frontend `invoke()` calls with zero untracked orphans. |
-| **Type Sync Checker** | `bun run check:types` | Asserts Rust Serde structs match TypeScript interfaces field-for-field and wire-type-for-wire-type across 1466 data fields, over 211 structs, in 83 contracts. The IPC payload types that remain unchecked are enumerated with a reason each in `scripts/ipc-type-coverage-contract.test.ts`. |
+| **IPC Checker** | `bun run check:ipc` | Verifies all 278 Rust `cmd_*` handlers match frontend `invoke()` calls with zero untracked orphans. |
+| **Type Sync Checker** | `bun run check:types` | Asserts Rust Serde structs match TypeScript interfaces field-for-field and wire-type-for-wire-type across 1661 data fields, over 235 structs, in 93 contracts. The IPC payload types that remain unchecked are enumerated with a reason each in `scripts/ipc-type-coverage-contract.test.ts`. |
 | **Release Version Gate** | `bun run check:release` | Validates that `package.json`, `tauri.conf.json`, `Cargo.toml`, `Cargo.lock`, and every discovered plugin manifest agree. Plugin manifests are found under `plugins/<name>/` rather than hardcoded, because one package ships a manifest per agent client and the newest one is the likeliest to be missed. |
 | **MCP Install Doctor** | `bun run mcp:doctor` | Handshakes the `gitpulse-mcp` on PATH — the binary the plugin manifests spawn — and asserts both its version and its manifest's store schema match this tree, then asks what source both binaries were built from against the digest `mcp:install` recorded. Version is the release identity and cannot see a fix that landed between releases; the digest can. Missing schema identity is unresponsive, never a pass, and an unrecorded install is *unverifiable*, never an OK. Reports *absent*, *unresponsive*, *stale*, and *unverifiable* as distinct failures. |
 

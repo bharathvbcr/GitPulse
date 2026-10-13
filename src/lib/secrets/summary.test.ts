@@ -8,6 +8,7 @@ import {
   filterFindings,
   groupSizes,
   isStale,
+  locationLabel,
   locationChips,
   scopeNotes,
   scanFailureCopy,
@@ -23,6 +24,7 @@ function report(overrides: Partial<SecretsReport> = {}): SecretsReport {
     diagnostic: null,
     kingfisher_present: true,
     kingfisher_version: "2.7.0",
+    kingfisher_version_rejected: false,
     nested_repos_scanned: true,
     completeness: "complete",
     findings: [],
@@ -270,13 +272,32 @@ describe("parseSecretsReport", () => {
     expect(verdict(parsed).title).toBe("5 findings+");
   });
 
-  it("coerces unknown locations to unknown and bad numbers to zero", () => {
+  it("coerces unknown locations to unknown, bad counts to zero and a bad line to none", () => {
     const parsed = parseSecretsReport({
       ...report(),
       findings: [{ ...row(), location: "committed", line: -4, secret_group: Number.NaN }],
       findings_total: Number.POSITIVE_INFINITY,
     });
-    expect(parsed.findings[0]).toMatchObject({ location: "unknown", line: 0, secret_group: 0 });
+    expect(parsed.findings[0]).toMatchObject({ location: "unknown", line: null, secret_group: 0 });
     expect(parsed.findings_total).toBe(1);
+  });
+
+  it("shows no line number for a finding without one", () => {
+    const parsed = parseSecretsReport({
+      ...report(),
+      findings: [
+        { ...row(), line: null },
+        { ...row({ path: "b.sh" }), line: 0 },
+        { ...row({ path: "c.sh" }), line: 7 },
+      ],
+    });
+    expect(parsed.findings.map((f) => f.line)).toEqual([null, null, 7]);
+    expect(parsed.findings.map(locationLabel)).toEqual(["a.sh", "b.sh", "c.sh:7"]);
+  });
+
+  it("carries a refused scan version through the IPC boundary", () => {
+    expect(parseSecretsReport({ ...report(), kingfisher_version_rejected: true })
+      .kingfisher_version_rejected).toBe(true);
+    expect(parseSecretsReport(report()).kingfisher_version_rejected).toBe(false);
   });
 });

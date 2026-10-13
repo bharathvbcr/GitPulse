@@ -1,29 +1,8 @@
 import { describe, expect, it } from "vitest";
 import type { BlameLine } from "../../files/types";
 import type { FileStatus } from "../../stores/repoStore";
-
-/**
- * Deep equality comparator for BlameLine arrays, matching the canonical
- * implementation in BlameViewer.svelte.
- */
-export function areBlameLinesEqual(a: BlameLine[], b: BlameLine[]): boolean {
-  if (a === b) return true;
-  if (a.length !== b.length) return false;
-  for (let i = 0; i < a.length; i++) {
-    const la = a[i];
-    const lb = b[i];
-    if (
-      la.line_no !== lb.line_no ||
-      la.commit_id !== lb.commit_id ||
-      la.timestamp !== lb.timestamp ||
-      la.author_name !== lb.author_name ||
-      la.content !== lb.content
-    ) {
-      return false;
-    }
-  }
-  return true;
-}
+import { areBlameLinesEqual } from "../../metrics/blameTimeline";
+import { wallClockBudget } from "../../testing/wallClock";
 
 /**
  * Computes the blame fingerprint with full sensitivity to file status,
@@ -200,7 +179,7 @@ describe("BlameViewer SWR Hardening & Concurrency Stress Tests", () => {
       const t0 = performance.now();
       expect(areBlameLinesEqual(fileA, fileB)).toBe(true);
       const elapsed = performance.now() - t0;
-      expect(elapsed).toBeLessThan(50);
+      expect(elapsed).toBeLessThan(wallClockBudget(50));
     });
 
     it("detects granular mutations across all BlameLine fields", () => {

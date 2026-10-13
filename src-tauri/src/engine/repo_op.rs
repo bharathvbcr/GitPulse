@@ -29,6 +29,7 @@
 //!   be indistinguishable from one that ran and found nothing.
 
 use crate::engine::git_cli::{git_text, validate_repo};
+use crate::engine::git_reader::symbolic_ref_target;
 use crate::engine::git_writer::repo_mutation_lock;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -121,7 +122,8 @@ pub struct RepoOperation {
     /// Total steps in this operation, when it is a sequence.
     pub total_steps: Option<usize>,
     /// The branch the operation is being applied *to* — the rebased branch's
-    /// own name, or the checked-out branch for a merge. `None` on detached HEAD.
+    /// own name, or the checked-out branch for a merge. `None` on detached HEAD,
+    /// or when reading it failed (`warnings` says so).
     pub head_ref: Option<String>,
     /// What is coming in: the merged branch, the commit being replayed, or the
     /// new base of a rebase. Short and human-facing, never used as argv.
@@ -205,6 +207,19 @@ pub fn detect(repo: &Path) -> Result<Option<RepoOperation>, String> {
         available,
         warnings,
     }))
+}
+
+/// Which operation `repo`'s worktree is parked in, and nothing else about it.
+///
+/// A look at the control files and no more: no process is started, whatever
+/// is parked. [`detect`] goes on to name the branch, describe the incoming
+/// commit and list the conflicts, which costs a child each; a caller that
+/// reports only the kind (the insights snapshot, once per worktree) should not
+/// pay for the rest. Same precedence, same classification.
+pub fn detect_kind(repo: &Path) -> Result<Option<OperationKind>, String> {
+    let paths = resolve_control_paths(repo)?;
+    let mut warnings: Vec<String> = Vec::new();
+    Ok(classify(repo, &paths, &mut warnings)?.map(|(kind, _)| kind))
 }
 
 /// Resolves every probe path without starting git.
@@ -421,11 +436,18 @@ fn head_ref_for(
         }
     }
     // Not a rebase (or head-name unreadable): ask for the live branch.
-    // `symbolic-ref --quiet` exits non-zero on a detached HEAD, which is a
-    // legitimate answer of "no branch", not a failure worth warning about.
-    let raw = git_text(repo, &["symbolic-ref", "--quiet", "HEAD"]).ok()?;
-    let name = short_ref(&raw);
-    (!name.is_empty()).then_some(name)
+    // A detached HEAD is a legitimate answer of "no branch" (`Ok(None)`); a
+    // read that failed is a degraded field and is reported in `warnings`, so
+    // the label never presents an unreadable HEAD as a detached one.
+    match symbolic_ref_target(repo, "HEAD") {
+        Ok(target) => target
+            .map(|raw| short_ref(&raw))
+            .filter(|name| !name.is_empty()),
+        Err(err) => {
+            warnings.push(format!("cannot read the checked-out branch: {err}"));
+            None
+        }
+    }
 }
 
 /// What is being brought in by the parked step.
@@ -922,10 +944,14 @@ mod tests {
     fn control_paths_match_git_rev_parse() {
         use crate::test_support::git_in;
         let main = crate::test_support::git_repo();
-        let root = main.path().canonicalize().unwrap();
+        // Plain, not `canonicalize`: `linked` is handed to git as an argument,
+        // and git cannot create a worktree at a `\\?\` path.
+        let plain =
+            |path: &std::path::Path| crate::engine::git_cli::canonicalize_plain(path).unwrap();
+        let root = plain(main.path());
         git_in(&root, &["commit", "--allow-empty", "-q", "-m", "base"]);
         let holder = tempfile::tempdir().unwrap();
-        let linked = holder.path().canonicalize().unwrap().join("linked");
+        let linked = plain(holder.path()).join("linked");
         git_in(
             &root,
             &[
@@ -938,7 +964,7 @@ mod tests {
             ],
         );
         let bare_dir = tempfile::tempdir().unwrap();
-        let bare = bare_dir.path().canonicalize().unwrap();
+        let bare = plain(bare_dir.path());
         git_in(&bare, &["init", "--bare", "-q"]);
 
         // Probe files mostly do not exist, so compare through their parent.
@@ -994,5 +1020,77 @@ mod tests {
         // so nothing a concurrent test spawns can land here.
         let spawned = crate::engine::git_cli::spawn_log::spawns_in(&root);
         assert!(spawned.is_empty(), "spawned: {spawned:?}");
+    }
+
+    /// The kind alone is the kind the full report names, for every probe, and
+    /// is read without starting a process even when an operation is parked.
+    #[test]
+    fn detect_kind_names_what_detect_names_without_a_process() {
+        let repo = crate::test_support::git_repo();
+        let root = repo.path().canonicalize().unwrap();
+        assert_eq!(detect_kind(&root).unwrap(), None);
+        let git_dir = root.join(".git");
+        let head = "deadbeef\n";
+        for probe in PROBE_ORDER {
+            let path = git_dir.join(probe);
+            if *probe == "rebase-merge" || *probe == "rebase-apply" {
+                std::fs::create_dir_all(&path).unwrap();
+            } else {
+                std::fs::write(&path, head).unwrap();
+            }
+            let before = crate::engine::git_cli::spawn_log::spawns_in(&root).len();
+            let kind = detect_kind(&root).unwrap();
+            assert_eq!(
+                crate::engine::git_cli::spawn_log::spawns_in(&root).len(),
+                before,
+                "{probe}: reading the kind started a process"
+            );
+            let full = detect(&root).unwrap().map(|op| op.kind);
+            assert!(kind.is_some(), "{probe} was not classified");
+            assert_eq!(kind, full, "{probe}");
+            std::fs::remove_dir_all(&path)
+                .or_else(|_| std::fs::remove_file(&path))
+                .unwrap();
+        }
+        assert_eq!(detect_kind(&root).unwrap(), None);
+    }
+
+    fn head_ref_of(repo: &Path) -> (Option<String>, Vec<String>) {
+        // A merge reads no control file, so no path is consulted.
+        let paths: Vec<PathBuf> = Vec::new();
+        let mut warnings = Vec::new();
+        let head = head_ref_for(repo, OperationKind::Merge, &paths, &mut warnings);
+        (head, warnings)
+    }
+
+    #[test]
+    fn head_ref_names_the_checked_out_branch_without_warning() {
+        let repo = crate::test_support::git_repo();
+        let root = repo.path().canonicalize().unwrap();
+        assert_eq!(head_ref_of(&root), (Some("main".to_string()), Vec::new()));
+    }
+
+    #[test]
+    fn a_detached_head_is_no_branch_and_no_warning() {
+        use crate::test_support::git_in;
+        let repo = crate::test_support::git_repo();
+        let root = repo.path().canonicalize().unwrap();
+        git_in(&root, &["commit", "--allow-empty", "-q", "-m", "base"]);
+        git_in(&root, &["checkout", "-q", "--detach"]);
+        assert_eq!(head_ref_of(&root), (None, Vec::new()));
+    }
+
+    /// A HEAD that could not be read is not a detached HEAD: the label stays
+    /// empty but the report says the read failed.
+    #[test]
+    fn a_failed_head_read_is_reported_not_taken_for_detached() {
+        let dir = tempfile::tempdir().unwrap();
+        let (head, warnings) = head_ref_of(dir.path());
+        assert_eq!(head, None);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings[0].contains("cannot read the checked-out branch"),
+            "{warnings:?}"
+        );
     }
 }

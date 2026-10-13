@@ -2,6 +2,7 @@
 // and its grammars; everything above it — the model types, language detection,
 // go.mod parsing, the ignore rules — does not, and is what a *query* consumer
 // actually uses.
+pub mod androidmanifest;
 pub mod cache;
 pub mod clonesig;
 #[cfg(feature = "parse")]
@@ -14,7 +15,9 @@ mod entry_names;
 pub mod embedded;
 pub mod fallback;
 pub mod frameworks;
+pub mod gofacts;
 pub mod gomod;
+pub mod gradle;
 #[cfg(feature = "parse")]
 pub mod heritage;
 #[cfg(feature = "parse")]
@@ -22,6 +25,7 @@ pub mod langcalls;
 #[cfg(feature = "parse")]
 pub(crate) mod langdecl;
 pub mod rustsig;
+pub mod swifttargets;
 // Takes a `tree_sitter::Node` for the same reason `langimports` does, and is
 // called from the same seam.
 #[cfg(feature = "parse")]
@@ -44,6 +48,7 @@ mod git_metadata;
 pub mod paths;
 pub mod progress;
 pub mod safe_fs;
+pub mod secret;
 /// The bounded subprocess runner, re-exported at the path its callers have
 /// always used by the kernel crates. The implementation lives in `dc-proc`
 /// because nothing in this crate uses it, and `dc-verify` and `dc-regress`
@@ -68,13 +73,20 @@ mod returns;
 // The type a Rust local has where its own binder states it. Walks a parse
 // tree; its one caller is `treesitter::collect_site_bindings`.
 #[cfg(feature = "parse")]
-mod rustlocal;
-#[cfg(feature = "parse")]
 mod literals;
+pub mod pyproject;
+#[cfg(feature = "parse")]
+mod rustlocal;
+// The names a Swift callable binds and the types it writes for them. Walks a
+// parse tree; its callers are `treesitter::collect_site_bindings` and
+// `treesitter::collect_scope_locals`.
+#[cfg(feature = "parse")]
+mod swiftscope;
 #[cfg(feature = "parse")]
 pub mod treesitter;
 pub mod tsconfig;
 pub mod wiring;
+pub mod workspaces;
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -86,7 +98,8 @@ use rayon::prelude::*;
 
 pub use gomod::{
     collect_go_modules, collect_project_manifests, git_worktree_root, go_dirs_with_unindexed_files,
-    parse_go_mod, GoModule, ProjectManifests,
+    parse_cargo_crate_names, parse_go_mod, GoModule, GradleSettings, ProjectManifests,
+    RustCrateManifest,
 };
 pub use languages::{
     declared_language_ids, detect_language, is_default_index_excluded, is_ignored_path,
@@ -97,6 +110,7 @@ pub use paths::{
     code_graph_path, compact_code_graph_path, content_cache_path, plugin_dir, repo_map_path,
     state_dir, store_path, workspace_path,
 };
+pub use swifttargets::SwiftTarget;
 #[cfg(feature = "parse")]
 pub use treesitter::{extract_treesitter, linked_grammar_count, linked_grammar_keys};
 
@@ -401,12 +415,53 @@ pub fn content_hash(source: &str) -> u64 {
         })
 }
 
-/// Evaluate Git ignore rules the same way `WalkBuilder` does for a cold build.
+/// The one configuration of the tree walk, and so the one statement of which
+/// rule files decide "is this path excluded".
 ///
-/// `WalkBuilder.git_ignore(true)` reads `.gitignore` from the git worktree
-/// root down, including parents of `root` when the build is rooted in a
-/// subdirectory. The watcher must use this same stack or incremental
-/// generations admit files the next cold build drops.
+/// Every walk of the tree builds from this — the cold walk and the status
+/// freshness walk ([`scan_tree`]) and the manifest walk
+/// ([`collect_project_manifests`]) — and [`is_gitignored`], which the watcher
+/// asks per event, evaluates exactly these sources with exactly this
+/// precedence. Spelled out rather than left at the crate's defaults, because
+/// the defaults were the problem: the walk honoured `.ignore` files and
+/// `core.excludesFile` by default while the watcher, written against a
+/// reading of "gitignore rules", honoured neither — so a file named in
+/// `.ignore` was dropped by every `devmap build` and re-added by the next
+/// watcher event, forever, and `status` never settled.
+///
+/// The decision is that **everyone honours all four**, in the walk's order:
+///
+/// 1. `.ignore` in the path's directory or any ancestor, deepest first — the
+///    ripgrep/fd convention, read whether or not the tree is a git repository;
+/// 2. `.gitignore` from the path's directory up to the git worktree root;
+/// 3. the repository's `info/exclude` (the common directory's, in a worktree);
+/// 4. git's global excludes file (`core.excludesFile`, honouring
+///    `GIT_CONFIG_GLOBAL`, else `$XDG_CONFIG_HOME/git/ignore`).
+///
+/// The first kind with any match decides, whitelist or ignore. 2–4 apply only
+/// inside a git repository, as git itself applies them. A directory a rule
+/// excludes takes everything under it along. `.rgignore` and other
+/// tool-specific files are honoured by no one.
+pub fn walk_builder(root: &Path) -> ignore::WalkBuilder {
+    let mut builder = ignore::WalkBuilder::new(root);
+    builder
+        .hidden(false)
+        .parents(true)
+        .ignore(true)
+        .git_ignore(true)
+        .git_exclude(true)
+        .git_global(true)
+        .require_git(true);
+    builder
+}
+
+/// Evaluate the ignore rules the same way [`walk_builder`]'s walk does.
+///
+/// The watcher must use this same stack or incremental generations admit files
+/// the next cold build drops — which is not hypothetical: it read only
+/// `info/exclude` and the `.gitignore` chain while the walk also read `.ignore`
+/// and the global excludes file, and a `.ignore`d `skipme.ts` flapped in and
+/// out of the graph on every edit.
 ///
 /// "The same way" includes **tolerating the same broken files**. A rule file
 /// is not all-or-nothing: `GitignoreBuilder::add` compiles every line it can
@@ -438,22 +493,52 @@ pub fn is_gitignored_reporting(
     is_dir: bool,
 ) -> anyhow::Result<(bool, Vec<String>)> {
     let path_abs = path_under_root(root, path)?;
-    let (matchers, problems) = ignore_matchers_for(root, &path_abs, is_dir)?;
-    Ok((
-        matches_ignore(&matchers, &path_abs, is_dir).unwrap_or(false),
-        problems,
-    ))
+    let root_abs = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    let mut problems = Vec::new();
+    let mut matchers = Vec::new();
+    for rule in ignore_rule_sources(root, &path_abs, is_dir)? {
+        if let Some(matcher) = compile_ignore_rules(&mut problems, &rule)? {
+            matchers.push((rule, matcher));
+        }
+    }
+    // The walk never tests its root, and prunes every directory under it that
+    // a rule excludes — so a path is excluded when it, or any directory
+    // between the root and it, is.
+    let mut candidates: Vec<(PathBuf, bool)> = path_abs
+        .ancestors()
+        .skip(1)
+        .take_while(|ancestor| ancestor.starts_with(&root_abs) && *ancestor != root_abs)
+        .map(|ancestor| (ancestor.to_path_buf(), true))
+        .collect();
+    candidates.reverse();
+    candidates.push((path_abs.clone(), is_dir));
+    let ignored = candidates.iter().any(|(candidate, candidate_is_dir)| {
+        walk_verdict(&matchers, candidate, *candidate_is_dir).is_ignore()
+    });
+    Ok((ignored, problems))
 }
 
-/// Ignore-rule files that affect `path`, from the git worktree root (or `root`
-/// when there is no git metadata) down to the path. Watcher cache stamps use
-/// this list so a parent `.gitignore` edit invalidates verdicts.
+/// Every rule file [`is_gitignored`] reads for `path`, existing or not.
+///
+/// Watcher cache stamps use this list, so an edit to any of them — a parent
+/// `.gitignore`, a `.ignore`, `info/exclude`, the global excludes file that
+/// lives outside the watched tree — invalidates the verdicts it backed.
 pub fn ignore_rule_files(root: &Path, path: &Path, is_dir: bool) -> anyhow::Result<Vec<PathBuf>> {
     let path_abs = path_under_root(root, path)?;
-    Ok(ignore_rule_bases(root, &path_abs, is_dir)?
+    Ok(ignore_rule_sources(root, &path_abs, is_dir)?
         .into_iter()
-        .map(|(_, rules)| rules)
+        .map(|rule| rule.path)
         .collect())
+}
+
+/// Whether `path` names a rule file [`walk_builder`]'s walk reads: a
+/// `.gitignore` or `.ignore` anywhere, a repository's `info/exclude`, or the
+/// global excludes file. What the watcher clears its verdict cache on.
+pub fn is_ignore_rule_file(path: &Path) -> bool {
+    path.file_name()
+        .is_some_and(|name| name == ".gitignore" || name == ".ignore")
+        || path.ends_with("info/exclude")
+        || ignore::gitignore::gitconfig_excludes_path().is_some_and(|global| global == path)
 }
 
 fn path_under_root(root: &Path, path: &Path) -> anyhow::Result<PathBuf> {
@@ -470,58 +555,79 @@ fn path_under_root(root: &Path, path: &Path) -> anyhow::Result<PathBuf> {
     Ok(path_abs)
 }
 
-fn ignore_rule_bases(
-    root: &Path,
-    path: &Path,
-    is_dir: bool,
-) -> anyhow::Result<Vec<(PathBuf, PathBuf)>> {
-    let git_root = git_worktree_root(root)
-        .or_else(|| root.canonicalize().ok())
-        .unwrap_or_else(|| root.to_path_buf());
+/// The four kinds of rule file, in the order the walk lets them decide.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum RuleKind {
+    Ignore,
+    GitIgnore,
+    GitExclude,
+    Global,
+}
+
+#[derive(Debug, Clone)]
+struct RuleSource {
+    kind: RuleKind,
+    /// The directory the file's patterns are relative to.
+    base: PathBuf,
+    path: PathBuf,
+}
+
+fn ignore_rule_sources(root: &Path, path: &Path, is_dir: bool) -> anyhow::Result<Vec<RuleSource>> {
     let path_abs = if path.is_absolute() {
         path.to_path_buf()
     } else {
         root.join(path)
     };
     let path_abs = path_abs.canonicalize().unwrap_or(path_abs);
-    let git_root = git_root.canonicalize().unwrap_or(git_root);
-    let rel = path_abs
-        .strip_prefix(&git_root)
-        .unwrap_or(path_abs.as_path());
-    let parent = if is_dir {
-        rel
+    let directory = if is_dir {
+        path_abs.as_path()
     } else {
-        rel.parent().unwrap_or_else(|| Path::new(""))
+        path_abs.parent().unwrap_or_else(|| Path::new("/"))
     };
+    // Shallowest first; `walk_verdict` reads them deepest first.
+    let mut directories: Vec<&Path> = directory.ancestors().collect();
+    directories.reverse();
 
+    let mut rules: Vec<RuleSource> = directories
+        .iter()
+        .map(|dir| RuleSource {
+            kind: RuleKind::Ignore,
+            base: dir.to_path_buf(),
+            path: dir.join(".ignore"),
+        })
+        .collect();
+    let Some(git_root) = git_worktree_root(root) else {
+        // `require_git`: outside a repository only `.ignore` applies.
+        return Ok(rules);
+    };
+    let git_root = git_root.canonicalize().unwrap_or(git_root);
+    rules.extend(
+        directories
+            .iter()
+            .filter(|dir| dir.starts_with(&git_root))
+            .map(|dir| RuleSource {
+                kind: RuleKind::GitIgnore,
+                base: dir.to_path_buf(),
+                path: dir.join(".gitignore"),
+            }),
+    );
     let exclude = git_metadata(&git_root)?.map_or_else(
         || git_root.join(".git/info/exclude"),
         |metadata| metadata.common_dir.join("info/exclude"),
     );
-    let mut rules = vec![
-        (git_root.clone(), exclude),
-        (git_root.clone(), git_root.join(".gitignore")),
-    ];
-    let mut current = git_root;
-    for component in parent.components() {
-        current.push(component.as_os_str());
-        rules.push((current.clone(), current.join(".gitignore")));
+    rules.push(RuleSource {
+        kind: RuleKind::GitExclude,
+        base: git_root.clone(),
+        path: exclude,
+    });
+    if let Some(global) = ignore::gitignore::gitconfig_excludes_path() {
+        rules.push(RuleSource {
+            kind: RuleKind::Global,
+            base: git_root,
+            path: global,
+        });
     }
     Ok(rules)
-}
-
-fn ignore_matchers_for(
-    root: &Path,
-    path: &Path,
-    is_dir: bool,
-) -> anyhow::Result<(Vec<ignore::gitignore::Gitignore>, Vec<String>)> {
-    let bases = ignore_rule_bases(root, path, is_dir)?;
-    let mut matchers = Vec::new();
-    let mut problems = Vec::new();
-    for (base, rules) in &bases {
-        add_ignore_rules(&mut matchers, &mut problems, base, rules)?;
-    }
-    Ok((matchers, problems))
 }
 
 /// Compile one rule file into a matcher, keeping every line that is valid.
@@ -533,46 +639,75 @@ fn ignore_matchers_for(
 /// and no rule applies, which is again what the cold walker does. Neither case
 /// may abort the evaluation: an ignore verdict that fails is a verdict the
 /// watcher reads as "ignored", so one typo would freeze the whole index.
-fn add_ignore_rules(
-    matchers: &mut Vec<ignore::gitignore::Gitignore>,
+fn compile_ignore_rules(
     problems: &mut Vec<String>,
-    base: &Path,
-    rules: &Path,
-) -> anyhow::Result<()> {
-    if !rules.is_file() {
-        return Ok(());
+    rule: &RuleSource,
+) -> anyhow::Result<Option<ignore::gitignore::Gitignore>> {
+    if !rule.path.is_file() {
+        return Ok(None);
     }
-    let mut builder = ignore::gitignore::GitignoreBuilder::new(base);
-    if let Some(error) = builder.add(rules) {
+    let mut builder = ignore::gitignore::GitignoreBuilder::new(&rule.base);
+    if let Some(error) = builder.add(&rule.path) {
         problems.push(format!(
-            "ignore rules {rules:?} are partly unusable and those lines are not \
-             being applied: {error}"
+            "ignore rules {:?} are partly unusable and those lines are not \
+             being applied: {error}",
+            rule.path
         ));
     }
-    matchers.push(builder.build()?);
-    Ok(())
+    Ok(Some(builder.build()?))
 }
 
-fn matches_ignore(
-    matchers: &[ignore::gitignore::Gitignore],
+/// One entry's verdict under the walk's precedence: per kind, the deepest rule
+/// file with any match for the entry; across kinds, the first kind that has
+/// one. Mirrors `ignore::dir::Ignore::matched_ignore`, which is not public.
+fn walk_verdict(
+    matchers: &[(RuleSource, ignore::gitignore::Gitignore)],
     path: &Path,
     is_dir: bool,
-) -> Option<bool> {
-    let mut ignored = None;
-    for matcher in matchers {
-        let relative = path.strip_prefix(matcher.path()).unwrap_or(path);
-        let matched = matcher.matched_path_or_any_parents(relative, is_dir);
-        if matched.is_ignore() {
-            ignored = Some(true);
-        } else if matched.is_whitelist() {
-            ignored = Some(false);
+) -> ignore::Match<()> {
+    for kind in [
+        RuleKind::Ignore,
+        RuleKind::GitIgnore,
+        RuleKind::GitExclude,
+        RuleKind::Global,
+    ] {
+        // A directory's own rule file governs what is *inside* it, not the
+        // directory itself; the global and exclude files have no such scope.
+        let mut applicable: Vec<&(RuleSource, ignore::gitignore::Gitignore)> = matchers
+            .iter()
+            .filter(|(rule, _)| rule.kind == kind)
+            .filter(|(rule, _)| {
+                matches!(kind, RuleKind::GitExclude | RuleKind::Global)
+                    || (path.starts_with(&rule.base) && path != rule.base)
+            })
+            .collect();
+        applicable.sort_by_key(|(rule, _)| std::cmp::Reverse(rule.base.components().count()));
+        for (_, matcher) in applicable {
+            match matcher.matched(path, is_dir) {
+                ignore::Match::None => {}
+                ignore::Match::Ignore(_) => return ignore::Match::Ignore(()),
+                ignore::Match::Whitelist(_) => return ignore::Match::Whitelist(()),
+            }
         }
     }
-    ignored
+    ignore::Match::None
+}
+
+/// Extracts one file, with the values of a secret file withheld.
+///
+/// Every engine below — refusal, notebook, tree-sitter and its fallbacks —
+/// returns through here, so [`secret::withhold_secret_values`] runs once on
+/// whatever came back, before the extraction reaches the cache, the store or
+/// a query.
+#[cfg(feature = "parse")]
+pub fn extract_file(path: &str, source: &str) -> Extraction {
+    let mut extraction = extract_file_unfiltered(path, source);
+    secret::withhold_secret_values(&mut extraction);
+    extraction
 }
 
 #[cfg(feature = "parse")]
-pub fn extract_file(path: &str, source: &str) -> Extraction {
+fn extract_file_unfiltered(path: &str, source: &str) -> Extraction {
     if source.len() as u64 > MAX_SOURCE_BYTES {
         return treesitter::refused_extraction(
             path,
@@ -584,6 +719,27 @@ pub fn extract_file(path: &str, source: &str) -> Extraction {
                 MAX_SOURCE_BYTES
             ),
         );
+    }
+    // An Android manifest is data the framework reads, not source: the
+    // components it names are entry points, and a manifest the reader cannot
+    // read is a recorded failure, not "no components" (which would silently
+    // un-exempt every one of them).
+    if androidmanifest::is_android_manifest(path) {
+        return match androidmanifest::parse_components(source) {
+            Ok(_) => treesitter::skipped_extraction(
+                path,
+                "config",
+                source,
+                "not parsed as source: an Android manifest, read for the components it declares"
+                    .to_string(),
+            ),
+            Err(reason) => treesitter::refused_extraction(
+                path,
+                "config",
+                source,
+                format!("AndroidManifest.xml could not be read: {reason}"),
+            ),
+        };
     }
     // Notebooks divert here rather than inside `extract_treesitter`, because
     // what they need is not a different grammar but a different *source*: the
@@ -866,7 +1022,8 @@ impl ScannedTree {
     }
 
     /// Like [`Self::file_delta`], and collect up to `sample_cap` differing paths
-    /// (added, then changed, then removed) so a status surface can name them.
+    /// (added, then changed, then removed or over the limit) so a status
+    /// surface can name them.
     pub fn file_delta_with_samples(
         &self,
         previous: &BTreeMap<String, u64>,
@@ -893,9 +1050,18 @@ impl ScannedTree {
                 }
             }
         }
+        let over_limit: std::collections::BTreeSet<&str> = self
+            .report
+            .over_limit()
+            .map(|(path, _, _)| path.as_str())
+            .collect();
         for path in previous.keys() {
             if !current.contains_key(path.as_str()) {
-                delta.removed += 1;
+                if over_limit.contains(path.as_str()) {
+                    delta.over_limit += 1;
+                } else {
+                    delta.removed += 1;
+                }
                 push(path);
             }
         }
@@ -1075,9 +1241,7 @@ fn walk_candidates(root: &Path) -> anyhow::Result<(Vec<(String, PathBuf)>, Disco
     let unreadable_writer = std::sync::Arc::clone(&unreadable);
     let walk_root = root.to_path_buf();
     let pruned_writer = std::sync::Arc::clone(&pruned);
-    let walker = ignore::WalkBuilder::new(root)
-        .hidden(false)
-        .git_ignore(true)
+    let walker = walk_builder(root)
         .filter_entry(move |entry| {
             if !entry.file_type().is_some_and(|kind| kind.is_dir()) {
                 return true;
@@ -1186,6 +1350,21 @@ fn walk_candidates(root: &Path) -> anyhow::Result<(Vec<(String, PathBuf)>, Disco
             continue;
         };
         let rel_str = rel_str.replace('\\', "/");
+        // A symlinked *directory* that leaves the repository is refused before
+        // the source gate, not after it. The gate asks whether a path's name is
+        // a source file's, and `crates/dc-verify` is not — so a link to a whole
+        // crate outside the tree was filed `NonSource`, the ordinary skip, and
+        // every symbol under it was absent with `discovery_refused: 0` and
+        // `search` answering "Available, 0" for a function that exists. The
+        // walk never descends a link, so nothing else accounts for those
+        // files. A directory the index never walks anyway — `node_modules`,
+        // a build output — is still the ordinary case, by `is_ignored_path`.
+        if let Err(reason @ DiscoverySkipReason::EscapesRoot { .. }) = &candidate {
+            if !is_ignored_path(&rel_str) && fs::metadata(p).is_ok_and(|target| target.is_dir()) {
+                report.skipped_paths.push((rel_str, reason.clone()));
+                continue;
+            }
+        }
         if !is_indexable_source(&rel_str) {
             report
                 .skipped_paths

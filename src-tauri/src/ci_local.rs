@@ -593,7 +593,12 @@ pub fn plan_ci_with_affected(repo_root: &Path, seeds: &[String]) -> CiPlan {
         );
     }
     let repo_str = repo_root.to_string_lossy();
-    let affected = crate::codeintel::affected_tests(&repo_str, seeds, None, None);
+    let affected = crate::codeintel::affected_tests(
+        &repo_str,
+        seeds,
+        None,
+        crate::codeintel::WalkBounds::default(),
+    );
     plan_ci_from_affected(repo_root, seeds, &affected)
 }
 
@@ -716,6 +721,9 @@ pub fn run_ci_local(repo_path: &str) -> Result<CiLocalReport, String> {
 }
 
 fn finish_run(repo: &Path, plan: CiPlan, started: Instant) -> CiLocalReport {
+    // The tree the steps are about to test, read before they run: the note
+    // below attests to this commit, not to whatever HEAD is minutes later.
+    let tested = TestedTree::capture(repo);
     let test_scope = plan.test_scope.clone();
     let results = run_plan(plan.steps, |step| {
         let step_started = Instant::now();
@@ -765,7 +773,7 @@ fn finish_run(repo: &Path, plan: CiPlan, started: Instant) -> CiLocalReport {
         u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
         test_scope,
     );
-    let (recorded_commit, not_recorded_reason) = record_verification(repo, &report);
+    let (recorded_commit, not_recorded_reason) = record_verification(repo, &report, &tested);
     report.recorded_commit = recorded_commit;
     report.not_recorded_reason = not_recorded_reason;
     report
@@ -850,10 +858,31 @@ fn working_tree_is_dirty(repo: &Path) -> Result<bool, String> {
     Ok(!out.trim().is_empty())
 }
 
-/// Records a completed run as a verification note on HEAD.
+/// The commit and cleanliness of the checkout a run is about to test.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TestedTree {
+    head: String,
+    dirty: bool,
+}
+
+impl TestedTree {
+    /// `Err` when either question could not be answered, which is never the
+    /// same as an answer: a note must not be written on a check that did not run.
+    fn capture(repo: &Path) -> Result<Self, String> {
+        let dirty = working_tree_is_dirty(repo)?;
+        let head = git_text(repo, &["rev-parse", "HEAD"])
+            .map_err(|e| format!("could not resolve HEAD: {e}"))?
+            .trim()
+            .to_string();
+        Ok(Self { head, dirty })
+    }
+}
+
+/// Records a completed run as a verification note on the commit it tested.
 ///
-/// Returns the commit the note landed on, or the reason no note was written.
-/// Exactly one of the two is non-empty.
+/// `tested` is the checkout as it was *before* the run. Returns the commit the
+/// note landed on, or the reason no note was written. Exactly one of the two
+/// is non-empty.
 ///
 /// # Why a dirty tree is refused
 ///
@@ -863,12 +892,24 @@ fn working_tree_is_dirty(repo: &Path) -> Result<bool, String> {
 /// survive into every clone of the repository, long after the uncommitted
 /// changes that produced it were gone. Untracked files are excluded from the
 /// check: they are not part of any tree, so they cannot make HEAD's tree a lie.
-fn record_verification(repo: &Path, report: &CiLocalReport) -> (String, String) {
+///
+/// # Why the state is read before the run
+///
+/// The run takes minutes. HEAD read afterwards names whatever was checked out
+/// by then, and a note on that commit claims a pass nothing observed. So the
+/// commit and cleanliness are captured up front and re-read after: if either
+/// moved while the steps ran, the run tested something that is no longer the
+/// checkout, and no note is written.
+fn record_verification(
+    repo: &Path,
+    report: &CiLocalReport,
+    tested: &Result<TestedTree, String>,
+) -> (String, String) {
     let repo_str = repo.to_string_lossy().to_string();
 
-    match working_tree_is_dirty(repo) {
-        Err(e) => return (String::new(), e),
-        Ok(true) => {
+    let tested = match tested {
+        Err(e) => return (String::new(), e.clone()),
+        Ok(tested) if tested.dirty => {
             return (
                 String::new(),
                 "not recorded: the working tree has uncommitted changes, so this run \
@@ -876,13 +917,21 @@ fn record_verification(repo: &Path, report: &CiLocalReport) -> (String, String) 
                     .to_string(),
             )
         }
-        Ok(false) => {}
-    }
-
-    let head = match git_text(repo, &["rev-parse", "HEAD"]) {
-        Err(e) => return (String::new(), format!("could not resolve HEAD: {e}")),
-        Ok(out) => out.trim().to_string(),
+        Ok(tested) => tested,
     };
+    match TestedTree::capture(repo) {
+        Err(e) => return (String::new(), e),
+        Ok(now) if now != *tested => {
+            return (
+                String::new(),
+                "not recorded: the checkout changed while the run was in progress, so the \
+                 run did not test what is checked out now"
+                    .to_string(),
+            )
+        }
+        Ok(_) => {}
+    }
+    let head = tested.head.clone();
 
     let note = crate::engine::provenance::VerificationNote {
         verdict: run_verdict(report).to_string(),
@@ -1569,7 +1618,8 @@ mod verification_note_tests {
         let dir = repo();
         let r = report(&[("Frontend unit tests", "passed"), ("Clippy", "passed")]);
 
-        let (commit, reason) = record_verification(dir.path(), &r);
+        let (commit, reason) =
+            record_verification(dir.path(), &r, &TestedTree::capture(dir.path()));
         assert_eq!(reason, "", "a clean tree has no reason to refuse");
         assert_eq!(commit, head(dir.path()));
 
@@ -1593,7 +1643,8 @@ mod verification_note_tests {
         std::fs::write(dir.path().join("a.txt"), "changed\n").unwrap();
 
         let r = report(&[("Frontend unit tests", "passed")]);
-        let (commit, reason) = record_verification(dir.path(), &r);
+        let (commit, reason) =
+            record_verification(dir.path(), &r, &TestedTree::capture(dir.path()));
 
         assert_eq!(commit, "", "nothing may be recorded");
         assert!(
@@ -1619,7 +1670,11 @@ mod verification_note_tests {
         let dir = repo();
         std::fs::write(dir.path().join("scratch.log"), "noise\n").unwrap();
 
-        let (commit, reason) = record_verification(dir.path(), &report(&[("Tests", "passed")]));
+        let (commit, reason) = record_verification(
+            dir.path(),
+            &report(&[("Tests", "passed")]),
+            &TestedTree::capture(dir.path()),
+        );
         assert_eq!(reason, "");
         assert_eq!(commit, head(dir.path()));
     }
@@ -1629,7 +1684,8 @@ mod verification_note_tests {
         let dir = repo();
         let r = report(&[("Tests", "failed"), ("Clippy", "skipped")]);
 
-        let (commit, reason) = record_verification(dir.path(), &r);
+        let (commit, reason) =
+            record_verification(dir.path(), &r, &TestedTree::capture(dir.path()));
         assert_eq!(reason, "");
         let note = crate::engine::provenance::read_verification_note(
             dir.path().to_str().unwrap(),
@@ -1650,7 +1706,7 @@ mod verification_note_tests {
     fn the_note_carries_step_names_and_statuses_never_their_output() {
         let dir = repo();
         let r = report(&[("Tests", "failed")]);
-        let (commit, _) = record_verification(dir.path(), &r);
+        let (commit, _) = record_verification(dir.path(), &r, &TestedTree::capture(dir.path()));
 
         let note = crate::engine::provenance::read_verification_note(
             dir.path().to_str().unwrap(),
@@ -1697,9 +1753,56 @@ mod verification_note_tests {
     fn an_unanswerable_cleanliness_check_refuses_to_record() {
         let dir = tempfile::tempdir().expect("tempdir");
         // A directory, but not a repository: `git status` fails here.
-        let (commit, reason) = record_verification(dir.path(), &report(&[("Tests", "passed")]));
+        let (commit, reason) = record_verification(
+            dir.path(),
+            &report(&[("Tests", "passed")]),
+            &TestedTree::capture(dir.path()),
+        );
         assert_eq!(commit, "");
         assert!(!reason.is_empty(), "the failure must explain itself");
         assert!(working_tree_is_dirty(dir.path()).is_err());
+    }
+
+    /// The run takes minutes; HEAD read afterwards names whatever is checked
+    /// out by then. A note on a commit the steps never saw is a false pass.
+    #[test]
+    fn a_head_that_moved_during_the_run_is_not_recorded() {
+        let dir = repo();
+        let before = TestedTree::capture(dir.path());
+        let tested = head(dir.path());
+        std::fs::write(dir.path().join("a.txt"), "two\n").unwrap();
+        crate::test_support::git_in(dir.path(), &["add", "-A"]);
+        crate::test_support::git_in(dir.path(), &["commit", "-q", "-m", "c1"]);
+        let moved = head(dir.path());
+        assert_ne!(tested, moved, "the fixture must move HEAD");
+
+        let (commit, reason) =
+            record_verification(dir.path(), &report(&[("Tests", "passed")]), &before);
+
+        assert_eq!(commit, "", "no note may be written on the moved HEAD");
+        assert!(reason.contains("changed while the run"), "got {reason:?}");
+        for sha in [&tested, &moved] {
+            assert_eq!(
+                crate::engine::provenance::read_verification_note(
+                    dir.path().to_str().unwrap(),
+                    sha
+                )
+                .expect("read"),
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn a_tree_dirtied_during_the_run_is_not_recorded() {
+        let dir = repo();
+        let before = TestedTree::capture(dir.path());
+        std::fs::write(dir.path().join("a.txt"), "edited mid-run\n").unwrap();
+
+        let (commit, reason) =
+            record_verification(dir.path(), &report(&[("Tests", "passed")]), &before);
+
+        assert_eq!(commit, "");
+        assert!(reason.contains("changed while the run"), "got {reason:?}");
     }
 }

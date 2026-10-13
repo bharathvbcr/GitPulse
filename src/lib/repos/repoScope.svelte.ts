@@ -31,7 +31,7 @@ export interface RepoScope {
  * it, and never on mount: the initial state is the mounted state.
  *
  * Call from component initialisation. `activePath` is read inside the effect,
- * so passing `() => $repoStore.currentPath` makes the change tracked; `reset`
+ * so passing `() => $currentRepoPath` (a value-compared store, so unrelated publishes do not wake it) makes the change tracked; `reset`
  * runs untracked, so writing `$state` in it cannot loop.
  */
 export function repoScope(

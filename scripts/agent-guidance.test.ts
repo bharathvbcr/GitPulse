@@ -1,4 +1,4 @@
-import { readdirSync, readFileSync } from "node:fs";
+import { readFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { describe, expect, it } from "vitest";
 import { AGENT_COPY_COMPLETION, AGENT_GUIDANCE_SECTION as GUIDANCE } from "../src/lib/workbench/taskCompose";
@@ -83,11 +83,26 @@ it("does not ship GitNexus skills under .claude/skills", () => {
  * listed here, so adding or renaming a skill fails this test instead of
  * quietly leaving the preamble a version behind.
  */
-const skillNames = (dir: string): string[] =>
-  readdirSync(new URL(`../${dir}`, import.meta.url), { withFileTypes: true })
-    .filter((entry) => entry.isDirectory())
-    .map((entry) => entry.name)
-    .sort();
+const skillNames = (dir: string): string[] => {
+  // Ask git, not the filesystem: ignored local skills (.agents/skills/<private>)
+  // exist on one machine and in no clone, and must not decide this contract.
+  const listed = spawnSync("git", ["ls-files", "-z", "--", dir], {
+    cwd: new URL("..", import.meta.url),
+    encoding: "utf8",
+    timeout: 5_000,
+  });
+  expect(listed.error, "git ls-files could not run").toBeUndefined();
+  expect(listed.status, `git ls-files ${dir} failed`).toBe(0);
+  const prefix = `${dir}/`;
+  return [
+    ...new Set(
+      listed.stdout
+        .split("\0")
+        .filter((path) => path.startsWith(prefix) && path.split("/").length > 3)
+        .map((path) => path.slice(prefix.length).split("/")[0]),
+    ),
+  ].sort();
+};
 const bundledSkills = [...skillNames(".agents/skills"), ...skillNames("plugins/gitpulse/skills")];
 /** "devmap" must match on its own, not inside "devmap-impact". */
 const namesWhole = (haystack: string, needle: string): boolean =>

@@ -4,17 +4,20 @@ package gussetcheck
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
 	"github.com/bharathvbcr/DevCouncil/backend/go_orchestrator/gussetfn"
 )
 
-func TestRun(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	if err := Run(ctx); err != nil {
-		t.Fatal(err)
+func TestClassifyMapsUnsupportedToCouldNotRun(t *testing.T) {
+	err := classify(gussetfn.ErrUnsupported)
+	if !errors.Is(err, ErrUnsupported) || !errors.Is(err, gussetfn.ErrUnsupported) {
+		t.Fatalf("classify(ErrUnsupported) = %v, want ErrUnsupported wrapping the engine's", err)
+	}
+	if classify(nil) != nil {
+		t.Fatal("classify(nil) must stay nil")
 	}
 }
 
@@ -24,8 +27,8 @@ func TestSelfTestProvesTheFirewall(t *testing.T) {
 	if err := SelfTest(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if err := Run(ctx); err != nil {
-		t.Fatalf("Run after SelfTest: %v", err)
+	if err := classify(gussetfn.Check(ctx)); err != nil {
+		t.Fatalf("Check after SelfTest: %v", err)
 	}
 }
 

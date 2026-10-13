@@ -42,6 +42,13 @@ export interface CommitDetails {
    */
   files_total_count?: number;
   files_list_truncated?: boolean;
+  /**
+   * Present when git's own output was cut at the backend's byte budget (a
+   * clause such as "git output exceeded 4 MB"). Everything derived from the
+   * file records is then a lower bound: the list, the count and the +/-
+   * totals. Absent when git was read to the end.
+   */
+  numstat_truncation_reason?: string;
 }
 
 /** A file left out of a truncated commit diff, stats only. */
@@ -52,7 +59,7 @@ export interface SkippedFileStat {
 }
 
 /** Wire shape of `cmd_get_commit_diff` (snake_case over IPC). */
-export interface DiffPayload {
+export interface GraphDiffPayload {
   content: string;
   truncated: boolean;
   included_files: number;
@@ -84,7 +91,7 @@ function coerceSkippedFiles(value: unknown): SkippedFileStat[] {
   return files;
 }
 
-function emptyDiffPayload(): DiffPayload {
+function emptyDiffPayload(): GraphDiffPayload {
   return {
     content: "",
     truncated: false,
@@ -97,13 +104,13 @@ function emptyDiffPayload(): DiffPayload {
 }
 
 /**
- * Defensively turns whatever crossed `invoke()` into a `DiffPayload`. The
+ * Defensively turns whatever crossed `invoke()` into a `GraphDiffPayload`. The
  * backend is transitioning from a bare diff string to this object, and other
  * stores still hold `string | null`-typed diff state, so every wrong shape
  * degrades to a safe default instead of throwing downstream: a legacy string
  * becomes an untruncated payload; null, arrays and other junk become empty.
  */
-export function normalizeDiffPayload(raw: unknown): DiffPayload {
+export function normalizeDiffPayload(raw: unknown): GraphDiffPayload {
   if (typeof raw === "string") {
     return { ...emptyDiffPayload(), content: raw };
   }
@@ -143,6 +150,8 @@ export interface RefDecoration {
   kind: RefKind;
   commit_id: string;
   is_head: boolean;
+  /** Owning remote of a remote-tracking ref (longest configured name). */
+  remote?: string;
 }
 
 export interface CommitGraphPayload {
@@ -236,6 +245,13 @@ interface CachedGraph {
   notices: string[];
   mainlineId: string | null;
   mainlineName: string | null;
+  /**
+   * {@link graphPayloadSignature} of the payload this entry was built from.
+   * Stored, not re-derived: a reload compares against it, and re-deriving it
+   * walked every cached row (up to the commit cap, 14 fields each) on every
+   * watcher refresh, on top of the walk over the new payload.
+   */
+  signature: string;
 }
 function emptyVisible(
   path: string | null,
@@ -331,34 +347,6 @@ export function graphPayloadSignature(payload: {
   // leave a stale count on screen.
   const notices = (payload.notices ?? []).join("\u0002");
   return `${payload.head_id ?? ""}\u0001${payload.has_more === true ? "more" : "end"}\u0001${refs}\u0001${mainline}\u0001${notices}\u0001${rows}`;
-}
-
-/**
- * One comparable string for "did the rendered history change". A watcher
- * refresh re-walks history every few seconds; on a quiet repo the payload is
- * structurally identical (fresh identities, same content) and must not
- * republish — every emission wipes the canvas strip cache and re-renders the
- * table. Delegates to {@link graphPayloadSignature} so both call sites share
- * one canonical definition of "structurally identical payload".
- */
-function cachedSignature(cache: {
-  rows: VisualCommitRow[];
-  headId: string | null;
-  refs: RefDecoration[];
-  hasMore: boolean;
-  notices: string[];
-  mainlineId: string | null;
-  mainlineName: string | null;
-}): string {
-  return graphPayloadSignature({
-    rows: cache.rows,
-    head_id: cache.headId,
-    refs: cache.refs,
-    has_more: cache.hasMore,
-    notices: cache.notices,
-    mainline_id: cache.mainlineId,
-    mainline_name: cache.mainlineName,
-  });
 }
 
 export function createGraphStore(
@@ -615,13 +603,16 @@ export function createGraphStore(
         }
 
         const previous = cache.get(repoPath);
+        // One walk over the payload per reload: the cached side was hashed
+        // when it was stored, and the new entry keeps this one.
+        const signature = graphPayloadSignature(payload);
         if (
           previous &&
           previous.query === query &&
           previous.revision === revision &&
           previous.refScope === refScope &&
           previous.maxCommits === max &&
-          cachedSignature(previous) === graphPayloadSignature(payload)
+          previous.signature === signature
         ) {
           // Identical reload: retire the flag, keep every array identity so
           // downstream caches (canvas strips) survive untouched.
@@ -657,6 +648,7 @@ export function createGraphStore(
           notices: payload.notices ?? [],
           mainlineId: payload.mainline_id ?? null,
           mainlineName: payload.mainline_name ?? null,
+          signature,
         };
         cache.set(repoPath, next);
         if (visiblePath === repoPath) {

@@ -1,4 +1,5 @@
 import { writable } from "svelte/store";
+import { createDeferredWrite, flushOnPageHide } from "../async/deferredWrite";
 import { clampTerminalFontSize, TERMINAL_FONT_DEFAULT } from "../terminal/viewControls";
 import { LAUNCHERS, type LauncherKind } from "../terminal/tabs";
 import {
@@ -528,11 +529,24 @@ function persist(prefs: InterfacePrefs) {
   }
 }
 
+/**
+ * How long a changed preference may wait before it is saved. A dock drag or a
+ * settings slider changes a preference on every pointer move; each save
+ * serializes every preference and writes it synchronously. Moves inside one
+ * window share one save, and the page-hide flush covers the window the app
+ * is closed in.
+ */
+export const INTERFACE_PERSIST_DELAY_MS = 250;
+
 function createInterfaceStore() {
-  const initial = readPrefs();
-  const { subscribe, set, update } = writable<InterfacePrefs>(initial);
+  let current = readPrefs();
+  const { subscribe, set } = writable<InterfacePrefs>(current);
+  const pendingSave = createDeferredWrite(() => persist(current), INTERFACE_PERSIST_DELAY_MS);
+  flushOnPageHide(() => pendingSave.flush());
 
   function commit(next: InterfacePrefs) {
+    pendingSave.cancel();
+    current = next;
     persist(next);
     set(next);
   }
@@ -541,20 +555,23 @@ function createInterfaceStore() {
    * Every setter is "merge these fields, then write through", so it lives in
    * one place: a setter that forgot to persist used to be a one-word typo
    * away, and each new preference no longer copies the pattern again.
+   *
+   * A patch that changes nothing is dropped before it reaches the store: a
+   * writable notifies on every object it is given, equal or not, so a drag
+   * held still — or clamped at its limit — republished the preferences to
+   * every subscriber on each pointer move.
    */
   function patch(
     changes:
       | Partial<InterfacePrefs>
       | ((prefs: InterfacePrefs) => Partial<InterfacePrefs>),
   ) {
-    update((prefs) => {
-      const next = {
-        ...prefs,
-        ...(typeof changes === "function" ? changes(prefs) : changes),
-      };
-      persist(next);
-      return next;
-    });
+    const partial = typeof changes === "function" ? changes(current) : changes;
+    const keys = Object.keys(partial) as (keyof InterfacePrefs)[];
+    if (keys.every((key) => Object.is(current[key], partial[key]))) return;
+    current = { ...current, ...partial };
+    set(current);
+    pendingSave.schedule();
   }
 
   const clampScale = (scale: number) =>
@@ -562,6 +579,8 @@ function createInterfaceStore() {
 
   return {
     subscribe,
+    /** Saves a pending change now; the page-hide handler does the same. */
+    flush: () => pendingSave.flush(),
     setAccent: (accent: AccentId) => patch({ accent }),
     setReduceMotion: (reduce: boolean) => patch({ reduceMotion: reduce }),
     setTimestampStyle: (style: TimestampStyle) => patch({ timestampStyle: style }),

@@ -80,44 +80,11 @@ pub(super) fn affected_test_tokens(test: &AffectedTest) -> u32 {
 /// Here a directory must be *exactly* a test directory, and a file must carry a
 /// recognised test affix. Recorded in `DIVERGENCES.md`: the affected-test list
 /// gets shorter and the entries that leave were never tests.
-pub fn is_test_path(path: &str) -> bool {
-    let normalized = path.replace('\\', "/");
-    let Some((directories, file_name)) = normalized.rsplit_once('/') else {
-        return is_test_file_name(&normalized);
-    };
-    let in_test_directory = directories.split('/').any(|segment| {
-        matches!(
-            segment.to_lowercase().as_str(),
-            "test" | "tests" | "spec" | "specs" | "__tests__" | "testing" | "e2e"
-        )
-    });
-    in_test_directory || is_test_file_name(file_name)
-}
-
-/// Whether a bare file name carries a test affix.
 ///
-/// Affixes only, never bare substrings, and the boundary is the point: `test`
-/// as a suffix of a *word* (`contest`, `attestation`, `latest`) is not a test
-/// affix, and `testing_utils.py` is not `test_utils.py`. The camel-case arm
-/// reads the original casing, so `FooTest.java` is recognised while `contest`
-/// is not — which is why the name is not lower-cased wholesale first.
-pub(super) fn is_test_file_name(file_name: &str) -> bool {
-    let lowered = file_name.to_lowercase();
-    let stem = file_name.split('.').next().unwrap_or(file_name);
-    let lowered_stem = lowered.split('.').next().unwrap_or(&lowered);
-    lowered.starts_with("test_")
-        || lowered.starts_with("spec_")
-        || lowered.contains(".test.")
-        || lowered.contains(".spec.")
-        || lowered.contains("_test.")
-        || lowered.contains("_spec.")
-        || lowered.contains("-test.")
-        || lowered.contains("-spec.")
-        || matches!(lowered_stem, "test" | "tests" | "spec" | "specs")
-        || stem.ends_with("Test")
-        || stem.ends_with("Tests")
-        || stem.ends_with("Spec")
-        || stem.ends_with("Specs")
+/// The rule itself is `dc_glob::is_test_path`, the one implementation held to
+/// `protocols/test-paths/v1.json`.
+pub fn is_test_path(path: &str) -> bool {
+    dc_glob::is_test_path(path)
 }
 
 /// Fold one reached symbol into the nearest-test table.
@@ -158,6 +125,7 @@ pub(super) fn unavailable_response<T>(resolution: ResolutionAvailability) -> Res
         dead_clusters: None,
         dead_clusters_truncated: 0,
         dead_clusters_incomplete: None,
+        excluded: None,
         unresolved_namesakes: None,
         scope: None,
     }
@@ -338,6 +306,7 @@ where
         dead_clusters: None,
         dead_clusters_truncated: 0,
         dead_clusters_incomplete: None,
+        excluded: None,
         unresolved_namesakes: None,
         scope: None,
     }
@@ -368,6 +337,7 @@ where
             dead_clusters: None,
             dead_clusters_truncated: 0,
             dead_clusters_incomplete: None,
+            excluded: None,
             unresolved_namesakes: None,
             scope: None,
         };
@@ -388,7 +358,27 @@ where
         dead_clusters: None,
         dead_clusters_truncated: 0,
         dead_clusters_incomplete: None,
+        excluded: None,
         unresolved_namesakes: None,
         scope: None,
+    }
+}
+
+#[cfg(test)]
+mod test_path_conformance {
+    use super::is_test_path;
+
+    /// Held to the one rule every implementation shares.
+    #[test]
+    fn is_test_path_agrees_with_every_row_of_the_shared_fixture() {
+        let rows =
+            dc_glob::parse_test_path_rows(include_str!("../../../../protocols/test-paths/v1.json"))
+                .expect("fixture");
+        let wrong: Vec<_> = rows
+            .iter()
+            .filter(|(path, expected)| is_test_path(path) != *expected)
+            .map(|(path, expected)| format!("{path} (expected {expected})"))
+            .collect();
+        assert!(wrong.is_empty(), "{wrong:?}");
     }
 }

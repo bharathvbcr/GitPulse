@@ -12,6 +12,7 @@ import {
   MAX_DEFERRED_RETRIES,
   deferredRetryDelayMs,
   isDeferredUnderLoad,
+  jitteredDelayMs,
   jitteredRetryDelayMs,
   outcomeUnknown,
   RETRY_JITTER,
@@ -87,5 +88,17 @@ describe("deferred-under-load marker", () => {
     }
     // The first retry still clears the gate's 2 s queue budget.
     expect(jitteredRetryDelayMs(1, () => 0)).toBeGreaterThan(2_000);
+  });
+
+  it("spreads any wait it is given across the jitter, and is the deferral path's own", () => {
+    const spread = [0, 0.25, 0.5, 0.75, 1].map((draw) => jitteredDelayMs(1_000, () => draw));
+    expect(spread).toEqual([1_000, 1_125, 1_250, 1_375, 1_500]);
+    expect(jitteredDelayMs(1_000, () => Number.NaN)).toBe(1_000);
+    expect(jitteredDelayMs(1_000, () => 9)).toBe(1_500);
+    for (let attempt = 1; attempt <= MAX_DEFERRED_RETRIES; attempt += 1) {
+      expect(jitteredRetryDelayMs(attempt, () => 0.4)).toBe(
+        jitteredDelayMs(deferredRetryDelayMs(attempt), () => 0.4),
+      );
+    }
   });
 });

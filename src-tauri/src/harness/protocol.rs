@@ -69,6 +69,20 @@ pub struct HelloResult {
     /// advertise the identical operation.
     #[serde(default)]
     pub managed_providers: Option<Vec<String>>,
+    /// Each served op's lane and server-side deadline. `None` means this Manvi
+    /// predates the field and did not say; it is never read as "no deadlines".
+    #[serde(default)]
+    pub op_limits: Option<std::collections::HashMap<String, OpLimit>>,
+}
+
+/// One op's lane and the deadline Manvi enforces on it.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct OpLimit {
+    #[serde(default)]
+    pub lane: String,
+    /// Zero for an op Manvi answers inline and never holds.
+    #[serde(default)]
+    pub deadline_ms: u64,
 }
 
 /// What the installed harness says about its adapter for one provider.
@@ -117,6 +131,7 @@ mod managed_adapter_tests {
             posture: "host".into(),
             managed_providers: managed
                 .map(|list| list.iter().map(|p| (*p).to_owned()).collect::<Vec<_>>()),
+            op_limits: None,
         }
     }
 
@@ -239,6 +254,7 @@ mod managed_adapter_tests {
             ops: vec![],
             posture: "host".into(),
             managed_providers: Some(many),
+            op_limits: None,
         };
         assert_eq!(hello.managed_adapter("claude"), ManagedAdapter::Present);
         assert_eq!(hello.managed_adapter("codex"), ManagedAdapter::Present);

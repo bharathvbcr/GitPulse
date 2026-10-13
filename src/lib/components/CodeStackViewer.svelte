@@ -20,7 +20,8 @@
     stackTreeRows,
     type RestackStep,
   } from "../stack/tree";
-  import { repoStore } from "../stores/repoStore";
+  import { untrack } from "svelte";
+  import { currentRepoPath, repoStore } from "../stores/repoStore";
   import { harnessStore, type Guarded } from "../stores/harnessStore";
   import { askConfirm } from "../stores/modalStore";
   import { invoke } from "../ipc/invoke";
@@ -235,40 +236,36 @@
     }
   }
 
-  // Memo guard so unrelated store emissions do not refetch: the stack
-  // reloads when the repository changes or its generation bumps (watcher
-  // refreshes, branch mutations) — nothing else.
-  let prevRepoPath: string | null = null;
-  let prevGeneration = -1;
+  // The stack reloads when the repository changes or its generation bumps
+  // (watcher refreshes, branch mutations) — nothing else. Both keys compare
+  // by value, so the store's unrelated emissions do not refetch.
+  const generation = $derived($repoStore.generation);
 
   $effect(() => {
-    const repo = $repoStore.currentPath;
-    const generation = $repoStore.generation;
-    if (!repo) {
-      prevRepoPath = null;
-      prevGeneration = -1;
-      inflight?.cancel();
-      restackGuard?.cancel();
-      payload = null;
-      loadError = null;
-      restackError = null;
-      isLoading = false;
-      return;
-    }
-    if (repo === prevRepoPath && generation === prevGeneration) return;
-    prevRepoPath = repo;
-    prevGeneration = generation;
-    // Hydrate the last-known hierarchy synchronously so a revisit renders
-    // instantly; the fetch below then refreshes it in place.
-    const cached = stackCache.get(repo);
-    if (cached) payload = cached;
-    void loadStack(repo);
-    const started = inflight;
-    return () => {
-      if (inflight === started) {
-        started?.cancel();
+    const repo = $currentRepoPath;
+    void generation;
+    return untrack(() => {
+      if (!repo) {
+        inflight?.cancel();
+        restackGuard?.cancel();
+        payload = null;
+        loadError = null;
+        restackError = null;
+        isLoading = false;
+        return undefined;
       }
-    };
+      // Hydrate the last-known hierarchy synchronously so a revisit renders
+      // instantly; the fetch below then refreshes it in place.
+      const cached = stackCache.get(repo);
+      if (cached) payload = cached;
+      void loadStack(repo);
+      const started = inflight;
+      return () => {
+        if (inflight === started) {
+          started?.cancel();
+        }
+      };
+    });
   });
 
   $effect(() => {

@@ -1,50 +1,50 @@
 use crate::model::*;
 
+/// Whether `path` is a test file for liveness.
+///
+/// The rule is `dc_glob::is_test_path`, the one implementation held to
+/// `protocols/test-paths/v1.json`. Liveness adds two things the shared rule does
+/// not say, and both are exemptions rather than a second rule:
+///
+/// * `conftest.py` and the Android `androidTest` directory, which pytest and
+///   Gradle give a meaning no path affix carries;
+/// * a dotfile is not a test for sitting in a test directory. The JVM layout
+///   used to `return true` outright, ahead of that guard, so the rule held for
+///   `tests/.eslintrc` and not for `app/src/test/.eslintrc` — the same file, one
+///   directory layout apart — and every dotfile a JVM project keeps beside its
+///   tests was annotated `TestFile`, exempting the whole file from liveness. A
+///   dotfile named like a test (`tests/.eslintrc.test.js`) still is one.
 pub fn is_test_path(path: &str) -> bool {
     let norm = path.replace('\\', "/");
-    let norm_lower = norm.to_lowercase();
     let name = norm.rsplit('/').next().unwrap_or(&norm);
-    let name_lower = name.to_lowercase();
-
-    let parts: Vec<&str> = norm_lower.split('/').collect();
-    let mut in_test_dir = parts.iter().rev().skip(1).any(|p| {
-        *p == "tests" || *p == "test" || *p == "__tests__" || *p == "spec" || *p == "androidtest"
-    });
-
-    // The Android / JVM layout, which contributes to the *directory* verdict
-    // and does not stand in for it. This used to `return true` outright, ahead
-    // of the `!name.starts_with('.')` guard below, so the rule the kernel
-    // published held for `tests/.eslintrc` and not for `app/src/test/.eslintrc`
-    // — the same file, one directory layout apart. Every dotfile a JVM project
-    // keeps beside its tests was annotated `TestFile`, which exempts the whole
-    // file from liveness.
-    //
-    // Kept as a branch rather than deleted even though the segment table above
-    // already answers `test` and `androidtest`: it mirrors
-    // `devcouncil.indexing.wiring.is_test_path`, which the parity module pins,
-    // and it is what keeps the JVM layout working if that table ever narrows.
-    if norm_lower.contains("/src/test/") || norm_lower.contains("/src/androidtest/") {
-        in_test_dir = true;
+    // A file with no extension that is merely named `test` is not an affix
+    // match: the JVM branch answers for the directory a file sits in, and
+    // `app/src/test` — a file — was once exempted from liveness as one.
+    let bare_name = !name.contains('.')
+        && matches!(
+            name.to_lowercase().as_str(),
+            "test" | "tests" | "spec" | "specs" | "androidtest"
+        );
+    if (!bare_name && dc_glob::is_test_file_name(name)) || name.eq_ignore_ascii_case("conftest.py")
+    {
+        return true;
     }
-
-    let looks_like_test = name_lower.starts_with("test_")
-        || name_lower == "conftest.py"
-        || name_lower.ends_with("_test.py")
-        || name_lower.ends_with("_test.go")
-        || name_lower.ends_with(".test.js")
-        || name_lower.ends_with(".test.ts")
-        || name_lower.ends_with(".test.jsx")
-        || name_lower.ends_with(".test.tsx")
-        || name_lower.ends_with(".spec.js")
-        || name_lower.ends_with(".spec.ts")
-        || name_lower.ends_with(".spec.jsx")
-        || name_lower.ends_with(".spec.tsx")
-        || name_lower.ends_with("_spec.rb")
-        || name.ends_with("Tests.swift")
-        || name.ends_with("Test.kt")
-        || name.ends_with("Tests.kt");
-
-    looks_like_test || (in_test_dir && !name.starts_with('.'))
+    if name.starts_with('.') {
+        return false;
+    }
+    // `testdata` is the shared rule's, and liveness answers it with its own
+    // fixture rule (`is_fixture_path`) and its own exemption reason, so it is
+    // left out here and the two never claim one file twice.
+    let directories: Vec<&str> = norm.split('/').collect();
+    let directories = &directories[..directories.len().saturating_sub(1)];
+    let outside_fixtures = directories
+        .iter()
+        .filter(|segment| !segment.eq_ignore_ascii_case("testdata"))
+        .fold(String::new(), |acc, segment| acc + segment + "/");
+    dc_glob::in_test_directory(&(outside_fixtures + name))
+        || directories
+            .iter()
+            .any(|segment| segment.eq_ignore_ascii_case("androidtest"))
 }
 
 /// Suffixes a minifier writes, and a human does not.
@@ -172,11 +172,11 @@ pub fn source_has_generated_header(source: &str) -> bool {
 /// (`devmap-analyze/src/liveness.rs`) exempts every symbol in a file carrying
 /// one — so a single such line hid a whole file from the dead-code scan.
 ///
-/// `devcouncil.indexing.wiring.is_wiring_decorated` is the spec, and this is
-/// its rule transcribed: split off everything from the first `(`, strip the
+/// The rule, transcribed from the Python `is_wiring_decorated` (deleted since):
+/// split off everything from the first `(`, strip the
 /// leading `@`, trim, lowercase, then split on `.` and whitespace for the
-/// segment set. The hint table itself is unchanged and is pinned equal to the
-/// Python one by `tests/unit/test_wiring_parity_with_kernel.py`.
+/// segment set. The hint table is pinned by this crate's own tests; the Python
+/// parity test that once compared it is deleted.
 pub fn is_wiring_decorator(decorator: &str) -> bool {
     let hints = [
         "app.",
@@ -298,6 +298,14 @@ pub fn rust_attribute_entry_reason(attribute_path: &str) -> Option<&'static str>
             "language item invoked by the runtime"
         }
         "wasm_bindgen" => "exported to the JavaScript host",
+        // `#[tauri::command]`, or `#[command]` after `use tauri::command`. The
+        // webview invokes it over IPC by the name `generate_handler!` lists;
+        // no Rust call site exists, so a private command was published dead
+        // at 0.9 (the audit's Rust C39). Only the bare spelling or the
+        // `tauri::` path: another crate's `command` attribute says nothing.
+        "command" if matches!(attribute_path.trim(), "command" | "tauri::command") => {
+            "Tauri command, invoked from the webview over IPC"
+        }
         _ => return None,
     })
 }
@@ -413,9 +421,10 @@ pub fn has_shebang(source: &str) -> bool {
 
 /// Directory names that hold test data rather than program text.
 ///
-/// Kept apart from [`is_test_path`], which is pinned equal to
-/// `devcouncil.indexing.wiring.is_test_path` by a parity test — widening that
-/// one would break the parity rather than fix the finding.
+/// Kept apart from [`is_test_path`]: widening that one would move every
+/// test-path decision, not just this finding. The Python `is_test_path` it
+/// was once pinned equal to is deleted; the rule is pinned by this crate's own
+/// tests.
 const FIXTURE_DIR_SEGMENTS: &[&str] = &[
     "testdata",
     "test-data",
@@ -709,6 +718,115 @@ pub fn go_runtime_entry_reason(
     }
 }
 
+/// The manifest kinds that scope module privacy, by file name: `"js"` for a
+/// `package.json`, `"gradle"` for a Gradle build script. `None` for anything
+/// else. Liveness assigns each source file to its nearest manifest of the kind
+/// its language is built by, so a library nested inside an application keeps
+/// its own verdict.
+pub fn module_manifest_family(path: &str) -> Option<&'static str> {
+    match path.rsplit('/').next().unwrap_or(path) {
+        "package.json" => Some("js"),
+        "build.gradle" | "build.gradle.kts" => Some("gradle"),
+        _ => None,
+    }
+}
+
+/// Why the package or module this manifest roots has no consumer outside the
+/// corpus, or `None` when it may have one (or this is not such a manifest).
+///
+/// * A `package.json` with none of the fields a consumer resolves an import
+///   through — `exports`, `main`, `module`, `types`, `typings`, `browser`,
+///   `bin` — is an application, not a library: nothing can import it.
+/// * A Gradle script applying `com.android.application` builds an APK, which
+///   nothing links against. `apply false` on the line (a root script declaring
+///   the plugin version for its modules) does not apply it.
+///
+/// A manifest this cannot parse is answered `None`: widening on no evidence is
+/// the one direction this must not err in.
+pub fn module_private_scope_reason(path: &str, source: &str) -> Option<&'static str> {
+    match module_manifest_family(path)? {
+        "js" => {
+            let manifest: serde_json::Value = serde_json::from_str(source).ok()?;
+            let object = manifest.as_object()?;
+            const PUBLISHED: &[&str] = &[
+                "exports", "main", "module", "types", "typings", "browser", "bin",
+            ];
+            (!PUBLISHED.iter().any(|field| object.contains_key(*field))).then_some(
+                "its package.json publishes no entry point (no `exports`, `main`, `module`, \
+                 `types` or `bin`), so nothing outside the corpus can import it",
+            )
+        }
+        "gradle" => source
+            .lines()
+            .any(|line| line.contains("com.android.application") && !line.contains("apply false"))
+            .then_some(
+                "its Gradle module applies `com.android.application`, and nothing links against \
+                 an application",
+            ),
+        _ => None,
+    }
+}
+
+/// Android component supertypes: a class extending one is instantiated by the
+/// framework by name — from `AndroidManifest.xml`, a layout or WorkManager —
+/// never by a call in the corpus.
+///
+/// The model the Kotlin widening waits on. `AndroidManifest.xml` is not indexed,
+/// so the component is recognised by what it extends rather than by the line
+/// that registers it; that also covers a component the manifest of another
+/// variant registers, and errs toward withholding.
+pub fn android_component_supertype_reason(supertype: &str) -> Option<&'static str> {
+    matches!(
+        supertype,
+        "Activity"
+            | "AppCompatActivity"
+            | "ComponentActivity"
+            | "FragmentActivity"
+            | "Service"
+            | "IntentService"
+            | "LifecycleService"
+            | "JobService"
+            | "BroadcastReceiver"
+            | "ContentProvider"
+            | "Application"
+            | "MultiDexApplication"
+            | "Fragment"
+            | "DialogFragment"
+            | "BottomSheetDialogFragment"
+            | "Worker"
+            | "CoroutineWorker"
+            | "ListenableWorker"
+            | "AppWidgetProvider"
+            | "TileService"
+            | "AccessibilityService"
+            | "InputMethodService"
+            | "FirebaseMessagingService"
+    )
+    .then_some("Android component the framework instantiates by name, not by a call in the corpus")
+}
+
+/// Go functions the toolchain publishes to code outside the corpus by a
+/// directive comment above the declaration.
+///
+/// `//export Name` hands `Name` to C through cgo, and `//go:linkname Name
+/// target` lets the linker bind it from another package. Neither leaves a call
+/// site in any Go file, so both are reachable with the evidence outside the
+/// corpus — the case `RuntimeEntryPoint` names. Matched on the directive's own
+/// first argument, so a directive about a different function in the same
+/// comment block cannot exempt this one.
+pub fn go_directive_entry_reason(comment: &str, name: &str) -> Option<&'static str> {
+    let line = comment.trim();
+    let named = |rest: &str| rest.split_whitespace().next() == Some(name);
+    if let Some(rest) = line.strip_prefix("//export ") {
+        return named(rest).then_some("exported to C by a cgo //export directive");
+    }
+    if let Some(rest) = line.strip_prefix("//go:linkname ") {
+        return named(rest)
+            .then_some("named by a //go:linkname directive; the linker binds it across packages");
+    }
+    None
+}
+
 /// Go framework entry points recognised by a parameter's declared type.
 ///
 /// Ruleguard rules are ordinary package-level functions whose first parameter
@@ -814,13 +932,20 @@ pub fn swift_runtime_supertype_reason(supertype: &str) -> Option<&'static str> {
 
 /// Kotlin annotations that hand a declaration to a runtime.
 ///
-/// Compose calls a `@Composable` from a composition it owns, JUnit collects
-/// `@Test` by reflection, and every dependency-injection and
+/// Compose tooling renders a `@Preview` with no caller in the corpus, JUnit
+/// collects `@Test` by reflection, and every dependency-injection and
 /// serialization-plugin annotation names a caller in generated or framework code
 /// that this corpus does not contain.
+///
+/// `@Composable` is **not** here. It marks a function the compiler plugin lets
+/// run inside a composition — and a composable runs only when another composable
+/// calls it, by an ordinary call the extractor records. Treating the annotation
+/// as an entry point exempted every unused composable in an app: the
+/// 2026-10-09 audit's `UnusedBadge` shape. The root of a composition is reached
+/// from `setContent { … }` in an Activity, which is an ordinary call too.
 pub fn kotlin_annotation_entry_reason(annotation: &str) -> Option<&'static str> {
     Some(match annotation {
-        "Composable" | "Preview" => "invoked by the Jetpack Compose runtime",
+        "Preview" => "rendered by the Compose preview tooling, which no code in the corpus calls",
         "Test" | "Before" | "After" | "BeforeEach" | "AfterEach" | "BeforeClass" | "AfterClass"
         | "BeforeAll" | "AfterAll" | "ParameterizedTest" | "RepeatedTest" => JVM_TEST_RUNNER,
         "Inject" | "Provides" | "Binds" | "Module" | "Component" | "HiltAndroidApp"
@@ -1187,8 +1312,8 @@ const ENTRY_POINT_CAP: usize = 512;
 
 /// Module paths one `pkg.mod:attr` target is tried against.
 ///
-/// Pinned equal to `wiring._add_module_file`'s candidate list by
-/// `tests/unit/test_wiring_parity_with_kernel.py`.
+/// Ported from the Python `wiring._add_module_file` candidate list (deleted
+/// since); the Rust tests pin it now.
 const ENTRY_POINT_CANDIDATES: usize = 4;
 
 /// Symbol identities a Python console-script declaration names, with a reason.
@@ -1223,6 +1348,9 @@ const ENTRY_POINT_CANDIDATES: usize = 4;
 pub fn config_entry_point_symbols(path: &str, source: &str) -> Vec<WiringAnnotation> {
     let normalized = normalize_path(path);
     let name = normalized.rsplit('/').next().unwrap_or(&normalized);
+    if name == "AndroidManifest.xml" {
+        return android_component_entry_points(&normalized, source);
+    }
     if name != "pyproject.toml" {
         return Vec::new();
     }
@@ -1270,6 +1398,46 @@ pub fn config_entry_point_symbols(path: &str, source: &str) -> Vec<WiringAnnotat
     annotations
 }
 
+/// Prefix of a [`WiringKind::ConfigEntryPoint`] target that names an Android
+/// component rather than a `file::symbol`: `android-component:<module dir>|<name>`.
+///
+/// A manifest names a class by its package-qualified name (or `.Name`, relative
+/// to a namespace the Gradle script declares), never by file, so the join to a
+/// symbol is made where the class's own `package` header is known: the
+/// analysis pass reads this target against each Kotlin or Java class's package
+/// and the module directory the manifest governs.
+pub const ANDROID_COMPONENT_TARGET_PREFIX: &str = "android-component:";
+
+/// The components an `AndroidManifest.xml` declares, as entry-point claims.
+/// A manifest the reader cannot read makes no claim here; the extraction
+/// records the failure itself.
+fn android_component_entry_points(path: &str, source: &str) -> Vec<WiringAnnotation> {
+    let Ok(components) = crate::androidmanifest::parse_components(source) else {
+        return Vec::new();
+    };
+    // The module is the directory above `src/`: `app/src/main/AndroidManifest.xml`
+    // governs `app/`.
+    let module = path
+        .split_once("/src/")
+        .map(|(module, _)| module)
+        .or_else(|| path.strip_prefix("src/").map(|_| ""))
+        .unwrap_or_default();
+    components
+        .into_iter()
+        .map(|component| WiringAnnotation {
+            kind: WiringKind::ConfigEntryPoint,
+            target_symbol: format!(
+                "{ANDROID_COMPONENT_TARGET_PREFIX}{module}|{}",
+                component.name
+            ),
+            details: format!(
+                "declared as an Android <{}> component by {path}: {}",
+                component.tag, component.name
+            ),
+        })
+        .collect()
+}
+
 fn is_language_main(path: &str, source: &str) -> bool {
     let p = path.replace('\\', "/");
     let name = p.rsplit('/').next().unwrap_or(path);
@@ -1289,6 +1457,14 @@ fn is_language_main(path: &str, source: &str) -> bool {
 
 pub fn extract_wiring_annotations(path: &str, source: &str) -> Vec<WiringAnnotation> {
     let mut annotations = Vec::new();
+
+    if let Some(reason) = module_private_scope_reason(path, source) {
+        annotations.push(WiringAnnotation {
+            kind: WiringKind::ModulePrivateScope,
+            target_symbol: path.to_string(),
+            details: reason.to_string(),
+        });
+    }
 
     if is_vendored_path(path) {
         annotations.push(WiringAnnotation {
@@ -1478,8 +1654,8 @@ pub fn extract_wiring_annotations(path: &str, source: &str) -> Vec<WiringAnnotat
 
 /// The author's explicit "this file is intentionally unwired" declaration.
 ///
-/// One spelling, matching `devcouncil.indexing.wiring.ALLOW_UNWIRED` exactly.
-/// The two are asserted equal by `tests/allow_unwired_and_dynamic_imports.rs`,
+/// One spelling. `tests/allow_unwired_and_dynamic_imports.rs` pins the literal
+/// and checks it against a file in this repository that carries the marker,
 /// because a marker the kernel spells differently is a marker the kernel
 /// ignores — silently, and only for the files that use it.
 pub const ALLOW_UNWIRED: &str = "devcouncil: allow-unwired";
@@ -1880,7 +2056,7 @@ mod tests {
             rust_attribute_entry_reason("main"),
             rust_attribute_entry_reason("no_mangle"),
             python_harness_entry_reason("pytest_configure"),
-            kotlin_annotation_entry_reason("Composable"),
+            kotlin_annotation_entry_reason("Preview"),
         ] {
             let reason = reason.expect("an entry point has a reason");
             assert!(!is_test_harness_reason(reason), "{reason}");
@@ -2083,6 +2259,63 @@ mod tests {
     }
 
     #[test]
+    fn only_a_manifest_that_publishes_nothing_scopes_module_privacy() {
+        let app = r#"{ "name": "@acme/web", "dependencies": { "react": "18.3.1" } }"#;
+        let lib = r#"{ "name": "@acme/shared", "main": "src/index.ts", "types": "src/index.ts" }"#;
+        let exported = r#"{ "name": "x", "exports": { ".": "./index.js" } }"#;
+        assert!(module_private_scope_reason("apps/web/package.json", app).is_some());
+        assert!(module_private_scope_reason("packages/shared/package.json", lib).is_none());
+        assert!(module_private_scope_reason("package.json", exported).is_none());
+        assert!(module_private_scope_reason("package.json", "{ not json").is_none());
+
+        let android_app = "plugins {\n    id(\"com.android.application\")\n}\n";
+        let root =
+            "plugins {\n    id(\"com.android.application\") version \"8.7.0\" apply false\n}\n";
+        let library = "plugins { id(\"com.android.library\") }\n";
+        assert!(module_private_scope_reason("app/build.gradle.kts", android_app).is_some());
+        assert!(module_private_scope_reason("build.gradle.kts", root).is_none());
+        assert!(module_private_scope_reason("core/build.gradle.kts", library).is_none());
+        assert!(module_private_scope_reason("app/src/Main.kt", android_app).is_none());
+    }
+
+    #[test]
+    fn android_components_are_entry_points_and_ordinary_bases_are_not() {
+        assert!(android_component_supertype_reason("BroadcastReceiver").is_some());
+        assert!(android_component_supertype_reason("AppCompatActivity").is_some());
+        assert!(android_component_supertype_reason("ViewModel").is_none());
+    }
+
+    #[test]
+    fn a_composable_is_called_and_a_preview_is_rendered() {
+        assert_eq!(kotlin_annotation_entry_reason("Composable"), None);
+        assert!(kotlin_annotation_entry_reason("Preview").is_some());
+    }
+
+    #[test]
+    fn a_tauri_command_is_an_entry_point_and_another_crates_command_is_not() {
+        assert!(rust_attribute_entry_reason("tauri::command").is_some());
+        assert!(rust_attribute_entry_reason("command").is_some());
+        assert!(rust_attribute_entry_reason("clap::command").is_none());
+    }
+
+    #[test]
+    fn go_directives_exempt_only_the_function_they_name() {
+        assert!(go_directive_entry_reason("//export SecretCallback", "SecretCallback").is_some());
+        assert!(go_directive_entry_reason(
+            "//go:linkname LinkedClock example.com/app/svc.linkedClock",
+            "LinkedClock"
+        )
+        .is_some());
+        // Another function's directive, a prose mention, and a spaced
+        // `// export` (which cgo does not honour) exempt nothing.
+        assert!(go_directive_entry_reason("//export Other", "SecretCallback").is_none());
+        assert!(
+            go_directive_entry_reason("// SecretCallback is exported", "SecretCallback").is_none()
+        );
+        assert!(go_directive_entry_reason("// export SecretCallback", "SecretCallback").is_none());
+    }
+
+    #[test]
     fn go_ruleguard_matcher_param_is_a_framework_entry() {
         assert_eq!(
             go_framework_param_entry_reason("Matcher", Some("dsl")),
@@ -2235,8 +2468,8 @@ mod tests {
     /// `register` and `@FastAPI_thing` a `fastapi`. Because the annotation this
     /// feeds targets the *file* and `is_file_exempt` exempts every symbol in
     /// the file, one such line hides a whole file from the dead-code scan.
-    /// `devcouncil.indexing.wiring.is_wiring_decorated` is the spec: dotted
-    /// hints match as prefixes, bare hints as whole segments.
+    /// Dotted hints match as prefixes, bare hints as whole segments. (The Python
+    /// `is_wiring_decorated` this was ported from is deleted.)
     #[test]
     fn wiring_decorator_hints_are_prefixes_and_segments_not_substrings() {
         for decorator in [
@@ -2717,5 +2950,26 @@ u = \"pkg.b:run [fast]\"
         assert!(annotations
             .iter()
             .any(|a| a.target_symbol == "pkg/mod0.py::main"));
+    }
+}
+
+#[cfg(test)]
+mod test_path_conformance {
+    use super::{is_fixture_path, is_test_path};
+
+    /// Held to the one rule every implementation shares.
+    #[test]
+    fn is_test_path_agrees_with_every_row_of_the_shared_fixture() {
+        let rows =
+            dc_glob::parse_test_path_rows(include_str!("../../../protocols/test-paths/v1.json"))
+                .expect("fixture");
+        let wrong: Vec<_> = rows
+            .iter()
+            // Liveness exempts a fixture directory under its own reason, so a
+            // row the shared rule calls a test is held to "test or fixture".
+            .filter(|(path, expected)| (is_test_path(path) || is_fixture_path(path)) != *expected)
+            .map(|(path, expected)| format!("{path} (expected {expected})"))
+            .collect();
+        assert!(wrong.is_empty(), "{wrong:?}");
     }
 }

@@ -1,17 +1,26 @@
 //! Prebuilt release install rung: download, verify checksum, install.
 //!
 //! A checksum mismatch is a **refusal** — never a fallback to running the
-//! binary anyway. Until sibling repos publish release assets, this rung
-//! reports itself unavailable with a platform-specific reason.
+//! binary anyway. What may be installed is decided in this repository, not by
+//! the server: [`PINNED_RELEASES`] names the exact version, asset and SHA-256
+//! of each prebuilt. A `releases/latest` redirect or a `.sha256` file served
+//! beside the archive proves nothing (whoever can replace the archive can
+//! replace its checksum), so neither is consulted. A platform with no pin is
+//! unavailable with a reason, and the source installs remain.
 
 use super::{ExternalTool, PUBLIC_DEVMAP_REPO, PUBLIC_MANVI_REPO};
 use crate::engine::git_cli;
 use serde::{Deserialize, Serialize};
-use std::fs::{self, File};
-use std::io::Read;
+use std::fs;
+#[cfg(test)]
+use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
+
+/// curl follows redirects (`-L`), and by default would follow one to `http`,
+/// `ftp` or `file`. These pin both the first request and every hop to https.
+const CURL_HTTPS_ONLY: [&str; 4] = ["--proto", "=https", "--proto-redir", "=https"];
 
 const DOWNLOAD_DEADLINE: Duration = Duration::from_secs(5 * 60);
 const DOWNLOAD_CAP: usize = 256 * 1024 * 1024;
@@ -21,7 +30,10 @@ const DOWNLOAD_CAP: usize = 256 * 1024 * 1024;
 pub enum ReleaseAvailability {
     Available {
         asset_url: String,
-        checksum_url: String,
+        /// Release tag the pin names, e.g. `v0.2.3`.
+        version: String,
+        /// Expected SHA-256 of the archive, from [`PINNED_RELEASES`].
+        sha256: String,
         asset_name: String,
     },
     Unavailable {
@@ -70,10 +82,6 @@ fn repo_for(tool: ExternalTool) -> &'static str {
     }
 }
 
-fn asset_stem(tool: ExternalTool) -> &'static str {
-    tool.as_str()
-}
-
 pub(crate) fn binary_name(tool: ExternalTool) -> &'static str {
     if cfg!(windows) {
         match tool {
@@ -103,21 +111,114 @@ fn platform_supported(tool: ExternalTool) -> Result<(), String> {
     Ok(())
 }
 
-pub fn release_urls(tool: ExternalTool) -> ReleaseAvailability {
+/// One prebuilt this build of GitPulse will install: a release tag, the asset
+/// in it for one target, and that asset's SHA-256 as recorded here.
+#[derive(Debug, Clone, Copy)]
+pub struct PinnedRelease {
+    pub tool: &'static str,
+    /// Release tag, `vMAJOR.MINOR.PATCH`.
+    pub version: &'static str,
+    pub target: &'static str,
+    pub asset_name: &'static str,
+    /// 64 lowercase hex characters.
+    pub sha256: &'static str,
+}
+
+/// The prebuilts GitPulse will install.
+///
+/// Empty on purpose: the published DevCouncil/Manvi assets are not in the
+/// format this installer unpacks (devmap ships `devmap-cli-<target>.tar.xz`
+/// and `.zip`, this extracts `.tar.gz`), and a SHA-256 is only worth pinning
+/// for an artifact that was actually installed and checked. Add an entry
+/// (tool, tag, target, asset, digest) when a release in the supported format
+/// is published and verified; until then the rung reports itself unavailable
+/// and the pinned source installs are used.
+pub const PINNED_RELEASES: &[PinnedRelease] = &[];
+
+/// The pin for `tool` on `target`, if the table has one.
+fn pinned_for<'a>(
+    table: &'a [PinnedRelease],
+    tool: ExternalTool,
+    target: &str,
+) -> Option<&'a PinnedRelease> {
+    table
+        .iter()
+        .find(|pin| pin.tool == tool.as_str() && pin.target == target)
+}
+
+/// Where `pin` is downloaded from: an exact tag, never `latest`.
+fn pinned_asset_url(tool: ExternalTool, pin: &PinnedRelease) -> String {
+    format!(
+        "{}/releases/download/{}/{}",
+        repo_for(tool).trim_end_matches(".git"),
+        pin.version,
+        pin.asset_name
+    )
+}
+
+fn release_urls_in(table: &[PinnedRelease], tool: ExternalTool) -> ReleaseAvailability {
     if let Err(reason) = platform_supported(tool) {
         return ReleaseAvailability::Unavailable { reason };
     }
     let target = platform_target();
-    let stem = asset_stem(tool);
-    let asset_name = format!("{stem}-{target}.tar.gz");
-    let base = format!(
-        "{}/releases/latest/download",
-        repo_for(tool).trim_end_matches(".git")
-    );
-    ReleaseAvailability::Available {
-        asset_url: format!("{base}/{asset_name}"),
-        checksum_url: format!("{base}/{asset_name}.sha256"),
-        asset_name,
+    match pinned_for(table, tool, target) {
+        Some(pin) => ReleaseAvailability::Available {
+            asset_url: pinned_asset_url(tool, pin),
+            version: pin.version.to_string(),
+            sha256: pin.sha256.to_ascii_lowercase(),
+            asset_name: pin.asset_name.to_string(),
+        },
+        None => ReleaseAvailability::Unavailable {
+            reason: format!(
+                "no pinned prebuilt {} release for {target}; GitPulse installs only releases whose \
+                 checksum it carries",
+                tool.as_str()
+            ),
+        },
+    }
+}
+
+pub fn release_urls(tool: ExternalTool) -> ReleaseAvailability {
+    release_urls_in(PINNED_RELEASES, tool)
+}
+
+/// `1.2.3` from the first `MAJOR.MINOR.PATCH` run in `text` (`v0.2.3`,
+/// `devmap 0.2.4 (store schema 26 …)`). Pre-release suffixes are ignored.
+pub(crate) fn version_triple(text: &str) -> Option<(u32, u32, u32)> {
+    let bytes = text.as_bytes();
+    let mut start = 0;
+    while start < bytes.len() {
+        if !bytes[start].is_ascii_digit() {
+            start += 1;
+            continue;
+        }
+        let mut end = start;
+        while end < bytes.len() && (bytes[end].is_ascii_digit() || bytes[end] == b'.') {
+            end += 1;
+        }
+        let mut parts = text[start..end].split('.').map(|p| p.parse::<u32>().ok());
+        if let (Some(Some(a)), Some(Some(b)), Some(Some(c))) =
+            (parts.next(), parts.next(), parts.next())
+        {
+            return Some((a, b, c));
+        }
+        start = end;
+    }
+    None
+}
+
+/// Refuses to replace an installed `installed` version with an older
+/// `pinned` one. An installed binary whose version cannot be read does not
+/// block the install; a pin whose own version cannot be read does.
+fn refuse_downgrade(installed: Option<&str>, pinned: &str) -> Result<(), String> {
+    let pinned_version = version_triple(pinned)
+        .ok_or_else(|| format!("pinned release version {pinned:?} is not MAJOR.MINOR.PATCH"))?;
+    match installed.and_then(version_triple) {
+        Some(current) if current > pinned_version => Err(format!(
+            "refusing to downgrade: {}.{}.{} is installed and the pinned release is {pinned}",
+            current.0, current.1, current.2
+        )),
+        _ => Ok(()),
     }
 }
 
@@ -127,7 +228,8 @@ pub fn probe_release(tool: ExternalTool) -> ReleaseAvailability {
     let urls = release_urls(tool);
     let ReleaseAvailability::Available {
         asset_url,
-        checksum_url,
+        version,
+        sha256,
         asset_name,
     } = urls
     else {
@@ -136,12 +238,13 @@ pub fn probe_release(tool: ExternalTool) -> ReleaseAvailability {
     match http_head_ok(&asset_url) {
         Ok(true) => ReleaseAvailability::Available {
             asset_url,
-            checksum_url,
+            version,
+            sha256,
             asset_name,
         },
         Ok(false) => ReleaseAvailability::Unavailable {
             reason: format!(
-                "no prebuilt release asset {asset_name} yet (publish a GitHub release with checksums)"
+                "pinned release asset {asset_name} ({version}) is not published at its URL"
             ),
         },
         Err(e) => ReleaseAvailability::Unavailable {
@@ -166,13 +269,33 @@ pub(super) fn network_probes() -> usize {
     NETWORK_PROBES.load(std::sync::atomic::Ordering::SeqCst)
 }
 
-fn http_head_ok(url: &str) -> Result<bool, String> {
+fn curl_head_args(url: &str) -> Vec<String> {
+    let mut args: Vec<String> = ["-fsI", "-L"].map(String::from).into();
+    args.extend(CURL_HTTPS_ONLY.map(String::from));
+    args.extend(["--max-time".to_string(), "15".to_string(), url.to_string()]);
+    args
+}
+
+fn curl_download_args(url: &str, dest: &Path) -> Vec<String> {
+    let mut args: Vec<String> = ["-fsSL", "-L"].map(String::from).into();
+    args.extend(CURL_HTTPS_ONLY.map(String::from));
+    args.extend([
+        "--max-time".to_string(),
+        DOWNLOAD_DEADLINE.as_secs().to_string(),
+        "-o".to_string(),
+        dest.display().to_string(),
+        url.to_string(),
+    ]);
+    args
+}
+
+pub(crate) fn http_head_ok(url: &str) -> Result<bool, String> {
     #[cfg(test)]
     NETWORK_PROBES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     let curl =
         git_cli::find_external_tool("curl").ok_or_else(|| "curl is not installed".to_string())?;
     let mut cmd = Command::new(&curl);
-    cmd.args(["-fsI", "-L", "--max-time", "15", url]);
+    cmd.args(curl_head_args(url));
     let run =
         git_cli::run_bounded_capped(cmd, "curl head", Duration::from_secs(20), None, 64 * 1024)?;
     Ok(run.success)
@@ -185,15 +308,7 @@ fn download_to(url: &str, dest: &Path) -> Result<(), String> {
         fs::create_dir_all(parent).map_err(|e| format!("create {}: {e}", parent.display()))?;
     }
     let mut cmd = Command::new(&curl);
-    cmd.args([
-        "-fsSL",
-        "-L",
-        "--max-time",
-        &DOWNLOAD_DEADLINE.as_secs().to_string(),
-        "-o",
-        &dest.display().to_string(),
-        url,
-    ]);
+    cmd.args(curl_download_args(url, dest));
     let run =
         git_cli::run_bounded_capped(cmd, "curl download", DOWNLOAD_DEADLINE, None, DOWNLOAD_CAP)?;
     if !run.success {
@@ -376,12 +491,25 @@ fn find_named_file(root: &Path, name: &str) -> Result<PathBuf, String> {
     found.ok_or_else(|| format!("archive did not contain {name}"))
 }
 
-/// Download, verify checksum (refuse on mismatch), install into app bin dir.
+/// A fixed, empty directory the toolchain installs run from, under the app's
+/// own data. `cargo` reads `.cargo/config.toml` from every ancestor of its
+/// working directory and `go` reads `go.work`/`go.mod`, so running from the
+/// launch directory would let a file there redirect the install.
+pub fn install_work_dir() -> Result<PathBuf, String> {
+    let dir = app_bin_dir()?.join(".install-cwd");
+    fs::create_dir_all(&dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
+    Ok(dir)
+}
+
+/// Download the pinned asset, verify it against the digest recorded in this
+/// repository (refuse on mismatch), refuse a downgrade, install into the app
+/// bin dir.
 pub fn install_prebuilt(tool: ExternalTool) -> Result<PathBuf, String> {
     let availability = probe_release(tool);
     let ReleaseAvailability::Available {
         asset_url,
-        checksum_url,
+        version,
+        sha256,
         asset_name,
     } = availability
     else {
@@ -391,25 +519,20 @@ pub fn install_prebuilt(tool: ExternalTool) -> Result<PathBuf, String> {
         return Err(reason);
     };
 
+    let dest = app_bin_dir()?.join(binary_name(tool));
+    if dest.is_file() {
+        let installed = super::probe_version(&dest.display().to_string(), tool);
+        refuse_downgrade(installed.as_deref(), &version)?;
+    }
+
     let work = app_bin_dir()?.join(format!(".download-{}", tool.as_str()));
     fs::create_dir_all(&work).map_err(|e| e.to_string())?;
     let archive = work.join(&asset_name);
-    let checksum_file = work.join(format!("{asset_name}.sha256"));
-
-    download_to(&checksum_url, &checksum_file)?;
-    let expected = {
-        let mut f = File::open(&checksum_file).map_err(|e| e.to_string())?;
-        let mut text = String::new();
-        f.read_to_string(&mut text).map_err(|e| e.to_string())?;
-        parse_checksum_file(&text)?
-    };
-
     download_to(&asset_url, &archive)?;
 
     // Verify before trusting — mismatch refuses; never fall back.
-    verify_checksum(&archive, &expected)?;
+    verify_checksum(&archive, &sha256)?;
 
-    let dest = app_bin_dir()?.join(binary_name(tool));
     extract_binary_from_tar_gz(&archive, tool, &dest)?;
     let _ = fs::remove_dir_all(&work);
     Ok(dest)
@@ -526,6 +649,96 @@ mod tests {
         assert!(err.contains("checksum mismatch"), "{err}");
         // File may exist on disk but must not be treated as installed success.
         assert!(err.contains("refusing"));
+    }
+
+    #[test]
+    fn an_empty_pin_table_makes_the_release_rung_unavailable_not_latest() {
+        let ReleaseAvailability::Unavailable { reason } =
+            release_urls_in(&[], ExternalTool::Devmap)
+        else {
+            panic!("no pin must mean unavailable");
+        };
+        assert!(!platform_target().is_empty());
+        assert!(
+            reason.contains("pinned") || reason.contains("platform"),
+            "{reason}"
+        );
+    }
+
+    #[test]
+    fn a_pinned_release_downloads_a_tag_and_carries_its_own_digest() {
+        let digest = "AB".repeat(32);
+        let table = [PinnedRelease {
+            tool: "devmap",
+            version: "v0.2.3",
+            target: platform_target(),
+            asset_name: "devmap-x.tar.gz",
+            sha256: Box::leak(digest.into_boxed_str()),
+        }];
+        if platform_supported(ExternalTool::Devmap).is_err() {
+            return;
+        }
+        let ReleaseAvailability::Available {
+            asset_url,
+            version,
+            sha256,
+            ..
+        } = release_urls_in(&table, ExternalTool::Devmap)
+        else {
+            panic!("a pinned target is available");
+        };
+        assert!(
+            asset_url.contains("/releases/download/v0.2.3/"),
+            "{asset_url}"
+        );
+        assert!(!asset_url.contains("latest"), "{asset_url}");
+        assert_eq!(version, "v0.2.3");
+        assert_eq!(sha256, "ab".repeat(32));
+        // Another tool on the same target has no pin.
+        assert!(matches!(
+            release_urls_in(&table, ExternalTool::Manvi),
+            ReleaseAvailability::Unavailable { .. }
+        ));
+    }
+
+    #[test]
+    fn every_shipped_pin_is_well_formed() {
+        for pin in PINNED_RELEASES {
+            assert!(pin.sha256.len() == 64 && pin.sha256.chars().all(|c| c.is_ascii_hexdigit()));
+            assert!(version_triple(pin.version).is_some(), "{}", pin.version);
+            assert!(pin.version.starts_with('v'));
+        }
+    }
+
+    #[test]
+    fn a_downgrade_is_refused_and_an_upgrade_or_unknown_is_not() {
+        assert!(refuse_downgrade(Some("devmap 0.2.4 (store schema 26)"), "v0.2.3").is_err());
+        assert!(refuse_downgrade(Some("0.2.3"), "v0.2.3").is_ok());
+        assert!(refuse_downgrade(Some("devmap 0.2.2"), "v0.2.3").is_ok());
+        assert!(refuse_downgrade(None, "v0.2.3").is_ok());
+        assert!(refuse_downgrade(Some("unknown"), "v0.2.3").is_ok());
+        assert!(
+            refuse_downgrade(Some("1.0.0"), "latest").is_err(),
+            "an unreadable pin blocks"
+        );
+        assert_eq!(version_triple("v10.20.30-rc1"), Some((10, 20, 30)));
+        assert_eq!(version_triple("build 06d704b92682"), None);
+    }
+
+    #[test]
+    fn curl_is_confined_to_https_for_the_request_and_every_redirect() {
+        for args in [
+            curl_head_args("https://example.com/a"),
+            curl_download_args("https://example.com/a", Path::new("/tmp/a")),
+        ] {
+            let at = args.iter().position(|a| a == "--proto").expect("--proto");
+            assert_eq!(args[at + 1], "=https");
+            let at = args
+                .iter()
+                .position(|a| a == "--proto-redir")
+                .expect("--proto-redir");
+            assert_eq!(args[at + 1], "=https");
+        }
     }
 
     #[test]

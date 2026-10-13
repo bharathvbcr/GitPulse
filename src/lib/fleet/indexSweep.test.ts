@@ -108,6 +108,14 @@ describe("runIndexSweep", () => {
     expect(firstIndexFailure(result)?.label).toBe("a");
   });
 
+  it("records a refusal the CLI reported as JSON on stdout, with nothing on stderr", async () => {
+    const result = await runIndexSweep(targets("a"), {
+      initialize: async () => init(),
+      build: async () => built({ ok: false, stderr: "", report: { error: "refusing to build: .devmap is a symlink" } }),
+    });
+    expect(result.outcomes[0].reason).toBe("refusing to build: .devmap is a symlink");
+  });
+
   it("names a deadline rather than reporting an empty failure", async () => {
     const result = await runIndexSweep(targets("a"), {
       initialize: async () => init(),

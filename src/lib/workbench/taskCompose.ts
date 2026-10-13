@@ -1,4 +1,4 @@
-import { PRIORITY_LABELS } from "./boardDrag";
+import { priorityLabel } from "./taskPriority";
 import { STATUS_LABELS, type TaskDraft, type TaskStatus } from "./client";
 import { displayTitle } from "./taskDelete";
 import { formatLogsSection } from "./taskLogs";
@@ -197,12 +197,35 @@ export const AGENT_COPY_COMPLETION =
 const TITLE_CAP = 300;
 const NOTES_CAP = 65_536;
 const WEAK_TITLE_CLAUSE = /^(?:\d+|[A-Za-z]{1,4}|[A-Za-z](?:\.[A-Za-z])+)$/;
+/**
+ * Control characters, plus the invisible ones that survive a copy from a chat
+ * or a web page: zero-width spaces and joiners, the byte-order mark, the word
+ * joiner, and the bidi embeddings and isolates that can make a title read
+ * differently from the text it holds.
+ */
+const INVISIBLE = /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F\u0085\u200B-\u200D\uFEFF\u2060\u202A-\u202E\u2066-\u2069]/g;
+/** Unicode's line and paragraph separators, which `\n` splitting would miss. */
+const LINE_SEPARATORS = /\u2028|\u2029/g;
+const BARE_URL = /^https?:\/\/\S+$/i;
+const TITLE_CONTENT = /[\p{L}\p{N}\p{Extended_Pictographic}]/u;
+const TITLE_LEAD_IN = /^(?:#{1,6}\s+|[-*+]\s+(?:\[[ xX]\]\s+)?|>\s+)/;
+const TITLE_QUOTES: ReadonlyArray<readonly [string, string]> = [['"', '"'], ["'", "'"], ["“", "”"], ["‘", "’"], ["«", "»"]];
 
+/** A line without its heading, list or quote lead-ins, and one pair of wrapping quotes. */
 function stripTitleMarkup(line: string): string {
-  return line
-    .replace(/^#{1,6}\s+/, "")
-    .replace(/^[-*+]\s+(?:\[[ xX]\]\s+)?/, "")
-    .trim();
+  let next = line.trim();
+  for (let i = 0; i < 3 && TITLE_LEAD_IN.test(next); i++) next = next.replace(TITLE_LEAD_IN, "").trim();
+  for (const [open, close] of TITLE_QUOTES) {
+    if (next.length > open.length + close.length && next.startsWith(open) && next.endsWith(close)) {
+      return next.slice(open.length, next.length - close.length).trim();
+    }
+  }
+  return next;
+}
+
+/** A pasted link or a line of punctuation names nothing; the next line may. */
+function canTitle(line: string): boolean {
+  return TITLE_CONTENT.test(line) && !BARE_URL.test(line);
 }
 
 function isWeakTitleClause(clause: string): boolean {
@@ -226,16 +249,18 @@ function titleSource(text: string): string {
   const lines = text.split(/\n/);
   for (const raw of lines) {
     const line = stripTitleMarkup(raw.trim());
-    if (!line) continue;
+    if (!line || !canTitle(line)) continue;
     const clause = firstStrongClause(line);
     if (!isWeakTitleClause(clause)) return clause;
   }
-  return stripTitleMarkup((lines[0] ?? text).trim()) || text;
+  // Only weak clauses: the first line that names anything, even weakly. Notes
+  // that are nothing but links have no title, and the caller says so.
+  return lines.map((raw) => stripTitleMarkup(raw.trim())).find(canTitle) ?? "";
 }
 
 export function sanitizeNotes(value: unknown, cap = NOTES_CAP): string {
   if (typeof value !== "string") return "";
-  const cleaned = value.replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g, "").trim();
+  const cleaned = value.replace(INVISIBLE, "").replace(LINE_SEPARATORS, "\n").trim();
   if (!cleaned) return "";
   const limit = Number.isSafeInteger(cap) && cap >= 32 ? cap : NOTES_CAP;
   return [...cleaned].slice(0, limit).join("");
@@ -350,7 +375,7 @@ export function formatDraftAgentCopy(draft: DraftAgentCopy): string | null {
   const labels = (draft.labels ?? []).map((item) => item.trim()).filter(Boolean);
   const repos = (draft.repositoryNames ?? []).map((item) => item.trim()).filter(Boolean);
   const status = draft.status && STATUS_LABELS[draft.status] ? STATUS_LABELS[draft.status] : "Unspecified";
-  const priority = PRIORITY_LABELS[(draft.priority ?? 1) as 0 | 1 | 2 | 3] ?? "Unknown";
+  const priority = priorityLabel(draft.priority);
   const lines = [
     AGENT_COPY_COMPLETION,
     "",

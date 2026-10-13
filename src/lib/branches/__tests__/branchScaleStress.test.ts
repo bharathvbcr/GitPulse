@@ -7,6 +7,7 @@ import {
 } from "../groupBranches";
 import { flattenRows } from "../flattenRows";
 import { computeWindow } from "../../dom/virtualWindow";
+import { wallClockBudget } from "../../testing/wallClock";
 
 function generateStressBranches(count: number): { branches: BranchInfo[]; tags: TagInfo[] } {
   const branches: BranchInfo[] = [];
@@ -83,7 +84,7 @@ describe("Branch scale and stress benchmarks (10,000+ branches)", () => {
     expect(sections.length).toBeGreaterThanOrEqual(3);
     const totalBranchCount = sections.reduce((sum, s) => sum + s.branchCount, 0);
     expect(totalBranchCount).toBe(TOTAL_BRANCHES + tags.length);
-    expect(duration).toBeLessThan(2000); // Tripwire: generous for loaded machines
+    expect(duration).toBeLessThan(wallClockBudget(2000)); // Tripwire: generous for loaded machines
   });
 
   it("handles pinned branches section efficiently at 10,000 branch scale", () => {
@@ -103,7 +104,7 @@ describe("Branch scale and stress benchmarks (10,000+ branches)", () => {
     expect(pinnedSection).toBeDefined();
     expect(pinnedSection?.branchCount).toBe(5);
     expect(pinnedSection?.branches.length).toBe(5);
-    expect(duration).toBeLessThan(2000);
+    expect(duration).toBeLessThan(wallClockBudget(2000));
   });
 
   // Wall-clock budgets here are regression tripwires, not SLAs: this suite
@@ -120,7 +121,7 @@ describe("Branch scale and stress benchmarks (10,000+ branches)", () => {
       const filtered = filterBranchSections(sections, "", tab);
       const duration = performance.now() - start;
 
-      expect(duration).toBeLessThan(2000);
+      expect(duration).toBeLessThan(wallClockBudget(2000));
       expect(filtered).toBeDefined();
     }
   });
@@ -132,7 +133,7 @@ describe("Branch scale and stress benchmarks (10,000+ branches)", () => {
     const result1 = filterBranchSections(sections, "feature");
     const duration1 = performance.now() - start;
 
-    expect(duration1).toBeLessThan(2000);
+    expect(duration1).toBeLessThan(wallClockBudget(2000));
     expect(result1.length).toBeGreaterThan(0);
 
     // Repeated query hits memoized branch text
@@ -156,7 +157,7 @@ describe("Branch scale and stress benchmarks (10,000+ branches)", () => {
     const allRows = flattenRows(sections, isCollapsed);
     const flattenDuration = performance.now() - flattenStart;
 
-    expect(flattenDuration).toBeLessThan(2000);
+    expect(flattenDuration).toBeLessThan(wallClockBudget(2000));
     expect(allRows.length).toBeGreaterThan(5000);
 
     // Test virtual window calculations across 100 random scroll positions
@@ -173,7 +174,7 @@ describe("Branch scale and stress benchmarks (10,000+ branches)", () => {
       expect(win.end).toBeLessThanOrEqual(allRows.length);
     }
     const windowDuration = performance.now() - windowStart;
-    expect(windowDuration).toBeLessThan(2000); // O(1) window slicing tripwire
+    expect(windowDuration).toBeLessThan(wallClockBudget(2000)); // O(1) window slicing tripwire
   });
 
   it("accurately highlights substrings with zero regex and zero crash on exotic tokens", () => {

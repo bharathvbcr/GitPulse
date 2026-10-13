@@ -14,16 +14,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
+#[cfg(unix)]
 use std::time::Duration;
 use tempfile::TempDir;
-
-/// The sidecar serial is this crate's de-facto environment serial: the tests
-/// that override `GITPULSE_*` binary paths, `GITPULSE_DEVCOUNCIL_ROOT`,
-/// `GITPULSE_MANVI_ROOT` and `PATH` all take it, because the thing those
-/// variables ultimately steer is which binary a spawn finds. Declaring it here
-/// rather than in `env` keeps that module includable by `gitpulsed`, which is a
-/// separate crate and cannot name this type.
-impl env::EnvSerial for crate::harness::sidecar::SidecarTestGuard {}
 
 static HARNESS_CLONE_SEQ: AtomicU64 = AtomicU64::new(0);
 
@@ -58,6 +51,12 @@ pub(crate) fn isolated_libtest_command(filter: &str) -> (Command, IsolatedHarnes
         .file_name()
         .expect("test executable name")
         .to_string_lossy();
+    static SWEPT: std::sync::Once = std::sync::Once::new();
+    SWEPT.call_once(|| {
+        if let Some(dir) = src.parent() {
+            sweep_dead_isolates(dir, &stem, process_is_alive);
+        }
+    });
     let path = src.with_file_name(format!(
         "{stem}-isolate-{}-{}",
         std::process::id(),
@@ -84,18 +83,59 @@ pub(crate) fn isolated_libtest_command(filter: &str) -> (Command, IsolatedHarnes
     (command, IsolatedHarnessGuard { path })
 }
 
-/// Coverage instrumentation makes sub-second process and thread deadlines
-/// flake. Production timeouts stay unchanged; only tests should call this.
+/// Removes copies a killed run left beside the harness. Each is a full copy of
+/// the test image (tens to hundreds of MB), removed by its guard's `Drop`,
+/// which a run that is killed (a timeout, a signal, a crash) never reaches; they
+/// then accumulate in `target/` run after run. A copy is named for the process
+/// that made it, so one whose process is gone is nobody's.
 #[cfg(test)]
-pub(crate) fn coverage_relaxed(duration: Duration) -> Duration {
-    if std::env::var_os("CARGO_LLVM_COV").is_some()
-        || std::env::var_os("LLVM_PROFILE_FILE").is_some()
-    {
-        duration.saturating_mul(8).max(Duration::from_secs(5))
-    } else {
-        duration
+fn sweep_dead_isolates(dir: &Path, stem: &str, alive: impl Fn(u32) -> bool) -> usize {
+    let prefix = format!("{stem}-isolate-");
+    let Ok(entries) = fs::read_dir(dir) else {
+        return 0;
+    };
+    let mut removed = 0;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(rest) = name.to_str().and_then(|name| name.strip_prefix(&prefix)) else {
+            continue;
+        };
+        let Some(pid) = rest
+            .split('-')
+            .next()
+            .and_then(|pid| pid.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        if !alive(pid) && fs::remove_file(entry.path()).is_ok() {
+            removed += 1;
+        }
     }
+    removed
 }
+
+/// Whether `pid` names a process that exists. A permission error still means it
+/// does (the copy is then left alone), and a reused pid keeps a stale copy
+/// until its new owner exits, which costs disk, never correctness.
+#[cfg(all(test, unix))]
+fn process_is_alive(pid: u32) -> bool {
+    extern "C" {
+        fn kill(pid: i32, signal: i32) -> i32;
+    }
+    let Ok(pid) = i32::try_from(pid) else {
+        return false;
+    };
+    // SAFETY: signal 0 only checks that the process exists.
+    unsafe { kill(pid, 0) == 0 || std::io::Error::last_os_error().raw_os_error() != Some(3) }
+}
+
+#[cfg(all(test, not(unix)))]
+fn process_is_alive(_pid: u32) -> bool {
+    true
+}
+
+#[cfg(test)]
+pub(crate) use env::coverage_relaxed;
 
 /// Runs `git` in `dir` with the test identity pinned, and asserts it succeeded.
 ///
@@ -158,6 +198,41 @@ pub(crate) fn trust_repo(dir: &Path) {
     let path = dir.to_str().expect("fixture path");
     let preview = crate::repository_trust::inspect(path).expect("inspect fixture");
     crate::repository_trust::grant(path, &preview.identity, false).expect("approve fixture");
+}
+
+/// A main checkout (one commit of `seed.txt` on `main`) with `linked`
+/// worktrees, `wt-00`.. on branches `agent/00`.., under one parent directory.
+/// Each linked path is trusted and returned in the spelling git lists it in
+/// (plain canonical form), which is also the key the spawn log files its
+/// children under.
+#[cfg(test)]
+pub(crate) fn repo_with_worktrees(linked: usize) -> (TempDir, TempDir, Vec<PathBuf>) {
+    let main = TempDir::new().unwrap();
+    git_in(main.path(), &["init", "-b", "main"]);
+    fs::write(main.path().join("seed.txt"), "seed").unwrap();
+    git_in(main.path(), &["add", "."]);
+    git_in(main.path(), &["commit", "-m", "init"]);
+    let parent = TempDir::new().unwrap();
+    let paths = (0..linked)
+        .map(|i| {
+            let path = parent.path().join(format!("wt-{i:02}"));
+            let branch = format!("agent/{i:02}");
+            git_in(
+                main.path(),
+                &[
+                    "worktree",
+                    "add",
+                    "-q",
+                    "-b",
+                    &branch,
+                    path.to_str().unwrap(),
+                ],
+            );
+            trust_repo(&path);
+            crate::engine::git_cli::canonicalize_plain(&path).unwrap()
+        })
+        .collect();
+    (main, parent, paths)
 }
 
 /// A fresh repository on `main`, for suites that only need somewhere to scan.
@@ -273,16 +348,375 @@ mod tests {
         holder.join().unwrap();
     }
 
+    /// The defect: a killed run left its harness copies in `target/` for good.
     #[test]
-    fn coverage_relaxed_leaves_plain_runs_unchanged() {
+    fn copies_left_by_dead_processes_are_swept_and_live_ones_are_not() {
+        use super::{fs, sweep_dead_isolates};
+        let dir = tempfile::tempdir().unwrap();
+        let name = |pid: u32, seq: u32| format!("gitpulse_lib-abc-isolate-{pid}-{seq}");
+        let ours = std::process::id();
+        for file in [
+            name(4_000_001, 0),
+            name(4_000_001, 1),
+            name(ours, 0),
+            // Not ours to touch: another stem, and no pid at all.
+            "other_lib-abc-isolate-4000001-0".to_owned(),
+            "gitpulse_lib-abc-isolate-notapid-0".to_owned(),
+            "gitpulse_lib-abc".to_owned(),
+        ] {
+            fs::write(dir.path().join(file), b"image").unwrap();
+        }
+        let removed = sweep_dead_isolates(dir.path(), "gitpulse_lib-abc", |pid| pid == ours);
+        assert_eq!(removed, 2);
+        let left: Vec<String> = fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        for kept in [
+            name(ours, 0),
+            "other_lib-abc-isolate-4000001-0".to_owned(),
+            "gitpulse_lib-abc-isolate-notapid-0".to_owned(),
+            "gitpulse_lib-abc".to_owned(),
+        ] {
+            assert!(left.contains(&kept), "{kept} was removed: {left:?}");
+        }
+        assert_eq!(left.len(), 4);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn this_process_is_alive_and_an_unused_pid_is_not() {
+        use super::process_is_alive;
+        assert!(process_is_alive(std::process::id()));
+        assert!(!process_is_alive(4_000_001));
+    }
+
+    #[test]
+    fn coverage_relaxed_never_tightens_and_only_loosens_for_a_reason() {
         let budget = Duration::from_millis(400);
         let instrumented = std::env::var_os("CARGO_LLVM_COV").is_some()
             || std::env::var_os("LLVM_PROFILE_FILE").is_some();
         let relaxed = coverage_relaxed(budget);
+        assert!(relaxed >= budget, "{relaxed:?}");
         if instrumented {
             assert!(relaxed >= Duration::from_secs(5), "{relaxed:?}");
-        } else {
+        } else if super::env::host_load().is_none_or(|(load, cpus)| load < cpus as f64 * 0.8) {
+            // A host with a core free for every runnable task, by a margin the
+            // slow-moving average cannot cross between the two samples.
             assert_eq!(relaxed, budget);
         }
+    }
+}
+
+/// The hermetic environment's canary: the places GitPulse keeps state, and the
+/// git configuration every fixture repository inherits, must all resolve under
+/// this process's own root and never under the developer's home. A resolver
+/// added later that reads some other variable gets its own line here, which is
+/// the point: the failure names the one path that escaped.
+#[cfg(test)]
+mod hermetic_canary {
+    use super::env::{env_serial, hermetic};
+    use crate::procguard::LockedSpawn;
+    use std::path::{Path, PathBuf};
+
+    fn assert_under_root(what: &str, path: Option<PathBuf>) {
+        let root = hermetic::root();
+        let path = path.unwrap_or_else(|| panic!("{what} did not resolve at all"));
+        assert!(
+            path.starts_with(&root),
+            "{what} resolved to {}, outside this test process's hermetic root {}; a test that \
+             reads it is reading (and may be writing) the developer's real state",
+            path.display(),
+            root.display()
+        );
+    }
+
+    #[test]
+    fn every_per_user_state_directory_resolves_under_the_per_process_root() {
+        // Another test may have a scoped override bound; read between them.
+        let _serial = env_serial();
+        assert_under_root(
+            "tool_config::default_config_dir",
+            crate::tool_config::default_config_dir(),
+        );
+        assert_under_root(
+            "tool_config::default_cache_dir",
+            crate::tool_config::default_cache_dir(),
+        );
+        assert_under_root(
+            "workbench::conversation::claude_home",
+            crate::workbench::conversation::claude_home(),
+        );
+        assert_under_root("ingest::transcript_root", crate::ingest::transcript_root());
+        assert_under_root(
+            "repository_trust::persistent_root",
+            crate::repository_trust::persistent_root().ok(),
+        );
+    }
+
+    #[test]
+    fn this_process_is_not_running_in_the_developers_home() {
+        let _serial = env_serial();
+        let home = std::env::var_os("HOME").map(PathBuf::from);
+        assert!(
+            home.as_deref()
+                .is_some_and(|home| home.starts_with(hermetic::root())),
+            "HOME is {home:?}, not under {}",
+            hermetic::root().display()
+        );
+        if let Some(real) = hermetic::real_home() {
+            assert!(
+                !home.as_deref().is_some_and(|home| home.starts_with(&real)),
+                "HOME still points into the developer's {}",
+                real.display()
+            );
+        }
+    }
+
+    /// A developer's `core.hooksPath`, `init.defaultBranch` or `commit.gpgsign`
+    /// applies inside every fixture repository unless git is told where its
+    /// global and system configuration are. Asked of git itself rather than
+    /// the environment, because the claim is about what git reads.
+    #[test]
+    fn git_reads_no_configuration_outside_the_fixture() {
+        let _serial = env_serial();
+        assert_eq!(
+            std::env::var("GIT_CONFIG_NOSYSTEM").as_deref(),
+            Ok("1"),
+            "system git configuration is not disabled"
+        );
+        let fixture = PathBuf::from(
+            std::env::var_os("GIT_CONFIG_GLOBAL").expect("GIT_CONFIG_GLOBAL must be set"),
+        );
+        assert!(
+            fixture.starts_with(hermetic::root()),
+            "GIT_CONFIG_GLOBAL is {}",
+            fixture.display()
+        );
+        let outside = tempfile::tempdir().unwrap();
+        let output = std::process::Command::new("git")
+            .args(["config", "--list", "--show-origin"])
+            .current_dir(outside.path())
+            .output_locked()
+            .expect("spawn git");
+        assert!(
+            output.status.success(),
+            "git config --list: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let listing = String::from_utf8_lossy(&output.stdout);
+        let foreign: Vec<&str> = listing
+            .lines()
+            .filter(|line| !origin_is_under(line, hermetic::root().as_path()))
+            .collect();
+        assert!(
+            foreign.is_empty(),
+            "git reads configuration from outside the hermetic root: {foreign:?}"
+        );
+    }
+
+    fn origin_is_under(line: &str, root: &Path) -> bool {
+        line.strip_prefix("file:")
+            .is_some_and(|rest| Path::new(rest).starts_with(root))
+    }
+}
+
+/// Every lock a test takes before touching the environment is the same lock.
+///
+/// `GITPULSE_TOOL_CONFIG` was bound under the tool-config lock while
+/// `devmap::cli::resolve_binary` read the very same file under the sidecar
+/// serial, so a reader holding the one it believed was *the* serial saw another
+/// test's binding half-installed. Asserted through the reader's own lock rather
+/// than by naming the locks, because the claim is about what a reader observes.
+#[cfg(test)]
+mod one_environment_lock {
+    use super::env::{bind_env, env_serial};
+    use crate::tool_config::TOOL_CONFIG_ENV;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    const WRITER_VALUE: &str = "/writer/tools.json";
+
+    #[test]
+    fn a_reader_under_the_sidecar_serial_never_observes_a_concurrently_bound_tool_config() {
+        let (bound_tx, bound_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let writer = std::thread::spawn(move || {
+            let serial = env_serial();
+            let _env = bind_env(&serial).set(TOOL_CONFIG_ENV, WRITER_VALUE);
+            bound_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+        });
+        bound_rx.recv().unwrap();
+
+        let (seen_tx, seen_rx) = mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            let _sidecar = crate::harness::sidecar::test_serial();
+            seen_tx.send(std::env::var_os(TOOL_CONFIG_ENV)).unwrap();
+        });
+        // Long enough that a reader which is not excluded has certainly run;
+        // short enough to be invisible. If the reader is excluded it is still
+        // blocked here, which is the point.
+        std::thread::sleep(Duration::from_millis(150));
+        release_tx.send(()).unwrap();
+        writer.join().unwrap();
+        reader.join().unwrap();
+
+        let seen = seen_rx.recv().unwrap();
+        assert_eq!(
+            seen, None,
+            "a reader holding the sidecar serial observed another test's TOOL_CONFIG_ENV binding; \
+             the two serials are not one lock"
+        );
+    }
+
+    #[test]
+    fn the_lock_is_reentrant_on_its_owner_and_releases_on_the_last_drop() {
+        let outer = env_serial();
+        let inner = env_serial();
+        drop(inner);
+        let (tx, rx) = mpsc::channel();
+        let other = std::thread::spawn(move || {
+            let _guard = env_serial();
+            tx.send(()).unwrap();
+        });
+        assert!(
+            rx.recv_timeout(Duration::from_millis(100)).is_err(),
+            "another thread took the lock while the owner still held it"
+        );
+        drop(outer);
+        rx.recv_timeout(Duration::from_secs(5))
+            .expect("the lock was never released after the last guard dropped");
+        other.join().unwrap();
+    }
+}
+
+/// The disk-write guard: a test process that writes without bound is stopped,
+/// loudly, instead of finishing green an hour later having burned the SSD.
+#[cfg(test)]
+mod diskio_guard {
+    use super::env::diskio::{self, Limits};
+    use std::io::Write;
+    use std::time::Duration;
+
+    const MIB: u64 = 1 << 20;
+
+    fn limits(rate_mib: u64, window_s: u64, total_mib: u64) -> Limits {
+        Limits {
+            rate: rate_mib * MIB,
+            window: Duration::from_secs(window_s),
+            total: total_mib * MIB,
+        }
+    }
+
+    fn at(seconds: u64, mib: u64) -> (Duration, u64) {
+        (Duration::from_secs(seconds), mib * MIB)
+    }
+
+    #[test]
+    fn a_sustained_rate_over_the_window_breaks_the_budget() {
+        // 101 MB/s, the rate of the 549.8 GiB report, against a 40 MiB/s limit.
+        let samples: Vec<_> = (0..=40).map(|s| at(s, s * 100)).collect();
+        let why = diskio::verdict(&samples, &limits(40, 30, 1 << 20)).expect("over budget");
+        assert!(why.contains("MiB/s"), "{why}");
+    }
+
+    #[test]
+    fn a_short_burst_inside_the_window_is_not_a_runaway() {
+        // 2 GiB in one second, then quiet: 2 GiB over 30 s is ~68 MiB/s, so use
+        // a limit that the *average* respects while the instant rate does not.
+        let mut samples = vec![at(0, 0), at(1, 2048)];
+        samples.extend((2..=31).map(|s| at(s, 2048)));
+        assert_eq!(diskio::verdict(&samples, &limits(80, 30, 1 << 20)), None);
+    }
+
+    #[test]
+    fn a_young_process_has_no_rate_to_judge_yet() {
+        let samples = [at(0, 0), at(5, 5_000)];
+        assert_eq!(diskio::verdict(&samples, &limits(40, 30, 1 << 20)), None);
+    }
+
+    #[test]
+    fn the_total_budget_applies_whatever_the_rate() {
+        let samples = [at(0, 0), at(600, 9_000)];
+        let why = diskio::verdict(&samples, &limits(1 << 20, 30, 8_192)).expect("over total");
+        assert!(why.contains("budget"), "{why}");
+        assert_eq!(diskio::verdict(&[], &limits(40, 30, 8_192)), None);
+    }
+
+    #[test]
+    fn the_budget_setting_can_tighten_or_disable_but_never_silently_disable() {
+        assert!(diskio::limits(None).is_some());
+        assert_eq!(diskio::limits(Some("0")), None);
+        assert_eq!(diskio::limits(Some("64")).map(|l| l.total), Some(64 * MIB));
+        assert!(
+            diskio::limits(Some("lots")).is_some(),
+            "an unparseable budget must leave the guard on"
+        );
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn the_os_counter_sees_what_this_process_writes() {
+        let before = diskio::bytes_written().expect("this platform has a write counter");
+        let dir = tempfile::tempdir().unwrap();
+        let mut file = std::fs::File::create(dir.path().join("payload")).unwrap();
+        file.write_all(&vec![0xA5u8; 16 * MIB as usize]).unwrap();
+        file.sync_all().unwrap();
+        let after = diskio::bytes_written().expect("counter still readable");
+        assert!(
+            after >= before + 8 * MIB,
+            "wrote 16 MiB and synced it, but the counter moved {} bytes",
+            after.saturating_sub(before)
+        );
+    }
+
+    /// Runs only as the child of the test below: writes until something stops it.
+    #[test]
+    #[ignore = "child of a_runaway_writer_is_aborted_by_the_watchdog"]
+    fn child_runaway_writer() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut file = std::fs::File::create(dir.path().join("runaway")).unwrap();
+        let chunk = vec![0x5Au8; 8 * MIB as usize];
+        for _ in 0..24 {
+            file.write_all(&chunk).unwrap();
+            file.sync_all().unwrap();
+            std::thread::sleep(Duration::from_millis(250));
+        }
+    }
+
+    #[cfg(unix)]
+    fn run_child(budget: &str) -> std::process::Output {
+        use crate::procguard::LockedSpawn;
+        let (mut command, _guard) =
+            super::isolated_libtest_command("test_support::diskio_guard::child_runaway_writer");
+        command
+            .arg("--ignored")
+            .env(diskio::BUDGET_ENV, budget)
+            .stdin(std::process::Stdio::null());
+        command.output_locked().expect("run child test")
+    }
+
+    /// The guard itself: a child allowed 64 MiB that writes 192 MiB must be
+    /// stopped by the watchdog; the same child with the guard off must finish,
+    /// which is what shows the stop was the guard's and not the writer's.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn a_runaway_writer_is_aborted_by_the_watchdog() {
+        let guarded = run_child("64");
+        let stderr = String::from_utf8_lossy(&guarded.stderr);
+        assert!(
+            !guarded.status.success() && stderr.contains("DISK WRITE BUDGET EXCEEDED"),
+            "the watchdog did not stop a writer over its budget: {:?}\n{stderr}",
+            guarded.status
+        );
+
+        let unguarded = run_child("0");
+        assert!(
+            unguarded.status.success(),
+            "with the guard off the child must complete (it is the control): {}\n{}",
+            String::from_utf8_lossy(&unguarded.stdout),
+            String::from_utf8_lossy(&unguarded.stderr)
+        );
     }
 }

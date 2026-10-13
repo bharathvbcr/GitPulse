@@ -8,6 +8,8 @@
  * already running, or the previous poll has not landed yet.
  */
 
+import type { RepoChange } from "./events";
+
 export const STATUS_POLL_INTERVAL_MS = 6_000;
 
 /**
@@ -135,4 +137,41 @@ export function shouldRunStatusPoll(input: PollGateInput): boolean {
     return false;
   }
   return true;
+}
+
+const MAX_POLLED_PATHS = 64;
+const MARKDOWN_EXT = /\.(md|markdown|mdown|mkd|mdx)$/i;
+
+/**
+ * The change a status poll observed, in the watcher's vocabulary, or null when
+ * the two lists are the same.
+ *
+ * The worktree watch is non-recursive, so an edit to `docs/guide.md` reaches
+ * no `repo-changed` event and the code index and document vault stayed stale
+ * until something touched the index. The poll already reads the whole
+ * worktree's status, so it names what moved: every row that appeared,
+ * disappeared or changed. An entry that is, or may contain, a document (a
+ * Markdown name, or no extension) also marks `documents`, as the watcher does.
+ */
+export function changeFromStatusPoll(
+  before: readonly StatusLike[],
+  after: readonly StatusLike[],
+): RepoChange | null {
+  const prior = new Map(before.map((row) => [row.path, row]));
+  const touched: string[] = [];
+  for (const row of after) {
+    const old = prior.get(row.path);
+    prior.delete(row.path);
+    if (old === undefined || !statusEqual(old, row)) touched.push(row.path);
+  }
+  touched.push(...prior.keys());
+  if (touched.length === 0) return null;
+  const mayHoldDocuments = touched.some(
+    (path) => MARKDOWN_EXT.test(path) || path.endsWith("/") || !/\.[^/]*$/.test(path),
+  );
+  return {
+    kinds: mayHoldDocuments ? ["worktree", "documents"] : ["worktree"],
+    paths: touched.slice(0, MAX_POLLED_PATHS),
+    paths_truncated: touched.length > MAX_POLLED_PATHS,
+  };
 }
