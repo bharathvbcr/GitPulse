@@ -643,7 +643,7 @@ mod tests {
         let started = Instant::now();
         ready.wait().unwrap();
         assert!(
-            started.elapsed() < Duration::from_secs(3),
+            started.elapsed() < crate::test_support::coverage_relaxed(Duration::from_secs(3)),
             "the wait outlived the output: {:?}",
             started.elapsed()
         );
@@ -667,7 +667,9 @@ mod tests {
         // may report the hangup before the exit; either way the sleep ends
         // with the child's death, and the ask that follows finds it.
         let mut asked = false;
-        while !asked && started.elapsed() < Duration::from_secs(3) {
+        while !asked
+            && started.elapsed() < crate::test_support::coverage_relaxed(Duration::from_secs(3))
+        {
             ready.wait().unwrap();
             asked = ready.take_exit_hint();
         }
@@ -801,12 +803,14 @@ mod tests {
         assert_eq!(watch.watch(quick.id() as i32), Watch::Watching);
         let started = Instant::now();
         let mut exited = 0;
-        while exited == 0 && started.elapsed() < Duration::from_secs(5) {
+        while exited == 0
+            && started.elapsed() < crate::test_support::coverage_relaxed(Duration::from_secs(5))
+        {
             exited = watch.wait(Duration::from_secs(5)).unwrap();
         }
         assert_eq!(exited, 1);
         assert!(
-            started.elapsed() < Duration::from_secs(3),
+            started.elapsed() < crate::test_support::coverage_relaxed(Duration::from_secs(3)),
             "the wait outlived the exit: {:?}",
             started.elapsed()
         );
@@ -822,7 +826,9 @@ mod tests {
         }
         let mut exited = 0;
         let started = Instant::now();
-        while exited < jobs.len() && started.elapsed() < Duration::from_secs(5) {
+        while exited < jobs.len()
+            && started.elapsed() < crate::test_support::coverage_relaxed(Duration::from_secs(5))
+        {
             exited += watch.wait(Duration::from_secs(5)).unwrap();
         }
         assert_eq!(exited, jobs.len());
