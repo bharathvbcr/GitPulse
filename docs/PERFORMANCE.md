@@ -1093,3 +1093,41 @@ continuously costs the daemon one event per write).
   repositories with very large ignored trees (where the untracked cache is
   documented to help, and which the synthetic fixtures do not model); the page
   cache is never dropped, so "cold" is indicative only.
+
+## 2026-10-13: the pulse walk no longer verifies signatures (ft-9cfa4e7403d33c0e25e752db97175af9)
+
+`%G?` runs the user's signing program for every signed commit it prints. The
+pulse walk carried it, so its cost was the number of signed commits times the
+verifier (10 s for one PGP commit, measured). The walk now reads whether each
+commit carries a signature from the commit objects, in one
+`git cat-file --batch`, and starts no verifier; the selected commit is verified
+alone by `cmd_verify_commit_signature` (30 s limit, cached for 60 s against the
+config files, the allowed-signers and revocation files and the keyring).
+Commit details keep `git_processes = 1`.
+
+`pulse signed N` rows in `command_timings`: three chains of 500 hand-written
+commits carrying 0, 50 and 500 signature headers, and a stand-in signing
+program that counts its calls and sleeps 20 ms per call. A is the base commit
+`8026dd7e` with the same bench file (`GITPULSE_BENCH_ALLOW_VERIFIER=1`, which
+the bench otherwise refuses without); B is this change. Runs were B, A, B, A,
+N = 5 each, min-of-N, on a host at load 27 to 63 on 18 CPUs (so absolute times
+are inflated):
+
+| row | A min (run 1 / 2) | B min (run 1 / 2) | A verifier calls | B verifier calls | A / B git processes |
+| --- | --- | --- | --- | --- | --- |
+| pulse signed 0 | 32.2 ms / 28.6 ms | 93.5 ms / 103.7 ms | 0 | 0 | 1 / 2 |
+| pulse signed 50 | 2.31 s / 2.73 s | 75.0 ms / 108.2 ms | 50 | 0 | 1 / 2 |
+| pulse signed 500 | 25.08 s / 29.46 s | 75.1 ms / 121.1 ms | 500 | 0 | 1 / 2 |
+
+A grows with the signed count (about 50 ms per signed commit with the 20 ms
+stand-in, process start-up included); B does not depend on it. The unsigned
+chain is slower in B by about 60 to 70 ms in these runs: it pays one more
+process (the batch read of 500 commits) and a raw `git cat-file --batch` of 500
+commits takes 10 to 20 ms here, so most of the difference is process start-up
+under load, not git's work. That row's time is not a clean number on this host;
+re-take it on a quiet one before reading it as a cost. The three rows are added
+to the baseline (B run 1); no existing row was reseeded.
+
+DORA: `--since-as-filter` walks past the first old committer date instead of
+stopping there, so the scan reads commits plain `--since` skipped. On git
+older than 2.37 the scan is count-bounded (`-n cap+1`, window applied here).

@@ -125,6 +125,7 @@
     "allow-cmd-fleet-record-metrics",
     "allow-cmd-fleet-snapshot",
     "allow-cmd-get-commit-details",
+    "allow-cmd-verify-commit-signature",
     "allow-cmd-get-commit-diff",
     "allow-cmd-get-commit-file-diff",
     "allow-cmd-get-commit-files",

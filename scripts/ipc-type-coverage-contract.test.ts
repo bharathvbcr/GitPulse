@@ -80,6 +80,7 @@ const UNCHECKED = new Map<string, { reason: string; orphanCommand?: string }>([
   ["CodeintelFileSymbols", { reason: "mirrored in src/lib/codeintel/types.ts — expand codeintel CONTRACTS" }],
   ["CodeintelLayeredImpact", { reason: "mirrored in src/lib/codeintel/types.ts — expand codeintel CONTRACTS" }],
   ["CodeintelNeighbors", { reason: "mirrored in src/lib/codeintel/types.ts — expand codeintel CONTRACTS" }],
+  ["CommitSignatureCheck", { reason: "mirrored in src/lib/pulse/types.ts (with the CommitSignature and SignatureStatus enums) — pending CONTRACTS row" }],
   ["DeadbranchBackupInfo", { reason: "deadbranch backup list; mirrored in src/lib/branches/types.ts" }],
   ["DeadbranchCleanResult", { reason: "deadbranch prune outcome; mirrored in src/lib/branches/types.ts" }],
   ["DeadbranchRestoreResult", { reason: "deadbranch restore outcome; mirrored in src/lib/branches/types.ts" }],
