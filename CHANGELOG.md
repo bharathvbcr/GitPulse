@@ -13,6 +13,27 @@ before that tag is pushed.
 
 ### Changed
 
+- **Open tabs no longer hold their commit history, and terminal history is a
+  setting.**
+  - The graph keeps the rows of the 6 most recently used repositories. A tab
+    you have not looked at in a while shows the loading state and reloads
+    when you return, at the page size and with the commit selected that it had.
+    Measured with `scripts/memory-footprint.mjs` on the two committed
+    real-repository fixtures, a 5,000-row page is about 3 MB (600 to 760 bytes a
+    row), and more once you "load more".
+  - **Settings → Appearance → Terminal scrollback** sets the rows each terminal
+    keeps: 5,000 for shells as before, 1,000 for agent CLIs and task runs.
+    xterm stores twelve bytes per column per row whether or not the row has text,
+    so a filled 200-column session of 5,000 rows holds 11.6 MB (about 14 MB with
+    its JavaScript objects), against 2.4 MB at 1,000 rows. Changing the setting trims
+    open terminals at once.
+  - On macOS, Option is Meta in the terminal (Option+B / Option+F send ESC b /
+    ESC f), and Option-click selects inside mouse-reporting programs. A layout
+    that types a character with Option, such as `@` on a German keyboard,
+    cannot type it inside a terminal.
+  - Terminal rows are now exactly one font height tall (line height 1 rather
+    than 1.15), so a row is a whole number of CSS pixels on a 2x display at every
+    text size (11px text had a 14.5px row). Text is denser than before.
 - **Switching repository tabs no longer rebuilds the sidebar, the view shell
   or the status bar.** All three were keyed on the active repository's path, so
   every switch destroyed and recreated them. They now stay mounted and re-point

@@ -106,6 +106,13 @@ export const SETTINGS_CATALOG: readonly SettingEntry[] = [
     keywords: "terminal screen reader voiceover accessibility a11y announce assistive shell console",
   },
   {
+    id: "terminal-scrollback",
+    section: "appearance",
+    label: "Terminal scrollback",
+    keywords:
+      "terminal scrollback history rows lines buffer memory ram agent shell console output scroll back",
+  },
+  {
     id: "timestamps",
     section: "appearance",
     label: "Timestamps",

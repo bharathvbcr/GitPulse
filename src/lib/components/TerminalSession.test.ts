@@ -67,6 +67,18 @@ describe("TerminalSession PTY contracts", () => {
     expect(source.match(/new XTerm\(/g)?.length).toBe(1);
   });
 
+  it("builds its xterm options from the shared owners, not literals", () => {
+    const ensureBody = source.slice(
+      source.indexOf("function ensureTerm"),
+      source.indexOf("function refitIfResized"),
+    );
+    expect(ensureBody).toContain("scrollback: sessionScrollback()");
+    expect(ensureBody).toContain("lineHeight: TERMINAL_LINE_HEIGHT");
+    expect(ensureBody).toContain("...macOptionOptions(");
+    expect(ensureBody).not.toMatch(/scrollback:\s*\d/);
+    expect(ensureBody).not.toMatch(/lineHeight:\s*\d/);
+  });
+
   it("decouples creation from attachment: ensureTerm never opens a container", () => {
     const ensureBody = source.slice(
       source.indexOf("function ensureTerm"),

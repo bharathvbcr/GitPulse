@@ -110,8 +110,9 @@
   import { toastStore } from "../stores/toastStore";
   import { keepDetached, parseListing } from "../terminal/detachedSessions";
   import {
-    clampTerminalFontSize, hasRenderedBox, macLineEditing, spawnGridSize, terminalViewChord, terminalSearchSummary,
-    TERMINAL_FONT_DEFAULT, TERMINAL_FONT_MIN, TERMINAL_FONT_MAX,
+    clampTerminalFontSize, hasRenderedBox, macLineEditing, macOptionOptions, spawnGridSize, terminalScrollbackFor,
+    terminalViewChord, terminalSearchSummary,
+    TERMINAL_FONT_DEFAULT, TERMINAL_FONT_MIN, TERMINAL_FONT_MAX, TERMINAL_LINE_HEIGHT,
     SEARCH_HIGHLIGHT_LIMIT, SEARCH_QUERY_LIMIT,
   } from "../terminal/viewControls";
 
@@ -380,13 +381,19 @@
     return action.reason;
   }
 
+  /** Rows of history this session keeps: its kind's setting, see `terminalScrollbackFor`. */
+  function sessionScrollback(): number {
+    return terminalScrollbackFor({ launcher, taskRunId }, get(interfaceStore));
+  }
+
   function ensureTerm(): XTerm | null {
     if (term) return term;
     const created = new XTerm({
       fontFamily:
         "ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', monospace",
       fontSize,
-      lineHeight: 1.15,
+      lineHeight: TERMINAL_LINE_HEIGHT,
+      ...macOptionOptions(get(hostPlatform).os),
       // The official search addon uses xterm's proposed decoration API.
       allowProposedApi: true,
       cursorBlink: true,
@@ -397,7 +404,7 @@
       // renderers; this terminal loads fit/search addons, so the DOM renderer
       // draws the background as a plain CSS colour.
       allowTransparency: true,
-      scrollback: 5000,
+      scrollback: sessionScrollback(),
       screenReaderMode: get(interfaceStore).terminalScreenReader,
       /**
        * OSC 8 hyperlinks — the ones a program embeds in its own output.
@@ -1127,6 +1134,15 @@
   $effect(() => {
     const on = $interfaceStore.terminalScreenReader;
     if (term) term.options.screenReaderMode = on;
+  });
+
+  /**
+   * Scrollback follows its setting on live sessions too. Lowering it trims the
+   * oldest rows at once, which is the point of lowering it.
+   */
+  $effect(() => {
+    const rows = terminalScrollbackFor({ launcher, taskRunId }, $interfaceStore);
+    if (term && term.options.scrollback !== rows) term.options.scrollback = rows;
   });
 
   /**

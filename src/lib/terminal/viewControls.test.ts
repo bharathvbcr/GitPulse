@@ -1,5 +1,18 @@
 import { describe, expect, it } from "vitest";
-import { clampTerminalFontSize, hasRenderedBox, macLineEditing, spawnGridSize, terminalSearchSummary, terminalViewChord } from "./viewControls";
+import {
+  clampTerminalFontSize,
+  clampTerminalScrollback,
+  hasRenderedBox,
+  macLineEditing,
+  macOptionOptions,
+  spawnGridSize,
+  terminalScrollbackFor,
+  terminalSearchSummary,
+  terminalViewChord,
+  TERMINAL_AGENT_SCROLLBACK_DEFAULT,
+  TERMINAL_LINE_HEIGHT,
+  TERMINAL_SCROLLBACK_DEFAULT,
+} from "./viewControls";
 import { initialState, openTab, terminalTabDestination } from "./tabs";
 
 const key = (key: string, mods = {}) => ({ key, metaKey: false, ctrlKey: false, altKey: false, shiftKey: false, ...mods });
@@ -84,6 +97,41 @@ describe("terminal view controls", () => {
   it("bounds text size, including malformed and fractional requests", () => {
     expect([NaN, Infinity, -Infinity].map(clampTerminalFontSize)).toEqual([12, 12, 12]);
     expect([-10, 10, 12.6, 24, 1000].map(clampTerminalFontSize)).toEqual([10, 10, 13, 24, 24]);
+  });
+
+  it("keeps scrollback within bounds and falls back for anything unreadable", () => {
+    expect([-5, 0, 99, 100, 2500.4, 50_000, 1e9].map((n) => clampTerminalScrollback(n, 5000))).toEqual([
+      100, 100, 100, 100, 2500, 50_000, 50_000,
+    ]);
+    for (const bad of [Number.NaN, Number.POSITIVE_INFINITY, "5000", null, undefined, {}]) {
+      expect(clampTerminalScrollback(bad, 1234)).toBe(1234);
+    }
+  });
+
+  it("gives an agent or task-run session the smaller scrollback, a shell the larger", () => {
+    const settings = { terminalScrollback: 8000, terminalAgentScrollback: 700 };
+    expect(terminalScrollbackFor({ launcher: "shell" }, settings)).toBe(8000);
+    expect(terminalScrollbackFor({ launcher: "claude" }, settings)).toBe(700);
+    expect(terminalScrollbackFor({ launcher: "shell", taskRunId: "run-1" }, settings)).toBe(700);
+    // A corrupt stored value degrades to the per-kind default, never to the other kind's.
+    expect(terminalScrollbackFor({ launcher: "shell" }, { terminalScrollback: Number.NaN, terminalAgentScrollback: 1 })).toBe(
+      TERMINAL_SCROLLBACK_DEFAULT,
+    );
+    expect(terminalScrollbackFor({ launcher: "codex" }, { terminalScrollback: 1, terminalAgentScrollback: Number.NaN })).toBe(
+      TERMINAL_AGENT_SCROLLBACK_DEFAULT,
+    );
+    expect(TERMINAL_AGENT_SCROLLBACK_DEFAULT).toBeLessThan(TERMINAL_SCROLLBACK_DEFAULT);
+  });
+
+  it("treats Option as Meta on macOS only", () => {
+    expect(macOptionOptions("macos")).toEqual({ macOptionIsMeta: true, macOptionClickForcesSelection: true });
+    for (const os of ["linux", "windows", undefined]) {
+      expect(macOptionOptions(os)).toEqual({ macOptionIsMeta: false, macOptionClickForcesSelection: false });
+    }
+  });
+
+  it("uses a whole-number line height", () => {
+    expect(Number.isInteger(TERMINAL_LINE_HEIGHT)).toBe(true);
   });
 
   it("distinguishes no matches, selection, and capped results", () => {

@@ -444,6 +444,13 @@
     },
   ];
 
+  const TERMINAL_SCROLLBACK_OPTIONS: readonly { value: string; label: string; title: string }[] =
+    [500, 1000, 2000, 5000, 10000, 20000].map((rows) => ({
+      value: String(rows),
+      label: rows.toLocaleString("en-US"),
+      title: `Keep ${rows.toLocaleString("en-US")} rows of history`,
+    }));
+
   const TAB_WIDTH_OPTIONS: readonly { value: string; label: string; title: string }[] =
     TAB_WIDTHS.map((width) => ({
       value: String(width),
@@ -684,6 +691,30 @@
                       costs time on a session that prints continuously. It does not make
                       the shell's input line an editable field: text-expansion tools that
                       rewrite the focused field still cannot act inside a terminal.
+                    </p>
+                  </div>
+
+                  <div data-setting="terminal-scrollback" hidden={!shown("terminal-scrollback")}>
+                    <div class="text-textMuted text-[10px] mb-1.5">Terminal scrollback: shells (rows)</div>
+                    <SettingSegment
+                      ariaLabel="Shell terminal scrollback rows"
+                      options={TERMINAL_SCROLLBACK_OPTIONS}
+                      value={String($interfaceStore.terminalScrollback)}
+                      onselect={(rows) => interfaceStore.setTerminalScrollback(Number(rows))}
+                    />
+                    <div class="text-textMuted text-[10px] mt-2 mb-1.5">Terminal scrollback: agents and task runs (rows)</div>
+                    <SettingSegment
+                      ariaLabel="Agent terminal scrollback rows"
+                      options={TERMINAL_SCROLLBACK_OPTIONS}
+                      value={String($interfaceStore.terminalAgentScrollback)}
+                      onselect={(rows) => interfaceStore.setTerminalAgentScrollback(Number(rows))}
+                    />
+                    <p class="text-textMuted text-[10px] leading-snug mt-1.5">
+                      Rows of history each terminal keeps. Every terminal holds about
+                      twelve bytes per column per row whether or not the row has text
+                      (roughly 12 MB for 5,000 rows at 200 columns), and the terminals
+                      of every repository tab you have visited stay open, so agents
+                      default to 1,000. Lowering a value trims open terminals at once.
                     </p>
                   </div>
 
