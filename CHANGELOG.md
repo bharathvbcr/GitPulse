@@ -13,6 +13,16 @@ before that tag is pushed.
 
 ### Fixed
 
+- A slow host no longer kills a terminal's input. Any keystroke whose answer
+  took more than five seconds stopped the tab's input for good ("Input delivery
+  failed; restart before typing again"), and Restart ended the process in it,
+  an agent included; every late resize said "Resize failed". Input now waits for
+  the real answer and keeps what was typed meanwhile queued, in order, with one
+  notice that it is slow; it stops only when the backend says the session is
+  gone or nothing answers for 60 s, and then says so. A slow resize is silent
+  and a failed one is reported once per run of failures. Deadlines count the
+  time the page actually waited, so a blocked or hidden window no longer
+  charges its own stall to the backend.
 - A terminal that prints a lot no longer costs the webview a script evaluation
   per kilobyte. Each `terminal-output` event is a script run on the app's main
   thread, and macOS hands a PTY reader about 1 KiB per read, so a 1 MiB burst
@@ -22,6 +32,16 @@ before that tag is pushed.
   up to 16 KiB: the same burst is 64 events, byte for byte, with the same
   acknowledgement accounting. A repainting TUI already arrived as about one
   event per frame and is unchanged.
+- Typing and resizing a terminal no longer wait behind git. Terminal commands
+  shared the pool every git command uses (`queue_ms=1165` for a keystroke on a
+  loaded host, git commands holding threads for minutes), and a resize blocked a
+  Tauri async worker on a mutex instead. Keystrokes and resizes now run on a
+  thread per session (in order, bounded, a full queue refused at once) and the
+  slower commands (close, attach, context, list) on a separate bounded pool, so
+  a session whose child stopped reading delays only itself and the frontend's
+  five-second deadlines no longer measure the slowest git command in flight.
+  The new-session command also reads settings and looks for the hook binary on
+  the blocking pool instead of an async worker.
 - Every signal GitPulse sends now goes through one guarded primitive,
   `procguard::signal`. It refuses pid 0, 1 and negative ids, the app's own
   process, group and session, a group GitPulse did not create, and a pid whose

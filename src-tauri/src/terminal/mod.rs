@@ -13,12 +13,16 @@ use crate::harness::{guard_command, PolicyVerdict};
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::Engine;
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
+mod executor;
 mod flow;
 pub(crate) mod foreground;
 pub mod incident;
 #[cfg(unix)]
 mod input;
+mod ipc;
+use executor::Executor;
 use flow::{OutputFlow, Route};
+pub use ipc::{control_async, resize_async, write_async};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::io::{Read, Write};
@@ -51,11 +55,29 @@ const TERMINAL_ARGV_BYTES_CAP: usize = 128 * 1024;
 pub const DEFAULT_PTY_SESSIONS: usize = 32;
 /// The most a user may choose. Each session is a PTY pair, a reader thread
 /// and an output window of `flow::OUTPUT_WINDOW` (256 KiB), so this bounds
-/// those at 256 descriptors, 128 threads and 32 MiB — and stays well inside
-/// macOS's system-wide PTY allowance (`kern.tty.ptmx_max`, 511 by default),
-/// which every other terminal on the machine shares.
+/// those at 256 descriptors, 128 reader threads and 32 MiB — and stays well
+/// inside macOS's system-wide PTY allowance (`kern.tty.ptmx_max`, 511 by
+/// default), which every other terminal on the machine shares. Threads beyond
+/// the readers are on demand and end when idle (see `executor`): at most two
+/// per session (its input and geometry lanes), and a control pool as wide as
+/// this, so 128 + 256 + 128 at the very worst.
 pub const MAX_PTY_SESSIONS: usize = 128;
 const MAX_PTY_INPUT_BYTES: usize = 64 * 1024;
+/// Writes that may wait behind the one being delivered to a session. The
+/// frontend sends one at a time and waits for each, so this is headroom for a
+/// burst of IPC calls, not a working depth; past it a write is refused at once.
+/// Public so the native latency tests and the queue bound share one number.
+pub const INPUT_QUEUE_CAPACITY: usize = 64;
+/// Resizes that may wait behind the one being applied to a session.
+pub const GEOMETRY_QUEUE_CAPACITY: usize = 16;
+/// Slow terminal commands (context, close, attach) that may wait for a thread.
+const CONTROL_QUEUE_CAPACITY: usize = 256;
+/// How long a session's lane thread outlives its last job.
+const LANE_IDLE: Duration = Duration::from_secs(30);
+/// How long a control-pool thread outlives its last job.
+const CONTROL_IDLE: Duration = Duration::from_secs(5);
+/// How long a resize waits for the master lock before it answers "busy".
+const MASTER_LOCK_BUDGET: Duration = Duration::from_secs(2);
 const MAX_PTY_ROWS: u16 = 1_000;
 const MAX_PTY_COLS: u16 = 1_000;
 
@@ -203,6 +225,12 @@ struct SessionEntry {
     /// Canonical repository root. `spawned.cwd` is where the process started,
     /// which may be a directory inside it.
     repo: std::path::PathBuf,
+    /// Where this session's keystrokes are written: one thread, in order, so a
+    /// child that has stopped reading delays only its own input.
+    input: Executor,
+    /// Where this session's resizes are applied, apart from `input` so a
+    /// write spinning on a full tty never holds a resize behind it.
+    geometry: Executor,
 }
 
 /// Thread-safe registry of live PTY sessions.
@@ -219,6 +247,10 @@ pub struct TerminalSessions {
     output_stall_ms: Arc<AtomicU64>,
     /// Mass external-signal deaths, recorded once each (see [`incident`]).
     incidents: Arc<incident::Recorder>,
+    /// The slower commands that are not per keystroke, off the pool every git
+    /// command shares (see `executor`). As wide as the session cap, so closing
+    /// every tab at once still closes them side by side, as it did.
+    control: Executor,
 }
 
 impl Default for TerminalSessions {
@@ -229,11 +261,33 @@ impl Default for TerminalSessions {
             limit: Arc::new(AtomicUsize::new(DEFAULT_PTY_SESSIONS)),
             output_stall_ms: Arc::new(AtomicU64::new(DEFAULT_OUTPUT_STALL.as_millis() as u64)),
             incidents: Arc::default(),
+            control: Executor::new(
+                "control",
+                MAX_PTY_SESSIONS,
+                CONTROL_QUEUE_CAPACITY,
+                CONTROL_IDLE,
+            ),
         }
     }
 }
 
 impl TerminalSessions {
+    /// The lane that delivers `session_id`'s keystrokes.
+    fn input_lane(&self, session_id: &str) -> Result<Executor, String> {
+        self.lock_sessions()
+            .get(session_id)
+            .map(|session| session.input.clone())
+            .ok_or_else(|| format!("Terminal session '{session_id}' not found"))
+    }
+
+    /// The lane that applies `session_id`'s resizes.
+    fn geometry_lane(&self, session_id: &str) -> Result<Executor, String> {
+        self.lock_sessions()
+            .get(session_id)
+            .map(|session| session.geometry.clone())
+            .ok_or_else(|| format!("Terminal session '{session_id}' not found"))
+    }
+
     /// The session map, recovering from a poisoned lock. The map holds only
     /// handles, and every writer inserts or removes one whole entry, so a
     /// panic under the lock cannot leave it half-updated; refusing to read it
@@ -1504,6 +1558,8 @@ fn spawn_session_inner<R: tauri::Runtime>(
             cwd: start.to_string_lossy().into_owned(),
         },
         repo: repo.clone(),
+        input: Executor::new("input", 1, INPUT_QUEUE_CAPACITY, LANE_IDLE),
+        geometry: Executor::new("geometry", 1, GEOMETRY_QUEUE_CAPACITY, LANE_IDLE),
     };
 
     {
@@ -2074,11 +2130,95 @@ pub fn resize_session(
         .get(session_id)
         .map(|session| session.master.clone())
         .ok_or_else(|| format!("Terminal session '{session_id}' not found"))?;
-    let resized = master
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .resize(bounded_pty_size(rows, cols));
+    // Bounded, like a write's wait for its lock: the lane that calls this is
+    // one thread, and a master lock that never came free must make this resize
+    // fail, not take every later resize of the session down with it.
+    let resized = lock_within(&master, MASTER_LOCK_BUDGET)?.resize(bounded_pty_size(rows, cols));
     resized.map_err(|e| format!("Failed to resize terminal: {e}"))
+}
+
+/// Takes `lock` within `budget`, recovering a poisoned one (a PTY master holds
+/// no state a panic could leave half-written).
+fn lock_within<T: ?Sized>(
+    lock: &Mutex<Box<T>>,
+    budget: Duration,
+) -> Result<std::sync::MutexGuard<'_, Box<T>>, String> {
+    let deadline = Instant::now() + budget;
+    loop {
+        match lock.try_lock() {
+            Ok(guard) => return Ok(guard),
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => return Ok(poisoned.into_inner()),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                if Instant::now() >= deadline {
+                    return Err(format!(
+                        "Terminal is busy; the resize gave up after {}ms",
+                        budget.as_millis()
+                    ));
+                }
+                thread::sleep(Duration::from_millis(2));
+            }
+        }
+    }
+}
+
+/// A session's master lock, held by a thread of its own until released or
+/// dropped. For tests that need the one lock a resize waits on to be busy
+/// without reaching into the session map.
+#[doc(hidden)]
+pub struct MasterHold {
+    release: Option<std::sync::mpsc::Sender<()>>,
+    holder: Option<thread::JoinHandle<()>>,
+}
+
+impl MasterHold {
+    /// Lets go of the lock and waits for the holding thread to end.
+    pub fn release(mut self) {
+        self.finish();
+    }
+
+    fn finish(&mut self) {
+        drop(self.release.take());
+        if let Some(holder) = self.holder.take() {
+            let _ = holder.join();
+        }
+    }
+}
+
+impl Drop for MasterHold {
+    fn drop(&mut self) {
+        self.finish();
+    }
+}
+
+/// Takes `session_id`'s master lock on a thread of its own and returns once it
+/// is held.
+#[doc(hidden)]
+pub fn hold_master(state: &TerminalSessions, session_id: &str) -> Result<MasterHold, String> {
+    let master = state
+        .lock_sessions()
+        .get(session_id)
+        .map(|session| session.master.clone())
+        .ok_or_else(|| format!("Terminal session '{session_id}' not found"))?;
+    let (release, released) = std::sync::mpsc::channel::<()>();
+    let (held_tx, held_rx) = std::sync::mpsc::channel::<()>();
+    let holder = thread::Builder::new()
+        .name("master-hold".into())
+        .spawn(move || {
+            let _guard = master
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let _ = held_tx.send(());
+            // Ends when the sender is dropped or sends.
+            let _ = released.recv();
+        })
+        .map_err(|e| e.to_string())?;
+    held_rx
+        .recv()
+        .map_err(|_| "the master hold thread ended before locking".to_string())?;
+    Ok(MasterHold {
+        release: Some(release),
+        holder: Some(holder),
+    })
 }
 
 /// Kills a PTY session.
