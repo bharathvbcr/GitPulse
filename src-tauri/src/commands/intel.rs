@@ -606,7 +606,7 @@ pub async fn cmd_fleet_record_metrics(
 }
 
 #[cfg(test)]
-mod tests {
+mod payload_cap_tests {
     use super::*;
     use crate::commands::payload::{MAX_CONTENT_BYTES, MAX_PREVIEW_FILE_BYTES};
 
@@ -693,25 +693,26 @@ exit 2
             .collect();
         let repo_path = repo.path().to_string_lossy().into_owned();
 
-        let worker = std::thread::spawn({
-            let files = files.clone();
-            move || preview_many_cancellable(&repo_path, &files, Some("preview-cancel-test".into()))
+        let outcome = std::thread::scope(|scope| {
+            let worker = scope.spawn(|| {
+                preview_many_cancellable(&repo_path, &files, Some("preview-cancel-test".into()))
+            });
+            // The first file is running once its call is logged; the token is
+            // registered before that.
+            let started = std::time::Instant::now();
+            while std::fs::read_to_string(&log).map_or(true, |text| text.lines().count() == 0) {
+                assert!(
+                    started.elapsed()
+                        < crate::test_support::env::coverage_relaxed(
+                            std::time::Duration::from_secs(30)
+                        ),
+                    "no preview started"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            assert!(crate::codeintel::cancel_query("preview-cancel-test"));
+            worker.join().unwrap()
         });
-        // The first file is running once its call is logged; the token is
-        // registered before that.
-        let started = std::time::Instant::now();
-        while std::fs::read_to_string(&log).map_or(true, |text| text.lines().count() == 0) {
-            assert!(
-                started.elapsed()
-                    < crate::test_support::env::coverage_relaxed(std::time::Duration::from_secs(
-                        30
-                    )),
-                "no preview started"
-            );
-            std::thread::sleep(std::time::Duration::from_millis(20));
-        }
-        assert!(crate::codeintel::cancel_query("preview-cancel-test"));
-        let outcome = worker.join().unwrap();
         crate::devmap::cli::clear_preview_debounces();
 
         assert!(outcome.cancelled, "{:?}", outcome.reason);

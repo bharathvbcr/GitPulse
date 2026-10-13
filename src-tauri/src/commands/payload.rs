@@ -110,7 +110,7 @@ pub(crate) fn check_preview_batch(files: &[(String, String)]) -> Result<(), Payl
 }
 
 #[cfg(test)]
-mod tests {
+mod payload_tests {
     use super::*;
 
     fn file(path: &str, bytes: usize) -> (String, String) {
