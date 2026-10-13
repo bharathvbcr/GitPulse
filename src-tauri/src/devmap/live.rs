@@ -63,6 +63,7 @@ use crate::engine::git_cli::is_deferred_under_load;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
+use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -893,20 +894,17 @@ pub(crate) fn live_refresh(
         }
         LiveBuildRun::Detached => {
             let thread_settle = settle.clone();
-            let started = std::thread::Builder::new()
-                .name("devmap-live-build".into())
-                .spawn(move || {
+            let started = crate::supervisor::spawn_once(
+                "devmap-live-build",
+                "devmap-live-build",
+                move || {
                     crate::engine::git_cli::with_background_processes(|| {
-                        prepared.run_then(|spawned| {
-                            let outcome = thread_settle.record(spawned, build_clock.elapsed());
-                            lock_finished_builds().insert(thread_settle.repo_path.clone(), outcome);
-                            // Free for the next repository the moment the
-                            // outcome is collectable, not when this thread
-                            // finishes unwinding.
-                            drop(slot);
+                        run_detached_build(slot, thread_settle, build_clock, |settler| {
+                            prepared.run_then(settler)
                         })
                     });
-                });
+                },
+            );
             match started {
                 Ok(_) => LiveRefreshOutcome {
                     decision: LiveRefreshDecision::Started,
@@ -930,6 +928,43 @@ pub(crate) fn live_refresh(
                 ),
             }
         }
+    }
+}
+
+/// What a detached build hands the child's result to once it has run.
+type BuildSettler = Box<dyn FnOnce(Result<BuildOutcome, String>)>;
+
+/// The body of the detached build thread: `run` runs the child and gives its
+/// result to the settler, which records the outcome for the next ask and then
+/// frees the live slot.
+///
+/// A panic in `run` unwinds through the settler, so the slot is released by
+/// [`LiveBuildSlot`]'s `Drop` either way. What an unwind alone would lose is the
+/// outcome and the wait: the next ask would find the repository idle with
+/// nothing pending and start the same build again on every tick. So the panic is
+/// recorded as a failed build, which sets the failure wait, and then resumed for
+/// `supervisor::spawn_once` to list the thread as stopped in Diagnostics.
+fn run_detached_build(
+    slot: LiveBuildSlot,
+    settle: LiveSettle,
+    build_clock: Instant,
+    run: impl FnOnce(BuildSettler),
+) {
+    let panicked = settle.clone();
+    let settler: BuildSettler = Box::new(move |spawned| {
+        let outcome = settle.record(spawned, build_clock.elapsed());
+        lock_finished_builds().insert(settle.repo_path.clone(), outcome);
+        // Free for the next repository the moment the outcome is
+        // collectable, not when this thread finishes unwinding.
+        drop(slot);
+    });
+    if let Err(payload) = catch_unwind(AssertUnwindSafe(|| run(settler))) {
+        let outcome = panicked.record(
+            Err("the live index build thread panicked".into()),
+            build_clock.elapsed(),
+        );
+        lock_finished_builds().insert(panicked.repo_path.clone(), outcome);
+        resume_unwind(payload);
     }
 }
 
@@ -1933,6 +1968,112 @@ exit 2
         // Collected once; the rest it set now answers the next tick.
         let next = start_refresh(&path, true);
         assert_eq!(next.decision, LiveRefreshDecision::SkipCooldown, "{next:?}");
+    }
+
+    /// A detached build whose thread panics must not hold the one live slot
+    /// for the rest of the process, and must not be forgotten: the outcome is a
+    /// failed build with its wait (so the next tick does not start the same
+    /// build again), and Diagnostics lists the thread as stopped.
+    #[test]
+    #[cfg(unix)]
+    fn a_panicking_detached_build_frees_the_slot_and_records_a_failure() {
+        let _lock = crate::harness::sidecar::test_serial();
+        clear_all_live_echo_cooldowns();
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                clear_all_live_echo_cooldowns();
+                crate::supervisor::note_recovered("devmap-live-build");
+            }
+        }
+        let _reset = Reset;
+        let path = "/gitpulse-test/panicking-detached-build".to_string();
+        let slot = LiveBuildSlot::claim(&path).expect("the slot is free");
+        assert!(
+            LiveBuildSlot::claim("/gitpulse-test/other").is_err(),
+            "the slot is held while the build runs"
+        );
+        let settle = LiveSettle {
+            repo_path: path.clone(),
+            decision: LiveRefreshDecision::Refresh,
+            facts: facts(true, false, true, false),
+            artifacts_missing: false,
+            started: Instant::now(),
+        };
+        let started = Instant::now();
+        let handle =
+            crate::supervisor::spawn_once("devmap-live-build", "devmap-live-build", move || {
+                run_detached_build(slot, settle, started, |_settler| {
+                    panic!("injected build panic")
+                })
+            })
+            .expect("thread starts");
+        handle.join().expect("spawn_once records the panic itself");
+
+        drop(LiveBuildSlot::claim("/gitpulse-test/other").expect("the panic freed the slot"));
+        let outcome = lock_finished_builds()
+            .remove(&path)
+            .expect("a panicked build leaves an outcome for the next ask");
+        assert_eq!(
+            outcome.decision,
+            LiveRefreshDecision::Refresh,
+            "{outcome:?}"
+        );
+        assert!(outcome.build.is_none(), "{outcome:?}");
+        assert!(
+            outcome
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("panicked")),
+            "{outcome:?}"
+        );
+        assert!(
+            outcome.cooldown_remaining_ms.is_some_and(|ms| ms > 0),
+            "a panicked build must wait like a failed one: {outcome:?}"
+        );
+        assert!(
+            live_wait(&path, Instant::now()).is_some(),
+            "the failure wait is recorded"
+        );
+        let listed = crate::supervisor::degraded()
+            .into_iter()
+            .find(|d| d.subsystem == "devmap-live-build")
+            .expect("Diagnostics lists the stopped thread");
+        assert!(listed.stopped, "{listed:?}");
+        assert!(listed.reason.contains("injected build panic"), "{listed:?}");
+    }
+
+    /// A detached build that settles normally records its outcome and frees
+    /// the slot exactly as before.
+    #[test]
+    #[cfg(unix)]
+    fn a_settled_detached_build_records_its_outcome_and_frees_the_slot() {
+        let _lock = crate::harness::sidecar::test_serial();
+        clear_all_live_echo_cooldowns();
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                clear_all_live_echo_cooldowns();
+            }
+        }
+        let _reset = Reset;
+        let path = "/gitpulse-test/settled-detached-build".to_string();
+        let slot = LiveBuildSlot::claim(&path).expect("the slot is free");
+        let settle = LiveSettle {
+            repo_path: path.clone(),
+            decision: LiveRefreshDecision::Refresh,
+            facts: facts(true, false, true, false),
+            artifacts_missing: false,
+            started: Instant::now(),
+        };
+        run_detached_build(slot, settle, Instant::now(), |settler| {
+            settler(Err("devmap could not run".into()))
+        });
+        drop(LiveBuildSlot::claim("/gitpulse-test/other").expect("the settler freed the slot"));
+        let outcome = lock_finished_builds()
+            .remove(&path)
+            .expect("outcome stored");
+        assert_eq!(outcome.reason.as_deref(), Some("devmap could not run"));
     }
 
     /// One automatic build at a time across every repository: the frontend

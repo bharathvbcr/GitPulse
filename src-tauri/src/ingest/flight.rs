@@ -258,38 +258,39 @@ where
     let slots = Arc::clone(slots);
     let flight = Arc::clone(flight);
     let key = key.to_string();
-    std::thread::Builder::new()
-        .name("catch-up".into())
-        .spawn(move || {
-            let budget = Budget::within(wait);
-            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                work(&budget, &flight.progress)
-            }))
-            .unwrap_or_else(|_| CatchUp {
-                error: "catch-up panicked".into(),
-                ..CatchUp::default()
-            });
-            flight.progress.enter(Phase::Done);
-            // The slot is updated before the waiters are woken, so a caller
-            // that returns and immediately asks again sees this result.
-            {
-                let mut slots = slots
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                let slot = slots.entry(key).or_default();
-                slot.running = None;
-                slot.last = Some(Finished {
-                    at: Instant::now(),
-                    result: result.clone(),
-                });
-            }
-            *flight
-                .done
+    // The worker catches its own panic and turns it into the pass's reported
+    // error, so waiters are always woken; the supervisor adds the Diagnostics
+    // record for anything that escapes that.
+    crate::supervisor::spawn_once("catch-up", "catch-up", move || {
+        let budget = Budget::within(wait);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            work(&budget, &flight.progress)
+        }))
+        .unwrap_or_else(|_| CatchUp {
+            error: "catch-up panicked".into(),
+            ..CatchUp::default()
+        });
+        flight.progress.enter(Phase::Done);
+        // The slot is updated before the waiters are woken, so a caller
+        // that returns and immediately asks again sees this result.
+        {
+            let mut slots = slots
                 .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(result);
-            flight.ready.notify_all();
-        })
-        .map(|_| ())
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let slot = slots.entry(key).or_default();
+            slot.running = None;
+            slot.last = Some(Finished {
+                at: Instant::now(),
+                result: result.clone(),
+            });
+        }
+        *flight
+            .done
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(result);
+        flight.ready.notify_all();
+    })
+    .map(|_| ())
 }
 
 fn await_flight(flight: &Arc<Flight>, remaining: Duration, wait: Duration) -> CatchUp {
