@@ -1,5 +1,6 @@
-import { describe, expect, it, vi } from "vitest";
-import { invalidateSharedReads, withDeferralRetry } from "./invoke";
+import { readFileSync } from "node:fs";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
+import { configureSharedReads, invalidateSharedReads, withDeferralRetry } from "./invoke";
 import { SHARED_READ_COMMANDS } from "./sharedReads";
 import { readCommandsSource } from "../../../scripts/commands-source";
 
@@ -15,6 +16,30 @@ function backend() {
   const invoke = withDeferralRetry(raw as never, { random: () => 0, whenShown: () => Promise.resolve() });
   return { raw, pending, invoke };
 }
+
+// The window's entry registers the list in production (src/main.ts); these
+// tests register it themselves and put the empty default back afterwards.
+beforeAll(() => configureSharedReads(SHARED_READ_COMMANDS));
+afterAll(() => configureSharedReads(new Set()));
+
+describe("a window that registers no list joins nothing", () => {
+  it("sends every identical read to the backend, and invoke.ts does not import the list", () => {
+    configureSharedReads(new Set());
+    try {
+      const b = backend();
+      void b.invoke("cmd_get_status", { repoPath: "/r" });
+      void b.invoke("cmd_get_status", { repoPath: "/r" });
+      expect(b.raw).toHaveBeenCalledTimes(2);
+    } finally {
+      configureSharedReads(SHARED_READ_COMMANDS);
+    }
+    // The structure that keeps the status popover's ACL grant exact: the
+    // literals live in sharedReads.ts, which only the main window's entry imports.
+    const source = readFileSync(new URL("./invoke.ts", import.meta.url), "utf8");
+    expect(source).not.toMatch(/from "\.\/sharedReads"/);
+    expect(source).not.toMatch(/"cmd_[a-z_]+"/);
+  });
+});
 
 describe("identical concurrent reads reach the backend once", () => {
   it("answers two identical in-flight reads with one call", async () => {
