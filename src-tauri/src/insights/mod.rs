@@ -4060,7 +4060,8 @@ mod tests {
 
         assert!(
             took < deadline + Duration::from_secs(1),
-            "a 1 s deadline returned after {took:?}"
+            "a 1 s deadline returned after {took:?} (the snapshot reports {} ms)",
+            snap.duration_ms
         );
         assert!(snap.deadline_expired, "{snap:?}");
         // The reads that did not happen are unknown, never clean.
@@ -4101,7 +4102,9 @@ mod tests {
 
         // The main checkout is in the first wave and the last worktree in the
         // third: the edit lands after the snapshot began and before the last
-        // worktree's turn.
+        // worktree's turn. Relies on a fan-out of 4: with 10 worktrees, main is
+        // read in wave 1 and the last in wave 3, so a change to
+        // DIRTY_SCAN_FAN_OUT that put them in one wave would make this vacuous.
         let edited = last.clone();
         let snap = crate::engine::worktree::status_probes::with_probe(
             std::slice::from_ref(&root),
@@ -4139,7 +4142,8 @@ mod tests {
         fs::write(linked[0].join("late.txt"), "first").unwrap();
 
         // The last worktree is read in the third wave; the main checkout, read
-        // in the first, is edited just before it.
+        // in the first, is edited just before it. Relies on the same fan-out of 4
+        // as the test above.
         let edited = root.clone();
         let snap = crate::engine::worktree::status_probes::with_probe(
             std::slice::from_ref(&last),
