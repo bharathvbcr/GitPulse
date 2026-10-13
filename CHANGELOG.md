@@ -13,6 +13,28 @@ before that tag is pushed.
 
 ### Changed
 
+- **A repository is read one snapshot at a time, and switching back to a tab
+  you just read no longer reads it again.**
+  - A watcher event, a poll, an activation or a mutation's refresh that arrives
+    while a snapshot is running no longer starts a second one beside it. They
+    share one more read, taken after the first. Against a 4 s `git status` and a
+    watcher event every 250 ms, reads used to stack 17 deep on one repository.
+  - Switching to a tab whose snapshot landed in the last 5 s, under a live
+    watch, issues no snapshot read (the tab-switch harness went from 22 IPC
+    calls a switch to 15; the 7 removed are the snapshot reads and the stats
+    drain).
+  - The status poll rests ten times what its last `git status` cost, so a 4 s
+    status keeps git under 10% busy instead of about 40%. A repository with a
+    live watcher that has been quiet for a minute is polled once a minute,
+    and the watch is re-asserted on a timer rather than every tenth poll.
+  - Branch churn is not asked for again when no branch tip has moved since the
+    last complete drain, and a cold pass stops starting new tips after 5 s and
+    says so (`capped`), the next call resuming from the cache. The drain stays
+    one call at a time: the backend runs a pass serially on purpose, to keep
+    its git start rate under the app-wide cap.
+  - Identical read-only calls in flight (`cmd_get_status`, `cmd_list_branches`,
+    the graph and a few more, an explicit list) reach the backend once; a
+    caller that gives up leaves the call running for the others.
 - **Open tabs no longer hold their commit history, and terminal history is a
   setting.**
   - The graph keeps the rows of the 6 most recently used repositories. A tab

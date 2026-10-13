@@ -128,10 +128,10 @@ import {
 } from "../repos/operation";
 import type { RepoChange } from "../repos/events";
 import {
-  STATUS_POLL_INTERVAL_MS,
   changeFromStatusPoll,
   shallowRecordListEqual,
   shouldRunStatusPoll,
+  statusPollRestMs,
   statusesEqual,
 } from "../repos/statusPoll";
 import {
@@ -174,6 +174,12 @@ const PERSIST_DEBOUNCE_MS = 300;
  * resumes on the next refresh.
  */
 export const STATS_DRAIN_MAX_BATCHES = 64;
+/**
+ * How recent a landed snapshot must be for activating its tab to skip the read
+ * (given a live watch). Short because the skip trusts the watcher for the
+ * interval; long enough to cover switching back and forth between two tabs.
+ */
+export const ACTIVATION_FRESH_MS = 5_000;
 /** Publish coalesced stats every N batches (and always on the final drain). */
 export const STATS_PUBLISH_EVERY = 8;
 /**
@@ -295,7 +301,7 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
   // Per-tab and per-path records the poll, hydrate, stats and mutation paths
   // keep. One owner, so every close route forgets all of them (`sessionBook.ts`).
   const sessionBook = createSessionBook((a, b) => sameRepo(a, b, options));
-  const { familyUnknown, snapshotRuns, pollRuns, statsInflight, mutationEchoUntil } = sessionBook;
+  const { familyUnknown, snapshotRuns, pollRuns, statsInflight, mutationEchoUntil, statsDrained } = sessionBook;
 
   // Diff selection: file, commit, commit file and range share one fetch path
   // (`repos/diffSelection.ts`), which also owns the token that orders them.
@@ -317,12 +323,18 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
    *
    * Re-asserting repairs rather than merely reports: `cmd_watch_repo` returns
    * immediately when the session is still registered, and creates a fresh
-   * watcher when it was reaped. Every 10 ticks (~60s) keeps a dead watch's
-   * blind window bounded to about a minute without putting a subprocess on
-   * the 6-second path.
+   * watcher when it was reaped. Once a minute keeps a dead watch's blind
+   * window bounded to about a minute without putting a subprocess on the
+   * 6-second path. Timed rather than counted: a quiet repository with a live
+   * watch polls once a minute (`statusPollRestMs`), and ten of those ticks
+   * would leave a dead watch blind for ten.
    */
-  const WATCH_REASSERT_EVERY_TICKS = 10;
-  let pollTickCount = 0;
+  const WATCH_REASSERT_EVERY_MS = 60_000;
+  let lastWatchReassertAt = Date.now();
+  /** How long the last poll took, which sets how long the next one waits. */
+  let pollLastDurationMs: number | null = null;
+  /** Polls in a row that found the active repository's statuses unchanged. */
+  let pollQuietCount = 0;
 
   function onStatusPollVisibility(): void {
     if (!pollWanted) return;
@@ -352,8 +364,13 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
 
   function armStatusPoll(): void {
     if (!pollWanted || pollTimer !== null || typeof setTimeout === "undefined") return;
+    const active = activeSession();
     const decision = decideCadence({
-      baseMs: STATUS_POLL_INTERVAL_MS,
+      baseMs: statusPollRestMs({
+        watchLive: !!active && !needsFullPoll(active.watch),
+        lastDurationMs: pollLastDurationMs,
+        quietPolls: pollQuietCount,
+      }),
       lagMs: readEventLoopDelay(),
       paused: readBackgroundDocument(),
     });
@@ -410,8 +427,8 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
     // self-heals, and so its loss becomes visible if it cannot. Deliberately
     // not awaited: the status tick must not wait on it, and its own result is
     // generation-guarded before it lands.
-    pollTickCount += 1;
-    if (pollTickCount % WATCH_REASSERT_EVERY_TICKS === 0) {
+    if (Date.now() - lastWatchReassertAt >= WATCH_REASSERT_EVERY_MS) {
+      lastWatchReassertAt = Date.now();
       void acquireWatch(sessionId, path, true);
     }
 
@@ -425,10 +442,13 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
     // extra cost is one snapshot per interval and only while degraded.
     if (needsFullPoll(session!.watch)) {
       pollInflight = true;
+      const startedAt = Date.now();
       try {
         await hydrate(sessionId, path, generation);
       } finally {
         pollInflight = false;
+        pollLastDurationMs = Date.now() - startedAt;
+        pollQuietCount = 0;
       }
       return;
     }
@@ -441,10 +461,12 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
     const snapshotRunAtStart = snapshotRuns.get(sessionId);
     pollRuns.set(sessionId, run);
     pollInflight = true;
+    const startedAt = Date.now();
     try {
       const statuses = await invokeFn<FileStatus[]>("cmd_get_status", {
         repoPath: path,
       });
+      pollLastDurationMs = Date.now() - startedAt;
       if (pollRuns.get(sessionId) !== run) return;
       if (snapshotRuns.get(sessionId) !== snapshotRunAtStart) return;
       // A quiet repo returns byte-identical statuses every 6s; republishing
@@ -457,8 +479,10 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
         live.generation === generation &&
         statusesEqual(statuses, live.statuses)
       ) {
+        pollQuietCount += 1;
         return;
       }
+      pollQuietCount = 0;
       const before = live && live.generation === generation ? live.statuses : [];
       applyToSession(sessionId, generation, { statuses });
       // The watcher cannot see nested edits (its worktree watch is
@@ -1218,7 +1242,43 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
     return true;
   }
 
-  async function hydrate(id: string, path: string, generation: number) {
+  /**
+   * Reads the tab's snapshot. At most one runs per tab: a request while one is
+   * running does not start a second, it is answered by one trailing run that
+   * every request meanwhile shares (`hydrateFlight.ts`). Every caller — a
+   * watcher event, a poll, an activation, a mutation's refresh — comes through
+   * here, so the cost of a burst of them is one snapshot plus one more.
+   */
+  function hydrate(id: string, path: string, generation: number): Promise<void> {
+    return sessionBook.hydrates.run(id, generation, () => hydrateNow(id, path, generation));
+  }
+
+  /**
+   * Whether the tab's snapshot is recent enough that activating it need not
+   * read again: it landed within {@link ACTIVATION_FRESH_MS}, the tab holds a
+   * live watch (a degraded or parked one reports nothing), the last read did
+   * not fail, and no read is in flight — that one belongs to the epoch being
+   * left, and the store would discard its answer.
+   */
+  function snapshotIsFresh(id: string, generation: number): boolean {
+    const session = internal.sessions[id];
+    const landedAt = sessionBook.hydratedAt.get(id);
+    return (
+      !!session &&
+      session.generation === generation &&
+      session.hasHydrated &&
+      !session.error &&
+      !session.trustRequired &&
+      !needsFullPoll(session.watch) &&
+      landedAt !== undefined &&
+      Date.now() - landedAt < ACTIVATION_FRESH_MS &&
+      sessionBook.hydrates.current(id) === null
+    );
+  }
+
+  async function hydrateNow(id: string, path: string, generation: number) {
+    // A trailing run starts after the tab may have been closed.
+    if (!internal.sessions[id]) return;
     const run = (snapshotRuns.get(id) ?? 0) + 1;
     snapshotRuns.set(id, run);
     // Synchronous unless there is something to learn: an extra yield on every
@@ -1244,6 +1304,7 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
       // failed drain must retry on the next refresh, and the backend
       // memoizes per-tip so an unchanged repo costs one cheap call.
       if (internal.sessions[id]?.generation === generation) {
+        sessionBook.hydratedAt.set(id, Date.now());
         contentRevisions.update((revisions) => ({
           ...Object.fromEntries(Object.values(internal.sessions)
             .filter((session) => revisions[session.path] !== undefined)
@@ -1280,12 +1341,39 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
     return `${isRemote ? "remote" : "local"}:${remoteName ?? ""}:${name}`;
   }
 
+  /**
+   * What the churn of a branch list was measured against: every branch and the
+   * tip it points at. Churn is relative to the default branch, so a moved
+   * default invalidates every other row's numbers even though their own tips
+   * did not move — which is why the whole list is the signature, not each row's
+   * tip on its own.
+   */
+  function branchTipSignature(branches: readonly BranchInfo[]): string {
+    return branches
+      .map((b) => `${branchStatsKey(b.name, b.is_remote, b.remote_name)}@${b.tip_commit_id}${b.is_default ? "*" : ""}`)
+      .sort()
+      .join("\n");
+  }
+
   async function fetchBranchStats(
     id: string,
     path: string,
     generation: number,
   ) {
     if (statsInflight.has(id)) return;
+    // Nothing to ask when the last drain finished cleanly and no tip has moved
+    // since: the answer is what the rows already carry. A refresh that changed
+    // only the work tree, or nothing at all, used to cost a backend call (and
+    // its refs listing) every time.
+    const known = internal.sessions[id];
+    if (
+      known &&
+      known.generation === generation &&
+      !known.statsFailed &&
+      statsDrained.get(id) === branchTipSignature(known.branches)
+    ) {
+      return;
+    }
     statsInflight.add(id);
     // Raise the churn marker only when some branch actually misses stats
     // (or the last attempt failed): after a completed drain every rendered
@@ -1305,6 +1393,10 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
       statsInflight.delete(id);
       return;
     }
+    // The list the backend is being asked about. A refresh that moves a tip
+    // while the drain runs leaves that tip without numbers, so the drain may
+    // only vouch for the list it started with.
+    const startSignature = branchTipSignature(start.branches);
     // Stats are collected here and merged into the LIVE branch list at each
     // publish. Writing back a copy of the list as it stood when the drain
     // began reverted a refresh that landed meanwhile: a deleted branch came
@@ -1399,7 +1491,20 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
       // bound or losing walks to errors must NOT read as success — BranchList
       // renders its "churn unavailable" marker off statsFailed.
       flush(false, !drainedCleanly || lastBatchHadFailures);
+      const settled = internal.sessions[id];
+      if (
+        settled &&
+        settled.generation === generation &&
+        drainedCleanly &&
+        !lastBatchHadFailures &&
+        branchTipSignature(settled.branches) === startSignature
+      ) {
+        statsDrained.set(id, startSignature);
+      } else {
+        statsDrained.delete(id);
+      }
     } catch {
+      statsDrained.delete(id);
       // Final failure: stop posing zeros as data — BranchList renders its
       // "churn unavailable" marker off statsFailed instead.
       flush(false, true);
@@ -1861,7 +1966,14 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
       putSession({ ...activation, isLoading: !session.hasHydrated });
       publish();
       revealGraph(activation);
+      // Asked before `onActivated`, which cancels what is owed: a refresh the
+      // policy still owes this repository is a reason to read it now.
+      const refreshOwed = watcherRefreshPolicy
+        .owed()
+        .some((key) => sameRepo(key, session.path, options));
       watcherRefreshPolicy.onActivated(session.path);
+      pollQuietCount = 0;
+      pollLastDurationMs = null;
       // `force` is restore presenting a saved tab, not a person clicking it.
       if (!extras.force) await noteTabActivated(session.path);
       // A parked tab comes back live here; a watched one moves to the front
@@ -1869,7 +1981,12 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
       // one evicted. After the note, which must precede every native call
       // this activation makes.
       await acquireWatch(id, session.path, true);
-      await hydrate(id, session.path, activation.generation);
+      // A snapshot that landed seconds ago under a live watcher is what a
+      // fresh read would return: the watcher reports anything since. Reading
+      // again on every switch is six git reads and a stats drain for nothing.
+      if (extras.force || refreshOwed || !snapshotIsFresh(id, activation.generation)) {
+        await hydrate(id, session.path, activation.generation);
+      }
       ensureStatusPoll();
       flushPersist();
     },

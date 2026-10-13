@@ -8,9 +8,62 @@
  * already running, or the previous poll has not landed yet.
  */
 
+import { CADENCE_CEILING_MS } from "../runtime/loadCadence";
 import type { RepoChange } from "./events";
 
 export const STATUS_POLL_INTERVAL_MS = 6_000;
+/**
+ * The period of a poll that has found nothing for a while on a repository
+ * whose watcher is live. The watcher reports everything under `.git` and the
+ * top of the work tree; the poll exists for what it cannot see (nested edits)
+ * and as a net under a watcher that died, so a quiet repository needs it
+ * rarely.
+ */
+export const STATUS_POLL_QUIET_INTERVAL_MS = 60_000;
+/** Consecutive polls that found nothing before a watched repository counts as quiet. */
+export const STATUS_POLL_QUIET_AFTER = 10;
+/**
+ * How many times its own cost a poll waits before the next one. `git status`
+ * on a large work tree took 4 s on average (9.4 s at worst), and a fixed 6 s
+ * rest after it kept git running about 40% of the time on the one repository
+ * someone was looking at. Ten times the last duration holds the duty cycle
+ * under 10% whatever the repository costs.
+ */
+export const STATUS_POLL_COST_FACTOR = 10;
+/** No rest is ever longer than the cadence ceiling, however slow the last poll was. */
+export const STATUS_POLL_MAX_INTERVAL_MS = CADENCE_CEILING_MS;
+
+export interface PollRestInput {
+  /** The active repository's watcher is confirmed live (`watching`). */
+  watchLive: boolean;
+  /** How long the last poll's `git status` took; null before the first. */
+  lastDurationMs: number | null;
+  /** Polls in a row that found the statuses unchanged. */
+  quietPolls: number;
+}
+
+/**
+ * The rest between one poll finishing and the next starting, before the
+ * event-loop stretch `decideCadence` adds on top.
+ *
+ * - The base is the usual interval; a live watcher whose repository has been
+ *   quiet for {@link STATUS_POLL_QUIET_AFTER} polls lengthens it to
+ *   {@link STATUS_POLL_QUIET_INTERVAL_MS}. A poll that finds a change ends the
+ *   quiet stretch, so a nested edit that is still going on stays at the short
+ *   interval.
+ * - The base is never shorter than {@link STATUS_POLL_COST_FACTOR} times what
+ *   the last poll cost, so a slow repository polls rarely whether or not its
+ *   watcher is live.
+ */
+export function statusPollRestMs(input: PollRestInput): number {
+  const quiet = input.watchLive && input.quietPolls >= STATUS_POLL_QUIET_AFTER;
+  const base = quiet ? STATUS_POLL_QUIET_INTERVAL_MS : STATUS_POLL_INTERVAL_MS;
+  const cost =
+    input.lastDurationMs !== null && Number.isFinite(input.lastDurationMs) && input.lastDurationMs > 0
+      ? input.lastDurationMs * STATUS_POLL_COST_FACTOR
+      : 0;
+  return Math.min(STATUS_POLL_MAX_INTERVAL_MS, Math.max(base, cost));
+}
 
 /**
  * Structural shape the publish gate compares; FileStatus is compatible.
