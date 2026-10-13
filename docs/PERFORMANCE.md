@@ -992,3 +992,101 @@ cycle 1.00, 40 builds started for 40 ticks**, 40 status probes. On main, every
 whole storm. This is the figure the live-index governor (lane
 `hx/lag1-live-index`) should bring down; the bench goes through the public
 `devmap::live::maybe_refresh` only.
+
+## 2026-10-13: `git status` against user-enabled `core.untrackedCache` / `core.fsmonitor` (spike ft-7450105d)
+
+Question: is there a case for a Health hint that tells a user how to turn these
+two git features on? **Owner decision, unchanged by this spike:** GitPulse never
+writes repo config and never passes `-c core.untrackedCache` or
+`-c core.fsmonitor`. Two reasons stand independent of the numbers:
+
+* every git child runs with `GIT_OPTIONAL_LOCKS=0` (`engine/git_cli.rs`), which
+  stops `git status` from refreshing the index, and the untracked cache is a
+  feature of the index, so `-c core.untrackedCache=true` could neither help nor
+  persist;
+* `-c core.fsmonitor=true` starts a long-lived `git fsmonitor--daemon` per
+  repository that procguard and the spawn gate do not own, and that outlives
+  GitPulse.
+
+`storage/mod.rs` passes `core.fsmonitor=false` on `ls-files`, so a read there
+cannot start the daemon. `tests/git_config_posture.rs` scans the production
+source and fails on any `git config` write argv, and on any
+`core.untrackedCache` / `core.fsmonitor` that is not `=false`.
+
+### How it was measured
+
+`node scripts/bench-git-status-config.mjs --repo <source> [--synthetic <files>]
+[--untracked <n>] [--rounds <n>] [--json <file>]`. Each source is cloned four
+times into `tmp/` (default, untrackedCache, fsmonitor, both) and the user's
+configuration is applied to the clone with `git config --local`; the source repo
+is never touched. `GIT_CONFIG_GLOBAL=/dev/null` and `GIT_CONFIG_NOSYSTEM=1`
+keep the default variant default. Per round every variant runs once, the order
+rotated; the figure is min-of-N (and p50) of the warm rounds, after two plain
+`git status` runs (the user's own, which populate the cache and start the
+daemon). Two invocations: **gitpulse** (`STATUS_ARGV` with
+`GIT_OPTIONAL_LOCKS=0`, what GitPulse runs) and **plain** (a terminal). Cold is
+the first GitPulse-style status after configuring, with the OS page cache not
+dropped, so it is indicative only. Every clone's daemon is stopped with `git
+fsmonitor--daemon stop` before its directory is removed, on normal exit and on
+SIGINT / SIGTERM; the script counts the daemons it started by the IPC socket
+each holds open under its own clones, and fails if any outlives the run
+(**leaked after cleanup: 0** in every run below).
+
+Host: macOS arm64, 18 cpus, git 2.56.0, **loaded** (load average 10 to 44 at the
+start of the runs; other agent sessions were building). Min-of-N and the
+interleaving are the mitigation; read ratios, not single milliseconds. Sources:
+this repository (2,798 tracked files), DevCouncil (6,220) and Manvi (977) as
+read-only clone sources, plus **synthetic** repositories (flat `src/pkgNNNN/`
+trees of one-line files) standing in for repositories too large to keep around.
+
+### Result: warm `git status`, min of N, GitPulse invocation
+
+| repository | tracked | default | untrackedCache | fsmonitor | both |
+| --- | --- | --- | --- | --- | --- |
+| Manvi | 977 | 9.6 ms | 9.0 (0.94x) | 11.6 (**1.21x**) | 10.2 (1.07x) |
+| GitPulse | 2,798 | 13.2 ms | 13.2 (1.00x) | 18.2 (**1.38x**) | 13.8 (1.05x) |
+| DevCouncil | 6,220 | 22.1 ms | 21.7 (0.98x) | 20.1 (0.91x) | 19.5 (0.88x) |
+| synthetic | 40,000 | 49 to 51 ms | 48.9 to 52.0 (1.00 to 1.02x) | 27.8 to 39.0 (**0.55 to 0.80x**) | 29.0 to 30.9 (0.59 to 0.63x) |
+| synthetic | 100,000 | 115.1 ms | 113.3 (0.98x) | 64.6 (**0.56x**) | 65.1 (0.57x) |
+
+(The 40,000-file row spans three runs, with and without 3,000 extra untracked
+files; the 6,220 / 2,798 / 977 rows are from the 15-round run. The plain
+invocation gives the same picture: fsmonitor 1.29x slower at 977 files, 1.73x at
+2,798, 0.91x at 6,220, 0.49 to 0.63x at 40,000 and above.) The untracked cache
+was verified to be in effect (the `UNTR` extension is present in the index of
+the two variants that enable it) and made no measurable difference at any size
+here, with or without 3,000 untracked files, in either invocation.
+
+Daemon cost, per repository with the daemon on: **one extra process, about 8 MB
+resident, about 0.02 s of CPU over the whole run, 0.0 idle wakeups per second
+sampled with `top` on a quiet tree** (low confidence: `top`'s IDLEW column, not
+`ri_interrupt_wkups`, and a quiet tree is the best case; a build that writes
+continuously costs the daemon one event per write).
+
+### Decision
+
+* **No Health hint is shipped.** `core.fsmonitor` only pays above roughly 10k
+  tracked files (parity at 6k, 20 to 45 percent faster at 40k, 44 percent at
+  100k), and it **costs 20 to 40 percent more** on the 1k to 3k-file repositories
+  that are the common case, because every status then waits on a round trip to the
+  daemon. The absolute saving at the top of the range, 20 to 50 ms per status,
+  is on a background read. `core.untrackedCache` showed no effect, and under
+  `GIT_OPTIONAL_LOCKS=0` GitPulse's own status cannot refresh it.
+* **If a hint is ever added**, it is for `core.fsmonitor` only, shown only when
+  the repository has at least 40,000 tracked files, `core.fsmonitor` is unset,
+  and git is new enough to ship the built-in daemon; it shows the `git config`
+  command for the user to run themselves and writes nothing. Never for
+  `core.untrackedCache`.
+* **Self-echo (cookie write) risk is covered, not eliminated.** With the daemon
+  on, every `git status` writes a cookie under `.git/fsmonitor--daemon/cookies`.
+  The watcher classifies those writes (and a linked worktree's) as noise
+  (`watcher/mod.rs`, tests `fsmonitor_daemon_writes_are_noise_but_lookalikes_are_not`,
+  `a_linked_worktrees_fsmonitor_writes_are_noise_to_the_main_worktree`,
+  `a_status_read_under_fsmonitor_does_not_announce_itself`), so enabling it does
+  not create a refresh loop; the daemon process itself is the user's to manage,
+  and `git fsmonitor--daemon stop` is the only thing that ends it.
+* **Not measured:** installed-app behaviour (the app's own status is spawn-gated
+  and admission-controlled); Linux and Windows (the built-in daemon differs);
+  repositories with very large ignored trees (where the untracked cache is
+  documented to help, and which the synthetic fixtures do not model); the page
+  cache is never dropped, so "cold" is indicative only.

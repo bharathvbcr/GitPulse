@@ -895,3 +895,219 @@ describe("freshness soak", () => {
     expect(c.pendingTimers).toBe(0);
   });
 });
+
+describe("cost-derived refresh floor", () => {
+  /** An in-memory CostStore, shared between "reloads" by passing it twice. */
+  function memoryStore(initial: Record<string, number> = {}) {
+    const values = new Map<string, number>(Object.entries(initial));
+    return {
+      values,
+      load: (metric: string, repoPath: string) => values.get(`${metric}|${repoPath}`) ?? null,
+      save: (metric: string, repoPath: string, ewmaMs: number) => {
+        values.set(`${metric}|${repoPath}`, ewmaMs);
+      },
+    };
+  }
+
+  /** Each measurement takes `cost()` ms of fake time before it resolves. */
+  function costing(c: ReturnType<typeof fakeClock>, cost: () => number) {
+    const calls: string[] = [];
+    return {
+      calls,
+      measure: async (repoPath: string) => {
+        calls.push(repoPath);
+        c.advance(cost());
+        return { n: calls.length };
+      },
+    };
+  }
+
+  const FLOOR = { factor: 10, maxMs: 600_000 };
+
+  function build(c: ReturnType<typeof fakeClock>, source: ReturnType<typeof costing>, store = memoryStore()) {
+    return {
+      store,
+      metric: createMetric(
+        {
+          name: "loc",
+          measure: source.measure,
+          debounceMs: 0,
+          minIntervalMs: 20_000,
+          costFloor: { ...FLOOR, store },
+        },
+        c.clock,
+      ),
+    };
+  }
+
+  async function settle() {
+    for (let i = 0; i < 4; i += 1) await Promise.resolve();
+  }
+
+  it("makes the next refresh wait at least ten times a recorded 10 s run", async () => {
+    const c = fakeClock();
+    const source = costing(c, () => 10_000);
+    const { metric } = build(c, source);
+    await metric.refresh(REPO);
+    expect(source.calls).toHaveLength(1);
+
+    // Past the fixed 20 s floor this used to run at once.
+    c.advance(30_000);
+    await metric.refresh(REPO);
+    c.advance(10);
+    await settle();
+    expect(source.calls, "still inside 10 x 10 s").toHaveLength(1);
+
+    c.advance(60_000);
+    await settle();
+    expect(source.calls, "at 90 s after completion").toHaveLength(1);
+
+    c.advance(10_000);
+    await settle();
+    expect(source.calls, "100 s after completion").toHaveLength(2);
+  });
+
+  it("leaves the floor at the base for a 50 ms run", async () => {
+    const c = fakeClock();
+    const source = costing(c, () => 50);
+    const { metric } = build(c, source);
+    await metric.refresh(REPO);
+
+    c.advance(19_000);
+    await metric.refresh(REPO);
+    c.advance(10);
+    await settle();
+    expect(source.calls, "inside the 20 s base").toHaveLength(1);
+
+    c.advance(1_100);
+    await settle();
+    expect(source.calls, "just past the base").toHaveLength(2);
+  });
+
+  it("never lets one pathological run push the floor past the ceiling", async () => {
+    const c = fakeClock();
+    const source = costing(c, () => 500_000);
+    const { metric } = build(c, source);
+    await metric.refresh(REPO);
+
+    // 10 x 500 s would be 83 minutes; the ceiling is 10.
+    c.advance(590_000);
+    await metric.refresh(REPO);
+    await settle();
+    expect(source.calls).toHaveLength(1);
+    c.advance(11_000);
+    await settle();
+    expect(source.calls).toHaveLength(2);
+  });
+
+  it("lets the floor fall back to the base as the scan gets cheap", async () => {
+    const c = fakeClock();
+    let cost = 10_000;
+    const source = costing(c, () => cost);
+    const { metric, store } = build(c, source);
+    await metric.refresh(REPO);
+    expect(store.values.get(`loc|${REPO}`)).toBe(10_000);
+
+    cost = 10;
+    for (let i = 0; i < 12; i += 1) {
+      await metric.refresh(REPO, { force: true });
+    }
+    const average = store.values.get(`loc|${REPO}`)!;
+    expect(average, "decayed").toBeLessThan(2_000);
+    // 10 x the decayed average is back at (or under) the 20 s base.
+    c.advance(19_000);
+    await metric.refresh(REPO);
+    c.advance(1_100);
+    await settle();
+    expect(source.calls.length).toBeGreaterThan(13);
+  });
+
+  it("keeps the average per repository, across a reload", async () => {
+    const store = memoryStore();
+    const c1 = fakeClock();
+    const slow = costing(c1, () => 10_000);
+    await build(c1, slow, store).metric.refresh(REPO);
+    expect(store.values.get(`loc|${REPO}`)).toBe(10_000);
+    expect(store.values.has("loc|/other"), "another repository is untouched").toBe(false);
+
+    // A fresh metric (an app restart) over the same store: the first run costs
+    // 50 ms, but the remembered 10 s still dominates the average.
+    const c2 = fakeClock();
+    const quick = costing(c2, () => 50);
+    const { metric } = build(c2, quick, store);
+    await metric.refresh(REPO);
+    c2.advance(30_000);
+    await metric.refresh(REPO);
+    c2.advance(10);
+    await settle();
+    expect(quick.calls, "the persisted cost still holds the floor above the 20 s base").toHaveLength(1);
+
+    // And an unrelated repository has no history: it runs at the base.
+    await metric.refresh("/other");
+    c2.advance(21_000);
+    await metric.refresh("/other");
+    await settle();
+    expect(quick.calls.filter((r) => r === "/other")).toHaveLength(2);
+  });
+
+  it("starts from the base when the store is unreadable or lies", async () => {
+    const c = fakeClock();
+    const source = costing(c, () => 50);
+    const metric = createMetric(
+      {
+        name: "loc",
+        measure: source.measure,
+        debounceMs: 0,
+        minIntervalMs: 20_000,
+        costFloor: {
+          ...FLOOR,
+          store: {
+            load: () => {
+              throw new Error("storage blocked");
+            },
+            save: () => {
+              throw new Error("storage blocked");
+            },
+          },
+        },
+      },
+      c.clock,
+    );
+    await metric.refresh(REPO);
+    expect(metric.snapshot(REPO).state).toBe("ready");
+    c.advance(21_000);
+    await metric.refresh(REPO);
+    await settle();
+    expect(source.calls).toHaveLength(2);
+
+    const negative = createMetric(
+      {
+        name: "loc",
+        measure: source.measure,
+        debounceMs: 0,
+        minIntervalMs: 20_000,
+        costFloor: { ...FLOOR, store: { load: () => -5, save: () => {} } },
+      },
+      c.clock,
+    );
+    await negative.refresh(REPO);
+    c.advance(21_000);
+    await negative.refresh(REPO);
+    await settle();
+    expect(source.calls.length).toBe(4);
+  });
+
+  it("does not apply a floor unless the metric asks for one", async () => {
+    const c = fakeClock();
+    const source = costing(c, () => 10_000);
+    const metric = createMetric(
+      { name: "loc", measure: source.measure, debounceMs: 0, minIntervalMs: 20_000 },
+      c.clock,
+    );
+    await metric.refresh(REPO);
+    c.advance(21_000);
+    await metric.refresh(REPO);
+    await settle();
+    expect(source.calls).toHaveLength(2);
+  });
+});

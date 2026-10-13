@@ -164,6 +164,13 @@ export interface DependabotReport {
   slug: string;
   alerts: DependabotAlertInfo[];
   truncated: boolean;
+  /**
+   * Severity tiers whose alerts are missing because that tier's request failed
+   * or the fetch deadline cut it off. Non-empty means `alerts` is a lower
+   * bound, not "all but these": a critical alert may be among the missing.
+   * Absent is none.
+   */
+  partial_tiers?: string[];
   error?: string | null;
   /** Present only when `available` is false; omitted on success (serde skip). */
   unavailable_reason?: GithubUnavailableReason;
@@ -201,6 +208,8 @@ export interface CodeScanningReport {
   slug: string;
   alerts: CodeScanningAlertInfo[];
   truncated: boolean;
+  /** Same contract as {@link DependabotReport.partial_tiers}. */
+  partial_tiers?: string[];
   error?: string | null;
   /** Present only when `available` is false; omitted on success (serde skip). */
   unavailable_reason?: GithubUnavailableReason;
@@ -242,6 +251,7 @@ function parseGithubSecurityEnvelope<TAlert>(
   slug: string;
   alerts: TAlert[];
   truncated: boolean;
+  partial_tiers: string[];
   error?: string | null;
   unavailable_reason?: GithubUnavailableReason;
 } {
@@ -272,6 +282,7 @@ function parseGithubSecurityEnvelope<TAlert>(
     slug: typeof value.slug === "string" ? value.slug : "",
     alerts: Array.isArray(value.alerts) ? (value.alerts as TAlert[]) : [],
     truncated: value.truncated === true,
+    partial_tiers: stringArray(value.partial_tiers, `${kind} partial_tiers`),
     error: typeof error === "string" ? error : error === null ? null : undefined,
     unavailable_reason: parseUnavailableReason(value.unavailable_reason),
   };

@@ -53,6 +53,7 @@ mod history;
 mod inspect;
 mod intel;
 mod knowledge;
+mod payload;
 mod policy;
 mod refs;
 mod remote;
