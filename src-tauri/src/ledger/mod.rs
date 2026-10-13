@@ -2129,9 +2129,23 @@ pub struct PruneReport {
 
 /// The default retention policy ([`RETAIN_EVENT_DAYS`], [`RETAIN_NEWEST_EVENTS`])
 /// applied in bounded batches: at most [`PRUNE_MAX_BATCHES`] of [`PRUNE_BATCH`]
-/// rows, and no batch starts once `deadline` has passed.
+/// rows, no batch starts once `deadline` has passed, and a ledger a pass
+/// left with nothing to prune is not scanned again for [`PRUNE_CLEAN_INTERVAL`].
 pub fn prune_expired(repo_path: &str, deadline: Option<std::time::Instant>) -> PruneReport {
     prune_with_policy(repo_path, RETAIN_EVENT_DAYS, RETAIN_NEWEST_EVENTS, deadline)
+}
+
+/// How long a ledger a pass left with nothing to prune is not scanned again by
+/// this process. Finding the candidates reads every row below the newest
+/// [`RETAIN_NEWEST_EVENTS`] under the write lock — close to a second on a
+/// year of events — and catch-up runs on every open and every daemon cycle,
+/// while the policy is measured in days.
+const PRUNE_CLEAN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
+
+/// When each ledger, by database path, was last found with nothing to prune.
+fn prune_clean_at() -> &'static Mutex<HashMap<PathBuf, std::time::Instant>> {
+    static CLEAN: OnceLock<Mutex<HashMap<PathBuf, std::time::Instant>>> = OnceLock::new();
+    CLEAN.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 fn prune_with_policy(
@@ -2141,12 +2155,30 @@ fn prune_with_policy(
     deadline: Option<std::time::Instant>,
 ) -> PruneReport {
     let mut report = PruneReport::default();
+    let db_path = ledger_path(repo_path);
+    let clean = prune_clean_at()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(&db_path)
+        .is_some_and(|at| at.elapsed() < PRUNE_CLEAN_INTERVAL);
+    if clean {
+        return report;
+    }
     for _ in 0..PRUNE_MAX_BATCHES {
         if deadline.is_some_and(|d| std::time::Instant::now() >= d) {
             break;
         }
         match prune_events(repo_path, older_than_days, keep_newest) {
-            Ok(0) => break,
+            // Only a pass that reached the end is remembered; one cut short by
+            // its deadline, its batch cap or an error leaves the rest to the
+            // next pass.
+            Ok(0) => {
+                prune_clean_at()
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .insert(db_path, std::time::Instant::now());
+                break;
+            }
             Ok(n) => report.deleted += n,
             Err(error) => {
                 log::error!(target: "ledger", "event retention failed for {repo_path}: {error}");

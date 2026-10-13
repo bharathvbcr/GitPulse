@@ -441,3 +441,62 @@ fn a_pass_past_its_deadline_starts_no_batch() {
     let report = prune_with_policy(&repo, 1, 5, None);
     assert_eq!(report.deleted, 15);
 }
+
+fn age_all_events(repo: &str) {
+    with_conn(repo, |conn| {
+        conn.execute("UPDATE events SET ts_utc = '2001-01-01T00:00:00.000Z'", [])
+            .map_err(|e| LedgerError::new("t", e.to_string()))
+    })
+    .unwrap();
+}
+
+/// Finding the candidates scans every row older than the newest
+/// `keep_newest` inside the write transaction. On a year of real events that
+/// is close to a second of write lock per catch-up when nothing has expired,
+/// so a pass that reached "nothing left" is not repeated for a day.
+#[test]
+fn a_clean_prune_pass_is_not_repeated_within_the_interval() {
+    let (_dir, repo) = repo_dir();
+    let recent = ids::iso8601_utc(ids::now_millis());
+    insert_events(&repo, 20, &recent, "new");
+    let first = prune_with_policy(&repo, 1, 5, None);
+    assert_eq!((first.deleted, first.error.as_str()), (0, ""));
+    age_all_events(&repo);
+    let second = prune_with_policy(&repo, 1, 5, None);
+    assert_eq!(second.deleted, 0, "a clean ledger was scanned again at once");
+    assert_eq!(event_count(&repo), 20);
+}
+
+/// Only a pass that reached the end is remembered: one stopped by its
+/// deadline or its batch cap leaves the backlog to the very next pass.
+#[test]
+fn an_unfinished_prune_pass_does_not_defer_the_next() {
+    let (_dir, repo) = repo_dir();
+    insert_events(&repo, 20, "2001-01-01T00:00:00.000Z", "old");
+    let expired = std::time::Instant::now() - Duration::from_secs(1);
+    assert_eq!(prune_with_policy(&repo, 1, 5, Some(expired)).deleted, 0);
+    assert_eq!(prune_with_policy(&repo, 1, 5, None).deleted, 15);
+}
+
+/// A row exactly at the cutoff is not older than it, and the floor is
+/// counted in ids from the newest: an empty ledger, a ledger no larger than
+/// the floor, and a floor of zero (clamped to one) all leave the newest row.
+#[test]
+fn prune_boundaries_hold_on_empty_floor_and_clamped_inputs() {
+    let (_dir, repo) = repo_dir();
+    assert_eq!(prune_events(&repo, 1, 5).unwrap(), 0, "empty ledger");
+    insert_events(&repo, 5, "2001-01-01T00:00:00.000Z", "old");
+    assert_eq!(prune_events(&repo, 1, 5).unwrap(), 0, "at the floor");
+    assert_eq!(prune_events(&repo, 1, 0).unwrap(), 4, "floor clamps to one");
+    assert_eq!(event_count(&repo), 1);
+}
+
+/// Rows stamped in the future (a clock that ran ahead) are never older than
+/// the cutoff, so they are kept however far past the floor they sit.
+#[test]
+fn future_stamped_events_are_never_pruned() {
+    let (_dir, repo) = repo_dir();
+    insert_events(&repo, 30, "2999-01-01T00:00:00.000Z", "future");
+    assert_eq!(prune_events(&repo, 1, 5).unwrap(), 0);
+    assert_eq!(event_count(&repo), 30);
+}
