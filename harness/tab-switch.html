@@ -427,8 +427,9 @@
           await switchTo(ALPHA);
           await sleepUntil(() => text(worktreesPanel()).includes("alpha-wt-one"));
 
-          // A merge dialog is aimed at one repository's branches; it must not stay
-          // up over the next one.
+          // A merge dialog carries the repository it was opened for. It owns the
+          // switch itself: it stays up, says the repository changed, and refuses
+          // to merge into the new one (the `branches` harness pins the same).
           const mergeRow = $$("*", branchList()).find((el) => el.children.length === 0 && text(el).includes("alpha-only"));
           mergeRow?.dispatchEvent(new MouseEvent("contextmenu", { bubbles: true, cancelable: true, clientX: 120, clientY: 300 }));
           await settle();
@@ -436,7 +437,14 @@
           await settle();
           check("branches (alpha): the merge dialog is open", () => !!$("#merge-branch-title"));
           await switchTo(BETA);
-          check("branches: the merge dialog aimed at alpha is closed", () => !$("#merge-branch-title"));
+          check("branches: the merge dialog aimed at alpha says the repository changed and cannot merge", () => {
+            const box = $("#merge-branch-title")?.closest('[role="dialog"], div');
+            const merge = $$("button").find((b) => text(b) === "Merge branch");
+            return !!$("#merge-branch-title") && text(document.body).includes("The repository changed") && merge?.disabled === true && !!box;
+          });
+          $('button[aria-label="Close merge dialog"]')?.click();
+          await settle();
+          check("…and closes from its own button", () => !$("#merge-branch-title"));
           await switchTo(ALPHA);
           await sleepUntil(() => text(worktreesPanel()).includes("alpha-wt-one"));
 
