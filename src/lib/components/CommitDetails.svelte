@@ -24,6 +24,7 @@
   import MarkdownBody from "./MarkdownBody.svelte";
   import { formatPathParts } from "../files/formatPath";
   import { formatDate, shortHash } from "../format";
+  import { summarizeCommitFiles } from "../diff/commitFilesNotice";
   import { formatError } from "../ui/formatError";
   import { copyText } from "../desktop/clipboard";
   import { toastStore } from "../stores/toastStore";
@@ -54,12 +55,7 @@
   });
   // When the backend capped the list, the header reports the true file count
   // instead of the size of the capped slice.
-  let filesListTruncated = $derived(details?.files_list_truncated === true);
-  let changedFileCount = $derived(
-    filesListTruncated && typeof details?.files_total_count === "number"
-      ? details.files_total_count
-      : details?.changed_files.length ?? 0
-  );
+  let filesSummary = $derived(summarizeCommitFiles(details));
 
   // Same story for the inline preview: a capped slice keeps the pane
   // responsive, and the full diff opens in the virtualized Diff view. The
@@ -258,10 +254,10 @@
     <div class="flex-1 grid grid-cols-3 divide-x divide-border min-h-0">
       <div class="p-2 overflow-y-auto space-y-1">
         <div class="text-[10px] font-semibold uppercase text-textMuted px-2 py-1">
-          Changed Files ({changedFileCount})
+          Changed Files ({filesSummary.count})
           {#if details}
-            <span class="normal-case font-mono text-green-400 ml-1">+{details.total_additions}</span>
-            <span class="normal-case font-mono text-red-400">-{details.total_deletions}</span>
+            <span class="normal-case font-mono text-green-400 ml-1">+{details.total_additions}{filesSummary.partial ? "+" : ""}</span>
+            <span class="normal-case font-mono text-red-400">-{details.total_deletions}{filesSummary.partial ? "+" : ""}</span>
           {/if}
         </div>
         {#if details?.body}
@@ -314,9 +310,12 @@
             </div>
           {/if}
         </div>
-        {#if filesListTruncated}
-          <div class="px-2 pb-1 text-[10px] text-textMuted">
-            +only first {(details?.changed_files.length ?? 0).toLocaleString()} listed
+        {#if filesSummary.note}
+          <div
+            class="px-2 pb-1 text-[10px] {filesSummary.partial ? 'text-amber-400' : 'text-textMuted'}"
+            data-testid="commit-files-note"
+          >
+            {filesSummary.note}
           </div>
         {/if}
         {#each fileList as f (f.path)}

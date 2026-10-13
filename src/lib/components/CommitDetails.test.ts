@@ -22,6 +22,13 @@ describe("CommitDetails", () => {
     expect(source).toContain("filePath={f.path}");
   });
 
+  it("renders the cut-output notice and marks partial totals from the shared summary", () => {
+    expect(source).toContain("summarizeCommitFiles(details)");
+    expect(source).toContain('data-testid="commit-files-note"');
+    expect(source).toContain('filesSummary.partial ? "+" : ""');
+    expect(source).not.toContain("changedFileCount");
+  });
+
   it("only announces clipboard success after the shared copy seam succeeds", () => {
     const shaCopy = source.slice(source.indexOf("async function copySha"), source.indexOf("async function copyMessage"));
     const messageCopy = source.slice(source.indexOf("async function copyMessage"), source.indexOf("async function explainCommit"));

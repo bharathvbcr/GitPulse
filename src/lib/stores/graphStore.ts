@@ -42,6 +42,13 @@ export interface CommitDetails {
    */
   files_total_count?: number;
   files_list_truncated?: boolean;
+  /**
+   * Present when git's own output was cut at the backend's byte budget (a
+   * clause such as "git output exceeded 4 MB"). Everything derived from the
+   * file records is then a lower bound: the list, the count and the +/-
+   * totals. Absent when git was read to the end.
+   */
+  numstat_truncation_reason?: string;
 }
 
 /** A file left out of a truncated commit diff, stats only. */
