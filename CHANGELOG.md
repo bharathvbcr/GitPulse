@@ -168,6 +168,25 @@ before that tag is pushed.
 - **WebView2-only browser arguments no longer sit in the macOS configuration.**
   They now live only in the Windows configuration.
 - **A build that would ship source maps now fails.**
+- **One failing GitHub alert tier no longer hides the others.**
+  - Severity tiers are fetched three at a time, all under one 20 s deadline.
+  - A tier that fails or runs out of time is named as missing, and Health shows
+    "Incomplete" instead of an empty or "unavailable" list.
+  - A failed request is not remembered for the session, so reopening Health
+    asks again.
+- **Code-intelligence previews and file saves refuse oversized content
+  up front.**
+  - The limits are 2 MiB per previewed file, 8 MiB and 256 files per preview
+    batch, and 8 MiB per save. Each is checked before any work starts.
+  - A preview batch that is superseded is now actually cancelled, within one
+    file.
+- **Slow repository metrics refresh less often.** Lines of code, coverage and
+  storage wait at least ten times their measured cost before refreshing again,
+  up to 10 minutes. A manual Rescan still runs at once.
+- **With many repositories open, ledger reads stay warm.** The worktree-family
+  and ledger-import memories used to empty completely when they filled (256
+  families, 64 ledgers), so every read went back to `git`. They now drop only
+  the least recently used entry.
 
 - **A commit that finished after you switched repository tabs cleared the other
   repository's message.** The commit box wiped the draft and the amend flag of
