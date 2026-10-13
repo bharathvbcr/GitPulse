@@ -142,14 +142,25 @@ mod tests {
                 let started = started.clone();
                 handle.spawn_blocking(move || {
                     started.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                    std::thread::sleep(std::time::Duration::from_millis(400));
+                    std::thread::sleep(std::time::Duration::from_millis(1500));
                 })
             })
             .collect();
-        std::thread::sleep(std::time::Duration::from_millis(150));
-        let running = started.load(std::sync::atomic::Ordering::SeqCst);
+        // However long a loaded host takes to start the pool's threads, the
+        // limit is reached and then held while the first bodies still sleep.
+        let began = std::time::Instant::now();
+        while started.load(std::sync::atomic::Ordering::SeqCst) < MAX_BLOCKING_THREADS {
+            assert!(
+                began.elapsed()
+                    < crate::test_support::coverage_relaxed(std::time::Duration::from_secs(10)),
+                "the blocking pool never reached {MAX_BLOCKING_THREADS} threads"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
         assert_eq!(
-            running, MAX_BLOCKING_THREADS,
+            started.load(std::sync::atomic::Ordering::SeqCst),
+            MAX_BLOCKING_THREADS,
             "only {MAX_BLOCKING_THREADS} blocking bodies may run at once; the rest wait"
         );
         runtime.block_on(async {
