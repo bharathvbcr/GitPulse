@@ -802,7 +802,7 @@ report prints the host-load ratio next to every bench; **a time failure on a hos
 the JSON shows loaded (ratio above 1) is a reason to re-run, not a finding**.
 Counter failures are not load-dependent.
 
-Committed baselines: `local-macos-aarch64` (below). `ubuntu-latest` and
+Committed baselines: `local-macos-aarch64` (below, re-seeded after the lag-audit Waves 1 and 2). `ubuntu-latest` and
 `macos-latest` have **no committed baseline yet**; until the first
 `workflow_dispatch` seeds them, the scheduled job fails loudly on those classes.
 
@@ -814,7 +814,7 @@ Committed baselines: `local-macos-aarch64` (below). `ubuntu-latest` and
 | `graph_diff` | `compute_word_diff` at 100 / 10k / 60k chars; `LaneSolver::solve` linear and merge-heavy at 10k and 100k rows | G-tests-perf-05 |
 | `watcher` | `record_event_signal` over a 10k-event burst, `IgnoreRules` populated with 600 prefixes, events/s | G-tests-perf-05 (through `watcher::bench_seam`, below) |
 | `repo_read` | `get_status` at 1k and 10k files, clean and dirty, with git processes | A-git-05; git-status-assist-spike |
-| `command_timings` | insights snapshot, `list_worktrees`, language stats, docs refresh, `catch_up` (steady and cold), commit details on an 18-worktree fixture | the lag audit's snapshot / listing / stats / docs / catch-up / commit-details cards |
+| `command_timings` | insights snapshot, `list_worktrees listing`, `list_worktrees full`, language stats, docs refresh, `catch_up` (steady and cold), commit details on an 18-worktree fixture | the lag audit's snapshot / listing / stats / docs / catch-up / commit-details cards; `list_worktrees listing` (`list_worktrees_scanned` at `ScanDepth::Listing`, the `cmd_list_worktrees` default) is the baseline for ft-28c58695 (card 4), and `list_worktrees full` (`ScanDepth::Full`, the Worktrees panel's explicit opt-in) is the baseline for the Worktrees panel path |
 | `terminal_pty` | MB/s through a real PTY, IPC messages per MiB, keystroke echo p50 idle and during a flood in another session | terminal-output-channel; terminal-reader-kqueue |
 | `idle_wakeups` | process interrupt wakeups/s with 0, 1, 8, 32 idle terminal sessions | terminal-reader-kqueue; always-on-pollers |
 | `live_index` | duty cycle of the live index under a 40-tick, 250 ms-cadence edit storm against a stub `devmap` | live-index-duty-cycle |
@@ -839,7 +839,77 @@ live-index poller) is in the app process and not started by the library from a
 bench. Spawns for rows other than the ones listed come from `trace2` and exist
 only where a row lists `git_processes`.
 
-### Baseline, `local-macos-aarch64`, loaded host
+### Baseline, `local-macos-aarch64`, after the lag-audit Waves 1 and 2
+
+This is the committed baseline. It was re-seeded on 2026-10-12 from `main` at
+`43f54d7f`, in full mode (not `--smoke`).
+
+The machine and toolchain are the same as for the earlier baseline below:
+Apple M5 Pro, 18 logical CPUs, macOS 27.0.1, rustc 1.99.0, git 2.56.0.
+
+Load was much lower than in the first run, but it was not idle:
+- 6.0–9.6 on 18 CPUs (0.3–0.5x) for every bench except `repo_read`.
+- Other sessions' builds pushed load to 21 by the end of the run.
+- In that run, `repo_read`'s 1k-file `get_status` rows recorded a min of 22 ms.
+  A re-run measured 12.2 ms and then 8.3 ms, so the outlier came from the load
+  spike, not from the code.
+- `repo_read` was therefore re-run on its own, at load 22.5 (1.2x), and that
+  JSON is the one committed.
+
+Every bench JSON carries its own host snapshot.
+
+Against the pre-fix baseline below, the comparator flagged only the intended
+work-counter changes and the renamed row:
+
+| row | before (`a92e40fb`) | after (`43f54d7f`) | card |
+| --- | --- | --- | --- |
+| insights snapshot, git processes | 37 | **21** | ft-c242f35b |
+| MCP `tools/call insights`, git processes | 11 | **6** | ft-c242f35b |
+| commit details, git processes | 2 | **1** | ft-fa9dbbe1 |
+| language stats, git processes | 1 | 2 (adds `check-attr` for linguist attributes) | ft-9cc9813f |
+| live-index storm, builds started for 40 ticks | 40 (duty cycle 1.00) | **1 (duty cycle 0.04)** | ft-fa689914 |
+| `list_worktrees` | one row, `ScanDepth::Full`, 39 git processes | split: `full` 38, **`listing` 1** | ft-28c58695 |
+
+`command_timings` uses N = 15, and N = 5 for the cold catch-up. Its fixture has
+600 files, 61 commits and 18 worktrees, 17 of them dirty. Load was 8.9.
+
+| row | min | p50 | p95 | counters |
+| --- | --- | --- | --- | --- |
+| insights snapshot | 165.0 ms | 248.8 ms | 270.8 ms | 18 worktrees, 7 facets ok, 21 git processes |
+| list_worktrees full | 349.1 ms | 435.7 ms | 489.3 ms | 18 worktrees, 38 git processes |
+| list_worktrees listing | 7.3 ms | 23.3 ms | 24.6 ms | 18 worktrees, 1 git process |
+| language stats | 17.6 ms | 32.3 ms | 39.3 ms | 600 of 600 files, 8 languages, 2 git processes |
+| docs refresh | 387.3 us | 446.1 us | 757.4 us | 75 notes |
+| catch_up steady | 34.3 ms | 48.7 ms | 53.6 ms | 0 recorded |
+| catch_up cold | 61.0 ms | 69.8 ms | 71.6 ms | 485 recorded, 60 transcripts, 5 reflog entries |
+| commit details | 123.8 us | 156.2 us | 205.1 us | 1 parent, 1 git process (repeat views are cache hits) |
+
+Other benches:
+- **`live_index`**: duty cycle **0.04**, 1 build started and 39 ticks skipped by
+  the cooldown, over 40 ticks.
+- **`mcp_protocol`**:
+  - `tools/call insights`: min 29.3 ms, 6 git processes.
+  - `collision_risk`: min 25.1 ms.
+  - `tools/list`: min 341.3 us, 55.6 KB.
+- **`repo_read`**, from the re-run at load 22.5:
+  - 1k files: clean 8.3 ms, dirty (50) 23.9 ms.
+  - 10k files: clean 25.3 ms, dirty (500) 70.8 ms.
+- **`graph_diff`**:
+  - lane_solver: linear 100k in 34.5 ms, merge-heavy 100k in 22.9 ms.
+  - word_diff: 10,000 chars in 356.6 us.
+- **`watcher`**: 10,000 events in 13.1 ms.
+- **`terminal_pty`**: the cards that change these numbers are terminal cards 11
+  and 12, which have not landed.
+  - Flood: 30.5 MB/s, still 1,024 IPC messages per MiB.
+  - Echo: 20.8 us idle and 7.6 us beside a flood.
+- **`idle_wakeups`**: 2.2/s with no sessions, 12.2/s with 1, 80.8/s with 8 and
+  315.4/s with 32. That is still about 9.8 wake-ups per second for each idle
+  session, the reader's poll. Card 12, the kqueue reader, is what brings it down.
+
+### Pre-fix baseline (`a92e40fb`, loaded host), superseded
+
+This is kept as the record of the numbers before Waves 1 and 2. The committed
+JSON is the baseline above.
 
 Machine: Apple M5 Pro (Mac17,8), 18 logical CPUs, 64 GiB, macOS 27.0.1, rustc
 1.99.0, git 2.56.0, release profile (`cargo bench`). Library code is main

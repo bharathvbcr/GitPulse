@@ -1,5 +1,6 @@
 //! Command timings on a generated 18-worktree repository: the insights
-//! snapshot, `list_worktrees`, language statistics, docs refresh, `catch_up`
+//! snapshot, `list_worktrees` (the command's default `Listing` depth and the
+//! Worktrees panel's `Full` depth), language statistics, docs refresh, `catch_up`
 //! and commit details.
 //!
 //! Run with `cargo bench --manifest-path src-tauri/Cargo.toml --bench command_timings`.
@@ -14,7 +15,7 @@
 //!   linked worktrees (18 in all), each linked worktree with one dirty file;
 //!   markdown files for the docs vault; 60 transcript files for `catch_up`;
 //! * counters: worktrees listed, files scanned, notes indexed, ledger events
-//!   recorded, and (insights, listing) the git processes started, counted from
+//!   recorded, and (insights, both listings) the git processes started, counted from
 //!   git's own trace2 in a separate untimed pass;
 //! * `catch_up` has two rows. `steady` is the re-open cost: the watermark makes
 //!   every transcript a skip, which is what a user pays on each launch. `cold`
@@ -30,6 +31,7 @@ mod common;
 use common::fixture::{build_repo, count_git_processes, Repo, Spec};
 use common::{interleave, require_no_failed_facets, Case, Report, Sample};
 use gitpulse_lib::engine::git_reader::GitReader;
+use gitpulse_lib::engine::worktree::ScanDepth;
 use gitpulse_lib::{docs, ingest, insights};
 use serde_json::json;
 use std::path::Path;
@@ -125,14 +127,31 @@ fn main() {
         let facets_ok = require_no_failed_facets("insights::snapshot", &value);
         (snapshot, facets_ok)
     };
-    let list = |path: &str| {
+    // The Worktrees panel's explicit opt-in: `ScanDepth::Full`.
+    let list_full = |path: &str| {
         gitpulse_lib::engine::worktree::list_worktrees(path)
-            .unwrap_or_else(|error| panic!("list_worktrees failed: {error}"))
+            .unwrap_or_else(|error| panic!("list_worktrees full failed: {error}"))
+    };
+    // What `cmd_list_worktrees` runs by default
+    // (`depth.unwrap_or(ScanDepth::Listing)`): one `git worktree list`. At this
+    // depth a failure is the `Err`, and an entry cannot carry a partial scan,
+    // so the only way to time a degraded answer is a short list.
+    let list_listing = |path: &str| {
+        let worktrees =
+            gitpulse_lib::engine::worktree::list_worktrees_scanned(path, ScanDepth::Listing)
+                .unwrap_or_else(|error| panic!("list_worktrees listing failed: {error}"));
+        assert_eq!(
+            worktrees.len(),
+            SPEC.linked_worktrees + 1,
+            "the listing did not return every worktree, so this run would time a partial answer"
+        );
+        worktrees
     };
 
     // Work counters (git processes) in their own untimed pass.
     let (_, snapshot_procs) = count_git_processes(|| snapshot(&path));
-    let (_, list_procs) = count_git_processes(|| list(&path));
+    let (_, list_full_procs) = count_git_processes(|| list_full(&path));
+    let (_, list_listing_procs) = count_git_processes(|| list_listing(&path));
     // Unbounded: the production 10 s deadline is a property of the host's load,
     // and a scan it cut short would be timed as if it were the whole work.
     let (_, lang_procs) =
@@ -155,12 +174,19 @@ fn main() {
                 .counter("facets_ok", facets_ok)
                 .counter("git_processes", snapshot_procs)
         }),
-        Case::new("list_worktrees", || {
-            let worktrees = list(&path);
+        Case::new("list_worktrees full", || {
+            let worktrees = list_full(&path);
             std::hint::black_box(&worktrees);
             Sample::default()
                 .counter("worktrees", worktrees.len() as u64)
-                .counter("git_processes", list_procs)
+                .counter("git_processes", list_full_procs)
+        }),
+        Case::new("list_worktrees listing", || {
+            let worktrees = list_listing(&path);
+            std::hint::black_box(&worktrees);
+            Sample::default()
+                .counter("worktrees", worktrees.len() as u64)
+                .counter("git_processes", list_listing_procs)
         }),
         Case::new("language stats", || {
             let report = GitReader::get_repo_language_stats_bounded(&path, None)
