@@ -161,7 +161,44 @@ impl AdmittedPair {
     }
 
     /// Proves membership with `git worktree list` and names the family.
+    ///
+    /// Git is asked once per registry state, not once per call: a family that
+    /// Git has authenticated is remembered for as long as the repository's own
+    /// metadata ([`Self::metadata_checkouts`]) names the same checkouts, so a
+    /// worktree added, removed, moved or pruned is seen on the next call. A
+    /// repository whose metadata cannot account for its whole family is never
+    /// remembered and asks Git every time, as before. Trust and the common
+    /// directory are checked by [`admit_worktree_pair`] on every call, before
+    /// this one: a revoked grant is refused whatever is remembered here.
     pub fn authenticate(self) -> Result<WorktreeFamily, String> {
+        let registry = self.registry_fingerprint();
+        if let Some(registry) = &registry {
+            if let Some(family) =
+                remembered_family(&self.common, registry, &self.repo, &self.worktree)
+            {
+                return Ok(family);
+            }
+        }
+        let common = self.common.clone();
+        let family = self.authenticate_with_git()?;
+        if let Some(registry) = registry {
+            remember_family(common, registry, &family);
+        }
+        Ok(family)
+    }
+
+    /// The registry as the metadata view names it: sorted, without repeats, so
+    /// two reads of an unchanged registry are equal whatever order the
+    /// directory listed its entries in. `None` when the metadata cannot
+    /// account for the whole family.
+    fn registry_fingerprint(&self) -> Option<Vec<PathBuf>> {
+        let mut checkouts = self.metadata_checkouts()?;
+        checkouts.sort();
+        checkouts.dedup();
+        Some(checkouts)
+    }
+
+    fn authenticate_with_git(self) -> Result<WorktreeFamily, String> {
         let AdmittedPair {
             repo,
             worktree,
@@ -213,6 +250,68 @@ impl AdmittedPair {
             members: registered,
         })
     }
+}
+
+/// What Git last said a repository's family is, and the registry state it said
+/// it for. Kept per common directory, not per pair: every worktree of one
+/// repository shares the answer, so eighteen worktrees cost one `git worktree
+/// list`, not eighteen.
+struct Remembered {
+    registry: Vec<PathBuf>,
+    /// Git's own listing, primary first.
+    members: Vec<PathBuf>,
+}
+
+/// Families remembered at once. Far above the repositories one session opens;
+/// past it the memory is dropped and the next call asks Git.
+const MAX_REMEMBERED_FAMILIES: usize = 256;
+
+fn remembered_families() -> &'static Mutex<std::collections::HashMap<PathBuf, Remembered>> {
+    static REMEMBERED: OnceLock<Mutex<std::collections::HashMap<PathBuf, Remembered>>> =
+        OnceLock::new();
+    REMEMBERED.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+}
+
+/// The remembered family for `common`, if the registry is still the one it was
+/// authenticated against *and* both paths are in it. A pair outside the
+/// remembered members is not answered here: Git decides, and says why.
+fn remembered_family(
+    common: &Path,
+    registry: &[PathBuf],
+    repo: &Path,
+    worktree: &Path,
+) -> Option<WorktreeFamily> {
+    let held = remembered_families()
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    let remembered = held.get(common).filter(|r| r.registry == registry)?;
+    let anchor = remembered.members.first()?.clone();
+    if !remembered.members.iter().any(|path| path == repo)
+        || !remembered.members.iter().any(|path| path == worktree)
+    {
+        return None;
+    }
+    Some(WorktreeFamily {
+        anchor,
+        worktree: worktree.to_path_buf(),
+        members: remembered.members.clone(),
+    })
+}
+
+fn remember_family(common: PathBuf, registry: Vec<PathBuf>, family: &WorktreeFamily) {
+    let mut held = remembered_families()
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    if held.len() >= MAX_REMEMBERED_FAMILIES && !held.contains_key(&common) {
+        held.clear();
+    }
+    held.insert(
+        common,
+        Remembered {
+            registry,
+            members: family.members.clone(),
+        },
+    );
 }
 
 /// Largest repository `config` [`AdmittedPair::metadata_checkouts`] reads.

@@ -1609,16 +1609,24 @@ impl GitReader {
     }
 
     pub fn get_reflog(repo_path: &str, max_entries: usize) -> Result<Vec<ReflogEntry>, String> {
+        Self::get_reflog_within(repo_path, max_entries, None)
+    }
+
+    /// [`Self::get_reflog`] with the Git child held to `timeout` when one is
+    /// given, so a caller on a deadline is not left behind the default
+    /// ninety-second ceiling.
+    pub fn get_reflog_within(
+        repo_path: &str,
+        max_entries: usize,
+        timeout: Option<std::time::Duration>,
+    ) -> Result<Vec<ReflogEntry>, String> {
         let repo = validate_repo(repo_path)?;
-        let count = max_entries.clamp(1, 10_000).to_string();
-        let stdout = git_text(
-            &repo,
-            &[
-                "reflog",
-                &format!("-n{}", count),
-                "--format=%H%x00%gd%x00%gs%x00%ct",
-            ],
-        )?;
+        let limit = format!("-n{}", max_entries.clamp(1, 10_000));
+        let args = ["reflog", limit.as_str(), "--format=%H%x00%gd%x00%gs%x00%ct"];
+        let stdout = match timeout {
+            Some(timeout) => crate::engine::git_cli::git_text_with_timeout(&repo, &args, timeout)?,
+            None => git_text(&repo, &args)?,
+        };
         let mut entries = Vec::new();
         for (idx, line) in stdout.lines().enumerate() {
             let parts: Vec<&str> = line.split('\x00').collect();

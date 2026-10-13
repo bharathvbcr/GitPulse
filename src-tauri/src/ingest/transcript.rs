@@ -84,9 +84,73 @@ const MUTATING: [&str; 4] = ["Edit", "Write", "NotebookEdit", "Bash"];
 /// gap in what we saw, not a failure of the thing being observed. The caller
 /// counts skips so the gap is reportable.
 pub fn parse_line(line: &str) -> Vec<ToolCall> {
+    match parse_record(line) {
+        LineOutcome::Calls(calls) => calls,
+        LineOutcome::NoCalls | LineOutcome::Unreadable => Vec::new(),
+    }
+}
+
+/// What one transcript line turned out to hold.
+#[derive(Debug, Clone, PartialEq)]
+pub enum LineOutcome {
+    /// Readable, and holds no mutating tool call: not an assistant record, or
+    /// an assistant record of prose and reads.
+    NoCalls,
+    /// Tagged as an assistant record but not JSON this build can read — the one
+    /// outcome that is a gap worth counting.
+    Unreadable,
+    /// The mutating tool calls the record holds. Never empty.
+    Calls(Vec<ToolCall>),
+}
+
+/// The tag the assistant records this parser reads carry, as Claude Code
+/// writes it. Used only to decide whether an unreadable line is a gap worth
+/// counting; a spaced spelling of it is not.
+const ASSISTANT_TAG: &str = "\"type\":\"assistant\"";
+
+#[cfg(test)]
+thread_local! {
+    /// JSON documents this thread has deserialized through [`parse_record`].
+    pub(super) static PARSES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// [`parse_line`], saying *why* a line yielded nothing, so no caller has to
+/// deserialize the line a second time to find out.
+///
+/// Most lines of a transcript are tool results and progress records that can
+/// never hold a call, and most assistant lines are prose or reads. A line
+/// that names no `"assistant"` and no `"tool_use"` cannot hold a call whether
+/// or not it is well formed, so it is not built into a document: at most it is
+/// validated, without allocating, when it claims to be an assistant record.
+pub fn parse_record(line: &str) -> LineOutcome {
+    let claims_assistant = line.contains(ASSISTANT_TAG);
+    if !(line.contains("\"assistant\"") && line.contains("\"tool_use\"")) {
+        #[cfg(test)]
+        PARSES.with(|parses| parses.set(parses.get() + usize::from(claims_assistant)));
+        return if claims_assistant && serde_json::from_str::<serde::de::IgnoredAny>(line).is_err() {
+            LineOutcome::Unreadable
+        } else {
+            LineOutcome::NoCalls
+        };
+    }
+    #[cfg(test)]
+    PARSES.with(|parses| parses.set(parses.get() + 1));
     let Ok(record) = serde_json::from_str::<serde_json::Value>(line) else {
-        return Vec::new();
+        return if claims_assistant {
+            LineOutcome::Unreadable
+        } else {
+            LineOutcome::NoCalls
+        };
     };
+    let calls = calls_in(&record);
+    if calls.is_empty() {
+        LineOutcome::NoCalls
+    } else {
+        LineOutcome::Calls(calls)
+    }
+}
+
+fn calls_in(record: &serde_json::Value) -> Vec<ToolCall> {
     if record.get("type").and_then(|t| t.as_str()) != Some("assistant") {
         return Vec::new();
     }
@@ -289,5 +353,62 @@ mod tests {
         ))[0];
         assert!(belongs_to(c, "/repo"));
         assert!(belongs_to(c, "/repo/.claude/worktrees/wt"));
+    }
+
+    fn parses_for(line: &str) -> (LineOutcome, usize) {
+        let before = PARSES.with(std::cell::Cell::get);
+        let outcome = parse_record(line);
+        (outcome, PARSES.with(std::cell::Cell::get) - before)
+    }
+
+    const PROSE: &str = r#"{"type":"assistant","sessionId":"S1","timestamp":"2026-09-01T12:00:00.000Z","message":{"content":[{"type":"text","text":"done"}]}}"#;
+    const TOOL_RESULT: &str =
+        r#"{"type":"user","message":{"content":[{"type":"tool_result","content":"ok"}]}}"#;
+    const BROKEN: &str = r#"{"type":"assistant", this is not json}"#;
+
+    /// A line is deserialized at most once, whatever it turns out to hold. A
+    /// prose-only assistant line used to be parsed by `parse_line` and again by
+    /// the caller, which parsed it just to learn it was readable.
+    #[test]
+    fn no_line_is_deserialized_twice() {
+        let edit = record("Edit", r#"{"file_path":"/repo/a.rs"}"#);
+        for line in [edit.as_str(), PROSE, TOOL_RESULT, BROKEN, ""] {
+            let (_, parses) = parses_for(line);
+            assert!(parses <= 1, "{parses} parses of {line}");
+        }
+    }
+
+    #[test]
+    fn a_line_that_cannot_hold_a_call_is_never_built_into_a_document() {
+        // A tool result is the bulk of a transcript's bytes. It is neither an
+        // assistant record nor a `tool_use`, so nothing is deserialized.
+        assert_eq!(parses_for(TOOL_RESULT), (LineOutcome::NoCalls, 0));
+    }
+
+    #[test]
+    fn failure_is_reported_distinctly_from_having_no_calls() {
+        assert_eq!(parse_record(BROKEN), LineOutcome::Unreadable);
+        assert_eq!(parse_record(PROSE), LineOutcome::NoCalls);
+        // Broken, but not tagged as an assistant record: not a gap worth
+        // counting, exactly as before.
+        assert_eq!(parse_record("not json at all"), LineOutcome::NoCalls);
+        // A call-bearing line that is truncated mid-record.
+        let edit = record("Edit", r#"{"file_path":"/repo/a.rs"}"#);
+        assert_eq!(
+            parse_record(&edit[..edit.len() - 3]),
+            LineOutcome::Unreadable
+        );
+    }
+
+    #[test]
+    fn parse_line_and_parse_record_agree_on_calls() {
+        let edit = record("Edit", r#"{"file_path":"/repo/a.rs"}"#);
+        match parse_record(&edit) {
+            LineOutcome::Calls(calls) => assert_eq!(calls, parse_line(&edit)),
+            other => panic!("expected calls, got {other:?}"),
+        }
+        // A read-only tool is a readable record with nothing to record.
+        let read = record("Read", r#"{"file_path":"/repo/a.rs"}"#);
+        assert_eq!(parse_record(&read), LineOutcome::NoCalls);
     }
 }
