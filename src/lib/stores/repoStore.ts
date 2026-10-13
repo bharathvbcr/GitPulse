@@ -1,6 +1,6 @@
 import type { RebaseStep } from "../rebase/planner";
 import { derived, get, writable } from "svelte/store";
-import { invoke } from "../ipc/invoke";
+import { invalidateSharedReads, invoke } from "../ipc/invoke";
 import { formatError } from "../ui/formatError";
 import { diagnostics } from "../diagnostics/diagnostics";
 import { askConfirm } from "./modalStore";
@@ -2307,6 +2307,12 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
       return () => void polledChangeListeners.delete(listener);
     },
     handleRepoChanged: async (changedPath?: string | null) => {
+      // The one entry for "the repository changed under us": a read already
+      // running began before this change, so no refresh asked for from here
+      // may join it (ipc/invoke.ts). Before every early return below, because
+      // a dropped echo or an unopened path still leaves a poll's read running
+      // that predates it.
+      invalidateSharedReads();
       // Watcher events arrive per file; a checkout or rebase fires many at
       // once. Each changed path collapses onto its own trailing window so a
       // storm becomes one refresh; explicit refresh() calls stay undelayed.

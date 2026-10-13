@@ -86,6 +86,27 @@ export type DeferralRetryOptions = {
   whenShown?: () => Promise<void>;
 };
 
+/**
+ * The join generation for identical in-flight reads (`sharedReads.ts`). A call
+ * joins a running read only if both started in the same generation.
+ *
+ * Module-wide, not per `withDeferralRetry` instance: what ends a generation
+ * (a write through any entry point, a watcher event) is a fact about the
+ * repository, not about one wrapper.
+ */
+let readGeneration = 0;
+
+/**
+ * Ends the current join generation: reads already running will not be joined
+ * by a call made from now on. For the one place that learns the repository
+ * changed outside this window's own commands (`repoStore.handleRepoChanged`,
+ * where watcher events enter), called BEFORE the refresh is requested, so the
+ * refresh reads after the change instead of riding a read that began before it.
+ */
+export function invalidateSharedReads(): void {
+  readGeneration += 1;
+}
+
 function messageOf(error: unknown): string {
   if (typeof error === "string") return error;
   if (error instanceof Error) return error.message;
@@ -148,7 +169,7 @@ export function withDeferralRetry(raw: Raw, options: DeferralRetryOptions = {}) 
   const whenShown = options.whenShown ?? whenDocumentShown;
   const retrying = new Map<string, Promise<unknown>>();
   /** Allowlisted reads in flight, by command and canonical arguments; see `sharedReads.ts`. */
-  const sharing = new Map<string, Promise<unknown>>();
+  const sharing = new Map<string, { promise: Promise<unknown>; generation: number }>();
 
   /**
    * One call to `raw`, always as a promise. Tauri's own `invoke` returns one;
@@ -197,21 +218,37 @@ export function withDeferralRetry(raw: Raw, options: DeferralRetryOptions = {}) 
     // promise is shared as it is: each caller's deadline or abort signal wraps
     // it in `bound`, so one caller giving up detaches that caller and leaves
     // the call running for the others.
-    if (SHARED_READ_COMMANDS.has(cmd) && rest.length <= 1 && !isBinary(rest[0])) {
-      const key = lazyRetryKey(cmd, rest[0]);
-      if (key !== null) {
-        const live = sharing.get(key);
-        if (live) return live as Promise<T>;
-        const shared = dispatchOne<T>(cmd, rest);
-        sharing.set(key, shared);
-        const clear = () => {
-          if (sharing.get(key) === shared) sharing.delete(key);
-        };
-        shared.then(clear, clear);
-        return shared;
+    if (SHARED_READ_COMMANDS.has(cmd)) {
+      if (rest.length <= 1 && !isBinary(rest[0])) {
+        const key = lazyRetryKey(cmd, rest[0]);
+        if (key !== null) {
+          const live = sharing.get(key);
+          // Only a call that started in the same generation: anything that
+          // may have changed the repository since (a write, an unknown
+          // command, a watcher event) makes the running read a pre-change
+          // answer, which a caller asking now must not be handed.
+          if (live && live.generation === readGeneration) return live.promise as Promise<T>;
+          const shared = dispatchOne<T>(cmd, rest);
+          sharing.set(key, { promise: shared, generation: readGeneration });
+          const clear = () => {
+            if (sharing.get(key)?.promise === shared) sharing.delete(key);
+          };
+          shared.then(clear, clear);
+          return shared;
+        }
       }
+      return dispatchOne<T>(cmd, rest);
     }
-    return dispatchOne<T>(cmd, rest);
+    // Not a named read: it may change what a read would answer, so it ends
+    // the generation twice, when it is sent and when it settles. A read that
+    // started before either is never joined by one that starts after.
+    readGeneration += 1;
+    const call = dispatchOne<T>(cmd, rest);
+    const settled = () => {
+      readGeneration += 1;
+    };
+    call.then(settled, settled);
+    return call;
   }
 
   function dispatchOne<T>(cmd: string, rest: Rest): Promise<T> {

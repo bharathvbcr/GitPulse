@@ -35,8 +35,11 @@ before that tag is pushed.
     one call at a time: the backend runs a pass serially on purpose, to keep
     its git start rate under the app-wide cap.
   - Identical read-only calls in flight (`cmd_get_status`, `cmd_list_branches`,
-    the graph and a few more, an explicit list) reach the backend once; a
-    caller that gives up leaves the call running for the others.
+    the graph and a few more, an explicit list) reach the backend once, but
+    only within one generation: any other command (a write, or one not on the
+    list) and every watcher event ends the generation, so a refresh asked for
+    after a change never rides a read that began before it. A caller that gives
+    up leaves the call running for the others.
 - **Open tabs no longer hold their commit history, and terminal history is a
   setting.**
   - The graph keeps the rows of the 6 most recently used repositories. A tab

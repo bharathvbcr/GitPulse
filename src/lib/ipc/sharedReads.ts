@@ -9,6 +9,14 @@
  * is the frontend half: a call whose command is named here and whose arguments
  * are plain data joins the same call already in flight.
  *
+ * A call joins only a read that started in the SAME join generation (see
+ * `readGeneration` in invoke.ts). Every command not named here ends a
+ * generation when it is sent and again when it settles, and
+ * `invalidateSharedReads()` ends one on a watcher event, so a read that began
+ * before a change is never handed to a caller asking after it. The backend's
+ * `run_read_shared` is sound for the same reason: it shares only reads that
+ * have not started.
+ *
  * An allowlist, never a pattern. Joining is only correct for a command that
  * changes nothing the second caller would have seen differently, so a command
  * earns its place by being read through its handler, and a new command is not
