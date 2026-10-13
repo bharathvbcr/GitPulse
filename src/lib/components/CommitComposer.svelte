@@ -147,7 +147,12 @@
       commitError = null;
       isCommitting = false;
       lastVerdict = null;
+      // Cancelled once, here, and let go: the blast effect cancels whatever
+      // guard it finds when it re-runs for the new repository, and a guard
+      // that is still held would be cancelled (and its query cancelled over
+      // IPC) a second time.
       blastGuard?.cancel();
+      blastGuard = null;
       blast = null;
       blastLoading = false;
     },
