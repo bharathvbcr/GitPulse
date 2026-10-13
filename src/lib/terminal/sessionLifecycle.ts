@@ -1,6 +1,6 @@
 import { mergeTerminalNotice, type PtyBus, type TerminalExitEvent } from "./ptyBus";
 import type { TerminalSpawned } from "./runResult";
-import { createTerminalInput, terminalDeadline } from "./inputQueue";
+import { INPUT_HARD_MS, TerminalTimeoutError, createTerminalInput, sessionIsGone, terminalDeadline } from "./inputQueue";
 import { SessionCapacityError, type createSessionRegistry } from "./sessionRegistry";
 import type { LauncherKind } from "./tabs";
 
@@ -24,6 +24,13 @@ export interface SessionHooks {
   exit(event: TerminalExitEvent): void;
   reset(): void | Promise<void>;
   warning(message: string): void;
+  /**
+   * Typed input is queued behind a send the backend has not answered yet. Called
+   * with the notice, and with null when that send settles. Not a warning: it
+   * retracts itself and must not clear one the view is showing for another
+   * reason.
+   */
+  slow?(message: string | null): void;
   /**
    * Output was skipped for this view (`terminal-loss`). What it had painted
    * may end mid escape sequence; the view must leave that sequence before
@@ -89,6 +96,8 @@ export function createSessionLifecycle(options: {
   let input: ReturnType<typeof createTerminalInput> | null = null;
   let pendingSize: { rows: number; cols: number } | null = null;
   let resizing = false;
+  /** A resize failure was already reported and none has succeeded since. */
+  let resizeWarned = false;
   let attemptEnded = false;
   /** Banner text already shown. A later clean exit must not drop it. */
   let shownError: string | null = null;
@@ -112,6 +121,7 @@ export function createSessionLifecycle(options: {
     subscription?.(); subscription = null;
     slot?.release(); slot = null;
     id = null;
+    resizeWarned = false;
   }
   function fail(message: string, retain = false) {
     input?.dispose();
@@ -254,7 +264,7 @@ export function createSessionLifecycle(options: {
         input = createTerminalInput((data, binary) => transport.write(spawned.id, data, binary), (message, fatal) => {
           if (fatal) fail(message);
           else if (!disposed) hooks.warning(message);
-        });
+        }, { onSlow: (message) => { if (!disposed || message === null) hooks.slow?.(message); } });
         state("running");
         if (!reattached) {
           // This id belongs to a new process. Its predecessor's loss does not.
@@ -319,6 +329,17 @@ export function createSessionLifecycle(options: {
     starting = launch(reconnect).finally(() => { starting = null; });
     return starting;
   }
+  /**
+   * Latest wins and one is in flight at a time: sizes that arrive while a resize
+   * is being answered collapse into the one pending size. A slow answer is
+   * awaited without a word (a window drag on a loaded host is a stream of
+   * these); only a failure is said, and once per streak, because the next
+   * resize carries the whole size and repairs it. A session that is gone is
+   * the exit path's to report. The bound exists so that a resize which never
+   * answers cannot hold `resizing` (this lifecycle's, not one session's) for
+   * good; if the abandoned resize lands late it is stale by one size, which the
+   * resize that followed it has already superseded or will.
+   */
   async function resizeLatest() {
     if (resizing) return;
     resizing = true;
@@ -326,8 +347,17 @@ export function createSessionLifecycle(options: {
       while (pendingSize && id && !disposed) {
         const size = pendingSize, target = id;
         pendingSize = null;
-        try { await terminalDeadline(transport.resize(target, size.rows, size.cols), 5000, "Terminal resize"); }
-        catch (error) { if (!disposed && id === target) hooks.warning(`Resize failed: ${String(error)}`); }
+        try {
+          await terminalDeadline(transport.resize(target, size.rows, size.cols), INPUT_HARD_MS, "Terminal resize", { pauseWhileHidden: true });
+          resizeWarned = false;
+        } catch (error) {
+          if (!disposed && id === target && !sessionIsGone(error) && !resizeWarned) {
+            resizeWarned = true;
+            hooks.warning(error instanceof TerminalTimeoutError
+              ? `Resize failed: no answer from the terminal backend for ${Math.round(error.ms / 1000)} s; the host may be overloaded.`
+              : `Resize failed: ${String(error)}`);
+          }
+        }
       }
     } finally { resizing = false; }
   }

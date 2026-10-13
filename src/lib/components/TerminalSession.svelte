@@ -232,6 +232,8 @@
   let awaitingAcknowledgement = $state(false);
   let container = $state<HTMLDivElement | null>(null);
   let warning = $state<string | null>(null);
+  /** Typing is queued behind a send the host has not answered; retracts itself, separate from `warning`. */
+  let slowInput = $state<string | null>(null);
   let shellPath = $state("");
   /** Absolute directory the current process started in, as the backend reported it. */
   let startedIn = $state("");
@@ -765,6 +767,7 @@
           });
         },
         warning(message) { warning = message; },
+        slow(message) { slowInput = message; },
         // CAN aborts any escape, OSC or DCS sequence the gap cut short, and
         // does nothing at all on the ground state. Queued behind what was
         // painted, ahead of what the resumed stream sends.
@@ -1255,6 +1258,9 @@
       <span class="flex-1 min-w-0 truncate" title={warning}>{warning}</span>
       <button type="button" aria-label="Dismiss terminal message" class="gp-icon-btn" onclick={() => (warning = null)}><X size={12} /></button>
     </div>
+  {/if}
+  {#if slowInput}
+    <div role="status" class="shrink-0 text-[11px] text-amber-300 px-3 py-1 border-b border-border/60 truncate" title={slowInput}>{slowInput}</div>
   {/if}
   {#if findOpen}
     <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
