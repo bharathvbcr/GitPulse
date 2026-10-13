@@ -1451,13 +1451,7 @@ impl GitReader {
     ) -> Result<CommitDetails, String> {
         let repo = validate_repo(repo_path)?;
         validate_oid(commit_id)?;
-        let args = [
-            "show",
-            "--numstat",
-            "-z",
-            COMMIT_SHOW_FORMAT,
-            commit_id,
-        ];
+        let args = ["show", "--numstat", "-z", COMMIT_SHOW_FORMAT, commit_id];
         let (stdout, cut) = if is_full_oid(commit_id) {
             ref_cache::git_text_capped(&repo, &[], &args, cap)?
         } else {
@@ -4343,7 +4337,10 @@ fn parse_commit_show(stdout: &str, cut: Option<&Incomplete>) -> Result<CommitDet
     let fields: Vec<&str> = parts.by_ref().take(COMMIT_SHOW_FIELDS).collect();
     if fields.len() < COMMIT_SHOW_FIELDS {
         return Err(match cut {
-            Some(why) => format!("Commit metadata was cut short: git output {}", why.describe()),
+            Some(why) => format!(
+                "Commit metadata was cut short: git output {}",
+                why.describe()
+            ),
             None => "Failed to parse commit metadata format".into(),
         });
     }
@@ -8142,7 +8139,11 @@ __GP_PULSE__\0def456\0abc123\x001700000100\0N\0second\0Ada\0ada@example.com\0\0\
             assert_eq!(details.body, "body text");
             assert_eq!(details.changed_files.len(), 3);
             let spawned = spawned_since(&repo, before);
-            assert_eq!(spawned.len(), 1, "one git process per first load: {spawned:?}");
+            assert_eq!(
+                spawned.len(),
+                1,
+                "one git process per first load: {spawned:?}"
+            );
         });
     }
 
@@ -8201,7 +8202,14 @@ __GP_PULSE__\0def456\0abc123\x001700000100\0N\0second\0Ada\0ada@example.com\0\0\
         std::fs::write(repo.join("renamed.txt"), "one\ntwo\nthree\nfour\n").unwrap();
         std::fs::write(repo.join("blob.bin"), [9u8, 0, 0, 7]).unwrap();
         git_in(&repo, &["add", "-A"]);
-        git_in(&repo, &["commit", "-m", "rename and rewrite\n\nCo-authored-by: Pat <pat@example.com>"]);
+        git_in(
+            &repo,
+            &[
+                "commit",
+                "-m",
+                "rename and rewrite\n\nCo-authored-by: Pat <pat@example.com>",
+            ],
+        );
         git_in(&repo, &["checkout", "-b", "side", "HEAD~1"]);
         std::fs::write(repo.join("side.txt"), "side\n").unwrap();
         git_in(&repo, &["add", "side.txt"]);
@@ -8231,9 +8239,15 @@ __GP_PULSE__\0def456\0abc123\x001700000100\0N\0second\0Ada\0ada@example.com\0\0\
             assert!(!details.files_list_truncated);
             checked += 1;
         }
-        assert!(checked >= 5, "seed, rename, side, merge and an empty commit: {checked}");
+        assert!(
+            checked >= 5,
+            "seed, rename, side, merge and an empty commit: {checked}"
+        );
         let renamed = &by_summary["rename and rewrite"];
-        assert_eq!(renamed.co_authors, vec!["Pat <pat@example.com>".to_string()]);
+        assert_eq!(
+            renamed.co_authors,
+            vec!["Pat <pat@example.com>".to_string()]
+        );
         assert!(renamed
             .changed_files
             .iter()
@@ -8245,7 +8259,7 @@ __GP_PULSE__\0def456\0abc123\x001700000100\0N\0second\0Ada\0ada@example.com\0\0\
         assert_eq!(by_summary["merge side"].parent_ids.len(), 2);
         let empty = &by_summary["nothing changed"];
         assert!(empty.changed_files.is_empty());
-        let value = serde_json::to_value(&empty).unwrap();
+        let value = serde_json::to_value(empty).unwrap();
         assert!(
             value.get("numstat_truncation_reason").is_none(),
             "absent, not null, when git was read whole: {value}"
@@ -8261,8 +8275,7 @@ __GP_PULSE__\0def456\0abc123\x001700000100\0N\0second\0Ada\0ada@example.com\0\0\
             let (_dir, repo, head) = repo_with_commit_of(200);
             let path = repo.to_string_lossy().into_owned();
             let cap = 2048;
-            let details =
-                GitReader::commit_details_capped(&path, &head, cap).expect("cut details");
+            let details = GitReader::commit_details_capped(&path, &head, cap).expect("cut details");
             let reason = details
                 .numstat_truncation_reason
                 .as_deref()
@@ -8294,12 +8307,12 @@ __GP_PULSE__\0def456\0abc123\x001700000100\0N\0second\0Ada\0ada@example.com\0\0\
 
     #[test]
     fn a_cut_stream_drops_the_record_it_ended_inside() {
-        let stream = "1\t0\ta.txt\02\t1\t\0old name\0new name\03\t3\tb";
+        let stream = "1\t0\ta.txt\x002\t1\t\0old name\0new name\x003\t3\tb";
         assert_eq!(
             drop_partial_numstat_tail(stream),
-            "1\t0\ta.txt\02\t1\t\0old name\0new name\0"
+            "1\t0\ta.txt\x002\t1\t\0old name\0new name\0"
         );
-        let renaming = "1\t0\ta.txt\02\t1\t\0old name\0";
+        let renaming = "1\t0\ta.txt\x002\t1\t\0old name\0";
         assert_eq!(drop_partial_numstat_tail(renaming), "1\t0\ta.txt\0");
         assert_eq!(drop_partial_numstat_tail("4\t"), "");
         assert_eq!(drop_partial_numstat_tail(""), "");
