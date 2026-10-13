@@ -41,6 +41,43 @@ import { performance } from "node:perf_hooks";
 const here = dirname(fileURLToPath(import.meta.url));
 const scratchRoot = resolve(here, "..", "tmp");
 
+/**
+ * @typedef {{ name: string, config: Array<[string, string]> }} Variant
+ * @typedef {{ n: number, min: number, p50: number | null, max: number }} Summary
+ * @typedef {{
+ *   cold_ms: number,
+ *   entries: number,
+ *   gitpulse: number[] | Summary,
+ *   plain: number[] | Summary,
+ *   index_has_untracked_cache?: boolean,
+ * }} VariantResult
+ * @typedef {{
+ *   processes: number,
+ *   rss_kb: number,
+ *   cpu_seconds: number,
+ *   idle_wakeups_per_second?: number | null,
+ *   note?: string,
+ * }} DaemonCost
+ * @typedef {{
+ *   repo: string,
+ *   tracked_files: number,
+ *   variants: Record<string, VariantResult>,
+ *   daemon: DaemonCost | null,
+ * }} RepoRow
+ * @typedef {{
+ *   git: string,
+ *   rounds: number,
+ *   untracked_files_added: number,
+ *   host: { cpus: number, loadavg_start: number[], loadavg_end?: number[] },
+ *   repos: RepoRow[],
+ *   daemons_before?: number,
+ *   daemons_leaked?: number,
+ * }} Report
+ * @typedef {{ repos: string[], rounds: number, untracked: number, synthetic: number, json: string | null }} Args
+ * @typedef {"gitpulse" | "plain"} Mode
+ */
+
+/** @type {Variant[]} */
 const VARIANTS = [
   { name: "default", config: [] },
   { name: "untrackedCache", config: [["core.untrackedCache", "true"]] },
@@ -58,7 +95,12 @@ const VARIANTS = [
 const GITPULSE_STATUS = ["-c", "core.quotepath=off", "status", "--porcelain=v1", "-u", "-z"];
 const PLAIN_STATUS = ["status", "--porcelain=v1", "-u", "-z"];
 
+/**
+ * @param {string[]} argv
+ * @returns {Args}
+ */
 function parseArgs(argv) {
+  /** @type {Args} */
   const out = { repos: [], rounds: 9, untracked: 0, synthetic: 0, json: null };
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i];
@@ -78,7 +120,11 @@ function parseArgs(argv) {
   return out;
 }
 
-/** Environment for a measured child: no user or system config can change the variant. */
+/**
+ * Environment for a measured child: no user or system config can change the variant.
+ * @param {Record<string, string>} [extra]
+ * @returns {NodeJS.ProcessEnv}
+ */
 function gitEnv(extra = {}) {
   return {
     ...process.env,
@@ -90,17 +136,28 @@ function gitEnv(extra = {}) {
   };
 }
 
+/** @param {string} path */
 function insideScratch(path) {
   return resolve(path).startsWith(scratchRoot + sep);
 }
 
+/**
+ * @param {string} cwd
+ * @param {string[]} args
+ * @param {NodeJS.ProcessEnv} [env]
+ */
 function git(cwd, args, env = gitEnv()) {
   const result = spawnSync("git", args, { cwd, env, encoding: "utf8", maxBuffer: 256 * 1024 * 1024 });
   if (result.error) throw result.error;
   return result;
 }
 
-/** The only place configuration is written: `--local`, inside a scratch clone. */
+/**
+ * The only place configuration is written: `--local`, inside a scratch clone.
+ * @param {string} cloneDir
+ * @param {string} key
+ * @param {string} value
+ */
 function setLocalConfig(cloneDir, key, value) {
   if (!insideScratch(cloneDir)) throw new Error(`refusing to write config outside the scratch root: ${cloneDir}`);
   const result = git(cloneDir, ["config", "--local", key, value]);
@@ -117,8 +174,13 @@ function daemonPids() {
   );
 }
 
-/** Daemons holding a file under `dir` open: the ones this run started. */
+/**
+ * Daemons holding a file under `dir` open: the ones this run started.
+ * @param {string} dir
+ * @returns {number[]}
+ */
 function daemonsUnder(dir) {
+  /** @type {number[]} */
   const owned = [];
   for (const pid of daemonPids()) {
     // The daemon's own working directory is the user's home; what ties it to
@@ -130,6 +192,7 @@ function daemonsUnder(dir) {
   return owned;
 }
 
+/** @param {number} pid */
 function alive(pid) {
   try {
     process.kill(pid, 0);
@@ -139,6 +202,10 @@ function alive(pid) {
   }
 }
 
+/**
+ * @param {string} cloneDir
+ * @param {Mode} mode
+ */
 function timeStatus(cloneDir, mode) {
   const argv = mode === "gitpulse" ? GITPULSE_STATUS : PLAIN_STATUS;
   const env = mode === "gitpulse" ? gitEnv({ GIT_OPTIONAL_LOCKS: "0" }) : gitEnv();
@@ -150,16 +217,29 @@ function timeStatus(cloneDir, mode) {
   return { ms: elapsed, entries };
 }
 
+/**
+ * @param {number[]} sorted
+ * @param {number} q
+ * @returns {number | null}
+ */
 function quantile(sorted, q) {
   if (sorted.length === 0) return null;
   return sorted[Math.min(sorted.length - 1, Math.floor(q * sorted.length))];
 }
 
+/**
+ * @param {number[]} samples
+ * @returns {Summary}
+ */
 function summarize(samples) {
   const sorted = [...samples].sort((a, b) => a - b);
   return { n: sorted.length, min: sorted[0], p50: quantile(sorted, 0.5), max: sorted[sorted.length - 1] };
 }
 
+/**
+ * @param {number[]} pids
+ * @returns {DaemonCost}
+ */
 function processCost(pids) {
   if (pids.length === 0) return { processes: 0, rss_kb: 0, cpu_seconds: 0 };
   const result = spawnSync("ps", ["-o", "rss=,cputime=", "-p", pids.join(",")], { encoding: "utf8" });
@@ -176,7 +256,12 @@ function processCost(pids) {
   return { processes: pids.length, rss_kb: rss, cpu_seconds: cpu };
 }
 
-/** Idle wakeups per second for `pids` over `seconds`, from `top`'s IDLEW column. */
+/**
+ * Idle wakeups per second for `pids` over `seconds`, from `top`'s IDLEW column.
+ * @param {number[]} pids
+ * @param {number} seconds
+ * @returns {number | null}
+ */
 function idleWakeups(pids, seconds) {
   if (pids.length === 0) return null;
   let total = 0;
@@ -196,6 +281,10 @@ function idleWakeups(pids, seconds) {
   return total / seconds;
 }
 
+/**
+ * @param {string} cloneDir
+ * @param {number} count
+ */
 function populateUntracked(cloneDir, count) {
   if (count === 0) return;
   const dir = join(cloneDir, "spike-untracked");
@@ -213,6 +302,8 @@ function populateUntracked(cloneDir, count) {
  * A scratch repository of `files` tracked files (fixed names and content, a
  * fixed identity and date), standing in for a repository too large to keep
  * around. Built inside the scratch root; it is a clone source like any other.
+ * @param {string} dir
+ * @param {number} files
  */
 function makeSyntheticRepo(dir, files) {
   mkdirSync(dir, { recursive: true });
@@ -240,6 +331,7 @@ function makeSyntheticRepo(dir, files) {
   }
 }
 
+/** @param {string} cloneDir */
 function stopDaemon(cloneDir) {
   // `stop` on a clone with no daemon exits non-zero; that is fine.
   spawnSync("git", ["fsmonitor--daemon", "stop"], { cwd: cloneDir, env: gitEnv(), encoding: "utf8" });
@@ -249,10 +341,12 @@ async function main() {
   const args = parseArgs(process.argv.slice(2));
   mkdirSync(scratchRoot, { recursive: true });
   const workDir = mkdtempSync(join(scratchRoot, "git-status-spike-"));
-  const clones = []; // { dir }
+  /** @type {Array<{ dir: string }>} */
+  const clones = [];
   let cleaned = false;
   const daemonsBefore = daemonPids();
   /** Pids of daemons this run's clones started (matched by working directory). */
+  /** @type {Set<number>} */
   const mine = new Set();
 
   function cleanup() {
@@ -268,6 +362,7 @@ async function main() {
     });
   }
 
+  /** @type {Report} */
   const report = {
     git: git(process.cwd(), ["--version"]).stdout.trim(),
     rounds: args.rounds,
@@ -275,9 +370,11 @@ async function main() {
     host: { cpus: cpus().length, loadavg_start: loadavg() },
     repos: [],
   };
+  /** @type {unknown} */
   let failure = null;
   try {
-    const sources = args.repos.map((path) => ({ path, label: path.split(sep).filter(Boolean).pop() }));
+    /** @type {Array<{ path: string, label: string }>} */
+    const sources = args.repos.map((path) => ({ path, label: path.split(sep).filter(Boolean).pop() ?? path }));
     if (args.synthetic > 0) {
       const path = join(workDir, "synthetic-source");
       makeSyntheticRepo(path, args.synthetic);
@@ -285,7 +382,9 @@ async function main() {
     }
     for (const { path: source, label: name } of sources) {
       const tracked = git(source, ["ls-files", "-z"]).stdout.split("\0").filter(Boolean).length;
+      /** @type {RepoRow} */
       const row = { repo: name, tracked_files: tracked, variants: {}, daemon: null };
+      /** @type {Array<{ variant: Variant, dir: string }>} */
       const variantClones = [];
       const repoDir = join(workDir, `clones-${name}`);
       mkdirSync(repoDir, { recursive: true });
@@ -325,17 +424,17 @@ async function main() {
       await new Promise((done) => setTimeout(done, 1500));
 
       // Warm, interleaved: one sample of every variant per round, rotating who goes first.
-      for (const mode of ["gitpulse", "plain"]) {
+      for (const mode of /** @type {Mode[]} */ (["gitpulse", "plain"])) {
         for (let round = 0; round < args.rounds; round += 1) {
           for (let k = 0; k < variantClones.length; k += 1) {
             const { variant, dir } = variantClones[(k + round) % variantClones.length];
-            row.variants[variant.name][mode].push(timeStatus(dir, mode).ms);
+            /** @type {number[]} */ (row.variants[variant.name][mode]).push(timeStatus(dir, mode).ms);
           }
         }
       }
       for (const entry of Object.values(row.variants)) {
-        entry.gitpulse = summarize(entry.gitpulse);
-        entry.plain = summarize(entry.plain);
+        entry.gitpulse = summarize(/** @type {number[]} */ (entry.gitpulse));
+        entry.plain = summarize(/** @type {number[]} */ (entry.plain));
       }
 
       // Daemon cost, from the daemons this run started (not the user's own).
@@ -367,7 +466,7 @@ async function main() {
   report.daemons_leaked = leaked.length;
 
   if (failure) {
-    console.error(`spike failed: ${failure.message}`);
+    console.error(`spike failed: ${failure instanceof Error ? failure.message : String(failure)}`);
     process.exitCode = 1;
   }
   printReport(report);
@@ -378,10 +477,12 @@ async function main() {
   }
 }
 
+/** @param {number | null | undefined} ms */
 function fmt(ms) {
   return ms === null || ms === undefined ? "n/a" : `${ms.toFixed(1)}`;
 }
 
+/** @param {Report} report */
 function printReport(report) {
   console.log(
     `${report.git}; ${report.rounds} interleaved rounds; ${report.untracked_files_added} untracked files added per clone; ` +
@@ -391,16 +492,23 @@ function printReport(report) {
     console.log(`\n${row.repo} (${row.tracked_files} tracked files). ms, min / p50 of warm rounds; cold = first status`);
     console.log("variant         cold   gitpulse(min/p50)   plain(min/p50)   (* = UNTR extension present in the index)");
     const base = row.variants.default;
-    for (const [name, entry] of Object.entries(row.variants)) {
-      const speed = (mode) => (base[mode].min > 0 ? ` ${(entry[mode].min / base[mode].min).toFixed(2)}x` : "");
+    for (const [name, result] of Object.entries(row.variants)) {
+      const warm = /** @type {{ gitpulse: Summary, plain: Summary }} */ (result);
+      const baseWarm = /** @type {{ gitpulse: Summary, plain: Summary }} */ (base);
+      /** @param {Mode} mode */
+      const speed = (mode) =>
+        baseWarm[mode].min > 0 ? ` ${(warm[mode].min / baseWarm[mode].min).toFixed(2)}x` : "";
       console.log(
-        `${name.padEnd(15)}${entry.index_has_untracked_cache ? "*" : " "}${fmt(entry.cold_ms).padStart(6)}   ${fmt(entry.gitpulse.min).padStart(7)} / ${fmt(entry.gitpulse.p50).padEnd(7)}${speed("gitpulse").padEnd(7)} ${fmt(entry.plain.min).padStart(7)} / ${fmt(entry.plain.p50).padEnd(7)}${speed("plain")}`,
+        `${name.padEnd(15)}${result.index_has_untracked_cache ? "*" : " "}${fmt(result.cold_ms).padStart(6)}   ${fmt(warm.gitpulse.min).padStart(7)} / ${fmt(warm.gitpulse.p50).padEnd(7)}${speed("gitpulse").padEnd(7)} ${fmt(warm.plain.min).padStart(7)} / ${fmt(warm.plain.p50).padEnd(7)}${speed("plain")}`,
       );
     }
     const d = row.daemon;
-    console.log(
-      `fsmonitor daemons started: ${d.processes}, rss ${d.rss_kb} KB, cpu ${d.cpu_seconds.toFixed(2)} s, idle wakeups/s ${d.idle_wakeups_per_second === null ? "n/a" : d.idle_wakeups_per_second.toFixed(1)}`,
-    );
+    if (d) {
+      const wakeups = d.idle_wakeups_per_second;
+      console.log(
+        `fsmonitor daemons started: ${d.processes}, rss ${d.rss_kb} KB, cpu ${d.cpu_seconds.toFixed(2)} s, idle wakeups/s ${wakeups === null || wakeups === undefined ? "n/a" : wakeups.toFixed(1)}`,
+      );
+    }
   }
   console.log(`\nfsmonitor daemons before: ${report.daemons_before}; leaked after cleanup: ${report.daemons_leaked}`);
 }
