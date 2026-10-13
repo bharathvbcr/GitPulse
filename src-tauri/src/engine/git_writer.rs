@@ -2589,9 +2589,16 @@ fn plan_push_argv(
 /// no refusal here. Anything that renders a name into text a human might paste
 /// into a shell must quote it (see `deadbranch`'s backup file).
 ///
-/// One rule is stricter than git: a leading `-` is refused on every path, so a
-/// name can never be read as an option. The tests check this function against
-/// `git check-ref-format` over a table and a sweep of short names.
+/// Two rules are stricter than git, on purpose:
+/// - a leading `-` is refused on every path, so a name can never be read as an
+///   option;
+/// - the C1 control code points U+0080-U+009F are refused. Git sees them as
+///   ordinary bytes and accepts them, but branch names are rendered into
+///   xterm.js terminals, which act on them (U+009B is CSI), so accepting one
+///   would be a terminal escape-injection path.
+///
+/// The tests check this function against `git check-ref-format` over a table and
+/// a sweep of short names, and name the C1 rows as the expected divergence.
 pub fn validate_ref_name(name: &str) -> Result<(), String> {
     if name.is_empty() || name.starts_with('-') || name.contains('\0') {
         return Err("Invalid ref name".into());
@@ -2620,9 +2627,13 @@ pub fn validate_ref_name(name: &str) -> Result<(), String> {
         return Err("Invalid ref name: invalid '@' sequence".into());
     }
     // Rules 4, 5 and 10: ASCII control characters (DEL included), space, and
-    // `~ ^ : ? * [ \`. A lone `]` is legal; only `[` opens a glob.
+    // `~ ^ : ? * [ \`. A lone `]` is legal; only `[` opens a glob. DEL and the
+    // C1 range U+0080-U+009F are refused together (the C1 half is stricter than
+    // git; see above).
     if name.chars().any(|c| {
-        c < ' ' || c == '\x7f' || matches!(c, ' ' | '~' | '^' | ':' | '?' | '*' | '[' | '\\')
+        c < ' '
+            || ('\u{7f}'..='\u{9f}').contains(&c)
+            || matches!(c, ' ' | '~' | '^' | ':' | '?' | '*' | '[' | '\\')
     }) {
         return Err("Invalid ref name: contains a character git forbids in ref names".into());
     }
@@ -3098,10 +3109,10 @@ mod tests {
         ("a.lock.x", true),
         ("a/lockfile", true),
         ("foo.lockdown", true),
-        // Non-ASCII bytes are never control characters to git, C1 included.
+        // Other non-ASCII text is ordinary.
         ("ü", true),
         ("日本語/ブランチ", true),
-        ("a\u{85}b", true),
+        ("a\u{a0}b", true),
         // Rule 1: a component may not start with `.` or end with `.lock`.
         (".a", false),
         ("a/.b", false),
@@ -3150,7 +3161,18 @@ mod tests {
         ("--force", false),
         ("-", false),
         ("a\0b", false),
+        // Stricter than git: C1 control code points (see `REF_NAME_C1_ROWS`).
+        ("a\u{80}b", false),
+        ("a\u{85}b", false),
+        ("a\u{9b}b", false),
+        ("a\u{9f}b", false),
     ];
+
+    /// The rows of [`REF_NAME_TABLE`] where `validate_ref_name` is deliberately
+    /// stricter than git: C1 control code points, which git accepts and which
+    /// xterm.js interprets (U+009B is CSI). The git comparison expects git to
+    /// ACCEPT each of these and the validator to refuse it; it never skips them.
+    const REF_NAME_C1_ROWS: &[&str] = &["a\u{80}b", "a\u{85}b", "a\u{9b}b", "a\u{9f}b"];
 
     /// Rows `git check-ref-format --branch` answers about something other than
     /// the name: `HEAD` is refused as a branch name, and `@` / `@{-N}` are
@@ -3221,6 +3243,14 @@ mod tests {
             // `--branch` on a plain name is the whole of what a branch needs;
             // the table's `@` and `@{-1}` rows are asked of plain mode below.
             if REF_NAME_PLAIN_MODE_ROWS.contains(&name) {
+                continue;
+            }
+            if REF_NAME_C1_ROWS.contains(&name) {
+                // The one intended divergence: git accepts, the validator refuses.
+                assert!(
+                    git && !accepted && validate_ref_name(name).is_err(),
+                    "{name:?} must be accepted by git and refused by validate_ref_name"
+                );
                 continue;
             }
             assert_eq!(
