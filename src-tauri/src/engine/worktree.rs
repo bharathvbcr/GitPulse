@@ -1910,6 +1910,11 @@ pub const BASE_RECORD: &str = "gitpulse-base";
 pub fn write_base_record(worktree: &Path, branch: &str, oid: &str) -> Result<(), String> {
     validate_ref_name(branch)?;
     validate_oid(oid)?;
+    if !matches!(oid.len(), 40 | 64) {
+        return Err(format!(
+            "{oid} is not a full commit id, so it is not recorded as a base"
+        ));
+    }
     let dir = resolve_git_dir(worktree)?;
     std::fs::write(dir.join(BASE_RECORD), format!("{branch}\n{oid}\n")).map_err(|e| {
         format!(
@@ -1940,7 +1945,12 @@ fn read_base_record(worktree: &Path) -> Result<Option<(String, String)>, String>
         return Err(corrupt("it does not have exactly two lines"));
     };
     validate_ref_name(branch).map_err(|e| corrupt(&e))?;
-    validate_oid(oid).map_err(|e| corrupt(&e))?;
+    // A full id only: an abbreviation is whatever git resolves it to today.
+    if !matches!(oid.len(), 40 | 64) || !oid.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(corrupt(
+            "the commit id is not a full 40 or 64 character hex id",
+        ));
+    }
     Ok(Some((branch.to_string(), oid.to_ascii_lowercase())))
 }
 
@@ -2115,6 +2125,27 @@ fn merge_and_teardown_with(
         );
     }
 
+    // Unmerged index entries with no merge in progress are the user's own (a
+    // conflicted stash pop they are resolving). Git would refuse to merge over
+    // them, and a rollback of that refusal would reset their resolution away,
+    // so none of that is started. What a rollback later undoes is then
+    // provably this call's: the checkout had none before it.
+    let (unmerged, unmerged_total) =
+        crate::engine::repo_op::conflicted_paths(&repo).map_err(|e| {
+            format!(
+                "The main checkout's unmerged files could not be checked: {e}. Nothing was merged."
+            )
+        })?;
+    if unmerged_total > 0 {
+        let shown: Vec<&str> = unmerged.iter().take(5).map(String::as_str).collect();
+        return Err(format!(
+            "The main checkout has {unmerged_total} unmerged file(s) with no merge in progress ({}{}). Resolve and commit them, or restore them, before merging {branch}; nothing was merged and nothing was reset.",
+            shown.join(", "),
+            if unmerged_total > shown.len() { ", ..." } else { "" }
+        )
+        .into());
+    }
+
     // 3. Collision / uncommitted changes check
     let worktree_text = worktree.to_string_lossy().to_string();
     let (changed, _) = changed_paths(&worktree_text)?;
@@ -2165,6 +2196,13 @@ fn merge_and_teardown_with(
                 target_branch: target.to_string(),
                 base_oid: base_oid.clone(),
             };
+            if base_oid.len() != before_oid.len() {
+                return Err(format!(
+                    "{branch}'s recorded base {base_oid} is not in this repository's object format ({}-character ids); nothing was merged.",
+                    before_oid.len()
+                )
+                .into());
+            }
             if base_branch != target {
                 return Err(mismatch(format!(
                     "{branch} was cut from {base_branch}, but the merge target is {target}. Nothing was merged."
@@ -2217,7 +2255,7 @@ fn merge_and_teardown_with(
         // force-deleted the branch whose work was never committed.
         GitWriter::squash_merge_locked(&repo, &branch, gate).map_err(|failure| match failure {
             SquashFailure::Merge(e) => MergeTeardownError::Refused { message: e },
-            SquashFailure::Conflict(e) => failed_merge_error(&repo, &branch, target, e),
+            SquashFailure::Conflict(e) => failed_merge_error(gate, &repo, &branch, target, e),
             // Staged, not rolled back: `git reset --merge` is the user's call.
             SquashFailure::Commit(e) => MergeTeardownError::SquashParked {
                 message: format!("{e} The worktree and the branch {branch} were kept on {target}."),
@@ -2242,6 +2280,7 @@ fn merge_and_teardown_with(
             gate(&merge)?;
             if let Err(e) = git_text(&repo, &merge) {
                 return Err(failed_merge_error(
+                    gate,
                     &repo,
                     &branch,
                     target,
@@ -2299,7 +2338,7 @@ fn merge_and_teardown_with(
         Some(kept) => Err(kept),
         None => gate(&remove)
             .and_then(|()| unchanged_since_merge(&repo, true))
-            .and_then(|()| remove_with_retry(&repo, &worktree_text, gate, sleep)),
+            .and_then(|()| remove_with_retry(&repo, &worktree_text, sleep)),
     };
     let (worktree_removed, removal_error) = match removal {
         Ok(()) => (true, None),
@@ -2364,6 +2403,7 @@ fn merge_and_teardown_with(
 /// with the checkout restored, or, when git failed for a reason that changed
 /// nothing, a plain refusal. Runs under the repository lock.
 fn failed_merge_error(
+    gate: &mut dyn FnMut(&[&str]) -> Result<(), String>,
     repo: &Path,
     branch: &str,
     target: &str,
@@ -2379,7 +2419,7 @@ fn failed_merge_error(
     let started = listing_error.is_some()
         || total > 0
         || !matches!(crate::engine::repo_op::detect_kind(repo), Ok(None));
-    let rollback = GitWriter::rollback_failed_merge_locked(repo);
+    let rollback = GitWriter::rollback_failed_merge_gated(repo, gate);
     if !started && rollback.is_ok() {
         return MergeTeardownError::Refused {
             message: format!("Merging {branch} into {target} failed; nothing was changed: {cause}"),
@@ -2396,13 +2436,17 @@ fn failed_merge_error(
     } else {
         format!("failed part-way: {cause}")
     };
-    let (rolled_back, rollback_error) = match rollback {
-        Ok(()) => (true, None),
-        Err(e) => (false, Some(e)),
+    let (rolled_back, rollback_error, gate_note) = match rollback {
+        Ok(note) => (true, None, note),
+        Err(e) => (false, Some(e), None),
     };
     let outcome = match &rollback_error {
-        None => "It was rolled back; nothing was merged and the worktree and the branch were kept."
-            .to_string(),
+        None => format!(
+            "It was rolled back; nothing was merged and the worktree and the branch were kept.{}",
+            gate_note
+                .map(|note| format!(" Note: {note}."))
+                .unwrap_or_default()
+        ),
         Some(e) => format!(
             "It could not be rolled back ({e}): the main checkout is left in the middle of it. \
              Abort the merge there before merging anything else."
@@ -2420,14 +2464,76 @@ fn failed_merge_error(
     }
 }
 
+/// A worktree path as git compares it: the directory beside it resolved (a
+/// symlinked temp or home directory is written by git in its real form), and
+/// its own name kept, so it can be told apart after the directory is gone.
+fn lane_identity(path: &Path) -> PathBuf {
+    match (
+        path.parent().and_then(|parent| parent.canonicalize().ok()),
+        path.file_name(),
+    ) {
+        (Some(parent), Some(name)) => parent.join(name),
+        _ => path.to_path_buf(),
+    }
+}
+
+/// Whether git still lists `worktree_text` as a worktree of `repo`.
+fn still_listed(repo: &Path, worktree_text: &str) -> Result<bool, String> {
+    let wanted = lane_identity(Path::new(worktree_text));
+    Ok(read_worktree_entries(repo)?
+        .iter()
+        .any(|entry| lane_identity(Path::new(&entry.path)) == wanted))
+}
+
+/// Finishes the removal of a worktree whose directory is already gone (a
+/// partial delete) by removing its own record, `<common>/worktrees/<id>`,
+/// and nothing else. `worktree prune` does this for every stale record in the
+/// repository, including a lane on a volume that is unmounted right now. The
+/// record is found by its `gitdir` file pointing at this worktree, and a
+/// locked one is left, since a lock is somebody's statement that it stays.
+fn remove_own_worktree_record(repo: &Path, worktree_text: &str) -> Result<(), String> {
+    let records = resolve_git_common_dir(repo)?.join("worktrees");
+    let wanted = lane_identity(Path::new(worktree_text));
+    let listing = std::fs::read_dir(&records)
+        .map_err(|e| format!("could not read {}: {e}", records.display()))?;
+    for entry in listing {
+        let record = entry
+            .map_err(|e| format!("could not read {}: {e}", records.display()))?
+            .path();
+        let Ok(pointer) = std::fs::read(record.join("gitdir")) else {
+            continue;
+        };
+        if pointer.len() > 4096 {
+            continue;
+        }
+        let pointer = String::from_utf8_lossy(&pointer);
+        let Some(gitdir_parent) = Path::new(pointer.trim()).parent() else {
+            continue;
+        };
+        if lane_identity(gitdir_parent) != wanted {
+            continue;
+        }
+        if record.join("locked").exists() {
+            return Err(format!(
+                "its record {} is locked, so it was left",
+                record.display()
+            ));
+        }
+        return std::fs::remove_dir_all(&record)
+            .map_err(|e| format!("could not remove its record {}: {e}", record.display()));
+    }
+    Ok(())
+}
+
 /// Removes the merged worktree, trying up to [`MAX_REMOVE_ATTEMPTS`] times
 /// with [`REMOVE_BACKOFF`] between. When a try fails after taking the
-/// directory away (a partial delete), git still lists the worktree, and
-/// pruning is what finishes the removal. Caller holds the repository lock.
+/// directory away (a partial delete), git still lists the worktree, and only
+/// its own record is removed to finish it. Either way the removal is reported
+/// as done only once git no longer lists the path. Caller holds the
+/// repository lock.
 fn remove_with_retry(
     repo: &Path,
     worktree_text: &str,
-    gate: &mut dyn FnMut(&[&str]) -> Result<(), String>,
     sleep: &mut dyn FnMut(Duration),
 ) -> Result<(), String> {
     let mut last = String::new();
@@ -2436,16 +2542,23 @@ fn remove_with_retry(
             sleep(REMOVE_BACKOFF[attempt - 1]);
         }
         match remove_worktree_locked(repo, worktree_text, true) {
-            Ok(()) => return Ok(()),
+            Ok(()) => {
+                return if still_listed(repo, worktree_text)? {
+                    Err(format!("git removed {worktree_text} but still lists it"))
+                } else {
+                    Ok(())
+                };
+            }
             Err(e) => last = e,
         }
         if !Path::new(worktree_text).exists() {
-            let prune = prune_worktree_argv();
-            let prune: Vec<&str> = prune.iter().skip(1).map(String::as_str).collect();
-            gate(&prune)?;
-            return git_text(repo, &prune)
-                .map(drop)
-                .map_err(|e| format!("{last}; pruning what was left of it failed: {e}"));
+            remove_own_worktree_record(repo, worktree_text)
+                .map_err(|e| format!("{last}; finishing the removal failed: {e}"))?;
+            return if still_listed(repo, worktree_text)? {
+                Err(format!("{last}; git still lists {worktree_text}"))
+            } else {
+                Ok(())
+            };
         }
     }
     Err(format!(
@@ -4627,29 +4740,30 @@ some-future-field whatever
         let repo = dir.path();
         std::fs::remove_dir_all(wt.path()).unwrap();
         let mut waits = Vec::new();
-        remove_with_retry(
-            repo,
-            wt.path().to_str().unwrap(),
-            &mut allow_all,
-            &mut |wait| waits.push(wait),
-        )
+        remove_with_retry(repo, wt.path().to_str().unwrap(), &mut |wait| {
+            waits.push(wait)
+        })
         .unwrap();
         assert!(waits.is_empty(), "a vanished directory was waited for");
         assert_eq!(list_worktrees(repo.to_str().unwrap()).unwrap().len(), 1);
     }
 
     #[test]
-    fn a_refused_prune_is_reported_not_swallowed() {
+    fn a_locked_lane_whose_directory_is_gone_is_reported_not_unregistered() {
         let (dir, wt) = teardown_fixture(None);
-        std::fs::remove_dir_all(wt.path()).unwrap();
-        let refused = remove_with_retry(
+        crate::test_support::git_in(
             dir.path(),
-            wt.path().to_str().unwrap(),
-            &mut |_| Err("policy: prune denied".into()),
-            &mut |_| {},
-        )
-        .unwrap_err();
-        assert!(refused.contains("prune denied"), "{refused}");
+            &["worktree", "lock", wt.path().to_str().unwrap()],
+        );
+        std::fs::remove_dir_all(wt.path()).unwrap();
+        let refused =
+            remove_with_retry(dir.path(), wt.path().to_str().unwrap(), &mut |_| {}).unwrap_err();
+        assert!(refused.contains("locked"), "{refused}");
+        assert_eq!(
+            list_worktrees(dir.path().to_str().unwrap()).unwrap().len(),
+            2,
+            "the locked lane's record was removed"
+        );
     }
 
     #[test]
@@ -5881,10 +5995,8 @@ some-future-field whatever
         let (a, b) = (a.join().unwrap(), b.join().unwrap());
         let oks = [&a, &b].iter().filter(|r| r.is_ok()).count();
         assert!(oks >= 1, "neither succeeded: {a:?} {b:?}");
-        for r in [&a, &b] {
-            if let Ok(res) = r {
-                assert!(res.merged);
-            }
+        for res in [&a, &b].into_iter().flatten() {
+            assert!(res.merged);
         }
         main_checkout_is_idle(&repo);
         assert!(repo.join("feature.txt").exists());

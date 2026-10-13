@@ -85,11 +85,21 @@ export interface RunRead { state: string; exitCode: number | null; cwd: string; 
 export interface MainState { dirty: number | null; operation: string | null }
 
 /** Why the main checkout is not free to launch from or merge into, or "" when it is. A state that could not be read is not free. */
-function mainBlocker(state: MainState): string {
-  if (state.operation) return `a ${state.operation} is in progress in the main checkout`;
-  if (state.dirty === null) return "the main checkout's uncommitted changes could not be counted";
-  if (state.dirty > 0) return `the main checkout has ${state.dirty} uncommitted file${state.dirty === 1 ? "" : "s"}`;
+function mainBlocker(state: MainState | null | undefined): string {
+  // Free only on a reading that says so: a whole-number zero count and no operation. Anything else, a malformed reading included, is not free.
+  if (!state || typeof state !== "object") return "the main checkout could not be read";
+  if (typeof state.operation === "string" && state.operation) return `a ${state.operation} is in progress in the main checkout`;
+  const { dirty } = state;
+  if (typeof dirty === "number" && Number.isInteger(dirty) && dirty > 0) return `the main checkout has ${dirty} uncommitted file${dirty === 1 ? "" : "s"}`;
+  if (!(typeof dirty === "number" && Number.isInteger(dirty) && dirty === 0)) return "the main checkout's uncommitted changes could not be counted";
+  if (state.operation !== null) return "the main checkout's operation state could not be read";
   return "";
+}
+
+/** The host's `code` on a rejection that is a conflict or a parked squash, typed or not: a malformed object still says what the host said. */
+function haltingCode(cause: unknown): "conflict" | "squash_parked" | null {
+  const code = cause instanceof MergeTeardownFailure ? cause.failure.code : cause !== null && typeof cause === "object" ? (cause as { code?: unknown }).code : null;
+  return code === "conflict" || code === "squash_parked" ? code : null;
 }
 
 export interface WaveDeps {
@@ -200,6 +210,8 @@ export function resumeWave(record: WaveRecord, deps: WaveDeps): Promise<WaveRunn
 async function drive(start: WaveRecord, deps: WaveDeps, fresh: boolean): Promise<WaveRunner> {
   // A merge interrupted by a restart may or may not have happened; it is never repeated blind.
   let record = fresh ? start : { ...start, members: start.members.map((m) => (m.phase === "merging" ? { ...m, phase: "held" as MemberPhase, detail: "Interrupted while merging; check the branch before merging again." } : m)) };
+  // A merge cut off by a restart may have conflicted and been rolled back, or landed: its outcome is unknown, and every member behind it was cut from the same base.
+  const interrupted = !fresh && start.state === "running" ? start.members.find((m) => m.phase === "merging") : undefined;
   const abort = new AbortController();
   let cancelled = false;
   const save = async (change: Partial<WaveRecord> = {}) => {
@@ -313,14 +325,14 @@ async function drive(start: WaveRecord, deps: WaveDeps, fresh: boolean): Promise
       const said = await deps.merge({ taskId: next.taskId, runId: next.runId, cwd: next.cwd, head: next.head });
       await update(next.taskId, { phase: "merged", detail: said });
     } catch (cause) {
-      const failure = cause instanceof MergeTeardownFailure ? cause.failure : null;
-      if (failure?.code === "conflict" || failure?.code === "squash_parked") {
+      const halting = haltingCode(cause);
+      if (halting) {
         // Nothing after a conflict may merge: the next member's branch was cut
         // from the same base, and a squash left parked is still in the checkout.
-        const pending = failure.code === "conflict" ? `conflict in ${next.title}` : `squash parked in main (${next.title})`;
+        const pending = halting === "conflict" ? `conflict in ${next.title}` : `squash parked in main (${next.title})`;
         await update(next.taskId, { phase: "held", detail: `Not merged: ${message(cause)}` });
         await save({ members: record.members.map((m) => (m.phase === "ready" ? { ...m, phase: "held" as MemberPhase, detail: `not merged: ${pending} pending` } : m)) });
-        await stopTerminal("halted", `Merging "${next.title}" ended in a ${failure.code === "conflict" ? "conflict" : "parked squash"}; no further task was launched or merged.`);
+        await stopTerminal("halted", `Merging "${next.title}" ended in a ${halting === "conflict" ? "conflict" : "parked squash"}; no further task was launched or merged.`);
         return true;
       }
       await update(next.taskId, { phase: "held", detail: `Not merged: ${message(cause)}` });
@@ -338,6 +350,10 @@ async function drive(start: WaveRecord, deps: WaveDeps, fresh: boolean): Promise
   const loop = (async (): Promise<WaveRecord> => {
     try {
       if (fresh && !(await launchBatch())) return record;
+      if (interrupted) {
+        await save({ members: record.members.map((m) => (m.phase === "ready" ? { ...m, phase: "held" as MemberPhase, detail: `not merged: the merge of ${interrupted.title} was interrupted and its outcome is unknown, pending` } : m)) });
+        await stopTerminal("halted", `The merge of "${interrupted.title}" was interrupted by a restart; check the main checkout and the branch before merging anything else. Nothing was launched or merged.`);
+      }
       while (record.state === "running") {
         if (cancelled) { await stopTerminal("cancelled", "Stopped by the person; no further task was launched or merged."); break; }
         const live = record.members.find((m) => m.phase === "launching" || m.phase === "running" || m.phase === "verifying");
@@ -374,6 +390,13 @@ async function drive(start: WaveRecord, deps: WaveDeps, fresh: boolean): Promise
 }
 
 function message(cause: unknown): string {
-  const text = cause instanceof Error ? cause.message : String(cause);
+  let text: string;
+  if (cause instanceof Error) text = cause.message;
+  else if (cause !== null && typeof cause === "object") {
+    // A typed host rejection is `{code, message, ...}`; never "[object Object]".
+    const said = (cause as { message?: unknown }).message;
+    if (typeof said === "string" && said) text = said;
+    else { try { text = JSON.stringify(cause) ?? String(cause); } catch { text = Object.prototype.toString.call(cause); } }
+  } else text = String(cause);
   return text.length > 400 ? `${text.slice(0, 399)}…` : text;
 }

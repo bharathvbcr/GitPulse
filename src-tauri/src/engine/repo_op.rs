@@ -218,8 +218,10 @@ pub fn detect(repo: &Path) -> Result<Option<RepoOperation>, String> {
 
 /// Which operation `repo`'s worktree is parked in, and nothing else about it.
 ///
-/// A look at the control files and no more: no process is started, whatever
-/// is parked. [`detect`] goes on to name the branch, describe the incoming
+/// A look at the control files and no more: no process is started, except one
+/// `git diff --cached` when `SQUASH_MSG` is present (a leftover message file
+/// alone is not a parked squash), and none for any other kind. [`detect`] goes
+/// on to name the branch, describe the incoming
 /// commit and list the conflicts, which costs a child each; a caller that
 /// reports only the kind (the insights snapshot, once per worktree) should not
 /// pay for the rest. Same precedence, same classification.
@@ -253,7 +255,7 @@ fn resolve_control_paths(repo: &Path) -> Result<Vec<PathBuf>, String> {
 /// Returns the kind together with the marker directory/file it was found
 /// through, so progress and ref lookups do not re-derive it.
 fn classify<'a>(
-    _repo: &Path,
+    repo: &Path,
     paths: &'a [PathBuf],
     warnings: &mut Vec<String>,
 ) -> Result<Option<(OperationKind, &'a Path)>, String> {
@@ -286,7 +288,15 @@ fn classify<'a>(
                 }
             }
             "MERGE_HEAD" => OperationKind::Merge,
-            "SQUASH_MSG" => OperationKind::SquashMerge,
+            // `SQUASH_MSG` outlives a squash that was committed with `-m` or
+            // that staged nothing. It is a parked squash only while the index
+            // still differs from HEAD (staged changes or unmerged entries).
+            "SQUASH_MSG" => {
+                if !squash_is_staged(repo, warnings) {
+                    continue;
+                }
+                OperationKind::SquashMerge
+            }
             "CHERRY_PICK_HEAD" => OperationKind::CherryPick,
             "REVERT_HEAD" => OperationKind::Revert,
             "BISECT_LOG" => OperationKind::Bisect,
@@ -297,6 +307,28 @@ fn classify<'a>(
         return Ok(Some((kind, path)));
     }
     Ok(None)
+}
+
+/// Whether the index differs from HEAD, which is what makes a `SQUASH_MSG` a
+/// squash waiting to be committed. A read that could not be made counts as
+/// staged, with a warning: an unreadable index must not read as idle.
+fn squash_is_staged(repo: &Path, warnings: &mut Vec<String>) -> bool {
+    match crate::engine::git_cli::git_captured(repo, &["diff", "--cached", "--quiet"]) {
+        Ok(run) if run.success => false,
+        Ok(run) if run.status_code == 1 => true,
+        Ok(run) => {
+            warnings.push(format!(
+                "could not tell whether a squash is staged (git exit {}): {}",
+                run.status_code,
+                String::from_utf8_lossy(&run.stderr).trim()
+            ));
+            true
+        }
+        Err(err) => {
+            warnings.push(format!("could not tell whether a squash is staged: {err}"));
+            true
+        }
+    }
 }
 
 /// Reads a bounded control file, folding "absent" into `None` and a genuine
@@ -777,6 +809,22 @@ mod tests {
         );
     }
 
+    /// `SQUASH_MSG` outlives a squash committed with `-m`: with the index equal
+    /// to HEAD that is a leftover file, not a parked squash.
+    #[test]
+    fn a_leftover_squash_message_with_a_clean_index_is_idle() {
+        let repo = crate::test_support::git_repo();
+        let root = repo.path().canonicalize().unwrap();
+        crate::test_support::git_in(&root, &["commit", "--allow-empty", "-q", "-m", "base"]);
+        std::fs::write(
+            root.join(".git/SQUASH_MSG"),
+            "Squashed commit of the following:\n",
+        )
+        .unwrap();
+        assert_eq!(detect_kind(&root).unwrap(), None);
+        assert!(detect(&root).unwrap().is_none());
+    }
+
     #[test]
     fn a_parked_squash_is_undone_by_reset_merge() {
         let dir = tempfile::tempdir().unwrap();
@@ -1145,16 +1193,29 @@ mod tests {
             } else {
                 std::fs::write(&path, head).unwrap();
             }
+            // A leftover SQUASH_MSG is a parked squash only while something is
+            // staged, which is the one answer that costs a process.
+            let allowed = if *probe == "SQUASH_MSG" {
+                std::fs::write(root.join("staged.txt"), "x\n").unwrap();
+                crate::test_support::git_in(&root, &["add", "staged.txt"]);
+                1
+            } else {
+                0
+            };
             let before = crate::engine::git_cli::spawn_log::spawns_in(&root).len();
             let kind = detect_kind(&root).unwrap();
             assert_eq!(
                 crate::engine::git_cli::spawn_log::spawns_in(&root).len(),
-                before,
-                "{probe}: reading the kind started a process"
+                before + allowed,
+                "{probe}: reading the kind started the wrong number of processes"
             );
             let full = detect(&root).unwrap().map(|op| op.kind);
             assert!(kind.is_some(), "{probe} was not classified");
             assert_eq!(kind, full, "{probe}");
+            if *probe == "SQUASH_MSG" {
+                crate::test_support::git_in(&root, &["reset", "-q", "--", "staged.txt"]);
+                std::fs::remove_file(root.join("staged.txt")).unwrap();
+            }
             std::fs::remove_dir_all(&path)
                 .or_else(|_| std::fs::remove_file(&path))
                 .unwrap();
