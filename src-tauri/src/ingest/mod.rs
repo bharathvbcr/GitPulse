@@ -63,6 +63,12 @@ pub struct CatchUp {
     /// the transcript format is known to move — 17 distinct schema versions
     /// appear across the real corpus.
     pub skipped_lines: i64,
+    /// Calls whose cwd could not be checked for a departed worktree (hostile or
+    /// over-deep path, a filesystem error, or more distinct cwds than one pass
+    /// looks up). They were attributed to the deepest live worktree holding
+    /// them, so the count says how many may belong to a removed one.
+    #[serde(default)]
+    pub unverified_departed: i64,
     /// Reflog entries replayed.
     pub reflog_entries: i64,
     /// True when the wall-clock deadline stopped the pass early.
@@ -497,6 +503,7 @@ impl CatchUp {
         self.transcripts = transcripts.transcripts;
         self.transcripts_listed = transcripts.transcripts_listed;
         self.skipped_lines = transcripts.skipped_lines;
+        self.unverified_departed = transcripts.unverified_departed;
         self.truncated = self.truncated || transcripts.truncated;
         if self.error.is_empty() {
             self.error = if transcripts.truncated && transcripts.error.is_empty() {

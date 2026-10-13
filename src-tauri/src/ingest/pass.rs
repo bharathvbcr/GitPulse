@@ -8,8 +8,12 @@
 //!
 //! * each corpus file is read once, from the lowest offset any participant
 //!   still owes it;
-//! * each line is parsed once, then offered to every participant whose own
-//!   cursor is at or below the line's byte offset;
+//! * each line is parsed once, then each call in it goes to exactly one
+//!   participant: the deepest worktree it lies under (worktrees nest under
+//!   `<repo>/.claude/worktrees`), if that participant's own cursor is at or
+//!   below the line's byte offset. A call from a worktree that has since been
+//!   removed is recorded under that worktree's own path, hosted by the live
+//!   root around it, never folded into the repository;
 //! * every participant's cursor advances in one transaction.
 //!
 //! Nothing about what a worktree *means* by its cursor changed. A participant
@@ -71,6 +75,25 @@ pub(super) fn ingest_family_until(
     siblings: &[String],
     expired: &mut dyn FnMut(&CatchUp) -> bool,
 ) -> CatchUp {
+    ingest_family_with(
+        ledger_repo,
+        trigger,
+        siblings,
+        expired,
+        &transcript::path_exists,
+    )
+}
+
+/// [`ingest_family_until`] with the filesystem's answer to "does this path
+/// exist" supplied, which is all that tells a removed worktree from a
+/// subdirectory of a live one.
+pub(super) fn ingest_family_with(
+    ledger_repo: &str,
+    trigger: &str,
+    siblings: &[String],
+    expired: &mut dyn FnMut(&CatchUp) -> bool,
+    exists: &dyn Fn(&str) -> std::io::Result<bool>,
+) -> CatchUp {
     let mut out = CatchUp::default();
     let Some(root) = super::transcript_root() else {
         out.error = "no home directory, so transcripts cannot be located".into();
@@ -82,16 +105,29 @@ pub(super) fn ingest_family_until(
         return out;
     }
 
-    let mut paths: Vec<&str> = vec![trigger];
+    // Every checkout of the family decides which of them owns a call, however
+    // many of them this pass has room to serve: a worktree left out of the
+    // pass must still keep its calls from the shallower root around it.
+    let mut roots: Vec<&str> = vec![trigger];
+    let mut seen: HashSet<&str> = HashSet::from([trigger]);
     for sibling in siblings {
-        if paths.len() < MAX_PARTICIPANTS && !paths.contains(&sibling.as_str()) {
-            paths.push(sibling);
+        if seen.insert(sibling.as_str()) {
+            roots.push(sibling);
         }
     }
-    let mut participants = match participants(ledger_repo, &paths, &mut out, expired) {
+    let paths = &roots[..roots.len().min(MAX_PARTICIPANTS)];
+    let mut participants = match participants(ledger_repo, paths, &mut out, expired) {
         Some(participants) => participants,
         None => return out,
     };
+    let by_path: HashMap<&str, usize> = paths
+        .iter()
+        .enumerate()
+        .map(|(index, path)| (*path, index))
+        .collect();
+    let mut resolver = transcript::DepartedResolver::new(exists);
+    // What each departed worktree's own cursor consumed, loaded once per pass.
+    let mut departed_cursors: HashMap<String, HashMap<String, u64>> = HashMap::new();
 
     let mut files = Vec::new();
     let walk = super::collect_jsonl_until(&root, &mut files, 0, &mut || expired(&out));
@@ -172,35 +208,68 @@ pub(super) fn ingest_family_until(
                 transcript::LineOutcome::Unreadable => out.skipped_lines += 1,
                 transcript::LineOutcome::Calls(calls) => {
                     for call in calls {
-                        for (slot, owes) in owed.iter().enumerate() {
-                            // Bytes before a participant's own cursor are ones
-                            // it has already consumed.
-                            if line.offset < owes.start {
-                                continue;
-                            }
-                            let participant = &participants[owes.participant];
-                            if !transcript::belongs_to(&call, &participant.path) {
-                                continue;
-                            }
-                            if owes.floored
-                                && !participant.baseline.is_empty()
-                                && call.ts_utc.as_str() <= participant.baseline.as_str()
-                            {
-                                continue;
-                            }
-                            drafts[slot].push(super::transcript_draft(
-                                &call,
-                                ledger_repo,
-                                &participant.path,
-                                &participant.task_id,
-                            ));
+                        // One owner per call. A removed worktree owns its calls
+                        // under its own path, hosted by the live root around it
+                        // so that root's cursor keeps them exactly-once.
+                        let departed = resolver.departed(&call, &roots);
+                        let (host, departed_root) = match &departed {
+                            Some(departed) => (departed.host, Some(departed.root.as_str())),
+                            None => match transcript::attribution_root(&call, &roots) {
+                                Some(root) => (root, None),
+                                None => continue,
+                            },
+                        };
+                        // A host this pass has no room for, or one that owes
+                        // nothing here, is not replaced by a shallower root.
+                        let Some(&index) = by_path.get(host) else {
+                            continue;
+                        };
+                        let Some(slot) = owed.iter().position(|o| o.participant == index) else {
+                            continue;
+                        };
+                        let owes = &owed[slot];
+                        // Bytes before a participant's own cursor are ones
+                        // it has already consumed.
+                        if line.offset < owes.start {
+                            continue;
                         }
+                        let participant = &participants[index];
+                        if owes.floored
+                            && !participant.baseline.is_empty()
+                            && call.ts_utc.as_str() <= participant.baseline.as_str()
+                        {
+                            continue;
+                        }
+                        let (worktree, task_id) = match departed_root {
+                            Some(root) => {
+                                if departed_consumed(
+                                    ledger_repo,
+                                    root,
+                                    &file_key,
+                                    line.offset,
+                                    len,
+                                    &mut departed_cursors,
+                                    &mut out,
+                                ) {
+                                    continue;
+                                }
+                                (root, None)
+                            }
+                            None => (participant.path.as_str(), participant.task_id.clone()),
+                        };
+                        drafts[slot].push(super::transcript_draft(
+                            &call,
+                            ledger_repo,
+                            worktree,
+                            &task_id,
+                        ));
                     }
                 }
             }
         }
         #[cfg(test)]
         BYTES_READ.with(|read| read.set(read.get() + reader.bytes_read()));
+        out.unverified_departed = resolver.unverified;
 
         let end = start + consumed;
         let mut has_events = false;
@@ -255,6 +324,40 @@ pub(super) fn ingest_family_until(
         }
     }
     out
+}
+
+/// Whether a worktree that has since been removed already consumed the line at
+/// `offset` of `file_key` in a pass of its own, so recording it again from the
+/// host's cursor would double it. A cursor past the file's `len` is stale (the
+/// file was rewritten shorter) and consumed nothing of it. Its cursors are read once per pass and only
+/// ever read: nothing is written for a path that no longer exists.
+///
+/// A ledger that cannot be read is reported in `out.error` and answers "not
+/// consumed": a repeated row is recoverable, a lost one is not.
+fn departed_consumed(
+    ledger_repo: &str,
+    root: &str,
+    file_key: &str,
+    offset: u64,
+    len: u64,
+    cursors: &mut HashMap<String, HashMap<String, u64>>,
+    out: &mut CatchUp,
+) -> bool {
+    if !cursors.contains_key(root) {
+        let offsets = match ledger::transcript_progress_many(ledger_repo, &[root]) {
+            Ok(mut progress) => progress.pop().map(|p| p.offsets).unwrap_or_default(),
+            Err(e) => {
+                out.error =
+                    format!("a removed worktree's transcript progress could not be read: {e}");
+                HashMap::new()
+            }
+        };
+        cursors.insert(root.to_string(), offsets);
+    }
+    cursors
+        .get(root)
+        .and_then(|offsets| offsets.get(file_key))
+        .is_some_and(|consumed| *consumed > offset && *consumed <= len)
 }
 
 /// Every participant's progress, with the baseline floor frozen for any that
