@@ -24,7 +24,7 @@ import { get } from "svelte/store";
 import { invoke as tauriInvoke } from "../ipc/invoke";
 import { ptyBus as tauriBus } from "./ptyBus.tauri";
 import type { PtyBus } from "./ptyBus";
-import { FAMILY_LOOKUP_MS, terminalDeadline, type DeadlineClock } from "./inputQueue";
+import { FAMILY_LOOKUP_MS, terminalDeadline } from "./inputQueue";
 import type { TerminalListing } from "./runResult";
 import { terminalSessions, type createSessionRegistry, type TerminalSessionRecord } from "./sessionRegistry";
 import { enqueueTaskTerminal } from "./taskLaunches";
@@ -183,11 +183,10 @@ export function keepDetached(
 export async function listingFamily(
   listing: Pick<TerminalListing, "run_id" | "repo">,
   familyOf: (repo: string) => Promise<string | null>,
-  clock?: DeadlineClock,
 ): Promise<string | null> {
   if (!listing.run_id) return null;
   try {
-    return await terminalDeadline(familyOf(listing.repo), FAMILY_LOOKUP_MS, "Resolving repository family", { clock });
+    return await terminalDeadline(familyOf(listing.repo), FAMILY_LOOKUP_MS, "Resolving repository family");
   } catch {
     return null;
   }

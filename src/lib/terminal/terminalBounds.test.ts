@@ -40,6 +40,25 @@ function killSleepsMs(): number {
   return Number(grace![1]) + Number(poll![1]) * 1000 + SWEEP_AND_REAP_MS;
 }
 
+/** The top-level arguments of every `terminalDeadline(...)` call in `source`, found by walking the parentheses. */
+function deadlineArguments(source: string): string[][] {
+  const calls: string[][] = [];
+  for (const start of source.matchAll(/terminalDeadline\(/g)) {
+    const args: string[] = [];
+    let depth = 1, current = "";
+    for (let i = start.index + start[0].length; i < source.length && depth > 0; i++) {
+      const ch = source[i];
+      if ("([{".includes(ch)) depth++;
+      else if (")]}".includes(ch)) depth--;
+      if (depth === 0) break;
+      if (ch === "," && depth === 1) { args.push(current); current = ""; } else current += ch;
+    }
+    args.push(current);
+    calls.push(args);
+  }
+  return calls;
+}
+
 describe("the terminal command bounds against the backend they wait for", () => {
   it("a close is not called slow before its own grace could explain it, and not failed within its worst case", () => {
     const sleeps = killSleepsMs();
@@ -65,11 +84,15 @@ describe("the terminal command bounds against the backend they wait for", () => 
       join(here, "detachedSessions.ts"),
       join(root, "src", "lib", "components", "TerminalSession.svelte"),
     ];
-    // The ms argument of a terminalDeadline(...) call: the second top-level argument.
-    const literal = /terminalDeadline\((?:[^(),]|\([^()]*\))+,\s*\d[\d_]*\s*,/g;
     for (const file of files) {
-      const found = readFileSync(file, "utf8").match(literal) ?? [];
+      const found = deadlineArguments(readFileSync(file, "utf8")).filter((args) => /^\s*\d[\d_]*\s*$/.test(args[1] ?? ""));
       expect(found, `${file} has a numeric terminal deadline`).toEqual([]);
     }
+  });
+
+  it("the scan sees the calls it is looking at, including one with nested parentheses", () => {
+    const calls = deadlineArguments('await terminalDeadline(Promise.resolve(hooks.reset()), 5000, "Draining", { a: 1 });');
+    expect(calls).toHaveLength(1);
+    expect(calls[0][1].trim()).toBe("5000");
   });
 });
