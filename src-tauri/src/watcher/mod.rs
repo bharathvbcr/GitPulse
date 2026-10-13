@@ -4,6 +4,8 @@ pub mod bench_seam;
 pub mod debouncer;
 #[cfg(test)]
 mod registration_timing;
+#[cfg(test)]
+mod storm;
 
 pub use debouncer::RepoFileWatcher;
 

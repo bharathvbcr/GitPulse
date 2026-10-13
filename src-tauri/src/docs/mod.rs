@@ -143,8 +143,15 @@ fn scan_clock() -> SystemTime {
 #[derive(Default)]
 struct VaultSlot {
     published: Mutex<Option<Arc<CachedVault>>>,
-    build: Mutex<()>,
+    /// The build lock. Its value is [`REFRESH_TICKETS`] as read just before
+    /// the scan that produced `published` read any file: a forced refresh whose
+    /// ticket is `<=` it was requested before that scan began, so the scan
+    /// already reflects it.
+    build: Mutex<u64>,
 }
+
+/// Hands out a ticket per load, in request order.
+static REFRESH_TICKETS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 impl VaultSlot {
     fn current(&self) -> Option<Arc<CachedVault>> {
@@ -207,10 +214,14 @@ fn vault_slot(repo: &Path) -> Arc<VaultSlot> {
 ///
 /// A build runs under the slot's build lock only: concurrent queries keep
 /// answering from the previous snapshot until the new one is swapped in with
-/// one write. Forced refreshes queue behind each other and each builds on the
-/// one before, so none returns a snapshot older than its request. A failed
-/// build publishes nothing.
+/// one write. Forced refreshes queue behind each other, and none returns a
+/// snapshot older than its request: each is satisfied by the first scan that
+/// began after it was made. Callers that overlap therefore share one scan
+/// instead of each running its own after the last, because a scan reads the
+/// files after every request that queued before it started. A failed build
+/// publishes nothing.
 fn load_vault(repo_path: &str, force: bool) -> Result<Arc<CachedVault>, String> {
+    use std::sync::atomic::Ordering;
     let repo = validate_repo(repo_path)?;
     let slot = vault_slot(&repo);
     if !force {
@@ -218,19 +229,26 @@ fn load_vault(repo_path: &str, force: bool) -> Result<Arc<CachedVault>, String> 
             return Ok(value);
         }
     }
-    let _build = slot
+    // Drawn before waiting on the build lock, so a refresh queued behind a
+    // running scan can tell whether a scan that began after its request has
+    // finished by the time it gets the lock.
+    let ticket = REFRESH_TICKETS.fetch_add(1, Ordering::SeqCst) + 1;
+    let mut scan_began = slot
         .build
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let previous = slot.current();
-    if !force {
-        // A cold query that queued behind another cold build.
-        if let Some(value) = previous.as_ref() {
+    if let Some(value) = previous.as_ref() {
+        // A cold query that queued behind another cold build, or a forced
+        // refresh requested before the scan that published this snapshot began.
+        if !force || *scan_began >= ticket {
             return Ok(Arc::clone(value));
         }
     }
+    let began = REFRESH_TICKETS.load(Ordering::SeqCst);
     let value = build_vault(&repo, previous.as_ref())?;
     slot.publish(&value);
+    *scan_began = began;
     Ok(value)
 }
 
@@ -510,6 +528,8 @@ fn build_vault(
             key,
             paths: Arc::clone(&paths),
         });
+    #[cfg(test)]
+    probe::note_scan(repo);
     #[cfg(test)]
     probe::pause_point(repo);
     let mut truncated = paths.len() > MAX_DOC_FILES;
@@ -842,6 +862,30 @@ mod probe {
         }
     }
 
+    fn scans() -> &'static Mutex<HashMap<PathBuf, u64>> {
+        static SCANS: OnceLock<Mutex<HashMap<PathBuf, u64>>> = OnceLock::new();
+        SCANS.get_or_init(|| Mutex::new(HashMap::new()))
+    }
+
+    /// A build of `repo` began. Process-wide (not per thread like the counters
+    /// above), because the builds a test counts run on other threads.
+    pub(super) fn note_scan(repo: &Path) {
+        *scans()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entry(repo.to_path_buf())
+            .or_default() += 1;
+    }
+
+    pub(super) fn scans_run(repo: &Path) -> u64 {
+        scans()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(repo)
+            .copied()
+            .unwrap_or(0)
+    }
+
     pub(super) fn pause_point(repo: &Path) {
         let armed = armed()
             .lock()
@@ -1094,6 +1138,55 @@ mod tests {
             "docs_refresh_bench target=synthetic-5000 one_edit_ms={one_edit_ms:.2} \
              one_edit_reads_per_run={}",
             (probe::files_read() - reads) / RUNS
+        );
+    }
+
+    /// Forced refreshes for one repository that arrive together share a scan.
+    ///
+    /// Every forced refresh used to queue on the repository's slot and then run
+    /// its own full read of every tracked note, so N overlapping requests cost N
+    /// sequential scans — the 1.2-1.9 s `cmd_docs_refresh` entries in the live
+    /// log, repeated. A request is satisfied by any scan that began after it was
+    /// made, because that scan reads the files after the request.
+    #[test]
+    fn overlapping_forced_refreshes_share_one_scan() {
+        let _resident = resident();
+        const CALLERS: usize = 8;
+        let dir = git_repo();
+        let path = dir.path().to_str().unwrap().to_owned();
+        let body = "## Section\nText with [[note-000]] and #tag.\n\n".repeat(200);
+        for n in 0..300 {
+            write(
+                dir.path(),
+                &format!("note-{n:03}.md"),
+                &format!("# Note {n}\n{body}"),
+            );
+        }
+        git_in(dir.path(), &["add", "."]);
+        let repo = validate_repo(&path).unwrap();
+        let before = probe::scans_run(&repo);
+        let barrier = Arc::new(std::sync::Barrier::new(CALLERS));
+        let started = Instant::now();
+        let handles: Vec<_> = (0..CALLERS)
+            .map(|_| {
+                let (path, barrier) = (path.clone(), Arc::clone(&barrier));
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    refresh(&path).unwrap().note_count
+                })
+            })
+            .collect();
+        for handle in handles {
+            assert_eq!(handle.join().unwrap(), 300);
+        }
+        let scans = probe::scans_run(&repo) - before;
+        println!(
+            "docs_refresh_overlap callers={CALLERS} scans={scans} wall_ms={}",
+            started.elapsed().as_millis()
+        );
+        assert!(
+            scans <= 2,
+            "{CALLERS} overlapping refreshes ran {scans} scans"
         );
     }
 

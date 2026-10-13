@@ -6,6 +6,7 @@ pub mod codeintel;
 pub mod commands;
 pub(crate) mod coverage_toolchain;
 pub mod daemon_lock;
+pub(crate) mod deadline;
 pub mod desktop;
 pub mod devmap;
 pub mod diff;

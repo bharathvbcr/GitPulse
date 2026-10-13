@@ -253,11 +253,14 @@ fn accept_loop(listener: std::os::unix::net::UnixListener, generation: u64) {
 }
 
 #[cfg(unix)]
-fn handle(mut stream: std::os::unix::net::UnixStream) {
+fn handle(stream: std::os::unix::net::UnixStream) {
+    use crate::deadline::DeadlineStream;
     use std::io::{Read, Write};
     let _ = stream.set_nonblocking(false);
-    let _ = stream.set_read_timeout(Some(CONNECTION_TIMEOUT));
-    let _ = stream.set_write_timeout(Some(CONNECTION_TIMEOUT));
+    // One deadline for the whole exchange, not a timeout per read: a peer that
+    // keeps a byte in flight inside each read timeout would otherwise hold
+    // this loop, and every other agent's report, for as long as it likes.
+    let mut stream = DeadlineStream::new(stream, std::time::Instant::now() + CONNECTION_TIMEOUT);
     let mut bytes = Vec::new();
     let read = (&mut stream)
         .take(MAX_REPORT_BYTES as u64 + 1)
@@ -867,6 +870,35 @@ mod tests {
             r#"{"ok":true}"#
         );
         apply_at(false, None);
+    }
+
+    /// `CONNECTION_TIMEOUT` is documented as a wall-clock ceiling on one
+    /// connection, and the accept loop serves connections one at a time. A
+    /// peer that keeps a byte in flight inside every read timeout never trips
+    /// a per-read timeout, so it held the loop — and every other agent's
+    /// notification behind it — for up to `MAX_REPORT_BYTES` timeouts.
+    #[test]
+    fn a_peer_dripping_bytes_cannot_hold_the_connection_past_its_ceiling() {
+        use std::io::Write;
+        let (mut client, server) = std::os::unix::net::UnixStream::pair().unwrap();
+        let drip = std::thread::spawn(move || {
+            // Well inside the read timeout each time; stops once the server
+            // closes its end, or after far longer than the ceiling.
+            for _ in 0..40 {
+                if client.write_all(b" ").is_err() {
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(250));
+            }
+        });
+        let started = std::time::Instant::now();
+        handle(server);
+        let held = started.elapsed();
+        drip.join().unwrap();
+        assert!(
+            held < CONNECTION_TIMEOUT + std::time::Duration::from_secs(1),
+            "one connection held the accept loop for {held:?}"
+        );
     }
 
     #[test]

@@ -23,6 +23,12 @@ not published upstream releases.
   also survives failed thread spawning without leaking its callback context.
   Retirement invalidates/releases the stream without the unrelated privileged
   volume-history purge RPC, following [notify PR 795](https://github.com/notify-rs/notify/pull/795).
+  The FSEvents callback also never unwinds into its `extern "C"` frame, which
+  would abort the process: paths are decoded as raw bytes, flag bits Apple adds
+  later are ignored, a poisoned handler lock is recovered, and a panic in the
+  handler drops only that batch. The `callback_robustness` tests in
+  `fsevent.rs` cover this; they need the crate's own dev-dependencies, so run
+  them from a copy of the crate outside the workspace.
   `native_watcher_faults` injects native failures into the actual dependency and
   tests a stop issued before loop entry. The original registry manifest and all
   source files are retained; only `src/fsevent.rs` is patched. Upstream tests are

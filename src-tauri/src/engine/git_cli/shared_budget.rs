@@ -787,6 +787,50 @@ mod tests {
         assert_eq!(shared.take_at(0, 4, 1, S), Take::Granted);
     }
 
+    /// A thread stuck inside the critical section must not park every other
+    /// spawn decision: waiting on a peer thread is bounded by the same
+    /// [`LOCK_PATIENCE`] as waiting on another process. The decision comes back
+    /// `Unavailable` (fail open, counted), never as a hang and never as `Denied`.
+    ///
+    /// The helper thread reports through a channel and the test waits on it
+    /// with a deadline, so a patience that stopped being enforced fails here
+    /// instead of hanging the suite.
+    #[test]
+    fn a_wedged_thread_makes_other_threads_unavailable_within_the_patience() {
+        let dir = tempfile::tempdir().unwrap();
+        let shared = budget(&dir);
+        let wedged = shared.lock().expect("lock");
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let started = Instant::now();
+        let answer = std::thread::scope(|scope| {
+            scope.spawn(|| {
+                let _ = sender.send(shared.take_at(0, 4, 1, S));
+            });
+            let answer = receiver.recv_timeout(crate::test_support::coverage_relaxed(
+                Duration::from_secs(5),
+            ));
+            // Release the wedge whatever happened, so the helper can finish
+            // and the scope can join it.
+            drop(wedged);
+            answer
+        });
+        let outcome =
+            answer.expect("the decision never came back: the in-process wait is unbounded");
+        assert!(
+            matches!(&outcome, Take::Unavailable(reason) if reason.contains("another thread")),
+            "{outcome:?}"
+        );
+        assert!(
+            started.elapsed() < crate::test_support::coverage_relaxed(Duration::from_secs(1)),
+            "bounded wait"
+        );
+        assert_eq!(
+            shared.take_at(0, 4, 1, S),
+            Take::Granted,
+            "the record is usable again once the wedged holder lets go"
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn an_unsafe_record_is_refused_at_open() {

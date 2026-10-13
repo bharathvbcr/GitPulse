@@ -845,7 +845,23 @@
      if event_type == NSEventType::LeftMouseDown {
 --- a/notify/src/fsevent.rs
 +++ b/notify/src/fsevent.rs
-@@ -67,7 +67,7 @@
+@@ -21,12 +21,13 @@
+ use fsevent_sys as fs;
+ use fsevent_sys::core_foundation as cf;
+ use std::collections::HashMap;
+-use std::ffi::CStr;
++use std::ffi::{CStr, OsStr};
+ use std::fmt;
+ use std::os::raw;
++use std::os::unix::ffi::OsStrExt;
+ use std::path::{Path, PathBuf};
+ use std::ptr;
+-use std::sync::{Arc, Mutex};
++use std::sync::{Arc, Mutex, PoisonError};
+ use std::thread;
+ 
+ bitflags::bitflags! {
+@@ -67,7 +68,7 @@
      latency: cf::CFTimeInterval,
      flags: fs::FSEventStreamCreateFlags,
      event_handler: Arc<Mutex<dyn EventHandler>>,
@@ -854,7 +870,7 @@
      recursive_info: HashMap<PathBuf, bool>,
  }
  
-@@ -262,9 +262,45 @@
+@@ -262,11 +263,47 @@
      }
  }
  
@@ -893,16 +909,18 @@
 +    );
 +    fn CFRunLoopSourceSignal(source: CFRunLoopSourceRef);
 +    fn CFRunLoopSourceInvalidate(source: CFRunLoopSourceRef);
-+}
-+
+ }
+ 
 +extern "C" fn stop_runloop_perform(_info: *mut raw::c_void) {
 +    // Runs on the watcher thread, inside the running runloop, where
 +    // `CFRunLoopStop` is guaranteed to take effect.
 +    unsafe { cf::CFRunLoopStop(cf::CFRunLoopGetCurrent()) }
- }
- 
++}
++
  struct FsEventPathsMut<'a>(&'a mut FsEventWatcher);
-@@ -284,9 +320,7 @@
+ impl<'a> FsEventPathsMut<'a> {
+     fn new(watcher: &'a mut FsEventWatcher) -> Self {
+@@ -284,9 +321,7 @@
      }
  
      fn commit(self: Box<Self>) -> Result<()> {
@@ -913,7 +931,7 @@
      }
  }
  
-@@ -308,16 +342,14 @@
+@@ -308,16 +343,14 @@
      fn watch_inner(&mut self, path: &Path, recursive_mode: RecursiveMode) -> Result<()> {
          self.stop();
          let result = self.append_path(path, recursive_mode);
@@ -932,7 +950,7 @@
          result
      }
  
-@@ -331,19 +363,29 @@
+@@ -331,19 +364,29 @@
              return;
          }
  
@@ -970,7 +988,7 @@
          }
      }
  
-@@ -410,8 +452,9 @@
+@@ -410,8 +453,9 @@
  
      fn run(&mut self) -> Result<()> {
          if unsafe { cf::CFArrayGetCount(self.paths) } == 0 {
@@ -982,7 +1000,7 @@
          }
  
          // We need to associate the stream context with our callback in order to propagate events
-@@ -443,6 +486,23 @@
+@@ -443,6 +487,23 @@
              )
          };
  
@@ -1006,7 +1024,7 @@
          // Wrapper to help send CFRef types across threads.
          struct CFSendWrapper(cf::CFRef);
  
-@@ -452,7 +512,7 @@
+@@ -452,7 +513,7 @@
          unsafe impl Send for CFSendWrapper {}
  
          // move into thread
@@ -1015,16 +1033,11 @@
  
          // channel to pass runloop around
          let (rl_tx, rl_rx) = unbounded();
-@@ -471,28 +531,95 @@
+@@ -471,28 +532,95 @@
                          cur_runloop,
                          cf::kCFRunLoopDefaultMode,
                      );
 -                    fs::FSEventStreamStart(stream);
--
--                    // the calling to CFRunLoopRun will be terminated by CFRunLoopStop call in drop()
--                    rl_tx
--                        .send(CFSendWrapper(cur_runloop))
--                        .expect("Unable to send runloop to watcher");
 +                    if fs::FSEventStreamStart(stream) == 0 {
 +                        // Propagate the failure instead of carrying on: if this
 +                        // thread exited while the caller held a runloop handle,
@@ -1033,7 +1046,11 @@
 +                        let _ = rl_tx.send(Err(Error::generic("unable to start FSEvent stream")));
 +                        return;
 +                    }
-+
+ 
+-                    // the calling to CFRunLoopRun will be terminated by CFRunLoopStop call in drop()
+-                    rl_tx
+-                        .send(CFSendWrapper(cur_runloop))
+-                        .expect("Unable to send runloop to watcher");
 +                    // The source through which stop() asks this thread to
 +                    // shut down. It must be created and added to the runloop
 +                    // before the handles are published below, so the caller
@@ -1061,7 +1078,7 @@
 +                        return;
 +                    }
 +                    CFRunLoopAddSource(cur_runloop, stop_source, cf::kCFRunLoopDefaultMode);
-+
+ 
 +                    // Retain the runloop so the reference we send to the
 +                    // caller survives even if this thread exits before
 +                    // stop() uses it. The caller releases both handles in
@@ -1081,7 +1098,7 @@
 +                        fs::FSEventStreamInvalidate(stream);
 +                        return;
 +                    };
- 
++
                      cf::CFRunLoopRun();
 +
 +                    // Detach the stop source from the runloop; the caller
@@ -1126,7 +1143,155 @@
  
          Ok(())
      }
-@@ -649,3 +776,180 @@
+@@ -511,7 +639,10 @@
+     event_flags: *const fs::FSEventStreamEventFlags, // const FSEventStreamEventFlags eventFlags[]
+     event_ids: *const fs::FSEventStreamEventId,      // const FSEventStreamEventId eventIds[]
+ ) {
+-    unsafe {
++    // A panic unwinding out of an `extern "C"` function aborts the process, and
++    // the user's event handler runs in here. Contain it: the batch is dropped,
++    // the stream keeps delivering later ones.
++    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+         callback_impl(
+             stream_ref,
+             info,
+@@ -520,6 +651,9 @@
+             event_flags,
+             event_ids,
+         )
++    }));
++    if outcome.is_err() {
++        log::error!("FSEvents callback panicked; dropped a batch of {num_events} event(s)");
+     }
+ }
+ 
+@@ -536,15 +670,13 @@
+     let event_handler = &(*info).event_handler;
+ 
+     for p in 0..num_events {
+-        let path = CStr::from_ptr(*event_paths.add(p))
+-            .to_str()
+-            .expect("Invalid UTF8 string.");
+-        let path = PathBuf::from(path);
++        // Paths are bytes, not necessarily UTF-8.
++        let path = PathBuf::from(OsStr::from_bytes(
++            CStr::from_ptr(*event_paths.add(p)).to_bytes(),
++        ));
+ 
+-        let flag = *event_flags.add(p);
+-        let flag = StreamFlags::from_bits(flag).unwrap_or_else(|| {
+-            panic!("Unable to decode StreamFlags: {}", flag);
+-        });
++        // Bits this table does not know (Apple adds them) are ignored.
++        let flag = StreamFlags::from_bits_truncate(*event_flags.add(p));
+ 
+         let mut handle_event = false;
+         for (p, r) in &(*info).recursive_info {
+@@ -570,7 +702,10 @@
+         for ev in translate_flags(flag, true).into_iter() {
+             // TODO: precise
+             let ev = ev.add_path(path.clone());
+-            let mut event_handler = event_handler.lock().expect("lock not to be poisoned");
++            // A handler that panicked earlier poisoned the lock; keep delivering.
++            let mut event_handler = event_handler
++                .lock()
++                .unwrap_or_else(PoisonError::into_inner);
+             event_handler.handle_event(Ok(ev));
+         }
+     }
+@@ -644,8 +779,272 @@
+     println!("in test: {} works", file!());
+ }
+ 
++// The FSEvents callback runs in an `extern "C"` frame, where a panic aborts
++// the whole process. These drive `callback` itself with hand-built FSEvents
++// arguments.
++#[cfg(test)]
++mod callback_robustness {
++    use super::*;
++    use std::ffi::CString;
++    use std::sync::mpsc;
++
++    fn fire(info: &StreamContextInfo, paths: &[CString], flags: &[fs::FSEventStreamEventFlags]) {
++        let ptrs: Vec<*const libc::c_char> = paths.iter().map(|p| p.as_ptr()).collect();
++        callback(
++            ptr::null_mut(),
++            info as *const StreamContextInfo as *mut libc::c_void,
++            ptrs.len(),
++            ptrs.as_ptr() as *mut libc::c_void,
++            flags.as_ptr(),
++            ptr::null(),
++        );
++    }
++
++    fn context<F: EventHandler>(handler: F, root: &Path) -> StreamContextInfo {
++        let mut recursive_info = HashMap::new();
++        recursive_info.insert(root.to_path_buf(), true);
++        StreamContextInfo {
++            event_handler: Arc::new(Mutex::new(handler)),
++            recursive_info,
++        }
++    }
++
++    #[test]
++    fn non_utf8_path_and_unknown_flag_bits_are_delivered() {
++        let (tx, rx) = mpsc::channel();
++        let info = context(tx, Path::new("/watched"));
++        let mut raw = b"/watched/bad-".to_vec();
++        raw.extend_from_slice(&[0xff, 0xfe]);
++        let unknown = 0x8000_0000;
++        fire(
++            &info,
++            &[CString::new(raw.clone()).unwrap()],
++            &[fs::kFSEventStreamEventFlagItemCreated | unknown],
++        );
++        let ev = rx.try_recv().expect("event delivered").unwrap();
++        assert!(matches!(ev.kind, EventKind::Create(_)));
++        assert_eq!(ev.paths, vec![PathBuf::from(OsStr::from_bytes(&raw))]);
++    }
++
++    #[test]
++    fn unknown_flag_bits_alone_keep_known_behaviour() {
++        let (tx, rx) = mpsc::channel();
++        let info = context(tx, Path::new("/watched"));
++        fire(
++            &info,
++            &[CString::new("/watched/a").unwrap()],
++            &[fs::kFSEventStreamEventFlagItemRemoved | 0x4000_0000],
++        );
++        let ev = rx.try_recv().expect("event delivered").unwrap();
++        assert!(matches!(ev.kind, EventKind::Remove(_)));
++        assert!(rx.try_recv().is_err());
++    }
++
++    #[test]
++    fn panicking_handler_does_not_unwind_out_and_later_batches_still_run() {
++        let calls = Arc::new(Mutex::new(0u32));
++        let seen = calls.clone();
++        let info = context(
++            move |_ev: Result<Event>| {
++                let mut n = seen.lock().unwrap();
++                *n += 1;
++                if *n == 1 {
++                    drop(n);
++                    panic!("handler failure");
++                }
++            },
++            Path::new("/watched"),
++        );
++        let path = [CString::new("/watched/a").unwrap()];
++        let flags = [fs::kFSEventStreamEventFlagItemCreated];
++        fire(&info, &path, &flags);
++        // Reaching here means the panic was contained; the lock was poisoned
++        // by the first call and must be recovered for the second.
++        assert!(info.event_handler.is_poisoned());
++        fire(&info, &path, &flags);
++        assert_eq!(*calls.lock().unwrap(), 2);
++    }
++}
++
+ #[test]
+ fn test_steam_context_info_send_and_sync() {
      fn check_send<T: Send + Sync>() {}
      check_send::<StreamContextInfo>();
  }

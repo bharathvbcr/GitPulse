@@ -44,6 +44,16 @@ before that tag is pushed.
   - It reads only the notes that changed.
   - The build happens outside the lock that queries wait on.
   - Renaming a note reuses the cached vault instead of rebuilding it.
+  - Refreshes that overlap share one scan, instead of each running its own
+    after the last.
+- **The live index asks `devmap status` once per repository, not once per
+  caller.** The repository's build slot is now held from the status question
+  through the build, so a burst of edits no longer starts a status process each
+  or a second build behind the first. A caller that finds it held is told a
+  build is running and tries again later.
+- **The wave, verification and host-load polls stop while the window is
+  hidden.** They resume with one immediate refresh when it returns. A test now
+  fails on any new timer that keeps ticking behind a hidden window.
 - **Reading the ledger no longer asks git for the worktree list every time.**
   - Git's answer is remembered while the repository's worktree registry is
     unchanged. A worktree that is added, removed or moved, or a checkout that
@@ -153,6 +163,21 @@ before that tag is pushed.
 - **WebView2-only browser arguments no longer sit in the macOS configuration.**
   They now live only in the Windows configuration.
 - **A build that would ship source maps now fails.**
+- **A file-system event can no longer abort GitPulse on macOS.** A path that is
+  not valid UTF-8, a flag bit that macOS adds later, or a panic in the watch
+  handler could unwind out of the FSEvents callback and end the process. Each is
+  now handled, and a panic costs only that batch of events.
+- **A slow repository no longer piles up refreshes.** While a repository's
+  refresh is still running, further file events wait and are paid with one
+  trailing refresh, instead of starting overlapping reads of the same
+  repository.
+- **Closing a tab group now releases its tabs like closing a single tab.** Their
+  per-repository records and cached journals no longer outlive them.
+- **A peer that sends a byte at a time can no longer hold a local socket open.**
+  The alert bridge and the code-index daemon probe each cut a connection at one
+  wall-clock deadline, and the two private copies of that deadline in the Lappi
+  and local-model clients are now one. A panic while updating the native menu is
+  reported to the command that asked, instead of ending the app.
 
 - **A commit that finished after you switched repository tabs cleared the other
   repository's message.** The commit box wiped the draft and the amend flag of
