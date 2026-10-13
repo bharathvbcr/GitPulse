@@ -399,6 +399,15 @@ fn note_hit() {
     HITS.with(|cell| cell.set(cell.get() + 1));
 }
 
+/// Held by every test that counts on an answer staying kept, here and in other
+/// modules, and by the one that fills the budget: that one evicts whatever
+/// else is in the process-wide table.
+#[cfg(test)]
+pub(crate) fn retention() -> std::sync::MutexGuard<'static, ()> {
+    static SERIAL: Mutex<()> = Mutex::new(());
+    SERIAL.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
 /// Runs `f` with no racy window, so every stamp it reads is stored. For tests
 /// outside this module that count spawns: a fixture repository's config was
 /// written moments ago, which the window would otherwise treat as unsettled.
@@ -451,14 +460,6 @@ mod tests {
 
     /// Runs `f` with no racy window, so every stamp is stored: what the oracle
     /// then proves is that the stamp itself sees every change, with no help
-    /// Held by every test that counts on an answer staying kept, and by the
-    /// one that fills the budget: that one evicts whatever else is in the
-    /// process-wide table.
-    fn retention() -> std::sync::MutexGuard<'static, ()> {
-        static SERIAL: Mutex<()> = Mutex::new(());
-        SERIAL.lock().unwrap_or_else(PoisonError::into_inner)
-    }
-
     /// from the window.
     fn eager<T>(f: impl FnOnce() -> T) -> T {
         without_racy_window(f)

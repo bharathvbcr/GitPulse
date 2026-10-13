@@ -8151,6 +8151,9 @@ __GP_PULSE__\0def456\0abc123\x001700000100\0N\0second\0Ada\0ada@example.com\0\0\
     /// without a child.
     #[test]
     fn reselecting_a_commit_spawns_nothing() {
+        // The answer must stay in the process-wide table between the two
+        // calls; the test that fills that table's byte budget evicts it.
+        let _held = ref_cache::retention();
         ref_cache::without_racy_window(|| {
             let (_dir, repo, head) = repo_with_commit_of(3);
             let path = repo.to_string_lossy().into_owned();
