@@ -4,6 +4,7 @@ import { createSessionLifecycle, type SessionTransport } from "./sessionLifecycl
 import { createSessionRegistry } from "./sessionRegistry";
 import type { PtySessionHandlers } from "./ptyBus";
 import { DEFAULT_TERMINAL_SESSIONS } from "./sessionLimit";
+import { CONTEXT_READ_MS, KILL_HARD_MS } from "./inputQueue";
 
 type Slot = ReturnType<ReturnType<typeof createSessionRegistry>["reserve"]>;
 
@@ -224,7 +225,7 @@ describe("terminal lifecycle races", () => {
       const pending = deferred<void>(), f = fixture({ kill: () => pending.promise });
       await f.owner.start();
       const restart = f.owner.restart();
-      await vi.advanceTimersByTimeAsync(5000); await restart;
+      await vi.advanceTimersByTimeAsync(KILL_HARD_MS + 500); await restart;
       expect(get(f.registry)).toHaveLength(1);
       expect(f.transport.spawn).toHaveBeenCalledTimes(1);
       pending.resolve(); await get(f.registry)[0].close();
@@ -333,6 +334,91 @@ describe("terminal lifecycle races", () => {
     expect(resize).toHaveBeenCalledTimes(1); pending.resolve(); await flush();
     expect(resize).toHaveBeenCalledTimes(2); expect(resize).toHaveBeenLastCalledWith("native-a", 1000, 1000);
     f.owner.dispose(); await flush();
+  });
+  it("tells the view that typing is queued behind a slow answer, retracts it, and never fails the session", async () => {
+    vi.useFakeTimers();
+    try {
+      const pending = deferred<void>(), write = vi.fn(() => pending.promise), f = fixture({ write });
+      const slow = vi.fn();
+      (f.hooks as { slow?: (message: string | null) => void }).slow = slow;
+      await f.owner.start();
+      expect(f.owner.write("ls\n")).toBe(true);
+      await vi.advanceTimersByTimeAsync(5500); await flush();
+      expect(slow).toHaveBeenCalledTimes(1);
+      expect(slow).toHaveBeenLastCalledWith(expect.stringContaining("slowly"));
+      expect(f.hooks.state).not.toHaveBeenCalledWith("error", expect.anything());
+      pending.resolve(); await flush();
+      expect(slow).toHaveBeenCalledTimes(2);
+      expect(slow).toHaveBeenLastCalledWith(null);
+      expect(f.owner.write("pwd\n")).toBe(true);
+      f.owner.dispose(); await flush();
+    } finally { vi.useRealTimers(); }
+  });
+  describe("resize on a slow host", () => {
+    it("coalesces 50 resizes behind a resize that answers late: two calls, no warning, the latest size wins", async () => {
+      // The defect: a resize merely slower than the old 5 s wall-clock deadline
+      // was reported as "Resize failed: Error: Terminal resize timed out", once
+      // per resize event, so dragging a window on a loaded host spammed it.
+      vi.useFakeTimers();
+      try {
+        const pending = deferred<void>(), resize = vi.fn(() => pending.promise), f = fixture({ resize });
+        await f.owner.start();
+        for (let i = 1; i <= 50; i++) f.owner.resize(10 + i, 20 + i);
+        await vi.advanceTimersByTimeAsync(6000); await flush();
+        expect(f.hooks.warning).not.toHaveBeenCalled();
+        expect(resize).toHaveBeenCalledTimes(1);
+        for (let i = 51; i <= 60; i++) f.owner.resize(10 + i, 20 + i);
+        pending.resolve(); await flush();
+        expect(resize).toHaveBeenCalledTimes(2);
+        expect(resize).toHaveBeenLastCalledWith("native-a", 70, 80);
+        expect(f.hooks.warning).not.toHaveBeenCalled();
+        f.owner.dispose(); await flush();
+      } finally { vi.useRealTimers(); }
+    });
+    it("warns once for a streak of rejected resizes and again only after one succeeded", async () => {
+      let outcome: "reject" | "ok" = "reject";
+      const resize = vi.fn(async () => { if (outcome === "reject") throw new Error("pty busy"); });
+      const f = fixture({ resize });
+      await f.owner.start();
+      for (let i = 1; i <= 5; i++) { f.owner.resize(i, i); await flush(); }
+      expect(resize).toHaveBeenCalledTimes(5);
+      expect(f.hooks.warning).toHaveBeenCalledTimes(1);
+      expect(f.hooks.warning).toHaveBeenCalledWith(expect.stringContaining("Resize failed"));
+      outcome = "ok"; f.owner.resize(6, 6); await flush();
+      expect(f.hooks.warning).toHaveBeenCalledTimes(1);
+      outcome = "reject"; f.owner.resize(7, 7); await flush(); f.owner.resize(8, 8); await flush();
+      expect(f.hooks.warning).toHaveBeenCalledTimes(2);
+      f.owner.dispose(); await flush();
+    });
+    it("is silent when the session is gone: the exit path reports that", async () => {
+      const resize = vi.fn(async () => { throw new Error("Terminal session 'native-a' not found"); });
+      const f = fixture({ resize });
+      await f.owner.start();
+      for (let i = 1; i <= 3; i++) { f.owner.resize(i, i); await flush(); }
+      expect(resize).toHaveBeenCalledTimes(3);
+      expect(f.hooks.warning).not.toHaveBeenCalled();
+      f.owner.dispose(); await flush();
+    });
+    it("a resize with no answer at all is abandoned at the hard bound, so a later session can resize", async () => {
+      // `resizing` is the lifecycle's, not one session's. A resize that never
+      // answers must not hold it for ever or the next process never resizes.
+      vi.useFakeTimers();
+      try {
+        const resize = vi.fn(() => (resize.mock.calls.length === 1 ? new Promise<void>(() => {}) : Promise.resolve()));
+        const f = fixture({ resize });
+        await f.owner.start();
+        f.owner.resize(30, 90);
+        await vi.advanceTimersByTimeAsync(59_000); await flush();
+        expect(f.hooks.warning).not.toHaveBeenCalled();
+        f.owner.resize(31, 91);
+        await vi.advanceTimersByTimeAsync(2_000); await flush();
+        expect(resize).toHaveBeenCalledTimes(2);
+        expect(resize).toHaveBeenLastCalledWith("native-a", 31, 91);
+        expect(f.hooks.warning).toHaveBeenCalledTimes(1);
+        expect(f.hooks.warning).toHaveBeenCalledWith(expect.stringContaining("no answer"));
+        f.owner.dispose(); await flush();
+      } finally { vi.useRealTimers(); }
+    });
   });
   it("enforces the global slot ceiling across 100 concurrent repository starts", async () => {
     const registry = createSessionRegistry();
@@ -480,7 +566,7 @@ describe("a view that goes away without Close", () => {
         const f = fixture({}, registry, "tab-a", false, { keep, idle });
         await f.owner.start();
         f.owner.dispose();
-        await vi.advanceTimersByTimeAsync(2000); await flush();
+        await vi.advanceTimersByTimeAsync(CONTEXT_READ_MS + 500); await flush();
         expect(f.transport.kill).not.toHaveBeenCalled();
         expect(f.transport.detach).toHaveBeenCalledWith("native-a");
         expect(get(registry).map((r) => r.key)).toEqual(["detached:native-a"]);

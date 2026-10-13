@@ -181,7 +181,7 @@ pub async fn cmd_discard_changes(
 ) -> Result<Guarded<()>, String> {
     off_thread(move || {
         let op = discard_file_op(&repo_path, &file_path);
-        let policy = crate::harness::guard_file(&repo_path, &file_path, op)?;
+        let policy = guard_file(&repo_path, &file_path, op)?;
         GitWriter::discard_changes(&repo_path, &file_path)?;
         Ok(Guarded { policy, output: () })
     })
@@ -199,7 +199,12 @@ pub async fn cmd_discard_changes(
 ///
 /// An unreadable index fails closed to the destructive reading: a probe that
 /// could not run must not produce the gentler claim.
+///
+/// The probe is git and runs before the gate does, so it promotes the click
+/// first: shed as a deferrable read under memory pressure it would fail closed
+/// to "delete" for a file that is only being restored.
 pub(super) fn discard_file_op(repo_path: &str, file_path: &str) -> &'static str {
+    crate::engine::git_cli::mark_user_action(repo_path);
     match GitReader::is_tracked(repo_path, file_path) {
         Ok(true) => "modify",
         Ok(false) | Err(_) => "delete",

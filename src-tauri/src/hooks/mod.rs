@@ -42,6 +42,9 @@ use crate::engine::git_cli::find_git_root;
 use crate::harness::{self, PolicyStatus, ScopedVerdict};
 use crate::insights::{self, same_path, CollisionRisk, InsightsSnapshot};
 
+pub mod advisory_once;
+pub mod signal_guard;
+
 /// Wall-clock ceiling for the work behind one hook invocation.
 ///
 /// A PreToolUse hook runs on *every* matching tool call, so the cost of this
@@ -162,6 +165,9 @@ pub struct HookInput {
     pub last_assistant_message: String,
     /// `StopFailure`'s `error`: `rate_limit`, `overloaded`, ….
     pub error: String,
+    /// The host's id for one tool call (`tool_use_id`). Two copies of this
+    /// hook judging the same call see the same id ([`advisory_once`]).
+    pub tool_use_id: String,
 }
 
 impl HookInput {
@@ -201,6 +207,7 @@ impl HookInput {
             agent_id: string_at(Some(value), "agent_id"),
             last_assistant_message: string_at(Some(value), "last_assistant_message"),
             error: string_at(Some(value), "error"),
+            tool_use_id: string_at(Some(value), "tool_use_id"),
         }
     }
 }
@@ -1043,8 +1050,18 @@ fn gate_decision(judged: &ScopedVerdict, what: Judged) -> HookOutput {
 }
 
 /// Gathers, then decides. The impure half of command-gate.
+///
+/// A command that signals processes is first measured by [`signal_guard`],
+/// which refuses one whose reach includes an agent session or GitPulse; a
+/// refusal there is final, and anything else is combined with the harness's
+/// answer.
 pub fn run_command_gate(input: &HookInput) -> HookOutput {
-    command_gate_with(input, |job| within_budget(BUDGET, job))
+    let guard = signal_guard::run(input);
+    if signal_guard::refuses(&guard) {
+        return guard;
+    }
+    let gate = command_gate_with(input, |job| within_budget(BUDGET, job));
+    signal_guard::combine(guard, gate)
 }
 
 /// Judges one command line the way the hook does, on `lane`'s sidecar.
@@ -1570,6 +1587,10 @@ pub fn run_session_brief(input: &HookInput) -> HookOutput {
 
 /// Every subcommand `gitpulse-hook` answers to.
 pub const SUBCOMMANDS: [&str; 4] = ["collision-guard", "command-gate", "session-brief", "notify"];
+
+/// The subcommands GitPulse puts on the sessions it launches, beside any the
+/// plugin runs (`workbench::claude_hook`). Two copies may judge one call.
+pub const INJECTED_SUBCOMMANDS: [&str; 2] = ["collision-guard", "command-gate"];
 
 /// The arguments that ask this binary who it is instead of running a hook.
 pub const IDENTITY_FLAGS: [&str; 2] = ["--version", "-V"];

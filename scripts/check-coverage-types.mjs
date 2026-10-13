@@ -13,8 +13,8 @@
  *   (c) a shared field whose normalized wire type or backend-required
  *       presence no longer agrees.
  *
- * SCOPE: see CONTRACTS below for exactly what is checked — 93 contracts over
- * 235 structs, spanning both wire surfaces: command returns and event payloads.
+ * SCOPE: see CONTRACTS below for exactly what is checked — 95 contracts over
+ * 241 structs, spanning both wire surfaces: command returns and event payloads.
  * Enums are still skipped here and covered separately, by
  * scripts/enum-variant-contract.test.ts. That is most, not all, of the named types crossing the IPC
  * boundary: the ones still missing declare their TypeScript interface inside a
@@ -116,6 +116,11 @@ export const CONTRACTS = Object.freeze([
   { label: "verify-status", rustPath: rust("workbench", "verify_status.rs"), tsPath: ts("workbench", "verifyStatus.ts"), structs: ["PostedVerifyStatus"] },
   { label: "coverage", rustPath: DEFAULT_RUST_SOURCE, tsPath: DEFAULT_TS_SOURCE, structs: CHECKED_STRUCTS },
   { label: "terminal", rustPath: TERMINAL_RUST_SOURCE, tsPath: TERMINAL_TS_SOURCE, structs: TERMINAL_STRUCTS },
+  // A mass external-signal death, on the `terminal-incident` event and in
+  // `cmd_terminal_incidents`. The offer to resume the dead sessions and the
+  // Health list both read it, and `sender` is what keeps "who killed them"
+  // from becoming "nobody did" when a field is renamed.
+  { label: "terminal-incident", rustPath: rust("terminal", "incident.rs"), tsPath: ts("terminal", "incident.ts"), structs: ["TerminalIncidentPayload", "Sender"] },
   { label: "ai", rustPath: rust("ai", "mod.rs"), tsPath: ts("stores", "harnessStore.ts"), structs: ["AiGeneration", "AiStatus"] },
   // Apple Intelligence crosses IPC as four structs, and the error is one of
   // them on purpose: the frontend branches on `code`, so a rename there would
@@ -222,6 +227,7 @@ export const CONTRACTS = Object.freeze([
   { label: "host-load-readings", rustPath: rust("sysload", "sensor.rs"), tsPath: ts("stores", "hostLoadStore.ts"), structs: ["HostSample", "Compressor", "CompressorDelta", "Cores"] },
   { label: "host-load-processes", rustPath: rust("sysload", "procscan.rs"), tsPath: ts("stores", "hostLoadStore.ts"), structs: ["ProcView", "AgentSession", "LaunchedTree", "ForeignProcess", "Orphan", "MemguardHealth", "SessionCount"] },
   { label: "host-load-settings", rustPath: rust("tool_config.rs"), tsPath: ts("stores", "hostLoadStore.ts"), structs: ["HostLoadSettings"] },
+  { label: "host-load-governor", rustPath: rust("sysload", "governor.rs"), tsPath: ts("stores", "hostLoadStore.ts"), structs: ["GovernorVerdict", "GovernorReport", "GovernorPulse", "Shed"] },
   // What an agent CLI starts with in a terminal tab, and which modes this
   // build can expand. `modes` and `launchers` are what the chooser renders, so
   // a renamed field would empty the chooser rather than fail — leaving a panel

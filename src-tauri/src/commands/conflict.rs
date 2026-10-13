@@ -19,7 +19,7 @@ pub async fn cmd_save_conflict(
         save_conflict_folded(
             &repo_path,
             &request,
-            |file, op| crate::harness::guard_file(&repo_path, file, op),
+            |file, op| guard_file(&repo_path, file, op),
             |argv| guard(&repo_path, argv),
         )
     })

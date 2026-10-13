@@ -31,6 +31,20 @@ pub(super) fn guard(
     crate::harness::guard_command(repo_path, argv)
 }
 
+/// [`guard`] for a file write the user clicked: a save, a discard, a conflict
+/// resolution, a move or a cleanup. The harness's file check resolves the
+/// worktree's task binding with git, so the promotion comes first: as a
+/// deferrable read that lookup is shed under memory pressure
+/// (`sysload::governor`), and the click it guards would be refused with it.
+pub(super) fn guard_file(
+    repo_path: &str,
+    file_path: &str,
+    op: &str,
+) -> Result<crate::harness::PolicyVerdict, String> {
+    crate::engine::git_cli::mark_user_action(repo_path);
+    crate::harness::guard_file(repo_path, file_path, op)
+}
+
 /// [`guard`] for a mutation nobody clicked (the auto-fetch timer): the same
 /// write gate, without promoting the command to a user action, so the spawn
 /// gate can still defer or shed it behind the user's own work.

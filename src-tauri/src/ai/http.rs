@@ -10,10 +10,11 @@
 //! It also means no new dependency: `std::net` is enough for JSON over
 //! loopback, including the chunked responses llama.cpp-family servers send.
 
-use std::io;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 use std::time::{Duration, Instant};
+
+use crate::deadline::DeadlineStream;
 
 /// Hard ceiling on a response body. A model server answering a completion in
 /// gigabytes is a malfunction, and reading it into memory would make the
@@ -42,40 +43,6 @@ fn read_line_capped<R: Read>(reader: &mut BufReader<R>) -> Result<String, String
         ));
     }
     String::from_utf8(bytes).map_err(|_| "non-UTF-8 byte in response framing".to_string())
-}
-
-/// Enforces one wall-clock deadline across every socket read and write. The
-/// per-operation timeouts it installs shrink as the deadline approaches, so a
-/// peer dribbling single bytes can no longer keep a transfer alive forever.
-struct DeadlineStream {
-    inner: TcpStream,
-    deadline: Instant,
-}
-
-impl DeadlineStream {
-    fn remaining(&self) -> io::Result<Duration> {
-        self.deadline
-            .checked_duration_since(Instant::now())
-            .ok_or_else(|| io::Error::new(io::ErrorKind::TimedOut, "overall deadline exceeded"))
-    }
-}
-
-impl Read for DeadlineStream {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        self.inner.set_read_timeout(Some(self.remaining()?))?;
-        self.inner.read(buf)
-    }
-}
-
-impl Write for DeadlineStream {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.inner.set_write_timeout(Some(self.remaining()?))?;
-        self.inner.write(buf)
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        self.inner.flush()
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -275,10 +242,7 @@ pub fn request(
     let stream = connect_any(&candidates, started + timeout)
         .map_err(|e| format!("cannot reach {}: {}", endpoint.base_url(), e))?;
     let _ = stream.set_nodelay(true);
-    let mut bounded = DeadlineStream {
-        inner: stream,
-        deadline: started + timeout,
-    };
+    let mut bounded = DeadlineStream::new(stream, started + timeout);
 
     let full_path = format!("{}{}", endpoint.prefix, path);
     let mut head = format!(

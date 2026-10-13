@@ -58,7 +58,7 @@ pub fn degraded() -> Vec<Degraded> {
     records().clone()
 }
 
-fn payload_text(payload: &(dyn std::any::Any + Send)) -> String {
+pub(crate) fn payload_text(payload: &(dyn std::any::Any + Send)) -> String {
     let text = payload
         .downcast_ref::<&str>()
         .map(|s| (*s).to_owned())

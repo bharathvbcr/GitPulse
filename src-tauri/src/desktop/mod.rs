@@ -607,6 +607,19 @@ pub fn set_menu_state<R: Runtime>(app: &AppHandle<R>, next: MenuState) -> Result
     popover::publish(app, &next)
 }
 
+/// Runs `update`, turning a panic into the error the caller is waiting for.
+///
+/// Everything handed to `run_on_main_thread` executes inside the AppKit event
+/// loop. A panic there does not fail one command: tao re-raises it out of the
+/// run loop, or the Objective-C trampoline aborts on it, and either way the
+/// whole process goes with it. The caller's channel would also never be
+/// answered. Only the message is kept; the panic hook has already logged the
+/// payload and the backtrace.
+fn unwind_to_error(update: impl FnOnce() -> Result<(), String>) -> Result<(), String> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(update))
+        .unwrap_or_else(|_| Err("The native menu update panicked and was abandoned".to_string()))
+}
+
 async fn on_main_thread<R: Runtime, F>(app: AppHandle<R>, update: F) -> Result<(), String>
 where
     F: FnOnce(&AppHandle<R>) -> Result<(), String> + Send + 'static,
@@ -614,7 +627,7 @@ where
     let (sender, receiver) = std::sync::mpsc::sync_channel(1);
     let handle = app.clone();
     app.run_on_main_thread(move || {
-        if sender.send(update(&handle)).is_err() {
+        if sender.send(unwind_to_error(|| update(&handle))).is_err() {
             log::warn!(target: "desktop", "Native menu caller disconnected");
         }
     })
@@ -828,6 +841,24 @@ mod tests {
             exit::Begin::Proceed
         );
         assert_eq!(*confirmations.lock().unwrap(), 1);
+    }
+
+    /// `on_main_thread` runs its closure inside the AppKit event loop, where an
+    /// unwinding panic ends the process rather than failing the command. It
+    /// has to come back as the error the awaiting command reports.
+    #[test]
+    fn a_panic_inside_a_main_thread_update_is_an_error_not_a_dead_app() {
+        let app = tauri::test::mock_builder()
+            .manage(DesktopState::default())
+            .build(crate::context())
+            .unwrap();
+        let outcome = tauri::async_runtime::block_on(on_main_thread(app.handle().clone(), |_| {
+            panic!("the menu rebuild hit an impossible state")
+        }));
+        let message = outcome.expect_err("a panicking update cannot have succeeded");
+        assert!(message.contains("panicked"), "unexpected error: {message}");
+        let fine = tauri::async_runtime::block_on(on_main_thread(app.handle().clone(), |_| Ok(())));
+        assert_eq!(fine, Ok(()), "a healthy update is unchanged");
     }
 
     #[test]

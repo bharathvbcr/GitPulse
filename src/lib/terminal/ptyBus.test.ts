@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import { createSessionLifecycle } from "./sessionLifecycle";
 import { createSessionRegistry } from "./sessionRegistry";
+import { MAX_TERMINAL_OUTPUT_B64, MAX_TERMINAL_OUTPUT_CHUNK } from "./outputCredit";
 import { createPtyBus, MAX_FORGOTTEN_SESSIONS, MAX_PENDING_IDS, MAX_PTY_TOMBSTONES, type EventListen, type TerminalExitEvent } from "./ptyBus";
 
 /** A controllable stand-in for Tauri's event transport. */
@@ -203,7 +204,7 @@ describe("ptyBus early output", () => {
     bus.subscribe("anchor", { onOutput: vi.fn(), onExit: vi.fn() });
     const onError = vi.fn();
     const onOutput = vi.fn();
-    transport.emit("terminal-output", output("late", "A".repeat(8193)));
+    transport.emit("terminal-output", output("late", "A".repeat(MAX_TERMINAL_OUTPUT_B64 + 1)));
     transport.emit("terminal-output", output("late", "QQ=="));
     bus.subscribe("late", { onOutput, onExit: vi.fn(), onError });
     expect(onOutput).toHaveBeenCalledTimes(1);
@@ -258,7 +259,7 @@ describe("ptyBus early output", () => {
     const onError = vi.fn();
     const onOutput = vi.fn();
     bus.subscribe("live", { onOutput, onExit: vi.fn(), onError });
-    transport.emit("terminal-output", output("live", "A".repeat(8193)));
+    transport.emit("terminal-output", output("live", "A".repeat(MAX_TERMINAL_OUTPUT_B64 + 1)));
     transport.emit("terminal-output", output("live", "QQ=="));
     expect(onError).toHaveBeenCalledTimes(1);
     expect(onError).toHaveBeenCalledWith(expect.stringContaining("exceeded"));
@@ -422,7 +423,7 @@ describe("ptyBus early output", () => {
       error: expect.stringContaining("buffer limit"),
     }));
 
-    transport.emit("terminal-output", output("both", "A".repeat(8193)));
+    transport.emit("terminal-output", output("both", "A".repeat(MAX_TERMINAL_OUTPUT_B64 + 1)));
     for (let i = 0; i < 129; i++) transport.emit("terminal-output", output("both", "QQ=="));
     transport.emit("terminal-exit", exit("both"));
     const both = { onOutput: vi.fn(), onExit: vi.fn(), onError: vi.fn() };
@@ -514,7 +515,7 @@ describe("ptyBus early output", () => {
       bus,
     });
     await owner.start();
-    transport.emit("terminal-output", output("native-live", "A".repeat(8193)));
+    transport.emit("terminal-output", output("native-live", "A".repeat(MAX_TERMINAL_OUTPUT_B64 + 1)));
     transport.emit("terminal-output", output("native-live", "QQ=="));
     expect(owner.write("still-alive")).toBe(true);
     expect(hooks.output).toHaveBeenCalledWith("QQ==", "native-live");
@@ -581,7 +582,7 @@ describe("ptyBus early output", () => {
     const bus = createPtyBus(transport.listen);
     const onExit = vi.fn();
     bus.subscribe("live-native", { onOutput: vi.fn(), onExit, onError: vi.fn() });
-    transport.emit("terminal-output", output("live-native", "A".repeat(8193)));
+    transport.emit("terminal-output", output("live-native", "A".repeat(MAX_TERMINAL_OUTPUT_B64 + 1)));
     transport.emit("terminal-exit", { ...exit("live-native"), reaped: false, exit_code: null, error: "wait failed" });
     const delivered = onExit.mock.calls[0]?.[0] as TerminalExitEvent;
     expect(delivered.error).toContain("wait failed");
@@ -611,7 +612,7 @@ describe("ptyBus early output", () => {
       bus,
     });
     await owner.start();
-    transport.emit("terminal-output", output("native-both", "A".repeat(8193)));
+    transport.emit("terminal-output", output("native-both", "A".repeat(MAX_TERMINAL_OUTPUT_B64 + 1)));
     expect(owner.write("still-alive")).toBe(true);
     transport.emit("terminal-exit", { ...exit("native-both"), reaped: false, exit_code: null, error: "wait failed" });
     expect(owner.write("after-exit")).toBe(false);
@@ -729,7 +730,7 @@ it("does not invent a reserved length for an event that cannot name one", () => 
   const bus = createPtyBus(transport.listen);
   const live = { onOutput: vi.fn(), onExit: vi.fn() };
   bus.subscribe("live", live);
-  for (const bytes of [undefined, 0, 1.5, 4097, -1]) {
+  for (const bytes of [undefined, 0, 1.5, MAX_TERMINAL_OUTPUT_CHUNK + 1, -1]) {
     transport.emit("terminal-output", { id: "live", data_b64: "QQ==", bytes });
   }
   expect(live.onOutput).toHaveBeenCalledTimes(5);

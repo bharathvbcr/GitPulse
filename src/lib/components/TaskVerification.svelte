@@ -5,6 +5,7 @@
    * sidecar down) and polls while a verification is running.
    */
   import { onMount } from "svelte";
+  import { createAdaptiveTimer } from "../runtime/adaptiveTimer";
   import { explainError } from "../workbench/client";
   import { getVerification, runVerification, type Verification } from "../workbench/verification";
   import { askConfirm } from "../stores/modalStore";
@@ -54,10 +55,10 @@
   }
   $effect(() => { void revision; void refresh(); });
   $effect(() => { void readOptIn(repositoryPath); });
-  onMount(() => {
-    const timer = setInterval(() => { if (verification?.state === "running") void refresh(); }, 4000);
-    return () => clearInterval(timer);
-  });
+  onMount(() =>
+    // Stops while the window is hidden and polls once when it returns.
+    createAdaptiveTimer(() => { if (verification?.state === "running") void refresh(); }, 4000),
+  );
 </script>
 
 <section class="verification" data-testid="task-verification">

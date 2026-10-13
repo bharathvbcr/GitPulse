@@ -120,13 +120,18 @@ export const HEALTH_SECTIONS: readonly HealthSectionSpec[] = Object.freeze([
     summary: "Symbols the code graph found no reference to.",
   },
   {
+    id: "terminal-incidents",
+    label: "Terminal incidents",
+    heading: "Terminal incidents",
+    summary: "Terminal sessions that were killed together from outside GitPulse, and who sent the signal.",
+  },
+  {
     id: "host-load",
     label: "Host load",
     heading: "Host load",
     summary:
       "This machine's memory pressure, the agent sessions running on it, and what is using memory — for every repository, not just this one.",
-  },
-]);
+  },]);
 
 /** Section ids in rendered order. */
 export const HEALTH_SECTION_IDS: readonly string[] = Object.freeze(

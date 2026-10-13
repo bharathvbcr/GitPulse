@@ -6,6 +6,7 @@ pub mod codeintel;
 pub mod commands;
 pub(crate) mod coverage_toolchain;
 pub mod daemon_lock;
+pub(crate) mod deadline;
 pub mod desktop;
 pub mod devmap;
 pub mod diff;
@@ -86,6 +87,7 @@ fn start_host_load_sampler<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
     };
     let mut options = sysload::SamplerOptions::new(dir);
     options.enabled = Box::new(|| tool_config::host_load_settings().enabled);
+    options.govern_launches = Box::new(|| tool_config::host_load_settings().govern_launches);
     let emitter = app.clone();
     options.on_tick = Some(Box::new(move |pulse| {
         if let Err(error) = emitter.emit("host-load-pulse", pulse) {
@@ -493,6 +495,7 @@ pub fn run() {
             cmd_terminal_export,
             cmd_terminal_resize,
             cmd_terminal_kill,
+            cmd_terminal_incidents,
             cmd_terminal_context,
             cmd_terminal_sessions,
             cmd_terminal_attach,
@@ -596,6 +599,7 @@ pub fn run() {
             cmd_lappi_settings_save,
             cmd_host_load_status,
             cmd_host_load_terminate_orphan,
+            cmd_host_load_admit_anyway,
             cmd_host_load_settings,
             cmd_host_load_settings_save,
             cmd_attempt_review,

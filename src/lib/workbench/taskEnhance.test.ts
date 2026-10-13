@@ -4,6 +4,7 @@ import { acceptEnhancementInput, appendedHistory, enhancementMoved, createEnhanc
   assistEngineName,
   draftingKind,
   draftingVerb,
+  liveEnhancement,
   enhancementApplyBlock,
   enhancementOptionLabel,
   DEFAULT_ASSIST_ENGINE,
@@ -366,5 +367,34 @@ describe("enhancementMoved", () => {
       requests += 2;
     }
     expect(requests).toBe(10 + 2 * 2);
+  });
+});
+
+describe("liveEnhancement", () => {
+  // The store counts a pending proposal as live only until `expires_at`
+  // (`work_enhancements ... state='pending' AND expires_at>now`); a generate
+  // that was lost leaves one behind, and it must not block the next Ask.
+  it("a pending proposal is live until it expires, and not after", () => {
+    const pending = summary({ state: "pending", created_at: 100, expires_at: 200 });
+    expect(liveEnhancement(pending, 199)).toBe(true);
+    expect(liveEnhancement(pending, 200)).toBe(false);
+    expect(liveEnhancement(pending, 10_000)).toBe(false);
+  });
+  it("a running or cancelling proposal stays live past its expiry: only recovery ends it", () => {
+    for (const state of ["running", "cancel_requested"] as const) {
+      expect(liveEnhancement(summary({ state, expires_at: 200 }), 10_000), state).toBe(true);
+    }
+  });
+  it("adversarial: a pending proposal whose expiry is not a usable number stays live (fail closed)", () => {
+    // `now >= NaN` is false: a malformed expiry must never read as expired and unblock a second Ask.
+    expect(liveEnhancement(summary({ state: "pending", expires_at: Number.NaN }), 10_000)).toBe(true);
+    // A host clock behind the store's by a second: the boundary is the store's own (`expires_at>now`).
+    expect(liveEnhancement(summary({ state: "pending", expires_at: 200 }), 199.999)).toBe(true);
+  });
+  it("settled and absent proposals are never live", () => {
+    for (const state of ["ready", "failed", "cancelled", "interrupted", "dismissed", "accepted", "undone"] as const) {
+      expect(liveEnhancement(summary({ state, expires_at: 10_000 }), 100), state).toBe(false);
+    }
+    expect(liveEnhancement(null, 100)).toBe(false);
   });
 });

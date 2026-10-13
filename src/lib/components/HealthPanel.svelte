@@ -91,6 +91,7 @@
   import HealthSummaryCard from "./health/HealthSummaryCard.svelte";
   import GithubAlertsSection from "./health/GithubAlertsSection.svelte";
   import AlertLinkButton from "./health/AlertLinkButton.svelte";
+  import TerminalIncidentsSection from "./health/TerminalIncidentsSection.svelte";
   import { runManviAction } from "../terminal/manviAction";
   import { formatError } from "../ui/formatError";
   import {
@@ -1652,6 +1653,8 @@
           </p>
         {/if}
       </HealthSection>
+
+      <TerminalIncidentsSection />
 
       <!-- Machine-wide, not this repository's: the same readings under every
            repository's Health. Last, because it is context for the findings

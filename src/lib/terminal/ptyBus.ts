@@ -13,7 +13,7 @@
  * nobody has claimed are held, bounded, and replayed the moment it subscribes.
  */
 
-import { reservedTerminalBytes } from "./outputCredit";
+import { MAX_TERMINAL_OUTPUT_B64, reservedTerminalBytes } from "./outputCredit";
 import type { TerminalOutputPayload, TerminalExitPayload } from "./runResult";
 export type TerminalOutputEvent = TerminalOutputPayload;
 export type TerminalExitEvent = TerminalExitPayload;
@@ -216,7 +216,7 @@ export function createPtyBus(listen: EventListen): PtyBus {
       report("Invalid terminal output event");
       return;
     }
-    if (payload.data_b64.length > 8192) {
+    if (payload.data_b64.length > MAX_TERMINAL_OUTPUT_B64) {
       const target = handlers.get(payload.id);
       if (target) {
         noteLive(payload.id, OVERSIZE);

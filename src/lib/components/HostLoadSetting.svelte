@@ -35,12 +35,12 @@
     }
   }
 
-  async function save(enabled: boolean) {
+  async function save(change: Partial<HostLoadSettings>) {
     if (busy) return;
     busy = true;
     error = "";
     try {
-      settings = await saveHostLoadSettings({ ...settings, enabled });
+      settings = await saveHostLoadSettings({ ...settings, ...change });
     } catch (cause) {
       error = explainError(cause);
     } finally {
@@ -60,7 +60,14 @@
     description="On by default. Every 2 seconds GitPulse reads this computer's memory pressure, swap and compressor, and finds the agent sessions running on it, for Health and for the agents GitPulse launches. Off stops the readings; nothing is ever sent anywhere."
     checked={settings.enabled}
     disabled={busy}
-    onchange={(next) => void save(next)}
+    onchange={(next) => void save({ enabled: next })}
+  />
+  <SettingToggle
+    label="Refuse agent launches under severe memory pressure"
+    description="On by default. When the kernel reports critical memory pressure, or the memory compressor is thrashing, GitPulse refuses to start an agent until it clears, and says which. You can always choose Admit anyway in Health. Off still sheds GitPulse's own background and refresh work under pressure, but never refuses a launch. Needs the measurement above."
+    checked={settings.govern_launches}
+    disabled={busy || !settings.enabled}
+    onchange={(next) => void save({ govern_launches: next })}
   />
   {#if error}
     <p class="text-amber-300">{error}</p>

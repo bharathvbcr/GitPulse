@@ -11,6 +11,7 @@
 //! its timer while the window is hidden. Either request failing is recorded
 //! in the status, not hidden.
 
+use super::governor::{self, Governor, GovernorPulse, GovernorReport, Input};
 use super::procscan::{ProcView, ScanContext, Scanner};
 use super::sensor::{CompressorTrend, Level, OsSensor, Reading, Sensor};
 use super::snapshot::{self, Snapshot, TickStats, Writer, WriterIdentity};
@@ -65,6 +66,9 @@ pub struct HostLoadStatus {
     pub role: Role,
     pub sensor: SensorReport,
     pub pressure: PressureInput,
+    /// What the governor decided from this sensor: admission, shedding and
+    /// why (`sysload::governor`).
+    pub governor: GovernorReport,
     pub snapshot_path: Option<String>,
     pub writer: Option<WriterIdentity>,
     pub writer_is_self: bool,
@@ -88,6 +92,7 @@ pub struct HostLoadPulse {
     pub enabled: bool,
     pub compressor_thrash: bool,
     pub role: Role,
+    pub governor: GovernorPulse,
 }
 
 pub fn pulse_of(status: &HostLoadStatus) -> HostLoadPulse {
@@ -102,6 +107,7 @@ pub fn pulse_of(status: &HostLoadStatus) -> HostLoadPulse {
             .as_ref()
             .is_some_and(|s| s.compressor_thrash),
         role: status.role,
+        governor: GovernorPulse::of(&status.governor),
     }
 }
 
@@ -112,6 +118,9 @@ pub struct SamplerOptions {
     pub cadence: Duration,
     /// `host_load.enabled`, read once per tick.
     pub enabled: Box<dyn Fn() -> bool + Send>,
+    /// `host_load.govern_launches`, read once per tick: whether severe
+    /// pressure refuses agent launches.
+    pub govern_launches: Box<dyn Fn() -> bool + Send>,
     /// Called after every tick with that tick's pulse.
     pub on_tick: Option<Box<dyn Fn(HostLoadPulse) + Send>>,
 }
@@ -122,6 +131,7 @@ impl SamplerOptions {
             dir,
             cadence: Duration::from_millis(CADENCE_MS),
             enabled: Box::new(|| true),
+            govern_launches: Box::new(|| true),
             on_tick: None,
         }
     }
@@ -130,6 +140,9 @@ impl SamplerOptions {
 struct Shared {
     dir: PathBuf,
     status: Mutex<Option<HostLoadStatus>>,
+    /// This sampler's governor. Only the app's is registered for the rest
+    /// of the process to ask (`governor::report`).
+    governor: Arc<Mutex<Governor>>,
     stop: AtomicBool,
 }
 
@@ -167,7 +180,9 @@ static APP_SAMPLER: OnceLock<Arc<Shared>> = OnceLock::new();
 /// writer candidate in the same process.
 pub fn start_app(options: SamplerOptions) -> Result<StopHandle, String> {
     let handle = start(options)?;
-    if APP_SAMPLER.set(handle.shared.clone()).is_err() {
+    if APP_SAMPLER.set(handle.shared.clone()).is_err()
+        || !governor::register_app(handle.shared.governor.clone())
+    {
         handle.stop();
         return Err("the app's host-load sampler is already running".into());
     }
@@ -183,6 +198,7 @@ pub fn start(options: SamplerOptions) -> Result<StopHandle, String> {
     let shared = Arc::new(Shared {
         dir: options.dir.clone(),
         status: Mutex::new(None),
+        governor: Arc::new(Mutex::new(Governor::default())),
         stop: AtomicBool::new(false),
     });
     let worker = shared.clone();
@@ -211,7 +227,12 @@ pub fn status() -> HostLoadStatus {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
         {
-            return status;
+            // Aged to now, not to the tick that stored it: a sampler that
+            // stopped ticking must not leave a fresh-looking verdict.
+            return HostLoadStatus {
+                governor: governor::report(),
+                ..status
+            };
         }
         return reader_status(&shared.dir, Role::Reader, Vec::new(), TickStats::default());
     }
@@ -228,6 +249,7 @@ pub fn status() -> HostLoadStatus {
                 reason: Some("no per-user config directory (HOME / APPDATA unset)".into()),
             },
             pressure: PressureInput::Unavailable,
+            governor: governor::report(),
             snapshot_path: None,
             writer: None,
             writer_is_self: false,
@@ -251,6 +273,7 @@ fn reader_status(dir: &Path, role: Role, problems: Vec<String>, tick: TickStats)
         platform: Platform::current(),
         role,
         pressure: PressureInput::of(&sensor),
+        governor: governor::report(),
         sensor,
         snapshot_path: Some(path.to_string_lossy().into_owned()),
         writer: snap.as_ref().map(|s| s.writer.clone()),
@@ -309,6 +332,31 @@ fn fill(
     snap.orphans = u32::try_from(view.orphans.len()).unwrap_or(u32::MAX);
 }
 
+/// What tells one published sample from another: the writer's boot, its
+/// sequence number and when it wrote.
+type SampleKey = (u64, u64, u64);
+
+/// Whether `snapshot` is a sample the governor has not counted yet, noting it
+/// in `last` when it is. A reader ticks on its own clock and rereads its
+/// writer's last record until the next one lands; counting each reread as a
+/// sample would let one reading from a stalled writer trip the hysteresis.
+/// No snapshot is never a new sample: there is nothing to count.
+fn new_sample(last: &mut Option<SampleKey>, snapshot: Option<&Snapshot>) -> bool {
+    let Some(snapshot) = snapshot else {
+        return false;
+    };
+    let key = (
+        snapshot.written.boot_id,
+        snapshot.seq,
+        snapshot.written.mono_ns,
+    );
+    if *last == Some(key) {
+        return false;
+    }
+    *last = Some(key);
+    true
+}
+
 /// The supervised thread's name and its Diagnostics subsystem.
 const SUBSYSTEM: &str = "host-load-sampler";
 
@@ -334,6 +382,7 @@ fn run(shared: &Shared, options: &SamplerOptions) {
     let cpu_origin = super::probe::thread_cpu_ns();
     let mut slot: u64 = 0;
     let mut tick = TickStats::default();
+    let mut last_sample = None;
 
     while !shared.stop.load(Ordering::Acquire) {
         let began = Instant::now();
@@ -370,6 +419,31 @@ fn run(shared: &Shared, options: &SamplerOptions) {
             }
             None => reader_status(&shared.dir, Role::Reader, tick_problems, tick),
         };
+
+        let govern_launches = (options.govern_launches)();
+        let mut status = status;
+        {
+            let mut governor = shared
+                .governor
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let input =
+                Input::from_report(&status.sensor, status.snapshot.as_ref(), govern_launches);
+            let observation = if new_sample(&mut last_sample, status.snapshot.as_ref()) {
+                governor.observe(Instant::now(), input)
+            } else {
+                governor.observe_repeat(Instant::now(), input)
+            };
+            if observation.notice_raised {
+                log::warn!(
+                    target: "host_load",
+                    "refusing agent launches for {} min under pressure: {}",
+                    governor::REFUSAL_NOTICE_AFTER.as_secs() / 60,
+                    observation.verdict.message
+                );
+            }
+            status.governor = governor.report(Instant::now());
+        }
 
         let took = began.elapsed();
         tick.ticks += 1;
@@ -419,6 +493,31 @@ fn run(shared: &Shared, options: &SamplerOptions) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A reader rereads its writer's last record until the next one lands:
+    /// the reread is not a new sample, a new sequence or a new boot is.
+    #[test]
+    fn a_reread_record_is_not_a_new_sample() {
+        let clock = |mono_ns, boot_id| Clock {
+            wall_ms: 1_700_000_000_000,
+            mono_ns,
+            boot_id,
+        };
+        let record = |seq, mono_ns, boot_id| {
+            let mut snap = Snapshot::empty(clock(mono_ns, boot_id), own_identity(), true);
+            snap.seq = seq;
+            snap
+        };
+        let mut last = None;
+        assert!(!new_sample(&mut last, None), "no record, nothing to count");
+        assert!(new_sample(&mut last, Some(&record(7, 100, 1))));
+        assert!(!new_sample(&mut last, Some(&record(7, 100, 1))), "a reread");
+        assert!(!new_sample(&mut last, Some(&record(7, 100, 1))), "a reread");
+        assert!(new_sample(&mut last, Some(&record(8, 200, 1))));
+        // A new writer that restarted its sequence, or a new boot.
+        assert!(new_sample(&mut last, Some(&record(8, 300, 1))));
+        assert!(new_sample(&mut last, Some(&record(8, 300, 2))));
+    }
 
     fn report(state: SensorState, level: Option<Level>, enabled: bool) -> SensorReport {
         SensorReport {

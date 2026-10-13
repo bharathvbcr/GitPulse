@@ -1,6 +1,9 @@
 import { mergeTerminalNotice, type PtyBus, type TerminalExitEvent } from "./ptyBus";
 import type { TerminalSpawned } from "./runResult";
-import { createTerminalInput, terminalDeadline } from "./inputQueue";
+import {
+  CLOSE_SLOW_NOTICE, CONTEXT_READ_MS, CONTROL_QUICK_MS, INPUT_HARD_MS, KEEP_MS, KILL_HARD_MS, KILL_SOFT_MS, RENDERER_DRAIN_MS,
+  TerminalTimeoutError, createTerminalInput, sessionIsGone, terminalDeadline, type DeadlineClock,
+} from "./inputQueue";
 import { SessionCapacityError, type createSessionRegistry } from "./sessionRegistry";
 import type { LauncherKind } from "./tabs";
 
@@ -24,6 +27,13 @@ export interface SessionHooks {
   exit(event: TerminalExitEvent): void;
   reset(): void | Promise<void>;
   warning(message: string): void;
+  /**
+   * Typed input is queued behind a send the backend has not answered yet. Called
+   * with the notice, and with null when that send settles. Not a warning: it
+   * retracts itself and must not clear one the view is showing for another
+   * reason.
+   */
+  slow?(message: string | null): void;
   /**
    * Output was skipped for this view (`terminal-loss`). What it had painted
    * may end mid escape sequence; the view must leave that sequence before
@@ -77,6 +87,8 @@ export function createSessionLifecycle(options: {
    * or absent: this lifecycle stays the owner, listed and stoppable.
    */
   keep?: (sessionId: string) => Promise<((slot: Slot) => void) | null>;
+  /** The page's sense of time for every deadline here; absent, the real one. A test seam. */
+  clock?: DeadlineClock;
 }) {
   const { bus, registry, transport, hooks } = options;
   let id: string | null = null;
@@ -89,6 +101,8 @@ export function createSessionLifecycle(options: {
   let input: ReturnType<typeof createTerminalInput> | null = null;
   let pendingSize: { rows: number; cols: number } | null = null;
   let resizing = false;
+  /** A resize failure was already reported and none has succeeded since. */
+  let resizeWarned = false;
   let attemptEnded = false;
   /** Banner text already shown. A later clean exit must not drop it. */
   let shownError: string | null = null;
@@ -112,6 +126,7 @@ export function createSessionLifecycle(options: {
     subscription?.(); subscription = null;
     slot?.release(); slot = null;
     id = null;
+    resizeWarned = false;
   }
   function fail(message: string, retain = false) {
     input?.dispose();
@@ -127,7 +142,20 @@ export function createSessionLifecycle(options: {
     input?.dispose();
     const notice = mergeTerminalNotice(shownError, lossNotice);
     slot?.update(notice ?? "closing");
-    closing = terminalDeadline(transport.kill(target), 5000, "Closing terminal").then(() => {
+    // The bounds and the reason for each are in `inputQueue.ts` (KILL_HARD_MS).
+    // A close is something the user is watching, so a slow one is said, in
+    // the view and in Sessions, and retracted when it settles. A window nobody
+    // can see does not count against it: the failure it would report, "Close
+    // failed", could not be seen either, and the kill lands regardless.
+    closing = terminalDeadline(transport.kill(target), KILL_HARD_MS, "Closing terminal", {
+      clock: options.clock,
+      pauseWhileHidden: true,
+      softMs: KILL_SOFT_MS,
+      onSlow: (slow) => {
+        if (id === target) slot?.update(slow ? CLOSE_SLOW_NOTICE : notice ?? "closing");
+        if (!disposed || !slow) hooks.slow?.(slow ? CLOSE_SLOW_NOTICE : null);
+      },
+    }).then(() => {
       if (id === target) {
         attemptEnded = true;
         release();
@@ -164,19 +192,19 @@ export function createSessionLifecycle(options: {
     if (!target) { release(); return; }
     let idle = false;
     try {
-      idle = options.idle ? await terminalDeadline(options.idle(target), 1500, "Reading terminal context") : false;
+      idle = options.idle ? await terminalDeadline(options.idle(target), CONTEXT_READ_MS, "Reading terminal context", { clock: options.clock }) : false;
     } catch { idle = false; }
     if (id !== target) return;
     if (idle) { await closeCurrent(); return; }
     let adopt: ((slot: Slot) => void) | null = null;
     try {
-      adopt = options.keep ? await terminalDeadline(options.keep(target), 3000, "Listing terminal") : null;
+      adopt = options.keep ? await terminalDeadline(options.keep(target), KEEP_MS, "Listing terminal", { clock: options.clock }) : null;
     } catch { adopt = null; }
     if (id !== target) return;
     input?.dispose();
     let kept = false;
     try {
-      kept = await terminalDeadline(transport.detach(target), 5000, "Detaching terminal");
+      kept = await terminalDeadline(transport.detach(target), CONTROL_QUICK_MS, "Detaching terminal", { clock: options.clock, pauseWhileHidden: true });
     } catch (error) {
       if (id === target) slot?.update(`Still running; its view closed but it could not be detached. ${String(error)}`);
       throw error;
@@ -254,7 +282,7 @@ export function createSessionLifecycle(options: {
         input = createTerminalInput((data, binary) => transport.write(spawned.id, data, binary), (message, fatal) => {
           if (fatal) fail(message);
           else if (!disposed) hooks.warning(message);
-        });
+        }, { clock: options.clock, onSlow: (message) => { if (!disposed || message === null) hooks.slow?.(message); } });
         state("running");
         if (!reattached) {
           // This id belongs to a new process. Its predecessor's loss does not.
@@ -319,6 +347,17 @@ export function createSessionLifecycle(options: {
     starting = launch(reconnect).finally(() => { starting = null; });
     return starting;
   }
+  /**
+   * Latest wins and one is in flight at a time: sizes that arrive while a resize
+   * is being answered collapse into the one pending size. A slow answer is
+   * awaited without a word (a window drag on a loaded host is a stream of
+   * these); only a failure is said, and once per streak, because the next
+   * resize carries the whole size and repairs it. A session that is gone is
+   * the exit path's to report. The bound exists so that a resize which never
+   * answers cannot hold `resizing` (this lifecycle's, not one session's) for
+   * good; if the abandoned resize lands late it is stale by one size, which the
+   * resize that followed it has already superseded or will.
+   */
   async function resizeLatest() {
     if (resizing) return;
     resizing = true;
@@ -326,8 +365,17 @@ export function createSessionLifecycle(options: {
       while (pendingSize && id && !disposed) {
         const size = pendingSize, target = id;
         pendingSize = null;
-        try { await terminalDeadline(transport.resize(target, size.rows, size.cols), 5000, "Terminal resize"); }
-        catch (error) { if (!disposed && id === target) hooks.warning(`Resize failed: ${String(error)}`); }
+        try {
+          await terminalDeadline(transport.resize(target, size.rows, size.cols), INPUT_HARD_MS, "Terminal resize", { clock: options.clock, pauseWhileHidden: true });
+          resizeWarned = false;
+        } catch (error) {
+          if (!disposed && id === target && !sessionIsGone(error) && !resizeWarned) {
+            resizeWarned = true;
+            hooks.warning(error instanceof TerminalTimeoutError
+              ? `Resize failed: no answer from the terminal backend for ${Math.round(error.ms / 1000)} s; the host may be overloaded.`
+              : `Resize failed: ${String(error)}`);
+          }
+        }
       }
     } finally { resizing = false; }
   }
@@ -340,7 +388,7 @@ export function createSessionLifecycle(options: {
         if (disposed) return;
         if (options.singleAttempt) { await start(true); return; }
         await closeCurrent();
-        await terminalDeadline(Promise.resolve(hooks.reset()), 5000, "Draining terminal renderer");
+        await terminalDeadline(Promise.resolve(hooks.reset()), RENDERER_DRAIN_MS, "Draining terminal renderer", { clock: options.clock, pauseWhileHidden: true });
         await start();
       })().catch((error: unknown) => state("error", String(error))).finally(() => { restarting = null; });
       return restarting;

@@ -1,6 +1,7 @@
 //! Provider arguments and one temporary source file for an explicitly requested
 //! terminal attempt. User task text never becomes shell syntax or an argv blob.
 
+use super::claude_hook;
 use super::WorkbenchError;
 use crate::engine::git_cli::{
     capture_command, extended_child_path, resolve_spawn_program_with, CapturedOutput,
@@ -527,7 +528,7 @@ pub(crate) fn model_choice_from_record(
 }
 
 /// Keys for Claude Code's session-scoped `--settings` object, with their values.
-type ClaudeSettings = Vec<(&'static str, String)>;
+type ClaudeSettings = Vec<(&'static str, serde_json::Value)>;
 
 /// A [`ModelChoice`] as `provider`'s own flags, plus any keys that belong in
 /// Claude Code's `--settings` object. Validated first, so nothing a launch
@@ -549,7 +550,9 @@ fn model_flags(
         let Some(value) = value else { continue };
         match model_control(provider, field) {
             Some(ModelControl::Flag(flag)) => flags.extend([flag.to_owned(), value.clone()]),
-            Some(ModelControl::ClaudeSetting(key)) => settings.push((key, value.clone())),
+            Some(ModelControl::ClaudeSetting(key)) => {
+                settings.push((key, serde_json::Value::String(value.clone())))
+            }
             None => return Err(format!("{provider} does not take a {field} setting.")),
         }
     }
@@ -578,7 +581,7 @@ fn merge_claude_settings(flags: &mut Vec<String>, entries: ClaudeSettings) -> Re
         None => (None, serde_json::Map::new()),
     };
     for (key, value) in entries {
-        object.insert(key.to_owned(), serde_json::Value::String(value));
+        object.insert(key.to_owned(), value);
     }
     let merged = serde_json::Value::Object(object).to_string();
     match at {
@@ -599,6 +602,9 @@ pub(crate) struct LaunchOptions<'a> {
     pub setting_sources: Option<&'a str>,
     /// The user's model choice for this launcher, if they made one.
     pub model: Option<&'a ModelChoice>,
+    /// The `gitpulse-hook` binary to run as this launch's PreToolUse hook,
+    /// when the launch is to carry it (see [`claude_hook`]). Claude Code only.
+    pub hook: Option<&'a Path>,
 }
 
 /// Every flag an agent launch adds for the user's settings rather than for
@@ -626,7 +632,61 @@ pub(crate) fn launch_flags(
         flags.extend(model);
         merge_claude_settings(&mut flags, settings)?;
     }
+    if let (Some(binary), "claude") = (options.hook, provider) {
+        let hooks = claude_hook::settings_hooks(binary)?;
+        merge_claude_settings(&mut flags, vec![("hooks", hooks)])?;
+    }
     Ok(flags)
+}
+
+/// Where the caller's own `--settings` sits in `args`, before any `--`
+/// separator: after it every argument is the prompt, even one that reads
+/// `--settings`.
+fn caller_settings_at(args: &[String]) -> Option<usize> {
+    let end = args
+        .iter()
+        .position(|arg| arg == "--")
+        .unwrap_or(args.len());
+    args[..end].iter().position(|arg| arg == "--settings")
+}
+
+/// Folds the launch's `--settings` object into one the caller already passed.
+///
+/// `--settings` takes one value, so two occurrences would drop the first —
+/// the notification channel and the command gate along with it. The caller's
+/// keys win; their hooks stay and ours are added after them. A caller value
+/// that is a file path cannot be merged into, so the caller's is kept as it
+/// is and the launch's own settings are dropped, which is logged.
+fn fold_caller_settings(flags: Vec<String>, args: &mut [String], at: usize) -> Vec<String> {
+    let Some(ours_at) = flags.iter().position(|flag| flag == "--settings") else {
+        return flags;
+    };
+    let ours: Option<serde_json::Map<String, serde_json::Value>> = flags
+        .get(ours_at + 1)
+        .and_then(|raw| serde_json::from_str(raw).ok());
+    let theirs: Option<serde_json::Map<String, serde_json::Value>> = args
+        .get(at + 1)
+        .and_then(|raw| serde_json::from_str(raw).ok());
+    match (ours, theirs) {
+        (Some(ours), Some(mut theirs)) => {
+            for (key, value) in ours {
+                if key == "hooks" {
+                    let merged = claude_hook::merge_hooks(theirs.get("hooks"), value);
+                    theirs.insert(key, merged);
+                } else {
+                    theirs.entry(key).or_insert(value);
+                }
+            }
+            args[at + 1] = serde_json::Value::Object(theirs).to_string();
+        }
+        _ => log::warn!(
+            target: "workbench",
+            "a launch's own --settings was dropped: the caller passed a --settings that is not a JSON object"
+        ),
+    }
+    let mut rest = flags;
+    rest.drain(ours_at..(ours_at + 2).min(rest.len()));
+    rest
 }
 
 /// A plain agent tab's arguments with the [`launch_flags`] in front.
@@ -644,11 +704,16 @@ pub(crate) fn with_launch_flags(
         Some(provider) => launch_flags(provider, options)?,
         None => Vec::new(),
     };
+    let mut caller = args.clone().unwrap_or_default();
+    let flags = match caller_settings_at(&caller) {
+        Some(at) => fold_caller_settings(flags, &mut caller, at),
+        None => flags,
+    };
     if flags.is_empty() {
-        return Ok(args);
+        return Ok(args.map(|_| caller));
     }
     let mut out = flags;
-    out.extend(args.unwrap_or_default());
+    out.extend(caller);
     Ok(Some(out))
 }
 
@@ -1437,6 +1502,7 @@ mod tests {
             notify,
             setting_sources,
             model: None,
+            hook: None,
         }
     }
 
@@ -2704,6 +2770,7 @@ mod model_tests {
                     notify: true,
                     setting_sources: Some("user"),
                     model: Some(&choice),
+                    hook: None,
                 },
                 Some(vec!["--".into(), "Fix the failing test".into()]),
             )
@@ -2745,6 +2812,7 @@ mod model_tests {
                     notify: true,
                     setting_sources: None,
                     model: Some(&choice),
+                    hook: None,
                 },
             },
         )
@@ -3011,6 +3079,7 @@ mod model_tests {
                     notify: true,
                     setting_sources: None,
                     model: Some(&choice),
+                    hook: None,
                 },
             )
             .unwrap_or_else(|error| panic!("{launcher}: {}", error.message));
@@ -3112,5 +3181,157 @@ mod launch_choice_tests {
         };
         let refused = model_choice_record(&joined).unwrap_err();
         assert!(refused.contains("fallback"), "{refused}");
+    }
+}
+
+#[cfg(test)]
+mod hook_launch_tests {
+    use super::{launch_flags, with_launch_flags, LaunchOptions};
+    use serde_json::Value;
+    use std::path::Path;
+
+    const HOOK: &str = "/Applications/GitPulse.app/Contents/MacOS/gitpulse-hook";
+
+    fn with_hook(notify: bool) -> LaunchOptions<'static> {
+        LaunchOptions {
+            notify,
+            hook: Some(Path::new(HOOK)),
+            ..LaunchOptions::default()
+        }
+    }
+
+    fn settings_of(argv: &[String]) -> Value {
+        let at = argv
+            .iter()
+            .position(|a| a == "--settings")
+            .expect("--settings");
+        assert_eq!(
+            argv.iter().filter(|a| *a == "--settings").count(),
+            1,
+            "{argv:?}"
+        );
+        serde_json::from_str(&argv[at + 1]).expect("settings JSON")
+    }
+
+    #[test]
+    fn one_settings_object_carries_the_channel_and_the_hooks() {
+        let flags = launch_flags("claude", &with_hook(true)).unwrap();
+        let settings = settings_of(&flags);
+        let mut keys: Vec<_> = settings.as_object().unwrap().keys().cloned().collect();
+        keys.sort();
+        assert_eq!(keys, ["hooks", "preferredNotifChannel"]);
+        let commands: Vec<String> = settings["hooks"]["PreToolUse"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|group| group["hooks"][0]["command"].as_str().unwrap().to_owned())
+            .collect();
+        assert_eq!(commands.len(), 2);
+        for command in commands {
+            assert!(command.starts_with(&format!("'{HOOK}' ")), "{command}");
+        }
+    }
+
+    #[test]
+    fn the_hook_rides_a_launch_that_sends_no_notification_flags() {
+        let flags = launch_flags("claude", &with_hook(false)).unwrap();
+        let settings = settings_of(&flags);
+        assert_eq!(
+            settings.as_object().unwrap().keys().collect::<Vec<_>>(),
+            ["hooks"]
+        );
+    }
+
+    #[test]
+    fn no_hook_leaves_the_launch_exactly_as_it_was() {
+        let flags = launch_flags(
+            "claude",
+            &LaunchOptions {
+                notify: true,
+                ..LaunchOptions::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            flags,
+            ["--settings", r#"{"preferredNotifChannel":"terminal_bell"}"#]
+        );
+    }
+
+    #[test]
+    fn only_claude_takes_the_hook() {
+        for provider in ["codex", "grok", "agy"] {
+            let flags = launch_flags(provider, &with_hook(false)).unwrap();
+            assert!(
+                !flags.iter().any(|f| f == "--settings"),
+                "{provider}: {flags:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_callers_own_settings_object_is_merged_not_duplicated() {
+        let caller = vec![
+            "--settings".to_owned(),
+            r#"{"model":"opus","preferredNotifChannel":"iterm2","hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"mine"}]}]}}"#
+                .to_owned(),
+            "--".to_owned(),
+            "hello".to_owned(),
+        ];
+        let argv = with_launch_flags(Some("claude"), &with_hook(true), Some(caller))
+            .unwrap()
+            .unwrap();
+        let settings = settings_of(&argv);
+        assert_eq!(settings["model"], "opus");
+        // The caller's own value wins over the launch's.
+        assert_eq!(settings["preferredNotifChannel"], "iterm2");
+        let groups = settings["hooks"]["PreToolUse"].as_array().unwrap();
+        assert_eq!(groups.len(), 3);
+        assert_eq!(groups[0]["hooks"][0]["command"], "mine");
+        assert_eq!(argv[argv.len() - 2..], ["--", "hello"]);
+    }
+
+    #[test]
+    fn a_settings_file_path_from_the_caller_is_kept_and_nothing_is_doubled() {
+        let caller = vec!["--settings".to_owned(), "/tmp/their.json".to_owned()];
+        let argv = with_launch_flags(Some("claude"), &with_hook(true), Some(caller.clone()))
+            .unwrap()
+            .unwrap();
+        assert_eq!(argv, caller);
+    }
+
+    #[test]
+    fn a_prompt_that_reads_settings_is_not_a_settings_flag() {
+        let caller = vec!["--".to_owned(), "--settings".to_owned(), "{}".to_owned()];
+        let argv = with_launch_flags(Some("claude"), &with_hook(true), Some(caller))
+            .unwrap()
+            .unwrap();
+        assert_eq!(argv.iter().filter(|a| *a == "--settings").count(), 2);
+        assert_eq!(argv[argv.len() - 3..], ["--", "--settings", "{}"]);
+        assert!(settings_of(&argv[..argv.len() - 3]).get("hooks").is_some());
+    }
+
+    #[test]
+    fn resume_and_session_id_arguments_pass_through_untouched() {
+        for caller in [
+            vec!["--resume", "6f0a6d1e-1111-4222-8333-444455556666"],
+            vec!["--session-id", "6f0a6d1e-1111-4222-8333-444455556666"],
+            vec!["--continue"],
+        ] {
+            let caller: Vec<String> = caller.into_iter().map(str::to_owned).collect();
+            let argv = with_launch_flags(Some("claude"), &with_hook(true), Some(caller.clone()))
+                .unwrap()
+                .unwrap();
+            assert!(argv.ends_with(&caller), "{argv:?}");
+            assert!(settings_of(&argv[..argv.len() - caller.len()])
+                .get("hooks")
+                .is_some());
+        }
+    }
+
+    #[test]
+    fn no_flags_and_no_arguments_stay_no_arguments() {
+        let none = with_launch_flags(Some("claude"), &LaunchOptions::default(), None).unwrap();
+        assert_eq!(none, None);
     }
 }

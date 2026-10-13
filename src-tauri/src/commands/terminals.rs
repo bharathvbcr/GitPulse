@@ -29,31 +29,43 @@ pub async fn cmd_terminal_spawn(
     start_dir: Option<String>,
 ) -> Result<crate::terminal::TerminalSpawned, String> {
     let state = state.inner().clone();
-    // Expanded here, at the boundary, rather than in the caller: the flags for
-    // a mode are the workbench's table and the frontend never carries them.
-    // The refusals inside are what make a bypassed session impossible without
-    // an acknowledgement, whatever the frontend did or forgot to do. The
-    // notification and setting-source flags go in first so the policy flags
-    // land in front of them: policy, launch flags, then the caller's prompt.
-    let defaults = crate::tool_config::agent_defaults();
-    let sources = defaults.claude_setting_sources_arg();
-    let args = crate::workbench::terminal_command::apply_permission_mode(
-        program.as_deref(),
-        permission_mode.as_deref(),
-        acknowledged.unwrap_or(false),
-        crate::workbench::terminal_command::with_launch_flags(
-            program.as_deref(),
-            &crate::workbench::terminal_command::LaunchOptions {
-                notify: crate::tool_config::session_alerts().configure_agents,
-                setting_sources: sources.as_deref(),
-                model: program
-                    .as_deref()
-                    .and_then(|launcher| defaults.model_for(launcher)),
-            },
-            args,
-        )?,
-    )?;
     off_thread(move || {
+        // Expanded here, at the boundary, rather than in the caller: the flags
+        // for a mode are the workbench's table and the frontend never carries
+        // them. The refusals inside are what make a bypassed session
+        // impossible without an acknowledgement, whatever the frontend did or
+        // forgot to do. The notification and setting-source flags go in first
+        // so the policy flags land in front of them: policy, launch flags,
+        // then the caller's prompt.
+        //
+        // On the blocking pool with the spawn, not before it: the settings
+        // file is read and the hook binary is looked for on disk, and an
+        // `async fn` doing either parks a Tauri async-runtime worker.
+        let defaults = crate::tool_config::agent_defaults();
+        let sources = defaults.claude_setting_sources_arg();
+        // Before the flags: the hook goes on every claude launch, plugin or not
+        // (`workbench::claude_hook`).
+        let hook = match program.as_deref() {
+            Some(provider) => crate::workbench::claude_hook::for_launch(provider.trim()),
+            None => crate::workbench::claude_hook::HookInjection::NotApplicable,
+        };
+        let args = crate::workbench::terminal_command::apply_permission_mode(
+            program.as_deref(),
+            permission_mode.as_deref(),
+            acknowledged.unwrap_or(false),
+            crate::workbench::terminal_command::with_launch_flags(
+                program.as_deref(),
+                &crate::workbench::terminal_command::LaunchOptions {
+                    notify: crate::tool_config::session_alerts().configure_agents,
+                    setting_sources: sources.as_deref(),
+                    model: program
+                        .as_deref()
+                        .and_then(|launcher| defaults.model_for(launcher)),
+                    hook: hook.binary(),
+                },
+                args,
+            )?,
+        )?;
         crate::terminal::spawn_session_in(
             &app,
             &state,
@@ -72,13 +84,22 @@ pub async fn cmd_terminal_spawn(
 /// What a live session is running and where, read once on request: the
 /// foreground program, whether it is a job under the shell, and its working
 /// directory — inside the repository or not.
+///
+/// The terminal commands below this one do not use `off_thread`: it is tokio's
+/// shared blocking pool, which git commands can hold for minutes, wrapped in a
+/// git admission scope a PTY has no use for. They run on `terminal::executor`
+/// instead (a lane per session for keystrokes and resizes, a control pool for
+/// the rest), and the frontend's five-second deadlines are measured against
+/// that, not against the slowest git command in flight.
 #[tauri::command(async)]
 pub async fn cmd_terminal_context(
     state: State<'_, crate::terminal::TerminalSessions>,
     session_id: String,
 ) -> Result<crate::terminal::TerminalContext, String> {
-    let state = state.inner().clone();
-    off_thread(move || crate::terminal::session_context(&state, &session_id)).await
+    crate::terminal::control_async(&state, "terminal_context", move |state| {
+        crate::terminal::session_context(state, &session_id)
+    })
+    .await
 }
 
 /// Every live terminal session, including ones started by a page that has
@@ -88,8 +109,10 @@ pub async fn cmd_terminal_context(
 pub async fn cmd_terminal_sessions(
     state: State<'_, crate::terminal::TerminalSessions>,
 ) -> Result<Vec<crate::terminal::TerminalListing>, String> {
-    let state = state.inner().clone();
-    off_thread(move || Ok(crate::terminal::list_sessions(&state))).await
+    crate::terminal::control_async(&state, "terminal_sessions", |state| {
+        Ok(crate::terminal::list_sessions(state))
+    })
+    .await
 }
 
 /// Shows a session a reloaded page left running in a new tab. Refused for a
@@ -101,11 +124,13 @@ pub async fn cmd_terminal_attach(
     rows: u16,
     cols: u16,
 ) -> Result<crate::terminal::TerminalSpawned, String> {
-    let state = state.inner().clone();
-    off_thread(move || crate::terminal::attach_session(&state, &session_id, rows, cols)).await
+    crate::terminal::control_async(&state, "terminal_attach", move |state| {
+        crate::terminal::attach_session(state, &session_id, rows, cols)
+    })
+    .await
 }
 
-/// Feeds keystrokes into a live session's PTY.
+/// Feeds keystrokes into a live session's PTY, in the order the calls arrive.
 #[tauri::command(async)]
 pub async fn cmd_terminal_write(
     state: State<'_, crate::terminal::TerminalSessions>,
@@ -113,15 +138,7 @@ pub async fn cmd_terminal_write(
     data: String,
     binary: Option<bool>,
 ) -> Result<(), String> {
-    let state = state.inner().clone();
-    off_thread(move || {
-        if binary.unwrap_or(false) {
-            crate::terminal::write_binary_to_session(&state, &session_id, &data)
-        } else {
-            crate::terminal::write_to_session(&state, &session_id, &data)
-        }
-    })
-    .await
+    crate::terminal::write_async(&state, session_id, data, binary.unwrap_or(false)).await
 }
 
 /// Resizes a live session's PTY to the frontend grid.
@@ -132,7 +149,7 @@ pub async fn cmd_terminal_resize(
     rows: u16,
     cols: u16,
 ) -> Result<(), String> {
-    crate::terminal::resize_session(&state, &session_id, rows, cols)
+    crate::terminal::resize_async(&state, session_id, rows, cols).await
 }
 
 /// Leaves a session running with no view, for a tab that went away without
@@ -142,18 +159,35 @@ pub async fn cmd_terminal_detach(
     state: State<'_, crate::terminal::TerminalSessions>,
     session_id: String,
 ) -> Result<bool, String> {
-    let state = state.inner().clone();
-    off_thread(move || crate::terminal::detach_session(&state, &session_id)).await
+    crate::terminal::control_async(&state, "terminal_detach", move |state| {
+        crate::terminal::detach_session(state, &session_id)
+    })
+    .await
 }
 
 /// Kills a session's shell and frees its slot.
+///
+/// A close waits out a hangup grace and polls for cleanup for seconds, which is
+/// why it is on the control pool and never on a session's input lane.
 #[tauri::command(async)]
 pub async fn cmd_terminal_kill(
     state: State<'_, crate::terminal::TerminalSessions>,
     session_id: String,
 ) -> Result<(), String> {
-    let state = state.inner().clone();
-    off_thread(move || crate::terminal::kill_session(&state, &session_id)).await
+    crate::terminal::control_async(&state, "terminal_kill", move |state| {
+        crate::terminal::kill_session(state, &session_id)
+    })
+    .await
+}
+
+/// Mass external-signal deaths recorded this run, newest first and bounded.
+///
+/// Inline on purpose: one short mutex around an in-memory list, no I/O.
+#[tauri::command(async)]
+pub async fn cmd_terminal_incidents(
+    state: State<'_, crate::terminal::TerminalSessions>,
+) -> Result<Vec<crate::terminal::incident::TerminalIncidentPayload>, String> {
+    Ok(state.incidents())
 }
 
 /// Exports user-selected terminal output through the native save dialog.
@@ -178,6 +212,12 @@ pub async fn cmd_terminal_export(data: String) -> Result<bool, String> {
 }
 
 /// Releases rendered output bytes so the PTY reader can continue.
+///
+/// Inline on purpose, unlike the commands above: it is a map lookup and one
+/// counter update under short locks, no I/O and no wait, and it is sent for
+/// every rendered chunk, so a hop to another thread would cost more than the
+/// work. Routing it through the session's input lane would also hold the
+/// release of output behind a write that is waiting on a stuck child.
 #[tauri::command(async)]
 pub async fn cmd_terminal_ack(
     state: State<'_, crate::terminal::TerminalSessions>,

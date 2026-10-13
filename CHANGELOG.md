@@ -11,6 +11,10 @@ before that tag is pushed.
 
 ## [Unreleased]
 
+### Added
+
+- Host load governor, cards 1b and 1c: one verdict (`sysload::governor`) from the host-load sensor now decides what GitPulse does under memory pressure. Agent launches are refused at severe pressure (kernel level critical, or a thrashing memory compressor) before their checkout probes, capacity check and PTY open, with a typed `host_pressure` refusal that names the resource and value; the user's own shell is never gated, and stop, kill, cancel, save, commit, release and reconcile are never gated. GitPulse's own work is shed through the spawn gate's existing classes with the existing "deferred under load" marker: background work at `warn`, background and reactive work at critical or thrash, never a user action, resuming when the pressure clears. A stale-old or dead sensor admits with a warning and a `host_load.sensor_unavailable` ledger event and sheds nothing; Health shows it as ungoverned. Overrides are human only: **Admit anyway** (Health, and beside Retry on a refused launch) asks in a native dialog, then admits for two minutes. After 30 minutes of continuous refusal a toast offers one click to stop refusing; the refusal never lifts on its own. New setting `host_load.govern_launches`, new command `cmd_host_load_admit_anyway` (granted to the main window; 279 handlers). See `docs/LOAD_GOVERNOR.md`.
+
 ### Changed
 
 - **A repository is read one snapshot at a time, and switching back to a tab
@@ -106,6 +110,16 @@ before that tag is pushed.
   - It reads only the notes that changed.
   - The build happens outside the lock that queries wait on.
   - Renaming a note reuses the cached vault instead of rebuilding it.
+  - Refreshes that overlap share one scan, instead of each running its own
+    after the last.
+- **The live index asks `devmap status` once per repository, not once per
+  caller.** The repository's build slot is now held from the status question
+  through the build, so a burst of edits no longer starts a status process each
+  or a second build behind the first. A caller that finds it held is told a
+  build is running and tries again later.
+- **The wave, verification and host-load polls stop while the window is
+  hidden.** They resume with one immediate refresh when it returns. A test now
+  fails on any new timer that keeps ticking behind a hidden window.
 - **Reading the ledger no longer asks git for the worktree list every time.**
   - Git's answer is remembered while the repository's worktree registry is
     unchanged. A worktree that is added, removed or moved, or a checkout that
@@ -152,6 +166,53 @@ before that tag is pushed.
 
 ### Fixed
 
+
+- A slow host no longer kills a terminal's input. Any keystroke whose answer
+  took more than five seconds stopped the tab's input for good ("Input delivery
+  failed; restart before typing again"), and Restart ended the process in it,
+  an agent included; every late resize said "Resize failed". Input now waits for
+  the real answer and keeps what was typed meanwhile queued, in order, with one
+  notice that it is slow; it stops only when the backend says the session is
+  gone or nothing answers for 60 s, and then says so. A slow resize is silent
+  and a failed one is reported once per run of failures. Deadlines count the
+  time the page actually waited, so a blocked or hidden window no longer
+  charges its own stall to the backend.
+- Closing a terminal no longer skips its question when GitPulse could not tell
+  what was running in it. A context read that timed out, failed or came back
+  unreadable was treated as "nothing running", so a shell with a live job closed
+  without a word whenever the host was slow. The read now reports known, nothing
+  to stop, or unknown, and unknown (or a foreground or job list the OS would
+  not describe) asks: "GitPulse could not tell whether something is still
+  running in this terminal." The quit guard likewise reports a shell whose
+  answer was unreadable instead of counting it as clear.
+- A terminal that prints a lot no longer costs the webview a script evaluation
+  per kilobyte. Each `terminal-output` event is a script run on the app's main
+  thread, and macOS hands a PTY reader about 1 KiB per read, so a 1 MiB burst
+  was 1024 events. The reader now gathers what the tty has queued (a stream
+  that goes quiet for 2 ms, or has been held 8 ms, is sent; anything under
+  512 bytes, such as an echoed key or a prompt, is sent at once) into events of
+  up to 16 KiB: the same burst is 64 events, byte for byte, with the same
+  acknowledgement accounting. A repainting TUI already arrived as about one
+  event per frame and is unchanged.
+- Typing and resizing a terminal no longer wait behind git. Terminal commands
+  shared the pool every git command uses (`queue_ms=1165` for a keystroke on a
+  loaded host, git commands holding threads for minutes), and a resize blocked a
+  Tauri async worker on a mutex instead. Keystrokes and resizes now run on a
+  thread per session (in order, bounded, a full queue refused at once) and the
+  slower commands (close, attach, context, list) on a separate bounded pool, so
+  a session whose child stopped reading delays only itself and the frontend's
+  five-second deadlines no longer measure the slowest git command in flight.
+  The new-session command also reads settings and looks for the hook binary on
+  the blocking pool instead of an async worker.
+- Every signal GitPulse sends now goes through one guarded primitive,
+  `procguard::signal`. It refuses pid 0, 1 and negative ids, the app's own
+  process, group and session, a group GitPulse did not create, and a pid whose
+  start time moved, and it logs who sent each signal and why. Terminal close,
+  the Health orphan Terminate and every spawned-child teardown use it; a test
+  fails the build if production code signals a process any other way. The
+  browser-regression watchdog and `dev-port` reclaim likewise refuse a pid they
+  have not verified.
+
 - **Branch names that git allows now work.**
   - Branches such as `fix/a&b`, `feat(ui)=x` or `a]b` were refused as "Invalid
     ref name". GitPulse now applies git's own ref-name rules.
@@ -168,6 +229,21 @@ before that tag is pushed.
 - **WebView2-only browser arguments no longer sit in the macOS configuration.**
   They now live only in the Windows configuration.
 - **A build that would ship source maps now fails.**
+- **A file-system event can no longer abort GitPulse on macOS.** A path that is
+  not valid UTF-8, a flag bit that macOS adds later, or a panic in the watch
+  handler could unwind out of the FSEvents callback and end the process. Each is
+  now handled, and a panic costs only that batch of events.
+- **A slow repository no longer piles up refreshes.** While a repository's
+  refresh is still running, further file events wait and are paid with one
+  trailing refresh, instead of starting overlapping reads of the same
+  repository.
+- **Closing a tab group now releases its tabs like closing a single tab.** Their
+  per-repository records and cached journals no longer outlive them.
+- **A peer that sends a byte at a time can no longer hold a local socket open.**
+  The alert bridge and the code-index daemon probe each cut a connection at one
+  wall-clock deadline, and the two private copies of that deadline in the Lappi
+  and local-model clients are now one. A panic while updating the native menu is
+  reported to the command that asked, instead of ending the app.
 - **One failing GitHub alert tier no longer hides the others.**
   - Severity tiers are fetched three at a time, all under one 20 s deadline.
   - A tier that fails or runs out of time is named as missing, and Health shows

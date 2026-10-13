@@ -133,7 +133,10 @@ impl Fixture {
         text.lines()
             .filter_map(|line| {
                 let mut parts = line.split_whitespace();
-                Some((parts.next()?.parse().ok()?, parts.next()?.parse().ok()?))
+                let child: i32 = parts.next()?.parse().ok()?;
+                let grandchild: i32 = parts.next()?.parse().ok()?;
+                // 0, 1 and negatives address more than one process.
+                (child > 1 && grandchild > 1).then_some((child, grandchild))
             })
             .collect()
     }

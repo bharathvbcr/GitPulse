@@ -2,6 +2,8 @@ import { derived, writable, type Readable } from "svelte/store";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { invoke } from "../ipc/invoke";
 import { isTauri } from "../platform";
+import { refusalNotice } from "../health/hostLoad";
+import { toastStore } from "./toastStore";
 
 /**
  * Host load as the app's sampler publishes it (`src-tauri/src/sysload`,
@@ -202,11 +204,66 @@ export interface ProcView {
   orphans: Orphan[];
 }
 
+/** What the governor says is binding (`sysload::Binding`). */
+export type Binding = "memory_pressure" | "compressor_thrash";
+export type Tier = "clear" | "elevated" | "severe";
+export type Reason =
+  | "healthy"
+  | "elevated"
+  | "pressure"
+  | "launch_gate_off"
+  | "sensor_unavailable"
+  | "switched_off"
+  | "not_governed";
+
+/** Which of the spawn gate's classes are shed; a user action never is. */
+export interface Shed {
+  background: boolean;
+  reactive: boolean;
+}
+
+export interface GovernorVerdict {
+  admit: boolean;
+  shed: Shed;
+  reason: Reason;
+  tier: Tier;
+  binding: Binding | null;
+  sensor: SensorState;
+  age_ms: number | null;
+  message: string;
+  warnings: string[];
+}
+
+/** `sysload::GovernorReport`: the verdict, how long refusal has run, a live override. */
+export interface GovernorReport {
+  verdict: GovernorVerdict;
+  refusing_for_s: number | null;
+  notice: boolean;
+  largest_foreign: number | null;
+  override_remaining_s: number | null;
+}
+
+/** `sysload::GovernorPulse`: the part of the report each tick carries. */
+export interface GovernorPulse {
+  admit: boolean;
+  shed_background: boolean;
+  shed_reactive: boolean;
+  binding: Binding | null;
+  refusing_for_s: number | null;
+  notice: boolean;
+  overridden: boolean;
+  largest_foreign: number | null;
+}
+
+/** The error code a refused agent launch carries (`sysload::REFUSAL_CODE`). */
+export const HOST_PRESSURE_REFUSAL = "host_pressure";
+
 export interface HostLoadStatus {
   platform: Platform;
   role: Role;
   sensor: SensorReport;
   pressure: PressureInput;
+  governor: GovernorReport;
   snapshot_path: string | null;
   writer: WriterIdentity | null;
   writer_is_self: boolean;
@@ -224,10 +281,13 @@ export interface HostLoadPulse {
   enabled: boolean;
   compressor_thrash: boolean;
   role: Role;
+  governor: GovernorPulse;
 }
 
 export interface HostLoadSettings {
   enabled: boolean;
+  /** Whether severe pressure refuses agent launches (`host_load.govern_launches`). */
+  govern_launches: boolean;
 }
 
 /** The event the app's sampler emits after every tick. */
@@ -243,6 +303,16 @@ export function pulseOf(status: HostLoadStatus): HostLoadPulse {
     enabled: status.sensor.enabled ?? false,
     compressor_thrash: status.snapshot?.compressor_thrash ?? false,
     role: status.role,
+    governor: {
+      admit: status.governor.verdict.admit,
+      shed_background: status.governor.verdict.shed.background,
+      shed_reactive: status.governor.verdict.shed.reactive,
+      binding: status.governor.verdict.binding,
+      refusing_for_s: status.governor.refusing_for_s,
+      notice: status.governor.notice,
+      overridden: status.governor.override_remaining_s !== null,
+      largest_foreign: status.governor.largest_foreign,
+    },
   };
 }
 
@@ -250,6 +320,34 @@ const pulseStore = writable<HostLoadPulse | null>(null);
 const statusStore = writable<HostLoadStatus | null>(null);
 
 let listening: Promise<UnlistenFn | null> | null = null;
+let noticeShown = false;
+
+/**
+ * Tells the person, once per run, that launches have been refused for 30
+ * minutes, with the one click that stops it. The refusal itself never lifts
+ * on its own: a deny that quietly became an allow would be the failure this
+ * notice exists to prevent, so the flip is the person's.
+ */
+function announceRefusal(pulse: HostLoadPulse): void {
+  if (!pulse.governor.notice) {
+    noticeShown = false;
+    return;
+  }
+  if (noticeShown) return;
+  noticeShown = true;
+  toastStore.add({
+    kind: "warning",
+    message: refusalNotice(pulse.governor),
+    duration: 0,
+    action: {
+      label: "Stop refusing launches",
+      onClick: async () => {
+        const settings = await loadHostLoadSettings();
+        await saveHostLoadSettings({ ...settings, govern_launches: false });
+      },
+    },
+  });
+}
 
 /**
  * Starts listening for the sampler's pulse, once per page, and reads the
@@ -260,6 +358,7 @@ export function startHostLoad(): void {
   if (listening || !isTauri()) return;
   listening = listen<HostLoadPulse>(HOST_LOAD_PULSE_EVENT, (event) => {
     pulseStore.set(event.payload);
+    announceRefusal(event.payload);
   }).catch(() => null);
   void refreshHostLoad().catch(() => undefined);
 }
@@ -283,8 +382,22 @@ export async function terminateOrphan(pid: number, startUs: number): Promise<str
   return message;
 }
 
+/**
+ * A person's "Admit anyway" on a refused agent launch. The backend asks in a
+ * native dialog that page script cannot answer, then admits launches for two
+ * minutes; a No rejects, so a caller must not retry on a rejection.
+ */
+export async function admitAnyway(): Promise<string> {
+  const message = await invoke<string>("cmd_host_load_admit_anyway");
+  void refreshHostLoad().catch(() => undefined);
+  return message;
+}
+
 /** Mirrors `HostLoadSettings::default` in Rust: on. */
-export const DEFAULT_HOST_LOAD_SETTINGS: HostLoadSettings = { enabled: true };
+export const DEFAULT_HOST_LOAD_SETTINGS: HostLoadSettings = {
+  enabled: true,
+  govern_launches: true,
+};
 
 export async function loadHostLoadSettings(): Promise<HostLoadSettings> {
   if (!isTauri()) return DEFAULT_HOST_LOAD_SETTINGS;
@@ -313,6 +426,7 @@ export const hostPressure: Readable<PressureInput> = derived(
 /** Test seam: resets the module state between tests. */
 export function resetHostLoadForTests(): void {
   listening = null;
+  noticeShown = false;
   pulseStore.set(null);
   statusStore.set(null);
 }

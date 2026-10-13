@@ -90,7 +90,13 @@ where
     T: Send + 'static,
 {
     let mut timing = crate::logging::performance::CommandTiming::queue(std::any::type_name::<F>());
+    // A test's governor injection is thread-local; carry it to the pool thread
+    // so a test can drive the real command under pressure.
+    #[cfg(test)]
+    let injected = crate::sysload::injected_governor_input();
     tauri::async_runtime::spawn_blocking(move || {
+        #[cfg(test)]
+        let _carried = injected.map(crate::sysload::inject_governor);
         timing.start();
         // Every command starts as a deferrable read. `guard` promotes the
         // rest of a mutation's body to a user action, and this scope is what

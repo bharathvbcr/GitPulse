@@ -125,7 +125,7 @@ pub async fn cmd_write_file_content(
 ) -> Result<Guarded<()>, String> {
     super::payload::check_content("file content", &content, super::payload::MAX_CONTENT_BYTES)?;
     off_thread(move || {
-        let policy = crate::harness::guard_file(&repo_path, &file_path, "modify")?;
+        let policy = guard_file(&repo_path, &file_path, "modify")?;
         sandbox_write_edited_text(&repo_path, &file_path, &content)?;
         Ok(Guarded { policy, output: () })
     })

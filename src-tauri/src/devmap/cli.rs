@@ -648,15 +648,74 @@ pub fn prepare(repo_path: &str, manifest: bool) -> Result<PreparedBuild, String>
 }
 
 fn prepare_args(repo_path: &str, args: &'static [&'static str]) -> Result<PreparedBuild, String> {
-    let repo = validate_repo(repo_path)?;
-    let guard = BuildGuard::try_acquire(&repo)?;
-    let binary = resolve_binary()?;
-    Ok(PreparedBuild {
-        repo,
-        binary,
-        args,
-        guard,
-    })
+    claim_build(repo_path)
+        .map_err(ClaimRefusal::into_message)?
+        .prepare_args(args)
+}
+
+/// Why [`claim_build`] could not hand out a permit.
+#[derive(Debug)]
+pub enum ClaimRefusal {
+    /// Another probe or build already holds the repository's writer slot.
+    Busy(String),
+    /// The path is not a repository this app may index; the message says why.
+    Invalid(String),
+}
+
+impl ClaimRefusal {
+    fn into_message(self) -> String {
+        match self {
+            ClaimRefusal::Busy(message) | ClaimRefusal::Invalid(message) => message,
+        }
+    }
+}
+
+/// The exclusive right to probe and build one repository's index.
+///
+/// The live gate used to take the per-repository [`BuildGuard`] only when its
+/// build was about to spawn, so every caller that arrived while the first was
+/// still asking `devmap status` ran a status child of its own, and one that
+/// probed just before the first build finished then built a second time behind
+/// it. A permit is the guard claimed *early*: held from the first question to
+/// the last answer, it makes the probe and the build one operation per
+/// repository. A concurrent caller is refused at once ([`ClaimRefusal::Busy`]),
+/// which the live gate maps to `skip_building`; the frontend retries on its own
+/// backoff, and that retry is the coalesced follow-up. It is the same guard
+/// [`PreparedBuild`] holds, handed on by [`BuildPermit::prepare`], not a second
+/// lock beside it.
+#[derive(Debug)]
+pub struct BuildPermit {
+    repo: PathBuf,
+    guard: BuildGuard,
+}
+
+/// Claim `repo_path`'s writer slot, refusing (never queueing) when it is held.
+pub fn claim_build(repo_path: &str) -> Result<BuildPermit, ClaimRefusal> {
+    let repo = validate_repo(repo_path).map_err(ClaimRefusal::Invalid)?;
+    let guard = BuildGuard::try_acquire(&repo).map_err(ClaimRefusal::Busy)?;
+    Ok(BuildPermit { repo, guard })
+}
+
+impl BuildPermit {
+    /// [`prepare`] under this permit: the writer slot stays held, unbroken,
+    /// from the claim to the end of the build.
+    pub fn prepare(self, manifest: bool) -> Result<PreparedBuild, String> {
+        self.prepare_args(if manifest {
+            MANIFEST_BUILD_ARGS
+        } else {
+            INCREMENTAL_BUILD_ARGS
+        })
+    }
+
+    fn prepare_args(self, args: &'static [&'static str]) -> Result<PreparedBuild, String> {
+        let binary = resolve_binary()?;
+        Ok(PreparedBuild {
+            repo: self.repo,
+            binary,
+            args,
+            guard: self.guard,
+        })
+    }
 }
 
 impl PreparedBuild {
@@ -2353,6 +2412,176 @@ exit 2
                 "{command} accepted an explicit failure with exit 0"
             );
         }
+    }
+    /// Install one stub that serves every repository and records, in a shared
+    /// directory, how many stub children are alive at the same moment.
+    ///
+    /// Each repository's own `argv.log` (the stub runs with the repository as
+    /// its working directory) says how many `status` and `build` children that
+    /// repository was charged. `status` and `build` both linger long enough
+    /// that callers released together genuinely overlap.
+    #[cfg(unix)]
+    fn write_overlap_devmap(dir: &Path, gate: &Path) -> PathBuf {
+        let path = dir.join("devmap");
+        let script = format!(
+            r#"#!/bin/sh
+printf '%s\n' "$*" >> argv.log
+touch "{gate}/alive.$$"
+ls "{gate}" | grep -c '^alive\.' >> "{gate}/peak.log"
+if [ "$1" = "status" ]; then
+  sleep 0.3
+  rm -f "{gate}/alive.$$"
+  printf '%s\n' '{{"is_fresh":false,"schema_outdated":false}}'
+  exit 0
+fi
+if [ "$1" = "build" ]; then
+  sleep 0.6
+  rm -f "{gate}/alive.$$"
+  printf '%s\n' '{{"ok":true}}'
+  exit 0
+fi
+rm -f "{gate}/alive.$$"
+exit 2
+"#,
+            gate = gate.display()
+        );
+        fs::write(&path, script).expect("write overlap devmap");
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = fs::metadata(&path).expect("meta").permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&path, perms).expect("chmod");
+        path
+    }
+
+    #[cfg(unix)]
+    fn count_argv(repo: &Path, verb: &str) -> usize {
+        argv_log(repo)
+            .lines()
+            .filter(|line| line.split_whitespace().next() == Some(verb))
+            .count()
+    }
+
+    /// A watcher storm that reaches `maybe_refresh` from many threads at once,
+    /// for several repositories, costs each repository one probe and at most
+    /// one build, and never more live children than the background class may
+    /// hold.
+    ///
+    /// The per-repo guard used to be taken only when the build spawned, so every
+    /// caller that arrived while the first was still probing ran its own
+    /// `devmap status` child, and a caller that probed before the first build
+    /// finished then ran a second, redundant build behind it.
+    #[test]
+    #[cfg(unix)]
+    fn concurrent_live_refreshes_cost_one_probe_and_one_build_per_repo() {
+        const REPOS: usize = 4;
+        const CALLERS: usize = 6;
+        let _lock = crate::harness::sidecar::test_serial();
+        let repos: Vec<_> = (0..REPOS).map(|_| git_repo()).collect();
+        let canonical: Vec<String> = repos
+            .iter()
+            .map(|repo| {
+                repo.path()
+                    .canonicalize()
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        let gate = tempfile::TempDir::new().expect("gate dir");
+        let bin_dir = tempfile::TempDir::new().expect("bin dir");
+        let bin = write_overlap_devmap(bin_dir.path(), gate.path());
+        let _bound = bind_test_binary(bin.to_string_lossy().into_owned());
+
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(REPOS * CALLERS));
+        let mut handles = Vec::new();
+        for path in &canonical {
+            for _ in 0..CALLERS {
+                let (path, barrier) = (path.clone(), std::sync::Arc::clone(&barrier));
+                handles.push(std::thread::spawn(move || {
+                    barrier.wait();
+                    crate::engine::git_cli::with_background_processes(|| {
+                        crate::devmap::maybe_refresh(&path, true)
+                    })
+                }));
+            }
+        }
+        let outcomes: Vec<_> = handles
+            .into_iter()
+            .map(|handle| handle.join().expect("refresh thread"))
+            .collect();
+
+        let mut total_builds = 0;
+        for repo in &repos {
+            let statuses = count_argv(repo.path(), "status");
+            let builds = count_argv(repo.path(), "build");
+            assert!(
+                statuses <= 1,
+                "{statuses} probes for one repo:\n{}",
+                argv_log(repo.path())
+            );
+            assert!(
+                builds <= 1,
+                "{builds} builds for one repo:\n{}",
+                argv_log(repo.path())
+            );
+            total_builds += builds;
+        }
+        assert!(
+            total_builds >= 1,
+            "the storm never produced a build: {outcomes:?}"
+        );
+        let refreshed = outcomes
+            .iter()
+            .filter(|outcome| outcome.decision == crate::devmap::LiveRefreshDecision::Refresh)
+            .count();
+        assert_eq!(
+            refreshed, total_builds,
+            "a refresh decision without a build: {outcomes:?}"
+        );
+        let peak = fs::read_to_string(gate.path().join("peak.log"))
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|line| line.trim().parse::<usize>().ok())
+            .max()
+            .unwrap_or(0);
+        assert!(
+            (1..=4).contains(&peak),
+            "background devmap children alive at once: {peak}"
+        );
+    }
+
+    /// A caller turned away by a held permit spawns nothing and is told the
+    /// writer is busy; the same call is admitted the moment the permit drops.
+    #[test]
+    #[cfg(unix)]
+    fn a_held_permit_turns_a_live_refresh_away_without_a_probe() {
+        let _lock = crate::harness::sidecar::test_serial();
+        let repo = git_repo();
+        let canonical = repo.path().canonicalize().unwrap();
+        let path = canonical.to_str().unwrap();
+        let _devmap = bind_recording_devmap(repo.path());
+        let permit = claim_build(path).expect("first claim");
+        assert!(claim_build(path).is_err(), "a second claim must be refused");
+        let busy = crate::devmap::maybe_refresh(path, true);
+        assert_eq!(
+            busy.decision,
+            crate::devmap::LiveRefreshDecision::SkipBuilding
+        );
+        assert!(busy.facts.already_building, "{busy:?}");
+        assert_eq!(
+            argv_log(repo.path()),
+            "",
+            "a refused caller spawned a child"
+        );
+        drop(permit);
+        assert!(!is_build_in_flight(path));
+        let admitted = crate::devmap::maybe_refresh(path, true);
+        assert_ne!(
+            admitted.decision,
+            crate::devmap::LiveRefreshDecision::SkipBuilding,
+            "{admitted:?}"
+        );
+        assert!(count_argv(repo.path(), "status") >= 1);
     }
     /// A repository is indexed by the live gate whenever it is a retained tab,
     /// but initialization runs only for the *active* one. So the build path

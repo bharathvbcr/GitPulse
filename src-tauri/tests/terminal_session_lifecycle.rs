@@ -95,7 +95,7 @@ fn read_pid(path: &std::path::Path, within: Duration) -> i32 {
     let deadline = Instant::now() + within;
     loop {
         if let Ok(text) = std::fs::read_to_string(path) {
-            if let Ok(pid) = text.trim().parse::<i32>() {
+            if let Some(pid) = text.trim().parse::<i32>().ok().filter(|pid| *pid > 1) {
                 return pid;
             }
         }
@@ -526,6 +526,127 @@ fn context_reads_race_spawns_and_closes_without_leaking_a_slot() {
         );
     }
     gitpulse_lib::terminal::shutdown_sessions(&h.state).unwrap();
+}
+
+/// Sixteen closers on one session, plus a bystander session and a process in
+/// a group of its own: exactly one close does the stopping, every other closer
+/// returns Ok without signalling anything, a close after the session is gone is
+/// a no-op, and nothing outside the session is touched.
+#[test]
+fn sixteen_closers_of_one_session_stop_it_once_and_touch_nothing_else() {
+    use std::os::unix::process::CommandExt;
+    let h = harness();
+    let _cleanup = TerminalCleanup(h.state.clone());
+    let dir = repo();
+    let pidfile = dir.path().join("job.pid");
+    let doomed = spawn_session(
+        h.app.handle(),
+        &h.state,
+        dir.path().to_str().unwrap(),
+        24,
+        80,
+        Some("/bin/bash".into()),
+        Some(vec!["-i".into()]),
+        None,
+    )
+    .unwrap();
+    write_to_session(
+        &h.state,
+        &doomed.id,
+        &format!("sleep 30 & echo $! > '{}'; echo armed\n", pidfile.display()),
+    )
+    .unwrap();
+    assert!(wait_for_output(&h.output, "armed", Duration::from_secs(10)));
+    let job = read_pid(&pidfile, Duration::from_secs(5));
+    let bystander = spawn_session(
+        h.app.handle(),
+        &h.state,
+        dir.path().to_str().unwrap(),
+        24,
+        80,
+        Some("/bin/sh".into()),
+        Some(vec!["-c".into(), "sleep 30".into()]),
+        None,
+    )
+    .unwrap();
+    let mut outsider = std::process::Command::new("sleep")
+        .arg("30")
+        .process_group(0)
+        .spawn_locked()
+        .expect("outsider");
+
+    std::thread::scope(|scope| {
+        for _ in 0..16 {
+            scope.spawn(|| {
+                kill_session(&h.state, &doomed.id).expect("every closer is answered");
+            });
+        }
+    });
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while alive(job) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let survived = alive(job);
+    // SAFETY: the job is this test's own grandchild.
+    unsafe { libc::kill(job, libc::SIGKILL) };
+    assert!(!survived, "the session's job outlived its close");
+    kill_session(&h.state, &doomed.id).expect("closing a closed session is a no-op");
+    assert!(
+        outsider.try_wait().unwrap().is_none(),
+        "a close reached a process outside the session"
+    );
+    assert!(
+        gitpulse_lib::terminal::list_sessions(&h.state)
+            .iter()
+            .any(|listing| listing.id == bystander.id),
+        "closing one session ended another"
+    );
+    let _ = outsider.kill();
+    let _ = outsider.wait();
+}
+
+/// A close is marked as GitPulse's own before the first signal leaves, so a
+/// reader that sees the child die never counts our hangup as an external death.
+/// The shell traps SIGHUP and records that it arrived; at that moment the close
+/// is still waiting out its grace, so the session must already read as ending.
+#[test]
+fn a_close_marks_the_session_ended_by_gitpulse_before_it_signals() {
+    let h = harness();
+    let _cleanup = TerminalCleanup(h.state.clone());
+    let dir = repo();
+    let marker = dir.path().join("hup.seen");
+    let script = format!(
+        "trap 'echo hup > {}; sleep 20' HUP; echo armed; while :; do sleep 0.1; done",
+        marker.display()
+    );
+    let session = spawn_session(
+        h.app.handle(),
+        &h.state,
+        dir.path().to_str().unwrap(),
+        24,
+        80,
+        Some("/bin/bash".into()),
+        Some(vec!["-c".into(), script]),
+        None,
+    )
+    .unwrap();
+    assert!(wait_for_output(&h.output, "armed", Duration::from_secs(10)));
+    std::thread::scope(|scope| {
+        let closer = scope.spawn(|| kill_session(&h.state, &session.id));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !marker.exists() {
+            assert!(Instant::now() < deadline, "the hangup never arrived");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let ending = gitpulse_lib::terminal::list_sessions(&h.state)
+            .iter()
+            .any(|listing| listing.id == session.id && listing.ending);
+        assert!(
+            ending,
+            "the hangup was sent before the session was marked as ended by GitPulse"
+        );
+        closer.join().unwrap().expect("close finishes");
+    });
 }
 
 mod common;

@@ -237,7 +237,12 @@
           check("first launch creates one session", spawned.length === 1);
           check("prompt is not typed into a shell", writes.length === 0);
           await launch("claude"); await until(() => spawned.some(row => row.program === "claude"));
-          check("Claude receives same prompt", JSON.stringify(spawned.find(row => row.program === "claude").args) === JSON.stringify(expectedArgv("claude", expectedPrompt)));
+          // A hosted Claude launch is given a session id in front of its own
+          // arguments (`withSessionId`), so a killed conversation can be resumed.
+          const claudeArgs = spawned.find(row => row.program === "claude").args;
+          check("Claude receives same prompt, after the hosted session id",
+            claudeArgs[0] === "--session-id" && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(claudeArgs[1])
+              && JSON.stringify(claudeArgs.slice(2)) === JSON.stringify(expectedArgv("claude", expectedPrompt)));
           button("Hide the terminal dock").click(); await tick();
           button("View agent session").click(); await tick();
           check("view agent reopens existing tab without spawning", spawned.length === 2 && visible('[role="tab"][aria-selected="true"]').some(node => node.textContent.includes("Claude")));

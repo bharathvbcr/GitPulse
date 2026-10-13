@@ -13,14 +13,20 @@ use crate::harness::{guard_command, PolicyVerdict};
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::Engine;
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
+mod executor;
 mod flow;
 pub(crate) mod foreground;
+pub mod incident;
 #[cfg(unix)]
 mod input;
+mod ipc;
+use executor::Executor;
 use flow::{OutputFlow, Route};
+pub use ipc::{control_async, resize_async, write_async};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::io::{Read, Write};
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -49,11 +55,76 @@ const TERMINAL_ARGV_BYTES_CAP: usize = 128 * 1024;
 pub const DEFAULT_PTY_SESSIONS: usize = 32;
 /// The most a user may choose. Each session is a PTY pair, a reader thread
 /// and an output window of `flow::OUTPUT_WINDOW` (256 KiB), so this bounds
-/// those at 256 descriptors, 128 threads and 32 MiB — and stays well inside
-/// macOS's system-wide PTY allowance (`kern.tty.ptmx_max`, 511 by default),
-/// which every other terminal on the machine shares.
+/// those at 256 descriptors, 128 reader threads and 32 MiB — and stays well
+/// inside macOS's system-wide PTY allowance (`kern.tty.ptmx_max`, 511 by
+/// default), which every other terminal on the machine shares. Threads beyond
+/// the readers are on demand and end when idle (see `executor`): at most two
+/// per session (its input and geometry lanes), and a control pool as wide as
+/// this, so 128 + 256 + 128 at the very worst.
 pub const MAX_PTY_SESSIONS: usize = 128;
 const MAX_PTY_INPUT_BYTES: usize = 64 * 1024;
+/// Writes that may wait behind the one being delivered to a session. The
+/// frontend sends one at a time and waits for each, so this is headroom for a
+/// burst of IPC calls, not a working depth; past it a write is refused at once.
+/// Public so the native latency tests and the queue bound share one number.
+pub const INPUT_QUEUE_CAPACITY: usize = 64;
+/// Resizes that may wait behind the one being applied to a session.
+pub const GEOMETRY_QUEUE_CAPACITY: usize = 16;
+/// Slow terminal commands (context, close, attach) that may wait for a thread.
+const CONTROL_QUEUE_CAPACITY: usize = 256;
+/// How long a session's lane thread outlives its last job.
+const LANE_IDLE: Duration = Duration::from_secs(30);
+/// How long a control-pool thread outlives its last job.
+const CONTROL_IDLE: Duration = Duration::from_secs(5);
+/// Words that mark an answer as "there is no session any more". The frontend
+/// ends a tab's input on an answer carrying one (`inputQueue.ts::sessionIsGone`,
+/// matched as whole words, ignoring case) and on nothing else a backend says;
+/// every other refusal drops one chunk of a session that is still there. Its
+/// `SESSION_GONE_MARKERS` is checked against this line by text, so a message
+/// that means "gone" must carry one of these, and one that does not must not.
+pub const SESSION_GONE_MARKERS: [&str; 3] = ["not found", "session is closed", "Terminal closed"];
+
+/// Whether the frontend reads `message` as a session that is gone: the same
+/// rule as `sessionIsGone`, for tests that hold a backend answer to it.
+#[doc(hidden)]
+pub fn reads_as_session_gone(message: &str) -> bool {
+    let lower = message.to_lowercase();
+    let word = |c: Option<char>| c.is_some_and(|c| c.is_alphanumeric() || c == '_');
+    SESSION_GONE_MARKERS.iter().any(|marker| {
+        let marker = marker.to_lowercase();
+        lower.match_indices(&marker).any(|(at, _)| {
+            !word(lower[..at].chars().next_back())
+                && !word(lower[at + marker.len()..].chars().next())
+        })
+    })
+}
+
+#[cfg(test)]
+#[test]
+fn reads_as_session_gone_matches_whole_words_ignoring_case() {
+    for gone in [
+        "Terminal session 'term-1' not found",
+        "Terminal session is closed",
+        "terminal closed after writing 0 of 9 input bytes",
+        "x: NOT FOUND.",
+    ] {
+        assert!(reads_as_session_gone(gone), "{gone}");
+    }
+    for live in [
+        "The terminal input queue is full (64 waiting); try again in a moment",
+        "Terminal is busy; the resize gave up after 2000ms",
+        "Terminal input timed out after writing 3 of 6 bytes; input was not retried",
+        "cannot_found",
+        "xnot found",
+        "not foundry",
+        "Terminal closedown",
+    ] {
+        assert!(!reads_as_session_gone(live), "{live}");
+    }
+}
+
+/// How long a resize waits for the master lock before it answers "busy".
+const MASTER_LOCK_BUDGET: Duration = Duration::from_secs(2);
 const MAX_PTY_ROWS: u16 = 1_000;
 const MAX_PTY_COLS: u16 = 1_000;
 
@@ -106,9 +177,16 @@ pub struct TerminalSpawned {
     pub cwd: String,
 }
 
-/// Bytes one `read` may reserve. The renderer refuses a reserved length
-/// outside `1..=OUTPUT_CHUNK_BYTES` instead of guessing one from base64.
-pub const OUTPUT_CHUNK_BYTES: usize = 4096;
+/// Bytes one `terminal-output` event may carry, and reserve. The renderer
+/// refuses a reserved length outside `1..=OUTPUT_CHUNK_BYTES` instead of
+/// guessing one from base64. Written as a literal: the frontend's
+/// `MAX_TERMINAL_OUTPUT_CHUNK` is checked against this line by text.
+///
+/// This is the size of an *event*, not of a `read`: the reader gathers what the
+/// program has printed into one event because each event is a script evaluated
+/// in the webview, and the kernel hands a macOS PTY reader at most 1 KiB at a
+/// time. Event-per-read made a flood cost one evaluation per KiB.
+pub const OUTPUT_CHUNK_BYTES: usize = 16384;
 
 #[derive(Clone, Serialize)]
 pub struct TerminalOutputPayload {
@@ -129,7 +207,7 @@ fn output_payload_names_the_reserved_length() {
     let value = serde_json::to_value(&payload).unwrap();
     assert_eq!(value["bytes"], 1);
     assert_eq!(value["data_b64"], "QQ==");
-    assert_eq!(OUTPUT_CHUNK_BYTES, 4096);
+    assert_eq!(OUTPUT_CHUNK_BYTES, 16384);
 }
 
 /// Output a live session's view will never see. The process keeps running;
@@ -148,6 +226,21 @@ pub const SHED_NOTICE: &str = "Terminal output was skipped while this window was
 /// sheds instead. Long enough that a busy page is not shed for a hiccup;
 /// shedding no longer costs the process, only skipped output.
 pub const DEFAULT_OUTPUT_STALL: Duration = Duration::from_secs(30);
+
+/// Output at least this large, read and still dry, is the front of a stream
+/// rather than an echo or a prompt, and is worth a short wait for more. Below
+/// it the reader sends at once: a typed character must not pay for batching.
+#[cfg(unix)]
+const GATHER_MIN_BYTES: usize = 512;
+/// How long a stream may go quiet before what has been gathered is sent. A
+/// producer faster than the reader leaves gaps far shorter than this; a
+/// finished frame leaves a longer one.
+#[cfg(unix)]
+const GATHER_QUIET: Duration = Duration::from_millis(2);
+/// The longest output waits to be sent once it has begun to be gathered, so a
+/// steady trickle still reaches the view this often.
+#[cfg(unix)]
+const GATHER_MAX_HOLD: Duration = Duration::from_millis(8);
 
 #[derive(Clone, Serialize)]
 pub struct TerminalExitPayload {
@@ -179,6 +272,12 @@ struct SessionEntry {
     /// Canonical repository root. `spawned.cwd` is where the process started,
     /// which may be a directory inside it.
     repo: std::path::PathBuf,
+    /// Where this session's keystrokes are written: one thread, in order, so a
+    /// child that has stopped reading delays only its own input.
+    input: Executor,
+    /// Where this session's resizes are applied, apart from `input` so a
+    /// write spinning on a full tty never holds a resize behind it.
+    geometry: Executor,
 }
 
 /// Thread-safe registry of live PTY sessions.
@@ -193,6 +292,12 @@ pub struct TerminalSessions {
     /// Milliseconds a reader waits on an unacknowledged window before it
     /// sheds (`DEFAULT_OUTPUT_STALL`). Live, so a test can shorten it.
     output_stall_ms: Arc<AtomicU64>,
+    /// Mass external-signal deaths, recorded once each (see [`incident`]).
+    incidents: Arc<incident::Recorder>,
+    /// The slower commands that are not per keystroke, off the pool every git
+    /// command shares (see `executor`). As wide as the session cap, so closing
+    /// every tab at once still closes them side by side, as it did.
+    control: Executor,
 }
 
 impl Default for TerminalSessions {
@@ -202,11 +307,46 @@ impl Default for TerminalSessions {
             active_sessions: Arc::default(),
             limit: Arc::new(AtomicUsize::new(DEFAULT_PTY_SESSIONS)),
             output_stall_ms: Arc::new(AtomicU64::new(DEFAULT_OUTPUT_STALL.as_millis() as u64)),
+            incidents: Arc::default(),
+            control: Executor::new(
+                "control",
+                MAX_PTY_SESSIONS,
+                CONTROL_QUEUE_CAPACITY,
+                CONTROL_IDLE,
+            ),
         }
     }
 }
 
 impl TerminalSessions {
+    /// The lane that delivers `session_id`'s keystrokes.
+    fn input_lane(&self, session_id: &str) -> Result<Executor, String> {
+        self.lock_sessions()
+            .get(session_id)
+            .map(|session| session.input.clone())
+            .ok_or_else(|| format!("Terminal session '{session_id}' not found"))
+    }
+
+    /// Threads alive on the open sessions' input and geometry lanes. A
+    /// process-wide thread count cannot tell these apart from tokio's pool,
+    /// which grows and shrinks on its own; tests that need to see lanes
+    /// retire ask this.
+    #[doc(hidden)]
+    pub fn lane_threads(&self) -> usize {
+        self.lock_sessions()
+            .values()
+            .map(|session| session.input.workers() + session.geometry.workers())
+            .sum()
+    }
+
+    /// The lane that applies `session_id`'s resizes.
+    fn geometry_lane(&self, session_id: &str) -> Result<Executor, String> {
+        self.lock_sessions()
+            .get(session_id)
+            .map(|session| session.geometry.clone())
+            .ok_or_else(|| format!("Terminal session '{session_id}' not found"))
+    }
+
     /// The session map, recovering from a poisoned lock. The map holds only
     /// handles, and every writer inserts or removes one whole entry, so a
     /// panic under the lock cannot leave it half-updated; refusing to read it
@@ -215,6 +355,11 @@ impl TerminalSessions {
         self.sessions
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Recorded mass-death incidents, newest first and bounded.
+    pub fn incidents(&self) -> Vec<incident::TerminalIncidentPayload> {
+        self.incidents.recent()
     }
 
     /// How many sessions may be open at once right now.
@@ -245,6 +390,24 @@ impl TerminalSessions {
     pub fn set_output_stall_timeout(&self, timeout: Duration) {
         let ms = timeout.as_millis().clamp(10, 300_000) as u64;
         self.output_stall_ms.store(ms, Ordering::Release);
+    }
+}
+
+/// Removes a session from the map when its reader thread ends, however it
+/// ends. The normal tail removes the entry itself, before it announces the
+/// exit; this is the road for every other way out, so an entry never outlives
+/// the only thread that could ever finish it.
+struct SessionSlot {
+    sessions: Arc<Mutex<HashMap<String, SessionEntry>>>,
+    id: String,
+}
+
+impl Drop for SessionSlot {
+    fn drop(&mut self) {
+        self.sessions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&self.id);
     }
 }
 
@@ -1313,6 +1476,12 @@ fn spawn_session_inner<R: tauri::Runtime>(
     validate_pty_options(program.as_deref(), args.as_deref(), env.as_ref())?;
     let repo = validate_repo(repo_path)?;
     let start = resolve_start_dir(&repo, start_dir)?;
+    // An agent CLI is a launch the load governor may refuse under severe
+    // memory pressure; the user's own shell (no program) never is.
+    if program.as_deref().is_some_and(|p| !p.trim().is_empty()) {
+        crate::sysload::admit(crate::sysload::Site::PtySpawn, &repo.to_string_lossy())
+            .map_err(|refused| refused.message())?;
+    }
     let reservation = reserve_session(state)?;
     let pty_system = native_pty_system();
     let size = bounded_pty_size(rows, cols);
@@ -1454,6 +1623,8 @@ fn spawn_session_inner<R: tauri::Runtime>(
             cwd: start.to_string_lossy().into_owned(),
         },
         repo: repo.clone(),
+        input: Executor::new("input", 1, INPUT_QUEUE_CAPACITY, LANE_IDLE),
+        geometry: Executor::new("geometry", 1, GEOMETRY_QUEUE_CAPACITY, LANE_IDLE),
     };
 
     {
@@ -1477,8 +1648,11 @@ fn spawn_session_inner<R: tauri::Runtime>(
     let thread_child = child.clone();
     let thread_master = master.clone();
     let thread_observer = observer.clone();
+    let incident_log = state.incidents.clone();
+    let incident_program = shell.clone();
+    let incident_cwd = start.to_string_lossy().into_owned();
     if start_error.is_some() {
-        dead.store(true, Ordering::Release);
+        dead.store(true, Ordering::SeqCst);
         output_flow.stop();
         if let Err(error) = terminate_pty_child(&child, &master) {
             log::error!(target: "terminal", "could not stop a task session after bookkeeping failure: {error}");
@@ -1489,105 +1663,173 @@ fn spawn_session_inner<R: tauri::Runtime>(
     // the reader thread outlives every borrow it could otherwise take.
     let watcher = SessionWatcher::new(&session_id, &resolved, &repo);
 
+    let slot = SessionSlot {
+        sessions: state.sessions.clone(),
+        id: session_id.clone(),
+    };
     let reader_thread = crate::supervisor::spawn_once(
         format!("pty-read-{session_id}"),
         "terminal reader",
         move || {
+            // Dropped when this thread ends by any road, a panic included.
+            let _slot = slot;
             let mut reservation = Some(reservation);
             let mut failure = None;
             let mut watcher = watcher;
+            // One event's worth: output is gathered here until the tty has
+            // nothing more queued, or the event is full.
             let mut buf = [0u8; OUTPUT_CHUNK_BYTES];
+            // How much of `buf` is read but not yet sent. Invariant at the top
+            // of the loop: `filled < buf.len()`, so a read never has an empty
+            // slice to fill (which would answer `Ok(0)`, the end of the tty).
+            let mut filled = 0usize;
+            // When `buf` last went from empty to holding output.
+            #[cfg_attr(not(unix), allow(unused_assignments, unused_variables))]
+            let mut gathering_since = Instant::now();
             // Logged once per run of failures, not once per chunk.
             let mut emit_failing = false;
-            loop {
-                match reader.read(&mut buf) {
-                    Ok(0) => break,
+            // Sends `data` to the view as one event. A reservation that fails
+            // (the flow was stopped) ends the process, as before; everything
+            // else (a view that is detached, behind, or whose emit failed) is
+            // handled here and never ends it.
+            let mut deliver = |data: &[u8], failure: &mut Option<String>| {
+                let n = data.len();
+                let stall = Duration::from_millis(output_stall_ms.load(Ordering::Acquire));
+                let delivery = output_flow.reserve(n, stall).map(|route| {
+                    let resumed = match route {
+                        // Detached: the page that would paint this is gone.
+                        // The process keeps running; the bytes are not sent.
+                        Route::Hold => return,
+                        // The view is alive but behind. Never a reason to
+                        // end the process: drop, keep draining, say so once.
+                        Route::Shed { began } => {
+                            if began {
+                                log::warn!(
+                                    target: "terminal",
+                                    "{program_for_log} terminal: view did not acknowledge output for {}ms; skipping output until it catches up (process left running)",
+                                    stall.as_millis()
+                                );
+                                if let Err(error) = app_handle.emit("terminal-loss", TerminalLossPayload {
+                                    id: sid_for_thread.clone(),
+                                    message: SHED_NOTICE.into(),
+                                }) {
+                                    log::warn!(target: "terminal", "{program_for_log} terminal: could not report skipped output: {error}");
+                                }
+                            }
+                            return;
+                        }
+                        Route::Resume => true,
+                        Route::Deliver => false,
+                    };
+                    let sent = app_handle.emit("terminal-output", TerminalOutputPayload {
+                        id: sid_for_thread.clone(),
+                        data_b64: BASE64_STANDARD.encode(data),
+                        bytes: n,
+                    });
+                    match sent {
+                        Ok(()) => {
+                            emit_failing = false;
+                            if resumed {
+                                log::info!(target: "terminal", "{program_for_log} terminal: view caught up; output resumed");
+                                repaint_current(&thread_master);
+                            }
+                        }
+                        // A failed emit is the event loop's trouble,
+                        // not the process's; it keeps running. Shed
+                        // as after a stall (see `OutputFlow::shed`).
+                        Err(error) => {
+                            if !std::mem::replace(&mut emit_failing, true) {
+                                log::warn!(target: "terminal", "{program_for_log} terminal: failed to emit terminal-output, skipping output: {error}");
+                            }
+                            if output_flow.shed(n) {
+                                if let Err(error) = app_handle.emit("terminal-loss", TerminalLossPayload {
+                                    id: sid_for_thread.clone(),
+                                    message: SHED_NOTICE.into(),
+                                }) {
+                                    log::warn!(target: "terminal", "{program_for_log} terminal: could not report skipped output: {error}");
+                                }
+                            }
+                        }
+                    }
+                });
+                if let Err(error) = delivery {
+                    if !dead_flag.swap(true, Ordering::SeqCst) {
+                        *failure = Some(error);
+                        output_flow.stop();
+                        if let Err(error) = terminate_pty_child(&thread_child, &thread_master) {
+                            log::warn!(target: "terminal", "could not signal failed terminal: {error}");
+                        }
+                    }
+                }
+            };
+            // Sends what has been gathered, unless the session is being torn
+            // down: then the bytes are only drained, as `dead_flag` always did.
+            macro_rules! flush {
+                () => {
+                    if filled > 0 && !dead_flag.load(Ordering::Relaxed) {
+                        deliver(&buf[..filled], &mut failure);
+                    }
+                    filled = 0;
+                };
+            }
+            // A panic anywhere in the loop (the scanner, an event listener) is
+            // contained here: the thread must not end with the child alive and
+            // nothing reading its tty, which is a session "running" forever.
+            let pumped = catch_unwind(AssertUnwindSafe(|| loop {
+                match reader.read(&mut buf[filled..]) {
+                    Ok(0) => {
+                        flush!();
+                        break;
+                    }
                     Ok(n) => {
                         // Read before the liveness check below: a session being
                         // torn down can still be asking for attention, and this
                         // costs one pass over bytes already in cache.
-                        watcher.observe(&buf[..n]);
+                        watcher.observe(&buf[filled..filled + n]);
+                        if filled == 0 {
+                            gathering_since = Instant::now();
+                        }
+                        filled += n;
                         // On close, drain kernel output until EOF. Leaving a
                         // full tty queue undrained can prevent a killed writer
                         // from completing on macOS, stranding its process slot.
                         if dead_flag.load(Ordering::Relaxed) {
+                            filled = 0;
                             continue;
                         }
-                        let stall = Duration::from_millis(output_stall_ms.load(Ordering::Acquire));
-                        let delivery = output_flow.reserve(n, stall).map(|route| {
-                            let resumed = match route {
-                                // Detached: the page that would paint this is gone.
-                                // The process keeps running; the bytes are not sent.
-                                Route::Hold => return,
-                                // The view is alive but behind. Never a reason to
-                                // end the process: drop, keep draining, say so once.
-                                Route::Shed { began } => {
-                                    if began {
-                                        log::warn!(
-                                            target: "terminal",
-                                            "{program_for_log} terminal: view did not acknowledge output for {}ms; skipping output until it catches up (process left running)",
-                                            stall.as_millis()
-                                        );
-                                        if let Err(error) = app_handle.emit("terminal-loss", TerminalLossPayload {
-                                            id: sid_for_thread.clone(),
-                                            message: SHED_NOTICE.into(),
-                                        }) {
-                                            log::warn!(target: "terminal", "{program_for_log} terminal: could not report skipped output: {error}");
-                                        }
-                                    }
-                                    return;
-                                }
-                                Route::Resume => true,
-                                Route::Deliver => false,
-                            };
-                            let sent = app_handle.emit("terminal-output", TerminalOutputPayload {
-                                id: sid_for_thread.clone(),
-                                data_b64: BASE64_STANDARD.encode(&buf[..n]),
-                                bytes: n,
-                            });
-                            match sent {
-                                Ok(()) => {
-                                    emit_failing = false;
-                                    if resumed {
-                                        log::info!(target: "terminal", "{program_for_log} terminal: view caught up; output resumed");
-                                        repaint_current(&thread_master);
-                                    }
-                                }
-                                // A failed emit is the event loop's trouble,
-                                // not the process's; it keeps running. Shed
-                                // as after a stall (see `OutputFlow::shed`).
-                                Err(error) => {
-                                    if !std::mem::replace(&mut emit_failing, true) {
-                                        log::warn!(target: "terminal", "{program_for_log} terminal: failed to emit terminal-output, skipping output: {error}");
-                                    }
-                                    if output_flow.shed(n) {
-                                        if let Err(error) = app_handle.emit("terminal-loss", TerminalLossPayload {
-                                            id: sid_for_thread.clone(),
-                                            message: SHED_NOTICE.into(),
-                                        }) {
-                                            log::warn!(target: "terminal", "{program_for_log} terminal: could not report skipped output: {error}");
-                                        }
-                                    }
-                                }
-                            }
-                        });
-                        if let Err(error) = delivery {
-                            if !dead_flag.swap(true, Ordering::SeqCst) {
-                                failure = Some(error);
-                                output_flow.stop();
-                                if let Err(error) =
-                                    terminate_pty_child(&thread_child, &thread_master)
-                                {
-                                    log::warn!(target: "terminal", "could not signal failed terminal: {error}");
-                                }
-                            }
+                        // Keep reading while the tty has more: the kernel hands
+                        // out a KiB or so per read, and an event per read is a
+                        // script evaluated in the webview per KiB. A full
+                        // event goes now; otherwise the WouldBlock arm below
+                        // sends what has been gathered once the tty is dry.
+                        // Off Unix the read blocks and never says WouldBlock,
+                        // so each read is its own event there.
+                        if filled == buf.len() || cfg!(not(unix)) {
+                            flush!();
                         }
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
                     #[cfg(unix)]
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                        // Nothing is queued, so everything the session printed
-                        // has been read. A job left running in the background
+                        // Nothing is queued. Output that looks like a stream may
+                        // be only a gap in one: give it a moment, never past
+                        // `GATHER_MAX_HOLD` from the first byte.
+                        if filled >= GATHER_MIN_BYTES {
+                            let held = gathering_since.elapsed();
+                            if held < GATHER_MAX_HOLD {
+                                let wait = GATHER_QUIET.min(GATHER_MAX_HOLD - held);
+                                if matches!(
+                                    input::wait_for_output_within(reader_fd, wait),
+                                    Ok(true)
+                                ) {
+                                    continue;
+                                }
+                            }
+                        }
+                        // Everything the session printed has been read: send
+                        // it before waiting for more.
+                        flush!();
+                        // A job left running in the background
                         // (`sleep &`, a dev server) still holds the terminal
                         // open, and EOF will not come while it lives: the
                         // session is over when its own process is, the way
@@ -1612,8 +1854,13 @@ fn spawn_session_inner<R: tauri::Runtime>(
                             break;
                         }
                     }
-                    Err(e) if is_end_of_terminal(&e) => break,
+                    Err(e) if is_end_of_terminal(&e) => {
+                        flush!();
+                        break;
+                    }
                     Err(e) => {
+                        // What was read before the failure is still output.
+                        flush!();
                         // The shell may still be running, with nothing left
                         // reading what it prints or delivering what is typed:
                         // stop it and say why, rather than leave a frozen tab.
@@ -1627,8 +1874,26 @@ fn spawn_session_inner<R: tauri::Runtime>(
                         break;
                     }
                 }
+            }));
+            if let Err(payload) = pumped {
+                // Not "terminal reader": every reader that ends normally
+                // clears that record, which would erase this one at once.
+                crate::supervisor::note_stopped("terminal reader panic", payload.as_ref());
+                failure.get_or_insert_with(|| {
+                    format!(
+                        "Terminal output reader panicked: {}",
+                        crate::supervisor::payload_text(payload.as_ref())
+                    )
+                });
+                dead_flag.store(true, Ordering::SeqCst);
+                output_flow.stop();
+                if let Err(error) = terminate_pty_child(&thread_child, &thread_master) {
+                    log::warn!(target: "terminal", "could not signal a terminal whose reader panicked: {error}");
+                }
             }
 
+            // Read before the store below: set means GitPulse ended it.
+            let ended_by_gitpulse = dead_flag.load(Ordering::SeqCst);
             dead_flag.store(true, Ordering::SeqCst);
             output_flow.stop();
             watcher.ended();
@@ -1662,9 +1927,26 @@ fn spawn_session_inner<R: tauri::Runtime>(
                     );
                     // Shutdown waits for session removal. Persist the owned
                     // process's outcome before telling shutdown it is cleaned up.
+                    // A panic in the bookkeeping must not keep the exit from
+                    // being announced or the entry from leaving the map.
                     if let Some(observer) = &thread_observer {
-                        observer.finished(&payload);
+                        if let Err(panic) =
+                            catch_unwind(AssertUnwindSafe(|| observer.finished(&payload)))
+                        {
+                            crate::supervisor::note_stopped(
+                                "terminal observer panic",
+                                panic.as_ref(),
+                            );
+                        }
                     }
+                    incident::report_exit(
+                        &incident_log,
+                        &app_handle,
+                        ended_by_gitpulse,
+                        &payload,
+                        &incident_program,
+                        &incident_cwd,
+                    );
                     drop(reservation.take());
                     sessions_map
                         .lock()
@@ -1681,6 +1963,7 @@ fn spawn_session_inner<R: tauri::Runtime>(
         let mut guard = state.lock_sessions();
         guard.remove(&session_id);
         drop(guard);
+        dead.store(true, Ordering::SeqCst);
         terminate_pty_child(&child, &master)?;
         let exit = child
             .lock()
@@ -1905,19 +2188,117 @@ pub fn resize_session(
     rows: u16,
     cols: u16,
 ) -> Result<(), String> {
-    let guard = state.lock_sessions();
-    if let Some(session) = guard.get(session_id) {
-        let size = bounded_pty_size(rows, cols);
-        session
-            .master
-            .lock()
-            .map_err(|e| format!("Terminal size lock error: {e}"))?
-            .resize(size)
-            .map_err(|e| format!("Failed to resize terminal: {e}"))?;
-        Ok(())
-    } else {
-        Err(format!("Terminal session '{session_id}' not found"))
+    // The map is let go before the master is waited for: one session's busy
+    // master must not stall list, write, kill and attach for all the others.
+    let master = state
+        .lock_sessions()
+        .get(session_id)
+        .map(|session| session.master.clone())
+        .ok_or_else(|| format!("Terminal session '{session_id}' not found"))?;
+    // Bounded, like a write's wait for its lock: the lane that calls this is
+    // one thread, and a master lock that never came free must make this resize
+    // fail, not take every later resize of the session down with it.
+    let resized = lock_within(&master, MASTER_LOCK_BUDGET)?.resize(bounded_pty_size(rows, cols));
+    resized.map_err(|e| format!("Failed to resize terminal: {e}"))
+}
+
+/// Takes `lock` within `budget`, recovering a poisoned one (a PTY master holds
+/// no state a panic could leave half-written).
+fn lock_within<T: ?Sized>(
+    lock: &Mutex<Box<T>>,
+    budget: Duration,
+) -> Result<std::sync::MutexGuard<'_, Box<T>>, String> {
+    let deadline = Instant::now() + budget;
+    loop {
+        match lock.try_lock() {
+            Ok(guard) => return Ok(guard),
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => return Ok(poisoned.into_inner()),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                if Instant::now() >= deadline {
+                    return Err(format!(
+                        "Terminal is busy; the resize gave up after {}ms",
+                        budget.as_millis()
+                    ));
+                }
+                thread::sleep(Duration::from_millis(2));
+            }
+        }
     }
+}
+
+/// A session's master lock, held by a thread of its own until released or
+/// dropped. For tests that need the one lock a resize waits on to be busy
+/// without reaching into the session map.
+#[doc(hidden)]
+pub struct MasterHold {
+    release: Option<std::sync::mpsc::Sender<()>>,
+    holder: Option<thread::JoinHandle<()>>,
+}
+
+impl MasterHold {
+    /// Lets go of the lock and waits for the holding thread to end.
+    pub fn release(mut self) {
+        self.finish();
+    }
+
+    fn finish(&mut self) {
+        drop(self.release.take());
+        if let Some(holder) = self.holder.take() {
+            let _ = holder.join();
+        }
+    }
+}
+
+impl Drop for MasterHold {
+    fn drop(&mut self) {
+        self.finish();
+    }
+}
+
+/// The size the kernel holds for `session_id`'s PTY, as `(rows, cols)`. For
+/// tests that need to know which of many resizes was applied last.
+#[doc(hidden)]
+pub fn pty_size(state: &TerminalSessions, session_id: &str) -> Result<(u16, u16), String> {
+    let master = state
+        .lock_sessions()
+        .get(session_id)
+        .map(|session| session.master.clone())
+        .ok_or_else(|| format!("Terminal session '{session_id}' not found"))?;
+    let size = lock_within(&master, MASTER_LOCK_BUDGET)?
+        .get_size()
+        .map_err(|e| format!("Failed to read the terminal size: {e}"))?;
+    Ok((size.rows, size.cols))
+}
+
+/// Takes `session_id`'s master lock on a thread of its own and returns once it
+/// is held.
+#[doc(hidden)]
+pub fn hold_master(state: &TerminalSessions, session_id: &str) -> Result<MasterHold, String> {
+    let master = state
+        .lock_sessions()
+        .get(session_id)
+        .map(|session| session.master.clone())
+        .ok_or_else(|| format!("Terminal session '{session_id}' not found"))?;
+    let (release, released) = std::sync::mpsc::channel::<()>();
+    let (held_tx, held_rx) = std::sync::mpsc::channel::<()>();
+    let holder = thread::Builder::new()
+        .name("master-hold".into())
+        .spawn(move || {
+            let _guard = master
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let _ = held_tx.send(());
+            // Ends when the sender is dropped or sends.
+            let _ = released.recv();
+        })
+        .map_err(|e| e.to_string())?;
+    held_rx
+        .recv()
+        .map_err(|_| "the master hold thread ended before locking".to_string())?;
+    Ok(MasterHold {
+        release: Some(release),
+        holder: Some(holder),
+    })
 }
 
 /// Kills a PTY session.
@@ -1939,8 +2320,12 @@ pub fn kill_session(state: &TerminalSessions, session_id: &str) -> Result<(), St
     };
     if let Some((child, master, flow, dead)) = handles {
         log::info!(target: "terminal", "terminal close requested");
-        terminate_pty_child(&child, &master)?;
+        // Marked before the first signal, not after: the reader that sees the
+        // child die reads this flag to tell a close GitPulse asked for from an
+        // external death, and a reader finishing between the signal and the
+        // store would count our own hangup as someone else's kill.
         dead.store(true, Ordering::SeqCst);
+        terminate_pty_child(&child, &master)?;
         flow.stop();
         let deadline = Instant::now() + Duration::from_secs(2);
         loop {
@@ -2049,12 +2434,16 @@ fn stop_session_jobs(sid: i32, grace: Duration) {
     };
     let signal = |signo: libc::c_int, groups: &BTreeSet<i32>| {
         for group in groups {
-            // SAFETY: the group has a member in the session this call owns
-            // (the leader cannot be reaped while its lock is held), so the id
-            // cannot belong to a stranger.
-            unsafe {
-                libc::killpg(*group, signo);
-            }
+            // The group has a member in the session this call owns (the leader
+            // cannot be reaped while its lock is held). The primitive still
+            // refuses an id that is not an ordinary group, our own group or
+            // session, and a group whose leader is now in another session.
+            let _ = crate::procguard::signal::signal_group(
+                *group,
+                signo,
+                crate::procguard::signal::Basis::Session(sid),
+                "terminal close",
+            );
         }
     };
     let first = match groups() {
@@ -3370,6 +3759,80 @@ mod tests {
         );
     }
 
+    /// Under severe memory pressure an agent launch is refused before its PTY
+    /// opens and before it takes a session slot, naming the binding resource
+    /// and value. The user's own shell is never gated, and the launch is
+    /// admitted again once the pressure clears.
+    #[cfg(unix)]
+    #[test]
+    fn an_agent_pty_is_refused_under_pressure_a_shell_is_not_and_it_resumes() {
+        use crate::sysload::GovernorInput;
+        let dir = tempfile::tempdir().unwrap();
+        init_test_repo(dir.path());
+        let repo = dir.path().to_str().unwrap();
+        let app = tauri::test::mock_builder().build(crate::context()).unwrap();
+        let state = TerminalSessions::default();
+        let marker = dir.path().join("agent-ran");
+        let agent = |state: &TerminalSessions| {
+            spawn_session_inner(
+                app.handle(),
+                state,
+                repo,
+                None,
+                24,
+                80,
+                Some("/bin/sh".into()),
+                Some(vec!["-c".into(), format!("touch '{}'", marker.display())]),
+                None,
+                None,
+            )
+        };
+
+        let pressed = crate::sysload::inject_governor(GovernorInput::test_pressure(
+            crate::sysload::Level::Critical,
+        ));
+        let refusal = agent(&state).unwrap_err();
+        assert!(
+            refusal.contains("Agent launch refused (pty_spawn)"),
+            "{refusal}"
+        );
+        assert!(refusal.contains("critical (kernel level 4)"), "{refusal}");
+        assert_eq!(
+            state.active_sessions.load(Ordering::SeqCst),
+            0,
+            "a refused launch holds no session slot"
+        );
+        assert!(!marker.exists());
+
+        // The user's own shell (no program) is not an agent launch.
+        let shell = spawn_session_inner(
+            app.handle(),
+            &state,
+            repo,
+            None,
+            24,
+            80,
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("a plain shell is never refused");
+        kill_session(&state, &shell.id).unwrap();
+        drop(pressed);
+
+        // Pressure cleared: the same launch is admitted and runs.
+        let _calm = crate::sysload::inject_governor(GovernorInput::test_pressure(
+            crate::sysload::Level::Normal,
+        ));
+        agent(&state).expect("admitted once the pressure clears");
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        while !marker.exists() && std::time::Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert!(marker.exists(), "the admitted agent ran");
+    }
+
     /// A task attempt's terminal carries its run id in `GITPULSE_RUN_ID`; a
     /// plain terminal carries none. Neither can be set by the IPC caller: a
     /// spoofed value in the caller's map is replaced or removed.
@@ -3499,6 +3962,185 @@ mod tests {
         kill_session(&state, &spawned.id).unwrap();
         assert!(list_sessions(&state).is_empty());
         assert_eq!(detach_all(&state), 0);
+    }
+
+    /// An observer that panics when told the process ended, standing for any
+    /// bookkeeping the end of a session runs before it lets go of the entry.
+    #[cfg(unix)]
+    struct PanicsOnFinish;
+    #[cfg(unix)]
+    impl SessionObserver for PanicsOnFinish {
+        fn run_id(&self) -> &str {
+            "run-panics"
+        }
+        fn before_spawn(&self, _: &str) -> Result<(), String> {
+            Ok(())
+        }
+        fn started(&self, _: &str, _: Option<u32>) -> Result<(), String> {
+            Ok(())
+        }
+        fn spawn_failed(&self, _: &str, reason: &str) {
+            panic!("spawn failed: {reason}")
+        }
+        fn finished(&self, _: &TerminalExitPayload) {
+            panic!("injected panic in the end-of-session bookkeeping");
+        }
+    }
+
+    /// The defect: a panic in the reader thread's tail left the session in the
+    /// map for good - listed as live and never announced as exited - because
+    /// only the tail removed it. The frontend then showed a terminal with no
+    /// process behind it.
+    #[cfg(unix)]
+    #[test]
+    fn a_panic_ending_a_session_still_removes_it_and_announces_the_exit() {
+        use tauri::Listener;
+        let dir = tempfile::tempdir().unwrap();
+        init_test_repo(dir.path());
+        let app = tauri::test::mock_builder().build(crate::context()).unwrap();
+        let state = TerminalSessions::default();
+        let exited = Arc::new(AtomicBool::new(false));
+        let flag = exited.clone();
+        app.listen("terminal-exit", move |_| flag.store(true, Ordering::SeqCst));
+        spawn_session_inner(
+            app.handle(),
+            &state,
+            dir.path().to_str().unwrap(),
+            None,
+            24,
+            80,
+            Some("/bin/sh".into()),
+            Some(vec!["-c".into(), "exit 0".into()]),
+            None,
+            Some(Arc::new(PanicsOnFinish)),
+        )
+        .unwrap();
+        assert!(
+            wait_until(Duration::from_secs(10), || list_sessions(&state).is_empty()),
+            "a session whose end-of-session bookkeeping panicked stayed in the map"
+        );
+        assert!(
+            wait_until(Duration::from_secs(5), || exited.load(Ordering::SeqCst)),
+            "the view is told the session ended"
+        );
+        assert_eq!(state.active_sessions.load(Ordering::SeqCst), 0);
+    }
+
+    /// The defect: a panic while reading output (the scanner, an event
+    /// listener) ended the reader thread with the child still alive and
+    /// nothing reading its tty. The session stayed "running" forever and its
+    /// output backed up until the program blocked. The reader now contains the
+    /// panic, stops the child, and takes the normal exit path.
+    #[cfg(unix)]
+    #[test]
+    fn a_panic_while_reading_output_ends_the_session_instead_of_orphaning_it() {
+        use tauri::Listener;
+        let dir = tempfile::tempdir().unwrap();
+        init_test_repo(dir.path());
+        let app = tauri::test::mock_builder().build(crate::context()).unwrap();
+        let state = TerminalSessions::default();
+        app.listen("terminal-output", |_| {
+            panic!("injected panic while delivering output");
+        });
+        let pid_file = dir.path().join("reader-panic.pid");
+        spawn_session_inner(
+            app.handle(),
+            &state,
+            dir.path().to_str().unwrap(),
+            None,
+            24,
+            80,
+            Some("/bin/sh".into()),
+            Some(vec![
+                "-c".into(),
+                format!("echo $$ > '{}'; echo hello; sleep 300", pid_file.display()),
+            ]),
+            None,
+            None,
+        )
+        .unwrap();
+        let pid = read_pid(&pid_file);
+        // The listener's panic poisons the event bus, so the exit event
+        // itself cannot be announced here; what must hold is that the process
+        // does not outlive its reader.
+        assert!(
+            wait_until(Duration::from_secs(15), || list_sessions(&state).is_empty()),
+            "the reader panicked and the session was left running"
+        );
+        assert!(
+            wait_until(Duration::from_secs(5), || unsafe { libc::kill(pid, 0) }
+                != 0),
+            "the child of a reader that panicked was left running"
+        );
+    }
+
+    /// The defect: `resize_session` held the whole session map while it waited
+    /// for one session's master lock, so one busy master stalled list, write,
+    /// kill and attach for every other session.
+    #[cfg(unix)]
+    #[test]
+    fn a_resize_waiting_on_one_master_does_not_hold_the_session_map() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = TerminalSessions::default();
+        let spawned = spawn_script(&state, dir.path(), "sleep 300".into());
+        let master = state
+            .lock_sessions()
+            .get(&spawned.id)
+            .unwrap()
+            .master
+            .clone();
+        let held = master.lock().unwrap();
+        let resizer = {
+            let state = state.clone();
+            let id = spawned.id.clone();
+            thread::spawn(move || resize_session(&state, &id, 30, 100))
+        };
+        thread::sleep(Duration::from_millis(200));
+        let (send, receive) = std::sync::mpsc::channel();
+        let lister = state.clone();
+        thread::spawn(move || send.send(list_sessions(&lister).len()));
+        let listed = receive.recv_timeout(Duration::from_secs(2));
+        drop(held);
+        resizer.join().unwrap().unwrap();
+        assert_eq!(
+            listed.expect("list_sessions was stuck behind another session's resize"),
+            1
+        );
+        kill_session(&state, &spawned.id).unwrap();
+    }
+
+    /// The defect: a poisoned master lock made every later resize fail with
+    /// "Terminal size lock error", so the PTY kept its old size for good.
+    #[cfg(unix)]
+    #[test]
+    fn a_poisoned_master_lock_does_not_stop_resizing() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = TerminalSessions::default();
+        let spawned = spawn_script(&state, dir.path(), "sleep 300".into());
+        let master = state
+            .lock_sessions()
+            .get(&spawned.id)
+            .unwrap()
+            .master
+            .clone();
+        let poisoner = master.clone();
+        let _ = thread::spawn(move || {
+            let _held = poisoner.lock().unwrap();
+            panic!("injected panic under the master lock");
+        })
+        .join();
+        assert!(
+            master.is_poisoned(),
+            "positive control: the lock is poisoned"
+        );
+        resize_session(&state, &spawned.id, 40, 120).unwrap();
+        let size = master
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get_size()
+            .unwrap();
+        assert_eq!((size.rows, size.cols), (40, 120));
+        kill_session(&state, &spawned.id).unwrap();
     }
 
     /// The native smoke test the browser harness cannot be: it executes a real

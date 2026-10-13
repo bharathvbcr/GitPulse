@@ -738,7 +738,9 @@ async function currentCommand(pid) {
  * Kills `pid`, but only while it still runs the command it was vetted as.
  * `expectNeedle` closes most of the pid-reuse window between listing a stale
  * listener and delivering signals: a recycled pid running anything else is
- * left alone. Null/empty needle skips the check (used by non-reclaim paths).
+ * left alone. A null or empty needle means nothing was vetted, so nothing is
+ * signalled: a listener whose command could not be read must never be killed
+ * on the strength of a pid alone.
  *
  * @param {number} pid
  * @param {string | null} [expectNeedle]
@@ -750,7 +752,7 @@ export async function killPid(pid, expectNeedle = null) {
   if (pid === process.pid || pid === process.ppid) return;
   /** @returns {Promise<boolean>} false = do not signal this pid anymore */
   const stillUs = async () => {
-    if (!expectNeedle) return true;
+    if (!expectNeedle) return false;
     const cmd = await currentCommand(pid);
     // Empty output means the process is already gone (fine) or ps could not
     // read it — either way we must not send it a signal.

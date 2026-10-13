@@ -48,7 +48,8 @@ From the forensics of 2026-10-09 (V = verified, I = inferred):
 | One process over 32 GiB, or pressure level 4 for 3 samples | memguard | GitPulse never kills a single process for its footprint. |
 | A `mac_heavy.sh` job tree over its RSS cap | mac_heavy | Card 4 exempts trees carrying `MAC_HEAVY_LABEL`. |
 | The **sum** of a GitPulse-launched tree | Card 4 (supervisor) | Advise by default; enforce is opt-in. |
-| Admission, shedding, leases, the hook, advice | Cards 1b, 1c, 1d, 3 | **The sensor only measures and publishes.** |
+| Admission and shedding | Cards 1b and 1c, one verdict (`sysload::governor`) | See Admission and shedding. |
+| Leases, the hook, advice | Cards 1d, 3 | **The sensor only measures and publishes.** They consume the same verdict. |
 
 The sensor's one action is a person clicking **Terminate** on a foreign orphan
 in Health. That signal is re-checked on the live process before it is sent
@@ -59,8 +60,8 @@ in Health. That signal is re-checked on the live process before it is sent
 | Card | Scope | State |
 |---|---|---|
 | 1 (sensor) | This page: sampler, `host-load.v1`, sensor states, sessions by process scan, `GITPULSE_RUN_ID`, memguard health, orphans, Health | Implemented |
-| 1b | Admission of agent launches on the sensor state | Not started |
-| 1c | Shedding background work; consumes `hostPressure` | Not started |
+| 1b | Admission of agent launches on the sensor state | Implemented (see Admission and shedding) |
+| 1c | Shedding GitPulse's own background and reactive work | Implemented (see Admission and shedding) |
 | 1d | Leases and the priority queue ("time slots") | Not started |
 | 3 | The `gitpulse-hook` check, the skill, `doctor` | Not started |
 | Per-call gate cost | The hook's per-call budget | Separate card |
@@ -319,6 +320,79 @@ grants (`cmd_host_load_status`, `cmd_host_load_settings`,
 `cmd_host_load_settings_save`) read the sensor and toggle the sampler's kill
 switch.
 
+## Admission and shedding (cards 1b and 1c)
+
+One function owns the decision: `sysload::governor::decide` turns a sensor
+report into a **verdict** (admit or refuse launches, which spawn classes to
+shed, and the reason). It is pure over a report, so it is tested with the
+replay path (a real `host-load.v1` record read at chosen ages) and consumed
+the same way by cards 3 and 4. The two callers are thin:
+
+- **1b, `sysload::admit`.** Called before an agent launch's checkout probes
+  (`terminal_launch::prepare_in`), before its capacity check and worktree
+  build (`ensure_room`), and before an agent CLI's PTY opens
+  (`terminal::spawn_session_inner`; the user's own shell is never gated).
+  `tests/governor_sites.rs` pins those places by function name.
+- **1c, `sysload::shed`.** Read by the spawn gate (`git_cli::acquire_until`)
+  and nowhere else. A shed spawn is refused at once with the existing
+  "deferred under load" marker, so the frontend's retries resume it when the
+  pressure clears. There is no new scheduler: the classes are the ones
+  `e9a64486` and `bb302b7f` introduced, and a user action (a commit, a save,
+  or a read credited to one) is never shed.
+
+| Input | Verdict |
+|---|---|
+| pressure `normal`, no thrash | nothing shed, launches admitted |
+| pressure `warn` | background work shed, launches admitted |
+| pressure `critical` **or** `compressor_thrash` | background and reactive work shed, launches refused |
+| sensor stale-recent (at most 120 s) | govern on the last-known level, with a "stale Ns" warning |
+| sensor stale-old or dead, level unreadable | admit with a warning, nothing shed; ledger `host_load.sensor_unavailable`; Health says "ungoverned" |
+| `host_load.enabled` off, or a platform that is not governed | admit, nothing shed |
+
+**What binds.** Two inputs, each named in the reason with its value:
+the kernel pressure level, and the sensor's `compressor_thrash` flag (the
+2026-10-07 panic was compressor exhaustion while the level lagged, so the level
+alone would have admitted into it). The ruling left this as a user decision
+(memory pressure only, or also the compressor); this build takes the second
+option and puts it in one clearly named place, `Binding::CompressorThrash`.
+Swap at or above a quarter of RAM, which the same ruling listed, is not an
+input.
+
+**Hysteresis.** A tier is entered after 3 consecutive sensor ticks at or above
+it and left after 5 consecutive ticks below it, so a level flapping at a
+threshold neither flaps the verdict nor escalates it. Ageing is measured on a
+monotonic clock from the last tick, so a sampler that stops ticking walks the
+verdict through stale-recent, stale-old and dead while it is asked.
+
+**Overrides are human only.** Health's **Admit anyway** (and the same button
+on a refused launch in the task form, beside **Retry**) asks in a native Yes/No
+dialog that page script cannot click, then admits launches for 120 s
+(`cmd_host_load_admit_anyway`, granted to the main window like the other
+host-load commands; the dialog is the boundary, as for Terminate). There is no
+agent `force`, and no queue: Retry asks again, a queue is card 1d's.
+
+**A refusal never quietly becomes an allow.** After 30 minutes of continuous
+pressure refusal the pulse carries a notice, and the app raises a toast that
+names the binding resource and the largest foreign footprint, with a one-click
+**Stop refusing launches** (`host_load.govern_launches` off). The verdict does
+not change on its own at 30 minutes or at any later time. The notice is an
+in-app toast, not a native banner.
+
+**Never gated.** Stop, kill, cancel, save, commit, release and reconcile are
+not admission sites. `cancel_release_and_reconcile_are_never_gated_by_pressure`
+runs three of them at `critical`, and the spawn-gate test shows an interactive
+spawn is admitted while background and reactive are shed.
+
+**Ledger.** Each admission step records `host_load.admit`,
+`host_load.refuse` (outcome `blocked`), `host_load.sensor_unavailable` or
+`host_load.override_admit`, with the site, reason, binding, sensor state and
+message, in the launch's repository. It is written off the launch path.
+
+**Scope of shedding.** Only the app process sheds. `gitpulse-mcp`, `gitpulsed`
+and the hook have no governor, so an agent's MCP calls are never refused on
+pressure. Shedding acts on spawns through the gate; background work that
+spawns no git child (a pure IPC read) is not shed by this card.
+
 ## Health and the status bar
 
 Health → **Host load** (machine-wide, under every repository's Health) shows:
@@ -332,6 +406,7 @@ Health → **Host load** (machine-wide, under every repository's Health) shows:
 - the five heaviest processes GitPulse did not start, with the 6 s lag note;
 - the memguard line and its warnings;
 - orphans;
+- the governor: which classes are shed and why, whether launches are refused and for how long, **Admit anyway**, and "ungoverned" when the sensor is stale-old or dead;
 - the sampler's own ticks, overruns, missed ticks, tick times and CPU.
 
 It also says: *replay-verified; no real memory-pressure event has been
@@ -340,7 +415,7 @@ is recorded.
 
 The status bar is quiet while the machine is fine. It speaks when pressure is
 warn or critical, when the compressor is thrashing, or when the sampler has
-stopped ("Load sensor: no sampler"). Clicking it opens Health.
+stopped ("Load sensor: no sampler"). While the governor acts it adds "· launches refused" or "· shedding". Clicking it opens Health.
 
 ## Settings
 
@@ -350,6 +425,11 @@ written to the file only when off. Off stops the readings, not the heartbeat:
 the sampler keeps publishing a snapshot that says "switched off", so readers
 can tell that apart from a sampler that died. A malformed `host_load` block
 leaves the switch on and costs no other setting.
+
+**Settings → Agents → Host load → "Refuse agent launches under severe memory
+pressure"** (`host_load.govern_launches`, on by default, written only when
+off). Off still sheds GitPulse's own work under pressure but never refuses a
+launch; it is what the 30-minute notice flips.
 
 ## Part 0: what was settled before building
 
