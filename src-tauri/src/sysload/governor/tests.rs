@@ -605,7 +605,11 @@ fn one_sample_reread_never_trips_the_hysteresis() {
         assert_eq!(seen.verdict.tier, Tier::Clear, "tick {tick}");
     }
     // Two genuinely new critical samples make three: entered.
-    let (seen, _) = feed(&mut governor, t0 + 30 * SECOND, vec![input(Level::Critical); 2]);
+    let (seen, _) = feed(
+        &mut governor,
+        t0 + 30 * SECOND,
+        vec![input(Level::Critical); 2],
+    );
     assert!(!seen.verdict.admit, "{:?}", seen.verdict);
     // While refusing, a reread keeps the tier and the refusal clock running.
     let reread = governor.observe_repeat(t0 + 40 * SECOND, input(Level::Critical));
@@ -630,7 +634,11 @@ fn a_stopped_sampler_ends_the_refusal_run_in_the_report() {
     let mut governor = Governor::default();
     let (_, t) = feed(&mut governor, t0, vec![input(Level::Critical); 3]);
     let later = t + REFUSAL_NOTICE_AFTER;
-    assert!(governor.observe(later, input(Level::Critical)).notice_raised);
+    assert!(
+        governor
+            .observe(later, input(Level::Critical))
+            .notice_raised
+    );
     assert!(governor.report(later).notice);
     let quiet = governor.report(later + 200 * SECOND);
     assert!(quiet.verdict.admit, "{:?}", quiet.verdict);
