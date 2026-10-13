@@ -4666,7 +4666,7 @@ mod tests {
         // Another test's probe, as it would leave the cache.
         assert!(matches!(probe_gh_cli(), ToolProbe::Present(_)));
         let refused =
-            crate::engine::git_cli::with_forced_spawn_failure_of("--version", || probe_gh_cli());
+            crate::engine::git_cli::with_forced_spawn_failure_of("--version", probe_gh_cli);
         assert!(
             matches!(refused, ToolProbe::NotRun(_)),
             "a refused `gh --version` was answered from the cache: {refused:?}"
