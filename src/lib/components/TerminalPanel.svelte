@@ -46,7 +46,7 @@
   import { copyText } from "../desktop/clipboard";
   import { formatError } from "../ui/formatError";
   import TerminalSession from "./TerminalSession.svelte";
-  import { closeQuestion, startDirFrom } from "../terminal/sessionContext";
+  import { CONTEXT_UNKNOWN, closeQuestion, startDirFrom } from "../terminal/sessionContext";
   import { askConfirm } from "../stores/modalStore";
   import { openTaskForRun } from "../workbench/taskOpen";
   import { sessionRow, type CheckoutTab } from "../terminal/checkoutLabel";
@@ -499,8 +499,9 @@
    */
   async function openBeside(launcher: LauncherKind): Promise<boolean> {
     const fromId = tabState.activeId;
-    const context = launcher === "shell" && fromId ? await sessions[fromId]?.readContext() : null;
-    const dir = startDirFrom(context ?? null);
+    // An unreadable context offers no directory, so the tab starts at the root.
+    const read = launcher === "shell" && fromId ? await sessions[fromId]?.readContext() : undefined;
+    const dir = startDirFrom(read ?? CONTEXT_UNKNOWN);
     if (!newTab(launcher)) return false;
     if (dir && tabState.activeId) tabState = setTabStartDir(tabState, tabState.activeId, dir);
     return true;
@@ -521,8 +522,8 @@
   /**
    * Close, asking first when a job is running in the foreground or the tab's
    * own process is a running agent (see `closeQuestion`). A shell whose
-   * foreground cannot be read closes as it always has: an unknown is not a
-   * reason to interrupt.
+   * foreground cannot be read asks too, and says it could not tell: an
+   * unknown is never read as idle.
    *
    * The tab's × and the chord come through here; the Sessions list asks the
    * same question through the registry's `confirmClose`, so a session in
@@ -557,7 +558,8 @@
       running: status === "starting" || status === "running",
       taskAttempt: Boolean(tab.taskRunId),
     };
-    const question = closeQuestion((await sessions[id]?.readContext()) ?? null, tabLabel(tab), agent);
+    // A tab with no mounted session to ask is unknown, not idle.
+    const question = closeQuestion((await sessions[id]?.readContext()) ?? CONTEXT_UNKNOWN, tabLabel(tab), agent);
     return !question || (await askConfirm({ ...question, confirmLabel: "Close", destructive: true }));
   }
 

@@ -48,6 +48,14 @@ describe("what quitting would end", () => {
     expect(risks).toEqual([{ label: "Shell (claude)", repoPath: "/repos/app" }]);
   });
 
+  it("reports a shell whose foreground came back unreadable instead of counting it as clear", async () => {
+    const onError = vi.fn();
+    const records = [record({ key: "s1", label: "Shell", sessionId: "term-1", launcher: "shell" })];
+    const risks = await quitRisks(records, { invoke: host([], { "term-1": { process: 42, busy: "yes" } }), onError });
+    expect(risks).toEqual([]);
+    expect(onError).toHaveBeenCalledWith("the foreground of Shell", expect.any(Error));
+  });
+
   it("goes ahead on what it knows when a question cannot be answered, and says so", async () => {
     const onError = vi.fn();
     const invoke = vi.fn(async () => { throw new Error("host busy"); }) as never;

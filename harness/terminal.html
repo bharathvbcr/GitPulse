@@ -24,6 +24,8 @@
       /** What `cmd_terminal_context` reports for every session: where it is, and whether a job runs. */
       let contextDir = "";
       let contextBusy = false;
+      /** `cmd_terminal_context` never answers: a host too loaded to scan processes. */
+      let contextHangs = false;
       /** Sessions a tab let go of without Close (`cmd_terminal_detach`). */
       const detachedIds = new Set();
       /** `startDir` of every `cmd_terminal_spawn`, in order. */
@@ -130,9 +132,13 @@
           case "cmd_terminal_context": {
             const root = sessions.get(args.sessionId);
             if (!root) throw new Error(`Terminal session '${args.sessionId}' not found`);
+            // A host that never answers: the page's own deadline is all that ends the wait.
+            if (contextHangs) return new Promise(() => {});
             return {
               process: contextBusy ? "cargo" : "zsh",
               busy: contextBusy,
+              // The real host always reports it: foreground and jobs are separate questions.
+              jobs: contextBusy,
               cwd: contextDir ? `${root}/${contextDir}` : root,
               repo_dir: contextDir,
             };
@@ -561,6 +567,23 @@
           await wait(300);
           check("an idle shell closes without a question",
             () => !get(promptState) && report.killed === killedBeforeIdle + 1);
+          // A host too slow to describe the shell is not an idle shell. The
+          // context read used to time out into null, null meant "nothing
+          // running", and the close went through unasked.
+          contextHangs = true;
+          const tabsBeforeHang = visible('[role="tab"]').length;
+          const killedBeforeHang = report.killed;
+          await press(label("Terminal input"), "W", { ctrlKey: true, shiftKey: true });
+          const hangDeadline = performance.now() + 15000;
+          while (performance.now() < hangDeadline && !get(promptState)) await wait(100);
+          const unsure = get(promptState);
+          check("closing a terminal whose context read never answers asks first, saying it could not tell",
+            () => unsure?.options.mode === "confirm" && unsure.options.message.includes("could not tell") && report.killed === killedBeforeHang);
+          completePrompt(false);
+          await wait(200);
+          check("declining that question keeps the session running",
+            () => visible('[role="tab"]').length === tabsBeforeHang && report.killed === killedBeforeHang);
+          contextHangs = false;
           // A reload used to leave its sessions running, unlisted, uncounted,
           // and — once one printed a window's worth — killed for want of an
           // acknowledgement. The new page adopts them.

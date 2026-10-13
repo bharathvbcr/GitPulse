@@ -78,7 +78,7 @@
   import { formatError } from "../ui/formatError";
   import { createSessionLifecycle } from "../terminal/sessionLifecycle";
   import { CONTEXT_READ_MS, terminalDeadline } from "../terminal/inputQueue";
-  import { parseTerminalContext, type TerminalContext } from "../terminal/sessionContext";
+  import { isProvablyIdle, parseTerminalContext, readSessionContext, type ContextRead } from "../terminal/sessionContext";
   import { isEditingElsewhere } from "../keyboard/terminalFocus";
   import { planPaste } from "../terminal/pasteGuard";
   import { askConfirm } from "../stores/modalStore";
@@ -675,7 +675,7 @@
         if (launcher !== "shell") return false;
         const context = parseTerminalContext(await invoke<unknown>("cmd_terminal_context", { sessionId }));
         // `busy` is only the foreground; a `cmd &` or a `^Z`'d editor is a job too.
-        return context?.busy === false && context.jobs === false;
+        return context !== null && isProvablyIdle(context);
       },
       // Listed in Sessions, where it can be shown again or stopped. Looked up
       // while this tab still holds the slot, which it then hands over.
@@ -944,21 +944,18 @@
   }
 
   /**
-   * What this session is running and where, or null when it has no live
-   * process or the answer is malformed. Bounded (CONTEXT_READ_MS, whose reason
-   * is in `inputQueue.ts`): a stuck query must not hold up the close or the new
-   * tab that asked. Null on timeout is "could not tell", not "nothing is
-   * running": the caller decides what that means.
+   * What this session is running and where. Bounded (CONTEXT_READ_MS, whose
+   * reason is in `inputQueue.ts`): a stuck query must not hold up the close or
+   * the new tab that asked. The answer keeps "could not tell" apart from
+   * "nothing is running" (see `ContextRead`); the decision logic is in
+   * `readSessionContext`, which this only feeds the tab's own state.
    */
-  export async function readContext(): Promise<TerminalContext | null> {
+  export function readContext(): Promise<ContextRead> {
     const sessionId = nativeSessionId;
-    if (!sessionId || !lifecycle?.isCurrent(sessionId)) return null;
-    try {
-      const raw = await terminalDeadline(invoke<unknown>("cmd_terminal_context", { sessionId }), CONTEXT_READ_MS, "Reading terminal context");
-      return parseTerminalContext(raw);
-    } catch {
-      return null;
-    }
+    return readSessionContext(
+      { sessionId, current: Boolean(sessionId && lifecycle?.isCurrent(sessionId)), spawning, exited },
+      (id) => terminalDeadline(invoke<unknown>("cmd_terminal_context", { sessionId: id }), CONTEXT_READ_MS, "Reading terminal context"),
+    );
   }
 
   function setFontSize(size: number) {

@@ -23,6 +23,14 @@ before that tag is pushed.
   and a failed one is reported once per run of failures. Deadlines count the
   time the page actually waited, so a blocked or hidden window no longer
   charges its own stall to the backend.
+- Closing a terminal no longer skips its question when GitPulse could not tell
+  what was running in it. A context read that timed out, failed or came back
+  unreadable was treated as "nothing running", so a shell with a live job closed
+  without a word whenever the host was slow. The read now reports known, nothing
+  to stop, or unknown, and unknown (or a foreground or job list the OS would
+  not describe) asks: "GitPulse could not tell whether something is still
+  running in this terminal." The quit guard likewise reports a shell whose
+  answer was unreadable instead of counting it as clear.
 - A terminal that prints a lot no longer costs the webview a script evaluation
   per kilobyte. Each `terminal-output` event is a script run on the app's main
   thread, and macOS hands a PTY reader about 1 KiB per read, so a 1 MiB burst

@@ -61,8 +61,11 @@ export async function quitRisks(
     shells.slice(0, MAX_SHELL_TABS_PROBED).map(async (record) => {
       try {
         const context = parseTerminalContext(await invoke<unknown>("cmd_terminal_context", { sessionId: record.sessionId }));
-        const agent = agentKindOf(context?.process ?? null);
-        if (agent && context?.busy === true) risks.push({ label: `${record.label} (${agent})`, repoPath: record.repoPath });
+        // A malformed answer is a check that did not run, and is reported as
+        // one rather than passing silently as "no agent here".
+        if (!context) throw new Error("The terminal host returned an unreadable context.");
+        const agent = agentKindOf(context.process);
+        if (agent && context.busy === true) risks.push({ label: `${record.label} (${agent})`, repoPath: record.repoPath });
       } catch (error) {
         report(`the foreground of ${record.label}`, error);
       }
