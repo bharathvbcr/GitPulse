@@ -11,6 +11,25 @@ before that tag is pushed.
 
 ## [Unreleased]
 
+### Changed
+
+- **Switching repository tabs no longer rebuilds the sidebar, the view shell
+  or the status bar.** All three were keyed on the active repository's path, so
+  every switch destroyed and recreated them. They now stay mounted and re-point
+  at the new repository; each part that holds state of its own (filters, open
+  menus, drafts, scroll offsets, worktree rows) resets it on the switch, and an
+  answer still in flight for the repository you left no longer lands in the one
+  you are looking at. The contents of each view panel are still rebuilt per
+  repository. One visible difference: the view's entrance fade no longer replays
+  on a switch.
+
+### Fixed
+
+- **A commit that finished after you switched repository tabs cleared the other
+  repository's message.** The commit box wiped the draft and the amend flag of
+  whichever repository was showing when the commit returned, not the one it ran
+  in. It now leaves the repository you are looking at alone.
+
 ## [1.4.0] - 2026-10-11
 
 Agents that start in the background with a pane showing every one at work,

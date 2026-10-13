@@ -47,6 +47,7 @@
   import { popover } from "../ui/popover";
   import { parsePinned, pinnedKey, prunePinnedIndex, saveRepoPins, serializePinned } from "../branches/pins";
   import { browserStorage } from "../repos/persist";
+  import { repoScope } from "../repos/repoScope.svelte";
   import { branchRowHeight, sidebarRowHeight, BRANCH_OVERSCAN } from "../sidebar/metrics";
   import { formatTimestamp, timestampTitle } from "../ui/timestampStyle";
   import { plural } from "../format";
@@ -450,20 +451,25 @@
     if (suggesting) return;
     const repo = $repoStore.currentPath;
     if (!repo) return;
+    const epoch = tabScope.epoch;
     suggesting = true;
     try {
       const gen = await invoke<AiGeneration>("cmd_ai_suggest_branch_name", {
         repoPath: repo,
       });
-      // The suggestion raced a tab switch: it belongs to another repo now.
-      if ($repoStore.currentPath !== repo) return;
+      // The suggestion raced a tab switch: it belongs to another repo now,
+      // even when the person has since switched back (the epoch counts
+      // switches, the path only compares endpoints).
+      if (!tabScope.isCurrent(epoch)) return;
       const raw = (gen?.text || "").trim().split(/\s+/)[0] || "";
       if (raw) createName = raw.replace(/^[#`]+/, "").replace(/[`]+$/, "");
     } catch (err) {
-      if ($repoStore.currentPath !== repo) return;
+      if (!tabScope.isCurrent(epoch)) return;
       repoStore.setError(formatError(err));
     } finally {
-      suggesting = false;
+      // A switch already cleared the flag; a stale request must not clear the
+      // new repository's own in-flight one.
+      if (tabScope.isCurrent(epoch)) suggesting = false;
     }
   }
 
@@ -714,6 +720,37 @@
   $effect(() => {
     if ($currentRepoPath) untrack(loadPinned);
   });
+
+  /**
+   * The list is mounted once per window, so a tab switch re-points the store
+   * and nothing else. Everything below is the repository being left: what was
+   * typed, which folders were opened, the highlighted row, an open context menu
+   * or merge dialog (aimed at the old repository's branches), a half-typed new
+   * branch name, and how far the list was scrolled. The pins are re-read for
+   * the new repository here rather than waiting for the effect above, which
+   * runs after the first paint. `freshnessStore` is reset by its own effect.
+   */
+  const tabScope = repoScope(
+    () => $currentRepoPath,
+    () => {
+      applyFilter.cancel();
+      query = "";
+      debouncedQuery = "";
+      activeTab = "all";
+      creating = false;
+      createName = "";
+      suggesting = false;
+      collapsed = {};
+      selectedIndex = -1;
+      locateName = null;
+      closeMenu();
+      mergeRequest = null;
+      scrollTop = 0;
+      if (containerEl) containerEl.scrollTop = 0;
+      pinnedSignature = null;
+      loadPinned();
+    },
+  );
 
   onMount(() => {
     // One-shot eviction sweep: bounds the per-repo pin keys on disk even if

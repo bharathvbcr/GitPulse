@@ -36,39 +36,49 @@ describe("TerminalPanel lifecycle hygiene", () => {
   });
 });
 
+const read = (name: string) => readFileSync(join(here, name), "utf8");
+const panel = read("ViewSectionPanel.svelte");
+const VIEWS = ["WorkspaceView", "CodeView", "HistoryView", "InsightsView"];
+const KEY = "{#key $repoStore.currentPath}";
+const keyCount = (text: string) => text.split(KEY).length - 1;
+
 describe("terminal repository boundary", () => {
   it("hosts the dock outside every currentPath key so a repo tab switch cannot kill the shell", () => {
-    // Git UI still remounts per repository; the PTY must not. Nested keys
-    // would make "the next {/key}" the wrong closer — these keys are
-    // sequential on purpose.
-    const key = "{#key $repoStore.currentPath}";
-    const close = "{/key}";
-    const dockIdx = app.indexOf("<TerminalDock");
-    expect(dockIdx).toBeGreaterThan(-1);
-    expect(app.split(key).length - 1).toBeGreaterThanOrEqual(2);
-
-    let from = 0;
-    let keys = 0;
-    while (from < app.length) {
-      const start = app.indexOf(key, from);
-      if (start === -1) break;
-      const end = app.indexOf(close, start + key.length);
-      expect(end).toBeGreaterThan(start);
-      expect(
-        dockIdx < start || dockIdx > end,
-        "TerminalDock sits inside {#key $repoStore.currentPath}, which remounts and kills the PTY on a tab switch",
-      ).toBe(true);
-      keys += 1;
-      from = end + close.length;
+    // The dock is hosted by App.svelte, which holds no per-repository key at
+    // all, and none of the views whose panels ARE keyed render a dock.
+    expect(app).toContain("<TerminalDock");
+    expect(keyCount(app), "App.svelte keys something on currentPath").toBe(0);
+    for (const view of VIEWS) {
+      expect(read(`${view}.svelte`), `${view} hosts the dock inside a keyed panel`).not.toContain("TerminalDock");
     }
-    expect(keys).toBeGreaterThanOrEqual(2);
+    expect(panel).not.toContain("TerminalDock");
   });
 
-  it("still remounts the git UI when the repository tab changes", () => {
-    // The dock moved out of the key; Sidebar and the view column must stay
-    // inside one, or a switch would leak the previous repo's graph/diff into
-    // the next worktree.
-    expect(app).toMatch(/\{#key \$repoStore\.currentPath\}[\s\S]*<Sidebar/);
-    expect(app).toMatch(/\{#key \$repoStore\.currentPath\}[\s\S]*gp-view/);
+  it("does not rebuild the shell when the repository tab changes", () => {
+    // Sidebar, the workspace column and the status bar used to sit inside
+    // three `{#key $repoStore.currentPath}` blocks, so every tab switch tore
+    // down and rebuilt all of them. Each now resets its own per-repository
+    // state in place; the harness that mounts the real App covers behaviour.
+    expect(app).toContain("<Sidebar");
+    expect(app).toContain("<StatusBar");
+    expect(app).toContain("gp-view");
+    expect(keyCount(app)).toBe(0);
+    // A stateful component that survives the switch must say how it resets.
+    for (const name of ["Sidebar", "BranchList", "CommitComposer", "AgentCommitMenu", "WorktreesPanel", "LanguageSegment"]) {
+      expect(read(`${name}.svelte`), `${name} outlives a tab switch without a repoScope reset`).toContain("repoScope(");
+    }
+  });
+
+  it("keys the view leaves per repository inside the panel, in one place", () => {
+    // What a panel holds (a diff, a file tree, a commit table) keeps scroll
+    // offsets, open tabs and drafts that belong to one repository. Until a
+    // leaf is untangled it is rebuilt on a switch, so nothing leaks into the
+    // next worktree. ViewSectionPanel is the single owner of that key.
+    expect(keyCount(panel)).toBe(1);
+    expect(panel).toMatch(/\{#key \$repoStore\.currentPath\}\s*\{@render children\(\)\}\s*\{\/key\}/);
+    for (const view of VIEWS) {
+      expect(read(`${view}.svelte`), `${view} does not render its content in a ViewSectionPanel`).toContain("<ViewSectionPanel");
+      expect(keyCount(read(`${view}.svelte`)), `${view} keys on its own`).toBe(0);
+    }
   });
 });
