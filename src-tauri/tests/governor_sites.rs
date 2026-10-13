@@ -37,6 +37,16 @@ fn production(source: &str) -> &str {
         .map_or(source, |end| &source[..end])
 }
 
+/// A file that is only ever compiled as a `#[cfg(test)]` module of its own
+/// (`tests.rs`, `*_tests.rs`). `production` cannot cut these: the attribute
+/// sits in the parent, so the whole file is test code and may call
+/// `sysload::shed` or `admit` to exercise the gate without being a caller of it.
+fn is_test_module_file(file: &Path) -> bool {
+    file.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name == "tests.rs" || name.ends_with("_tests.rs"))
+}
+
 /// `file:function` for every production line that contains one of `needles`,
 /// the function being the nearest `fn` at or above the line.
 fn call_sites(needles: &[&str]) -> Vec<String> {
@@ -45,7 +55,7 @@ fn call_sites(needles: &[&str]) -> Vec<String> {
     let sysload = crate_dir().join("src").join("sysload");
     let mut sites = Vec::new();
     for file in &files {
-        if file.starts_with(&sysload) {
+        if file.starts_with(&sysload) || is_test_module_file(file) {
             continue;
         }
         let source = std::fs::read_to_string(file).unwrap();
