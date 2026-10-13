@@ -95,6 +95,90 @@ fn discard_declares_delete_for_the_file_it_will_delete() {
     assert_eq!(discard_file_op(&root, "fresh.txt"), "delete");
 }
 
+/// Discard is a user's click, so memory pressure must not shed it: the load
+/// governor sheds reactive spawns at critical, and a discard whose git
+/// children ran in that class was refused — and its `is_tracked` probe, shed
+/// too, declared a tracked file's restore as a delete.
+#[test]
+fn discard_is_never_shed_under_memory_pressure() {
+    use crate::sysload::{GovernorInput, Level};
+    let dir = repo_with_tracked_and_untracked();
+    let root = dir.path().to_string_lossy().to_string();
+    std::fs::write(dir.path().join("README.md"), "# edited\n").unwrap();
+    let _pressed = crate::sysload::inject_governor(GovernorInput::test_pressure(Level::Critical));
+    assert_eq!(
+        crate::sysload::shed(),
+        crate::sysload::Shed {
+            background: true,
+            reactive: true
+        },
+        "the injected governor sheds reactive work"
+    );
+    // The real command, through `off_thread`, which carries this thread's
+    // injection to the pool thread it hops to.
+    let result =
+        tauri::async_runtime::block_on(cmd_discard_changes(root.clone(), "README.md".to_string()));
+    assert!(
+        result.is_ok(),
+        "discard was refused under pressure: {:?}",
+        result.err()
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("README.md")).unwrap(),
+        "# t\n",
+        "the tracked file was restored"
+    );
+}
+
+/// The probe that picks the declared operation runs before the gate, so it
+/// carries its own promotion: shed as a deferrable read it failed closed to
+/// "delete" for a tracked file that is only being restored.
+#[test]
+fn discard_probe_declares_modify_under_memory_pressure() {
+    use crate::sysload::{GovernorInput, Level};
+    let dir = repo_with_tracked_and_untracked();
+    let root = dir.path().to_string_lossy().to_string();
+    let _pressed = crate::sysload::inject_governor(GovernorInput::test_pressure(Level::Critical));
+    let unpromoted =
+        crate::engine::git_cli::run_command_scope(|| GitReader::is_tracked(&root, "README.md"));
+    assert!(
+        unpromoted.is_err(),
+        "the probe is shed when unpromoted: {unpromoted:?}"
+    );
+    let declared =
+        crate::engine::git_cli::run_command_scope(|| Ok(discard_file_op(&root, "README.md")));
+    assert_eq!(declared, Ok("modify"));
+}
+
+/// Every file write a person clicks — save, conflict save, move, cleanup —
+/// passes the commands' `guard_file`, whose task-binding lookup is git. Under
+/// critical pressure that lookup, run as a deferrable read, was shed and the
+/// save refused as "scope unavailable"; promoted first, it runs.
+#[test]
+fn a_clicked_file_write_is_judged_under_memory_pressure() {
+    use crate::sysload::{GovernorInput, Level};
+    let dir = repo_with_tracked_and_untracked();
+    let root = dir.path().to_string_lossy().to_string();
+    let _pressed = crate::sysload::inject_governor(GovernorInput::test_pressure(Level::Critical));
+    let unpromoted = crate::engine::git_cli::run_command_scope(|| {
+        crate::harness::guard_file(&root, "README.md", "modify")
+    });
+    assert!(
+        unpromoted
+            .as_ref()
+            .err()
+            .is_some_and(|e| e.contains("memory pressure")),
+        "the lookup this guards against is shed when unpromoted: {unpromoted:?}"
+    );
+    let clicked =
+        crate::engine::git_cli::run_command_scope(|| guard_file(&root, "README.md", "modify"));
+    assert!(
+        clicked.is_ok(),
+        "a save was refused under pressure: {:?}",
+        clicked.err()
+    );
+}
+
 #[test]
 fn last_fetch_at_reads_fetch_head_mtime_or_none() {
     let dir = repo_with_tracked_and_untracked();

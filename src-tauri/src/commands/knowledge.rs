@@ -132,9 +132,8 @@ pub(super) fn guard_move(
             guard(repo_path, &refs)
         }
         MovePlan::Untracked { from, to } => {
-            crate::engine::git_cli::mark_user_action(repo_path);
-            let source = crate::harness::guard_file(repo_path, from, "delete")?;
-            let destination = crate::harness::guard_file(repo_path, to, "modify")?;
+            let source = guard_file(repo_path, from, "delete")?;
+            let destination = guard_file(repo_path, to, "modify")?;
             Ok(strictest_verdict(source, destination))
         }
     }

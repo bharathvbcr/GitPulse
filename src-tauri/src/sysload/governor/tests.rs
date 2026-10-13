@@ -585,3 +585,87 @@ fn a_decision_is_recorded_in_the_ledger_with_its_binding_and_value() {
         "{detail}"
     );
 }
+
+/// A reader whose writer stalled rereads one record every tick. One critical
+/// sample read many times is still one sample: it must not enter the tier
+/// three samples enter, and the stale walk still fails it open.
+#[test]
+fn one_sample_reread_never_trips_the_hysteresis() {
+    let t0 = Instant::now();
+    let mut governor = Governor::default();
+    governor.observe(t0, input(Level::Critical));
+    for tick in 1..=10u64 {
+        let reread = Input {
+            state: SensorState::StaleRecent,
+            age_ms: Some(tick * 2000),
+            ..input(Level::Critical)
+        };
+        let seen = governor.observe_repeat(t0 + SECOND * (2 * tick) as u32, reread);
+        assert!(seen.verdict.admit, "tick {tick}: {:?}", seen.verdict);
+        assert_eq!(seen.verdict.tier, Tier::Clear, "tick {tick}");
+    }
+    // Two genuinely new critical samples make three: entered.
+    let (seen, _) = feed(&mut governor, t0 + 30 * SECOND, vec![input(Level::Critical); 2]);
+    assert!(!seen.verdict.admit, "{:?}", seen.verdict);
+    // While refusing, a reread keeps the tier and the refusal clock running.
+    let reread = governor.observe_repeat(t0 + 40 * SECOND, input(Level::Critical));
+    assert!(!reread.verdict.admit);
+    assert!(governor.report(t0 + 40 * SECOND).refusing_for_s.is_some());
+    // And a reread the stale walk made ungovernable fails open.
+    let old = Input {
+        state: SensorState::StaleOld,
+        age_ms: Some(130_000),
+        ..input(Level::Critical)
+    };
+    let seen = governor.observe_repeat(t0 + 170 * SECOND, old);
+    assert!(seen.verdict.admit && seen.verdict.reason == Reason::SensorUnavailable);
+}
+
+/// A sampler that stops ticking mid-refusal walks the verdict to "sensor
+/// unavailable": the report must not keep saying launches have been refused
+/// for ever-longer, nor keep the 30-minute notice up beside an admit.
+#[test]
+fn a_stopped_sampler_ends_the_refusal_run_in_the_report() {
+    let t0 = Instant::now();
+    let mut governor = Governor::default();
+    let (_, t) = feed(&mut governor, t0, vec![input(Level::Critical); 3]);
+    let later = t + REFUSAL_NOTICE_AFTER;
+    assert!(governor.observe(later, input(Level::Critical)).notice_raised);
+    assert!(governor.report(later).notice);
+    let quiet = governor.report(later + 200 * SECOND);
+    assert!(quiet.verdict.admit, "{:?}", quiet.verdict);
+    assert_eq!(quiet.refusing_for_s, None);
+    assert!(!quiet.notice);
+}
+
+/// Hysteresis is symmetric: a run enters the lowest tier it held throughout
+/// and leaves to the highest. Leaving severe on four warn samples and a clear
+/// one lands on elevated (background still shed), not on clear; and the tier
+/// entered carries the binding of the sample that set it.
+#[test]
+fn a_run_leaves_to_the_highest_tier_it_held_and_enters_with_its_binding() {
+    let t0 = Instant::now();
+    let mut governor = Governor::default();
+    let (_, t) = feed(&mut governor, t0, vec![input(Level::Critical); 3]);
+    let mut run = vec![input(Level::Warn); 4];
+    run.push(input(Level::Normal));
+    let (seen, _) = feed(&mut governor, t, run);
+    assert!(seen.verdict.admit);
+    assert_eq!(seen.verdict.tier, Tier::Elevated, "{:?}", seen.verdict);
+    assert!(seen.verdict.shed.background && !seen.verdict.shed.reactive);
+
+    // Warn, critical, thrash: the run enters elevated, bound by the pressure
+    // level that put it there — not by the compressor of the last sample.
+    let mut governor = Governor::default();
+    let (seen, _) = feed(
+        &mut governor,
+        t0,
+        vec![
+            input(Level::Warn),
+            input(Level::Critical),
+            thrashing(Level::Normal),
+        ],
+    );
+    assert_eq!(seen.verdict.tier, Tier::Elevated);
+    assert_eq!(seen.verdict.binding, Some(Binding::MemoryPressure));
+}
