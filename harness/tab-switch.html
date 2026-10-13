@@ -383,6 +383,19 @@
           await switchTo(ALPHA);
           await sleepUntil(() => text(worktreesPanel()).includes("alpha-wt-one"));
 
+          // A merge dialog is aimed at one repository's branches; it must not stay
+          // up over the next one.
+          const mergeRow = $$("*", branchList()).find((el) => el.children.length === 0 && text(el).includes("alpha-only"));
+          mergeRow?.dispatchEvent(new MouseEvent("contextmenu", { bubbles: true, cancelable: true, clientX: 120, clientY: 300 }));
+          await settle();
+          $$('[role="menuitem"]').find((el) => text(el).includes("Merge into current"))?.click();
+          await settle();
+          check("branches (alpha): the merge dialog is open", () => !!$("#merge-branch-title"));
+          await switchTo(BETA);
+          check("branches: the merge dialog aimed at alpha is closed", () => !$("#merge-branch-title"));
+          await switchTo(ALPHA);
+          await sleepUntil(() => text(worktreesPanel()).includes("alpha-wt-one"));
+
           // ---- 4. an answer in flight for the repository left does not land -----
           const releaseGenerate = hold("cmd_ai_generate_commit_message", ALPHA);
           generateBtn().click();
