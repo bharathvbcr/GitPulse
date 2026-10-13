@@ -35,7 +35,7 @@ function branch(name: string, tip: string, extra: Partial<BranchInfo> = {}): Bra
   } as BranchInfo;
 }
 
-function harness(options: { statusMs?: number; tips?: () => Record<string, string> } = {}) {
+function harness(options: { statusMs?: number | ((path: string) => number); tips?: () => Record<string, string> } = {}) {
   const counters: Counters = { calls: {}, statusInFlight: 0, statusPeak: 0, statusStarts: [] };
   const statuses = [{ path: "README.md", status_code: "M", is_staged: false, is_conflicted: false, additions: 1, deletions: 0 }];
   const tips = options.tips ?? (() => ({ main: "aaa", topic: "bbb" }));
@@ -49,7 +49,8 @@ function harness(options: { statusMs?: number; tips?: () => Record<string, strin
         counters.statusStarts.push(Date.now());
         counters.statusInFlight += 1;
         counters.statusPeak = Math.max(counters.statusPeak, counters.statusInFlight);
-        if (options.statusMs) await new Promise((resolve) => setTimeout(resolve, options.statusMs));
+        const wait = typeof options.statusMs === "function" ? options.statusMs(path) : options.statusMs;
+        if (wait) await new Promise((resolve) => setTimeout(resolve, wait));
         counters.statusInFlight -= 1;
         return statuses as never;
       }
@@ -205,35 +206,39 @@ describe("the status poll rests in proportion to what it costs", () => {
     expect(counters.statusStarts.length).toBeGreaterThan(0);
   });
 
-  it("an idle repository with a live watcher is polled at most once a minute", async () => {
+  it("a watched repository unchanged for 20 polls is still polled about every 6 s when status is cheap", async () => {
+    // The worktree watch is non-recursive (watcher/debouncer.rs), so the poll
+    // is what sees an ordinary nested edit: a quiet stretch must not slow it.
     vi.useFakeTimers();
     const { store, counters } = harness();
     await store.openRepo("/r/idle");
-    // A minute of nothing is what makes it quiet.
-    await vi.advanceTimersByTimeAsync(2 * 60_000);
+    expect(get(store).watch.status).toBe("watching");
+    await vi.advanceTimersByTimeAsync(30 * 6_500);
+    expect(counters.statusStarts.length).toBeGreaterThanOrEqual(21);
     counters.statusStarts.length = 0;
-    const from = Date.now();
 
-    await vi.advanceTimersByTimeAsync(10 * 60_000);
+    await vi.advanceTimersByTimeAsync(5 * 60_000);
 
-    expect(counters.statusStarts.length).toBeLessThanOrEqual(10);
+    // 300 s at a 6 s rest is ~50 polls; a quiet tier would give 5.
+    expect(counters.statusStarts.length).toBeGreaterThanOrEqual(40);
     for (let i = 1; i < counters.statusStarts.length; i += 1) {
-      expect(counters.statusStarts[i] - counters.statusStarts[i - 1]).toBeGreaterThanOrEqual(59_000);
+      expect(counters.statusStarts[i] - counters.statusStarts[i - 1]).toBeLessThanOrEqual(7_000);
     }
-    expect(Date.now() - from).toBe(10 * 60_000);
   });
 });
 
 describe("the poll's rest follows the tab on screen", () => {
-  it("a switch from a quiet tab polls the new tab within the usual interval, not after the quiet minute", async () => {
+  it("a switch from a slow tab polls the new tab within the usual interval, not after the slow tab's rest", async () => {
     vi.useFakeTimers();
-    const { store, counters } = harness();
-    await store.openRepo("/r/busy");
-    await store.openRepo("/r/quiet");
-    const busyId = get(store).openTabs.find((tab) => tab.path === "/r/busy")!.id;
-    // The quiet tab is on screen long enough for the poll to settle into its
-    // quiet minute, with the next poll armed a full minute out.
-    await vi.advanceTimersByTimeAsync(3 * 60_000 + 30_000);
+    const { store, counters } = harness({ statusMs: (path) => (path === "/r/slow" ? 4_000 : 0) });
+    await store.openRepo("/r/fast");
+    const opening = store.openRepo("/r/slow");
+    await vi.advanceTimersByTimeAsync(4_100);
+    await opening;
+    const busyId = get(store).openTabs.find((tab) => tab.path === "/r/fast")!.id;
+    // The slow tab is on screen long enough for its poll to settle into a
+    // rest of ten times its 4 s status.
+    await vi.advanceTimersByTimeAsync(60_000);
     counters.statusStarts.length = 0;
 
     await store.activateTab(busyId);

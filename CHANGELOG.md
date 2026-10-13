@@ -24,9 +24,11 @@ before that tag is pushed.
     calls a switch to 15; the 7 removed are the snapshot reads and the stats
     drain).
   - The status poll rests ten times what its last `git status` cost, so a 4 s
-    status keeps git under 10% busy instead of about 40%. A repository with a
-    live watcher that has been quiet for a minute is polled once a minute,
-    and the watch is re-asserted on a timer rather than every tenth poll.
+    status keeps git under 10% busy instead of about 40%. A cheap status is still
+    polled every 6 s however long nothing has changed: the worktree watch is
+    non-recursive, so the poll is what sees an edit to a nested file. The watch
+    is re-asserted on a one-minute timer rather than every tenth poll, so a
+    slow repository's longer rest does not lengthen a dead watch's blind window.
   - Branch churn is not asked for again when no branch tip has moved since the
     last complete drain, and a cold pass stops starting new tips after 5 s and
     says so (`capped`), the next call resuming from the cache. The drain stays

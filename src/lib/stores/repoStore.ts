@@ -325,16 +325,14 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
    * immediately when the session is still registered, and creates a fresh
    * watcher when it was reaped. Once a minute keeps a dead watch's blind
    * window bounded to about a minute without putting a subprocess on the
-   * 6-second path. Timed rather than counted: a quiet repository with a live
-   * watch polls once a minute (`statusPollRestMs`), and ten of those ticks
-   * would leave a dead watch blind for ten.
+   * 6-second path. Timed rather than counted: a slow repository's poll rests
+   * ten times its cost (`statusPollRestMs`, up to two minutes), and ten of
+   * those ticks would leave a dead watch blind for twenty.
    */
   const WATCH_REASSERT_EVERY_MS = 60_000;
   let lastWatchReassertAt = Date.now();
   /** How long the last poll took, which sets how long the next one waits. */
   let pollLastDurationMs: number | null = null;
-  /** Polls in a row that found the active repository's statuses unchanged. */
-  let pollQuietCount = 0;
 
   function onStatusPollVisibility(): void {
     if (!pollWanted) return;
@@ -364,13 +362,8 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
 
   function armStatusPoll(): void {
     if (!pollWanted || pollTimer !== null || typeof setTimeout === "undefined") return;
-    const active = activeSession();
     const decision = decideCadence({
-      baseMs: statusPollRestMs({
-        watchLive: !!active && !needsFullPoll(active.watch),
-        lastDurationMs: pollLastDurationMs,
-        quietPolls: pollQuietCount,
-      }),
+      baseMs: statusPollRestMs({ lastDurationMs: pollLastDurationMs }),
       lagMs: readEventLoopDelay(),
       paused: readBackgroundDocument(),
     });
@@ -386,8 +379,8 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
   /**
    * Re-arms a waiting poll against the current rest. The rest was chosen for
    * the repository that was active when it was armed; after a switch it may
-   * be a minute (a quiet watched tab) or ten times a slow tab's status, and
-   * the tab now showing deserves its own cadence from the moment it shows.
+   * be ten times a slow tab's status, and the tab now showing deserves its
+   * own cadence from the moment it shows.
    */
   function rearmStatusPoll() {
     if (!pollWanted || pollTimer === null) return;
@@ -461,7 +454,6 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
       } finally {
         pollInflight = false;
         pollLastDurationMs = Date.now() - startedAt;
-        pollQuietCount = 0;
       }
       return;
     }
@@ -492,10 +484,8 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
         live.generation === generation &&
         statusesEqual(statuses, live.statuses)
       ) {
-        pollQuietCount += 1;
         return;
       }
-      pollQuietCount = 0;
       const before = live && live.generation === generation ? live.statuses : [];
       applyToSession(sessionId, generation, { statuses });
       // The watcher cannot see nested edits (its worktree watch is
@@ -1985,7 +1975,6 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
         .owed()
         .some((key) => sameRepo(key, session.path, options));
       watcherRefreshPolicy.onActivated(session.path);
-      pollQuietCount = 0;
       pollLastDurationMs = null;
       rearmStatusPoll();
       // `force` is restore presenting a saved tab, not a person clicking it.
