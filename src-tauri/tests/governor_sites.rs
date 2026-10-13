@@ -11,6 +11,8 @@
 //! `sysload::shed` has one caller too: the spawn gate. Shedding is a verdict
 //! the existing admission classes consume, not a second scheduler.
 
+mod common;
+
 use std::path::{Path, PathBuf};
 
 fn crate_dir() -> &'static Path {
