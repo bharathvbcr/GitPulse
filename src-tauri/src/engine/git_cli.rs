@@ -3510,6 +3510,16 @@ pub(crate) fn with_forced_spawn_failure_of<T>(arg: &str, body: impl FnOnce() -> 
     body()
 }
 
+/// True while this thread is inside [`with_forced_spawn_failure`] or
+/// [`with_forced_spawn_failure_of`]. Process-wide caches of spawn results
+/// consult it: the forced refusal is thread-local, the cache is shared, and
+/// another test warming the cache would otherwise let the real tool answer past
+/// the refusal.
+#[cfg(test)]
+pub(crate) fn forced_failure_active() -> bool {
+    FORCE_SPAWN_FAILURE.get() || FORCED_FAILURE_ARG.with(|slot| slot.borrow().is_some())
+}
+
 #[cfg(test)]
 fn forced_failure_matches(cmd: &Command) -> bool {
     FORCED_FAILURE_ARG.with(|slot| {

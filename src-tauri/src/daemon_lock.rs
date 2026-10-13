@@ -55,6 +55,12 @@ impl DaemonLock {
     }
 }
 
+impl Drop for DaemonLock {
+    fn drop(&mut self) {
+        unlock(&self._file);
+    }
+}
+
 fn open(path: &Path) -> std::io::Result<File> {
     let mut options = OpenOptions::new();
     options.read(true).write(true).create(true).truncate(false);
@@ -97,6 +103,34 @@ fn try_lock(file: &File) -> std::io::Result<bool> {
 fn try_lock(_file: &File) -> std::io::Result<bool> {
     Ok(true)
 }
+
+/// Gives the lock back now, whoever else still holds a descriptor to the file.
+///
+/// An `flock` belongs to the open file description, not to one descriptor, and
+/// closing a descriptor releases it only when it is the last. The file is
+/// opened close-on-exec, but a process forked on another thread between the
+/// open and the close (the terminal's `fork`, a `posix_spawn`) copies the
+/// descriptor and keeps the copy until its `exec` runs. Releasing by close
+/// alone left the lock held for that long: a probe saw a daemon that had
+/// already stopped, and a daemon starting at that instant could be refused as
+/// a second owner. `LOCK_UN` ends the lock on the description itself.
+#[cfg(unix)]
+fn unlock(file: &File) {
+    use std::os::unix::io::AsRawFd;
+    loop {
+        // SAFETY: a valid descriptor owned by `file` for the whole call.
+        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) };
+        // Nothing to report on failure: closing the descriptor, which follows,
+        // is the release this falls back to.
+        if rc == 0 || std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
+            return;
+        }
+    }
+}
+
+/// On Windows the handle is the lock, and handles are not inherited by copy.
+#[cfg(windows)]
+fn unlock(_file: &File) {}
 
 fn read_owner(path: &Path) -> Owner {
     let mut text = String::new();
@@ -151,6 +185,7 @@ pub fn acquire(dir: &Path, version: &str) -> Acquire {
                     .and_then(|()| file.write_all(record.as_bytes()))
                     .and_then(|()| file.flush());
                 if let Err(error) = written {
+                    unlock(&file);
                     return Acquire::Unavailable(format!(
                         "cannot record the owner in {}: {error}",
                         path.display()
@@ -183,8 +218,13 @@ pub fn running(dir: &Path) -> Result<Option<Owner>, String> {
         Err(error) => return Err(format!("cannot open {}: {error}", path.display())),
     };
     match try_lock(&file) {
-        // We took it, so nobody held it; dropping `file` gives it back.
-        Ok(true) => Ok(None),
+        // We took it, so nobody held it. The probe gives it back by unlocking
+        // rather than by closing alone, or a process forked meanwhile would
+        // hold it for the daemon that starts next.
+        Ok(true) => {
+            unlock(&file);
+            Ok(None)
+        }
         Ok(false) => Ok(Some(read_owner(&path))),
         Err(error) => Err(format!("cannot lock {}: {error}", path.display())),
     }
@@ -259,102 +299,6 @@ pub fn cmd_daemon_status() -> DaemonStatus {
 mod tests {
     use super::*;
 
-    /// Waits, with a bound, for the lock in `dir` to be free.
-    ///
-    /// `flock` belongs to the open file description, not the descriptor, so a
-    /// child another test forked while the lock was held (a PTY child between
-    /// fork and exec) keeps it until its exec closes the close-on-exec
-    /// descriptor. Under load that window is long, so the release is awaited
-    /// instead of asserted at once.
-    fn released(dir: &Path) -> bool {
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
-        loop {
-            if !status_in(dir, "1.4.0").running {
-                return true;
-            }
-            if std::time::Instant::now() >= deadline {
-                return false;
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        }
-    }
-
-    /// A pipe whose ends close on exec, made where `procguard` makes its own.
-    #[cfg(unix)]
-    fn cloexec_pipe() -> (i32, i32) {
-        let mut fds = [0i32; 2];
-        let made = crate::procguard::with_inheritance_lock(|| {
-            // SAFETY: `fds` is a valid two-element buffer for pipe(2); fcntl
-            // acts on the descriptors it just returned.
-            unsafe {
-                libc::pipe(fds.as_mut_ptr()) == 0
-                    && fds
-                        .iter()
-                        .all(|&fd| libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) == 0)
-            }
-        });
-        assert!(made, "pipe(2) failed");
-        (fds[0], fds[1])
-    }
-
-    /// The window `released` exists for, made deterministic: a child forked
-    /// while the lock is held keeps it after its owner dropped it, until the
-    /// child execs.
-    #[cfg(unix)]
-    #[test]
-    fn a_child_forked_under_the_lock_holds_it_until_it_execs() {
-        use crate::procguard::LockedSpawn;
-        use std::os::unix::process::CommandExt;
-        let dir = tempfile::tempdir().unwrap();
-        let first = match acquire(dir.path(), "1.4.0") {
-            Acquire::Held(lock) => lock,
-            other => panic!("the first daemon was not admitted: {other:?}"),
-        };
-        // `ready` tells this thread the child is between fork and exec;
-        // `go` tells the child it may exec.
-        let (ready_read, ready_write) = cloexec_pipe();
-        let (go_read, go_write) = cloexec_pipe();
-        let spawner = std::thread::spawn(move || {
-            let mut command = std::process::Command::new("true");
-            // SAFETY: the closure runs between fork and exec and calls only
-            // the async-signal-safe write and poll.
-            unsafe {
-                command.pre_exec(move || {
-                    libc::write(ready_write, b"x".as_ptr().cast(), 1);
-                    let mut wait = libc::pollfd {
-                        fd: go_read,
-                        events: libc::POLLIN,
-                        revents: 0,
-                    };
-                    // Bounded, so a parent that panicked cannot strand it.
-                    libc::poll(&mut wait, 1, 10_000);
-                    Ok(())
-                });
-            }
-            command.status_locked()
-        });
-        let mut byte = [0u8; 1];
-        // SAFETY: `byte` is a valid one-byte buffer and `ready_read` is open.
-        let read = unsafe { libc::read(ready_read, byte.as_mut_ptr().cast(), 1) };
-        assert_eq!(read, 1, "the child never reached its pre-exec hook");
-        drop(first);
-        let held_by_child = status_in(dir.path(), "1.4.0").running;
-        // SAFETY: `byte` is a valid one-byte buffer and `go_write` is open.
-        unsafe { libc::write(go_write, b"x".as_ptr().cast(), 1) };
-        spawner.join().unwrap().unwrap();
-        assert!(
-            held_by_child,
-            "a forked child holds the open file description, so the lock outlives its owner"
-        );
-        assert!(released(dir.path()));
-        // SAFETY: the four descriptors were opened above and are closed once.
-        unsafe {
-            for fd in [ready_read, ready_write, go_read, go_write] {
-                libc::close(fd);
-            }
-        }
-    }
-
     /// The defect: nothing stopped a second daemon. A second acquire is
     /// refused, names the first owner, and succeeds once the first is gone.
     #[test]
@@ -375,8 +319,33 @@ mod tests {
         assert!(status.running && status.mismatch, "{status:?}");
         assert!(!status_in(dir.path(), "1.4.0").mismatch);
         drop(first);
-        assert!(released(dir.path()));
+        assert!(!status_in(dir.path(), "1.4.0").running);
         assert!(matches!(acquire(dir.path(), "1.4.1"), Acquire::Held(_)));
+    }
+
+    /// The flake from the full suite: a process forked on another thread
+    /// while the lock was held copies the descriptor and keeps the copy until
+    /// its `exec`; closing ours then left the lock held, and the daemon read
+    /// as still running. A duplicated descriptor shares the open file
+    /// description exactly as a forked copy does, so it stands in for the
+    /// child deterministically.
+    #[cfg(unix)]
+    #[test]
+    fn releasing_the_lock_does_not_wait_for_a_forked_copy_of_the_descriptor() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = match acquire(dir.path(), "1.4.0") {
+            Acquire::Held(lock) => lock,
+            other => panic!("the first daemon was not admitted: {other:?}"),
+        };
+        let forked_copy = first._file.try_clone().unwrap();
+        assert!(status_in(dir.path(), "1.4.0").running);
+        drop(first);
+        assert!(
+            !status_in(dir.path(), "1.4.0").running,
+            "a copy of the descriptor kept a stopped daemon's lock held"
+        );
+        assert!(matches!(acquire(dir.path(), "1.4.1"), Acquire::Held(_)));
+        drop(forked_copy);
     }
 
     #[test]

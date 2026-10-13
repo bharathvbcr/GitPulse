@@ -39,7 +39,9 @@ impl BoundedOutput {
         let disabled = Arc::new(AtomicBool::new(false));
         let stopped = disabled.clone();
         let (ready_tx, ready_rx) = mpsc::sync_channel(1);
-        crate::supervisor::spawn_once(name, "output writer", move || {
+        // One worker per stream: another stream's worker finishing cleanly
+        // must not clear this one's stopped record.
+        crate::supervisor::spawn_one_of_many(name, "output writer", move || {
             let _ = ready_tx.send(());
             while let Ok(request) = receiver.recv() {
                 if stopped.load(Ordering::Acquire) {
@@ -259,6 +261,66 @@ mod tests {
 
     /// A panic in the writer thread used to vanish with the thread; it is now
     /// a stopped subsystem in Diagnostics, and the caller still gets an error.
+    /// The flake: every stream has its own writer thread but they share one
+    /// subsystem name, so another stream's writer finishing cleanly cleared the
+    /// `stopped` record a panicked writer had just made, and Diagnostics stopped
+    /// listing a dead writer.
+    #[test]
+    fn another_writer_finishing_cleanly_does_not_clear_a_stopped_writer() {
+        struct SignalsDrop(mpsc::Sender<()>);
+        impl Write for SignalsDrop {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        impl Drop for SignalsDrop {
+            fn drop(&mut self) {
+                let _ = self.0.send(());
+            }
+        }
+        let stopped = || {
+            crate::supervisor::degraded()
+                .iter()
+                .any(|d| d.subsystem == "output writer" && d.stopped)
+        };
+        let panicked = BoundedOutput::new(
+            PanickingWriter,
+            "supervisor-test-output-panics",
+            1024,
+            Duration::from_millis(500),
+        )
+        .unwrap();
+        assert!(panicked.write(b"x").is_err());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !stopped() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(stopped(), "the panicked writer was never recorded");
+
+        let (gone, worker_gone) = mpsc::channel();
+        let clean = BoundedOutput::new(
+            SignalsDrop(gone),
+            "supervisor-test-output-clean",
+            1024,
+            Duration::from_millis(500),
+        )
+        .unwrap();
+        clean.write(b"fine\n").unwrap();
+        drop(clean);
+        worker_gone
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the clean writer's worker did not finish");
+        // The worker records its exit just after it drops the writer.
+        std::thread::sleep(Duration::from_millis(150));
+        assert!(
+            stopped(),
+            "a clean writer's exit cleared another writer's stopped record"
+        );
+    }
+
     #[test]
     fn a_panicking_writer_is_recorded_as_a_stopped_subsystem() {
         let output = BoundedOutput::new(
