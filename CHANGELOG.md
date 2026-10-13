@@ -13,6 +13,16 @@ before that tag is pushed.
 
 ### Fixed
 
+- Typing and resizing a terminal no longer wait behind git. Terminal commands
+  shared the pool every git command uses (`queue_ms=1165` for a keystroke on a
+  loaded host, git commands holding threads for minutes), and a resize blocked a
+  Tauri async worker on a mutex instead. Keystrokes and resizes now run on a
+  thread per session (in order, bounded, a full queue refused at once) and the
+  slower commands (close, attach, context, list) on a separate bounded pool, so
+  a session whose child stopped reading delays only itself and the frontend's
+  five-second deadlines no longer measure the slowest git command in flight.
+  The new-session command also reads settings and looks for the hook binary on
+  the blocking pool instead of an async worker.
 - Every signal GitPulse sends now goes through one guarded primitive,
   `procguard::signal`. It refuses pid 0, 1 and negative ids, the app's own
   process, group and session, a group GitPulse did not create, and a pid whose
