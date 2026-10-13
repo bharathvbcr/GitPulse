@@ -1183,7 +1183,13 @@ done
             // A call with no model of its own must not retire the
             // model-selected worker: the next enhancement would otherwise find
             // its worker gone mid-run.
-            let pid_before = host.0.worker.lock().unwrap().as_ref().map(|(_, w)| Arc::as_ptr(w));
+            let pid_before = host
+                .0
+                .worker
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map(|(_, w)| Arc::as_ptr(w));
             host.request("tasks.suggest", "{}").unwrap();
             let guard = host.0.worker.lock().unwrap();
             let (fingerprint, live) = guard.as_ref().expect("worker still live");

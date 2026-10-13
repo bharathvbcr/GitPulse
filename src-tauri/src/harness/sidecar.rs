@@ -2811,7 +2811,10 @@ done
         ] {
             let message = missing_op_message(op);
             assert!(message.contains(op), "{message}");
-            assert!(message.ends_with(&format!("Update Manvi to use {feature}.")), "{message}");
+            assert!(
+                message.ends_with(&format!("Update Manvi to use {feature}.")),
+                "{message}"
+            );
         }
         assert!(!missing_op_message("work.tasks.suggest").contains("enhancements"));
     }
