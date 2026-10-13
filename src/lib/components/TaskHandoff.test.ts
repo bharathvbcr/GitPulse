@@ -22,6 +22,18 @@ describe("the agent handoff has one implementation", () => {
     expect(form).not.toContain('choose({ provider: "codex" })');
   });
 
+  it("answers a launch the load governor refused with Retry and a human-only Admit anyway", () => {
+    // The refusal is a typed `host_pressure` error. Retry asks again with no
+    // queue (a queue is card 1d's); Admit anyway goes through the one command
+    // that asks in a native dialog, and a No leaves the refusal standing
+    // rather than launching.
+    expect(form).toContain("HOST_PRESSURE_REFUSAL");
+    expect(form).toContain("refusedByPressure");
+    expect(form).toContain(">Retry</button>");
+    expect(form).toContain(">Admit anyway</button>");
+    expect(form).toMatch(/await admitAnyway\(\);\s*\} catch \(cause\) \{\s*error = explainError\(cause\);\s*return;/);
+  });
+
   it("leaves the launch to the form, so neither host can grow a second one", () => {
     // The board sheet and the editor panel are chrome around one form. If
     // either started calling `prepareTaskRun` itself, the checkout resolution,

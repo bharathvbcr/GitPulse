@@ -98,8 +98,18 @@ export function draftingVerb(kind: DraftingKind, quick: boolean): string {
   return kind === "improve" ? "Improve" : "Draft";
 }
 
-export const liveEnhancement = (proposal: Pick<Enhancement, "state"> | null): boolean =>
-  proposal !== null && (LIVE_ENHANCEMENT_STATES as readonly string[]).includes(proposal.state);
+/**
+ * Whether a proposal still has a worker on it, as of `now` (Unix seconds).
+ *
+ * The store counts a `pending` proposal as live only until its `expires_at`
+ * (`state='pending' AND expires_at>now`, dc-store `enhancements.rs`): a generate
+ * that was lost leaves one behind, and it stops blocking the next ask on its
+ * own. `running` and `cancel_requested` stay live past their expiry, because
+ * only the recovery that resolves the uncertain attempt ends them.
+ */
+export const liveEnhancement = (proposal: Pick<Enhancement, "state" | "expires_at"> | null, now: number = Date.now() / 1000): boolean =>
+  proposal !== null && (LIVE_ENHANCEMENT_STATES as readonly string[]).includes(proposal.state)
+    && !(proposal.state === "pending" && now >= proposal.expires_at);
 
 /**
  * Whether a re-read of a proposal says anything the last read did not.

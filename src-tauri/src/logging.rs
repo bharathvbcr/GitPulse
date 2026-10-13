@@ -1982,6 +1982,62 @@ mod tests {
             .contains("disk log disabled after"));
     }
 
+    /// An open that fails (here the log path is briefly a directory) costs
+    /// the line and backs off like a failed write; it neither retires the sink
+    /// nor touches the path again until the backoff has passed, and the sink
+    /// writes again once the path is usable.
+    #[test]
+    fn a_failed_open_backs_off_and_recovers_when_the_path_is_usable() {
+        let dir = tempfile::tempdir().unwrap();
+        let sink = FileSink::open_in(dir.path(), "gitpulse");
+        let previous = sink.current.with_extension("log.moved");
+        fs::rename(&sink.current, &previous).unwrap();
+        fs::create_dir(&sink.current).unwrap();
+        sink.write_line("refused by the open");
+        {
+            let state = sink.state.lock().unwrap();
+            assert!(!state.retired, "one failed open must not retire the sink");
+            assert_eq!(state.failures, 1);
+            assert!(state.retry_at.is_some());
+        }
+        fs::remove_dir(&sink.current).unwrap();
+        // Inside the backoff nothing is opened, so the path stays absent.
+        sink.write_line("dropped while backing off");
+        assert!(
+            !sink.current.exists(),
+            "the disk was touched while backing off"
+        );
+        sink.state.lock().unwrap().retry_at = None;
+        sink.write_line("lands once the path is usable");
+        let written = fs::read_to_string(&sink.current).unwrap();
+        assert!(
+            written.contains("lands once the path is usable"),
+            "{written}"
+        );
+        assert!(!written.contains("refused by the open"));
+        assert_eq!(sink.state.lock().unwrap().dropped, 2);
+    }
+
+    /// Counters saturate rather than wrap, and a saturated failure count still
+    /// retires the sink instead of computing a backoff from it.
+    #[test]
+    fn saturated_counters_neither_wrap_nor_overflow_the_backoff() {
+        let mut state = SinkState {
+            file: None,
+            bytes: 0,
+            degraded: None,
+            retired: false,
+            dropped: u64::MAX,
+            failures: u32::MAX - 1,
+            retry_at: None,
+            cause: String::new(),
+            inject_write_errors: 0,
+        };
+        state.note_failure("EIO".into());
+        assert_eq!((state.dropped, state.failures), (u64::MAX, u32::MAX));
+        assert!(state.retired && state.retry_at.is_none());
+    }
+
     #[test]
     fn the_backoff_grows_and_is_capped() {
         let mut state = SinkState {

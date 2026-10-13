@@ -1476,6 +1476,12 @@ fn spawn_session_inner<R: tauri::Runtime>(
     validate_pty_options(program.as_deref(), args.as_deref(), env.as_ref())?;
     let repo = validate_repo(repo_path)?;
     let start = resolve_start_dir(&repo, start_dir)?;
+    // An agent CLI is a launch the load governor may refuse under severe
+    // memory pressure; the user's own shell (no program) never is.
+    if program.as_deref().is_some_and(|p| !p.trim().is_empty()) {
+        crate::sysload::admit(crate::sysload::Site::PtySpawn, &repo.to_string_lossy())
+            .map_err(|refused| refused.message())?;
+    }
     let reservation = reserve_session(state)?;
     let pty_system = native_pty_system();
     let size = bounded_pty_size(rows, cols);
@@ -3751,6 +3757,80 @@ mod tests {
             observer.failed.load(Ordering::SeqCst),
             "a consumed launch claim must receive its failure receipt"
         );
+    }
+
+    /// Under severe memory pressure an agent launch is refused before its PTY
+    /// opens and before it takes a session slot, naming the binding resource
+    /// and value. The user's own shell is never gated, and the launch is
+    /// admitted again once the pressure clears.
+    #[cfg(unix)]
+    #[test]
+    fn an_agent_pty_is_refused_under_pressure_a_shell_is_not_and_it_resumes() {
+        use crate::sysload::GovernorInput;
+        let dir = tempfile::tempdir().unwrap();
+        init_test_repo(dir.path());
+        let repo = dir.path().to_str().unwrap();
+        let app = tauri::test::mock_builder().build(crate::context()).unwrap();
+        let state = TerminalSessions::default();
+        let marker = dir.path().join("agent-ran");
+        let agent = |state: &TerminalSessions| {
+            spawn_session_inner(
+                app.handle(),
+                state,
+                repo,
+                None,
+                24,
+                80,
+                Some("/bin/sh".into()),
+                Some(vec!["-c".into(), format!("touch '{}'", marker.display())]),
+                None,
+                None,
+            )
+        };
+
+        let pressed = crate::sysload::inject_governor(GovernorInput::test_pressure(
+            crate::sysload::Level::Critical,
+        ));
+        let refusal = agent(&state).unwrap_err();
+        assert!(
+            refusal.contains("Agent launch refused (pty_spawn)"),
+            "{refusal}"
+        );
+        assert!(refusal.contains("critical (kernel level 4)"), "{refusal}");
+        assert_eq!(
+            state.active_sessions.load(Ordering::SeqCst),
+            0,
+            "a refused launch holds no session slot"
+        );
+        assert!(!marker.exists());
+
+        // The user's own shell (no program) is not an agent launch.
+        let shell = spawn_session_inner(
+            app.handle(),
+            &state,
+            repo,
+            None,
+            24,
+            80,
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("a plain shell is never refused");
+        kill_session(&state, &shell.id).unwrap();
+        drop(pressed);
+
+        // Pressure cleared: the same launch is admitted and runs.
+        let _calm = crate::sysload::inject_governor(GovernorInput::test_pressure(
+            crate::sysload::Level::Normal,
+        ));
+        agent(&state).expect("admitted once the pressure clears");
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        while !marker.exists() && std::time::Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert!(marker.exists(), "the admitted agent ran");
     }
 
     /// A task attempt's terminal carries its run id in `GITPULSE_RUN_ID`; a

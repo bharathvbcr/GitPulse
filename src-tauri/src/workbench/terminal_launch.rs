@@ -354,7 +354,7 @@ fn prepare_kind(state: &WorkbenchState, input: &str, kind: &str) -> Result<Value
     }
     // Nothing prepared under this id (`own_prepared` answered every other
     // case), so this attempt needs room and a tree of its own.
-    ensure_room(state)?;
+    ensure_room(state, &input.repo_path)?;
     let task = state
         .with_store(|store| query(store, "items.get", &json!({"id":input.task_id}).to_string()))?;
     let title = task["item"]["title"].as_str().unwrap_or_default();
@@ -497,6 +497,19 @@ fn recorded_model_choice(input: &Preparation, kind: &str) -> Result<Value, Workb
     }
 }
 
+/// Asks the load governor before a launch step costs anything: under severe
+/// memory pressure the step is refused with `host_pressure`, which the form
+/// answers with Retry and "Admit anyway". Only launches call this; stop,
+/// cancel, release and reconcile never do (`sysload::Site`).
+pub(super) fn admit_launch(
+    site: crate::sysload::Site,
+    repo_path: &str,
+) -> Result<(), WorkbenchError> {
+    crate::sysload::admit(site, repo_path)
+        .map(|_| ())
+        .map_err(|refused| WorkbenchError::new(crate::sysload::REFUSAL_CODE, refused.message()))
+}
+
 fn prepare_in(
     state: &WorkbenchState,
     input: &Preparation,
@@ -504,6 +517,9 @@ fn prepare_in(
     repo_path: &str,
     model_choice: &Value,
 ) -> Result<Value, WorkbenchError> {
+    // Before the checkout probes: they are child processes, and a launch into
+    // a machine at its limit is the thing the governor exists to stop.
+    admit_launch(crate::sysload::Site::CheckoutProbe, repo_path)?;
     let checkout = checkout(repo_path)?;
     let body = json!({
         "model_choice": model_choice,
@@ -550,7 +566,8 @@ fn setting_up() -> WorkbenchError {
 /// add` and the whole `post_create` hook. Read-only, with the same one
 /// release of provably stranded attempts the store refusal gets; the store
 /// still decides, since this count can only be low.
-fn ensure_room(state: &WorkbenchState) -> Result<(), WorkbenchError> {
+fn ensure_room(state: &WorkbenchState, repo_path: &str) -> Result<(), WorkbenchError> {
+    admit_launch(crate::sysload::Site::EnsureRoom, repo_path)?;
     let limit = state.live_runs();
     if super::reconcile::live_count(state)? < u64::from(limit) {
         return Ok(());
@@ -1670,6 +1687,115 @@ mod tests {
             .unwrap()
     }
 
+    /// Under severe memory pressure a launch is refused at its first step with
+    /// a typed `host_pressure` error naming the site, the binding resource
+    /// and its value: in place at the checkout probe, with a worktree at the
+    /// capacity check, before anything is built. Nothing is stored, and the
+    /// same request is admitted when the pressure clears.
+    #[test]
+    fn a_launch_is_refused_under_pressure_before_any_probe_or_worktree_and_resumes() {
+        use crate::sysload::{GovernorInput, Level};
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("repo");
+        init(&root);
+        commit(&root);
+        let state = host(&dir.path().join("profile.sqlite"));
+        seed(&state, &root);
+        let worktrees = || {
+            git_text(&root, &["worktree", "list"])
+                .unwrap()
+                .lines()
+                .count()
+        };
+
+        let pressed =
+            crate::sysload::inject_governor(GovernorInput::test_pressure(Level::Critical));
+        let in_place = state
+            .request("runs.prepare_terminal", &prepare(&root).to_string())
+            .unwrap_err();
+        assert_eq!(in_place.code, crate::sysload::REFUSAL_CODE);
+        assert!(
+            in_place.message.contains("checkout_probe"),
+            "{}",
+            in_place.message
+        );
+        assert!(
+            in_place.message.contains("critical (kernel level 4)"),
+            "{}",
+            in_place.message
+        );
+        let mut worktree = prepare(&root);
+        worktree["worktree"] = json!(true);
+        let isolated = state
+            .request("runs.prepare_terminal", &worktree.to_string())
+            .unwrap_err();
+        assert_eq!(isolated.code, crate::sysload::REFUSAL_CODE);
+        assert!(
+            isolated.message.contains("ensure_room"),
+            "{}",
+            isolated.message
+        );
+        // Read once the pressure is lifted: under it the test's own worktree
+        // listing is a reactive spawn and is shed too.
+        drop(pressed);
+        assert_eq!(worktrees(), 1, "no worktree is built for a refused launch");
+        assert_eq!(state.request("runs.list", "{}").unwrap()["total"], 0);
+
+        let _calm = crate::sysload::inject_governor(GovernorInput::test_pressure(Level::Normal));
+        let admitted = state
+            .request("runs.prepare_terminal", &prepare(&root).to_string())
+            .unwrap();
+        assert_eq!(admitted["item"]["state"], "prepared");
+    }
+
+    /// Stop, cancel, release and reconcile act on attempts that already exist
+    /// and free what they hold, so they are the last things pressure may
+    /// refuse: each still works at critical.
+    #[test]
+    fn cancel_release_and_reconcile_are_never_gated_by_pressure() {
+        use crate::sysload::{GovernorInput, Level};
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("repo");
+        init(&root);
+        commit(&root);
+        let state = host(&dir.path().join("profile.sqlite"));
+        seed(&state, &root);
+        let calm = crate::sysload::inject_governor(GovernorInput::test_pressure(Level::Normal));
+        state
+            .request("runs.prepare_terminal", &prepare(&root).to_string())
+            .unwrap();
+        drop(calm);
+
+        let pressed =
+            crate::sysload::inject_governor(GovernorInput::test_pressure(Level::Critical));
+        assert!(
+            crate::sysload::admit(crate::sysload::Site::PtySpawn, root.to_str().unwrap()).is_err()
+        );
+        let cancelled = cancel(&state, "run");
+        assert_eq!(cancelled["item"]["state"], "cancelled");
+        drop(pressed);
+
+        let calm = crate::sysload::inject_governor(GovernorInput::test_pressure(Level::Normal));
+        let mut second = prepare(&root);
+        second["id"] = json!("run2");
+        second["request_id"] = json!("prepare2");
+        state
+            .request("runs.prepare_terminal", &second.to_string())
+            .unwrap();
+        drop(calm);
+
+        let _pressed =
+            crate::sysload::inject_governor(GovernorInput::test_pressure(Level::Critical));
+        let released = state.request("runs.release", r#"{"id":"run2"}"#).unwrap();
+        assert_eq!(released["ok"], true);
+        let reconciled = super::super::reconcile::sweep(&state);
+        assert!(
+            reconciled.is_ok(),
+            "{:?}",
+            reconciled.err().map(|e| e.message)
+        );
+    }
+
     /// A full profile is refused before anything is built: the worktree, its
     /// branch and the repository's whole setup hook used to run first, only
     /// to be torn down again when the store said no. The refusal is the
@@ -1887,6 +2013,38 @@ mod tests {
         assert_eq!(gitpulse_branches(&root), "");
         assert_eq!(cancelled["worktree"]["removed"], true, "{cancelled}");
         assert_eq!(cancelled["worktree"]["path"], json!(cwd));
+    }
+
+    /// Cancel is the way a person gives a refused or unwanted attempt's
+    /// worktree back, so it is never shed: its removal is git work that must
+    /// run at critical pressure too, not be deferred as a refresh would be.
+    #[test]
+    fn cancelling_reclaims_the_worktree_even_while_pressure_sheds_reactive_work() {
+        use crate::sysload::{GovernorInput, Level};
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("repo");
+        init(&root);
+        commit(&root);
+        let state = host(&dir.path().join("profile.sqlite"));
+        seed(&state, &root);
+        let run = state
+            .request(
+                "runs.prepare_terminal",
+                &with_worktree(&root, "abad1dea-p").to_string(),
+            )
+            .unwrap();
+        let cwd = run["item"]["cwd"].as_str().unwrap().to_owned();
+        assert!(Path::new(&cwd).is_dir());
+        let pressed =
+            crate::sysload::inject_governor(GovernorInput::test_pressure(Level::Critical));
+        let cancelled = cancel(&state, "abad1dea-p");
+        assert_eq!(cancelled["item"]["state"], "cancelled");
+        assert_eq!(
+            cancelled["worktree"]["removed"], true,
+            "cancel's worktree removal was shed under pressure: {cancelled}"
+        );
+        drop(pressed);
+        assert!(!Path::new(&cwd).exists());
     }
 
     /// Work in the tree is never thrown away to tidy up: a cancelled attempt

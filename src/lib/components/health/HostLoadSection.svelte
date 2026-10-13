@@ -17,12 +17,15 @@
   import { keyedList } from "../../ui/eachKeys";
   import HealthTable from "./HealthTable.svelte";
   import {
+    admitAnyway,
     hostLoadStatus,
     refreshHostLoad,
     terminateOrphan,
     type Orphan,
   } from "../../stores/hostLoadStore";
   import {
+    admissionLine,
+    governorLine,
     bytes,
     bytesPerSecond,
     describeReading,
@@ -91,6 +94,22 @@
     stopRefresh?.();
   });
 
+  let admitting = $state(false);
+  let admitOutcome = $state("");
+
+  /** A person's "Admit anyway": the backend asks in a native dialog, then admits for two minutes. */
+  async function admit() {
+    admitting = true;
+    admitOutcome = "";
+    try {
+      admitOutcome = await admitAnyway();
+    } catch (cause) {
+      admitOutcome = explainError(cause);
+    } finally {
+      admitting = false;
+    }
+  }
+
   async function terminate(orphan: Orphan) {
     if (confirming !== orphan.pid) {
       confirming = orphan.pid;
@@ -158,6 +177,29 @@
       <p class="text-textMuted">
         Replay-verified; no real memory-pressure event has been observed by this sensor yet.
       </p>
+    </div>
+
+    <div class="rounded-2xl border border-border/70 bg-surface p-3 shadow-card space-y-1" data-testid="host-load-governor">
+      <p class="text-textPrimary font-medium" data-testid="host-load-governor-shedding">{governorLine(status.governor)}</p>
+      <p class="{status.governor.verdict.admit ? 'text-textMuted' : 'text-amber-300'}" data-testid="host-load-governor-admission">{admissionLine(status.governor)}</p>
+      {#if status.governor.verdict.reason === "sensor_unavailable"}
+        <p class="text-amber-300">Launches are admitted and nothing extra is shed while the sensor cannot be read.</p>
+      {/if}
+      {#if !status.governor.verdict.admit && status.governor.override_remaining_s === null}
+        <div class="flex items-center gap-2 pt-1">
+          <button
+            type="button"
+            class="rounded border border-border/70 px-2 py-0.5 text-textPrimary hover:bg-surfaceHover disabled:opacity-50"
+            disabled={admitting}
+            onclick={() => void admit()}
+            data-testid="host-load-admit-anyway"
+          >Admit anyway</button>
+          <span class="text-textMuted">Asks in a system dialog; admits launches for two minutes.</span>
+        </div>
+      {/if}
+      {#if admitOutcome}
+        <p class="text-textMuted" data-testid="host-load-admit-outcome">{admitOutcome}</p>
+      {/if}
     </div>
 
     {#if host && snap}

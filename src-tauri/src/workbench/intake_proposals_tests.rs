@@ -287,6 +287,202 @@ fn only_the_selected_parts_are_applied() {
     assert_eq!(board(&store, &repo).len(), 2, "no split was created");
 }
 
+/// A refinement that proposes only acceptance criteria, as Manvi stored it.
+fn stored_criteria(store: &Store, task: &str, revision: i64, criteria: Value) -> String {
+    let id = format!("enh-criteria-{task}");
+    let create = json!({
+        "id": id, "request_id": format!("create-{id}"), "expected_revision": 0,
+        "task_id": task, "source_revision": revision, "kind": "refine",
+        "fields": ["acceptance_criteria", "split_into", "duplicate_of"],
+        "provider": "local", "model": "test-model",
+    });
+    query(store, "enhancements.create", &create.to_string()).unwrap();
+    let complete = json!({
+        "id": id, "request_id": format!("complete-{id}"), "expected_revision": 1,
+        "acceptance_criteria": criteria, "split_into": [], "duplicate_of": [],
+        "rationale": "grounded",
+    });
+    query(store, "enhancements.complete", &complete.to_string()).unwrap();
+    id
+}
+
+#[test]
+fn a_criterion_the_task_already_has_is_not_added_again_for_differing_whitespace() {
+    let (_d, store, repo) = setup();
+    let (id, revision) = reviewed(&store, &repo);
+    let proposal = stored_criteria(&store, &id, revision, json!(["  Existing criterion\n"]));
+    // Nothing the proposal offers is new: applying it alone is refused rather
+    // than appending the same criterion twice, and the task is untouched.
+    let refused = apply_refinement(
+        &store,
+        &apply_input(&repo, &proposal, revision, json!(["acceptance_criteria"])),
+    )
+    .unwrap_err();
+    assert_eq!(refused.code, "invalid_input", "{refused:?}");
+    let card = get_item(&store, &id).unwrap().unwrap();
+    assert_eq!(card["acceptance_criteria"], json!(["Existing criterion"]));
+    assert_eq!(card["revision"], revision);
+
+    // Chosen with another part, the criteria that add nothing are left out of
+    // the accept and are not reported as added.
+    let applied = apply_refinement(
+        &store,
+        &apply_input(
+            &repo,
+            &proposal,
+            revision,
+            json!(["acceptance_criteria", "duplicate_of"]),
+        ),
+    )
+    .unwrap_or_else(|error| panic!("{error:?}"));
+    assert_eq!(applied["criteria_added"], 0, "{applied}");
+    assert_eq!(
+        get_item(&store, &id).unwrap().unwrap()["acceptance_criteria"],
+        json!(["Existing criterion"])
+    );
+}
+
+/// An apply whose reply was lost is retried as the same request, and the store
+/// replays the receipt. Which parts are sent must not depend on the task as it
+/// is after the first write, or the retry is a different request under a used
+/// request_id (or "nothing to apply") and is refused although the apply
+/// succeeded.
+#[test]
+fn a_retried_apply_replays_rather_than_being_refused_by_its_own_first_write() {
+    for fields in [
+        json!(["acceptance_criteria"]),
+        json!(["acceptance_criteria", "duplicate_of"]),
+    ] {
+        let (_d, store, repo) = setup();
+        let (id, revision) = reviewed(&store, &repo);
+        let proposal = stored_criteria(&store, &id, revision, json!(["A fresh criterion"]));
+        let input = apply_input(&repo, &proposal, revision, fields.clone());
+        let first = apply_refinement(&store, &input).unwrap_or_else(|e| panic!("{fields}: {e:?}"));
+        assert_eq!(first["outcome"], "applied", "{first}");
+        assert_eq!(first["criteria_added"], 1, "{first}");
+        let again = apply_refinement(&store, &input)
+            .unwrap_or_else(|e| panic!("{fields}: the retry was refused: {e:?}"));
+        assert_eq!(again["outcome"], "applied", "{again}");
+        assert_eq!(again["revision"], first["revision"], "{again}");
+        assert_eq!(again["criteria_added"], first["criteria_added"], "{again}");
+        assert_eq!(
+            get_item(&store, &id).unwrap().unwrap()["acceptance_criteria"],
+            json!(["Existing criterion", "A fresh criterion"]),
+            "{fields}: applied once"
+        );
+    }
+}
+
+#[test]
+fn criteria_added_is_what_the_task_actually_gained() {
+    let (_d, store, repo) = setup();
+    let (id, revision) = reviewed(&store, &repo);
+    let proposal = stored_criteria(
+        &store,
+        &id,
+        revision,
+        json!(["Exports CSV", "  Exports CSV  "]),
+    );
+    let before = get_item(&store, &id).unwrap().unwrap()["acceptance_criteria"]
+        .as_array()
+        .unwrap()
+        .len();
+    let applied = apply_refinement(
+        &store,
+        &apply_input(&repo, &proposal, revision, json!(["acceptance_criteria"])),
+    )
+    .unwrap();
+    let after = get_item(&store, &id).unwrap().unwrap()["acceptance_criteria"]
+        .as_array()
+        .unwrap()
+        .len();
+    assert_eq!(
+        applied["criteria_added"].as_u64().unwrap() as usize,
+        after - before,
+        "{applied}"
+    );
+}
+
+#[test]
+fn a_reviewed_list_longer_than_one_call_can_carry_is_refused_on_both_paths() {
+    let (_d, store, repo) = setup();
+    let too_many: Vec<String> = (0..=MAX_REVIEWED_RELATED)
+        .map(|n| format!("ft-{n}"))
+        .collect();
+    let error = file_proposal(
+        &store,
+        &file_input(&repo, json!({"reviewed_related": too_many})),
+    )
+    .unwrap_err();
+    assert_eq!(error.code, "invalid_input", "{error:?}");
+    assert!(board(&store, &repo).is_empty());
+
+    let (id, revision) = reviewed(&store, &repo);
+    let other = original(&store, &repo);
+    let proposal = stored_refinement(&store, &id, revision, &other);
+    let mut input: Value = serde_json::from_str(&apply_input(
+        &repo,
+        &proposal,
+        revision,
+        json!(["split_into"]),
+    ))
+    .unwrap();
+    input["reviewed_related"] = json!(too_many);
+    let error = apply_refinement(&store, &input.to_string()).unwrap_err();
+    assert_eq!(error.code, "invalid_input", "{error:?}");
+    assert_eq!(
+        get_item(&store, &id).unwrap().unwrap()["revision"],
+        revision
+    );
+}
+
+/// The refusal names one page of 25; the person confirms what they were shown
+/// and the host asks again with everything confirmed so far. Sixty related
+/// tasks take three confirmations, and the filing then succeeds: the review is
+/// cumulative, never replaced by the latest page.
+#[test]
+fn sixty_related_tasks_are_reviewed_page_by_page_and_the_filing_then_succeeds() {
+    let (_d, store, repo) = setup();
+    let repository = registered(&store, &repo);
+    for n in 0..60 {
+        place(
+            &store,
+            &repository,
+            &task(
+                &format!("gp-rel-{n}"),
+                &format!("Remove the unreferenced helper quuxify case{n}x"),
+            ),
+            false,
+            now_millis(),
+        )
+        .unwrap();
+    }
+    let mut reviewed_ids: Vec<String> = Vec::new();
+    let mut pages = 0;
+    let filed = loop {
+        let reply = file_proposal(
+            &store,
+            &file_input(&repo, json!({"reviewed_related": reviewed_ids})),
+        )
+        .unwrap();
+        if reply["outcome"] != "related_tasks_exist" {
+            break reply;
+        }
+        pages += 1;
+        assert!(pages <= 3, "the review must converge: {reply}");
+        let page = reply["related"].as_array().unwrap();
+        assert!(page.len() <= MAX_RELATED, "{}", page.len());
+        for related in page {
+            let id = related["item_id"].as_str().unwrap().to_owned();
+            assert!(!reviewed_ids.contains(&id), "{id} was already reviewed");
+            reviewed_ids.push(id);
+        }
+    };
+    assert_eq!(filed["outcome"], "filed", "{filed}");
+    assert_eq!(pages, 3, "25 + 25 + 10");
+    assert_eq!(reviewed_ids.len(), 60);
+}
+
 #[test]
 fn a_split_that_looks_like_open_work_is_held_until_the_person_confirms() {
     let (_d, store, repo) = setup();

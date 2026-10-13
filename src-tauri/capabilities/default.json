@@ -163,6 +163,7 @@
     "allow-cmd-grants-view",
     "allow-cmd-harness-reconnect",
     "allow-cmd-harness-status",
+    "allow-cmd-host-load-admit-anyway",
     "allow-cmd-host-load-settings",
     "allow-cmd-host-load-settings-save",
     "allow-cmd-host-load-status",

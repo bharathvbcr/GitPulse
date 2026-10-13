@@ -37,6 +37,17 @@ describe("record codec", () => {
     expect(decodeWave(`pasted trace\n${encodeWave(r)}\nmore`)).toEqual(r);
   });
 
+  it("round-trips a refused wave and the person's allowance of an unchecked ranking", () => {
+    for (const r of [record({ state: "refused", note: "Nothing was launched: x" }), record({ acceptUnchecked: true }), record({ acceptUnchecked: false })]) {
+      expect(decodeWave(encodeWave(r))).toEqual(r);
+    }
+    // A record from before the allowance existed reads as not allowed, never as allowed.
+    const legacy = JSON.parse(JSON.stringify(record()));
+    delete legacy.acceptUnchecked;
+    expect(decodeWave(`${WAVE_MARK}${JSON.stringify(legacy)}`)?.acceptUnchecked).not.toBe(true);
+    expect(decodeWave(`${WAVE_MARK}${JSON.stringify({ ...legacy, acceptUnchecked: "yes" })}`)).toBeNull();
+  });
+
   it("refuses anything it cannot trust, rather than guessing", () => {
     const good = JSON.parse(JSON.stringify(record()));
     const bad: unknown[] = [
