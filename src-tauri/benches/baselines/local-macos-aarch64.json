@@ -5,15 +5,15 @@
   "arch": "aarch64",
   "benches": {
     "command_timings": {
-      "commit": "9789a8e60eb60d2a55ad405ded36b69261fb8b4b",
+      "commit": "43f54d7fe82964f23ce45ac8e63e8cbf0770b240",
       "smoke": false,
       "cpu_count": 18,
-      "load1": 37.908203125,
+      "load1": 8.94482421875,
       "rows": {
         "catch_up cold": {
           "n": 5,
           "time_gated": true,
-          "min_ns": 76185834,
+          "min_ns": 61033250,
           "counters": {
             "recorded": 485,
             "reflog_entries": 5,
@@ -24,7 +24,7 @@
         "catch_up steady": {
           "n": 15,
           "time_gated": true,
-          "min_ns": 35763125,
+          "min_ns": 34321417,
           "counters": {
             "recorded": 0,
             "reflog_entries": 0,
@@ -35,16 +35,16 @@
         "commit details": {
           "n": 15,
           "time_gated": true,
-          "min_ns": 16107500,
+          "min_ns": 123834,
           "counters": {
-            "git_processes": 2,
+            "git_processes": 1,
             "parents": 1
           }
         },
         "docs refresh": {
           "n": 15,
           "time_gated": true,
-          "min_ns": 11388000,
+          "min_ns": 387291,
           "counters": {
             "notes": 75
           }
@@ -52,45 +52,54 @@
         "insights snapshot": {
           "n": 15,
           "time_gated": true,
-          "min_ns": 485043750,
+          "min_ns": 164950792,
           "counters": {
             "facets_ok": 7,
-            "git_processes": 37,
+            "git_processes": 21,
             "worktrees": 18
           }
         },
         "language stats": {
           "n": 15,
           "time_gated": true,
-          "min_ns": 55363166,
+          "min_ns": 17642042,
           "counters": {
             "candidate_files": 600,
-            "git_processes": 1,
+            "git_processes": 2,
             "languages": 8,
             "scanned_files": 600
           }
         },
-        "list_worktrees": {
+        "list_worktrees full": {
           "n": 15,
           "time_gated": true,
-          "min_ns": 541627083,
+          "min_ns": 349134500,
           "counters": {
-            "git_processes": 39,
+            "git_processes": 38,
+            "worktrees": 18
+          }
+        },
+        "list_worktrees listing": {
+          "n": 15,
+          "time_gated": true,
+          "min_ns": 7286333,
+          "counters": {
+            "git_processes": 1,
             "worktrees": 18
           }
         }
       }
     },
     "graph_diff": {
-      "commit": "9789a8e60eb60d2a55ad405ded36b69261fb8b4b",
+      "commit": "43f54d7fe82964f23ce45ac8e63e8cbf0770b240",
       "smoke": false,
       "cpu_count": 18,
-      "load1": 43.728515625,
+      "load1": 7.82666015625,
       "rows": {
         "lane_solver linear 100k": {
           "n": 7,
           "time_gated": true,
-          "min_ns": 41073166,
+          "min_ns": 34510041,
           "counters": {
             "connections": 99999,
             "merges": 0,
@@ -101,7 +110,7 @@
         "lane_solver linear 10k": {
           "n": 30,
           "time_gated": true,
-          "min_ns": 2447250,
+          "min_ns": 2395708,
           "counters": {
             "connections": 9999,
             "merges": 0,
@@ -112,7 +121,7 @@
         "lane_solver merge-heavy 100k": {
           "n": 7,
           "time_gated": true,
-          "min_ns": 24829000,
+          "min_ns": 22943500,
           "counters": {
             "connections": 83000,
             "merges": 16600,
@@ -123,7 +132,7 @@
         "lane_solver merge-heavy 10k": {
           "n": 30,
           "time_gated": true,
-          "min_ns": 1878166,
+          "min_ns": 1806416,
           "counters": {
             "connections": 8330,
             "merges": 1666,
@@ -134,7 +143,7 @@
         "word_diff 100 chars": {
           "n": 100,
           "time_gated": true,
-          "min_ns": 3833,
+          "min_ns": 3708,
           "counters": {
             "changed_segments": 4,
             "input_bytes": 210,
@@ -145,7 +154,7 @@
         "word_diff 10000 chars": {
           "n": 100,
           "time_gated": true,
-          "min_ns": 374584,
+          "min_ns": 356625,
           "counters": {
             "changed_segments": 74,
             "input_bytes": 20477,
@@ -156,7 +165,7 @@
         "word_diff 60000 chars": {
           "n": 100,
           "time_gated": true,
-          "min_ns": 1625,
+          "min_ns": 1583,
           "counters": {
             "changed_segments": 2,
             "input_bytes": 122619,
@@ -167,15 +176,15 @@
       }
     },
     "idle_wakeups": {
-      "commit": "9789a8e60eb60d2a55ad405ded36b69261fb8b4b",
+      "commit": "43f54d7fe82964f23ce45ac8e63e8cbf0770b240",
       "smoke": false,
       "cpu_count": 18,
-      "load1": 30.3671875,
+      "load1": 8.0537109375,
       "rows": {
         "idle 0 sessions": {
           "n": 3,
           "time_gated": false,
-          "min_ns": 5004627250,
+          "min_ns": 5001933167,
           "counters": {
             "sessions": 0
           }
@@ -183,7 +192,7 @@
         "idle 1 sessions": {
           "n": 3,
           "time_gated": false,
-          "min_ns": 5001325042,
+          "min_ns": 5005068833,
           "counters": {
             "sessions": 1
           }
@@ -191,7 +200,7 @@
         "idle 32 sessions": {
           "n": 3,
           "time_gated": false,
-          "min_ns": 5000036917,
+          "min_ns": 5002549083,
           "counters": {
             "sessions": 32
           }
@@ -199,7 +208,7 @@
         "idle 8 sessions": {
           "n": 3,
           "time_gated": false,
-          "min_ns": 5000166625,
+          "min_ns": 5002132208,
           "counters": {
             "sessions": 8
           }
@@ -207,15 +216,15 @@
       }
     },
     "live_index": {
-      "commit": "9789a8e60eb60d2a55ad405ded36b69261fb8b4b",
+      "commit": "43f54d7fe82964f23ce45ac8e63e8cbf0770b240",
       "smoke": false,
       "cpu_count": 18,
-      "load1": 24.0341796875,
+      "load1": 8.0517578125,
       "rows": {
         "edit storm 40 ticks": {
           "n": 3,
           "time_gated": false,
-          "min_ns": 13555360333,
+          "min_ns": 9751973208,
           "counters": {
             "ticks": 40
           }
@@ -223,15 +232,15 @@
       }
     },
     "mcp_protocol": {
-      "commit": "9789a8e60eb60d2a55ad405ded36b69261fb8b4b",
+      "commit": "43f54d7fe82964f23ce45ac8e63e8cbf0770b240",
       "smoke": false,
       "cpu_count": 18,
-      "load1": 39.146484375,
+      "load1": 5.98388671875,
       "rows": {
         "codeintel status": {
           "n": 30,
           "time_gated": true,
-          "min_ns": 69273000,
+          "min_ns": 49085041,
           "counters": {
             "facets_ok": 1
           }
@@ -239,43 +248,43 @@
         "completion/complete": {
           "n": 200,
           "time_gated": true,
-          "min_ns": 2000,
+          "min_ns": 1833,
           "counters": {}
         },
         "prompts/list": {
           "n": 200,
           "time_gated": true,
-          "min_ns": 7125,
+          "min_ns": 6792,
           "counters": {}
         },
         "resources/list": {
           "n": 200,
           "time_gated": true,
-          "min_ns": 3708,
+          "min_ns": 3500,
           "counters": {}
         },
         "resources/read server/manifest": {
           "n": 200,
           "time_gated": true,
-          "min_ns": 605792,
+          "min_ns": 587958,
           "counters": {}
         },
         "resources/templates/list": {
           "n": 200,
           "time_gated": true,
-          "min_ns": 10208,
+          "min_ns": 9458,
           "counters": {}
         },
         "server/discover": {
           "n": 200,
           "time_gated": true,
-          "min_ns": 3333,
+          "min_ns": 2750,
           "counters": {}
         },
         "tools/call collision_risk": {
           "n": 30,
           "time_gated": true,
-          "min_ns": 36021708,
+          "min_ns": 25141834,
           "counters": {
             "facets_ok": 1
           }
@@ -283,28 +292,28 @@
         "tools/call insights": {
           "n": 30,
           "time_gated": true,
-          "min_ns": 118761958,
+          "min_ns": 29263250,
           "counters": {
             "facets_ok": 7,
-            "git_processes": 11
+            "git_processes": 6
           }
         },
         "tools/call rejected argument": {
           "n": 200,
           "time_gated": true,
-          "min_ns": 2750,
+          "min_ns": 2625,
           "counters": {}
         },
         "tools/list": {
           "n": 200,
           "time_gated": true,
-          "min_ns": 349833,
+          "min_ns": 341292,
           "counters": {}
         },
         "validate (accepting)": {
           "n": 200,
           "time_gated": true,
-          "min_ns": 375,
+          "min_ns": 292,
           "counters": {
             "violations": 0
           }
@@ -312,7 +321,7 @@
         "validate (rejecting)": {
           "n": 200,
           "time_gated": true,
-          "min_ns": 833,
+          "min_ns": 625,
           "counters": {
             "violations": 4
           }
@@ -320,15 +329,15 @@
       }
     },
     "repo_read": {
-      "commit": "9789a8e60eb60d2a55ad405ded36b69261fb8b4b",
+      "commit": "43f54d7fe82964f23ce45ac8e63e8cbf0770b240",
       "smoke": false,
       "cpu_count": 18,
-      "load1": 36.1650390625,
+      "load1": 22.4990234375,
       "rows": {
         "get_status 10k files clean": {
           "n": 15,
           "time_gated": true,
-          "min_ns": 31219375,
+          "min_ns": 25284042,
           "counters": {
             "git_processes": 1,
             "rows": 0
@@ -337,7 +346,7 @@
         "get_status 10k files dirty": {
           "n": 15,
           "time_gated": true,
-          "min_ns": 96643834,
+          "min_ns": 70782083,
           "counters": {
             "git_processes": 2,
             "rows": 500
@@ -346,7 +355,7 @@
         "get_status 1k files clean": {
           "n": 15,
           "time_gated": true,
-          "min_ns": 11631208,
+          "min_ns": 8309875,
           "counters": {
             "git_processes": 1,
             "rows": 0
@@ -355,7 +364,7 @@
         "get_status 1k files dirty": {
           "n": 15,
           "time_gated": true,
-          "min_ns": 34118375,
+          "min_ns": 23896917,
           "counters": {
             "git_processes": 2,
             "rows": 50
@@ -364,15 +373,15 @@
       }
     },
     "terminal_pty": {
-      "commit": "9789a8e60eb60d2a55ad405ded36b69261fb8b4b",
+      "commit": "43f54d7fe82964f23ce45ac8e63e8cbf0770b240",
       "smoke": false,
       "cpu_count": 18,
-      "load1": 35.76806640625,
+      "load1": 9.63671875,
       "rows": {
         "echo during flood": {
           "n": 9,
           "time_gated": false,
-          "min_ns": 15167,
+          "min_ns": 7625,
           "counters": {
             "keystrokes": 12
           }
@@ -380,7 +389,7 @@
         "echo idle": {
           "n": 9,
           "time_gated": false,
-          "min_ns": 29000,
+          "min_ns": 20833,
           "counters": {
             "keystrokes": 12
           }
@@ -388,7 +397,7 @@
         "flood 16 MiB": {
           "n": 9,
           "time_gated": false,
-          "min_ns": 548649500,
+          "min_ns": 499866500,
           "counters": {
             "bytes_received": 16777216
           }
@@ -396,15 +405,15 @@
       }
     },
     "watcher": {
-      "commit": "9789a8e60eb60d2a55ad405ded36b69261fb8b4b",
+      "commit": "43f54d7fe82964f23ce45ac8e63e8cbf0770b240",
       "smoke": false,
       "cpu_count": 18,
-      "load1": 44.79931640625,
+      "load1": 8.20849609375,
       "rows": {
         "record_event_signal 10000-event burst": {
           "n": 60,
           "time_gated": true,
-          "min_ns": 15135875,
+          "min_ns": 13128791,
           "counters": {
             "admitted": 7000,
             "dropped": 3000,
