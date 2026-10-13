@@ -11,12 +11,26 @@
 //! This builds the same `IgnoreRules` the loop builds (from `git ls-files -o -i
 //! --directory -z` output, through the same parser) and calls the same
 //! function; it adds no logic of its own.
+//!
+//! [`start_idle_watch`] is the second door, for `benches/idle_wakeups.rs`: the
+//! public `start_watch` needs a real window system's `AppHandle`, which a bench
+//! does not have, and what that bench measures is the loop itself. It starts
+//! the same session `start_watch` does, with callbacks that drop what they are
+//! told.
 
 use std::path::{Path, PathBuf};
 
 use notify::Event;
 
-use super::{parse_ignored_directories, record_event_signal, ChangeAccumulator, IgnoreRules};
+use super::{
+    parse_ignored_directories, record_event_signal, start_watch_observed, ChangeAccumulator,
+    IgnoreRules, WatcherState,
+};
+
+/// Starts a real watch session on `repo_path` whose announcements go nowhere.
+pub fn start_idle_watch(state: &WatcherState, repo_path: &str) -> Result<String, String> {
+    start_watch_observed(state, repo_path.to_owned(), |_| {}, |_| {})
+}
 
 /// A worktree's classifier: its ignore rules and the path facts the loop holds.
 pub struct StormClassifier {
