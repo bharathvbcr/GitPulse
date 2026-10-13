@@ -2,6 +2,7 @@
 //! Labels come from compiler type names, never captured command arguments.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Condvar, Mutex, Once, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -154,6 +155,11 @@ struct InFlight {
     calls: HashMap<u64, Running>,
     finished_after_report: HashMap<&'static str, u64>,
     untracked: u64,
+    /// The watchdog is asleep with no deadline, so only a notification ends
+    /// its sleep. While it is awake (sweeping, or in its timed wait between
+    /// sweeps) a call that is inserted is found by the next sweep, and waking
+    /// it for that call buys nothing.
+    parked: bool,
 }
 
 impl InFlight {
@@ -268,6 +274,8 @@ impl InFlight {
 struct Watch {
     state: Mutex<InFlight>,
     wake: Condvar,
+    /// Times the watchdog came back from a wait: a notification, or a tick.
+    wakes: AtomicU64,
 }
 
 fn watch() -> &'static Watch {
@@ -276,6 +284,7 @@ fn watch() -> &'static Watch {
     let watch = WATCH.get_or_init(|| Watch {
         state: Mutex::new(InFlight::default()),
         wake: Condvar::new(),
+        wakes: AtomicU64::new(0),
     });
     WATCHDOG.call_once(|| {
         // One thread per process, parked while nothing is in flight. A spawn
@@ -293,16 +302,23 @@ fn run_watchdog(watch: &Watch) {
     let mut state = watch.state.lock().unwrap_or_else(PoisonError::into_inner);
     loop {
         while state.calls.is_empty() && state.finished_after_report.is_empty() {
+            // Set under the lock the wait releases, so a call inserted after
+            // this sees it and notifies, and one inserted before it is
+            // already in `calls`.
+            state.parked = true;
             state = watch
                 .wake
                 .wait(state)
                 .unwrap_or_else(PoisonError::into_inner);
+            state.parked = false;
+            watch.wakes.fetch_add(1, Ordering::Relaxed);
         }
         state = watch
             .wake
             .wait_timeout(state, WATCH_TICK)
             .unwrap_or_else(PoisonError::into_inner)
             .0;
+        watch.wakes.fetch_add(1, Ordering::Relaxed);
         let sweep = state.sweep(Instant::now());
         // Log outside the lock: the durable sink does file I/O.
         drop(state);
@@ -372,6 +388,7 @@ pub(crate) fn flush() {
 }
 
 pub(crate) struct CommandTiming {
+    watch: &'static Watch,
     operation: &'static str,
     id: Option<u64>,
     queued: Instant,
@@ -383,15 +400,24 @@ impl CommandTiming {
     /// Registers a call before it waits for a blocking worker, so a saturated
     /// pool is visible as calls waiting, not only as late completions.
     pub(crate) fn queue(operation: &'static str) -> Self {
+        Self::queue_on(watch(), operation)
+    }
+
+    /// [`CommandTiming::queue`] on a given watchdog. The watchdog is woken only
+    /// when it is asleep with no deadline: awake, it finds this call at its next
+    /// sweep, and a keystroke per call used to cost it a wake each.
+    fn queue_on(watch: &'static Watch, operation: &'static str) -> Self {
         let queued = Instant::now();
-        let watch = watch();
-        let id = watch
-            .state
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .insert(operation, queued);
-        watch.wake.notify_one();
+        let (id, asleep) = {
+            let mut state = watch.state.lock().unwrap_or_else(PoisonError::into_inner);
+            let id = state.insert(operation, queued);
+            (id, state.parked)
+        };
+        if asleep {
+            watch.wake.notify_one();
+        }
         Self {
+            watch,
             operation,
             id,
             queued,
@@ -403,7 +429,7 @@ impl CommandTiming {
     pub(crate) fn start(&mut self) {
         self.started = Instant::now();
         if let Some(id) = self.id {
-            watch()
+            self.watch
                 .state
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
@@ -421,7 +447,7 @@ impl CommandTiming {
 impl Drop for CommandTiming {
     fn drop(&mut self) {
         if let Some(id) = self.id {
-            watch()
+            self.watch
                 .state
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
@@ -487,9 +513,11 @@ pub(crate) fn enable_test_facade() {
 #[cfg(test)]
 mod tests {
     use super::{
-        InFlight, RunningReport, SlowCommands, MAX_IN_FLIGHT, MAX_OPERATIONS, MAX_RUNNING_LINES,
-        OVERFLOW, REPORT_INTERVAL, RUNNING_BUDGET, SLOW,
+        run_watchdog, CommandTiming, InFlight, RunningReport, SlowCommands, Watch, MAX_IN_FLIGHT,
+        MAX_OPERATIONS, MAX_RUNNING_LINES, OVERFLOW, REPORT_INTERVAL, RUNNING_BUDGET, SLOW,
     };
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Condvar, Mutex, PoisonError};
     use std::time::{Duration, Instant};
 
     #[test]
@@ -693,5 +721,70 @@ mod tests {
             .observe("another overflow", now, SLOW, Duration::ZERO)
             .is_none());
         assert_eq!(tracker.operations.len(), MAX_OPERATIONS);
+    }
+
+    /// A watchdog of its own, so a test counts its wakes and the process-wide
+    /// one (shared with every other test) is left alone.
+    fn private_watch() -> &'static Watch {
+        let watch: &'static Watch = Box::leak(Box::new(Watch {
+            state: Mutex::new(InFlight::default()),
+            wake: Condvar::new(),
+            wakes: AtomicU64::new(0),
+        }));
+        crate::supervisor::spawn_service("test-perf-watch", move || run_watchdog(watch))
+            .expect("watchdog thread");
+        watch
+    }
+
+    fn wait_until(limit: Duration, done: impl Fn() -> bool) -> bool {
+        let deadline = Instant::now() + limit;
+        while !done() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        done()
+    }
+
+    fn parked(watch: &Watch) -> bool {
+        watch
+            .state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .parked
+    }
+
+    /// The defect: every call woke the watchdog, a keystroke included, so
+    /// typing cost a thread wake per key on the thread that reads the input.
+    /// An awake watchdog finds a new call at its next sweep.
+    #[test]
+    fn a_burst_of_quick_calls_wakes_the_watchdog_once_not_once_per_call() {
+        let watch = private_watch();
+        assert!(wait_until(Duration::from_secs(2), || parked(watch)));
+        let before = watch.wakes.load(Ordering::Relaxed);
+        for _ in 0..50 {
+            let call = CommandTiming::queue_on(watch, "keystroke");
+            std::thread::sleep(Duration::from_millis(2));
+            drop(call);
+        }
+        let wakes = watch.wakes.load(Ordering::Relaxed) - before;
+        println!("50 calls woke the watchdog {wakes} times");
+        assert!(wakes <= 3, "{wakes} wakes for 50 calls");
+    }
+
+    /// And the watchdog is not blinded by that: a call that arrives while it
+    /// sleeps with no deadline wakes it, and a call that stays in flight is
+    /// swept every tick after.
+    #[test]
+    fn a_call_that_stays_in_flight_is_still_swept_every_tick() {
+        let watch = private_watch();
+        assert!(wait_until(Duration::from_secs(2), || parked(watch)));
+        let before = watch.wakes.load(Ordering::Relaxed);
+        let call = CommandTiming::queue_on(watch, "stuck");
+        // The notification, then a sweep at each tick it stays.
+        let swept = wait_until(Duration::from_secs(8), || {
+            watch.wakes.load(Ordering::Relaxed) - before >= 3
+        });
+        let wakes = watch.wakes.load(Ordering::Relaxed) - before;
+        drop(call);
+        assert!(swept, "only {wakes} wakes while a call stayed in flight");
     }
 }

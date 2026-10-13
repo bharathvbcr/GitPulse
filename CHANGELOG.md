@@ -121,6 +121,12 @@ before that tag is pushed.
   instead of being dropped with its credit still owed. An exit waits for an end
   marker sent down the channel after the last byte, so it can no longer
   overtake output still being fetched.
+- Typing no longer wakes the still-running watchdog once per key. Every
+  command registers with a watchdog thread that reports calls stuck past five
+  seconds, and registering notified it each time, so a burst of 50 keystrokes
+  woke it 50 times. It is now notified only when it is asleep with no deadline;
+  awake, it finds the call at its next one-second sweep, and a call that stays
+  in flight is still reported on the same schedule.
 - Closing a terminal waits for its jobs by sleeping on their exit, not by
   reading the whole process table every 20 ms. A cleanup that takes 0.8 s read
   the table 32 times and now reads it twice; jobs that obey the hangup end the
