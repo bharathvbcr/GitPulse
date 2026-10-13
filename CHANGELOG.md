@@ -13,6 +13,14 @@ before that tag is pushed.
 
 ### Changed
 
+- **An idle terminal no longer wakes its reader ten times a second.** Each
+  session's reader polled its PTY every 100 ms and asked `waitpid` whether the
+  shell had exited, about 860,000 wakeups a day per idle session, which also
+  kept the Mac out of App Nap. It now sleeps in one kernel wait (kqueue on
+  macOS, epoll and a pidfd on Linux) that ends on output, a hangup or the
+  shell's exit. Whether the shell exited is still decided by asking it, and a
+  missed exit notification is caught by a five-minute safety net (or, where
+  exits cannot be watched, by the old 100 ms lap).
 - **Switching repository tabs no longer rebuilds the sidebar, the view shell
   or the status bar.** All three were keyed on the active repository's path, so
   every switch destroyed and recreated them. They now stay mounted and re-point

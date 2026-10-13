@@ -9,17 +9,17 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, TryLockError};
 use std::time::{Duration, Instant};
 
-/// Wait for the shared nonblocking master to become readable. A readiness
-/// notification, including hangup, only triggers another read: buffered bytes
-/// must still be drained before the reader can declare EOF.
-pub(super) fn wait_for_output(fd: std::os::fd::RawFd) -> std::io::Result<()> {
-    wait_for_output_within(fd, std::time::Duration::from_millis(100)).map(|_| ())
-}
-
-/// [`wait_for_output`] for at most `timeout` (rounded up to a millisecond,
-/// which is poll's resolution). Whether the descriptor became ready: `false`
-/// is a timeout or an interruption, both of which hand control back to the
-/// caller so it can run its own shutdown checks.
+/// Waits for the shared nonblocking master to become readable for at most
+/// `timeout` (rounded up to a millisecond, which is poll's resolution). A
+/// readiness notification, including hangup, only triggers another read:
+/// buffered bytes must still be drained before the reader can declare EOF.
+/// Whether the descriptor became ready: `false` is a timeout or an
+/// interruption, both of which hand control back to the caller so it can run
+/// its own shutdown checks.
+///
+/// This is the short, active wait (a stream's gap, the readiness fallback's
+/// lap). A session with nothing to read sleeps in `readiness`, which ends on
+/// the child's exit as well and has no lap.
 pub(super) fn wait_for_output_within(
     fd: std::os::fd::RawFd,
     timeout: std::time::Duration,
@@ -197,13 +197,18 @@ fn close_paste(writer: &mut (dyn Write + Send)) {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_paste_open, wait_for_output, write_with_timeout};
+    use super::{is_paste_open, wait_for_output_within, write_with_timeout};
     use std::io::{self, Read, Write};
     use std::os::fd::AsRawFd;
     use std::os::unix::net::UnixStream;
     use std::sync::atomic::AtomicBool;
     use std::sync::Mutex;
     use std::time::{Duration, Instant};
+
+    /// One 100 ms lap, the longest the readiness fallback sleeps.
+    fn wait_for_output(fd: std::os::fd::RawFd) -> io::Result<()> {
+        wait_for_output_within(fd, Duration::from_millis(100)).map(|_| ())
+    }
 
     /// The defect: a poisoned writer lock answered "Terminal writer lock
     /// failed" for the rest of the session, so one panic under it made a live

@@ -20,6 +20,8 @@ pub mod incident;
 #[cfg(unix)]
 mod input;
 mod ipc;
+#[cfg(unix)]
+mod readiness;
 use executor::Executor;
 use flow::{OutputFlow, Route};
 pub use ipc::{control_async, resize_async, write_async};
@@ -267,6 +269,9 @@ struct SessionEntry {
     child: Arc<Mutex<Box<dyn Child + Send + Sync>>>,
     dead: Arc<AtomicBool>,
     flow: Arc<OutputFlow>,
+    /// Times the reader returned from waiting for this session to do
+    /// something: output, an exit, or a timer. An idle session adds none.
+    wakeups: Arc<AtomicU64>,
     tracked_run: Option<String>,
     spawned: TerminalSpawned,
     /// Canonical repository root. `spawned.cwd` is where the process started,
@@ -1596,6 +1601,11 @@ fn spawn_session_inner<R: tauri::Runtime>(
     let start_error = observer
         .as_ref()
         .and_then(|observer| observer.started(&session_id, child.process_id()).err());
+    // Registered before the reader exists and before anything can have asked
+    // the child whether it ran: a child that exits from here on is reported to
+    // the watch, and one that already has is found by the reader's first ask.
+    #[cfg(unix)]
+    let readiness = readiness::Readiness::new(reader_fd, child.process_id());
     let child = Arc::new(Mutex::new(child));
 
     // Drop slave explicitly; master remains open.
@@ -1603,6 +1613,7 @@ fn spawn_session_inner<R: tauri::Runtime>(
 
     let dead = Arc::new(AtomicBool::new(false));
     let output_flow = Arc::new(OutputFlow::default());
+    let wakeups = Arc::new(AtomicU64::new(0));
     let master = Arc::new(Mutex::new(pair.master));
     let entry = SessionEntry {
         master: master.clone(),
@@ -1610,6 +1621,7 @@ fn spawn_session_inner<R: tauri::Runtime>(
         child: child.clone(),
         dead: dead.clone(),
         flow: output_flow.clone(),
+        wakeups: wakeups.clone(),
         tracked_run: observer.as_ref().map(|o| o.run_id().to_owned()),
         spawned: TerminalSpawned {
             id: session_id.clone(),
@@ -1670,6 +1682,8 @@ fn spawn_session_inner<R: tauri::Runtime>(
             let mut reservation = Some(reservation);
             let mut failure = None;
             let mut watcher = watcher;
+            #[cfg(unix)]
+            let mut readiness = readiness;
             // One event's worth: output is gathered here until the tty has
             // nothing more queued, or the event is full.
             let mut buf = [0u8; OUTPUT_CHUNK_BYTES];
@@ -1828,13 +1842,20 @@ fn spawn_session_inner<R: tauri::Runtime>(
                         // open, and EOF will not come while it lives: the
                         // session is over when its own process is, the way
                         // every terminal ends a tab whose shell has exited.
-                        if child_has_exited(&thread_child) {
+                        //
+                        // Asked when the readiness wait says the answer may have
+                        // changed (an exit, a timer, the first lap), not on every
+                        // pass: output alone says nothing about the child.
+                        if readiness.take_exit_hint() && child_has_exited(&thread_child) {
                             break;
                         }
                         // thread_master owns reader_fd until this thread exits.
-                        // Readiness wakes interactive output promptly; the wait
-                        // remains bounded even if a child stops producing data.
-                        if let Err(error) = input::wait_for_output(reader_fd) {
+                        // The kernel wakes this thread for output or for the
+                        // child's exit; a quiet session sleeps, bounded only by
+                        // the safety net.
+                        let waited = readiness.wait();
+                        wakeups.fetch_add(1, Ordering::Relaxed);
+                        if let Err(error) = waited {
                             if !dead_flag.swap(true, Ordering::SeqCst) {
                                 failure =
                                     Some(format!("Terminal output readiness failed: {error}"));
@@ -2367,6 +2388,16 @@ pub fn shutdown_sessions(state: &TerminalSessions) -> Result<(), String> {
         )),
         (failures, _) => Err(format!("Could not stop {failures} terminal sessions")),
     }
+}
+
+/// How many times `session_id`'s reader has woken from an idle wait. `None`
+/// for a session that is not (or no longer) open. An idle session's reader
+/// sleeps until output, an exit or its safety net, so this does not move.
+pub fn reader_wakeups(state: &TerminalSessions, session_id: &str) -> Option<u64> {
+    state
+        .lock_sessions()
+        .get(session_id)
+        .map(|s| s.wakeups.load(Ordering::Relaxed))
 }
 
 /// Acknowledgements release only bytes already emitted for this session.
@@ -4179,6 +4210,30 @@ mod tests {
             thread::sleep(Duration::from_millis(20));
         }
         panic!("{} was never written", file.display());
+    }
+
+    /// The defect: every session's reader woke ten times a second for as long
+    /// as the session lived, to ask "has the shell exited?" and "is there
+    /// output?" of a kernel that would have said when either became true.
+    /// One idle session was ~860k wakeups a day, and the wakeups kept the
+    /// machine out of App Nap.
+    #[cfg(unix)]
+    #[test]
+    fn an_idle_session_does_not_wake_its_reader() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = TerminalSessions::default();
+        let spawned = spawn_script(&state, dir.path(), "echo ready; exec cat".into());
+        // Let the shell start and print before the window opens.
+        thread::sleep(Duration::from_millis(700));
+        let before = reader_wakeups(&state, &spawned.id).expect("open session");
+        thread::sleep(Duration::from_millis(1500));
+        let after = reader_wakeups(&state, &spawned.id).expect("open session");
+        kill_session(&state, &spawned.id).unwrap();
+        assert!(
+            after - before <= 1,
+            "the reader woke {} times in 1.5 s of idleness",
+            after - before
+        );
     }
 
     /// The defect: Close signalled the tty's one foreground group and then the
