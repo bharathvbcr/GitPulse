@@ -257,13 +257,22 @@
           // ---- xterm options that only the real renderer can show.
           // Option+B on a Mac keyboard composes a glyph unless Option is Meta;
           // xterm keys the ESC prefix off keyCode, not the composed character.
-          if (/Mac/.test(navigator.platform)) {
+          // Off a Mac, xterm sends the ESC prefix for Alt without being asked, so
+          // there the row proves the key reaches the PTY and not the option; the
+          // row says which host it ran on, so a pass is never read as more.
+          {
+            const onMac = /Mac/.test(navigator.platform);
             const helper = visible("textarea.xterm-helper-textarea")[0] ?? document.querySelector("textarea.xterm-helper-textarea");
             const writesBeforeOption = written.length;
             helper.focus();
             helper.dispatchEvent(new KeyboardEvent("keydown", { key: "∫", code: "KeyB", keyCode: 66, altKey: true, bubbles: true, cancelable: true }));
             await wait();
-            check("Option+B sends ESC b on macOS instead of composing a glyph", () => written.slice(writesBeforeOption).includes("\u001bb"));
+            check(
+              onMac
+                ? "Option+B sends ESC b on macOS instead of composing a glyph"
+                : "Alt+B sends ESC b (non-macOS host: macOptionIsMeta is not exercised here)",
+              () => written.slice(writesBeforeOption).includes("\u001bb"),
+            );
           }
           // A fractional row height re-snaps every paint. 11px text is where the
           // old 1.15 line height left a half-pixel row on a 2x display.

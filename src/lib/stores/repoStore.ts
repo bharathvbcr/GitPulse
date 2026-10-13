@@ -383,6 +383,19 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
     }, decision.delayMs);
   }
 
+  /**
+   * Re-arms a waiting poll against the current rest. The rest was chosen for
+   * the repository that was active when it was armed; after a switch it may
+   * be a minute (a quiet watched tab) or ten times a slow tab's status, and
+   * the tab now showing deserves its own cadence from the moment it shows.
+   */
+  function rearmStatusPoll() {
+    if (!pollWanted || pollTimer === null) return;
+    clearTimeout(pollTimer);
+    pollTimer = null;
+    armStatusPoll();
+  }
+
   function ensureStatusPoll() {
     if (pollWanted || typeof setTimeout === "undefined") return;
     pollWanted = true;
@@ -1974,6 +1987,7 @@ export function createRepoStore(deps: RepoStoreDeps = {}) {
       watcherRefreshPolicy.onActivated(session.path);
       pollQuietCount = 0;
       pollLastDurationMs = null;
+      rearmStatusPoll();
       // `force` is restore presenting a saved tab, not a person clicking it.
       if (!extras.force) await noteTabActivated(session.path);
       // A parked tab comes back live here; a watched one moves to the front

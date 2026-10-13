@@ -224,6 +224,27 @@ describe("the status poll rests in proportion to what it costs", () => {
   });
 });
 
+describe("the poll's rest follows the tab on screen", () => {
+  it("a switch from a quiet tab polls the new tab within the usual interval, not after the quiet minute", async () => {
+    vi.useFakeTimers();
+    const { store, counters } = harness();
+    await store.openRepo("/r/busy");
+    await store.openRepo("/r/quiet");
+    const busyId = get(store).openTabs.find((tab) => tab.path === "/r/busy")!.id;
+    // The quiet tab is on screen long enough for the poll to settle into its
+    // quiet minute, with the next poll armed a full minute out.
+    await vi.advanceTimersByTimeAsync(3 * 60_000 + 30_000);
+    counters.statusStarts.length = 0;
+
+    await store.activateTab(busyId);
+    const switchedAt = Date.now();
+    await vi.advanceTimersByTimeAsync(7_000);
+
+    // The activation's own snapshot is the first status read; the poll is the second.
+    expect(counters.statusStarts.filter((at) => at >= switchedAt && at - switchedAt <= 7_000).length).toBeGreaterThanOrEqual(2);
+  });
+});
+
 describe("branch churn is asked for only when a tip moved", () => {
   it("makes no cmd_branch_stats call for a refresh that left every tip alone", async () => {
     const { store, counters } = harness();
