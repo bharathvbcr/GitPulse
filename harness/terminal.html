@@ -230,7 +230,7 @@
       async function runChecks() {
         const { results, check, stopped } = createChecks();
         try {
-          const writesBefore = report.writes;
+          let writesBefore = report.writes;
           const status = () => visible('[role="status"]')[0]?.textContent;
           const input = async (text) => {
             const field = label("Find in terminal output");
@@ -253,6 +253,57 @@
             if (bad) throw new Error(JSON.stringify(bad));
             return true;
           });
+
+          // ---- xterm options that only the real renderer can show.
+          // Option+B on a Mac keyboard composes a glyph unless Option is Meta;
+          // xterm keys the ESC prefix off keyCode, not the composed character.
+          // Off a Mac, xterm sends the ESC prefix for Alt without being asked, so
+          // there the row proves the key reaches the PTY and not the option; the
+          // row says which host it ran on, so a pass is never read as more.
+          {
+            const onMac = /Mac/.test(navigator.platform);
+            const helper = visible("textarea.xterm-helper-textarea")[0] ?? document.querySelector("textarea.xterm-helper-textarea");
+            const writesBeforeOption = written.length;
+            helper.focus();
+            helper.dispatchEvent(new KeyboardEvent("keydown", { key: "∫", code: "KeyB", keyCode: 66, altKey: true, bubbles: true, cancelable: true }));
+            await wait();
+            check(
+              onMac
+                ? "Option+B sends ESC b on macOS instead of composing a glyph"
+                : "Alt+B sends ESC b (non-macOS host: macOptionIsMeta is not exercised here)",
+              () => written.slice(writesBeforeOption).includes("\u001bb"),
+            );
+          }
+          // The setting is applied to a live terminal: with it off the same key
+          // composes instead of sending ESC b. Only a Mac has anything to turn off.
+          if (/Mac/.test(navigator.platform)) {
+            interfaceStore.setTerminalOptionAsMeta(false);
+            await wait();
+            const writesBeforeOff = written.length;
+            document.querySelector("textarea.xterm-helper-textarea").dispatchEvent(new KeyboardEvent("keydown", { key: "∫", code: "KeyB", keyCode: 66, altKey: true, bubbles: true, cancelable: true }));
+            await wait();
+            check("with Option as Meta off, Option+B no longer sends ESC b (setting applied live)", () => !written.slice(writesBeforeOff).includes("\u001bb"));
+            interfaceStore.setTerminalOptionAsMeta(true);
+            await wait();
+          }
+          // CHARACTERIZATION, not a fix test: it passes with the old and the
+          // current code. xterm floors a row to whole DEVICE pixels, so the row
+          // height times the display's pixel ratio is an integer at 11px text
+          // (a half-pixel CSS row on a 2x display is still whole device pixels).
+          interfaceStore.setTerminalFontSize(11);
+          await wait(400);
+          check("characterization: rendered rows are a whole number of device pixels at 11px text", () => {
+            const heights = visible(".xterm-rows > div").map((row) => parseFloat(row.style.height));
+            if (!heights.length) throw new Error("no rows rendered");
+            const ratio = window.devicePixelRatio || 1;
+            const bad = heights.filter((height) => Math.abs(height * ratio - Math.round(height * ratio)) > 0.01);
+            if (bad.length) throw new Error(`row heights ${[...new Set(bad)].join(", ")} CSS px at ${ratio}x`);
+            return true;
+          });
+          interfaceStore.setTerminalFontSize(12);
+          await wait(400);
+          // The Option+B above is this block's own write, not linkification's.
+          writesBefore = report.writes;
 
           // ---- Linkification, against the real xterm and the real provider.
           // Source assertions can show the provider is registered; only this

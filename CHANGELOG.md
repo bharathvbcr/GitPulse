@@ -13,6 +13,53 @@ before that tag is pushed.
 
 ### Changed
 
+- **A repository is read one snapshot at a time, and switching back to a tab
+  you just read no longer reads it again.**
+  - A watcher event, a poll, an activation or a mutation's refresh that arrives
+    while a snapshot is running no longer starts a second one beside it. They
+    share one more read, taken after the first. Against a 4 s `git status` and a
+    watcher event every 250 ms, reads used to stack 17 deep on one repository.
+  - Switching to a tab whose snapshot landed in the last 5 s, under a live
+    watch, issues no snapshot read (the tab-switch harness went from 22 IPC
+    calls a switch to 15; the 7 removed are the snapshot reads and the stats
+    drain).
+  - The status poll rests ten times what its last `git status` cost, so a 4 s
+    status keeps git under 10% busy instead of about 40%. A cheap status is still
+    polled every 6 s however long nothing has changed: the worktree watch is
+    non-recursive, so the poll is what sees an edit to a nested file. The watch
+    is re-asserted on a one-minute timer rather than every tenth poll, so a
+    slow repository's longer rest does not lengthen a dead watch's blind window.
+  - Branch churn is not asked for again when no branch tip has moved since the
+    last complete drain, and a cold pass stops starting new tips after 5 s and
+    says so (`capped`), the next call resuming from the cache. The drain stays
+    one call at a time: the backend runs a pass serially on purpose, to keep
+    its git start rate under the app-wide cap.
+  - Identical read-only calls in flight (`cmd_get_status`, `cmd_list_branches`,
+    the graph and a few more, an explicit list) reach the backend once, but
+    only within one generation: any other command (a write, or one not on the
+    list) and every watcher event ends the generation, so a refresh asked for
+    after a change never rides a read that began before it. A caller that gives
+    up leaves the call running for the others.
+- **Open tabs no longer hold their commit history, and terminal history is a
+  setting.**
+  - The graph keeps the rows of the 6 most recently used repositories. A tab
+    you have not looked at in a while shows the loading state and reloads
+    when you return, at the page size and with the commit selected that it had.
+    Measured with `scripts/memory-footprint.mjs` on the two committed
+    real-repository fixtures, a 5,000-row page is about 3 MB (600 to 760 bytes a
+    row), and more once you "load more".
+  - **Settings → Appearance → Terminal scrollback** sets the rows each terminal
+    keeps: 5,000 for shells as before, 1,000 for agent CLIs and task runs.
+    xterm stores twelve bytes per column per row whether or not the row has text,
+    so a filled 200-column session of 5,000 rows holds 11.6 MB (about 14 MB with
+    its JavaScript objects), against 2.4 MB at 1,000 rows. Changing the setting trims
+    open terminals at once.
+  - On macOS, Option is Meta in the terminal by default (Option+B / Option+F
+    send ESC b / ESC f), and Option-click selects inside mouse-reporting
+    programs. **Settings → Appearance → Option as Meta in terminals** turns it
+    off, for a layout that types a character with Option (such as `@` on a
+    German keyboard) and so cannot type it in a terminal while it is on. The
+    setting applies to open terminals at once and is hidden off macOS.
 - **Switching repository tabs no longer rebuilds the sidebar, the view shell
   or the status bar.** All three were keyed on the active repository's path, so
   every switch destroyed and recreated them. They now stay mounted and re-point

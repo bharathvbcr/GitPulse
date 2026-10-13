@@ -61,7 +61,8 @@ sessions. Selecting a third tab replaces the second pane.
 
 **Find** searches the active session's retained output, including wrapped lines and
 Unicode text. It supports next/previous matches and case sensitivity. Search is
-literal, limited to 256 characters, and retains the existing 5,000-line scrollback.
+literal, limited to 256 characters, and searches whatever scrollback the session keeps
+(see **Scrollback** below).
 At 1,000 highlighted results the UI reports **1000+ matches**, not an exact total.
 
 Use **Latest output** to return from scrollback. **Clear scrollback** retains the
@@ -195,8 +196,9 @@ restart the session before entering more input.
 
 The native PTY pauses after 256 KiB of output awaiting renderer acknowledgements.
 If the renderer stops acknowledging for 30 seconds, the session closes with a
-delivery error. This bounds output in transit; retained history is still limited
-to 5,000 scrollback lines. Copy/export includes that retained buffer, not output
+delivery error. This bounds output in transit; retained history is limited
+to the session's scrollback (5,000 lines for a shell and 1,000 for an agent by
+default). Copy/export includes that retained buffer, not output
 already evicted. Exports are limited to 16 MiB.
 
 Listener attachment, input, resize, and close requests have five-second frontend
@@ -239,6 +241,33 @@ opened for an unrelated reason.
 
 Hyperlinks a program embeds itself (OSC 8) obey the same allowlist, checked
 against the escape sequence's target rather than its display text.
+
+## Scrollback
+
+**Settings → Appearance → Terminal scrollback** sets how many rows of history a
+terminal keeps, separately for shells (default 5,000) and for agent CLIs and
+task runs (default 1,000). The value is read when a terminal starts, and changing
+it applies to terminals already open: lowering it trims their oldest rows at
+once. Accepted values are 100 to 50,000.
+
+xterm allocates twelve bytes per column for every row of history whether or not
+the row holds text, so a filled 5,000-row session 200 columns wide holds about
+11.6 MB (measured against the bundled xterm 6.0.0: 11.56 MB of cell storage plus
+about 2.4 MB of JavaScript objects). The terminals of every repository tab you
+have visited stay open, which is why agents, whose useful history is the
+transcript the CLI keeps itself, default lower.
+
+## Option as Meta (macOS)
+
+On macOS, Option is Meta in the terminal by default: Option+B and Option+F send
+`ESC b` and `ESC f` (word motion in readline and zle) rather than composing a
+glyph, and Option-click still selects text in a program that has mouse reporting
+on. The cost is that a layout which types a character with Option (for example
+`@` on a German keyboard) cannot type it inside a terminal.
+
+**Settings → Appearance → Option as Meta in terminals** turns it off, for that
+trade-off. The change applies to terminals already open. The setting is not
+shown, and does nothing, off macOS.
 
 ## Screen reader support
 

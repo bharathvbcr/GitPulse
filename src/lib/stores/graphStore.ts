@@ -5,6 +5,7 @@ import { diagnostics, type DiagnosticsStore } from "../diagnostics/diagnostics";
 import type { VisualCommitRow, LaneConnection } from "../canvas/GraphRenderer";
 import {
   DEFAULT_MAX_COMMITS,
+  GRAPH_CACHE_LIMIT,
   nextLoadLimit,
 } from "./graphLimits";
 import { normalizeGraphQuery } from "../graph/graphFetchScheduler";
@@ -224,6 +225,21 @@ export interface GraphState {
   mainlineName: string | null;
 }
 
+/**
+ * What is kept of a repository whose rows were shed: the view it was showing
+ * (so a reload asks for the same page, query, branch and scope) and which
+ * commit was selected. No rows: the next load repopulates them through the
+ * ordinary stale-while-revalidate path, with the loading state because there is
+ * nothing to show meanwhile.
+ */
+interface ShedView {
+  query: string;
+  revision: string | null;
+  refScope: RefScope;
+  maxCommits: number;
+  selectedCommitId: string | null;
+}
+
 interface CachedGraph {
   rows: VisualCommitRow[];
   commits: VisualCommitRow[];
@@ -361,8 +377,11 @@ export function createGraphStore(
      * to reset query and branch.
      */
     refScope?: () => RefScope;
+    /** How many repositories keep their rows; see {@link GRAPH_CACHE_LIMIT}. */
+    cacheLimit?: number;
   } = {}
 ) {
+  const cacheLimit = Math.max(1, Math.floor(deps.cacheLimit ?? GRAPH_CACHE_LIMIT));
   const invokeFn = deps.invoke ?? (invoke as InvokeFn);
   // Normalized at the seam: a persisted preference is user data, and the IPC
   // boundary must never receive a value the backend will refuse to
@@ -378,7 +397,16 @@ export function createGraphStore(
   // default sink, same pattern as the invoke seam above.
   const reportFailure =
     deps.diagnostics?.warn ?? ((source: string, detail: unknown) => diagnostics.warn(source, detail));
+  /**
+   * Repositories holding their rows, least recently used first (a Map keeps
+   * insertion order; {@link touch} re-inserts). Bounded by `cacheLimit`.
+   */
   const cache = new Map<string, CachedGraph>();
+  /**
+   * Repositories whose rows were shed to stay within `cacheLimit`. Dropped
+   * with the tab (`evict`), like everything else held per path.
+   */
+  const shed = new Map<string, ShedView>();
   /**
    * Ordering epochs come from store-wide monotonic counters, so a value is
    * never handed out twice. That is what makes pruning safe: evict() deletes
@@ -441,7 +469,43 @@ export function createGraphStore(
   }
 
   function limitFor(repoPath: string): number {
-    return cache.get(repoPath)?.maxCommits ?? DEFAULT_MAX_COMMITS;
+    return cache.get(repoPath)?.maxCommits ?? shed.get(repoPath)?.maxCommits ?? DEFAULT_MAX_COMMITS;
+  }
+
+  /** Marks `path` most recently used. */
+  function touch(path: string, entry: CachedGraph): void {
+    cache.delete(path);
+    cache.set(path, entry);
+  }
+
+  /**
+   * Drops the rows of the least recently used repositories until `cacheLimit`
+   * remain. The visible repository is never a victim, whatever its recency.
+   * What a shed repository keeps is a {@link ShedView}; `evict` is the only
+   * thing that forgets it.
+   */
+  function trim(): void {
+    while (cache.size > cacheLimit) {
+      let victim: string | null = null;
+      for (const path of cache.keys()) {
+        if (path !== visiblePath) {
+          victim = path;
+          break;
+        }
+      }
+      if (victim === null) return;
+      const entry = cache.get(victim);
+      cache.delete(victim);
+      if (entry) {
+        shed.set(victim, {
+          query: entry.query,
+          revision: entry.revision,
+          refScope: entry.refScope,
+          maxCommits: entry.maxCommits,
+          selectedCommitId: entry.selectedCommit?.id ?? null,
+        });
+      }
+    }
   }
 
   async function fetchDetails(
@@ -484,6 +548,7 @@ export function createGraphStore(
       }
       const cached = cache.get(path);
       if (cached) {
+        touch(path, cached);
         update((s) => ({
           ...s,
           rows: cached.rows,
@@ -506,8 +571,12 @@ export function createGraphStore(
       }
       update(() => emptyVisible(path, limitFor(path), true));
     },
+    /** How many repositories hold rows right now (at most `cacheLimit`), for tests and diagnostics. */
+    retainedGraphs: (): number => cache.size,
+    /** Everything held for a closed tab: rows, the shed view, and the ordering state. */
     evict: (path: string) => {
       cache.delete(path);
+      shed.delete(path);
       // Prune the ordering maps too: entries for closed repos would otherwise
       // grow without bound. A missing entry orphans every outstanding token
       // for this path (undefined === token is false), which is exactly what
@@ -622,7 +691,7 @@ export function createGraphStore(
           return;
         }
 
-        const keepId = previous?.selectedCommit?.id;
+        const keepId = previous?.selectedCommit?.id ?? shed.get(repoPath)?.selectedCommitId ?? undefined;
         const kept = keepId ? payload.rows.find((row) => row.id === keepId) : undefined;
         const selectedCommit =
           kept ?? (payload.rows.length > 0 ? (payload.rows[0] ?? null) : null);
@@ -650,7 +719,9 @@ export function createGraphStore(
           mainlineName: payload.mainline_name ?? null,
           signature,
         };
-        cache.set(repoPath, next);
+        shed.delete(repoPath);
+        touch(repoPath, next);
+        trim();
         if (visiblePath === repoPath) {
           update((s) => ({
             ...s,
